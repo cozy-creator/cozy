@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -17,8 +19,9 @@ import (
 )
 
 // runReport is one run's execution evidence: cold setup apart from inference, the per-step
-// series, and which ranks ran it. Every fact comes from the daemon's records (durable
-// events and the kept triage bundle); JSON also carries both sources whole.
+// series, which ranks ran it, and each child call it made. Every fact comes from the
+// daemon's records (durable events and the kept triage bundle); JSON also carries both
+// sources whole.
 type runReport struct {
 	Number      int64  `json:"number"`
 	RequestID   string `json:"request_id"`
@@ -38,9 +41,10 @@ type runReport struct {
 	Steps    []reportSteps   `json:"steps,omitempty"`
 	Degree   int             `json:"degree,omitempty"`
 	Ranks    []reportRank    `json:"ranks,omitempty"`
+	Calls    []reportCall    `json:"calls,omitempty"`
 	// Resolved is what the machine installed and which checkpoint each Model slot ran: the
 	// run's reproducible identity, recorded by the machine that chose it.
-	Resolved map[string]any      `json:"resolved,omitempty"`
+	Resolved json.RawMessage     `json:"resolved,omitempty"`
 	Events   []api.EvidenceEvent `json:"events"`
 	Triage   json.RawMessage     `json:"triage,omitempty"`
 	// Result is the run's inline result once this host holds it.
@@ -63,9 +67,6 @@ type reportStage struct {
 	Count       int     `json:"count,omitempty"`
 	Bytes       int64   `json:"bytes,omitempty"`
 	Detail      string  `json:"detail,omitempty"`
-	// Ranks are a GPU call's own ranks, from its release: a child call's attention kernels
-	// live only here, never in the root's triage.
-	Ranks []reportRank `json:"ranks,omitempty"`
 }
 
 type reportSteps struct {
@@ -78,6 +79,32 @@ type reportSteps struct {
 	MaxMS      float64      `json:"max_ms"`
 	Series     [][2]float64 `json:"series,omitempty"` // [end_unix_ms, ms] per step
 	Dropped    int          `json:"series_dropped,omitempty"`
+}
+
+// reportCall is one child call the run made: the function it ran under the author's
+// label, the GPUs it held, its timeline and its per-step times. Runtime records a call
+// on the run's journal when it settles; until then only its phases and grants show.
+type reportCall struct {
+	Number      int           `json:"number"` // its place in the run's call order, from 1
+	Request     string        `json:"request"`
+	Parent      string        `json:"parent,omitempty"`
+	Index       int           `json:"index"` // its index among its parent's calls
+	Attempt     int64         `json:"attempt,omitempty"`
+	Module      string        `json:"module,omitempty"`
+	Function    string        `json:"function,omitempty"`
+	Label       string        `json:"label,omitempty"`
+	Status      string        `json:"status,omitempty"` // empty until Runtime records it settled
+	Error       string        `json:"error,omitempty"`
+	GPUs        []int         `json:"gpus,omitempty"`
+	StartUnixMS int64         `json:"start_unix_ms,omitempty"`
+	MS          float64       `json:"ms"`
+	Stages      []reportStage `json:"stages"`
+	Steps       []reportSteps `json:"steps,omitempty"`
+	// Ranks are the call's own ranks and attention kernels, from its GPU release: a child
+	// call's never reach the root's triage.
+	Ranks []reportRank `json:"ranks,omitempty"`
+
+	timed []reportStage // its latest record's attribution stages, beside Stages until sorted
 }
 
 // reportRank is Runtime's per-rank record, read tolerantly.
@@ -144,6 +171,72 @@ type triageEvidence struct {
 	} `json:"measurements"`
 }
 
+// The evidence events run show reads, each decoded once into its own type. A payload
+// that does not decode is skipped: one odd record never hides the rest.
+
+// gpuEvent is Runtime's grant or release of one call attempt's devices (`request#attempt`).
+type gpuEvent struct {
+	Key      string       `json:"key"`
+	Ordinals []int        `json:"ordinals"`
+	Ranks    []reportRank `json:"ranks"` // a release's per-rank execution evidence
+}
+
+type preparingEvent struct {
+	Stage            string `json:"stage"`
+	Detail           string `json:"detail"`
+	MS               int64  `json:"ms"`
+	StartedUnixMS    int64  `json:"started_unix_ms"`
+	TransferredBytes int64  `json:"transferred_bytes"`
+	OriginBytes      int64  `json:"origin_bytes"`
+	CachedBytes      int64  `json:"cached_bytes"`
+}
+
+// logEvent is one Runtime log record. A phase record (a source download, a conversion, a
+// call's input check) names its phase and elapsed time, and its call when it is one's.
+type logEvent struct {
+	AtUnixMS int64 `json:"at_unix_ms"`
+	Fields   struct {
+		Phase         string   `json:"phase"`
+		ChildRequest  string   `json:"child_request"`
+		ElapsedMS     *float64 `json:"elapsed_ms"`
+		StartedUnixMS int64    `json:"started_unix_ms"`
+		TotalBytes    int64    `json:"total_bytes"`
+		Bytes         int64    `json:"bytes"`
+		MovedBytes    int64    `json:"moved_bytes"`
+		Rate          float64  `json:"rate_bytes_per_second"`
+		Completed     *bool    `json:"completed"`
+		Detail        string   `json:"detail"` // what it found: an executor start's legs, the kernels' compiles
+	} `json:"fields"`
+}
+
+type warningEvent struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type outputsEvent struct {
+	Outputs       []json.RawMessage `json:"outputs"`
+	Bytes         int64             `json:"bytes"`
+	StartedUnixMS int64             `json:"started_unix_ms"`
+	MS            int64             `json:"ms"`
+}
+
+// callEvent is Runtime's record of one settled child call (machine_calls.CallRecord).
+type callEvent struct {
+	Request      string                 `json:"request"`
+	Parent       string                 `json:"parent"`
+	Index        int                    `json:"index"`
+	Attempt      int64                  `json:"attempt"`
+	Module       string                 `json:"module"`
+	Export       string                 `json:"export"`
+	Label        string                 `json:"label"`
+	Status       string                 `json:"status"`
+	Error        string                 `json:"error"`
+	CalledUnixMS int64                  `json:"called_unix_ms"`
+	Stages       map[string]triageTrack `json:"stages"`
+	Steps        map[string]triageTrack `json:"steps"`
+}
+
 func handleRunShow(ctx *Context) *exit.Error {
 	client, problem := dial(ctx)
 	if problem != nil {
@@ -157,7 +250,15 @@ func handleRunShow(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, buildRunReport(life, evidence))
+	report := buildRunReport(life, evidence)
+	if selector := strings.TrimSpace(ctx.Inv.Value("--call")); selector != "" {
+		call, problem := report.call(selector)
+		if problem != nil {
+			return problem
+		}
+		return emit(ctx, callReport{run: report, reportCall: call})
+	}
+	return emit(ctx, report)
 }
 
 func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
@@ -174,46 +275,109 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		report.CollectionPending, report.CollectionError = view.CollectionRefused, view.ObservationError
 	}
 	created, _ := time.Parse(time.RFC3339Nano, life.CreatedAt)
-	granted := map[string]int{}
+	calls := map[string]*reportCall{}
+	call := func(request string) *reportCall {
+		if calls[request] == nil {
+			calls[request] = &reportCall{Request: request, Stages: []reportStage{}}
+		}
+		return calls[request]
+	}
+	type grant struct {
+		stages *[]reportStage
+		index  int
+	}
+	granted := map[string]grant{}        // an open GPU grant's stage, by its key
+	phases := map[string][]reportStage{} // phase records naming a child request, by it
 	for _, event := range evidence.Events {
+		at, _ := time.Parse(time.RFC3339Nano, event.At)
 		switch event.Type {
 		case "machine.gpu.grant":
-			// Runtime's device lease for one call: the ordinals it granted, held until the
-			// matching release.
-			at, _ := time.Parse(time.RFC3339Nano, event.At)
-			key, _ := event.Payload["key"].(string)
-			granted[key] = len(report.Stages)
-			report.Stages = append(report.Stages, reportStage{Name: "GPU " + key, Kind: "gpu",
-				StartUnixMS: at.UnixMilli(), Detail: "ordinals " + fmt.Sprint(event.Payload["ordinals"])})
-		case "machine.gpu.release":
-			key, _ := event.Payload["key"].(string)
-			if index, ok := granted[key]; ok {
-				at, _ := time.Parse(time.RFC3339Nano, event.At)
-				report.Stages[index].MS = float64(at.UnixMilli() - report.Stages[index].StartUnixMS)
-				report.Stages[index].Ranks = releasedRanks(event.Payload["ranks"])
+			// Runtime's device lease for one call attempt, held until the matching release.
+			var lease gpuEvent
+			if json.Unmarshal(event.Payload, &lease) != nil {
+				continue
 			}
+			stage := reportStage{Name: "GPU", Kind: "gpu", StartUnixMS: at.UnixMilli(),
+				Detail: "ordinals " + fmt.Sprint(lease.Ordinals)}
+			stages := &report.Stages
+			if request, _, _ := strings.Cut(lease.Key, "#"); request != life.RequestID {
+				c := call(request)
+				c.GPUs, stages = union(c.GPUs, lease.Ordinals), &c.Stages
+			} else {
+				stage.Name += " " + lease.Key
+			}
+			*stages = append(*stages, stage)
+			granted[lease.Key] = grant{stages, len(*stages) - 1}
+		case "machine.gpu.release":
+			var release gpuEvent
+			if json.Unmarshal(event.Payload, &release) != nil {
+				continue
+			}
+			if open, ok := granted[release.Key]; ok {
+				stage := &(*open.stages)[open.index]
+				stage.MS = float64(at.UnixMilli() - stage.StartUnixMS)
+			}
+			if request, _, _ := strings.Cut(release.Key, "#"); request != life.RequestID && len(release.Ranks) > 0 {
+				call(request).Ranks = release.Ranks
+			}
+			delete(granted, release.Key)
+		case "machine.call":
+			var record callEvent
+			if json.Unmarshal(event.Payload, &record) != nil || record.Request == "" {
+				continue
+			}
+			c := call(record.Request)
+			c.Parent, c.Index, c.Attempt, c.Module, c.Function = record.Parent, record.Index, record.Attempt, record.Module, record.Export
+			c.Label, c.Status, c.Error = record.Label, record.Status, record.Error
+			c.StartUnixMS = record.CalledUnixMS
+			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
+			c.timed = nil
+			for name, track := range record.Stages {
+				c.timed = append(c.timed, reportStage{Name: name, Kind: "inference",
+					StartUnixMS: track.StartedUnixMS, MS: track.TotalMS, Count: track.Count})
+			}
+			c.Steps = stepSummaries(record.Steps)
 		case "machine.resolved":
 			report.Resolved = event.Payload
 		case "machine.warning", "request.warning":
-			code, _ := event.Payload["code"].(string)
-			message, _ := event.Payload["message"].(string)
-			report.Warnings = append(report.Warnings, reportWarning{Code: code, Message: message})
+			var warning warningEvent
+			if json.Unmarshal(event.Payload, &warning) == nil {
+				report.Warnings = append(report.Warnings, reportWarning(warning))
+			}
 		case "request.preparing":
-			report.Stages = append(report.Stages, preparingStage(event.Payload))
+			var preparing preparingEvent
+			if json.Unmarshal(event.Payload, &preparing) == nil {
+				report.Stages = append(report.Stages, preparingStage(preparing))
+			}
 		case "request.log":
-			if stage, ok := phaseStage(event.Payload); ok {
-				report.Stages = append(report.Stages, stage)
+			var record logEvent
+			if json.Unmarshal(event.Payload, &record) != nil {
+				continue
+			}
+			if stage, ok := phaseStage(record); ok {
+				phases[record.Fields.ChildRequest] = append(phases[record.Fields.ChildRequest], stage)
 			}
 		case "request.outputs_fetched":
-			outputs, _ := event.Payload["outputs"].([]any)
-			moved := payloadInt(event.Payload["bytes"])
-			report.Stages = append(report.Stages, reportStage{Name: "output transfer", Kind: "transfer",
-				StartUnixMS: payloadInt(event.Payload["started_unix_ms"]), MS: float64(payloadInt(event.Payload["ms"])),
-				Bytes: moved, Count: len(outputs), Detail: fmt.Sprintf("%d output(s), %s", len(outputs), units.Bytes(moved))})
-		case "request.completed", "request.failed", "request.canceled":
-			if ended, err := time.Parse(time.RFC3339Nano, event.At); err == nil && !created.IsZero() {
-				report.WallMS = ended.Sub(created).Milliseconds()
+			var fetched outputsEvent
+			if json.Unmarshal(event.Payload, &fetched) != nil {
+				continue
 			}
+			report.Stages = append(report.Stages, reportStage{Name: "output transfer", Kind: "transfer",
+				StartUnixMS: fetched.StartedUnixMS, MS: float64(fetched.MS), Bytes: fetched.Bytes, Count: len(fetched.Outputs),
+				Detail: fmt.Sprintf("%d output(s), %s", len(fetched.Outputs), units.Bytes(fetched.Bytes))})
+		case "request.completed", "request.failed", "request.canceled":
+			if !at.IsZero() && !created.IsZero() {
+				report.WallMS = at.Sub(created).Milliseconds()
+			}
+		}
+	}
+	// A call's phases are its own; a shared preparation's (a model download several calls
+	// wait on) and the run's are the run's.
+	for child, stages := range phases {
+		if c := calls[child]; c != nil && child != "" {
+			c.Stages = append(c.Stages, stages...)
+		} else {
+			report.Stages = append(report.Stages, stages...)
 		}
 	}
 	var triage triageEvidence
@@ -233,16 +397,42 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			report.Stages = append(report.Stages, reportStage{Name: name, Kind: "inference",
 				StartUnixMS: track.StartedUnixMS, MS: track.TotalMS, Count: track.Count})
 		}
-		for name, track := range triage.Measurements.Attribution.Steps {
-			report.Steps = append(report.Steps, stepSummary(name, track))
-		}
-		sort.Slice(report.Steps, func(i, j int) bool { return report.Steps[i].Name < report.Steps[j].Name })
+		report.Steps = stepSummaries(triage.Measurements.Attribution.Steps)
 	}
-	// Setup, GPU wait, then execution phases and inference, then transfer; within an
-	// order, by start (unknown last).
+	sortStages(report.Stages)
+	for _, c := range calls {
+		// A call's own timeline reads in the order it happened.
+		c.Stages = append(c.Stages, c.timed...)
+		sort.SliceStable(c.Stages, func(i, j int) bool { return c.Stages[i].StartUnixMS < c.Stages[j].StartUnixMS })
+		if c.StartUnixMS == 0 && len(c.Stages) > 0 {
+			// Settled before Runtime recorded calls, or still running: its first and last
+			// recorded phase or grant bound it.
+			c.StartUnixMS = c.Stages[0].StartUnixMS
+			for _, stage := range c.Stages {
+				c.MS = max(c.MS, float64(stage.StartUnixMS-c.StartUnixMS)+stage.MS)
+			}
+		}
+		report.Calls = append(report.Calls, *c)
+	}
+	sort.Slice(report.Calls, func(i, j int) bool {
+		a, b := report.Calls[i], report.Calls[j]
+		if a.StartUnixMS != b.StartUnixMS {
+			return a.StartUnixMS < b.StartUnixMS
+		}
+		return a.Request < b.Request
+	})
+	for i := range report.Calls {
+		report.Calls[i].Number = i + 1
+	}
+	return report
+}
+
+// sortStages orders setup, GPU wait, then execution phases and inference, then transfer;
+// within an order, by start (unknown last).
+func sortStages(stages []reportStage) {
 	order := map[string]int{"setup": 0, "gpu": 1, "phase": 2, "inference": 2, "transfer": 3}
-	sort.SliceStable(report.Stages, func(i, j int) bool {
-		a, b := report.Stages[i], report.Stages[j]
+	sort.SliceStable(stages, func(i, j int) bool {
+		a, b := stages[i], stages[j]
 		if order[a.Kind] != order[b.Kind] {
 			return order[a.Kind] < order[b.Kind]
 		}
@@ -254,29 +444,74 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		}
 		return a.Name < b.Name
 	})
-	return report
 }
 
-func preparingStage(payload map[string]any) reportStage {
-	stage, _ := payload["stage"].(string)
+func union(held, more []int) []int {
+	for _, ordinal := range more {
+		if !slices.Contains(held, ordinal) {
+			held = append(held, ordinal)
+		}
+	}
+	slices.Sort(held)
+	return held
+}
+
+// call selects one of the run's calls by its number, its request id (with or without
+// `call-`, or a unique prefix), its label, or its function when only one call ran it.
+func (r runReport) call(selector string) (reportCall, *exit.Error) {
+	if number, err := strconv.Atoi(strings.TrimPrefix(selector, "#")); err == nil {
+		if number >= 1 && number <= len(r.Calls) {
+			return r.Calls[number-1], nil
+		}
+		return reportCall{}, exit.New(exit.NotFound, "run %s has %d call(s); there is no call %d",
+			runReference(r.Number, r.RequestID), len(r.Calls), number)
+	}
+	id := "call-" + strings.TrimPrefix(selector, "call-")
+	for _, match := range []func(reportCall) bool{
+		func(c reportCall) bool { return c.Request == id },
+		func(c reportCall) bool { return strings.EqualFold(c.Label, selector) },
+		func(c reportCall) bool { return strings.HasPrefix(c.Request, id) },
+		func(c reportCall) bool { return c.Function == selector },
+	} {
+		var found []reportCall
+		for _, c := range r.Calls {
+			if match(c) {
+				found = append(found, c)
+			}
+		}
+		if len(found) == 1 {
+			return found[0], nil
+		}
+		if len(found) > 1 {
+			numbers := make([]string, len(found))
+			for i, c := range found {
+				numbers[i] = strconv.Itoa(c.Number)
+			}
+			return reportCall{}, exit.Usagef("%q names %d calls of run %s (%s); pass its number",
+				selector, len(found), runReference(r.Number, r.RequestID), strings.Join(numbers, ", "))
+		}
+	}
+	return reportCall{}, exit.New(exit.NotFound, "run %s has no call %q; `cozy run show %s` lists its calls",
+		runReference(r.Number, r.RequestID), selector, runReference(r.Number, r.RequestID))
+}
+
+func preparingStage(event preparingEvent) reportStage {
 	name := map[string]string{"resolved": "resolve", "downloading": "download",
 		"preparing": "package environment", "connect": "machine connection",
 		"package_preparation": "package preparation", "machine": "machine preparation", "model_defaults": "model defaults",
-		"inputs": "input staging", "submit": "submission"}[stage]
+		"inputs": "input staging", "submit": "submission"}[event.Stage]
 	if name == "" {
-		name = stage
+		name = event.Stage
 	}
-	detail, _ := payload["detail"].(string)
-	row := reportStage{Name: name, Kind: "setup", StartUnixMS: payloadInt(payload["started_unix_ms"]),
-		MS: float64(payloadInt(payload["ms"])), Detail: detail}
-	if moved := payloadInt(payload["transferred_bytes"]); moved > 0 && stage == "downloading" {
+	row := reportStage{Name: name, Kind: "setup", StartUnixMS: event.StartedUnixMS, MS: float64(event.MS), Detail: event.Detail}
+	if moved := event.TransferredBytes; moved > 0 && event.Stage == "downloading" {
 		row.Bytes = moved
 		row.Detail = units.Bytes(moved)
 		if row.MS > 0 {
 			row.Detail += fmt.Sprintf(" at %s/s", units.Bytes(int64(float64(moved)/(row.MS/1000))))
 		}
-		if origin, cached := payloadInt(payload["origin_bytes"]), payloadInt(payload["cached_bytes"]); origin+cached > 0 {
-			row.Detail += fmt.Sprintf(" (origin %s, cached %s)", units.Bytes(origin), units.Bytes(cached))
+		if event.OriginBytes+event.CachedBytes > 0 {
+			row.Detail += fmt.Sprintf(" (origin %s, cached %s)", units.Bytes(event.OriginBytes), units.Bytes(event.CachedBytes))
 		}
 	}
 	return row
@@ -285,35 +520,31 @@ func preparingStage(payload map[string]any) reportStage {
 // phaseStage reads one Runtime phase record: a named piece of execution work (a source
 // download, a conversion, a checkpoint upload) with its elapsed time and, for byte work,
 // what it moved and at what average rate.
-func phaseStage(payload map[string]any) (reportStage, bool) {
-	fields, _ := payload["fields"].(map[string]any)
-	name, _ := fields["phase"].(string)
-	elapsed, timed := number(fields["elapsed_ms"])
-	if name == "" || !timed {
+func phaseStage(record logEvent) (reportStage, bool) {
+	fields := record.Fields
+	if fields.Phase == "" || fields.ElapsedMS == nil {
 		return reportStage{}, false
 	}
-	start := payloadInt(fields["started_unix_ms"])
-	if start == 0 {
-		if at := payloadInt(payload["at_unix_ms"]); at > 0 {
-			start = at - int64(elapsed)
+	elapsed := *fields.ElapsedMS
+	start := fields.StartedUnixMS
+	if start == 0 && record.AtUnixMS > 0 {
+		start = record.AtUnixMS - int64(elapsed)
+	}
+	row := reportStage{Name: fields.Phase, Kind: "phase", StartUnixMS: start, MS: elapsed}
+	if fields.TotalBytes > 0 {
+		row.Bytes = fields.Bytes
+		row.Detail = units.Bytes(row.Bytes) + " of " + units.Bytes(fields.TotalBytes)
+		if fields.MovedBytes != row.Bytes {
+			row.Detail += ", " + units.Bytes(fields.MovedBytes) + " moved"
+		}
+		if fields.Rate > 0 {
+			row.Detail += " at " + units.Bytes(int64(fields.Rate)) + "/s"
 		}
 	}
-	row := reportStage{Name: name, Kind: "phase", StartUnixMS: start, MS: elapsed}
-	if total := payloadInt(fields["total_bytes"]); total > 0 {
-		row.Bytes = payloadInt(fields["bytes"])
-		row.Detail = units.Bytes(row.Bytes) + " of " + units.Bytes(total)
-		if moved := payloadInt(fields["moved_bytes"]); moved != row.Bytes {
-			row.Detail += ", " + units.Bytes(moved) + " moved"
-		}
-		if rate, ok := number(fields["rate_bytes_per_second"]); ok && rate > 0 {
-			row.Detail += " at " + units.Bytes(int64(rate)) + "/s"
-		}
+	if row.Detail == "" {
+		row.Detail = fields.Detail
 	}
-	if detail, _ := fields["detail"].(string); row.Detail == "" && detail != "" {
-		// What the phase found: an executor start's legs, each kernel's compile state.
-		row.Detail = detail
-	}
-	if completed, ok := fields["completed"].(bool); ok && !completed {
+	if fields.Completed != nil && !*fields.Completed {
 		row.Detail = strings.TrimPrefix(row.Detail+"; did not complete", "; ")
 	}
 	return row, true
@@ -327,14 +558,20 @@ func setupStage(name string, start int64, ms float64, created time.Time, detail 
 	return reportStage{Name: name, Kind: "setup", StartUnixMS: start, MS: ms, Detail: detail}
 }
 
-func stepSummary(name string, track triageTrack) reportSteps {
-	steps := reportSteps{Name: name, Count: track.Count, TotalMS: track.TotalMS,
-		FirstMS: track.FirstMS, MinMS: track.MinMS, MaxMS: track.MaxMS, Series: track.Series,
-		Dropped: track.SeriesDropped}
-	if track.Count > 1 {
-		steps.RestMeanMS = (track.TotalMS - track.FirstMS) / float64(track.Count-1)
+// stepSummaries are the step tracks by name.
+func stepSummaries(tracks map[string]triageTrack) []reportSteps {
+	var out []reportSteps
+	for name, track := range tracks {
+		steps := reportSteps{Name: name, Count: track.Count, TotalMS: track.TotalMS,
+			FirstMS: track.FirstMS, MinMS: track.MinMS, MaxMS: track.MaxMS, Series: track.Series,
+			Dropped: track.SeriesDropped}
+		if track.Count > 1 {
+			steps.RestMeanMS = (track.TotalMS - track.FirstMS) / float64(track.Count-1)
+		}
+		out = append(out, steps)
 	}
-	return steps
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // topLegs names the three most expensive legs; JSON keeps every one in the triage bundle.
@@ -351,11 +588,6 @@ func topLegs(legs map[string]float64) string {
 	return strings.Join(parts, ", ")
 }
 
-func payloadInt(value any) int64 {
-	n, _ := number(value)
-	return int64(n)
-}
-
 // span spells milliseconds as seconds, or minutes and seconds past a minute.
 func span(ms float64) string {
 	if ms < 1000 {
@@ -367,16 +599,10 @@ func span(ms float64) string {
 	return fmt.Sprintf("%.1fs", ms/1000)
 }
 
-func (r runReport) Emit(w io.Writer, mode output.Mode) error {
-	if !mode.Human || mode.JSON {
-		// JSON whatever the machine format: the bundle's lists of nested objects are
-		// outside what the TOON encoder round-trips.
-		encoder := json.NewEncoder(w)
-		encoder.SetEscapeHTML(false)
-		return encoder.Encode(r)
-	}
+// offsets spells an instant as its offset from the run's creation.
+func (r runReport) offsets() func(int64) string {
 	created, _ := time.Parse(time.RFC3339Nano, r.CreatedAt)
-	offset := func(unixMS int64) string {
+	return func(unixMS int64) string {
 		if unixMS == 0 || created.IsZero() {
 			return "-"
 		}
@@ -385,6 +611,13 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		}
 		return "-" + span(-float64(unixMS-created.UnixMilli()))
 	}
+}
+
+func (r runReport) Emit(w io.Writer, mode output.Mode) error {
+	if !mode.Human || mode.JSON {
+		return emitJSON(w, r)
+	}
+	offset := r.offsets()
 	fmt.Fprintf(w, "run %d %s  %s", r.Number, r.Status, r.Target)
 	if r.Machine != "" {
 		fmt.Fprintf(w, "  on %s", r.Machine)
@@ -416,75 +649,140 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		fmt.Fprintf(w, "collection pending: %s — %s\n", r.CollectionPending, r.CollectionError)
 	}
 	table := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if len(r.Stages) > 0 {
+	emitTimeline(w, table, r.Stages, r.Steps, offset, mode.Full)
+	emitRanks(w, table, r.Degree, r.Ranks, offset, mode.Full)
+	if len(r.Calls) == 0 {
+		return nil
+	}
+	fmt.Fprintf(w, "\ncalls (%d)\n", len(r.Calls))
+	fmt.Fprintln(table, "#\tCALL\tFUNCTION\tSTATUS\tGPUS\tSTART\tTIME\tSTEPS\tATTENTION")
+	for _, c := range r.Calls {
+		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.Number, clip(c.name(), 40), dash(c.Function),
+			dash(c.Status), dash(gpuList(c.GPUs)), offset(c.StartUnixMS), span(c.MS), dash(stepsCell(c.Steps)),
+			dash(clip(served(c.Ranks), 40)))
+	}
+	table.Flush()
+	if !mode.Full {
+		fmt.Fprintf(w, "\n`cozy run show %s --call <#>` shows one call's stages, steps, ranks and attention kernels; --full shows every call's.\n",
+			runReference(r.Number, r.RequestID))
+		return nil
+	}
+	for _, c := range r.Calls {
+		fmt.Fprintln(w)
+		c.emit(w, table, len(r.Calls), offset, true)
+	}
+	return nil
+}
+
+// callReport is one call of a run (`cozy run show <run> --call <call>`).
+type callReport struct {
+	run runReport
+	reportCall
+}
+
+func (c callReport) Emit(w io.Writer, mode output.Mode) error {
+	if !mode.Human || mode.JSON {
+		return emitJSON(w, c.reportCall)
+	}
+	fmt.Fprintf(w, "run %d %s  %s", c.run.Number, c.run.Status, c.run.Target)
+	if c.run.Machine != "" {
+		fmt.Fprintf(w, "  on %s", c.run.Machine)
+	}
+	fmt.Fprintln(w)
+	c.emit(w, tabwriter.NewWriter(w, 0, 0, 2, ' ', 0), len(c.run.Calls), c.run.offsets(), mode.Full)
+	return nil
+}
+
+// emit prints one call: what it ran, its timeline on the run's clock, its steps and ranks.
+func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset func(int64) string, full bool) {
+	fmt.Fprintf(w, "call %d of %d  %s", c.Number, calls, c.name())
+	if c.Function != "" {
+		fmt.Fprintf(w, "  %s", c.Function)
+	}
+	fmt.Fprintf(w, "  %s  %s\n", dash(c.Status), span(c.MS))
+	fmt.Fprintf(w, "request %s", c.Request)
+	if c.Parent != "" {
+		fmt.Fprintf(w, " · parent %s · index %d · attempt %d", c.Parent, c.Index, c.Attempt)
+	}
+	if len(c.GPUs) > 0 {
+		fmt.Fprintf(w, " · GPUs %s", gpuList(c.GPUs))
+	}
+	fmt.Fprintln(w)
+	if c.Error != "" {
+		fmt.Fprintf(w, "error: %s\n", c.Error)
+	}
+	emitTimeline(w, table, c.Stages, c.Steps, offset, full)
+	emitRanks(w, table, len(c.Ranks), c.Ranks, offset, full)
+}
+
+// name is the call's label, else its request id's first eight digits.
+func (c reportCall) name() string {
+	if c.Label != "" {
+		return c.Label
+	}
+	return clip(c.Request, len("call-")+9)
+}
+
+func emitTimeline(w io.Writer, table *tabwriter.Writer, stages []reportStage, steps []reportSteps, offset func(int64) string, full bool) {
+	if len(stages) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(table, "STAGE\tKIND\tSTART\tTIME\tDETAIL")
-		for _, stage := range r.Stages {
+		for _, stage := range stages {
 			detail := stage.Detail
 			if stage.Kind == "inference" && stage.Count > 1 {
 				detail = strings.TrimPrefix(detail+fmt.Sprintf(", %d×", stage.Count), ", ")
 			}
 			if stage.Kind == "phase" {
-				detail = output.Elide(detail, 120, mode.Full)
+				detail = output.Elide(detail, 120, full)
 			}
 			fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n", stage.Name, stage.Kind, offset(stage.StartUnixMS),
 				span(stage.MS), detail)
 		}
 		table.Flush()
 	}
-	if len(r.Steps) > 0 {
+	if len(steps) > 0 {
 		fmt.Fprintln(w)
 	}
-	for _, steps := range r.Steps {
-		fmt.Fprintf(w, "steps %s: %d in %s", steps.Name, steps.Count, span(steps.TotalMS))
-		if steps.Count > 1 {
-			fmt.Fprintf(w, "; first %s, then mean %s (min %s, max %s)", span(steps.FirstMS),
-				span(steps.RestMeanMS), span(steps.MinMS), span(steps.MaxMS))
+	for _, track := range steps {
+		fmt.Fprintf(w, "steps %s: %d in %s", track.Name, track.Count, span(track.TotalMS))
+		if track.Count > 1 {
+			fmt.Fprintf(w, "; first %s, then mean %s (min %s, max %s)", span(track.FirstMS),
+				span(track.RestMeanMS), span(track.MinMS), span(track.MaxMS))
 		}
 		fmt.Fprintln(w)
 	}
-	if len(r.Ranks) > 0 {
-		fmt.Fprintf(w, "\nranks (degree %d)\n", r.Degree)
-		fmt.Fprintln(table, "RANK\tGPU\tARCH\tUUID\tPID\tSTART\tTIME\tATTENTION")
-		for _, rank := range r.Ranks {
-			gpu, start, took := "-", "-", "-"
-			if rank.Ordinal >= 0 {
-				gpu = fmt.Sprint(rank.Ordinal)
-			}
-			if rank.StartUS > 0 {
-				start, took = offset(rank.StartUS/1000), span(float64(rank.EndUS-rank.StartUS)/1000)
-			}
-			fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", rank.Rank, gpu, dash(rank.Arch),
-				output.Elide(dash(rank.UUID), 17, mode.Full), rank.PID, start, took, rankAttention(rank))
-		}
-		table.Flush()
-		emitKernels(w, table, "attention kernels", r.Ranks, mode.Full)
-	}
-	for _, stage := range r.Stages {
-		emitKernels(w, table, "attention kernels, "+stage.Name, stage.Ranks, mode.Full)
-	}
-	return nil
 }
 
-// releasedRanks reads a GPU release's ranks tolerantly; an older machine sends none.
-func releasedRanks(value any) []reportRank {
-	raw, err := json.Marshal(value)
-	var ranks []reportRank
-	if err != nil || json.Unmarshal(raw, &ranks) != nil {
-		return nil
+func emitRanks(w io.Writer, table *tabwriter.Writer, degree int, ranks []reportRank, offset func(int64) string, full bool) {
+	if len(ranks) == 0 {
+		return
 	}
-	return ranks
+	fmt.Fprintf(w, "\nranks (degree %d)\n", degree)
+	fmt.Fprintln(table, "RANK\tGPU\tARCH\tUUID\tPID\tSTART\tTIME\tATTENTION")
+	for _, rank := range ranks {
+		gpu, start, took := "-", "-", "-"
+		if rank.Ordinal >= 0 {
+			gpu = fmt.Sprint(rank.Ordinal)
+		}
+		if rank.StartUS > 0 {
+			start, took = offset(rank.StartUS/1000), span(float64(rank.EndUS-rank.StartUS)/1000)
+		}
+		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", rank.Rank, gpu, dash(rank.Arch),
+			output.Elide(dash(rank.UUID), 17, full), rank.PID, start, took, rankAttention(rank))
+	}
+	table.Flush()
+	emitKernels(w, table, ranks, full)
 }
 
 // emitKernels prints each rank's attention kernels: the one that served, and for every other
 // kernel of its chains why it did not (still compiling, failed, absent, unsupported), with
 // its compile time on this machine.
-func emitKernels(w io.Writer, table *tabwriter.Writer, title string, ranks []reportRank, full bool) {
+func emitKernels(w io.Writer, table *tabwriter.Writer, ranks []reportRank, full bool) {
 	header := false
 	for _, rank := range ranks {
 		for _, kernel := range rank.Attention.Kernels {
 			if !header {
-				fmt.Fprintln(w, "\n"+title)
+				fmt.Fprintln(w, "\nattention kernels")
 				fmt.Fprintln(table, "RANK\tKERNEL\tSTATE\tCOMPILE\tDETAIL")
 				header = true
 			}
@@ -503,6 +801,63 @@ func emitKernels(w io.Writer, table *tabwriter.Writer, title string, ranks []rep
 		}
 	}
 	table.Flush()
+}
+
+// emitJSON writes JSON whatever the machine format: the bundle's lists of nested objects
+// are outside what the TOON encoder round-trips.
+func emitJSON(w io.Writer, value any) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(value)
+}
+
+// stepsCell is a call's step tracks at a glance: count and mean step time.
+func stepsCell(steps []reportSteps) string {
+	parts := make([]string, 0, len(steps))
+	for _, track := range steps {
+		parts = append(parts, fmt.Sprintf("%s %d× %s", track.Name, track.Count, span(track.TotalMS/float64(max(track.Count, 1)))))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// served names the attention kernels that served a call's ranks, else what its ranks observed.
+func served(ranks []reportRank) string {
+	var names []string
+	for _, rank := range ranks {
+		for _, kernel := range rank.Attention.Kernels {
+			if kernel.Served && !slices.Contains(names, kernel.Kernel) {
+				names = append(names, kernel.Kernel)
+			}
+		}
+	}
+	if len(names) > 0 {
+		return strings.Join(names, ",")
+	}
+	for _, rank := range ranks {
+		if seen := rank.Attention.Observed; seen != "" && !slices.Contains(names, seen) {
+			names = append(names, seen)
+		}
+	}
+	return strings.Join(names, ",")
+}
+
+// gpuList spells ordinals, a contiguous run as its bounds: "0", "0-3", "0 2".
+func gpuList(ordinals []int) string {
+	if n := len(ordinals); n > 2 && ordinals[n-1]-ordinals[0] == n-1 {
+		return fmt.Sprintf("%d-%d", ordinals[0], ordinals[n-1])
+	}
+	parts := make([]string, len(ordinals))
+	for i, ordinal := range ordinals {
+		parts[i] = strconv.Itoa(ordinal)
+	}
+	return strings.Join(parts, " ")
+}
+
+func clip(value string, limit int) string {
+	if runes := []rune(value); len(runes) > limit {
+		return string(runes[:limit-1]) + "…"
+	}
+	return value
 }
 
 func dash(value string) string {

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -45,7 +46,9 @@ type Event struct {
 	Type      string
 	Attempt   int64
 	Payload   map[string]any
-	At        string
+	// Raw is the payload as recorded, for a reader that decodes it into its own type.
+	Raw json.RawMessage
+	At  string
 }
 
 // Terminal event types. A client stops on these and never reconnects (the absorbing
@@ -231,31 +234,53 @@ func (s *Store) failQueuedRequest(requestID string, expected *Request, payload m
 // one of these instead of one connection per request (the connection-cap reason the
 // local host multiplexes at all).
 func (s *Store) EventsAfter(requestID string, cursor int64, limit int) ([]Event, *exit.Error) {
-	return s.events(requestID, cursor, limit, false)
+	return s.events(requestID, cursor, limit)
 }
 
-// EvidenceEvents is one request's durable record without its imported progress samples.
-// A multi-hour machine run journals a sample a second; those ticks would otherwise fill
-// a bounded read before its phase records and terminal.
+// maxEvidenceStreams bounds the progress streams one evidence read carries.
+const maxEvidenceStreams = 256
+
+// progressRow is a sample of a narrated position: Runtime's lossy progress lane, and a log
+// carrying a `position` (a prefetch's download). progressStream is the stream it samples.
+const (
+	progressRow    = `(type='machine.progress' OR (type='request.log' AND json_extract(payload,'$.fields.position') IS NOT NULL))`
+	progressStream = `COALESCE(json_extract(payload,'$.payload.stage'),json_extract(payload,'$.name')||' '||COALESCE(json_extract(payload,'$.fields.stage'),''))`
+)
+
+// EvidenceEvents is one request's durable record: its first `limit` lifecycle events in
+// order, beside the latest sample of each progress stream. Progress reads under its own
+// bound, coalesced per stream, so no rate of samples displaces a grant, a phase boundary
+// or a terminal (run 1510: 4,065 prefetch positions filled its 4,096 rows).
 func (s *Store) EvidenceEvents(requestID string, limit int) ([]Event, *exit.Error) {
-	return s.events(requestID, 0, limit, true)
+	lifecycle, e := s.scanEvents(`SELECT seq,request_id,type,attempt,payload,at FROM request_events
+		WHERE request_id=? AND type!='machine.triage' AND NOT `+progressRow+` ORDER BY seq LIMIT ?`, requestID, limit)
+	if e != nil {
+		return nil, e
+	}
+	latest, e := s.scanEvents(`SELECT seq,request_id,type,attempt,payload,at FROM request_events WHERE seq IN (
+		SELECT MAX(seq) FROM request_events WHERE request_id=? AND `+progressRow+`
+		GROUP BY type,`+progressStream+` ORDER BY MAX(seq) DESC LIMIT ?)`, requestID, maxEvidenceStreams)
+	if e != nil {
+		return nil, e
+	}
+	out := append(lifecycle, latest...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out, nil
 }
 
-func (s *Store) events(requestID string, cursor int64, limit int, withoutTicks bool) ([]Event, *exit.Error) {
+func (s *Store) events(requestID string, cursor int64, limit int) ([]Event, *exit.Error) {
 	// A kept triage bundle rides beside the events as a document, never as one of them.
 	query := `SELECT seq,request_id,type,attempt,payload,at FROM request_events
 		WHERE seq>? AND type!='machine.triage'`
-	if withoutTicks {
-		query += ` AND type!='machine.progress'`
-	}
 	args := []any{cursor}
 	if requestID != "" {
 		query += ` AND request_id=?`
 		args = append(args, requestID)
 	}
-	query += ` ORDER BY seq LIMIT ?`
-	args = append(args, limit)
+	return s.scanEvents(query+` ORDER BY seq LIMIT ?`, append(args, limit)...)
+}
 
+func (s *Store) scanEvents(query string, args ...any) ([]Event, *exit.Error) {
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the event stream: %s", err)
@@ -270,6 +295,7 @@ func (s *Store) events(requestID string, cursor int64, limit int, withoutTicks b
 		}
 		// One payload a stream consumer cannot read as an object is carried, not allowed
 		// to end every stream reading past it.
+		e.Raw = json.RawMessage(body)
 		if err := json.Unmarshal([]byte(body), &e.Payload); err != nil {
 			var value any
 			if json.Unmarshal([]byte(body), &value) == nil {
@@ -277,6 +303,7 @@ func (s *Store) events(requestID string, cursor int64, limit int, withoutTicks b
 			} else {
 				e.Payload = map[string]any{"unreadable": body}
 			}
+			e.Raw, _ = json.Marshal(e.Payload)
 		}
 		out = append(out, e)
 	}
