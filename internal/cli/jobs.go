@@ -116,6 +116,19 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
+	if !chosen && len(trees) == 0 && providerSourced(overrides.Models) {
+		byRoot, note := sourceByReleaseRoot(ctx, selectedRental)
+		if byRoot {
+			// The machine resolves the source headers-first, narrows to the reviewed profiles
+			// or selects one, and downloads only those members: no host narrowing, no transfer.
+			if models, chosen, e = modelChoices(ctx, target, job, overrides.Models, nil); e != nil {
+				return e
+			}
+		} else {
+			sub.LaneNote = note
+			fmt.Fprintf(ctx.Err, "note: %s\n", note)
+		}
+	}
 	if !chosen {
 		if source, profiles, models, e = resolveJobModelInputs(ctx, target, job, overrides.Models); e != nil {
 			return e
@@ -126,6 +139,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		if len(trees) > 0 {
 			return exit.Usagef("foreign model inputs cannot also use local input trees")
 		}
+		// A new rental, an older Runtime or an editable package: the model transfer lane.
 		return submitSourceTransfer(ctx, "model-upload", source, ctx.Inv.Value("--upload-to"),
 			&sourceInvocation{Target: target, Job: job, Profiles: profiles}, sub)
 	}

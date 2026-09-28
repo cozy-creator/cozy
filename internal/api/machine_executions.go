@@ -24,6 +24,28 @@ type MachineExecutions interface {
 	Withdraw(string)
 	// PruneOperationCache frees one machine's unused cached operation results.
 	PruneOperationCache(ctx context.Context, machine string) (uint32, uint64, bool, *exit.Error)
+	// Lanes is what one machine's Runtime takes now, as its kept workspace reports it.
+	Lanes(ctx context.Context, machine string) (MachineLanes, *exit.Error)
+}
+
+// MachineLanes names the submission lanes a machine's Runtime takes. A job naming a
+// provider source goes by release root only where both hold; elsewhere by model transfer.
+type MachineLanes struct {
+	ReleaseRootJobs    bool `json:"release_root_jobs"`
+	ReleaseRootSources bool `json:"release_root_sources"`
+}
+
+func (s *Server) rentalLanes(w http.ResponseWriter, r *http.Request) {
+	if s.machineExecutions == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+		return
+	}
+	lanes, problem := s.machineExecutions.Lanes(r.Context(), r.PathValue("rental_id"))
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	s.ok(w, r, http.StatusOK, lanes)
 }
 
 // This is a client observation, not an execution or custody receipt of its own.

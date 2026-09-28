@@ -372,6 +372,13 @@ func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
 	return res, e
 }
 
+// RentalLanes is which submission lanes a rental's Runtime takes now.
+func (c *Client) RentalLanes(rentalID string) (api.MachineLanes, *exit.Error) {
+	var lanes api.MachineLanes
+	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/lanes", nil, &lanes)
+	return lanes, problem
+}
+
 func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Error) {
 	var result api.RentalPruneResult
 	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prune", map[string]any{}, &result)

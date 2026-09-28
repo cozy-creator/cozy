@@ -18,10 +18,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -578,5 +584,99 @@ func TestAJobTakesThePreparedPathOnAMachineWithoutReleaseRootJobs(t *testing.T) 
 	_, out := runCozy(t, root, "run", "show", id, "--json")
 	if !strings.Contains(out, "lacks release_root_jobs") {
 		t.Fatalf("the run does not say it took the prepared job path: %s", out)
+	}
+}
+
+// sourceJobHome is a rented pod whose Runtime either takes jobs with provider sources by
+// release root or (older) takes neither.
+func sourceJobHome(t *testing.T, older bool) (string, *releaseMachine, *records.Store, *ladderHub) {
+	t.Helper()
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machine := newReleaseMachine()
+	machine.jobsOlder.Store(older)
+	root := startRentedPod(t, h, &fakePod{}, func(string) machineExecutionPeer { return machine },
+		"--extra-index-url https://public.example/v1/index/proof/simple/\n")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	t.Cleanup(func() { store.Close() })
+	return root, machine, store, h
+}
+
+const sourceJobModel = "hf://example/diffusers@cccccccccccccccccccccccccccccccccccccccc"
+
+func sourceJob(t *testing.T, root, key string) (int, string) {
+	return runCozy(t, root, "run", ladderPackage+"/long_form", "model.source="+sourceJobModel,
+		"--source-profile", "source=fixture/diffusers/1", "--rental=tessa", "--json", "--idempotency-key", key)
+}
+
+// A job's provider-source Model on a machine whose Runtime makes it goes by release root:
+// the machine narrows the source; the host reads no provider and records no transfer.
+func TestAJobsProviderSourceGoesByReleaseRootWhereTheMachineMakesIt(t *testing.T) {
+	root, machine, store, _ := sourceJobHome(t, false)
+	if code, out := sourceJob(t, root, "source-root"); code != 0 {
+		t.Fatalf("the source job was refused [exit %d]: %s", code, out)
+	}
+	var id string
+	waitFor(t, root, "the source job's acceptance", func() bool {
+		row, problem := store.RequestByIdempotencyKey("source-root")
+		if problem == nil && row != nil {
+			id = row.ID
+		}
+		return id != "" && machine.accepted(id)
+	})
+	row, problem := store.RequestRow(id)
+	fatal(t, problem)
+	machine.mu.Lock()
+	last := machine.roots[len(machine.roots)-1]
+	machine.mu.Unlock()
+	if row.ModelTransfer != nil || !last.Job || len(last.Models) != 1 || last.Models[0].Source != sourceJobModel ||
+		!slices.Equal(last.Models[0].Profiles, []string{"fixture/diffusers/1"}) {
+		t.Fatalf("the source job did not go by release root: transfer %+v, root %+v", row.ModelTransfer, last)
+	}
+}
+
+// On an older Runtime the same job takes the model transfer lane: its producer validation
+// answers, and no release root reaches the machine.
+func TestAJobsProviderSourceTakesTheTransferLaneOnAnOlderMachine(t *testing.T) {
+	root, machine, _, _ := sourceJobHome(t, true)
+	code, out, said := runCozyStreams(t, root, "run", ladderPackage+"/long_form", "model.source="+sourceJobModel,
+		"--source-profile", "source=fixture/diffusers/1", "--rental=tessa", "--json", "--idempotency-key", "source-transfer")
+	if code == 0 || !strings.Contains(out, "model_producer") || !strings.Contains(said, "lacks release_root_jobs") {
+		t.Fatalf("an older machine's source job did not take the transfer lane [exit %d]: %s\n%s", code, out, said)
+	}
+	machine.mu.Lock()
+	defer machine.mu.Unlock()
+	if len(machine.roots) != 0 {
+		t.Fatalf("an older machine was sent %d release roots", len(machine.roots))
+	}
+}
+
+// A job recorded as the machine's to make but dispatched to a Runtime without the capability
+// (an update refused onto an older Runtime, a rollback) is refused by name, never re-routed.
+func TestAJobsSourceChoiceIsRefusedByNameWhereTheMachineCannotMakeIt(t *testing.T) {
+	root, machine, store, h := sourceJobHome(t, true)
+	selected, problem := rental.Resolve(store, "tessa")
+	fatal(t, problem)
+	// This process froze its config at its first load; the daemon's client addresses it.
+	cfg, problem := config.Load()
+	fatal(t, problem)
+	cfg = cfg.ForHub(h.server.URL)
+	cfg.Home = root
+	daemonClient, problem := client.Open(cfg, daemon.Probe(cfg))
+	fatal(t, problem)
+	handle, problem := daemonClient.SubmitJob(api.JobSubmission{Package: ladderPackage, Function: "long_form",
+		Input: []byte("{}"), Release: "1.0.0", Rental: true, RentalRequired: true, RequestedRental: selected.Row.ID,
+		Models: []orchestrator.ModelRef{{Choice: true, Package: ladderPackage, Slot: "long_form.models.source",
+			BindingPath: "long_form.models.source", Source: sourceJobModel, Profiles: []string{"fixture/diffusers/1"}}}}, "stale-lane")
+	fatal(t, problem)
+	waitFor(t, root, "the refusal by name", func() bool {
+		_, out := runCozy(t, root, "run", "show", handle.JobID, "--json")
+		return strings.Contains(out, "no longer advertises release_root_jobs")
+	})
+	machine.mu.Lock()
+	defer machine.mu.Unlock()
+	if len(machine.roots) != 0 || machine.prepared.Load() != 0 {
+		t.Fatalf("a machine without release_root_jobs was sent %d roots and %d prepared jobs", len(machine.roots), machine.prepared.Load())
 	}
 }
