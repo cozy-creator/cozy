@@ -21,7 +21,9 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/capability"
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"github.com/cozy-creator/cozy/tests/product/webrtctest"
@@ -391,4 +393,27 @@ func TestRunPlayPrintsALinkThatPlays(t *testing.T) {
 	_, err = page.Goto(printed.Link)
 	must(t, err)
 	playerWait(t, page, "the printed link plays the film to its end", `video().ended && decoded(1.5, 36)`)
+}
+
+// A rented run's growing video says, once, how to watch it in a browser; a local run's does not.
+func TestAwaitNamesThePlayCommandForARentedVideo(t *testing.T) {
+	product := func(output string, rev float64) localapi.Event {
+		return localapi.Event{Type: "request.product", RequestID: "job-film", Payload: map[string]any{"item": "12/" + output,
+			"output": output, "op": "set", "rev": rev, "length": 1000 * rev, "media_type": "video/mp4", "path": "/out/12-" + output + ".mp4"}}
+	}
+	for _, rented := range []bool{true, false} {
+		p, buf := progressSink(output.Mode{Human: true}, false)
+		if rented {
+			p.On(localapi.Event{Type: "request.rentals", RequestID: "job-film", Payload: map[string]any{"line": "renting H100 on jaguarman"}})
+		}
+		p.On(product("video", 1))
+		p.On(product("video", 2))
+		p.On(product("preview", 1))
+		p.Done()
+		got := buf.String()
+		plays := strings.Count(got, "play in a browser: cozy run play job-film")
+		if rented && (plays != 2 || !strings.Contains(got, "cozy run play job-film --output preview")) || !rented && plays != 0 {
+			t.Fatalf("rented=%t:\n%s", rented, got)
+		}
+	}
 }
