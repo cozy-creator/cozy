@@ -35,6 +35,8 @@ type liveView struct {
 	hasOverall                   bool
 	eta                          time.Duration
 	hasETA                       bool
+	held                         map[string][]any // this run's GPU grants: call key -> ordinals
+	waits                        []gpuWait
 
 	shown   []string // rows on screen
 	cells   []int    // their widths, to erase them after a resize
@@ -61,6 +63,14 @@ type liveStage struct {
 	stepSeconds    float64
 	steps          int
 	position       float64
+}
+
+// gpuWait is one of this run's calls waiting for GPUs; ownRun says only this run holds them.
+type gpuWait struct {
+	key                  string
+	width                int
+	ownRun, behindOthers bool
+	since                time.Time
 }
 
 type liveDone struct {
@@ -186,6 +196,8 @@ func (p *RunProgress) onLive(e localapi.Event) {
 	case "failed", "canceled":
 		p.settle(kind, at)
 		return
+	case "machine.gpu.grant", "machine.gpu.release", "machine.gpu.wait":
+		v.gpu(e, at)
 	case "attempt_failed", "requeued":
 		v.retireAll(at, true)
 		v.executing, v.status = false, "retrying"
@@ -210,8 +222,8 @@ func (p *RunProgress) liveProgress(fields map[string]any, at time.Time) {
 	}
 	name, _ := fields["stage"].(string)
 	name = strings.TrimSpace(name)
-	if name == "" {
-		return
+	if name == "" || strings.HasPrefix(name, "Waiting for GPU (") {
+		return // Runtime's words for a gpu.wait, which this view reads typed
 	}
 	scope, _, nested := strings.Cut(name, " / ")
 	s := v.open(scope)
@@ -238,6 +250,32 @@ func (p *RunProgress) liveProgress(fields map[string]any, at time.Time) {
 	// A child's own scope (a weights download) has nothing left once its count is whole.
 	if !s.announced && s.counted && s.current == s.total {
 		v.retire(s, at, false)
+	}
+}
+
+// gpu follows this run's device grants and GPU waits. A wait whose blockers are all this
+// run's own execution is not behind another run.
+func (v *liveView) gpu(e localapi.Event, at time.Time) {
+	key, _ := e.Payload["key"].(string)
+	v.waits = slices.DeleteFunc(v.waits, func(w gpuWait) bool { return w.key == key })
+	switch e.Type {
+	case "machine.gpu.grant":
+		if v.held == nil {
+			v.held = map[string][]any{}
+		}
+		v.held[key], _ = e.Payload["ordinals"].([]any)
+	case "machine.gpu.release":
+		delete(v.held, key)
+	default:
+		width, _ := number(e.Payload["width"])
+		blocked, _ := e.Payload["blocked_by"].([]any)
+		wait := gpuWait{key: key, width: int(width), ownRun: len(blocked) > 0, since: at}
+		for _, root := range blocked {
+			if root != e.RequestID {
+				wait.ownRun, wait.behindOthers = false, true
+			}
+		}
+		v.waits = append(v.waits, wait)
 	}
 }
 
@@ -405,6 +443,22 @@ func (p *RunProgress) frame(at time.Time, width, height int) []string {
 	}
 	for _, s := range v.scopes {
 		active = append(active, s.rows(at, width)...)
+	}
+	for _, w := range v.waits {
+		if !v.ended.IsZero() {
+			break
+		}
+		held := map[any]bool{}
+		for _, ordinals := range v.held {
+			for _, ordinal := range ordinals {
+				held[ordinal] = true
+			}
+		}
+		detail := api.GPUWaitDetail(w.width, len(held), w.ownRun)
+		if w.behindOthers {
+			detail += ", behind another run"
+		}
+		active = append(active, "  ▸ waiting for GPU ("+detail+") · "+shortDuration(max(at.Sub(w.since), 0)))
 	}
 	if v.hasOverall && v.ended.IsZero() {
 		row := "  overall " + meter(v.overall, width)

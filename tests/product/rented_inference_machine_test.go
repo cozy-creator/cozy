@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -103,6 +104,19 @@ func (m *runtimeMachine) record(kind string, body []byte) {
 	m.state.Sequence++
 	m.events = append(m.events, &pb.MachineExecutionEvent{Sequence: m.state.Sequence, AttemptOrdinal: 1,
 		AtMs: uint64(time.Now().UnixMilli()), Kind: kind, BodyCanonicalBytes: body})
+}
+
+// waitOnOwnCalls gives this run's other calls all four GPUs and holds one more call
+// behind them: the wait's only blocker is the run itself.
+func (m *runtimeMachine) waitOnOwnCalls() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for ordinal := range 4 {
+		grant, _ := json.Marshal(map[string]any{"key": fmt.Sprintf("call-%d#1", ordinal), "ordinals": []int{ordinal}})
+		m.record("gpu.grant", grant)
+	}
+	wait, _ := json.Marshal(map[string]any{"key": "call-4#1", "width": 1, "blocked_by": []string{m.state.RequestId}})
+	m.record("gpu.wait", wait)
 }
 
 // finish grants the GPUs and ends the call.
@@ -233,6 +247,16 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 	}
 	if _, show := runCozy(t, root, "run", "show", "2"); !strings.Contains(show, "waiting for GPU (needs 4, behind run 1)") {
 		t.Fatalf("run show does not say the run waits for GPUs:\n%s", show)
+	}
+	// Behind only its own calls, a run is not behind itself.
+	machine.waitOnOwnCalls()
+	const own = "waiting for GPU (needs 1, 4 in use by this run's other calls)"
+	waitFor(t, root, "the wait on the run's own calls", func() bool {
+		_, list = runCozy(t, root, "run", "list")
+		return strings.Contains(list, own)
+	})
+	if _, show := runCozy(t, root, "run", "show", "2"); !strings.Contains(show, own) || strings.Contains(show, "behind run 2") {
+		t.Fatalf("run show names the run as its own blocker:\n%s", show)
 	}
 	machine.finish()
 	store, problem := records.Open(layout.DB)

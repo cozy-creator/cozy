@@ -98,32 +98,31 @@ Run 1504 · paul/minimax-h3/long_form · lafter · completed · 6m55s
   ✓ Segment 2 of 2                              2m4s
   ✓ Assembling video                            1s`
 
+// Run 1514: four references on the machine's four GPUs, a fifth waiting behind its own run.
+var liveFrames1514 = []struct{ at, frame string }{
+	{"09:54:30", `
+Run 1514 · paul/minimax-h3/long_form · darkness · running · 8s
+  ✓ starting  0.6s
+  ▸ Creating reference White1 · generating image · 7s
+    ██████████████░░░░░░  70%  step 28/40 · 0.21s/step avg · ETA ~3s
+  ▸ Creating reference White2 · generating image · 7s
+    ████████████░░░░░░░░  60%  step 24/40 · 0.21s/step avg · ETA ~3s
+  ▸ Creating reference White3 · generating image · 7s
+    ██████████░░░░░░░░░░  50%  step 20/40 · 0.21s/step avg · ETA ~4s
+  ▸ Creating reference Hero · Checking model inputs · 7s
+  ▸ Creating reference Background · generating image · 7s
+    ██████████░░░░░░░░░░  50%  step 20/40 · 0.20s/step avg · ETA ~4s
+  ▸ waiting for GPU (needs 1, 4 in use by this run's other calls) · 6s`},
+}
+
 func TestLiveRunViewGoldenFrames(t *testing.T) {
-	events := recordedRun(t, "run-1510")
-	began := recordedAt(t, events[0])
+	goldenFrames(t, "1510", "darkness", liveFrames1510)
+	goldenFrames(t, "1514", "darkness", liveFrames1514)
+
+	events := recordedRun(t, "run-1504")
 	sink := &renderBuffer{}
 	ctx := &cli.Context{Inv: &cli.Invocation{Mode: output.Mode{Human: true, Live: true}}, Out: sink, Err: sink}
-	p := cli.NewProgress(ctx, false, began)
-	t.Cleanup(p.Done)
-	p.Describe("1510", "paul/minimax-h3/long_form", "darkness", "queued")
-	next := 0
-	for _, want := range liveFrames1510 {
-		clock, err := time.Parse("15:04:05.999", want.at)
-		must(t, err)
-		at := time.Date(began.Year(), began.Month(), began.Day(), clock.Hour(), clock.Minute(),
-			clock.Second(), clock.Nanosecond(), time.UTC)
-		for ; next < len(events) && !recordedAt(t, events[next]).After(at); next++ {
-			p.On(events[next])
-		}
-		if got := "\n" + strings.Join(p.Frame(at, 80), "\n"); got != want.frame {
-			t.Fatalf("frame at %s:\n%s\nwant:%s", want.at, got, want.frame)
-		}
-	}
-
-	events = recordedRun(t, "run-1504")
-	sink = &renderBuffer{}
-	ctx = &cli.Context{Inv: &cli.Invocation{Mode: output.Mode{Human: true, Live: true}}, Out: sink, Err: sink}
-	p = cli.NewProgress(ctx, false, recordedAt(t, events[0]))
+	p := cli.NewProgress(ctx, false, recordedAt(t, events[0]))
 	p.Describe("1504", "paul/minimax-h3/long_form", "lafter", "running")
 	for _, e := range events {
 		p.On(e)
@@ -136,6 +135,31 @@ func TestLiveRunViewGoldenFrames(t *testing.T) {
 	// replay of every event.
 	if got := screen(sink.String()); got != settled1504[1:]+"\n" {
 		t.Fatalf("the terminal was left with:\n%s", got)
+	}
+}
+
+// goldenFrames replays a recorded run and compares its frames at moments of the run.
+func goldenFrames(t *testing.T, run, machine string, frames []struct{ at, frame string }) {
+	t.Helper()
+	events := recordedRun(t, "run-"+run)
+	began := recordedAt(t, events[0])
+	sink := &renderBuffer{}
+	ctx := &cli.Context{Inv: &cli.Invocation{Mode: output.Mode{Human: true, Live: true}}, Out: sink, Err: sink}
+	p := cli.NewProgress(ctx, false, began)
+	defer p.Done()
+	p.Describe(run, "paul/minimax-h3/long_form", machine, "queued")
+	next := 0
+	for _, want := range frames {
+		clock, err := time.Parse("15:04:05.999", want.at)
+		must(t, err)
+		at := time.Date(began.Year(), began.Month(), began.Day(), clock.Hour(), clock.Minute(),
+			clock.Second(), clock.Nanosecond(), time.UTC)
+		for ; next < len(events) && !recordedAt(t, events[next]).After(at); next++ {
+			p.On(events[next])
+		}
+		if got := "\n" + strings.Join(p.Frame(at, 80), "\n"); got != want.frame {
+			t.Fatalf("run %s frame at %s:\n%s\nwant:%s", run, want.at, got, want.frame)
+		}
 	}
 }
 

@@ -1286,7 +1286,7 @@ func fillPhase(life *Lifecycle, phase orchestrator.PhaseObservation) {
 }
 
 // fillGPUWait says an active Runtime execution waits for GPUs, how many, and the first
-// run of this host holding them.
+// other run of this host holding them; when only this run's own calls hold them, how many.
 func (s *Server) fillGPUWait(life *Lifecycle, row records.Request) {
 	if life.Status != "queued" && life.Status != "in_progress" {
 		return
@@ -1295,16 +1295,40 @@ func (s *Server) fillGPUWait(life *Lifecycle, row records.Request) {
 	if problem != nil || wait == nil {
 		return
 	}
-	life.Phase, life.PhaseDetail = orchestrator.PhaseGPUWait, fmt.Sprintf("needs %d", wait.Width)
+	life.Phase, life.PhaseDetail = orchestrator.PhaseGPUWait, GPUWaitDetail(wait.Width, 0, false)
+	own := 0
 	for _, root := range wait.BlockedBy {
-		if blocker, problem := s.store.RequestByReference(root); problem == nil && blocker != nil {
+		if root == row.ID {
+			own++
+			continue
+		}
+		blocker, problem := s.store.RequestByReference(root)
+		if problem == nil && blocker != nil && blocker.ParentRequestID == row.ID {
+			own++
+		} else if problem == nil && blocker != nil {
 			life.WaitingFor = &orchestrator.WaitingRun{Number: blocker.Number, RequestID: blocker.ID}
 			return
 		}
 	}
-	if len(wait.BlockedBy) > 0 {
+	if own > 0 && own == len(wait.BlockedBy) {
+		held, _ := s.store.MachineGPUsHeld(row.ID)
+		life.PhaseDetail = GPUWaitDetail(wait.Width, held, true)
+	} else if len(wait.BlockedBy) > 0 {
 		life.PhaseDetail += ", behind other work"
 	}
+}
+
+// GPUWaitDetail is a GPU wait's detail: the devices the call needs and, when only its own
+// run holds the GPUs, how many of them that run's other calls are using.
+func GPUWaitDetail(width, held int, ownRun bool) string {
+	detail := fmt.Sprintf("needs %d", width)
+	switch {
+	case ownRun && held > 0:
+		detail += fmt.Sprintf(", %d in use by this run's other calls", held)
+	case ownRun:
+		detail += ", in use by this run's other calls"
+	}
+	return detail
 }
 
 // staleDaemonRemedy names the recovery for a submission field this running daemon does

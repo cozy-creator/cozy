@@ -500,6 +500,19 @@ func (s *Store) MachineGPUWait(requestID string) (*MachineGPUWaiting, *exit.Erro
 	return &wait, nil
 }
 
+// MachineGPUsHeld counts the devices this execution's calls hold: granted, not yet released.
+func (s *Store) MachineGPUsHeld(requestID string) (int, *exit.Error) {
+	var held int
+	err := s.db.QueryRow(`SELECT COUNT(DISTINCT o.value) FROM request_events g, json_each(g.payload,'$.ordinals') o
+		WHERE g.request_id=? AND g.type='machine.gpu.grant' AND NOT EXISTS(SELECT 1 FROM request_events r
+		WHERE r.request_id=g.request_id AND r.seq>g.seq AND r.type='machine.gpu.release'
+		AND json_extract(r.payload,'$.key')=json_extract(g.payload,'$.key'))`, requestID).Scan(&held)
+	if err != nil {
+		return 0, exit.Internalf("cannot count GPUs held by %s: %s", requestID, err)
+	}
+	return held, nil
+}
+
 // MachineGPUWaiting is Runtime's gpu.wait body: the call, the device count it needs and the
 // roots holding the devices ahead of it.
 type MachineGPUWaiting struct {
