@@ -367,10 +367,6 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if constraints.Working, problem = m.store.WorkingPeaks(req); problem != nil {
 		return none, "", problem
 	}
-	compatible, problem := m.compatibility(origin, req, constraints)
-	if problem != nil {
-		return none, "", problem
-	}
 	throughput, problem := m.throughput(origin, req)
 	if problem != nil {
 		return none, "", problem
@@ -384,7 +380,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	defer m.mu.Unlock()
 	for {
 		// The fleet is read again on every pass: a refused buy ran with the lock released.
-		attached, problem := m.attachedLocked(origin, req, runtimeOwned, bySKU, needsAccelerator, constraints, compatible)
+		attached, problem := m.attachedLocked(origin, req, runtimeOwned, bySKU, needsAccelerator, constraints)
 		if problem != nil {
 			return none, "", problem
 		}
@@ -475,7 +471,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 // fleet holds two is the shape that read as waste live. A purchase in flight is a
 // candidate too, before its pod has a row: the machine on its way.
 func (m *managedRentals) attachedLocked(origin string, req records.Request, runtimeOwned bool, bySKU map[machineKey]hub.RentalSKU,
-	needsAccelerator bool, constraints rental.Constraints, compatible map[string]*exit.Error) ([]orchestrator.PlacementCandidate, *exit.Error) {
+	needsAccelerator bool, constraints rental.Constraints) ([]orchestrator.PlacementCandidate, *exit.Error) {
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		return nil, problem
@@ -534,21 +530,6 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 				out = append(out, c)
 				continue
 			}
-			if len(constraints.Requirements) > 0 || constraints.RequiresPython != "" {
-				problem, read := compatible[row.ID]
-				if !read {
-					// Ready since this decision read the fleet: the next one reads it.
-					c.Verdict = orchestrator.VerdictAttaching
-					out = append(out, c)
-					continue
-				}
-				if problem != nil {
-					c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + problem.Message
-					out = append(out, c)
-					continue
-				}
-			}
-
 			reason, problem := m.standingLocked(row, req, runtimeOwned)
 			if problem != nil {
 				return nil, problem
@@ -588,27 +569,6 @@ func (m *managedRentals) reservationsLocked(rows []records.Rental) ([]records.Re
 		if op == nil || !have[op.RentalID] {
 			out = append(out, machine)
 		}
-	}
-	return out, nil
-}
-
-// compatibility is whether each attachable rental on origin can run the request's
-// requirements (nil: it can), read from the Hub before the decision takes the lock.
-func (m *managedRentals) compatibility(origin string, req records.Request, constraints rental.Constraints) (map[string]*exit.Error, *exit.Error) {
-	out := map[string]*exit.Error{}
-	if len(constraints.Requirements) == 0 && constraints.RequiresPython == "" {
-		return out, nil
-	}
-	rows, problem := m.store.Rentals()
-	if problem != nil {
-		return nil, problem
-	}
-	for _, row := range rows {
-		if m.origin(row.Hub) != origin || !localRentalAttachable(row) ||
-			req.RequestedRental != "" && row.ID != req.RequestedRental || req.RentNew && row.ManagedRequestID != req.ID {
-			continue
-		}
-		out[row.ID] = rentalCompatibility(m.at(origin), row.ID, constraints)
 	}
 	return out, nil
 }
@@ -1257,7 +1217,8 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 	var listingProblem *exit.Error
 	if asked == nil {
 		hctx, cancel := hub.Context()
-		listing, listed, listingProblem = owner.Rentals(hctx)
+		listing, listingProblem = owner.Rentals(hctx)
+		listed = listingProblem == nil
 		cancel()
 	}
 	m.mu.Lock()
@@ -1740,32 +1701,6 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 		}
 	}
 	return out, nil
-}
-
-func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints) *exit.Error {
-	call, cancel := hub.Context()
-	defer cancel()
-	facts, problem := client(ctx).RentalImageInventory(call, id)
-	if problem != nil {
-		return problem
-	}
-	raw := facts.ImageInventory
-	inventory, err := rental.ImageInventory(raw)
-	if err != nil {
-		return exit.Named(exit.Structural, "rental.image_inventory_invalid", "%s", err)
-	}
-	policy := [][]string{}
-	if constraints.SupportedPythonMinors != nil {
-		policy = append(policy, constraints.SupportedPythonMinors)
-	}
-	_, reason := launch.InventoryPython(inventory, constraints.RequiresPython, constraints.PythonVersion, policy...)
-	if strings.HasPrefix(reason, "no available Python executor") && launch.ProvisionablePython(rental.ImagePythonCapabilities(raw), constraints.RequiresPython, constraints.PythonVersion, policy...) {
-		reason = ""
-	}
-	if reason != "" {
-		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
-	}
-	return nil
 }
 
 func (m *managedRentals) observeIdle(row records.Rental) (rental.Idleness, *exit.Error) {

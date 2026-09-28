@@ -278,6 +278,16 @@ func (c *Client) PackageSourceArchive(ctx context.Context, ref Ref, release stri
 	return out, e
 }
 
+// LockedRequirements is one release's exact locked export. Only the temporary prepared path
+// reads it (tracker proto-062 R2); a machine reads its own.
+func (c *Client) LockedRequirements(ctx context.Context, ref Ref, release string) ([]byte, *exit.Error) {
+	var out []byte
+	e := c.do(ctx, call{method: http.MethodGet,
+		path:          resourcePath("packages", ref) + "/releases/" + url.PathEscape(release) + "/locked-requirements",
+		responseBytes: 1 << 20, raw: &out}, nil)
+	return out, e
+}
+
 func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string, pythonVersion ...string) (PackageDownloadPlan, *exit.Error) {
 	var out PackageDownloadPlan
 	kept := c.releaseCachePath("downloads", ref, release, strings.Join(pythonVersion, ","))

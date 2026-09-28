@@ -378,6 +378,6 @@ func TestMachineCancellationBeforeTransmissionCreatesNoRemotePromise(t *testing.
 	}
 }
 
-func (*retentionReleaseMachine) Lanes(context.Context, string) (api.MachineLanes, *exit.Error) {
-	return api.MachineLanes{}, nil
+func (*retentionReleaseMachine) Describe(context.Context, string, string, string) (api.DescribedRelease, *exit.Error) {
+	return api.DescribedRelease{}, nil
 }

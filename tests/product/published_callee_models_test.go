@@ -66,16 +66,12 @@ func publishCalleeReleaseOf(t *testing.T, h *ladderHub, root string) map[string]
 		"[project]\nname = \"child\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\ndependencies = []\n",
 		"version = 1\nrequires-python = \">=3.12\"\n\n[[package]]\nname = \"child\"\nversion = \"0.1.0\"\nsource = { editable = \".\" }\n")
 	pin := func(pkg, release string) string {
-		return string(testPrepareFacts(pkg, release).LockedRequirements)
+		return string(testLockedRequirements(pkg, release))
 	}
 	facts := map[string]calleeFacts{
 		ladderPackage: {iface: rootIface, locked: pin(ladderPackage, "1.0.0") + "child==0.1.0 --hash=sha256:" + childDigest + "\n"},
 		calleePackage: {iface: childIface, locked: pin(calleePackage, "0.1.0")},
 	}
-	inventory, err := json.Marshal(map[string]any{"format": "tensorhub.image_inventory/1",
-		"profile": "python3.12-cpu-linux-x86", "python": "3.12.8",
-		"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.41"}}})
-	must(t, err)
 	fallback := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body any
@@ -94,14 +90,16 @@ func publishCalleeReleaseOf(t *testing.T, h *ladderHub, root string) map[string]
 			h.mu.Lock()
 			body = map[string]any{"bindings": append([]hub.PackageBindingRow{}, h.bindings...)}
 			h.mu.Unlock()
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/"+podRental+"/prepare-facts":
-			selected, known := facts[r.URL.Query().Get("package")]
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/locked-requirements"):
+			// The temporary prepared path reads each release's lock (proto-062 R2).
+			pkg := strings.TrimPrefix(strings.TrimSuffix(r.URL.Path, "/locked-requirements"), "/v1/packages/")
+			selected, known := facts[pkg[:strings.LastIndex(pkg, "/releases/")]]
 			if !known {
 				http.NotFound(w, r)
 				return
 			}
-			body = hub.PrepareFactsView{Application: "app", ModelSlotPaths: []string{ladderSlot},
-				ImageInventory: inventory, LockedRequirements: selected.locked}
+			_, _ = w.Write([]byte(selected.locked))
+			return
 		default:
 			fallback.ServeHTTP(w, r)
 			return

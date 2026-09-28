@@ -5,6 +5,7 @@ import (
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 // The shared machine RPCs stay explicitly unsupported on these protocol fixtures.
@@ -31,10 +32,21 @@ func (p *idleHoldPeer) AcknowledgeMachineExecutionCollection(ctx context.Context
 	return p.UnimplementedWorkerControlServer.AcknowledgeMachineExecutionCollection(ctx, request)
 }
 func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
-	if machine, ok := p.machine.(machineSubmitPeer); ok {
-		return machine.GetMachineExecutionWorkspace(ctx, request)
+	machine, ok := p.machine.(machineSubmitPeer)
+	if !ok {
+		return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
 	}
-	return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
+	workspace, err := machine.GetMachineExecutionWorkspace(ctx, request)
+	if err == nil && request.Describe != nil && workspace.DescribedRelease == nil {
+		// The machine reads a release at its own Hub; this pod's Hub is the fixture's.
+		p.mu.Lock()
+		described := p.releases[request.Describe.Package]
+		p.mu.Unlock()
+		if described != nil && (request.Describe.Release == "" || request.Describe.Release == described.Release) {
+			workspace.DescribedRelease = proto.Clone(described).(*pb.DescribedRelease)
+		}
+	}
+	return workspace, err
 }
 
 // machineTriagePeer reads a retained triage bundle for its owner through the Host.

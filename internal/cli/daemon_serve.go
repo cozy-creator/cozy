@@ -22,7 +22,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
@@ -128,23 +127,13 @@ func serveDaemon(ctx *Context) *exit.Error {
 	updates := &rentalRuntimeUpdates{machines: machines}
 	machines.updates = updates
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
-	// A rental's release facts come from the hub it was bought from.
-	prepareFacts := func(c context.Context, connection *orchestrator.WorkerConnection,
-		ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
-		owner := ctx
-		if connection != nil {
-			owner = fleet.atRental(connection.RentalID)
-		}
-		return rental.PrepareFactsSource(client(owner))(c, connection, ref)
-	}
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution:  machines.Start,
 		RentalRuntimePreflight: machines.updates.preflight,
 		Cfg:                    ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
-		RentalPrepareFacts: prepareFacts,
-		RentalFleet:        fleet.status, AcquireManagedRental: fleet.acquire,
+		RentalFleet: fleet.status, AcquireManagedRental: fleet.acquire,
 		ReleaseManagedRental:  fleet.release,
 		ReleaseRetainedRental: fleet.releaseRetained,
 		ModelTransfers:        transfers,

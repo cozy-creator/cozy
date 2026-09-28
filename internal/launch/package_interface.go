@@ -466,7 +466,7 @@ func (e *Entrypoint) RequirePublic() *exit.Error {
 }
 
 // ModelSlotPaths is every entrypoint and job model-slot path, sorted unique: the
-// wire's model_slot_paths and the hub's prepare-facts rule.
+// wire's model_slot_paths.
 func (d *PackageInterface) ModelSlotPaths() []string {
 	paths := []string{}
 	for _, entry := range append(append([]Entrypoint(nil), d.Entrypoints...), d.Jobs...) {

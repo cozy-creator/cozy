@@ -29,9 +29,8 @@ import (
 
 type publishedPreparation struct {
 	*pb.DesiredPlacementSet
-	InstalledPackage   *pb.InstalledPackage
-	LockedRequirements []byte
-	Retained           bool // the machine answered from its preparation of these exact inputs
+	InstalledPackage *pb.InstalledPackage
+	Retained         bool // the machine answered from its preparation of these exact inputs
 }
 
 func retainWorkerInstallation(connection *machineConnection, expected localpackage.Installation, installed *pb.InstalledPackage) *exit.Error {
@@ -337,41 +336,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if problem != nil {
 			return problem
 		}
-		if request.IsJob() && !workspace.ReleaseRootJobs {
-			// Checked again at dispatch: an update can have taken the capability away since
-			// the job was recorded. Source choices have no other path from here.
-			if sourced(request.Models) {
-				return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
-					"this machine no longer advertises release_root_jobs; %s", machines.RuntimeUpdate(connection.Name))
-			}
-			if request, problem = m.compatibleJobModels(ctx, request, connection); problem != nil {
-				return problem
-			}
-			rooted = false
-		}
-		if sourced(request.Models) && !workspace.ReleaseRootSources {
-			// Never the compatibility path: a Runtime without source choices would bind the
-			// slot's default, a different model than the one asked for.
-			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
-				"this machine's Runtime cannot make a provider-source model; %s", machines.RuntimeUpdate(connection.Name))
-		}
-		if rooted && !workspace.ReleaseRoots {
-			if request, problem = m.compatibleModels(ctx, request, connection); problem != nil {
-				return problem
-			}
-			rooted = false
-		}
-	}
-	if rooted {
-		workspace, problem := m.workspace(ctx, connection)
+		built, problem := m.releaseRootSubmission(ctx, request, connection)
 		if problem != nil {
 			return problem
 		}
-		built, problem := m.releaseRootSubmission(ctx, request, connection, workspace)
-		if problem != nil {
-			return problem
-		}
-		built.ExpectedExecutionWorkspaceId, built.OwnerMemo = workspace.ExecutionWorkspaceId, workspace.MemoLookup
+		built.ExpectedExecutionWorkspaceId, built.OwnerMemo = workspace.ExecutionWorkspaceId, true
 		if built.PublicationAuthorizationId, problem = m.publicationAuthorization(ctx, request.ID, link.MachineID, connection); problem != nil {
 			return problem
 		}
@@ -406,6 +375,8 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		var built *pb.MachineExecutionSubmit
 		if request.LocalInstallationID == "" {
+			_ = m.store.AppendEvent(request.ID, "request.preparing", 0, map[string]any{"stage": "machine",
+				"detail": "temporary prepared path: release roots do not yet carry adapters (proto-062 R2)"})
 			built, problem = m.publishedSubmission(ctx, request, connection)
 			if problem != nil {
 				return problem
@@ -436,30 +407,10 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			for i, installed := range graph.InstalledPackages {
 				graph.InstalledPackages[i] = connection.installed[installed.InstallationId]
 			}
-			origin, problem := connection.PublicOrigin(ctx)
-			if problem != nil {
-				return problem
-			}
-			workspace, problem := m.workspace(ctx, connection)
-			if problem != nil {
-				return problem
-			}
-			if workspace.ResolvesModelDefaults {
-				// A callee's omitted Model is resolved by the machine at this origin when called.
-				graph.CatalogOrigin = origin
-			}
 			var encodeErr error
 			capture.Canonical, capture.Digest, encodeErr = canonical.Identity(&graph)
 			if encodeErr != nil {
 				return exit.Internalf("cannot retain worker installation metadata: %s", encodeErr)
-			}
-			if !workspace.ResolvesModelDefaults {
-				began := time.Now()
-				var detail string
-				if capture, detail, problem = m.resolver.captureMachineModelDefaults(capture, request, origin); problem != nil {
-					return problem
-				}
-				m.submissionStage(request.ID, "model_defaults", detail, began)
 			}
 			installed := connection.installed[request.LocalInstallationID]
 			if installed == nil {
@@ -516,11 +467,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 				}
 			}
 		}
-		workspace, problem := m.workspace(ctx, connection)
-		if problem != nil {
-			return problem
-		}
-		built.PublicationAuthorizationId, built.OwnerMemo = authorization, workspace.MemoLookup
+		built.PublicationAuthorizationId, built.OwnerMemo = authorization, true
 		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.WireMinor)
 		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, link.MachineID, built); problem != nil {
 			return problem
@@ -600,30 +547,8 @@ func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *m
 	if problem != nil {
 		return problem
 	}
-	if problem := exactExecutionGPUs(submission, workspace); problem != nil {
-		return problem
-	}
 	submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
-	if problem := m.store.RecordMachineSubmission(requestID, submission); problem != nil || workspace.SourceCredentials || len(m.resolver.SourceCredentials()) == 0 {
-		return problem
-	}
-	return m.store.AppendEvent(requestID, "request.warning", 0, map[string]any{"message": "this machine's Runtime cannot receive your Hugging Face or Civitai credential, so a gated source fails there; " + machines.RuntimeUpdate(machine)})
-}
-
-// exactExecutionGPUs sends a counted group only to a Runtime that runs it exactly. Without
-// that capability a count covering the whole machine is already Runtime's own width; a
-// narrower one cannot be honoured and refuses.
-func exactExecutionGPUs(submission *pb.MachineExecutionSubmit, workspace *pb.MachineExecutionWorkspace) *exit.Error {
-	set := submission.PreparedState.GetPlacementSet()
-	if set.GetExecutionGpus() == 0 || workspace.ExactExecutionGpus {
-		return nil
-	}
-	if devices := len(workspace.Devices); devices == 0 || int(set.ExecutionGpus) < devices {
-		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
-			"this call runs on exactly %d GPUs of the machine, and its Runtime cannot hold a call to an exact GPU count; update the rental Runtime", set.ExecutionGpus)
-	}
-	set.ExecutionGpus = 0
-	return nil
+	return m.store.RecordMachineSubmission(requestID, submission)
 }
 
 func currentExecutionWorkspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
@@ -1021,10 +946,6 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 // awaitEvents holds one events read open until the machine records the next event, so the
 // observer asks again at once instead of on a clock. A control that takes the turn ends it.
 func (m *machineRuns) awaitEvents(ctx context.Context, connection *machineConnection, request string, query *pb.MachineExecutionQuery, cursor uint64) {
-	workspace, problem := m.workspace(ctx, connection)
-	if problem != nil || !workspace.EventWait {
-		return
-	}
 	if _, err := connection.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor, Limit: 1, Wait: true}); err == nil {
 		m.mu.Lock()
 		m.awaited[request] = true
@@ -1225,9 +1146,6 @@ func machineObservationError(problem *exit.Error) json.RawMessage {
 // readMachineTriage reads one attempt's retained triage bundle through the Host, the same
 // guarded connection its outcome came over.
 func readMachineTriage(ctx context.Context, connection *machineConnection, query *pb.MachineExecutionQuery, attempt uint64, ref *pb.TriageBundleRef) ([]byte, *exit.Error) {
-	if !connection.SupportsTriage {
-		return nil, exit.Named(exit.Structural, "machine_execution.triage_unsupported", "this machine's Host reads no triage bundle")
-	}
 	triage, err := connection.Host.ReadMachineExecutionTriage(ctx, &pb.MachineExecutionTriageQuery{Execution: query, AttemptOrdinal: attempt})
 	if err != nil {
 		return nil, machineTransport(err)

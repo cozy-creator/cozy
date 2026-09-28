@@ -3,17 +3,18 @@ package hub
 import (
 	"context"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // OwnedMachine is a user's own machine as the hub registered it (proto-062): the worker
-// identity its Host presents and the capability it authenticates with, returned once.
+// identity its Host presents, the capability it authenticates with, and the hub-known half
+// of its grant (under the names a rental's pod receives them), returned once.
 type OwnedMachine struct {
-	ID          string `json:"id"`
-	WorkerToken string `json:"worker_token"`
+	ID          string            `json:"id"`
+	WorkerToken string            `json:"worker_token"`
+	Environment map[string]string `json:"environment"`
 }
 
 // ownedMachinePrefix is the hub's spelling for an owned machine's worker id; no rental id
@@ -40,34 +41,13 @@ func (c *Client) RegisterMachine(ctx context.Context) (OwnedMachine, *exit.Error
 	if len(out.WorkerToken) != 43 {
 		return OwnedMachine{}, exit.Named(exit.Conflict, "hub.machine_token_invalid", "the hub returned no worker capability for the registered machine")
 	}
+	if len(out.Environment) == 0 {
+		return OwnedMachine{}, exit.Named(exit.Conflict, "hub.machine_environment_invalid", "the hub returned no environment for the registered machine")
+	}
+	for name := range out.Environment {
+		if !strings.HasPrefix(name, "TENSORHUB_") {
+			return OwnedMachine{}, exit.Named(exit.Conflict, "hub.machine_environment_invalid", "the hub's machine environment names %s, which is not a hub fact", name)
+		}
+	}
 	return out, nil
-}
-
-// MachineEnvironment is the hub-known half of an owned machine's grant, under the names a
-// rental's pod receives them.
-func (c *Client) MachineEnvironment(ctx context.Context, id string) (map[string]string, *exit.Error) {
-	if problem := validMachineID(id); problem != nil {
-		return nil, problem
-	}
-	var out struct {
-		Environment map[string]string `json:"environment"`
-	}
-	if problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/machines/" + url.PathEscape(id) + "/environment", auth: true}, &out); problem != nil {
-		return nil, problem
-	}
-	return out.Environment, nil
-}
-
-// MachinePrepareFacts reads the release facts for preparing one package release on an owned
-// machine. It has no registered image, so the inventory is absent.
-func (c *Client) MachinePrepareFacts(ctx context.Context, id, pkg, release string) (PrepareFactsView, *exit.Error) {
-	if problem := validMachineID(id); problem != nil {
-		return PrepareFactsView{}, problem
-	}
-	query := url.Values{"package": {pkg}, "release": {release}}
-	var out PrepareFactsView
-	problem := c.do(ctx, call{method: http.MethodGet,
-		path: "/v1/machines/" + url.PathEscape(id) + "/prepare-facts?" + query.Encode(),
-		auth: true, responseBytes: maxPrepareFactsResponseBytes}, &out)
-	return out, problem
 }

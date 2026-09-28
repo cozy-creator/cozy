@@ -54,7 +54,6 @@ func TestFreshRentalConcurrentCallsShareOneControlClaim(t *testing.T) {
 	h.rentals[parityRental] = map[string]any{"rental_id": parityRental, "name": "tessa", "state": "ready",
 		"requested_accelerator_model": model, "accelerator_count": count, "hourly_rate_usd_micros": 1,
 		"worker_address": launch.Addr, "media_address": launch.MediaAddr}
-	h.inventories = map[string]json.RawMessage{parityRental: json.RawMessage(`{"format":"tensorhub.image_inventory/1","profile":"python3.12-cpu-linux-x86","python":"3.12"}`)}
 	h.mu.Unlock()
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: parityRental, MachineName: "tessa", SKU: "virtual-4", State: "ready",
 		AcceleratorModel: model, AcceleratorCount: count, HourlyRateUSDMicros: 1, Hub: h.server.URL,

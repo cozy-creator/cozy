@@ -42,19 +42,13 @@ type Machine struct {
 	WireMinor uint32
 	// CertificateDigest is the pinned leaf's sha256, the identity publication authority binds.
 	CertificateDigest []byte
-	// SupportsTriage is whether the Host reads a retained triage bundle for its owner.
-	SupportsTriage bool
-	// ClaimSurvivesRestart is what this dial's ClaimAck said: the boot's Runtime keeps its
-	// owner across Host and Runtime restarts, so later dials need no Control Claim.
-	ClaimSurvivesRestart bool
 
-	claimAck  *pb.ClaimAck
-	hub       *hub.Client
-	hubID     string // the hub's identity for the machine: a rental id or an owned machine id
-	owned     bool
-	release   func()
-	publicOrg string
-	kept      bool // the connection is the Resolver's, kept for the machine's next call
+	claimAck *pb.ClaimAck
+	hub      *hub.Client
+	hubID    string // the hub's identity for the machine: a rental id or an owned machine id
+	owned    bool
+	release  func()
+	kept     bool // the connection is the Resolver's, kept for the machine's next call
 	// workspace is what this claimed connection's Runtime reported of itself, shared by
 	// every use of the connection and gone with it (Resolver.Forget, a new lifetime).
 	workspace *atomic.Pointer[pb.MachineExecutionWorkspace]
@@ -89,46 +83,6 @@ func (m *Machine) RentalID() string {
 	return m.hubID
 }
 
-// PrepareFacts are the hub-known release facts for preparing one published package on this
-// machine. A rental's join its placed image's inventory; an owned machine runs no registered
-// image, so its preparation carries none.
-func (m *Machine) PrepareFacts(ctx context.Context, ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
-	if m.owned {
-		view, problem := m.hub.MachinePrepareFacts(ctx, m.hubID, ref.Package, ref.Release)
-		if problem != nil {
-			return orchestrator.PrepareFacts{}, problem
-		}
-		facts, problem := rental.PrepareFactsFromView(view, ref.Package, ref.Release)
-		if problem != nil {
-			return orchestrator.PrepareFacts{}, problem
-		}
-		return withInterface(ctx, m.hub, facts, ref)
-	}
-	return rental.PrepareFactsSource(m.hub)(ctx, &orchestrator.WorkerConnection{RentalID: m.hubID}, ref)
-}
-
-func withInterface(ctx context.Context, client *hub.Client, facts orchestrator.PrepareFacts, ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
-	pkg, problem := hub.ParseRef(ref.Package)
-	if problem != nil {
-		return orchestrator.PrepareFacts{}, problem
-	}
-	detail, problem := client.PackageRelease(ctx, pkg, ref.Release)
-	if problem != nil {
-		return orchestrator.PrepareFacts{}, problem
-	}
-	facts.PackageInterface, problem = rental.ReleaseInterface(detail, ref.Package, ref.Release)
-	return facts, problem
-}
-
-// PublicOrigin is where this machine reads public hub bytes: the origin its grant names.
-func (m *Machine) PublicOrigin(ctx context.Context) (string, *exit.Error) {
-	if m.owned {
-		return m.publicOrg, nil
-	}
-	facts, problem := m.hub.RentalImageInventory(ctx, m.hubID)
-	return facts.PublicOrigin, problem
-}
-
 // Resolver finds machines by name.
 type Resolver struct {
 	Host *Host
@@ -149,10 +103,9 @@ type Resolver struct {
 	Held func(bootID string) bool
 
 	mu sync.Mutex
-	// claimed names the worker lifetimes this daemon has Control Claimed. An older Runtime
-	// forgets its owner's protocol level when it restarts, so each lifetime Claims again;
-	// durable names the boots whose Runtime reported claim_survives_restart, Claimed once.
-	claimed, durable map[string]bool
+	// claimed names the worker boots this daemon has Control Claimed: a boot's Runtime keeps
+	// its owner across Host and Runtime restarts, so each boot is Claimed once.
+	claimed map[string]bool
 	// dialing names each machine identity a Dial is connecting to; concurrent Dials wait
 	// for it and share its connection and Claim instead of Claiming against each other.
 	dialing map[string]chan struct{}
@@ -176,11 +129,9 @@ func (r *Resolver) Forget(name string) {
 		kept.Conn.Close()
 		delete(r.kept, name)
 	}
-	for _, record := range []map[string]bool{r.claimed, r.durable} {
-		for key := range record {
-			if strings.HasPrefix(key, name+"\x00") {
-				delete(record, key)
-			}
+	for key := range r.claimed {
+		if strings.HasPrefix(key, name+"\x00") {
+			delete(r.claimed, key)
 		}
 	}
 }
@@ -215,9 +166,7 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 		if problem != nil {
 			return nil, problem
 		}
-		environment, _ := r.Host.environment(ctx, launch.WorkerID, nil)
 		machine.hub, machine.hubID, machine.owned = client, launch.WorkerID, true
-		machine.publicOrg = environment["TENSORHUB_PUBLIC_ORIGIN"]
 		t = target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
 			lifetime: fmt.Sprint(launch.PID)}
 	} else {
@@ -255,7 +204,7 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 	identity := lifetime + "\x00" + t.addr + "\x00" + t.workerID + "\x00" + string(t.pin.Digest())
 	r.mu.Lock()
 	if r.claimed == nil {
-		r.claimed, r.durable, r.kept = map[string]bool{}, map[string]bool{}, map[string]*keptMachine{}
+		r.claimed, r.kept = map[string]bool{}, map[string]*keptMachine{}
 		r.dialing = map[string]chan struct{}{}
 	}
 	for {
@@ -289,7 +238,7 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 		close(done)
 	}()
 	boot := name + "\x00" + t.bootID
-	claimed := r.claimed[lifetime] || r.durable[boot] || !machine.owned && r.Held != nil && r.Held(t.bootID)
+	claimed := r.claimed[boot] || !machine.owned && r.Held != nil && r.Held(t.bootID)
 	r.mu.Unlock()
 	if problem := machine.dial(ctx, t, !claimed); problem != nil {
 		if machine.release != nil {
@@ -298,10 +247,7 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 		return nil, problem
 	}
 	r.mu.Lock()
-	r.claimed[lifetime] = true
-	if machine.ClaimSurvivesRestart {
-		r.durable[boot] = true
-	}
+	r.claimed[boot] = true
 	if previous := r.kept[name]; previous != nil {
 		previous.Conn.Close() // the machine's earlier lifetime
 	}
@@ -335,20 +281,19 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 		connection.Close()
 		return Transport(err)
 	}
-	m.Protocol, m.WireMinor, m.SupportsTriage = info, info.WireMinor, info.SupportsMachineExecutionTriage
+	m.Protocol, m.WireMinor = info, info.WireMinor
 	claim, ack, problem := claim(ctx, connection, t, info.WireMinor, controlClaim)
 	if problem != nil {
 		connection.Close()
 		return problem
 	}
-	m.Claim, m.claimAck, m.ClaimSurvivesRestart = claim, ack, ack.GetClaimSurvivesRestart()
+	m.Claim, m.claimAck = claim, ack
 	return nil
 }
 
 // claim authenticates this owner to the worker lifetime the target names: the owner key's
 // Ed25519 signature over ClaimProof/1, presented on every call. The first connection to a
 // lifetime also opens one Control Claim, which records the owner and its protocol level.
-// A boot whose Runtime reported claim_survives_restart is Claimed once, not per lifetime.
 func claim(ctx context.Context, connection *grpc.ClientConn, t target, wireMinor uint32, control bool) (*pb.Claim, *pb.ClaimAck, *exit.Error) {
 	transcript, err := canonical.Bytes(&pb.ClaimProof{RecordOwnerEpoch: orchestrator.RecordOwnerEpoch,
 		WorkerId: t.workerID, WorkerBootId: t.bootID, WorkerTlsCertificateDigest: t.pin.Digest()})

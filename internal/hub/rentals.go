@@ -590,17 +590,14 @@ func (w wireRental) named(what string) *exit.Error {
 // Identity is validated per row and a row that cannot be named is DROPPED rather
 // than failing the listing: a hub that serves one malformed row must not thereby
 // hide the ten good ones, which is the same lesson as the release path's (cl-193).
-func (c *Client) Rentals(ctx context.Context) ([]Rental, bool, *exit.Error) {
+func (c *Client) Rentals(ctx context.Context) ([]Rental, *exit.Error) {
 	var out struct {
 		Rentals []wireRental `json:"rentals"`
 	}
 	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals", auth: true,
 		responseBytes: maxRentalListingBytes}, &out)
 	if e != nil {
-		if unpublishedRoute(e) {
-			return nil, false, nil
-		}
-		return nil, false, e
+		return nil, e
 	}
 	rentals := make([]Rental, 0, len(out.Rentals))
 	for _, wire := range out.Rentals {
@@ -609,19 +606,7 @@ func (c *Client) Rentals(ctx context.Context) ([]Rental, bool, *exit.Error) {
 		}
 		rentals = append(rentals, wire.rental())
 	}
-	return rentals, true, nil
-}
-
-// unpublishedRoute says a refusal came from the hub's own router rather than from the
-// hub's product: net/http answers an unregistered path 404 and a registered path with
-// the wrong method 405, both as PLAIN TEXT with no error envelope, which is exactly
-// what `hub.untyped_refusal` names. A hub older than th-199 has `POST /v1/rentals` and
-// therefore answers 405, not 404 — reading only the 404 would have made every
-// pre-th-199 hub a hard failure of the listing rather than a hub that does not publish
-// one. A typed refusal is the product speaking and is never silently swallowed.
-func unpublishedRoute(e *exit.Error) bool {
-	return e.ErrName() == "hub.untyped_refusal" &&
-		(e.Code == exit.NotFound || e.Code == exit.Validation)
+	return rentals, nil
 }
 
 // Rental reads one rental's current state using the renter's account authority.
@@ -680,40 +665,6 @@ func (c *Client) Release(ctx context.Context, id, reason string) *exit.Error {
 	return c.do(ctx, call{
 		method: http.MethodDelete, path: "/v1/rentals/" + url.PathEscape(id), auth: true, reason: reason,
 	}, nil)
-}
-
-// PrepareFactsView is the rental-scoped prepare-facts answer verbatim (wire 31,
-// xs-019): the release facts a PreparePackageSetCall carries on fields 3-6.
-// The inventory is the placed image's registered tensorhub.image_inventory/1
-// document, untouched by this client.
-type PrepareFactsView struct {
-	PythonRequires     string          `json:"python_requires"`
-	PythonVersion      string          `json:"python_version"`
-	Application        string          `json:"application"`
-	ModelSlotPaths     []string        `json:"model_slot_paths"`
-	ImageInventory     json.RawMessage `json:"image_inventory"`
-	LockedRequirements string          `json:"locked_requirements"`
-}
-
-// The locked requirements alone may reach the 1 MiB wire bound; the inventory
-// rides beside them.
-const maxPrepareFactsResponseBytes = 4 << 20
-
-// PrepareFacts reads the hub-known release facts for dispatching one committed
-// package release to this rental (GET /v1/rentals/{id}/prepare-facts).
-func (c *Client) PrepareFacts(ctx context.Context, id, pkg, release string) (PrepareFactsView, *exit.Error) {
-	if e := validateRentalID(id); e != nil {
-		return PrepareFactsView{}, e
-	}
-	query := url.Values{"package": {pkg}, "release": {release}}
-	var out PrepareFactsView
-	e := c.do(ctx, call{method: http.MethodGet,
-		path: "/v1/rentals/" + url.PathEscape(id) + "/prepare-facts?" + query.Encode(),
-		auth: true, responseBytes: maxPrepareFactsResponseBytes}, &out)
-	if e != nil {
-		return PrepareFactsView{}, e
-	}
-	return out, nil
 }
 
 // canonicalServingModels sorts and de-duplicates the declared set so the authored
@@ -783,21 +734,4 @@ func (c *Client) RentalSKUStatus(ctx context.Context, name string, gpus int) (Re
 		return RentalSKUStatus{}, e
 	}
 	return out, nil
-}
-
-// RentalImageInventoryView names the assigned image and the Hub's public byte
-// endpoint. The endpoint is independent of the client's configured control URL.
-type RentalImageInventoryView struct {
-	ImageInventory json.RawMessage `json:"image_inventory"`
-	PublicOrigin   string          `json:"public_origin"`
-}
-
-// RentalImageInventory reads the image actually assigned to this rental.
-func (c *Client) RentalImageInventory(ctx context.Context, id string) (RentalImageInventoryView, *exit.Error) {
-	if problem := validateRentalID(id); problem != nil {
-		return RentalImageInventoryView{}, problem
-	}
-	var out RentalImageInventoryView
-	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals/" + url.PathEscape(id) + "/image-inventory", auth: true, responseBytes: maxPrepareFactsResponseBytes}, &out)
-	return out, problem
 }

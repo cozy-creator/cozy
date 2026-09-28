@@ -27,7 +27,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -63,10 +62,7 @@ func (c *Orchestrator) issueThroughHost(s *session, w *worker, label string, ope
 type packagePrepare struct {
 	label string
 	// pkg names the package this preparation carries.
-	pkg string
-	// ref is the exact release this preparation carries — what the facts fetch
-	// names against the rental-scoped prepare-facts route.
-	ref         *pb.DownloadPackageRef
+	pkg         string
 	downloadSet []byte
 }
 
@@ -135,40 +131,16 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			sets = append(sets, held)
 			continue
 		}
-		// MINOR 31 (xs-019): the call carries the hub-known release facts on
-		// fields 3-6; the pod host refuses one without them. They are fetched
-		// here, on the prepare's own goroutine, because the source is a network
-		// call and issuePackageSet's callers include the control stream's
-		// receive loop.
-		facts, problem := c.opt.RentalPrepareFacts(s.ctx, w.spec.Connection, prep.ref)
-		if problem != nil {
-			if problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
-				c.setDesiredUnavailable(w, seq, exit.Unavailablef(
-					"PodHost prepare %s has no release facts yet: %s", prep.label, problem.Message))
-				return
-			}
-			if !refuse(prep.pkg, exit.Named(exit.Structural, "worker.prepare_facts_refused",
-				"the hub refused the release facts for %s: %s", prep.label, problem.Message)) {
-				return
-			}
-			continue
-		}
 		if problem := requireAdapterDownloadPeer(s, prep.downloadSet); problem != nil {
 			if !refuse(prep.pkg, problem) {
 				return
 			}
 			continue
 		}
+		// The release alone: the machine reads its facts at its own Hub.
 		call := &pb.PreparePackageSetCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
 			DownloadDelegation: append([]byte(nil), prep.downloadSet...),
-		},
-			Application:    facts.Application,
-			ModelSlotPaths: append([]string(nil), facts.ModelSlotPaths...),
-			ImageInventory: facts.ImageInventory,
-			PythonRequires: facts.PythonRequires, PythonVersion: hostruntime.PythonMinor(facts.PythonVersion),
-			LockedRequirements: append([]byte(nil), facts.LockedRequirements...),
-			PackageInterface:   append([]byte(nil), facts.PackageInterface...),
-		}
+		}}
 		result := c.runHostPrepare(s, w, seq, prep.label,
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 				return s.host.PreparePackageSet(ctx, call)
@@ -316,8 +288,7 @@ var safeCodeRE = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
 // re-issued the same revision forever. That is proto-035's rule — a refusal is resumable
 // only if the refusing party could answer differently to the IDENTICAL request later — and
 // a deny-list cannot enforce it, because the codes that violate it are exactly the ones not
-// yet enumerated. It is also how the Unimplemented loop happened (cozy #298), eleven lines
-// from `RentalPrepareFacts`, which has had the right polarity all along.
+// yet enumerated. It is also how the Unimplemented loop happened (cozy #298).
 //
 // So: an allow-list of the codes that describe a condition of the MOMENT rather than of the
 // request. Anything else — NotFound, OutOfRange, DataLoss, AlreadyExists, and whatever is

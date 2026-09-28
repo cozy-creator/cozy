@@ -22,9 +22,10 @@ func publishedPlanInterface(plan hub.PackageDownloadPlan) (*launch.PackageInterf
 	return launch.DecodePackageInterface(document.Bytes)
 }
 
-// dependencies joins exact committed callee wheels before the machine accepts
-// execution. Subsequent child scheduling needs no client or catalog lookup.
-func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request records.Request, connection *machineConnection, capture *pb.MachineExecutionCapture, rootLocked []byte) *exit.Error {
+// capturePublishedDependencies joins exact committed callee wheels before the machine
+// accepts execution, for the temporary prepared path only (tracker proto-062 R2): it reads
+// each release's lock and plan at the Hub, which a release root never does.
+func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request records.Request, connection *machineConnection, capture *pb.MachineExecutionCapture) *exit.Error {
 	type node struct {
 		installationID string
 		plan           hub.PackageDownloadPlan
@@ -38,7 +39,12 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 	if problem != nil {
 		return problem
 	}
-	rootPlan, problem := m.resolver.catalog(request.Hub).PackageDownloads(ctx, rootRef, request.Release)
+	catalog := m.resolver.catalog(request.Hub)
+	rootPlan, problem := catalog.PackageDownloads(ctx, rootRef, request.Release)
+	if problem != nil {
+		return problem
+	}
+	rootLocked, problem := catalog.LockedRequirements(ctx, rootRef, request.Release)
 	if problem != nil {
 		return problem
 	}
@@ -71,7 +77,11 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 				if problem != nil {
 					return problem
 				}
-				plan, problem := m.resolver.catalog(request.Hub).PackageDownloads(ctx, ref, dependency.Version)
+				plan, problem := catalog.PackageDownloads(ctx, ref, dependency.Version)
+				if problem != nil {
+					return problem
+				}
+				locked, problem := catalog.LockedRequirements(ctx, ref, dependency.Version)
 				if problem != nil {
 					return problem
 				}
@@ -95,7 +105,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 				if problem != nil {
 					return problem
 				}
-				child = node{installed.InstallationId, plan, iface, prepared.LockedRequirements}
+				child = node{installed.InstallationId, plan, iface, locked}
 				nodes[childKey] = child
 				capture.InstalledPackages = append(capture.InstalledPackages, installed)
 				addPublishedBindings(capture, installed.InstallationId, installed.InstallationId, iface, true)
@@ -117,22 +127,6 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 	sort.Slice(capture.InstalledPackages, func(i, j int) bool {
 		return capture.InstalledPackages[i].InstallationId < capture.InstalledPackages[j].InstallationId
 	})
-	workspace, problem := m.workspace(ctx, connection)
-	if problem != nil {
-		return problem
-	}
-	if workspace.ResolvesModelDefaults {
-		// A callee's omitted Model is resolved by the machine at this origin when called.
-		capture.CatalogOrigin = connection.publicOrigin
-		return nil
-	}
-	// An older Runtime is handed every installation's default rows, probing each exact
-	// checkpoint once for the capture.
-	began, reads := time.Now(), modelDefaultReads{}
-	for key, node := range nodes {
-		m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.installationID, node.iface, request, connection.publicOrigin, reads)
-	}
-	m.submissionStage(request.ID, "model_defaults", modelDefaultsDetail(capturedRungs(capture), len(reads)), began)
 	return nil
 }
 

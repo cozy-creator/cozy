@@ -1528,13 +1528,13 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	listed, listing := false, 0
 	if known.RentalID == "" {
 		hctx, cancel := hub.Context()
-		remote, published, problem := c.Rentals(hctx)
+		remote, problem := c.Rentals(hctx)
 		cancel()
 		if problem != nil {
 			return problem.WithRemedy("the hub could not be asked which rentals this account owns; " +
 				"a pod may still be billing under this name and nothing here has been changed")
 		}
-		listed, listing = published, len(remote)
+		listed, listing = true, len(remote)
 		for _, seen := range remote {
 			if seen.ID != subject && seen.Name != subject {
 				continue

@@ -3,8 +3,6 @@ package producttest
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
-	hubapi "github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
@@ -107,18 +104,6 @@ func TestRebootedRentalIsReattachedAndServesNewWork(t *testing.T) {
 	release := rentalReleaseFacts()
 	release.PackageInterface = []byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[]}`)
 	peer.packageReleases = map[string]any{"proof/restart@1": release}
-	facts := testPrepareFacts("proof/restart", "1")
-	inventory, err := json.Marshal(map[string]any{"format": "tensorhub.image_inventory/1",
-		"profile": facts.ImageInventory.Profile, "python": facts.ImageInventory.Python, "distributions": []any{}})
-	must(t, err)
-	served := peer.server.Config.Handler
-	peer.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/rentals/"+podRental+"/prepare-facts" {
-			served.ServeHTTP(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(hubapi.PrepareFactsView{Application: "proof:app", ImageInventory: inventory, LockedRequirements: string(facts.LockedRequirements)})
-	})
 	row := records.Rental{ID: podRental, MachineName: "rebooted", State: "ready", SKU: "cpu", AcceleratorModel: "fake-4090",
 		AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: peer.server.URL, Address: first.Addr,
 		MediaAddress: first.Media.Addr, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -409,21 +410,7 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	ctx, cancel := hub.Context()
-	defer cancel()
-	detail, problem := r.catalog(origin).PackageRelease(ctx, ref, release)
-	if problem != nil {
-		return empty, nil, problem
-	}
-	if detail.Release.Release != release {
-		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
-			"Tensorhub answered release %s@%s for the queued release %s", pkg, detail.Release.Release, release)
-	}
-	requirements, problem := detail.Requirements()
-	if problem != nil {
-		return empty, nil, problem
-	}
-	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	requirements, packageInterface, problem := r.releaseInterface(origin, ref, release)
 	if problem != nil {
 		return empty, nil, problem
 	}
@@ -500,6 +487,8 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 		// so the pod prepares both entrypoints once and a switch between them is a
 		// dispatch. Owner overrides and authored defaults use the same selection here.
 		// Sharing only saves a later preparation, so an unreadable override set skips it.
+		ctx, cancel := hub.Context()
+		defer cancel()
 		if rows, problem := r.catalog(origin).PackageBindings(ctx, ref); problem == nil {
 			defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows, ref.Org)
 			shareModelSlots(models, entrypoint, packageInterface.Entrypoints, defaults)
@@ -623,13 +612,18 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 }
 
 // releaseInterface is a published release's interface and locked closure: this computer's
-// verified install of it when there is one, else Tensorhub's release card.
+// verified install of it when there is one, else the interface its machine described here (a
+// run on a known machine reads no Hub), else Tensorhub's release card (choosing a machine).
 func (r *Resolver) releaseInterface(origin string, ref hub.Ref, release string) ([]string, *launch.PackageInterface, *exit.Error) {
 	if _, installed, problem := r.store.ActivePackage(ref.String()); problem == nil && installed != nil &&
 		installed.SourceKind == "tensorhub" && installed.Version == release {
 		if held, packageInterface, problem := r.installPackageInterface(installed.ID); problem == nil {
 			return strings.Split(held.Closure, "\n"), packageInterface, nil
 		}
+	}
+	if raw, err := os.ReadFile(releaseInterfacePath(home.Paths(r.cfg.Home).Root, ref.String(), release)); err == nil {
+		packageInterface, problem := launch.DecodePackageInterface(raw)
+		return nil, packageInterface, problem
 	}
 	ctx, cancel := hub.Context()
 	defer cancel()

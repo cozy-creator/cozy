@@ -76,11 +76,6 @@ type Options struct {
 	RentalClaimProof RentalClaimProofSource
 	// RentalPackageSet signs Creator's logical package/model download authority.
 	RentalPackageSet RentalPackageSetSource
-	// RentalPrepareFacts fetches the hub-known release facts one
-	// PreparePackageSetCall carries on fields 3-6 (wire 31, xs-019) for
-	// dispatching one package release to this rental. Callback for the same
-	// reason RentalPackageSet is: the orchestrator holds no Tensorhub client.
-	RentalPrepareFacts RentalPrepareFactsSource
 	// RentalFleet renders the request's hub's fleet burn line after reconciling that
 	// hub's rentals with it. AcquireManagedRental is the placement decision for a --rental
 	// request no rental holds a placement for (placement-economics.md): it pins the
@@ -104,25 +99,6 @@ type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error
 // boot (owner ruling 2026-09-03).
 type RentalPackageSetSource func([]*pb.DownloadPackageRef,
 	[]*pb.DownloadModelRef) ([]byte, *exit.Error)
-
-// PrepareFacts is the hub-known half of one PreparePackageSetCall: the release
-// facts (fields 3-6, 10) the record owner fetched for this exact package release on
-// this rental. The pod host relays them verbatim to the Runtime's preparation,
-// which refuses a call without them.
-type PrepareFacts struct {
-	PythonRequires, PythonVersion string
-	Application                   string
-	ModelSlotPaths                []string
-	ImageInventory                *pb.ImageInventory
-	LockedRequirements            []byte
-	// PackageInterface is the release's canonical PackageInterface/1 bytes (wire 61).
-	PackageInterface []byte
-}
-
-// RentalPrepareFactsSource answers one package release's facts for one rental.
-// Every call returns a fresh value; the orchestrator sends it on the wire as is.
-type RentalPrepareFactsSource func(context.Context, *WorkerConnection,
-	*pb.DownloadPackageRef) (PrepareFacts, *exit.Error)
 
 type RentalObservation struct {
 	RentalID               string

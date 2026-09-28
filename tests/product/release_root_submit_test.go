@@ -19,29 +19,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
-// releaseMachine is a Runtime that takes roots by their release: it names the releases it
-// holds no installation of, installs from the facts that follow, resolves and prepares on
-// its own and mints each receipt. It keeps every input object it was sent, per owner, and
-// counts everything that reaches it.
+// releaseMachine is a Runtime that takes roots by their release: it installs what it lacks
+// from its own Hub, resolves and prepares on its own and mints each receipt. It keeps every
+// input object it was sent, per owner, and counts everything that reaches it.
 type releaseMachine struct {
 	acceptingMachines
 	mu        sync.Mutex
@@ -62,9 +54,6 @@ type releaseMachine struct {
 	// predates that terminal (it was journaled between the observer's two reads).
 	ended sync.Map
 	stale sync.Map
-	// jobsOlder is a Runtime without release_root_jobs: it takes a job only prepared.
-	jobsOlder atomic.Bool
-	prepared  atomic.Int32
 }
 
 const resolvedBody = `{"installation_id":"inst-h3","models":[{"gpus":2,"lane":"fp8-adaln-pruned","manifest":{"digest":"sha256:` +
@@ -150,7 +139,7 @@ func (m *releaseMachine) GetMachineExecutionWorkspace(ctx context.Context, query
 	workspace, err := m.acceptingMachines.GetMachineExecutionWorkspace(ctx, query)
 	if workspace != nil {
 		workspace.ReleaseRoots, workspace.ResolvesModelDefaults, workspace.InputObjectReuse = true, true, true
-		workspace.ReleaseRootSources, workspace.ReleaseRootJobs = true, !m.jobsOlder.Load()
+		workspace.ReleaseRootSources, workspace.ReleaseRootJobs = true, true
 		workspace.EventWait = m.changed != nil
 	}
 	return workspace, err
@@ -159,29 +148,16 @@ func (m *releaseMachine) GetMachineExecutionWorkspace(ctx context.Context, query
 func (m *releaseMachine) SubmitMachineExecution(ctx context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	m.submits.Add(1)
 	root := submit.ReleaseRoot
-	if root == nil && m.jobsOlder.Load() && submit.PreparedState.GetJob() != nil {
-		m.prepared.Add(1)
-		receipt, err := m.acceptingMachines.SubmitMachineExecution(ctx, submit)
-		m.acceptedAt.Store(submit.Offer.RequestId, time.Now())
-		return receipt, err
-	}
 	if root == nil || len(submit.CaptureCanonicalBytes) > 0 || submit.PreparedState != nil || len(submit.Offer.InvocationSpecCanonicalBytes) > 0 {
 		return nil, status.Error(codes.InvalidArgument, "a release root names only its request")
 	}
-	key := root.Package + "@" + root.Release
-	m.mu.Lock()
-	for _, row := range root.Installations {
-		if row.Key == key && row.Preparation.GetApplication() != "" && len(row.Preparation.LockedRequirements) > 0 {
-			m.installed[key] = true
-		}
+	if len(root.Installations) > 0 || len(root.Callees) > 0 || root.CatalogOrigin != "" {
+		return nil, status.Error(codes.InvalidArgument, "a release root names no facts, closure or catalog: the machine reads its own Hub")
 	}
-	installed := m.installed[key]
+	m.mu.Lock()
+	m.installed[root.Package+"@"+root.Release] = true // installed from its own Hub
 	m.roots = append(m.roots, proto.Clone(root).(*pb.ReleaseRoot))
 	m.mu.Unlock()
-	if !installed {
-		_ = grpc.SetTrailer(ctx, metadata.Pairs("cozy-error-code", "release_root_installations_absent", "cozy-absent-release", key))
-		return nil, status.Error(codes.FailedPrecondition, "install facts are absent for "+key)
-	}
 	receipt, err := m.acceptingMachines.SubmitMachineExecution(ctx, submit)
 	m.acceptedAt.Store(submit.Offer.RequestId, time.Now())
 	if receipt != nil {
@@ -266,9 +242,9 @@ esac
 	}
 }
 
-// A warm resubmission of a published serving call to a named rental is one message the
-// machine takes by release: no hub read, no preparation, no fit, no ladder, no input byte
-// the machine already holds, and no new connection. A cold machine asks for install facts.
+// A published serving call to a named rental is one message the machine takes by release:
+// no hub read, no preparation, no fit, no ladder, cold or warm. The machine installs from its
+// own Hub. Warm, no input byte it already holds is sent again, and no new connection is made.
 func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
@@ -345,8 +321,13 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 	}
 	cold := run("cold")
 	prepared("cold")
-	if machine.submits.Load() != 2 || !machine.installed[ladderPackage+"@1.0.0"] {
-		t.Fatalf("a cold machine takes the facts it named on its second submit; %d submits", machine.submits.Load())
+	if calls := hubCalls.Load(); calls != 0 {
+		var paths []string
+		hubPaths.Range(func(key, _ any) bool { paths = append(paths, key.(string)); return true })
+		t.Fatalf("a cold run made %d hub calls; want none: %v", calls, paths)
+	}
+	if machine.submits.Load() != 1 || !machine.installed[ladderPackage+"@1.0.0"] {
+		t.Fatalf("a cold machine installs by itself on the one submit; %d submits", machine.submits.Load())
 	}
 	coldBytes := machine.blobBytes.Load()
 	if coldBytes == 0 {
@@ -381,7 +362,7 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 		t.Fatalf("the warm run dialed the machine again (%d probes)", pod.protocolReads-dials)
 	}
 	last := machine.roots[len(machine.roots)-1]
-	if last.Entrypoint != "generate" || len(last.Models) != 0 || len(last.Installations) != 0 || len(last.InputAccess) != 2 || last.CatalogOrigin != "https://public.example" {
+	if last.Entrypoint != "generate" || len(last.Models) != 0 || len(last.InputAccess) != 2 {
 		t.Fatalf("the warm root is not the one message the machine resolves: %+v", last)
 	}
 	// The machine's own record of what it installed and resolved is the run's identity.
@@ -508,162 +489,44 @@ func TestObserverTakesTheMachinesNextEventWithoutPolling(t *testing.T) {
 	t.Logf("machine event to recorded: %s", took.Round(time.Millisecond))
 }
 
-// A machine whose Runtime predates release roots is not refused: the client resolves the
-// call's slots and prepares it as before, and the run says how to reach the fast path.
-func TestOlderRuntimeTakesTheCompatibilityPath(t *testing.T) {
+// A checkpoint named by digest alone (a lane no release names yet) reaches the machine as
+// the release root's exact choice (runs 1406/1408/1411: it was never asked).
+func TestCheckpointOverrideGoesByReleaseRoot(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
-	machine := &runtimeMachine{older: true}
+	machine := &runtimeMachine{blocker: "none"}
 	pod := &fakePod{machine: machine, deviceCount: 4}
-	root, layout := rentedLadderMachine(t, h, pod, func(_ home.Layout, store *records.Store) {
-		holder, _, problem := store.Submit(records.Request{ID: "req-gpu-holder", IdemKey: "gpu-holder", BodyDigest: childDigest("7"),
-			Package: ladderPackage, Entrypoint: "generate", Payload: []byte(`{}`)})
-		fatal(t, problem)
-		_, problem = store.FailQueuedRequest(holder.ID, map[string]any{"error_type": "proof", "error": "held elsewhere"})
-		fatal(t, problem)
-		machine.blocker = holder.ID
-	})
-	if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", "older"); code != 0 {
-		t.Fatalf("the run was refused on an older Runtime [exit %d]: %s", code, out)
+	root, layout := rentedLadderMachine(t, h, pod, nil)
+	if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "model.model="+ladderModel+"#"+bf16Manifest,
+		"--rental=tessa", "--json", "--idempotency-key", "checkpoint"); code != 0 {
+		t.Fatalf("the checkpoint override was refused [exit %d]: %s", code, out)
 	}
-	waitFor(t, root, "the Runtime submission", func() bool { return machine.submitted() != nil })
-	machine.finish()
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
-	var row *records.Request
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		row, problem = store.RequestByIdempotencyKey("older")
-		if problem == nil && row.State == "succeeded" {
-			break
-		}
-		if time.Now().After(deadline) {
-			_, show := runCozy(t, root, "run", "show", "2", "--json")
-			t.Fatalf("the run did not complete (%s): %s\n%s", row.State, show, tail(filepath.Join(root, "daemon.log")))
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	submission := machine.submitted()
-	if submission.ReleaseRoot != nil || submission.PreparedState.GetPlacementSet() == nil {
-		t.Fatalf("an older Runtime was sent a release root: %+v", submission)
-	}
-	pod.mu.Lock()
-	prepares := len(pod.prepares)
-	pod.mu.Unlock()
-	if prepares == 0 || len(row.Models) != 1 || row.Models[0].Manifest == "" {
-		t.Fatalf("the compatibility path did not prepare the pinned model: %d preparations, %+v", prepares, row.Models)
-	}
-	_, show := runCozy(t, root, "run", "show", "2", "--json")
-	if !strings.Contains(show, "lacks release roots; used the compatibility path") || !strings.Contains(show, "cozy rental update") {
-		t.Fatalf("the run does not say it took the compatibility path: %s", show)
-	}
-}
-
-// A checkpoint named by digest alone (a lane no release names yet) reaches the machine on
-// both paths: a release root carries it as the exact choice, and an older Runtime is asked
-// to download and bind exactly that checkpoint (runs 1406/1408/1411: it was never asked).
-func TestCheckpointOverrideRunsOnBothPaths(t *testing.T) {
-	for _, older := range []bool{false, true} {
-		t.Run(map[bool]string{false: "release root", true: "compatibility"}[older], func(t *testing.T) {
-			h := newLadderHub(t)
-			h.bind(goodLadder())
-			machine := &runtimeMachine{older: older, blocker: "none"}
-			pod := &fakePod{machine: machine, deviceCount: 4}
-			root, layout := rentedLadderMachine(t, h, pod, nil)
-			if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "model.model="+ladderModel+"#"+bf16Manifest,
-				"--rental=tessa", "--json", "--idempotency-key", "checkpoint"); code != 0 {
-				t.Fatalf("the checkpoint override was refused [exit %d]: %s", code, out)
-			}
-			store, problem := records.Open(layout.DB)
-			fatal(t, problem)
-			defer store.Close()
-			var row *records.Request
-			waitFor(t, root, "the submission or a settled run", func() bool {
-				row, problem = store.RequestByIdempotencyKey("checkpoint")
-				return problem == nil && row != nil && (machine.submitted() != nil || records.Settled(row.State))
-			})
-			submission := machine.submitted()
-			if submission == nil {
-				_, show := runCozy(t, root, "run", "show", "2", "--json")
-				t.Fatalf("the checkpoint override never reached the machine: %s", show)
-			}
-			digest, err := canonical.Raw(bf16Manifest)
-			must(t, err)
-			if !older {
-				choices := submission.GetReleaseRoot().GetModels()
-				if len(choices) != 1 || choices[0].Repository != ladderModel || !bytes.Equal(choices[0].Manifest.GetDigest(), digest) {
-					t.Fatalf("the release root does not carry the exact checkpoint: %+v", choices)
-				}
-				return
-			}
-			pod.mu.Lock()
-			prepares := append([]*pb.PreparePackageSetCall(nil), pod.prepares...)
-			pod.mu.Unlock()
-			asked := false
-			for _, call := range prepares {
-				var set pb.DownloadDelegation
-				must(t, canonical.Unmarshal(call.PackageSet.DownloadDelegation, &set))
-				for _, model := range set.Models {
-					asked = asked || model.Model == ladderModel && model.Manifest == bf16Manifest && model.Slot == ladderSlot
-				}
-			}
-			if !asked {
-				t.Fatalf("the older Runtime was never asked for the checkpoint: %d preparation(s)", len(prepares))
-			}
-			machine.finish()
-			waitFor(t, root, "the checkpoint run to succeed", func() bool {
-				row, problem = store.RequestByIdempotencyKey("checkpoint")
-				return problem == nil && row.State == "succeeded"
-			})
-		})
-	}
-}
-
-// A machine whose Runtime lacks release_root_jobs is asked again at dispatch, not trusted
-// from when the job was recorded: the daemon resolves the job's Model as the client did
-// before and submits it prepared, and the run says which path it took.
-func TestAJobTakesThePreparedPathOnAMachineWithoutReleaseRootJobs(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
-	machine := newReleaseMachine()
-	machine.jobsOlder.Store(true)
-	pod := &fakePod{}
-	root := startRentedPod(t, h, pod, func(string) machineExecutionPeer { return machine },
-		"--extra-index-url https://public.example/v1/index/proof/simple/\n")
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	if code, out := runCozy(t, root, "run", ladderPackage+"/long_form",
-		"model.source="+ladderModel+"@"+ladderRelease+"/"+ladderLane, "--rental=tessa", "--json",
-		"--idempotency-key", "older-job"); code != 0 {
-		t.Fatalf("the job was refused [exit %d]: %s", code, out)
-	}
-	var id string
-	waitFor(t, root, "the prepared job's acceptance", func() bool {
-		row, problem := store.RequestByIdempotencyKey("older-job")
-		if problem == nil && row != nil {
-			id = row.ID
-		}
-		return id != "" && machine.accepted(id)
+	waitFor(t, root, "the submission or a settled run", func() bool {
+		row, problem := store.RequestByIdempotencyKey("checkpoint")
+		return problem == nil && row != nil && (machine.submitted() != nil || records.Settled(row.State))
 	})
-	if machine.prepared.Load() != 1 || len(machine.roots) != 0 {
-		t.Fatalf("an older machine took %d prepared jobs and %d release roots; want 1 and 0", machine.prepared.Load(), len(machine.roots))
+	submission := machine.submitted()
+	if submission == nil {
+		_, show := runCozy(t, root, "run", "show", "2", "--json")
+		t.Fatalf("the checkpoint override never reached the machine: %s", show)
 	}
-	_, out := runCozy(t, root, "run", "show", id, "--json")
-	if !strings.Contains(out, "lacks release_root_jobs") {
-		t.Fatalf("the run does not say it took the prepared job path: %s", out)
+	digest, err := canonical.Raw(bf16Manifest)
+	must(t, err)
+	choices := submission.GetReleaseRoot().GetModels()
+	if len(choices) != 1 || choices[0].Repository != ladderModel || !bytes.Equal(choices[0].Manifest.GetDigest(), digest) {
+		t.Fatalf("the release root does not carry the exact checkpoint: %+v", choices)
 	}
 }
 
-// sourceJobHome is a rented pod whose Runtime either takes jobs with provider sources by
-// release root or (older) takes neither.
-func sourceJobHome(t *testing.T, older bool) (string, *releaseMachine, *records.Store, *ladderHub) {
+// sourceJobHome is a rented pod whose Runtime takes jobs with provider sources by release root.
+func sourceJobHome(t *testing.T) (string, *releaseMachine, *records.Store, *ladderHub) {
 	t.Helper()
 	h := newLadderHub(t)
 	h.bind(goodLadder())
 	machine := newReleaseMachine()
-	machine.jobsOlder.Store(older)
 	root := startRentedPod(t, h, &fakePod{}, func(string) machineExecutionPeer { return machine },
 		"--extra-index-url https://public.example/v1/index/proof/simple/\n")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -682,7 +545,7 @@ func sourceJob(t *testing.T, root, key string) (int, string) {
 // A job's provider-source Model on a machine whose Runtime makes it goes by release root:
 // the machine narrows the source; the host reads no provider and records no transfer.
 func TestAJobsProviderSourceGoesByReleaseRootWhereTheMachineMakesIt(t *testing.T) {
-	root, machine, store, _ := sourceJobHome(t, false)
+	root, machine, store, _ := sourceJobHome(t)
 	if code, out := sourceJob(t, root, "source-root"); code != 0 {
 		t.Fatalf("the source job was refused [exit %d]: %s", code, out)
 	}
@@ -702,51 +565,6 @@ func TestAJobsProviderSourceGoesByReleaseRootWhereTheMachineMakesIt(t *testing.T
 	if row.ModelTransfer != nil || !last.Job || len(last.Models) != 1 || last.Models[0].Source != sourceJobModel ||
 		!slices.Equal(last.Models[0].Profiles, []string{"fixture/diffusers/1"}) {
 		t.Fatalf("the source job did not go by release root: transfer %+v, root %+v", row.ModelTransfer, last)
-	}
-}
-
-// On an older Runtime the same job takes the model transfer lane: its producer validation
-// answers, and no release root reaches the machine.
-func TestAJobsProviderSourceTakesTheTransferLaneOnAnOlderMachine(t *testing.T) {
-	root, machine, _, _ := sourceJobHome(t, true)
-	code, out, said := runCozyStreams(t, root, "run", ladderPackage+"/long_form", "model.source="+sourceJobModel,
-		"--source-profile", "source=fixture/diffusers/1", "--rental=tessa", "--json", "--idempotency-key", "source-transfer")
-	if code == 0 || !strings.Contains(out, "model_producer") || !strings.Contains(said, "lacks release_root_jobs") {
-		t.Fatalf("an older machine's source job did not take the transfer lane [exit %d]: %s\n%s", code, out, said)
-	}
-	machine.mu.Lock()
-	defer machine.mu.Unlock()
-	if len(machine.roots) != 0 {
-		t.Fatalf("an older machine was sent %d release roots", len(machine.roots))
-	}
-}
-
-// A job recorded as the machine's to make but dispatched to a Runtime without the capability
-// (an update refused onto an older Runtime, a rollback) is refused by name, never re-routed.
-func TestAJobsSourceChoiceIsRefusedByNameWhereTheMachineCannotMakeIt(t *testing.T) {
-	root, machine, store, h := sourceJobHome(t, true)
-	selected, problem := rental.Resolve(store, "tessa")
-	fatal(t, problem)
-	// This process froze its config at its first load; the daemon's client addresses it.
-	cfg, problem := config.Load()
-	fatal(t, problem)
-	cfg = cfg.ForHub(h.server.URL)
-	cfg.Home = root
-	daemonClient, problem := client.Open(cfg, daemon.Probe(cfg))
-	fatal(t, problem)
-	handle, problem := daemonClient.SubmitJob(api.JobSubmission{Package: ladderPackage, Function: "long_form",
-		Input: []byte("{}"), Release: "1.0.0", Rental: true, RentalRequired: true, RequestedRental: selected.Row.ID,
-		Models: []orchestrator.ModelRef{{Choice: true, Package: ladderPackage, Slot: "long_form.models.source",
-			BindingPath: "long_form.models.source", Source: sourceJobModel, Profiles: []string{"fixture/diffusers/1"}}}}, "stale-lane")
-	fatal(t, problem)
-	waitFor(t, root, "the refusal by name", func() bool {
-		_, out := runCozy(t, root, "run", "show", handle.JobID, "--json")
-		return strings.Contains(out, "no longer advertises release_root_jobs")
-	})
-	machine.mu.Lock()
-	defer machine.mu.Unlock()
-	if len(machine.roots) != 0 || machine.prepared.Load() != 0 {
-		t.Fatalf("a machine without release_root_jobs was sent %d roots and %d prepared jobs", len(machine.roots), machine.prepared.Load())
 	}
 }
 
@@ -780,4 +598,77 @@ func TestATerminalBetweenTheStateAndEventReadsIsNotWaitedFor(t *testing.T) {
 		row, problem := store.RequestRow(id)
 		return problem == nil && row != nil && row.State == "canceled"
 	})
+}
+
+// A release this computer never installed is described by the machine it runs on: the run
+// reads the interface from the machine, which reads its own Hub, and the client makes no
+// Hub request at all.
+func TestAReleaseNotInstalledHereIsDescribedByItsMachine(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machine := newReleaseMachine()
+	root := startRentedPod(t, h, &fakePod{}, func(string) machineExecutionPeer { return machine }, "")
+	var hubCalls atomic.Int32
+	var hubPaths sync.Map
+	served := h.server.Config.Handler
+	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1/rentals") { // the fleet's own reconciliation
+			hubCalls.Add(1)
+			hubPaths.Store(r.Method+" "+r.URL.Path, true)
+		}
+		served.ServeHTTP(w, r)
+	})
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json",
+		"--idempotency-key", "described"); code != 0 {
+		t.Fatalf("the run was refused [exit %d]: %s", code, out)
+	}
+	var id string
+	waitFor(t, root, "the acceptance", func() bool {
+		row, problem := store.RequestByIdempotencyKey("described")
+		if problem == nil && row != nil {
+			id = row.ID
+		}
+		return id != "" && machine.accepted(id)
+	})
+	if calls := hubCalls.Load(); calls != 0 {
+		var paths []string
+		hubPaths.Range(func(key, _ any) bool { paths = append(paths, key.(string)); return true })
+		t.Fatalf("a run on a known machine made %d hub calls; want none: %v", calls, paths)
+	}
+	machine.mu.Lock()
+	defer machine.mu.Unlock()
+	if last := machine.roots[len(machine.roots)-1]; last.Release != "1.0.0" || last.Entrypoint != "generate" {
+		t.Fatalf("the root does not name the release its machine described: %+v", last)
+	}
+}
+
+// installedHere records a published release as `cozy package install` leaves it, so a run
+// naming a rental these tests cannot reach reads the release's interface here.
+func installedHere(t *testing.T, root, hubURL, pkg, release string) {
+	t.Helper()
+	response, err := http.Get(hubURL + "/v1/packages/" + pkg + "/releases/" + release)
+	must(t, err)
+	var detail struct {
+		PackageInterface json.RawMessage `json:"package_interface"`
+	}
+	must(t, json.NewDecoder(response.Body).Decode(&detail))
+	response.Body.Close()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	sum := sha256.Sum256([]byte(pkg + "@" + release))
+	id := fmt.Sprintf("%x", sum[:8])
+	installed := records.PackageInstall{ID: id, Package: pkg, Major: 1, Version: release,
+		SourceKind: "tensorhub", SourceRef: pkg + "@" + release, Verified: true, Dir: layout.InstallDir(id)}
+	iface, err := canonical.NormalizeJCS(detail.PackageInterface)
+	must(t, err)
+	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0o700))
+	must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), iface, 0o444))
+	_, problem = store.Activate(installed)
+	fatal(t, problem)
 }

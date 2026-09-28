@@ -213,8 +213,6 @@ func conversionRental(row *map[string]any, grants *[]map[string]any, mu *sync.Mu
 		detail.PackageInterface = iface
 		detail.Release.PackageInterfaceDigest = assessmentDigest(iface)
 		detail.Release.PackageInterfaceLength = int64(len(iface))
-		inventory := map[string]any{"format": "tensorhub.image_inventory/1", "profile": "python3.12-cpu-linux-x86", "python": "3.12.12",
-			"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.52"}}}
 		mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -224,18 +222,9 @@ func conversionRental(row *map[string]any, grants *[]map[string]any, mu *sync.Mu
 			}
 			_ = json.NewEncoder(w).Encode(*row)
 		})
-		mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, _ *http.Request) {
-			_ = json.NewEncoder(w).Encode(map[string]any{"image_inventory": inventory})
-		})
-		mux.HandleFunc("GET /v1/rentals/{id}/prepare-facts", func(w http.ResponseWriter, _ *http.Request) {
-			contract, problem := launch.DecodePackageInterface(iface)
-			if problem != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			raw, _ := json.Marshal(inventory)
-			_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: contract.Application, ModelSlotPaths: contract.ModelSlotPaths(),
-				ImageInventory: raw, LockedRequirements: "--index-url https://pypi.org/simple\nquantize==1.0.0 --hash=sha256:" + strings.Repeat("11", 32) + "\n"})
+		// The temporary prepared path reads the release's lock (proto-062 R2).
+		mux.HandleFunc("GET /v1/packages/{org}/{name}/releases/{release}/locked-requirements", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("--index-url https://pypi.org/simple\nquantize==1.0.0 --hash=sha256:" + strings.Repeat("11", 32) + "\n"))
 		})
 		mux.HandleFunc("POST /v1/machine-authorizations", func(w http.ResponseWriter, r *http.Request) {
 			var grant map[string]any
@@ -300,6 +289,7 @@ func newConversionFixture(t *testing.T) *conversionFixture {
 	f.machine = &conversionMachine{publishes: true, states: map[string]*pb.MachineExecutionState{},
 		events: map[string][]*pb.MachineExecutionEvent{}, outcomes: map[string]*pb.AttemptOutcome{}}
 	f.pod = &fakePod{controlKey: public, machine: f.machine, derivedRetain: f.machine.retain,
+		releases: map[string]*pb.DescribedRelease{"proof/quantize": {Package: "proof/quantize", Release: "1.0.0", PackageInterface: []byte(conversionInterface)}},
 		preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
 			placement := podPlacement(download, pkg, release, "quantize")
 			placement.PackageInterface = []byte(conversionInterface)
@@ -378,64 +368,6 @@ func (f *conversionFixture) published(t *testing.T, out string) *records.Request
 		t.Fatalf("the run does not report the published checkpoint: %s", out)
 	}
 	return request
-}
-
-// A conversion on the rental that ingested its source is a Runtime execution: the
-// retained ingest there does not exclude it, the submission carries the destination on the
-// weights output with the destination as its only publication grant, and the checkpoint
-// Runtime publishes becomes the run's model output. The same command again is a memo hit.
-// A Runtime that ignores the destination fails the run instead of reporting it published.
-func TestRentedConversionPublishesFromTheMachineThatIngestedItsSource(t *testing.T) {
-	f := newConversionFixture(t)
-	f.start(t)
-	root, machine := f.root, f.machine
-	convert := []string{"run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "steps=7",
-		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json"}
-	code, out := runCozy(t, root, convert...)
-	if code != 0 {
-		t.Fatalf("the rented conversion did not publish [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
-	}
-	var state struct {
-		Job string `json:"job"`
-	}
-	must(t, json.Unmarshal([]byte(out), &state))
-	f.published(t, out)
-
-	// The same conversion again is the completed run itself.
-	code, again := runCozy(t, root, convert...)
-	var replay struct {
-		Job string `json:"job"`
-	}
-	must(t, json.Unmarshal([]byte(again), &replay))
-	if code != 0 || replay.Job != state.Job || len(machine.submitted()) != 1 {
-		t.Fatalf("a completed conversion was not a memo hit [exit %d]: %s", code, again)
-	}
-
-	// An exact checkpoint input on the named rental, as `org/model#sha256:…`.
-	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source#"+f.source, "proof/output", "steps=9",
-		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
-	if code != 0 || len(machine.submitted()) != 2 {
-		t.Fatalf("a checkpoint input's rented conversion did not publish [exit %d]: %s", code, out)
-	}
-
-	// A Runtime that predates destinations runs the job and ignores the grant.
-	machine.mu.Lock()
-	machine.publishes = false
-	machine.mu.Unlock()
-	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "steps=8",
-		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
-	if code == 0 || !strings.Contains(out, "upload.destination_missing") || !strings.Contains(out, "0.18.52") {
-		t.Fatalf("an unpublished destination was reported as a success [exit %d]: %s", code, out)
-	}
-	// After the Runtime update the same command runs again rather than replaying that run.
-	machine.mu.Lock()
-	machine.publishes = true
-	machine.mu.Unlock()
-	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "steps=8",
-		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
-	if code != 0 || !strings.Contains(out, childDigest("c")) || len(machine.submitted()) != 4 {
-		t.Fatalf("the updated machine did not publish the re-run [exit %d]: %s", code, out)
-	}
 }
 
 func mustJSON(t *testing.T, value any) string {

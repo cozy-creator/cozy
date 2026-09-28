@@ -313,7 +313,7 @@ func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.C
 	if problem != nil {
 		return nil, problem
 	}
-	environment, problem := h.environment(ctx, registered.ID, client)
+	environment, problem := h.environment()
 	if problem != nil {
 		return nil, problem
 	}
@@ -502,6 +502,10 @@ func (h *Host) registration(ctx context.Context, hubOrigin string, client *hub.C
 		return registration{}, problem.WithRemedy("sign in with `cozy auth login`; a machine is registered to the user who owns it")
 	}
 	registered = registration{Hub: hubOrigin, ID: machine.ID, WorkerToken: machine.WorkerToken}
+	environment, _ := json.Marshal(machine.Environment)
+	if err := writePrivate(h.path("environment.json"), environment); err != nil {
+		return registration{}, exit.Internalf("cannot record the machine environment: %s", err)
+	}
 	raw, _ := json.Marshal(registered)
 	if err := writePrivate(h.path("registration.json"), raw); err != nil {
 		return registration{}, exit.Internalf("cannot record the machine registration: %s", err)
@@ -509,32 +513,13 @@ func (h *Host) registration(ctx context.Context, hubOrigin string, client *hub.C
 	return registered, nil
 }
 
-// environment is the hub-authored half of the grant. The last answer is kept, so a machine
-// already registered still launches while its hub is briefly unreachable.
-func (h *Host) environment(ctx context.Context, id string, client *hub.Client) (map[string]string, *exit.Error) {
+// environment is the hub-authored half of the grant, as the hub answered the registration.
+func (h *Host) environment() (map[string]string, *exit.Error) {
 	var environment map[string]string
-	var problem *exit.Error
-	if client != nil {
-		environment, problem = client.MachineEnvironment(ctx, id)
-	}
-	if problem == nil && environment != nil {
-		for name := range environment {
-			if !strings.HasPrefix(name, "TENSORHUB_") {
-				return nil, exit.New(exit.Conflict, "the hub's machine environment names %s, which is not a hub fact", name)
-			}
-		}
-		raw, _ := json.Marshal(environment)
-		if err := writePrivate(h.path("environment.json"), raw); err != nil {
-			return nil, exit.Internalf("cannot record the machine environment: %s", err)
-		}
-		return environment, nil
-	}
 	raw, err := os.ReadFile(h.path("environment.json"))
-	if err != nil || json.Unmarshal(raw, &environment) != nil {
-		if problem == nil {
-			problem = exit.Named(exit.Unavailable, "machine.environment_unavailable", "the hub named no environment for this machine")
-		}
-		return nil, problem
+	if err != nil || json.Unmarshal(raw, &environment) != nil || len(environment) == 0 {
+		return nil, exit.Named(exit.Unavailable, "machine.environment_unavailable", "this machine's registration recorded no hub environment").
+			WithRemedy("re-register it: remove %s and run it again", h.path("registration.json"))
 	}
 	return environment, nil
 }

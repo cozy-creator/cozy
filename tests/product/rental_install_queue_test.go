@@ -20,7 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -346,18 +345,6 @@ func TestQueuedRentalInstallReclaimsARestartedWorker(t *testing.T) {
 	release := rentalReleaseFacts()
 	release.PackageInterface = []byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[]}`)
 	peer.packageReleases = map[string]any{"proof/restart@1": release}
-	facts := testPrepareFacts("proof/restart", "1")
-	inventory, err := json.Marshal(map[string]any{"format": "tensorhub.image_inventory/1",
-		"profile": facts.ImageInventory.Profile, "python": facts.ImageInventory.Python, "distributions": []any{}})
-	must(t, err)
-	served := peer.server.Config.Handler
-	peer.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/rentals/"+podRental+"/prepare-facts" {
-			served.ServeHTTP(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: "proof:app", ImageInventory: inventory, LockedRequirements: string(facts.LockedRequirements)})
-	})
 	row := records.Rental{ID: podRental, MachineName: "restarted", State: "ready", SKU: "cpu", AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, Hub: peer.server.URL, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: "boot-before-restart"}
 	fatal(t, store.RecordRental(row))
 	queued, problem := store.BeginRentalInstall(podRental, records.RentalInstallSelection{Package: "proof/restart", Release: "1"})

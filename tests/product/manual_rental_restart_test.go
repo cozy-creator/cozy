@@ -224,12 +224,6 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 			case "/v1/packages/proof/idle-job/releases/1":
 				_ = json.NewEncoder(w).Encode(rentalReleaseFacts())
 				return
-			case "/v1/rentals/" + podRental + "/image-inventory":
-				_ = json.NewEncoder(w).Encode(map[string]any{"image_inventory": map[string]any{
-					"format": "tensorhub.image_inventory/1", "profile": "python3.12-cpu-linux-x86", "python": "3.12.12",
-					"interpreters": []map[string]string{{"version": "3.12.12", "abi": "cp312"}}, "distributions": []any{},
-				}})
-				return
 			case "/v1/rentals":
 				_ = json.NewEncoder(w).Encode(map[string]any{"rentals": []map[string]any{rentalView}})
 				return

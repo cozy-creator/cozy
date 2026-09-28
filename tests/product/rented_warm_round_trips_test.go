@@ -46,20 +46,6 @@ func startRentedPod(t *testing.T, h *ladderHub, pod *fakePod, machine func(block
 	must(t, err)
 	must(t, json.NewDecoder(response.Body).Decode(&detail))
 	response.Body.Close()
-	facts := testPrepareFacts(ladderPackage, "1.0.0")
-	inventory, err := json.Marshal(map[string]any{"format": "tensorhub.image_inventory/1",
-		"profile": facts.ImageInventory.Profile, "python": facts.ImageInventory.Python,
-		"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.41"}}})
-	must(t, err)
-	served := h.server.Config.Handler
-	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/rentals/"+podRental+"/prepare-facts" {
-			served.ServeHTTP(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: "h3:app", ModelSlotPaths: []string{ladderSlot},
-			ImageInventory: inventory, LockedRequirements: string(facts.LockedRequirements) + lockedExtra})
-	})
 	root := ladderRoot(t, h)
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -75,6 +61,7 @@ func startRentedPod(t *testing.T, h *ladderHub, pod *fakePod, machine func(block
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
 	pod.controlKey, pod.machine, pod.deviceCount = public, machine(holder.ID), 4
+	pod.releases = map[string]*pb.DescribedRelease{ladderPackage: {Package: ladderPackage, Release: "1.0.0", PackageInterface: detail.PackageInterface}}
 	pod.preparedPlacement = func(download []byte, pkg, release string) *pb.Placement {
 		placement := modelBearingPlacement(t)(download, pkg, release)
 		placement.PackageInterface = detail.PackageInterface

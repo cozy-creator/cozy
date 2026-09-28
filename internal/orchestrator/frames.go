@@ -222,10 +222,6 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 		return exit.Named(exit.Unavailable, "rental.package_set_signer_missing",
 			"this Cozy daemon has no package_set signer")
 	}
-	if c.opt.RentalPrepareFacts == nil {
-		return exit.Named(exit.Unavailable, "rental.prepare_facts_source_missing",
-			"this Cozy daemon has no rental prepare-facts source")
-	}
 	selections, problem := splitPackageSet(packages, models)
 	if problem != nil {
 		return problem
@@ -252,10 +248,8 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 		}
 		sets[selection.name] = body
 		prepares = append(prepares, packagePrepare{
-			label: hostLabel("package_set", selection.name),
-			pkg:   selection.name,
-			ref: &pb.DownloadPackageRef{Package: selection.packages[0].Package,
-				Release: selection.packages[0].Release},
+			label:       hostLabel("package_set", selection.name),
+			pkg:         selection.name,
 			downloadSet: append([]byte(nil), body...),
 		})
 	}

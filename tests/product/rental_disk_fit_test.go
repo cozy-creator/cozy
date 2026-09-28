@@ -90,8 +90,6 @@ func ingestOnAttachedRental(t *testing.T, diskGB int) ([]map[string]any, records
 	}
 	var bought []map[string]any
 	stand.mu.Lock()
-	stand.inventories = map[string]json.RawMessage{podRental: json.RawMessage(`{"format":"tensorhub.image_inventory/1",` +
-		`"profile":"python3.12-cpu-linux-x86","python":"3.12.12","interpreters":[{"version":"3.12.12","abi":"cp312"}],"distributions":[]}`)}
 	stand.rent = func(request map[string]any) map[string]any {
 		bought = append(bought, request)
 		return map[string]any{"rental_id": "pr-disk-fit-bought", "name": request["name"], "state": "pending_acquisition",

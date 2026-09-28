@@ -13,7 +13,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -89,19 +88,6 @@ func TestPersistedRentalIntentFromAnotherBuildResumes(t *testing.T) {
 	}
 	if _, problem := hub.ParseRentalRequestBytes([]byte(`{"name":"twine"}`)); problem == nil {
 		t.Fatal("an intent naming no SKU or width was accepted")
-	}
-}
-
-// A newer image inventory document keeps preparing packages on rentals.
-func TestImageInventoryFromNewerHubIsRead(t *testing.T) {
-	inventory, err := rental.ImageInventory(json.RawMessage(`{"format":"tensorhub.image_inventory/2","profile":"python3.12-cpu-linux-x86",` +
-		`"python":"3.12.12","cuda":{"runtime":"12.8"},"distributions":[{"name":"numpy","version":"2.1.0","source":"image"},{"name":"","version":"1"}]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if inventory.Profile != "python3.12-cpu-linux-x86" || len(inventory.Distributions) != 1 ||
-		inventory.Distributions[0].Distribution != "numpy" {
-		t.Fatalf("inventory misread: %+v", inventory)
 	}
 }
 

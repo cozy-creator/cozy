@@ -13,7 +13,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -94,48 +93,16 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 	return source, profiles, nil, nil
 }
 
-// jobModelChoices are a published job's explicit Model choices, unresolved, when it runs on
-// a named rental and no slot names a provider source: that machine resolves them (release
-// roots), or the daemon does at dispatch for one without. It answers false when the client
-// must resolve them itself: choosing a machine to rent reads the ladders.
+// jobModelChoices are a published job's explicit Model choices, unresolved, when it runs on a
+// known machine (this computer's or a named rental): that machine resolves them, provider
+// sources included. It answers false when the client must resolve them itself: choosing a
+// machine to rent reads the ladders.
 func jobModelChoices(ctx *Context, target Target, job *launch.Entrypoint, overrides map[string]string,
-	trees bool, rental string) ([]orchestrator.ModelRef, bool, *exit.Error) {
-	if trees || rental == "" || len(ctx.Inv.Values["--source-profile"]) > 0 {
+	rental string) ([]orchestrator.ModelRef, bool, *exit.Error) {
+	if rental == "" && rentalRequested(ctx) {
 		return nil, false, nil
 	}
-	for _, raw := range overrides {
-		if strings.Contains(raw, "://") {
-			return nil, false, nil
-		}
-	}
 	return modelChoices(ctx, target, job, overrides, nil)
-}
-
-func providerSourced(overrides map[string]string) bool {
-	for _, raw := range overrides {
-		if strings.Contains(raw, "://") {
-			return true
-		}
-	}
-	return false
-}
-
-// sourceByReleaseRoot answers whether the daemon's machine for this job takes a provider
-// source itself: a named rental whose Runtime advertises release-root jobs and sources.
-// Anything else, a new rental or an older Runtime, takes the model transfer lane.
-func sourceByReleaseRoot(ctx *Context, rental string) (bool, string) {
-	if rental == "" {
-		return false, "a new rental's Runtime is not known yet; used the ModelTransfer path"
-	}
-	c, problem := dial(ctx)
-	if problem != nil {
-		return false, "the daemon could not say which lanes the machine takes; used the ModelTransfer path"
-	}
-	lanes, problem := c.RentalLanes(rental)
-	if problem != nil || !lanes.ReleaseRootJobs || !lanes.ReleaseRootSources {
-		return false, "machine lacks release_root_jobs; used the ModelTransfer path (" + machines.RuntimeUpdate(rental) + " for the fast path)"
-	}
-	return true, ""
 }
 
 func jobOutputDestination(ctx *Context, job *launch.Entrypoint, sub *api.JobSubmission) *exit.Error {

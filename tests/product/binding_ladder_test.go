@@ -103,18 +103,6 @@ func newOrgLadderHub(t *testing.T, org string, authored ...[]launch.ModelDefault
 		market: market20260907(), iface: iface}
 	mux := http.NewServeMux()
 	h.mux = mux
-	mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, r *http.Request) {
-		h.mu.Lock()
-		version := h.runtimeVersions[r.PathValue("id")]
-		h.mu.Unlock()
-		if version == "" {
-			version = "0.15.0"
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"image_inventory": map[string]any{
-			"format": "tensorhub.image_inventory/1", "profile": "torch2.13.0-cu130-cp312-linux-x86", "python": "3.12.12",
-			"distributions": []map[string]string{{"name": runtimeDistribution, "version": version}, {"name": "torch", "version": "2.13.0"}},
-		}})
-	})
 	mux.HandleFunc("GET /v1/packages/"+org+"/h3", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: org, Name: "h3"},
 			Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})

@@ -37,17 +37,6 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 				"hourly_rate_usd_micros": 100000,
 			})
 		})
-		mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, r *http.Request) {
-			inventoryReads.Add(1)
-			version := "0.15.0"
-			if r.PathValue("id") == old {
-				version = "0.13.0"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"image_inventory": map[string]any{
-				"format": "tensorhub.image_inventory/1", "profile": "python3.12-cpu-linux-x86", "python": "3.12.12",
-				"distributions": []map[string]string{{"name": runtimeDistribution, "version": version}},
-			}})
-		})
 	})
 	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -57,6 +46,7 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 		fatal(t, st.RecordRental(records.Rental{ID: id, MachineName: name, AcceleratorModel: "CPU", AcceleratorCount: 1, State: "ready", HourlyRateUSDMicros: 100000, Address: "127.0.0.1:1", CertPath: "unused", Hub: hubURL}))
 	}
 	st.Close()
+	installedHere(t, root, hubURL, "proof/quantize", "1.0.0")
 	args := []string{"run", "proof/quantize/quantize", "steps=7", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--json", "--full"}
 	for _, name := range []string{"isao", current} {
 		request, _, out := submitRun(t, root, "named-"+name, append(append([]string{}, args...), "--rental="+name)...)
@@ -224,6 +214,7 @@ func TestAutomaticAndNamedRentalChoicesAllowPrivateSDKVersions(t *testing.T) {
 		h.addReady(id, name, h100SXM, row.HourlyRateUSDMicros)
 	}
 	st.Close()
+	installedHere(t, root, h.server.URL, ladderPackage, "1.0.0")
 	startDaemonProcess(t, root)
 	for _, arm := range []struct{ key, flag string }{{"automatic-runtime", "--rental-only"}, {"named-runtime", "--rental=giriko"}} {
 		_, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", arm.flag, "--json", "--idempotency-key", arm.key)
@@ -345,6 +336,7 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 			fatal(t, st.RecordRental(records.Rental{ID: id, MachineName: "isao", SKU: "h100-80", AcceleratorModel: h100SXM, AcceleratorCount: 1, HourlyRateUSDMicros: 2490000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL}))
 			h.addReady(id, "isao", h100SXM, 2490000)
 			st.Close()
+			installedHere(t, root, h.server.URL, ladderPackage, "1.0.0")
 			startDaemonProcess(t, root)
 			args := []string{"run", ladderPackage + "/generate", "steps=1", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
 			if kind == "job" {

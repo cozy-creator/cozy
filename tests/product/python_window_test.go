@@ -161,17 +161,6 @@ func TestRentalPythonProvisioningKeepsCaptureAndInventorySeparate(t *testing.T) 
 			}
 		})
 	}
-	raw := json.RawMessage(`{"format":"tensorhub.image_inventory/1","profile":"python3.12-cpu-linux-x86","python":"3.12.12","interpreters":[{"version":"3.12.12","abi":"cp312"}],"provisionable_minors":["3.12","3.13","3.14"],"distributions":[]}`)
-	inventory, err := rental.ImageInventory(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(inventory.Interpreters) != 1 {
-		t.Fatal("capability became an installed executor")
-	}
-	if !launch.ProvisionablePython(rental.ImagePythonCapabilities(raw), ">=3.13", "3.13.7") {
-		t.Fatal("rental reuse lost provisioning capability")
-	}
 }
 
 func TestRentalPythonProvisioningDoesNotHideInvalidInstalledABI(t *testing.T) {

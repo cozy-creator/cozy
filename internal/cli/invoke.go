@@ -30,6 +30,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -2602,6 +2603,9 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 		target.Release = facts.Install.Version
 		if strings.HasPrefix(target.Package, "local/") {
 			target.InstallID = facts.Install.ID
+		} else {
+			// The run's results are read against the release's interface with no Hub call.
+			keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, target.Release, facts.PackageInterface.Raw)
 		}
 		adoptInstallHub(ctx, facts.Install)
 		return target, facts.PackageInterface, nil
@@ -2609,6 +2613,27 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	if problem.Code != exit.NotFound || strings.HasPrefix(target.Package, "local/") {
 		return Target{}, nil, problem
 	}
+	// A known machine describes the release itself, at its own Hub: the run reads no Hub.
+	if machine, known, problem := knownMachine(ctx); problem != nil {
+		return Target{}, nil, problem
+	} else if known {
+		c, problem := dial(ctx)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		described, problem := c.DescribeRelease(machine, target.Package, "")
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		packageInterface, problem := launch.DecodePackageInterface(described.PackageInterface)
+		if problem != nil {
+			return Target{}, nil, exit.Named(exit.Conflict, "machine.package_interface_invalid",
+				"the machine described an invalid package interface: %s", problem.Message)
+		}
+		target.Release = described.Release
+		return target, packageInterface, nil
+	}
+	// Choosing a machine to rent reads the release at the Hub.
 	ref, problem := hub.ParseRef(target.Package)
 	if problem != nil {
 		return Target{}, nil, problem
@@ -2639,6 +2664,16 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	}
 	target.Release = release
 	return target, packageInterface, nil
+}
+
+// knownMachine is the machine a run names without renting one: this computer's, or a named
+// rental. It answers false when the run asks the fleet to choose or buy one.
+func knownMachine(ctx *Context) (string, bool, *exit.Error) {
+	if ctx.Inv.Value("--rental") != "" {
+		selected, problem := requestedRental(ctx)
+		return selected, problem == nil, problem
+	}
+	return machines.Local, !rentalRequested(ctx), nil
 }
 
 // newestPackageRelease is the newest non-yanked release by PEP 440 order, preferring a

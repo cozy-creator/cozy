@@ -311,8 +311,6 @@ func newRentedIngestPod(t *testing.T, providerProbe string, extraConfig ...strin
 		hub.set(podRental, key, value)
 	}
 	hub.mu.Lock()
-	hub.inventories = map[string]json.RawMessage{podRental: json.RawMessage(`{"format":"tensorhub.image_inventory/1",` +
-		`"profile":"python3.12-cpu-linux-x86","python":"3.12.12","distributions":[{"name":"` + runtimeDistribution + `","version":"0.18.51"}]}`)}
 	hub.mu.Unlock()
 	served := hub.server.Config.Handler
 	hub.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

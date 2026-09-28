@@ -67,9 +67,7 @@ func newMachineHub(t *testing.T) *machineHub {
 			h.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]string{"id": id, "worker_token": token})
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/machines/") && strings.HasSuffix(r.URL.Path, "/environment") && authorized:
-			_ = json.NewEncoder(w).Encode(map[string]any{"environment": h.environment()})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "worker_token": token, "environment": h.environment()})
 		default:
 			served.ServeHTTP(w, r)
 		}
@@ -225,11 +223,12 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 	return out
 }
 
-// One product body, run on this computer's machine and on a rental: the literal same Host
-// binary with a real Runtime worker measuring a virtual four-device inventory. The local
-// machine is registered and launched by the daemon; the rental is the same binary a
-// provider booted, pinned and attached. Only the machine name and address may differ.
-func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
+// parityMachines is one daemon root with both machines of the parity body: this computer's,
+// installed and launched by the daemon, and the rental `tessa`, the same Host binary a
+// provider booted and the daemon attached. Each runs a real Runtime worker measuring a
+// virtual four-device inventory.
+func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.Store) {
+	t.Helper()
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: the pod-supervisor both machines run")
 	}
@@ -266,7 +265,7 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 	launch, identity, token, _ := providerHost(t, h, layout, source, uv)
 	// The rental's paid hardware is what its worker's ClaimAck reads back: the inventory the
 	// Runtime schedules on, the same four virtual devices its workspace reports.
@@ -275,13 +274,20 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	h.rentals[parityRental] = map[string]any{"rental_id": parityRental, "name": "tessa", "state": "ready",
 		"requested_accelerator_model": model, "accelerator_count": count, "hourly_rate_usd_micros": 1,
 		"worker_address": launch.Addr, "media_address": launch.MediaAddr}
-	h.inventories = map[string]json.RawMessage{parityRental: json.RawMessage(`{"format":"tensorhub.image_inventory/1","profile":"python3.12-cpu-linux-x86","python":"3.12"}`)}
 	h.mu.Unlock()
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: parityRental, MachineName: "tessa", SKU: "virtual-4", State: "ready",
 		AcceleratorModel: model, AcceleratorCount: count, HourlyRateUSDMicros: 1, Hub: h.server.URL,
 		Address: launch.Addr, MediaAddress: launch.MediaAddr, ExpectedWorkerID: launch.WorkerID, ExpectedWorkerBootID: launch.BootID},
 		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})), secret.New(token), identity))
+	return h, root, layout, store
+}
 
+// One product body, run on this computer's machine and on a rental: the literal same Host
+// binary with a real Runtime worker measuring a virtual four-device inventory. The local
+// machine is registered and launched by the daemon; the rental is the same binary a
+// provider booted, pinned and attached. Only the machine name and address may differ.
+func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
+	h, root, layout, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
@@ -331,8 +337,8 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 
 	// A stopped machine launches again on its next call under a fresh receipt key, keeping
 	// its root and boot: the Host's idle exit and relaunch. The Runtime counts every Control
-	// Claim in its ownership record: a Runtime reporting claim_survives_restart runs the call
-	// on the Claim the daemon already holds; an older one is Claimed again.
+	// Claim in its ownership record: the relaunched Runtime runs the call on the Claim the
+	// daemon already holds, with no second Control Claim.
 	bootID := filepath.Join(root, "machine", "root", "run/cozy/bootstrap/pod-boot-id")
 	before, err := os.ReadFile(bootID)
 	must(t, err)
@@ -355,7 +361,9 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	if after, err := os.ReadFile(bootID); err != nil || string(after) != string(before) {
 		t.Fatalf("the relaunched machine is another boot (%q, was %q): %v", after, before, err)
 	}
-	relaunchClaims := streams() - claimsBefore
+	if relaunchClaims := streams() - claimsBefore; relaunchClaims != 0 {
+		t.Fatalf("the relaunch took %d Control Claims; a boot is Claimed once", relaunchClaims)
+	}
 
 	// Both machines report the Runtime's measured inventory through the same Host call.
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, nil), HubOrigin: h.server.URL,
@@ -369,14 +377,6 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 		must(t, err)
 		if len(workspace.Devices) != 4 || workspace.Devices[3].Name != "Virtual Accelerator" || workspace.ExecutorUidIsolation {
 			t.Fatalf("%s reports %d devices (%v), executor isolation %v", name, len(workspace.Devices), workspace.Devices, workspace.ExecutorUidIsolation)
-		}
-		if name == machines.Local {
-			// This fresh daemon-side resolver's own Control Claim read the capability back.
-			want := map[bool]int{true: 0, false: 1}[machine.ClaimSurvivesRestart]
-			t.Logf("claim_survives_restart=%v; the relaunch took %d Control Claim(s)", machine.ClaimSurvivesRestart, relaunchClaims)
-			if relaunchClaims != want {
-				t.Fatalf("the relaunch took %d Control Claims; claim_survives_restart=%v wants %d", relaunchClaims, machine.ClaimSurvivesRestart, want)
-			}
 		}
 	}
 }

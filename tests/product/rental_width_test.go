@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -55,10 +54,6 @@ func rentalWidthWiring(t *testing.T, pod *fakePod, connection *orchestrator.Work
 				return nil, exit.Internalf("%v", err)
 			}
 			return body, nil
-		}
-		o.RentalPrepareFacts = func(_ context.Context, _ *orchestrator.WorkerConnection,
-			ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
-			return testPrepareFacts(ref.Package, ref.Release), nil
 		}
 	}
 }

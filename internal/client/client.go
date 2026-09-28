@@ -372,11 +372,12 @@ func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
 	return res, e
 }
 
-// RentalLanes is which submission lanes a rental's Runtime takes now.
-func (c *Client) RentalLanes(rentalID string) (api.MachineLanes, *exit.Error) {
-	var lanes api.MachineLanes
-	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/lanes", nil, &lanes)
-	return lanes, problem
+// DescribeRelease asks one machine ("local" or a rental id) for a published release's interface.
+func (c *Client) DescribeRelease(machine, pkg, release string) (api.DescribedRelease, *exit.Error) {
+	var described api.DescribedRelease
+	query := url.Values{"package": {pkg}, "release": {release}}
+	problem := c.call(http.MethodGet, "/v1/local/machines/"+url.PathEscape(machine)+"/describe?"+query.Encode(), nil, &described)
+	return described, problem
 }
 
 func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Error) {

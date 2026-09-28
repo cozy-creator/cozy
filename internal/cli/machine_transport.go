@@ -23,11 +23,10 @@ import (
 // prepared on it. Every call below is the same PodHost call whichever machine answers it.
 type machineConnection struct {
 	*machines.Machine
-	runs         *machineRuns
-	installed    map[string]*pb.InstalledPackage
-	placements   map[string]*pb.DesiredPlacementSet // each captured revision's code-only placement
-	publicOrigin string                             // renter-authenticated Hub facts name the public byte endpoint
-	progress     *transfer.Progress
+	runs       *machineRuns
+	installed  map[string]*pb.InstalledPackage
+	placements map[string]*pb.DesiredPlacementSet // each captured revision's code-only placement
+	progress   *transfer.Progress
 }
 
 // connect opens the machine a run executes on; holder is what the run is doing there,
@@ -42,11 +41,6 @@ func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machin
 
 func (c *machineConnection) preparePublished(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 	ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
-	facts, problem := c.PrepareFacts(ctx, ref)
-	if problem != nil {
-		return nil, problem
-	}
-	c.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
 	// The package's exact model bindings ride its own download set, so TensorFS holds
 	// each checkpoint before execution admits it. A published callee's bindings ride
 	// the callee's preparation (capturePublishedDependencies).
@@ -54,11 +48,9 @@ func (c *machineConnection) preparePublished(ctx context.Context, request record
 	if problem != nil {
 		return nil, problem
 	}
+	// The release alone: the machine reads its facts at its own Hub.
 	stream, err := c.Host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
 		Claim: c.Claim, SupportsModelMaterializationRecovery: true, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
-		Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
-		PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion, ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
-		PackageInterface: facts.PackageInterface,
 	})
 	if err != nil {
 		return nil, machineTransport(err)
@@ -68,7 +60,7 @@ func (c *machineConnection) preparePublished(ctx context.Context, request record
 	if problem != nil {
 		return nil, problem
 	}
-	return &publishedPreparation{DesiredPlacementSet: event.PlacementSet, InstalledPackage: event.InstalledPackage, LockedRequirements: facts.LockedRequirements, Retained: observed.retained}, nil
+	return &publishedPreparation{DesiredPlacementSet: event.PlacementSet, InstalledPackage: event.InstalledPackage, Retained: observed.retained}, nil
 }
 
 func (c *machineConnection) retainModel(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
@@ -196,15 +188,7 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, bootID, pkg, release
 	var packages []*pb.DownloadPackageRef
 	call := &pb.PreparePackageSetCall{Claim: connection.Claim, SupportsModelMaterializationRecovery: true}
 	if pkg != "" {
-		ref := &pb.DownloadPackageRef{Package: pkg, Release: release}
-		facts, problem := connection.PrepareFacts(ctx, ref)
-		if problem != nil {
-			return problem
-		}
-		packages = append(packages, ref)
-		call.Application, call.ModelSlotPaths, call.ImageInventory = facts.Application, facts.ModelSlotPaths, facts.ImageInventory
-		call.PythonRequires, call.PythonVersion, call.LockedRequirements = facts.PythonRequires, facts.PythonVersion, facts.LockedRequirements
-		call.PackageInterface = facts.PackageInterface
+		packages = append(packages, &pb.DownloadPackageRef{Package: pkg, Release: release})
 	}
 	downloads, problem := rental.DownloadSet(packages, models)
 	if problem != nil {
@@ -219,18 +203,28 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, bootID, pkg, release
 	return problem
 }
 
-// Lanes is what one machine's Runtime takes now: its kept workspace, re-read after an update.
-func (m *machineRuns) Lanes(ctx context.Context, machine string) (api.MachineLanes, *exit.Error) {
-	connection, problem := m.connect(ctx, machine, "reading which lanes it takes")
+// Describe asks the machine for a published release's interface, as it reads it at its own Hub.
+func (m *machineRuns) Describe(ctx context.Context, machine, pkg, release string) (api.DescribedRelease, *exit.Error) {
+	connection, problem := m.connect(ctx, machine, "describing "+pkg)
 	if problem != nil {
-		return api.MachineLanes{}, problem
+		return api.DescribedRelease{}, problem
 	}
 	defer connection.Close()
-	workspace, problem := m.workspace(ctx, connection)
-	if problem != nil {
-		return api.MachineLanes{}, problem
+	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{
+		Claim: connection.Claim, Describe: &pb.PackageSelection{Package: pkg, Release: release}})
+	if err != nil {
+		return api.DescribedRelease{}, machineTransport(err)
 	}
-	return api.MachineLanes{ReleaseRootJobs: workspace.ReleaseRootJobs, ReleaseRootSources: workspace.ReleaseRootSources}, nil
+	described := workspace.GetDescribedRelease()
+	if described == nil {
+		return api.DescribedRelease{}, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
+			"this machine's Runtime describes no release; %s", machines.RuntimeUpdate(machine))
+	}
+	if described.Package != pkg || described.Release == "" || release != "" && described.Release != release {
+		return api.DescribedRelease{}, exit.New(exit.Conflict, "the machine described another release than %s", pkg)
+	}
+	keepReleaseInterface(m.layout.Root, pkg, described.Release, described.PackageInterface)
+	return api.DescribedRelease{Package: described.Package, Release: described.Release, PackageInterface: described.PackageInterface}, nil
 }
 
 // PruneOperationCache frees one machine's unused cached operation results through its Host.

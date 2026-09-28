@@ -52,7 +52,7 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 		InstalledPackages:  []*pb.InstalledPackage{installed},
 	}
 	addPublishedBindings(capture, installed.InstallationId, installed.InstallationId, iface, true)
-	if problem := m.capturePublishedDependencies(ctx, request, connection, capture, prepared.LockedRequirements); problem != nil {
+	if problem := m.capturePublishedDependencies(ctx, request, connection, capture); problem != nil {
 		return nil, problem
 	}
 
@@ -111,15 +111,11 @@ func (m *machineRuns) bindServingPlan(request records.Request, installationID st
 // Both published and synced-source jobs use the executing installation's
 // declaration. The client's SDK never supplies a competing root descriptor.
 func machineJobPlan(ctx context.Context, connection *machineConnection, request records.Request, installationID string, job *launch.Entrypoint) (*orchestrator.JobPlan, *exit.Error) {
-	workspace, problem := currentExecutionWorkspace(ctx, connection)
-	if problem != nil {
-		return nil, problem
-	}
 	plan := &orchestrator.JobPlan{
 		Function: request.Entrypoint, DescriptorID: job.DescriptorID, InstallationID: installationID,
 		Outputs: launch.AssetPaths(job.Result), NeedsAccelerator: request.NeedsAccelerator,
 		RSSCap: orchestrator.DefaultJobRSSCap, AcceleratorDeclared: job.Accelerator != nil,
-		CPUSlotModelInputs: workspace.CpuSlotModelInputs,
+		CPUSlotModelInputs: true,
 	}
 	for _, output := range job.WeightsOutputs {
 		plan.Outputs = append(plan.Outputs, output.OutputID)
