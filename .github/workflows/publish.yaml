@@ -73,12 +73,18 @@ jobs:
         with:
           ref: ${{ steps.src.outputs.sha }}
       - uses: actions/download-artifact@v4
+        if: inputs.from_run != ''
         with:
           pattern: wheel-*
           merge-multiple: true
           path: dist
-          run-id: ${{ inputs.from_run || github.run_id }}
+          run-id: ${{ inputs.from_run }}
           github-token: ${{ github.token }}
+      - name: Take the wheel wheels handed over
+        if: inputs.from_run == ''
+        run: |
+          src="$HOME/actions-runner/_release/tensorfs/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p dist && cp "$src"/*.whl dist/
       # The sdist carries sources only, never the staged binary; pyproject's `data`
       # option needs the directory to exist even for an sdist.
       - run: mkdir -p wheel-data/scripts

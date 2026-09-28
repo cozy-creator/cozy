@@ -32,12 +32,12 @@ jobs:
             cargo build --release --locked -p tensorfs-core --bin tfs
             install -D -m 755 target/release/tfs wheel-data/scripts/tfs
       - run: ls -l dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-linux-x86_64
-          path: dist/*.whl
-          if-no-files-found: error
-          retention-days: 3
+      # The org's artifact storage is exhausted; publish runs on this same runner and takes
+      # the wheel from a runner-local directory keyed by the run.
+      - name: Hand the wheel to publish
+        run: |
+          out="$HOME/actions-runner/_release/tensorfs/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf "$out" && mkdir -p "$out" && cp dist/*.whl "$out"/ && ls -l "$out"
       # The manylinux container writes root-owned files into the runner's workspace.
       - if: always()
         run: docker run --rm -v "$GITHUB_WORKSPACE:/w" alpine:3.20 chown -R "$(id -u):$(id -g)" /w
