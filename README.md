@@ -542,6 +542,7 @@ cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candid
 
 cozy rental list                   # current rented machines, live on a terminal
 cozy rental show otter             # one rental's facts, including accrued spend
+cozy rental logs otter -f          # the provider's boot log, followed while it boots
 cozy run org/package/generate --rental=otter prompt="moonlit lake"
 cozy rental end otter
 ```
