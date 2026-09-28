@@ -78,4 +78,3 @@ func TestCivitaiCompanionsArePlannedAsTheRentalSelectsThem(t *testing.T) {
 		})
 	}
 }
-

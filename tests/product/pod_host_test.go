@@ -132,7 +132,10 @@ type fakePod struct {
 	retainPrepared bool
 	retained       map[string]*pb.PrepareEvent
 
-	mu                 sync.Mutex
+	mu sync.Mutex
+	// held are the installations this pod prepared, and sent the operations whose files it
+	// received: a machine reopens only those, and refuses any other without its files.
+	held, sent         map[string]bool
 	acks               []*pb.SnapshotAck
 	desired            []*pb.DesiredWorkerState
 	prepares           []*pb.PreparePackageSetCall
@@ -464,6 +467,20 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 // already holds verified, and the prepared placement is a development one carrying the
 // exact project wheel and the local revision digest, as Runtime authors it.
 func (p *fakePod) LocalPackageUpload(stream grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error {
+	upload := &sentUpload{BidiStreamingServer: stream}
+	err := p.localPackageUpload(upload)
+	if err == nil && upload.operation != "" {
+		p.mu.Lock()
+		if p.sent == nil {
+			p.sent = map[string]bool{}
+		}
+		p.sent[upload.operation] = true
+		p.mu.Unlock()
+	}
+	return err
+}
+
+func (p *fakePod) localPackageUpload(stream grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error {
 	if p.localUpload != nil {
 		return p.localUpload(stream)
 	}
@@ -538,7 +555,45 @@ func (p *fakePod) PreparePrivatePlacement(call *pb.PreparePrivatePlacementCall, 
 	return p.privatePrepare(call, stream)
 }
 
+// sentUpload names the operation an upload's header carries.
+type sentUpload struct {
+	grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]
+	operation string
+}
+
+func (s *sentUpload) Recv() (*pb.LocalPackageUploadFrame, error) {
+	frame, err := s.BidiStreamingServer.Recv()
+	if header := frame.GetHeader(); err == nil && header != nil {
+		s.operation = header.OperationId
+	}
+	return frame, err
+}
+
+// PrepareLocalPackage reopens an installation the pod holds, or prepares one whose files it
+// was sent. Any other is refused as the Host and Runtime refuse it, so the owner sends it.
 func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
+	selected := call.GetLocalPackageSet()
+	installation := selected.GetPackage().GetInstallationId()
+	p.mu.Lock()
+	known := p.held[installation] || p.sent[selected.GetOperationId()]
+	p.mu.Unlock()
+	if !known {
+		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED,
+			SafeCode: "local_package_reuse_unavailable", SafeDetail: installation})
+	}
+	err := p.prepareLocalPackage(call, stream)
+	if err == nil {
+		p.mu.Lock()
+		if p.held == nil {
+			p.held = map[string]bool{}
+		}
+		p.held[installation] = true
+		p.mu.Unlock()
+	}
+	return err
+}
+
+func (p *fakePod) prepareLocalPackage(call *pb.PrepareLocalPackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
 	if p.localPrepare != nil {
 		return p.localPrepare(call, stream)
 	}
