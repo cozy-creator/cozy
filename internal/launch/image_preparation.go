@@ -3,6 +3,11 @@ package launch
 import (
 	"context"
 	"encoding/json"
+	"image"
+	_ "image/gif"  // header geometry only
+	_ "image/jpeg" // header geometry only
+	_ "image/png"  // header geometry only
+	"os"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
@@ -10,11 +15,6 @@ import (
 
 // The host Runtime owns the image profile and codec behavior. These are ordinary
 // typed questions through RuntimeCLI; package code is never imported here.
-type ImagePreparationProfile struct {
-	Profile   string `json:"profile"`
-	Qualified bool   `json:"qualified"`
-}
-
 type PreparedImage struct {
 	Status    string `json:"status"`
 	Path      string `json:"path"`
@@ -33,10 +33,24 @@ func ImagePreparationTool(root string, env []string) (RuntimeCLI, *exit.Error) {
 	return RuntimeCLI{Bin: binary, Dir: root, Home: root, Env: env}, nil
 }
 
-func (r RuntimeCLI) ImagePreparationProfile(ctx context.Context) (ImagePreparationProfile, *exit.Error) {
-	var result ImagePreparationProfile
-	problem := r.callContext(ctx, &result, "image-preparation-profile")
-	return result, problem
+// ImageFits answers from the image header alone whether image-fit/1 leaves it unchanged:
+// its longest edge and pixel count are within the policy's caps. known is false for another
+// profile or a header this host cannot read; only then is the Runtime asked.
+func ImageFits(path string, policy ImagePreparation) (fits, known bool) {
+	if policy.Profile != "image-fit/1" {
+		return false, false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false, false
+	}
+	defer file.Close()
+	header, _, err := image.DecodeConfig(file)
+	if err != nil || header.Width <= 0 || header.Height <= 0 {
+		return false, false
+	}
+	edge, pixels := int64(max(header.Width, header.Height)), int64(header.Width)*int64(header.Height)
+	return (policy.MaxEdge == nil || edge <= *policy.MaxEdge) && (policy.MaxPixels == nil || pixels <= *policy.MaxPixels), true
 }
 
 func (r RuntimeCLI) PrepareImage(ctx context.Context, source string, kind AssetsKind) (PreparedImage, *exit.Error) {

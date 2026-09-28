@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,10 +53,24 @@ func (p *fakePod) ReadByteTreeObject(call *pb.NativeByteReadCall, stream grpc.Se
 	return p.UnimplementedPodHostServer.ReadByteTreeObject(call, stream)
 }
 
-// fileMachine holds its result bytes by digest until the collector releases them.
+// fileMachine holds its result bytes by digest until the collector releases them. It records
+// the order of its custody calls, and with `together` a read waits (up to 30 s) for that
+// many reads to be in flight at once.
 type fileMachine struct {
 	finishedMachine
-	objects map[string][]byte
+	objects  map[string][]byte
+	together int
+	order    sync.Mutex
+	calls    []string
+	reading  int
+	met      chan struct{}
+	overlap  int // the most reads in flight together
+}
+
+func (m *fileMachine) note(call string) {
+	m.order.Lock()
+	defer m.order.Unlock()
+	m.calls = append(m.calls, call)
 }
 
 func (m *fileMachine) RetainByteTree(_ context.Context, call *pb.NativeByteRetentionCall) (*pb.NativeByteRetentionResult, error) {
@@ -62,13 +78,42 @@ func (m *fileMachine) RetainByteTree(_ context.Context, call *pb.NativeByteReten
 }
 
 func (m *fileMachine) ReleaseByteTree(_ context.Context, call *pb.NativeByteRetentionCall) (*pb.NativeByteRetentionResult, error) {
+	m.note("release")
 	return &pb.NativeByteRetentionResult{RetentionId: call.Request.RetentionId, Source: call.Request.Source, Released: true}, nil
 }
 
+func (m *fileMachine) AcknowledgeMachineExecutionCollection(ctx context.Context, ack *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
+	state, err := m.finishedMachine.AcknowledgeMachineExecutionCollection(ctx, ack)
+	if err == nil {
+		m.note("ack")
+	}
+	return state, err
+}
+
 func (m *fileMachine) ReadByteTreeObject(call *pb.NativeByteReadCall, stream grpc.ServerStreamingServer[pb.NativeByteReadChunk]) error {
+	m.note("read")
 	data, ok := m.objects[string(call.Object.Digest)]
 	if !ok {
 		return status.Error(codes.NotFound, "no such object")
+	}
+	if m.together > 0 {
+		m.order.Lock()
+		if m.met == nil {
+			m.met = make(chan struct{})
+		}
+		if m.reading++; m.reading == m.together {
+			close(m.met)
+		}
+		met := m.met
+		m.order.Unlock()
+		select {
+		case <-met:
+		case <-time.After(30 * time.Second):
+		}
+		m.order.Lock()
+		m.overlap = max(m.overlap, m.reading)
+		m.reading--
+		m.order.Unlock()
 	}
 	return stream.Send(&pb.NativeByteReadChunk{Offset: 0, Data: data})
 }
@@ -77,9 +122,9 @@ func (m *fileMachine) ReadByteTreeObject(call *pb.NativeByteReadCall, stream grp
 // is ignored with a warning; a declared output it does not return fails alone, and the
 // outputs it did return are still collected.
 func TestMachineOutputsAreCollectedPastExtrasAndOmissions(t *testing.T) {
-	out, store, requestID, image := runDriftedMachine(t, "output-tolerance", true, func(image, mask map[string]any) map[string]any {
+	out, store, requestID, image := runDriftedMachine(t, "output-tolerance", []string{"image", "extra"}, func(image, mask map[string]any) map[string]any {
 		return map[string]any{"image": image, "mask": mask}
-	})
+	}, nil)
 	for _, want := range []string{`warning: the machine returned output "extra", which the package does not declare; ignored`,
 		`warning: output "mask" failed: the machine did not return it`} {
 		if !strings.Contains(out, want) {
@@ -92,9 +137,9 @@ func TestMachineOutputsAreCollectedPastExtrasAndOmissions(t *testing.T) {
 // The result DOCUMENT drifts the same way: a field the package does not declare is ignored
 // and a declared output absent from it fails alone. Neither rejects the whole result.
 func TestMachineResultDocumentDriftFailsOnlyItsOutput(t *testing.T) {
-	out, store, requestID, image := runDriftedMachine(t, "result-drift", false, func(image, _ map[string]any) map[string]any {
+	out, store, requestID, image := runDriftedMachine(t, "result-drift", []string{"image"}, func(image, _ map[string]any) map[string]any {
 		return map[string]any{"image": image, "caption_v2": "a field a newer package added"}
-	})
+	}, nil)
 	for _, want := range []string{`warning: the machine returned result field "caption_v2", which the package does not declare; ignored`,
 		`warning: output "mask" failed: the machine did not return it`} {
 		if strings.Count(out, want) != 1 {
@@ -123,11 +168,38 @@ func requireOnlyImageCollected(t *testing.T, store *records.Store, requestID str
 	}
 }
 
+// A finished run's outputs are read at once, and each retention is released after the
+// collection is acknowledged: the result waits on its slowest output, not on their sum.
+func TestMachineOutputsAreReadTogetherAndReleasedAfterCollection(t *testing.T) {
+	var machine *fileMachine
+	_, store, requestID, _ := runDriftedMachine(t, "collect-together", []string{"image", "mask"}, func(image, mask map[string]any) map[string]any {
+		return map[string]any{"image": image, "mask": mask}
+	}, func(m *fileMachine) { m.together, machine = 2, m })
+	outputs, problem := store.VisibleOutputs(requestID)
+	fatal(t, problem)
+	if len(outputs) != 2 {
+		t.Fatalf("collected outputs = %+v, want image and mask", outputs)
+	}
+	waitFor(t, t.TempDir(), "both retentions released", func() bool {
+		machine.order.Lock()
+		defer machine.order.Unlock()
+		return strings.Count(strings.Join(machine.calls, " "), "release") == 2
+	})
+	machine.order.Lock()
+	defer machine.order.Unlock()
+	if machine.overlap != 2 {
+		t.Fatalf("the outputs were read one after another (at most %d in flight): %v", machine.overlap, machine.calls)
+	}
+	if ack := slices.Index(machine.calls, "ack"); ack < 0 || slices.Index(machine.calls, "release") < ack {
+		t.Fatalf("a retention was released before the collection was acknowledged: %v", machine.calls)
+	}
+}
+
 // runDriftedMachine runs one real daemon collecting a machine job whose package declares
 // two image outputs, `image` and `mask`, and watches it through the CLI. The machine returns
-// the `image` bytes, the result document `result` builds, and — when `extraFile` — bytes
-// for an undeclared `extra` output.
-func runDriftedMachine(t *testing.T, tag string, extraFile bool, result func(image, mask map[string]any) map[string]any) (string, *records.Store, string, []byte) {
+// the bytes of each `returned` output (`extra` is one the package does not declare) and the
+// result document `result` builds; `configure`, when set, adjusts the machine first.
+func runDriftedMachine(t *testing.T, tag string, returned []string, result func(image, mask map[string]any) map[string]any, configure func(*fileMachine)) (string, *records.Store, string, []byte) {
 	t.Helper()
 	root := t.TempDir()
 	layout, problem := home.Open(root)
@@ -172,14 +244,15 @@ func runDriftedMachine(t *testing.T, tag string, extraFile bool, result func(ima
 					Manifest: &pb.Ref{Digest: bytes.Repeat([]byte{marker + 1}, 32), Length: 64}, ContentBytes: uint64(len(data))}},
 			map[string]any{"asset_ref": spelled, "digest": spelled, "kind": "image", "media_type": "image/png", "size_bytes": len(data)}
 	}
+	mask := []byte("\x89PNG mask returned by the machine")
 	imageEntry, imageRow := entry("image", image, 1)
 	extraEntry, _ := entry("extra", extra, 3)
-	_, maskRow := entry("mask", []byte("never sent"), 5)
+	maskEntry, maskRow := entry("mask", mask, 5)
 	inline, err := json.Marshal(result(imageRow, maskRow))
 	must(t, err)
-	manifest := []*pb.OutputEntry{imageEntry}
-	if extraFile {
-		manifest = append(manifest, extraEntry)
+	var manifest []*pb.OutputEntry
+	for _, name := range returned {
+		manifest = append(manifest, map[string]*pb.OutputEntry{"image": imageEntry, "extra": extraEntry, "mask": maskEntry}[name])
 	}
 	specDigest, err := canonical.Spell(receipt.InvocationSpecDigest)
 	must(t, err)
@@ -195,7 +268,10 @@ func runDriftedMachine(t *testing.T, tag string, extraFile bool, result func(ima
 			outcome: &pb.AttemptOutcome{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecDigest: receipt.InvocationSpecDigest,
 				OutcomeId: tag + "-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body},
 		},
-		objects: map[string][]byte{string(imageEntry.Digest): image, string(extraEntry.Digest): extra},
+		objects: map[string][]byte{string(imageEntry.Digest): image, string(extraEntry.Digest): extra, string(maskEntry.Digest): mask},
+	}
+	if configure != nil {
+		configure(machine)
 	}
 
 	pod := &fakePod{controlKey: public, machine: machine}

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -129,45 +130,21 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 	if plan == nil {
 		return false, nil
 	}
-	for _, file := range plan.files {
-		file, problem := m.store.FreezeMachineFileResult(request.ID, file)
+	// Every file moves at once. Its retention is released after the collection is
+	// acknowledged (releaseMachineFiles), off the caller's path.
+	problems := make([]*exit.Error, len(plan.files))
+	var wait sync.WaitGroup
+	for index, file := range plan.files {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			problems[index] = m.copyMachineFile(ctx, request.ID, connection, file)
+		}()
+	}
+	wait.Wait()
+	for _, problem := range problems {
 		if problem != nil {
 			return false, problem
-		}
-		if file.State == "pending" {
-			retained, err := connection.retainBytes(ctx, fileRetentionRequest(file))
-			if err != nil {
-				return false, machineTransport(err)
-			}
-			if problem := verifyFileRetention(file, retained, false); problem != nil {
-				return false, problem
-			}
-			if problem := receiveMachineFile(ctx, connection, file); problem != nil {
-				return false, problem
-			}
-			if problem := m.store.AdvanceMachineFileResult(request.ID, file.RetentionID, "copied"); problem != nil {
-				return false, problem
-			}
-		} else if problem := verifyMachineResultCopy(file); problem != nil {
-			// The machine still holds bytes it has not released: receive them again.
-			if file.State != "copied" {
-				return false, problem
-			}
-			if problem := receiveMachineFile(ctx, connection, file); problem != nil {
-				return false, problem
-			}
-		}
-		if file.State != "released" {
-			released, err := connection.releaseBytes(ctx, fileRetentionRequest(file))
-			if err != nil {
-				return false, machineTransport(err)
-			}
-			if problem := verifyFileRetention(file, released, true); problem != nil {
-				return false, problem
-			}
-			if problem := m.store.AdvanceMachineFileResult(request.ID, file.RetentionID, "released"); problem != nil {
-				return false, problem
-			}
 		}
 	}
 	export, problem := m.store.OutputExportOf(request.ID)
@@ -193,6 +170,32 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 		}
 	}
 	return true, nil
+}
+
+// copyMachineFile holds one output on the machine under its own retention and copies it
+// here once; a copy already made is verified, and received again while the machine holds it.
+func (m *machineRuns) copyMachineFile(ctx context.Context, request string, connection *machineConnection, file records.MachineFileResult) *exit.Error {
+	file, problem := m.store.FreezeMachineFileResult(request, file)
+	if problem != nil {
+		return problem
+	}
+	if file.State != "pending" {
+		if problem := verifyMachineResultCopy(file); problem == nil || file.State != "copied" {
+			return problem
+		}
+		return receiveMachineFile(ctx, connection, file)
+	}
+	retained, err := connection.retainBytes(ctx, fileRetentionRequest(file))
+	if err != nil {
+		return machineTransport(err)
+	}
+	if problem := verifyFileRetention(file, retained, false); problem != nil {
+		return problem
+	}
+	if problem := receiveMachineFile(ctx, connection, file); problem != nil {
+		return problem
+	}
+	return m.store.AdvanceMachineFileResult(request, file.RetentionID, "copied")
 }
 
 func verifyMachineFileCopy(output records.Output) *exit.Error {

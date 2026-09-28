@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/png"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -56,6 +58,10 @@ type releaseMachine struct {
 	changed chan struct{}
 	waits   atomic.Int32
 	running sync.Map
+	// ended marks the runs the machine canceled; stale, the one whose next state read
+	// predates that terminal (it was journaled between the observer's two reads).
+	ended sync.Map
+	stale sync.Map
 	// jobsOlder is a Runtime without release_root_jobs: it takes a job only prepared.
 	jobsOlder atomic.Bool
 	prepared  atomic.Int32
@@ -75,6 +81,9 @@ func (m *releaseMachine) events(request string) []*pb.MachineExecutionEvent {
 	if _, ok := m.running.Load(request); ok {
 		out = append(out, &pb.MachineExecutionEvent{Sequence: 2, AttemptOrdinal: 1, AtMs: uint64(time.Now().UnixMilli()), Kind: "running", BodyCanonicalBytes: []byte(`{"generation":1}`)})
 	}
+	if _, ok := m.ended.Load(request); ok {
+		out = append(out, &pb.MachineExecutionEvent{Sequence: uint64(len(out) + 1), AttemptOrdinal: 1, AtMs: uint64(time.Now().UnixMilli()), Kind: "canceled", BodyCanonicalBytes: []byte(`{"generation":1}`)})
+	}
 	return out
 }
 
@@ -82,6 +91,12 @@ func (m *releaseMachine) GetMachineExecution(ctx context.Context, query *pb.Mach
 	state, err := m.acceptingMachines.GetMachineExecution(ctx, query)
 	if state != nil {
 		state.Sequence = uint64(len(m.events(query.RequestId)))
+		if _, ended := m.ended.Load(query.RequestId); ended {
+			state.State = "canceled"
+		}
+		if _, stale := m.stale.LoadAndDelete(query.RequestId); stale {
+			state.State, state.Sequence = "running", state.Sequence-1
+		}
 	}
 	return state, err
 }
@@ -116,6 +131,10 @@ func (m *releaseMachine) ListMachineExecutionEvents(ctx context.Context, query *
 // begin records that a run started executing and wakes the reads held open for it.
 func (m *releaseMachine) begin(request string) {
 	m.running.Store(request, true)
+	m.wake()
+}
+
+func (m *releaseMachine) wake() {
 	m.mu.Lock()
 	close(m.changed)
 	m.changed = make(chan struct{})
@@ -216,14 +235,49 @@ func (m *releaseMachine) ImportInputTree(stream grpc.ClientStreamingServer[pb.In
 		ProducerRootId: retention, ReceiptDigest: receipt[:], Manifest: header.Manifest, ContentBytes: header.ContentBytes}})
 }
 
+// hostRuntimeRecorder is a PATH whose first cozy-runtime identifies itself, answers every
+// image-prepare "raw" and records each question; asked returns (and clears) what it was asked.
+func hostRuntimeRecorder(t *testing.T, root string) (path string, asked func() []string) {
+	t.Helper()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "asked")
+	script := fmt.Sprintf(`#!/bin/sh
+case "$*" in
+*version*) echo version >> %[1]q; echo '{"distribution":"%[2]s","wire_protocol":"cozy.worker.v1+minor.%[3]d"}' ;;
+*image-prepare*) source=$(sed -n 's/.*"source_path":"\([^"]*\)".*/\1/p'); echo "image-prepare $source" >> %[1]q
+  echo "{\"status\":\"raw\",\"path\":\"$source\",\"media_type\":\"image/png\",\"profile\":\"image-fit/1\"}" ;;
+*) echo "$*" >> %[1]q; exit 3 ;;
+esac
+`, log, hostruntime.ToolFloor, pb.WireMinor)
+	must(t, os.WriteFile(filepath.Join(dir, hostruntime.Distribution), []byte(script), 0o755))
+	path = dir
+	for _, item := range childEnv(t, root) {
+		if inherited, ok := strings.CutPrefix(item, "PATH="); ok {
+			path += string(os.PathListSeparator) + inherited
+		}
+	}
+	return path, func() []string {
+		raw, _ := os.ReadFile(log)
+		_ = os.Remove(log)
+		if len(raw) == 0 {
+			return nil
+		}
+		return strings.Split(strings.TrimSpace(string(raw)), "\n")
+	}
+}
+
 // A warm resubmission of a published serving call to a named rental is one message the
 // machine takes by release: no hub read, no preparation, no fit, no ladder, no input byte
 // the machine already holds, and no new connection. A cold machine asks for install facts.
 func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
-	h.workflow = []byte(strings.Replace(string(workflowInterface), `"request":{"fields":[{"name":"steps","type":"int"}]}`,
-		`"request":{"fields":[{"asset_bound":{"max_bytes":67108864},"name":"image","type":{"asset":"image"}},{"name":"steps","type":"int"}]}`, 1))
+	// Its references are an Assets slot that asks for image-fit/1 preparation, as H3's does.
+	h.workflow = []byte(strings.Replace(string(workflowInterface), `"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]}`,
+		`"assets":{"kinds":[{"kind":"image","max_count":2,"media_types":["image/png"],"prepare":{"max_edge":64,"profile":"image-fit/1"}}],"parameter":"assets","view":"decoded"},`+
+			`"name":"generate","request":{"fields":[{"name":"steps","type":"int"},{"constraints":{"min_length":1,"max_length":2},"name":"assets",`+
+			`"type":{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"},`+
+			`{"name":"fidelity","type":{"literal":["auto","high","low","medium"]},"wire":"optional"}]}}}]}`, 1))
 	machine := newReleaseMachine()
 	pod := &fakePod{}
 	root := startRentedPod(t, h, pod, func(string) machineExecutionPeer { return machine },
@@ -239,11 +293,17 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 		}
 		served.ServeHTTP(w, r)
 	})
-	picture := filepath.Join(t.TempDir(), "mara.png")
-	file, err := os.Create(picture)
-	must(t, err)
-	must(t, png.Encode(file, image.NewRGBA(image.Rect(0, 0, 48, 48))))
-	must(t, file.Close())
+	// One reference already fits the policy; the other is larger and is the host Runtime's
+	// to prepare. The Runtime on PATH records what it is asked and answers "raw".
+	pictures := t.TempDir()
+	picture, large := filepath.Join(pictures, "mara.png"), filepath.Join(pictures, "veyra.png")
+	for path, edge := range map[string]int{picture: 48, large: 96} {
+		file, err := os.Create(path)
+		must(t, err)
+		must(t, png.Encode(file, image.NewRGBA(image.Rect(0, 0, edge, edge))))
+		must(t, file.Close())
+	}
+	path, hostRuntime := hostRuntimeRecorder(t, root)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -260,7 +320,7 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 	fatal(t, problem)
 	run := func(key string, extra ...string) time.Duration {
 		began := time.Now()
-		if code, out := runCozy(t, root, append([]string{"run", ladderPackage + "/generate", "steps=1", "--asset", "image=" + picture,
+		if code, out := runCozyPath(t, root, path, append([]string{"run", ladderPackage + "/generate", "steps=1", "--asset", picture, "--asset", large,
 			"--rental=tessa", "--json", "--idempotency-key", key}, extra...)...); code != 0 {
 			t.Fatalf("the %s run was refused [exit %d]: %s", key, code, out)
 		}
@@ -276,7 +336,15 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 		return at.(time.Time).Sub(began)
 	}
 
+	// Only the image larger than its policy starts a Runtime process: one admission and one
+	// preparation. A reference that already fits costs no process at all.
+	prepared := func(key string) {
+		if asked := hostRuntime(); !slices.Equal(asked, []string{"version", "image-prepare " + large}) {
+			t.Fatalf("the %s CLI asked the host Runtime %q; want only the larger image prepared", key, asked)
+		}
+	}
 	cold := run("cold")
+	prepared("cold")
 	if machine.submits.Load() != 2 || !machine.installed[ladderPackage+"@1.0.0"] {
 		t.Fatalf("a cold machine takes the facts it named on its second submit; %d submits", machine.submits.Load())
 	}
@@ -292,6 +360,7 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 	machine.submits.Store(0)
 
 	warm := run("warm")
+	prepared("warm")
 	if calls := hubCalls.Load(); calls != 0 {
 		var paths []string
 		hubPaths.Range(func(key, _ any) bool { paths = append(paths, key.(string)); return true })
@@ -312,7 +381,7 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 		t.Fatalf("the warm run dialed the machine again (%d probes)", pod.protocolReads-dials)
 	}
 	last := machine.roots[len(machine.roots)-1]
-	if last.Entrypoint != "generate" || len(last.Models) != 0 || len(last.Installations) != 0 || len(last.InputAccess) != 1 || last.CatalogOrigin != "https://public.example" {
+	if last.Entrypoint != "generate" || len(last.Models) != 0 || len(last.Installations) != 0 || len(last.InputAccess) != 2 || last.CatalogOrigin != "https://public.example" {
 		t.Fatalf("the warm root is not the one message the machine resolves: %+v", last)
 	}
 	// The machine's own record of what it installed and resolved is the run's identity.
@@ -679,4 +748,36 @@ func TestAJobsSourceChoiceIsRefusedByNameWhereTheMachineCannotMakeIt(t *testing.
 	if len(machine.roots) != 0 || machine.prepared.Load() != 0 {
 		t.Fatalf("a machine without release_root_jobs was sent %d roots and %d prepared jobs", len(machine.roots), machine.prepared.Load())
 	}
+}
+
+// A terminal the machine journals between the observer's state read and its event read is
+// taken at once: the observer reads the state again instead of holding a read open for an
+// event after the machine's last one.
+func TestATerminalBetweenTheStateAndEventReadsIsNotWaitedFor(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machine := newReleaseMachine()
+	machine.changed = make(chan struct{})
+	root := startRentedPod(t, h, &fakePod{}, func(string) machineExecutionPeer { return machine },
+		"--extra-index-url https://public.example/v1/index/proof/simple/\n")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", "raced"); code != 0 {
+		t.Fatalf("the run was refused [exit %d]: %s", code, out)
+	}
+	var id string
+	waitFor(t, root, "an events read held open", func() bool {
+		if row, problem := store.RequestByIdempotencyKey("raced"); problem == nil && row != nil {
+			id = row.ID
+		}
+		return id != "" && machine.waits.Load() > 0
+	})
+	machine.stale.Store(id, true)
+	machine.ended.Store(id, true)
+	machine.wake()
+	waitFor(t, root, "the observed terminal", func() bool {
+		row, problem := store.RequestRow(id)
+		return problem == nil && row != nil && row.State == "canceled"
+	})
 }

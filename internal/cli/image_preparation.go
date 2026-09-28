@@ -9,52 +9,42 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 )
 
-// imagePreparer is optional client work. Missing/unqualified local capability
-// preserves the ordinary raw path; Fingerprint still enforces its admitted bound.
-// Runtime retains resized derivatives in its shared system temporary media directory.
+// imagePreparer is optional client work. An image its header shows already fits the policy
+// is sent as it is, with no Runtime process; only a larger one asks the host Runtime, whose
+// image-prepare answers raw when it lacks the profile or its codecs. Any answer other than a
+// prepared image under the declared profile uploads the source unchanged. Runtime retains
+// resized derivatives in its shared system temporary media directory.
 func imagePreparer(ctx *Context) launch.ImagePreparer {
-	var tool launch.RuntimeCLI
-	var profile launch.ImagePreparationProfile
-	checked, unavailable := false, false
-	prepare := func(source string, kind launch.AssetsKind) (string, *exit.Error) {
-		if unavailable {
+	var tool *launch.RuntimeCLI
+	unavailable := false
+	return func(source string, kind launch.AssetsKind) (string, *exit.Error) {
+		if kind.Preparation == nil || unavailable {
+			return source, nil
+		}
+		if fits, known := launch.ImageFits(source, *kind.Preparation); known && fits {
 			return source, nil
 		}
 		callCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
-		if !checked {
-			checked = true
-			var problem *exit.Error
-			tool, problem = launch.ImagePreparationTool(ctx.Cfg.Home, ctx.Cfg.Tool())
-			if callCtx.Err() != nil {
-				return "", exit.New(exit.Canceled, "image preparation was cancelled")
-			}
+		if tool == nil {
+			found, problem := launch.ImagePreparationTool(ctx.Cfg.Home, ctx.Cfg.Tool())
 			if problem != nil {
 				unavailable = true
 				return source, nil
 			}
-			profile, problem = tool.ImagePreparationProfile(callCtx)
-			if callCtx.Err() != nil {
-				return "", exit.New(exit.Canceled, "image preparation was cancelled")
-			}
-			if problem != nil || !profile.Qualified {
-				unavailable = true
-				return source, nil
-			}
+			tool = &found
 		}
-		if kind.Preparation == nil || profile.Profile != kind.Preparation.Profile {
-			return source, nil
-		}
-		// Preparation is optional client work: any answer other than a prepared image
-		// under the qualified profile uploads the source unchanged.
 		prepared, problem := tool.PrepareImage(callCtx, source, kind)
 		if callCtx.Err() != nil {
 			return "", exit.New(exit.Canceled, "image preparation was cancelled")
 		}
-		if problem != nil || prepared.Profile != profile.Profile || prepared.Status != "prepared" || prepared.Path == "" {
+		if problem != nil {
+			unavailable = true // a Runtime that cannot answer one image answers no other
+			return source, nil
+		}
+		if prepared.Profile != kind.Preparation.Profile || prepared.Status != "prepared" || prepared.Path == "" {
 			return source, nil
 		}
 		return prepared.Path, nil
 	}
-	return prepare
 }

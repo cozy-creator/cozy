@@ -887,10 +887,25 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 			break
 		}
 	}
+	if state.Sequence < cursor {
+		// The pages ran past the state read (its outcome was journaled in between): read it
+		// again, or the held read that follows waits for an event after the last one.
+		if state, err = connection.Host.GetMachineExecution(ctx, query); err != nil {
+			return machineTransport(err)
+		}
+		if problem := m.store.ObserveMachineExecution(request.ID, state, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, state.Sequence)}); problem != nil {
+			return problem
+		}
+	}
 	if problem := m.reconcilePublications(ctx, request.ID, request.Hub, connection, query); problem != nil {
 		return problem
 	}
 	if state.Collected || state.State == "canceled" || state.State != "succeeded" && state.State != "failed" {
+		if state.Collected {
+			if problem := m.releaseMachineFiles(ctx, request.ID, connection); problem != nil {
+				return problem
+			}
+		}
 		if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
 			return problem
 		}
@@ -939,26 +954,37 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem := m.store.RecordMachineOutcome(request.ID, outcome); problem != nil {
 		return problem
 	}
+	// Evidence, not custody: the triage bundle is read beside the result, and a bundle the
+	// machine cannot hand over leaves the run as it is.
+	var bundle []byte
+	var triageProblem *exit.Error
+	var triage sync.WaitGroup
 	if ref := body.TriageBundle; ref != nil {
-		// Evidence, not custody: a bundle the machine cannot hand over leaves the run as it is.
-		if bundle, problem := readMachineTriage(ctx, connection, query, outcome.AttemptOrdinal, ref); problem != nil {
-			fmt.Fprintf(m.context.Out, "machine execution %s: triage bundle not kept: %s\n", request.ID, problem.Message)
-		} else if problem := m.store.RecordMachineTriage(request.ID, int64(outcome.AttemptOrdinal), bundle); problem != nil {
-			return problem
-		}
-	}
-	if modelProblem != nil {
-		return modelProblem
+		triage.Add(1)
+		go func() {
+			defer triage.Done()
+			bundle, triageProblem = readMachineTriage(ctx, connection, query, outcome.AttemptOrdinal, ref)
+		}()
 	}
 	written := writtenBytes(&body)
-	models, problem := m.collectMachineModels(ctx, request, connection, outcome, modelPlan, written)
-	if problem != nil {
-		return problem
+	models, files, problem := false, false, modelProblem
+	if problem == nil {
+		models, problem = m.collectMachineModels(ctx, request, connection, outcome, modelPlan, written)
 	}
-	if planProblem != nil {
-		return planProblem
+	if problem == nil {
+		problem = planProblem
 	}
-	files, problem := m.collectMachineFiles(ctx, request, connection, plan)
+	if problem == nil {
+		files, problem = m.collectMachineFiles(ctx, request, connection, plan)
+	}
+	triage.Wait()
+	if body.TriageBundle != nil && triageProblem != nil {
+		fmt.Fprintf(m.context.Out, "machine execution %s: triage bundle not kept: %s\n", request.ID, triageProblem.Message)
+	} else if body.TriageBundle != nil {
+		if recorded := m.store.RecordMachineTriage(request.ID, int64(outcome.AttemptOrdinal), bundle); recorded != nil {
+			return recorded
+		}
+	}
 	if problem != nil {
 		return problem
 	}
@@ -984,7 +1010,11 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem := m.store.ObserveMachineExecution(request.ID, collected, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, collected.Sequence)}); problem != nil {
 		return problem
 	}
-	// The run is complete for its caller; its inputs are released after, not before.
+	// The run is complete for its caller; its output retentions and inputs are released
+	// after, not before.
+	if problem := m.releaseMachineFiles(ctx, request.ID, connection); problem != nil {
+		return problem
+	}
 	return m.releaseMachineInputs(ctx, request, connection)
 }
 
