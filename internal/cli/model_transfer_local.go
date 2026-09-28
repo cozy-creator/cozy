@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -185,7 +186,11 @@ func planLocalSourceProfiles(tool *tfs.Tool, ctx *Context, slots map[string]stri
 			return nil, nil, problem
 		}
 		plans[slot] = plan
-		for _, member := range sourcePlanMembers(plan, files) {
+		planned := sourcePlanMembers(plan, files)
+		if plan.Profile == tfs.AsIsProfile {
+			fmt.Fprintf(ctx.Err, "note: %s (%s)\n", tfs.AsIsNote, strings.Join(planned, ", "))
+		}
+		for _, member := range planned {
 			members[member] = true
 		}
 	}

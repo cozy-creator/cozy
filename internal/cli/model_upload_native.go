@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -156,7 +157,8 @@ func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profi
 		profiles = []string{recipe.Profile}
 	}
 	named := nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}
-	if len(profiles) > 0 {
+	asIs := slices.Contains(profiles, tfs.AsIsProfile)
+	if len(profiles) > 0 && !asIs {
 		narrowed, problem := narrowSourceToProfiles(ctx, source, profiles)
 		if hostUnaware(problem) {
 			return deferToRental(ctx, named, problem), nil
@@ -180,6 +182,20 @@ func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profi
 	}
 	if !conversion.decided() {
 		return nativeIngestPlan{}, exit.Named(exit.Unavailable, "model_source.preflight_unavailable", "source headers must be inspected before ingestion: %s", conversion.Undecided)
+	}
+	if plan, ok := conversion.Plans["model"]; asIs || ok && plan.Profile == tfs.AsIsProfile {
+		// Stored as-is: sized by what this host would keep, while the rental's TensorFS,
+		// which may recognize more, decides unless as-is was named.
+		members := []string{}
+		for _, plan := range conversion.Plans {
+			for _, planned := range plan.Sources {
+				members = append(members, planned.SourceMember)
+			}
+		}
+		if source, problem = selectPublishMembers(source, members); problem != nil {
+			return nativeIngestPlan{}, problem
+		}
+		return nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}, nil
 	}
 	if len(profiles) == 0 {
 		profiles = []string{conversion.Plans["model"].Profile}

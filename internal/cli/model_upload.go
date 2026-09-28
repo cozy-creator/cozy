@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 type publishSource struct {
@@ -351,7 +352,9 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 		// A single carrier is already exact (for example Civitai's primary
 		// checkpoint). Multi-carrier provider repositories must be narrowed by
 		// TensorFS's reviewed profiles before any body is persisted or granted.
-		if len(resolved.Files) > 1 && len(sourceProfiles) > 0 {
+		// An as-is plan narrows itself from the headers, as an unnamed selection does.
+		if len(resolved.Files) > 1 && len(sourceProfiles) > 0 &&
+			!slices.Contains(sourceProfiles, tfs.AsIsProfile) {
 			tool, _, problem := localTensorFS(ctx)
 			if problem != nil {
 				return publishSource{}, problem
@@ -447,6 +450,11 @@ func narrowPublishSource(ctx *Context, source publishSource, profiles []string) 
 	if problem != nil {
 		return publishSource{}, problem
 	}
+	return selectPublishMembers(source, members)
+}
+
+// selectPublishMembers narrows a provider resolution to exact carrier members and their shards.
+func selectPublishMembers(source publishSource, members []string) (publishSource, *exit.Error) {
 	selected, problem := source.Resolution.Select(members)
 	if problem != nil {
 		return publishSource{}, problem
