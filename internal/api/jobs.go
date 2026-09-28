@@ -522,7 +522,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		}
 		logical, job, problem := s.packages.ResolveRemoteJob(hub,
 			sub.Package, sub.Release, sub.Function, sub.Models,
-			sub.ModelTransfer.HasAcquisition())
+			sub.ModelTransfer.HasAcquisition() || chosenModels(sub))
 		if problem != nil {
 			return out, nil, problem
 		}
@@ -1376,4 +1376,18 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		"job_id": row.ID, "attempt": last.Attempt, "status": "cancel_requested",
 		"note": "the attempt's own journaled terminal settles it; watch the event stream",
 	})
+}
+
+// chosenModels is a job on a named machine whose slots that machine resolves (release
+// roots), or the daemon does at dispatch for one without: nothing is resolved on record.
+func chosenModels(sub JobSubmission) bool {
+	if sub.RequestedRental == "" {
+		return false
+	}
+	for _, model := range sub.Models {
+		if !model.Choice {
+			return false
+		}
+	}
+	return true
 }

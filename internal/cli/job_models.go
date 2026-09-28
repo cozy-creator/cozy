@@ -93,6 +93,23 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 	return source, profiles, nil, nil
 }
 
+// jobModelChoices are a published job's explicit Model choices, unresolved, when it runs on
+// a named rental and no slot names a provider source: that machine resolves them (release
+// roots), or the daemon does at dispatch for one without. It answers false when the client
+// must resolve them itself: choosing a machine to rent reads the ladders.
+func jobModelChoices(ctx *Context, target Target, job *launch.Entrypoint, overrides map[string]string,
+	trees bool, rental string) ([]orchestrator.ModelRef, bool, *exit.Error) {
+	if trees || rental == "" || len(ctx.Inv.Values["--source-profile"]) > 0 {
+		return nil, false, nil
+	}
+	for _, raw := range overrides {
+		if strings.Contains(raw, "://") {
+			return nil, false, nil
+		}
+	}
+	return modelChoices(ctx, target, job, overrides, nil)
+}
+
 func jobOutputDestination(ctx *Context, job *launch.Entrypoint, sub *api.JobSubmission) *exit.Error {
 	destination := strings.TrimSpace(ctx.Inv.Value("--upload-to"))
 	if destination == "" {

@@ -50,6 +50,9 @@ type releaseMachine struct {
 	changed chan struct{}
 	waits   atomic.Int32
 	running sync.Map
+	// jobsOlder is a Runtime without release_root_jobs: it takes a job only prepared.
+	jobsOlder atomic.Bool
+	prepared  atomic.Int32
 }
 
 const resolvedBody = `{"installation_id":"inst-h3","models":[{"gpus":2,"lane":"fp8-adaln-pruned","manifest":{"digest":"sha256:` +
@@ -122,7 +125,7 @@ func (m *releaseMachine) GetMachineExecutionWorkspace(ctx context.Context, query
 	workspace, err := m.acceptingMachines.GetMachineExecutionWorkspace(ctx, query)
 	if workspace != nil {
 		workspace.ReleaseRoots, workspace.ResolvesModelDefaults, workspace.InputObjectReuse = true, true, true
-		workspace.ReleaseRootSources = true
+		workspace.ReleaseRootSources, workspace.ReleaseRootJobs = true, !m.jobsOlder.Load()
 		workspace.EventWait = m.changed != nil
 	}
 	return workspace, err
@@ -131,6 +134,12 @@ func (m *releaseMachine) GetMachineExecutionWorkspace(ctx context.Context, query
 func (m *releaseMachine) SubmitMachineExecution(ctx context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	m.submits.Add(1)
 	root := submit.ReleaseRoot
+	if root == nil && m.jobsOlder.Load() && submit.PreparedState.GetJob() != nil {
+		m.prepared.Add(1)
+		receipt, err := m.acceptingMachines.SubmitMachineExecution(ctx, submit)
+		m.acceptedAt.Store(submit.Offer.RequestId, time.Now())
+		return receipt, err
+	}
 	if root == nil || len(submit.CaptureCanonicalBytes) > 0 || submit.PreparedState != nil || len(submit.Offer.InvocationSpecCanonicalBytes) > 0 {
 		return nil, status.Error(codes.InvalidArgument, "a release root names only its request")
 	}
@@ -340,6 +349,39 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 			t.Fatalf("the %s root does not name the source for the machine: %+v", key, last.Models)
 		}
 	}
+
+	// A published job is a release root too: the machine resolves its Model and mints the
+	// job. Warm, it costs no Hub call and one submission, and names the owner's grant.
+	for _, key := range []string{"job-cold", "job-warm"} {
+		hubCalls.Store(0)
+		hubPaths.Clear()
+		machine.submits.Store(0)
+		if code, out := runCozy(t, root, "run", ladderPackage+"/long_form", "--rental=tessa", "--json",
+			"--idempotency-key", key); code != 0 {
+			t.Fatalf("the %s job was refused [exit %d]: %s", key, code, out)
+		}
+		var id string
+		waitFor(t, root, "the "+key+" acceptance", func() bool {
+			row, problem := store.RequestByIdempotencyKey(key)
+			if problem == nil && row != nil {
+				id = row.ID
+			}
+			return id != "" && machine.accepted(id)
+		})
+		if calls := hubCalls.Load(); key == "job-warm" && calls != 0 {
+			var paths []string
+			hubPaths.Range(func(key, _ any) bool { paths = append(paths, key.(string)); return true })
+			t.Fatalf("a warm job made %d hub calls; want none: %v", calls, paths)
+		}
+		if machine.submits.Load() != 1 {
+			t.Fatalf("the %s job took %d submits; want one", key, machine.submits.Load())
+		}
+		last := machine.roots[len(machine.roots)-1]
+		if !last.Job || last.Entrypoint != "long_form" || last.PublicationGrant != "local/_job-"+id ||
+			len(last.Models) != 0 || len(last.InputAccess) != 0 {
+			t.Fatalf("the %s job is not the one message the machine mints: %+v", key, last)
+		}
+	}
 }
 
 // The observer holds one events read open on its kept connection: a run's next machine
@@ -500,5 +542,41 @@ func TestCheckpointOverrideRunsOnBothPaths(t *testing.T) {
 				return problem == nil && row.State == "succeeded"
 			})
 		})
+	}
+}
+
+// A machine whose Runtime lacks release_root_jobs is asked again at dispatch, not trusted
+// from when the job was recorded: the daemon resolves the job's Model as the client did
+// before and submits it prepared, and the run says which path it took.
+func TestAJobTakesThePreparedPathOnAMachineWithoutReleaseRootJobs(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machine := newReleaseMachine()
+	machine.jobsOlder.Store(true)
+	pod := &fakePod{}
+	root := startRentedPod(t, h, pod, func(string) machineExecutionPeer { return machine },
+		"--extra-index-url https://public.example/v1/index/proof/simple/\n")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	if code, out := runCozy(t, root, "run", ladderPackage+"/long_form",
+		"model.source="+ladderModel+"@"+ladderRelease+"/"+ladderLane, "--rental=tessa", "--json",
+		"--idempotency-key", "older-job"); code != 0 {
+		t.Fatalf("the job was refused [exit %d]: %s", code, out)
+	}
+	var id string
+	waitFor(t, root, "the prepared job's acceptance", func() bool {
+		row, problem := store.RequestByIdempotencyKey("older-job")
+		if problem == nil && row != nil {
+			id = row.ID
+		}
+		return id != "" && machine.accepted(id)
+	})
+	if machine.prepared.Load() != 1 || len(machine.roots) != 0 {
+		t.Fatalf("an older machine took %d prepared jobs and %d release roots; want 1 and 0", machine.prepared.Load(), len(machine.roots))
+	}
+	_, out := runCozy(t, root, "run", "show", id, "--json")
+	if !strings.Contains(out, "lacks release_root_jobs") {
+		t.Fatalf("the run does not say it took the prepared job path: %s", out)
 	}
 }

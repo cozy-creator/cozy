@@ -108,9 +108,18 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if deadline%time.Millisecond != 0 {
 		sub.TimeoutMS++
 	}
-	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides.Models)
+	// On a known machine, a published job's explicit choices are the machine's to resolve
+	// (release roots); a machine without them gets them resolved by the daemon at dispatch.
+	var source string
+	var profiles map[string]string
+	models, chosen, e := jobModelChoices(ctx, target, job, overrides.Models, len(trees) > 0, selectedRental)
 	if e != nil {
 		return e
+	}
+	if !chosen {
+		if source, profiles, models, e = resolveJobModelInputs(ctx, target, job, overrides.Models); e != nil {
+			return e
+		}
 	}
 	sub.Models = models
 	if source != "" {
