@@ -149,8 +149,8 @@ Plain encodings return `torch.Tensor`; the two current rowwise FP8 encodings ret
 ## Store root
 
 TensorFS owns its Store location independently of Creator. User-facing entrypoints resolve one
-default in this order: an explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`. They never
-read `COZY_HOME`. Core Rust Store operations remain explicit-root.
+default in this order: an explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`. Core Rust
+Store operations remain explicit-root.
 
 A Store is created only where someone NAMED it — a root argument, or `TENSORFS_HOME` — and only by
 `init`/`ensure`. `$HOME/.tensorfs` is a place to look, not a place to conjure: with no root named
