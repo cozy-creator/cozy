@@ -16,7 +16,9 @@ func localMachineHost(ctx *Context) (*machines.Host, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	return machines.NewHost(layout.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child()), nil
+	host := machines.NewHost(layout.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child())
+	host.GPUBudget = ctx.Cfg.MachineGPUBudget
+	return host, nil
 }
 
 func handleMachineInstall(ctx *Context) *exit.Error {

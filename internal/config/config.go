@@ -77,6 +77,10 @@ type Config struct {
 	CivitaiToken           secret.Value
 	CivitaiTokenSource     string
 
+	// MachineGPUBudget caps the GPU memory this computer's machine may use, verbatim from
+	// `machine.gpu_budget`: its Runtime reads it as gpu.budget. Nil leaves the GPUs uncapped.
+	MachineGPUBudget any
+
 	Tfs       string
 	TfsSource string
 	// TensorFSRoot is the independent local TensorFS Store this Creator consumes
@@ -252,6 +256,7 @@ var fileKeys = map[string]bool{
 	"maintenance":                   true,
 	"placement":                     true,
 	"hubs":                          true,
+	"machine":                       true,
 }
 
 // nestedFileKeys are the one-level sections config.yaml admits, each mapping its
@@ -262,6 +267,7 @@ var nestedFileKeys = map[string]map[string]string{
 	"daemon":      {"idle_shutdown_s": "daemon_idle_shutdown_s"},
 	"maintenance": {"gc_cron": "maintenance_gc_cron"},
 	"placement":   {"prefer": "placement_prefer"},
+	"machine":     {"gpu_budget": "machine_gpu_budget"},
 }
 
 var environmentNames = map[string]string{
@@ -438,6 +444,7 @@ func load() (Config, *exit.Error) {
 		HubURL:                   hubURL,
 		HubName:                  hubName,
 		Hubs:                     hubs,
+		MachineGPUBudget:         file.gpuBudget,
 		HubToken:                 hubToken,
 		ConfiguredHubURL:         hubURL,
 		HubURLSource:             sourceOf("tensorhub_url", file, environment, "default"),
@@ -565,6 +572,8 @@ type resolver struct {
 	ignored []string
 	// conflicting names behaviour settings the file gives two different values.
 	conflicting map[string]bool
+	// gpuBudget is `machine.gpu_budget`, verbatim: a size, a byte count, or a per-GPU map.
+	gpuBudget any
 }
 
 func (r *resolver) Resolve(_ *kong.Context, _ *kong.Path, flag *kong.Flag) (any, error) {
@@ -744,6 +753,21 @@ func fileYAML(reader io.Reader) (*resolver, error) {
 		}
 		if !fileKeys[key.Value] {
 			out.ignored = append(out.ignored, key.Value)
+			continue
+		}
+		if key.Value == "machine" {
+			if value.Kind != yaml.MappingNode {
+				return nil, fmt.Errorf("line %d value for \"machine\" is not a mapping", value.Line)
+			}
+			for j := 0; j < len(value.Content); j += 2 {
+				if value.Content[j].Value != "gpu_budget" {
+					out.ignored = append(out.ignored, "machine."+value.Content[j].Value)
+					continue
+				}
+				if err := value.Content[j+1].Decode(&out.gpuBudget); err != nil {
+					return nil, fmt.Errorf("line %d machine.gpu_budget: %s", value.Line, err)
+				}
+			}
 			continue
 		}
 		if key.Value == "hubs" {

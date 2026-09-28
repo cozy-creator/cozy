@@ -29,6 +29,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
+	"go.yaml.in/yaml/v3"
 )
 
 // Host is this computer's machine: the literal pod-supervisor a rented pod runs, launched
@@ -44,6 +45,8 @@ type Host struct {
 	cached *cachedLaunch
 	// inherited are the locale and trust-store values a Host may carry from its launcher.
 	inherited []string
+	// GPUBudget is `machine.gpu_budget`, written for the Runtime at every launch.
+	GPUBudget any
 }
 
 func NewHost(dir, store string, environ []string) *Host {
@@ -375,6 +378,9 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, hubOrigin, 
 	mediaPort := freePort(workerPort)
 	env := append(append([]string(nil), base...),
 		"COZY_WORKER_INTERNAL_PORT="+strconv.Itoa(workerPort), "COZY_MEDIA_INTERNAL_PORT="+strconv.Itoa(mediaPort))
+	if problem := h.writeRuntimeConfig(); problem != nil {
+		return nil, problem
+	}
 	log, err := os.OpenFile(h.path("host.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, exit.Internalf("cannot open the machine Host log: %s", err)
@@ -676,4 +682,27 @@ func logSince(path string, offset int64) string {
 		}
 	}
 	return fmt.Sprint(strings.Join(lines, "\n"))
+}
+
+// writeRuntimeConfig gives the Runtime this computer's GPU budget: gpu.budget in the machine
+// root's etc/cozy/runtime.yaml, or no file when none is configured.
+func (h *Host) writeRuntimeConfig() *exit.Error {
+	path := filepath.Join(h.Root(), "etc/cozy/runtime.yaml")
+	if h.GPUBudget == nil {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return exit.Internalf("cannot clear the machine's Runtime config: %s", err)
+		}
+		return nil
+	}
+	body, err := yaml.Marshal(map[string]any{"gpu": map[string]any{"budget": h.GPUBudget}})
+	if err == nil {
+		err = os.MkdirAll(filepath.Dir(path), 0o755)
+	}
+	if err == nil {
+		err = os.WriteFile(path, body, 0o644)
+	}
+	if err != nil {
+		return exit.Internalf("cannot write the machine's Runtime config: %s", err)
+	}
+	return nil
 }
