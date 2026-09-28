@@ -109,7 +109,7 @@ sys.exit(runtime_worker.main([], gpus=[{"device_index": i, "device_name": "Virtu
 
 // providerHost boots the same Host binary as a rental's provider would: under its own root,
 // with the rental's Creator key as the owner key its grant names.
-func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machines.Source, uv string) (*machines.Launch, rental.CreatorIdentity, string) {
+func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machines.Source, uv string) (*machines.Launch, rental.CreatorIdentity, string, string) {
 	t.Helper()
 	identity, problem := rental.PendingCreatorIdentity(layout, "parity-rental")
 	fatal(t, problem)
@@ -138,7 +138,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	t.Cleanup(func() { _ = host.Stop(context.Background()) })
 	token, err := os.ReadFile(filepath.Join(dir, "media-token"))
 	must(t, err)
-	return launch, identity, string(token)
+	return launch, identity, string(token), host.Root()
 }
 
 func parityProject(t *testing.T) string {
@@ -267,7 +267,7 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
-	launch, identity, token := providerHost(t, h, layout, source, uv)
+	launch, identity, token, _ := providerHost(t, h, layout, source, uv)
 	// The rental's paid hardware is what its worker's ClaimAck reads back: the inventory the
 	// Runtime schedules on, the same four virtual devices its workspace reports.
 	const model, count = "Virtual Accelerator", 4
