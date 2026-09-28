@@ -45,14 +45,6 @@ type sourceCapability struct {
 	ExpiresAtUnix                   uint64
 }
 
-// sourceInvocation is the already resolved ordinary job. Source acquisition does
-// not select another package or construct another payload.
-type sourceInvocation struct {
-	Target   Target
-	Job      *launch.Entrypoint
-	Profiles map[string]string
-}
-
 func sourceProfileNames(profiles map[string]string) []string {
 	names := make([]string, 0, len(profiles))
 	for _, name := range profiles {
@@ -77,23 +69,12 @@ func handleModelDownload(ctx *Context) *exit.Error {
 	return handleModelTransfer(ctx, "model-download")
 }
 
+// handleModelTransfer moves a local file, a local/ alias or a Tensorhub checkpoint into
+// a Tensorhub destination (upload) or a local/ alias (download) on this computer.
 func handleModelTransfer(ctx *Context, kind string) *exit.Error {
-	return submitSourceTransfer(ctx, kind, ctx.Inv.Args[0], ctx.Inv.Args[1], nil,
-		api.JobSubmission{Input: []byte("{}")})
-}
-
-// submitSourceTransfer is shared by ordinary modeled jobs and standalone ingest.
-// It freezes the existing source inventory and headers before submitting the same
-// JobSubmission and ModelTransferIntent consumed by the resumable transfer owner.
-func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
-	invocation *sourceInvocation, submission api.JobSubmission,
-) *exit.Error {
-	destinationArg = strings.TrimSpace(destinationArg)
-	destination := destinationArg
-	privateOutputs := invocation != nil && destinationArg == ""
-	if privateOutputs {
-		submission.RetainWork = true
-	} else if kind == "model-upload" {
+	sourceArg, destinationArg := ctx.Inv.Args[0], strings.TrimSpace(ctx.Inv.Args[1])
+	var destination string
+	if kind == "model-upload" {
 		ref, problem := hub.ParseRef(destinationArg)
 		if problem != nil {
 			return problem
@@ -112,106 +93,38 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 			return problem
 		}
 		destination = "local/" + name
-		if ctx.Inv.Bool("--rental-only") {
+	}
+	if rentalRequested(ctx) {
+		if kind == "model-download" {
 			return exit.Named(exit.Unavailable, "model_download.rented_return_unavailable",
-				"rented model download cannot yet return an output to local TensorFS").
-				WithRemedy("run without --rental or --rental-only; tracked remote-return support is not landed")
+				"a rented machine cannot return a model into a local/ alias").
+				WithRemedy("omit local/NAME to download into the rental's own store with --rental=NAME")
 		}
-	}
-	preflightLocalOnly := localOnlyModelSource(sourceArg)
-	if !(preflightLocalOnly && ctx.Inv.Bool("--rental") && !ctx.Inv.Bool("--rental-only")) {
-		if problem := validateRunPlacement(ctx); problem != nil {
-			return problem
-		}
-	}
-	var suppliedProfiles map[string]string
-	if invocation != nil {
-		suppliedProfiles = invocation.Profiles
-	}
-	localOnly := preflightLocalOnly
-	if localOnly && (ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != "") {
-		return exit.Usagef("a local model source cannot run under --rental-only").
-			WithRemedy("omit --rental-only or use an addressable provider/Tensorhub source")
-	}
-	effectiveRental := rentalRequested(ctx) && !localOnly
-	if kind == "model-download" && effectiveRental {
-		return exit.Named(exit.Unavailable, "model_download.rented_return_unavailable",
-			"rented model download cannot yet return an output to local TensorFS").
-			WithRemedy("run locally until the negotiated weights-read return plane is active")
-	}
-	if invocation == nil && effectiveRental {
 		return exit.Named(exit.Unavailable, "model_transfer.rented_source_unavailable",
-			"a rented worker ingests only Hugging Face and Civitai sources").
+			"a rented machine ingests only Hugging Face and Civitai sources").
 			WithRemedy("upload this source without --rental")
 	}
-	if invocation == nil && len(ctx.Inv.Values["--source-profile"]) > 0 {
-		return exit.Usagef("--source-profile selects the profiles a rented ingest converts").
-			WithRemedy("add --rental=<name>, or omit --source-profile to use the one profile the headers match")
+	if len(ctx.Inv.Values["--source-profile"]) > 0 {
+		return exit.Usagef("--source-profile selects the profiles a provider ingest converts").
+			WithRemedy("omit --source-profile to use the one profile the headers match")
 	}
-	if localOnly {
-		ctx.Inv.Bools["--rental"] = false
-		ctx.Inv.Bools["--rental-only"] = false
-	}
-	sourceProfiles := sourceProfileNames(suppliedProfiles)
-	source, problem := resolvePublishSource(ctx, sourceArg, sourceProfiles)
+	source, problem := resolvePublishSource(ctx, sourceArg, nil)
 	if problem != nil {
 		return problem
 	}
-	if effectiveRental && catalogModelSpelling(source.Canonical) {
-		return exit.Named(exit.Unavailable, "model_transfer.rented_catalog_source_unavailable",
-			"rented model transfer cannot yet bind a Tensorhub checkpoint through the worker download set").
-			WithRemedy("run locally or use the original pinned provider source until the tracked catalog binding lands")
-	}
-	plan := modeltransfer.Plan{
-		Kind: kind, Destination: destination,
-		Source: source.Canonical, SourceSelection: source.Selection,
-		SourceLicense: source.License, InputLane: source.Lane,
-		SourceFiles: source.Exact,
-	}
-	if invocation != nil {
-		plan.SourceProfiles = suppliedProfiles
-		for _, output := range invocation.Job.WeightsOutputs {
-			plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID})
-		}
-	} else {
-		plan.Outputs = []modeltransfer.OutputPin{{Name: "model"}}
-	}
-	// THE GUARD (tfs-076). A conversion plan is a function of the source HEADERS, so it is
-	// decidable HERE — owner-side, before a rental is requested, before a byte of payload
-	// moves, and before this process submits anything. Runs 290, 294 and 309 each moved
-	// 210.3 GB and then refused on facts that were in the first few kilobytes of each
-	// member.
-	//
-	// Placed on the RENTED transfer, which is the one that spends money to find out. A
-	// local transfer already plans from headers itself, in prepareLocalTransferSources,
-	// and paying for a second header read here would be the same work twice.
-	conversion := conversionPreflight{Undecided: "not run on this path"}
-	if effectiveRental {
-		pctx, cancel := hub.LongContext()
-		decided, problem := preflightConversionPlan(pctx, ctx, source, plan.SourceProfiles)
-		cancel()
-		if problem != nil {
-			return problem
-		}
-		conversion = decided
-		if effectiveRental && !conversion.decided() {
-			return exit.Named(exit.Unavailable, "model_source.preflight_unavailable",
-				"source headers must be inspected before renting: %s", conversion.Undecided).
-				WithRemedy("retry after the provider can serve every selected source header")
-		}
-	}
-
-	if kind == "model-upload" && !privateOutputs {
+	if kind == "model-upload" {
 		ref, _ := hub.ParseRef(destination)
 		if _, problem := ownedPublication(ctx, ref); problem != nil {
 			return problem
 		}
 	}
-	intent := modelTransferIntent(plan)
-	for i := range intent.SourceFiles {
-		intent.SourceFiles[i].Header = conversion.Headers[intent.SourceFiles[i].Member]
-	}
-	intent.LocalOnly = localOnly
+	intent := modelTransferIntent(modeltransfer.Plan{
+		Kind: kind, Destination: destination,
+		Source: source.Canonical, SourceSelection: source.Selection,
+		SourceLicense: source.License, InputLane: source.Lane,
+		SourceFiles: source.Exact, Outputs: []modeltransfer.OutputPin{{Name: "model"}},
+	})
+	intent.LocalOnly = localOnlyModelSource(sourceArg)
 	daemonState, _, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return problem
@@ -221,19 +134,8 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 	if problem != nil {
 		return problem
 	}
-	submission.ModelTransfer = &intent
-	submission.Rental, submission.RentalRequired = effectiveRental, ctx.Inv.Bool("--rental-only") || submission.RequestedRental != ""
-	if invocation != nil && kind == "model-upload" && !privateOutputs {
-		org := strings.Split(destination, "/")[0]
-		if submission.Org != "" && submission.Org != org {
-			return exit.Usagef("--org must match the --upload-to organization")
-		}
-		submission.Org = org
-	}
+	submission := api.JobSubmission{Input: []byte("{}"), ModelTransfer: &intent}
 	handle, problem := local.SubmitJob(submission, requestKey(ctx.Inv.Value("--idempotency-key")))
-	if invocation != nil {
-		releaseSnapshotReader(invocation.Target)
-	}
 	if problem != nil {
 		return problem
 	}

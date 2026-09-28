@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -290,14 +289,4 @@ func (s *Server) cancelForDown(row records.Request) (bool, *exit.Error) {
 			"the daemon was torn down with `cozy down --all` while this attempt's execution "+
 				"context was already gone: "+problem.Message)
 	}
-}
-
-func joinLifecycleIdentities(groups ...[]LifecycleIdentity) string {
-	var names []string
-	for _, group := range groups {
-		for _, identity := range group {
-			names = append(names, fmt.Sprintf("%s %s (%s)", identity.Kind, identity.ID, identity.State))
-		}
-	}
-	return strings.Join(names, ", ")
 }

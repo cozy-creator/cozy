@@ -319,20 +319,6 @@ type packageSelection struct {
 	models   []*pb.DownloadModelRef
 }
 
-// contentKey is the selection's logical content — what a download set names beside
-// its expiry and worker identity. Equal keys authorize the same bytes.
-func (g packageSelection) contentKey() string {
-	var sb strings.Builder
-	for _, row := range g.packages {
-		sb.WriteString("p\x00" + row.Package + "\x00" + row.Release + "\x01")
-	}
-	for _, row := range g.models {
-		sb.WriteString("m\x00" + row.Package + "\x00" + row.Slot + "\x00" + row.Model + "\x00" +
-			row.Release + "\x00" + row.Lane + "\x00" + row.Manifest + "\x01")
-	}
-	return sb.String()
-}
-
 // splitPackageSet gives every package of the merged logical set its own selection,
 // ordered by package name. Every model rides with its named package; a model naming no
 // selected package has no prepare to ride and is refused here, where the defect is

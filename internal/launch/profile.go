@@ -23,9 +23,6 @@ type BaseProfile struct {
 	TorchRelease     string
 }
 
-// TorchFree answers whether this base carries no Torch at all.
-func (p BaseProfile) TorchFree() bool { return p.TorchRelease == "none" }
-
 var (
 	torchProfile = regexp.MustCompile(`^torch([0-9]+\.[0-9]+\.[0-9]+)-([a-z0-9]+)-(cp[0-9]{3})-([a-z0-9-]+)$`)
 	cpuProfile   = regexp.MustCompile(`^python([0-9]+)\.([0-9]+)-cpu-([a-z0-9-]+)$`)

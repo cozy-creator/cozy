@@ -1437,13 +1437,6 @@ func (m *managedRentals) letGo(released, failed []string) *exit.Error {
 	return nil
 }
 
-// fleetLineLocked is the fleet line where one is known. A Hub without an account
-// listing has none, and that is no reason to defer anything about a rental.
-func (m *managedRentals) fleetLineLocked(origin string) string {
-	line, _ := m.lineLocked(origin)
-	return line
-}
-
 // lineLocked is one hub's fleet line: that account's machines and burn.
 func (m *managedRentals) lineLocked(origin string) (string, *exit.Error) {
 	count, burn, problem := m.totalsLocked(origin)

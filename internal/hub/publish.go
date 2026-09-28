@@ -8,7 +8,6 @@ package hub
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -23,9 +22,6 @@ type Object struct {
 	ID     string `json:"object_id"`
 	Length int64  `json:"length"`
 }
-
-// B64 wraps exact document bytes for the declaration.
-func B64(raw []byte) string { return base64.StdEncoding.EncodeToString(raw) }
 
 // Session is the compact durable view returned by the idempotent publication PUT.
 type Session struct {

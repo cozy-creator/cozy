@@ -677,11 +677,6 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 	return out, nil
 }
 
-func validateJobPayload(pkg string, job launch.JobFacts, payload json.RawMessage) *exit.Error {
-	return launch.ValidatePayload(pkg,
-		&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request}, payload)
-}
-
 // validOrg keeps the SCRATCH REPO's name spellable. The org is one path segment of
 // `<org>/_job-<request-id>`, so a separator or a dot component in it would move the
 // publication root — which is the escape the destination fence exists to refuse. Refusing

@@ -1437,24 +1437,6 @@ func idleShutdownNote() string {
 	return "Idle machines shut down after 15 minutes. Use cozy rental keepalive <name> for one explicit reset."
 }
 
-// plainDuration spells a grace the way a person would: "5 minutes", "90 seconds", "2 hours".
-func plainDuration(d time.Duration) string {
-	switch {
-	case d%time.Hour == 0:
-		return plural(int(d/time.Hour), "hour")
-	case d%time.Minute == 0:
-		return plural(int(d/time.Minute), "minute")
-	}
-	return plural(int(d/time.Second), "second")
-}
-
-func plural(n int, unit string) string {
-	if n == 1 {
-		return "1 " + unit
-	}
-	return fmt.Sprintf("%d %ss", n, unit)
-}
-
 func idleReleaseNote() string {
 	return "rentals end after 15 minutes without active work; cozy rental keepalive <name> explicitly resets that deadline"
 }

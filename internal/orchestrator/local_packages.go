@@ -509,15 +509,6 @@ func (c *Orchestrator) localControlContext(ctx context.Context, instanceID strin
 	}
 }
 
-func (c *Orchestrator) localStatus(operationID, digest string) localTransferStatus {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if transfer := c.localTransfers[operationID]; transfer != nil {
-		return transfer.status[digest]
-	}
-	return localTransferStatus{}
-}
-
 func (c *Orchestrator) onLocalPackageFileStatus(current *session,
 	frame *pb.LocalPackageFileStatus,
 ) {

@@ -16,8 +16,6 @@ package transfer
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -35,13 +33,6 @@ import (
 )
 
 const modelUploadOperationVersion = "model-checkpoint-upload/1\x00"
-
-// CheckpointOperationID binds one checkpoint upload intent.
-func CheckpointOperationID(ref hub.Ref, manifestID string) string {
-	subject := modelUploadOperationVersion + ref.String() + "\x00" + manifestID
-	sum := sha256.Sum256([]byte(subject))
-	return "manifest-" + hex.EncodeToString(sum[:])
-}
 
 // One object write or read at the storage edge is bounded by BYTES MOVING, not by a
 // clock — see `mover`. The 30-minute constant that used to live here said in its own

@@ -10,7 +10,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 //go:embed active_requirements.py
@@ -21,26 +20,6 @@ type RequirementSelection struct {
 	RequiresPython string              `json:"requires_python"`
 	Requirements   []string            `json:"requirements"`
 	Extras         map[string][]string `json:"extras"`
-}
-
-func ActiveWheelRequirements(ctx context.Context, project string, extras []string, paths []string, python string) (RequirementSelection, *exit.Error) {
-	metadata := map[string]string{}
-	for _, path := range paths {
-		raw, problem := wheel.Metadata(path)
-		if problem != nil {
-			return RequirementSelection{}, problem
-		}
-		name, _, problem := wheel.MetadataIdentity(raw)
-		if problem != nil {
-			return RequirementSelection{}, problem
-		}
-		name = normalizedProjectName(name)
-		if _, duplicate := metadata[name]; duplicate {
-			return RequirementSelection{}, exit.New(exit.Conflict, "captured wheel metadata repeats a distribution")
-		}
-		metadata[name] = string(raw)
-	}
-	return ActiveRequirements(ctx, project, extras, metadata, python)
 }
 
 // ActiveRequirements binds selected extras using the standard PEP 508 parser,

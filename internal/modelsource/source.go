@@ -3,7 +3,6 @@
 package modelsource
 
 import (
-	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -307,14 +306,3 @@ func badSource(raw, why string) *exit.Error {
 }
 
 func (s Source) String() string { return s.Canonical }
-
-func (s Source) Description() string {
-	switch s.Kind {
-	case HuggingFace:
-		return fmt.Sprintf("Hugging Face %s/%s", s.Org, s.Repo)
-	case Civitai:
-		return fmt.Sprintf("Civitai model version %d", s.VersionID)
-	default:
-		return s.Path
-	}
-}

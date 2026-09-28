@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"path/filepath"
-	"sort"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/scratch"
@@ -48,23 +47,6 @@ type conversionPreflight struct {
 }
 
 func (p conversionPreflight) decided() bool { return len(p.Plans) > 0 }
-
-// Sessions names each slot's conversion journal key, in slot order. The pod computes the
-// same sixteen characters from the same headers — the key is a function of the source
-// headers with zero tensor bytes read — so this says IN ADVANCE which journal a rented run
-// will open.
-func (p conversionPreflight) Sessions() []string {
-	slots := make([]string, 0, len(p.Plans))
-	for slot := range p.Plans {
-		slots = append(slots, slot)
-	}
-	sort.Strings(slots)
-	out := make([]string, 0, len(slots))
-	for _, slot := range slots {
-		out = append(out, slot+"="+p.Plans[slot].Session)
-	}
-	return out
-}
 
 // preflightConversionPlan reads each reviewed carrier's header by ranged GET and plans the
 // conversion from it. No rental, no pod, no destination store, and no tensor byte: on

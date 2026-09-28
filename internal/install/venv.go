@@ -3,10 +3,7 @@ package install
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -216,26 +213,6 @@ func runtimeScratchHome() string {
 	return filepath.Join(base, "cozy", "runtime-install")
 }
 
-// writeLockedRequirements merges the export's registry rows with the release's own exact
-// wheel pins into the ONE document Runtime's reader admits: two https index directives,
-// then hash-pinned rows sorted by normalized distribution.
-func writeLockedRequirements(exported, target, indexURL string,
-	wheels []PublishedWheel,
-) *exit.Error {
-	raw, err := os.ReadFile(exported)
-	if err != nil {
-		return exit.Internalf("cannot read the exported registry closure: %s", err)
-	}
-	body, problem := LockedRequirements(raw, indexURL, wheels)
-	if problem != nil {
-		return problem
-	}
-	if err := os.WriteFile(target, body, 0o600); err != nil {
-		return exit.Internalf("cannot retain the locked-requirements export: %s", err)
-	}
-	return nil
-}
-
 // LockedRequirements renders the same exact wheel inventory for an installed
 // package or a worker-local dependency; it never resolves names or versions. A universal
 // lock forks a distribution by environment marker, so one name may repeat under different
@@ -370,19 +347,6 @@ func Disk(dir string) (exclusive, shared int64) {
 		shared += row.allocated
 	}
 	return
-}
-
-func fileDigest(p string) (string, error) {
-	f, err := os.Open(p)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 var extraName = regexp.MustCompile(`^\s*(cu\d{2,4})\s*=`)
