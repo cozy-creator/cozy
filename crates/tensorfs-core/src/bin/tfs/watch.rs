@@ -29,8 +29,6 @@ use std::process::{Child, ChildStdout, ExitStatus};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use tensorfs_core::catalog::BUSY_TIMEOUT;
-
 /// How many times its own worst silence a worker is granted before the parent looks for
 /// inactivity, and how many times its own projected run it may spin without progress.
 /// Three doublings past the demonstrated maximum: the worst of n observed gaps
@@ -101,8 +99,11 @@ fn parse_progress(line: &str) -> Option<(u64, u64)> {
     Some((moved.parse().ok()?, admitted.parse().ok()?))
 }
 
+/// Patience before a worker has shown any gap to measure against.
+const FIRST_PATIENCE: Duration = Duration::from_secs(5);
+
 fn patience(worst_gap: Duration) -> Duration {
-    (worst_gap * PATIENCE_FACTOR).max(BUSY_TIMEOUT)
+    (worst_gap * PATIENCE_FACTOR).max(FIRST_PATIENCE)
 }
 
 /// What a silent-but-active worker is allowed: the whole declared input at the rate this

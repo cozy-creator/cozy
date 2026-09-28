@@ -1530,7 +1530,7 @@ impl Store {
         fault: &Fault,
         operation: Option<&str>,
     ) -> Result<Put> {
-        let catalog = match crate::catalog::Catalog::open_admitting(&self.root) {
+        let catalog = match crate::catalog::Catalog::open(&self.root) {
             Ok(catalog) => catalog,
             Err(refusal) => return cleanup(&verified.tmp, refusal),
         };

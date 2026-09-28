@@ -6,7 +6,6 @@ use std::fs::{self, File};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
-use std::time::Duration;
 
 use fs2::FileExt;
 use rusqlite::{params, Connection};
@@ -14,10 +13,7 @@ use rusqlite::{params, Connection};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::storage::Projection;
 
-/// The longest one catalog call may SLEEP on another writer's lock before it refuses. It is
-/// the only wait a store operation can legitimately spend blocked and idle, so it is also
-/// the floor under any patience a supervisor grants a worker that has gone quiet.
-pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+mod lock;
 
 /// The catalog this build writes. A newer build may only ADD tables and columns (an
 /// incompatible change renames the table), so any catalog at this version or later that
@@ -60,11 +56,6 @@ fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
         code: Code::IO_FAILED,
         detail: format!("{}: {error}", what.as_ref()),
     }
-}
-
-/// Whether a catalog refusal is SQLite's busy timeout expiring behind another writer.
-fn busy(refusal: &Refusal) -> bool {
-    refusal.code == Code::IO_FAILED && refusal.detail.ends_with("database is locked")
 }
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
@@ -134,13 +125,32 @@ fn connect(path: &Path) -> Result<Connection> {
         }
         sql("open catalog", error)
     })?;
-    connection
-        .busy_timeout(BUSY_TIMEOUT)
-        .map_err(|error| sql("set catalog busy timeout", error))?;
-    connection
-        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
-        .map_err(|error| sql("configure catalog", error))?;
+    configure(&connection, path)?;
     Ok(connection)
+}
+
+/// Journal and sync by what a crash can take from the disk the catalog lives on
+/// (`disk::DiskClass`): an ephemeral disk dies with the machine, so no sync buys anything;
+/// a persistent one keeps a WAL synced at checkpoints; a network filesystem keeps the
+/// rollback journal and a full sync, because WAL's shared memory is not coherent across
+/// hosts. The catalog is only ever opened by processes on one host otherwise.
+pub(crate) fn configure(connection: &Connection, path: &Path) -> Result<()> {
+    lock::wait_for_live_holders(connection, path)?;
+    let (journal, synchronous) = match crate::disk::DiskClass::of(path.parent().unwrap_or(path)) {
+        crate::disk::DiskClass::Ephemeral => ("wal", "OFF"),
+        crate::disk::DiskClass::Persistent => ("wal", "NORMAL"),
+        crate::disk::DiskClass::Network => ("delete", "FULL"),
+    };
+    connection
+        .query_row(&format!("PRAGMA journal_mode={journal}"), [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| sql("set catalog journal", error))?;
+    connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys=ON; PRAGMA synchronous={synchronous};"
+        ))
+        .map_err(|error| sql("configure catalog", error))
 }
 
 /// A connection to an existing catalog of exactly this schema.
@@ -388,22 +398,6 @@ impl Catalog {
         };
         catalog.initialize_schema()?;
         Ok(catalog)
-    }
-
-    /// `open` for an object admission. A catalog busy past SQLite's timeout while this
-    /// process's own admission batches keep committing is a queue, not a failure: the
-    /// verified bytes wait for their turn instead of being thrown away and fetched again.
-    /// Busy with no batch committed in the meantime is another writer's lock, and refuses.
-    pub(crate) fn open_admitting(root: &Path) -> Result<Self> {
-        loop {
-            let committed = crate::stats::snapshot().admission_batches;
-            match Self::open(root) {
-                Err(refusal)
-                    if busy(&refusal) && crate::stats::snapshot().admission_batches > committed => {
-                }
-                opened => return opened,
-            }
-        }
     }
 
     pub fn open(root: &Path) -> Result<Self> {
@@ -1624,6 +1618,89 @@ mod tests {
             std::process::id(),
             crate::meta::now_nanos_unique()
         ))
+    }
+
+    /// Another process holding the catalog's write lock: this test binary, re-run as
+    /// `lock_holder_child`, until it has taken the lock.
+    fn holder(catalog: &Path, millis: u64) -> std::process::Child {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "catalog::tests::lock_holder_child", "--ignored"])
+            .args(["--nocapture", "--test-threads=1"])
+            .env("TENSORFS_TEST_HOLD", catalog)
+            .env("TENSORFS_TEST_HOLD_MS", millis.to_string())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let held = lines
+            .by_ref()
+            .map_while(std::result::Result::ok)
+            .any(|line| line.ends_with("held"));
+        assert!(held, "the holder never took the catalog lock");
+        std::thread::spawn(move || lines.for_each(drop));
+        child
+    }
+
+    #[test]
+    #[ignore = "run by holder() in a child process"]
+    fn lock_holder_child() {
+        let path = std::env::var("TENSORFS_TEST_HOLD").unwrap();
+        let millis: u64 = std::env::var("TENSORFS_TEST_HOLD_MS")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let connection = Connection::open(path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        connection
+            .execute(
+                "INSERT INTO tensorfs_released_manifests VALUES ('held','by',?1)",
+                [std::process::id().to_string()],
+            )
+            .unwrap();
+        println!("held");
+        std::thread::sleep(std::time::Duration::from_millis(millis));
+        connection.execute_batch("COMMIT").unwrap();
+    }
+
+    fn write(catalog: &Catalog, name: &str) -> Result<usize> {
+        catalog
+            .connection()?
+            .execute(
+                "INSERT INTO tensorfs_released_manifests VALUES ('org',?1,'digest')",
+                [name],
+            )
+            .map_err(|error| sql("test write", error))
+    }
+
+    #[test]
+    fn a_live_lock_holder_is_waited_for_past_any_fixed_deadline() {
+        let root = temporary("live-holder");
+        fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::initialize(&root).unwrap();
+        let mut child = holder(&catalog.path, 7_000);
+        let started = std::time::Instant::now();
+        assert_eq!(write(&catalog, "after-holder").unwrap(), 1);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(6));
+        assert!(child.wait().unwrap().success());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stopped_lock_holder_is_refused() {
+        use rustix::process::{kill_process, Pid, Signal};
+        let root = temporary("stopped-holder");
+        fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::initialize(&root).unwrap();
+        let mut child = holder(&catalog.path, 60_000);
+        let pid = Pid::from_raw(child.id() as i32).unwrap();
+        kill_process(pid, Signal::STOP).unwrap();
+        let refused = write(&catalog, "behind-a-stopped-holder").unwrap_err();
+        assert!(refused.detail.contains("locked"), "{refused:?}");
+        kill_process(pid, Signal::KILL).unwrap();
+        child.wait().unwrap();
+        assert_eq!(write(&catalog, "after-the-holder-died").unwrap(), 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
