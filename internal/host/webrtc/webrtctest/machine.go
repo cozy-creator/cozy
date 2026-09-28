@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,32 +30,38 @@ import (
 )
 
 // Machine is an outputs.Source over files: each revision's bytes are written (appended in
-// place, or replaced by rename) before its entry is journaled, as the Runtime does.
+// place, or replaced by rename) before its entry is journaled, as the Runtime does. Like the
+// machine's fold, revisions carry their sha256 once the run's terminal exists.
 type Machine struct {
 	dir     string
 	mu      sync.Mutex
-	logs    map[string][]outputs.Entry
-	current map[string]outputs.Entry // the latest entry of each output
-	changed chan struct{}            // closed on every entry
+	logs    map[uint64][]outputs.Entry
+	current map[string]int // the log index of each output's latest entry, by path
+	changed chan struct{}  // closed on every entry
 	keys    []ed25519.PublicKey
 	rekeyed chan struct{} // closed when the keys change
 }
 
 func NewMachine(dir string, keys ...ed25519.PublicKey) *Machine {
-	return &Machine{dir: dir, logs: map[string][]outputs.Entry{}, current: map[string]outputs.Entry{},
+	return &Machine{dir: dir, logs: map[uint64][]outputs.Entry{}, current: map[string]int{},
 		changed: make(chan struct{}), keys: keys, rekeyed: make(chan struct{})}
 }
 
-func (m *Machine) path(run, output string, index int) string {
-	if index >= 0 {
-		return filepath.Join(m.dir, fmt.Sprintf("%s-%s-%d", run, output, index))
-	}
-	return filepath.Join(m.dir, run+"-"+output)
+func (m *Machine) path(run uint64, output string, index int) string {
+	return filepath.Join(m.dir, fmt.Sprintf("%d-%s-%d", run, output, index))
 }
 
-// Append adds data, which plays for durationUS, to an output in place; final makes it the
-// output's last revision.
-func (m *Machine) Append(run, output string, index int, data []byte, durationUS uint64, final bool) outputs.Entry {
+// latest is an output's current entry; ok is false before its first. Callers hold mu.
+func (m *Machine) latest(run uint64, path string) (outputs.Entry, bool) {
+	i, ok := m.current[path]
+	if !ok {
+		return outputs.Entry{}, false
+	}
+	return m.logs[run][i], true
+}
+
+// Append adds data, which plays for durationUS, to an output in place.
+func (m *Machine) Append(run uint64, output string, index int, data []byte, durationUS uint64) outputs.Entry {
 	path := m.path(run, output, index)
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err == nil {
@@ -65,14 +72,14 @@ func (m *Machine) Append(run, output string, index int, data []byte, durationUS 
 		panic(err)
 	}
 	m.mu.Lock()
-	previous := m.current[path]
-	m.mu.Unlock()
-	return m.journal(run, output, index, path, previous.Length+uint64(len(data)), &previous.Length,
-		previous.DurationUS+durationUS, final)
+	defer m.mu.Unlock()
+	previous, _ := m.latest(run, path)
+	from := uint64(previous.Length)
+	return m.journal(run, output, index, path, previous.Length+int64(len(data)), &from, previous.DurationUS+durationUS)
 }
 
 // Replace rewrites an output's bytes by rename, so readers of the old revision keep them.
-func (m *Machine) Replace(run, output string, index int, data []byte, durationUS uint64, final bool) outputs.Entry {
+func (m *Machine) Replace(run uint64, output string, index int, data []byte, durationUS uint64) outputs.Entry {
 	path := m.path(run, output, index)
 	if err := os.WriteFile(path+".new", data, 0o600); err != nil {
 		panic(err)
@@ -80,33 +87,37 @@ func (m *Machine) Replace(run, output string, index int, data []byte, durationUS
 	if err := os.Rename(path+".new", path); err != nil {
 		panic(err)
 	}
-	return m.journal(run, output, index, path, uint64(len(data)), nil, durationUS, final)
-}
-
-// journal records a revision; durationUS is the output's whole duration, as the fold's.
-func (m *Machine) journal(run, output string, index int, path string, length uint64, appended *uint64, durationUS uint64, final bool) outputs.Entry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	e := outputs.Entry{Seq: uint64(len(m.logs[run]) + 1), Output: output, Index: index, Rev: m.current[path].Rev + 1,
+	return m.journal(run, output, index, path, int64(len(data)), nil, durationUS)
+}
+
+// journal records a revision; durationUS is the whole output's, as the fold's. Callers hold mu.
+func (m *Machine) journal(run uint64, output string, index int, path string, length int64, appended *uint64, durationUS uint64) outputs.Entry {
+	previous, _ := m.latest(run, path)
+	e := outputs.Entry{Seq: uint64(len(m.logs[run]) + 1), Output: output, Index: index, Rev: previous.Rev + 1,
 		Length: length, AppendedFrom: appended, DurationUS: durationUS, MediaType: "video/mp4", Label: output}
-	if final {
+	m.current[path] = len(m.logs[run])
+	m.logs[run] = append(m.logs[run], e)
+	m.notify()
+	return e
+}
+
+// End journals the run's terminal: every output's current revision becomes final.
+func (m *Machine) End(run uint64, status string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for path, i := range m.current {
+		if !strings.HasPrefix(filepath.Base(path), fmt.Sprintf("%d-", run)) {
+			continue
+		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			panic(err)
 		}
 		sum := sha256.Sum256(raw)
-		e.SHA256 = hex.EncodeToString(sum[:])
+		m.logs[run][i].SHA256 = "sha256:" + hex.EncodeToString(sum[:])
 	}
-	m.logs[run] = append(m.logs[run], e)
-	m.current[path] = e
-	m.notify()
-	return e
-}
-
-// End journals the run's terminal.
-func (m *Machine) End(run, status string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.logs[run] = append(m.logs[run], outputs.Entry{Seq: uint64(len(m.logs[run]) + 1), Index: -1, Status: status})
 	m.notify()
 }
@@ -116,11 +127,11 @@ func (m *Machine) notify() {
 	m.changed = make(chan struct{})
 }
 
-func (m *Machine) Open(run, output string, index int) (outputs.Snapshot, error) {
+func (m *Machine) Open(run uint64, output string, index int) (outputs.Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	path := m.path(run, output, index)
-	e, ok := m.current[path]
+	e, ok := m.latest(run, path)
 	if !ok {
 		return outputs.Snapshot{}, outputs.ErrNotFound
 	}
@@ -128,16 +139,16 @@ func (m *Machine) Open(run, output string, index int) (outputs.Snapshot, error) 
 	if err != nil {
 		return outputs.Snapshot{}, err
 	}
-	return outputs.Snapshot{Body: file, Length: e.Length, Rev: e.Rev, SHA256: e.SHA256}, nil
+	return outputs.Snapshot{Body: file, Length: e.Length, Rev: e.Rev, SHA256: e.SHA256, Final: e.SHA256 != ""}, nil
 }
 
-func (m *Machine) Entries(ctx context.Context, run string, after uint64) ([]outputs.Entry, error) {
+func (m *Machine) Entries(ctx context.Context, run uint64, after uint64) ([]outputs.Entry, error) {
 	for {
 		m.mu.Lock()
-		log, changed := m.logs[run], m.changed
+		log, changed := slices.Clone(m.logs[run]), m.changed
 		m.mu.Unlock()
 		if n := uint64(len(log)); after < n {
-			return slices.Clone(log[after:]), nil
+			return log[after:], nil
 		} else if n > 0 && log[n-1].Status != "" {
 			return log[n-1:], nil
 		}

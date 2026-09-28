@@ -22,7 +22,8 @@ func BenchmarkGet(b *testing.B) {
 		for _, rwnd := range []uint32{0, 8 << 20} {
 			b.Run(fmt.Sprintf("rtt=%s/client-rwnd=%d", rtt, rwnd), func(b *testing.B) {
 				h := newHarness(b)
-				h.m.Append("7", "film", -1, film, 1_000_000, true)
+				h.m.Append(7, "film", -1, film, 1_000_000)
+				h.m.End(7, "completed")
 				addr := h.srv.Addr
 				if rtt > 0 {
 					addr = newRelay(b, addr, rtt/2).addr()

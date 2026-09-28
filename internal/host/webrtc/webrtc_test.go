@@ -109,9 +109,10 @@ func segment(n int, fill byte) []byte { return bytes.Repeat([]byte{fill}, n) }
 func TestGetServesARangeOfTheCurrentBytes(t *testing.T) {
 	h := newHarness(t)
 	seg := [][]byte{segment(100_000, 1), segment(150_000, 2), segment(70_000, 3)}
-	h.m.Append("7", "video", -1, seg[0], 1_000_000, false)
-	h.m.Append("7", "video", -1, seg[1], 1_000_000, false)
-	h.m.Append("7", "video", -1, seg[2], 1_000_000, true)
+	h.m.Append(7, "video", -1, seg[0], 1_000_000)
+	h.m.Append(7, "video", -1, seg[1], 1_000_000)
+	h.m.Append(7, "video", -1, seg[2], 1_000_000)
+	h.m.End(7, "completed")
 	c := h.open(1 << 20)
 
 	h.send(c, map[string]any{"t": "get", "id": 1, "run": "7", "output": "video", "offset": 100_000, "length": 150_000})
@@ -120,8 +121,7 @@ func TestGetServesARangeOfTheCurrentBytes(t *testing.T) {
 		t.Fatal("the middle segment differs")
 	}
 	whole := bytes.Join(seg, nil)
-	sum := sha256.Sum256(whole)
-	if end.Length != uint64(len(whole)) || end.SHA256 != hex.EncodeToString(sum[:]) {
+	if end.Length != uint64(len(whole)) || end.SHA256 != sha(whole) {
 		t.Fatalf("end %s", end.Raw)
 	}
 
@@ -183,7 +183,7 @@ func (h *harness) follow(c *webrtctest.Client, after, offset uint64) {
 
 func sha(b []byte) string {
 	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func TestFollowStreamsEachAppendAsItLands(t *testing.T) {
@@ -195,9 +195,10 @@ func TestFollowStreamsEachAppendAsItLands(t *testing.T) {
 	for k := range 3 {
 		seg := segment(200_000+k*50_000, byte(k+1))
 		whole = append(whole, seg...)
-		e := h.m.Append("7", "video", -1, seg, 1_000_000, k == 2)
+		e := h.m.Append(7, "video", -1, seg, 1_000_000)
 		h.until(c, &f, func() bool { return len(f.got) == len(whole) && f.seq == e.Seq })
 	}
+	h.m.End(7, "completed")
 	h.until(c, &f, func() bool { return f.end != nil })
 	if !bytes.Equal(f.got, whole) || f.end.Status != "completed" || f.end.SHA256 != sha(whole) || f.end.Length != uint64(len(whole)) {
 		t.Fatalf("end %s after %d bytes", f.end.Raw, len(f.got))
@@ -223,12 +224,13 @@ func TestFollowResumesAfterTheConnectionDies(t *testing.T) {
 	h.send(c, map[string]any{"t": "credit", "bytes": held})
 	h.follow(c, 0, 0)
 	var f follower
-	h.m.Append("7", "video", -1, seg[0], 1_000_000, false)
-	h.m.Append("7", "video", -1, seg[1], 1_000_000, false)
+	h.m.Append(7, "video", -1, seg[0], 1_000_000)
+	h.m.Append(7, "video", -1, seg[1], 1_000_000)
 	h.until(c, &f, func() bool { return uint64(len(f.got)) == held })
 	r.kill()
 
-	h.m.Append("7", "video", -1, seg[2], 1_000_000, true)
+	h.m.Append(7, "video", -1, seg[2], 1_000_000)
+	h.m.End(7, "completed")
 	resumed := h.open(64 << 20)
 	if f.seq != 1 {
 		t.Fatalf("the cursor is at entry %d", f.seq)
@@ -246,11 +248,11 @@ func TestFollowResetsWhenTheOutputIsReplaced(t *testing.T) {
 	c := h.open(64 << 20)
 	h.follow(c, 0, 0)
 	var f follower
-	h.m.Append("7", "video", -1, segment(100_000, 1), 1_000_000, false)
+	h.m.Append(7, "video", -1, segment(100_000, 1), 1_000_000)
 	h.until(c, &f, func() bool { return len(f.got) == 100_000 })
 	cursor := f
 	replaced := segment(80_000, 9)
-	h.m.Replace("7", "video", -1, replaced, 1_000_000, false)
+	h.m.Replace(7, "video", -1, replaced, 1_000_000)
 	h.until(c, &f, func() bool { return f.resets == 1 && bytes.Equal(f.got, replaced) })
 
 	// A client that held the first revision resumes into the replacement: reset, then all of it.
@@ -258,9 +260,9 @@ func TestFollowResetsWhenTheOutputIsReplaced(t *testing.T) {
 	h.follow(late, cursor.seq, uint64(len(cursor.got)))
 	h.until(late, &cursor, func() bool { return cursor.resets == 1 && bytes.Equal(cursor.got, replaced) })
 
-	h.m.End("7", "canceled")
+	h.m.End(7, "canceled")
 	h.until(c, &f, func() bool { return f.end != nil })
-	if f.end.Status != "canceled" || f.end.Length != uint64(len(replaced)) || f.end.SHA256 != "" {
+	if f.end.Status != "canceled" || f.end.Length != uint64(len(replaced)) || f.end.SHA256 != sha(replaced) {
 		t.Fatalf("end %s", f.end.Raw)
 	}
 }
