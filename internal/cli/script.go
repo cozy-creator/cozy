@@ -77,6 +77,17 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*recor
 			writer.Unlock()
 		}
 	}()
+	// An unchanged tree (its files and its local dependencies) runs the snapshot it already
+	// has: the same installation, which its machine already holds.
+	live, _, problem := pack.SourceStats()
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	if held, surface := heldSnapshot(store, "local/"+pack.Name, pack.Release, live); held != nil {
+		handedOff = true
+		return Target{Package: held.Package, InstallID: held.ID, Release: held.Version, Snapshot: true,
+			releaseCapture: writer.Unlock}, surface, nil
+	}
 	if err := os.MkdirAll(layout.Tmp, 0700); err != nil {
 		return Target{}, nil, exit.Internalf("cannot create invocation staging: %s", err)
 	}
@@ -122,9 +133,32 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*recor
 		_, _ = install.Reclaim(layout, store, result.Install.ID)
 		return Target{}, nil, problem
 	}
+	_ = packagepublish.RecordInvocationSource(result.Install.Dir, live)
 	handedOff = true
 	return Target{Package: result.Install.Package, InstallID: result.Install.ID,
 		Release: result.Install.Version, Snapshot: true, releaseCapture: writer.Unlock}, surface, nil
+}
+
+// heldSnapshot is a retained snapshot of pkg@release captured from exactly this live tree, and
+// its interface. The capture's writer claim keeps it from collection until the run owns it.
+func heldSnapshot(store *records.Store, pkg, release string, live map[string]packagepublish.SourceStamp) (*records.PackageInstall, *launch.PackageInterface) {
+	candidates, problem := store.SourceEnvironments(pkg, release)
+	if problem != nil {
+		return nil, nil
+	}
+	for i := range candidates {
+		if !packagepublish.InvocationSourceUnchanged(candidates[i].Dir, live) {
+			continue
+		}
+		raw, err := os.ReadFile(launch.PackageInterfacePath(candidates[i].Dir))
+		if err != nil {
+			continue
+		}
+		if surface, problem := launch.DecodePackageInterface(raw); problem == nil {
+			return &candidates[i], surface
+		}
+	}
+	return nil, nil
 }
 
 func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {

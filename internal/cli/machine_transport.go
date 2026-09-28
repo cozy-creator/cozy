@@ -140,6 +140,14 @@ func (c *machineConnection) prepare(ctx context.Context, request string, revisio
 		return problem
 	}
 	if !transfer.Uploaded {
+		// A machine that already holds this installation (an unchanged editable package run
+		// again) reopens it: nothing is uploaded. Any other answer is an upload.
+		if stream, err := c.Host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: c.Claim, LocalPackageSet: selected}); err == nil {
+			if event, problem := readMachinePreparationEvent(stream, nil); problem == nil {
+				c.placements[revision.ID] = event.PlacementSet
+				return retainWorkerInstallation(c, revision, event.InstalledPackage)
+			}
+		}
 		if transfer.Operation != operation || transfer.Uploaded {
 			if problem := m.store.AppendEvent(request, "machine.package_upload_started", 0, map[string]any{"worker_boot_id": c.Claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
 				return problem
