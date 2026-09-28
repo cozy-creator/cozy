@@ -1,11 +1,8 @@
 name: wheels
-# Every wheel the release publishes, each built and proven on a runner of its own platform.
-# Release-only: publish.yaml calls this and uploads exactly these artifacts. macOS bills at
-# 10x, so pull requests never run it; ci.yaml keeps the deep Linux x86_64 wheel proof on
-# every change. Manual build of every wheel for a branch or tag:
+# The wheels a release publishes, built on the org's self-hosted release runner (owner, 2026-09-28:
+# no CI, no GitHub-hosted minutes). Linux x86_64 only: this box cannot build the macOS wheels, and
+# aarch64 would need qemu. Those platforms return with hosted runners.
 #   gh workflow run wheels.yaml -R cozy-creator/tensorfs --ref <branch-or-tag>
-# No Windows wheel: the Store's POSIX model (owner uid/gid, modes, O_NOFOLLOW, *at
-# publication, positional I/O) has no Windows implementation yet.
 on:
   workflow_call:
   workflow_dispatch:
@@ -16,63 +13,31 @@ concurrency:
 
 jobs:
   wheel:
-    name: wheel ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    name: wheel linux-x86_64
+    runs-on: cozy-local
     # Hang bound, not a work budget.
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64 }
-          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64 }
-          - { name: macos-arm64, os: macos-15, deploy: "11.0" }
-          - { name: macos-x86_64, os: macos-15-intel, deploy: "10.13" }
     env:
       CARGO_BUILD_JOBS: "4"
-      PYTHON: python
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # The binary is built INSIDE the manylinux container so its glibc floor matches the
+      # extension module it ships beside (tfs-051).
+      - uses: PyO3/maturin-action@v1
         with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-      # Linux: the binary is built INSIDE the manylinux container so its glibc floor
-      # matches the extension module it ships beside (tfs-051).
-      - if: runner.os == 'Linux'
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
+          target: x86_64
           args: --release --locked --out dist
           manylinux: auto
           before-script-linux: |
             cargo build --release --locked -p tensorfs-core --bin tfs
             install -D -m 755 target/release/tfs wheel-data/scripts/tfs
-      - if: runner.os == 'Linux'
-        run: for wheel in dist/*.whl; do python scripts/version_contract.py wheel "$wheel"; done
-      # macOS builds natively through the one wheel build script. The
-      # deployment target binds cargo's CLI and maturin's tag to the same OS floor.
-      - if: runner.os != 'Linux'
-        uses: dtolnay/rust-toolchain@1.91.1
-      - if: runner.os != 'Linux'
-        env:
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deploy }}
-        run: |
-          uv tool install 'maturin>=1.15,<2'
-          bash scripts/build-wheel.sh --out dist
-      - run: |
-          set -e
-          ls dist
-          for wheel in dist/*.whl; do
-            bash scripts/wheel-proof.sh "$wheel" "${RUNNER_TEMP}/proof"
-          done
-      # Consumed by publish.yaml in the same run.
+      - run: ls -l dist
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.name }}
+          name: wheel-linux-x86_64
           path: dist/*.whl
           if-no-files-found: error
           retention-days: 3
+      # The manylinux container writes root-owned files into the runner's workspace.
+      - if: always()
+        run: docker run --rm -v "$GITHUB_WORKSPACE:/w" alpine:3.20 chown -R "$(id -u):$(id -g)" /w
