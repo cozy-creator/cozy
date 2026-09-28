@@ -338,6 +338,12 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if problem != nil {
 			return problem
 		}
+		if sourced(request.Models) && !workspace.ReleaseRootSources {
+			// Never the compatibility path: a Runtime without source choices would bind the
+			// slot's default, a different model than the one asked for.
+			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
+				"this machine's Runtime cannot make a provider-source model; %s", machines.RuntimeUpdate(connection.Name))
+		}
 		if !workspace.ReleaseRoots {
 			if request, problem = m.compatibleModels(ctx, request, connection); problem != nil {
 				return problem

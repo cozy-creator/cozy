@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -119,8 +121,8 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		if ctx.Inv.Value("--retry") != "" {
 			return exit.Usagef("--retry applies only to job transactions")
 		}
-		if ctx.Inv.Value("--upload-to") != "" || len(ctx.Inv.Values["--source-profile"]) > 0 {
-			return exit.Usagef("--upload-to and --source-profile apply only to job callables")
+		if ctx.Inv.Value("--upload-to") != "" {
+			return exit.Usagef("--upload-to applies only to job callables")
 		}
 		if len(ctx.Inv.Values["--input"]) > 0 {
 			return exit.Usagef("--input-tree applies only to a job callable")
@@ -215,9 +217,13 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	} else {
 		packagePublishStatus(ctx, "Finding a rental machine...")
 	}
-	models, chosen, e := modelChoices(target, ep, overrides.Models, loras)
+	models, chosen, e := modelChoices(ctx, target, ep, overrides.Models, loras)
 	if e != nil {
 		return e
+	}
+	if sourced(models) && (!chosen || managedRental && selectedRental == "") {
+		return exit.Usagef("a provider-source model runs on a named machine").
+			WithRemedy("add --rental=<name>; the machine resolves, narrows and converts the source itself")
 	}
 	if !chosen || managedRental && selectedRental == "" {
 		// Choosing a machine to rent reads the ladders; so do editable code, provider
@@ -301,19 +307,47 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 
 // modelChoices are a published call's explicit `model.<param>=` selections, parsed and
 // nothing more: the machine that runs the call resolves them and every other slot for its
-// own devices. It answers false for a call the machine cannot take that way.
-func modelChoices(target Target, ep *launch.Entrypoint, overrides map[string]string, loras []launch.LoRAOverride) ([]orchestrator.ModelRef, bool, *exit.Error) {
+// own devices. A provider source is only pinned to its commit (one metadata read, none when
+// the caller named the commit); the machine narrows and converts it. It answers false for a
+// call the machine cannot take that way.
+func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string, loras []launch.LoRAOverride) ([]orchestrator.ModelRef, bool, *exit.Error) {
+	profiles, problem := parseSourceProfileFlags(ctx)
+	if problem != nil {
+		return nil, false, problem
+	}
 	if strings.HasPrefix(target.Package, "local/") || target.Snapshot || len(loras) > 0 {
+		if len(profiles) > 0 {
+			return nil, false, exit.Usagef("--source-profile applies only to a published call's provider-source model")
+		}
 		return nil, false, nil
 	}
 	var out []orchestrator.ModelRef
 	for _, slot := range ep.Models {
 		raw, chosen := overrides[slot.Path]
+		parameter := slot.Path[strings.LastIndex(slot.Path, ".")+1:]
+		profile, profiled := profiles[parameter]
+		delete(profiles, parameter)
 		if !chosen {
+			if profiled {
+				return nil, false, exit.Usagef("--source-profile %s=%s names no provider-source model", parameter, profile)
+			}
 			continue
 		}
 		if strings.Contains(raw, "://") {
-			return nil, false, nil
+			source, problem := pinnedProviderSource(ctx, raw)
+			if problem != nil {
+				return nil, false, problem
+			}
+			row := orchestrator.ModelRef{Choice: true, Package: target.Package, Slot: slot.Path,
+				BindingPath: slot.Path, Source: source}
+			if profiled {
+				row.Profiles = []string{profile}
+			}
+			out = append(out, row)
+			continue
+		}
+		if profiled {
+			return nil, false, exit.Usagef("--source-profile %s=%s names no provider-source model", parameter, profile)
 		}
 		model, release, lane, manifest, problem := hub.ParseModelRef(raw)
 		if problem != nil {
@@ -322,7 +356,43 @@ func modelChoices(target Target, ep *launch.Entrypoint, overrides map[string]str
 		out = append(out, orchestrator.ModelRef{Choice: true, Package: target.Package, Slot: slot.Path,
 			BindingPath: slot.Path, Model: model, CatalogRepository: model, Release: release, Lane: lane, Manifest: manifest})
 	}
+	for parameter := range profiles {
+		return nil, false, exit.Usagef("--source-profile %s names no model parameter of %s", parameter, target.Function)
+	}
 	return out, true, nil
+}
+
+func sourced(models []orchestrator.ModelRef) bool {
+	return slices.ContainsFunc(models, func(model orchestrator.ModelRef) bool { return model.Source != "" })
+}
+
+// pinnedProviderSource spells a Hugging Face or Civitai source at an immutable revision.
+func pinnedProviderSource(ctx *Context, raw string) (string, *exit.Error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", exit.Internalf("cannot resolve the current directory: %s", err)
+	}
+	source, problem := modelsource.Parse(raw, cwd)
+	if problem != nil {
+		return "", problem
+	}
+	if source.Kind != modelsource.HuggingFace && source.Kind != modelsource.Civitai {
+		return "", exit.Usagef("model input %q is not a Tensorhub, Hugging Face, or Civitai reference", raw)
+	}
+	token := ctx.Cfg.HuggingFaceToken
+	if source.Kind == modelsource.Civitai {
+		token = ctx.Cfg.CivitaiToken
+	}
+	resolver, problem := modelsource.NewResolver(source.Kind, token)
+	if problem != nil {
+		return "", problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	if source, problem = resolver.Pin(hctx, source); problem != nil {
+		return "", problem
+	}
+	return source.Canonical, nil
 }
 
 // invocationModelSpec is one slot's selection before the card is read: an explicit

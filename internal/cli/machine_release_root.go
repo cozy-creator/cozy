@@ -73,7 +73,13 @@ func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records
 		Callees: edges, DeadlineUnixMs: uint64(max(request.DeadlineUnixMS, 0)), AttentionKernel: request.AttentionKernel,
 		CatalogOrigin: origin}
 	for _, model := range request.Models {
-		choice := &pb.ModelChoice{Parameter: model.Slot[strings.LastIndex(model.Slot, ".")+1:],
+		parameter := model.Slot[strings.LastIndex(model.Slot, ".")+1:]
+		if model.Source != "" {
+			root.Models = append(root.Models, &pb.ModelChoice{Parameter: parameter, Source: model.Source,
+				Profiles: model.Profiles})
+			continue
+		}
+		choice := &pb.ModelChoice{Parameter: parameter,
 			Repository: model.Model, Release: model.Release, Lane: model.Lane}
 		if model.Manifest != "" {
 			digest, err := canonical.Raw(model.Manifest)
