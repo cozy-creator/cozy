@@ -38,7 +38,7 @@ func TestMachineGPUBudgetPassesThroughVerbatim(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(row.config), 0o600))
 		child := exec.Command(os.Args[0], "-test.run=^TestMachineGPUBudgetPassesThroughVerbatim$", "-gpu-budget-child")
-		child.Env = append(os.Environ(), "COZY_HOME="+root)
+		child.Env = childEnv(t, root)
 		out, err := child.Output()
 		if err != nil || !strings.Contains(string(out), row.runtime) {
 			t.Fatalf("%q gave %q (%v), want %q", row.config, out, err, row.runtime)
