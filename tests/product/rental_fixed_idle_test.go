@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -237,48 +236,6 @@ func TestRentalKeepaliveUsesCurrentSignedClaimAndRefusesUnconfirmedResult(t *tes
 	}
 	if _, problem := owner.c.KeepRentalAlive(context.Background(), podRental, strings.Repeat("x", 129)); problem == nil {
 		t.Fatal("oversized request id admitted")
-	}
-}
-
-func TestRentalIdleSchemaUpgradePreservesReadyAndRetainedWork(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.sqlite")
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	at := time.Now().UTC()
-	row := idleRecord(t, store, "schema42", at)
-	request := recordPrivateTransaction(t, store, "schema42", row.ID)
-	changed, problem := store.BlockRetainedWork(request.ID, "fixture", "retained before upgrade")
-	fatal(t, problem)
-	if !changed {
-		t.Fatal("retained request did not settle")
-	}
-	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	revertRecordsSchema(t, db, 42)
-	_, err = db.Exec(`DROP TABLE device_memory_measurements; DROP TABLE rental_idle; PRAGMA user_version=42`)
-	must(t, err)
-	must(t, db.Close())
-	store, problem = records.Open(path)
-	if problem == nil {
-		store.Close()
-		t.Fatal("reader migrated schema outside daemon lock")
-	}
-	store, problem = records.OpenForDaemon(path, "")
-	fatal(t, problem)
-	defer store.Close()
-	current, problem := store.RentalRow(row.ID)
-	fatal(t, problem)
-	if current == nil || current.ReadyAt != row.ReadyAt || current.ExpectedWorkerBootID != row.ExpectedWorkerBootID {
-		t.Fatal("migration changed rental clock/identity")
-	}
-	// Schema 46 derives the local installation from install_id; this row has none.
-	request.LocalInstallationID = ""
-	assertPrivateTransactionIdentity(t, store, request, "blocked")
-	idle, problem := rental.ObserveIdle(store, *current)
-	fatal(t, problem)
-	if idle.PendingPreparation != 0 || !idle.Due(idle.Since.Add(900*time.Second)) {
-		t.Fatal("migration invented activity or changed idle period")
 	}
 }
 

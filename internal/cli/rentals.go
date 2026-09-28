@@ -57,17 +57,6 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 		return home.Layout{}, nil, e
 	}
 	st, e := records.Open(l.DB)
-	if e != nil && e.ErrName() == "records_schema_upgrade_required" {
-		// Only the daemon can migrate. Start it if this root is unowned, or wait
-		// for an existing startup to finish. A live older daemon stays in place;
-		// the reopened reader then reports its own schema requirement.
-		state, _, problem := ensureDaemon(ctx)
-		if problem != nil {
-			return home.Layout{}, nil, problem
-		}
-		ctx.Daemon = state
-		st, e = records.Open(l.DB)
-	}
 	if e != nil {
 		return home.Layout{}, nil, e
 	}

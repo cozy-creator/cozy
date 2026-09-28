@@ -31,22 +31,14 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 	if problem != nil {
 		return problem
 	}
-	// Older pending lookups carried only a prequalified target. Cancellation may
-	// recover and release their receipts, but cannot turn them into a new result.
-	legacyCancellation := context == nil && request.State == "canceling"
-	if context == nil && !legacyCancellation {
+	if context == nil {
 		return exit.Named(exit.Conflict, "operation.context_absent", "cached computation has no bound callee environment")
 	}
-	key := ""
-	if legacyCancellation {
-		key, problem = OperationKey(request)
-	} else {
-		key, problem = QualifiedOperationKey(request, context.NumericalEnvironment)
-	}
+	key, problem := QualifiedOperationKey(request, context.NumericalEnvironment)
 	if problem != nil {
 		return problem
 	}
-	if key != cached.Key || (context != nil && key != context.Key) || !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
+	if key != cached.Key || key != context.Key || !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
 		return exit.Named(exit.Conflict, "operation.consumer_changed", "cached computation does not match this unoffered private child")
 	}
 	if request.State == "succeeded" && request.ReusedFrom == cached.SourceRequestID {
@@ -68,19 +60,14 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 	if problem != nil {
 		return problem
 	}
-	if sourceContext == nil && !legacyCancellation {
+	if sourceContext == nil {
 		return exit.Named(exit.Conflict, "operation.source_changed", "cached source has no recorded callee environment")
 	}
-	sourceKey := ""
-	if sourceContext == nil {
-		sourceKey, problem = OperationKey(source)
-	} else {
-		sourceKey, problem = QualifiedOperationKey(source, sourceContext.NumericalEnvironment)
-	}
+	sourceKey, problem := QualifiedOperationKey(source, sourceContext.NumericalEnvironment)
 	if problem != nil {
 		return problem
 	}
-	if sourceKey != key || (sourceContext != nil && sourceKey != sourceContext.Key) || !source.ChildReusable || source.Worker != request.Worker {
+	if sourceKey != key || sourceKey != sourceContext.Key || !source.ChildReusable || source.Worker != request.Worker {
 		return exit.Named(exit.Conflict, "operation.source_changed", "cached result changed its computation or workspace")
 	}
 	var state, status, invocation, outcome, digest string

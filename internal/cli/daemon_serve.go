@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -96,19 +95,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	defer held.Release()
 
-	// The schema-22 migration folds each kept triage file into its attempt row; the
-	// retired-shape sweep below removes the directory afterwards.
-	st, e := records.OpenForDaemon(l.DB, filepath.Join(l.Root, "triage"))
+	st, e := records.OpenForDaemon(l.DB)
 	if e != nil {
 		closeListeners()
 		return e
 	}
 	defer st.Close()
-	if e := st.AssignRecordHubs(ctx.Cfg.HubURL); e != nil {
-		closeListeners()
-		return e
-	}
-	retired, retiredNote := reclaimNote(reclaim.Retired(l))
 
 	// The resolver is built BEFORE the orchestrator, because the orchestrator holds it:
 	// select-or-start is the scheduler's act, and a request whose binding no live worker
@@ -263,10 +255,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 		workers.Removed, workers.Scanned, output.Bytes(workers.Bytes), workersNote)
 	fmt.Fprintf(ctx.Out, "  tmp sweep: reclaimed %d of %d entr(y|ies), freed %s%s\n",
 		tmp.Removed, tmp.Scanned, output.Bytes(tmp.Bytes), tmpNote)
-	if retired.Scanned+publications.Scanned+rentalSecrets.Scanned > 0 {
-		fmt.Fprintf(ctx.Out, "  lifecycle sweep: %d retired entr(y|ies)%s · %d publication root(s) settled%s · %d stale rental secret(s) erased%s\n",
-			retired.Removed, retiredNote, publications.Removed, publicationsNote,
-			rentalSecrets.Removed, rentalSecretsNote)
+	if publications.Scanned+rentalSecrets.Scanned > 0 {
+		fmt.Fprintf(ctx.Out, "  lifecycle sweep: %d publication root(s) settled%s · %d stale rental secret(s) erased%s\n",
+			publications.Removed, publicationsNote, rentalSecrets.Removed, rentalSecretsNote)
 	}
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)

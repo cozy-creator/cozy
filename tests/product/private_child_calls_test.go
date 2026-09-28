@@ -58,7 +58,7 @@ func TestUnpublishedChildReopenPreservesPriorOwnership(t *testing.T) {
 	before, problem := store.RequestRow(prior.ID)
 	fatal(t, problem)
 	store.Close()
-	store, problem = records.OpenForDaemon(path, "")
+	store, problem = records.OpenForDaemon(path)
 	fatal(t, problem)
 	defer store.Close()
 	after, problem := store.RequestRow(prior.ID)

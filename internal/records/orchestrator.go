@@ -100,11 +100,6 @@ const workerSessionIndex = `
 CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
   WHERE session_id IS NOT NULL`
 
-// workerProcessCols is the whole row, in table order: the schema-12 rebuild copies every
-// column across by name rather than trusting positional SELECT *.
-const workerProcessCols = `instance_id,package,install_id,worker_id,
-	devices,pid,birth,session_id,state,opened_at,closed_at`
-
 const attemptsDDL = `
 CREATE TABLE IF NOT EXISTS attempts (
   request_id       TEXT    NOT NULL REFERENCES requests(id),
@@ -960,9 +955,6 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,capture,attention_kernel,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
 	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub`
-
-// requestColsPriorHub is the request row before it recorded its Tensorhub (schema 49).
-var requestColsPriorHub = strings.TrimSuffix(requestCols, ",hub")
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -2761,21 +2753,4 @@ func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
 		out = append(out, c)
 	}
 	return out, nil
-}
-
-// AssignRecordHubs gives records written before they carried a hub the Tensorhub they
-// were created under: a request its rental's, else the daemon's configured default; a
-// published install the configured default. Later records carry their hub, so this
-// settles once.
-func (s *Store) AssignRecordHubs(defaultHub string) *exit.Error {
-	defaultHub = strings.TrimRight(defaultHub, "/")
-	if _, err := s.db.Exec(`UPDATE requests SET hub=COALESCE((SELECT rentals.hub FROM rentals
-		WHERE rentals.id IN (requests.worker, requests.requested_rental) AND rentals.hub<>'' LIMIT 1), ?)
-		WHERE hub=''`, defaultHub); err != nil {
-		return exit.Internalf("cannot assign request Tensorhubs: %s", err)
-	}
-	if _, err := s.db.Exec(`UPDATE installs SET hub=? WHERE hub='' AND source_kind='tensorhub'`, defaultHub); err != nil {
-		return exit.Internalf("cannot assign install Tensorhubs: %s", err)
-	}
-	return nil
 }

@@ -476,15 +476,6 @@ type RentalFailure struct {
 
 const rentalCols = `id,machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider,failure_provider_resource_id,failure_provider_host_id,failure_provider_state,failure_container_state`
 
-// rentalColsPriorThirtyThree is the released column list every schema before 33 carried:
-// the current one without the rental's width.
-var rentalColsPriorThirtyThree = strings.Replace(rentalCols, ",accelerator_count", "", 1)
-
-const rentalColsPriorTwentyOne = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at`
-
-// rentalColsPriorThirteen is the released column list every schema before 13 carried.
-var rentalColsPriorThirteen = strings.TrimSuffix(rentalColsPriorTwentyOne, ",ready_at")
-
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.AcceleratorModel, &r.AcceleratorCount,

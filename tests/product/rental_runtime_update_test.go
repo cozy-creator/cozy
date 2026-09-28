@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -87,34 +86,6 @@ func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testi
 	use, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
 	fatal(t, problem)
 	use()
-}
-
-func TestRuntimeUpdateMigrationFrom41PreservesRental(t *testing.T) {
-	f := developmentFixtureAt(t)
-	f.attach(t, "127.0.0.1:1")
-	f.store.Close()
-	db, err := sql.Open("sqlite", filepath.Join(f.layout.Root, "creator.sqlite"))
-	must(t, err)
-	revertRecordsSchema(t, db, 41)
-	_, err = db.Exec("DROP TABLE device_memory_measurements; DROP TABLE rental_idle; DROP TABLE rental_runtime_updates")
-	must(t, err)
-	_, err = db.Exec("PRAGMA user_version=41")
-	must(t, err)
-	must(t, db.Close())
-	if old, problem := records.Open(f.layout.DB); problem == nil {
-		old.Close()
-		t.Fatal("an ordinary reader migrated the daemon-owned database")
-	}
-	store, problem := records.OpenForDaemon(f.layout.DB, "")
-	fatal(t, problem)
-	defer store.Close()
-	row, problem := store.RentalRow(f.rentalID)
-	fatal(t, problem)
-	if row == nil || row.ExpectedWorkerBootID != f.peer.bootID {
-		t.Fatalf("migration lost the pinned rental: %+v", row)
-	}
-	_, problem = store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "", nil)
-	fatal(t, problem)
 }
 
 func TestRentalDependencyVerdictIsSharedByRootAndServingPreparation(t *testing.T) {

@@ -3,7 +3,6 @@ package producttest
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -249,42 +248,6 @@ func TestRentalInstallAdmissionAndStatusAPIWhileBooting(t *testing.T) {
 		if held == nil || held.State != "queued" || !reflect.DeepEqual(held.Selection, selection) {
 			t.Fatalf("202 was not backed by exact durable intent: %+v", held)
 		}
-	}
-}
-
-func TestRentalInstallSchema46MigrationPreservesRental(t *testing.T) {
-	layout, store := rentalInstallStore(t)
-	machine := rentalInstallMachine("converging")
-	rentalInstallCheck(t, store.RecordRental(machine))
-	store.Close()
-	db, err := sql.Open("sqlite", layout.DB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	revertRecordsSchema(t, db, 46)
-	if _, err := db.Exec("PRAGMA user_version=46"); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-	old, problem := records.Open(layout.DB)
-	if old != nil {
-		old.Close()
-	}
-	if problem == nil || problem.ErrName() != "records_schema_upgrade_required" {
-		t.Fatalf("old daemon was not protected: %v", problem)
-	}
-	migrated, problem := records.OpenForDaemon(layout.DB, filepath.Join(layout.Root, "triage"))
-	rentalInstallCheck(t, problem)
-	defer migrated.Close()
-	row, problem := migrated.RentalRow(machine.ID)
-	rentalInstallCheck(t, problem)
-	if row == nil || row.State != "converging" {
-		t.Fatal("migration changed existing rental", row)
-	}
-	accepted, problem := migrated.BeginRentalInstall(machine.ID, records.RentalInstallSelection{Package: "paul/minimax-h3", Release: "1.15.7"})
-	rentalInstallCheck(t, problem)
-	if accepted.State != "queued" {
-		t.Fatal(accepted)
 	}
 }
 

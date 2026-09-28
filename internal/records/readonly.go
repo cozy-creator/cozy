@@ -9,7 +9,7 @@ import (
 )
 
 // OpenReadOnly opens an existing database for reading. It never creates, initializes,
-// migrates or waits on a lock: a missing file, a busy database, or one lacking a table or
+// changes or waits on a lock: a missing file, a busy database, or one lacking a table or
 // column this Creator reads is refused at once. Extra tables, columns and indexes and
 // another schema number are fine.
 func OpenReadOnly(path string) (*Store, *exit.Error) {

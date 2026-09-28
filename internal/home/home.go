@@ -5,18 +5,13 @@ package home
 
 import (
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/flock"
-	_ "modernc.org/sqlite"
 )
 
 // Layout is the resolved set of paths every cl-009 verb works against. Every
@@ -76,13 +71,6 @@ func Open(root string) (Layout, *exit.Error) {
 		return Layout{}, exit.Internalf("cannot protect the private local root %s: %s", root, err)
 	}
 	l := Paths(root)
-	// A prior root's records.db is the same database under its retired name. The rename
-	// runs here — cheap, idempotent, and before any open — so no second code path ever
-	// reads the old spelling. WAL/SHM siblings move with it or not at all: a database
-	// whose main file moved without its WAL would silently lose committed pages.
-	if e := renameRecords(root, l.Daemon, l.DB); e != nil {
-		return Layout{}, e
-	}
 	// Only the two roots every verb touches exist up front. Everything else is created
 	// by its writer at the moment work exists, and reclaimed when the work dies.
 	for _, dir := range []string{l.Installs, l.Outputs} {
@@ -94,8 +82,8 @@ func Open(root string) (Layout, *exit.Error) {
 }
 
 // Paths derives the layout from root without touching the filesystem. Only readers that
-// must not create or migrate anything (shell completion) use it directly; everything else
-// goes through Open.
+// must not create anything (shell completion) use it directly; everything else goes
+// through Open.
 func Paths(root string) Layout {
 	l := Layout{
 		Root:     root,
@@ -119,132 +107,6 @@ func Paths(root string) Layout {
 // retain independent hardlinks, so deleting cache entries never invalidates them.
 func (l Layout) DependencyCache() string {
 	return filepath.Join(l.LocalPackages, "dependency-objects")
-}
-
-// renameRecords moves a pre-cl-116 records.db (and its WAL/SHM siblings) onto the
-// creator.sqlite spelling. It refuses when both databases exist — two lifecycle
-// authorities in one root is a state no rename may silently pick a winner for — and it
-// refuses under a LIVE daemon: an old-build daemon still holds records.db open, and
-// renaming its WAL out from under it would split committed pages from their database.
-// The daemon liveness lock is held across the renames so no daemon can start mid-move.
-func renameRecords(root, daemonLock, db string) *exit.Error {
-	prior := filepath.Join(root, "records.db")
-	if _, err := os.Lstat(prior); err != nil {
-		return nil
-	}
-	if _, err := os.Lstat(db); err == nil {
-		// BOTH SPELLINGS EXIST, AND THAT IS USUALLY NOT AN AMBIGUITY (cl-134). An old
-		// build run once inside an already-migrated root recreates records.db, runs its
-		// own migrations into it, and writes no row. Every current binary then refused
-		// the whole root, and the refusal named a decision — "remove the one that is not
-		// the lifecycle authority" — that it gave the reader no evidence to make. The
-		// answer needed a sqlite shell to see. Observed twice on 2026-09-04.
-		//
-		// A database carrying no rows in any table carries no lifecycle, and that is
-		// decidable rather than a judgement: a real pre-cl-116 authority has installs,
-		// rentals or runs in it. So the empty one is sidelined and the root opens.
-		holds, why := priorStoreHoldsRecords(prior)
-		if !holds && why == "" {
-			stamp := time.Now().UTC().Format("20060102T150405Z")
-			for _, suffix := range []string{"", "-wal", "-shm"} {
-				from := prior + suffix
-				if _, err := os.Lstat(from); err != nil {
-					continue
-				}
-				if err := os.Rename(from, prior+".superseded-"+stamp+suffix); err != nil {
-					return exit.Internalf("cannot set aside %s: %s", from, err)
-				}
-			}
-			fmt.Fprintf(os.Stderr,
-				"cozy: %s held an empty records.db beside creator.sqlite — an older build "+
-					"recreated it and wrote nothing. Set aside as records.db.superseded-%s; "+
-					"creator.sqlite is the lifecycle authority and is untouched.\n", root, stamp)
-			return nil
-		}
-		detail := "it carries lifecycle rows"
-		if why != "" {
-			detail = why
-		}
-		return exit.Named(exit.Conflict, "records_ambiguous",
-			"%s holds both records.db and creator.sqlite, and the records.db is not "+
-				"obviously stale (%s); this build only ever writes creator.sqlite, so move "+
-				"records.db aside if it predates the migration", root, detail).
-			WithRemedy("inspect both, then move the one you do not want aside: `mv %s %s.aside`",
-				prior, prior)
-	}
-	f, err := os.OpenFile(daemonLock, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return exit.Internalf("cannot take the daemon lock to migrate %s: %s", root, err)
-	}
-	defer f.Close()
-	if err := flock.Exclusive(f); err != nil {
-		return exit.Named(exit.Conflict, "records_migration_blocked",
-			"a running Cozy daemon still owns %s under its old records.db name", root).
-			WithRemedy("stop it with `cozy down`, then retry; the new daemon migrates the database at start").
-			WithNext("cozy down")
-	}
-	defer flock.Release(f)
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		from, to := prior+suffix, db+suffix
-		if _, err := os.Lstat(from); err != nil {
-			continue
-		}
-		if err := os.Rename(from, to); err != nil {
-			return exit.Internalf("cannot move %s to %s: %s", from, to, err)
-		}
-	}
-	return nil
-}
-
-// priorStoreHoldsRecords answers whether a records.db beside creator.sqlite is a real
-// pre-cl-116 lifecycle authority or a scratch file a stale binary created after the
-// migration already ran. It returns (holds, why): `why` is non-empty when the question
-// could not be ANSWERED, which is treated exactly like "holds" — this decides whether to
-// move a database, so it is conservative in one direction only.
-//
-// The file is opened read-only and immutable, so a live old-build daemon still holding it
-// is never disturbed. `immutable=1` skips locking and therefore IGNORES the WAL, so a
-// non-empty WAL is checked first and answered as "holds": rows committed only there would
-// otherwise read as an empty database, which is the one wrong answer that loses data.
-func priorStoreHoldsRecords(path string) (holds bool, why string) {
-	if info, err := os.Lstat(path + "-wal"); err == nil && info.Size() > 0 {
-		return true, "it has an unmerged write-ahead log"
-	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1")
-	if err != nil {
-		return true, "it could not be opened to answer"
-	}
-	defer db.Close()
-	rows, err := db.Query(
-		"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-	if err != nil {
-		return true, "its table list could not be read"
-	}
-	var tables []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			return true, "its table list could not be read"
-		}
-		tables = append(tables, name)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return true, "its table list could not be read"
-	}
-	rows.Close()
-	for _, table := range tables {
-		var any int
-		q := fmt.Sprintf(`SELECT EXISTS(SELECT 1 FROM "%s")`, strings.ReplaceAll(table, `"`, `""`))
-		if err := db.QueryRow(q).Scan(&any); err != nil {
-			return true, "table " + table + " could not be counted"
-		}
-		if any == 1 {
-			return true, "table " + table + " carries rows"
-		}
-	}
-	return false, ""
 }
 
 // RentalMediaToken is one rental's provisioned media bearer, mode 0600. It is deliberately

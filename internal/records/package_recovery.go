@@ -45,15 +45,12 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 		return 0, exit.Named(exit.Validation, "package_inventory_source_unreadable",
 			"cannot read package inventory source %s: %s", absolute, err)
 	}
-	// The source is opened READ-ONLY and is never migrated, so it is read with the current
-	// schema's own table and column names or not at all. Reading an older shape would mean
-	// a second spelling of the install table living on in this one reader; a newer one is
-	// read through the columns this build knows.
+	// The source is read READ-ONLY with the current schema's names; a newer one is read
+	// through the columns this build knows.
 	version, err := databaseVersion(source)
 	if err != nil || version < schemaVersion {
 		return 0, exit.Named(exit.Validation, "package_inventory_source_schema_unsupported",
-			"package inventory source has schema %d, not %d", version, schemaVersion).
-			WithRemedy("open that backup with this build of cozy first; it migrates in place")
+			"package inventory source has schema %d, not %d", version, schemaVersion)
 	}
 	if problem := requireTables(source, "installs", "pins"); problem != nil {
 		return 0, problem

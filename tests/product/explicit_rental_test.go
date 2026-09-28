@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -179,39 +178,6 @@ func TestRequestedRentalLossSettlesWithoutFallback(t *testing.T) {
 	}
 	if purchases.Load() != 0 {
 		t.Fatal("loss bought replacement")
-	}
-}
-
-func TestSchema36MigrationKeepsAutomaticAssignments(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	st, problem := records.Open(path)
-	fatal(t, problem)
-	_, _, problem = st.Submit(records.Request{ID: "existing", IdemKey: "existing", BodyDigest: "sha256:" + strings.Repeat("3", 64), Package: "proof/model", Entrypoint: "run", Payload: []byte("{}"), Rental: true, Worker: "prior"})
-	fatal(t, problem)
-	st.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	revertRecordsSchema(t, db, 36)
-	var create string
-	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='requests'`).Scan(&create))
-	create = strings.Replace(create, "  attention_kernel TEXT NOT NULL DEFAULT '',\n", "", 1)
-	create = strings.Replace(create, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)
-	_, err = db.Exec(`DROP TABLE device_memory_measurements; DROP TABLE rental_idle; DROP TABLE rental_runtime_updates; DROP TRIGGER machine_execution_no_local_attempt; DROP TABLE machine_executions; DROP TABLE IF EXISTS successful_work_releases; ALTER TABLE requests DROP COLUMN attention_kernel; ALTER TABLE requests DROP COLUMN requested_rental; PRAGMA user_version=36`)
-	must(t, err)
-	_, err = db.Exec(`PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=? WHERE name='requests'; PRAGMA writable_schema=OFF`, create)
-	must(t, err)
-	db.Close()
-	if prior, problem := records.Open(path); problem == nil {
-		prior.Close()
-		t.Fatal("reader silently migrated shared state")
-	}
-	st, problem = records.OpenForDaemon(path, "")
-	fatal(t, problem)
-	defer st.Close()
-	row, problem := st.RequestRow("existing")
-	fatal(t, problem)
-	if row.Worker != "prior" || row.RequestedRental != "" {
-		t.Fatalf("migration converted automatic pin into affinity: %+v", row)
 	}
 }
 

@@ -164,8 +164,7 @@ func incompatible(db schemaDB, required shape) ([]string, error) {
 }
 
 // addColumn restores a missing column with its declared type and default. A NOT NULL
-// column with no default gets its type's zero value, which is what every migration
-// that introduced such a column backfilled.
+// column with no default gets its type's zero value.
 func addColumn(name, kind string, notNull bool, fallback sql.NullString, primary bool) string {
 	if primary {
 		return ""

@@ -3,7 +3,6 @@ package producttest
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -248,45 +247,4 @@ func TestNativeArtifactTransferRefusalClassification(t *testing.T) {
 	if publication.ArtifactTransferRefusal("", "") != nil {
 		t.Fatal("successful native transfer became a refusal")
 	}
-}
-
-func TestNativeEffectCancellationMigrationPreservesExecutingIntent(t *testing.T) {
-	store, call, path := effectCancelFixture(t)
-	frozen := []byte(`{"baseline":1}`)
-	fatal(t, store.FreezeNativeCall(call.ID, frozen))
-	fatal(t, store.StartNativeEffectWrite(call.ID))
-	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	restorePriorCallIndexBounds(t, db)
-	// Rebuild the exact previous schema, retaining its actual executing row.
-	var ddl string
-	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='native_calls'`).Scan(&ddl))
-	_, err = db.Exec(`ALTER TABLE native_calls RENAME TO prior32`)
-	must(t, err)
-	ddl = strings.Replace(ddl, " cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),\n", "", 1)
-	_, err = db.Exec(ddl)
-	must(t, err)
-	const columns = "id,parent_request_id,call_index,kind,operation,intent_digest,request,frozen,state,result,native_receipt,safe_code,worker,instance_id,worker_boot_id,parent_attempt"
-	_, err = db.Exec(`INSERT INTO native_calls(` + columns + `) SELECT ` + columns + ` FROM prior32`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE prior32`)
-	must(t, err)
-	revertRentalsBeforeWidth(t, db)
-	for _, statement := range []string{`DROP TABLE attempt_serving_placements`, `DROP TABLE request_child_arguments`, `DROP TABLE byte_outputs`, `ALTER TABLE requests DROP COLUMN capture`, `ALTER TABLE native_artifact_retentions DROP COLUMN artifact_kind`, `ALTER TABLE native_artifact_retentions DROP COLUMN producer_attempt`, `ALTER TABLE native_artifact_retentions DROP COLUMN producer_output_id`, `ALTER TABLE native_artifact_retentions DROP COLUMN content_bytes`} {
-		_, err = db.Exec(statement)
-		must(t, err)
-	}
-	_, err = db.Exec(`DROP TABLE IF EXISTS successful_work_releases; PRAGMA user_version=31`)
-	must(t, err)
-	must(t, db.Close())
-	migrated, problem := records.OpenForDaemon(path, filepath.Join(t.TempDir(), "triage"))
-	fatal(t, problem)
-	defer migrated.Close()
-	row, problem := migrated.NativeCall(call.ParentRequestID, 0)
-	fatal(t, problem)
-	if row.State != "executing" || row.CancelRequested || !bytes.Equal(row.Frozen, frozen) || row.IntentDigest != call.IntentDigest {
-		t.Fatalf("migration changed accepted history: %+v", row)
-	}
-	cancelEffect(t, migrated, call)
 }

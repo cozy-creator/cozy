@@ -57,7 +57,7 @@ func TestLostRetainedWorkReconcilesWithoutChangingHistoryOrCustody(t *testing.T)
 	fatal(t, problem)
 	store.Close()
 
-	store, problem = records.OpenForDaemon(path, "")
+	store, problem = records.OpenForDaemon(path)
 	fatal(t, problem)
 	defer store.Close()
 	row, problem := store.RequestByReference(request.ID)

@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"testing"
@@ -231,39 +230,5 @@ func TestOperationLookupBlocksPauseAndCancelUntilReconciled(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestOperationLookupSchemaUpgradePreservesRequests(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	old := recordPrivateTransaction(t, store, "schema28", "")
-	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	restorePriorCallIndexBounds(t, db)
-	for _, table := range []string{"attempt_serving_placements", "request_child_arguments", "byte_outputs", "native_artifact_retentions", "native_calls", "request_operation_lookups"} {
-		_, err = db.Exec(`DROP TABLE ` + table)
-		must(t, err)
-	}
-	revertRentalsBeforeWidth(t, db)
-	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN capture`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE IF EXISTS successful_work_releases; PRAGMA user_version=28`)
-	must(t, err)
-	must(t, db.Close())
-	store, problem = records.OpenForDaemon(path, "")
-	fatal(t, problem)
-	defer store.Close()
-	row, problem := store.RequestRow(old.ID)
-	fatal(t, problem)
-	if row.BodyDigest != old.BodyDigest || row.ReuseScope != old.ReuseScope {
-		t.Fatal("cache RPC migration changed prior work")
-	}
-	lookup, problem := store.OperationLookup(old.ID)
-	fatal(t, problem)
-	if lookup != nil {
-		t.Fatal("migration invented a cache lookup")
 	}
 }

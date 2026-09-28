@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -68,64 +67,6 @@ func TestRentalInventoryHumanDrainingKeepsRawStates(t *testing.T) {
 	output, err = compatibilityCLI(t, layout.Root, "rental", "list", "--json")
 	if err != nil || strings.Count(output, `"state":"release_requested"`) != 2 || strings.Contains(output, `"state":"draining"`) {
 		t.Fatalf("human projection changed raw API states: %v %s", err, output)
-	}
-}
-
-func TestRentalSchemaGuardPreservesActiveOwnerAndRetainedRows(t *testing.T) {
-	layout, lock, pid, done := compatibilityOwner(t)
-	path, db := retainedWidthDatabase(t, true)
-	before := map[string]string{}
-	for _, table := range []string{"rentals", "requests", "attempts", "byte_outputs", "worker_processes", "native_artifact_retentions"} {
-		before[table] = tableRows(t, db, table)
-	}
-	must(t, db.Close())
-	must(t, os.Rename(path, layout.DB))
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer server.Close()
-	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "schema=33\n")
-	output, err := compatibilityCLI(t, layout.Root, "rental", "ssh-info", "shelly", "--json")
-	if err == nil || !strings.Contains(output, "records_schema_upgrade_required") {
-		t.Fatalf("older live owner's schema was not preserved: %v %s", err, output)
-	}
-	db, err = sql.Open("sqlite", layout.DB)
-	must(t, err)
-	defer db.Close()
-	var version int
-	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 33 {
-		t.Fatalf("live owner's schema changed to %d", version)
-	}
-	for table, want := range before {
-		if got := tableRows(t, db, table); got != want {
-			t.Fatalf("retained %s rows changed", table)
-		}
-	}
-	select {
-	case <-done:
-		t.Fatal("schema guard stopped the active owner")
-	default:
-	}
-}
-
-func TestRentalReaderStartsDaemonToMigrateAnUnownedRoot(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "creator.sqlite")
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	ddl, err := os.ReadFile("testdata/records-schema33-before-rental-width.sql")
-	must(t, err)
-	_, err = db.Exec(string(ddl))
-	must(t, err)
-	must(t, db.Close())
-	output, err := compatibilityCLI(t, root, "rental", "ssh-info", "missing", "--json")
-	if err == nil || !strings.Contains(output, "development rental is not attached") {
-		t.Fatalf("reader did not pass the daemon migration: %v %s", err, output)
-	}
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	store.Close()
-	if state := daemon.Probe(config.Config{Home: root}); !state.Up {
-		t.Fatal("migration did not leave the owning daemon running")
 	}
 }
 

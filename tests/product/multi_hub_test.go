@@ -6,7 +6,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -352,45 +351,6 @@ func configuredHub(t *testing.T, root string) string {
 	return ""
 }
 
-// Requests recorded before per-request hubs read as the hub they were created under:
-// their rental's when they have one, else the daemon's configured hub.
-func TestSchema48RequestsTakeTheirHub(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	store, problem := records.OpenForDaemon(path, "")
-	fatal(t, problem)
-	const rentalHub, defaultHub = "http://rental-hub.invalid", "http://default-hub.invalid"
-	fatal(t, store.RecordRental(records.Rental{ID: "pr-b2b2b2b2b2b2b2b2b2b2", MachineName: "bravo", State: "ready",
-		Hub: rentalHub, AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
-	for _, request := range []records.Request{
-		{ID: "req-pinned", Worker: "pr-b2b2b2b2b2b2b2b2b2b2", Rental: true},
-		{ID: "req-local"},
-	} {
-		request.IdemKey, request.BodyDigest = request.ID, "sha256:"+strings.Repeat("ab", 32)
-		request.Package, request.Entrypoint, request.Payload = "proof/example", "generate", []byte("{}")
-		_, _, problem := store.Submit(request)
-		fatal(t, problem)
-	}
-	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	revertRecordsSchema(t, db, 48)
-	_, err = db.Exec(`PRAGMA user_version=48`)
-	must(t, err)
-	must(t, db.Close())
-
-	store, problem = records.OpenForDaemon(path, "")
-	fatal(t, problem)
-	defer store.Close()
-	fatal(t, store.AssignRecordHubs(defaultHub+"/"))
-	for id, want := range map[string]string{"req-pinned": rentalHub, "req-local": defaultHub} {
-		row, problem := store.RequestRow(id)
-		fatal(t, problem)
-		if row == nil || row.Hub != want {
-			t.Fatalf("%s migrated to hub %+v, want %s", id, row, want)
-		}
-	}
-}
-
 // An every-hub listing names a hub it cannot read, keeps that hub's rentals as this
 // host's records marked unverified, and still lists every other hub in full. Run
 // history is local and never depends on a hub.
@@ -555,40 +515,6 @@ func TestPackageUpdateAllUsesEachInstallsHub(t *testing.T) {
 	code, out := runCozy(t, root, "package", "list", "--json", "--full")
 	if code != 0 || !strings.Contains(out, `"hub":"b"`) || !strings.Contains(out, `"hub":"a"`) {
 		t.Fatalf("package list does not show each install's hub: %d %s", code, out)
-	}
-}
-
-// Installs recorded before they carried a hub gain the column on open and take the
-// configured hub once; a local install stays hubless.
-func TestInstallsWithoutAHubTakeTheConfiguredOne(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	store, problem := records.OpenForDaemon(path, "")
-	fatal(t, problem)
-	for _, install := range []records.PackageInstall{
-		{ID: "3333333333333333", Package: "proof/old", SourceKind: "tensorhub"},
-		{ID: "4444444444444444", Package: "local/editable", SourceKind: "local"},
-	} {
-		install.Major, install.Version, install.Dir = 1, "1.0.0", t.TempDir()
-		_, problem := store.Activate(install)
-		fatal(t, problem)
-	}
-	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	_, err = db.Exec(`ALTER TABLE installs DROP COLUMN hub`)
-	must(t, err)
-	must(t, db.Close())
-
-	store, problem = records.OpenForDaemon(path, "")
-	fatal(t, problem)
-	defer store.Close()
-	fatal(t, store.AssignRecordHubs("http://configured-hub.invalid/"))
-	for id, want := range map[string]string{"3333333333333333": "http://configured-hub.invalid", "4444444444444444": ""} {
-		install, problem := store.Install(id)
-		fatal(t, problem)
-		if install == nil || install.Hub != want {
-			t.Fatalf("install %s hub = %+v, want %q", id, install, want)
-		}
 	}
 }
 

@@ -435,41 +435,6 @@ func secretOwner(name string) (string, bool) {
 	return "", false
 }
 
-// ------------------------------------------------------------------ retired shapes
-
-// Retired removes the top-level entries this Creator no longer writes (cl-116): the
-// triage file store (its bundles now live in their attempt rows), the upload store, the
-// job-plan and JIT-cache planes, the separate client credential and the old writer
-// lock, and the CUDA-companion wheel store (cr-094: the kernels are one of
-// cozy-runtime's own wheel files now, selected by wheel tag, so no side channel joins
-// them to a venv). It runs after the records open — the schema-22 migration has already
-// folded kept triage files in — and repeats harmlessly.
-func Retired(l home.Layout) (Swept, *exit.Error) {
-	var swept Swept
-	var first *exit.Error
-	for _, name := range []string{
-		"triage", "uploads", "job-plans", "jit-cache", "client.cred", "writer.lock",
-		"private-packages", "companions",
-		// The Runtime this daemon used to spawn itself; this computer's machine replaced it.
-		"runtime",
-	} {
-		path := filepath.Join(l.Root, name)
-		if _, err := os.Lstat(path); err != nil {
-			continue
-		}
-		swept.Scanned++
-		freed, problem := removeTree(path)
-		if problem != nil {
-			if first == nil {
-				first = problem
-			}
-			continue
-		}
-		swept.add(freed, true)
-	}
-	return swept, first
-}
-
 // EmptyRoots prunes on-demand directories whose work is gone. Every one of these is
 // recreated by its writer at the moment work exists, so an empty one is debris, not
 // structure. Each remove refuses unless the directory is empty, which is the point.

@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -70,38 +69,6 @@ func TestServingCallEnvelopeRefusesUnknownOrUncanonicalArguments(t *testing.T) {
 		if _, _, problem := records.ServingCallArguments([]byte(body)); problem == nil {
 			t.Fatalf("accepted %s", body)
 		}
-	}
-}
-
-func TestServingArgumentsSchemaUpgradePreservesPrivateParent(t *testing.T) {
-	for _, version := range []int{33, 34} {
-		t.Run(fmt.Sprint(version), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "creator.sqlite")
-			store, problem := records.Open(path)
-			fatal(t, problem)
-			prior := recordPrivateTransaction(t, store, "schema33-parent", "")
-			store.Close()
-			db, err := sql.Open("sqlite", path)
-			must(t, err)
-			restorePriorCallIndexBounds(t, db)
-			_, err = db.Exec(`DROP TABLE attempt_serving_placements`)
-			must(t, err)
-			_, err = db.Exec(`DROP TABLE request_child_arguments`)
-			must(t, err)
-			_, err = db.Exec(`DROP TABLE successful_work_releases`)
-			must(t, err)
-			_, err = db.Exec(fmt.Sprintf(`PRAGMA user_version=%d`, version))
-			must(t, err)
-			db.Close()
-			store, problem = records.OpenForDaemon(path, "")
-			fatal(t, problem)
-			defer store.Close()
-			after, problem := store.RequestRow(prior.ID)
-			fatal(t, problem)
-			if after == nil || after.BodyDigest != prior.BodyDigest || string(after.Payload) != string(prior.Payload) {
-				t.Fatal("schema35 changed its existing parent")
-			}
-		})
 	}
 }
 
