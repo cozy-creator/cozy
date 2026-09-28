@@ -99,6 +99,8 @@ func TestTheProviderDrawsTheProvisioningBoundary(t *testing.T) {
 		{"created container", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting", Container: "created"})}, orchestrator.PhaseProvisioning},
 		{"image pull read from the boot log", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting", Activity: "pulling_image"})}, orchestrator.PhasePullingImage},
 		{"started container", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting", Container: "running", RuntimeObserved: true})}, orchestrator.PhaseBooting},
+		{"container phase", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting", Phase: "container"})}, orchestrator.PhaseProvisioning},
+		{"supervisor starting", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting", Phase: "host"})}, orchestrator.PhaseBooting},
 		// A rental back in acquisition after a refused attempt is buying AGAIN. Measured on
 		// run 207 — 32.1s of a 227.9s wait was one datacenter declining, and the request
 		// silently moved.

@@ -88,8 +88,7 @@ func (p *RunProgress) sparsePhase(e localapi.Event) {
 	key := "phase:" + name
 	if boot := bootOf(fields); boot != nil {
 		// A new attempt or a new stage is news; a boot log line or a clock is not.
-		key = fmt.Sprint("boot:", boot.Attempt, boot.State, boot.Activity, boot.Container, boot.Started(),
-			boot.HostAnsweredAt.IsZero())
+		key = fmt.Sprint("boot:", boot.Attempt, boot.State, boot.Phase, boot.Activity, boot.Container, boot.Started())
 	}
 	if key != p.sparseStage {
 		p.sparseStarted = eventTime(e)

@@ -55,10 +55,10 @@ func describeBoot(machine string, b *hub.RentalBoot, now time.Time) bootWords {
 		w.stage = "finding another host"
 	case b.State == "obligated" || b.State == "ambiguous":
 		w.stage = "creating pod"
-	case !b.HostAnsweredAt.IsZero():
-		w.stage = "starting Runtime (" + brief(now.Sub(b.HostAnsweredAt)) + ")"
-	case !b.ContainerStartedAt.IsZero():
-		w.stage = "starting supervisor (" + brief(now.Sub(b.ContainerStartedAt)) + ")"
+	case b.Phase == "runtime":
+		w.stage = "starting Runtime" + since(b.PhaseStartedAt, now)
+	case b.Phase == "host":
+		w.stage = "starting supervisor" + since(b.PhaseStartedAt, now)
 	case b.Started():
 		w.stage = "starting Runtime"
 	case b.Activity != "":
@@ -114,6 +114,14 @@ func brief(d time.Duration) string {
 		return fmt.Sprintf("%dm", int(d/time.Minute))
 	}
 	return fmt.Sprintf("%dh%dm", int(d/time.Hour), int(d%time.Hour/time.Minute))
+}
+
+// since is how long a phase has run, for a phase the Hub timed.
+func since(started, now time.Time) string {
+	if started.IsZero() {
+		return ""
+	}
+	return " (" + brief(now.Sub(started)) + ")"
 }
 
 func ago(d time.Duration) string {
