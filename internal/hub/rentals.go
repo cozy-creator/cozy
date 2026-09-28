@@ -723,7 +723,8 @@ type RentalQuote struct {
 // QuoteRental prices the exact body a rental POST would send.
 func (c *Client) QuoteRental(ctx context.Context, body []byte) (RentalQuote, *exit.Error) {
 	var out RentalQuote
-	e := c.do(ctx, call{method: http.MethodPost, path: "/v1/rental-quotes", bodyBytes: body}, &out)
+	// The quote sizes the owner's own unpublished checkpoints only for a signed-in owner.
+	e := c.do(ctx, call{method: http.MethodPost, path: "/v1/rental-quotes", bodyBytes: body, optionalAuth: true}, &out)
 	return out, e
 }
 

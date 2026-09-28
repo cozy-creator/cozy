@@ -480,7 +480,9 @@ func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelReso
 		query.Set("lane", lane)
 	}
 	var out ModelResolution
-	e := c.do(ctx, call{method: http.MethodGet,
+	// An unpublished checkpoint resolves only for its owner, so a signed-in reader presents
+	// its bearer; a signed-out one reads published releases.
+	e := c.do(ctx, call{method: http.MethodGet, optionalAuth: true,
 		path: "/v1/models/resolve?" + query.Encode()}, &out)
 	return out, e
 }

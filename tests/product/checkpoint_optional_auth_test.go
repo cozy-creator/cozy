@@ -26,6 +26,9 @@ func (s *checkpointTokenSource) AccessToken(context.Context) (secret.Value, *exi
 }
 func (s *checkpointTokenSource) Invalidate() { s.refreshed.Add(1) }
 
+// Unpublished checkpoints are private to their account (Tensorhub #852): every by-digest
+// read, including model resolution and rental quotes, presents the owner's bearer when one
+// exists and reads anonymously otherwise.
 func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 	for _, test := range []struct {
 		name, token, machine, authorization string
@@ -45,16 +48,21 @@ func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				if r.Header.Get("Authorization") != test.authorization {
-					t.Error("checkpoint read changed credential handling")
+					t.Errorf("%s changed credential handling: %q", r.URL.Path, r.Header.Get("Authorization"))
 				}
 				if test.status != 200 {
 					w.WriteHeader(test.status)
 					_, _ = w.Write([]byte(`{"error":{"code":"proof.refused","message":"refused"}}`))
 					return
 				}
-				if r.Method == http.MethodPost {
+				switch {
+				case r.URL.Path == "/v1/models/resolve":
+					_, _ = w.Write([]byte(`{"model":"proof/source","manifest_id":"sha256:fixture"}`))
+				case r.URL.Path == "/v1/rental-quotes":
+					_, _ = w.Write([]byte(`{"price_usd_micros_per_hour":1}`))
+				case r.Method == http.MethodPost:
 					_, _ = w.Write([]byte(`{"reads":[]}`))
-				} else {
+				default:
 					_, _ = w.Write([]byte(`{"fixture":"manifest"}`))
 				}
 			}))
@@ -64,7 +72,9 @@ func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 			ref := hub.Ref{Org: "proof", Name: "source"}
 			_, manifestErr := client.CheckpointManifest(context.Background(), ref, "fixture")
 			_, readsErr := client.CheckpointReads(context.Background(), ref, "fixture", nil)
-			for _, problem := range []*exit.Error{manifestErr, readsErr} {
+			_, resolveErr := client.ResolveModel(context.Background(), "proof/source#sha256:fixture", "")
+			_, quoteErr := client.QuoteRental(context.Background(), []byte(`{}`))
+			for _, problem := range []*exit.Error{manifestErr, readsErr, resolveErr, quoteErr} {
 				if (problem == nil) != (test.status == 200) {
 					t.Fatal("checkpoint read did not preserve the Hub result")
 				}
@@ -72,7 +82,7 @@ func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 					t.Fatal("checkpoint refusal was reclassified as login failure")
 				}
 			}
-			if calls.Load() != 2 || source.refreshed.Load() != 0 {
+			if calls.Load() != 4 || source.refreshed.Load() != 0 {
 				t.Fatal("optional checkpoint read retried or required credential refresh")
 			}
 		})
