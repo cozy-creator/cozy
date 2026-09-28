@@ -34,6 +34,7 @@ type session struct {
 	abort  context.CancelFunc
 	authed bool   // guarded by srv.mu
 	key    string // guarded by srv.mu
+	ufrag  string // claimed by the first Binding request
 
 	ch    *channel
 	grant capability.Grant // the reader's
@@ -153,7 +154,18 @@ func newSession(s *server, tcp *net.TCPConn) *session {
 func (c *session) run() {
 	defer c.srv.drop(c)
 	defer c.abort()
-	ch, err := connect(c.ctx, c.tcp, c.srv.cfg.Leaf)
+	defer func() {
+		if c.ufrag != "" {
+			c.srv.release(c.ufrag)
+		}
+	}()
+	ch, err := connect(c.ctx, c.tcp, c.srv.cfg.Leaf, func(ufrag string) bool {
+		if !c.srv.claim(ufrag) {
+			return false
+		}
+		c.ufrag = ufrag
+		return true
+	})
 	if err != nil {
 		return
 	}

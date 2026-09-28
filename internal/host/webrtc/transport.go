@@ -35,10 +35,11 @@ var (
 
 // iceConn is the packet conn DTLS reads: its DTLS frames, with STUN answered on the way.
 type iceConn struct {
-	tcp *net.TCPConn
-	r   *bufio.Reader
-	pwd string // fixed by the first Binding request
-	wmu sync.Mutex
+	tcp   *net.TCPConn
+	r     *bufio.Reader
+	pwd   string                  // fixed by the first Binding request
+	claim func(ufrag string) bool // admits the first Binding's ufrag to this connection
+	wmu   sync.Mutex
 }
 
 // frame reads one RFC 4571 frame into p.
@@ -82,7 +83,7 @@ func (c *iceConn) answer(frame []byte) error {
 	local, _, _ := strings.Cut(user.String(), ":")
 	integrity := stun.NewShortTermIntegrity(local)
 	if !strings.HasPrefix(local, UfragPrefix) || c.pwd != "" && local != c.pwd ||
-		integrity.Check(m) != nil || stun.Fingerprint.Check(m) != nil {
+		integrity.Check(m) != nil || stun.Fingerprint.Check(m) != nil || c.pwd == "" && !c.claim(local) {
 		return errFraming
 	}
 	c.pwd = local
@@ -125,9 +126,10 @@ type channel struct {
 }
 
 // connect runs one connection up to its open data channel. A first frame that is not a
-// valid Binding request closes it before any DTLS state exists.
-func connect(ctx context.Context, tcp *net.TCPConn, leaf tls.Certificate) (*channel, error) {
-	ice := &iceConn{tcp: tcp, r: bufio.NewReaderSize(tcp, 64<<10)}
+// valid Binding request, or whose ufrag claim refuses, closes it unanswered, before any DTLS
+// state exists.
+func connect(ctx context.Context, tcp *net.TCPConn, leaf tls.Certificate, claim func(string) bool) (*channel, error) {
+	ice := &iceConn{tcp: tcp, r: bufio.NewReaderSize(tcp, 64<<10), claim: claim}
 	first := make([]byte, 1500)
 	n, err := ice.frame(first)
 	if err != nil || first[0] > 3 {
