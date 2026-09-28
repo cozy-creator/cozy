@@ -37,6 +37,7 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 		}
 		served.ServeHTTP(w, r)
 	})
+	serveOtherBytes(h, manifest)
 	root, err := os.MkdirTemp("", "czd")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
@@ -51,7 +52,11 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 			_ = removeAllForce(root)
 		}
 	})
-	if code, out := runCozy(t, root, "machine", "install", "--host", *machineHostBinary); code != 0 {
+	install := []string{"machine", "install", "--host", *machineHostBinary}
+	if *machineRuntimeWheel != "" {
+		install = append(install, "--runtime-wheel", *machineRuntimeWheel, "--tensorfs-wheel", *machineTensorFSWheel)
+	}
+	if code, out := runCozy(t, root, install...); code != 0 {
 		t.Fatalf("machine install [exit %d]\n%s", code, out)
 	}
 	code, out := runCozy(t, root, "model", "download", "proof/model#"+manifest, "--json")
@@ -81,9 +86,9 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 		t.Fatal("the local machine never settled the installation")
 	}
 	t.Logf("local installation settled: %s %s: %s", settled.State, settled.ErrorCode, settled.Error)
-	// The stand-in hub serves no model bytes, so this computer's machine refuses the download
-	// by its own name (or its Host by a boot refusal on a mismatched cohort). What must never
-	// appear is a rental-only refusal or a classic local worker.
+	// The stand-in hub serves bytes that are not the model, so this computer's machine refuses
+	// the download by its own name. What must never appear is a rental-only refusal or a
+	// classic local worker.
 	if settled.State != "failed" || strings.HasPrefix(settled.ErrorCode, "rental.") ||
 		!strings.HasPrefix(settled.ErrorCode, "machine") && !strings.Contains(settled.ErrorCode, "download") {
 		t.Fatalf("the installation did not reach the local Host: %+v", settled)
@@ -93,4 +98,36 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 	if len(requests) != 0 {
 		t.Fatalf("a model download submitted a run: %+v", requests)
 	}
+}
+
+// serveOtherBytes has the machine's Hub doors (behind their private CA) resolve manifest to
+// a closure of one object and presign both onto bytes that do not hash to them: the Host's
+// fetch runs end to end and its TensorFS refuses what arrives.
+func serveOtherBytes(h *machineHub, manifest string) {
+	lengths := map[string]int{strings.TrimPrefix(manifest, "sha256:"): 128, strings.Repeat("b", 64): 64}
+	doors := h.worker.Config.Handler
+	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/tensorfs/closure":
+			var asked struct{ Lane string }
+			_ = json.NewDecoder(r.Body).Decode(&asked)
+			_ = json.NewEncoder(w).Encode(map[string]any{"complete": true, "lane": asked.Lane, "model": "proof/model",
+				"manifest":            map[string]any{"length": 128, "sha256": strings.TrimPrefix(manifest, "sha256:")},
+				"objects":             []any{map[string]any{"length": 64, "sha256": strings.Repeat("b", 64)}},
+				"presign_max_digests": 64, "release": "", "scope": "runtime"})
+		case r.URL.Path == "/v1/tensorfs/presign":
+			var asked struct{ Digests []string }
+			_ = json.NewDecoder(r.Body).Decode(&asked)
+			urls := map[string]string{}
+			for _, digest := range asked.Digests {
+				urls[digest] = h.worker.URL + "/o/" + digest
+			}
+			now := time.Now().Unix()
+			_ = json.NewEncoder(w).Encode(map[string]any{"expires_at_unix": now + 3600, "server_time_unix": now, "urls": urls})
+		case strings.HasPrefix(r.URL.Path, "/o/") && lengths[strings.TrimPrefix(r.URL.Path, "/o/")] > 0:
+			_, _ = w.Write(make([]byte, lengths[strings.TrimPrefix(r.URL.Path, "/o/")]))
+		default:
+			doors.ServeHTTP(w, r)
+		}
+	})
 }
