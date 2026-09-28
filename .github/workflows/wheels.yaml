@@ -5,6 +5,11 @@ name: wheels
 #   gh workflow run wheels.yaml -R cozy-creator/tensorfs --ref <branch-or-tag>
 on:
   workflow_call:
+    inputs:
+      ref:
+        description: Tree to build (a release tag); default the caller's ref
+        type: string
+        default: ''
   workflow_dispatch:
 # A literal prefix: a called workflow sees the caller's github.workflow.
 concurrency:
@@ -21,6 +26,8 @@ jobs:
       CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       # The binary is built INSIDE the manylinux container so its glibc floor matches the
       # extension module it ships beside (tfs-051).
       - uses: PyO3/maturin-action@v1
