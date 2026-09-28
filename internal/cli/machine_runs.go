@@ -461,6 +461,13 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 				problem = connection.prepare(ctx, request.ID, revision)
 			}
 			if problem != nil {
+				// The root's preparation precedes its submission, so a machine that refuses
+				// it never took the run: the refusal ends it rather than being asked again.
+				if refusedPreparation(problem) {
+					if recordProblem := m.store.RefuseMachineSubmission(request.ID, problem.ErrName(), problem.Message); recordProblem != nil {
+						return recordProblem
+					}
+				}
 				return problem
 			}
 		}
@@ -617,6 +624,15 @@ func (m *machineRuns) supplySourceCredentials(ctx context.Context, connection *m
 }
 
 func machineTransport(err error) *exit.Error { return machines.Transport(err) }
+
+// refusedPreparation is a machine's refusal to prepare that retrying cannot change.
+func refusedPreparation(problem *exit.Error) bool {
+	switch problem.ErrName() {
+	case "machine_execution.prepare_refused", "machine_execution.runtime_requirement", "machine_execution.package_requirement":
+		return true
+	}
+	return false
+}
 
 func (m *machineRuns) executionConnection(ctx context.Context, request records.Request) (*machineConnection, *records.MachineExecution, *pb.MachineExecutionQuery, *exit.Error) {
 	if lost, problem := m.store.MachineExecutionLost(request.ID); problem != nil || lost {
