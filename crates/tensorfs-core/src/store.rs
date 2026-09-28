@@ -586,6 +586,23 @@ impl Store {
         }
     }
 
+    /// Make this handle's unsynced admissions durable now, names included. Without an epoch
+    /// each admission already made itself durable (or, on an ephemeral disk, needs nothing).
+    pub(crate) fn sync_admitted(&self) -> Result<()> {
+        match &self.epoch {
+            Some(epoch) => epoch.sync_now_named(),
+            None => Ok(()),
+        }
+    }
+
+    /// Sync the last batch and retire the epoch's marker.
+    pub(crate) fn finish_admitted(&self) -> Result<()> {
+        match &self.epoch {
+            Some(epoch) => epoch.finish().map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
     /// The same Store as if it lived on a disk of `class`: benchmarks of one real disk.
     #[cfg(test)]
     pub(crate) fn with_disk_class(self, class: crate::disk::DiskClass) -> Store {

@@ -2346,6 +2346,19 @@ fn planned_row(
     })
 }
 
+/// The Store a live writer admits through. On a persistent disk its parts and progress
+/// documents are not synced one by one: each checkpoint (and the commit) makes everything
+/// admitted since the previous one durable at once, before the root names it, so a crash
+/// loses at most the work after the last checkpoint. An ephemeral disk needs no sync at all.
+pub fn writer_store(store: &Store) -> Result<Store> {
+    Ok(store.syncing(crate::unsynced::Epoch::begin_every(store, u64::MAX)?))
+}
+
+/// The writer is done: sync anything admitted since its last checkpoint and retire its epoch.
+pub fn finish_writer(store: &Store) -> Result<()> {
+    store.finish_admitted()
+}
+
 pub fn begin(
     store: &Store,
     meta: &Meta,
@@ -2810,6 +2823,8 @@ impl CheckpointCursor {
         let Some(mut root) = root else {
             return Ok(None);
         };
+        // Everything the new head names is durable before the root publishes it.
+        store.sync_admitted()?;
         root.checkpoint = extended.head.head.clone();
         roots::write(store, &root)?;
         self.tip
@@ -2935,6 +2950,7 @@ pub fn checkpoint_progress(
         objects,
         None,
     )?;
+    store.sync_admitted()?;
     let mut txn = meta.txn_for(transaction)?;
     let row = open_row(&mut txn.rows, transaction, writer_session)?;
     retain_progress(store, row, exported.head.head.as_ref())?;
@@ -3609,6 +3625,7 @@ pub fn commit(
     walk.require_held(store, &crate::ingest::custody::live(store.root())?)?;
     let (inherited_payload_objects, inherited_payload_bytes) =
         inherit_observation(&header, &row_before)?;
+    store.sync_admitted()?;
 
     let mut txn = meta.txn_for(&transaction)?;
     let row = open_row(&mut txn.rows, &transaction, writer_session)?;
@@ -4598,3 +4615,6 @@ mod companion_tests;
 
 #[cfg(test)]
 mod part_rows_tests;
+
+#[cfg(test)]
+mod group_commit_tests;

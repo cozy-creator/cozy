@@ -123,6 +123,20 @@ fn io(error: std::io::Error) -> Refusal {
 fn directory(store: &Store) -> PathBuf {
     store.root().join("roots/derived")
 }
+
+/// A root must survive the machine on every disk but an ephemeral one, whose Store dies with
+/// its container. A parts journal follows the Store's admissions instead ([`Store::flushes`]):
+/// under a writer's epoch its lines become durable with that writer's next checkpoint.
+fn durable(store: &Store) -> bool {
+    store.disk_class() != crate::disk::DiskClass::Ephemeral
+}
+
+/// Create the root directory; true when this call created it (so its parents need a sync).
+fn create_directory(store: &Store) -> Result<bool> {
+    let created = !directory(store).is_dir();
+    fs::create_dir_all(directory(store)).map_err(io)?;
+    Ok(created)
+}
 fn path(store: &Store, transaction: &str) -> Result<PathBuf> {
     let transaction = super::transaction_id(transaction)?;
     Ok(directory(store).join(format!(
@@ -150,7 +164,7 @@ pub(super) fn append_parts(store: &Store, transaction: &str, objects: &[ObjectRe
         return Ok(());
     }
     let path = parts_path(store, transaction)?;
-    fs::create_dir_all(directory(store)).map_err(io)?;
+    let parents = create_directory(store)?;
     let created = !path.exists();
     let mut file = OpenOptions::new()
         .read(true)
@@ -170,11 +184,12 @@ pub(super) fn append_parts(store: &Store, transaction: &str, objects: &[ObjectRe
         vec![b'\n']
     };
     bytes.extend(parts_line(objects));
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_data())
-        .map_err(io)?;
-    if created {
-        sync_directories(store)?;
+    file.write_all(&bytes).map_err(io)?;
+    if store.flushes() {
+        file.sync_data().map_err(io)?;
+        if created {
+            sync_directories(store, parents)?;
+        }
     }
     Ok(())
 }
@@ -182,7 +197,7 @@ pub(super) fn append_parts(store: &Store, transaction: &str, objects: &[ObjectRe
 /// Replace the journal with exactly these objects (a writer's merged progress).
 pub(super) fn rewrite_parts(store: &Store, transaction: &str, objects: &[ObjectRef]) -> Result<()> {
     let path = parts_path(store, transaction)?;
-    fs::create_dir_all(directory(store)).map_err(io)?;
+    let parents = create_directory(store)?;
     let temporary = path.with_extension(format!("parts-tmp-{}", crate::meta::now_nanos_unique()));
     let mut file = OpenOptions::new()
         .write(true)
@@ -194,11 +209,15 @@ pub(super) fn rewrite_parts(store: &Store, transaction: &str, objects: &[ObjectR
     } else {
         parts_line(objects)
     };
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(io)?;
+    file.write_all(&bytes).map_err(io)?;
+    if store.flushes() {
+        file.sync_all().map_err(io)?;
+    }
     fs::rename(&temporary, &path).map_err(io)?;
-    sync_directories(store)
+    if store.flushes() {
+        sync_directories(store, parents)?;
+    }
+    Ok(())
 }
 
 /// Every object named by any transaction's parts journal.
@@ -235,12 +254,15 @@ pub(super) fn journaled(store: &Store) -> Result<Vec<ObjectRef>> {
     Ok(objects)
 }
 
-fn sync_directories(store: &Store) -> Result<()> {
-    for directory in [
+/// A rename needs its own directory synced; the parents only when this write created it.
+fn sync_directories(store: &Store, parents: bool) -> Result<()> {
+    let own = [directory(store)];
+    let all = [
         directory(store),
         store.root().join("roots"),
         store.root().to_path_buf(),
-    ] {
+    ];
+    for directory in if parents { &all[..] } else { &own[..] } {
         File::open(directory)
             .and_then(|file| file.sync_all())
             .map_err(io)?;
@@ -301,25 +323,20 @@ pub(super) fn write(store: &Store, root: &Root) -> Result<()> {
         return refuse(Code::COUNT_CAP, "private derived root exceeds its byte cap");
     }
     let path = path(store, &root.transaction)?;
-    fs::create_dir_all(directory(store)).map_err(io)?;
+    let parents = create_directory(store)?;
     let temporary = path.with_extension(format!("tmp-{}", crate::meta::now_nanos_unique()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(io)?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(io)?;
+    file.write_all(&bytes).map_err(io)?;
+    if durable(store) {
+        file.sync_all().map_err(io)?;
+    }
     fs::rename(&temporary, &path).map_err(io)?;
-    for directory in [
-        directory(store),
-        store.root().join("roots"),
-        store.root().to_path_buf(),
-    ] {
-        File::open(directory)
-            .and_then(|file| file.sync_all())
-            .map_err(io)?;
+    if durable(store) {
+        sync_directories(store, parents)?;
     }
     Ok(())
 }
@@ -396,6 +413,7 @@ pub(super) fn remove(store: &Store, transaction: &str) -> Result<()> {
         Err(error) => return Err(io(error)),
     }
     match fs::remove_file(path(store, transaction)?) {
+        Ok(()) if !durable(store) => Ok(()),
         Ok(()) => File::open(directory(store))
             .and_then(|file| file.sync_all())
             .map_err(io),
