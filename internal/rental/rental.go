@@ -352,10 +352,8 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 // dispatchable without crossing this records boundary.
 func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit.Error {
 	return func(observed orchestrator.RentalObservation) *exit.Error {
-		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator,
-			observed.Backend, observed.DriverVersion, observed.BackendVersion,
-			observed.DeviceMemoryTotalBytes, observed.WorkerInstance, observed.WorkerID,
-			observed.WorkerBootID, observed.DeviceCount)
+		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator, observed.Backend,
+			observed.WorkerInstance, observed.WorkerID, observed.WorkerBootID, observed.DeviceCount)
 	}
 }
 

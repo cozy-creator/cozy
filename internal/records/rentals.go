@@ -738,8 +738,7 @@ func (s *Store) RentalByMachine(name string) (*Rental, *exit.Error) {
 
 // ObserveRentalWorker validates the direct ClaimAck against Tensorhub's pinned worker
 // and requested SKU. Hardware observations are live control facts, not rental-row history.
-func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
-	backendVersion string, deviceMemory uint64, instance, workerID, bootID string, count int) *exit.Error {
+func (s *Store) ObserveRentalWorker(id, accelerator, backend, instance, workerID, bootID string, count int) *exit.Error {
 	row, err := scanRental(s.db.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return exit.New(exit.NotFound, "no rental %s on this host", id)
@@ -750,10 +749,8 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	cpu := CPUAccelerator(row.AcceleratorModel)
 	complete := row.State == "ready" || row.State == "attached"
 	if cpu {
-		// A worker that measured no accelerator reports backend "none", or nothing at all.
-		complete = complete && accelerator == "" && (backend == "none" || backend == "") && count == 0 &&
-			driverVersion == "" && backendVersion == "" && deviceMemory == 0 &&
-			instance != "" && workerID != "" && bootID != ""
+		// A CPU pod reports no accelerator; its image's torch may still name a CUDA toolkit.
+		complete = complete && accelerator == "" && count == 0 && instance != "" && workerID != "" && bootID != ""
 	} else {
 		complete = complete && accelerator != "" && backend != "" && count > 0 &&
 			instance != "" && workerID != "" && bootID != ""

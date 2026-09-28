@@ -6,6 +6,7 @@ package producttest
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -158,6 +159,11 @@ type fakePod struct {
 	// else is what `session.py::apply_job_directive` refuses as `job_plan_mismatch`.
 	stagedJobBuild string
 	jobDirectives  []*pb.JobDirective
+
+	// prune answers the Host's cache pruning; resources is what the worker's ClaimAck reads
+	// back, nil for one fake-4090 per device.
+	prune     func(*pb.PruneOperationCacheCall) (*pb.PruneOperationCacheResult, error)
+	resources *pb.WorkerResources
 }
 
 func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
@@ -331,8 +337,8 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
 				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: p.bootID(),
 				Accepted: true, WireMinor: minor, WorkerId: p.workerID(), WorkerInstanceId: "inst-pod-1",
-				Resources: &pb.WorkerResources{Backend: "cuda", DeviceName: "fake-4090",
-					DeviceCount: max(p.deviceCount, 1), DeviceMemoryTotalBytes: 24 << 30},
+				Resources: cmp.Or(p.resources, &pb.WorkerResources{Backend: "cuda", DeviceName: "fake-4090",
+					DeviceCount: max(p.deviceCount, 1), DeviceMemoryTotalBytes: 24 << 30}),
 			}}}); err != nil {
 				return err
 			}
@@ -951,6 +957,13 @@ func (p *fakePod) WatchProgress(open *pb.ProgressOpen, stream pb.WorkerControl_W
 	}
 	<-stream.Context().Done()
 	return nil
+}
+
+func (p *fakePod) PruneOperationCache(_ context.Context, call *pb.PruneOperationCacheCall) (*pb.PruneOperationCacheResult, error) {
+	if p.prune == nil {
+		return nil, status.Error(codes.Unimplemented, "cache pruning unavailable")
+	}
+	return p.prune(call)
 }
 
 func (p *fakePod) KeepRentalAlive(ctx context.Context, request *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
