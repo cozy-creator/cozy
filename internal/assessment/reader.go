@@ -1,3 +1,5 @@
+// Package assessment verifies report association against Creator's retained work.
+// cozy-eval owns report semantics; this package compares only its validated facts.
 package assessment
 
 import (
@@ -8,6 +10,8 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
+
+const MaxBytes = 8 << 20
 
 // Inspect invokes the host's trusted evaluator, never the submitted package's
 // interpreter. Only immutable report bytes cross stdin; diagnostics expose no
