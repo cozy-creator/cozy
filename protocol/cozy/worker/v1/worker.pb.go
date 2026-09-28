@@ -3404,7 +3404,12 @@ type ReleaseRoot struct {
 	// The account an unpublished installation's org-relative Model references name: it has no
 	// org of its own. A published release's org is its package's. Sent only to a machine whose
 	// workspace advertises release_root_owner.
-	Owner         string `protobuf:"bytes,17,opt,name=owner,proto3" json:"owner,omitempty"`
+	Owner string `protobuf:"bytes,17,opt,name=owner,proto3" json:"owner,omitempty"`
+	// Wire 67: the Tensorhub origin this run came from. The machine reads the release, its callees,
+	// its package index and its Models there, with its registration at that Hub. Empty: the
+	// machine's default Hub. A Runtime before 67 ignores it and reads its default Hub, so a
+	// controller sends another Hub's run only to a machine whose range reaches 67.
+	Hub           string `protobuf:"bytes,18,opt,name=hub,proto3" json:"hub,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3533,6 +3538,13 @@ func (x *ReleaseRoot) GetInstallationId() string {
 func (x *ReleaseRoot) GetOwner() string {
 	if x != nil {
 		return x.Owner
+	}
+	return ""
+}
+
+func (x *ReleaseRoot) GetHub() string {
+	if x != nil {
+		return x.Hub
 	}
 	return ""
 }
@@ -6254,8 +6266,11 @@ type PreparePackageSetCall struct {
 	PythonVersion  string `protobuf:"bytes,9,opt,name=python_version,json=pythonVersion,proto3" json:"python_version,omitempty"`
 	// The hub release's PackageInterface/1 canonical bytes. Empty: Runtime obtains them itself.
 	PackageInterface []byte `protobuf:"bytes,10,opt,name=package_interface,json=packageInterface,proto3" json:"package_interface,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Wire 67: the Tensorhub origin the set is read and its Models fetched at; empty: the machine's
+	// default Hub.
+	Hub           string `protobuf:"bytes,11,opt,name=hub,proto3" json:"hub,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PreparePackageSetCall) Reset() {
@@ -6349,6 +6364,13 @@ func (x *PreparePackageSetCall) GetPackageInterface() []byte {
 		return x.PackageInterface
 	}
 	return nil
+}
+
+func (x *PreparePackageSetCall) GetHub() string {
+	if x != nil {
+		return x.Hub
+	}
+	return ""
 }
 
 type PrepareLocalPackageCall struct {
@@ -8434,6 +8456,8 @@ type PreparePackageSetRequest struct {
 	// kernel probes); it reads no model and answers installed_package only. The Host calls
 	// again without it once every model is verified in the Store.
 	ModelsLanding bool `protobuf:"varint,13,opt,name=models_landing,json=modelsLanding,proto3" json:"models_landing,omitempty"`
+	// Wire 67: as PreparePackageSetCall.hub.
+	Hub           string `protobuf:"bytes,14,opt,name=hub,proto3" json:"hub,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -8543,6 +8567,13 @@ func (x *PreparePackageSetRequest) GetModelsLanding() bool {
 		return x.ModelsLanding
 	}
 	return false
+}
+
+func (x *PreparePackageSetRequest) GetHub() string {
+	if x != nil {
+		return x.Hub
+	}
+	return ""
 }
 
 // The placed worker image's pinned inventory (`tensorhub.image_inventory/1` facts). The list
@@ -13423,6 +13454,7 @@ type PackageSelection struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // exact org/name package identity
 	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"` // exact semantic release
+	Hub           string                 `protobuf:"bytes,5,opt,name=hub,proto3" json:"hub,omitempty"`         // Wire 67: the Tensorhub origin it is read at; empty: the default Hub
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13467,6 +13499,13 @@ func (x *PackageSelection) GetPackage() string {
 func (x *PackageSelection) GetRelease() string {
 	if x != nil {
 		return x.Release
+	}
+	return ""
+}
+
+func (x *PackageSelection) GetHub() string {
+	if x != nil {
+		return x.Hub
 	}
 	return ""
 }
@@ -22280,7 +22319,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x12source_credentials\x18\f \x03(\v2 .cozy.worker.v1.SourceCredentialR\x11sourceCredentials\x12>\n" +
 	"\frelease_root\x18\r \x01(\v2\x1b.cozy.worker.v1.ReleaseRootR\vreleaseRoot\x12\x1d\n" +
 	"\n" +
-	"owner_memo\x18\x0e \x01(\bR\townerMemoJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\x87\x05\n" +
+	"owner_memo\x18\x0e \x01(\bR\townerMemoJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\x99\x05\n" +
 	"\vReleaseRoot\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12\x1e\n" +
@@ -22298,7 +22337,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x13weights_destination\x18\x0e \x01(\tR\x12weightsDestination\x12+\n" +
 	"\x11publication_grant\x18\x0f \x01(\tR\x10publicationGrant\x12'\n" +
 	"\x0finstallation_id\x18\x10 \x01(\tR\x0einstallationId\x12\x14\n" +
-	"\x05owner\x18\x11 \x01(\tR\x05ownerJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\f\x10\rR\acalleesR\rinstallationsR\x0ecatalog_origin\"\xde\x01\n" +
+	"\x05owner\x18\x11 \x01(\tR\x05owner\x12\x10\n" +
+	"\x03hub\x18\x12 \x01(\tR\x03hubJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\f\x10\rR\acalleesR\rinstallationsR\x0ecatalog_origin\"\xde\x01\n" +
 	"\vModelChoice\x12\x1c\n" +
 	"\tparameter\x18\x01 \x01(\tR\tparameter\x12\x1e\n" +
 	"\n" +
@@ -22546,7 +22586,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\n" +
 	"wire_minor\x18\x01 \x01(\rR\twireMinor\x12,\n" +
 	"\x12minimum_wire_minor\x18\x02 \x01(\rR\x10minimumWireMinorJ\x04\b\x03\x10\n" +
-	"R\x1bsupports_mixed_model_inputsR'supports_model_materialization_recoveryR!supports_local_installation_reuseR\x19supports_rental_keepaliveR$supports_weights_transaction_refusalR!supports_machine_execution_triageR\x1esupports_prepare_while_landing\"\xfa\x03\n" +
+	"R\x1bsupports_mixed_model_inputsR'supports_model_materialization_recoveryR!supports_local_installation_reuseR\x19supports_rental_keepaliveR$supports_weights_transaction_refusalR!supports_machine_execution_triageR\x1esupports_prepare_while_landing\"\x8c\x04\n" +
 	"\x15PreparePackageSetCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12B\n" +
 	"\vpackage_set\x18\x02 \x01(\v2!.cozy.worker.v1.DesiredPackageSetR\n" +
@@ -22558,7 +22598,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fpython_requires\x18\b \x01(\tR\x0epythonRequires\x12%\n" +
 	"\x0epython_version\x18\t \x01(\tR\rpythonVersion\x12+\n" +
 	"\x11package_interface\x18\n" +
-	" \x01(\fR\x10packageInterfaceJ\x04\b\a\x10\bR'supports_model_materialization_recovery\"\x9a\x01\n" +
+	" \x01(\fR\x10packageInterface\x12\x10\n" +
+	"\x03hub\x18\v \x01(\tR\x03hubJ\x04\b\a\x10\bR'supports_model_materialization_recovery\"\x9a\x01\n" +
 	"\x17PrepareLocalPackageCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12R\n" +
 	"\x11local_package_set\x18\x02 \x01(\v2&.cozy.worker.v1.DesiredLocalPackageSetR\x0flocalPackageSet\"\xd9\x01\n" +
@@ -22696,7 +22737,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x04file\x18\x04 \x01(\v2#.cozy.worker.v1.LocalPackageFileRefR\x04fileJ\x04\b\x03\x10\x04R\rsource_digest\"E\n" +
 	"\x17LocalPackageUploadChunk\x12\x16\n" +
 	"\x06offset\x18\x01 \x01(\x04R\x06offset\x12\x12\n" +
-	"\x04data\x18\x02 \x01(\fR\x04data\"\xc1\x04\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\"\xd3\x04\n" +
 	"\x18PreparePackageSetRequest\x12/\n" +
 	"\x13download_delegation\x18\x01 \x01(\fR\x12downloadDelegation\x12 \n" +
 	"\vapplication\x18\x04 \x01(\tR\vapplication\x12(\n" +
@@ -22709,7 +22750,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	" \x01(\tR\x0epythonRequires\x12%\n" +
 	"\x0epython_version\x18\v \x01(\tR\rpythonVersion\x12+\n" +
 	"\x11package_interface\x18\f \x01(\fR\x10packageInterface\x12%\n" +
-	"\x0emodels_landing\x18\r \x01(\bR\rmodelsLandingJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04R\x05filesR\x10environment_root\"\xd2\x01\n" +
+	"\x0emodels_landing\x18\r \x01(\bR\rmodelsLanding\x12\x10\n" +
+	"\x03hub\x18\x0e \x01(\tR\x03hubJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04R\x05filesR\x10environment_root\"\xd2\x01\n" +
 	"\x0eImageInventory\x12\x18\n" +
 	"\aprofile\x18\x01 \x01(\tR\aprofile\x12\x16\n" +
 	"\x06python\x18\x02 \x01(\tR\x06python\x12G\n" +
@@ -23154,10 +23196,11 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x10\vR\x12environment_digestR\x1aenvironment_receipt_digestR\rqualificationR\venvironment\"5\n" +
 	"\x03Ref\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\fR\x06digest\x12\x16\n" +
-	"\x06length\x18\x02 \x01(\x04R\x06length\"q\n" +
+	"\x06length\x18\x02 \x01(\x04R\x06length\"\x83\x01\n" +
 	"\x10PackageSelection\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
-	"\arelease\x18\x02 \x01(\tR\areleaseJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\x0erelease_digestR\rproject_wheel\"\xb8\x01\n" +
+	"\arelease\x18\x02 \x01(\tR\arelease\x12\x10\n" +
+	"\x03hub\x18\x05 \x01(\tR\x03hubJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\x0erelease_digestR\rproject_wheel\"\xb8\x01\n" +
 	"\x12DevelopmentPackage\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12'\n" +
