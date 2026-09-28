@@ -41,9 +41,9 @@ operation.commit_release(None, "1.0.0", "bf16", manifest, len(raw))
 print(json.dumps({"manifest_id": manifest, "manifest_length": len(raw)}))
 `
 
-// probeProject is the parity package with a CPU job reading one Model slot: a derive-only
-// Manifest capability, so the job never loads it.
-func probeProject(t *testing.T) string {
+// probeProject is the parity package with a CPU job reading one Model slot by its authored
+// default lane: a derive-only Manifest capability, so the job never loads it.
+func probeProject(t *testing.T, lane string) string {
 	t.Helper()
 	project := parityProject(t)
 	must(t, os.WriteFile(filepath.Join(project, "machine_parity.py"), []byte(`import msgspec
@@ -70,7 +70,7 @@ class TouchResult(msgspec.Struct):
 app = App()
 
 
-@app.job(defaults={"source": [{"gpu": "*", "lane": "proof/probe@1.0.0/bf16"}]})
+@app.job(defaults={"source": [{"gpu": "*", "lane": "`+lane+`"}]})
 def touch(payload: TouchRequest, source: Probe) -> TouchResult:
     return TouchResult(value=payload.value + 1)
 `), 0o600))
@@ -103,7 +103,7 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			handler.ServeHTTP(w, r)
 		})
 	}
-	publishParityRelease(t, h, root, probeProject(t))
+	publishParityRelease(t, h, root, probeProject(t, "proof/probe@1.0.0/bf16"))
 	binding := `{"bindings":[{"slot":"touch.models.source","model":"proof/probe","release":"1.0.0","revision":1,"ladder":[{"gpu":"*","lane":"bf16"}]}]}`
 	doors := h.worker.Config.Handler
 	h.worker.Config.Handler = count("machine", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -168,6 +168,32 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			read := strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/bindings") && strings.Contains(calls, "machine GET /v1/models/resolve")
 			if (key == "changed") != read || key == "warm again" && calls != "" {
 				t.Fatalf("the %s run on %s read: %q", key, venue, calls)
+			}
+		}
+	}
+
+	// Unpublished code is no different. Its org-relative default names the caller's account,
+	// read once and kept, which the root carries as its owner; the machine resolves the slot.
+	h.mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"proof"}`))
+	})
+	if code, out := runCozy(t, root, "package", "install", probeProject(t, "probe@1.0.0/bf16"), "--editable"); code != 0 {
+		t.Fatalf("editable install [exit %d]\n%s", code, out)
+	}
+	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {
+		for _, key := range []string{"cold", "warm"} {
+			mu.Lock()
+			seen = nil
+			mu.Unlock()
+			if code, out := runCozy(t, root, append([]string{"run", "local/machine-parity/touch", "value=1", "--await", "--json"}, args...)...); code != 0 || !strings.Contains(out, `"value":2`) {
+				t.Fatalf("%s local/ touch on %s [exit %d]\n%s", key, venue, code, out)
+			}
+			mu.Lock()
+			calls := strings.Join(seen, "\n")
+			mu.Unlock()
+			t.Logf("%s local/ run on %s: %q", key, venue, calls)
+			if key == "cold" && !strings.Contains(calls, "machine GET /v1/models/resolve") || key == "warm" && calls != "" {
+				t.Fatalf("the %s local/ run on %s read: %q", key, venue, calls)
 			}
 		}
 	}

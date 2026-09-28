@@ -322,7 +322,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if problem := connection.ValidateNewWork(); problem != nil {
 		return problem
 	}
-	rooted := len(link.Submission) == 0 && releaseRoot(request)
+	rooted := len(link.Submission) == 0 && m.releaseRoot(request)
 	if rooted {
 		workspace, problem := m.workspace(ctx, connection)
 		if problem != nil {

@@ -241,7 +241,14 @@ func short12(value string) string {
 // namespace answers the signed-in caller on the daemon's Tensorhub: the account an
 // editable source's account index and org-relative model defaults resolve against.
 func (r *Resolver) namespace() (packagepublish.Namespace, *exit.Error) {
-	c := hub.New(r.cfg, "cozy-daemon").WithTokenSource(accountauth.New(r.cfg))
+	return r.namespaceAt("")
+}
+
+// namespaceAt is the caller on one Tensorhub, "" the daemon's. Its account is read once per
+// credential and kept, so a run asks no Hub.
+func (r *Resolver) namespaceAt(origin string) (packagepublish.Namespace, *exit.Error) {
+	cfg := r.cfg.ForHub(origin)
+	c := hub.New(cfg, "cozy-daemon").WithTokenSource(accountauth.New(cfg))
 	ctx, cancel := hub.Context()
 	defer cancel()
 	account, problem := c.CurrentAccount(ctx)

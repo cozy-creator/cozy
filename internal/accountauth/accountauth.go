@@ -185,6 +185,17 @@ func (m *Manager) AccessToken(ctx context.Context) (secret.Value, *exit.Error) {
 	return session.AccessToken, problem
 }
 
+// Identity names this origin's machine key without its secret: a login replaces it, so what is
+// kept for one key is not read for the next. "" when there is none.
+func (m *Manager) Identity() string {
+	raw, err := os.ReadFile(m.path)
+	var stored credential
+	if err != nil || json.Unmarshal(raw, &stored) != nil || stored.DeviceKeyID == "" {
+		return ""
+	}
+	return "key:" + stored.DeviceKeyID
+}
+
 // CredentialPresent reports whether this Tensorhub origin has a local machine
 // record. It does not read or validate secret bytes.
 func (m *Manager) CredentialPresent() bool {

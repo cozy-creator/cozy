@@ -3328,8 +3328,11 @@ type ReleaseRoot struct {
 	// as for a release. Absent here: Submit refuses with cozy-error-code
 	// release_root_installation_absent, and the controller prepares it and asks again.
 	InstallationId string `protobuf:"bytes,16,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// The account an unpublished installation's org-relative Model references name: it has no
+	// org of its own. A published release's org is its package's.
+	Owner         string `protobuf:"bytes,17,opt,name=owner,proto3" json:"owner,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReleaseRoot) Reset() {
@@ -3449,6 +3452,13 @@ func (x *ReleaseRoot) GetPublicationGrant() string {
 func (x *ReleaseRoot) GetInstallationId() string {
 	if x != nil {
 		return x.InstallationId
+	}
+	return ""
+}
+
+func (x *ReleaseRoot) GetOwner() string {
+	if x != nil {
+		return x.Owner
 	}
 	return ""
 }
@@ -20707,7 +20717,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x12source_credentials\x18\f \x03(\v2 .cozy.worker.v1.SourceCredentialR\x11sourceCredentials\x12>\n" +
 	"\frelease_root\x18\r \x01(\v2\x1b.cozy.worker.v1.ReleaseRootR\vreleaseRoot\x12\x1d\n" +
 	"\n" +
-	"owner_memo\x18\x0e \x01(\bR\townerMemoJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\xf1\x04\n" +
+	"owner_memo\x18\x0e \x01(\bR\townerMemoJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\x87\x05\n" +
 	"\vReleaseRoot\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12\x1e\n" +
@@ -20724,7 +20734,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x03job\x18\r \x01(\bR\x03job\x12/\n" +
 	"\x13weights_destination\x18\x0e \x01(\tR\x12weightsDestination\x12+\n" +
 	"\x11publication_grant\x18\x0f \x01(\tR\x10publicationGrant\x12'\n" +
-	"\x0finstallation_id\x18\x10 \x01(\tR\x0einstallationIdJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\f\x10\rR\acalleesR\rinstallationsR\x0ecatalog_origin\"\xde\x01\n" +
+	"\x0finstallation_id\x18\x10 \x01(\tR\x0einstallationId\x12\x14\n" +
+	"\x05owner\x18\x11 \x01(\tR\x05ownerJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\f\x10\rR\acalleesR\rinstallationsR\x0ecatalog_origin\"\xde\x01\n" +
 	"\vModelChoice\x12\x1c\n" +
 	"\tparameter\x18\x01 \x01(\tR\tparameter\x12\x1e\n" +
 	"\n" +

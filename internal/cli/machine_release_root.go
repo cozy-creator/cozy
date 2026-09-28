@@ -28,13 +28,18 @@ import (
 // its own Hub, resolves every open slot for its own devices, prepares and mints the offer;
 // nothing here reads the Hub, a ladder or a package.
 
-// releaseRoot answers whether a request is submitted as one root: every published root, and
-// an unpublished installation's root with a provider-source Model, which only a root carries.
-func releaseRoot(request records.Request) bool {
-	if request.LocalInstallationID != "" {
-		return sourced(request.Models)
+// releaseRoot answers whether a request is submitted as one root: every published root, an
+// unpublished installation that calls no other unpublished installation (the machine resolves
+// its slots itself), and one with a provider-source Model, which only a root carries.
+func (m *machineRuns) releaseRoot(request records.Request) bool {
+	if request.LocalInstallationID == "" {
+		return !strings.HasPrefix(request.Package, "local/")
 	}
-	return !strings.HasPrefix(request.Package, "local/")
+	if sourced(request.Models) {
+		return true
+	}
+	capture, problem := m.resolver.CaptureMachineExecution(request)
+	return problem == nil && len(capture.Installations) == 1
 }
 
 // capturedRevision is the unpublished installation a root names. A root carries that one
@@ -59,6 +64,11 @@ func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records
 			return nil, problem
 		}
 		root.Release, root.InstallationId = "", request.LocalInstallationID
+		// Unpublished code has no org: its org-relative Model defaults name the caller's
+		// account, which the machine needs only for such a default and refuses without.
+		if caller, problem := m.resolver.namespaceAt(request.Hub); problem == nil {
+			root.Owner = caller.Account
+		}
 	}
 	if request.IsJob() {
 		root.Job, root.PublicationGrant = true, home.ScratchRepo(request.Org, request.ID)

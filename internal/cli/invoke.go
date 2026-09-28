@@ -348,12 +348,31 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 	for parameter := range profiles {
 		return nil, false, exit.Usagef("--source-profile %s names no model parameter of %s", parameter, target.Function)
 	}
-	// Unpublished code resolves its own slots, unless every slot names one provider source:
-	// only the machine makes that, from a root naming the installation.
+	// Unpublished code is a root naming its installation, whose open slots the machine
+	// resolves under the owner the root names. Code that calls other unpublished code goes by
+	// capture instead, and resolves its own slots, unless every slot names one provider source.
 	if (strings.HasPrefix(target.Package, "local/") || target.Snapshot) && !oneSource(ep, out) {
-		return nil, false, nil
+		calls, problem := callsUnpublished(ctx, target.InstallID)
+		if problem != nil || calls {
+			return nil, false, problem
+		}
 	}
 	return out, true, nil
+}
+
+// callsUnpublished answers whether an installation's callables reach another unpublished
+// installation, which only a capture carries to a machine.
+func callsUnpublished(ctx *Context, install string) (bool, *exit.Error) {
+	_, store, _, problem := open(ctx.Cfg, false)
+	if problem != nil {
+		return false, problem
+	}
+	defer store.Close()
+	rows, problem := store.ChildBindings(install)
+	if problem != nil {
+		return false, problem
+	}
+	return slices.ContainsFunc(rows, func(row records.ChildBinding) bool { return row.ChildInstallID != install }), nil
 }
 
 func sourced(models []orchestrator.ModelRef) bool {
