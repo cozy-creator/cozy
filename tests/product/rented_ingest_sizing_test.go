@@ -16,6 +16,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 // A rented ingest (`cozy model upload <source> <repo> --rental-only`) runs as a script, and
@@ -34,6 +35,7 @@ func TestRentedIngestDeclaresItsPlannedSourceBytes(t *testing.T) {
 // The host and the rental install TensorFS independently, so the host's may know fewer
 // profiles. What this host does not recognize, a profile named or the source itself, is the
 // rental's to decide: the ingest still asks for its rental, and only the rental may refuse.
+// A host whose registry is a hint plans an unrecognized source as-is and says so.
 func TestHostTensorFSUnawareOfAProfileDefersToTheRental(t *testing.T) {
 	planned := civitaiPrimaryBytes(t, 128078)
 	for _, named := range [][]string{nil, {"--source-profile", "civitai/101055/128078/single-file-fp16"}} {
@@ -45,7 +47,8 @@ func TestHostTensorFSUnawareOfAProfileDefersToTheRental(t *testing.T) {
 		if request := paid(t, out, code); request.PlannedSourceBytes != planned {
 			t.Fatalf("%v: the deferred ingest declared %d planned source bytes, want %d", named, request.PlannedSourceBytes, planned)
 		}
-		if !strings.Contains(string(out), "the rental's TensorFS decides") {
+		if !strings.Contains(string(out), "the rental's TensorFS decides") && (named != nil ||
+			!strings.Contains(string(out), tfs.AsIsNote)) {
 			t.Fatalf("%v: a deferred ingest must say who decides: %s", named, out)
 		}
 	}

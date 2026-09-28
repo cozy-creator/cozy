@@ -421,6 +421,13 @@ type LocalAlias struct {
 	SourceSelection  string `json:"source_selection"`
 }
 
+// AsIsProfile is TensorFS's profile for a source no reviewed profile recognizes: its keys are
+// stored as they are, and a package may need to normalize them.
+const (
+	AsIsProfile = "as-is/1"
+	AsIsNote    = "unrecognized layout; stored as-is; packages may need to normalize it"
+)
+
 type SourceCarrier struct {
 	Member string
 	Path   string
