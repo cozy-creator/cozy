@@ -387,8 +387,11 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 }
 
 func TestRentalInventoryRefusesAnUnreadablePython(t *testing.T) {
-	inventory := &pb.ImageInventory{Python: "broken"}
-	if _, why := launch.InventoryPython(inventory, ">=3.12", ""); !strings.Contains(why, "invalid Python version") {
+	inventory := &pb.ImageInventory{Interpreters: []*pb.PythonInterpreter{{Version: "broken", Abi: "cp312"}}}
+	if _, why := launch.InventoryPython(inventory, ">=3.12", ""); why == "" {
+		t.Fatal("an unreadable Python version was accepted")
+	}
+	if _, why := launch.InventoryPython(&pb.ImageInventory{Python: "3.12.11"}, ">=3.12", ""); !strings.Contains(why, "no Python executor") {
 		t.Fatal(why)
 	}
 }

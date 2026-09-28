@@ -71,8 +71,7 @@ func pythonMismatch(profile BaseProfile, requiresPython string) string {
 		" and this base is " + profile.PythonABI
 }
 
-// InventoryPython selects among actual package executors. The legacy singleton
-// Python remains a fallback only for images without an executor advertisement.
+// InventoryPython selects among the image's advertised package executors.
 func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected string, supported ...[]string) (string, string) {
 	if inventory == nil {
 		return "", "the rental image inventory is absent"
@@ -86,14 +85,14 @@ func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected stri
 		return "", "the package reports invalid Requires-Python " + requiresPython
 	}
 	candidates := append([]*pb.PythonInterpreter(nil), inventory.Interpreters...)
-	if len(candidates) == 0 && inventory.Python != "" {
-		candidates = []*pb.PythonInterpreter{{Version: inventory.Python}}
+	if len(candidates) == 0 {
+		return "", "the rental image advertises no Python executor; use a current worker image"
 	}
 	for _, candidate := range candidates {
 		if candidate == nil {
 			return "", "the rental image reports an invalid Python executor"
 		}
-		if len(inventory.Interpreters) > 0 && candidate.Abi != "cp"+strings.ReplaceAll(hostruntime.PythonMinor(candidate.Version), ".", "") {
+		if candidate.Abi != "cp"+strings.ReplaceAll(hostruntime.PythonMinor(candidate.Version), ".", "") {
 			return "", "the rental image reports an incompatible Python ABI"
 		}
 		if _, err := pep440.Parse(candidate.Version); err != nil {

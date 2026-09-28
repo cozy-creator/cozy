@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -238,7 +237,6 @@ type WorkerLaunchSpec struct {
 	// rental the pod's paid width, which this daemon only reads. Lane ordinals are
 	// positions in it, and its length is the placement's device-group degree.
 	Devices           []string `json:"devices"`
-	GraceSec          float64  `json:"grace_sec"`
 	ArtifactCache     string   `json:"artifact_cache,omitempty"`
 	InstallRoot       string   `json:"install_root,omitempty"`
 	EnvironmentPython string   `json:"environment_python,omitempty"` // preinstalled package venv
@@ -1159,7 +1157,6 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		"--out", filepath.Join(root, "run"),
 		"--release-id", spec.Placement.Release,
 		"--devices", strings.Join(spec.Devices, ","),
-		"--grace", strconv.FormatFloat(graceOr(spec.GraceSec), 'f', -1, 64),
 	)
 	for _, option := range []struct{ flag, value string }{
 		{"--artifact-cache", spec.ArtifactCache},
@@ -1395,13 +1392,6 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 		instanceID, spec.Connection.Addr, byteplane.Addr(), len(planIDs))
 	go c.attach(w)
 	return instanceID, nil
-}
-
-func graceOr(v float64) float64 {
-	if v <= 0 {
-		return 3
-	}
-	return v
 }
 
 // ReportCadence is the worker's OWN ObservedWorkerState period, a protocol fact rather

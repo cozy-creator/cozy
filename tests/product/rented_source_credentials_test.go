@@ -94,7 +94,7 @@ async def main() -> dict[str, str]:
 		t.Fatalf("the credential was not supplied with the identical submission: %v", again.SourceCredentials)
 	}
 
-	// The provider refuses the fetch: typed, naming the token and the Runtime update.
+	// The provider refuses the fetch: typed, naming the token.
 	pod.machine.mu.Lock()
 	pod.machine.failure = "TRANSFER_FAILED: source worker ended without a bounded result; stderr: tensorfs.errors.TransferFailed: TRANSFER_FAILED: origin answered HTTP 401 to a length probe"
 	pod.machine.mu.Unlock()
@@ -104,8 +104,8 @@ async def main() -> dict[str, str]:
 		_, shown = pod.cozy("run", "watch", request, "--json")
 		return strings.Contains(shown, "model_source.auth_required")
 	})
-	if !strings.Contains(shown, "civitai_token") || !strings.Contains(shown, "cozy rental update "+podRental) {
-		t.Fatalf("the refusal does not name the token and the Runtime update:\n%s", shown)
+	if !strings.Contains(shown, "civitai_token") {
+		t.Fatalf("the refusal does not name the token:\n%s", shown)
 	}
 
 	// The token is on the wire only: not in the frozen submission, the store, any log or file

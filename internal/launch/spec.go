@@ -131,7 +131,6 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 		Python:    runtimeBin, Args: []string{"serve"},
 		Dir:               f.Source,
 		Devices:           devices,
-		GraceSec:          3,
 		ArtifactCache:     cache,
 		EnvironmentPython: f.environmentPython(),
 		TensorFSRoot:      config.Frozen().TensorFSRoot,

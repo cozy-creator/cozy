@@ -20,10 +20,10 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 	spec := orchestrator.WorkerLaunchSpec{
 		Python: runtime, Args: []string{"serve"}, Dir: f.Install.Dir,
 		EnvironmentPython: f.environmentPython(),
-		Devices:           devices, GraceSec: 3,
-		ArtifactCache: filepath.Join(f.Install.Dir, "artifact-cache"),
-		InstallRoot:   filepath.Join(f.Install.Dir, "worker-environments"),
-		TensorFSRoot:  config.Frozen().TensorFSRoot,
+		Devices:           devices,
+		ArtifactCache:     filepath.Join(f.Install.Dir, "artifact-cache"),
+		InstallRoot:       filepath.Join(f.Install.Dir, "worker-environments"),
+		TensorFSRoot:      config.Frozen().TensorFSRoot,
 		Placement: orchestrator.DesiredPlacement{
 			Package: f.Install.Package, InstallID: f.Install.ID, InstallationID: f.Install.ID, Release: f.Install.Version,
 		},

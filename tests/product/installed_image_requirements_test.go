@@ -55,7 +55,7 @@ func TestInstalledClosureAndWorkerRequirementsHaveSeparateMeanings(t *testing.T)
 			t.Fatalf("captured package ranges omitted %s: %v", required, selection.Requirements)
 		}
 	}
-	image := &pb.ImageInventory{Python: "3.12.11"}
+	image := &pb.ImageInventory{Interpreters: []*pb.PythonInterpreter{{Version: "3.12.11", Abi: "cp312"}}}
 	if _, reason := launch.InventoryPython(image, selection.RequiresPython, ""); reason != "" {
 		t.Fatalf("compatible image refused: %s", reason)
 	}
@@ -68,7 +68,7 @@ func TestInstalledClosureAndWorkerRequirementsHaveSeparateMeanings(t *testing.T)
 	metadata("helper", "1.0", "Requires-Dist: numpy>=1.26\n")
 	metadata("fixture", "1.0", "Requires-Python: >=3.12.11,<3.13\nRequires-Dist: helper==1.0\nRequires-Dist: torch==2.13.0\n")
 	selection, problem = install.ExecutionRequirements(context.Background(), root, "fixture", nil)
-	image.Python = "3.12.3"
+	image.Interpreters[0].Version = "3.12.3"
 	if _, reason := launch.InventoryPython(image, selection.RequiresPython, ""); problem != nil ||
 		selection.RequiresPython != ">=3.12.11,<3.13" || reason == "" {
 		t.Fatalf("authored Python constraint was lost: %q %v", selection.RequiresPython, problem)

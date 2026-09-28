@@ -112,7 +112,6 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		Args:              []string{"serve"},
 		Dir:               f.Source,
 		Devices:           devices,
-		GraceSec:          3,
 		ArtifactCache:     cache,
 		EnvironmentPython: environmentPython,
 		TensorFSRoot:      config.Frozen().TensorFSRoot,

@@ -243,9 +243,6 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 			if err == io.EOF {
 				err = status.Error(codes.FailedPrecondition, "the host closed the prepare stream without a terminal event")
 			}
-			if problem := RuntimeRequirementTrailer(stream.Trailer()); problem != nil {
-				return hostPrepareResult{fault: problem}
-			}
 			return classifyPrepareEnd(err)
 		}
 		c.ObservePrepareEvent(w.instanceID, machine, label, event)
@@ -259,9 +256,6 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 		last = event
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:
-			if problem := RuntimeRequirementEvent(event); problem != nil {
-				return hostPrepareResult{fault: problem}
-			}
 			if event.SafeCode == "package_environment_dependency_base_conflict" {
 				return hostPrepareResult{fault: exit.Named(exit.Structural, "machine_execution.runtime_requirement", "%s", event.SafeDetail)}
 			}

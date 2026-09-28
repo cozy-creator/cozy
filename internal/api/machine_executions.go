@@ -12,7 +12,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
@@ -198,7 +197,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 				state.ErrorType = strings.TrimPrefix(body.Cause.Code.String(), "CAUSE_CODE_")
 				if providerRefusal.MatchString(body.SafeMessage) {
 					state.ErrorType = "model_source.auth_required"
-					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the daemon config. A machine Runtime older than 0.18.54 cannot receive it: " + machines.RuntimeUpdate(link.MachineID)
+					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the daemon config"
 				}
 			}
 			if view.Collected && body.Result != nil && len(body.Result.InlineResult) > 0 {
