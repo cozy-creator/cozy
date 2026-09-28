@@ -115,7 +115,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	dir, err := os.MkdirTemp("", "czr")
 	must(t, err)
 	t.Cleanup(func() { _ = removeAllForce(dir) })
-	host := machines.NewHost(dir, nil)
+	host := machines.NewHost(dir, "", nil)
 	_, problem = host.Install(context.Background(), source, uv)
 	fatal(t, problem)
 	virtualInventory(t, host.Root())
@@ -366,7 +366,7 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	}
 
 	// Both machines report the Runtime's measured inventory through the same Host call.
-	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, nil), HubOrigin: h.server.URL,
+	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
 		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
 		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
 	for _, name := range []string{machines.Local, parityRental} {
