@@ -3,6 +3,7 @@ package cli
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,18 +18,43 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// releaseInterfacePath keeps one published release's interface as a machine described it:
-// immutable, so a run's results are read against it with no Hub or machine call.
+// keptRelease is one published release as this computer read it: immutable, so a run's
+// results are read against its interface with no Hub or machine call. Requirements, its
+// dependency closure, decide the machine class a rental needs; a machine's own description
+// carries none, and never erases the closure an install or the Hub gave.
+type keptRelease struct {
+	Interface    json.RawMessage `json:"package_interface"`
+	Requirements []string        `json:"requirements,omitempty"`
+}
+
 func releaseInterfacePath(root, pkg, release string) string {
 	name := sha256.Sum256([]byte(pkg + "@" + release))
 	return filepath.Join(root, "releases", "interfaces", hex.EncodeToString(name[:16])+".json")
 }
 
-func keepReleaseInterface(root, pkg, release string, raw []byte) {
+func keepReleaseInterface(root, pkg, release string, raw []byte, requirements []string) {
+	if requirements == nil {
+		requirements = readKeptRelease(root, pkg, release).Requirements
+	}
+	doc, err := json.Marshal(keptRelease{Interface: raw, Requirements: requirements})
 	path := releaseInterfacePath(root, pkg, release)
-	if os.MkdirAll(filepath.Dir(path), 0o700) == nil && os.WriteFile(path+".tmp", raw, 0o600) == nil {
+	if err == nil && os.MkdirAll(filepath.Dir(path), 0o700) == nil && os.WriteFile(path+".tmp", doc, 0o600) == nil {
 		_ = os.Rename(path+".tmp", path)
 	}
+}
+
+// readKeptRelease is the kept release, or none; a file holding only an interface has no
+// closure.
+func readKeptRelease(root, pkg, release string) keptRelease {
+	raw, err := os.ReadFile(releaseInterfacePath(root, pkg, release))
+	if err != nil {
+		return keptRelease{}
+	}
+	var kept keptRelease
+	if json.Unmarshal(raw, &kept) != nil || len(kept.Interface) == 0 {
+		return keptRelease{Interface: raw}
+	}
+	return kept
 }
 
 func (r *Resolver) capturedResultInterface(request records.Request) (*launch.PackageInterface, *exit.Error) {
@@ -51,8 +77,8 @@ func (r *Resolver) capturedResultInterface(request records.Request) (*launch.Pac
 			_, surface, problem := r.installPackageInterface(request.InstallID)
 			return surface, problem
 		}
-		if raw, err := os.ReadFile(releaseInterfacePath(home.Paths(r.cfg.Home).Root, root.Package, root.Release)); err == nil {
-			return launch.DecodePackageInterface(raw)
+		if kept := readKeptRelease(home.Paths(r.cfg.Home).Root, root.Package, root.Release); kept.Interface != nil {
+			return launch.DecodePackageInterface(kept.Interface)
 		}
 		ref, problem := hub.ParseRef(root.Package)
 		if problem != nil {

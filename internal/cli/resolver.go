@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -548,9 +547,9 @@ func (r *Resolver) releaseInterface(origin string, ref hub.Ref, release string) 
 			return strings.Split(held.Closure, "\n"), packageInterface, nil
 		}
 	}
-	if raw, err := os.ReadFile(releaseInterfacePath(home.Paths(r.cfg.Home).Root, ref.String(), release)); err == nil {
-		packageInterface, problem := launch.DecodePackageInterface(raw)
-		return nil, packageInterface, problem
+	if kept := readKeptRelease(home.Paths(r.cfg.Home).Root, ref.String(), release); kept.Interface != nil {
+		packageInterface, problem := launch.DecodePackageInterface(kept.Interface)
+		return kept.Requirements, packageInterface, problem
 	}
 	ctx, cancel := hub.Context()
 	defer cancel()

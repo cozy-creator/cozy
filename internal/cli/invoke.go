@@ -2612,7 +2612,8 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 			target.InstallID = facts.Install.ID
 		} else {
 			// The run's results are read against the release's interface with no Hub call.
-			keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, target.Release, facts.PackageInterface.Raw)
+			keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, target.Release, facts.PackageInterface.Raw,
+				strings.Split(facts.Install.Closure, "\n"))
 		}
 		adoptInstallHub(ctx, facts.Install)
 		return target, facts.PackageInterface, nil
@@ -2673,9 +2674,14 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 		return Target{}, nil, exit.Named(exit.Conflict, "rental.package_release_invalid",
 			"Tensorhub returned no immutable package release identity")
 	}
+	requirements, problem := detail.Requirements()
+	if problem != nil {
+		return Target{}, nil, problem
+	}
 	target.Release = release
-	// The run's results are read against this immutable release with no further Hub call.
-	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, release, detail.PackageInterface)
+	// The run's results, and its rental's machine class, read this immutable release with
+	// no further Hub call.
+	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, release, detail.PackageInterface, requirements)
 	return target, packageInterface, nil
 }
 

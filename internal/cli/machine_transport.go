@@ -222,7 +222,7 @@ func (m *machineRuns) Describe(ctx context.Context, machine, pkg, release string
 	if described.Package != pkg || described.Release == "" || release != "" && described.Release != release {
 		return api.DescribedRelease{}, exit.New(exit.Conflict, "the machine described another release than %s", pkg)
 	}
-	keepReleaseInterface(m.layout.Root, pkg, described.Release, described.PackageInterface)
+	keepReleaseInterface(m.layout.Root, pkg, described.Release, described.PackageInterface, nil)
 	return api.DescribedRelease{Package: described.Package, Release: described.Release, PackageInterface: described.PackageInterface}, nil
 }
 
