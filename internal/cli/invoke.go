@@ -567,10 +567,11 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 	return out, nil
 }
 
-// invocationDefaultBindings reads the package's CURRENT default bindings from the hub
-// (th-116, cl-166): mutable owner-written rows, each a model release and its ladder.
-// Owner rows take precedence; only absent rows use the selected callable metadata.
-// A failed Hub read cannot establish absence and therefore cannot silently fall back.
+// invocationDefaultBindings reads the package's CURRENT default bindings for these slots from
+// the hub (th-116, cl-166): mutable owner-written rows, each a model release and its ladder.
+// Owner rows take precedence; only absent rows use the selected callable metadata. A Hub that
+// cannot answer (one without owner bindings, or out of reach) leaves the release's declared
+// defaults, with a warning.
 func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot) (
 	map[string]hub.PackageBindingRow, *exit.Error,
 ) {
@@ -580,14 +581,22 @@ func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot)
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	rows, problem := client(ctx).PackageBindings(hctx, ref)
+	paths := make([]string, len(slots))
+	for i, slot := range slots {
+		paths[i] = slot.Path
+	}
+	rows, problem := client(ctx).PackageBindings(hctx, ref, paths...)
+	if problem != nil && problem.ErrName() != "hub.package_bindings_invalid" {
+		fmt.Fprintf(ctx.Err, "warning: %s owner bindings are not readable (%s); using the release's declared defaults\n", target.Package, problem.Message)
+		rows, problem = nil, nil
+	}
 	if problem != nil {
 		remedy := "choose the model per run: model.<param>=org/model@release"
 		if problem.Remedy != "" {
 			remedy = problem.Remedy + " — or " + remedy
 		}
 		return nil, exit.Named(problem.Code, "package_default_model_unavailable",
-			"%s default bindings are not readable: %s", target.Package, problem.Message).
+			"%s default bindings are unusable: %s", target.Package, problem.Message).
 			WithRemedy("%s", remedy)
 	}
 	return effectiveModelBindings(slots, rows, ref.Org), nil

@@ -388,16 +388,21 @@ func (c *Client) PackageBindingRows(ctx context.Context, ref Ref) ([]PackageBind
 	return out.Bindings, nil
 }
 
-// PackageBindings is every owner override, each usable. An unusable row is refused, not
-// skipped: skipping it would silently drop the owner's choice. The refusal names the row
-// and how to repair it.
-func (c *Client) PackageBindings(ctx context.Context, ref Ref) ([]PackageBindingRow, *exit.Error) {
+// PackageBindings is the owner overrides for `slots` (every slot when none is named), each
+// usable. An unusable row for one of them is refused, not skipped: skipping it would silently
+// drop the owner's choice. The refusal names the row and how to repair it. Rows for other
+// slots are not read.
+func (c *Client) PackageBindings(ctx context.Context, ref Ref, slots ...string) ([]PackageBindingRow, *exit.Error) {
 	rows, e := c.PackageBindingRows(ctx, ref)
 	if e != nil {
 		return nil, e
 	}
 	seen := make(map[string]bool, len(rows))
+	var used []PackageBindingRow
 	for _, row := range rows {
+		if len(slots) > 0 && !slices.Contains(slots, row.Slot) {
+			continue
+		}
 		reason := ""
 		switch {
 		case row.Slot == "":
@@ -422,8 +427,9 @@ func (c *Client) PackageBindings(ctx context.Context, ref Ref) ([]PackageBinding
 					ref.String(), row.Slot, ref.String(), row.Slot)
 		}
 		seen[row.Slot] = true
+		used = append(used, row)
 	}
-	return rows, nil
+	return used, nil
 }
 
 type PackageBindingWrite struct {

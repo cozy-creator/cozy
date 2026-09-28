@@ -78,21 +78,36 @@ func TestAuthoredModelDefaultPrecedence(t *testing.T) {
 	}
 }
 
-func TestAuthoredDefaultsDoNotHideOwnerReadFailure(t *testing.T) {
-	h := newLadderHub(t, authoredH3(ladderLane))
-	root := ladderRoot(t, h)
-	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
-	h.mu.Lock()
-	h.bindingsUnavailable = true
-	h.mu.Unlock()
-	code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental-only", "--json")
-	if code == 0 || !strings.Contains(out, "package_default_model_unavailable") {
-		t.Fatalf("unreadable owner choices silently fell back: %d %s", code, out)
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if len(h.posts) != 0 {
-		t.Fatal("unreadable override reached rental creation")
+// A Hub that cannot answer for the owner's bindings leaves the release's declared default, with
+// a warning; an unusable row for a slot the run does not use changes nothing.
+func TestOwnerBindingsTheRunCannotReadLeaveTheAuthoredDefault(t *testing.T) {
+	for _, mode := range []string{"unreadable", "other-slot-unusable"} {
+		t.Run(mode, func(t *testing.T) {
+			h := newLadderHub(t, authoredH3(ladderLane))
+			root := ladderRoot(t, h)
+			t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
+			other := goodLadder()
+			other.Slot, other.Ladder = "tune.models.model", nil
+			h.bind(other)
+			h.mu.Lock()
+			h.bindingsUnavailable = mode == "unreadable"
+			h.mu.Unlock()
+			code, out, stderr := runCozyStreams(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental-only", "--json", "--idempotency-key", mode)
+			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+			fatal(t, problem)
+			defer store.Close()
+			row, problem := store.RequestByIdempotencyKey(mode)
+			fatal(t, problem)
+			if row == nil || len(row.Models) != 1 || row.Models[0].Model != ladderModel || row.Models[0].Release != ladderRelease {
+				t.Fatalf("the run did not use its authored default [exit %d]: %s row=%+v", code, out, row)
+			}
+			if lane, ladder := row.Models[0].Lane, row.Models[0].Ladder; lane != ladderLane && (lane != "" || len(ladder) == 0 || ladder[0].Lane != ladderLane) {
+				t.Fatalf("the authored lane was not selected: %+v", row.Models[0])
+			}
+			if warned := strings.Contains(stderr, "owner bindings are not readable"); warned != (mode == "unreadable") {
+				t.Fatalf("warning shown=%v [exit %d]: %s", warned, code, stderr)
+			}
+		})
 	}
 }
 
