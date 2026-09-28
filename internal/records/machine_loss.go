@@ -169,7 +169,7 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 			return exit.Internalf("cannot project destroyed execution: %s", err)
 		}
 		if next != value.state {
-			if err := appendEventTx(tx, value.id, "request."+next, 0, detail); err != nil {
+			if err := appendEventTx(tx, value.id, StateEvent(next), 0, detail); err != nil {
 				return exit.Internalf("cannot record destroyed execution projection: %s", err)
 			}
 		}

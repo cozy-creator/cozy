@@ -919,15 +919,15 @@ func (s *Store) SettleModelTransferRequest(requestID string, attempt int64) (str
 	if requestState == "succeeded" || requestState == "failed" {
 		return requestState, nil
 	}
-	state, eventType := "failed", "request.failed"
+	state, eventType := "failed", "run.failed"
 	payload := map[string]any{"status": "FAILED", "cause": code,
 		"error_type": code, "error": detail, "outputs": []any{}, "requeuing": false}
 	if transferState == "completed" {
-		state, eventType = "succeeded", "request.completed"
+		state, eventType = "succeeded", "run.completed"
 		payload = map[string]any{"status": "SUCCEEDED", "cause": "COMPLETED",
 			"outputs": []any{}, "requeuing": false}
 	} else if transferState == "canceled" {
-		state, eventType = "canceled", "request.canceled"
+		state, eventType = "canceled", "run.canceled"
 		payload = map[string]any{"status": "CANCELED", "cause": "CLIENT_CANCELED",
 			"error_type": "CLIENT_CANCELED", "error": detail,
 			"outputs": []any{}, "requeuing": false}
@@ -977,7 +977,7 @@ func (s *Store) FailModelTransferRequest(requestID, code, detail string,
 	if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=?`, requestID); err != nil {
 		return false, exit.Internalf("cannot fail model transfer request: %s", err)
 	}
-	if err := appendEventTx(tx, requestID, "request.failed", 0, payload); err != nil {
+	if err := appendEventTx(tx, requestID, "run.failed", 0, payload); err != nil {
 		return false, exit.Internalf("cannot append model transfer failure: %s", err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -197,7 +197,7 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 			return Request{}, false, problem
 		}
 	}
-	event := "request.submitted"
+	event := "run.created"
 	payload := map[string]any{"parent_request_id": parent.ID, "call_index": r.ParentCallIndex, "child_intent_digest": r.ChildIntentDigest, "child_target_digest": r.ChildTargetDigest}
 	if err := appendEventTx(tx, r.ID, event, 0, payload); err != nil {
 		return Request{}, false, exit.Internalf("cannot journal child admission: %s", err)
@@ -236,7 +236,7 @@ func (s *Store) CompleteReusedChild(id string) *exit.Error {
 		}
 		return exit.Named(exit.Canceled, "child.result_stopped", "the reused result was stopped before publication")
 	}
-	if err := appendEventTx(tx, id, "request.completed", 0, map[string]any{"status": "SUCCEEDED", "reused": true}); err != nil {
+	if err := appendEventTx(tx, id, "run.completed", 0, map[string]any{"status": "SUCCEEDED", "reused": true}); err != nil {
 		return exit.Internalf("cannot journal reused child result: %s", err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -186,7 +186,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		state.ErrorType, state.ErrorCode, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
 	// The run's output log as this client holds it; its result is the fold once collected.
-	state.Products, _ = s.store.Products(row.ID)
+	state.Output, _ = s.store.Output(row.ID, row.State)
 	if outputs, problem := s.store.VisibleOutputs(row.ID); problem == nil {
 		for _, output := range outputs {
 			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest, Path: output.Path})
@@ -209,7 +209,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		}
 		if events, problem := s.store.EventsAfter(row.ID, 0, 256); problem == nil {
 			for _, event := range events {
-				if event.Type == "request.blocked" || event.Type == "request.failed" {
+				if event.Type == "request.blocked" || event.Type == "run.failed" {
 					state.ErrorType, _ = event.Payload["error_type"].(string)
 					state.ErrorCode, _ = event.Payload["error_code"].(string)
 					state.Error, _ = event.Payload["error"].(string)

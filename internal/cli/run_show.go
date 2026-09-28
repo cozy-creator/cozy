@@ -52,18 +52,11 @@ type runReport struct {
 	Result any `json:"result,omitempty"`
 	// Products are the run's output log: what it made, as it made it. A superseded one is
 	// an earlier revision of a single output.
-	// Outputs are the run's items at their current revision.
-	Outputs []reportOutput `json:"outputs,omitempty"`
+	// Output is the run's items at their current revision.
+	Output []records.OutputItem `json:"output,omitempty"`
 	// CollectionPending names why a finished result still waits on its machine.
 	CollectionPending string `json:"collection_pending,omitempty"`
 	CollectionError   string `json:"collection_error,omitempty"`
-}
-
-type reportOutput struct {
-	records.Product
-	// Status is in_progress while the run goes on, then completed, or incomplete when the run
-	// failed or was canceled.
-	Status string `json:"status"`
 }
 
 type reportWarning struct {
@@ -330,18 +323,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		report.Waiting = "waiting: " + life.WaitReason
 	}
 	report.Result = life.Result
-	for _, product := range records.Fold(life.Products) {
-		status := "in_progress"
-		switch {
-		case life.Status == "completed":
-			status = "completed"
-		case life.Status == "failed" || life.Status == "canceled":
-			status = "incomplete"
-		case product.Op == records.ProductAppend:
-			status = "completed" // a list element never changes once added
-		}
-		report.Outputs = append(report.Outputs, reportOutput{Product: product, Status: status})
-	}
+	report.Output = life.Output
 	if view := life.MachineExecution; view != nil && !view.Collected && view.CollectionRefused != "" {
 		report.CollectionPending, report.CollectionError = view.CollectionRefused, view.ObservationError
 	}
@@ -449,7 +431,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			report.Stages = append(report.Stages, reportStage{Name: "output transfer", Kind: "transfer",
 				StartUnixMS: fetched.StartedUnixMS, MS: float64(fetched.MS), Bytes: fetched.Bytes, Count: len(fetched.Outputs),
 				Detail: fmt.Sprintf("%d output(s), %s", len(fetched.Outputs), units.Bytes(fetched.Bytes))})
-		case "request.completed", "request.failed", "request.canceled":
+		case "run.completed", "run.failed", "run.canceled":
 			if !at.IsZero() && !created.IsZero() {
 				report.WallMS = at.Sub(created).Milliseconds()
 			}
@@ -773,13 +755,13 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		fmt.Fprintf(w, "collection pending: %s — %s\n", r.CollectionPending, r.CollectionError)
 	}
 	table := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if len(r.Outputs) > 0 {
+	if len(r.Output) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(table, "OUTPUT\tREV\tSIZE\tSTATUS\tFILE")
-		for _, item := range r.Outputs {
-			name := item.Output
-			if item.Op == records.ProductAppend {
-				name = fmt.Sprintf("%s %d", item.Output, item.Index+1)
+		for _, item := range r.Output {
+			name := item.Name
+			if item.Index > 0 {
+				name = fmt.Sprintf("%s %d", item.Name, item.Index)
 			}
 			fmt.Fprintf(table, "%s\tr%d\t%s\t%s\t%s\n", name, item.Rev, output.Bytes(item.Length), item.Status, item.Path)
 		}

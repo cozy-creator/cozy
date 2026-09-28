@@ -143,7 +143,7 @@ func TestPublicRunStatusWatchAcceptsOlderDaemonWithoutStopIdentity(t *testing.T)
 				if strings.HasSuffix(r.URL.Path, "/events") {
 					streams.Add(1)
 					w.Header().Set("Content-Type", "text/event-stream")
-					fmt.Fprint(w, "id: 3\ndata: "+`{"type":"request.blocked","request_id":"legacy-stop","event_id":3,"at":"2026-09-26T01:00:01Z","payload":{"status":"blocked","error_type":"dependency.missing","error":"repair input"}}`+"\n\n")
+					fmt.Fprint(w, "id: 3\ndata: "+`{"type":"request.blocked","request_id":"legacy-stop","sequence_number":3,"at":"2026-09-26T01:00:01Z","payload":{"status":"blocked","error_type":"dependency.missing","error":"repair input"}}`+"\n\n")
 					return
 				}
 				// Deliberately omit retry_available and stopped_event_id, as old releases do.

@@ -118,7 +118,7 @@ func (s *Store) CompleteRetainedRentalAbandonment(rental, actor string) *exit.Er
 		if _, err := tx.Exec(`UPDATE request_model_transfers SET state='canceled',updated_at=? WHERE request_id=? AND state!='completed'`, now(), id); err != nil {
 			return exit.Internalf("cannot settle released model work: %s", err)
 		}
-		if err := appendEventTx(tx, id, "request.canceled", 0, map[string]any{"status": "CANCELED", "actor": actor, "rental": rental, "error_type": "rental.released", "error": "the retained rental was explicitly released; its local intermediate bytes were discarded"}); err != nil {
+		if err := appendEventTx(tx, id, "run.canceled", 0, map[string]any{"status": "CANCELED", "actor": actor, "rental": rental, "error_type": "rental.released", "error": "the retained rental was explicitly released; its local intermediate bytes were discarded"}); err != nil {
 			return exit.Internalf("cannot journal retained rental settlement: %s", err)
 		}
 	}

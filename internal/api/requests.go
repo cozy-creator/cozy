@@ -801,10 +801,10 @@ type Lifecycle struct {
 	CanceledBy string     `json:"canceled_by,omitempty"`
 	Result     any        `json:"result,omitempty"`
 	Outputs    []MediaRef `json:"outputs"`
-	// Products are the run's output log in order: what it has made so far, as it made it.
-	Products []records.Product `json:"products,omitempty"`
-	Triage   *TriageRef        `json:"triage,omitempty"`
-	Rental   bool              `json:"rental,omitempty"`
+	// Output is the run's output items, each at its latest revision (OpenAI Responses' `output`).
+	Output []records.OutputItem `json:"output,omitempty"`
+	Triage *TriageRef           `json:"triage,omitempty"`
+	Rental bool                 `json:"rental,omitempty"`
 	// Machine names the selected or executing venue. Queued status does not imply
 	// that the machine has accepted an attempt; it may still be preparing this request.
 	// After execution, the recorded machine survives rental cleanup.
@@ -924,7 +924,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS,
-			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Products: state.Products,
+			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Output: state.Output,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
 			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}

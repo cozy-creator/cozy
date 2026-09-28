@@ -24,7 +24,8 @@ import (
 // Three properties a client may rely on, in the reference client's own vocabulary
 // (cozy.art's `startSSE`, which is what validated this surface):
 //
-//   - CURSOR RESUME. Every durable event carries `id:`. Reconnect with `?cursor=<id>` and
+//   - RESUME. Every durable event carries `id:` = its `sequence_number`. Reconnect with
+//     `?starting_after=<sequence_number>` (OpenAI Responses' name) and
 //     the stream replays everything after it, in order, across a server restart. The
 //     cursor is the durable row's own primary key — there is no second sequence to drift.
 //   - TERMINAL-STOP. A terminal event is ABSORBING on the per-request route: the server
@@ -69,11 +70,11 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 		return
 	}
 	cursor := int64(0)
-	if v := r.URL.Query().Get("cursor"); v != "" {
+	if v := r.URL.Query().Get("starting_after"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n < 0 {
-			s.refuse(w, r, http.StatusBadRequest, "invalid_cursor",
-				"cursor must be the id of an event this stream already delivered", "")
+			s.refuse(w, r, http.StatusBadRequest, "invalid_starting_after",
+				"starting_after must be the sequence_number of an event this stream already delivered", "")
 			return
 		}
 		cursor = n
@@ -220,21 +221,31 @@ func frameKey(frame orchestrator.Frame) string {
 }
 
 // Envelope is the ONE event shape on the wire. Every event — durable or live — has the
-// same five keys, so a client parses one thing. `event_id` is 0 for a live frame, which
+// same five keys, so a client parses one thing. `sequence_number` is 0 for a live frame, which
 // is exactly what "not resumable" looks like in the data rather than in prose.
 type Envelope struct {
-	Type      string         `json:"type"`
-	RequestID string         `json:"request_id"`
-	Attempt   uint64         `json:"attempt"`
-	EventID   int64          `json:"event_id"`
-	At        string         `json:"at"`
-	Payload   map[string]any `json:"payload"`
+	Type           string         `json:"type"`
+	RequestID      string         `json:"request_id"`
+	Attempt        uint64         `json:"attempt"`
+	SequenceNumber int64          `json:"sequence_number"`
+	At             string         `json:"at"`
+	Payload        map[string]any `json:"payload"`
 }
 
 func durableEnvelope(row records.Event) Envelope {
+	payload := row.Payload
+	if row.Type == records.OutputItemDelta {
+		// A revision is recorded whole for this client's fold; clients see its delta.
+		var product records.Product
+		if json.Unmarshal(row.Raw, &product) == nil {
+			raw, _ := json.Marshal(product.Delta())
+			payload = nil
+			_ = json.Unmarshal(raw, &payload)
+		}
+	}
 	return Envelope{
 		Type: row.Type, RequestID: row.RequestID, Attempt: uint64(row.Attempt),
-		EventID: row.Seq, At: row.At, Payload: row.Payload,
+		SequenceNumber: row.Seq, At: row.At, Payload: payload,
 	}
 }
 
@@ -245,7 +256,7 @@ func durableEnvelope(row records.Event) Envelope {
 func liveEnvelope(frame orchestrator.Frame) Envelope {
 	return Envelope{
 		Type: "request." + frame.Type, RequestID: frame.RequestID, Attempt: frame.Attempt,
-		EventID: 0, At: time.Now().UTC().Format(time.RFC3339Nano),
+		SequenceNumber: 0, At: time.Now().UTC().Format(time.RFC3339Nano),
 		Payload: map[string]any{"seq": frame.Seq, "value": frame.Value, "live": true},
 	}
 }

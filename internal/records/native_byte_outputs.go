@@ -193,7 +193,7 @@ func (s *Store) CompleteNativeRootResult(request string, attempt int64) *exit.Er
 	if _, err := tx.Exec(`UPDATE requests SET state='succeeded' WHERE id=? AND state='finalizing'`, request); err != nil {
 		return exit.Internalf("cannot complete native result: %s", err)
 	}
-	if err := appendEventTx(tx, request, "request.completed", attempt, payload); err != nil {
+	if err := appendEventTx(tx, request, "run.completed", attempt, payload); err != nil {
 		return exit.Internalf("cannot record native result completion: %s", err)
 	}
 	if err := tx.Commit(); err != nil {

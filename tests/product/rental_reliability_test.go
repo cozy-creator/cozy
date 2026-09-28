@@ -138,7 +138,7 @@ func TestPreparationFailureOnlySettlesCapturedSelection(t *testing.T) {
 			fatal(t, problem)
 			failures := 0
 			for _, event := range events {
-				if event.Type == "request.failed" {
+				if event.Type == "run.failed" {
 					failures++
 				}
 			}

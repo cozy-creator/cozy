@@ -181,7 +181,7 @@ func TestRentalFailureRecovery(t *testing.T) {
 // TestRentalFailureKeepsARecordedTerminal is the arm that must NOT fire. An attempt whose
 // worker already committed a terminal holds a real outcome that has not been acked yet.
 // Recovery must leave it completely alone: replacing it with a synthetic failure would
-// publish `request.failed` over a run that succeeded, which the dispatch code calls the
+// publish `run.failed` over a run that succeeded, which the dispatch code calls the
 // worst failure class this system has.
 func TestRentalFailureKeepsARecordedTerminal(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-failure-terminal")

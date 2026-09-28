@@ -977,7 +977,7 @@ func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *ex
 
 func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlement, bool, *exit.Error) {
 	// Machine work completion is recorded with its inactive state projection.
-	// Its later request.completed event describes outcome collection, not more
+	// Its later run.completed event describes outcome collection, not more
 	// compute; prefer the work timestamp so collection/reconnect cannot renew idle.
 	pinned, args := pinnedToRental("r.", id)
 	rows, err := reader.Query(`SELECT r.id,r.kind,r.created_at,
@@ -985,7 +985,7 @@ func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlem
 		  AND a.state IN ('terminal','closed') AND a.closed_at<>''
 		  ORDER BY a.attempt DESC LIMIT 1),''),
 		COALESCE((SELECT e.at FROM request_events e WHERE e.request_id=r.id
-		  AND e.type IN ('client.machine_work_finished','request.completed','request.failed','request.canceled','request.paused','request.blocked')
+		  AND e.type IN ('client.machine_work_finished','run.completed','run.failed','run.canceled','request.paused','request.blocked')
 		  ORDER BY (e.type='client.machine_work_finished') DESC,e.seq DESC LIMIT 1),'')
 		FROM requests r WHERE `+pinned+` AND r.rental=1
 		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned','paused','blocked')`, args...)
@@ -1206,7 +1206,7 @@ func (s *Store) AbandonLostAttempt(requestID string, attempt int64, reason strin
 		if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, requestID); err != nil {
 			return false, exit.Internalf("cannot fail lost-rental request: %s", err)
 		}
-		if err := appendEventTx(tx, requestID, "request.failed", attempt, map[string]any{
+		if err := appendEventTx(tx, requestID, "run.failed", attempt, map[string]any{
 			"status": "FAILED", "cause": "RENTAL_LOST", "error_type": errorType, "error": reason, "outputs": []any{}, "requeuing": false,
 		}); err != nil {
 			return false, exit.Internalf("cannot record selected rental loss: %s", err)
@@ -1221,7 +1221,7 @@ func (s *Store) AbandonLostAttempt(requestID string, attempt int64, reason strin
 			return false, exit.Internalf("cannot cancel %s after its attempt was lost: %s",
 				requestID, err)
 		}
-		if err := appendEventTx(tx, requestID, "request.canceled", attempt, map[string]any{
+		if err := appendEventTx(tx, requestID, "run.canceled", attempt, map[string]any{
 			"status": "CANCELED", "cause": "EXECUTION_CONTEXT_LOST",
 			"error_type": "EXECUTION_CONTEXT_LOST", "error": reason,
 			"outputs": []any{}, "requeuing": false,

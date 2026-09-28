@@ -87,7 +87,7 @@ func TestLostRetainedWorkReconcilesWithoutChangingHistoryOrCustody(t *testing.T)
 		}
 	}
 	last := events[len(events)-1]
-	if !reflect.DeepEqual(prior, original) || last.Type != "request.failed" || last.At != original.At ||
+	if !reflect.DeepEqual(prior, original) || last.Type != "run.failed" || last.At != original.At ||
 		last.Payload["original_error"] != original.Payload["error"] || last.Payload["reclassified_at"] == nil {
 		t.Fatalf("historical cause/clock was rewritten: prior=%+v terminal=%+v", prior, last)
 	}

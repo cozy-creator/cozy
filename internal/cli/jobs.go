@@ -461,7 +461,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	terminal, e := c.WatchContext(watchCtx, jobID, 0, func(event localapi.Event) bool {
 		if event.Type == "request.blocked" {
 			state, problem := c.Job(jobID)
-			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.EventID) {
+			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.SequenceNumber) {
 				projected := publicFailureEvent(event)
 				lines.On(projected)
 				stopped = &projected
@@ -522,7 +522,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		}
 		life, problem := waitOutputExport(client, api.Lifecycle{
 			RequestID: state.JobID, Status: state.Status, OutputExport: state.OutputExport,
-			MachineExecution: state.MachineExecution, Products: state.Products,
+			MachineExecution: state.MachineExecution, Output: state.Output,
 		})
 		if problem != nil {
 			return problem
@@ -750,7 +750,7 @@ func settled(status string) bool {
 // collection; only an unmet observation that stays unchanged for the whole stall budget
 // is reported, and the run and its retained result are untouched either way.
 func awaitMachineCollection(ctx *Context, state api.JobState) (api.JobState, *exit.Error) {
-	if !custodyOwed(state.MachineExecution, state.Status, len(state.Products)) {
+	if !custodyOwed(state.MachineExecution, state.Status, len(state.Output)) {
 		return state, nil
 	}
 	client, problem := dial(ctx)

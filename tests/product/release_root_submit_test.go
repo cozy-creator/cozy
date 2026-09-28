@@ -482,7 +482,7 @@ func TestObserverTakesTheMachinesNextEventWithoutPolling(t *testing.T) {
 	waitFor(t, root, "the observed start", func() bool {
 		events, problem := store.EventsAfter(id, 0, 256)
 		for _, event := range events {
-			if problem == nil && event.Type == "request.accepted" {
+			if problem == nil && event.Type == "run.in_progress" {
 				return true
 			}
 		}

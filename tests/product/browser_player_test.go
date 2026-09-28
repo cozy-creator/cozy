@@ -397,18 +397,25 @@ func TestRunPlayPrintsALinkThatPlays(t *testing.T) {
 
 // A rented run's growing video says, once, how to watch it in a browser; a local run's does not.
 func TestAwaitNamesThePlayCommandForARentedVideo(t *testing.T) {
-	product := func(output string, rev float64) localapi.Event {
-		return localapi.Event{Type: "request.product", RequestID: "job-film", Payload: map[string]any{"item": "12/" + output,
-			"output": output, "op": "set", "rev": rev, "length": 1000 * rev, "media_type": "video/mp4", "path": "/out/12-" + output + ".mp4"}}
+	added := func(output string) localapi.Event {
+		return localapi.Event{Type: "output_item.added", RequestID: "job-film", Payload: map[string]any{"output_index": 0,
+			"item": map[string]any{"id": "12/" + output, "type": "video", "name": output, "media_type": "video/mp4",
+				"status": "in_progress", "path": "/out/12-" + output + ".mp4"}}}
+	}
+	delta := func(output string, rev float64) localapi.Event {
+		return localapi.Event{Type: "output_item.delta", RequestID: "job-film", Payload: map[string]any{"item_id": "12/" + output,
+			"output_index": 0, "rev": rev, "length": 1000 * rev}}
 	}
 	for _, rented := range []bool{true, false} {
 		p, buf := progressSink(output.Mode{Human: true}, false)
 		if rented {
 			p.On(localapi.Event{Type: "request.rentals", RequestID: "job-film", Payload: map[string]any{"line": "renting H100 on jaguarman"}})
 		}
-		p.On(product("video", 1))
-		p.On(product("video", 2))
-		p.On(product("preview", 1))
+		p.On(added("video"))
+		p.On(delta("video", 1))
+		p.On(delta("video", 2))
+		p.On(added("preview"))
+		p.On(delta("preview", 1))
 		p.Done()
 		got := buf.String()
 		plays := strings.Count(got, "play in a browser: cozy run play job-film")

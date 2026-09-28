@@ -200,18 +200,18 @@ func (p *RunProgress) onLive(e localapi.Event) {
 			return
 		}
 		v.enter("wait", e, at, "queued")
-	case "accepted":
+	case "run.in_progress":
 		if v.executing {
 			return
 		}
 		v.enter("starting", e, at, "running")
 	case "progress":
 		p.liveProgress(fields, at)
-	case "completed", "succeeded":
+	case "run.completed":
 		p.settle("completed", at)
 		return
-	case "failed", "canceled":
-		p.settle(kind, at)
+	case "run.failed", "run.canceled":
+		p.settle(strings.TrimPrefix(kind, "run."), at)
 		return
 	case "machine.gpu.grant", "machine.gpu.release", "machine.gpu.wait":
 		v.gpu(e, at)

@@ -1602,7 +1602,7 @@ func (s *Store) SubmitWithEvent(r Request, event map[string]any) (Request, bool,
 		return Request{}, false, problem
 	}
 	if fresh && event != nil {
-		if err := appendEventTx(tx, recorded.ID, "request.submitted", 0, event); err != nil {
+		if err := appendEventTx(tx, recorded.ID, "run.created", 0, event); err != nil {
 			return Request{}, false, exit.Internalf("cannot freeze request submission intent: %s", err)
 		}
 	}

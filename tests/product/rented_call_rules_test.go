@@ -133,7 +133,7 @@ func TestRentedPreparationTransportLossKeepsTheRunQueued(t *testing.T) {
 	events, problem := store.EventsAfter(row.ID, 0, 200)
 	fatal(t, problem)
 	for _, event := range events {
-		if event.Type == "request.failed" {
+		if event.Type == "run.failed" {
 			t.Fatalf("the transport loss failed the run: %v", event.Payload)
 		}
 	}

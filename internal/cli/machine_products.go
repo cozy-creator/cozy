@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	"github.com/cozy-creator/cozy/internal/runoutputs"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // A run's outputs are items rewritten in place (progressive-outputs.md). The machine journals
@@ -46,13 +47,17 @@ func (m *machineRuns) holdProducts(ctx context.Context, request records.Request,
 				return nil, problem
 			}
 		}
-		if problem := checkProduct(event.GetProduct()); problem != nil {
-			return nil, problem
+		// An entry this client cannot hold is skipped (the page records a note); its words are
+		// made printable, never a reason to refuse the page.
+		source := sanitizeProduct(event.GetProduct())
+		if source == nil {
+			continue
 		}
-		item, _, err := fold.Add(event.Sequence, event.Product)
+		item, _, err := fold.Add(event.Sequence, source)
 		if err != nil {
-			return nil, exit.New(exit.Conflict, "the machine journaled an unusable output revision: %s", err)
+			continue
 		}
+		event = &pb.MachineExecutionEvent{Sequence: event.Sequence, Product: source}
 		product := productOf(item, event.Product)
 		if directory != "" {
 			// The file is where people look while the run goes on. A folder that refuses it never
@@ -92,37 +97,49 @@ func (m *machineRuns) outputFold(request records.Request) (*runoutputs.Fold, str
 	return fold, export.Directory, request, nil
 }
 
-// checkProduct refuses an entry this client cannot hold, before it reaches the fold.
-func checkProduct(source *pb.RunProduct) *exit.Error {
-	refuse := func(why string) *exit.Error {
-		return exit.New(exit.Conflict, "the machine journaled an unusable output revision: %s", why)
-	}
-	if source == nil || source.GetContent().GetLength() > math.MaxInt64 || !printable(source.Output, 1024) ||
-		!printable(source.Label, 256) || !printable(source.MediaType, 256) {
-		return refuse("its output, content or label is malformed")
-	}
-	if (source.Source == nil) == (len(source.Parts) == 0) || len(source.Parts) > 128 {
-		return refuse("it needs exactly one byte source or its parts")
-	}
-	if source.Source != nil && records.ValidateByteRef(source.Source.GetSource()) != nil {
-		return refuse("its byte source is malformed")
+// sanitizeProduct is an entry as this client holds it: its output, label and media type
+// made printable, or nil for one whose bytes cannot be read (no single source or parts).
+func sanitizeProduct(source *pb.RunProduct) *pb.RunProduct {
+	if source == nil || source.GetContent().GetLength() > math.MaxInt64 ||
+		(source.Source == nil) == (len(source.Parts) == 0) || len(source.Parts) > 128 ||
+		source.Source != nil && records.ValidateByteRef(source.Source.GetSource()) != nil {
+		return nil
 	}
 	for _, part := range source.Parts {
 		if records.ValidateByteRef(part.GetSource().GetSource()) != nil {
-			return refuse("a part is malformed")
+			return nil
 		}
 	}
-	return nil
+	clean := proto.Clone(source).(*pb.RunProduct)
+	clean.Output = printable(clean.Output, 1024, '_')
+	clean.Label = printable(clean.Label, 256, '?')
+	if clean.MediaType = printable(clean.MediaType, 256, '_'); clean.MediaType != source.MediaType || clean.MediaType == "" {
+		clean.MediaType = "application/octet-stream"
+	}
+	if clean.Output == "" {
+		return nil
+	}
+	return clean
 }
 
-func printable(value string, bound int) bool {
-	return len(value) <= bound && strings.IndexFunc(value, func(r rune) bool { return r < 0x20 || r > 0x7e }) < 0
+// printable is a peer's word as this client keeps it: printable ASCII, the rest `substitute`.
+func printable(value string, bound int, substitute rune) string {
+	runes := []rune(value)
+	if len(runes) > bound {
+		runes = runes[:bound]
+	}
+	for i, r := range runes {
+		if r < 0x20 || r > 0x7e {
+			runes[i] = substitute
+		}
+	}
+	return string(runes)
 }
 
 // productOf is the revision the fold made of one entry, as this client records it.
 func productOf(item runoutputs.Item, source *pb.RunProduct) records.Product {
 	current := item.Current
-	product := records.Product{Sequence: current.Sequence, Item: item.ID, Output: item.Output, Op: records.ProductSet,
+	product := records.Product{Sequence: current.Sequence, Item: item.ID, OutputIndex: item.OutputIndex, Type: item.Type, Output: item.Output, Op: records.ProductSet,
 		Index: source.Index, Rev: current.Rev, Digest: current.Digest, Length: current.Length, AppendedFrom: current.AppendedFrom,
 		DurationUs: current.DurationUs, MediaType: current.MediaType, Label: current.Label}
 	if item.List {

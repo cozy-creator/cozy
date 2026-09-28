@@ -192,6 +192,10 @@ func open(path string) (*Store, *exit.Error) {
 			db.Close()
 			return nil, e
 		}
+		if err := renameLifecycleEvents(db); err != nil {
+			db.Close()
+			return nil, exit.Internalf("cannot rename lifecycle events in %s: %s", path, err)
+		}
 	}
 	// The database retains request payloads, rental facts and triage bundles; 0600 is
 	// the same boundary the daemon record carries, and the WAL/SHM siblings SQLite

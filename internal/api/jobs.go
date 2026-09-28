@@ -818,25 +818,25 @@ type JobState struct {
 	Attempts         int                   `json:"attempts"`
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
-	QueuePosition    *int              `json:"queue_position,omitempty"`
-	QueueDepth       *int              `json:"queue_depth,omitempty"`
-	Progress         map[string]any    `json:"progress,omitempty"`
-	Stage            string            `json:"stage,omitempty"`
-	QueuedMS         int64             `json:"queued_ms"`
-	ExecutionMS      int64             `json:"execution_ms"`
-	Metrics          map[string]any    `json:"metrics,omitempty"`
-	ErrorType        string            `json:"error_type,omitempty"`
-	ErrorCode        string            `json:"error_code,omitempty"`
-	Error            string            `json:"error,omitempty"`
-	CanceledBy       string            `json:"canceled_by,omitempty"`
-	Result           any               `json:"result,omitempty"`
-	Outputs          []MediaRef        `json:"outputs"`
-	Products         []records.Product `json:"products,omitempty"`
-	OutputExport     *OutputExportRef  `json:"output_export,omitempty"`
-	Weights          []WeightsRef      `json:"weights,omitempty"`
-	Checkpoints      []JobCheckpoint   `json:"checkpoints,omitempty"`
-	ModelOutputs     map[string]string `json:"model_outputs,omitempty"`
-	ModelDestination string            `json:"model_destination,omitempty"`
+	QueuePosition    *int                 `json:"queue_position,omitempty"`
+	QueueDepth       *int                 `json:"queue_depth,omitempty"`
+	Progress         map[string]any       `json:"progress,omitempty"`
+	Stage            string               `json:"stage,omitempty"`
+	QueuedMS         int64                `json:"queued_ms"`
+	ExecutionMS      int64                `json:"execution_ms"`
+	Metrics          map[string]any       `json:"metrics,omitempty"`
+	ErrorType        string               `json:"error_type,omitempty"`
+	ErrorCode        string               `json:"error_code,omitempty"`
+	Error            string               `json:"error,omitempty"`
+	CanceledBy       string               `json:"canceled_by,omitempty"`
+	Result           any                  `json:"result,omitempty"`
+	Outputs          []MediaRef           `json:"outputs"`
+	Output           []records.OutputItem `json:"output,omitempty"`
+	OutputExport     *OutputExportRef     `json:"output_export,omitempty"`
+	Weights          []WeightsRef         `json:"weights,omitempty"`
+	Checkpoints      []JobCheckpoint      `json:"checkpoints,omitempty"`
+	ModelOutputs     map[string]string    `json:"model_outputs,omitempty"`
+	ModelDestination string               `json:"model_destination,omitempty"`
 	// ModelSources is the per-member source projection, and it exists because the
 	// aggregate beside it answers "how far" and nothing answers "why". Run 205 sat at
 	// 44 of 48 verified for 2h55m with four members permanently failed, and every read

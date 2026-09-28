@@ -36,10 +36,24 @@ CREATE TABLE IF NOT EXISTS request_events (
   payload    TEXT    NOT NULL,
   at         TEXT    NOT NULL
 )`, `
-CREATE INDEX IF NOT EXISTS request_events_by_request ON request_events(request_id, seq)`}
+CREATE INDEX IF NOT EXISTS request_events_by_request ON request_events(request_id, seq)`, `
+CREATE INDEX IF NOT EXISTS request_events_before_responses ON request_events(type)
+  WHERE type IN ('request.submitted','request.accepted','request.completed','request.failed','request.canceled')`}
+
+// renameLifecycleEvents gives rows recorded before the Responses-style names their names:
+// run.created, run.in_progress, run.completed, run.failed, run.canceled. The partial index
+// holds exactly the rows still to rename, so once they are renamed this costs nothing.
+func renameLifecycleEvents(db *sql.DB) error {
+	_, err := db.Exec(`UPDATE request_events SET type=CASE type
+  WHEN 'request.submitted' THEN 'run.created' WHEN 'request.accepted' THEN 'run.in_progress'
+  WHEN 'request.completed' THEN 'run.completed' WHEN 'request.failed' THEN 'run.failed'
+  ELSE 'run.canceled' END
+  WHERE type IN ('request.submitted','request.accepted','request.completed','request.failed','request.canceled')`)
+	return err
+}
 
 // Event is one durable lifecycle row. `Payload` is a JSON object; the contract's event
-// envelope is {type, request_id, attempt, event_id, at, payload}.
+// envelope is {type, request_id, attempt, sequence_number, at, payload}.
 type Event struct {
 	Seq       int64
 	RequestID string
@@ -54,13 +68,30 @@ type Event struct {
 // Terminal event types. A client stops on these and never reconnects (the absorbing
 // terminal rule the reference SSE client already implements).
 var terminalTypes = map[string]bool{
-	"request.completed": true,
-	"request.failed":    true,
-	"request.canceled":  true,
+	"run.completed": true,
+	"run.failed":    true,
+	"run.canceled":  true,
 }
 
 // TerminalEvent reports whether this event type ends the stream.
 func TerminalEvent(eventType string) bool { return terminalTypes[eventType] }
+
+// StateEvent is the event a run's move into `state` records: its OpenAI Responses-style
+// name for a lifecycle state (run.created, run.in_progress, run.completed, run.failed,
+// run.canceled), else request.<state> for a control step such as pausing.
+func StateEvent(state string) string {
+	switch state {
+	case "submitted":
+		return "run.created"
+	case "accepted", "running":
+		return "run.in_progress"
+	case "succeeded", "completed":
+		return "run.completed"
+	case "failed", "canceled":
+		return "run." + state
+	}
+	return "request." + state
+}
 
 func encodePayload(payload map[string]any) (string, *exit.Error) {
 	if payload == nil {
@@ -130,7 +161,7 @@ func (s *Store) CancelQueuedRequest(requestID string, payload map[string]any) (b
 		WHERE request_id=? AND state NOT IN ('completed','failed','canceled')`, now(), requestID); err != nil {
 		return false, exit.Internalf("cannot cancel model transfer %s: %s", requestID, err)
 	}
-	if err := appendEventTx(tx, requestID, "request.canceled", 0, payload); err != nil {
+	if err := appendEventTx(tx, requestID, "run.canceled", 0, payload); err != nil {
 		return false, exit.Internalf("cannot append queued cancellation for %s: %s", requestID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -220,7 +251,7 @@ func (s *Store) failQueuedRequest(requestID string, expected *Request, payload m
 		code, detail, now(), requestID); err != nil {
 		return false, exit.Internalf("cannot fail queued model transfer %s: %s", requestID, err)
 	}
-	if err := appendEventTx(tx, requestID, "request.failed", 0, payload); err != nil {
+	if err := appendEventTx(tx, requestID, "run.failed", 0, payload); err != nil {
 		return false, exit.Internalf("cannot append queued failure for %s: %s", requestID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -316,7 +347,7 @@ func (s *Store) scanEvents(query string, args ...any) ([]Event, *exit.Error) {
 func (s *Store) TerminalEventAt(requestID string) (string, *exit.Error) {
 	var at string
 	err := s.db.QueryRow(`SELECT at FROM request_events
-		WHERE request_id=? AND type IN ('request.completed','request.failed','request.canceled')
+		WHERE request_id=? AND type IN ('run.completed','run.failed','run.canceled')
 		ORDER BY seq DESC LIMIT 1`, requestID).Scan(&at)
 	if err == sql.ErrNoRows {
 		return "", nil
@@ -333,7 +364,7 @@ func (s *Store) TerminalOverallFraction(requestID string, attempt int64) (*float
 	var body string
 	err := s.db.QueryRow(`SELECT payload FROM request_events
 		WHERE request_id=? AND attempt=? AND type IN (
-		'request.completed','request.failed','request.canceled','request.attempt_failed',
+		'run.completed','run.failed','run.canceled','request.attempt_failed',
 		'request.pausing','request.blocked','request.canceling','request.finalizing')
 		AND json_extract(payload,'$.overall_fraction') IS NOT NULL
 		ORDER BY seq DESC LIMIT 1`, requestID, attempt).Scan(&body)
@@ -362,7 +393,7 @@ func (s *Store) TerminalOverallFraction(requestID string, attempt int64) (*float
 // WHO, not merely that it ended.
 func (s *Store) CancelAttribution(requestID string) (actor, errType, errText string, problem *exit.Error) {
 	rows, err := s.db.Query(`SELECT type, payload FROM request_events
-		WHERE request_id=? AND type IN ('request.cancel_requested','request.canceled')
+		WHERE request_id=? AND type IN ('request.cancel_requested','run.canceled')
 		ORDER BY seq DESC`, requestID)
 	if err != nil {
 		return "", "", "", exit.Internalf("cannot read cancellation events for %s: %s", requestID, err)
@@ -380,7 +411,7 @@ func (s *Store) CancelAttribution(requestID string) (actor, errType, errText str
 		if actor == "" {
 			actor, _ = payload["actor"].(string)
 		}
-		if eventType == "request.canceled" && errText == "" {
+		if eventType == "run.canceled" && errText == "" {
 			errType, _ = payload["error_type"].(string)
 			errText, _ = payload["error"].(string)
 		}
@@ -394,7 +425,7 @@ func (s *Store) CancelAttribution(requestID string) (actor, errType, errText str
 func (s *Store) SettledFailure(requestID string) (errType, errCode, errText string, problem *exit.Error) {
 	var body string
 	err := s.db.QueryRow(`SELECT payload FROM request_events
-		WHERE request_id=? AND type IN ('request.failed','request.blocked')
+		WHERE request_id=? AND type IN ('run.failed','request.blocked')
 		ORDER BY seq DESC LIMIT 1`, requestID).Scan(&body)
 	if err == sql.ErrNoRows {
 		return "", "", "", nil
@@ -589,8 +620,8 @@ type Wait struct {
 func (s *Store) CurrentWait(requestID string) (*Wait, *exit.Error) {
 	var kind, body string
 	err := s.db.QueryRow(`SELECT type,payload FROM request_events WHERE request_id=?
-		AND type IN ('request.parked','request.queued','request.preparing','request.accepted',
-		  'request.completed','request.failed','request.canceled')
+		AND type IN ('request.parked','request.queued','request.preparing','run.in_progress',
+		  'run.completed','run.failed','run.canceled')
 		ORDER BY seq DESC LIMIT 1`, requestID).Scan(&kind, &body)
 	if err == sql.ErrNoRows {
 		return nil, nil

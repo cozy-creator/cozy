@@ -104,7 +104,7 @@ func failLostRetainedWorkTx(tx *sql.Tx, id, machine, reason string) (bool, *exit
 	if _, err := tx.Exec(`UPDATE requests SET state='failed',retain_work=0 WHERE id=?`, id); err != nil {
 		return false, exit.Internalf("cannot settle retained-work loss: %s", err)
 	}
-	if err := appendLossEventTx(tx, id, "request.failed", ordinal, payload, at); err != nil {
+	if err := appendLossEventTx(tx, id, "run.failed", ordinal, payload, at); err != nil {
 		return false, exit.Internalf("cannot record retained-work failure: %s", err)
 	}
 	return true, nil
