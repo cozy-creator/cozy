@@ -3,7 +3,6 @@ package producttest
 import (
 	"database/sql"
 	"encoding/json"
-	"path/filepath"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -35,7 +34,7 @@ func machineChildren(t *testing.T, root string, store *records.Store, parentRef 
 	if len(children) != 0 || len(attempts) != 0 {
 		t.Fatal("Creator owns Runtime attempts or children")
 	}
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
+	db, err := sql.Open("sqlite", "file:"+machineJournal(root)+"?mode=ro")
 	must(t, err)
 	defer db.Close()
 	db.SetMaxOpenConns(1)

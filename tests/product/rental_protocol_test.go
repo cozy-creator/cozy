@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/records"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )

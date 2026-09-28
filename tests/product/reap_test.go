@@ -141,7 +141,11 @@ func reapMachineRuntimeRoot(root string) bool {
 	if err != nil {
 		return true
 	}
-	host := filepath.Join(root, "machine", "root", "usr", "local", "bin", "pod-supervisor")
+	machine := filepath.Join(root, "machine")
+	if resolved, err := filepath.EvalSymlinks(machine); err == nil {
+		machine = resolved
+	}
+	host := filepath.Join(machine, "root", "usr", "local", "bin", "pod-supervisor")
 	var owned []int
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())

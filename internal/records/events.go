@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"math"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -414,6 +415,32 @@ func (s *Store) LatestMachineProgress(requestID string, attempt int64) (map[stri
 		return nil, exit.Internalf("cannot decode machine progress for %s: %s", requestID, err)
 	}
 	return value, nil
+}
+
+// MachineProgressEstimate is how long an execution's attempt still needs, measured from its
+// own progress samples: the Runtime-stamped time between the first and latest whole-job
+// fraction, scaled to the remaining fraction. False without two advancing samples.
+func (s *Store) MachineProgressEstimate(requestID string, attempt int64) (int64, bool) {
+	sample := func(order string) (float64, time.Time, bool) {
+		var fraction sql.NullFloat64
+		var at string
+		err := s.db.QueryRow(`SELECT json_extract(payload,'$.payload.overall_fraction'),at FROM request_events
+			WHERE request_id=? AND attempt=? AND type='machine.progress'
+			AND json_type(payload,'$.payload.overall_fraction') IN ('real','integer')
+			ORDER BY seq `+order+` LIMIT 1`, requestID, attempt).Scan(&fraction, &at)
+		when, parseErr := time.Parse(time.RFC3339Nano, at)
+		return fraction.Float64, when, err == nil && fraction.Valid && parseErr == nil
+	}
+	firstFraction, firstAt, ok := sample("ASC")
+	if !ok {
+		return 0, false
+	}
+	lastFraction, lastAt, ok := sample("DESC")
+	if !ok || lastFraction <= firstFraction || !lastAt.After(firstAt) || lastFraction > 1 {
+		return 0, false
+	}
+	perFraction := float64(lastAt.Sub(firstAt).Milliseconds()) / (lastFraction - firstFraction)
+	return int64((1 - lastFraction) * perFraction), true
 }
 
 // AwaitingPublication is a sent checkpoint publication its machine can no longer settle:

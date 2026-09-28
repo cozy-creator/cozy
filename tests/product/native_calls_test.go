@@ -2,10 +2,11 @@ package producttest
 
 import (
 	"bytes"
-	"github.com/cozy-creator/cozy/internal/records"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func TestAcceptedPublicationCallRefusesChangedInputsBeforeReexecution(t *testing.T) {

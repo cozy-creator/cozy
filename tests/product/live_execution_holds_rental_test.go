@@ -93,7 +93,7 @@ func TestAcceptedExecutionHoldsTheRentalAgainstTheHostIdleRelease(t *testing.T) 
 		h.rentals[podRental][key] = value
 		h.mu.Unlock()
 	})
-	startDaemonProcess(t, root, pod.path())
+	startDaemonProcess(t, root, pod.path(t, root))
 	runtimeWheel, tensorfsWheel := localRuntimePair(t)
 
 	pod.sftpMode(t, "drop")

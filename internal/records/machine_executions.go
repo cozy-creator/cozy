@@ -99,12 +99,80 @@ func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 	return owed, nil
 }
 
+// The events that settle a finished machine execution's result custody after its terminal:
+// collected, refused until the owner acts, kept on the machine, or lost with it.
+const (
+	MachineResultCollected    = "client.machine_result_collected"
+	MachineCollectionRefused  = "client.machine_collection_refused"
+	MachineResultRetainedType = "machine.result_retained"
+)
+
+// CustodyEvent reports whether an event settles, for now, where a finished result is.
+func CustodyEvent(eventType string) bool {
+	switch eventType {
+	case MachineResultCollected, MachineCollectionRefused, MachineResultRetainedType, "client.machine_lost":
+		return true
+	}
+	return false
+}
+
+// RefuseMachineCollection records why a finished execution's result cannot be collected
+// until its owner acts. Nothing is recorded before the outcome or after collection, and a
+// repeated refusal is recorded once.
+func (s *Store) RefuseMachineCollection(id string, refusal *exit.Error) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin collection refusal: %s", err)
+	}
+	defer tx.Rollback()
+	link, err := scanMachineExecution(tx.QueryRow(`SELECT `+machineExecutionColumns+` FROM machine_executions WHERE request_id=?`, id))
+	if err != nil {
+		return exit.Internalf("cannot read machine collection: %s", err)
+	}
+	var outcome pb.AttemptOutcome
+	if link == nil || link.Collected || len(link.Outcome) == 0 || proto.Unmarshal(link.Outcome, &outcome) != nil {
+		return nil
+	}
+	code, message, problem := machineCollectionRefusal(tx, id)
+	if problem != nil || code == refusal.ErrName() && message == refusal.Message {
+		return problem
+	}
+	if err := appendEventTx(tx, id, MachineCollectionRefused, int64(outcome.AttemptOrdinal),
+		map[string]any{"machine_execution": true, "error_code": refusal.ErrName(), "error": refusal.Message}); err != nil {
+		return exit.Internalf("cannot record collection refusal: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit collection refusal: %s", err)
+	}
+	return nil
+}
+
+// MachineCollectionRefusal is the latest recorded reason a result could not be collected.
+func (s *Store) MachineCollectionRefusal(id string) (string, string, *exit.Error) {
+	return machineCollectionRefusal(s.db, id)
+}
+
+func machineCollectionRefusal(q interface {
+	QueryRow(string, ...any) *sql.Row
+}, id string) (string, string, *exit.Error) {
+	var code, message string
+	err := q.QueryRow(`SELECT COALESCE(json_extract(payload,'$.error_code'),''),COALESCE(json_extract(payload,'$.error'),'')
+ FROM request_events WHERE request_id=? AND type=? ORDER BY seq DESC LIMIT 1`, id, MachineCollectionRefused).Scan(&code, &message)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", exit.Internalf("cannot read collection refusal: %s", err)
+	}
+	return code, message, nil
+}
+
 // MachineResultRetained is why an execution's finished result stays with its machine
 // because this host has no recipient for it, or "" when none was recorded.
 func (s *Store) MachineResultRetained(id string) (string, *exit.Error) {
 	var reason string
 	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.reason'),'') FROM request_events
- WHERE request_id=? AND type='machine.result_retained' ORDER BY seq DESC LIMIT 1`, id).Scan(&reason)
+ WHERE request_id=? AND type=? ORDER BY seq DESC LIMIT 1`, id, MachineResultRetainedType).Scan(&reason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -441,6 +509,13 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 	}
 	if _, err := tx.Exec(`UPDATE requests SET state=?,ordinal=?,retain_work=CASE WHEN (? AND ?='succeeded') OR ?='canceled' THEN 0 ELSE retain_work END WHERE id=?`, nextState, state.AttemptOrdinal, state.Collected, nextState, nextState, id); err != nil {
 		return exit.Internalf("cannot project machine execution status: %s", err)
+	}
+	// Custody follows the terminal: a caller waiting for the result wakes on this event.
+	if state.Collected && !link.Collected {
+		if err := appendEventTx(tx, id, MachineResultCollected, int64(state.AttemptOrdinal),
+			map[string]any{"machine_execution": true, "state": state.State}); err != nil {
+			return exit.Internalf("cannot record machine result collection: %s", err)
+		}
 	}
 	if retentionReleased {
 		if _, err := tx.Exec(`UPDATE machine_executions SET pending_control=x'',cancel_requested=0 WHERE request_id=?`, id); err != nil {

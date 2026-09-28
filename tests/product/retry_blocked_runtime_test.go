@@ -1,13 +1,14 @@
 package producttest
 
 import (
+	"path/filepath"
+	"strings"
+	"testing"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"path/filepath"
-	"strings"
-	"testing"
 )
 
 func mustRetryNoError(t *testing.T, problem *exit.Error) {

@@ -141,17 +141,6 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	return launch, identity, string(token)
 }
 
-// hostAccelerators is this computer's NVIDIA devices as the driver names them, or the CPU
-// product when it has none.
-func hostAccelerators() (string, int) {
-	out, err := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader").Output()
-	names := strings.Fields(strings.ReplaceAll(strings.TrimSpace(string(out)), " ", "_"))
-	if err != nil || len(names) == 0 {
-		return "CPU", 0
-	}
-	return strings.ReplaceAll(names[0], "_", " "), len(names)
-}
-
 func parityProject(t *testing.T) string {
 	t.Helper()
 	project := filepath.Join(t.TempDir(), "machine-parity")
@@ -217,7 +206,9 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 	var out []string
 	for _, event := range events {
 		kind := event.Type
-		if kind == "request.rentals" || kind == "request.placement" {
+		// Where a run chose its rental is the one step a call on this computer skips; the
+		// Runtime's collection record is written after the terminal a client returns on.
+		if kind == "request.rentals" || kind == "request.placement" || kind == "machine.collected" {
 			continue
 		}
 		if kind == "request.preparing" {
@@ -300,9 +291,7 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 		args []string
 	}{{"local", nil}, {"rental", []string{"--rental=tessa"}}} {
 		t.Run(venue.name, func(t *testing.T) {
-			// `echo` (serving) result collection is broken on master and being fixed separately
-			// (proto-062); restore {"echo", `"value":82`} with that fix.
-			for _, call := range []struct{ function, want string }{{"add", `"value":42`}} {
+			for _, call := range []struct{ function, want string }{{"add", `"value":42`}, {"echo", `"value":82`}} {
 				key := "parity-" + venue.name + "-" + call.function
 				args := append([]string{"run", parityPackage + "/" + call.function, "value=41", "--await", "--json", "--idempotency-key", key}, venue.args...)
 				code, out := runCozy(t, root, args...)
@@ -317,11 +306,20 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 				if link == nil || link.MachineID != want || !link.Collected {
 					t.Fatalf("%s on %s was not a collected execution on %s: %+v", call.function, venue.name, want, link)
 				}
+				// The run's record shows the result the client received, as JSON and as text.
+				code, shown := runCozy(t, root, "run", "show", request.ID, "--json")
+				var report struct{ Result json.RawMessage }
+				if code != 0 || json.Unmarshal([]byte(shown), &report) != nil || !strings.Contains(string(report.Result), call.want) {
+					t.Fatalf("run show --json of %s on %s lacks its result [exit %d]\n%s", call.function, venue.name, code, shown)
+				}
+				if code, shown = runCozy(t, root, "run", "show", request.ID); code != 0 || !strings.Contains(shown, "result {"+call.want+"}") {
+					t.Fatalf("run show of %s on %s lacks its result [exit %d]\n%s", call.function, venue.name, code, shown)
+				}
 				journals[venue.name] = append(journals[venue.name], journal(t, store, request.ID))
 			}
 		})
 	}
-	if len(journals["local"]) != 1 || len(journals["rental"]) != 1 {
+	if len(journals["local"]) != 2 || len(journals["rental"]) != 2 {
 		t.Fatal("a venue did not complete the body")
 	}
 	for index := range journals["local"] {

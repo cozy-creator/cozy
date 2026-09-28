@@ -228,6 +228,12 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 | `request.completed` | `status`, `cause`, `outputs[]` (media ids), `triage_subject`, optional last measured `overall_fraction` |
 | `request.failed` | the above plus `error_type`, `error` |
 | `request.canceled` | the above |
+| `client.machine_result_collected` | a machine run's result reached this host, after its terminal — `state` |
+| `client.machine_collection_refused` | the result stays on its machine until its owner fixes the cause — `error_code`, `error` |
+
+A machine run's result custody follows its terminal. A client that needs the result reads
+the stream on from the terminal's `event_id` until `client.machine_result_collected`,
+`client.machine_collection_refused`, `machine.result_retained` or `client.machine_lost`.
 
 **Live** events (`event_id: 0`, `payload.live: true`) are the lossy lane: never durable,
 never replayed from a cursor. The LATEST tick is replayed immediately on connect so a

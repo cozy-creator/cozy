@@ -758,7 +758,8 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	cpu := CPUAccelerator(row.AcceleratorModel)
 	complete := row.State == "ready" || row.State == "attached"
 	if cpu {
-		complete = complete && accelerator == "" && backend == "none" && count == 0 &&
+		// A worker that measured no accelerator reports backend "none", or nothing at all.
+		complete = complete && accelerator == "" && (backend == "none" || backend == "") && count == 0 &&
 			driverVersion == "" && backendVersion == "" && deviceMemory == 0 &&
 			instance != "" && workerID != "" && bootID != ""
 	} else {

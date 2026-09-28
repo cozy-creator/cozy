@@ -158,7 +158,7 @@ sys.exit(main())
 		t.Fatal("Creator remains online")
 	}
 	unblock()
-	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
+	journal, err := sql.Open("sqlite", "file:"+machineJournal(root)+"?mode=ro")
 	must(t, err)
 	defer journal.Close()
 	journal.SetMaxOpenConns(1)

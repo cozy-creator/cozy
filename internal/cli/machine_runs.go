@@ -724,15 +724,27 @@ func (m *machineRuns) runName(request records.Request) string {
 }
 
 // Refresh brings a run's record up to date for a reader. A run the observer is following
-// already is: the observer holds its machine's next event, and the reader takes the record.
+// already is: the observer holds its machine's next event, and the reader takes the record,
+// unless its collection is refused.
 func (m *machineRuns) Refresh(parent context.Context, request records.Request) *exit.Error {
 	m.mu.Lock()
 	following := m.running[request.ID]
 	m.mu.Unlock()
-	if following {
+	if following && !m.collectionRefused(request.ID) {
 		return nil
 	}
 	return m.follow(parent, request)
+}
+
+// collectionRefused is whether a finished result waits on its owner. A reader asking about
+// it tries the collection again at once: the cause may be fixed since the observer tried.
+func (m *machineRuns) collectionRefused(id string) bool {
+	link, problem := m.store.MachineExecution(id)
+	if problem != nil || link == nil || link.Collected {
+		return false
+	}
+	code, _, problem := m.store.MachineCollectionRefusal(id)
+	return problem == nil && code != ""
 }
 
 func (m *machineRuns) follow(parent context.Context, request records.Request) *exit.Error {
@@ -741,6 +753,13 @@ func (m *machineRuns) follow(parent context.Context, request records.Request) *e
 	problem := m.refresh(ctx, request)
 	if problem != nil && errors.Is(context.Cause(ctx), errObservationYielded) {
 		return nil // the control that took the turn observes the execution itself
+	}
+	if problem != nil && problem.Code != exit.Unavailable && problem.Code != exit.Deadline && problem.Code != exit.Conflict {
+		// A finished result this host refuses (a destination it cannot write, say) waits
+		// on its owner; the record says why, and a caller waiting for the result wakes.
+		if recordProblem := m.store.RefuseMachineCollection(request.ID, problem); recordProblem != nil {
+			return recordProblem
+		}
 	}
 	return problem
 }
@@ -994,7 +1013,7 @@ func (m *machineRuns) retainedResult(request records.Request, outcome *pb.Attemp
 		return readProblem
 	}
 	if reason != problem.Message {
-		if recordProblem := m.store.AppendEvent(request.ID, "machine.result_retained", int64(outcome.AttemptOrdinal),
+		if recordProblem := m.store.AppendEvent(request.ID, records.MachineResultRetainedType, int64(outcome.AttemptOrdinal),
 			map[string]any{"reason": problem.Message}); recordProblem != nil {
 			return recordProblem
 		}

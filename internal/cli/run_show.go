@@ -39,6 +39,11 @@ type runReport struct {
 	Resolved map[string]any      `json:"resolved,omitempty"`
 	Events   []api.EvidenceEvent `json:"events"`
 	Triage   json.RawMessage     `json:"triage,omitempty"`
+	// Result is the run's inline result once this host holds it.
+	Result any `json:"result,omitempty"`
+	// CollectionPending names why a finished result still waits on its machine.
+	CollectionPending string `json:"collection_pending,omitempty"`
+	CollectionError   string `json:"collection_error,omitempty"`
 }
 
 type reportStage struct {
@@ -151,6 +156,10 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
 	if life.Phase == orchestrator.PhaseGPUWait || life.Phase == orchestrator.PhaseOwnerReconciliation {
 		report.Waiting = PhaseCell(life)
+	}
+	report.Result = life.Result
+	if view := life.MachineExecution; view != nil && !view.Collected && view.CollectionRefused != "" {
+		report.CollectionPending, report.CollectionError = view.CollectionRefused, view.ObservationError
 	}
 	created, _ := time.Parse(time.RFC3339Nano, life.CreatedAt)
 	granted := map[string]int{}
@@ -367,6 +376,14 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		fmt.Fprintf(w, " · wall %s", span(float64(r.WallMS)))
 	}
 	fmt.Fprintln(w)
+	if r.Result != nil {
+		if raw, err := json.Marshal(r.Result); err == nil {
+			fmt.Fprintf(w, "result %s\n", output.Elide(string(raw), 2000, mode.Full))
+		}
+	}
+	if r.CollectionPending != "" {
+		fmt.Fprintf(w, "collection pending: %s — %s\n", r.CollectionPending, r.CollectionError)
+	}
 	table := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	if len(r.Stages) > 0 {
 		fmt.Fprintln(w)

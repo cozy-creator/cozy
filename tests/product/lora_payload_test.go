@@ -1,11 +1,12 @@
 package producttest
 
 import (
-	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/records"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func TestLoRAOverridesPreserveOrderZeroAndExplicitComponents(t *testing.T) {

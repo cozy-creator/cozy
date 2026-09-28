@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/units"
@@ -133,7 +132,7 @@ func TestProductPath(t *testing.T) {
 	assertNoAttemptRoot(t, root)
 
 	// An unseeded run draws fresh entropy, so its bytes — and its name — differ.
-	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32")
+	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32", "--await")
 	if code != 0 {
 		t.Fatalf("second human invocation failed [exit %d]\n%s", code, stderr)
 	}
@@ -180,7 +179,7 @@ func TestProductPath(t *testing.T) {
 	fixedDir := filepath.Join(root, "fixed-seed-output")
 	for attempt := 0; attempt < 2; attempt++ {
 		code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
-			"size=32", "seed=7", "--out", fixedDir)
+			"size=32", "seed=7", "--out", fixedDir, "--await")
 		if code != 0 {
 			t.Fatalf("fixed-seed invocation %d failed [exit %d]\n%s", attempt+1, code, stderr)
 		}
@@ -280,21 +279,21 @@ func TestProductPath(t *testing.T) {
 	detachedDir := filepath.Join(root, "detached-output")
 	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
 		"size=32", "seed=9", "delay_ms=4500", "--out", detachedDir)
-	if code != 0 || !strings.Contains(stdout, `"status":"running"`) ||
+	// Detached before its machine accepted it (queued) or after (running); either way it names
+	// its durable destination.
+	if code != 0 || !regexp.MustCompile(`"status":"(queued|running)"`).MatchString(stdout) ||
 		!strings.Contains(stdout, `"output":"`+detachedDir+`"`) {
 		t.Fatalf("default run did not detach with its durable destination [exit %d]\nstdout:\n%s\nstderr:\n%s",
 			code, stdout, stderr)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		detached, err := os.ReadDir(detachedDir)
-		if err == nil && len(detached) == 1 && requestOutputName(detached[0].Name(), ".webp") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("daemon did not publish the detached WebP: %v, %v", detached, err)
-		}
-		time.Sleep(25 * time.Millisecond)
+	// The daemon finishes the detached run and publishes its file with no client attached;
+	// a later watch reads the settled run and its export.
+	if code, out := runCozy(t, root, "run", "watch", submittedRunReference(t, code, stdout), "--json"); code != 0 ||
+		!strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("detached run did not complete [exit %d]\n%s", code, out)
+	}
+	if detached, err := os.ReadDir(detachedDir); err != nil || len(detached) != 1 || !requestOutputName(detached[0].Name(), ".webp") {
+		t.Fatalf("daemon did not publish the detached WebP: %v, %v", detached, err)
 	}
 
 	// cl-089 first half: an unwritable --out refuses AT SUBMIT, typed, before any GPU
@@ -313,10 +312,9 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("a refused --out submission recorded a request row: %d -> %d", before, after)
 	}
 
-	// cl-089's incident shape — the destination dies AFTER the preflight passed — under
-	// direct writes: the worker writes the result where it lives and there is no second
-	// copy to publish later, so the run FAILS typed, naming the refused write, and a run
-	// after the directory is restored lands the file.
+	// cl-089's incident shape — the destination dies AFTER the preflight passed. The machine
+	// keeps the finished result until this client can take it; once the directory is
+	// restored the file lands.
 	incidentDir := filepath.Join(root, "incident-output")
 	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
 		"size=32", "seed=13", "delay_ms=4500", "--out", incidentDir)
@@ -329,16 +327,27 @@ func TestProductPath(t *testing.T) {
 	}
 	must(t, os.Chmod(incidentDir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(incidentDir, 0o755) })
+	// The run completed on its machine, which keeps the file: the refused destination is
+	// named as the reason its collection is pending, never a run failure or a silent hang.
 	code, out, stderr = runCozyStreams(t, root, "run", "watch", idMatch[1], "--json")
-	if code != 1 || !strings.Contains(out, `"code":"failed"`) ||
-		!strings.Contains(out, "output_spool_io") || !strings.Contains(out, "Permission denied") {
-		t.Fatalf("a destination that died after submit did not fail the run typed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, out, stderr)
+	if code != 0 || !strings.Contains(out, "collection pending: output_destination_unwritable") ||
+		!strings.Contains(out, "permission denied") {
+		t.Fatalf("a destination that died after submit was not reported as owed collection [exit %d]\nstdout:\n%s\nstderr:\n%s", code, out, stderr)
 	}
+	// The run's record says the same, as text and as JSON.
+	if code, out = runCozy(t, root, "run", "show", idMatch[1]); code != 0 ||
+		!strings.Contains(out, "collection pending: output_destination_unwritable") {
+		t.Fatalf("run show did not name the pending collection [exit %d]\n%s", code, out)
+	}
+	if code, out = runCozy(t, root, "run", "show", idMatch[1], "--json"); code != 0 ||
+		!strings.Contains(out, `"collection_pending":"output_destination_unwritable"`) {
+		t.Fatalf("run show --json did not name the pending collection [exit %d]\n%s", code, out)
+	}
+	// Watching again once the cause is fixed collects the result the machine kept.
 	must(t, os.Chmod(incidentDir, 0o755))
-	code, out = runCozy(t, root, "--json", "run", localWeightlessRef+"/tile",
-		"size=32", "seed=13", "--out", incidentDir, "--await")
-	if code != 0 || !strings.Contains(out, `"status":"completed"`) {
-		t.Fatalf("restored destination did not take the result [exit %d]\n%s", code, out)
+	code, out = runCozy(t, root, "run", "watch", idMatch[1], "--json")
+	if code != 0 || !strings.Contains(out, `"status":"completed"`) || strings.Contains(out, "collection pending") {
+		t.Fatalf("restored destination did not take the kept result [exit %d]\n%s", code, out)
 	}
 	incidentFiles, err := os.ReadDir(incidentDir)
 	must(t, err)

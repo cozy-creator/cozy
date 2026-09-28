@@ -15,7 +15,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 // THE JOB VERBS (cl-004): `submit` · `status` · `ls` · `follow` · `cancel`. They are
@@ -511,6 +510,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		}
 		life, problem := waitOutputExport(client, api.Lifecycle{
 			RequestID: state.JobID, Status: state.Status, OutputExport: state.OutputExport,
+			MachineExecution: state.MachineExecution,
 		})
 		if problem != nil {
 			return problem
@@ -570,6 +570,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	rec := compactRecord(fields, defaults...)
 	if machine := state.MachineExecution; machine != nil && machine.Retained != "" {
 		rec.Notes = append(rec.Notes, fmt.Sprintf("its result stays on %s: %s", machine.Machine, machine.Retained))
+	}
+	if machine := state.MachineExecution; machine != nil && !machine.Collected && machine.CollectionRefused != "" {
+		rec.Notes = append(rec.Notes, collectionPendingNote(machine, state.Number))
 	}
 	if len(state.RetainedOutputs) > 0 {
 		machine := state.RetainedOutputs[0].Machine
@@ -731,27 +734,20 @@ func settled(status string) bool {
 // collection; only an unmet observation that stays unchanged for the whole stall budget
 // is reported, and the run and its retained result are untouched either way.
 func awaitMachineCollection(ctx *Context, state api.JobState) (api.JobState, *exit.Error) {
+	if !custodyOwed(state.MachineExecution, state.Status) {
+		return state, nil
+	}
 	client, problem := dial(ctx)
 	if problem != nil {
 		return state, problem
 	}
 	client = client.Following((&reattachNotice{ctx: ctx}).say)
-	const poll = time.Second
-	last, since := "", time.Now()
-	for state.Status == "completed" && state.MachineExecution != nil && !state.MachineExecution.Collected &&
-		state.MachineExecution.Retained == "" {
-		if observed := state.MachineExecution.ObservationError; observed != last {
-			last, since = observed, time.Now()
-		} else if time.Since(since) >= transfer.StallBudget {
-			return state, exit.Named(exit.Unavailable, "machine_execution.result_collection_pending",
-				"run %s completed on its machine, but its result has not been collected: %s", state.JobID, last).
-				WithRemedy("the result stays retained on the machine; `cozy run watch %s` collects it once the machine answers", state.JobID)
-		}
-		time.Sleep(poll)
-		if state, problem = client.Job(state.JobID); problem != nil {
-			return state, problem
-		}
-		state.Status = publicObservedStatus(state.Status)
+	if problem := awaitResultCustody(client, state.JobID); problem != nil {
+		return state, problem
 	}
+	if state, problem = client.Job(state.JobID); problem != nil {
+		return state, problem
+	}
+	state.Status = publicObservedStatus(state.Status)
 	return state, nil
 }
