@@ -38,6 +38,10 @@ func retainWorkerInstallation(connection *machineConnection, expected localpacka
 // outputs to its destination; an older one silently ignores the destination.
 const machineDestinationRuntimeFloor = "0.18.52"
 
+// machineOutputLogRuntimeFloor is the first Runtime that reports a run's outputs as they are
+// made (worker wire 65); an older machine's runs are refused with this floor.
+const machineOutputLogRuntimeFloor = "0.18.73"
+
 // machineRuns is a client transport and observer. Stopping it closes connections
 // and upload/observation work; it never sends an execution cancellation.
 type machineRuns struct {
@@ -543,8 +547,9 @@ func currentExecutionWorkspace(ctx context.Context, connection *machineConnectio
 		return nil, exit.New(exit.Conflict, "machine returned an invalid execution workspace identity")
 	}
 	if !workspace.RunOutputLog {
-		return nil, exit.Named(exit.Unavailable, "machine.runtime_update_required",
-			"this machine's Runtime predates the run output log (wire 65), so its run could not report its outputs").
+		// Definitive: the run fails with this, rather than waiting on a machine that cannot serve it.
+		return nil, exit.Named(exit.Structural, "machine.runtime_update_required",
+			"this machine's Runtime predates the run output log; runs need Runtime %s or newer", machineOutputLogRuntimeFloor).
 			WithRemedy("update the machine's Runtime: `cozy rental update <rental>`, or `cozy machine install` for this computer")
 	}
 	return workspace, nil

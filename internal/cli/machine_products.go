@@ -65,9 +65,10 @@ func (m *machineRuns) holdProducts(ctx context.Context, request records.Request,
 				return nil, problem
 			}
 		}
-		if product.Path, problem = m.showProduct(request, product); problem != nil {
-			return nil, problem
-		}
+		// The bytes are held here now; the outputs folder is only where people look. A folder
+		// that refuses the file never stops the log: the run's end writes its result, and a
+		// refusal there waits on the owner as a pending collection (never a silent hang).
+		product.Path, _ = m.showProduct(request, product)
 		held[event.Sequence] = product
 	}
 	return held, nil

@@ -21,6 +21,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/transfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // machineConnection is one claimed machine, local or rented, and what this submission has
@@ -289,6 +291,9 @@ func (m *machineRuns) ForgetPackage(ctx context.Context, pkg string) api.Forgott
 		if problem == nil {
 			_, err := connection.Host.ForgetPackage(ctx, &pb.ForgetPackageCall{Claim: connection.Claim, Package: pkg})
 			connection.Close()
+			if status.Code(err) == codes.Unimplemented {
+				continue // an older machine keeps no package cache: it reads the package every run
+			}
 			if err != nil {
 				problem = machineTransport(err)
 			}
