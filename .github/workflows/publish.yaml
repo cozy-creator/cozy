@@ -4,26 +4,11 @@ name: Publish to PyPI
 # this workflow is the single release procedure. Manual run for an existing tag
 # (the tag's tree must carry this dispatch trigger):
 #   gh workflow run publish.yaml -R cozy-creator/tensorfs --ref vX.Y.Z
-# Runs on the org's self-hosted release runner (owner, 2026-09-28: no CI).
-# Publish the wheels an earlier run of this workflow already built (a run whose publish job
-# never started), from master:
-#   gh workflow run publish.yaml -R cozy-creator/tensorfs --ref master -f from_run=<run id>
-# Build and publish an existing tag with this (master's) workflow:
-#   gh workflow run publish.yaml -R cozy-creator/tensorfs --ref master -f release_tag=vX.Y.Z
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      from_run:
-        description: Publish this earlier run's wheel artifacts and its tagged tree's sdist
-        type: string
-        default: ''
-      release_tag:
-        description: Build and publish this existing vX.Y.Z tag
-        type: string
-        default: ''
 
 # Never cancel a publication midway.
 concurrency:
@@ -33,23 +18,21 @@ concurrency:
 jobs:
   # The tag must name the version the tree declares before anything is built.
   gate:
-    if: inputs.from_run == ''
-    runs-on: cozy-local
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          ref: ${{ inputs.release_tag || github.ref }}
+          python-version: "3.12"
+      # ci.yaml owns the Rust suite, the frozen vectors, and the deep wheel smoke on
+      # every push; the publish gate re-runs the version contract against the exact
+      # tagged tree rather than trusting that the tag points at a commit CI already saw.
+      - run: python3 scripts/version_contract.py source
       - name: Version matches tag
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          if [ -n "$RELEASE_TAG" ]; then NAME="$RELEASE_TAG"
-          else
-            [ "$GITHUB_REF_TYPE" = tag ] || { echo "publish runs on a v* tag, not $GITHUB_REF"; exit 1; }
-            NAME="$GITHUB_REF_NAME"
-          fi
-          TAG="${NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || { echo "publish runs on a v* tag, not $GITHUB_REF"; exit 1; }
+          TAG="${GITHUB_REF_NAME#v}"
           VER="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
           if [ "$TAG" != "$VER" ]; then
             echo "tag v$TAG != pyproject version $VER"; exit 1
@@ -59,68 +42,32 @@ jobs:
   wheels:
     needs: gate
     uses: ./.github/workflows/wheels.yaml
-    with:
-      ref: ${{ inputs.release_tag || github.ref }}
 
   publish:
     needs: wheels
-    if: always() && (inputs.from_run != '' || needs.wheels.result == 'success')
-    runs-on: cozy-local
+    runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.
     timeout-minutes: 30
     permissions:
       contents: read   # checkout on a private/org repo
-      actions: read    # download an earlier run's artifacts
       id-token: write  # PyPI trusted publishing (OIDC)
     steps:
-      - name: Source of the published tree
-        id: src
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FROM_RUN: ${{ inputs.from_run }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          if [ -n "$FROM_RUN" ]; then
-            echo "sha=$(gh api repos/$GITHUB_REPOSITORY/actions/runs/$FROM_RUN --jq .head_sha)" >> "$GITHUB_OUTPUT"
-          elif [ -n "$RELEASE_TAG" ]; then
-            echo "sha=$(gh api repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG --jq .sha)" >> "$GITHUB_OUTPUT"
-          else
-            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          fi
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.src.outputs.sha }}
       - uses: actions/download-artifact@v4
-        if: inputs.from_run != ''
         with:
           pattern: wheel-*
           merge-multiple: true
           path: dist
-          run-id: ${{ inputs.from_run }}
-          github-token: ${{ github.token }}
-      - name: Take the wheel wheels handed over
-        if: inputs.from_run == ''
-        run: |
-          src="$HOME/actions-runner/_release/tensorfs/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir -p dist && cp "$src"/*.whl dist/
       # The sdist carries sources only, never the staged binary; pyproject's `data`
       # option needs the directory to exist even for an sdist.
       - run: mkdir -p wheel-data/scripts
-      # The runner's system Python is externally managed (PEP 668); uv runs maturin in its own env.
       - name: Build sdist
-        run: uv tool run --from 'maturin>=1.15,<2' maturin sdist --out dist
-      - name: Wheels and sdist name the tree's version
-        run: |
-          ls -l dist
-          VER="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
-          for f in dist/*; do case "$(basename "$f")" in tensorfs-"$VER"[-.]*) ;; *) echo "$f is not $VER"; exit 1;; esac; done
-      # Trusted publishing is unchanged. This box cannot reach fulcio.sigstore.dev (TLS
-      # "wrong version number" from the host and from docker; pypi.org works), so the
-      # optional PEP 740 attestations are off while releases run here.
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      # `needs: wheels` fails the release if any platform failed: every platform or none.
+      - run: ls -l dist
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          attestations: false
-      - if: always()
-        run: docker run --rm -v "$GITHUB_WORKSPACE:/w" alpine:3.20 chown -R "$(id -u):$(id -g)" /w
