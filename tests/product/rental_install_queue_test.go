@@ -240,7 +240,10 @@ func TestRentalInstallAdmissionAndStatusAPIWhileBooting(t *testing.T) {
 		}
 		held, problem := store.RentalInstall(accepted.ID)
 		rentalInstallCheck(t, problem)
-		if held == nil || held.State != "queued" || !reflect.DeepEqual(held.Selection, selection) {
+		// The durable intent names the hub the request came through (#893): here the default.
+		want := selection
+		want.Hub = machine.Hub
+		if held == nil || held.State != "queued" || !reflect.DeepEqual(held.Selection, want) {
 			t.Fatalf("202 was not backed by exact durable intent: %+v", held)
 		}
 	}
