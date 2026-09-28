@@ -58,6 +58,9 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	for _, name := range g.Ignored {
 		fmt.Fprintf(log, "cozy machine: ignoring %s, which this machine does not read\n", name)
 	}
+	for _, line := range g.Skipped {
+		fmt.Fprintf(log, "cozy machine: ignoring %s\n", line)
+	}
 	layout := NewLayout(g)
 	id, err := prepare(g, layout)
 	if err != nil {
@@ -88,11 +91,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 			return err
 		}
 	}
-	m.tfs = &tensorFS{bin: layout.TFS, store: layout.Store, hub: g.PublicOrigin, credential: "worker " + g.WorkerID + " " + g.WorkerToken,
-		allowHosts: g.ObjectHosts, repoCache: g.RepoCacheRoot, observe: m.observeCache}
-	if len(g.HubCA) > 0 {
-		m.tfs.caFile = layout.boot("tensorhub-ca.crt")
-	}
+	m.tfs = &tensorFS{bin: layout.TFS, store: layout.Store, repoCache: g.RepoCacheRoot, observe: m.observeCache}
 	if m.childAddr, err = freeLoopback(); err != nil {
 		return err
 	}

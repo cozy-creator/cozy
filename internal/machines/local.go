@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -236,11 +237,30 @@ type hostRecord struct {
 	WorkerPort int    `json:"worker_port"`
 	MediaPort  int    `json:"media_port"`
 	ReceiptKey string `json:"receipt_key"`
+	// Hubs are the hubs it holds a registration for, each with the origin its Runtime
+	// reads that hub at; WireMinor is the top of its protocol range once dialed.
+	Hubs      map[string]string `json:"hubs,omitempty"`
+	WireMinor uint32            `json:"wire_minor,omitempty"`
+}
+
+// HubPerRunWire is the wire minor from which a machine reads each run at the hub the run
+// names (ReleaseRoot.hub and the rest), instead of only at the hub it was launched for.
+const HubPerRunWire = 67
+
+// serves says whether the Host runs hub's work where it is: at its own hub, or, for work
+// whose every call names its hub (named), at another it holds a registration for once it
+// reads a run's hub. reads is what such a call names.
+func (r *hostRecord) serves(hub string, named bool) (reads string, ok bool) {
+	if r.Hub == hub {
+		return "", true
+	}
+	reads = r.Hubs[hub]
+	return reads, named && reads != "" && r.WireMinor >= HubPerRunWire
 }
 
 type cachedLaunch struct {
 	*Launch
-	hub string
+	record hostRecord
 }
 
 // Launch is the running Host's identity once its readiness receipt verified.
@@ -250,15 +270,30 @@ type Launch struct {
 	Leaf             []byte
 	GPUs             []ReceiptGPU
 	PID              int
+	// Reads is the origin the machine reads the asked hub at when that is not its own
+	// hub: each run of it names this (wire 67). "" at its own hub.
+	Reads string
 }
 
-// Ensure answers the running Host, launching it when none runs. hubOrigin is the hub the
-// machine belongs to, and client speaks to it as the signed-in user.
-func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client) (*Launch, *exit.Error) {
+func (l *Launch) at(reads string) *Launch {
+	if l == nil {
+		return nil
+	}
+	out := *l
+	out.Reads = reads
+	return &out
+}
+
+// Ensure answers the running Host, launching it when none runs. hubOrigin is the hub whose
+// work it is asked for, client speaks to that hub as the signed-in user, and named says that
+// work names its hub on every call. A Host that cannot do that work where it is moves there.
+func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client, named bool) (*Launch, *exit.Error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if cached := h.cached; cached != nil && cached.hub == hubOrigin && h.alive(cached.PID) {
-		return cached.Launch, nil
+	if cached := h.cached; cached != nil && h.alive(cached.PID) {
+		if reads, ok := cached.record.serves(hubOrigin, named); ok {
+			return cached.at(reads), nil
+		}
 	}
 	unlock, problem := h.lock(ctx)
 	if problem != nil {
@@ -270,23 +305,62 @@ func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client)
 		return nil, problem
 	}
 	if record != nil && h.alive(record.PID) {
-		if record.Hub != hubOrigin {
+		if reads, ok := record.serves(hubOrigin, named); !ok {
 			// One root holds one Host: the machine moves to the selected hub.
 			if problem := h.stopLocked(ctx); problem != nil {
 				return nil, problem
 			}
 		} else if launch, problem := h.await(ctx, record); problem == nil || h.alive(record.PID) {
-			return h.remember(launch, hubOrigin), problem
+			return h.remember(launch, *record).at(reads), problem
 		}
 	}
 	return h.launchLocked(ctx, hubOrigin, client)
 }
 
-func (h *Host) remember(launch *Launch, hubOrigin string) *Launch {
+func (h *Host) remember(launch *Launch, record hostRecord) *Launch {
 	if launch != nil {
-		h.cached = &cachedLaunch{Launch: launch, hub: hubOrigin}
+		h.cached = &cachedLaunch{Launch: launch, record: record}
 	}
 	return launch
+}
+
+// Dialed records the running Host's protocol range, which says whether it reads a run's
+// hub where it is.
+func (h *Host) Dialed(ctx context.Context, pid int, wireMinor uint32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if cached := h.cached; cached != nil && cached.PID == pid && cached.record.WireMinor == wireMinor {
+		return
+	}
+	unlock, problem := h.lock(ctx)
+	if problem != nil {
+		return
+	}
+	defer unlock()
+	record, problem := h.record()
+	if problem != nil || record == nil || record.PID != pid {
+		return
+	}
+	if record.WireMinor != wireMinor {
+		record.WireMinor = wireMinor
+		raw, _ := json.Marshal(record)
+		if writePrivate(h.path("host.json"), raw) != nil {
+			return
+		}
+	}
+	if h.cached != nil && h.cached.PID == pid {
+		h.cached.record = *record
+	}
+}
+
+// Serves says whether the running Host does hub's work without moving; false when none runs.
+func (h *Host) Serves(hub string, named bool) bool {
+	record, problem := h.record()
+	if problem != nil || record == nil || !h.alive(record.PID) {
+		return false
+	}
+	_, ok := record.serves(hub, named)
+	return ok
 }
 
 // await reads the recorded Host's readiness receipt, waiting while it boots.
@@ -331,6 +405,10 @@ func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.C
 			WithRemedy("cozy machine install --host <pod-supervisor>")
 	}
 	registered, problem := h.registration(ctx, hubOrigin, client)
+	if problem != nil {
+		return nil, problem
+	}
+	all, problem := h.registrations()
 	if problem != nil {
 		return nil, problem
 	}
@@ -379,27 +457,43 @@ func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.C
 	for _, name := range names {
 		base = append(base, name+"="+environment[name])
 	}
+	// Every other registration rides along: a machine that reads a run's hub (wire 67)
+	// serves each of them without moving; an older one ignores them.
+	held := map[string]string{hubOrigin: environment["TENSORHUB_ORIGIN"]}
+	var others []map[string]any
+	for _, origin := range slices.Sorted(maps.Keys(all)) {
+		other := all[origin]
+		if origin == hubOrigin || other.ID == "" || other.Environment["TENSORHUB_ORIGIN"] == "" {
+			continue
+		}
+		held[origin] = other.Environment["TENSORHUB_ORIGIN"]
+		others = append(others, map[string]any{"worker_id": other.ID, "worker_token": other.WorkerToken, "environment": other.Environment})
+	}
+	if len(others) > 0 {
+		raw, _ := json.Marshal(others)
+		base = append(base, "COZY_MACHINE_HUBS_JSON="+string(raw))
+	}
 	// Free ports are chosen, not reserved: a port taken before the Host binds it ends
 	// that Host before readiness, and the next launch chooses again.
 	for attempt := 0; ; attempt++ {
-		launch, problem := h.start(ctx, base, key, hubOrigin, registered.ID)
+		launch, record, problem := h.start(ctx, base, key, hostRecord{Hub: hubOrigin, WorkerID: registered.ID, Hubs: held})
 		if problem == nil || problem.ErrName() != "machine.host_port_taken" || attempt == 2 {
-			return h.remember(launch, hubOrigin), problem
+			return h.remember(launch, record), problem
 		}
 	}
 }
 
-func (h *Host) start(ctx context.Context, base []string, key []byte, hubOrigin, workerID string) (*Launch, *exit.Error) {
+func (h *Host) start(ctx context.Context, base []string, key []byte, record hostRecord) (*Launch, hostRecord, *exit.Error) {
 	workerPort := freePort(0)
 	mediaPort := freePort(workerPort)
 	env := append(append([]string(nil), base...),
 		"COZY_WORKER_INTERNAL_PORT="+strconv.Itoa(workerPort), "COZY_MEDIA_INTERNAL_PORT="+strconv.Itoa(mediaPort))
 	if problem := h.writeRuntimeConfig(); problem != nil {
-		return nil, problem
+		return nil, record, problem
 	}
 	log, err := os.OpenFile(h.path("host.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, exit.Internalf("cannot open the machine Host log: %s", err)
+		return nil, record, exit.Internalf("cannot open the machine Host log: %s", err)
 	}
 	defer log.Close()
 	offset, _ := log.Seek(0, io.SeekEnd)
@@ -408,28 +502,28 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, hubOrigin, 
 	command.Stdout, command.Stderr = log, log
 	detach(command)
 	if err := command.Start(); err != nil {
-		return nil, exit.Internalf("cannot start the machine Host: %s", err)
+		return nil, record, exit.Internalf("cannot start the machine Host: %s", err)
 	}
 	go func() { _ = command.Wait() }()
-	record := &hostRecord{PID: command.Process.Pid, Hub: hubOrigin, WorkerID: workerID,
-		WorkerPort: workerPort, MediaPort: mediaPort, ReceiptKey: base64.RawURLEncoding.EncodeToString(key)}
+	record.PID, record.WorkerPort, record.MediaPort = command.Process.Pid, workerPort, mediaPort
+	record.ReceiptKey = base64.RawURLEncoding.EncodeToString(key)
 	raw, _ := json.Marshal(record)
 	if err := writePrivate(h.path("host.json"), raw); err != nil {
 		_ = command.Process.Signal(syscall.SIGTERM)
-		return nil, exit.Internalf("cannot record the machine Host: %s", err)
+		return nil, record, exit.Internalf("cannot record the machine Host: %s", err)
 	}
-	launch, problem := h.await(ctx, record)
+	launch, problem := h.await(ctx, &record)
 	if problem != nil && problem.ErrName() == "machine.host_exited" {
 		output := logSince(h.path("host.log"), offset)
 		if strings.Contains(output, "address already in use") {
-			return nil, exit.Named(exit.Unavailable, "machine.host_port_taken", "the machine Host's port was taken")
+			return nil, record, exit.Named(exit.Unavailable, "machine.host_port_taken", "the machine Host's port was taken")
 		}
-		return nil, exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness: %s", output)
+		return nil, record, exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness: %s", output)
 	}
 	if problem != nil && problem.Code == exit.Credential {
 		_ = command.Process.Signal(syscall.SIGTERM)
 	}
-	return launch, problem
+	return launch, record, problem
 }
 
 // Stop ends the running Host. Its Store, installs and identity remain under the root.

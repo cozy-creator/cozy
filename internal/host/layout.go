@@ -61,8 +61,9 @@ func prepare(g *Grant, l Layout) (*Identity, error) {
 			return nil, err
 		}
 	}
-	for _, stale := range []string{"readiness-payload", "tensorhub-ca.crt", "worker-activity"} {
-		if err := os.Remove(l.boot(stale)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	stale, _ := filepath.Glob(l.boot("hub-ca-*.crt"))
+	for _, name := range append(stale, l.boot("readiness-payload"), l.boot("tensorhub-ca.crt"), l.boot("worker-activity"), l.boot("machine-hubs.json")) {
+		if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 	}
@@ -86,12 +87,43 @@ func prepare(g *Grant, l Layout) (*Identity, error) {
 	if err := writeAtomic(l.boot("machine-publication-authority.json"), authority, 0o400); err != nil {
 		return nil, err
 	}
+	if err := writeHubs(g.Hubs, l); err != nil {
+		return nil, err
+	}
 	leaf, err := leaf(l.boot("tls.crt"), l.boot("tls.key"))
 	if err != nil {
 		return nil, err
 	}
 	sum := sha256.Sum256(leaf.Certificate[0])
 	return &Identity{BootID: string(bootID), Leaf: leaf, Digest: sum[:]}, nil
+}
+
+// writeHubs hands the Runtime every other Hub this machine is registered at, beside the closed
+// default-Hub grant an older Runtime reads alone: machine-hubs.json and each private CA.
+func writeHubs(hubs []HubGrant, l Layout) error {
+	if len(hubs) == 0 {
+		return nil
+	}
+	type entry struct {
+		Origin      string   `json:"origin"`
+		WorkerID    string   `json:"worker_id"`
+		WorkerToken string   `json:"worker_token"`
+		CA          string   `json:"ca,omitempty"`
+		ObjectHosts []string `json:"object_storage_hosts,omitempty"`
+	}
+	rows := make([]entry, 0, len(hubs))
+	for i, h := range hubs {
+		row := entry{Origin: h.Origin, WorkerID: h.WorkerID, WorkerToken: h.WorkerToken, ObjectHosts: h.ObjectHosts}
+		if len(h.CA) > 0 {
+			row.CA = fmt.Sprintf("hub-ca-%d.crt", i+1)
+			if err := writeAtomic(l.boot(row.CA), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: h.CA}), 0o444); err != nil {
+				return err
+			}
+		}
+		rows = append(rows, row)
+	}
+	raw, _ := json.Marshal(map[string]any{"version": 1, "hubs": rows})
+	return writeAtomic(l.boot("machine-hubs.json"), raw, 0o400)
 }
 
 func persistent(path string, mint func() ([]byte, error)) ([]byte, error) {
