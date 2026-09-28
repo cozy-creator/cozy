@@ -1,4 +1,4 @@
-package webrtc_test
+package producttest
 
 import (
 	"io"
@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// relay is a path between client and machine: it forwards each TCP connection with a
+// mediaLink is a path between client and machine: it forwards each TCP connection with a
 // one-way delay each way (RTT = 2 × delay), optionally through a bottleneck of rate bytes/s
 // with an unbounded queue, and can kill every connection at once.
-type relay struct {
+type mediaLink struct {
 	ln       net.Listener
 	delay    time.Duration
 	rate     float64
@@ -21,16 +21,16 @@ type relay struct {
 	maxQueue time.Duration // the longest any byte waited at the bottleneck
 }
 
-func newRelay(t testing.TB, target netip.AddrPort, delay time.Duration) *relay {
-	return newLink(t, target, delay, 0)
+func newMediaRelay(t testing.TB, target netip.AddrPort, delay time.Duration) *mediaLink {
+	return newMediaLink(t, target, delay, 0)
 }
 
-func newLink(t testing.TB, target netip.AddrPort, delay time.Duration, rate float64) *relay {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+func newMediaLink(t testing.TB, target netip.AddrPort, delay time.Duration, rate float64) *mediaLink {
+	ln, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow a test path between client and listener
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &relay{ln: ln, delay: delay, rate: rate}
+	r := &mediaLink{ln: ln, delay: delay, rate: rate}
 	t.Cleanup(func() { ln.Close(); r.kill() })
 	go func() {
 		for {
@@ -53,10 +53,10 @@ func newLink(t testing.TB, target netip.AddrPort, delay time.Duration, rate floa
 	return r
 }
 
-func (r *relay) addr() netip.AddrPort { return r.ln.Addr().(*net.TCPAddr).AddrPort() }
+func (r *mediaLink) addr() netip.AddrPort { return r.ln.Addr().(*net.TCPAddr).AddrPort() }
 
 // kill resets every connection, as a dropped path does.
-func (r *relay) kill() {
+func (r *mediaLink) kill() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, c := range r.conns {
@@ -66,7 +66,7 @@ func (r *relay) kill() {
 	r.conns = nil
 }
 
-func (r *relay) forward(dst, src net.Conn) {
+func (r *mediaLink) forward(dst, src net.Conn) {
 	defer dst.Close()
 	if r.delay == 0 && r.rate == 0 {
 		io.Copy(dst, src)
