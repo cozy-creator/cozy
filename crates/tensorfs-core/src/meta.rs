@@ -222,12 +222,7 @@ impl Meta {
 
     fn connection(&self) -> Result<Connection> {
         let connection = Connection::open(&self.db).map_err(|error| sql("open catalog", error))?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| sql("set catalog busy timeout", error))?;
-        connection
-            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
-            .map_err(|error| sql("configure catalog", error))?;
+        crate::catalog::configure(&connection, &self.db)?;
         Ok(connection)
     }
 

@@ -51,12 +51,8 @@
 //! a broken one.
 //!
 //! A refusal at the admission door propagates untouched: the bytes are wrong at the only
-//! authority there is. `IO_FAILED` is the one exception, and it is not an exception to the
-//! rule but an application of it: the catalog is a rollback-journal SQLite with a busy
-//! timeout, and sixteen concurrent writers make "database is locked" a fact about this
-//! second. A lock held five seconds ago is not held when we ask again, and it was killing
-//! whole multi-gigabyte walks after the bytes had landed. It re-asks with no wait at all,
-//! because the wait already happened inside SQLite'''s busy timeout.
+//! authority there is. The catalog waits for a live lock holder instead of refusing
+//! (`catalog::lock`), so sixteen concurrent writers queue rather than fail.
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, Destination, FetchPlan};
@@ -1490,15 +1486,13 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     if plan.wanted.is_empty() && records_checkpoint(request.store, &closure) {
         return Ok(report);
     }
-    // The proof and the index row both read and write the catalog, and a walk that has just
-    // landed gigabytes must not be thrown away because the store was busy for a moment while
-    // its own streams were closing. Same rule as the walk's: a contended local store is a
-    // fact about this second.
-    while_store_busy(|| match closure.scope.as_str() {
+    // The proof and the index row both write the catalog; a contended catalog waits for its
+    // live holder (`catalog::lock`), so a busy moment never throws a landed walk away.
+    match closure.scope.as_str() {
         "runtime" => plan.complete_cozytensors(request.store),
         _ => plan.complete(request.store),
-    })?;
-    while_store_busy(|| record_locally(request.store, &closure))?;
+    }?;
+    record_locally(request.store, &closure)?;
     Ok(report)
 }
 
@@ -1632,26 +1626,6 @@ fn holds_lane(repository: Option<&crate::repository::Repository>, closure: &hub:
                         .any(|lane| lane.lane == closure.lane && lane.manifest == closure.manifest)
             })
         })
-}
-
-/// Re-run while the LOCAL store answers `IO_FAILED`, which at this concurrency is dominated
-/// by SQLite's "database is locked". Bounded by the same `FETCH_ATTEMPTS` the walk uses, and
-/// with no wait of its own: the wait already happened inside the busy timeout, and a lock
-/// held a moment ago is not held now. Every other code is taken at face value on the first
-/// answer — proto-035's polarity, an allow-list of transient codes.
-fn while_store_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
-    let mut last = None;
-    for _ in 0..FETCH_ATTEMPTS {
-        match attempt() {
-            Ok(value) => return Ok(value),
-            Err(refusal) if refusal.code == Code::IO_FAILED => last = Some(refusal),
-            Err(refusal) => return Err(refusal),
-        }
-    }
-    Err(last.unwrap_or(Refusal {
-        code: Code::IO_FAILED,
-        detail: "the local store stayed busy".into(),
-    }))
 }
 
 /// RECORD WHAT THE PULL RESOLVED. The closure carries `model`, `release` and `lane` for
