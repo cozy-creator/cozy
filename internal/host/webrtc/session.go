@@ -348,8 +348,8 @@ func (c *session) get(st *stream, run uint64, req request, index int) {
 	}
 	etag := "r" + strconv.FormatUint(snap.Rev, 10)
 	end := snap.Length
-	if req.Length > 0 {
-		end = min(end, req.Offset+req.Length)
+	if req.Length > 0 && req.Length < end-req.Offset {
+		end = req.Offset + req.Length
 	}
 	switch {
 	case req.ETag != "" && req.ETag != etag:
