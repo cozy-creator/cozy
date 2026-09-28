@@ -2340,6 +2340,33 @@ pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
         .map_err(|e| io(format!("fsync dir {}", dir.display()), e))
 }
 
+/// Make an entry just renamed into `dir` durable. The ancestors up to the store `root` hold
+/// only directory entries, which change when a directory is created, so each process syncs
+/// them once per `dir` (by inode: a recreated directory syncs again) rather than on every
+/// write. A child call's input hold wrote one root and paid four fsyncs; it now pays two.
+pub(crate) fn fsync_entry_dir(root: &Path, dir: &Path) -> Result<()> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SYNCED: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
+    fsync_dir(dir)?;
+    let meta = fs::metadata(dir).map_err(|e| io(format!("stat {}", dir.display()), e))?;
+    let identity = (meta.dev(), meta.ino());
+    let synced = SYNCED.get_or_init(Default::default);
+    if synced.lock().is_ok_and(|set| set.contains(&identity)) {
+        return Ok(());
+    }
+    for ancestor in dir.ancestors().skip(1) {
+        fsync_dir(ancestor)?;
+        if ancestor == root {
+            break;
+        }
+    }
+    if let Ok(mut set) = synced.lock() {
+        set.insert(identity);
+    }
+    Ok(())
+}
+
 pub(crate) fn now_nanos_unique() -> u128 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);

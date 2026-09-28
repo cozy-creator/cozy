@@ -155,16 +155,7 @@ fn write(store: &Store, root: &CheckpointRoot) -> Result<()> {
             .and_then(|()| file.sync_all())
             .map_err(io)?;
         fs::rename(&temporary, path).map_err(io)?;
-        for directory in [
-            directory(store),
-            store.root().join("roots"),
-            store.root().to_path_buf(),
-        ] {
-            File::open(directory)
-                .and_then(|file| file.sync_all())
-                .map_err(io)?;
-        }
-        Ok(())
+        crate::store::fsync_entry_dir(store.root(), &directory(store))
     })();
     let _ = fs::remove_file(temporary);
     result

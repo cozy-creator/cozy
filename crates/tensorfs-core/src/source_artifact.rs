@@ -155,14 +155,7 @@ fn write(store: &Store, root: &TreeRoot) -> Result<()> {
         .and_then(|()| file.sync_all())
         .map_err(io)?;
     fs::rename(tmp, path).map_err(io)?;
-    for dir in [
-        directory(store),
-        store.root().join("roots"),
-        store.root().to_path_buf(),
-    ] {
-        File::open(dir).and_then(|f| f.sync_all()).map_err(io)?;
-    }
-    Ok(())
+    crate::store::fsync_entry_dir(store.root(), &directory(store))
 }
 fn verify(store: &Store, manifest: &ObjectRef) -> Result<Manifest> {
     let tree = store.read_manifest(manifest)?;
