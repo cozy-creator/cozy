@@ -10,6 +10,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -71,7 +72,7 @@ func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
 	if _, problem := install.CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected); problem == nil {
 		t.Fatal("remote wheel omitted its required Runtime closure")
 	}
-	dependencies["cozy-runtime"] = packagepublish.CapturedDependency{Name: "cozy-runtime", Version: "0.18.30", Requirement: "cozy-runtime==0.18.30"} //cozy:allow captured distribution row, nothing shells out
+	dependencies["cozy-runtime"] = packagepublish.CapturedDependency{Name: "cozy-runtime", Version: hostruntime.PackageFloor, Requirement: "cozy-runtime==" + hostruntime.PackageFloor} //cozy:allow captured distribution row, nothing shells out
 	result, problem := install.CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected)
 	if problem != nil {
 		t.Fatal(problem)
@@ -85,7 +86,7 @@ func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
 	if _, problem := install.InstalledRequirements(context.Background(), result.Install); problem != nil {
 		t.Fatal(problem)
 	}
-	if _, problem := localpackage.StageWheels(layout, result.Install, surface.Raw, []string{result.CapturedProjectWheel}, []byte("cozy-runtime==0.18.30\n")); problem != nil {
+	if _, problem := localpackage.StageWheels(layout, result.Install, surface.Raw, []string{result.CapturedProjectWheel}, []byte("cozy-runtime=="+hostruntime.PackageFloor+"\n")); problem != nil {
 		t.Fatal(problem)
 	}
 }

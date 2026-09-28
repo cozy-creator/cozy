@@ -41,7 +41,7 @@ func pythonExportToolchain(t *testing.T) (string, string, string) {
 	must(t, err)
 	runtimeScript := fmt.Sprintf(`#!/bin/sh
 if [ "$2" = version ]; then
- printf '%%s\n' '{"distribution":"%s","wire_protocol":"cozy.worker.v1+minor.54"}'
+ printf '%%s\n' '{"distribution":"%s","wire_protocol":"`+runtimeWireProtocol+`"}'
  exit 0
 fi
 if [ "$2" = python-ensure ]; then

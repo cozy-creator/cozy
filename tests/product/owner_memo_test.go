@@ -58,13 +58,11 @@ func TestAMachineMemoLookupIsAnsweredFromTheOwnersRecords(t *testing.T) {
 	must(t, err)
 	for _, arm := range []struct {
 		name     string
-		capable  bool
 		served   bool
 		answered []byte
 	}{
-		{"hit", true, true, recorded},
-		{"checkpoint gone", true, false, nil},
-		{"older runtime", false, true, nil},
+		{"hit", true, recorded},
+		{"checkpoint gone", false, nil},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -92,13 +90,13 @@ func TestAMachineMemoLookupIsAnsweredFromTheOwnersRecords(t *testing.T) {
 			fatal(t, store.LinkMachineExecution(request.ID, podRental))
 			capture, spec := []byte(`{"capture":"immutable"}`), []byte(`{"invocation":"immutable"}`)
 			submission := &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "workspace", SubmissionId: request.IdemKey,
-				CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture), OwnerMemo: arm.capable,
+				CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture), OwnerMemo: true,
 				Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}
 			fatal(t, store.RecordMachineSubmission(request.ID, submission))
 			fatal(t, store.AcceptMachineExecution(request.ID, &pb.MachineExecutionReceipt{RequestId: request.ID, SubmissionId: request.IdemKey,
 				CaptureDigest: submission.CaptureDigest, InvocationSpecDigest: submission.Offer.InvocationSpecDigest,
 				AcceptedAtMs: uint64(time.Now().UnixMilli()), WorkerId: podWorkerID, WorkerBootId: podBootID, ExecutionWorkspaceId: "workspace"}))
-			machine := &memoMachine{memo: arm.capable, reconcilingMachine: reconcilingMachine{state: &pb.MachineExecutionState{RequestId: request.ID,
+			machine := &memoMachine{memo: true, reconcilingMachine: reconcilingMachine{state: &pb.MachineExecutionState{RequestId: request.ID,
 				WorkerId: podWorkerID, WorkerBootId: podBootID, ExecutionWorkspaceId: "workspace", Generation: 1, AttemptOrdinal: 1, State: "running"}}}
 			machine.record("running", map[string]any{})
 			machine.record("memo.lookup", map[string]any{"call_index": 0, "operation": "upload_huggingface", "computation_digest": key})
@@ -138,17 +136,6 @@ func TestAMachineMemoLookupIsAnsweredFromTheOwnersRecords(t *testing.T) {
 				"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 			startDaemonProcess(t, root)
 
-			if !arm.capable {
-				waitFor(t, root, "the lookup to be observed", func() bool {
-					events, problem := store.EventsAfter(request.ID, 0, 100)
-					return problem == nil && len(events) > 0 && events[len(events)-1].Type == "machine.memo.lookup"
-				})
-				time.Sleep(3 * time.Second) // several observations: an older Runtime is never answered
-				if controls := machine.reconciled(); len(controls) != 0 {
-					t.Fatalf("a Runtime without memo_lookup was answered: %+v", controls)
-				}
-				return
-			}
 			waitFor(t, root, "the owner's answer", func() bool { return len(machine.reconciled()) > 0 })
 			answer := machine.reconciled()[0]
 			digest, _ := hex.DecodeString(strings.Repeat("a", 64))

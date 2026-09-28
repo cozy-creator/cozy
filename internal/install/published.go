@@ -86,4 +86,3 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	// Serving selections are prepared by the claimed worker before activation.
 	return packageInterface, empty, runtimeBin, environment, nil
 }
-

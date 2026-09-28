@@ -31,7 +31,6 @@ const reconciledPublication = "call-5e0c5e0c"
 // owner's forwarded finalization read, reporting the settlement as Runtime does.
 type reconcilingMachine struct {
 	mu       sync.Mutex
-	capable  bool
 	state    *pb.MachineExecutionState
 	events   []*pb.MachineExecutionEvent
 	controls []*pb.MachineExecutionControl
@@ -106,14 +105,12 @@ func TestExpiredMachinePublicationIsSettledFromTheOwnersHubRead(t *testing.T) {
 	committed := `{"operation":"` + reconciledPublication + `","result":{"checkpoint_id":"sha256:` + strings.Repeat("c", 64) +
 		`"},"state":"completed","status_url":"/v1/models/alice/model/publications/` + reconciledPublication + `/finalization"}`
 	for _, arm := range []struct {
-		name    string
-		capable bool
-		status  int
-		body    string
+		name   string
+		status int
+		body   string
 	}{
-		{"committed", true, http.StatusOK, committed},
-		{"never finalized", true, http.StatusNotFound, `{"error":{"code":"publication.finalization_absent","message":"finalization has not been requested"}}`},
-		{"older runtime", false, http.StatusOK, committed},
+		{"committed", http.StatusOK, committed},
+		{"never finalized", http.StatusNotFound, `{"error":{"code":"publication.finalization_absent","message":"finalization has not been requested"}}`},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -139,7 +136,7 @@ func TestExpiredMachinePublicationIsSettledFromTheOwnersHubRead(t *testing.T) {
 			fatal(t, store.AcceptMachineExecution(request.ID, &pb.MachineExecutionReceipt{RequestId: request.ID, SubmissionId: request.IdemKey,
 				CaptureDigest: submission.CaptureDigest, InvocationSpecDigest: submission.Offer.InvocationSpecDigest,
 				AcceptedAtMs: uint64(time.Now().UnixMilli()), WorkerId: podWorkerID, WorkerBootId: podBootID, ExecutionWorkspaceId: "workspace"}))
-			machine := &reconcilingMachine{capable: arm.capable, state: &pb.MachineExecutionState{RequestId: request.ID,
+			machine := &reconcilingMachine{state: &pb.MachineExecutionState{RequestId: request.ID,
 				WorkerId: podWorkerID, WorkerBootId: podBootID, ExecutionWorkspaceId: "workspace", Generation: 1, AttemptOrdinal: 1, State: "running"}}
 			machine.record("running", map[string]any{})
 			machine.record("publication_unresolved", map[string]any{"call_index": 3, "publication": reconciledPublication,
@@ -210,31 +207,17 @@ func TestExpiredMachinePublicationIsSettledFromTheOwnersHubRead(t *testing.T) {
 				_, show := runCozy(t, root, "run", "show", number)
 				return strings.Contains(list, surfaced) && strings.Contains(show, surfaced)
 			})
-			if arm.capable {
-				waitFor(t, root, "an owner read Hub could not answer yet", func() bool {
-					mu.Lock()
-					defer mu.Unlock()
-					return len(reads) > 0
-				})
-			}
+			waitFor(t, root, "an owner read Hub could not answer yet", func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(reads) > 0
+			})
 			if controls := machine.reconciled(); len(controls) != 0 {
 				t.Fatalf("a read that settled nothing was forwarded: %+v", controls)
 			}
 			mu.Lock()
 			answered = true
 			mu.Unlock()
-			if !arm.capable {
-				time.Sleep(3 * time.Second) // several observations: an older Runtime is never sent the action
-				if controls := machine.reconciled(); len(controls) != 0 {
-					t.Fatalf("an older Runtime was sent the reconciliation action: %+v", controls)
-				}
-				mu.Lock()
-				defer mu.Unlock()
-				if len(reads) != 0 {
-					t.Fatalf("the owner read Hub for a Runtime that cannot settle from it: %v", reads)
-				}
-				return
-			}
 			waitFor(t, root, "the forwarded owner read", func() bool { return len(machine.reconciled()) > 0 })
 			control := machine.reconciled()[0]
 			if control.Execution.GetRequestId() != request.ID || control.Publication.GetCallIndex() != 3 ||

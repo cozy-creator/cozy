@@ -13,7 +13,7 @@ func TestEnsurePythonUsesSharedRuntimeAndPreservesExactPatch(t *testing.T) {
 	root := t.TempDir()
 	script := `#!/bin/sh
 if [ "$2" = version ]; then
- printf '%s\n' '{"distribution":"` + hostruntime.ToolFloor + `","wire_protocol":"cozy.worker.v1+minor.54"}'
+ printf '%s\n' '{"distribution":"` + hostruntime.ToolFloor + `","wire_protocol":"` + runtimeWireProtocol + `"}'
  exit 0
 fi
 if [ "$1" != --json ] || [ "$2" != python-ensure ] || [ "$3" != '>=3.13,<3.14' ] || [ "$4" != 3.13.7 ]; then exit 2; fi
@@ -33,7 +33,7 @@ func TestEnsurePythonPreservesTypedProvisioningRefusal(t *testing.T) {
 	root := t.TempDir()
 	script := `#!/bin/sh
 if [ "$2" = version ]; then
- printf '%s\n' '{"distribution":"` + hostruntime.ToolFloor + `","wire_protocol":"cozy.worker.v1+minor.54"}'
+ printf '%s\n' '{"distribution":"` + hostruntime.ToolFloor + `","wire_protocol":"` + runtimeWireProtocol + `"}'
  exit 0
 fi
 printf '%s\n' 'Installing CPython 3.13.7' '{"error":{"name":"python_provision_failed","message":"download unavailable","remedy":"retry when online"}}' >&2

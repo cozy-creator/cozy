@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
@@ -46,6 +47,9 @@ func fullRun(t *testing.T, why string) {
 
 // The two binaries the suite drives as real processes, built once by TestMain.
 var cozyBin string
+
+// runtimeWireProtocol is what a current cozy-runtime's `version` names.
+var runtimeWireProtocol = fmt.Sprintf("cozy.worker.v1+minor.%d", pb.WireMinor)
 
 // scratchBase is this process's own scratch root. Named roots live under it, so two
 // concurrent runs of the same test never share a COZY_HOME or its database.

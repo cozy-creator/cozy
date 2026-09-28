@@ -37,12 +37,12 @@ func hostRuntimeIdentity(env []string) (distribution, commit string, err error) 
 	return version.Distribution, version.Commit, nil
 }
 
-// Runtime fixture declarations use a public compatibility floor. Exact local
+// Runtime fixture declarations use the oldest Runtime this Creator speaks to. Exact local
 // builds remain selected through their tool.uv.sources wheel path.
 func runtimeFixtureVersion(t *testing.T, wheel string) string {
 	t.Helper()
 	if wheel == "" {
-		return hostruntime.PackageFloor
+		return hostruntime.ToolFloor
 	}
 	parts := strings.Split(filepath.Base(wheel), "-")
 	if len(parts) < 3 || parts[0] != "cozy_runtime" || parts[1] == "" || !strings.HasSuffix(wheel, ".whl") {

@@ -21,7 +21,7 @@ func TestPythonInventoryCarriesRuntimeOwnedRoot(t *testing.T) {
 			must(t, err)
 			script := fmt.Sprintf(`#!/bin/sh
 if [ "$2" = version ]; then
- printf '%%s\n' '{"distribution":"%s","wire_protocol":"cozy.worker.v1+minor.54"}'
+ printf '%%s\n' '{"distribution":"%s","wire_protocol":"`+runtimeWireProtocol+`"}'
  exit 0
 fi
 if [ "$2" != python-interpreters ]; then exit 91; fi
@@ -55,7 +55,7 @@ func TestPythonInventoryAcceptsANewerReportRevision(t *testing.T) {
 	toolDir := t.TempDir()
 	script := fmt.Sprintf(`#!/bin/sh
 if [ "$2" = version ]; then
- printf '%%s\n' '{"distribution":"%s","wire_protocol":"cozy.worker.v1+minor.54"}'
+ printf '%%s\n' '{"distribution":"%s","wire_protocol":"`+runtimeWireProtocol+`"}'
  exit 0
 fi
 printf '%%s\n' '%s'
