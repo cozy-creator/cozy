@@ -20,22 +20,24 @@ import (
 // series, and which ranks ran it. Every fact comes from the daemon's records (durable
 // events and the kept triage bundle); JSON also carries both sources whole.
 type runReport struct {
-	Number      int64         `json:"number"`
-	RequestID   string        `json:"request_id"`
-	Status      string        `json:"status"`
-	Target      string        `json:"target"`
-	Machine     string        `json:"machine,omitempty"`
-	CreatedAt   string        `json:"created_at"`
-	QueuedMS    int64         `json:"queued_ms"`
-	ExecutionMS int64         `json:"execution_ms"`
-	WallMS      int64         `json:"wall_ms,omitempty"`
-	Waiting     string        `json:"waiting,omitempty"`
-	ErrorType   string        `json:"error_type,omitempty"`
-	Error       string        `json:"error,omitempty"`
-	Stages      []reportStage `json:"stages"`
-	Steps       []reportSteps `json:"steps,omitempty"`
-	Degree      int           `json:"degree,omitempty"`
-	Ranks       []reportRank  `json:"ranks,omitempty"`
+	Number      int64  `json:"number"`
+	RequestID   string `json:"request_id"`
+	Status      string `json:"status"`
+	Target      string `json:"target"`
+	Machine     string `json:"machine,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	QueuedMS    int64  `json:"queued_ms"`
+	ExecutionMS int64  `json:"execution_ms"`
+	WallMS      int64  `json:"wall_ms,omitempty"`
+	Waiting     string `json:"waiting,omitempty"`
+	ErrorType   string `json:"error_type,omitempty"`
+	Error       string `json:"error,omitempty"`
+	// Warnings are what the machine reported about the run without failing it.
+	Warnings []reportWarning `json:"warnings,omitempty"`
+	Stages   []reportStage   `json:"stages"`
+	Steps    []reportSteps   `json:"steps,omitempty"`
+	Degree   int             `json:"degree,omitempty"`
+	Ranks    []reportRank    `json:"ranks,omitempty"`
 	// Resolved is what the machine installed and which checkpoint each Model slot ran: the
 	// run's reproducible identity, recorded by the machine that chose it.
 	Resolved map[string]any      `json:"resolved,omitempty"`
@@ -46,6 +48,11 @@ type runReport struct {
 	// CollectionPending names why a finished result still waits on its machine.
 	CollectionPending string `json:"collection_pending,omitempty"`
 	CollectionError   string `json:"collection_error,omitempty"`
+}
+
+type reportWarning struct {
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message"`
 }
 
 type reportStage struct {
@@ -183,6 +190,10 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			}
 		case "machine.resolved":
 			report.Resolved = event.Payload
+		case "machine.warning", "request.warning":
+			code, _ := event.Payload["code"].(string)
+			message, _ := event.Payload["message"].(string)
+			report.Warnings = append(report.Warnings, reportWarning{Code: code, Message: message})
 		case "request.preparing":
 			report.Stages = append(report.Stages, preparingStage(event.Payload))
 		case "request.log":
@@ -375,6 +386,13 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	}
 	if r.Error != "" {
 		fmt.Fprintf(w, "\nerror %s: %s", r.ErrorType, r.Error)
+	}
+	for _, warning := range r.Warnings {
+		if warning.Code != "" {
+			fmt.Fprintf(w, "\nwarning %s: %s", warning.Code, warning.Message)
+		} else {
+			fmt.Fprintf(w, "\nwarning: %s", warning.Message)
+		}
 	}
 	fmt.Fprintf(w, "\nqueued %s · execution %s", span(float64(r.QueuedMS)), span(float64(r.ExecutionMS)))
 	if r.WallMS > 0 {

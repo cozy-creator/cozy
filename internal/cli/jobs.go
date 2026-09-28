@@ -66,8 +66,14 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
-	if overrides.AttentionKernel != "" {
-		return exit.Usagef("kernel.attention applies only to serving callables")
+	if pin := ctx.Inv.Value("--attention-kernel"); pin != "" {
+		if overrides.AttentionKernel != "" && overrides.AttentionKernel != pin {
+			return exit.Usagef("attention kernel was pinned as both %s and %s", overrides.AttentionKernel, pin)
+		}
+		overrides.AttentionKernel = pin
+	}
+	if problem := launch.ValidateAttentionOverride(overrides.AttentionKernel); problem != nil {
+		return problem
 	}
 	prepareImage := imagePreparer(ctx)
 	input, assetFiles, assetTrees, e := launch.ParseTreeAssets(job, input, ctx.Inv.Values["--asset"])
@@ -101,7 +107,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory,
-		PlannedSourceBytes: ctx.ingestBytes}
+		PlannedSourceBytes: ctx.ingestBytes, AttentionKernel: overrides.AttentionKernel}
 	if deadline%time.Millisecond != 0 {
 		sub.TimeoutMS++
 	}

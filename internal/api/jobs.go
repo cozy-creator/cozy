@@ -70,6 +70,8 @@ type JobSubmission struct {
 	// PlannedSourceBytes is what a script ingest will pull, so a rental bought for it
 	// is sized to the ingest.
 	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
+	// AttentionKernel is an optional developer execution-path pin; the job's calls inherit it.
+	AttentionKernel string `json:"attention_kernel,omitempty"`
 }
 
 // JobHandle is the 202 answer.
@@ -458,6 +460,10 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 		ModelTransfer: sub.ModelTransfer, PlannedSourceBytes: sub.PlannedSourceBytes,
+		AttentionKernel: sub.AttentionKernel,
+	}
+	if problem := launch.ValidateAttentionOverride(out.AttentionKernel); problem != nil {
+		return out, nil, problem
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental, hub); problem != nil {
 		return out, nil, problem
@@ -735,6 +741,9 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.TimeoutMS > 0 {
 		doc["timeout_ms"] = spec.TimeoutMS
+	}
+	if spec.AttentionKernel != "" {
+		doc["attention_kernel"] = spec.AttentionKernel
 	}
 	if len(spec.AllowPublish) > 0 {
 		values := make([]canonical.Value, 0, len(spec.AllowPublish))
