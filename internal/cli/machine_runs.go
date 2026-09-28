@@ -183,7 +183,11 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				}
 				if unsent {
 					// A run still waiting to reach its machine says why, as a queued run does.
-					_ = m.store.AppendEvent(request.ID, "request.parked", 0, map[string]any{"reason": problem.Message, "wait": orchestrator.WaitRental})
+					parked := map[string]any{"reason": problem.Message, "wait": orchestrator.WaitRental}
+					if row.Machine != "" {
+						parked["waiting_on"] = row.Machine
+					}
+					_ = m.store.AppendEvent(request.ID, "request.parked", 0, parked)
 				}
 			}
 			select {

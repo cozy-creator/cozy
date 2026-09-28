@@ -654,30 +654,8 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	m.mu.Unlock()
 	m.owner.AwaitRental(req.ID, purchase.machine)
 	row, bought, _, problem := purchase.complete(context.Background(), func(seen hub.Rental) {
-		// A failure carried by a rental that is BACK in pending_acquisition is the
-		// hub saying "that one did not work; I am buying again". The detail names
-		// what refused, so a replan is visible AND attributable rather than being
-		// 32 silent seconds inside a longer silence.
-		retrying := seen.Failure != nil
-		detail := seen.Detail
-		if retrying && seen.Failure.Code != "" {
-			detail = seen.Failure.Code
-			if seen.Failure.ProviderHostID != "" {
-				detail += " on " + seen.Failure.ProviderHostID
-			}
-		}
-		if name := orchestrator.PhaseOfHubRental(seen.State, seen.ProviderState,
-			seen.ContainerState, retrying); name != "" {
-			m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
-				Name: name, Machine: seen.Name, Detail: detail,
-				Rental: &orchestrator.RentalProgress{
-					AcceleratorModel:      seen.AcceleratorModel,
-					AcceleratorCount:      seen.AcceleratorCount,
-					HourlyRateUSDMicros:   seen.HourlyRateUSDMicros,
-					BaseWorkerImageDigest: seen.BaseWorkerImageDigest,
-					BaseWorkerImageTag:    seen.BaseWorkerImageTag,
-					BaseWorkerProfile:     seen.BaseWorkerProfile,
-				}})
+		if sample, ok := orchestrator.RentalSample(seen); ok {
+			m.owner.ObservePhase(req.ID, sample)
 		}
 	})
 	m.owner.ForgetPhase(req.ID)
@@ -750,6 +728,28 @@ func (m *managedRentals) releaseOrphaned() {
 // The cost is one GET per rental — a fleet is a handful of pods, not a datacenter.
 const hubReconcileCadence = 10 * time.Second
 
+// refreshBooting re-reads, at the cadence a rental verb samples a provisioning rental, only
+// the rentals the Hub is still acquiring: their boot is what the work pinned to them shows
+// while it waits. A problem waits for the sweep, which names it.
+func (m *managedRentals) refreshBooting() {
+	origins, problem := m.origins()
+	if problem != nil {
+		return
+	}
+	for _, origin := range origins {
+		_ = m.reconcileRows(origin, func(row records.Rental) bool { return acquiringState(row.State) })
+	}
+}
+
+// acquiringState is a Hub rental state before the pod is ready.
+func acquiringState(state string) bool {
+	switch state {
+	case "pending_acquisition", "acquiring", "booting":
+		return true
+	}
+	return false
+}
+
 // watch is the idle release's own loop. It re-reads the records at pollCadence — the
 // resolution every rental verb already samples a rental at — and acts only on what they
 // say; the grace is the debounce, and a sample that finds nothing to do costs a few local
@@ -783,7 +783,9 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 		closed := m.closed
 		m.mu.Unlock()
 		if !closed {
-			if time.Since(reconciled) >= hubReconcileCadence {
+			if time.Since(reconciled) < hubReconcileCadence {
+				m.refreshBooting()
+			} else {
 				reconciled = time.Now()
 				problems := m.reconcileAll()
 				m.mu.Lock()
@@ -997,17 +999,27 @@ func (m *managedRentals) wakeQueueAsync() {
 // existed. Local-row reconciliation can correct a row; it can never notice a pod that
 // has no row. The Hub is asked with the lock released; its answers are applied under
 // the lock to the rows as they are by then.
-func (m *managedRentals) reconcile(origin string) *exit.Error {
+func (m *managedRentals) reconcile(origin string) *exit.Error { return m.reconcileRows(origin, nil) }
+
+// reconcileRows is reconcile, or with only, a re-read of just the rows it keeps: no rowless
+// asks and no account listing.
+func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) bool) *exit.Error {
 	origin = m.origin(origin)
 	m.mu.Lock()
 	rows, problem := m.reconcilableLocked(origin)
 	var asks []records.RentalOperation
-	if problem == nil {
+	if problem == nil && only == nil {
 		asks, problem = m.rowlessAsksLocked(origin)
 	}
 	m.mu.Unlock()
 	if problem != nil {
 		return problem
+	}
+	if only != nil {
+		rows = slices.DeleteFunc(rows, func(row records.Rental) bool { return !only(row) })
+		if len(rows) == 0 {
+			return nil
+		}
 	}
 	owner := client(m.at(origin))
 	views := make([]rentalView, 0, len(rows))
@@ -1046,7 +1058,7 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 	var listing []hub.Rental
 	var listed bool
 	var listingProblem *exit.Error
-	if asked == nil {
+	if asked == nil && only == nil {
 		hctx, cancel := hub.Context()
 		listing, listingProblem = owner.Rentals(hctx)
 		listed = listingProblem == nil
@@ -1067,6 +1079,7 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 			// present the previous listing as current.
 			census.listed, census.listingProblem, census.unrecorded, census.live = false, asked, nil, nil
 		}
+	case only != nil:
 	default:
 		m.applyListingLocked(origin, listing, listed, listingProblem)
 	}
@@ -1298,6 +1311,9 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			continue
 		}
 		m.observeDiskLocked(row.ID, remote)
+		if m.owner != nil {
+			m.owner.ObserveRental(remote)
+		}
 		// Adopt the hub's reconciled billed rate (th-120): the burn this host
 		// reports and caps on must be what the provider actually charges.
 		if remote.HourlyRateUSDMicros > 0 {
@@ -1367,9 +1383,12 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 // to be found from the side that still has rows (observed live 2026-09-04, rental
 // pr-183abac284d1e16f5f0a).
 func (m *managedRentals) letGo(released, failed []string) *exit.Error {
-	if m.forget != nil {
-		for _, id := range append(failed, released...) {
+	for _, id := range append(failed, released...) {
+		if m.forget != nil {
 			m.forget(id)
+		}
+		if m.owner != nil {
+			m.owner.ForgetRental(id)
 		}
 	}
 	for _, id := range released {

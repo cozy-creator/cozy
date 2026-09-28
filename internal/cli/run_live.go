@@ -163,8 +163,14 @@ func (p *RunProgress) onLive(e localapi.Event) {
 		if name == "" || v.executing {
 			return // replayed preparation cannot replace execution
 		}
-		if machine, _ := fields["machine"].(string); machine != "" && v.machine == "" {
+		machine, _ := fields["machine"].(string)
+		if machine != "" && v.machine == "" {
 			v.machine = machine
+		}
+		if bootOf(fields) != nil {
+			// One stage for the whole boot, however many phases and attempts it passes.
+			v.enter("boot:"+machine, e, at, "queued")
+			break
 		}
 		v.enter("phase:"+name, e, at, "preparing")
 	case "preparing":
@@ -178,7 +184,7 @@ func (p *RunProgress) onLive(e localapi.Event) {
 		// A queue heartbeat says less than the live preparation phase.
 		cause, _ := e.Payload["wait"].(string)
 		capacity := cause == orchestrator.WaitSlotBusy || cause == orchestrator.WaitQueueAhead
-		if v.executing || v.phase != nil && strings.HasPrefix(v.phase.key, "phase:") && !capacity &&
+		if v.executing || v.phase != nil && v.phase.observed() && !capacity &&
 			!(cause == orchestrator.WaitRental && v.phase.key == "phase:rental") {
 			return
 		}
@@ -364,22 +370,39 @@ func (v *liveView) retire(s *liveStage, end time.Time, failed bool) {
 	v.done = append(v.done, liveDone{stage: stage, label: label, took: max(end.Sub(s.started), 0), failed: failed})
 }
 
-// enter makes key the preparation lane's current stage, closing a different one now.
+// observed is a stage a producer measured, which a queue heartbeat never replaces.
+func (s *liveStage) observed() bool {
+	return strings.HasPrefix(s.key, "phase:") || strings.HasPrefix(s.key, "boot:")
+}
+
+// enter makes key the preparation lane's current stage, closing a different one now. A
+// rental's boot takes over the queue wait it explains rather than closing it.
 func (v *liveView) enter(key string, e localapi.Event, at time.Time, status string) {
+	fields, _ := e.Payload["value"].(map[string]any)
+	started := at
+	if elapsed, ok := number(fields["elapsed_ms"]); ok && elapsed > 0 {
+		started = at.Add(-time.Duration(elapsed) * time.Millisecond)
+	}
 	if v.phase != nil && v.phase.key != key {
-		v.retire(v.phase, at, false)
+		if strings.HasPrefix(key, "boot:") && v.phase.key == "wait" {
+			started = v.phase.started
+		} else {
+			v.retire(v.phase, at, false)
+		}
 		v.phase = nil
 	}
 	if v.phase == nil {
-		started := at
-		if fields, ok := e.Payload["value"].(map[string]any); ok {
-			if elapsed, ok := number(fields["elapsed_ms"]); ok && elapsed > 0 {
-				started = at.Add(-time.Duration(elapsed) * time.Millisecond)
-			}
+		if boot := bootOf(fields); boot != nil && !boot.StartedAt.IsZero() && boot.StartedAt.Before(started) {
+			started = boot.StartedAt
 		}
 		v.phase = &liveStage{key: key, started: started}
 	}
 	v.phase.event, v.phase.last, v.status = e, at, status
+	if machine, ok := strings.CutPrefix(key, "boot:"); ok {
+		w := describeBoot(machine, bootOf(fields), at)
+		v.phase.label = joinParts(w.subject(machine), w.where)
+		return
+	}
 	switch key {
 	case "wait":
 		v.phase.label = strings.TrimSpace(HumanWaitLine(e.Payload))
@@ -388,7 +411,6 @@ func (v *liveView) enter(key string, e localapi.Event, at time.Time, status stri
 	case "starting":
 		v.phase.label = "starting"
 	default:
-		fields, _ := e.Payload["value"].(map[string]any)
 		name, _ := fields["phase"].(string)
 		if name == orchestrator.WaitSlotBusy || name == orchestrator.WaitQueueAhead {
 			v.phase.label = strings.TrimSpace(HumanPhaseLine(fields))
@@ -552,6 +574,15 @@ func (s *liveStage) rows(at time.Time, width int) []string {
 
 func (s *liveStage) phaseRows(at time.Time, width int) []string {
 	rows := []string{"  ▸ " + s.label + " · " + shortDuration(max(at.Sub(s.started), 0))}
+	if machine, ok := strings.CutPrefix(s.key, "boot:"); ok {
+		fields, _ := s.event.Payload["value"].(map[string]any)
+		w := describeBoot(machine, bootOf(fields), at)
+		if w.replan != "" {
+			rows = append(rows, "    "+w.replan)
+		}
+		rows = append(rows, "    "+joinParts(w.stage, w.activity))
+		return append(rows, rentalRows(fields)...)
+	}
 	if !strings.HasPrefix(s.key, "phase:") {
 		return rows
 	}

@@ -93,15 +93,9 @@ type Rental struct {
 	// a comparison neither end can make by saying the token.
 	MediaTokenSHA256    []string
 	HourlyRateUSDMicros int64
-	// ProviderState and ContainerState are the provider's own lifecycle words for this
-	// pod, as the hub last observed them. They are here for one reason: without them the
-	// whole interval between "renting" and "attachable" is a single edge, and a person
-	// watching it cannot tell a provider queue from a multi-gigabyte image pull. They are
-	// the same class of fact the hub already publishes inside RentalFailure — a provider
-	// lifecycle fact the hub observed — and carry no acquisition identity of their own.
-	// Blank whenever the hub has not observed the pod yet, or is older than the field.
-	ProviderState         string
-	ContainerState        string
+	// Boot is the pod's boot while the rental is acquired; nil before an attempt exists,
+	// once it is ready or ended, and from a Hub older than the field.
+	Boot                  *RentalBoot
 	BaseWorkerImageDigest string
 	BaseWorkerImageTag    string
 	BaseWorkerProfile     string
@@ -112,6 +106,80 @@ type Rental struct {
 	CreatedAt string
 	// ContainerDiskGB is the disk the Hub bought for the pod, or 0 when it does not say.
 	ContainerDiskGB int
+}
+
+// RentalBoot is one boot attempt as the Hub observed it: which attempt, where, how far the
+// provider has brought the container, and when its boot log last moved. State is the
+// attempt's (obligated, ambiguous, booting) or "replanning" between a failed attempt and
+// the next; ReplannedFrom is the failed attempt this one replaces. Activity is the Hub's
+// reading of the provider boot log before a container runs (pulling_image,
+// creating_container, starting_container, stopping_container). ContainerStartedAt is the
+// provider running the container, HostAnsweredAt the pod's supervisor first answering.
+// Times are on this host's clock: the decoder shifts them by the Hub's reading of its own.
+type RentalBoot struct {
+	Attempt            int            `json:"attempt"`
+	State              string         `json:"state"`
+	Datacenter         string         `json:"datacenter,omitempty"`
+	Container          string         `json:"container,omitempty"`
+	RuntimeObserved    bool           `json:"runtime_observed,omitempty"`
+	Activity           string         `json:"activity,omitempty"`
+	StartedAt          time.Time      `json:"started_at,omitzero"`
+	LastProgressAt     time.Time      `json:"last_progress_at,omitzero"`
+	BootLogAt          time.Time      `json:"boot_log_at,omitzero"`
+	ContainerStartedAt time.Time      `json:"container_started_at,omitzero"`
+	HostAnsweredAt     time.Time      `json:"host_answered_at,omitzero"`
+	ReplannedFrom      *ReplannedBoot `json:"replanned_from,omitempty"`
+}
+
+// ReplannedBoot is a failed attempt the rental replaced with another host. ObservedMaxMS is
+// the boot time the Hub had observed for that product and image when it ended this one.
+type ReplannedBoot struct {
+	Attempt       int       `json:"attempt"`
+	Datacenter    string    `json:"datacenter"`
+	StartedAt     time.Time `json:"started_at"`
+	EndedAt       time.Time `json:"ended_at"`
+	FailureCode   string    `json:"failure_code,omitempty"`
+	ObservedMaxMS int64     `json:"observed_max_ms,omitempty"`
+}
+
+// Started is a container the provider has started: the pod's own boot is under way.
+func (b *RentalBoot) Started() bool {
+	return b.RuntimeObserved || b.Container == "running" || !b.ContainerStartedAt.IsZero()
+}
+
+// wireBoot is the Hub's boot on the Hub's clock, read at observed_at.
+type wireBoot struct {
+	RentalBoot
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+// local moves the Hub's times onto this host's clock, as of now.
+func (w *wireBoot) local(now time.Time) *RentalBoot {
+	if w == nil {
+		return nil
+	}
+	boot := w.RentalBoot
+	if w.ObservedAt.IsZero() {
+		return &boot
+	}
+	skew := now.Sub(w.ObservedAt)
+	shift := func(at *time.Time) {
+		if !at.IsZero() {
+			*at = at.Add(skew)
+		}
+	}
+	shift(&boot.StartedAt)
+	shift(&boot.LastProgressAt)
+	shift(&boot.BootLogAt)
+	shift(&boot.ContainerStartedAt)
+	shift(&boot.HostAnsweredAt)
+	if from := boot.ReplannedFrom; from != nil {
+		moved := *from
+		shift(&moved.StartedAt)
+		shift(&moved.EndedAt)
+		boot.ReplannedFrom = &moved
+	}
+	return &boot
 }
 
 // RentalFailure is Tensorhub's sanitized terminal boot diagnosis. It contains
@@ -175,8 +243,7 @@ type wireRental struct {
 	CreatorPublicKey      string         `json:"creator_public_key"`
 	MediaTokenSHA256      []string       `json:"media_token_sha256"`
 	HourlyRateUSDMicros   int64          `json:"hourly_rate_usd_micros"`
-	ProviderState         string         `json:"provider_state,omitempty"`
-	ContainerState        string         `json:"container_state,omitempty"`
+	Boot                  *wireBoot      `json:"boot,omitempty"`
 	BaseWorkerImageDigest string         `json:"base_worker_image_digest,omitempty"`
 	BaseWorkerImageTag    string         `json:"base_worker_image_tag,omitempty"`
 	BaseWorkerProfile     string         `json:"base_worker_profile,omitempty"`
@@ -213,8 +280,7 @@ func (w wireRental) rental() Rental {
 		CreatorPublicKey:      w.CreatorPublicKey,
 		MediaTokenSHA256:      w.MediaTokenSHA256,
 		HourlyRateUSDMicros:   w.HourlyRateUSDMicros,
-		ProviderState:         w.ProviderState,
-		ContainerState:        w.ContainerState,
+		Boot:                  w.Boot.local(time.Now()),
 		BaseWorkerImageDigest: w.BaseWorkerImageDigest,
 		BaseWorkerImageTag:    w.BaseWorkerImageTag,
 		BaseWorkerProfile:     w.BaseWorkerProfile,
