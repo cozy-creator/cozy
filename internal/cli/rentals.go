@@ -151,7 +151,7 @@ func handleRent(ctx *Context) *exit.Error {
 	completed, detached := false, false
 	defer func() {
 		if !completed && !detached {
-			progress.On(localapi.Event{Type: "request.failed"})
+			progress.On(localapi.Event{Type: "run.failed"})
 		}
 		progress.Done()
 	}()
@@ -177,7 +177,7 @@ func handleRent(ctx *Context) *exit.Error {
 
 	// Tensorhub readiness means this host can reach the machine; its first use dials and
 	// claims it.
-	progress.On(localapi.Event{Type: "request.completed"})
+	progress.On(localapi.Event{Type: "run.completed"})
 	progress.Done()
 	completed = true
 	ready := attachable

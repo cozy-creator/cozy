@@ -86,7 +86,7 @@ func TestLiveTablesAndWatchOwnTerminalInput(t *testing.T) {
 		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Kind: kind,
 			BodyDigest: "sha256:" + strings.Repeat("ab", 32), Package: "fixture/input", Entrypoint: "generate", Payload: []byte("{}")})
 		fatal(t, problem)
-		fatal(t, store.AppendEvent(id, "request.submitted", 0, map[string]any{"package": "fixture/input"}))
+		fatal(t, store.AppendEvent(id, "run.created", 0, map[string]any{"package": "fixture/input"}))
 	}
 	for _, test := range []struct {
 		name string
@@ -120,14 +120,14 @@ func TestLiveTablesAndWatchOwnTerminalInput(t *testing.T) {
 		events, problem := store.EventsAfter(id, 0, 256)
 		fatal(t, problem)
 		for _, event := range events {
-			if event.Type == "request.cancel_requested" || event.Type == "request.canceled" {
+			if event.Type == "request.cancel_requested" || event.Type == "run.canceled" {
 				t.Fatalf("watcher signal created a cancellation event for %s: %+v", id, event)
 			}
 		}
 	}
 	t.Run("json does not borrow input", func(t *testing.T) {
 		p := liveInputPTY(t, root, "run", "watch", "req-input-serving", "--json")
-		waitUntil(t, "JSON watcher attached", func() bool { return strings.Contains(p.output.String(), "request.submitted") })
+		waitUntil(t, "JSON watcher attached", func() bool { return strings.Contains(p.output.String(), "run.created") })
 		state, err := unix.IoctlGetTermios(int(p.master.Fd()), unix.TCGETS)
 		must(t, err)
 		if *state != p.original {

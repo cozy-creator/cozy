@@ -10,7 +10,7 @@ import (
 
 func (s *Store) RequestPublicationRepositories(id string) ([]string, *exit.Error) {
 	var raw []byte
-	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.allow_publish'),'[]') FROM request_events WHERE request_id=? AND type='request.submitted' ORDER BY seq LIMIT 1`, id).Scan(&raw)
+	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.allow_publish'),'[]') FROM request_events WHERE request_id=? AND type='run.created' ORDER BY seq LIMIT 1`, id).Scan(&raw)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

@@ -9,10 +9,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/cli"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func liveEvent(kind string, fields map[string]any) localapi.Event {
-	return localapi.Event{Type: "request." + kind, Attempt: 1,
+	return localapi.Event{Type: records.StateEvent(kind), Attempt: 1,
 		At: time.Now().UTC().Format(time.RFC3339Nano), Payload: map[string]any{"value": fields}}
 }
 
@@ -103,7 +104,7 @@ func TestReattachedProgressUsesRecordedStageBoundaries(t *testing.T) {
 	start := time.Now().Add(-20 * time.Minute)
 	replay := func(kind string, after time.Duration, seq int64, fields map[string]any) localapi.Event {
 		e := liveEvent(kind, fields)
-		e.At, e.EventID = start.Add(after).UTC().Format(time.RFC3339Nano), seq
+		e.At, e.SequenceNumber = start.Add(after).UTC().Format(time.RFC3339Nano), seq
 		return e
 	}
 	queued := replay("queued", 0, 1, nil)

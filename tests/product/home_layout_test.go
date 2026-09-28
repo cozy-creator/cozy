@@ -120,7 +120,7 @@ func TestPublicationDebrisIsReclaimed(t *testing.T) {
 		Attempt: attempt, SessionID: session, InvocationDigest: digest,
 		TerminalID: "out-published", TerminalDigest: "sha256:" + sixtyFour("f"),
 		Status: "SUCCEEDED", Cause: "COMPLETED",
-		EventType: "request.completed", EventPayload: map[string]any{},
+		EventType: "run.completed", EventPayload: map[string]any{},
 		RequestState: "succeeded",
 		Publication: &records.Publication{RequestID: "req-published", Attempt: attempt,
 			Repo: home.ScratchRepo("local", "req-published"), Root: publishedRoot,

@@ -39,7 +39,7 @@ func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
 	_, problem = store.AcceptTerminal(records.Terminal{RequestID: first, Attempt: ordinal,
 		SessionID: "boot-clock", InvocationDigest: digest, TerminalID: "out-clock",
 		TerminalDigest: "sha256:" + strings.Repeat("c", 64), Status: "FAILED", Cause: "EXCEPTION",
-		EventType: "request.failed"})
+		EventType: "run.failed"})
 	fatal(t, problem)
 	fatal(t, store.Closed(first, ordinal))
 	// Replay controlled historical timestamps through real records. The producer's
@@ -51,7 +51,7 @@ func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
 	fraction := "2026-09-09T05:24:32.456Z"
 	_, err = db.Exec(`UPDATE attempts SET closed_at=? WHERE request_id=?`, whole, first)
 	must(t, err)
-	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='request.failed'`, fraction, first)
+	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='run.failed'`, fraction, first)
 	must(t, err)
 	check := func(id, at string, attempted bool) {
 		t.Helper()
@@ -65,11 +65,11 @@ func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
 	submit(second)
 	_, problem = store.FailQueuedRequest(second, nil)
 	fatal(t, problem)
-	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='request.failed'`, whole, second)
+	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='run.failed'`, whole, second)
 	must(t, err)
 	check(first, fraction, true)
 	later := "2026-09-09T05:24:32.789Z"
-	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='request.failed'`, later, second)
+	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='run.failed'`, later, second)
 	must(t, err)
 	check(second, later, false)
 }

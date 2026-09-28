@@ -148,7 +148,7 @@ func succeededWithTriage(t *testing.T, o *owner, bundle []byte) string {
 		SessionID: session, InvocationDigest: digest, TerminalID: "out-evidence",
 		TerminalDigest: "sha256:" + sixtyFour("f"), Status: "SUCCEEDED", TriageSubject: "trb-evidence",
 		TriageDigest: "sha256:" + sixtyFour("b"), TriageLength: int64(len(bundle)),
-		TriageBundle: bundle, EventType: "request.completed", EventPayload: map[string]any{},
+		TriageBundle: bundle, EventType: "run.completed", EventPayload: map[string]any{},
 		RequestState: "succeeded"}); problem != nil {
 		t.Fatal(problem)
 	}

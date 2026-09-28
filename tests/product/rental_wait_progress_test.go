@@ -69,7 +69,7 @@ func TestRentalWaitProgressDeduplicatesAlternatingNotices(t *testing.T) {
 				p.On(waitEnvelope("request.phase", time.Now(), map[string]any{
 					"value": map[string]any{"phase": "downloading", "machine": "isao"},
 				}))
-				p.On(waitEnvelope("request.completed", time.Now(), nil))
+				p.On(waitEnvelope("run.completed", time.Now(), nil))
 				if got := liveFrame(p, time.Now()); strings.Count(got, "✓") != 2 ||
 					!strings.Contains(got, "✓ downloading on isao") {
 					t.Fatalf("transition discarded finished wait/download stages: %q", got)

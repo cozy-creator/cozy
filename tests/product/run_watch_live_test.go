@@ -246,7 +246,7 @@ func TestRunWatchDrawsInPlace(t *testing.T) {
 			for i, e := range events {
 				encoded, err := json.Marshal(e)
 				must(t, err)
-				_, _ = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", e.EventID, encoded)
+				_, _ = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", e.SequenceNumber, encoded)
 				if i%(len(events)/3) == 0 { // two pauses mid-run: the terminal draws, then erases
 					w.(http.Flusher).Flush()
 					time.Sleep(3 * liveFramePause)

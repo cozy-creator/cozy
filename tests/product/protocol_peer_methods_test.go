@@ -65,6 +65,18 @@ func (p *fakePod) ControlMachineExecution(ctx context.Context, request *pb.Machi
 	}
 	return p.UnimplementedWorkerControlServer.ControlMachineExecution(ctx, request)
 }
+
+// machineByteReadPeer serves the bytes a run's output log names.
+type machineByteReadPeer interface {
+	ReadByteTreeObject(*pb.NativeByteReadCall, grpc.ServerStreamingServer[pb.NativeByteReadChunk]) error
+}
+
+func (p *fakePod) ReadByteTreeObject(call *pb.NativeByteReadCall, stream grpc.ServerStreamingServer[pb.NativeByteReadChunk]) error {
+	if machine, ok := p.machine.(machineByteReadPeer); ok {
+		return machine.ReadByteTreeObject(call, stream)
+	}
+	return p.UnimplementedPodHostServer.ReadByteTreeObject(call, stream)
+}
 func (p *fakePod) AcknowledgeMachineExecutionCollection(ctx context.Context, request *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
 	if p.machine != nil {
 		return p.machine.AcknowledgeMachineExecutionCollection(ctx, request)

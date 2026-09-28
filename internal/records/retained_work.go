@@ -432,7 +432,7 @@ func (s *Store) SettleIdleCancellation(id string) (bool, *exit.Error) {
 	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='canceled',updated_at=? WHERE request_id=? AND state!='completed'`, now(), id); err != nil {
 		return false, exit.Internalf("cannot abandon retained source transfer: %s", err)
 	}
-	if err := appendEventTx(tx, id, "request.canceled", 0, map[string]any{"status": "CANCELED", "cause": "CLIENT_CANCELED"}); err != nil {
+	if err := appendEventTx(tx, id, "run.canceled", 0, map[string]any{"status": "CANCELED", "cause": "CLIENT_CANCELED"}); err != nil {
 		return false, exit.Internalf("cannot journal canceled request: %s", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -455,7 +455,7 @@ func (s *Store) CompleteRetainedCancellation(id string) (bool, *exit.Error) {
 	if changed == 0 {
 		return false, nil
 	}
-	if err := appendEventTx(tx, id, "request.canceled", 0, map[string]any{"status": "CANCELED", "cause": "CLIENT_CANCELED"}); err != nil {
+	if err := appendEventTx(tx, id, "run.canceled", 0, map[string]any{"status": "CANCELED", "cause": "CLIENT_CANCELED"}); err != nil {
 		return false, exit.Internalf("cannot journal canceled request: %s", err)
 	}
 	if err := tx.Commit(); err != nil {

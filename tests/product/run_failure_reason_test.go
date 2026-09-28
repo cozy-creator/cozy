@@ -94,7 +94,7 @@ func TestFailedRunWatchCarriesItsTriageBundle(t *testing.T) {
 		SessionID: session, InvocationDigest: digest, TerminalID: "out-triage",
 		TerminalDigest: "sha256:" + sixtyFour("f"), Status: "FAILED", Cause: "handler_error",
 		TriageSubject: "trb-watch", TriageDigest: "sha256:" + sixtyFour("b"),
-		TriageLength: int64(len(bundle)), TriageBundle: bundle, EventType: "request.failed",
+		TriageLength: int64(len(bundle)), TriageBundle: bundle, EventType: "run.failed",
 		EventPayload: map[string]any{"error_type": "handler_error", "error": "ValueError: bad latent shape"},
 		RequestState: "failed"}); problem != nil {
 		t.Fatal(problem)

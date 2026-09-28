@@ -233,7 +233,7 @@ func submittedRetainWorkTx(tx *sql.Tx, r Request) (bool, error) {
 		return true, nil
 	}
 	var retained bool
-	err := tx.QueryRow(`SELECT json_extract(payload,'$.retain_work') FROM request_events WHERE request_id=? AND type='request.submitted' AND json_type(payload,'$.retain_work') IN ('true','false') ORDER BY seq LIMIT 1`, r.ID).Scan(&retained)
+	err := tx.QueryRow(`SELECT json_extract(payload,'$.retain_work') FROM request_events WHERE request_id=? AND type='run.created' AND json_type(payload,'$.retain_work') IN ('true','false') ORDER BY seq LIMIT 1`, r.ID).Scan(&retained)
 	if err == nil {
 		return retained, nil
 	}

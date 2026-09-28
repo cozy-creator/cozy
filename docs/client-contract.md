@@ -31,7 +31,7 @@ daemon.
 | `GET /v1/requests` | core | yes | listing, newest first; `?status=`, `?package=`, `?limit=` |
 | `GET /v1/requests/{id}` | core | yes | the lifecycle document |
 | `POST /v1/requests/{id}/cancel` | core | yes | requests cancellation; `?grace_ms=` |
-| `GET /v1/requests/{id}/events` | core | yes | SSE, one request, terminal-stop; `?cursor=` |
+| `GET /v1/requests/{id}/events` | core | yes | SSE, one request, terminal-stop; `?starting_after=` |
 | `GET /v1/media/{media_id}` | core | yes | bytes by opaque id; `HEAD`; one `Range` |
 
 ### Submit
@@ -200,37 +200,41 @@ lifecycle document.
 One envelope for every event, durable or live:
 
 ```json
-{"type": "request.accepted", "request_id": "req-…", "attempt": 1,
- "event_id": 42, "at": "2026-08-25T…", "payload": {…}}
+{"type": "run.in_progress", "request_id": "req-…", "attempt": 1,
+ "sequence_number": 42, "at": "2026-08-25T…", "payload": {…}}
 ```
 
 **Durable** events are rows in the host's authority. They are monotonic, totally ordered
-across all requests, and replayable: reconnect with `?cursor=<event_id>` and everything
-after it arrives in order, across a host restart. `id:` carries the cursor on the wire.
+across all requests, and replayable: reconnect with `?starting_after=<sequence_number>`
+(OpenAI Responses' names) and everything after it arrives in order, across a host restart.
+`id:` carries the `sequence_number` on the wire.
 
 | type | payload |
 |---|---|
-| `request.submitted` | `package`, `function`, `body_digest`, `plan_id`, `outputs` |
+| `run.created` | `package`, `function`, `body_digest`, `plan_id`, `outputs` |
 | `request.queued` | `reason` (verbatim diagnostic), `wait` (stable cause: `worker_start` · `worker_warming` · `slot_busy` · `queue_ahead` · `rental` · `model_transfer`), `waiting_on` (machine word, when known), `package`, `position` |
 | `request.routed` | the routing decision (residency-aware-routing.md §3.1): `candidates[]` (`worker`, `lane`, `held`, `cost`, `score`, `resident[]`, `manifests_missing`, `rental`), `pick` (`worker`, `lane`, `rental`, `pinned`) |
 | `request.placement` | the placement decision (placement-economics.md, attempt 0): no worker held the placement, so the fleet placed it on an attached rental or a bought pod — or waits on a fitting rental whose worker has not attached (`rental` absent, one candidate `attaching`, re-decided on the fleet's next observation) — `tier`, `config_digest`, `ladder[]` (the owner's fit map, absent when none is bound), `override` (an explicit `model.<param>=…/lane`, which is not a rung), `throughput[]` (every row used), `candidates[]` (`rental`, `machine`, `sku`, `rung` (absent under an override), `lane`, `fit`: `components …` · `rung_asserted` · `lane_bytes …` · `derive_only` (a JOB's models are never resident), `ahead`, `rate_usd_micros_per_hour`, `measured`, `time_s`, `cost_usd_micros`, `score`, `verdict`: `chosen` · `slower` · `dearer` · `unmeasured` · `attaching` · `no_rung` · `no_stock` · `excluded:<reason>`), `rental`, `bought`, `line` |
 | `request.parked` | the drain skipped a waiting request: the `request.queued` fields plus `lanes` and `overtaken` (younger work run ahead of it on its rental; at 2 nothing younger runs ahead) |
 | `request.dispatch_aborted` | pre-offer preparation failed; `cause`, `error`; no worker saw this ordinal |
 | `request.dispatched` | `instance_id`, `invocation_digest` |
-| `request.accepted` | `plan_digest`, `construction_digest`, `plan` |
+| `run.in_progress` | `plan_digest`, `construction_digest`, `plan` |
 | `request.attempt_failed` | one ATTEMPT ended and the request did NOT — `status`, `cause`, `requeuing: true`, optional last measured `overall_fraction` |
 | `request.requeued` | `cause` |
-| `request.completed` | `status`, `cause`, `outputs[]` (media ids), `triage_subject`, optional last measured `overall_fraction` |
-| `request.failed` | the above plus `error_type`, `error` |
-| `request.canceled` | the above |
+| `output_item.added` | an output item's first revision (OpenAI Responses' name): `output_index`, `item` (`id` `<run>/<output>[/<i>]`, `type`, `name`, `index` for a list element, `label`, `media_type`, `status: in_progress`, `path`) |
+| `output_item.delta` | a revision of the item, rewritten in place: `item_id`, `output_index`, `rev` (ETag `"r<rev>"`), `length`, `appended_from` (exactly when it appends), `duration_us`, `label` |
+| `output_item.done` | the item can no longer change: a list element at once, a single output at the run's terminal — `output_index`, `item` with `status` `completed` or `incomplete`, `rev`, `length`, `sha256` |
+| `run.completed` | `status`, `cause`, `output[]` (every item at its last revision), `triage_subject`, optional last measured `overall_fraction` |
+| `run.failed` | the above plus `error_type`, `error` |
+| `run.canceled` | the above |
 | `client.machine_result_collected` | a machine run's result reached this host, after its terminal — `state` |
 | `client.machine_collection_refused` | the result stays on its machine until its owner fixes the cause — `error_code`, `error` |
 
 A machine run's result custody follows its terminal. A client that needs the result reads
-the stream on from the terminal's `event_id` until `client.machine_result_collected`,
+the stream on from the terminal's `sequence_number` until `client.machine_result_collected`,
 `client.machine_collection_refused`, `machine.result_retained` or `client.machine_lost`.
 
-**Live** events (`event_id: 0`, `payload.live: true`) are the lossy lane: never durable,
+**Live** events (`sequence_number: 0`, `payload.live: true`) are the lossy lane: never durable,
 never replayed from a cursor. The LATEST tick is replayed immediately on connect so a
 mid-run subscriber renders current state. `request.progress` carries `value` (a fraction)
 and `seq`; when Runtime reports measured production coordinates, `value` is an object with
@@ -242,7 +246,7 @@ Three rules a client may rely on:
 
 1. **Terminal-stop.** On the per-request stream a terminal event is ABSORBING: the host
    closes and the client must not reconnect. The terminal set is exactly
-   `request.completed` · `request.failed` · `request.canceled`. **An attempt ending is
+   `run.completed` · `run.failed` · `run.canceled`. **An attempt ending is
    not a request ending**: an attempt a worker could not admit yet (`NO_CAPACITY`,
    `ADMISSION_EPOCH_STALE`) emits `request.attempt_failed` — deliberately outside that set
    — and the request waits in the queue.

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"regexp"
 	"strings"
@@ -227,7 +228,7 @@ func (s *Store) RentalHasMachineObligations(id string) (bool, *exit.Error) {
 func (s *Store) RequestExecutionTiming(id string) (int64, uint64, *exit.Error) {
 	var duration int64
 	var deadline uint64
-	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.timeout_ms'),0),COALESCE(json_extract(payload,'$.deadline_unix_ms'),0) FROM request_events WHERE request_id=? AND type='request.submitted' ORDER BY seq LIMIT 1`, id).Scan(&duration, &deadline)
+	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.timeout_ms'),0),COALESCE(json_extract(payload,'$.deadline_unix_ms'),0) FROM request_events WHERE request_id=? AND type='run.created' ORDER BY seq LIMIT 1`, id).Scan(&duration, &deadline)
 	if err == sql.ErrNoRows {
 		return 0, 0, nil
 	}
@@ -395,6 +396,20 @@ func machineObservationIdentity(link *MachineExecution, state *pb.MachineExecuti
 	return nil
 }
 
+// printableNote is a peer's word as a note may quote it: printable ASCII, bounded.
+func printableNote(value string) string {
+	runes := []rune(value)
+	if len(runes) > 64 {
+		runes = runes[:64]
+	}
+	for i, r := range runes {
+		if r < 0x20 || r > 0x7e {
+			runes[i] = '?'
+		}
+	}
+	return string(runes)
+}
+
 func observedMachineRequestState(value string) string {
 	switch value {
 	case "queued", "retrying":
@@ -445,9 +460,20 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 	if lost {
 		return exit.Named(exit.Conflict, "machine_execution.state_lost", "cannot observe execution on a confirmed destroyed machine")
 	}
+	if page == nil || page.NextAfter > page.HeadSequence || page.HeadSequence > math.MaxInt64 || page.CompactedThrough > page.HeadSequence {
+		return exit.New(exit.Conflict, "machine observation has an invalid event cursor")
+	}
+	// The machine is an independently upgraded peer: a state this client does not know is
+	// neither terminal nor a refusal. The run keeps its projection, says so once, and its
+	// events are recorded as ever; it never wedges on a word.
 	nextState := observedMachineRequestState(state.State)
-	if nextState == "" || page == nil || page.NextAfter > page.HeadSequence || page.HeadSequence > math.MaxInt64 || page.CompactedThrough > page.HeadSequence {
-		return exit.New(exit.Conflict, "machine observation has an invalid state or event cursor")
+	var notes []string
+	if nextState == "" {
+		var current string
+		if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, id).Scan(&current); err != nil {
+			return exit.Internalf("cannot read the run's state: %s", err)
+		}
+		nextState = current
 	}
 	var previous pb.MachineExecutionState
 	if len(link.ObservedState) > 0 {
@@ -460,6 +486,9 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 		if state.Generation == previous.Generation && state.AttemptOrdinal < previous.AttemptOrdinal {
 			return exit.New(exit.Conflict, "machine observation regressed its attempt ordinal")
 		}
+	}
+	if observedMachineRequestState(state.State) == "" && previous.State != state.State {
+		notes = append(notes, fmt.Sprintf("the machine reports state %q, which this Creator does not know; the run is followed as it was", printableNote(state.State)))
 	}
 	cursor := uint64(link.RemoteCursor)
 	retentionReleased := false
@@ -475,9 +504,15 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 		if event == nil || event.Sequence <= cursor {
 			continue
 		}
-		if event.Sequence > page.NextAfter || event.AtMs > math.MaxInt64 || event.AttemptOrdinal > math.MaxInt64 ||
-			event.Kind == "" || len(event.Kind) > 128 || len(event.BodyCanonicalBytes) > 64<<10 || !json.Valid(event.BodyCanonicalBytes) {
-			return exit.New(exit.Conflict, "machine returned an invalid execution event")
+		if event.Sequence > page.NextAfter {
+			return exit.New(exit.Conflict, "machine returned an event past its page")
+		}
+		// One unreadable event is skipped with a note; the rest of the page is kept.
+		if event.AtMs > math.MaxInt64 || event.AttemptOrdinal > math.MaxInt64 || event.Kind == "" || len(event.Kind) > 128 ||
+			len(event.BodyCanonicalBytes) > 64<<10 || !json.Valid(event.BodyCanonicalBytes) {
+			notes = append(notes, fmt.Sprintf("the machine's event %d was unreadable and is skipped", event.Sequence))
+			cursor = event.Sequence
+			continue
 		}
 		if event.Sequence-1 > max(cursor, page.CompactedThrough) {
 			gap, _ := json.Marshal(map[string]uint64{"after": cursor, "before": event.Sequence})
@@ -491,17 +526,29 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 			retentionReleased = true
 		}
 		if event.Kind == "running" {
-			kind = "request.accepted"
+			kind = "run.in_progress"
 		}
 		if event.Kind == "product" {
 			product, ok := held[event.Sequence]
 			if !ok {
-				return exit.New(exit.Conflict, "a run's product was observed before this client held its bytes")
+				// An output revision this client could not hold (a malformed entry) is skipped.
+				notes = append(notes, fmt.Sprintf("the machine's output revision %d was unusable and is skipped", event.Sequence))
+				cursor = event.Sequence
+				continue
 			}
-			kind = ProductType
-			if payload, err = json.Marshal(product); err != nil {
-				return exit.Internalf("cannot record a product: %s", err)
+			at := time.UnixMilli(int64(event.AtMs)).UTC().Format(time.RFC3339Nano)
+			for _, item := range outputItemEvents(product) {
+				raw, err := json.Marshal(item.payload)
+				if err != nil {
+					return exit.Internalf("cannot record an output revision: %s", err)
+				}
+				if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`,
+					id, item.kind, event.AttemptOrdinal, string(raw), at); err != nil {
+					return exit.Internalf("cannot record an output revision: %s", err)
+				}
 			}
+			cursor = event.Sequence
+			continue
 		}
 		if event.Kind == "progress" || event.Kind == "log" {
 			var progress struct {
@@ -517,6 +564,11 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 			return exit.Internalf("cannot cache machine event: %s", err)
 		}
 		cursor = event.Sequence
+	}
+	for _, note := range notes {
+		if err := appendEventTx(tx, id, "request.warning", int64(state.AttemptOrdinal), map[string]any{"message": note}); err != nil {
+			return exit.Internalf("cannot record a machine note: %s", err)
+		}
 	}
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(state)
 	if err != nil {
@@ -547,7 +599,8 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 	// Finish the local idle clock atomically with dropping the active request
 	// projection. Outcome collection happens later and must not leave an idle
 	// release window or renew this clock on repeated terminal observations.
-	if !machineWorkActive(state.State) && (len(link.ObservedState) == 0 ||
+	// A state this client does not know says nothing about whether the work finished.
+	if observedMachineRequestState(state.State) != "" && !machineWorkActive(state.State) && (len(link.ObservedState) == 0 ||
 		machineWorkActive(previous.State) || state.AttemptOrdinal > previous.AttemptOrdinal) {
 		if err := appendEventTx(tx, id, "client.machine_work_finished", int64(state.AttemptOrdinal),
 			map[string]any{"machine_execution": true, "state": state.State}); err != nil {
@@ -610,13 +663,25 @@ func (s *Store) RecordMachineOutcome(id string, outcome *pb.AttemptOutcome) *exi
 	if n, _ := result.RowsAffected(); n != 1 {
 		return exit.New(exit.Conflict, "machine execution changed during result collection")
 	}
-	kind := "request.failed"
+	kind := "run.failed"
 	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
-		kind = "request.completed"
+		kind = "run.completed"
 	} else if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_CANCELED {
-		kind = "request.canceled"
+		kind = "run.canceled"
 	}
-	facts := map[string]any{"machine_execution": true, "status": strings.TrimPrefix(body.Status.String(), "OUTCOME_STATUS_"), "outputs": []any{}}
+	// Every single output is done at the terminal, before it: the run carries its output.
+	itemStatus := "completed"
+	if body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
+		itemStatus = "incomplete"
+	}
+	output, problem := finishOutputs(tx, id, outcome.AttemptOrdinal, itemStatus)
+	if problem != nil {
+		return problem
+	}
+	if output == nil {
+		output = []OutputItem{}
+	}
+	facts := map[string]any{"machine_execution": true, "status": strings.TrimPrefix(body.Status.String(), "OUTCOME_STATUS_"), "outputs": []any{}, "output": output}
 	if body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
 		facts["error"] = body.SafeMessage
 	}
@@ -730,7 +795,7 @@ func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 	if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=CASE WHEN ?='canceled' THEN 0 ELSE retain_work END WHERE id=?`, state, state, id); err != nil {
 		return false, exit.Internalf("cannot project pending machine cancellation: %s", err)
 	}
-	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,0,?,?)`, id, "request."+state, `{"scope":"before_machine_acceptance"}`, now()); err != nil {
+	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,0,?,?)`, id, StateEvent(state), `{"scope":"before_machine_acceptance"}`, now()); err != nil {
 		return false, exit.Internalf("cannot record pending machine cancellation event: %s", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -754,7 +819,7 @@ func (s *Store) RefuseMachineSubmission(id, code, detail string) *exit.Error {
 	if _, err := tx.Exec(`UPDATE requests SET state='refused',retain_work=0 WHERE id=?`, id); err != nil {
 		return exit.Internalf("cannot retain machine refusal state: %s", err)
 	}
-	if err := appendEventTx(tx, id, "request.failed", 0, map[string]any{"error_type": code, "error": detail, "machine_accepted": false}); err != nil {
+	if err := appendEventTx(tx, id, "run.failed", 0, map[string]any{"error_type": code, "error": detail, "machine_accepted": false}); err != nil {
 		return exit.Internalf("cannot retain machine refusal event: %s", err)
 	}
 	if err := tx.Commit(); err != nil {

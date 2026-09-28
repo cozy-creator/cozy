@@ -114,7 +114,7 @@ func watchRunStream(ctx *Context, client runEventObserver, life api.Lifecycle, n
 	terminal, problem := client.WatchContext(watchCtx, id, 0, func(event localclient.Event) bool {
 		if event.Type == "request.blocked" {
 			state, problem := client.Request(id)
-			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.EventID) {
+			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.SequenceNumber) {
 				projected := publicFailureEvent(event)
 				lines.On(projected)
 				manualStop = &projected
@@ -148,7 +148,7 @@ func recordedRunStart(value string) time.Time {
 // Reattaching or collecting/exporting outputs later cannot extend a completed run.
 // Missing timestamps are unknown, not an elapsed observer clock or a fabricated zero.
 func recordedRunWall(createdAt string, terminal *localclient.Event) (int64, bool) {
-	if terminal == nil || terminal.EventID <= 0 || !localclient.Terminal(terminal.Type) {
+	if terminal == nil || terminal.SequenceNumber <= 0 || !localclient.Terminal(terminal.Type) {
 		return 0, false
 	}
 	began, err := time.Parse(time.RFC3339Nano, createdAt)

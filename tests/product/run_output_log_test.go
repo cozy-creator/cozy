@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -188,6 +189,59 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	if err != nil || digestOf(final) != last.Digest {
 		t.Fatalf("the final image is not the last revision: %v", err)
 	}
+	// Its events are OpenAI Responses' shape: each item added once, a delta per revision, done
+	// when it can no longer change (a list element at once, the image at the terminal), and
+	// the terminal carrying the run's output; every sequence_number above the one before.
+	events, problem := store.EventsAfter(request.ID, 0, 1000)
+	fatal(t, problem)
+	var sequence []string
+	var previous int64
+	var output []records.OutputItem
+	for _, event := range events {
+		if event.Seq <= previous {
+			t.Fatalf("event %d did not follow %d", event.Seq, previous)
+		}
+		previous = event.Seq
+		switch event.Type {
+		case records.OutputItemAdded, records.OutputItemDone:
+			var envelope struct {
+				Item records.OutputItem `json:"item"`
+			}
+			must(t, json.Unmarshal(event.Raw, &envelope))
+			sequence = append(sequence, event.Type+" "+envelope.Item.ID+" "+envelope.Item.Status+" "+envelope.Item.Sha256)
+		case records.OutputItemDelta:
+			var delta records.OutputDelta
+			must(t, json.Unmarshal(event.Raw, &delta))
+			sequence = append(sequence, fmt.Sprintf("%s %s r%d", event.Type, delta.ItemID, delta.Rev))
+		case "run.completed":
+			var terminal struct {
+				Output []records.OutputItem `json:"output"`
+			}
+			must(t, json.Unmarshal(event.Raw, &terminal))
+			output = terminal.Output
+			sequence = append(sequence, event.Type)
+		}
+	}
+	n := request.Number
+	frameDigest := func(k int) string {
+		data, err := os.ReadFile(filepath.Join(directory, fmt.Sprintf("%d-frames-%d.png", n, k)))
+		must(t, err)
+		return digestOf(data)
+	}
+	want := []string{fmt.Sprintf("output_item.added %d/image in_progress ", n)}
+	for k := 1; k <= 3; k++ {
+		want = append(want, fmt.Sprintf("output_item.delta %d/image r%d", n, k),
+			fmt.Sprintf("output_item.added %d/frames/%d in_progress ", n, k),
+			fmt.Sprintf("output_item.delta %d/frames/%d r1", n, k),
+			fmt.Sprintf("output_item.done %d/frames/%d completed %s", n, k, frameDigest(k)))
+	}
+	want = append(want, fmt.Sprintf("output_item.done %d/image completed %s", n, last.Digest), "run.completed")
+	if !slices.Equal(sequence, want) {
+		t.Fatalf("the run's output events are\n%s\nwant\n%s", strings.Join(sequence, "\n"), strings.Join(want, "\n"))
+	}
+	if len(output) != 4 || output[0].ID != fmt.Sprintf("%d/image", n) || output[0].Sha256 != last.Digest || output[0].Rev != 3 || output[0].Path != image {
+		t.Fatalf("run.completed does not carry the run's output: %+v", output)
+	}
 	// The machine itself serves the image, the current bytes of its third revision.
 	machineServesOutput(t, root, "image", last.Digest, 3)
 
@@ -216,6 +270,24 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "kept") {
 		t.Fatalf("the canceled run did not say what it kept:\n%s", stderr)
+	}
+	// Its image is done incomplete, at its last revision: revision 2's bytes and sha256.
+	events, problem = store.EventsAfter(request.ID, 0, 1000)
+	fatal(t, problem)
+	done := false
+	for _, event := range events {
+		if event.Type == records.OutputItemDone {
+			var envelope struct {
+				Item records.OutputItem `json:"item"`
+			}
+			must(t, json.Unmarshal(event.Raw, &envelope))
+			if envelope.Item.Name == "image" {
+				done = envelope.Item.Status == "incomplete" && envelope.Item.Sha256 == second.Digest && envelope.Item.Rev == 2
+			}
+		}
+	}
+	if !done || events[len(events)-1].Type != "run.canceled" && !slices.ContainsFunc(events, func(e records.Event) bool { return e.Type == "run.canceled" }) {
+		t.Fatal("the canceled run's image was not done incomplete at revision 2 before run.canceled")
 	}
 	// A growing video is one file a player reads while the run goes on, appended in place;
 	// its last revision is the final MP4.

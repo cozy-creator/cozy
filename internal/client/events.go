@@ -21,7 +21,7 @@ import (
 //   - TERMINAL-STOP. A terminal event closes the per-request stream, and that is where
 //     `cozy run` gets its exit code: the request's own settled status, mapped through the
 //     shared matrix. There is no polling loop and no timeout guessing what happened.
-//   - LIVE FRAMES ARE NOT DURABLE. `event_id: 0` says so in the data. They are what the
+//   - LIVE FRAMES ARE NOT DURABLE. `sequence_number: 0` says so in the data. They are what the
 //     progress line renders and are never counted as history.
 
 // Event is one envelope off the stream.
@@ -31,7 +31,7 @@ type Event = api.Envelope
 // request ending (decisions #360): `request.attempt_failed` is deliberately not here.
 func Terminal(t string) bool {
 	switch t {
-	case "request.completed", "request.failed", "request.canceled":
+	case "run.completed", "run.failed", "run.canceled":
 		return true
 	}
 	return false
@@ -97,7 +97,7 @@ func (c *Client) WatchContext(ctx context.Context, requestID string, from int64,
 
 func (c *Client) readStream(ctx context.Context, requestID string, cursor int64, on func(Event) bool) (
 	terminal *Event, last int64, stopped bool, fail *exit.Error) {
-	path := "/v1/requests/" + requestID + "/events?cursor=" + strconv.FormatInt(cursor, 10)
+	path := "/v1/requests/" + requestID + "/events?starting_after=" + strconv.FormatInt(cursor, 10)
 	req, e := c.request("GET", path, nil, "Accept", "text/event-stream")
 	if e != nil {
 		return nil, cursor, false, e
@@ -154,18 +154,18 @@ func (c *Client) readStream(ctx context.Context, requestID string, cursor int64,
 }
 
 // StreamStatus is the status a terminal event carries, for the exit mapping. The event
-// TYPE is the authority — `request.completed` / `failed` / `canceled` — because it is
+// TYPE is the authority — `run.completed` / `failed` / `canceled` — because it is
 // what terminal-stop already keyed on.
 func StreamStatus(e *Event) string {
 	if e == nil {
 		return ""
 	}
 	switch e.Type {
-	case "request.completed":
+	case "run.completed":
 		return "succeeded"
-	case "request.failed":
+	case "run.failed":
 		return "failed"
-	case "request.canceled":
+	case "run.canceled":
 		return "canceled"
 	}
 	return ""

@@ -1341,7 +1341,7 @@ func awaitResultCustody(c *localapi.Client, id string) *exit.Error {
 	if problem != nil || terminal == nil {
 		return problem
 	}
-	_, problem = c.Watch(id, terminal.EventID, func(event localapi.Event) bool { return !records.CustodyEvent(event.Type) })
+	_, problem = c.Watch(id, terminal.SequenceNumber, func(event localapi.Event) bool { return !records.CustodyEvent(event.Type) })
 	return problem
 }
 
@@ -1352,7 +1352,7 @@ func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *e
 	if life.MachineExecution == nil && (life.Status == "failed" || life.Status == "canceled") {
 		return life, nil
 	}
-	if custodyOwed(life.MachineExecution, life.Status, len(life.Products)) {
+	if custodyOwed(life.MachineExecution, life.Status, len(life.Output)) {
 		if problem := awaitResultCustody(c, life.RequestID); problem != nil {
 			return life, problem
 		}
@@ -1565,7 +1565,7 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 	terminal, e := c.WatchContext(watchCtx, requestID, 0, func(event localapi.Event) bool {
 		if event.Type == "request.blocked" {
 			state, problem := c.Request(requestID)
-			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.EventID) {
+			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.SequenceNumber) {
 				projected := publicFailureEvent(event)
 				lines.On(projected)
 				manualStop = &projected
@@ -1649,8 +1649,8 @@ type RunProgress struct {
 	sparseAt      time.Time
 	sparseStarted time.Time
 
-	// named are the output items whose file this run's lines already named.
-	named map[string]bool
+	// items are the run's output items as their output_item.added events named them.
+	items map[string]records.OutputItem
 	// rented is a run placed on a rental, whose video a browser can play (`cozy run play`).
 	rented bool
 
@@ -1659,50 +1659,65 @@ type RunProgress struct {
 	width func() int
 }
 
-// productLines are one output revision as it lands (progressive-outputs.md §3). A list
-// element never changes: one line names it and its file. A single output's file is named once,
-// then each revision is a line with its size, media time and what it added.
-func (p *RunProgress) productLines(e localapi.Event) []string {
-	var product records.Product
+// outputLines are a run's output_item events as lines (progressive-outputs.md §3): an item's
+// file once, when it is added; then one line per revision with its size, media time and what
+// it added. A list element never changes, so its one revision is one line.
+func (p *RunProgress) outputLines(e localapi.Event) []string {
 	raw, _ := json.Marshal(e.Payload)
-	if json.Unmarshal(raw, &product) != nil {
-		return nil
-	}
-	name := product.Output
-	if product.Op == records.ProductAppend {
-		name = fmt.Sprintf("%s %d", product.Output, product.Index+1)
-	}
-	var lines []string
-	if !p.named[product.Item] {
-		if p.named == nil {
-			p.named = map[string]bool{}
+	switch e.Type {
+	case records.OutputItemAdded:
+		var added struct {
+			Item records.OutputItem `json:"item"`
 		}
-		p.named[product.Item] = true
-		if product.Path != "" {
-			lines = append(lines, "  "+name+"  "+p.ctx.Mode().Hyperlink(product.Path))
+		if json.Unmarshal(raw, &added) != nil {
+			return nil
 		}
-		if product.Op == records.ProductAppend {
-			return append(lines, "  "+name+"  "+strings.TrimSpace(output.Bytes(product.Length)+"  "+product.Label))
+		if p.items == nil {
+			p.items = map[string]records.OutputItem{}
 		}
-		if p.rented && strings.HasPrefix(product.MediaType, "video/") {
+		p.items[added.Item.ID] = added.Item
+		var lines []string
+		if added.Item.Path != "" {
+			lines = append(lines, "  "+itemName(added.Item)+"  "+p.ctx.Mode().Hyperlink(added.Item.Path))
+		}
+		if p.rented && added.Item.Type == "video" {
 			play := "cozy run play " + e.RequestID
-			if product.Output != "video" {
-				play += " --output " + product.Output
+			if added.Item.Name != "video" {
+				play += " --output " + added.Item.Name
 			}
-			lines = append(lines, "  "+name+"  play in a browser: "+play)
+			lines = append(lines, "  "+itemName(added.Item)+"  play in a browser: "+play)
 		}
+		return lines
+	case records.OutputItemDelta:
+		var delta records.OutputDelta
+		if json.Unmarshal(raw, &delta) != nil {
+			return nil
+		}
+		item := p.items[delta.ItemID]
+		if item.Index > 0 {
+			return []string{"  " + itemName(item) + "  " + strings.TrimSpace(output.Bytes(delta.Length)+"  "+delta.Label)}
+		}
+		line := fmt.Sprintf("  %s r%d  %s", itemName(item), delta.Rev, output.Bytes(delta.Length))
+		if delta.DurationUs > 0 {
+			line += "  " + mediaTime(delta.DurationUs)
+		}
+		if delta.AppendedFrom != nil {
+			line += "  +" + output.Bytes(delta.Length-*delta.AppendedFrom)
+		}
+		if delta.Label != "" {
+			line += "  " + delta.Label
+		}
+		return []string{line}
 	}
-	line := fmt.Sprintf("  %s r%d  %s", name, product.Rev, output.Bytes(product.Length))
-	if product.DurationUs > 0 {
-		line += "  " + mediaTime(product.DurationUs)
+	return nil
+}
+
+// itemName is an item as the CLI names it: its output, and a list element's 1-based index.
+func itemName(item records.OutputItem) string {
+	if item.Index > 0 {
+		return fmt.Sprintf("%s %d", item.Name, item.Index)
 	}
-	if product.AppendedFrom != nil {
-		line += "  +" + output.Bytes(product.Length-*product.AppendedFrom)
-	}
-	if product.Label != "" {
-		line += "  " + product.Label
-	}
-	return append(lines, line)
+	return item.Name
 }
 
 // mediaTime is a media duration as m:ss.
@@ -1737,8 +1752,8 @@ func (p *RunProgress) On(e localapi.Event) bool {
 		p.notice(e, warningLine(e.Payload))
 		return true
 	}
-	if kind == "product" {
-		for _, line := range p.productLines(e) {
+	if strings.HasPrefix(e.Type, "output_item.") {
+		for _, line := range p.outputLines(e) {
 			p.notice(e, line)
 		}
 		return true
@@ -2082,11 +2097,11 @@ func progressLine(e localapi.Event, full bool) string {
 		if line, ok := e.Payload["line"].(string); ok {
 			return line
 		}
-	case "submitted":
+	case "run.created":
 		return ""
 	case "dispatched":
 		return "  worker selected"
-	case "accepted":
+	case "run.in_progress":
 		return "  Waiting for a progress update"
 	case "requeued":
 		return "  retrying"

@@ -45,7 +45,7 @@ func TestQueuedPreparationFailureAfterAbortedDispatch(t *testing.T) {
 	fatal(t, problem)
 	events, problem := store.EventsAfter(id, 0, 100)
 	fatal(t, problem)
-	if row.State != "failed" || row.Ordinal != ordinal || transfer.State != "failed" || transfer.ErrorCode != "placement_config_refused" || len(events) != 1 || events[0].Type != "request.failed" {
+	if row.State != "failed" || row.Ordinal != ordinal || transfer.State != "failed" || transfer.ErrorCode != "placement_config_refused" || len(events) != 1 || events[0].Type != "run.failed" {
 		t.Fatalf("current failure not atomic: request=%+v transfer=%+v events=%+v", row, transfer, events)
 	}
 }

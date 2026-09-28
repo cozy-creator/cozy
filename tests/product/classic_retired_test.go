@@ -70,7 +70,7 @@ func TestDaemonStartRetiresClassicWork(t *testing.T) {
 	events, problem := store.EventsAfter(blocked.ID, 0, 100)
 	fatal(t, problem)
 	last := events[len(events)-1]
-	if last.Type != "request.failed" || last.Payload["error_type"] != records.ClassicRetiredCode {
+	if last.Type != "run.failed" || last.Payload["error_type"] != records.ClassicRetiredCode {
 		t.Fatalf("classic retirement was not named: %+v", last)
 	}
 	again, problem := store.RetireClassicWork()

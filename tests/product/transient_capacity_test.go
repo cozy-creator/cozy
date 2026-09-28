@@ -165,7 +165,7 @@ func TestAMarketNoRungNamesStillFailsTerminally(t *testing.T) {
 	if row.State != "failed" {
 		t.Fatalf("the request settled %q; a ladder no machine fits is terminal", row.State)
 	}
-	cause := lastEventField(t, store, row.ID, "request.failed", "error_type")
+	cause := lastEventField(t, store, row.ID, "run.failed", "error_type")
 	if reason := failureReason(t, store, row.ID); cause != "rental.no_fitting_sku" ||
 		!containsAll(reason, "no_rung") {
 		t.Fatalf("the failure is %s / %q; want rental.no_fitting_sku over no_rung verdicts", cause, reason)
@@ -210,7 +210,7 @@ func TestAnIdleAttachedMachineOutranksWaitingForOneComingUp(t *testing.T) {
 	}
 }
 
-// parkReason is the newest `request.parked` reason, and failureReason the `request.failed`
+// parkReason is the newest `request.parked` reason, and failureReason the `run.failed`
 // error — the two ends a placement refusal can reach, read from the durable record rather
 // than from stdout.
 func parkReasons(t *testing.T, store *records.Store, requestID string) []string {
@@ -229,7 +229,7 @@ func parkReasons(t *testing.T, store *records.Store, requestID string) []string 
 
 func failureReason(t *testing.T, store *records.Store, requestID string) string {
 	t.Helper()
-	return lastEventField(t, store, requestID, "request.failed", "error")
+	return lastEventField(t, store, requestID, "run.failed", "error")
 }
 
 func lastEventField(t *testing.T, store *records.Store, requestID, eventType, field string) string {
