@@ -119,10 +119,9 @@ jobs:
       - name: Release artifacts install and upgrade
         if: env.FULL == 'true'
         run: |
-          scripts/release.sh --targets linux/amd64 --tag "ci-$GITHUB_SHA"
-          scripts/release.sh --targets linux/amd64 --tag "ci-$GITHUB_SHA-next"
-          scripts/accept.sh --dist "dist/ci-$GITHUB_SHA" --asset "cozy-ci-$GITHUB_SHA-linux-amd64.tar.gz" \
-            --upgrade "dist/ci-$GITHUB_SHA-next/cozy-ci-$GITHUB_SHA-next-linux-amd64.tar.gz" \
+          scripts/release.sh "ci-$GITHUB_SHA" linux/amd64
+          scripts/release.sh "ci-$GITHUB_SHA-next" linux/amd64
+          scripts/accept.sh --dist "dist/ci-$GITHUB_SHA" --upgrade "dist/ci-$GITHUB_SHA-next" \
             --prefix "$RUNNER_TEMP/prefix" --home "$RUNNER_TEMP/cozy-home"
       # Independent of the Go result, so one red check does not hide the other.
       - name: Python types

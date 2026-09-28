@@ -16,7 +16,7 @@
 # sweeps any strays a previous install left. A reader holding the old file keeps running
 # it, exactly as the Unix rename promises.
 #
-# There is no download and no channel here on purpose — same rule as install.sh.
+# Windows has no release yet, so this installs a local build or asset (install.sh downloads).
 
 [CmdletBinding()]
 param(
