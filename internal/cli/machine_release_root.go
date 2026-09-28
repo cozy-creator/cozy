@@ -254,18 +254,14 @@ func (m *machineRuns) releaseFacts(ctx context.Context, origin string, connectio
 	return facts, nil
 }
 
-// submissionRefused records a definitive refusal and names the failure.
+// submissionRefused names a failed release-root submission; a definitive refusal is recorded.
 func (m *machineRuns) submissionRefused(requestID string, trailer metadata.MD, err error) *exit.Error {
 	for _, code := range trailer.Get("cozy-error-code") {
 		switch code {
 		case "execution_workspace_changed", "execution_workspace_required":
 			return exit.Named(exit.Conflict, "machine_execution.workspace_changed", "execution workspace no longer matches the frozen submission; prior acceptance remains unresolved")
 		case "execution_submission_refused":
-			problem := machineTransport(err)
-			if recordProblem := m.store.RefuseMachineSubmission(requestID, problem.ErrName(), problem.Message); recordProblem != nil {
-				return recordProblem
-			}
-			return problem
+			return m.unaccepted(requestID, err)
 		}
 	}
 	return machineTransport(err)
