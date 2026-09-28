@@ -645,11 +645,7 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 		}
 		for _, code := range trailer.Get("cozy-error-code") {
 			if code == "execution_submission_refused" {
-				problem := machineTransport(err)
-				if recordProblem := m.store.RefuseMachineSubmission(requestID, problem.ErrName(), problem.Message); recordProblem != nil {
-					return recordProblem
-				}
-				break
+				return m.unaccepted(requestID, err)
 			}
 		}
 		return machineTransport(err)
@@ -661,6 +657,20 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 		return problem
 	}
 	return nil
+}
+
+// unaccepted is a submission the machine proved it never accepted. A definitive refusal
+// fails the run; a transient failure only means it is safe to send again, and the run
+// keeps trying while its machine lives.
+func (m *machineRuns) unaccepted(requestID string, err error) *exit.Error {
+	problem := machineTransport(err)
+	if problem.Code == exit.Unavailable {
+		return problem
+	}
+	if recordProblem := m.store.RefuseMachineSubmission(requestID, problem.ErrName(), problem.Message); recordProblem != nil {
+		return recordProblem
+	}
+	return problem
 }
 
 // supplySourceCredentials hands Runtime the owner's provider credentials again, by the identical
