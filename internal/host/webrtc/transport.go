@@ -173,7 +173,7 @@ func connect(ctx context.Context, tcp *net.TCPConn, leaf tls.Certificate) (*chan
 	}
 	go func() { // exactly one channel: a second one ends the session
 		if _, err := datachannel.Accept(a, config, dc); err == nil {
-			tcp.Close()
+			a.Abort("a session has one channel")
 		}
 	}()
 	return &channel{dtls: d, assoc: a, dc: dc, binding: Fingerprint(state.PeerCertificates[0])}, nil
