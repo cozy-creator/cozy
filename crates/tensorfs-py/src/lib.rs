@@ -135,6 +135,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(store::pull, m)?)?;
     m.add_function(wrap_pyfunction!(store::transfer_streams, m)?)?;
     m.add("STREAM_MEMORY", tensorfs_core::transport::STREAM_MEMORY)?;
+    m.add("AS_IS_PROFILE", tensorfs_core::ingest::source::AS_IS)?;
     m.add_class::<store::PyRepoObjectCache>()?;
     m.add_class::<store::PyStore>()?;
     m.add_class::<store::PyOperation>()?;

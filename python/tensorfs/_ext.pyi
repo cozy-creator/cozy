@@ -760,6 +760,8 @@ class PullCancellation:
 
 #: The most memory one transfer stream holds, whatever its object's size.
 STREAM_MEMORY: int
+#: The profile a source no reviewed profile recognizes is selected under: stored as-is.
+AS_IS_PROFILE: str
 
 # Concurrent transfer streams whose buffers fit the memory available now: at most `wanted`,
 # at least 1 (cgroup limit less unreclaimable usage, or MemAvailable).
