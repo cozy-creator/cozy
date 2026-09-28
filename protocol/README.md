@@ -11,10 +11,11 @@ The four files under `cozy/worker/v1/` are byte-identical to that commit's
 complete set from worker-protocol; do not hand-edit generated files here.
 
 `cozy.worker.v1` is the wire major because it is part of the protobuf package and gRPC
-service path. This cohort pins minor 64, the hard cut: the minimum equals the current
-minor, and no feature is negotiated per peer. A peer outside the range fails preparation
-and execution with `capability_unavailable` naming its update; Claim, status, collection,
-keepalive and release still work.
+service path. Components release independently: the minimum is the oldest deployed minor,
+never the current one, and an additive minor is used only after checking the peer's minor or
+capability (a peer without a new RPC answers `UNIMPLEMENTED` for that call only). A peer
+outside the range fails preparation and execution with `capability_unavailable` naming its
+update; Claim, status, collection, keepalive and release still work.
 
 `SOURCE` pins the upstream commit and per-file digests, matching what tensorhub and
 cozy-runtime carry, so a hand edit or a stale re-vendor is detectable from this repository
