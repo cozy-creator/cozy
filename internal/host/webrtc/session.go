@@ -304,7 +304,9 @@ func (c *session) request(req request) {
 	}
 }
 
-// push appends to a stream, or closes what it carries when the stream has ended.
+// push appends to a stream, or closes what it carries when the stream has ended. Entries
+// go out as soon as they are journaled, ahead of every stream's bytes, so a follower learns
+// an output's whole map at once; everything else keeps byte order.
 func (c *session) push(st *stream, items ...item) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -314,7 +316,13 @@ func (c *session) push(st *stream, items ...item) bool {
 		}
 		return false
 	}
-	st.items = append(st.items, items...)
+	for _, it := range items {
+		if _, eager := it.msg.(entryMsg); eager {
+			c.out = append(c.out, it.msg)
+		} else {
+			st.items = append(st.items, it)
+		}
+	}
 	c.signal()
 	return true
 }

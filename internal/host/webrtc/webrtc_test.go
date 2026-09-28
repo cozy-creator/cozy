@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"slices"
 	"testing"
 	"time"
 
@@ -131,5 +132,134 @@ func TestGetServesARangeOfTheCurrentBytes(t *testing.T) {
 	h.send(c, map[string]any{"t": "get", "id": 3, "run": "7", "output": "video", "offset": 0, "etag": "r3"})
 	if got, _ := h.body(c); !bytes.Equal(got, whole) {
 		t.Fatal("the whole output differs")
+	}
+}
+
+// follower is a client's copy of a followed output and its cursor (seq, len(got)).
+type follower struct {
+	got     []byte
+	seq     uint64 // the last entry whose bytes it holds in full
+	entries []webrtctest.Message
+	resets  int
+	end     *webrtctest.Message
+}
+
+// until applies messages until done says so, checking there is never a gap or a duplicate.
+func (h *harness) until(c *webrtctest.Client, f *follower, done func() bool) {
+	h.t.Helper()
+	for !done() {
+		m, ok := c.Recv(h.ctx)
+		if !ok {
+			h.t.Fatalf("the session ended: %s", m.T)
+		}
+		switch m.T {
+		case "entry":
+			f.entries = append(f.entries, m)
+		case "reset": // entries are eager: those from the reset on are the replacement's
+			f.entries = slices.DeleteFunc(f.entries, func(e webrtctest.Message) bool { return e.Seq < m.Seq })
+			f.got, f.seq = nil, 0
+			f.resets++
+		case "open", "data":
+			if m.Offset != uint64(len(f.got)) {
+				h.t.Fatalf("%s at %d while holding %d", m.T, m.Offset, len(f.got))
+			}
+			f.got = append(f.got, m.Data...)
+		case "end":
+			f.end = &m
+		default:
+			h.t.Fatalf("unexpected %s", m.Raw)
+		}
+		for _, e := range f.entries {
+			if e.Length <= uint64(len(f.got)) {
+				f.seq = e.Seq
+			}
+		}
+	}
+}
+
+func (h *harness) follow(c *webrtctest.Client, after, offset uint64) {
+	h.send(c, map[string]any{"t": "follow", "id": "v", "run": "7", "output": "video", "after": after, "offset": offset})
+}
+
+func sha(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func TestFollowStreamsEachAppendAsItLands(t *testing.T) {
+	h := newHarness(t)
+	c := h.open(64 << 20)
+	h.follow(c, 0, 0)
+	var f follower
+	var whole []byte
+	for k := range 3 {
+		seg := segment(200_000+k*50_000, byte(k+1))
+		whole = append(whole, seg...)
+		e := h.m.Append("7", "video", -1, seg, k == 2)
+		h.until(c, &f, func() bool { return len(f.got) == len(whole) && f.seq == e.Seq })
+	}
+	h.until(c, &f, func() bool { return f.end != nil })
+	if !bytes.Equal(f.got, whole) || f.end.Status != "completed" || f.end.SHA256 != sha(whole) || f.end.Length != uint64(len(whole)) {
+		t.Fatalf("end %s after %d bytes", f.end.Raw, len(f.got))
+	}
+	if len(f.entries) != 3 || *f.entries[2].AppendedFrom != uint64(len(whole)-300_000) || f.entries[2].Rev != 3 {
+		t.Fatalf("entries %+v", f.entries)
+	}
+}
+
+func TestFollowResumesAfterTheConnectionDies(t *testing.T) {
+	h := newHarness(t)
+	r := newRelay(t, h.srv.Addr, 0)
+	seg := [][]byte{segment(300_000, 1), segment(400_000, 2), segment(250_000, 3)}
+	c, err := webrtctest.Dial(h.ctx, r.addr(), h.srv.Fingerprint, webrtctest.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	h.send(c, map[string]any{"t": "hello", "v": 1, "cap": h.grant(nil)})
+	h.expect(c, "welcome")
+	held := uint64(len(seg[0]) + len(seg[1])/2) // credit ends mid-segment
+	h.send(c, map[string]any{"t": "credit", "bytes": held})
+	h.follow(c, 0, 0)
+	var f follower
+	h.m.Append("7", "video", -1, seg[0], false)
+	h.m.Append("7", "video", -1, seg[1], false)
+	h.until(c, &f, func() bool { return uint64(len(f.got)) == held })
+	r.kill()
+
+	h.m.Append("7", "video", -1, seg[2], true)
+	resumed := h.open(64 << 20)
+	if f.seq != 1 {
+		t.Fatalf("the cursor is at entry %d", f.seq)
+	}
+	h.follow(resumed, f.seq, uint64(len(f.got)))
+	h.until(resumed, &f, func() bool { return f.end != nil })
+	whole := bytes.Join(seg, nil)
+	if !bytes.Equal(f.got, whole) || f.end.SHA256 != sha(whole) || f.resets != 0 {
+		t.Fatalf("resumed to %d bytes, %d resets; end %s", len(f.got), f.resets, f.end.Raw)
+	}
+}
+
+func TestFollowResetsWhenTheOutputIsReplaced(t *testing.T) {
+	h := newHarness(t)
+	c := h.open(64 << 20)
+	h.follow(c, 0, 0)
+	var f follower
+	h.m.Append("7", "video", -1, segment(100_000, 1), false)
+	h.until(c, &f, func() bool { return len(f.got) == 100_000 })
+	cursor := f
+	replaced := segment(80_000, 9)
+	h.m.Replace("7", "video", -1, replaced, false)
+	h.until(c, &f, func() bool { return f.resets == 1 && bytes.Equal(f.got, replaced) })
+
+	// A client that held the first revision resumes into the replacement: reset, then all of it.
+	late := h.open(64 << 20)
+	h.follow(late, cursor.seq, uint64(len(cursor.got)))
+	h.until(late, &cursor, func() bool { return cursor.resets == 1 && bytes.Equal(cursor.got, replaced) })
+
+	h.m.End("7", "canceled")
+	h.until(c, &f, func() bool { return f.end != nil })
+	if f.end.Status != "canceled" || f.end.Length != uint64(len(replaced)) || f.end.SHA256 != "" {
+		t.Fatalf("end %s", f.end.Raw)
 	}
 }
