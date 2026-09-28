@@ -44,6 +44,7 @@ type runtimeMachine struct {
 	exactGPUs          bool
 	devices            int
 	sourceCredentials  bool
+	memoLookup         bool
 
 	submissions []*pb.MachineExecutionSubmit // every submission as sent, resubmissions included
 	failure     string                       // a failed terminal's safe message; empty succeeds
@@ -54,7 +55,7 @@ type runtimeMachine struct {
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	workspace := &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
 		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs, ExactExecutionGpus: m.exactGPUs,
-		SourceCredentials: m.sourceCredentials, ReleaseRoots: !m.older, ResolvesModelDefaults: !m.older}
+		SourceCredentials: m.sourceCredentials, ReleaseRoots: !m.older, ResolvesModelDefaults: !m.older, MemoLookup: m.memoLookup}
 	for ordinal := range m.devices {
 		workspace.Devices = append(workspace.Devices, &pb.MachineDevice{Ordinal: uint32(ordinal), Name: "fake-4090"})
 	}

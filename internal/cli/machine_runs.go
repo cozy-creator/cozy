@@ -359,7 +359,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if problem != nil {
 			return problem
 		}
-		built.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
+		built.ExpectedExecutionWorkspaceId, built.OwnerMemo = workspace.ExecutionWorkspaceId, workspace.MemoLookup
 		if built.PublicationAuthorizationId, problem = m.publicationAuthorization(ctx, request.ID, link.MachineID, connection); problem != nil {
 			return problem
 		}
@@ -504,7 +504,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 				}
 			}
 		}
-		built.PublicationAuthorizationId = authorization
+		workspace, problem := m.workspace(ctx, connection)
+		if problem != nil {
+			return problem
+		}
+		built.PublicationAuthorizationId, built.OwnerMemo = authorization, workspace.MemoLookup
 		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.WireMinor)
 		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, link.MachineID, built); problem != nil {
 			return problem
@@ -829,6 +833,9 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 		}
 		progress.Advance(1)
 		if problem := m.store.ObserveMachineExecution(request.ID, state, page); problem != nil {
+			return problem
+		}
+		if problem := m.answerMemoLookups(ctx, request, connection, query, page); problem != nil {
 			return problem
 		}
 		if page.NextAfter < page.HeadSequence && page.NextAfter <= cursor {

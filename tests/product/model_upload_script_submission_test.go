@@ -49,12 +49,16 @@ async def main() -> dict[str, str]:
 // job's slot=profile binding (#762).
 func TestRentedCivitaiIngestSubmitsTheSingleCallScript(t *testing.T) {
 	pod := newRentedIngestPod(t, "https://civitai.com/api/v1/model-versions/128078")
+	pod.machine.memoLookup = true // the owner answers this Runtime's memo lookups
 	code, out := pod.upload("civitai://128078", "proof/sdxl", "--source-profile", "civitai/sdxl/single-file/1")
 	if code != 0 || strings.Contains(out, "slot=profile") {
 		t.Fatalf("the rented ingest was refused [exit %d]:\n%s", code, out)
 	}
 	if script := pod.submittedScript(t); script != civitaiIngestScript {
 		t.Fatalf("the pod received another ingest script:\n%s\nwant:\n%s", script, civitaiIngestScript)
+	}
+	if !pod.machine.submitted().OwnerMemo {
+		t.Fatal("the submission to a memo_lookup Runtime does not say its owner answers memo lookups")
 	}
 }
 
