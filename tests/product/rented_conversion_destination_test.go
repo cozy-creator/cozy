@@ -50,12 +50,8 @@ type conversionMachine struct {
 }
 
 func (m *conversionMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
-	m.mu.Lock()
-	roots := m.jobRoots
-	m.mu.Unlock()
 	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "rented-workspace", ReleaseRoots: roots, ResolvesModelDefaults: roots,
-		ReleaseRootJobs: roots, ReleaseRootSources: roots}, nil
+		ExecutionWorkspaceId: "rented-workspace"}, nil
 }
 
 func (m *conversionMachine) SubmitMachineExecution(_ context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {

@@ -50,7 +50,7 @@ func (c *machineConnection) preparePublished(ctx context.Context, request record
 	}
 	// The release alone: the machine reads its facts at its own Hub.
 	stream, err := c.Host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
-		Claim: c.Claim, SupportsModelMaterializationRecovery: true, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
+		Claim: c.Claim, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
 	})
 	if err != nil {
 		return nil, machineTransport(err)
@@ -162,7 +162,7 @@ func (c *machineConnection) prepareModels(ctx context.Context, request records.R
 	}
 	selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, InstallationId: revision.ID, DownloadDelegation: downloads}
 	stream, err := c.Host.PreparePrivatePlacement(ctx, &pb.PreparePrivatePlacementCall{
-		Claim: c.Claim, SupportsModelMaterializationRecovery: true, PrivatePlacementSet: selected,
+		Claim: c.Claim, PrivatePlacementSet: selected,
 	})
 	if err != nil {
 		return nil, machineTransport(err)
@@ -186,7 +186,7 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, bootID, pkg, release
 		return problem
 	}
 	var packages []*pb.DownloadPackageRef
-	call := &pb.PreparePackageSetCall{Claim: connection.Claim, SupportsModelMaterializationRecovery: true}
+	call := &pb.PreparePackageSetCall{Claim: connection.Claim}
 	if pkg != "" {
 		packages = append(packages, &pb.DownloadPackageRef{Package: pkg, Release: release})
 	}

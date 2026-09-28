@@ -296,12 +296,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		}
 		c.mu.Unlock()
 	}()
-	if _, problem := probeWorkerProtocol(ctx, conn, w.spec.Connection != nil); problem != nil {
-		if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
-			c.refuseClaim(w, problem)
-		}
-		return fmt.Errorf("%s", problem.Message)
-	}
 	stream, err := client.Control(ctx)
 	if err != nil {
 		return err
@@ -473,13 +467,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onModelSourcePrepared(s, prepared)
-		case *pb.WorkerFrame_LocalPackageFileStatus:
-			status := m.LocalPackageFileStatus
-			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,
-				status.WorkerBootId) {
-				continue
-			}
-			c.onLocalPackageFileStatus(s, status)
 		case *pb.WorkerFrame_LocalPackageAbortStatus:
 			status := m.LocalPackageAbortStatus
 			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamEpoch,

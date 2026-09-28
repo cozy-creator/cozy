@@ -131,14 +131,8 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			sets = append(sets, held)
 			continue
 		}
-		if problem := requireAdapterDownloadPeer(s, prep.downloadSet); problem != nil {
-			if !refuse(prep.pkg, problem) {
-				return
-			}
-			continue
-		}
 		// The release alone: the machine reads its facts at its own Hub.
-		call := &pb.PreparePackageSetCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
+		call := &pb.PreparePackageSetCall{Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
 			DownloadDelegation: append([]byte(nil), prep.downloadSet...),
 		}}
 		result := c.runHostPrepare(s, w, seq, prep.label,

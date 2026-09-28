@@ -44,7 +44,7 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 				if row.absent {
 					return nil, status.Error(codes.Unimplemented, "old peer")
 				}
-				return &pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor, SupportsRentalKeepalive: !row.unsafe}, nil
+				return &pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor}, nil
 			}
 			pod.onFrame = func(frame *pb.RecordOwnerFrame, _ func(*pb.WorkerFrame) error) (bool, error) {
 				if frame.GetClaim() != nil {
@@ -63,7 +63,7 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 			}
 			if row.floor > 0 && row.floor <= row.minor && (row.minor < pb.MinCompatibleWireMinor || row.floor > pb.WireMinor) {
 				// Execution on a peer outside the range fails that operation alone, naming both ranges.
-				problem := orchestrator.ValidateWorkerProtocol(&pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor, SupportsRentalKeepalive: true}, podRental)
+				problem := orchestrator.ValidateWorkerProtocol(&pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor}, podRental)
 				if problem == nil || problem.ErrName() != pb.CapabilityUnavailableCode ||
 					!strings.Contains(problem.Message, fmt.Sprintf("%d–%d", row.floor, row.minor)) ||
 					!strings.Contains(problem.Message, fmt.Sprintf("%d–%d", pb.MinCompatibleWireMinor, pb.WireMinor)) {

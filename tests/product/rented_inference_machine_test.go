@@ -55,8 +55,7 @@ type runtimeMachine struct {
 
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	workspace := &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs, ExactExecutionGpus: m.exactGPUs,
-		SourceCredentials: m.sourceCredentials, ReleaseRoots: !m.older, ResolvesModelDefaults: !m.older, MemoLookup: m.memoLookup}
+		ExecutionWorkspaceId: "rented-workspace"}
 	for ordinal := range m.devices {
 		workspace.Devices = append(workspace.Devices, &pb.MachineDevice{Ordinal: uint32(ordinal), Name: "fake-4090"})
 	}

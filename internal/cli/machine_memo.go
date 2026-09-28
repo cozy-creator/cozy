@@ -17,17 +17,13 @@ import (
 // answerMemoLookups answers each memo.lookup in a page from the owner's own completed
 // results, before the observer reads again: a machine that asked waits only until then. The
 // results never leave this machine; a Hub only confirms that a recorded checkpoint still
-// exists. A machine without memo_lookup is never answered.
+// exists.
 func (m *machineRuns) answerMemoLookups(ctx context.Context, request records.Request, connection *machineConnection,
 	query *pb.MachineExecutionQuery, page *pb.MachineExecutionEventPage,
 ) *exit.Error {
 	for _, event := range page.Events {
 		if event.GetKind() != "memo.lookup" {
 			continue
-		}
-		workspace, problem := m.workspace(ctx, connection)
-		if problem != nil || !workspace.MemoLookup {
-			return problem
 		}
 		var lookup struct {
 			Operation string `json:"operation"`

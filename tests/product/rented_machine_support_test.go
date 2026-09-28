@@ -46,8 +46,7 @@ func newTerminalMachines(finish func(map[string]any) *pb.AttemptOutcomeBody) *te
 }
 
 func (m *terminalMachines) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
-	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace",
-		ReleaseRoots: !m.older.Load(), ResolvesModelDefaults: !m.older.Load()}, nil
+	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}, nil
 }
 
 // minted is what a Runtime names a submission's capture and invocation by: the submitted

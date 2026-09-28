@@ -554,18 +554,12 @@ type remotePlacementObservation struct {
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
 	knownPlanIDs        map[string]bool
-	// loadedPlanIDs are the bindings whose construction the live executor holds
-	// (minor 61). loadedKnown is false for an older worker, whose DISPATCHABLE
-	// placement holds its one construction: every dispatchable binding is loaded.
+	// loadedPlanIDs are the bindings whose construction the live executor holds.
 	loadedPlanIDs map[string]bool
-	loadedKnown   bool
 	fault         *pb.Fault
 }
 
 func (o remotePlacementObservation) loaded(planID string) bool {
-	if !o.loadedKnown {
-		return o.dispatchablePlanIDs[planID]
-	}
 	return o.loadedPlanIDs[planID]
 }
 

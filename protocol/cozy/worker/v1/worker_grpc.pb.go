@@ -12,14 +12,14 @@
 // required to be publicly exposed for topology symmetry.
 //
 // VERSIONING: the MAJOR is the package path (`cozy.worker.v1`). The MINOR is `wire_minor`, a
-// release train number. Peers are independently deployed and evolve separately: each advertises
-// its [minimum_wire_minor, wire_minor] range and capability booleans through ProtocolInfo.
-// Claim, ProtocolInfo, status, snapshots, keepalive, release and cancellation are never refused
-// over a wire minor. Each OPERATION gates on what it uses: ordinary preparation and execution
-// need the peer at or above WIRE_MINIMUM; a newer feature needs its generated `*WireMinor`
-// constant or its capability boolean. A missing capability fails only that operation with
-// `capability_unavailable`, naming the component to update; other work and rentals continue.
-// After the v1 freeze, breaking changes require a new package major.
+// release train number. Each peer advertises its [minimum_wire_minor, wire_minor] range through
+// ProtocolInfo, and its Claim carries its minor. Claim, ProtocolInfo, status, snapshots,
+// keepalive, release and cancellation are never refused over a wire minor. Preparation and
+// execution need the peer at or above WIRE_MINIMUM; below it only that operation fails with
+// `capability_unavailable`, naming the component to update, and other work and rentals continue.
+// Minor 64 is a hard cut: WIRE_MINIMUM equals WIRE_MINOR and no feature is negotiated per peer.
+// A later additive feature adds one capability boolean, which a sender checks before relying on
+// it; the next hard cut deletes it. After the v1 freeze, breaking changes need a new major.
 // R7 IS AN AUTHORING RULE ONLY: `reserved` numbers and names are compiler-enforced
 // tombstones against reuse; ordinary proto3 decoders do not refuse them on the wire and no
 // runtime polices them. All generated bindings and fixtures move together for this hardcut.
@@ -40,9 +40,8 @@
 // `MaxInlineControlBytes` (4 MiB) PER TRANSFER -- not per chunk. The distinction is the whole
 // rule: a 4 MiB frame is fine, and a 4 MiB frame sent 2,048 times to move 8 GiB is the defect,
 // because the total it moves is bounded by nothing. Anything larger than the ceiling travels
-// as a presigned URL to the process that holds the bytes, which is what `WeightsUploadGrant`,
-// `LocalPackageFileGrant` and `DeliveryGrant.outputs` already do. `MaxWeightsReadBytes` is a
-// bounded RANGE of an object an owner explicitly asked for, not a quantum of an unbounded whole.
+// as a presigned URL to the process that holds the bytes, which is what `WeightsUploadGrant`
+// and `DeliveryGrant.outputs` already do.
 //
 // The rule has NO carve-out and is mechanically enforced on the BOUND: tensorhub's
 // `scripts/fence.py` convicts any content-bearing `Max*Bytes` constant above the ceiling,
@@ -113,18 +112,17 @@
 // (th-007) stay reservations. The retired desired-state artifact delegation remains absent;
 // ArtifactSink host durability and transfers instead use the explicit host-only frames below.
 //
-// THE HOST APPENDS, NEVER RE-AUTHORS (proto-025, minor 21). A pod's supervisor is the
+// THE HOST APPENDS, NEVER RE-AUTHORS (proto-025). A pod's supervisor is the
 // pod-resident half of the HOST role the Cozy daemon performs in-process locally: it downloads
 // and verifies, asks the Runtime's loopback preparation for PlacementSet bytes, moves objects,
-// and keeps the pod ledger. Minor 21 gives that role its own lanes so the host never rewrites
+// and keeps the pod ledger. That role has its own lanes so the host never rewrites
 // a frame in flight: `PodHost` (owner <-> host, a second service on the pod listener),
 // `RuntimeWeights` (host <-> Runtime, loopback), and a host-authored SECOND snapshot document
-// beside the worker's, which passes through BYTE-IDENTICAL. The direction-annotated slots
-// still on RecordOwnerFrame / WorkerFrame / DesiredWorkerState.mode are the pre-21 shape of
-// the same lanes; they are RETIRING and are reserved at the first minor after every consumer
-// is off them. Nothing at 21 is removed or renumbered.
+// beside the worker's, which passes through BYTE-IDENTICAL. The owner's transfer lanes
+// (weights transfer, model source files and preparation, local package fetch and abort) still
+// ride RecordOwnerFrame / WorkerFrame slots on WorkerControl, which the Host routes itself.
 //
-// DEVICE LANES (proto-024, minor 22). The serialized resource inside one worker is a DEVICE
+// DEVICE LANES (proto-024). The serialized resource inside one worker is a DEVICE
 // LANE — a set of envelope-local device ordinals, one attempt seat, one ledger — not the worker
 // (cr-066). The one-counter-per-serialized-resource principle behind the admission gate (#472e)
 // therefore puts the seats PER LANE: `ObservedWorkerState.lanes[]`, with the worker-level
@@ -138,7 +136,7 @@
 // and the package's declared construction and refuses typed. `PlacementStatus.device_lane_id`
 // reports the lane a placement landed on. Nothing at 22 is removed or renumbered.
 //
-// THE ATTEMPT QUEUE (proto-026, minor 23; gpu-hot.md §3-§6). The worker ORDERS its lane; the
+// THE ATTEMPT QUEUE (proto-026; gpu-hot.md §3-§6). The worker ORDERS its lane; the
 // RecordOwner OFFERS depth. Acceptance is queue ADMISSION — journaled, hydrated, queued on a
 // lane — and binds neither a plan nor an executor epoch: both bind at DEVICE ENTRY. An attempt
 // on a lane is QUEUED -> RUNNING -> DEVICE_RELEASED -> OUTCOME_PENDING_ACK; the device seat is
@@ -157,12 +155,12 @@
 // placed or not), both also on `WorkerSnapshotBody/1`. No bytes, no headroom, no plan: the
 // orchestrator routes on counts and membership; VRAM arithmetic stays where it is measured.
 //
-// THE PACKAGE WIRE (xs-018/xs-019/xs-017, minor 30). What a pod is told about a published
+// THE PACKAGE WIRE (xs-018/xs-019/xs-017). What a pod is told about a published
 // package is the hub's own release material and nothing derived: `application`, the
 // interface-declared entrypoint model-slot paths, the placed image's pinned inventory, and the
 // release's hash-pinned requirements export — all hub-known before the pod exists. Runtime
 // preparation receives NO files: wheels come from the package indexes under --require-hashes,
-// the package interface rides as the hub release's bytes (minor 61), and model manifests/objects
+// the package interface rides as the hub release's bytes, and model manifests/objects
 // are resolved from the local TensorFS Store the privileged host admitted them to (proto-030).
 // `LocalDownloadFile` and `LocalDownloadKind` are DELETED with the per-file handoff; the
 // local-package plane keeps its explicitly supplied wheels — the only files with no index
@@ -172,18 +170,14 @@
 // published install's identity is its locked requirements export
 // (`Environment.locked_requirements`) over the image inventory, not a wheel list.
 //
-// THE STORAGE CUT (proto-031, minor 31). DownloadDelegation no longer reports held manifests:
+// THE STORAGE CUT (proto-031). DownloadDelegation no longer reports held manifests:
 // TensorFS computes the missing closure locally and asks only for those bytes. Preparation names
 // one immutable `install_root`, never an environment overlay. Local editable wheels stage below
 // that install namespace. The proto-026 residency sets on ObservedWorkerState and
 // WorkerSnapshotBody remain; the orchestrator still routes on them.
 //
-// THE EXECUTION LIFECYCLE (proto-061, minor 61; additive, floor 60, absent = unknown). Published
-// new preparation senders carry the hub release's PackageInterface/1 bytes, so no describe or
-// compatibility process runs per switch. The minor-60 CheckPackageSetCompatibility RPC remains
-// available while minor60 is supported; its validation shares the exact preparation cache.
-// Older senders may omit the interface; Runtime derives and caches it once per installed code.
-// Placement
+// THE EXECUTION LIFECYCLE (proto-061). A preparation may carry the hub release's
+// PackageInterface/1 bytes; without them Runtime obtains the interface itself. Placement
 // identity is the package release alone, stable as models are added. DISPATCHABLE means the
 // executor started and imported the package; models load on demand, and
 // `PlacementStatus.loaded_binding_digests` reports the constructions built in the live executor.
@@ -228,10 +222,10 @@ const (
 //
 // The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
 type WorkerControlClient interface {
-	// MINOR59. Discover Runtime's durable journal lifetime before freezing a submit.
+	// Discover Runtime's durable journal lifetime before freezing a submit.
 	// Authenticated like the other machine calls; no continuing Control stream needed.
 	GetMachineExecutionWorkspace(ctx context.Context, in *MachineExecutionWorkspaceQuery, opts ...grpc.CallOption) (*MachineExecutionWorkspace, error)
-	// MINOR51. Runtime owns accepted work independently of the caller connection.
+	// Runtime owns accepted work independently of the caller connection.
 	// These calls observe/control that authority; they do not establish a second
 	// RecordOwner or require a client coordinator inside the worker.
 	SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error)
@@ -240,8 +234,8 @@ type WorkerControlClient interface {
 	ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	CollectMachineExecution(ctx context.Context, in *MachineExecutionCollect, opts ...grpc.CallOption) (*AttemptOutcome, error)
 	AcknowledgeMachineExecutionCollection(ctx context.Context, in *MachineExecutionCollectionAck, opts ...grpc.CallOption) (*MachineExecutionState, error)
-	// Capability supports_machine_execution_triage. The triage bundle one terminal attempt's
-	// outcome names, read over the same authenticated seam as the outcome.
+	// The triage bundle one terminal attempt's outcome names, read over the same authenticated
+	// seam as the outcome.
 	ReadMachineExecutionTriage(ctx context.Context, in *MachineExecutionTriageQuery, opts ...grpc.CallOption) (*MachineExecutionTriage, error)
 	// Durable control: the RecordOwner's request stream carries RecordOwnerFrames, the worker's
 	// response stream carries WorkerFrames. Durable messages are never shed to backpressure.
@@ -382,10 +376,10 @@ type WorkerControl_WatchProgressClient = grpc.ServerStreamingClient[AttemptProgr
 //
 // The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
 type WorkerControlServer interface {
-	// MINOR59. Discover Runtime's durable journal lifetime before freezing a submit.
+	// Discover Runtime's durable journal lifetime before freezing a submit.
 	// Authenticated like the other machine calls; no continuing Control stream needed.
 	GetMachineExecutionWorkspace(context.Context, *MachineExecutionWorkspaceQuery) (*MachineExecutionWorkspace, error)
-	// MINOR51. Runtime owns accepted work independently of the caller connection.
+	// Runtime owns accepted work independently of the caller connection.
 	// These calls observe/control that authority; they do not establish a second
 	// RecordOwner or require a client coordinator inside the worker.
 	SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error)
@@ -394,8 +388,8 @@ type WorkerControlServer interface {
 	ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error)
 	CollectMachineExecution(context.Context, *MachineExecutionCollect) (*AttemptOutcome, error)
 	AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error)
-	// Capability supports_machine_execution_triage. The triage bundle one terminal attempt's
-	// outcome names, read over the same authenticated seam as the outcome.
+	// The triage bundle one terminal attempt's outcome names, read over the same authenticated
+	// seam as the outcome.
 	ReadMachineExecutionTriage(context.Context, *MachineExecutionTriageQuery) (*MachineExecutionTriage, error)
 	// Durable control: the RecordOwner's request stream carries RecordOwnerFrames, the worker's
 	// response stream carries WorkerFrames. Durable messages are never shed to backpressure.
@@ -701,9 +695,6 @@ const (
 	RuntimePreparation_WorkspaceReadByteTreeObject_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceReadByteTreeObject"
 	RuntimePreparation_ImportInputTree_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportInputTree"
 	RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady"
-	RuntimePreparation_ImportWorkspace_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportWorkspace"
-	RuntimePreparation_ActivateWorkspaceImport_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport"
-	RuntimePreparation_CheckPackageSetCompatibility_FullMethodName     = "/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility"
 	RuntimePreparation_PreparePackageSet_FullMethodName                = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
 	RuntimePreparation_PrepareModelSource_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
 	RuntimePreparation_ReleaseModelSource_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/ReleaseModelSource"
@@ -724,7 +715,7 @@ const (
 //
 // Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
 // service on its external listener. Runtime receives logical refs, hub-known release facts,
-// (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+// (local packages only) verified local wheel paths, and BOTH halves of the
 // signed download delegation, because the party that resolves a model's closure against the hub
 // is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
 // anonymous public index directives inside locked_requirements are the other origin that
@@ -740,19 +731,13 @@ type RuntimePreparationClient interface {
 	WorkspaceRetainDerivedResult(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	WorkspaceReleaseDerivedRetention(ctx context.Context, in *DerivedRetentionCall, opts ...grpc.CallOption) (*DerivedRetentionResult, error)
 	WorkspaceReleaseDerivedResult(ctx context.Context, in *DerivedResultReleaseCall, opts ...grpc.CallOption) (*DerivedResultReleaseResult, error)
-	// MINOR43. Ordinary byte-tree custody uses the same authenticated Workspace.
+	// Ordinary byte-tree custody uses the same authenticated Workspace.
 	WorkspaceRetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	WorkspaceReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	WorkspaceReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error)
-	// MINOR55. Authenticated root input intake; native bytes commit before a receipt.
+	// Authenticated root input intake; native bytes commit before a receipt.
 	ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error)
 	WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
-	// One-time authority transfer from a quiesced legacy Host journal. This is
-	// never forwarded from PodHost or exposed as an author-controlled cache write.
-	ImportWorkspace(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult], error)
-	ActivateWorkspaceImport(ctx context.Context, in *WorkspaceActivationCall, opts ...grpc.CallOption) (*WorkspaceImportResult, error)
-	// Retained for supported minor-60 Hosts. May retire only after minor60 leaves WIRE_MINIMUM.
-	CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
 	ReleaseModelSource(ctx context.Context, in *ReleaseModelSourceRequest, opts ...grpc.CallOption) (*ReleaseModelSourceResult, error)
@@ -917,39 +902,6 @@ func (c *runtimePreparationClient) WorkspaceWeightsIntentReady(ctx context.Conte
 	return out, nil
 }
 
-func (c *runtimePreparationClient) ImportWorkspace(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &RuntimePreparation_ServiceDesc.Streams[2], RuntimePreparation_ImportWorkspace_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[WorkspaceImportFrame, WorkspaceImportResult]{ClientStream: stream}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RuntimePreparation_ImportWorkspaceClient = grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult]
-
-func (c *runtimePreparationClient) ActivateWorkspaceImport(ctx context.Context, in *WorkspaceActivationCall, opts ...grpc.CallOption) (*WorkspaceImportResult, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WorkspaceImportResult)
-	err := c.cc.Invoke(ctx, RuntimePreparation_ActivateWorkspaceImport_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *runtimePreparationClient) CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CheckPackageSetCompatibilityResult)
-	err := c.cc.Invoke(ctx, RuntimePreparation_CheckPackageSetCompatibility_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *runtimePreparationClient) PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PreparePackageSetResult)
@@ -1076,7 +1028,7 @@ func (c *runtimePreparationClient) PreparePrivatePlacement(ctx context.Context, 
 //
 // Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
 // service on its external listener. Runtime receives logical refs, hub-known release facts,
-// (local packages only) verified local wheel paths, and — from minor 32 — BOTH halves of the
+// (local packages only) verified local wheel paths, and BOTH halves of the
 // signed download delegation, because the party that resolves a model's closure against the hub
 // is now Runtime's own TensorFS: no presigned URL, worker TLS credential, or index bearer. The
 // anonymous public index directives inside locked_requirements are the other origin that
@@ -1092,19 +1044,13 @@ type RuntimePreparationServer interface {
 	WorkspaceRetainDerivedResult(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	WorkspaceReleaseDerivedRetention(context.Context, *DerivedRetentionCall) (*DerivedRetentionResult, error)
 	WorkspaceReleaseDerivedResult(context.Context, *DerivedResultReleaseCall) (*DerivedResultReleaseResult, error)
-	// MINOR43. Ordinary byte-tree custody uses the same authenticated Workspace.
+	// Ordinary byte-tree custody uses the same authenticated Workspace.
 	WorkspaceRetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	WorkspaceReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	WorkspaceReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error
-	// MINOR55. Authenticated root input intake; native bytes commit before a receipt.
+	// Authenticated root input intake; native bytes commit before a receipt.
 	ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error
 	WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
-	// One-time authority transfer from a quiesced legacy Host journal. This is
-	// never forwarded from PodHost or exposed as an author-controlled cache write.
-	ImportWorkspace(grpc.ClientStreamingServer[WorkspaceImportFrame, WorkspaceImportResult]) error
-	ActivateWorkspaceImport(context.Context, *WorkspaceActivationCall) (*WorkspaceImportResult, error)
-	// Retained for supported minor-60 Hosts. May retire only after minor60 leaves WIRE_MINIMUM.
-	CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
 	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
 	ReleaseModelSource(context.Context, *ReleaseModelSourceRequest) (*ReleaseModelSourceResult, error)
@@ -1165,15 +1111,6 @@ func (UnimplementedRuntimePreparationServer) ImportInputTree(grpc.ClientStreamin
 }
 func (UnimplementedRuntimePreparationServer) WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error) {
 	return nil, status.Error(codes.Unimplemented, "method WorkspaceWeightsIntentReady not implemented")
-}
-func (UnimplementedRuntimePreparationServer) ImportWorkspace(grpc.ClientStreamingServer[WorkspaceImportFrame, WorkspaceImportResult]) error {
-	return status.Error(codes.Unimplemented, "method ImportWorkspace not implemented")
-}
-func (UnimplementedRuntimePreparationServer) ActivateWorkspaceImport(context.Context, *WorkspaceActivationCall) (*WorkspaceImportResult, error) {
-	return nil, status.Error(codes.Unimplemented, "method ActivateWorkspaceImport not implemented")
-}
-func (UnimplementedRuntimePreparationServer) CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error) {
-	return nil, status.Error(codes.Unimplemented, "method CheckPackageSetCompatibility not implemented")
 }
 func (UnimplementedRuntimePreparationServer) PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
@@ -1448,49 +1385,6 @@ func _RuntimePreparation_WorkspaceWeightsIntentReady_Handler(srv interface{}, ct
 	return interceptor(ctx, in, info, handler)
 }
 
-func _RuntimePreparation_ImportWorkspace_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(RuntimePreparationServer).ImportWorkspace(&grpc.GenericServerStream[WorkspaceImportFrame, WorkspaceImportResult]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RuntimePreparation_ImportWorkspaceServer = grpc.ClientStreamingServer[WorkspaceImportFrame, WorkspaceImportResult]
-
-func _RuntimePreparation_ActivateWorkspaceImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(WorkspaceActivationCall)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RuntimePreparationServer).ActivateWorkspaceImport(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: RuntimePreparation_ActivateWorkspaceImport_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RuntimePreparationServer).ActivateWorkspaceImport(ctx, req.(*WorkspaceActivationCall))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _RuntimePreparation_CheckPackageSetCompatibility_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PreparePackageSetRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RuntimePreparationServer).CheckPackageSetCompatibility(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: RuntimePreparation_CheckPackageSetCompatibility_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RuntimePreparationServer).CheckPackageSetCompatibility(ctx, req.(*PreparePackageSetRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _RuntimePreparation_PreparePackageSet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PreparePackageSetRequest)
 	if err := dec(in); err != nil {
@@ -1759,14 +1653,6 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimePreparation_WorkspaceWeightsIntentReady_Handler,
 		},
 		{
-			MethodName: "ActivateWorkspaceImport",
-			Handler:    _RuntimePreparation_ActivateWorkspaceImport_Handler,
-		},
-		{
-			MethodName: "CheckPackageSetCompatibility",
-			Handler:    _RuntimePreparation_CheckPackageSetCompatibility_Handler,
-		},
-		{
 			MethodName: "PreparePackageSet",
 			Handler:    _RuntimePreparation_PreparePackageSet_Handler,
 		},
@@ -1826,18 +1712,12 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:       _RuntimePreparation_ImportInputTree_Handler,
 			ClientStreams: true,
 		},
-		{
-			StreamName:    "ImportWorkspace",
-			Handler:       _RuntimePreparation_ImportWorkspace_Handler,
-			ClientStreams: true,
-		},
 	},
 	Metadata: "cozy/worker/v1/worker.proto",
 }
 
 const (
-	RuntimeWeights_Exchange_FullMethodName = "/cozy.worker.v1.RuntimeWeights/Exchange"
-	RuntimeWeights_Upload_FullMethodName   = "/cozy.worker.v1.RuntimeWeights/Upload"
+	RuntimeWeights_Upload_FullMethodName = "/cozy.worker.v1.RuntimeWeights/Upload"
 )
 
 // RuntimeWeightsClient is the client API for RuntimeWeights service.
@@ -1846,13 +1726,8 @@ const (
 //
 // Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
 // the same loopback listener as WorkerControl and RuntimePreparation; it is never registered
-// on the external listener. It carries the supervisor<->Runtime privates that were
-// direction-annotated WorkerControl frames before minor 21.
+// on the external listener. Runtime sends custody observations and outcomes on WorkerControl.
 type RuntimeWeightsClient interface {
-	// Retired at minor 41; implementations refuse this legacy custody stream. Runtime
-	// commits its common workspace journal and sends custody observations and outcomes
-	// on the same ordered WorkerControl stream. The Host never grants native authority.
-	Exchange(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[WeightsHostAck, WeightsHostEvent], error)
 	// One validated upload grant in, one terminal answer out. Runtime streams the bytes it holds.
 	Upload(ctx context.Context, in *WeightsUploadRequest, opts ...grpc.CallOption) (*WeightsUploadResult, error)
 }
@@ -1864,19 +1739,6 @@ type runtimeWeightsClient struct {
 func NewRuntimeWeightsClient(cc grpc.ClientConnInterface) RuntimeWeightsClient {
 	return &runtimeWeightsClient{cc}
 }
-
-func (c *runtimeWeightsClient) Exchange(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[WeightsHostAck, WeightsHostEvent], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &RuntimeWeights_ServiceDesc.Streams[0], RuntimeWeights_Exchange_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[WeightsHostAck, WeightsHostEvent]{ClientStream: stream}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RuntimeWeights_ExchangeClient = grpc.BidiStreamingClient[WeightsHostAck, WeightsHostEvent]
 
 func (c *runtimeWeightsClient) Upload(ctx context.Context, in *WeightsUploadRequest, opts ...grpc.CallOption) (*WeightsUploadResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -1894,13 +1756,8 @@ func (c *runtimeWeightsClient) Upload(ctx context.Context, in *WeightsUploadRequ
 //
 // Loopback-only Runtime-hosted weights seam. pod-supervisor is its only client and dials it on
 // the same loopback listener as WorkerControl and RuntimePreparation; it is never registered
-// on the external listener. It carries the supervisor<->Runtime privates that were
-// direction-annotated WorkerControl frames before minor 21.
+// on the external listener. Runtime sends custody observations and outcomes on WorkerControl.
 type RuntimeWeightsServer interface {
-	// Retired at minor 41; implementations refuse this legacy custody stream. Runtime
-	// commits its common workspace journal and sends custody observations and outcomes
-	// on the same ordered WorkerControl stream. The Host never grants native authority.
-	Exchange(grpc.BidiStreamingServer[WeightsHostAck, WeightsHostEvent]) error
 	// One validated upload grant in, one terminal answer out. Runtime streams the bytes it holds.
 	Upload(context.Context, *WeightsUploadRequest) (*WeightsUploadResult, error)
 	mustEmbedUnimplementedRuntimeWeightsServer()
@@ -1913,9 +1770,6 @@ type RuntimeWeightsServer interface {
 // pointer dereference when methods are called.
 type UnimplementedRuntimeWeightsServer struct{}
 
-func (UnimplementedRuntimeWeightsServer) Exchange(grpc.BidiStreamingServer[WeightsHostAck, WeightsHostEvent]) error {
-	return status.Error(codes.Unimplemented, "method Exchange not implemented")
-}
 func (UnimplementedRuntimeWeightsServer) Upload(context.Context, *WeightsUploadRequest) (*WeightsUploadResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method Upload not implemented")
 }
@@ -1939,13 +1793,6 @@ func RegisterRuntimeWeightsServer(s grpc.ServiceRegistrar, srv RuntimeWeightsSer
 	}
 	s.RegisterService(&RuntimeWeights_ServiceDesc, srv)
 }
-
-func _RuntimeWeights_Exchange_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(RuntimeWeightsServer).Exchange(&grpc.GenericServerStream[WeightsHostAck, WeightsHostEvent]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RuntimeWeights_ExchangeServer = grpc.BidiStreamingServer[WeightsHostAck, WeightsHostEvent]
 
 func _RuntimeWeights_Upload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(WeightsUploadRequest)
@@ -1977,14 +1824,7 @@ var RuntimeWeights_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimeWeights_Upload_Handler,
 		},
 	},
-	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "Exchange",
-			Handler:       _RuntimeWeights_Exchange_Handler,
-			ServerStreams: true,
-			ClientStreams: true,
-		},
-	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "cozy/worker/v1/worker.proto",
 }
 
@@ -2020,7 +1860,6 @@ const (
 	PodHost_ModelSourceAdopt_FullMethodName                      = "/cozy.worker.v1.PodHost/ModelSourceAdopt"
 	PodHost_CheckpointPage_FullMethodName                        = "/cozy.worker.v1.PodHost/CheckpointPage"
 	PodHost_CheckpointTransfer_FullMethodName                    = "/cozy.worker.v1.PodHost/CheckpointTransfer"
-	PodHost_LocalPackageFetch_FullMethodName                     = "/cozy.worker.v1.PodHost/LocalPackageFetch"
 	PodHost_LocalPackageUpload_FullMethodName                    = "/cozy.worker.v1.PodHost/LocalPackageUpload"
 	PodHost_LocalPackageAbort_FullMethodName                     = "/cozy.worker.v1.PodHost/LocalPackageAbort"
 	PodHost_WeightsTransfer_FullMethodName                       = "/cozy.worker.v1.PodHost/WeightsTransfer"
@@ -2086,7 +1925,7 @@ type PodHostClient interface {
 	RetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	ReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	ReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error)
-	// MINOR55. Proxies the bounded stream to Runtime without owning its byte custody.
+	// Proxies the bounded stream to Runtime without owning its byte custody.
 	ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error)
 	RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error)
 	LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error)
@@ -2094,7 +1933,6 @@ type PodHostClient interface {
 	ModelSourceAdopt(ctx context.Context, in *ModelSourceAdoptCall, opts ...grpc.CallOption) (*ModelSourcePrepared, error)
 	CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferCall, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
-	LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error)
 	LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error)
 	LocalPackageAbort(ctx context.Context, in *LocalPackageAbortCall, opts ...grpc.CallOption) (*LocalPackageAbortStatus, error)
 	WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error)
@@ -2467,28 +2305,9 @@ func (c *podHostClient) CheckpointTransfer(ctx context.Context, in *CheckpointTr
 	return out, nil
 }
 
-func (c *podHostClient) LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[6], PodHost_LocalPackageFetch_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[LocalPackageFetchCall, LocalPackageFileStatus]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PodHost_LocalPackageFetchClient = grpc.ServerStreamingClient[LocalPackageFileStatus]
-
 func (c *podHostClient) LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[7], PodHost_LocalPackageUpload_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[6], PodHost_LocalPackageUpload_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2511,7 +2330,7 @@ func (c *podHostClient) LocalPackageAbort(ctx context.Context, in *LocalPackageA
 
 func (c *podHostClient) WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[8], PodHost_WeightsTransfer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[7], PodHost_WeightsTransfer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2597,7 +2416,7 @@ type PodHostServer interface {
 	RetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	ReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	ReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error
-	// MINOR55. Proxies the bounded stream to Runtime without owning its byte custody.
+	// Proxies the bounded stream to Runtime without owning its byte custody.
 	ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error
 	RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error)
 	LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error)
@@ -2605,7 +2424,6 @@ type PodHostServer interface {
 	ModelSourceAdopt(context.Context, *ModelSourceAdoptCall) (*ModelSourcePrepared, error)
 	CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferCall) (*CheckpointTransferStatus, error)
-	LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error
 	LocalPackageUpload(grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]) error
 	LocalPackageAbort(context.Context, *LocalPackageAbortCall) (*LocalPackageAbortStatus, error)
 	WeightsTransfer(*WeightsTransferCall, grpc.ServerStreamingServer[WeightsTransferStatus]) error
@@ -2712,9 +2530,6 @@ func (UnimplementedPodHostServer) CheckpointPage(context.Context, *CheckpointPag
 }
 func (UnimplementedPodHostServer) CheckpointTransfer(context.Context, *CheckpointTransferCall) (*CheckpointTransferStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckpointTransfer not implemented")
-}
-func (UnimplementedPodHostServer) LocalPackageFetch(*LocalPackageFetchCall, grpc.ServerStreamingServer[LocalPackageFileStatus]) error {
-	return status.Error(codes.Unimplemented, "method LocalPackageFetch not implemented")
 }
 func (UnimplementedPodHostServer) LocalPackageUpload(grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]) error {
 	return status.Error(codes.Unimplemented, "method LocalPackageUpload not implemented")
@@ -3261,17 +3076,6 @@ func _PodHost_CheckpointTransfer_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PodHost_LocalPackageFetch_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(LocalPackageFetchCall)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(PodHostServer).LocalPackageFetch(m, &grpc.GenericServerStream[LocalPackageFetchCall, LocalPackageFileStatus]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PodHost_LocalPackageFetchServer = grpc.ServerStreamingServer[LocalPackageFileStatus]
-
 func _PodHost_LocalPackageUpload_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(PodHostServer).LocalPackageUpload(&grpc.GenericServerStream[LocalPackageUploadFrame, LocalPackageFileStatus]{ServerStream: stream})
 }
@@ -3472,11 +3276,6 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "ImportInputTree",
 			Handler:       _PodHost_ImportInputTree_Handler,
 			ClientStreams: true,
-		},
-		{
-			StreamName:    "LocalPackageFetch",
-			Handler:       _PodHost_LocalPackageFetch_Handler,
-			ServerStreams: true,
 		},
 		{
 			StreamName:    "LocalPackageUpload",

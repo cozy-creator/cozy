@@ -32,7 +32,7 @@ type memoMachine struct {
 
 func (m *memoMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "workspace", MemoLookup: m.memo}, nil
+		ExecutionWorkspaceId: "workspace"}, nil
 }
 
 func (m *memoMachine) ControlMachineExecution(_ context.Context, control *pb.MachineExecutionControl) (*pb.MachineExecutionState, error) {

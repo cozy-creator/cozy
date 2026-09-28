@@ -66,10 +66,6 @@ func (m *machineRuns) stageMachineInputs(ctx context.Context, request records.Re
 	if len(request.Assets) == 0 {
 		return nil, nil
 	}
-	reuse := false
-	if workspace, problem := m.workspace(ctx, connection); problem == nil {
-		reuse = workspace.InputObjectReuse
-	}
 	type staged struct {
 		header  *pb.InputTreeImportHeader
 		members []resultfiles.TreeMember
@@ -109,7 +105,7 @@ func (m *machineRuns) stageMachineInputs(ctx context.Context, request records.Re
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			if reuse && m.store.MachineInputSent(connection.Name, asset.Snapshot.Manifest.Digest) {
+			if m.store.MachineInputSent(connection.Name, asset.Snapshot.Manifest.Digest) {
 				if held, problem := m.importMachineInput(ctx, request.ID, asset, row.header, nil, connection, false); problem == nil {
 					row.held = held
 					return

@@ -1279,19 +1279,6 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		if _, problem := c.rentalControl(req.Worker); problem != nil {
 			return WorkerLaunchSpec{}, "", problem
 		}
-		c.mu.Lock()
-		var minor uint32
-		if worker := c.workers[instance]; worker != nil {
-			minor = worker.wireMinor
-		}
-		c.mu.Unlock()
-		required, problem := c.requiredUnpublishedWire(req)
-		if problem != nil {
-			return WorkerLaunchSpec{}, "", problem
-		}
-		if minor < required {
-			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
-		}
 	}
 	if problem := c.claimRentalPreparation(instance, req); problem != nil {
 		return WorkerLaunchSpec{}, "", problem
@@ -1546,16 +1533,6 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	if current == nil || (current.State != "submitted" && current.State != "queued") {
 		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its operation lookup was in progress")
 	}
-	if req.RetainWork {
-		required, problem := c.requiredUnpublishedWire(req)
-		if problem != nil {
-			return 0, problem
-		}
-		if w.wireMinor < required {
-			return 0, exit.Named(exit.Structural, "request.retention_unsupported",
-				"this private work requires worker wire %d; selected worker speaks %d", required, w.wireMinor)
-		}
-	}
 	if req.ParentRequestID != "" {
 		if problem := c.retainChildInputs(req); problem != nil {
 			return 0, problem
@@ -1617,15 +1594,6 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		if problem := requireAdapterPlacementEcho(req.Models, servingPlacement); problem != nil {
 			return 0, problem
 		}
-	}
-	if hasModelAdapters(req.Models) && w.wireMinor < pb.ModelAdapterWireMinor {
-		return 0, exit.Named(exit.Structural, "model_adapters_protocol_unsupported", "model adapters require worker protocol minor %d or newer", pb.ModelAdapterWireMinor)
-	}
-	if req.AttentionKernel != "" && w.declaredInstance != "" && w.wireMinor < pb.AttentionKernelWireMinor {
-		return 0, exit.Named(exit.Unavailable, "attention_kernel_protocol_unsupported",
-			"worker protocol minor %d cannot carry attention-kernel requests; need minor %d",
-			w.wireMinor, pb.AttentionKernelWireMinor).
-			WithRemedy("select a worker image with protocol minor %d or newer", pb.AttentionKernelWireMinor)
 	}
 	spec := &pb.InvocationSpec{
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong

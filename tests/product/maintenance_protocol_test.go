@@ -155,7 +155,7 @@ func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 		{name: "active attempt", minor: 60, floor: 59, busy: true},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			peer := &maintenancePeer{info: &pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor, SupportsRentalKeepalive: !row.unsafe}}
+			peer := &maintenancePeer{info: &pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor}}
 			if row.busy {
 				peer.held = []*pb.HeldAttempt{{RequestId: "active", AttemptOrdinal: 1}}
 			}

@@ -342,18 +342,14 @@ func controlClaim(parent context.Context, client pb.WorkerControlClient, claim *
 	}
 }
 
-// ValidateNewWork gates a new preparation or execution on the machine's protocol range and
-// idle guard. Observation, collection, cancellation and release reach any peer.
+// ValidateNewWork gates a new preparation or execution on the machine's protocol range.
+// Observation, collection, cancellation and release reach any peer.
 func (m *Machine) ValidateNewWork() *exit.Error {
 	if !m.owned {
 		return orchestrator.ValidateWorkerProtocol(m.Protocol, m.Name)
 	}
 	if problem := orchestrator.ValidateWorkerProtocol(m.Protocol, ""); problem != nil {
 		return problem.WithRemedy("install the current worker cohort: cozy machine install --host <pod-supervisor>")
-	}
-	if !m.Protocol.SupportsRentalKeepalive {
-		return exit.Named(exit.Conflict, "worker.rental_idle_guard_required", "this machine's Host reports no idle guard").
-			WithRemedy("install the current worker cohort: cozy machine install --host <pod-supervisor>")
 	}
 	return nil
 }
@@ -362,7 +358,7 @@ func (m *Machine) ValidateNewWork() *exit.Error {
 func Transport(err error) *exit.Error {
 	code := status.Code(err)
 	if code == codes.Unimplemented {
-		return exit.Named(exit.Unavailable, "machine_execution.worker_upgrade_required", "worker does not implement workspace-fenced execution; worker protocol 59 is required")
+		return exit.Named(exit.Unavailable, "machine_execution.worker_upgrade_required", "the worker does not implement machine execution; update its Runtime")
 	}
 	if code == codes.Unavailable || code == codes.DeadlineExceeded || code == codes.Canceled || code == codes.ResourceExhausted || code == codes.Aborted {
 		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "machine execution observation is unavailable: %s", status.Convert(err).Message())

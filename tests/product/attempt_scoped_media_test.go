@@ -37,20 +37,18 @@ func inputMediaClient(t *testing.T, address string, budget time.Duration) *media
 }
 
 // The pod's media server ships in its image, independently of this host. A plane at the
-// floor or newer is dialled and moves bytes; a route an older plane lacks fails only that
-// operation, and a plane below the floor is refused before any byte moves.
+// current revision or newer is dialled and moves bytes; an older plane is refused before
+// any byte moves.
 func TestMediaPlaneRevisionIsAFloor(t *testing.T) {
 	for _, arm := range []struct {
 		name     string
 		rev      *int
 		accepted bool
-		triage   bool
 	}{
-		{"absent", nil, false, false},
-		{"rev1", new(1), false, false},
-		{"rev2", new(2), true, false},
-		{"current", new(mediawire.ContractRev), true, true},
-		{"newer", new(mediawire.ContractRev + 1), true, true},
+		{"absent", nil, false},
+		{"older", new(mediawire.ContractRev - 1), false},
+		{"current", new(mediawire.ContractRev), true},
+		{"newer", new(mediawire.ContractRev + 1), true},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			var writes atomic.Int32
@@ -80,11 +78,7 @@ func TestMediaPlaneRevisionIsAFloor(t *testing.T) {
 			_, problem = client.PutInput("attempt-7", "payload", []byte("payload"))
 			fatal(t, problem)
 			_, problem = client.GetTriage("subject-1", inputDigest([]byte("{}")), 2)
-			if arm.triage {
-				fatal(t, problem)
-			} else if problem == nil || problem.ErrName() != "triage_unsupported" {
-				t.Fatalf("an older plane's missing triage route was not a typed operation failure: %v", problem)
-			}
+			fatal(t, problem)
 		})
 	}
 }

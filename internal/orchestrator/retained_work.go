@@ -9,10 +9,6 @@ import (
 	"time"
 )
 
-// Older hosts discard weights custody on OutcomeAck, so they cannot acknowledge
-// a retained stop even when their execution/cancellation protocol is compatible.
-const RetainedWorkWireMinor uint32 = 39
-
 func (c *Orchestrator) CancelRetainedRequest(id, actor string) *exit.Error {
 	if problem := c.opt.Store.RequestRetainedCancellation(id, actor); problem != nil {
 		return problem

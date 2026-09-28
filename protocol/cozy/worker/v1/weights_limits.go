@@ -7,7 +7,6 @@ const MaxWeightsReceiptAggregateBytes = 4 << 20
 const MaxWeightsDeclarationBytes = 1 << 20
 const MaxWeightsInventoryBytes = 4 << 20
 const MaxWeightsObjects = 65536
-const MaxWeightsReadBytes = 4 << 20
 const MaxWeightsGrantURLBytes = 16 << 10
 
 // MaxInlineControlBytes is the ceiling every content-bearing bound here must respect: the
@@ -20,7 +19,6 @@ const MaxRetainedModelArtifactBytes = 4096
 const MaxModelResultPointerBytes = 1024
 const MaxActiveChildCalls = 32
 const MaxNativeByteReadChunkBytes = 32 << 10
-const NativeRootInputsWireMinor = 55
 const MaxInputTreeManifestBytes = 1 << 20
 const MaxInputTreeChunkBytes = 1 << 20
 const MaxModelSourceHeaderBytes = MaxInlineControlBytes
@@ -32,15 +30,8 @@ const MaxModelSourceProfileBytes = 1024
 const MaxModelSourceURIBytes = 4096
 const MaxModelSourceLicenseBytes = 4096
 const MaxModelSourceURLBytes = 16 << 10
-// Wire47 expands private revisions to one project plus128 dependencies.
-const ExpandedLocalPackageFilesWireMinor = 47
-const LegacyMaxLocalPackageFiles = 33
 const MaxLocalPackageFiles = 129
 const MaxLocalPackageFilenameBytes = 255
-const MaxLocalPackageGrantURLBytes = 16 << 10
 const MaxModelSlotPaths = 256
-
-// ModelAdapterWireMinor is required before sending a nonempty model adapter stack.
-const ModelAdapterWireMinor uint32 = 57
 const MaxImageInventoryDistributions = 4096
 const MaxLockedRequirementsBytes = 1 << 20

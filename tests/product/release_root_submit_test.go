@@ -137,11 +137,6 @@ func newReleaseMachine() *releaseMachine {
 
 func (m *releaseMachine) GetMachineExecutionWorkspace(ctx context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	workspace, err := m.acceptingMachines.GetMachineExecutionWorkspace(ctx, query)
-	if workspace != nil {
-		workspace.ReleaseRoots, workspace.ResolvesModelDefaults, workspace.InputObjectReuse = true, true, true
-		workspace.ReleaseRootSources, workspace.ReleaseRootJobs = true, true
-		workspace.EventWait = m.changed != nil
-	}
 	return workspace, err
 }
 
@@ -150,9 +145,6 @@ func (m *releaseMachine) SubmitMachineExecution(ctx context.Context, submit *pb.
 	root := submit.ReleaseRoot
 	if root == nil || len(submit.CaptureCanonicalBytes) > 0 || submit.PreparedState != nil || len(submit.Offer.InvocationSpecCanonicalBytes) > 0 {
 		return nil, status.Error(codes.InvalidArgument, "a release root names only its request")
-	}
-	if len(root.Installations) > 0 || len(root.Callees) > 0 || root.CatalogOrigin != "" {
-		return nil, status.Error(codes.InvalidArgument, "a release root names no facts, closure or catalog: the machine reads its own Hub")
 	}
 	m.mu.Lock()
 	m.installed[root.Package+"@"+root.Release] = true // installed from its own Hub

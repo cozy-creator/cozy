@@ -11,12 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"google.golang.org/protobuf/proto"
-
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Pinned TLS and the real owner validate complete revision bounds before upload.
@@ -78,19 +75,4 @@ func TestUnpublishedWheelCapacityBeforeTransfer(t *testing.T) {
 			}
 		})
 	}
-}
-
-// Even the maximum capability-bearing frame remains below the control ceiling.
-func TestUnpublishedWheelMaximumGrantFrameFitsControl(t *testing.T) {
-	request := &pb.LocalPackageFetchRequest{RecordOwnerEpoch: ^uint64(0), ControlStreamEpoch: ^uint64(0), WorkerBootId: strings.Repeat("b", 256), OperationId: strings.Repeat("o", 256)}
-	for i := 0; i < pb.MaxLocalPackageFiles; i++ {
-		request.Files = append(request.Files, &pb.LocalPackageFileGrant{Digest: bytes.Repeat([]byte{byte(i)}, 32), Filename: strings.Repeat("f", pb.MaxLocalPackageFilenameBytes), Length: ^uint64(0), Url: strings.Repeat("u", pb.MaxLocalPackageGrantURLBytes)})
-	}
-	frame := &pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_LocalPackageFetchRequest{LocalPackageFetchRequest: request}}
-	encoded, err := proto.Marshal(frame)
-	must(t, err)
-	if len(encoded) > pb.MaxInlineControlBytes {
-		t.Fatalf("%d-byte frame exceeds %d-byte control ceiling", len(encoded), pb.MaxInlineControlBytes)
-	}
-	t.Logf("maximum captured wheel grant frame: %d bytes of %d", len(encoded), pb.MaxInlineControlBytes)
 }

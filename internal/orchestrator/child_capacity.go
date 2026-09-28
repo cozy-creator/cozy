@@ -7,19 +7,6 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-func (c *Orchestrator) requiredUnpublishedWire(req records.Request) (uint32, *exit.Error) {
-	// A composition parent speaks the child-call minor because it makes the calls; a
-	// captured callee needs it only when it IS one, which the second term already says.
-	bound, problem := c.opt.Store.CompositionParent(req.InstallID, req.Entrypoint)
-	if problem != nil {
-		return 0, problem
-	}
-	if bound || req.ParentRequestID != "" {
-		return 40, nil
-	}
-	return RetainedWorkWireMinor, nil
-}
-
 // jobExecutionRole can place a resource-free caller in the separate CPU slot.
 // Captured dependencies make child calls available; they do not require delegation
 // or prevent an ordinary job from using Models, weights outputs, or a device.
