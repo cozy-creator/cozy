@@ -563,6 +563,7 @@ type RentalCmd struct {
 	SSHInfo   RentalSSHInfoCmd   `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List      RentalListCmd      `cmd:"" help:"List rented machines, live on a terminal."`
 	Show      RentalShowCmd      `cmd:"" help:"Show one rental: state, rate, accrued spend and every other fact."`
+	Logs      RentalLogsCmd      `cmd:"" help:"Print the provider's boot log of a rental's attempt, kept after its pod is gone."`
 	New       RentalNewCmd       `cmd:"" help:"Start a private rental, or list available machine types."`
 	End       RentalEndCmd       `cmd:"" help:"End a private rental and stop billing."`
 	Prune     RentalPruneCmd     `cmd:"" help:"Free unused cached operation results on a private rental."`
@@ -641,6 +642,20 @@ type RentalShowCmd struct {
 
 func (c *RentalShowCmd) Run(r *Runtime) error {
 	return r.call(handleRentalShow, []string{c.Rental}, nil, nil, false)
+}
+
+type RentalLogsCmd struct {
+	Rental  string `arg:"" name:"rental" predictor:"rental" help:"Rental machine name or id."`
+	Follow  bool   `short:"f" help:"Keep printing while the rental boots, onto any attempt a replan starts."`
+	Attempt int    `help:"Attempt number, from 1; default the latest."`
+}
+
+func (c *RentalLogsCmd) Run(r *Runtime) error {
+	attempt := ""
+	if c.Attempt != 0 {
+		attempt = intText(c.Attempt)
+	}
+	return r.call(handleRentalLogs, []string{c.Rental}, bools("--follow", c.Follow), values("--attempt", attempt), false)
 }
 
 type UpCmd struct{}
