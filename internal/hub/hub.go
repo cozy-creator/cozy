@@ -335,7 +335,8 @@ func (c *Client) PackageCard(ctx context.Context, ref Ref) (PackageCard, *exit.E
 
 func (c *Client) ModelCard(ctx context.Context, ref Ref) (ModelCard, *exit.Error) {
 	var out ModelCard
-	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("models", ref)}, &out)
+	// A signed-in owner sees its own private repository; a signed-out reader sees public ones.
+	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("models", ref), optionalAuth: true}, &out)
 	return out, e
 }
 

@@ -60,6 +60,8 @@ func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 					_, _ = w.Write([]byte(`{"model":"proof/source","manifest_id":"sha256:fixture"}`))
 				case r.URL.Path == "/v1/rental-quotes":
 					_, _ = w.Write([]byte(`{"price_usd_micros_per_hour":1}`))
+				case r.URL.Path == "/v1/models/proof/source":
+					_, _ = w.Write([]byte(`{"model":{"org":"proof","name":"source"},"releases":[]}`))
 				case r.Method == http.MethodPost:
 					_, _ = w.Write([]byte(`{"reads":[]}`))
 				default:
@@ -74,7 +76,8 @@ func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 			_, readsErr := client.CheckpointReads(context.Background(), ref, "fixture", nil)
 			_, resolveErr := client.ResolveModel(context.Background(), "proof/source#sha256:fixture", "")
 			_, quoteErr := client.QuoteRental(context.Background(), []byte(`{}`))
-			for _, problem := range []*exit.Error{manifestErr, readsErr, resolveErr, quoteErr} {
+			_, cardErr := client.ModelCard(context.Background(), ref)
+			for _, problem := range []*exit.Error{manifestErr, readsErr, resolveErr, quoteErr, cardErr} {
 				if (problem == nil) != (test.status == 200) {
 					t.Fatal("checkpoint read did not preserve the Hub result")
 				}
@@ -82,7 +85,7 @@ func TestCheckpointReadsUseOptionalOwnerCredentials(t *testing.T) {
 					t.Fatal("checkpoint refusal was reclassified as login failure")
 				}
 			}
-			if calls.Load() != 4 || source.refreshed.Load() != 0 {
+			if calls.Load() != 5 || source.refreshed.Load() != 0 {
 				t.Fatal("optional checkpoint read retried or required credential refresh")
 			}
 		})
