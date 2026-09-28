@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
 	"strings"
 	"time"
 
@@ -261,8 +260,6 @@ func (c *Orchestrator) settleHostPrepare(s *session, w *worker, seq uint64, labe
 	}
 	return false
 }
-
-var safeCodeRE = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
 
 // classifyPrepareEnd sorts a prepare stream's end into "no verdict, the reconnect re-issues"
 // and the host's typed verdict on this desire.

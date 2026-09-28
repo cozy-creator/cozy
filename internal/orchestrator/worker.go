@@ -23,7 +23,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/processtree"
 	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/units"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -329,7 +328,6 @@ type worker struct {
 	spec       WorkerLaunchSpec
 	cmd        *exec.Cmd
 	logPath    string
-	home       string
 	planIDs    []string
 	// media is the pod's byte plane, dialled once at connect. Nil for a locally spawned
 	// worker: it shares this host's filesystem, so its grant IS a path and there is
@@ -427,11 +425,6 @@ type worker struct {
 	// run-once job worker exits with it the moment its terminal is acknowledged, and
 	// reading that as "the worker died" turns a completed job into a failed request.
 	exitCode int
-	pid      int // the process THIS orchestrator started; the only one that may register
-	// bootstrap is the per-spawn credential the worker verifies at Claim (#463's flip:
-	// the OWNER presents it as proof; the worker checks constant-time). Minted for every
-	// spawn on every platform — the flipped direction has no SO_PEERCRED to lean on.
-	bootstrap secret.Value
 	// placementID is the RecordOwner-minted routing key for the ONE placement this worker
 	// hosts (#481). Routing, never identity.
 	placementID string
@@ -519,10 +512,8 @@ type worker struct {
 	// and not yet seen absent, so a fault repeating on the report cadence logs once.
 	loggedFaults map[string]bool
 	// LRU is dispatch-based, not report-based: reports say the worker lives, while an
-	// accepted attempt says a user actually used it. Never-used workers fall back to
-	// residentRevision so two cold holders still have a deterministic oldest member.
-	residentRevision uint64
-	lastUseRevision  uint64
+	// accepted attempt says a user actually used it.
+	lastUseRevision uint64
 }
 
 type remotePlacementObservation struct {
@@ -736,14 +727,6 @@ const ReportCadence = 2 * time.Second
 // slow read, a GC pause, or a retry inside a transport can never be mistaken for a stall —
 // only silence that repeats can.
 const StillFactor = 8
-
-// mediaIOStallBudget bounds one socket operation that moves no bytes. It does not settle,
-// retire, or reclaim a worker and resets whenever bytes move.
-//
-// The figure is DERIVED, not chosen: a live pod proves it is there every ReportCadence on
-// the control stream, so StillFactor consecutive report periods with not one byte moving
-// on the byte plane is silence by the pod's own published cadence.
-const mediaIOStallBudget = StillFactor * ReportCadence
 
 // observeLatchedFault reads the fault a worker keeps against the desired revision it has
 // accepted but not converged. The Runtime LATCHES a materialization refusal for a desired
@@ -1562,9 +1545,6 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	}
 	if problem := c.ResumeOutputExports(); problem != nil {
 		return killed, forgotten, problem
-	}
-	if problem := c.ResumeNativeEffects(); problem != nil {
-		c.logf("native effect recovery pending: %s", problem.ErrName())
 	}
 	if problem := c.ResumeModelTransfers(); problem != nil {
 		return killed, forgotten, problem

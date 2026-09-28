@@ -8,8 +8,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-// Both transports address the same Runtime workspace authority. The remote Host
-// authenticates and forwards; the local service checks the current bootstrap claim.
+// The Host authenticates and forwards to the Runtime workspace authority.
 type operationWorkspace interface {
 	RecordOperationResult(context.Context, *pb.RecordOperationResultCall, ...grpc.CallOption) (*pb.RecordOperationResultResult, error)
 	LookupOperation(context.Context, *pb.LookupOperationCall, ...grpc.CallOption) (*pb.LookupOperationResult, error)

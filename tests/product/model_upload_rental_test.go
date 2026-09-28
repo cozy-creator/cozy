@@ -7,23 +7,23 @@ import (
 	"testing"
 )
 
-// Exercise the actual command parser and placement refusal without provider I/O,
-// a daemon or an allocation. A named rental must never degrade to a boolean.
+// A local source never goes to a rental, and a named rental must never degrade to a
+// boolean; both refuse without provider I/O, a daemon or an allocation.
 func TestModelUploadNamedRentalGrammar(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source.safetensors")
 	must(t, os.WriteFile(source, []byte("local source"), 0600))
 	for _, row := range []struct {
 		flags []string
+		code  int
 		want  string
 	}{
-		{[]string{"--rental=otter"}, "a local model source"},
-		{[]string{"--rental=otter", "--rental-only"}, "named --rental"},
-		{[]string{"--rental="}, "requires an existing rental name"},
+		{[]string{"--rental=otter"}, 1, "model_transfer.rented_source_unavailable"},
+		{[]string{"--rental="}, 2, "requires an existing rental name"},
 	} {
-		args := append([]string{"model", "upload", source, "proof/output"}, row.flags...)
+		args := append([]string{"model", "upload", source, "proof/output", "--json"}, row.flags...)
 		code, out := runCozy(t, root, args...)
-		if code != 2 || !strings.Contains(out, row.want) {
+		if code != row.code || !strings.Contains(out, row.want) {
 			t.Fatalf("%v [%d]: %s", args, code, out)
 		}
 	}

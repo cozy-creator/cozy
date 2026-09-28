@@ -3,172 +3,18 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"sort"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/publication"
-	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
-
-type pendingNativeArtifact struct {
-	session *session
-	request *pb.NativeArtifactTransfer
-	result  chan *pb.NativeArtifactTransferStatus
-}
-
-func (c *Orchestrator) artifactRoundtrip(ctx context.Context, worker string, command *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error) {
-	session, problem := c.workspaceControl(worker)
-	if problem != nil {
-		return nil, problem
-	}
-	if session == nil {
-		return nil, exit.Unavailablef("native artifact transfer awaits its claimed workspace")
-	}
-	c.mu.Lock()
-	currentWorker := c.workers[session.instanceID]
-	claimed := currentWorker != nil
-	c.mu.Unlock()
-	if !claimed {
-		return nil, exit.Unavailablef("native artifact publication awaits its claimed worker")
-	}
-	command.RecordOwnerEpoch, command.ControlStreamEpoch, command.WorkerBootId = recordOwnerEpoch, session.epoch, session.bootID
-	command.CommandId = c.artifactSequence.Add(1)
-	key := fmt.Sprintf("%s/%d", command.EffectId, command.CommandId)
-	pending := &pendingNativeArtifact{session: session, request: proto.Clone(command).(*pb.NativeArtifactTransfer), result: make(chan *pb.NativeArtifactTransferStatus, 1)}
-	c.artifactPending.Store(key, pending)
-	defer c.artifactPending.Delete(key)
-	if !session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_NativeArtifactTransfer{NativeArtifactTransfer: command}}) {
-		return nil, exit.Unavailablef("native artifact transfer stream is unavailable")
-	}
-	select {
-	case result := <-pending.result:
-		if problem := publication.ArtifactTransferRefusal(result.SafeCode, result.SafeDetail); problem != nil {
-			return nil, problem
-		}
-		return result, nil
-	case <-ctx.Done():
-		return nil, exit.New(exit.Canceled, "native artifact transfer caller stopped")
-	case <-session.ctx.Done():
-		return nil, exit.Unavailablef("native artifact transfer stream ended before acknowledgement")
-	case <-c.done:
-		return nil, exit.Unavailablef("native artifact transfer owner is stopping")
-	}
-}
-func (c *Orchestrator) onNativeArtifactTransfer(s *session, result *pb.NativeArtifactTransferStatus) {
-	if result == nil || c.fenced(s, result.RecordOwnerEpoch, result.ControlStreamEpoch, result.WorkerBootId) {
-		return
-	}
-	found, ok := c.artifactPending.Load(fmt.Sprintf("%s/%d", result.EffectId, result.CommandId))
-	if !ok {
-		return
-	}
-	pending := found.(*pendingNativeArtifact)
-	request := pending.request
-	if pending.session != s || !proto.Equal(result.Source, request.Source) || !proto.Equal(result.Manifest, request.Manifest) || result.GrantRevision != request.GrantRevision || len(result.Objects) > 128 || proto.Size(result) > pb.MaxInlineControlBytes {
-		return
-	}
-	if request.Grant != nil && result.ObjectId != request.Grant.ObjectId {
-		return
-	}
-	select {
-	case pending.result <- proto.Clone(result).(*pb.NativeArtifactTransferStatus):
-	default:
-	}
-}
-func (c *Orchestrator) nativeEffectSource(ctx context.Context, call records.NativeCall, artifact records.ModelArtifact) (records.NativeArtifactRetention, *exit.Error) {
-	held, problem := c.opt.Store.ReserveNativeArtifact(call.ID, call.ParentRequestID, "effect", "source", artifact)
-	if problem != nil {
-		return held, problem
-	}
-	if held.State != "held" {
-		if problem := c.changeNativeArtifactRetention(ctx, held, false); problem != nil {
-			return held, problem
-		}
-	}
-	return held, nil
-}
-
-func nativeTransferSource(h records.NativeArtifactRetention) *pb.DerivedRetentionRequest {
-	digest, _ := canonical.Raw(h.ReceiptDigest)
-	return &pb.DerivedRetentionRequest{WeightsTransactionId: h.TransactionID, TensorfsReceiptDigest: digest, RetentionId: h.RetentionID}
-}
-func nativeTransferManifest(h records.NativeArtifactRetention) *pb.Ref {
-	digest, _ := canonical.Raw(h.ManifestID)
-	return &pb.Ref{Digest: digest, Length: uint64(h.ManifestLength)}
-}
-
-func (c *Orchestrator) runNativeUpload(ctx context.Context, call records.NativeCall) ([]byte, *exit.Error) {
-	var request publication.UploadRequest
-	if problem := publication.DecodeEffect(call.Request, &request); problem != nil {
-		return nil, problem
-	}
-	var h records.NativeArtifactRetention
-	var problem *exit.Error
-	if len(call.Frozen) > 0 {
-		holds, problem := c.opt.Store.NativeArtifactRetentions(call.ID)
-		if problem != nil {
-			return nil, problem
-		}
-		for _, held := range holds {
-			if held.Kind == "effect" && held.Slot == "source" && held.State == "held" {
-				h = held
-			}
-		}
-		if h.RetentionID == "" {
-			return nil, exit.Named(exit.Conflict, "upload.source_hold_absent", "recorded effect has no retained native source")
-		}
-	} else {
-		h, problem = c.nativeEffectSource(ctx, call, request.Artifact)
-		if problem != nil {
-			return nil, problem
-		}
-	}
-	var intent publication.UploadIntent
-	if len(call.Frozen) == 0 {
-		intent.Request = request
-		if intent.Objects, intent.ClosureDigest, problem = c.HeldArtifactClosure(ctx, h.OwnerWorker, call.ID, nativeTransferSource(h), nativeTransferManifest(h)); problem != nil {
-			return nil, problem
-		}
-		frozen, problem := publication.Canonical(intent)
-		if problem != nil {
-			return nil, problem
-		}
-		if problem := c.opt.Store.FreezeNativeCall(call.ID, frozen); problem != nil {
-			return nil, problem
-		}
-		call.Frozen = frozen
-		call.State = "frozen"
-	} else if problem := publication.DecodeEffect(call.Frozen, &intent); problem != nil {
-		return nil, problem
-	}
-	owner, ok := c.opt.ModelTransfers.(interface {
-		UploadPublicationEffect(context.Context, records.NativeCall, publication.UploadIntent, publication.ObjectUploader) ([]byte, *exit.Error)
-	})
-	if !ok {
-		return nil, exit.Unavailablef("checkpoint effect has no publication owner")
-	}
-	return owner.UploadPublicationEffect(ctx, call, intent, func(ctx context.Context, grant hub.Grant, serverTime int64) *exit.Error {
-		return c.PushHeldArtifactObject(ctx, h.OwnerWorker, call.ID, nativeTransferSource(h), nativeTransferManifest(h), grant, serverTime)
-	})
-}
 
 // ArtifactRoundtrip sends one NativeArtifactTransfer to the machine holding the artifact and
 // answers its status, a refusal already typed.
 type ArtifactRoundtrip func(context.Context, *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error)
-
-// HeldArtifactClosure pages the exact object closure of an artifact this host holds on a
-// rental ("" for the local workspace) over WorkerControl.
-func (c *Orchestrator) HeldArtifactClosure(ctx context.Context, worker, operation string, source *pb.DerivedRetentionRequest,
-	manifest *pb.Ref) ([]hub.Object, string, *exit.Error) {
-	return HeldClosure(ctx, func(ctx context.Context, command *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error) {
-		return c.artifactRoundtrip(ctx, worker, command)
-	}, operation, source, manifest)
-}
 
 // HeldClosure pages the exact object closure of a held artifact, as its machine's native
 // store names it, and returns it sorted with its closure digest. operation names the upload
@@ -222,14 +68,6 @@ func HeldClosure(ctx context.Context, roundtrip ArtifactRoundtrip, operation str
 	}
 	digest, _ := canonical.Spell(closure)
 	return objects, digest, nil
-}
-
-// PushHeldArtifactObject sends one granted closure object over WorkerControl.
-func (c *Orchestrator) PushHeldArtifactObject(ctx context.Context, worker, operation string, source *pb.DerivedRetentionRequest,
-	manifest *pb.Ref, grant hub.Grant, serverTime int64) *exit.Error {
-	return PushHeld(ctx, func(ctx context.Context, command *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error) {
-		return c.artifactRoundtrip(ctx, worker, command)
-	}, operation, source, manifest, grant, serverTime)
 }
 
 // PushHeld sends one granted closure object of a held artifact from the machine holding it

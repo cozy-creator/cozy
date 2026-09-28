@@ -18,9 +18,6 @@ import (
 // component set and no construction digest on a job record — a job has no model
 // residency at all (cr-009 §2).
 
-// JobResourceCap is the orchestrator's declared host-memory bound for one local job attempt.
-const jobRSSBudget = orchestrator.DefaultJobRSSCap
-
 // JobFacts is one resolved `@job` on an installed package.
 type JobFacts struct {
 	Name     string

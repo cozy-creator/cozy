@@ -115,10 +115,6 @@ type Config struct {
 	// model gc` still reclaim on demand).
 	MaintenanceGCCron string
 
-	// Bootstrap is launcher-only. It is admitted from the process environment,
-	// never config.yaml, argv, or a child inheritance list.
-	Bootstrap secret.Value
-
 	inherited []string
 }
 
@@ -140,7 +136,6 @@ type values struct {
 	PlacementPrefer          string `name:"placement_prefer" default:"balanced"`
 	Port                     int    `name:"port" default:"8818"`
 	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
-	Bootstrap                string `name:"bootstrap"`
 }
 
 // Validate refuses only an empty location. Behaviour settings were admitted per key
@@ -277,7 +272,6 @@ var environmentNames = map[string]string{
 	"tfs":               "COZY_TFS",
 	"tensorfs_root":     "TENSORFS_HOME",
 	"tensorfs_registry": "COZY_TFS_REGISTRY",
-	"bootstrap":         "COZY_BOOTSTRAP_CREDENTIAL",
 }
 
 var processConfig struct {
@@ -454,7 +448,6 @@ func load() (Config, *exit.Error) {
 		MaintenanceGCCron:        strings.TrimSpace(input.MaintenanceGCCron),
 		PlacementPrefer:          input.PlacementPrefer,
 		Digest:                   digest,
-		Bootstrap:                secret.New(input.Bootstrap),
 		inherited:                inherited,
 	}
 	if !hubToken.Present() {

@@ -89,9 +89,6 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 	if c.onNativeSourceCall(s, parent, call) {
 		return
 	}
-	if c.onNativeEffect(s, *parent, call) {
-		return
-	}
 	existing, problem := c.opt.Store.ChildAt(parent.ID, int64(call.CallIndex))
 	if problem != nil {
 		refuse(problem)
@@ -356,9 +353,6 @@ func (c *Orchestrator) onChildCancel(s *session, call *pb.ChildCallCancel) {
 	}
 	parent, problem := c.childParent(s, call.ParentRequestId, call.ParentAttemptOrdinal, call.ParentInvocationSpecDigest)
 	if problem != nil {
-		return
-	}
-	if c.cancelNativeEffect(s, call) {
 		return
 	}
 	if c.cancelNativeSource(s, call) {

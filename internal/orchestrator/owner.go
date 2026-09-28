@@ -32,8 +32,8 @@ import (
 //
 // LAUNCH TIER (#437): record_owner_epoch is the constant 1 — this daemon is the one
 // RecordOwner of every worker it spawns or connects to; the machinery that MINTS competing
-// epochs is the hub's Wave-2 lease. Spawned workers authenticate Claim with their local
-// bootstrap; rented workers authenticate the channel with the provisioned Creator mTLS key.
+// epochs is the hub's Wave-2 lease. Rented workers authenticate the channel with the
+// provisioned Creator mTLS key.
 
 const recordOwnerEpoch = 1
 
@@ -311,23 +311,16 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	}()
 	defer close(s.out)
 
-	var proof []byte
-	claimWorkerID, claimBootID := "", ""
-	if w.spec.Connection != nil {
-		if c.opt.RentalClaimProof == nil {
-			return fmt.Errorf("the rental has no ClaimProof signer")
-		}
-		signed, problem := c.opt.RentalClaimProof(w.spec.Connection, recordOwnerEpoch)
-		if problem != nil {
-			c.refuseClaim(w, problem)
-			return fmt.Errorf("%s", problem.Message)
-		}
-		proof = signed
-		claimWorkerID, claimBootID = w.spec.Connection.WorkerID, w.spec.Connection.WorkerBootID
-		s.host = pb.NewPodHostClient(conn)
-	} else {
-		proof = []byte(w.bootstrap.Reveal())
+	if w.spec.Connection == nil || c.opt.RentalClaimProof == nil {
+		return fmt.Errorf("the rental has no ClaimProof signer")
 	}
+	proof, problem := c.opt.RentalClaimProof(w.spec.Connection, recordOwnerEpoch)
+	if problem != nil {
+		c.refuseClaim(w, problem)
+		return fmt.Errorf("%s", problem.Message)
+	}
+	claimWorkerID, claimBootID := w.spec.Connection.WorkerID, w.spec.Connection.WorkerBootID
+	s.host = pb.NewPodHostClient(conn)
 	s.claim = &pb.Claim{
 		RecordOwnerEpoch: recordOwnerEpoch,
 		RecordOwnerId:    recordOwnerID,
@@ -338,7 +331,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{
 		Claim: proto.Clone(s.claim).(*pb.Claim),
-	}}) //cozy:allow-reveal local bootstrap or signed rental ClaimProof crosses only on Claim
+	}})
 
 	// WatchProgress rides a PHYSICALLY separate connection (01), opened at the snapshot
 	// barrier below -- not at ClaimAck, which does not by itself complete the control
@@ -391,8 +384,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			}
 		case *pb.WorkerFrame_NativeSourceStatus:
 			c.onNativeSourceStatus(s, m.NativeSourceStatus)
-		case *pb.WorkerFrame_NativeArtifactTransferStatus:
-			c.onNativeArtifactTransfer(s, m.NativeArtifactTransferStatus)
 		case *pb.WorkerFrame_ChildCallRequest:
 			c.onChildCall(s, m.ChildCallRequest)
 		case *pb.WorkerFrame_ChildCallCancel:

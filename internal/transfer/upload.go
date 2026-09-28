@@ -32,8 +32,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
-const modelUploadOperationVersion = "model-checkpoint-upload/1\x00"
-
 // One object write or read at the storage edge is bounded by BYTES MOVING, not by a
 // clock — see `mover`. The 30-minute constant that used to live here said in its own
 // comment that it was standing in for a byte meter.

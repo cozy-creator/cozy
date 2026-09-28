@@ -28,7 +28,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -461,9 +460,7 @@ func (c *Orchestrator) modeClaimedLocked(w *worker, job bool, exempt ...string) 
 
 // Orchestrator is the Cozy daemon's scheduling role.
 type Orchestrator struct {
-	artifactSequence atomic.Uint64
-	artifactPending  sync.Map
-	opt              Options
+	opt Options
 
 	// done closes when the daemon is closing; Serve blocks on it (the owner DIALS
 	// workers, so there is no server here to run, #436). closeOnce makes Close
@@ -520,7 +517,6 @@ type Orchestrator struct {
 	rentalUseSeq      uint64
 	rentalMaintenance map[string]bool
 	revision          uint64 // hub-owned, monotonic; every Directive bumps it
-	residentRevision  uint64 // local serving-worker arrival order; tie-breaks never-used LRU rows
 	lastUseRevision   uint64 // successful local serving dispatch order
 	events            []string
 

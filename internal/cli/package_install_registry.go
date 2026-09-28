@@ -243,11 +243,6 @@ func requireCheckpointComponents(model string, slot launch.Slot, available []str
 		WithRemedy("select a checkpoint whose component set includes %s", strings.Join(missing, ", "))
 }
 
-type localModelSelection struct {
-	Model, Release, Lane, Manifest string
-	ManifestLength                 int64
-}
-
 // sameRelease compares release labels by PEP 440 value, so 1.0.0rc1 and 1.0.0-rc1 agree.
 func sameRelease(a, b string) bool {
 	left, errA := pep440.Parse(a)
