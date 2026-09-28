@@ -352,8 +352,9 @@ func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 	if rows := modelSourceLines(state.ModelSources); len(rows) > 0 {
 		fields = append(fields, output.Field{K: "model_sources", V: rows})
 	}
-	fields = append(fields, output.Field{
-		K: "retries", V: fmt.Sprintf("%d/%d", state.Requeues, state.RetryBudget)})
+	if state.Requeues > 0 {
+		fields = append(fields, output.Field{K: "requeued", V: fmt.Sprintf("%d (before execution began)", state.Requeues)})
+	}
 	if state.Bill != nil {
 		fields = append(fields, output.Field{K: "bill", V: microUSD(state.Bill.MicroUSD)})
 	}
@@ -641,10 +642,6 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		if state.Error != "" {
 			err.Message += ": " + state.Error
 		}
-	}
-	if state.Requeues > 0 {
-		err.WithRemedy("the orchestrator's retry projection spent %d of a %d-attempt budget "+
-			"on neutral outcomes before settling", state.Requeues, state.RetryBudget)
 	}
 	if state.Triage != nil {
 		err.WithNext("cozy run list --full")

@@ -1155,13 +1155,14 @@ func (s *Store) UnpinRentalWork(requestID, rentalID string) (bool, *exit.Error) 
 type LostAttemptOutcome int
 
 const (
-	// RequeueAfterLoss hands the request to the ordinary requeue budget. Recovery uses it:
-	// the machine died under the work, and the work should run somewhere else.
+	// RequeueAfterLoss parks retained work for its loss settlement (FailLostRetainedWork).
 	RequeueAfterLoss LostAttemptOutcome = iota
 	// CancelAfterLoss settles the request as canceled. Teardown uses it: the operator asked
 	// for everything to stop, and requeueing into a daemon that is shutting down would be
 	// answering a different question than the one they asked.
 	CancelAfterLoss
+	// FailAfterLoss fails the request. Recovery uses it: the work may have started, and
+	// started work is never run again.
 	FailAfterLoss
 )
 
@@ -1206,11 +1207,16 @@ func (s *Store) AbandonLostAttempt(requestID string, attempt int64, reason strin
 	}
 	switch outcome {
 	case FailAfterLoss:
+		errorType := "rental.lost"
+		var selected string
+		if err := tx.QueryRow(`SELECT requested_rental FROM requests WHERE id=?`, requestID).Scan(&selected); err == nil && selected != "" {
+			errorType = "rental.selected_lost"
+		}
 		if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, requestID); err != nil {
-			return false, exit.Internalf("cannot fail lost fixed-rental request: %s", err)
+			return false, exit.Internalf("cannot fail lost-rental request: %s", err)
 		}
 		if err := appendEventTx(tx, requestID, "request.failed", attempt, map[string]any{
-			"status": "FAILED", "cause": "RENTAL_LOST", "error_type": "rental.selected_lost", "error": reason, "outputs": []any{}, "requeuing": false,
+			"status": "FAILED", "cause": "RENTAL_LOST", "error_type": errorType, "error": reason, "outputs": []any{}, "requeuing": false,
 		}); err != nil {
 			return false, exit.Internalf("cannot record selected rental loss: %s", err)
 		}

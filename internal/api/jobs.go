@@ -822,11 +822,9 @@ type JobState struct {
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
 	QueuePosition *int `json:"queue_position,omitempty"`
 	QueueDepth    *int `json:"queue_depth,omitempty"`
-	// Requeues and RetryBudget are the orchestrator's RETRY PROJECTION made visible: how
-	// much of the durable budget the neutral outcomes have already spent, and what the
-	// bound is. A settlement that exhausted it names the budget in `error`.
+	// Requeues counts attempts re-offered because they never began executing. Started
+	// work is never run again.
 	Requeues         int64             `json:"requeues"`
-	RetryBudget      int64             `json:"retry_budget"`
 	Progress         map[string]any    `json:"progress,omitempty"`
 	Stage            string            `json:"stage,omitempty"`
 	QueuedMS         int64             `json:"queued_ms"`
@@ -987,8 +985,8 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		RetryOf:        row.RetryOf, ReuseScope: row.ReuseScope,
 		Number: row.Number, JobID: row.ID, Status: s.publicStatusOf(row), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
-		Requeues: row.Requeues, RetryBudget: orchestrator.MaxRequeues,
-		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
+		Requeues: row.Requeues,
+		Outputs:  []MediaRef{}, CreatedAt: row.CreatedAt,
 		EventsURL:    "/v1/requests/" + row.ID + "/events",
 		OutputExport: s.outputExportOf(row.ID),
 	}

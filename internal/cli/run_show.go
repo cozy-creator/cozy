@@ -30,6 +30,8 @@ type runReport struct {
 	ExecutionMS int64         `json:"execution_ms"`
 	WallMS      int64         `json:"wall_ms,omitempty"`
 	Waiting     string        `json:"waiting,omitempty"`
+	ErrorType   string        `json:"error_type,omitempty"`
+	Error       string        `json:"error,omitempty"`
 	Stages      []reportStage `json:"stages"`
 	Steps       []reportSteps `json:"steps,omitempty"`
 	Degree      int           `json:"degree,omitempty"`
@@ -152,6 +154,7 @@ func handleRunShow(ctx *Context) *exit.Error {
 func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	report := runReport{Number: life.Number, RequestID: life.RequestID, Status: life.Status,
 		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Machine: life.Machine,
+		ErrorType: life.ErrorType, Error: life.Error,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS, ExecutionMS: life.ExecutionMS,
 		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
 	if life.Phase == orchestrator.PhaseGPUWait || life.Phase == orchestrator.PhaseOwnerReconciliation {
@@ -370,6 +373,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	}
 	if r.Waiting != "" {
 		fmt.Fprintf(w, "\n%s", r.Waiting)
+	}
+	if r.Error != "" {
+		fmt.Fprintf(w, "\nerror %s: %s", r.ErrorType, r.Error)
 	}
 	fmt.Fprintf(w, "\nqueued %s · execution %s", span(float64(r.QueuedMS)), span(float64(r.ExecutionMS)))
 	if r.WallMS > 0 {

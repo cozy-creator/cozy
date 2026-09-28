@@ -337,7 +337,7 @@ Only a daemon holding the root lock may migrate an older database.
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | non-destructive disconnect guarded by required online work; `{force:true}` overrides that guard without canceling work; mutually exclusive `{all:true}` requests cancellation and paid teardown |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
-| `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
+| `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, requeues, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
 | `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
 | `POST /v1/local/jobs/{id}/retry-publication` | local | yes | retry failed output publication using the retained successful attempt and receipts; never rerun the producer |
@@ -400,9 +400,9 @@ cancellation; already uploaded checkpoints remain uploaded. Both decisions survi
 daemon restart. A failed request from an older build is not silently resurrected.
 
 `queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot;
-`requeues`/`retry_budget` are the record owner's durable-attempt facts. Several jobs submitted at once queue against one
-worker and drain in submission order, while the retry projection over neutral outcomes
-spends a durable budget that the settlement names when it is exhausted.
+`requeues` counts attempts re-offered because they never began executing; an attempt that
+started and failed ends the request failed with its reason and is never run again. Several
+jobs submitted at once queue against one worker and drain in submission order.
 
 ### Private transactions and child calls
 

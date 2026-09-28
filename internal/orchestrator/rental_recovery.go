@@ -31,11 +31,9 @@ import (
 //	queued, never dispatched   the pin is released and routing replans it. Nothing ran, so
 //	                           no requeue life is charged — the same rule `RequeueForCapacity`
 //	                           already applies to a worker that answered "not now".
-//	accepted by a worker       the attempt is closed as lost and the request goes through
-//	                           the ORDINARY requeue budget. It may have partially executed,
-//	                           so re-offering it costs a life and a request out of lives
-//	                           fails saying so, rather than being retried silently or
-//	                           stranded silently.
+//	accepted by a worker       the attempt is closed as lost and the request FAILS naming
+//	                           the loss. It may have executed, and started work is never
+//	                           run again.
 //
 // "Replanned if possible" needs an honest else-branch, and it already has one: an unpinned
 // --rental request runs `selectOrStart`, which acquires a rental or fails the request with
@@ -116,8 +114,8 @@ func (c *Orchestrator) lostRentalCause(rentalID string) string {
 //
 //	preparing / offered      never crossed to the worker. Aborted, which returns the
 //	                         request to `submitted`, and then released like any queued row.
-//	accepted / recovered_open  crossed, and may have executed. Stranded and re-offered
-//	                         under the requeue budget.
+//	accepted / recovered_open  crossed, and may have executed. Closed as lost; the
+//	                         request fails.
 //	terminal                 the worker already committed a real outcome that has not been
 //	                         acked. It is LEFT ALONE. Replacing a recorded terminal with a
 //	                         synthetic failure would publish `request.failed` over a run
@@ -148,44 +146,20 @@ func (c *Orchestrator) recoverPinned(req records.Request, rentalID, cause string
 			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
 			req.State = "submitted"
 		case "accepted", "recovered_open":
-			// THE IN-FLIGHT CASE. Its worker accepted it and owes a terminal that can never
-			// arrive: the pod holding the journal was destroyed. Close it as lost and
-			// re-offer under the budget.
-			abandoned, problem := c.opt.Store.AbandonLostAttempt(req.ID, attempt.Attempt,
-				"the rented machine was lost before this attempt reported a terminal ("+cause+")",
-				lostOutcome(req))
+			// THE IN-FLIGHT CASE. Its worker accepted it and may have executed it; the pod
+			// holding its journal is gone. Started work is never run again: the request
+			// fails, naming the loss.
+			reason := "the rented machine " + rentalID + " was lost while this attempt was running (" + cause + ")"
+			failed, problem := c.opt.Store.AbandonLostAttempt(req.ID, attempt.Attempt, reason, records.FailAfterLoss)
 			if problem != nil {
 				c.logf("%s#%d could not be abandoned: %s", req.ID, attempt.Attempt, problem.Message)
 				return
 			}
-			if !abandoned {
-				return
-			}
-			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
-			if req.RequestedRental != "" {
+			if failed {
+				c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
 				c.forget(req.ID)
-				return
+				c.signalClosed(requestWaitKey(req.ID), exit.Named(exit.Failed, "rental.lost", "%s", reason))
 			}
-			c.emit(req.ID, "request.attempt_failed", uint64(attempt.Attempt), map[string]any{
-				"status": "FAILED", "cause": "RENTAL_LOST", "error_type": "rental.lost",
-				"error":     "the rented machine " + rentalID + " was lost while this attempt was running (" + cause + ")",
-				"outputs":   []any{},
-				"requeuing": true,
-			})
-			// THE PIN GOES TOO, and it must go BEFORE the requeue. Both arms release it —
-			// they differ only in what the retry costs, never in where it may run. A
-			// requeue that kept the pin would re-dispatch the request straight back at the
-			// corpse, spend a life discovering the machine is still gone, and do it again
-			// until the budget ran out.
-			if _, problem := c.opt.Store.UnpinRentalWork(req.ID, rentalID); problem != nil {
-				c.logf("%s could not be released from lost rental %s: %s",
-					req.ID, rentalID, problem.Message)
-				return
-			}
-			c.logf("%s#%d was running on lost rental %s; re-offering it under the requeue budget",
-				req.ID, attempt.Attempt, rentalID)
-			// Charges a life on purpose: this attempt may have partially executed.
-			c.Requeue(req.ID, "the rented machine it was running on was lost")
 			return
 		}
 	}
@@ -341,11 +315,4 @@ func (c *Orchestrator) resumeManualRental(id string) {
 		case <-timer.C:
 		}
 	}
-}
-
-func lostOutcome(req records.Request) records.LostAttemptOutcome {
-	if req.RequestedRental != "" {
-		return records.FailAfterLoss
-	}
-	return records.RequeueAfterLoss
 }

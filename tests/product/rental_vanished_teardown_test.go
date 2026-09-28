@@ -98,14 +98,14 @@ func TestVanishedRentalReleasesItsAttempt(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// And the request reached a stated outcome rather than sitting in `dispatching`.
+	// And the request reached a stated outcome rather than sitting in `dispatching`: the
+	// attempt may have started, so it fails naming the lost machine and is not run again.
 	req, problem := store.RequestRow("req-vanished")
 	fatal(t, problem)
-	if req.Worker == "rental-that-was-ended" {
-		t.Fatalf("the request is still pinned to a rental that does not exist\n%s", tail(logPath))
-	}
-	if req.State == "dispatching" {
-		t.Fatalf("the request is still in_progress on a destroyed machine\n%s", tail(logPath))
+	errorType, _, _, problem := store.SettledFailure("req-vanished")
+	fatal(t, problem)
+	if req.State != "failed" || errorType != "rental.lost" {
+		t.Fatalf("the request on a destroyed machine is %s (%s), not failed naming the loss\n%s", req.State, errorType, tail(logPath))
 	}
 
 }

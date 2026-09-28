@@ -111,7 +111,7 @@ func activeParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T, pinned bool
 	waitUntil(t, "unrelated root queued", func() bool { return owner.c.QueuePosition(baseline) > 0 })
 	outcomeIdentity, _ := canonical.Spell(first.InvocationSpecDigest)
 	raw, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{RequestId: first.RequestId, AttemptOrdinal: first.AttemptOrdinal, InvocationSpecDigest: outcomeIdentity,
-		Status: pb.OutcomeStatus_OUTCOME_STATUS_ABANDONED, ExecutionStarted: true, Cause: &pb.OutcomeCause{Code: pb.CauseCode_CAUSE_CODE_EXECUTOR_INVALIDATED, Origin: pb.CauseOrigin_CAUSE_ORIGIN_EXECUTOR}})
+		Status: pb.OutcomeStatus_OUTCOME_STATUS_ABANDONED, Cause: &pb.OutcomeCause{Code: pb.CauseCode_CAUSE_CODE_EXECUTOR_INVALIDATED, Origin: pb.CauseOrigin_CAUSE_ORIGIN_EXECUTOR}})
 	must(t, err)
 	send := <-peerSend
 	must(t, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: &pb.AttemptOutcome{

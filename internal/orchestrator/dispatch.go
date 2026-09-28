@@ -138,9 +138,9 @@ type Result struct {
 	Body       []byte // the TerminalBody document, exactly as it was digested
 }
 
-// MaxRequeues is the durable per-request requeue bound. Retry is bounded and the bound
-// is a ROW, not a counter in memory: a worker that dies on every attempt exhausts it
-// instead of dispatching forever.
+// MaxRequeues is the durable per-request bound on re-offering attempts that never began
+// executing. The bound is a ROW, not a counter in memory: a worker that loses every offer
+// exhausts it instead of dispatching forever.
 const MaxRequeues = 3
 
 // Submit records the request and dispatches its FIRST attempt. It is idempotent in the
@@ -467,9 +467,8 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 	return attempt, nil
 }
 
-// Requeue is the orchestrator's PROJECTION over a neutral terminal: an ABANDONED attempt
-// or an infra-class failure earns a NEW ordinal, a fresh grant and a fresh execution —
-// never a patch to the one that died. It is charged against the request's durable budget.
+// Requeue is the orchestrator's PROJECTION over an attempt that never began executing: it
+// earns a NEW ordinal and a fresh grant, charged against the request's durable budget.
 func (c *Orchestrator) Requeue(requestID, why string) { c.requeue(requestID, why, true) }
 
 // RequeueForCapacity returns a request to the queue WITHOUT spending a life.

@@ -1701,39 +1701,29 @@ func (c *Orchestrator) captureTriage(s *session, requestID string, attempt uint6
 	return tr
 }
 
-// requeueable is the record owner's projection: an accepted-but-incomplete attempt, the
-// infra-class failures, and a WORKER pre-execution refusal earn a new ordinal. A
-// deterministic body failure and an author/runtime refusal settle — re-running them would
-// only fail again.
+// requeueable is the record owner's projection. Only an attempt that never began executing
+// earns a new ordinal: work that started and failed ends failed with its reason, and is
+// never run again (owner ruling 2026-09-28). `execution_started` is the structural bit the
+// worker sets (#480c), never inferred from a cause-code list.
 //
-// THE REFUSED PROJECTION SPLITS BY (cause, origin) — #480b, and it is the reason
-// retryability cannot be a wire fact. "Refused" used to mean one thing: a judgment about
-// the WORK, settle it. rev-2 routes a pre-execution capacity decline through the same
-// status, because every offer must get a JOURNALED outcome and there is no
-// AttemptDeclined message to add. Those consume the attempt ordinal and ZERO billed
-// execution budget, so the next ordinal may go out immediately and elsewhere.
-//
-// `execution_started` is the structural check, not a cause-code allowlist (#480c): the
-// author having run is a bit the worker sets, and inferring it from a code list is exactly
-// the fragility the bit exists to remove. A "worker refusal" that claims execution
-// started is a contradiction, and it settles rather than being re-dispatched.
-//
-// The re-dispatch still charges the request's DURABLE requeue budget. Zero BILLED budget
-// is a statement about money; the bound on how many times this record owner will try is its own,
-// and a worker refusing forever must still terminate.
+// Among the unstarted, a lost or infra-class attempt and a WORKER pre-execution refusal
+// are re-offered; an author/runtime refusal settles, because re-offering it would only be
+// refused again. The re-offer still charges the request's durable requeue budget, so a
+// worker that refuses forever still terminates.
 func requeueable(status, cause, origin string, executionStarted bool) bool {
-	if status == "ABANDONED" {
-		return true
-	}
-	if status == "REFUSED" {
-		return origin == "WORKER" && !executionStarted && preExecution(cause)
-	}
-	if status != "FAILED" {
+	if executionStarted {
 		return false
 	}
-	switch cause {
-	case "EXECUTOR_FAULT", "GRANT_EXPIRED", "WEIGHTS_UNFETCHABLE", "CAPABILITY_UNAVAILABLE":
+	switch status {
+	case "ABANDONED":
 		return true
+	case "REFUSED":
+		return origin == "WORKER" && preExecution(cause)
+	case "FAILED":
+		switch cause {
+		case "EXECUTOR_FAULT", "GRANT_EXPIRED", "WEIGHTS_UNFETCHABLE", "CAPABILITY_UNAVAILABLE":
+			return true
+		}
 	}
 	return false
 }
@@ -2013,8 +2003,7 @@ func outcomeError(status, cause, message string) *exit.Error {
 		}
 		return exit.New(exit.Canceled, "the attempt was canceled (%s): %s", cause, message)
 	case "ABANDONED":
-		return exit.New(exit.Failed, "the attempt was abandoned (%s): %s", cause, message).
-			WithRemedy("an abandoned attempt is requeued as a NEW ordinal, never re-executed")
+		return exit.New(exit.Failed, "the attempt was abandoned (%s): %s", cause, message)
 	default:
 		if cause == outcomeRefusedCause {
 			return exit.Named(exit.Failed, cause, "%s", message)

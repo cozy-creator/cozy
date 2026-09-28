@@ -425,6 +425,14 @@ const (
 	ExcludedDiskShort = "disk_short"
 )
 
+// RentalWorkerFailed is whether the rental's worker last reported WORKER_PHASE_FAILED.
+func (c *Orchestrator) RentalWorkerFailed(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w := c.workers[rentalInstanceID(id)]
+	return w != nil && w.phase == pb.WorkerPhase_WORKER_PHASE_FAILED
+}
+
 // RentalStanding is what this owner knows live about one ready rental a placement could
 // go to: the reason its worker cannot take this request's MODE, or the attempts the
 // worker holds and has been offered — what a new request waits behind, with the
@@ -1075,8 +1083,8 @@ func (c *Orchestrator) WakeQueue() {
 // recoverWorker settles the local process death from Creator's existing records
 // authority. Runtime is a disposable execution child: it owns neither a journal nor a
 // recovery decision. An unoffered assignment returns to the queue; an offer that may have
-// crossed the process boundary closes as ABANDONED and earns a fresh ordinal. The old
-// ordinal is never executed again.
+// crossed the process boundary closes as ABANDONED, and earns a fresh ordinal only if it
+// was never accepted. Work that may have started is never executed again.
 func (c *Orchestrator) recoverWorker(spec WorkerLaunchSpec) {
 	c.mu.Lock()
 	closing := c.closing

@@ -2226,7 +2226,8 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	}
 	// AND THE ATTEMPTS THAT OWE A TERMINAL. Remote rentals reconnect to pod-supervisor,
 	// whose worker-local ledger replays their exact state. Local Runtime is stateless, so
-	// Creator settles its own persisted assignment as ABANDONED and requeues it; restarting
+	// Creator settles its own persisted assignment as ABANDONED (requeued only if it never
+	// began executing); restarting
 	// an execution child to ask it what happened would recreate the duplicate journal this
 	// boundary removes.
 	unsettled, e := c.opt.Store.Unsettled()

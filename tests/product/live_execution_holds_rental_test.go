@@ -216,3 +216,53 @@ func TestAcceptedExecutionHoldsTheRentalAcrossADaemonRestart(t *testing.T) {
 		return problem == nil && row != nil && row.State == "succeeded"
 	})
 }
+
+// A run whose execution Runtime ends failed holds nothing. On nemuri (run 1474) a crashed
+// lane left the worker FAILED with the root open, renewed forever and with no reason shown;
+// Runtime now ends a FAILED worker's executions failed, with the worker's reason. The run
+// fails with that cause and message, `cozy run show` says so, and the Host's idle deadline
+// is no longer renewed.
+func TestAFailedExecutionStopsHoldingTheRentalAndShowsItsReason(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "runtime-bundle.json"))
+	must(t, err)
+	machine := &runtimeMachine{triage: bundle}
+	host := &hostIdleClock{window: 8 * time.Second}
+	root, layout := rentedLadderHome(t, h, &fakePod{machine: machine, keepalive: host.keepalive}, nil)
+	startDaemonProcess(t, root)
+	const key = "failed-worker-execution"
+	if code, out := cozyWithin(t, root, time.Minute, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", key); code != 0 {
+		t.Fatalf("the run was refused [exit %d]: %s", code, out)
+	}
+	eventually(t, root, "the machine accepting the run", func() bool { return machine.submitted() != nil })
+	host.start()
+	eventually(t, root, "the first renewal", func() bool {
+		renewals, _, _ := host.state()
+		return renewals >= 1
+	})
+	const reason = "worker FAILED: watchdog lane crashed finishing a child result: KeyError: 'child-3'"
+	machine.mu.Lock()
+	machine.failure, machine.code = reason, pb.CauseCode_CAUSE_CODE_LOCAL_SAFETY
+	machine.mu.Unlock()
+	machine.finish()
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	var row *records.Request
+	eventually(t, root, "the run failing", func() bool {
+		row, problem = store.RequestByIdempotencyKey(key)
+		fatal(t, problem)
+		link, problem := store.MachineExecution(row.ID)
+		fatal(t, problem)
+		return row.State == "failed" && link.Collected
+	})
+	if _, show := cozyWithin(t, root, time.Minute, "run", "show", row.ID); !strings.Contains(show, "LOCAL_SAFETY") || !strings.Contains(show, reason) {
+		t.Fatalf("run show does not give the failure's cause and message:\n%s", show)
+	}
+	settled, _, _ := host.state()
+	time.Sleep(2 * host.window)
+	if renewals, _, _ := host.state(); renewals > settled+1 {
+		t.Fatalf("the Host deadline was renewed %d more time(s) after the run failed", renewals-settled)
+	}
+}

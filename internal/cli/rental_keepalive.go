@@ -99,9 +99,9 @@ func (m *managedRentals) renew(ctx context.Context, id, requestID string) (*pb.K
 // executing on it. The Host releases on its own clock, from what its Runtime reports;
 // that report can lapse (a Runtime restarted by maintenance), and this host's accepted
 // executions are then the only evidence of live work. Renewal follows the Host's own
-// granted window.
+// granted window. A worker that reported itself FAILED runs nothing, so nothing is held.
 func (m *managedRentals) holdLocked(row records.Rental) {
-	if m.owner == nil || m.keeping[row.ID] > 0 {
+	if m.owner == nil || m.keeping[row.ID] > 0 || m.owner.RentalWorkerFailed(row.ID) {
 		return
 	}
 	due, problem := m.store.RentalKeepaliveDue(row, time.Now())

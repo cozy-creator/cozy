@@ -48,6 +48,7 @@ type runtimeMachine struct {
 
 	submissions []*pb.MachineExecutionSubmit // every submission as sent, resubmissions included
 	failure     string                       // a failed terminal's safe message; empty succeeds
+	code        pb.CauseCode                 // the failure's cause; AUTHOR_EXCEPTION when unset
 	refusal     string                       // a release root this Runtime cannot prepare
 	older       bool                         // a Runtime from before release roots
 }
@@ -129,6 +130,9 @@ func (m *runtimeMachine) status() pb.OutcomeStatus {
 func (m *runtimeMachine) cause() *pb.OutcomeCause {
 	if m.failure == "" {
 		return nil
+	}
+	if m.code != 0 {
+		return &pb.OutcomeCause{Code: m.code, Origin: pb.CauseOrigin_CAUSE_ORIGIN_WORKER, Detail: m.failure}
 	}
 	return &pb.OutcomeCause{Code: pb.CauseCode_CAUSE_CODE_AUTHOR_EXCEPTION, Detail: m.failure}
 }

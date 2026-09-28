@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -186,10 +187,6 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			state.Stage, _ = value["stage"].(string)
 		}
 	}
-	var submission pb.MachineExecutionSubmit
-	if proto.Unmarshal(link.Submission, &submission) == nil {
-		state.RetryBudget = int64(submission.MaxAttempts)
-	}
 	var terminal *pb.AttemptOutcomeBody
 	if len(link.Outcome) > 0 {
 		var outcome pb.AttemptOutcome
@@ -198,7 +195,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			terminal = &body
 			if state.ErrorType == "" && body.Cause != nil && body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
 				state.Error = body.SafeMessage
-				state.ErrorType = body.Cause.Code.String()
+				state.ErrorType = strings.TrimPrefix(body.Cause.Code.String(), "CAUSE_CODE_")
 				if providerRefusal.MatchString(body.SafeMessage) {
 					state.ErrorType = "model_source.auth_required"
 					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the daemon config. A machine Runtime older than 0.18.54 cannot receive it: " + machines.RuntimeUpdate(link.MachineID)
