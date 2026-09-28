@@ -1,16 +1,12 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // cl-121: the preparation a queued request is waiting on is OBSERVED, not logged and
@@ -27,93 +23,6 @@ import (
 // exercised is exactly how the defect survived: the protocol's own comment says the
 // counters are monotonic within a call, and nothing had ever checked that anybody read
 // a second one.
-
-// TestPreparationPhaseAdvancesWithTheStream drives the real PodHost prepare lane and
-// watches the phase lane move with it.
-func TestPreparationPhaseAdvancesWithTheStream(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public, downloadSamples: 5}
-	connection, _ := startFakePod(t, t.TempDir(), pod)
-	o := hostOwner(t, "prepare-phase", rentalWiring(connection, private))
-
-	instance, _, _, e := o.c.EnsureRental(podRental)
-	fatal(t, e)
-
-	// Sample the lane while the stream runs. The prepare is on its own goroutine — a
-	// multi-GiB materialization must never sit on the control stream's read loop — so
-	// the observation is read concurrently exactly as `run list` reads it.
-	type reading struct {
-		name  string
-		moved uint64
-		rate  float64
-	}
-	readings := make(chan []reading, 1)
-	go func() {
-		var seen []reading
-		deadline := time.Now().Add(20 * time.Second)
-		for time.Now().Before(deadline) {
-			if phase, ok := o.c.PreparationPhase(instance); ok {
-				last := reading{name: phase.Name, moved: phase.Moved, rate: phase.Rate}
-				if len(seen) == 0 || seen[len(seen)-1] != last {
-					seen = append(seen, last)
-				}
-				if phase.Name == orchestrator.PhaseWarming {
-					break
-				}
-			}
-			time.Sleep(time.Millisecond)
-		}
-		readings <- seen
-	}()
-
-	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
-		Package: "cozy/h3-package", Release: "1.0.7"}}, nil))
-	waitUntil(t, "the prepared placement_set on WorkerControl", func() bool {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.desired) >= 1
-	})
-
-	seen := <-readings
-	downloads, advanced, rated := 0, false, false
-	var previous uint64
-	for _, r := range seen {
-		if r.name != orchestrator.PhaseDownloading {
-			continue
-		}
-		downloads++
-		if downloads > 1 && r.moved > previous {
-			advanced = true
-		}
-		if r.rate > 0 {
-			rated = true
-		}
-		previous = r.moved
-	}
-	// THE ASSERTION THAT MATTERS. One reading proves the lane is connected; several
-	// increasing readings prove it is being fed. The old code would have passed a
-	// "downloading was observed" check and failed this one, because it read the counters
-	// only when the stage changed.
-	if downloads < 2 {
-		t.Fatalf("the lane saw %d downloading readings across %d samples; it is connected but not fed: %+v",
-			downloads, pod.downloadSamples, seen)
-	}
-	if !advanced {
-		t.Fatalf("downloading never advanced across %d readings: %+v", downloads, seen)
-	}
-	if !rated {
-		t.Fatalf("no reading carried a measured rate: %+v", seen)
-	}
-
-	final, ok := o.c.PreparationPhase(instance)
-	if !ok || final.Name != orchestrator.PhaseWarming {
-		t.Fatalf("after PREPARED the phase is %q, want %q", final.Name, orchestrator.PhaseWarming)
-	}
-	if final.HasBytes || final.Total != 0 || final.Moved != 0 || final.Rate != 0 || len(final.Models) != 0 {
-		t.Fatalf("completed download counters leaked into model loading: %+v", final)
-	}
-}
 
 // TestAPhaseWithNoDenominatorRendersBytesAndRate is the honesty arm. A producer that
 // declares no total must not cause a fraction to be invented, and the cell must still be

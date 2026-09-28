@@ -5,7 +5,6 @@ import (
 	"os"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -323,34 +322,6 @@ func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelR
 		return spec, nil
 	}
 	return facts.Spec()
-}
-
-func selectedInstallKey(installID string, models []orchestrator.ModelRef) string {
-	rows := append([]orchestrator.ModelRef(nil), models...)
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Slot < rows[j].Slot })
-	var key strings.Builder
-	key.WriteString(installID)
-	for _, row := range rows {
-		key.WriteByte(0)
-		key.WriteString(row.Slot)
-		key.WriteByte(0)
-		key.WriteString(row.Model)
-		key.WriteByte(0)
-		key.WriteString(row.Release)
-		key.WriteByte(0)
-		key.WriteString(row.Lane)
-		key.WriteByte(0)
-		key.WriteString(row.Manifest)
-		key.WriteByte(0)
-		key.WriteString(strconv.Itoa(len(row.Adapters)))
-		for _, adapter := range row.Adapters {
-			for _, part := range []string{adapter.Component, adapter.Model, adapter.Release, adapter.Lane, adapter.Manifest, adapter.SourceComponent, adapter.Scale} {
-				key.WriteByte(0)
-				key.WriteString(part)
-			}
-		}
-	}
-	return key.String()
 }
 
 func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,

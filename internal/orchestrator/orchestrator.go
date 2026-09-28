@@ -1062,12 +1062,6 @@ func (c *Orchestrator) recoverWorker(spec WorkerLaunchSpec) {
 	for _, attempt := range open {
 		c.settleLocalProcessDeath(attempt)
 	}
-	// Restore the same slot only after every old ordinal is durably closed or aborted.
-	// The fresh Runtime child receives only new work; it reconstructs nothing.
-	if _, _, e := c.EnsureWorker(spec); e != nil {
-		c.logf("the local slot %s could not be restarted after death settlement: %s",
-			spec.InstanceID(), e.Message)
-	}
 	c.reviveQueue()
 }
 

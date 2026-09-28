@@ -108,3 +108,11 @@ func publishCalleeReleaseOf(t *testing.T, h *ladderHub, root string) map[string]
 	})
 	return facts
 }
+
+// testLockedRequirements is one release's locked export in this suite.
+func testLockedRequirements(pkg, release string) []byte {
+	return []byte("--index-url https://pypi.org/simple\n" +
+		"--extra-index-url https://hub.invalid/v1/index/acme/simple/\n\n" +
+		pkg[strings.IndexByte(pkg, '/')+1:] + "==" + release +
+		" --hash=sha256:" + strings.Repeat("11", 32) + "\n")
+}

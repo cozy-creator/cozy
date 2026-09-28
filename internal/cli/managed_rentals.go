@@ -39,6 +39,8 @@ type managedRentals struct {
 	// immediately rather than waiting for the next poll or a new CLI request.
 	wakeQueue func()
 	installs  *rental.InstallQueue
+	// forget drops the daemon's kept connection to a machine whose rental ended.
+	forget func(string)
 	// said holds the last line printed about each rental, so the fleet speaks once per change.
 	said   map[string]string
 	closed bool
@@ -1017,8 +1019,8 @@ func (m *managedRentals) settle(release *pendingRelease) *exit.Error {
 			return observed
 		}
 	}
-	if m.owner != nil {
-		m.owner.DetachRental(id)
+	if m.forget != nil {
+		m.forget(id)
 	}
 	if _, problem := rental.Forget(m.layout, m.store, id); problem != nil {
 		return problem
@@ -1129,14 +1131,13 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 	return problem
 }
 
-// reattach moves a rebooted rental's control to its new boot, with the lock released.
+// reattach drops the kept connection to a rebooted rental, so its next use claims the new boot.
 // Work bound to the old boot settles on its own; the rental, its custody, installs and
 // queue continue on the new worker.
 func (m *managedRentals) reattach(ids []string) {
 	for _, id := range ids {
-		if m.owner != nil {
-			m.owner.DetachRental(id)
-			m.owner.ResumeRentalControl(id)
+		if m.forget != nil {
+			m.forget(id)
 		}
 	}
 	if len(ids) > 0 {
@@ -1373,11 +1374,6 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			if _, problem := finishRentalAttachment(m.layout, m.store, row, remote, operation.Key, token, creator); problem != nil {
 				return released, failed, rebooted, problem
 			}
-			if m.owner != nil {
-				// This method starts the existing reconnect loop asynchronously. No
-				// owner/queue work runs while this goroutine holds the fleet lock.
-				m.owner.ResumeRentalControl(row.ID)
-			}
 			// The rental just crossed acquiring -> attachable. Re-ask pinned
 			// machine executions now; they may have been parked before restart.
 			m.wakeQueueAsync()
@@ -1424,9 +1420,9 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 // to be found from the side that still has rows (observed live 2026-09-04, rental
 // pr-183abac284d1e16f5f0a).
 func (m *managedRentals) letGo(released, failed []string) *exit.Error {
-	if m.owner != nil {
+	if m.forget != nil {
 		for _, id := range append(failed, released...) {
-			m.owner.DetachRental(id)
+			m.forget(id)
 		}
 	}
 	for _, id := range released {

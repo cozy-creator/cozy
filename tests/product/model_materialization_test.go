@@ -1,112 +1,17 @@
 package producttest
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
 )
-
-func TestAcceptedModelCacheMissReensuresTheSameSelectionOnce(t *testing.T) {
-	for _, missAgain := range []bool{false, true} {
-		t.Run(map[bool]string{false: "refetched", true: "broken-ensure"}[missAgain], func(t *testing.T) {
-			public, private, err := ed25519.GenerateKey(rand.Reader)
-			must(t, err)
-			pod := &fakePod{controlKey: public, latch: &pb.Fault{Kind: pb.FaultKind_FAULT_KIND_ARTIFACT_FETCH_FAILED, Reason: "model_materialization_required", Detail: "native object absent"}}
-			var desires atomic.Int64
-			var observed func(uint64)
-			second := make(chan struct{})
-			pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
-				desired := frame.GetDesiredState()
-				if desired == nil || desired.GetPlacementSet() == nil {
-					return false, nil
-				}
-				n := desires.Add(1)
-				if n == 1 {
-					for index, change := range []func(*pb.ObservedWorkerState){
-						func(r *pb.ObservedWorkerState) { r.AcceptedDesiredStateRevision-- },
-						func(r *pb.ObservedWorkerState) { r.AcceptedPlacementSetDigest = bytes.Repeat([]byte{7}, 32) },
-						func(r *pb.ObservedWorkerState) { r.Faults[0].Subject = "unrelated-placement" },
-						func(r *pb.ObservedWorkerState) { r.Faults[0].Reason = "tensorfs_refused" },
-					} {
-						frame := pod.report(desired, 1)
-						state := frame.GetObservedState()
-						change(state)
-						state.AdmissionEpoch = uint64(100 + index)
-						if err := send(frame); err != nil {
-							return true, err
-						}
-						observed(state.AdmissionEpoch)
-						if desires.Load() != 1 {
-							t.Error("historical or unrelated fault caused a model re-ensure")
-						}
-					}
-					return true, send(pod.report(desired, 1))
-				}
-				if n == 2 {
-					defer close(second)
-					if !missAgain {
-						return true, send(pod.served(desired, 1))
-					}
-					for i := 0; i < orchestrator.StillFactor+2; i++ {
-						if err := send(pod.report(desired, 1)); err != nil {
-							return true, err
-						}
-					}
-					return true, nil
-				}
-				t.Error("native miss after completed ensure started an unlimited third preparation")
-				return true, nil
-			}
-			connection, _ := startFakePod(t, t.TempDir(), pod)
-			o := hostOwner(t, "cache-reensure", rentalWiring(connection, private))
-			instance, _, _, problem := o.c.EnsureRental(podRental)
-			fatal(t, problem)
-			observed = func(epoch uint64) {
-				waitUntil(t, "owner consumed unrelated miss report", func() bool { w := o.c.Worker(instance); return w != nil && w.AdmissionEpoch == epoch })
-			}
-			// This is the published inference path: the exact checkpoint rides the
-			// package preparation selection. A missing repository therefore causes a
-			// deterministic re-prepare of the same model before dispatch can resume.
-			model := &pb.DownloadModelRef{Package: "cozy/h3-package", Slot: "tile.models.model",
-				Model: "proof/h3", Release: "1.0.0", Lane: "bf16", Manifest: childDigest("8")}
-			fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "cozy/h3-package", Release: "1.0.7"}}, []*pb.DownloadModelRef{model}))
-			select {
-			case <-second:
-			case <-time.After(5 * time.Second):
-				t.Fatal("typed model absence did not rerun Host prepare")
-			}
-			if !missAgain {
-				waitUntil(t, "refetched model converged", func() bool { w := o.c.Worker(instance); return w != nil && w.ConvergedRevision == w.DesiredRevision })
-			} else {
-				time.Sleep(100 * time.Millisecond)
-			}
-			pod.mu.Lock()
-			defer pod.mu.Unlock()
-			if len(pod.prepares) != 2 || !bytes.Equal(pod.prepares[0].PackageSet.DownloadDelegation, pod.prepares[1].PackageSet.DownloadDelegation) {
-				t.Fatal("re-ensure changed the selected inputs", len(pod.prepares))
-			}
-			for _, prepare := range pod.prepares {
-				document, err := canonical.Read(prepare.PackageSet.DownloadDelegation, &pb.DownloadDelegation{})
-				must(t, err)
-				if len(document.List("models")) != 1 || document.List("models")[0].Str("manifest") != model.Manifest {
-					t.Fatalf("model checkpoint was not carried into package preparation: %s", prepare.PackageSet.DownloadDelegation)
-				}
-			}
-			if desires.Load() != 2 {
-				t.Fatal("cache miss was unbounded", desires.Load())
-			}
-		})
-	}
-}
 
 // A machine that finds a selected model's bytes gone refuses the job before admission
 // (model_materialization_required). That typed refusal ends the run at once with its reason

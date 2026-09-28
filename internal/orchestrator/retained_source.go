@@ -30,7 +30,6 @@ func (c *Orchestrator) releaseRetainedSource(ctx context.Context, request record
 	}
 	s, problem := c.rentalControl(request.Worker)
 	if problem != nil {
-		_, _, _, _ = c.ensureRentalContext(ctx, request.Worker)
 		return problem
 	}
 	if s.host == nil || s.claim == nil {

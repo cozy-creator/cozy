@@ -62,32 +62,6 @@ func (c *Orchestrator) rentalPreparationAllowedLocked(w *worker, req records.Req
 	return nil
 }
 
-func (c *Orchestrator) claimRentalPreparation(instance string, req records.Request) *exit.Error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	w := c.workers[instance]
-	if problem := c.rentalPreparationAllowedLocked(w, req); problem != nil {
-		return problem
-	}
-	parent, problem := c.activeParentFor(req)
-	if problem != nil {
-		return problem
-	}
-	w.preparingRequest, w.preparingReady = req.ID, false
-	w.orchestrationParent = parent
-	return nil
-}
-
-// A parent awaiting its child cannot complete behind an unrelated root's FIFO
-// claim. Only children of an exact still-active CPU parent receive this exception.
-func (c *Orchestrator) activeChild(req records.Request) bool {
-	if req.Worker == "" || req.ParentRequestID == "" {
-		return false
-	}
-	_, problem := c.retainedOrchestrationParent(req)
-	return problem == nil
-}
-
 // An unrelated root cannot consume an already-prepared ordinary lane while a
 // CPU parent owns the machine's composition. This also covers unpinned claims.
 func (c *Orchestrator) rentalParentAllows(w *worker, req records.Request) bool {

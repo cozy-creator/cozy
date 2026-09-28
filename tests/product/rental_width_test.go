@@ -84,31 +84,6 @@ func modelBearingPlacement(t *testing.T) func([]byte, string, string) *pb.Placem
 	}
 }
 
-// TestPodDeliveringFewerCardsThanPaidForIsRefused is the money arm. The width readback is
-// the same class of fence as the accelerator model's: a pod that does not deliver what is
-// being billed cannot be dispatched to, and the refusal names the two numbers so the
-// operator can act on it. Before cl-179 this check was `count == 1`, which is why a pod
-// that delivered exactly what was bought — four cards — was refused as well.
-func TestPodDeliveringFewerCardsThanPaidForIsRefused(t *testing.T) {
-	pod := &fakePod{serve: true, deviceCount: 2}
-	root := t.TempDir()
-	connection, certPath := startFakePod(t, root, pod)
-	o := hostOwner(t, "rental-width-short", rentalWidthWiring(t, pod, connection, certPath, 4))
-	_, _, _, problem := o.c.EnsureRental(podRental)
-	if problem == nil || problem.ErrName() != "rental.accelerator_count_mismatch" {
-		t.Fatalf("a pod delivering 2 of 4 paid cards was accepted: %v", problem)
-	}
-	if !strings.Contains(problem.Message, "2 accelerator(s)") ||
-		!strings.Contains(problem.Message, "bought 4") {
-		t.Fatalf("the refusal does not name both widths: %s", problem.Message)
-	}
-	pod.mu.Lock()
-	defer pod.mu.Unlock()
-	if len(pod.desired) != 0 {
-		t.Fatalf("a refused-width pod was sent %d desired state(s)", len(pod.desired))
-	}
-}
-
 // TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree is the PRE-SPEND half.
 // Width is not capacity — every rank of a group holds the full weights — so the only thing
 // that uses a second card is a group of that degree, and only the package's author can say

@@ -8,9 +8,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Unfinished work that only the retired classic local Runtime worker could run ends once,
-// named, at daemon start; work on this computer's machine and on rentals is untouched.
-func TestDaemonStartRetiresClassicLocalWork(t *testing.T) {
+// Unfinished work that only the retired classic worker session could run ends once,
+// named, at daemon start; machine executions are untouched.
+func TestDaemonStartRetiresClassicWork(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -33,7 +33,7 @@ func TestDaemonStartRetiresClassicLocalWork(t *testing.T) {
 	store, problem = records.OpenForDaemon(path)
 	fatal(t, problem)
 	defer store.Close()
-	retired, problem := store.RetireClassicLocalWork()
+	retired, problem := store.RetireClassicWork()
 	fatal(t, problem)
 	if len(retired) != 3 {
 		t.Fatalf("retired %v, want the three classic requests", retired)
@@ -59,10 +59,10 @@ func TestDaemonStartRetiresClassicLocalWork(t *testing.T) {
 	events, problem := store.EventsAfter(blocked.ID, 0, 100)
 	fatal(t, problem)
 	last := events[len(events)-1]
-	if last.Type != "request.failed" || last.Payload["error_type"] != records.ClassicLocalRetiredCode {
+	if last.Type != "request.failed" || last.Payload["error_type"] != records.ClassicRetiredCode {
 		t.Fatalf("classic retirement was not named: %+v", last)
 	}
-	again, problem := store.RetireClassicLocalWork()
+	again, problem := store.RetireClassicWork()
 	fatal(t, problem)
 	if len(again) != 0 {
 		t.Fatalf("retirement was not idempotent: %v", again)

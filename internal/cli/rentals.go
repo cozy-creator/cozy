@@ -15,7 +15,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -176,20 +175,8 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 
-	// Tensorhub readiness means only that this host can attach. The daemon claims the
-	// empty worker now; queued requests later send Creator-owned desired state directly.
-	ctx.Daemon = daemon.Probe(ctx.Cfg)
-	if !ctx.Daemon.Up {
-		return ctx.Daemon.Unavailable().WithRemedy(
-			"the paid rental is attached on this host; start `cozy run list` and resume with the same --idempotency-key")
-	}
-	local, e := dial(ctx)
-	if e != nil {
-		return e.WithRemedy("the paid rental is attached on this host; start `cozy run list` and resume with the same --idempotency-key")
-	}
-	if _, e := local.EnsureRental(attachable.ID); e != nil {
-		return e.WithRemedy("the paid rental is attached on this host; keep `cozy run list` running and resume with the same --idempotency-key")
-	}
+	// Tensorhub readiness means this host can reach the machine; its first use dials and
+	// claims it.
 	progress.On(localapi.Event{Type: "request.completed"})
 	progress.Done()
 	completed = true
@@ -1796,10 +1783,10 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 	if had {
 		local, problem := dial(w.ctx)
 		if problem != nil {
-			return problem.WithRemedy("the rental is gone at the hub, but its local credentials are kept until the daemon's worker control loop can detach")
+			return problem.WithRemedy("the rental is gone at the hub, but its local credentials are kept until the daemon drops its connection")
 		}
 		if _, problem := local.DetachRental(w.id); problem != nil {
-			return problem.WithRemedy("the rental is gone at the hub, but its local credentials are kept until the daemon's worker control loop can detach")
+			return problem.WithRemedy("the rental is gone at the hub, but its local credentials are kept until the daemon drops its connection")
 		}
 		if forgotten, problem = rental.Forget(l, st, w.id); problem != nil {
 			return problem

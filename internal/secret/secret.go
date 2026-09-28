@@ -79,12 +79,6 @@ func Mint() Value {
 	return Value{raw: hex.EncodeToString(b[:])}
 }
 
-// EnvEntry is the ENV-VAR CARRIER: the one place a credential becomes a child process's
-// environment entry (`NAME=value`). It exists so a launcher handing a per-spawn bootstrap
-// credential to the child it just created (#449) never touches the raw value itself —
-// same rule as the request-builder carrier in `api.Authorize`.
-func EnvEntry(name string, v Value) string { return name + "=" + v.raw }
-
 // FileBody is the FILE CARRIER: the one place a credential becomes the bytes of an
 // OS-protected 0600 handoff file (a rental's provisioned media bearer, cl-015). The
 // caller writes bytes it never looked at, which is the same rule EnvEntry keeps.

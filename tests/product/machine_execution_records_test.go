@@ -51,6 +51,7 @@ type retentionReleaseMachine struct {
 
 func (m *retentionReleaseMachine) Refresh(context.Context, records.Request) *exit.Error { return nil }
 func (m *retentionReleaseMachine) Withdraw(string)                                      {}
+func (m *retentionReleaseMachine) Forget(string)                                        {}
 
 func (m *retentionReleaseMachine) PruneOperationCache(context.Context, string) (uint32, uint64, bool, *exit.Error) {
 	return 0, 0, false, exit.Unavailablef("no machine")

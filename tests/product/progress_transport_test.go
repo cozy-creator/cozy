@@ -1,124 +1,13 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
-	"math"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
-
-// A lossy stream may fail without the durable control stream failing. It must
-// reconnect on its own, both before its first frame and after an established feed.
-func TestProgressWatchReconnectsWithoutRestartingControl(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	var calls atomic.Int32
-	pod := &fakePod{controlKey: public}
-	pod.watchProgress = func(open *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
-		call := calls.Add(1)
-		if call == 1 {
-			return status.Error(codes.Unavailable, "startup race")
-		}
-		data, err := json.Marshal(map[string]any{"type": "progress", "payload": map[string]any{
-			"stage": "denoise", "position": call - 1, "total": 30, "step_ms": 2000,
-		}})
-		if err != nil {
-			return err
-		}
-		frame := &pb.AttemptProgress{RecordOwnerEpoch: open.RecordOwnerEpoch,
-			ControlStreamEpoch: open.ControlStreamEpoch, WorkerBootId: open.WorkerBootId,
-			RequestId: "watch-reconnect", AttemptOrdinal: 1, Seq: uint64(call), Data: data}
-		if err := stream.Send(frame); err != nil {
-			return err
-		}
-		if call == 2 {
-			return status.Error(codes.Unavailable, "stream interruption")
-		}
-		<-stream.Context().Done()
-		return nil
-	}
-	connection, _ := startFakePod(t, t.TempDir(), pod)
-	o := hostOwner(t, "progress-reconnect", rentalWiring(connection, private))
-	_, _, _, e := o.c.EnsureRental(podRental)
-	fatal(t, e)
-	waitUntil(t, "progress after the independent watch reconnect", func() bool {
-		progress, ok := o.c.LatestProgress("watch-reconnect", 1)
-		return ok && progress.Position != nil && *progress.Position == 2
-	})
-	progress, _ := o.c.LatestProgress("watch-reconnect", 1)
-	if calls.Load() != 3 || progress.Stage != "denoise" || progress.StepMS == nil || *progress.StepMS != 2000 {
-		t.Fatalf("watch progress after reconnect: calls=%d progress=%+v", calls.Load(), progress)
-	}
-	pod.mu.Lock()
-	snapshots := len(pod.acks)
-	pod.mu.Unlock()
-	if snapshots != 1 {
-		t.Fatalf("progress-only disconnect restarted control: %d snapshots", snapshots)
-	}
-}
-
-func TestRoundedCountedProgressSurvivesLossyTransport(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	frames := make(chan map[string]any, 1)
-	pod := &fakePod{controlKey: public}
-	pod.watchProgress = func(open *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
-		for seq := uint64(1); ; seq++ {
-			select {
-			case fields := <-frames:
-				data, err := json.Marshal(map[string]any{"type": "progress", "payload": fields})
-				if err != nil {
-					return err
-				}
-				if err := stream.Send(&pb.AttemptProgress{
-					RecordOwnerEpoch: open.RecordOwnerEpoch, ControlStreamEpoch: open.ControlStreamEpoch,
-					WorkerBootId: open.WorkerBootId, RequestId: "rounded-progress", AttemptOrdinal: 1,
-					Seq: seq, Data: data,
-				}); err != nil {
-					return err
-				}
-			case <-stream.Context().Done():
-				return nil
-			}
-		}
-	}
-	connection, _ := startFakePod(t, t.TempDir(), pod)
-	o := hostOwner(t, "rounded-progress", rentalWiring(connection, private))
-	_, _, _, e := o.c.EnsureRental(podRental)
-	fatal(t, e)
-
-	// These are Runtime's six-decimal fractions. The 2 -> 5 jump drops two
-	// frames: its 42s interval represents one step, while three steps advanced.
-	for _, position := range []int64{0, 1, 2, 5, 18} {
-		fraction := math.Round(float64(position)/30*1e6) / 1e6
-		frames <- map[string]any{"stage": "denoise", "position": position, "total": 30,
-			"stage_fraction": fraction, "overall_fraction": fraction, "step_ms": 42000}
-		waitUntil(t, "rounded work coordinate", func() bool {
-			progress, ok := o.c.LatestProgress("rounded-progress", 1)
-			return ok && progress.Position != nil && *progress.Position == position
-		})
-		progress, _ := o.c.LatestProgress("rounded-progress", 1)
-		if progress.StageFraction == nil || *progress.StageFraction != float64(position)/30 {
-			t.Fatalf("counted fraction was not derived from its exact coordinates: %+v", progress)
-		}
-		if position > 0 {
-			want := (30 - position) * 42000
-			if !progress.Estimated || math.Abs(float64(progress.RemainingMS-want)) > 20 {
-				t.Fatalf("ETA priced coalesced steps as one interval: position=%d got=%d want=%d",
-					position, progress.RemainingMS, want)
-			}
-		}
-	}
-}
 
 func TestPreparationSnapshotCarriesRentalAndSeparateModelProgress(t *testing.T) {
 	o := hostOwner(t, "progress-metadata")

@@ -1,8 +1,6 @@
 package orchestrator
 
 import (
-	"time"
-
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -239,78 +237,4 @@ func (c *Orchestrator) CancelLostAttempt(requestID string, attempt int64, reason
 		exit.New(exit.Canceled, "%s was canceled; its execution context was gone", requestID))
 	c.RetryOutputExport(requestID)
 	return nil
-}
-
-// An explicitly rented pod is still owned when no request needs it. Restore its
-// existing signed control claim on restart so owner absence cannot reclaim it.
-// Each attachment uses the normal resolver and runs outside fleet acquisition.
-func (c *Orchestrator) resumeManualRentals() *exit.Error {
-	if c.opt.Rentals == nil {
-		return nil
-	}
-	rows, problem := c.opt.Store.Rentals()
-	if problem != nil {
-		return problem
-	}
-	for _, row := range rows {
-		retained, problem := c.opt.Store.RentalRetainsWork(row.ID)
-		if problem != nil {
-			return problem
-		}
-		if (row.ManagedRequestID != "" && !retained) || !records.RentalReadyState(row.State) {
-			continue
-		}
-		c.ResumeRentalControl(row.ID)
-	}
-	return nil
-}
-
-// ResumeRentalControl reconnects an already-owned ready rental after its local
-// authenticated target becomes durable. It shares restart recovery and never buys.
-func (c *Orchestrator) ResumeRentalControl(id string) {
-	go c.resumeManualRental(id)
-}
-
-func (c *Orchestrator) resumeManualRental(id string) {
-	for {
-		c.mu.Lock()
-		closing := c.closing
-		c.mu.Unlock()
-		if closing {
-			return
-		}
-		row, problem := c.opt.Store.RentalRow(id)
-		if problem != nil {
-			c.logf("rental %s control reattachment cannot read ownership: %s", id, problem.Message)
-			return
-		}
-		retained, retainedProblem := c.opt.Store.RentalRetainsWork(id)
-		if retainedProblem != nil {
-			return
-		}
-		if row == nil || (row.ManagedRequestID != "" && !retained) || !records.RentalReadyState(row.State) {
-			return
-		}
-		if _, _, _, problem = c.EnsureRental(id); problem == nil {
-			return
-		}
-		c.logf("rental %s control reattachment refused: %s", id, problem.Message)
-		if problem.Code != exit.Unavailable {
-			return
-		}
-		c.mu.Lock()
-		worker := c.workers[rentalInstanceID(id)]
-		connecting := worker != nil && !worker.exited && !worker.stopping
-		c.mu.Unlock()
-		if connecting {
-			return // the existing connection loop owns transport recovery
-		}
-		timer := time.NewTimer(ReportCadence)
-		select {
-		case <-c.done:
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
 }

@@ -1,8 +1,6 @@
 package orchestrator
 
 import (
-	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -88,46 +86,6 @@ func JobInstallationID(setBytes []byte, pkg string) (string, *exit.Error) {
 }
 
 var jobInstallationID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$`)
-
-// stageJobPlans writes one job plan record per declared job into the worker's own home.
-// The file name is the descriptor id's hex, which is how the supervisor finds it.
-func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
-	for _, p := range plans {
-		if !jobInstallationID.MatchString(p.InstallationID) {
-			return exit.New(exit.Validation, "job plan needs a bounded installation ID")
-		}
-		if _, err := canonical.Raw(p.DescriptorID); err != nil {
-			return exit.New(exit.Validation, "job plan descriptor identity is invalid")
-		}
-		dir := filepath.Join(workerHome, "job-plans", p.InstallationID)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return exit.Internalf("cannot create the job plan directory: %s", err)
-		}
-		data, err := json.MarshalIndent(p.Record, "", "  ")
-		if err != nil {
-			return exit.Internalf("cannot render the job plan record: %s", err)
-		}
-		name := strings.TrimPrefix(p.DescriptorID, "sha256:") + ".json"
-		path := filepath.Join(dir, name)
-		if held, err := os.ReadFile(path); err == nil && bytes.Equal(held, data) {
-			continue
-		}
-		// The record is derived from this Creator's plan; a file an earlier build
-		// rendered differently is replaced atomically rather than refused.
-		out, err := os.CreateTemp(dir, name+".*")
-		if err != nil {
-			return exit.Internalf("cannot stage exact job plan: %s", err)
-		}
-		_, writeError := out.Write(data)
-		syncError := out.Sync()
-		closeError := out.Close()
-		if writeError != nil || syncError != nil || closeError != nil || os.Chmod(out.Name(), 0o444) != nil || os.Rename(out.Name(), path) != nil {
-			_ = os.Remove(out.Name())
-			return exit.Internalf("cannot durably stage exact job plan")
-		}
-	}
-	return nil
-}
 
 // sendJobDirective issues the JOB-mode full-replace desired state. A DesiredWorkerState is
 // a discriminated COMPLETE replacement carrying its own `mode` oneof, so a worker is in

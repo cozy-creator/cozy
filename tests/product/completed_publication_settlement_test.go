@@ -2,21 +2,15 @@ package producttest
 
 import (
 	"bytes"
-	"crypto/ed25519"
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func completedPublicationFixture(t *testing.T) (*records.Store, *sql.DB, string) {
@@ -122,108 +116,5 @@ func TestIncompleteOrFailedPublicationCannotSucceedWithoutSession(t *testing.T) 
 				t.Fatalf("unproven publication succeeded: %s", row.State)
 			}
 		})
-	}
-}
-
-func TestCompletedPublicationEventuallyAcknowledgesSameOutcome(t *testing.T) {
-	store, db, id := completedPublicationFixture(t)
-	rows, problem := store.AllModelTransferWeights(id, 1)
-	fatal(t, problem)
-	fatal(t, store.CompleteModelTransfer(id, map[string]string{"model": rows[0].ManifestID}))
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public}
-	connection, _ := startFakePod(t, t.TempDir(), pod)
-	instance := (orchestrator.WorkerLaunchSpec{Connection: connection}).InstanceID()
-	declared, err := json.Marshal([]orchestrator.WeightsOutput{{OutputID: "model", MimeType: orchestrator.WeightsManifestMime, MaxBytes: 1 << 30}})
-	must(t, err)
-	_, err = db.Exec(`UPDATE requests SET worker=?`, podRental)
-	must(t, err)
-	_, err = db.Exec(`UPDATE attempts SET instance_id=?,session_id=?,terminal_id='out-retained',weights_outputs=?`, instance, podBootID, string(declared))
-	must(t, err)
-	attempt, problem := store.AttemptRow(id, 1)
-	fatal(t, problem)
-	// Bind the schema corpus to this real RecordOwner before the fixture begins.
-	receipt, err := canonical.Read(rows[0].Receipt, &pb.WeightsReceipt{})
-	must(t, err)
-	receipt["owner_authority_scope"] = "cozy-local-client"
-	receiptBytes, err := canonical.Write(receipt)
-	must(t, err)
-	receiptDigest, err := canonical.Spell(canonical.Digest(receiptBytes))
-	must(t, err)
-	body, err := canonical.Read(attempt.TerminalBody, &pb.AttemptOutcomeBody{})
-	must(t, err)
-	body["weights_receipts"] = []canonical.Value{map[string]canonical.Value{
-		"weights_receipt_digest":          receiptDigest,
-		"weights_receipt_canonical_bytes": base64.StdEncoding.EncodeToString(receiptBytes),
-	}}
-	outcomeBytes, err := canonical.Write(body)
-	must(t, err)
-	spelledOutcome, err := canonical.Spell(canonical.Digest(outcomeBytes))
-	must(t, err)
-	_, err = db.Exec(`UPDATE attempts SET terminal_body=?,terminal_digest=?`, outcomeBytes, spelledOutcome)
-	must(t, err)
-	_, err = db.Exec(`UPDATE request_model_transfer_outputs SET receipt=?,receipt_digest=?`, receiptBytes, receiptDigest)
-	must(t, err)
-	attempt, problem = store.AttemptRow(id, 1)
-	fatal(t, problem)
-	specDigest, err := canonical.Raw(attempt.InvocationDigest)
-	must(t, err)
-	outcomeDigest, err := canonical.Raw(attempt.TerminalDigest)
-	must(t, err)
-	pod.snapshotHeld = []*pb.HeldAttempt{{RequestId: id, AttemptOrdinal: 1, Kind: pb.AttemptKind_ATTEMPT_KIND_JOB,
-		State: pb.AttemptState_ATTEMPT_STATE_OUTCOME_PENDING_ACK, InvocationSpecDigest: specDigest,
-		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest}}
-	var releases, acks atomic.Int64
-	first := publicationStateOwner(t, "publication-before-reconnect", store, &releases)
-	fatal(t, first.c.ResumeModelTransfers())
-	waitUntil(t, "publication succeeds before peer reconnect", func() bool { row, p := store.RequestRow(id); fatal(t, p); return row.State == "succeeded" })
-	first.close()
-	var outcome *pb.AttemptOutcome
-	pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
-		if snapshot := frame.GetSnapshotAck(); snapshot != nil {
-			outcome = &pb.AttemptOutcome{RecordOwnerEpoch: snapshot.RecordOwnerEpoch, ControlStreamEpoch: snapshot.ControlStreamEpoch,
-				WorkerBootId: podBootID, RequestId: id, AttemptOrdinal: 1, InvocationSpecDigest: specDigest,
-				OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest, OutcomeCanonicalBytes: attempt.TerminalBody}
-			return true, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: outcome}})
-		}
-		if ack := frame.GetOutcomeAck(); ack != nil {
-			if !bytes.Equal(ack.OutcomeDigest, outcomeDigest) || ack.OutcomeId != attempt.TerminalID || ack.RequestId != id {
-				return true, fmt.Errorf("ACK substituted retained outcome")
-			}
-			if acks.Add(1) == 1 {
-				return true, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: outcome}})
-			}
-			return true, nil
-		}
-		return false, nil
-	}
-	second := hostOwner(t, "publication-after-reconnect", rentalWiring(connection, private), func(options *orchestrator.Options) {
-		options.Store = store
-		options.ReleaseManagedRental = func(string) (string, *exit.Error) { releases.Add(1); return "", nil }
-	})
-	_, _, _, problem = second.c.EnsureRental(podRental)
-	fatal(t, problem)
-	waitUntil(t, "same retained outcome ACKed on actual control stream", func() bool { return acks.Load() >= 2 })
-	row, problem := store.RequestRow(id)
-	fatal(t, problem)
-	attempts, problem := store.Attempts(id)
-	fatal(t, problem)
-	events, problem := store.EventsAfter(id, 0, 100)
-	fatal(t, problem)
-	completions := 0
-	for _, event := range events {
-		if event.Type == "request.completed" {
-			completions++
-		}
-	}
-	if row.State != "succeeded" || len(attempts) != 1 || attempts[0].State != "closed" || !bytes.Equal(attempts[0].TerminalBody, attempt.TerminalBody) || completions != 1 {
-		t.Fatalf("ACK replay changed completed publication: state=%s attempts=%d completions=%d", row.State, len(attempts), completions)
-	}
-	pod.mu.Lock()
-	offers := len(pod.offers)
-	pod.mu.Unlock()
-	if offers != 0 {
-		t.Fatal("publication cleanup reexecuted the producer")
 	}
 }

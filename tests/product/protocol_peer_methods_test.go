@@ -97,27 +97,6 @@ func (p *fakePod) AcknowledgeMachineExecutionCollection(ctx context.Context, req
 	}
 	return p.UnimplementedWorkerControlServer.AcknowledgeMachineExecutionCollection(ctx, request)
 }
-func (p *standInPod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
-	return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
-}
-func (p *standInPod) SubmitMachineExecution(ctx context.Context, request *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
-	return p.UnimplementedWorkerControlServer.SubmitMachineExecution(ctx, request)
-}
-func (p *standInPod) GetMachineExecution(ctx context.Context, request *pb.MachineExecutionQuery) (*pb.MachineExecutionState, error) {
-	return p.UnimplementedWorkerControlServer.GetMachineExecution(ctx, request)
-}
-func (p *standInPod) ListMachineExecutionEvents(ctx context.Context, request *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error) {
-	return p.UnimplementedWorkerControlServer.ListMachineExecutionEvents(ctx, request)
-}
-func (p *standInPod) ControlMachineExecution(ctx context.Context, request *pb.MachineExecutionControl) (*pb.MachineExecutionState, error) {
-	return p.UnimplementedWorkerControlServer.ControlMachineExecution(ctx, request)
-}
-func (p *standInPod) CollectMachineExecution(ctx context.Context, request *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	return p.UnimplementedWorkerControlServer.CollectMachineExecution(ctx, request)
-}
-func (p *standInPod) AcknowledgeMachineExecutionCollection(ctx context.Context, request *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
-	return p.UnimplementedWorkerControlServer.AcknowledgeMachineExecutionCollection(ctx, request)
-}
 
 type inputTreeImporter interface {
 	ImportInputTree(grpc.ClientStreamingServer[pb.InputTreeImportFrame, pb.NativeByteRetentionResult]) error

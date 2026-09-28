@@ -2,11 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"time"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"time"
 )
 
 func (c *Orchestrator) CancelRetainedRequest(id, actor string) *exit.Error {
@@ -448,8 +449,6 @@ func (c *Orchestrator) settleRetainedWeights(request records.Request, attempts [
 			c.mu.Unlock()
 			if session != nil {
 				_, _ = c.sendPendingWeightsFinalizations(session, id, attempt.Attempt)
-			} else if request.Worker != "" {
-				_, _, _, _ = c.EnsureRental(request.Worker)
 			}
 			return false, nil
 		}

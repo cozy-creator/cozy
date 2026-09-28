@@ -199,6 +199,9 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, bootID, pkg, release
 	return problem
 }
 
+// Forget drops the kept connection to a machine, so a rental's credentials can be removed.
+func (m *machineRuns) Forget(machine string) { m.machines.Forget(machine) }
+
 // Describe asks the machine for a published release's interface, as it reads it at its own Hub.
 func (m *machineRuns) Describe(ctx context.Context, machine, pkg, release string) (api.DescribedRelease, *exit.Error) {
 	connection, problem := m.connect(ctx, machine, "describing "+pkg)

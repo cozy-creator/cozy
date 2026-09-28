@@ -68,14 +68,13 @@ type fakePod struct {
 	mediaReservation func(int64, int) error
 	mediaRequest     func(http.ResponseWriter, *http.Request) bool
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
-	sourceRuntime   pb.RuntimePreparationClient
-	sourceRelease   func(context.Context, *pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
-	sourceControl   func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
-	weightsReady    func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
-	protocolInfo    func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
-	watchProgress   func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
-	recordOperation func(*pb.RecordOperationResultCall) (*pb.RecordOperationResultResult, error)
-	derivedRetain   func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
+	sourceRuntime pb.RuntimePreparationClient
+	sourceRelease func(context.Context, *pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
+	sourceControl func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
+	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
+	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
+	watchProgress func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
+	derivedRetain func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
 	// artifactTransfer answers `cozy run upload`'s retained-artifact commands.
 	artifactTransfer func(context.Context, *pb.NativeArtifactTransferCall) (*pb.NativeArtifactTransferStatus, error)
 	derivedRelease   func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
@@ -118,7 +117,6 @@ type fakePod struct {
 	// preparedPlacement supplies a complete second-implementation placement for
 	// tests of modeled callable routing. The normal package preparation path still runs.
 	preparedPlacement func([]byte, string, string) *pb.Placement
-	numericalDigest   []byte
 	// slots is the advertised seat count while serving; zero means one.
 	slots uint32
 	// reobserve re-sends the serving report for the last desired state, as the Runtime's
@@ -777,12 +775,6 @@ func podPlacement(downloadSet []byte, name, release, distribution string) *pb.Pl
 	}
 }
 
-// podPlanID is the plan a request binds to reach podPlacement's entrypoint for `name`.
-func podPlanID(name string) string {
-	spelled, _ := canonical.Spell(podEntrypoint("tile").EntrypointBindingDigest)
-	return spelled
-}
-
 func podEntrypoint(name string) *pb.Entrypoint {
 	raw, _ := canonical.Write(map[string]canonical.Value{"name": name, "slots": []canonical.Value{}})
 	return &pb.Entrypoint{Name: name, EntrypointBindingDigest: canonical.Digest(raw)}
@@ -949,14 +941,6 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 	}
 }
 
-// testLockedRequirements is one release's locked export in this suite.
-func testLockedRequirements(pkg, release string) []byte {
-	return []byte("--index-url https://pypi.org/simple\n" +
-		"--extra-index-url https://hub.invalid/v1/index/acme/simple/\n\n" +
-		pkg[strings.IndexByte(pkg, '/')+1:] + "==" + release +
-		" --hash=sha256:" + strings.Repeat("11", 32) + "\n")
-}
-
 func waitUntil(t *testing.T, what string, ok func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
@@ -967,99 +951,6 @@ func waitUntil(t *testing.T, what string, ok func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
-}
-
-// TestPodHostThreeStepSequence: the owner prepares through PodHost, then sends the exact
-// prepared placement_set bytes itself on WorkerControl. No package_set ever crosses the
-// control stream, and the snapshot ack echoes the host document's digest.
-func TestPodHostThreeStepSequence(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public}
-	root := t.TempDir()
-	connection, _ := startFakePod(t, root, pod)
-	o := hostOwner(t, "podhost", rentalWiring(connection, private))
-
-	instance, _, _, e := o.c.EnsureRental(podRental)
-	fatal(t, e)
-	waitUntil(t, "the peer receiving the snapshot acknowledgement", func() bool {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.acks) > 0
-	})
-	pod.mu.Lock()
-	acks, hostDigest := append([]*pb.SnapshotAck(nil), pod.acks...), pod.hostDigest
-	pod.mu.Unlock()
-	if len(acks) != 1 || !bytes.Equal(acks[0].HostSnapshotDigest, hostDigest) {
-		t.Fatalf("the snapshot ack did not echo the host document digest: %d ack(s) %x vs %x",
-			len(acks), acks[0].GetHostSnapshotDigest(), hostDigest)
-	}
-
-	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
-		Package: "cozy/h3-package", Release: "1.0.7"}}, nil))
-	waitUntil(t, "the prepared placement_set on WorkerControl", func() bool {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.desired) >= 1
-	})
-	pod.mu.Lock()
-	defer pod.mu.Unlock()
-	if len(pod.prepares) != 1 {
-		t.Fatalf("PodHost.PreparePackageSet was called %d times, want 1", len(pod.prepares))
-	}
-	if got := pod.prepares[0].Claim; got.ControlStreamEpoch != 0 || got.WorkerBootId != podBootID {
-		t.Fatalf("the host call's Claim is stream-scoped or misaddressed: %+v", got)
-	}
-	if first := pod.prepares[0]; first.Application != "" || len(first.LockedRequirements) != 0 || len(first.PackageInterface) != 0 {
-		t.Fatalf("the host call carries release facts the machine reads itself: app=%q", first.Application)
-	}
-	sent := pod.desired[0].GetPlacementSet()
-	if sent == nil || !bytes.Equal(sent.PlacementSetCanonicalBytes, pod.preparedSet) ||
-		!bytes.Equal(sent.PlacementSetDigest, pod.preparedDig) {
-		t.Fatalf("the desired state does not carry the exact bytes the host prepared")
-	}
-	facts := o.c.Worker(instance)
-	if facts == nil || facts.DesiredRevision != pod.desired[0].Revision {
-		t.Fatalf("the owner's desired revision %v is not the one it sent (%d)", facts, pod.desired[0].Revision)
-	}
-	log, err := os.ReadFile(filepath.Join(o.root, "orchestrator.log"))
-	must(t, err)
-	for _, want := range []string{"PodHost prepare package_set", "PREPARED", "prepared by the host as package_set"} {
-		if !strings.Contains(string(log), want) {
-			t.Errorf("the owner log does not show %q", want)
-		}
-	}
-}
-
-// TestPodHostRefusesUnverifiedHostDocument: a host document whose digest does not hash its
-// bytes is refused at the barrier exactly like a worker document would be. Dispatch never
-// opens, and the pod sees no ack.
-func TestPodHostRefusesUnverifiedHostDocument(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public, mutateHostDigest: true}
-	root := t.TempDir()
-	connection, _ := startFakePod(t, root, pod)
-	o := hostOwner(t, "podhost-red", rentalWiring(connection, private))
-
-	done := make(chan *exit.Error, 1)
-	go func() { _, _, _, e := o.c.EnsureRental(podRental); done <- e }()
-	waitUntil(t, "the owner's refusal of the host document", func() bool {
-		log, _ := os.ReadFile(filepath.Join(o.root, "orchestrator.log"))
-		return strings.Contains(string(log), "host_snapshot_digest") &&
-			strings.Contains(string(log), "NOT acknowledged")
-	})
-	pod.mu.Lock()
-	acks := len(pod.acks)
-	pod.mu.Unlock()
-	if acks != 0 {
-		t.Fatalf("the owner acknowledged a host document whose digest does not hash its bytes")
-	}
-	select {
-	case e := <-done:
-		t.Fatalf("EnsureRental returned (%s) although the barrier never opened", briefly(e))
-	default:
-	}
 }
 
 // localLauncher is the one Launcher method a rental-bound editable request uses: the

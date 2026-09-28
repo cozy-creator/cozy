@@ -50,7 +50,6 @@ func (c *Orchestrator) pauseRetainedSource(request records.Request) {
 		defer func() { c.mu.Lock(); delete(c.sourcePauseRunning, request.ID); c.mu.Unlock() }()
 		s, problem := c.rentalControl(request.Worker)
 		if problem != nil {
-			_, _, _, _ = c.EnsureRental(request.Worker)
 			return
 		}
 		if problem := c.controlRetainedSource(s.ctx, request, true); problem != nil {

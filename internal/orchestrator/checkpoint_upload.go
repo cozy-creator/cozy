@@ -2,8 +2,9 @@ package orchestrator
 
 import (
 	"context"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"time"
+
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"

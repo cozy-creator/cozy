@@ -262,14 +262,6 @@ func (c *Orchestrator) settleHostPrepare(s *session, w *worker, seq uint64, labe
 	return false
 }
 
-// runtimeErrorCode is a Runtime's own stable code for a failed call (`cozy-error-code`).
-func runtimeErrorCode(trailer metadata.MD) string {
-	if codes := trailer.Get("cozy-error-code"); len(codes) == 1 && safeCodeRE.MatchString(codes[0]) {
-		return codes[0]
-	}
-	return ""
-}
-
 var safeCodeRE = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
 
 // classifyPrepareEnd sorts a prepare stream's end into "no verdict, the reconnect re-issues"

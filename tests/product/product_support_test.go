@@ -243,16 +243,6 @@ func waitEvent(o *owner, substr string, timeout time.Duration) (string, bool) {
 	return "", false
 }
 
-func countEvents(o *owner, substr string) int {
-	n := 0
-	for _, line := range o.c.Events() {
-		if strings.Contains(line, substr) {
-			n++
-		}
-	}
-	return n
-}
-
 // ------------------------------------------------------------- a real hidden daemon process
 
 // daemonProcess is one Cozy daemon this suite owns. The separate process is the point:

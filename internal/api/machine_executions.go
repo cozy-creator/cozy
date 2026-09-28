@@ -27,6 +27,8 @@ type MachineExecutions interface {
 	// Describe is a published release as one machine reads it at its own Hub: the release
 	// (the newest when none is named) and its interface.
 	Describe(ctx context.Context, machine, pkg, release string) (DescribedRelease, *exit.Error)
+	// Forget drops this daemon's kept connection to a machine, before its credentials go.
+	Forget(machine string)
 }
 
 // DescribedRelease is one published release's interface, as the machine that runs it read it.

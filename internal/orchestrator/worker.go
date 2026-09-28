@@ -317,15 +317,6 @@ func (p DesiredPlacement) PlacementID() string {
 	return "plc-" + strings.TrimPrefix(p.InstanceID(), "ins-")
 }
 
-func (c *Orchestrator) workerWireMinor(rental string) uint32 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if w := c.workers[rentalInstanceID(rental)]; w != nil {
-		return w.wireMinor
-	}
-	return 0
-}
-
 // supportsCurrentProtocol is shared by placement reuse and dispatch. A claimed peer below
 // the execution floor keeps its Claim, snapshots and keepalive; only new preparation and
 // execution route elsewhere.
@@ -660,147 +651,6 @@ func (w *worker) observeJobs(n int) {
 	w.jobsAvail = max(0, n-w.reservedJobs)
 }
 
-// EnsureWorker makes one worker exist hosting one placement, and SAYS WHICH OF THE THREE
-// THINGS IT DID (#484). It is idempotent by construction rather than by a caller's check:
-// a slot already hosting this placement is `none`, a slot that exists without it converges
-// and is `placement_added`, and only an absent slot is spawned or connected.
-//
-// The three answers are not decoration. `cozy run` and POST /v1/local/workers both need
-// to tell an idempotent no-op from a real convergence, and a boolean `resident` could only
-// tell them "it was there", which is true of both.
-func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange, *exit.Error) {
-	if spec.Connection == nil {
-		return "", ChangeNone, ClassicLocalRetired()
-	}
-	release, problem := c.UseRental(spec.Connection.RentalID, "attaching its worker")
-	if problem != nil {
-		return "", ChangeNone, problem
-	}
-	defer release()
-	instanceID := spec.InstanceID()
-	var live *worker
-	var mine chan struct{}
-	for {
-		c.mu.Lock()
-		if c.closing {
-			c.mu.Unlock()
-			return "", ChangeNone, exit.Named(exit.Unavailable, "daemon.closing", "the daemon is closing; no worker can be started")
-		}
-		if inFlight := c.ensuring[instanceID]; inFlight != nil {
-			c.mu.Unlock()
-			<-inFlight
-			continue
-		}
-		live = c.workers[instanceID]
-		if live != nil && live.stopping {
-			stopped := live.stopped
-			c.mu.Unlock()
-			<-stopped
-			continue
-		}
-		if live != nil && live.exited {
-			live = nil
-		}
-		if live == nil {
-			mine = make(chan struct{})
-			c.ensuring[instanceID] = mine
-		}
-		c.mu.Unlock()
-		break
-	}
-	if live != nil {
-		if spec.Preparation != nil {
-			return instanceID, ChangeNone, nil
-		}
-		// A concurrent empty-rental attach may have waited for this connection.
-		// It requests the existing claim, never an empty replacement placement.
-		if spec.Connection != nil && spec.Placement.Package == "" {
-			return instanceID, ChangeNone, nil
-		}
-		// The worker is here. Does it already host what is wanted? The placement's
-		// identity for this purpose is its plan set, which is what the desired set names.
-		c.mu.Lock()
-		hosts := c.workers[instanceID] == live && hostsPlans(live, spec.Placement)
-		c.mu.Unlock()
-		if hosts {
-			return instanceID, ChangeNone, nil
-		}
-		if live.spec.Connection != nil {
-			if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
-				return instanceID, ChangeNone, e
-			}
-			c.mu.Lock()
-			live.spec.Placement = spec.Placement
-			live.planIDs = live.planIDs[:0]
-			for _, entrypoint := range spec.Placement.Entrypoints {
-				live.planIDs = append(live.planIDs, entrypoint.Digest)
-			}
-			sort.Strings(live.planIDs)
-			c.mu.Unlock()
-			return instanceID, ChangePlacementAdded, nil
-		}
-		if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
-			return instanceID, ChangeNone, e
-		}
-		// The launcher's record is what the matching layer reads. A local re-stage keeps
-		// the process but replaces its placement (cl-114: the same plans under a new
-		// model selection), so the spec must say what the worker was just asked to host —
-		// or the next request would be matched against the selection that was vacated.
-		c.mu.Lock()
-		if c.workers[instanceID] == live {
-			live.spec.Placement = spec.Placement
-			live.planIDs = live.planIDs[:0]
-			for _, entrypoint := range spec.Placement.Entrypoints {
-				live.planIDs = append(live.planIDs, entrypoint.Digest)
-			}
-			for _, job := range spec.Placement.Jobs {
-				live.planIDs = append(live.planIDs, job.DescriptorID)
-			}
-			sort.Strings(live.planIDs)
-		}
-		c.mu.Unlock()
-		return instanceID, ChangePlacementAdded, nil
-	}
-	defer func() {
-		c.mu.Lock()
-		if c.ensuring[instanceID] == mine {
-			delete(c.ensuring, instanceID)
-			close(mine)
-		}
-		c.mu.Unlock()
-	}()
-	id, e := c.connectWorker(spec)
-	return id, ChangeWorkerStarted, e
-}
-
-func lessRecentlyUsed(a, b *worker) bool {
-	if (a.lastUseRevision == 0) != (b.lastUseRevision == 0) {
-		return a.lastUseRevision == 0
-	}
-	if a.lastUseRevision != b.lastUseRevision {
-		return a.lastUseRevision < b.lastUseRevision
-	}
-	if a.residentRevision != b.residentRevision {
-		return a.residentRevision < b.residentRevision
-	}
-	return a.instanceID < b.instanceID
-}
-
-// EnsureRental attaches one generic empty worker without selecting a package. Later
-// desired state is Creator-owned and travels directly on this control stream.
-func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *exit.Error) {
-	return c.ensureRentalContext(context.Background(), id)
-}
-
-// EnsureRentalContext lets a foreground preparation stop waiting for an
-// unavailable control session when its caller disconnects.
-func (c *Orchestrator) EnsureRentalContext(ctx context.Context, id string) (string, string, WorkerChange, *exit.Error) {
-	if _, problem := c.retryRentalReadback(ctx, id); problem != nil {
-		return "", "", ChangeNone, problem
-	}
-	return c.ensureRentalContext(ctx, id)
-}
-
 // retryRentalReadback is an explicit caller's retry of an unreadable hardware
 // observation, not a retry of an identity mismatch. Re-enter the normal claim
 // and snapshot handshake; missing observations never authorize maintenance or
@@ -839,38 +689,6 @@ func (c *Orchestrator) retryRentalReadback(ctx context.Context, id string) (bool
 	return true, nil
 }
 
-func (c *Orchestrator) ensureRentalContext(ctx context.Context, id string) (string, string, WorkerChange, *exit.Error) {
-	if c.opt.Rentals == nil {
-		return "", "", ChangeNone, exit.Unavailablef("this Cozy daemon attaches no rented workers")
-	}
-	target, problem := c.opt.Rentals(id)
-	if problem != nil {
-		return "", "", ChangeNone, problem
-	}
-	if target == nil || target.Connection == nil {
-		return "", "", ChangeNone, exit.Internalf("rental %s resolved no connected worker", id)
-	}
-	instance := rentalInstanceID(id)
-	c.mu.Lock()
-	live := c.workers[instance]
-	already := live != nil && !live.exited && !live.stopping && live.spec.Connection != nil &&
-		live.spec.Connection.RentalID == id
-	c.mu.Unlock()
-	if already {
-		return instance, "", ChangeNone, c.ensureWorkerClaimedContext(ctx, instance)
-	}
-	spec := WorkerLaunchSpec{Connection: target.Connection, Devices: target.Devices}
-	instance, change, problem := c.EnsureWorker(spec)
-	if problem == nil {
-		problem = c.ensureWorkerClaimedContext(ctx, instance)
-	}
-	return instance, "", change, problem
-}
-
-func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
-	return c.ensureWorkerClaimedContext(context.Background(), instanceID)
-}
-
 func (c *Orchestrator) ensureWorkerClaimedContext(ctx context.Context, instanceID string) *exit.Error {
 	for {
 		c.mu.Lock()
@@ -901,175 +719,9 @@ func (c *Orchestrator) ensureWorkerClaimedContext(ctx context.Context, instanceI
 	}
 }
 
-func (c *Orchestrator) waitPackageStaged(instanceID string) *exit.Error {
-	for {
-		c.mu.Lock()
-		w := c.workers[instanceID]
-		ready := w != nil && !w.exited &&
-			w.acceptedRevision >= w.revision &&
-			w.materialization == pb.MaterializationState_MATERIALIZATION_STATE_STAGED
-		gone := w == nil || w.exited
-		var refused, desiredRefusal *exit.Error
-		faulted := false
-		if w != nil {
-			refused, desiredRefusal, faulted = w.refusal, w.desiredRefusal, w.faulted
-		}
-		c.mu.Unlock()
-		switch {
-		case ready:
-			return nil
-		case refused != nil:
-			return refused
-		case desiredRefusal != nil:
-			return desiredRefusal
-		case faulted:
-			return exit.New(exit.Failed, "the rented worker refused package preparation")
-		case gone:
-			return exit.New(exit.Failed, "the rented worker exited while preparing the package")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
 func validDigest(value string) bool {
 	_, err := canonical.Raw(value)
 	return err == nil
-}
-
-// DetachRental stops this daemon's control loop for one rented worker. It waits for an
-// in-flight attach to finish choosing the slot, then waits for the exact worker epoch
-// to quiesce. The caller may delete the rental's pinned certificate only after this returns.
-func (c *Orchestrator) DetachRental(id string) bool {
-	instanceID := rentalInstanceID(id)
-	for {
-		c.mu.Lock()
-		if inFlight := c.ensuring[instanceID]; inFlight != nil {
-			c.mu.Unlock()
-			<-inFlight
-			continue
-		}
-		w := c.workers[instanceID]
-		if w == nil || w.spec.Connection == nil || w.spec.Connection.RentalID != id {
-			c.mu.Unlock()
-			return false
-		}
-		c.mu.Unlock()
-		c.shutdownWorker(w, StopGrace)
-		return true
-	}
-}
-
-// hostsPlans answers whether a live worker was launched for exactly the selected
-// entrypoint bindings. The exact PlacementSet remains the authority: a local worker
-// holding the same plans under a DIFFERENT set — the same interface bound to a different
-// model selection (cl-114) — does not host this placement, and EnsureWorker re-stages it.
-func hostsPlans(w *worker, p DesiredPlacement) bool {
-	want := map[string]bool{}
-	for _, entrypoint := range p.Entrypoints {
-		want[entrypoint.Digest] = true
-	}
-	for _, j := range p.Jobs {
-		want[j.DescriptorID] = true
-		if j.OrchestrationParent != nil {
-			want[j.OrchestrationParent.DescriptorID] = true
-		}
-	}
-	if w.spec.Placement.PlacementSetDigest != p.PlacementSetDigest {
-		return false
-	}
-	if len(want) != len(w.planIDs) {
-		return false
-	}
-	for _, id := range w.planIDs {
-		if !want[id] {
-			return false
-		}
-	}
-	return true
-}
-
-// newWorker is the one place a worker's observed state starts, and it starts UNKNOWN:
-// every enum at its UNSPECIFIED zero, every map empty, zero seats. A worker this owner has
-// not heard from is not dispatchable, and the gates read that off these values rather than
-// off a separate "have we heard from it" flag that could disagree with them.
-func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
-	w := &worker{
-		instanceID:     instanceID,
-		spec:           spec,
-		placementID:    spec.Placement.PlacementID(),
-		dispatchable:   map[string]bool{},
-		materializable: map[string]bool{},
-		observedRemote: map[string]remotePlacementObservation{},
-		refused:        map[string]*refusedOutcome{},
-		stopped:        make(chan struct{}),
-		attachDone:     make(chan struct{}),
-	}
-	return w
-}
-
-// connectWorker registers an ALREADY-RUNNING worker (a rented pod's TLS leg, cl-015):
-// no spawn, no device grant (the pod's card is the pod's), no birth identity — the
-// conversation is the same claim the local path runs, dialed at the rental's address
-// with the pinned server cert and signed Creator ClaimProof (#445/proto-013).
-// The media plane remains the invocation byte path, but it is NOT a package distribution
-// path. Binding plans are ordinary artifact-grant subjects now: Tensorhub supplies their
-// locations and the worker verifies their digests while materializing PlacementSet/1.
-func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error) {
-	instanceID := spec.InstanceID()
-	if spec.Connection.Media == nil {
-		return "", exit.Named(exit.Unavailable, "rental_no_media_plane",
-			"rental %s pins a control address and no media plane, and a pod that cannot be "+
-				"handed bytes cannot be served", spec.Placement.Package).
-			WithRemedy("a rented pod runs its worker and a co-resident media server " +
-				"(cl-014); this host will not fall back to granting paths on its own disk, " +
-				"because the pod cannot reach them").
-			WithNext("cozy rental")
-	}
-	// This is a per-I/O byte-stall bound, not a worker lifecycle deadline.
-	byteplane, e := media.Dial(*spec.Connection.Media, mediaIOStallBudget,
-		int64(c.maxOutputBytes()))
-	if e != nil {
-		return "", e
-	}
-	if e := byteplane.Health(c.closingCtx); e != nil {
-		return "", e
-	}
-	// Health can block while the retained rental is released. Revalidate its
-	// existing authority without replacing this connection's pinned target.
-	if c.opt.Rentals != nil {
-		if _, problem := c.opt.Rentals(spec.Connection.RentalID); problem != nil {
-			return "", problem
-		}
-	}
-	planIDs := make([]string, 0, len(spec.Placement.Entrypoints))
-	for _, entrypoint := range spec.Placement.Entrypoints {
-		planIDs = append(planIDs, entrypoint.Digest)
-	}
-	sort.Strings(planIDs)
-	// AttachWorker, not SpawnWorker: the device-envelope admission arbitrates THIS host's
-	// cards, and the pod's card is the pod's. There is no grant to journal and none to
-	// release, which is also why nothing here has a pid or a birth identity to record.
-	c.mu.Lock()
-	if c.closing {
-		c.mu.Unlock()
-		return "", exit.Unavailablef("the daemon is closing; no rental worker was registered")
-	}
-	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
-		InstanceID: instanceID, Package: spec.Placement.Package,
-		InstallID: spec.Placement.InstallID, WorkerID: "remote",
-	}); e != nil {
-		c.mu.Unlock()
-		return "", e
-	}
-	w := newWorker(instanceID, spec)
-	w.logPath = "(connected worker: its log lives on the pod)"
-	w.planIDs, w.media = planIDs, byteplane
-	c.workers[instanceID] = w
-	c.mu.Unlock()
-	c.logf("worker %s CONNECTED at %s (media %s) plans=%d",
-		instanceID, spec.Connection.Addr, byteplane.Addr(), len(planIDs))
-	go c.attach(w)
-	return instanceID, nil
 }
 
 // ReportCadence is the worker's OWN ObservedWorkerState period, a protocol fact rather
@@ -1568,12 +1220,12 @@ func keysOf(m map[string]bool) []string {
 	return out
 }
 
-// ClassicLocalRetired names work that only the retired classic local Runtime worker could
-// run. This computer executes through its machine's Host; such work is never revived.
-func ClassicLocalRetired() *exit.Error {
-	return exit.Named(exit.Conflict, "request.classic_local_retired",
-		"this work needs the retired classic local Runtime worker; this computer now runs work through its machine").
-		WithRemedy("submit it again with the current cozy; it runs on this computer's machine")
+// ClassicRetired names work accepted for the retired classic worker session, local or
+// rented. Every machine now runs work as a machine execution; such work is never revived.
+func ClassicRetired() *exit.Error {
+	return exit.Named(exit.Conflict, records.ClassicRetiredCode,
+		"this work was accepted for the retired classic worker; machines now run work as machine executions").
+		WithRemedy("submit it again with the current cozy")
 }
 
 // StopGrace is how long a worker has between SIGTERM and SIGKILL. It is a CANCELLATION
@@ -1811,25 +1463,6 @@ func (c *Orchestrator) idleLocalProcessLocked(w *worker, active []records.Reques
 	return true
 }
 
-// An acknowledged completed GPU job retains its native workspace, not its device process.
-// The observed zero-flight capacity and shared offer/owner fence allow the next operation.
-func (c *Orchestrator) idleLocalDeviceHolderLocked(w *worker, active []records.Request) bool {
-	if !c.idleLocalProcessLocked(w, active, true) {
-		return false
-	}
-	if w.spec.IsJob() {
-		return !w.spec.Placement.Jobs[0].Orchestration && !w.lastReport.IsZero() &&
-			w.held == 0 && w.reservedJobs == 0 && w.snapshotAcknowledged
-	}
-	return c.idleLocalServingWorkerLocked(w, active)
-}
-
-func (c *Orchestrator) idleLocalServingWorkerLocked(w *worker, active []records.Request) bool {
-	return c.idleLocalWorkerLocked(w, active) &&
-		w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
-		w.admission == pb.AdmissionState_ADMISSION_STATE_OPEN
-}
-
 // Reconcile runs at boot, before anything is served. Rows describing processes from a
 // previous life are checked against their OS BIRTH identity: a matching birth is a real
 // orphan and is killed (it holds a device grant and a socket this daemon no longer
@@ -1868,14 +1501,14 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 			return killed, forgotten, e
 		}
 	}
-	// Work that only the retired classic local Runtime worker could run ends here, named,
-	// and custody no store can release any more (classic local, ended rentals) is forgotten.
-	retired, e := c.opt.Store.RetireClassicLocalWork()
+	// Work accepted for the retired classic worker session ends here, named, and custody no
+	// store can release any more (classic work, ended rentals) is forgotten.
+	retired, e := c.opt.Store.RetireClassicWork()
 	if e != nil {
 		return killed, forgotten, e
 	}
 	for _, id := range retired {
-		c.logf("%s needed the retired classic local Runtime worker; ended as %s", id, records.ClassicLocalRetiredCode)
+		c.logf("%s was accepted for the retired classic worker; ended as %s", id, records.ClassicRetiredCode)
 	}
 	if e := c.opt.Store.ForgetEndedRentalCustody(); e != nil {
 		return killed, forgotten, e
@@ -1937,9 +1570,6 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		return killed, forgotten, problem
 	}
 	if problem := c.ResumeQueuedRequests(); problem != nil {
-		return killed, forgotten, problem
-	}
-	if problem := c.resumeManualRentals(); problem != nil {
 		return killed, forgotten, problem
 	}
 	if problem := c.restoreRetainedWork(); problem != nil {

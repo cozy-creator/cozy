@@ -24,13 +24,6 @@ type Facts struct {
 	RuntimeCLI       RuntimeCLI
 }
 
-func (f *Facts) environmentPython() string {
-	if f.RuntimeCLI.EnvironmentPython != "" {
-		return f.RuntimeCLI.EnvironmentPython
-	}
-	return home.VenvPython(filepath.Join(f.Install.Dir, "venv"))
-}
-
 // EnvironmentPython preserves the ordinary venv layout and resolves only the
 // fixed builtin's independently prepared Runtime generation through bound metadata.
 func EnvironmentPython(inst records.PackageInstall) (string, *exit.Error) {

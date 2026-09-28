@@ -357,21 +357,6 @@ func (c *Client) Cancel(id, actor string) *exit.Error {
 
 // ------------------------------------------------------------ the LOCAL extension
 
-// StartResult is the rental-claim answer.
-type StartResult struct {
-	InstanceID string `json:"instance_id"`
-	Package    string `json:"package"`
-	Change     string `json:"change"`
-	Note       string `json:"note"`
-}
-
-// EnsureRental directly claims one attached empty worker and waits for ClaimAck.
-func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
-	var res StartResult
-	e := c.call("POST", "/v1/local/rentals/"+url.PathEscape(rentalID)+"/claim", map[string]any{}, &res)
-	return res, e
-}
-
 // DescribeRelease asks one machine ("local" or a rental id) for a published release's interface.
 func (c *Client) DescribeRelease(machine, pkg, release string) (api.DescribedRelease, *exit.Error) {
 	var described api.DescribedRelease
@@ -413,8 +398,7 @@ func (c *Client) PruneLocalCache() (api.CachePruneResult, *exit.Error) {
 	return result, problem
 }
 
-// DetachRental waits until the daemon no longer holds this rental's worker-control slot.
-// The result is false when the slot was already absent.
+// DetachRental drops the daemon's kept connection to one rented machine.
 func (c *Client) DetachRental(rentalID string) (bool, *exit.Error) {
 	var out struct {
 		Changed bool `json:"changed"`
