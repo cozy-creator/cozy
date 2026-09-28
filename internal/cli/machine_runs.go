@@ -62,12 +62,10 @@ type machineRuns struct {
 	machines  *machines.Resolver
 	observers sync.Map // one collection/control lock per observed request
 	uploading sync.Map // retained-output uploads in progress, by operation
-	// workspaces holds each machine lifetime's execution workspace (workspace); awaited
-	// names the runs whose last observation ended on the machine's next event.
-	workspaces sync.Map
-	origins    sync.Map // each machine's public catalog origin, read once
-	awaited    map[string]bool
-	updates    *rentalRuntimeUpdates
+	// awaited names the runs whose last observation ended on the machine's next event.
+	origins sync.Map // each machine's public catalog origin, read once
+	awaited map[string]bool
+	updates *rentalRuntimeUpdates
 	// ownerReads paces owner finalization reads of publications a machine cannot settle.
 	ownerReads ownerReads
 	// submitting stops each request's submission work in flight (upload, preparation,
@@ -961,16 +959,15 @@ func (m *machineRuns) awaitEvents(ctx context.Context, connection *machineConnec
 	}
 }
 
-// workspace is the machine's execution workspace and capabilities, read once per worker
-// lifetime; a submission its journal refuses as replaced reads it again.
+// workspace is the machine's execution workspace and capabilities, read once per claimed
+// connection; a submission its journal refuses as replaced reads it again.
 func (m *machineRuns) workspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
-	key := connection.Name + "\x00" + connection.Claim.WorkerBootId
-	if held, ok := m.workspaces.Load(key); ok {
-		return held.(*pb.MachineExecutionWorkspace), nil
+	if held := connection.Workspace(); held != nil {
+		return held, nil
 	}
 	workspace, problem := currentExecutionWorkspace(ctx, connection)
 	if problem == nil {
-		m.workspaces.Store(key, workspace)
+		connection.KeepWorkspace(workspace)
 	}
 	return workspace, problem
 }

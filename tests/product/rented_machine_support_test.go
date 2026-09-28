@@ -27,6 +27,8 @@ type terminalMachines struct {
 	attempts    atomic.Int32
 	// refuse is the refusal this Runtime answers a release root of a package with.
 	refuse map[string]string
+	// older is a Runtime from before release roots; a Runtime update can change it.
+	older  atomic.Bool
 	mu     sync.Mutex
 	finish func(payload map[string]any) *pb.AttemptOutcomeBody
 	runs   map[string]*terminalRun
@@ -45,7 +47,7 @@ func newTerminalMachines(finish func(map[string]any) *pb.AttemptOutcomeBody) *te
 
 func (m *terminalMachines) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace",
-		ReleaseRoots: true, ResolvesModelDefaults: true}, nil
+		ReleaseRoots: !m.older.Load(), ResolvesModelDefaults: !m.older.Load()}, nil
 }
 
 // minted is what a Runtime names a submission's capture and invocation by: the submitted

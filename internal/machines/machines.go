@@ -6,7 +6,9 @@ package machines
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -53,6 +55,18 @@ type Machine struct {
 	release   func()
 	publicOrg string
 	kept      bool // the connection is the Resolver's, kept for the machine's next call
+	// workspace is what this claimed connection's Runtime reported of itself, shared by
+	// every use of the connection and gone with it (Resolver.Forget, a new lifetime).
+	workspace *atomic.Pointer[pb.MachineExecutionWorkspace]
+}
+
+// Workspace is the execution workspace and capabilities this connection's Runtime
+// reported, or nil when none was read yet.
+func (m *Machine) Workspace() *pb.MachineExecutionWorkspace { return m.workspace.Load() }
+
+// KeepWorkspace records what the Runtime reported; nil asks it again next time.
+func (m *Machine) KeepWorkspace(workspace *pb.MachineExecutionWorkspace) {
+	m.workspace.Store(workspace)
 }
 
 // Close ends this use of the machine. A kept connection stays open for the next one.
@@ -143,6 +157,25 @@ type Resolver struct {
 type keptMachine struct {
 	*Machine
 	identity string
+}
+
+// Forget drops a machine's kept connection and Claim record. Its next call dials, claims
+// and asks the Runtime what it is again: a Runtime update keeps the worker boot, so nothing
+// in the dial identity says the Runtime and its capabilities changed.
+func (r *Resolver) Forget(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if kept := r.kept[name]; kept != nil {
+		kept.Conn.Close()
+		delete(r.kept, name)
+	}
+	for _, record := range []map[string]bool{r.claimed, r.durable} {
+		for key := range record {
+			if strings.HasPrefix(key, name+"\x00") {
+				delete(record, key)
+			}
+		}
+	}
 }
 
 // target is a machine's dial identity before its Claim.
@@ -262,6 +295,7 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 		return Transport(err)
 	}
 	m.Conn, m.Host, m.CertificateDigest = connection, pb.NewPodHostClient(connection), t.pin.Digest()
+	m.workspace = &atomic.Pointer[pb.MachineExecutionWorkspace]{}
 	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
 	info, err := m.Host.ProtocolInfo(probe, &pb.ProtocolInfoRequest{})
 	cancel()
