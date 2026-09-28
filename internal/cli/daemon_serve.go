@@ -176,6 +176,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	fleet.owner = c
+	found.Held = c.HoldsClaim
 	// Rental readiness is a queue-capacity edge. The fleet reconciler wakes
 	// pinned machine executions as soon as the hub publishes an attachable
 	// worker, including after a daemon restart.

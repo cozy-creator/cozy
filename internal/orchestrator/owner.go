@@ -550,6 +550,13 @@ func ObservationFromClaimAck(rentalID string, ack *pb.ClaimAck) RentalObservatio
 	}
 }
 
+// HoldsClaim answers whether this orchestrator holds an accepted control stream to the boot.
+func (c *Orchestrator) HoldsClaim(bootID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return bootID != "" && c.sessions[bootID] != nil
+}
+
 func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit.Error {
 	c.logf("ClaimAck boot=%s epoch=%d instance=%s minor=%d backend=%q device=%q",
 		ack.WorkerBootId, ack.ControlStreamEpoch, ack.WorkerInstanceId, ack.WireMinor,

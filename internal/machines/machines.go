@@ -143,12 +143,19 @@ type Resolver struct {
 	UseRental     func(id, holder string) (func(), *exit.Error)
 	ObserveRental func(orchestrator.RentalObservation) *exit.Error
 	RentalKey     func(string) (rental.CreatorIdentity, *exit.Error)
+	// Held answers whether this daemon's orchestrator holds the boot's control stream. A
+	// worker takes one control stream at a time, so a second Control Claim would fence the
+	// orchestrator's; its accepted Claim already names this owner.
+	Held func(bootID string) bool
 
 	mu sync.Mutex
 	// claimed names the worker lifetimes this daemon has Control Claimed. An older Runtime
 	// forgets its owner's protocol level when it restarts, so each lifetime Claims again;
 	// durable names the boots whose Runtime reported claim_survives_restart, Claimed once.
 	claimed, durable map[string]bool
+	// dialing names each machine identity a Dial is connecting to; concurrent Dials wait
+	// for it and share its connection and Claim instead of Claiming against each other.
+	dialing map[string]chan struct{}
 	// kept is one open, claimed connection per machine lifetime: every call to a machine
 	// rides it, so a call costs its own round trip and never a TLS handshake or probe.
 	kept map[string]*keptMachine
@@ -247,14 +254,42 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 	lifetime := name + "\x00" + t.bootID + "\x00" + t.lifetime
 	identity := lifetime + "\x00" + t.addr + "\x00" + t.workerID + "\x00" + string(t.pin.Digest())
 	r.mu.Lock()
-	if kept := r.kept[name]; kept != nil && kept.identity == identity {
-		r.mu.Unlock()
-		use := *kept.Machine
-		use.release, use.kept = machine.release, true
-		return &use, nil
+	if r.claimed == nil {
+		r.claimed, r.durable, r.kept = map[string]bool{}, map[string]bool{}, map[string]*keptMachine{}
+		r.dialing = map[string]chan struct{}{}
 	}
+	for {
+		if kept := r.kept[name]; kept != nil && kept.identity == identity {
+			r.mu.Unlock()
+			use := *kept.Machine
+			use.release, use.kept = machine.release, true
+			return &use, nil
+		}
+		dialing := r.dialing[identity]
+		if dialing == nil {
+			break
+		}
+		r.mu.Unlock()
+		select {
+		case <-dialing:
+		case <-ctx.Done():
+			if machine.release != nil {
+				machine.release()
+			}
+			return nil, Transport(status.FromContextError(ctx.Err()).Err())
+		}
+		r.mu.Lock()
+	}
+	done := make(chan struct{})
+	r.dialing[identity] = done
+	defer func() {
+		r.mu.Lock()
+		delete(r.dialing, identity)
+		r.mu.Unlock()
+		close(done)
+	}()
 	boot := name + "\x00" + t.bootID
-	claimed := r.claimed[lifetime] || r.durable[boot]
+	claimed := r.claimed[lifetime] || r.durable[boot] || !machine.owned && r.Held != nil && r.Held(t.bootID)
 	r.mu.Unlock()
 	if problem := machine.dial(ctx, t, !claimed); problem != nil {
 		if machine.release != nil {
@@ -263,9 +298,6 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 		return nil, problem
 	}
 	r.mu.Lock()
-	if r.claimed == nil {
-		r.claimed, r.durable, r.kept = map[string]bool{}, map[string]bool{}, map[string]*keptMachine{}
-	}
 	r.claimed[lifetime] = true
 	if machine.ClaimSurvivesRestart {
 		r.durable[boot] = true
