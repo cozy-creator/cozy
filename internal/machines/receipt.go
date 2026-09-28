@@ -14,12 +14,14 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/host"
 )
 
 // The readiness receipt, read as Tensorhub reads a pod's: the envelope over the media plane,
 // authenticated under the key the launcher minted, naming the TLS leaf that served it.
 const (
-	receiptDomain   = "cozy.pod-readiness/1\x00"
+	receiptDomain   = host.ReceiptDomain
 	maxReceiptBytes = 64 << 10
 )
 

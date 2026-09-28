@@ -256,6 +256,8 @@ def grow(ctx: Context, payload: Request, out: Outputs) -> Grown:
 	if _, err := os.Stat(last.Path); !os.IsNotExist(err) {
 		t.Fatalf("the partial file outlived its run: %v", err)
 	}
+	// The machine itself serves the image, the current bytes of its third revision.
+	machineServesOutput(t, root, "image", last.Digest, 3)
 
 	// Canceled after its second revision, the run keeps that revision as its result.
 	gate = filepath.Join(t.TempDir(), "canceled")
@@ -381,6 +383,10 @@ def grow(ctx: Context, payload: Request, out: Outputs) -> Grown:
 	if asked := hubCalls()[before:]; len(asked) != 0 {
 		t.Fatalf("the Hub was asked %d things while the runs went on:\n%s", len(asked), strings.Join(asked, "\n"))
 	}
+	// The machine serves the finished film itself, its parts joined, and keeps serving it with its
+	// Runtime stopped: a finished run's media never wakes the Runtime or renews idle.
+	filmRun := machineServesOutput(t, root, "video", last.Digest, 3)
+	machineServesOutputAsleep(t, root, filmRun, "video", last.Digest, 3)
 }
 
 func digestOf(data []byte) string {
