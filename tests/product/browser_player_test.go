@@ -1,9 +1,9 @@
 package producttest
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
-	"github.com/cozy-creator/cozy/internal/host/webrtc/webrtctest"
+	"github.com/cozy-creator/cozy/tests/product/webrtctest"
 	"github.com/playwright-community/playwright-go"
 )
 
@@ -33,8 +33,8 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 	if *playerBrowsers == "" {
 		t.Skip("requires -player-browsers and Playwright (go run github.com/playwright-community/playwright-go/cmd/playwright install firefox webkit)")
 	}
-	film := filmSegments(t)
-	ip := lanAddress(t)
+	film := playerFilm(t)
+	ip := playerLANAddress(t)
 	pages := httptest.NewServer(http.FileServer(http.Dir(filepath.Join("..", "..", "web", "player"))))
 	defer pages.Close()
 	pw, err := playwright.Run(&playwright.RunOptions{SkipInstallBrowsers: true})
@@ -67,31 +67,31 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			}
 
 			t.Run("live", func(t *testing.T) {
-				m.machine.Append("7", "video", -1, []byte(film[0]), 500_000, false)
+				m.machine.Append(7, "video", -1, film[0], 500_000)
 				page := open(m.link(nil, "video"))
-				waitPage(t, page, "segment 1 plays", `playing(0.5, 10)`)
+				playerWait(t, page, "segment 1 plays", `playing(0.5, 10)`)
 				_, err := page.Reload() // a reload mid-run follows from the start again
 				must(t, err)
-				waitPage(t, page, "segment 1 plays after a reload", `playing(0.5, 10)`)
-				m.machine.Append("7", "video", -1, []byte(film[1]), 500_000, false)
-				waitPage(t, page, "segment 2 plays", `playing(1.0, 22)`)
+				playerWait(t, page, "segment 1 plays after a reload", `playing(0.5, 10)`)
+				m.machine.Append(7, "video", -1, film[1], 500_000)
+				playerWait(t, page, "segment 2 plays", `playing(1.0, 22)`)
 				m.relay.cut() // the connection is lost mid-run: the page resumes at its cursor
-				m.machine.Append("7", "video", -1, []byte(film[2]), 500_000, true)
-				m.machine.End("7", "completed")
-				waitPage(t, page, "the finished film ends", `video().ended && frames() >= 36 && player().stats.connects === 2`)
-				if got := evaluate(t, page, `player().stats.bytes`); int(got.(float64)) != len(strings.Join(film, "")) {
-					t.Fatalf("the page received %v bytes for a %d-byte film: a resume repeated or skipped bytes", got, len(strings.Join(film, "")))
+				m.machine.Append(7, "video", -1, film[2], 500_000)
+				m.machine.End(7, "completed")
+				playerWait(t, page, "the finished film ends", `video().ended && frames() >= 36 && player().stats.connects === 2`)
+				if got := playerEval(t, page, `player().stats.bytes`); fmt.Sprint(got) != fmt.Sprint(len(bytes.Join(film, nil))) {
+					t.Fatalf("the page received %v bytes for a %d-byte film: a resume repeated or skipped bytes", got, len(bytes.Join(film, nil)))
 				}
 			})
 
 			t.Run("seek", func(t *testing.T) {
-				for k, segment := range film {
-					m.machine.Append("8", "video", -1, []byte(segment), 500_000, k == 2)
+				for _, segment := range film {
+					m.machine.Append(8, "video", -1, segment, 500_000)
 				}
-				m.machine.End("8", "completed")
+				m.machine.End(8, "completed")
 				// A small window and lookahead: the film's end is not held when the seek lands.
 				page := open(m.link(func(g *capability.Grant) { g.Run = "8" }, "video"))
-				result := evaluate(t, page, `(async () => {
+				result := playerEval(t, page, `(async () => {
 					const {play, parseLink} = await import("./cozy-webrtc.js");
 					player().close();
 					const v = video();
@@ -102,11 +102,11 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 					await until(() => !v.seeking && v.readyState >= 2);
 					return {gets: player().stats.gets, t: v.currentTime, buffered: ranges()};
 				})()`)
-				if r := result.(map[string]any); r["gets"] != 1.0 {
+				if r := result.(map[string]any); fmt.Sprint(r["gets"]) != "1" {
 					t.Fatalf("the seek was not served by one get: %v", r)
 				}
-				evaluate(t, page, `video().play()`)
-				waitPage(t, page, "the seeked film ends", `video().ended`)
+				playerEval(t, page, `video().play()`)
+				playerWait(t, page, "the seeked film ends", `video().ended`)
 			})
 
 			for _, arm := range []struct{ name, link, says string }{
@@ -116,7 +116,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			} {
 				t.Run(arm.name, func(t *testing.T) {
 					page := open(arm.link)
-					waitPage(t, page, "the page says "+arm.says, fmt.Sprintf(`document.getElementById("status").textContent.includes(%q)`, arm.says))
+					playerWait(t, page, "the page says "+arm.says, fmt.Sprintf(`document.getElementById("status").textContent.includes(%q)`, arm.says))
 				})
 			}
 		})
@@ -129,7 +129,7 @@ type playerMachine struct {
 	t       *testing.T
 	machine *webrtctest.Machine
 	server  webrtctest.Server
-	relay   *relay
+	relay   *playerRelay
 	key     ed25519.PrivateKey
 }
 
@@ -138,7 +138,7 @@ func newPlayerMachine(t *testing.T, ip string) *playerMachine {
 	must(t, err)
 	m := webrtctest.NewMachine(t.TempDir(), public)
 	server := webrtctest.Serve(t, ip, m)
-	return &playerMachine{t: t, machine: m, server: server, relay: newRelay(t, ip, server.Addr.String()), key: key}
+	return &playerMachine{t: t, machine: m, server: server, relay: newPlayerRelay(t, ip, server.Addr.String()), key: key}
 }
 
 // link is the fragment `cozy run play` prints: run 7's output, unless edit says otherwise.
@@ -163,18 +163,18 @@ func (m *playerMachine) linkWith(edit func(map[string]string)) string {
 	return fmt.Sprintf("v=1&a=%s&f=%s&c=%s&r=%s&o=%s", q["a"], q["f"], q["c"], q["r"], q["o"])
 }
 
-// relay forwards TCP to the listener; cut drops every connection, as a lost network does.
-type relay struct {
+// playerRelay forwards TCP to the listener; cut drops every connection, as a lost network does.
+type playerRelay struct {
 	addr  string
 	mu    sync.Mutex
 	conns []net.Conn
 }
 
-func newRelay(t *testing.T, ip, target string) *relay {
-	ln, err := net.Listen("tcp4", net.JoinHostPort(ip, "0"))
+func newPlayerRelay(t *testing.T, ip, target string) *playerRelay {
+	ln, err := net.Listen("tcp4", net.JoinHostPort(ip, "0")) //cozy:allow a test path the browser reaches on a non-loopback address
 	must(t, err)
 	t.Cleanup(func() { ln.Close() })
-	r := &relay{addr: ln.Addr().String()}
+	r := &playerRelay{addr: ln.Addr().String()}
 	go func() {
 		for {
 			in, err := ln.Accept()
@@ -196,7 +196,7 @@ func newRelay(t *testing.T, ip, target string) *relay {
 	return r
 }
 
-func (r *relay) cut() {
+func (r *playerRelay) cut() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, c := range r.conns {
@@ -205,9 +205,9 @@ func (r *relay) cut() {
 	r.conns = nil
 }
 
-// filmSegments is a real 1.5 s film, H.264 High and AAC, fragmented as the Runtime joins H3:
+// playerFilm is a real 1.5 s film, H.264 High and AAC, fragmented as the Runtime joins H3:
 // the init with the first 12-frame fragment, then one fragment per segment.
-func filmSegments(t *testing.T) []string {
+func playerFilm(t *testing.T) [][]byte {
 	path := filepath.Join(t.TempDir(), "film.mp4")
 	if out, err := exec.Command("/usr/bin/nice", "-n", "19", "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24",
 		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "1.5", "-vf", "noise=alls=60:allf=t",
@@ -215,23 +215,18 @@ func filmSegments(t *testing.T) []string {
 		"-movflags", "+frag_keyframe+empty_moov+default_base_moof+skip_trailer", path).CombinedOutput(); err != nil {
 		t.Fatalf("ffmpeg: %v %s", err, out)
 	}
-	data, err := os.ReadFile(path)
+	film, err := os.ReadFile(path)
 	must(t, err)
-	var cuts []int
-	for p := 0; p+8 <= len(data); p += int(binary.BigEndian.Uint32(data[p:])) {
-		if string(data[p+4:p+8]) == "moof" {
-			cuts = append(cuts, p)
-		}
+	header, pieces := fmp4Fragments(film)
+	if len(pieces) != 3 {
+		t.Fatalf("the film has %d fragments, not 3", len(pieces))
 	}
-	if len(cuts) != 3 {
-		t.Fatalf("the film has %d fragments, not 3", len(cuts))
-	}
-	return []string{string(data[:cuts[1]]), string(data[cuts[1]:cuts[2]]), string(data[cuts[2]:])}
+	return [][]byte{append(header, pieces[0]...), pieces[1], pieces[2]}
 }
 
-// lanAddress is this computer's first non-loopback IPv4 address: Chrome gathers no candidate
+// playerLANAddress is this computer's first non-loopback IPv4 address: Chrome gathers no candidate
 // on loopback, so it pairs with nothing there.
-func lanAddress(t *testing.T) string {
+func playerLANAddress(t *testing.T) string {
 	addrs, err := net.InterfaceAddrs()
 	must(t, err)
 	for _, a := range addrs {
@@ -244,26 +239,26 @@ func lanAddress(t *testing.T) string {
 }
 
 // The page helpers every wait and evaluation may use.
-const pageHelpers = `const video = () => document.getElementById("video"), player = () => window.cozyPlayer;
+const playerHelpers = `const video = () => document.getElementById("video"), player = () => window.cozyPlayer;
 const frames = () => video().getVideoPlaybackQuality().totalVideoFrames;
 const ranges = () => Array.from({length: video().buffered.length}, (_, i) => [video().buffered.start(i), video().buffered.end(i)]);
 const playing = (end, n) => ranges().some(([, e]) => e >= end - 0.05) && frames() >= n && !player().error;
 const until = f => new Promise((resolve, reject) => { const start = Date.now(), t = setInterval(() => {
   if (f()) { clearInterval(t); resolve(); } else if (Date.now() - start > 60000) { clearInterval(t); reject(new Error("timed out: " + f)); } }, 50); });`
 
-func waitPage(t *testing.T, page playwright.Page, what, condition string) {
+func playerWait(t *testing.T, page playwright.Page, what, condition string) {
 	t.Helper()
-	if _, err := page.WaitForFunction("() => { "+pageHelpers+" return "+condition+"; }", nil,
+	if _, err := page.WaitForFunction("() => { "+playerHelpers+" return "+condition+"; }", nil,
 		playwright.PageWaitForFunctionOptions{Polling: 100.0, Timeout: playwright.Float(60000)}); err != nil {
-		state, _ := page.Evaluate("() => { " + pageHelpers + ` return {status: document.getElementById("status").textContent, t: video().currentTime,
+		state, _ := page.Evaluate("() => { " + playerHelpers + ` return {status: document.getElementById("status").textContent, t: video().currentTime,
 			frames: frames(), buffered: ranges(), ended: video().ended, stats: player() && player().stats, error: player()?.error?.message}; }`)
 		t.Fatalf("waiting for %s: %v; the page: %v", what, err, state)
 	}
 }
 
-func evaluate(t *testing.T, page playwright.Page, expression string) any {
+func playerEval(t *testing.T, page playwright.Page, expression string) any {
 	t.Helper()
-	result, err := page.Evaluate("async () => { " + pageHelpers + " return await " + expression + "; }")
+	result, err := page.Evaluate("async () => { " + playerHelpers + " return await " + expression + "; }")
 	must(t, err)
 	return result
 }
