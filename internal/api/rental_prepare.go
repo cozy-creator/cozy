@@ -21,7 +21,6 @@ type RentalPackagePrepareResult = records.RentalInstall
 
 func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
-	decoder.DisallowUnknownFields()
 	var body RentalPackagePrepareRequest
 	if err := decoder.Decode(&body); err != nil {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "rental package preparation requires package and release", "send {\"package\":\"org/name\",\"release\":\"1.2.3\"}")

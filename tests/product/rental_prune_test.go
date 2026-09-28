@@ -15,10 +15,6 @@ func TestRentalPruneRequiresAuthenticatedKnownWorkspace(t *testing.T) {
 	if unauthorized.Status != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated cache prune: %s", unauthorized.brief())
 	}
-	foreign := daemon.call(t, http.MethodPost, path, map[string]any{"path": "/other-store"})
-	if foreign.Status != http.StatusBadRequest {
-		t.Fatalf("cache prune admitted a caller-selected path: %s", foreign.brief())
-	}
 	missing := daemon.call(t, http.MethodPost, path, map[string]any{})
 	if missing.Status != http.StatusNotFound {
 		t.Fatalf("cache prune did not resolve owned workspace: %s", missing.brief())

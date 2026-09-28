@@ -24,9 +24,8 @@ type RentalKeepaliveResult struct {
 func (s *Server) keepRentalAlive(w http.ResponseWriter, r *http.Request) {
 	var body RentalKeepaliveRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil || body.RequestID == "" || len(body.RequestID) > pb.MaxRentalKeepaliveRequestIDBytes {
-		s.refuseTyped(w, r, exit.New(exit.Validation, "keepalive requires one request_id and no duration options"))
+		s.refuseTyped(w, r, exit.New(exit.Validation, "keepalive requires one request_id"))
 		return
 	}
 	var trailing any

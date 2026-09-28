@@ -17,7 +17,6 @@ type RuntimeUpdateRequest struct {
 
 func (s *Server) startRuntimeUpdate(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
-	decoder.DisallowUnknownFields()
 	var body *RuntimeUpdateRequest
 	var trailing any
 	if decoder.Decode(&body) != nil || body == nil || decoder.Decode(&trailing) != io.EOF {

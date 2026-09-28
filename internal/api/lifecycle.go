@@ -50,7 +50,6 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 	}
 	data, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	err := decoder.Decode(&body)
 	var trailing any
 	if err == nil {

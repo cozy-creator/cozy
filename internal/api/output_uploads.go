@@ -27,7 +27,6 @@ func (s *Server) uploadJobOutput(w http.ResponseWriter, r *http.Request) {
 	}
 	var body OutputUploadRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
-	decoder.DisallowUnknownFields()
 	var trailing any
 	if err := decoder.Decode(&body); err != nil || body.Destination == "" || decoder.Decode(&trailing) != io.EOF {
 		s.refuseTyped(w, r, exit.New(exit.Validation, "an upload names one destination and at most one output"))
