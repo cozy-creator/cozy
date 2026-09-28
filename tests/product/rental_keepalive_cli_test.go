@@ -189,10 +189,6 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code, wrongBoot b
 			t.Fatal("manual keepalive admitted Runtime preparation or execution")
 		}
 	}
-	reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/keepalive", map[string]any{"request_id": "invalid-duration", "duration": 0})
-	if reply.Status == http.StatusOK {
-		t.Fatal("duration override admitted")
-	}
 	if code, _ := runCozy(t, root, "rental", "keepalive", "keepalive", "--duration", "0"); code == 0 {
 		t.Fatal("CLI duration override admitted")
 	}

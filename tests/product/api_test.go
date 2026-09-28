@@ -140,18 +140,6 @@ func TestLocalAPIDoor(t *testing.T) {
 	if noKey.Status != http.StatusBadRequest || noKey.code() != "idempotency_key_required" {
 		t.Errorf("a submission with no Idempotency-Key: %s", noKey.brief())
 	}
-	deletedBudget := svc.call(t, "POST", "/v1/requests", map[string]any{
-		"package": "x/y", "function": "f", "max_cost_usd_micros": -1,
-	}, "Idempotency-Key", "deleted-budget")
-	if deletedBudget.Status != http.StatusBadRequest || deletedBudget.code() != "malformed_body" {
-		t.Errorf("deleted max_cost field reached the queue: %s", deletedBudget.brief())
-	}
-	deletedWorker := svc.call(t, "POST", "/v1/requests", map[string]any{
-		"package": "x/y", "function": "f", "worker": "rental-1",
-	}, "Idempotency-Key", "deleted-worker")
-	if deletedWorker.Status != http.StatusBadRequest || deletedWorker.code() != "malformed_body" {
-		t.Errorf("deleted caller-selected worker reached the queue: %s", deletedWorker.brief())
-	}
 
 	// The credential rides the daemon's own OS-protected record, never argv, and never
 	// appears in anything the daemon writes elsewhere.

@@ -97,7 +97,6 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	var sub Submission
 	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
 	err = decoder.Decode(&sub)
 	var trailing any
 	if err == nil {
@@ -108,7 +107,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != io.EOF {
 		s.refuse(w, r, http.StatusBadRequest, "malformed_body",
-			"the submission is not a JSON object: "+err.Error(), staleDaemonRemedy(err))
+			"the submission is not a JSON object: "+err.Error(), "")
 		return
 	}
 	if sub.Package == "" || sub.Function == "" {
@@ -1301,13 +1300,4 @@ func GPUWaitDetail(width, held int, ownRun bool) string {
 		detail += ", in use by this run's other calls"
 	}
 	return detail
-}
-
-// staleDaemonRemedy names the recovery for a submission field this running daemon does
-// not implement: it predates the client, and a restart picks up the installed build.
-func staleDaemonRemedy(err error) string {
-	if err == nil || !strings.Contains(err.Error(), "unknown field") {
-		return ""
-	}
-	return "this daemon predates the cozy client that sent the request; run `cozy down` once its work settles, then retry (rentals survive a daemon restart)"
 }

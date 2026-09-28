@@ -107,7 +107,6 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	var sub JobSubmission
 	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
 	err = decoder.Decode(&sub)
 	var trailing any
 	if err == nil {
@@ -119,7 +118,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			detail = err.Error()
 		}
 		s.refuse(w, r, http.StatusBadRequest, "malformed_body",
-			"the submission is not one closed JSON object: "+detail, staleDaemonRemedy(err))
+			"the submission is not one closed JSON object: "+detail, "")
 		return
 	}
 	passThrough := sub.ModelTransfer != nil && sub.Package == "" && sub.Function == ""

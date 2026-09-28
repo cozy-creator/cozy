@@ -30,10 +30,9 @@ func (s *Server) pruneCache(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) pruneOperationCache(w http.ResponseWriter, r *http.Request, rental string) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
-	decoder.DisallowUnknownFields()
 	var body *struct{}
 	if err := decoder.Decode(&body); err != nil || body == nil {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "cache pruning takes an empty object", "send {} with no path or namespace")
+		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "cache pruning takes one JSON object", "send {}")
 		return
 	}
 	var trailing any

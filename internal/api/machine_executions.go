@@ -51,7 +51,6 @@ func (s *Server) forgetPackage(w http.ResponseWriter, r *http.Request) {
 		Package string `json:"package"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil || strings.Count(body.Package, "/") != 1 {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "name one package as org/name", "")
 		return
