@@ -377,3 +377,7 @@ func TestMachineCancellationBeforeTransmissionCreatesNoRemotePromise(t *testing.
 		t.Fatal("late preparation revived an already canceled unsent request")
 	}
 }
+
+func (*retentionReleaseMachine) Lanes(context.Context, string) (api.MachineLanes, *exit.Error) {
+	return api.MachineLanes{}, nil
+}

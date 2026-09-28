@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -38,8 +40,11 @@ import (
 // releaseRoot answers whether a request is submitted by its release: a published serving
 // root whose Models are only the caller's own choices.
 func releaseRoot(request records.Request) bool {
-	if request.LocalInstallationID != "" || request.IsJob() || strings.HasPrefix(request.Package, "local/") ||
-		request.Trees != "" || request.ModelTransfer != nil {
+	// A job's only transfer a release root carries is its `--upload-to` destination.
+	transfer := request.ModelTransfer != nil && (!request.IsJob() || request.ModelTransfer.HasAcquisition() ||
+		request.ModelTransfer.Destination == "")
+	if request.LocalInstallationID != "" || strings.HasPrefix(request.Package, "local/") ||
+		request.Trees != "" || transfer {
 		return false
 	}
 	for _, model := range request.Models {
@@ -72,6 +77,12 @@ func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records
 	root := &pb.ReleaseRoot{Package: request.Package, Release: request.Release, Entrypoint: request.Entrypoint,
 		Callees: edges, DeadlineUnixMs: uint64(max(request.DeadlineUnixMS, 0)), AttentionKernel: request.AttentionKernel,
 		CatalogOrigin: origin}
+	if request.IsJob() {
+		root.Job, root.PublicationGrant = true, home.ScratchRepo(request.Org, request.ID)
+		if request.ModelTransfer != nil {
+			root.WeightsDestination = request.ModelTransfer.Destination
+		}
+	}
 	for _, model := range request.Models {
 		parameter := model.Slot[strings.LastIndex(model.Slot, ".")+1:]
 		if model.Source != "" {
@@ -337,4 +348,67 @@ func (m *machineRuns) compatibleModels(ctx context.Context, request records.Requ
 	}
 	request.Models = models
 	return request, nil
+}
+
+// compatibleJobModels readies a job for a machine whose Runtime cannot take it by its
+// release: its slots are resolved as the client resolved them before (the same selection
+// and exact manifest reads), and the job goes the prepared path. It says so on the run.
+func (m *machineRuns) compatibleJobModels(ctx context.Context, request records.Request, connection *machineConnection) (records.Request, *exit.Error) {
+	_ = m.store.AppendEvent(request.ID, "request.preparing", 0, map[string]any{"stage": "machine",
+		"detail": "this machine lacks release_root_jobs; used the prepared job path (" + machines.RuntimeUpdate(connection.Name) + " for the fast path)"})
+	ref, problem := hub.ParseRef(request.Package)
+	if problem != nil {
+		return request, problem
+	}
+	detail, problem := m.resolver.catalog(request.Hub).PackageRelease(ctx, ref, request.Release)
+	if problem != nil {
+		return request, problem
+	}
+	surface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	if problem != nil {
+		return request, problem
+	}
+	job, problem := surface.Function(request.Entrypoint)
+	if problem != nil {
+		return request, problem
+	}
+	overrides := make(map[string]string, len(request.Models))
+	for _, model := range request.Models {
+		overrides[model.BindingSlot()] = choiceSpec(model)
+	}
+	resolving := &Context{Cfg: m.resolver.cfg.ForHub(request.Hub), Err: io.Discard}
+	target := Target{Package: request.Package, Function: request.Entrypoint, Release: request.Release}
+	selected, problem := invocationModelSpecs(resolving, target, job, overrides)
+	if problem != nil {
+		return request, problem
+	}
+	models, problem := resolveSelectedInvocationModels(resolving, target, job, selected)
+	if problem == nil {
+		models, problem = jobManifestInputs(resolving, job, models)
+	}
+	if problem != nil {
+		return request, problem
+	}
+	if problem := m.store.PinMachineModels(request.ID, models); problem != nil {
+		return request, problem
+	}
+	request.Models = models
+	return request, nil
+}
+
+// choiceSpec spells a recorded model choice in the one model-ref grammar.
+func choiceSpec(model records.ModelRef) string {
+	spec := model.Model
+	if model.Release != "" {
+		spec += "@" + model.Release
+		if model.Lane != "" {
+			spec += "/" + model.Lane
+		}
+	} else if model.Lane != "" {
+		spec += "#" + model.Lane
+	}
+	if model.Manifest != "" && (model.Release != "" || model.Lane == "") {
+		spec += "#" + model.Manifest
+	}
+	return spec
 }

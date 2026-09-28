@@ -549,21 +549,7 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	ctx, cancel := hub.Context()
-	defer cancel()
-	detail, problem := r.catalog(origin).PackageRelease(ctx, ref, release)
-	if problem != nil {
-		return empty, nil, problem
-	}
-	if detail.Release.Release != release {
-		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
-			"Tensorhub answered release %s@%s for the queued release %s", pkg, detail.Release.Release, release)
-	}
-	requirements, problem := detail.Requirements()
-	if problem != nil {
-		return empty, nil, problem
-	}
-	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	requirements, packageInterface, problem := r.releaseInterface(origin, ref, release)
 	if problem != nil {
 		return empty, nil, problem
 	}
@@ -583,6 +569,9 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	}
 	byParam := make(map[string]int, len(models))
 	for index, model := range models {
+		if model.Choice {
+			continue // the machine resolves a choice, or the daemon does at dispatch
+		}
 		if model.Package != pkg || model.Slot == "" || model.Model == "" ||
 			model.ManifestLength <= 0 || model.ManifestLength > (int64(1)<<53)-1 {
 			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
@@ -631,6 +620,33 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 		WeightsOutputs: weights, NeedsAccelerator: job.NeedsAccelerator(requirements), Models: models,
 		ProducerParams: params,
 	}, job, nil
+}
+
+// releaseInterface is a published release's interface and locked closure: this computer's
+// verified install of it when there is one, else Tensorhub's release card.
+func (r *Resolver) releaseInterface(origin string, ref hub.Ref, release string) ([]string, *launch.PackageInterface, *exit.Error) {
+	if _, installed, problem := r.store.ActivePackage(ref.String()); problem == nil && installed != nil &&
+		installed.SourceKind == "tensorhub" && installed.Version == release {
+		if held, packageInterface, problem := r.installPackageInterface(installed.ID); problem == nil {
+			return strings.Split(held.Closure, "\n"), packageInterface, nil
+		}
+	}
+	ctx, cancel := hub.Context()
+	defer cancel()
+	detail, problem := r.catalog(origin).PackageRelease(ctx, ref, release)
+	if problem != nil {
+		return nil, nil, problem
+	}
+	if detail.Release.Release != release {
+		return nil, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
+			"Tensorhub answered release %s@%s for the queued release %s", ref, detail.Release.Release, release)
+	}
+	requirements, problem := detail.Requirements()
+	if problem != nil {
+		return nil, nil, problem
+	}
+	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	return requirements, packageInterface, problem
 }
 
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error) {

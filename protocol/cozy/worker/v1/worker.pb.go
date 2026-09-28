@@ -3276,8 +3276,10 @@ type MachineExecutionWorkspace struct {
 	// Runtime resolves, downloads and converts a ModelChoice.source on the machine. False: a
 	// controller sends provider sources by the model transfer path, never as a release root.
 	ReleaseRootSources bool `protobuf:"varint,17,opt,name=release_root_sources,json=releaseRootSources,proto3" json:"release_root_sources,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Runtime accepts ReleaseRoot.job. False: a controller submits jobs by the prepared path.
+	ReleaseRootJobs bool `protobuf:"varint,18,opt,name=release_root_jobs,json=releaseRootJobs,proto3" json:"release_root_jobs,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *MachineExecutionWorkspace) Reset() {
@@ -3425,6 +3427,13 @@ func (x *MachineExecutionWorkspace) GetMemoLookup() bool {
 func (x *MachineExecutionWorkspace) GetReleaseRootSources() bool {
 	if x != nil {
 		return x.ReleaseRootSources
+	}
+	return false
+}
+
+func (x *MachineExecutionWorkspace) GetReleaseRootJobs() bool {
+	if x != nil {
+		return x.ReleaseRootJobs
 	}
 	return false
 }
@@ -3702,8 +3711,16 @@ type ReleaseRoot struct {
 	AttentionKernel string                  `protobuf:"bytes,10,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
 	Capture         *ActivationCapture      `protobuf:"bytes,11,opt,name=capture,proto3" json:"capture,omitempty"`
 	CatalogOrigin   string                  `protobuf:"bytes,12,opt,name=catalog_origin,json=catalogOrigin,proto3" json:"catalog_origin,omitempty"` // anonymous catalog origin for Model resolution; as public_origin
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// The entrypoint names a published job (workspace release_root_jobs): Runtime mints its
+	// JobInvocationSpec and directive from the job's declaration, as it does for child jobs.
+	Job bool `protobuf:"varint,13,opt,name=job,proto3" json:"job,omitempty"`
+	// `--upload-to`: each weights output is sent to model://<weights_destination>. Empty: the
+	// job's weights stay in the scratch grant.
+	WeightsDestination string `protobuf:"bytes,14,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"`
+	// The owner's scratch publication grant for this job ("org/_job-<request>").
+	PublicationGrant string `protobuf:"bytes,15,opt,name=publication_grant,json=publicationGrant,proto3" json:"publication_grant,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ReleaseRoot) Reset() {
@@ -3816,6 +3833,27 @@ func (x *ReleaseRoot) GetCapture() *ActivationCapture {
 func (x *ReleaseRoot) GetCatalogOrigin() string {
 	if x != nil {
 		return x.CatalogOrigin
+	}
+	return ""
+}
+
+func (x *ReleaseRoot) GetJob() bool {
+	if x != nil {
+		return x.Job
+	}
+	return false
+}
+
+func (x *ReleaseRoot) GetWeightsDestination() string {
+	if x != nil {
+		return x.WeightsDestination
+	}
+	return ""
+}
+
+func (x *ReleaseRoot) GetPublicationGrant() string {
+	if x != nil {
+		return x.PublicationGrant
 	}
 	return ""
 }
@@ -23950,7 +23988,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x13caller_deferred_key\x18\n" +
 	" \x01(\tR\x11callerDeferredKeyJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x05\x10\x06R\x16caller_revision_digestR\x10interface_digestR\x16callee_revision_digest\"M\n" +
 	"\x1eMachineExecutionWorkspaceQuery\x12+\n" +
-	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\"\xc6\x06\n" +
+	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\"\xf2\x06\n" +
 	"\x19MachineExecutionWorkspace\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12$\n" +
 	"\x0eworker_boot_id\x18\x02 \x01(\tR\fworkerBootId\x124\n" +
@@ -23971,7 +24009,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"event_wait\x18\x0f \x01(\bR\teventWait\x12\x1f\n" +
 	"\vmemo_lookup\x18\x10 \x01(\bR\n" +
 	"memoLookup\x120\n" +
-	"\x14release_root_sources\x18\x11 \x01(\bR\x12releaseRootSources\"\xb9\x01\n" +
+	"\x14release_root_sources\x18\x11 \x01(\bR\x12releaseRootSources\x12*\n" +
+	"\x11release_root_jobs\x18\x12 \x01(\bR\x0freleaseRootJobs\"\xb9\x01\n" +
 	"\rMachineDevice\x12\x18\n" +
 	"\aordinal\x18\x01 \x01(\rR\aordinal\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -23996,7 +24035,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x12source_credentials\x18\f \x03(\v2 .cozy.worker.v1.SourceCredentialR\x11sourceCredentials\x12>\n" +
 	"\frelease_root\x18\r \x01(\v2\x1b.cozy.worker.v1.ReleaseRootR\vreleaseRoot\x12\x1d\n" +
 	"\n" +
-	"owner_memo\x18\x0e \x01(\bR\townerMemo\"\xc8\x04\n" +
+	"owner_memo\x18\x0e \x01(\bR\townerMemo\"\xb8\x05\n" +
 	"\vReleaseRoot\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12\x1e\n" +
@@ -24012,7 +24051,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x10attention_kernel\x18\n" +
 	" \x01(\tR\x0fattentionKernel\x12;\n" +
 	"\acapture\x18\v \x01(\v2!.cozy.worker.v1.ActivationCaptureR\acapture\x12%\n" +
-	"\x0ecatalog_origin\x18\f \x01(\tR\rcatalogOrigin\"=\n" +
+	"\x0ecatalog_origin\x18\f \x01(\tR\rcatalogOrigin\x12\x10\n" +
+	"\x03job\x18\r \x01(\bR\x03job\x12/\n" +
+	"\x13weights_destination\x18\x0e \x01(\tR\x12weightsDestination\x12+\n" +
+	"\x11publication_grant\x18\x0f \x01(\tR\x10publicationGrant\"=\n" +
 	"\vReleaseEdge\x12\x16\n" +
 	"\x06caller\x18\x01 \x01(\tR\x06caller\x12\x16\n" +
 	"\x06callee\x18\x02 \x01(\tR\x06callee\"\xde\x01\n" +

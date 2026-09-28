@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -216,6 +217,20 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, bootID, pkg, release
 	}
 	_, problem = readMachinePreparationEvent(stream, nil)
 	return problem
+}
+
+// Lanes is what one machine's Runtime takes now: its kept workspace, re-read after an update.
+func (m *machineRuns) Lanes(ctx context.Context, machine string) (api.MachineLanes, *exit.Error) {
+	connection, problem := m.connect(ctx, machine, "reading which lanes it takes")
+	if problem != nil {
+		return api.MachineLanes{}, problem
+	}
+	defer connection.Close()
+	workspace, problem := m.workspace(ctx, connection)
+	if problem != nil {
+		return api.MachineLanes{}, problem
+	}
+	return api.MachineLanes{ReleaseRootJobs: workspace.ReleaseRootJobs, ReleaseRootSources: workspace.ReleaseRootSources}, nil
 }
 
 // PruneOperationCache frees one machine's unused cached operation results through its Host.

@@ -331,10 +331,23 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if problem := connection.ValidateNewWork(); problem != nil {
 		return problem
 	}
-	if len(link.Submission) == 0 && releaseRoot(request) {
+	rooted := len(link.Submission) == 0 && releaseRoot(request)
+	if rooted {
 		workspace, problem := m.workspace(ctx, connection)
 		if problem != nil {
 			return problem
+		}
+		if request.IsJob() && !workspace.ReleaseRootJobs {
+			// Checked again at dispatch: an update can have taken the capability away since
+			// the job was recorded. Source choices have no other path from here.
+			if sourced(request.Models) {
+				return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
+					"this machine no longer advertises release_root_jobs; %s", machines.RuntimeUpdate(connection.Name))
+			}
+			if request, problem = m.compatibleJobModels(ctx, request, connection); problem != nil {
+				return problem
+			}
+			rooted = false
 		}
 		if sourced(request.Models) && !workspace.ReleaseRootSources {
 			// Never the compatibility path: a Runtime without source choices would bind the
@@ -342,13 +355,14 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
 				"this machine's Runtime cannot make a provider-source model; %s", machines.RuntimeUpdate(connection.Name))
 		}
-		if !workspace.ReleaseRoots {
+		if rooted && !workspace.ReleaseRoots {
 			if request, problem = m.compatibleModels(ctx, request, connection); problem != nil {
 				return problem
 			}
+			rooted = false
 		}
 	}
-	if len(link.Submission) == 0 && releaseRoot(request) {
+	if rooted {
 		workspace, problem := m.workspace(ctx, connection)
 		if problem != nil {
 			return problem

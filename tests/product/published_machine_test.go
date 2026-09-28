@@ -105,3 +105,7 @@ func TestPublishedMachineRoutingOwnsEveryRentedJob(t *testing.T) {
 		}
 	}
 }
+
+func (publishedRouteObserver) Lanes(context.Context, string) (api.MachineLanes, *exit.Error) {
+	return api.MachineLanes{}, nil
+}
