@@ -37,6 +37,9 @@ type Grant struct {
 	PublicOrigin  string
 	ObjectHosts   []string
 	RepoCacheRoot string
+	// Hubs are the other Hubs this machine is registered at (COZY_MACHINE_HUBS_JSON): a run
+	// names one, and the machine reads that run's release, index and Models there.
+	Hubs []HubGrant
 	// Authorized are the device keys whose Claims and capabilities this machine accepts.
 	Authorized []ed25519.PublicKey
 	// ObservedAuth is the auth document a pre-M6 Hub froze; the receipt must repeat it.
@@ -47,6 +50,14 @@ type Grant struct {
 	receiptKey   []byte
 	inherited    []string // locale and trust-store settings the Runtime keeps
 	Ignored      []string
+	Skipped      []string // other-Hub registrations this machine could not read
+}
+
+// HubGrant is this machine's registration at another Hub.
+type HubGrant struct {
+	Origin, PublicOrigin, WorkerID, WorkerToken string
+	CA                                          []byte // DER
+	ObjectHosts                                 []string
 }
 
 // OwnerAuth is COZY_RECORD_OWNER_AUTH_JSON.
@@ -63,6 +74,7 @@ var grantNames = map[string]bool{
 	"COZY_MEDIA_INTERNAL_PORT": true, "COZY_WEBRTC_INTERNAL_PORT": true, "COZY_RECORD_OWNER_AUTH_JSON": true, "COZY_AUTHORIZED_KEYS": true,
 	"COZY_REPO_CACHE_ROOT": true, receiptKeyName: true, "TENSORHUB_ORIGIN": true,
 	"TENSORHUB_CA_DER_B64URL": true, "TENSORHUB_PUBLIC_ORIGIN": true, "TENSORHUB_OBJECT_STORAGE_HOSTS": true,
+	"COZY_MACHINE_HUBS_JSON": true,
 }
 
 // HasGrant says whether the environment names a machine at all.
@@ -121,20 +133,12 @@ func ReadGrant(environ []string) (*Grant, error) {
 	if g.MediaPort == g.WorkerPort {
 		return nil, fmt.Errorf("the worker and media ports must differ")
 	}
-	if g.HubOrigin, err = origin(env, "TENSORHUB_ORIGIN", true); err != nil {
+	own, err := hubGrant(env)
+	if err != nil {
 		return nil, err
 	}
-	if g.PublicOrigin, err = origin(env, "TENSORHUB_PUBLIC_ORIGIN", false); err != nil {
-		return nil, err
-	}
-	if text := env["TENSORHUB_CA_DER_B64URL"]; text != "" {
-		if g.HubCA = decode64(text); g.HubCA == nil {
-			return nil, fmt.Errorf("TENSORHUB_CA_DER_B64URL must be unpadded base64url DER")
-		}
-	}
-	if hosts := env["TENSORHUB_OBJECT_STORAGE_HOSTS"]; hosts != "" {
-		g.ObjectHosts = strings.Split(hosts, ",")
-	}
+	g.HubOrigin, g.PublicOrigin, g.HubCA, g.ObjectHosts = own.Origin, own.PublicOrigin, own.CA, own.ObjectHosts
+	g.Hubs, g.Skipped = otherHubs(env["COZY_MACHINE_HUBS_JSON"], g.HubOrigin)
 	g.RepoCacheRoot = env["COZY_REPO_CACHE_ROOT"]
 	if text := env["COZY_RECORD_OWNER_AUTH_JSON"]; text != "" {
 		g.ObservedAuth = &OwnerAuth{}
@@ -171,6 +175,71 @@ func ReadGrant(environ []string) (*Grant, error) {
 	}
 	slices.Sort(g.Ignored)
 	return g, nil
+}
+
+// hubGrant reads one Hub's TENSORHUB_* settings.
+func hubGrant(env map[string]string) (HubGrant, error) {
+	var h HubGrant
+	var err error
+	if h.Origin, err = origin(env, "TENSORHUB_ORIGIN", true); err != nil {
+		return h, err
+	}
+	if h.PublicOrigin, err = origin(env, "TENSORHUB_PUBLIC_ORIGIN", false); err != nil {
+		return h, err
+	}
+	if text := env["TENSORHUB_CA_DER_B64URL"]; text != "" {
+		if h.CA = decode64(text); h.CA == nil {
+			return h, fmt.Errorf("TENSORHUB_CA_DER_B64URL must be unpadded base64url DER")
+		}
+	}
+	if hosts := env["TENSORHUB_OBJECT_STORAGE_HOSTS"]; hosts != "" {
+		h.ObjectHosts = strings.Split(hosts, ",")
+	}
+	return h, nil
+}
+
+// otherHubs reads COZY_MACHINE_HUBS_JSON: each registration's worker id, token and the
+// TENSORHUB_* environment its Hub gave it. One this machine cannot read is skipped, never
+// fatal, so a newer launcher cannot stop an older machine.
+func otherHubs(text, own string) ([]HubGrant, []string) {
+	if text == "" {
+		return nil, nil
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal([]byte(text), &rows); err != nil {
+		return nil, []string{"COZY_MACHINE_HUBS_JSON is not a JSON list"}
+	}
+	var out []HubGrant
+	var skipped []string
+	seen := map[string]bool{own: true}
+	for i, raw := range rows {
+		var row struct {
+			WorkerID    string            `json:"worker_id"`
+			WorkerToken string            `json:"worker_token"`
+			Environment map[string]string `json:"environment"`
+		}
+		h, err := HubGrant{}, json.Unmarshal(raw, &row)
+		if err == nil {
+			h, err = hubGrant(row.Environment)
+		}
+		switch {
+		case err != nil:
+		case row.WorkerID == "" || len(row.WorkerID) > 256 || strings.TrimSpace(row.WorkerID) != row.WorkerID:
+			err = fmt.Errorf("its worker id is not one identifier of at most 256 bytes")
+		case len(decode64(row.WorkerToken)) != 32:
+			err = fmt.Errorf("its worker token is not 32 bytes of unpadded base64url")
+		case seen[h.Origin]:
+			err = fmt.Errorf("%s is named twice", h.Origin)
+		}
+		if err != nil {
+			skipped = append(skipped, fmt.Sprintf("hub registration %d: %v", i, err))
+			continue
+		}
+		seen[h.Origin] = true
+		h.WorkerID, h.WorkerToken = row.WorkerID, row.WorkerToken
+		out = append(out, h)
+	}
+	return out, skipped
 }
 
 func publicKey(spelled string) (ed25519.PublicKey, error) {

@@ -35,40 +35,49 @@ type machineConnection struct {
 	progress   *transfer.Progress
 }
 
-// connect opens a machine for work of the default hub; holder is what the caller is doing
+// connect opens a machine for work that reads no hub; holder is what the caller is doing
 // there, which a rental's maintenance refusal names.
 func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machineConnection, *exit.Error) {
-	return m.connectAt(ctx, name, "", holder)
+	return m.connectAt(ctx, name, "", holder, true)
 }
 
-// connectFor opens the machine a run executes on, at the run's hub: a run of an install
+// connectFor opens the machine a run executes on, for the run's hub: a run of an install
 // reads its release at the hub the install came from.
 func (m *machineRuns) connectFor(ctx context.Context, request records.Request, name, doing string) (*machineConnection, *exit.Error) {
+	named := namesHub(request)
 	if machines.IsLocal(name) {
-		if problem := m.localHubFree(request); problem != nil {
+		if problem := m.localHubFree(request, named); problem != nil {
 			return nil, problem
 		}
 	}
-	return m.connectAt(ctx, name, request.Hub, m.runHolder(request, doing))
+	return m.connectAt(ctx, name, request.Hub, m.runHolder(request, doing), named)
 }
 
-// connectAtHub opens a machine for work read at hub: this computer's machine moves there once
-// the work it holds for another hub has ended.
+// namesHub says whether every call of a run names its hub (wire 67), so a machine registered
+// there serves it wherever it is: a published inference root. A local package's install, a
+// captured run and a job's publication read the machine's own hub, so the machine moves.
+func namesHub(request records.Request) bool {
+	return request.LocalInstallationID == "" && !strings.HasPrefix(request.Package, "local/") &&
+		!request.IsJob() && request.ModelTransfer == nil
+}
+
+// connectAtHub opens a machine for a published release read at hub.
 func (m *machineRuns) connectAtHub(ctx context.Context, name, hub, holder string) (*machineConnection, *exit.Error) {
 	if machines.IsLocal(name) {
-		if problem := m.localHubFree(records.Request{Hub: hub}); problem != nil {
+		if problem := m.localHubFree(records.Request{Hub: hub}, true); problem != nil {
 			return nil, problem
 		}
 	}
-	return m.connectAt(ctx, name, hub, holder)
+	return m.connectAt(ctx, name, hub, holder, true)
 }
 
-// localHubFree keeps this computer's machine at its hub while it holds another hub's work:
-// moving its Host ends everything it holds. The run waits for that work to end.
-func (m *machineRuns) localHubFree(request records.Request) *exit.Error {
+// localHubFree keeps this computer's machine at its hub while it holds another hub's work
+// and cannot do this work where it is: moving its Host ends everything it holds. The work
+// waits for that to end.
+func (m *machineRuns) localHubFree(request records.Request, named bool) *exit.Error {
 	hub := cmp.Or(request.Hub, m.machines.HubOrigin)
 	status, problem := m.machines.Host.Status()
-	if problem != nil || !status.Running || status.Hub == hub {
+	if problem != nil || !status.Running || status.Hub == hub || m.machines.Host.Serves(hub, named) {
 		return nil
 	}
 	active, problem := m.store.ActiveRequests()
@@ -86,8 +95,8 @@ func (m *machineRuns) localHubFree(request records.Request) *exit.Error {
 	return nil
 }
 
-func (m *machineRuns) connectAt(ctx context.Context, name, hub, holder string) (*machineConnection, *exit.Error) {
-	machine, problem := m.machines.DialAt(ctx, name, hub, holder)
+func (m *machineRuns) connectAt(ctx context.Context, name, hub, holder string, named bool) (*machineConnection, *exit.Error) {
+	machine, problem := m.machines.DialAt(ctx, name, hub, holder, named)
 	if problem != nil {
 		return nil, problem
 	}
@@ -235,7 +244,7 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, hub, bootID, pkg, re
 		return problem
 	}
 	var packages []*pb.DownloadPackageRef
-	call := &pb.PreparePackageSetCall{Claim: connection.Claim}
+	call := &pb.PreparePackageSetCall{Claim: connection.Claim, Hub: connection.Hub}
 	if pkg != "" {
 		packages = append(packages, &pb.DownloadPackageRef{Package: pkg, Release: release})
 	}
@@ -263,7 +272,7 @@ func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release s
 	}
 	defer connection.Close()
 	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{
-		Claim: connection.Claim, Describe: &pb.PackageSelection{Package: pkg, Release: release}})
+		Claim: connection.Claim, Describe: &pb.PackageSelection{Package: pkg, Release: release, Hub: connection.Hub}})
 	if err != nil {
 		return api.DescribedRelease{}, machineTransport(err)
 	}

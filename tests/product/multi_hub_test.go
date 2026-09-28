@@ -24,6 +24,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/host"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -693,6 +694,177 @@ func TestLocalRunReadsTheCommandsHub(t *testing.T) {
 
 // A newer hub may hand a registered machine settings this CLI does not know. Registration
 // still succeeds: the hub's facts are kept and anything else is ignored, never refused.
+// This computer's machine holds a registration at each hub it has run work of. A run of hub
+// b after one of hub a reads its release at b's doors, and a model of hub b lands from b's
+// doors, each with b's registration; hub a is asked nothing of either. A machine whose range
+// reaches wire 67 serves both hubs where it is: the Host that served a serves b. An older
+// one moves to b instead.
+func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host: this computer's machine reads the releases")
+	}
+	iface := json.RawMessage(`{"format":"cozy.package.interface/1","application":"app:app","entrypoints":[{"name":"generate",` +
+		`"models":[],"request":{"fields":[]},"result":{"fields":[]}}],"jobs":[]}`)
+	type door struct {
+		asked, workers, fetchedAs sync.Map
+	}
+	manifest := "sha256:" + strings.Repeat("a", 64)
+	catalog := func(d *door, pkg string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			d.asked.Store(r.URL.Path, true)
+			if worker := r.Header.Get("X-Cozy-Worker-ID"); worker != "" {
+				d.workers.Store(worker, true)
+			}
+			switch {
+			case r.URL.Path == "/v1/tensorfs/closure":
+				d.fetchedAs.Store(r.Header.Get("X-Cozy-Worker-ID"), true)
+				// Bytes that are not the model: TensorFS fetches them and refuses what arrives.
+				_ = json.NewEncoder(w).Encode(map[string]any{"complete": true, "lane": "", "model": "proof/model",
+					"manifest":            map[string]any{"length": 128, "sha256": strings.TrimPrefix(manifest, "sha256:")},
+					"objects":             []any{map[string]any{"length": 64, "sha256": strings.Repeat("b", 64)}},
+					"presign_max_digests": 64, "release": "", "scope": "runtime"})
+				return
+			case r.URL.Path == "/v1/tensorfs/presign":
+				var asked struct{ Digests []string }
+				_ = json.NewDecoder(r.Body).Decode(&asked)
+				urls := map[string]string{}
+				for _, digest := range asked.Digests {
+					urls[digest] = "https://" + r.Host + "/o/" + digest
+				}
+				now := time.Now().Unix()
+				_ = json.NewEncoder(w).Encode(map[string]any{"expires_at_unix": now + 3600, "server_time_unix": now, "urls": urls})
+				return
+			case strings.HasPrefix(r.URL.Path, "/o/"):
+				_, _ = w.Write(make([]byte, 64))
+				return
+			}
+			switch strings.TrimPrefix(r.URL.Path, "/v1/packages/"+pkg) {
+			case "":
+				_ = json.NewEncoder(w).Encode(map[string]any{"releases": []any{map[string]any{"release": "1.0.0"}}})
+			case "/releases/1.0.0":
+				_ = json.NewEncoder(w).Encode(map[string]any{"release": map[string]any{"release": "1.0.0"},
+					"package_interface": iface, "requires_python": ">=3.12", "python_version": "3.12"})
+			case "/releases/1.0.0/locked-requirements":
+				_, _ = w.Write([]byte("msgspec==0.19.0\n"))
+			case "/bindings":
+				_ = json.NewEncoder(w).Encode(map[string]any{"bindings": []any{}})
+			default:
+				http.NotFound(w, r)
+			}
+		})
+	}
+	// Each hub's own API, as the command reads it.
+	var apiA, apiB sync.Map
+	api := func(asked *sync.Map) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			asked.Store(r.URL.Path, true)
+			if r.URL.Path != "/v1/models/resolve" {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/model", "manifest_id": manifest, "manifest_length": 128,
+				"bytes": 4096, "components": []string{"transformer"}})
+		})
+	}
+	hubA, hubB := httptest.NewServer(api(&apiA)), httptest.NewServer(api(&apiB))
+	t.Cleanup(hubA.Close)
+	t.Cleanup(hubB.Close)
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName),
+		[]byte("tensorhub_url: a\nport: 0\ntensorhub_token: two-hubs\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
+	provisionMachine(t, root)
+	var doorA, doorB door
+	for _, hub := range []struct {
+		origin  string
+		handler http.Handler
+	}{{hubA.URL, catalog(&doorA, "proof/alpha")}, {hubB.URL, catalog(&doorB, "proof/beta")}} {
+		doors, ca := hubTLSServer(t, hub.handler)
+		t.Cleanup(doors.Close)
+		registerMachineAt(t, root, hub.origin, map[string]string{"TENSORHUB_ORIGIN": doors.URL, "TENSORHUB_PUBLIC_ORIGIN": doors.URL,
+			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)})
+	}
+	var registered map[string]struct {
+		ID string `json:"id"`
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "machine", "registrations.json"))
+	must(t, err)
+	must(t, json.Unmarshal(raw, &registered))
+	launched := func() (record struct {
+		PID       int    `json:"pid"`
+		WireMinor uint32 `json:"wire_minor"`
+	}) {
+		raw, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
+		must(t, err)
+		must(t, json.Unmarshal(raw, &record))
+		return record
+	}
+
+	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")
+	if _, asked := doorA.asked.Load("/v1/packages/proof/alpha/releases/1.0.0/locked-requirements"); !asked {
+		t.Fatalf("the machine did not read hub a's release: %d %s", code, out)
+	}
+	first := launched()
+	if first.PID == 0 || first.WireMinor == 0 {
+		t.Fatalf("the launched Host's record names no process or protocol range: %+v", first)
+	}
+	code, out = runCozy(t, root, "run", "proof/beta/generate", "--tensorhub", "b", "--json")
+	if _, asked := doorB.asked.Load("/v1/packages/proof/beta/releases/1.0.0/locked-requirements"); !asked {
+		t.Fatalf("the machine did not read the release at the run's hub: %d %s", code, out)
+	}
+	for _, other := range []*sync.Map{&apiA, &doorA.asked} {
+		other.Range(func(path, _ any) bool {
+			if strings.HasPrefix(path.(string), "/v1/packages/proof/beta") {
+				t.Fatalf("hub a was asked %s for hub b's package", path)
+			}
+			return true
+		})
+	}
+	second := launched()
+	if (second.PID == first.PID) != (first.WireMinor >= 67) {
+		t.Fatalf("a machine at wire %d moved (Host %d, then %d): it moves exactly when it cannot read a run's hub",
+			first.WireMinor, first.PID, second.PID)
+	}
+	code, out = runCozy(t, root, "model", "download", "proof/model#"+manifest, "--tensorhub", "b", "--json")
+	var accepted struct{ ID string }
+	if code != 0 || json.Unmarshal([]byte(out), &accepted) != nil || accepted.ID == "" {
+		t.Fatalf("the model download of hub b was not accepted [exit %d]\n%s", code, out)
+	}
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	for deadline := time.Now().Add(3 * time.Minute); ; time.Sleep(250 * time.Millisecond) {
+		row, problem := store.RentalInstall(accepted.ID)
+		fatal(t, problem)
+		if row != nil && (row.State == "succeeded" || row.State == "failed") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the machine never settled the model download")
+		}
+	}
+	if _, as := doorB.fetchedAs.Load(registered[hubB.URL].ID); !as {
+		t.Fatal("the machine did not fetch hub b's model at b's doors with its registration there")
+	}
+	if _, asked := doorA.asked.Load("/v1/tensorfs/closure"); asked {
+		t.Fatal("hub a's doors were asked for hub b's model")
+	}
+	if _, asked := apiB.Load("/v1/models/resolve"); !asked {
+		t.Fatal("the model of hub b was not resolved at hub b")
+	}
+	if third := launched(); third.PID != second.PID {
+		t.Fatalf("the machine moved for a model of the hub it served (Host %d, then %d)", second.PID, third.PID)
+	}
+	if _, seen := doorB.workers.Load(registered[hubB.URL].ID); !seen {
+		t.Fatalf("hub b's doors were not read as the machine's registration there: %d %s", code, out)
+	}
+	doorB.workers.Range(func(worker, _ any) bool {
+		if worker != registered[hubB.URL].ID {
+			t.Fatalf("hub b's doors were read as %s, not as the machine's registration there", worker)
+		}
+		return true
+	})
+}
+
 func TestMachineRegistrationToleratesNewHubSettings(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/machines" {
@@ -713,5 +885,34 @@ func TestMachineRegistrationToleratesNewHubSettings(t *testing.T) {
 	}
 	if _, passed := machine.Environment["COZY_WEBRTC_INTERNAL_PORT"]; passed || strings.Join(machine.Ignored, ",") != "COZY_WEBRTC_INTERNAL_PORT,SOME_NEW_SETTING" {
 		t.Fatalf("settings the machine does not read reached it or went unnamed: %v ignored %v", machine.Environment, machine.Ignored)
+	}
+}
+
+// The launcher hands the machine every other registration in COZY_MACHINE_HUBS_JSON. One the
+// machine cannot read is named and skipped; it never stops the machine from booting.
+func TestMachineGrantReadsOtherHubsTolerantly(t *testing.T) {
+	key := make([]byte, 32)
+	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	hub := func(origin, id, token string) map[string]any {
+		return map[string]any{"worker_id": id, "worker_token": token, "future": true,
+			"environment": map[string]string{"TENSORHUB_ORIGIN": origin, "TENSORHUB_PUBLIC_ORIGIN": origin,
+				"TENSORHUB_OBJECT_STORAGE_HOSTS": "objects.b.example"}}
+	}
+	others, err := json.Marshal([]any{hub("https://b.example", "om-b", token), hub("https://c.example", "om-c", "short"),
+		hub("https://a.example", "om-a2", token), hub("http://d.example", "om-d", token), "not a registration"})
+	must(t, err)
+	base := []string{"COZY_MACHINE_ROOT=/", "COZY_WORKER_ID=om-a", "COZY_WORKER_AUTH_TOKEN=" + token,
+		"COZY_WORKER_INTERNAL_PORT=8443", "TENSORHUB_ORIGIN=https://a.example",
+		"COZY_AUTHORIZED_KEYS=" + base64.RawURLEncoding.EncodeToString(key)}
+	grant, err := host.ReadGrant(append(base, "COZY_MACHINE_HUBS_JSON="+string(others)))
+	must(t, err)
+	if len(grant.Hubs) != 1 || grant.Hubs[0].Origin != "https://b.example" || grant.Hubs[0].WorkerID != "om-b" ||
+		strings.Join(grant.Hubs[0].ObjectHosts, ",") != "objects.b.example" || len(grant.Skipped) != 4 {
+		t.Fatalf("other hubs read as %+v, skipped %q", grant.Hubs, grant.Skipped)
+	}
+	grant, err = host.ReadGrant(append(base, "COZY_MACHINE_HUBS_JSON={"))
+	must(t, err)
+	if len(grant.Hubs) != 0 || len(grant.Skipped) != 1 {
+		t.Fatalf("an unreadable list read as %+v, skipped %q", grant.Hubs, grant.Skipped)
 	}
 }

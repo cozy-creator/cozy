@@ -133,11 +133,15 @@ func (m *Machine) preparePackageSet(stream grpc.ServerStream) error {
 		if _, err := canonical.Read(desired, selected); err != nil {
 			return refused("package_set_invalid", fmt.Errorf("download document: %w", err), false)
 		}
+		source, registered := m.modelSource(call.Hub)
+		if !registered {
+			return refused("hub_unregistered", fmt.Errorf("this machine is not registered at %s", call.Hub), false)
+		}
 		modelsOnly := call.Application == "" && len(call.LockedRequirements) == 0 && len(selected.Packages) == 0
 		request := &pb.PreparePackageSetRequest{DownloadDelegation: desired, InstallRoot: m.layout.Installs,
 			Application: call.Application, PythonRequires: call.PythonRequires, PythonVersion: call.PythonVersion,
 			ModelSlotPaths: call.ModelSlotPaths, ImageInventory: call.ImageInventory,
-			LockedRequirements: call.LockedRequirements, PackageInterface: call.PackageInterface}
+			LockedRequirements: call.LockedRequirements, PackageInterface: call.PackageInterface, Hub: call.Hub}
 		emit(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED})
 		warm, stopWarm := context.WithCancel(ctx)
 		defer stopWarm()
@@ -159,7 +163,7 @@ func (m *Machine) preparePackageSet(stream grpc.ServerStream) error {
 		} else {
 			close(warmed)
 		}
-		if err := m.tfs.fetch(warm, desired, downloading(emit)); err != nil {
+		if err := m.tfs.fetch(warm, source, desired, downloading(emit)); err != nil {
 			stopWarm()
 			if answer, ok := <-warmed; ok {
 				return answer
@@ -205,7 +209,8 @@ func (m *Machine) preparePrivatePlacement(stream grpc.ServerStream) error {
 			desired = adapters
 		}
 		if len(desired) > 0 {
-			if err := m.tfs.fetch(ctx, desired, downloading(emit)); err != nil {
+			source, _ := m.modelSource("")
+			if err := m.tfs.fetch(ctx, source, desired, downloading(emit)); err != nil {
 				var fetch *fetchRefusal
 				if errors.As(err, &fetch) {
 					return prepared{code: fetch.Code, detail: safe(fetch.Detail), retry: fetch.Resumable}

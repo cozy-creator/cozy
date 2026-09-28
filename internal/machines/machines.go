@@ -41,6 +41,9 @@ type Machine struct {
 	Claim     *pb.Claim
 	Protocol  *pb.ProtocolInfoResult
 	WireMinor uint32
+	// Hub is the hub each run of this use names (ReleaseRoot.hub, wire 67): the origin the
+	// machine reads another hub it is registered at by. "" is the machine's own hub.
+	Hub string
 	// CertificateDER is the pinned leaf, the identity publication authority binds, and
 	// CertificateDigest its sha256.
 	CertificateDER    []byte
@@ -159,21 +162,34 @@ type target struct {
 // Dial connects to a machine and authenticates as its owner; holder names what the caller
 // is doing there, which a rental's maintenance refusal names. The caller closes it.
 func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *exit.Error) {
-	return r.DialAt(ctx, name, "", holder)
+	return r.DialAt(ctx, name, "", holder, true)
 }
 
-// DialAt is Dial for work of one hub: this computer's machine moves to that hub, as a run of
-// an install reads the release at the hub the install came from. "" is the default hub.
-func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string) (*Machine, *exit.Error) {
+// DialAt is Dial for work of one hub, as a run of an install reads the release at the hub the
+// install came from; "" is the default hub. When every call of the work names its hub
+// (named, and Machine.Hub), this computer's machine serves any hub it is registered at where
+// it is; otherwise, or when it cannot, it moves to that hub.
+func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
+	machine, problem := r.dialAt(ctx, name, origin, holder, named)
+	if problem == nil && machine.Hub != "" && machine.WireMinor < HubPerRunWire {
+		// Its range fell below reading a run's hub (a Runtime replaced in place): it moves.
+		machine.Close()
+		return r.dialAt(ctx, name, origin, holder, false)
+	}
+	return machine, problem
+}
+
+func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
 	machine := &Machine{Name: name}
 	var t target
+	pid := 0
 	if IsLocal(name) {
 		origin = cmp.Or(origin, r.HubOrigin)
 		var client *hub.Client
 		if r.Hub != nil {
 			client = r.Hub(origin)
 		}
-		launch, problem := r.Host.Ensure(ctx, origin, client)
+		launch, problem := r.Host.Ensure(ctx, origin, client, named)
 		if problem != nil {
 			return nil, problem
 		}
@@ -185,9 +201,10 @@ func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string) (*Ma
 		if problem != nil {
 			return nil, problem
 		}
-		machine.hub, machine.hubID, machine.owned = client, launch.WorkerID, true
+		machine.hub, machine.hubID, machine.owned, machine.Hub = client, launch.WorkerID, true, launch.Reads
 		t = target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
 			lifetime: fmt.Sprint(launch.PID)}
+		pid = launch.PID
 	} else {
 		release, problem := r.UseRental(name, holder)
 		if problem != nil {
@@ -230,7 +247,7 @@ func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string) (*Ma
 		if kept := r.kept[name]; kept != nil && kept.identity == identity {
 			r.mu.Unlock()
 			use := *kept.Machine
-			use.release, use.kept = machine.release, true
+			use.release, use.kept, use.Hub = machine.release, true, machine.Hub
 			return &use, nil
 		}
 		dialing := r.dialing[identity]
@@ -264,6 +281,9 @@ func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string) (*Ma
 			machine.release()
 		}
 		return nil, problem
+	}
+	if machine.owned {
+		r.Host.Dialed(ctx, pid, machine.WireMinor)
 	}
 	r.mu.Lock()
 	r.claimed[boot] = true

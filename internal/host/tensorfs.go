@@ -15,14 +15,21 @@ import (
 // TensorFS owns model bytes. The machine asks `tfs` for them and reads only its typed JSON
 // events and exit status, never text meant for people.
 type tensorFS struct {
-	bin, store, hub, caFile string
-	credential              string
+	bin, store string
+	repoCache  string
+	streams    atomic.Int64 // the stream level the last pull settled at
+	observe    func(cacheObservation)
+	capsOnce   sync.Once
+	caps       map[string]bool
+}
+
+// hubSource is where a fetch reads Models: one Hub's public origin, this machine's worker
+// capability there, its private CA and the hosts its bytes live on. Cache observations are
+// reported to the machine's own Hub only.
+type hubSource struct {
+	hub, caFile, credential string
 	allowHosts              []string
-	repoCache               string
-	streams                 atomic.Int64 // the stream level the last pull settled at
-	observe                 func(cacheObservation)
-	capsOnce                sync.Once
-	caps                    map[string]bool
+	own                     bool
 }
 
 // run execs tfs with an empty environment plus env; every stdout and stderr line goes to lines.
@@ -150,12 +157,12 @@ func modelsOf(desired []byte) ([]downloadModel, error) {
 
 // fetch lands every model the download set names through `tfs ensure`, or `tfs fetch` on a
 // TensorFS that predates it, reporting landed and total bytes as they move.
-func (t *tensorFS) fetch(ctx context.Context, desired []byte, progress func(landed, total int64)) error {
+func (t *tensorFS) fetch(ctx context.Context, source hubSource, desired []byte, progress func(landed, total int64)) error {
 	models, err := modelsOf(desired)
 	if err != nil {
 		return &fetchRefusal{Code: "model_fetch_set_invalid", Detail: err.Error()}
 	}
-	if len(models) > 0 && t.hub == "" {
+	if len(models) > 0 && source.hub == "" {
 		return &fetchRefusal{Code: "model_fetch_origin_absent", Detail: "this machine was granted no TENSORHUB_PUBLIC_ORIGIN"}
 	}
 	verb := "fetch"
@@ -164,15 +171,15 @@ func (t *tensorFS) fetch(ctx context.Context, desired []byte, progress func(land
 	}
 	var doneBytes int64
 	for _, model := range models {
-		args := []string{verb, t.store, model.refspec(), "--hub", t.hub}
-		if t.caFile != "" {
-			args = append(args, "--ca-file", t.caFile)
+		args := []string{verb, t.store, model.refspec(), "--hub", source.hub}
+		if source.caFile != "" {
+			args = append(args, "--ca-file", source.caFile)
 		}
 		if model.Lane != "" {
 			args = append(args, "--lane", model.Lane)
 		}
-		if len(t.allowHosts) > 0 {
-			args = append(args, "--allow-hosts", strings.Join(t.allowHosts, ","))
+		if len(source.allowHosts) > 0 {
+			args = append(args, "--allow-hosts", strings.Join(source.allowHosts, ","))
 		}
 		if streams := t.streams.Load(); streams > 0 {
 			args = append(args, "--streams-start", strconv.FormatInt(streams, 10))
@@ -195,7 +202,7 @@ func (t *tensorFS) fetch(ctx context.Context, desired []byte, progress func(land
 				}
 			case "pull.cache":
 				var seen cacheObservation
-				if t.observe != nil && json.Unmarshal([]byte(line), &seen) == nil && seen.Model == model.Model {
+				if t.observe != nil && source.own && json.Unmarshal([]byte(line), &seen) == nil && seen.Model == model.Model {
 					t.observe(seen)
 				}
 				return
@@ -210,7 +217,7 @@ func (t *tensorFS) fetch(ctx context.Context, desired []byte, progress func(land
 				progress(doneBytes+landed, doneBytes+total)
 			}
 		}
-		if err := t.run(ctx, []string{"TFS_CREDENTIAL=" + t.credential}, lines, args...); err != nil {
+		if err := t.run(ctx, []string{"TFS_CREDENTIAL=" + source.credential}, lines, args...); err != nil {
 			if refused != nil {
 				return refused
 			}

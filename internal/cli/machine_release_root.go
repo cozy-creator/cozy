@@ -58,7 +58,7 @@ func (m *machineRuns) capturedRevision(request records.Request) (localpackage.In
 
 func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records.Request, connection *machineConnection) (*pb.MachineExecutionSubmit, *exit.Error) {
 	root := &pb.ReleaseRoot{Package: request.Package, Release: request.Release, Entrypoint: request.Entrypoint,
-		DeadlineUnixMs: uint64(max(request.DeadlineUnixMS, 0)), AttentionKernel: request.AttentionKernel}
+		DeadlineUnixMs: uint64(max(request.DeadlineUnixMS, 0)), AttentionKernel: request.AttentionKernel, Hub: connection.Hub}
 	if request.LocalInstallationID != "" {
 		if _, problem := m.capturedRevision(request); problem != nil {
 			return nil, problem
