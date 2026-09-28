@@ -60,9 +60,6 @@ func ObservationFromClaimAck(rentalID string, ack *pb.ClaimAck) RentalObservatio
 	return RentalObservation{
 		RentalID: rentalID, Accelerator: resources.GetDeviceName(),
 		DeviceCount: int(resources.GetDeviceCount()), Backend: resources.GetBackend(),
-		DriverVersion: resources.GetDriverVersion(), BackendVersion: resources.GetBackendVersion(),
-		DeviceMemoryTotalBytes: resources.GetDeviceMemoryTotalBytes(),
-		WorkerInstance:         ack.WorkerInstanceId, WorkerID: ack.WorkerId,
-		WorkerBootID: ack.WorkerBootId,
+		WorkerInstance: ack.WorkerInstanceId, WorkerID: ack.WorkerId, WorkerBootID: ack.WorkerBootId,
 	}
 }

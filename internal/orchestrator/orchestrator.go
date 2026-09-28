@@ -65,16 +65,13 @@ type RentalPackageSetSource func([]*pb.DownloadPackageRef,
 	[]*pb.DownloadModelRef) ([]byte, *exit.Error)
 
 type RentalObservation struct {
-	RentalID               string
-	Accelerator            string
-	DeviceCount            int
-	Backend                string
-	DriverVersion          string
-	BackendVersion         string
-	DeviceMemoryTotalBytes uint64
-	WorkerInstance         string
-	WorkerID               string
-	WorkerBootID           string
+	RentalID       string
+	Accelerator    string
+	DeviceCount    int
+	Backend        string
+	WorkerInstance string
+	WorkerID       string
+	WorkerBootID   string
 }
 
 // ModelTransferOwner moves the daemon's own model transfers.
