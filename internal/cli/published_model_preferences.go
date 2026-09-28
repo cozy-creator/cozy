@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"context"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -32,7 +35,7 @@ func (r *Resolver) PublishedChildModels(command *Context, request records.Reques
 		}
 		seen[key], visiting[key] = true, true
 		defer delete(visiting, key)
-		plan, iface, locked, _, problem := r.publishedChildPreparation(ctx, command, selected)
+		plan, iface, locked, problem := r.publishedChildPreparation(ctx, command, selected)
 		if problem != nil {
 			return problem
 		}
@@ -72,4 +75,54 @@ func (r *Resolver) PublishedChildModels(command *Context, request records.Reques
 		return nil, problem
 	}
 	return models, nil
+}
+
+func publishedPlanInterface(plan hub.PackageDownloadPlan) (*launch.PackageInterface, *exit.Error) {
+	document, problem := exactPackageInstallDocument("package interface", plan.PackageInterface)
+	if problem != nil {
+		return nil, problem
+	}
+	return launch.DecodePackageInterface(document.Bytes)
+}
+
+// publishedChildPreparation is one published release's plan, interface and locked
+// closure, read to size a rental for a workflow's children before any machine is known.
+func (r *Resolver) publishedChildPreparation(ctx context.Context, command *Context, request records.Request) (*hub.PackageDownloadPlan, *launch.PackageInterface, []byte, *exit.Error) {
+	ref, problem := hub.ParseRef(request.Package)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	plan, problem := r.catalog(request.Hub).PackageDownloads(ctx, ref, request.Release)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	iface, problem := publishedPlanInterface(plan)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	config, problem := exactPackageInstallDocument("package.toml", plan.PackageConfig)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	ifaceDoc, problem := exactPackageInstallDocument("package interface", plan.PackageInterface)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	pyproject, problem := exactPackageInstallDocument("pyproject.toml", plan.Pyproject)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	uvLock, problem := exactPackageInstallDocument("uv.lock", plan.UVLock)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	source, problem := packageInstallPlanFacts(command, ref, request.Release, plan, config, ifaceDoc, pyproject, uvLock)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	locked, problem := install.PublishedRequirements(source)
+	if problem != nil {
+		return nil, nil, nil, problem
+	}
+	return &plan, iface, locked, nil
 }

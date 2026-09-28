@@ -27,12 +27,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-type publishedPreparation struct {
-	*pb.DesiredPlacementSet
-	InstalledPackage *pb.InstalledPackage
-	Retained         bool // the machine answered from its preparation of these exact inputs
-}
-
 func retainWorkerInstallation(connection *machineConnection, expected localpackage.Installation, installed *pb.InstalledPackage) *exit.Error {
 	if installed == nil || installed.InstallationId != expected.ID || installed.Package != expected.Package || installed.Release != expected.Release || len(installed.PackageInterface) == 0 {
 		return exit.New(exit.Validation, "worker did not return the selected installation and interface")
@@ -62,7 +56,6 @@ type machineRuns struct {
 	observers sync.Map // one collection/control lock per observed request
 	uploading sync.Map // retained-output uploads in progress, by operation
 	// awaited names the runs whose last observation ended on the machine's next event.
-	origins sync.Map // each machine's public catalog origin, read once
 	awaited map[string]bool
 	updates *rentalRuntimeUpdates
 	// ownerReads paces owner finalization reads of publications a machine cannot settle.
@@ -374,85 +367,75 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return problem
 		}
 		var built *pb.MachineExecutionSubmit
-		if request.LocalInstallationID == "" {
-			_ = m.store.AppendEvent(request.ID, "request.preparing", 0, map[string]any{"stage": "machine",
-				"detail": "temporary prepared path: release roots do not yet carry adapters (proto-062 R2)"})
-			built, problem = m.publishedSubmission(ctx, request, connection)
+		capture, problem := m.resolver.CaptureMachineExecution(request)
+		if problem != nil {
+			return problem
+		}
+		var placements *pb.DesiredPlacementSet
+		for index, revision := range capture.Installations {
+			if problem := connection.prepare(ctx, request.ID, revision); problem != nil {
+				return problem
+			}
+			capture.Installations[index].PackageInterface = connection.installed[revision.ID].PackageInterface
+			set, problem := connection.prepareModels(ctx, request, revision)
 			if problem != nil {
 				return problem
 			}
+			if revision.ID == request.LocalInstallationID {
+				placements = set
+			}
+		}
+		var graph pb.MachineExecutionCapture
+		if err := canonical.Unmarshal(capture.Canonical, &graph); err != nil {
+			return exit.Internalf("cannot read accepted installation graph: %s", err)
+		}
+		for i, installed := range graph.InstalledPackages {
+			graph.InstalledPackages[i] = connection.installed[installed.InstallationId]
+		}
+		var encodeErr error
+		capture.Canonical, capture.Digest, encodeErr = canonical.Identity(&graph)
+		if encodeErr != nil {
+			return exit.Internalf("cannot retain worker installation metadata: %s", encodeErr)
+		}
+		installed := connection.installed[request.LocalInstallationID]
+		if installed == nil {
+			return exit.New(exit.Conflict, "machine root installation is unavailable")
+		}
+		surface, problem := launch.DecodePackageInterface(installed.PackageInterface)
+		if problem != nil {
+			return problem
+		}
+		job, problem := surface.Function(request.Entrypoint)
+		if problem != nil {
+			return problem
+		}
+		if (job.Kind == "job") != request.IsJob() {
+			return exit.New(exit.Conflict, "installed callable changed its kind")
+		}
+		if job.Kind == "job" {
+			request.PlanID = job.DescriptorID
+		} else if request, problem = m.bindServingPlan(request, installed.InstallationId, placements); problem != nil {
+			return problem
+		}
+		began = time.Now()
+		byteInputs, problem := m.stageMachineInputs(ctx, request, connection)
+		if problem != nil {
+			return problem
+		}
+		if len(byteInputs) > 0 {
+			m.submissionStage(request.ID, "inputs", fmt.Sprintf("%d input(s)", len(byteInputs)), began)
+		}
+		if job.Kind == "job" {
+			var plan *orchestrator.JobPlan
+			if plan, problem = machineJobPlan(ctx, connection, request, installed.InstallationId, job); problem != nil {
+				return problem
+			}
+			built, problem = orchestrator.MachineJobSubmission(request, capture, plan, byteInputs)
 		} else {
-			capture, problem := m.resolver.CaptureMachineExecution(request)
-			if problem != nil {
-				return problem
-			}
-			var placements *pb.DesiredPlacementSet
-			for index, revision := range capture.Installations {
-				if problem := connection.prepare(ctx, request.ID, revision); problem != nil {
-					return problem
-				}
-				capture.Installations[index].PackageInterface = connection.installed[revision.ID].PackageInterface
-				set, problem := connection.prepareModels(ctx, request, revision)
-				if problem != nil {
-					return problem
-				}
-				if revision.ID == request.LocalInstallationID {
-					placements = set
-				}
-			}
-			var graph pb.MachineExecutionCapture
-			if err := canonical.Unmarshal(capture.Canonical, &graph); err != nil {
-				return exit.Internalf("cannot read accepted installation graph: %s", err)
-			}
-			for i, installed := range graph.InstalledPackages {
-				graph.InstalledPackages[i] = connection.installed[installed.InstallationId]
-			}
-			var encodeErr error
-			capture.Canonical, capture.Digest, encodeErr = canonical.Identity(&graph)
-			if encodeErr != nil {
-				return exit.Internalf("cannot retain worker installation metadata: %s", encodeErr)
-			}
-			installed := connection.installed[request.LocalInstallationID]
-			if installed == nil {
-				return exit.New(exit.Conflict, "machine root installation is unavailable")
-			}
-			surface, problem := launch.DecodePackageInterface(installed.PackageInterface)
-			if problem != nil {
-				return problem
-			}
-			job, problem := surface.Function(request.Entrypoint)
-			if problem != nil {
-				return problem
-			}
-			if (job.Kind == "job") != request.IsJob() {
-				return exit.New(exit.Conflict, "installed callable changed its kind")
-			}
-			if job.Kind == "job" {
-				request.PlanID = job.DescriptorID
-			} else if request, problem = m.bindServingPlan(request, installed.InstallationId, placements); problem != nil {
-				return problem
-			}
-			began = time.Now()
-			byteInputs, problem := m.stageMachineInputs(ctx, request, connection)
-			if problem != nil {
-				return problem
-			}
-			if len(byteInputs) > 0 {
-				m.submissionStage(request.ID, "inputs", fmt.Sprintf("%d input(s)", len(byteInputs)), began)
-			}
-			if job.Kind == "job" {
-				var plan *orchestrator.JobPlan
-				if plan, problem = machineJobPlan(ctx, connection, request, installed.InstallationId, job); problem != nil {
-					return problem
-				}
-				built, problem = orchestrator.MachineJobSubmission(request, capture, plan, byteInputs)
-			} else {
-				built, problem = orchestrator.MachineServingSubmission(request, capture, placements, byteInputs)
-			}
-			if problem != nil {
-				return problem
-			}
-
+			built, problem = orchestrator.MachineServingSubmission(request, capture, placements, byteInputs)
+		}
+		if problem != nil {
+			return problem
 		}
 		built.PublicationAuthorizationId, built.OwnerMemo = authorization, true
 		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, link.MachineID, built); problem != nil {

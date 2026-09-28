@@ -145,92 +145,33 @@ func TestRentedPreparationTransportLossKeepsTheRunQueued(t *testing.T) {
 	}
 }
 
-// A rented call's LoRA stack is part of what the pod must prepare. A preparation that
-// drops the stack, changes a strength or the order, or adds one nobody asked for is
-// refused before anything reaches Runtime; the exact echo is submitted.
-func TestRentedLoRAStackMustBeEchoedBeforeSubmission(t *testing.T) {
-	style := "sha256:" + strings.Repeat("2", 64)
-	for _, arm := range []string{"omitted", "changed_scale", "changed_order", "unexpected", "matched"} {
-		t.Run(arm, func(t *testing.T) {
-			h := newLadderHub(t)
-			h.bind(goodLadder())
-			served := h.server.Config.Handler
-			h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/v1/models/resolve" || r.URL.Query().Get("ref") != "proof/style@"+style {
-					served.ServeHTTP(w, r)
-					return
-				}
-				_ = json.NewEncoder(w).Encode(hub.ModelResolution{Model: "proof/style", ManifestID: style,
-					ManifestLength: 128, Bytes: 1 << 20, Components: []string{"adapter"}})
-			})
-			machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
-				return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
-			})
-			pod := &fakePod{machine: machines, preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
-				placement := modelBearingPlacement(t)(download, pkg, release)
-				var set pb.DownloadDelegation
-				must(t, canonical.Unmarshal(download, &set))
-				adapters := set.Models[0].Adapters
-				if arm == "unexpected" {
-					adapters = []*pb.DownloadAdapterRef{{Component: "fl2va_dit", Model: "proof/style", Manifest: style, SourceComponent: "adapter", Scale: "1"}}
-				}
-				slot := placement.Entrypoints[0].Slots[0]
-				for index, adapter := range adapters {
-					digest, err := canonical.Raw(adapter.Manifest)
-					must(t, err)
-					id := fmt.Sprintf("adapter-%d", index)
-					placement.Models = append(placement.Models, &pb.Model{Id: id, Repo: adapter.Model, Version: adapter.Release,
-						Lane: adapter.Lane, Manifest: &pb.Ref{Digest: digest, Length: 128}})
-					slot.Adapters = append(slot.Adapters, &pb.ModelAdapter{Component: adapter.Component, ModelId: id,
-						SourceComponent: adapter.SourceComponent, Scale: adapter.Scale})
-				}
-				switch arm {
-				case "omitted":
-					slot.Adapters = nil
-				case "changed_scale":
-					slot.Adapters[0].Scale = "1"
-				case "changed_order":
-					slot.Adapters[0], slot.Adapters[1] = slot.Adapters[1], slot.Adapters[0]
-				}
-				return placement
-			}}
-			root, layout := rentedLadderMachine(t, h, pod, nil)
-			store, problem := records.Open(layout.DB)
-			fatal(t, problem)
-			defer store.Close()
-			var loras []string
-			if arm != "unexpected" {
-				loras = []string{"--lora", "model:fl2va_dit=proof/style#" + style + ",0", "--lora", "model:fl2va_dit=proof/style#" + style + ",-0.25"}
-			}
-			row, out := rentedRun(t, root, store, arm, "generate", append([]string{"steps=1"}, loras...)...)
-			if arm == "unexpected" {
-				// No stack was asked for: the machine takes the call by its release, and
-				// nothing the client prepared can add one.
-				if submitted := machines.submitted(); row.State != "succeeded" || len(submitted) != 1 || submitted[0].ReleaseRoot == nil {
-					t.Fatalf("a call with no stack was not taken by its release: %s\n%s", row.State, out)
-				}
-				return
-			}
-			if arm == "matched" {
-				if row.State != "succeeded" || len(machines.submitted()) != 1 {
-					t.Fatalf("the echoed stack was not submitted: %s\n%s", row.State, out)
-				}
-				return
-			}
-			var page struct {
-				Invocations []struct {
-					Status    string `json:"status"`
-					ErrorType string `json:"error_type"`
-				}
-			}
-			_, list := runCozy(t, root, "run", "list", "--json", "--full")
-			must(t, json.Unmarshal([]byte(list), &page))
-			if len(page.Invocations) != 1 || page.Invocations[0].Status != "failed" ||
-				page.Invocations[0].ErrorType != "model_adapters_preparation_mismatch" || len(machines.submitted()) != 0 {
-				t.Fatalf("a preparation that %s the LoRA stack was not refused before submission (%d submitted): %s",
-					arm, len(machines.submitted()), list)
-			}
-		})
+// No Runtime writes a placement's adapter stack yet (proto-062 R2b): --lora is refused
+// before anything is read at the Hub or sent to a machine, never dropped or refused late.
+func TestALoRAStackIsRefusedBeforeAnythingIsReadOrSent(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
+		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
+	})
+	root, _ := rentedLadderMachine(t, h, &fakePod{machine: machines, preparedPlacement: modelBearingPlacement(t)}, nil)
+	var mu sync.Mutex
+	var seen []string
+	served := h.server.Config.Handler
+	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1/rentals") {
+			mu.Lock()
+			seen = append(seen, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+		}
+		served.ServeHTTP(w, r)
+	})
+	style := "proof/style#sha256:" + strings.Repeat("2", 64)
+	code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--lora", "model:fl2va_dit="+style+",0.5",
+		"--rental=tessa", "--json")
+	mu.Lock()
+	defer mu.Unlock()
+	if code == 0 || !strings.Contains(out, `"model_adapters.not_applied"`) || len(machines.submitted()) != 0 || len(seen) != 0 {
+		t.Fatalf("--lora was not refused up front [exit %d, %d submitted, hub %v]: %s", code, len(machines.submitted()), seen, out)
 	}
 }
 
@@ -286,12 +227,13 @@ func publishTenant(t *testing.T, h *ladderHub) []byte {
 func TestRentedRefusedPackageFailsAloneOnASharedPod(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
-	publishTenant(t, h)
+	iface := publishTenant(t, h)
 	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
 		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
 	})
 	machines.refuse = map[string]string{tenantPackage: "wheel_download_failed: tenant-0.1.0-py3-none-any.whl: transfer interrupted"}
-	pod := &fakePod{machine: machines}
+	pod := &fakePod{machine: machines, releases: map[string]*pb.DescribedRelease{
+		tenantPackage: {Package: tenantPackage, Release: "0.1.0", PackageInterface: iface}}}
 	root, layout := rentedLadderMachine(t, h, pod, nil)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)

@@ -102,7 +102,7 @@ func jobModelChoices(ctx *Context, target Target, job *launch.Entrypoint, overri
 	if rental == "" && rentalRequested(ctx) {
 		return nil, false, nil
 	}
-	return modelChoices(ctx, target, job, overrides, nil)
+	return modelChoices(ctx, target, job, overrides)
 }
 
 func jobOutputDestination(ctx *Context, job *launch.Entrypoint, sub *api.JobSubmission) *exit.Error {

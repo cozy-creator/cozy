@@ -14,11 +14,3 @@ func (m *machineRuns) submissionStage(request, stage, detail string, began time.
 	}
 	_ = m.store.AppendEvent(request, "request.preparing", 0, payload)
 }
-
-func preparedDetail(pkg, release string, prepared *publishedPreparation) string {
-	detail := pkg + "@" + release
-	if prepared.Retained {
-		detail += ", reused the machine's preparation"
-	}
-	return detail
-}

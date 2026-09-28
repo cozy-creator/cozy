@@ -39,30 +39,6 @@ func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machin
 	return &machineConnection{Machine: machine, runs: m, installed: map[string]*pb.InstalledPackage{}, placements: map[string]*pb.DesiredPlacementSet{}}, nil
 }
 
-func (c *machineConnection) preparePublished(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
-	ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
-	// The package's exact model bindings ride its own download set, so TensorFS holds
-	// each checkpoint before execution admits it. A published callee's bindings ride
-	// the callee's preparation (capturePublishedDependencies).
-	downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, orchestrator.DownloadModelRefs(request.PreparedModels()))
-	if problem != nil {
-		return nil, problem
-	}
-	// The release alone: the machine reads its facts at its own Hub.
-	stream, err := c.Host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
-		Claim: c.Claim, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
-	})
-	if err != nil {
-		return nil, machineTransport(err)
-	}
-	observed := c.runs.preparationPhase(request.ID, request.Package+"@"+request.Release)
-	event, problem := readMachinePreparationEvent(stream, observed.observe)
-	if problem != nil {
-		return nil, problem
-	}
-	return &publishedPreparation{DesiredPlacementSet: event.PlacementSet, InstalledPackage: event.InstalledPackage, Retained: observed.retained}, nil
-}
-
 func (c *machineConnection) retainModel(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
 	return c.Host.RetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: c.Claim, Request: request})
 }

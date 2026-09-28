@@ -26,24 +26,9 @@ import (
 // its own Hub, resolves every open slot for its own devices, prepares and mints the offer;
 // nothing here reads the Hub, a ladder or a package.
 
-// releaseRoot answers whether a request is submitted by its release: every published root
-// except those on the temporary prepared path.
+// releaseRoot answers whether a request is submitted by its release: every published root.
 func releaseRoot(request records.Request) bool {
-	return request.LocalInstallationID == "" && !strings.HasPrefix(request.Package, "local/") &&
-		!temporaryPreparedPath(request)
-}
-
-// temporaryPreparedPath names the published requests release roots do not carry yet:
-// adapters (--lora). They keep the prepared submission until tracker proto-062 R2 moves
-// them; delete this with it. (Intake captures input trees as staged inputs and keeps
-// model-transfer acquisitions off machine executions.)
-func temporaryPreparedPath(request records.Request) bool {
-	for _, model := range request.Models {
-		if len(model.Adapters) > 0 {
-			return true
-		}
-	}
-	return false
+	return request.LocalInstallationID == "" && !strings.HasPrefix(request.Package, "local/")
 }
 
 func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records.Request, connection *machineConnection) (*pb.MachineExecutionSubmit, *exit.Error) {

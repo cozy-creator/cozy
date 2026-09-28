@@ -1008,19 +1008,6 @@ func (r Request) OwnModels() []ModelRef {
 	return models
 }
 
-// PreparedModels are the selections one package's preparation carries. A preparation is
-// one package and that package's slots, so a published callee's defaults ride the
-// callee's own preparation, never its caller's.
-func (r Request) PreparedModels() []ModelRef {
-	var models []ModelRef
-	for _, model := range r.Models {
-		if model.Package == "" || model.Package == r.Package {
-			models = append(models, model)
-		}
-	}
-	return models
-}
-
 func (r Request) bindsOwnSlot(model ModelRef) bool {
 	for _, slot := range append([]string{model.BindingSlot()}, model.SharedSlots...) {
 		entrypoint, _, attributed := strings.Cut(slot, ".models.")

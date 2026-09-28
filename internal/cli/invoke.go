@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -207,9 +208,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	loras, e := launch.ParseLoRAs(ep, ctx.Inv.Values["--lora"])
-	if e != nil {
-		return e
+	if loras, e := launch.ParseLoRAs(ep, ctx.Inv.Values["--lora"]); e != nil || len(loras) > 0 {
+		return cmp.Or(e, loraNotApplied())
 	}
 	if !managedRental {
 		packagePublishStatus(ctx, "Execution target: local machine")
@@ -218,7 +218,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	} else {
 		packagePublishStatus(ctx, "Finding a rental machine...")
 	}
-	models, chosen, e := modelChoices(ctx, target, ep, overrides.Models, loras)
+	models, chosen, e := modelChoices(ctx, target, ep, overrides.Models)
 	if e != nil {
 		return e
 	}
@@ -227,12 +227,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 			WithRemedy("add --rental=<name>; the machine resolves, narrows and converts the source itself")
 	}
 	if !chosen || managedRental && selectedRental == "" {
-		// Choosing a machine to rent reads the ladders; so do editable code, provider
-		// sources and adapters.
+		// Choosing a machine to rent reads the ladders; so do editable code and provider
+		// sources.
 		if models, e = resolveInvocationModels(ctx, target, ep, overrides.Models); e != nil {
-			return e
-		}
-		if e = resolveInvocationLoRAs(ctx, target, models, loras); e != nil {
 			return e
 		}
 	}
@@ -311,12 +308,12 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 // own devices. A provider source is only pinned to its commit (one metadata read, none when
 // the caller named the commit); the machine narrows and converts it. It answers false for a
 // call the machine cannot take that way.
-func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string, loras []launch.LoRAOverride) ([]orchestrator.ModelRef, bool, *exit.Error) {
+func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string) ([]orchestrator.ModelRef, bool, *exit.Error) {
 	profiles, problem := parseSourceProfileFlags(ctx)
 	if problem != nil {
 		return nil, false, problem
 	}
-	if strings.HasPrefix(target.Package, "local/") || target.Snapshot || len(loras) > 0 {
+	if strings.HasPrefix(target.Package, "local/") || target.Snapshot {
 		if len(profiles) > 0 {
 			return nil, false, exit.Usagef("--source-profile applies only to a published call's provider-source model")
 		}

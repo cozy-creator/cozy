@@ -324,7 +324,10 @@ func rentedLadderHome(t *testing.T, h *ladderHub, pod *fakePod, before func(home
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
 	pod.controlKey = public
-	pod.releases = map[string]*pb.DescribedRelease{ladderPackage: {Package: ladderPackage, Release: "1.0.0", PackageInterface: detail.PackageInterface}}
+	if pod.releases == nil {
+		pod.releases = map[string]*pb.DescribedRelease{}
+	}
+	pod.releases[ladderPackage] = &pb.DescribedRelease{Package: ladderPackage, Release: "1.0.0", PackageInterface: detail.PackageInterface}
 	author := pod.preparedPlacement
 	if author == nil {
 		author = modelBearingPlacement(t)
