@@ -119,6 +119,10 @@ type Config struct {
 	// model gc` still reclaim on demand).
 	MaintenanceGCCron string
 
+	// PlayerURL is the page `cozy run play` links open: GitHub Pages' build of web/player
+	// unless another build is configured.
+	PlayerURL string
+
 	inherited []string
 }
 
@@ -138,6 +142,7 @@ type values struct {
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
 	MaintenanceGCCron        string `name:"maintenance_gc_cron" default:"0 3 * * *"`
 	PlacementPrefer          string `name:"placement_prefer" default:"balanced"`
+	PlayerURL                string `name:"player_url" default:"https://cozy-creator.github.io/cozy/play/"`
 	Port                     int    `name:"port" default:"8818"`
 	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
 }
@@ -248,6 +253,7 @@ var fileKeys = map[string]bool{
 	"civitai_token":                 true,
 	"tfs":                           true,
 	"tensorfs_root":                 true,
+	"player_url":                    true,
 	"local_rate_micro_usd_per_hour": true,
 	"port":                          true,
 	"yield":                         true,
@@ -465,6 +471,7 @@ func load() (Config, *exit.Error) {
 		DaemonIdleShutdown:       time.Duration(input.DaemonIdleShutdownS) * time.Second,
 		MaintenanceGCCron:        strings.TrimSpace(input.MaintenanceGCCron),
 		PlacementPrefer:          input.PlacementPrefer,
+		PlayerURL:                strings.TrimSpace(input.PlayerURL),
 		Digest:                   digest,
 		inherited:                inherited,
 	}

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:; img-src data:; connect-src 'none'">
+<link rel="icon" href="data:,">
+<title>Cozy player</title>
+<style>
+  :root { color-scheme: dark; font: 15px/1.4 system-ui, sans-serif; }
+  body { margin: 0; min-height: 100vh; display: grid; place-content: center; gap: 12px; padding: 16px; background: #111; color: #ddd; }
+  video { width: min(100%, 1344px); max-height: 80vh; background: #000; }
+  p { margin: 0; }
+  #status[data-state=error] { color: #f88; }
+  small { color: #888; }
+</style>
+<video id="video" controls muted autoplay playsinline></video>
+<p id="label"></p>
+<p id="status" role="status">Starting…</p>
+<small id="source"></small>
+<script type="module">
+  import {parseLink, play, unsupported} from "./cozy-webrtc.js";
+
+  const $ = id => document.getElementById(id);
+  const say = (state, text) => { $("status").dataset.state = state; $("status").textContent = text; };
+  const words = {
+    connecting: "Connecting to the machine…",
+    reconnecting: "Reconnecting…",
+    connected: "Connected.",
+  };
+  try {
+    const problem = unsupported();
+    if (problem) throw problem;
+    const link = parseLink(location.hash);
+    const name = link.output + (link.index === undefined ? "" : `/${link.index}`);
+    $("source").textContent = `Run ${link.run}, ${name}, from ${link.address}`;
+    const player = play($("video"), link);
+    window.cozyPlayer = player;
+    player.addEventListener("entry", e => { $("label").textContent = e.detail.label ?? ""; });
+    player.addEventListener("status", ({detail: {state, detail}}) => {
+      say(state, [words[state], detail].filter(Boolean).join(" "));
+    });
+    $("video").addEventListener("playing", () => { if (!player.error) say("playing", player.final ? "Finished." : "Playing live."); });
+    $("video").addEventListener("ended", () => say("ended", "Finished."));
+    // WebKit autoplays only with enough data buffered, which a live edge never has.
+    $("video").addEventListener("canplay", () => $("video").play().catch(() => {}), {once: true});
+  } catch (e) {
+    say("error", e.message);
+  }
+</script>

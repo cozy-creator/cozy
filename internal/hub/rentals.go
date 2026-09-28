@@ -110,6 +110,14 @@ type Rental struct {
 	// every provider charge has settled, else "estimate"; blank from a Hub older than the fact.
 	SpendUSDMicros int64
 	SpendBasis     string
+	// WebRTC is a ready machine-image rental's browser-media listener: the address a
+	// browser dials over ICE-TCP and the pinned leaf's "sha-256 AB:…". Nil otherwise.
+	WebRTC *RentalWebRTC
+}
+
+type RentalWebRTC struct {
+	Address     string `json:"address"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 // RentalBoot is one boot attempt as the Hub observed it: which attempt, where, how far the
@@ -255,6 +263,7 @@ type wireRental struct {
 	ContainerDiskGB       int            `json:"container_disk_gb,omitempty"`
 	SpendUSDMicros        int64          `json:"spend_usd_micros"`
 	SpendBasis            string         `json:"spend_basis"`
+	WebRTC                *RentalWebRTC  `json:"webrtc,omitempty"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -294,6 +303,7 @@ func (w wireRental) rental() Rental {
 		ContainerDiskGB:       w.ContainerDiskGB,
 		SpendUSDMicros:        w.SpendUSDMicros,
 		SpendBasis:            w.SpendBasis,
+		WebRTC:                w.WebRTC,
 	}
 }
 

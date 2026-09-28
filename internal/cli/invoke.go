@@ -1642,6 +1642,8 @@ type RunProgress struct {
 
 	// named are the output items whose file this run's lines already named.
 	named map[string]bool
+	// rented is a run placed on a rental, whose video a browser can play (`cozy run play`).
+	rented bool
 
 	// Injected clock and measure, so tests drive the REAL renderer deterministically.
 	now   func() time.Time
@@ -1651,9 +1653,9 @@ type RunProgress struct {
 // productLines are one output revision as it lands (progressive-outputs.md §3). A list
 // element never changes: one line names it and its file. A single output's file is named once,
 // then each revision is a line with its size, media time and what it added.
-func (p *RunProgress) productLines(payload map[string]any) []string {
+func (p *RunProgress) productLines(e localapi.Event) []string {
 	var product records.Product
-	raw, _ := json.Marshal(payload)
+	raw, _ := json.Marshal(e.Payload)
 	if json.Unmarshal(raw, &product) != nil {
 		return nil
 	}
@@ -1672,6 +1674,13 @@ func (p *RunProgress) productLines(payload map[string]any) []string {
 		}
 		if product.Op == records.ProductAppend {
 			return append(lines, "  "+name+"  "+strings.TrimSpace(output.Bytes(product.Length)+"  "+product.Label))
+		}
+		if p.rented && strings.HasPrefix(product.MediaType, "video/") {
+			play := "cozy run play " + e.RequestID
+			if product.Output != "video" {
+				play += " --output " + product.Output
+			}
+			lines = append(lines, "  "+name+"  play in a browser: "+play)
 		}
 	}
 	line := fmt.Sprintf("  %s r%d  %s", name, product.Rev, output.Bytes(product.Length))
@@ -1720,11 +1729,12 @@ func (p *RunProgress) On(e localapi.Event) bool {
 		return true
 	}
 	if kind == "product" {
-		for _, line := range p.productLines(e.Payload) {
+		for _, line := range p.productLines(e) {
 			p.notice(e, line)
 		}
 		return true
 	}
+	p.rented = p.rented || kind == "rentals" || kind == "placement"
 	if !p.ctx.Mode().Full && (kind == "rentals" || kind == "placement") {
 		p.rentalNotice(e)
 		if kind != "placement" || !waitingPlacement(e.Payload) {

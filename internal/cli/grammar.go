@@ -432,6 +432,7 @@ type RunCmd struct {
 	Resume  RunResumeCmd  `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List    RunListCmd    `cmd:"" help:"List current and past runs."`
 	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
+	Play    RunPlayCmd    `cmd:"" help:"Print a link that plays a run's output in any browser, live as it grows, straight from its rented machine."`
 	Show    RunShowCmd    `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, the GPUs it ran on and each GPU's attention kernels (served, or why not, and compile time), and each child call's function, label, GPUs, stages and steps."`
 }
 
@@ -473,6 +474,16 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--upload-to", c.UploadTo, "--allow-upload", c.AllowUpload, "--source-profile", c.SourceProfiles), !c.Describe)
+}
+
+type RunPlayCmd struct {
+	ID      string `arg:"" name:"run" help:"Run number or id."`
+	Output  string `default:"video" help:"The output to play: its name, or name/index for one item of a list."`
+	Expires string `default:"24h" help:"How long the link works; anyone holding it may watch this output until then."`
+}
+
+func (c *RunPlayCmd) Run(r *Runtime) error {
+	return r.call(handleRunPlay, []string{c.ID}, nil, values("--output", c.Output, "--expires", c.Expires), true)
 }
 
 type RunUploadCmd struct {
