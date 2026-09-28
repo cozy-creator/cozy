@@ -26,12 +26,12 @@ Rerun it to upgrade. Tab completion is installed automatically for bash and fish
 The host-tool step alone is:
 
 ```sh
-uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.41'
+uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.67'
 ```
 
 Keep `--python 3.12`: uv
 [ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
-so an unqualified install can select an interpreter Runtime cannot use. Runtime 0.18.41 is the
+so an unqualified install can select an interpreter Runtime cannot use. Runtime 0.18.67 is the
 controller minimum: the first release with the worker wire this Cozy speaks, org-relative
 default lanes, and native model ingestion. Existing
 captured package environments keep their declared SDK ranges; new caller-capable

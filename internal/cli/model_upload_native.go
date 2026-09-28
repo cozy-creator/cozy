@@ -22,11 +22,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
-// Floors for the generated ingest script: Runtime 0.18.51 and TensorFS 0.3.60 stream the
+// Floors for the generated ingest script: Runtime 0.18.67 and TensorFS 0.3.73 stream the
 // source through conversion into the publication within the rental's free disk.
 const (
-	ingestRuntimeFloor  = "0.18.51"
-	ingestTensorFSFloor = "0.3.60"
+	ingestRuntimeFloor  = "0.18.67"
+	ingestTensorFSFloor = "0.3.73"
 )
 
 // nativeModelUpload runs a rented provider ingest as an ordinary local script on the
