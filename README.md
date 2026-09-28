@@ -534,6 +534,7 @@ cozy rental new h100-sxm5-80gb \
 cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candidate image
 
 cozy rental list                   # current rented machines, live on a terminal
+cozy rental show otter             # one rental's facts, including accrued spend
 cozy run org/package/generate --rental=otter prompt="moonlit lake"
 cozy rental end otter
 ```
@@ -575,7 +576,8 @@ Keepalive authenticates directly to the pinned rental Host, so it also works whi
 Runtime is unavailable or incompatible during repair. It does not admit execution
 or open a new control claim.
 
-`cozy rental list` shows each known machine's idle time and release deadline;
+`cozy rental list` shows each known machine's idle time, release deadline and accrued spend
+(`est.` until the provider's charges settle, about an hour late; `-` from a Hub that does not say);
 `cozy rental end <name>` ends one now. A release Tensorhub does not confirm is retried.
 Activity is unknown for machines absent from this controller's history and for an
 explicit preparation interrupted by controller restart; their pod guard still applies.

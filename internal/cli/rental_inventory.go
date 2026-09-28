@@ -146,7 +146,8 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			ID: row.ID, MachineName: row.MachineName, SKU: row.SKU, State: row.State,
 			AcceleratorModel: row.AcceleratorModel, AcceleratorCount: row.AcceleratorCount,
 			HourlyRateUSDMicros: row.HourlyRateUSDMicros,
-			Address:             row.Address, MediaAddress: row.MediaAddress, Hub: row.Hub,
+			SpendUSDMicros:      live[row.ID].SpendUSDMicros, SpendBasis: live[row.ID].SpendBasis,
+			Address: row.Address, MediaAddress: row.MediaAddress, Hub: row.Hub,
 			RentedAt: row.RentedAt, ReadyAt: row.ReadyAt, BoughtFor: boughtFor[row.ID],
 			Activity: &api.RentalActivity{Running: idle.Running, Queued: idle.Queued},
 			Failure: hub.RentalFailure{
@@ -181,6 +182,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			ID: seen.ID, MachineName: seen.Name, State: seen.State,
 			AcceleratorModel: seen.AcceleratorModel, AcceleratorCount: seen.AcceleratorCount,
 			HourlyRateUSDMicros: seen.HourlyRateUSDMicros, Address: seen.Address,
+			SpendUSDMicros: seen.SpendUSDMicros, SpendBasis: seen.SpendBasis,
 			MediaAddress: seen.MediaAddress, Hub: origin, RentedAt: seen.CreatedAt,
 			Boot:                  seen.Boot,
 			BaseWorkerImageDigest: seen.BaseWorkerImageDigest, BaseWorkerImageTag: seen.BaseWorkerImageTag,

@@ -106,6 +106,10 @@ type Rental struct {
 	CreatedAt string
 	// ContainerDiskGB is the disk the Hub bought for the pod, or 0 when it does not say.
 	ContainerDiskGB int
+	// SpendUSDMicros is what the rental has cost so far. SpendBasis is "provider_billed" once
+	// every provider charge has settled, else "estimate"; blank from a Hub older than the fact.
+	SpendUSDMicros int64
+	SpendBasis     string
 }
 
 // RentalBoot is one boot attempt as the Hub observed it: which attempt, where, how far the
@@ -249,6 +253,8 @@ type wireRental struct {
 	BaseWorkerProfile     string         `json:"base_worker_profile,omitempty"`
 	CreatedAt             string         `json:"created_at,omitempty"`
 	ContainerDiskGB       int            `json:"container_disk_gb,omitempty"`
+	SpendUSDMicros        int64          `json:"spend_usd_micros"`
+	SpendBasis            string         `json:"spend_basis"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -286,6 +292,8 @@ func (w wireRental) rental() Rental {
 		BaseWorkerProfile:     w.BaseWorkerProfile,
 		CreatedAt:             w.CreatedAt,
 		ContainerDiskGB:       w.ContainerDiskGB,
+		SpendUSDMicros:        w.SpendUSDMicros,
+		SpendBasis:            w.SpendBasis,
 	}
 }
 

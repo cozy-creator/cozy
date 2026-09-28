@@ -24,7 +24,7 @@ func (h *fakeRentalHub) set(id, key string, value any) {
 }
 
 // TestRentalListLiveBoard is cl-114 as behaviour: `cozy rental list` on a terminal is
-// the fleet as a live board — MACHINE SKU STATE $/HOUR UPTIME RUNNING QUEUED IDLE, redrawn in
+// the fleet as a live board — MACHINE SKU STATE $/HOUR SPENT UPTIME RUNNING QUEUED IDLE, redrawn in
 // place every second — and the same verb piped or --json is one plain snapshot. The
 // board is watched through a real pseudo-terminal across planted transitions: the pod
 // acquiring, then ready with an idle countdown from the fixed fifteen-minute policy
@@ -78,7 +78,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 			})
 			fatal(t, problem)
 		case 2:
-			if !regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+\S+\s+0\s+1\s+-`).MatchString(drawn) {
+			if !regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+1\s+-`).MatchString(drawn) {
 				return nil
 			}
 			fatal(t, store.SettleRequest("req-rental-tui", "canceled"))
@@ -102,7 +102,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 			t.Fatalf("live board did not emit terminal restoration %q\n%q", control, tty)
 		}
 	}
-	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(tty) {
+	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+SPENT\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(tty) {
 		t.Fatalf("the board does not carry the ruled columns\n%q", tty)
 	}
 	if strings.Count(tty, "\x1b[H\x1b[J") < 5 {
@@ -117,7 +117,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if acquiring == nil || ready == nil || acquiring[0] >= ready[0] {
 		t.Fatalf("the board did not redraw acquiring→ready in order\n%q", tty)
 	}
-	busy := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+\S+\s+0\s+1\s+-`).FindStringIndex(tty)
+	busy := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+1\s+-`).FindStringIndex(tty)
 	if busy == nil {
 		t.Fatalf("queued work did not blank the idle countdown\n%q", tty)
 	}
@@ -141,7 +141,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if code != 0 || strings.ContainsAny(listed, "\r\x1b") {
 		t.Fatalf("piped snapshot carries terminal control bytes [exit %d]\n%q", code, listed)
 	}
-	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(listed) ||
+	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+SPENT\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(listed) ||
 		!strings.Contains(listed, "Remote machines running: 1") ||
 		!strings.Contains(listed, "Idle machines shut down after 15 minutes.") {
 		t.Fatalf("piped snapshot lost the ruled surface\n%s", listed)
