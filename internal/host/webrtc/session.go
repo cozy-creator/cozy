@@ -300,11 +300,11 @@ func (c *session) request(req request) {
 	st.ctx, st.cancel = context.WithCancel(c.ctx)
 	c.streams = append(c.streams, st)
 	c.mu.Unlock()
+	serve := c.follow // off the reader: opening an output may wait on the Runtime
 	if st.get {
-		c.get(st, run, req, index)
-	} else {
-		go c.follow(st, run, req, index)
+		serve = c.get
 	}
+	go serve(st, run, req, index)
 }
 
 // push appends to a stream, or closes what it carries when the stream has ended. Entries
@@ -615,8 +615,8 @@ func (c *session) windowOpen() bool {
 		c.sampleAt, c.sampleAcked = time.Now(), acked
 	}
 	window := max(minWindow, uint64(2*slices.Max(c.rates[:])*c.minRTT))
-	c.ch.dc.SetBufferedAmountLowThreshold(window - maxMessage)
-	return buffered < window
+	c.ch.dc.SetBufferedAmountLowThreshold(window - maxMessage) // before the check: a drop after it signals
+	return c.ch.dc.BufferedAmount() < window
 }
 
 // shut stops the sender: nothing more is queued, and every body is closed.
