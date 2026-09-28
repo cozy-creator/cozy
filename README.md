@@ -8,21 +8,20 @@ The command is `cozy`.
 
 ## Install
 
-Binary releases are not published yet. Building requires Go 1.26 or newer and
-[uv](https://docs.astral.sh/uv/getting-started/installation/).
+Linux and macOS, amd64 and arm64. Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```sh
-git clone https://github.com/cozy-creator/cozy.git
-cd cozy
-go build -o cozy .
-scripts/install.sh --binary ./cozy     # Windows: scripts\install.ps1 -Binary .\cozy.exe
+curl -fsSL https://github.com/cozy-creator/cozy/releases/latest/download/install.sh | sh
 ```
 
-The installer puts `cozy` in `~/.local/bin` and, in one uv tool environment, the host tools
-Cozy drives: `cozy-runtime` and TensorFS's `tfs`. A release asset installs the same way with
-`--asset <cozy-*.tar.gz>`, verified against its `SHA256SUMS` before anything is replaced.
-Rerun it to upgrade. Tab completion is installed automatically for bash and fish, and for zsh when
-`~/.local/share/zsh/site-functions` is on `fpath`; otherwise add `source <(cozy completion zsh)` to `~/.zshrc` after `compinit`.
+The installer checks the release against its `SHA256SUMS`, puts `cozy` in `~/.local/bin` and, in
+one uv tool environment, the host tools Cozy drives: `cozy-runtime` and TensorFS's `tfs`.
+`COZY_VERSION=v0.1.0` picks a release. Rerun it to upgrade: the new binary replaces the old by
+rename, so a running daemon keeps its binary and its work; the new one starts after the next
+`cozy down`, which refuses while work is active. From source: `go build -o ~/.local/bin/cozy .`
+(Go 1.26+; Windows: `scripts\install.ps1 -Binary .\cozy.exe`). Tab completion is installed
+automatically for bash and fish, and for zsh when `~/.local/share/zsh/site-functions` is on
+`fpath`; otherwise add `source <(cozy completion zsh)` to `~/.zshrc` after `compinit`.
 The host-tool step alone is:
 
 ```sh

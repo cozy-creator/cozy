@@ -33,7 +33,7 @@ const PackageFloor = "0.18.51"
 var floor = pep440.MustParse(ToolFloor)
 
 // InstallCommand installs this host's tools in one uv environment: cozy-runtime and the
-// TensorFS `tfs` its dependencies resolve. scripts/install.sh and install.ps1 run it.
+// TensorFS `tfs` its dependencies resolve. install.sh and scripts/install.ps1 run it.
 var InstallCommand = fmt.Sprintf(
 	"uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=%s'",
 	ToolFloor)

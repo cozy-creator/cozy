@@ -3,24 +3,24 @@
 # binary on a fresh home; no source package is called directly.
 set -uo pipefail
 
-DIST=""; ASSET=""; UPGRADE=""; PACKAGE_ARCHIVE=""
+DIST=""; UPGRADE=""; PACKAGE_ARCHIVE=""
 PREFIX="${COZY_PREFIX:-$HOME/.local}"
 HOME_DIR="${COZY_HOME:-$HOME/.cozy}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --dist) DIST="$2"; shift 2 ;;
-    --asset) ASSET="$2"; shift 2 ;;
     --upgrade) UPGRADE="$2"; shift 2 ;;
     --package) PACKAGE_ARCHIVE="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --home) HOME_DIR="$2"; shift 2 ;;
-    *) echo "usage: $0 --dist <dir> --asset <name> [--upgrade <path>] [--package <path>]" >&2; exit 2 ;;
+    *) echo "usage: $0 --dist <release dir> [--upgrade <release dir>] [--package <path>]" >&2; exit 2 ;;
   esac
 done
-[ -n "$DIST" ] && [ -n "$ASSET" ] || { echo "--dist and --asset are required" >&2; exit 2; }
+[ -d "$DIST" ] || { echo "--dist <release dir> is required" >&2; exit 2; }
+DIST="$(cd "$DIST" && pwd)"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL="$HERE/install.sh"
+INSTALL="$HERE/../install.sh"
 COZY="$PREFIX/bin/cozy"
 export COZY_HOME="$HOME_DIR"
 PASS=0; FAIL=0
@@ -32,16 +32,17 @@ check() {
 run() { OUT="$("$COZY" "$@" 2>&1)"; CODE=$?; return 0; }
 
 echo "Cozy release acceptance"
-echo "  asset: $DIST/$ASSET"
+echo "  release: $DIST"
 echo "  home:  $COZY_HOME"
 
-OUT="$("$INSTALL" --asset "$DIST/$ASSET" --prefix "$PREFIX" 2>&1)"; CODE=$?
+install_release() { OUT="$(COZY_RELEASE_URL="file://$1" COZY_PREFIX="$PREFIX" sh "$INSTALL" 2>&1)"; CODE=$?; }
+install_release "$DIST"
 check "verified release asset installs" "$([ "$CODE" = 0 ] && [ -x "$COZY" ] && echo 1 || echo 0)" "$OUT"
 TOOLS="$(uv tool dir --bin)"
 check "install provides cozy-runtime" "$("$TOOLS/cozy-runtime" version >/dev/null 2>&1 && echo 1 || echo 0)" "$OUT"
 check "install provides tfs" "$("$TOOLS/tfs" version 2>/dev/null | grep -q '^tfs ' && echo 1 || echo 0)" "$OUT"
 
-WANT_TAG="$(sed -n 's/^ *"tag": "\(.*\)",\?$/\1/p' "$DIST/RELEASE.json")"
+WANT_TAG="$(basename "$DIST")"; WANT_TAG="${WANT_TAG#v}"
 run -v
 check "-v reports the release tag without loading config" "$([ "$CODE" = 0 ] && [ "$OUT" = "$WANT_TAG" ] && echo 1 || echo 0)" "$OUT"
 
@@ -84,9 +85,9 @@ fi
 run down
 check "down stops the daemon and proves lock release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'daemon: +stopped' && echo 1 || echo 0)" "$OUT"
 
-if [ -n "$UPGRADE" ] && [ -f "$UPGRADE" ]; then
+if [ -n "$UPGRADE" ] && [ -d "$UPGRADE" ]; then
   BEFORE="$("$COZY" -v)"
-  OUT="$("$INSTALL" --asset "$UPGRADE" --prefix "$PREFIX" 2>&1)"; CODE=$?
+  install_release "$(cd "$UPGRADE" && pwd)"
   AFTER="$("$COZY" -v)"
   check "upgrade verifies and replaces the binary" "$([ "$CODE" = 0 ] && [ "$BEFORE" != "$AFTER" ] && echo 1 || echo 0)" "$BEFORE -> $AFTER"
 fi
