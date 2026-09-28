@@ -130,11 +130,11 @@ func TestInterleavedRunPreservesAssetsPayloadAndLiteralTail(t *testing.T) {
 	if !reflect.DeepEqual(labels, []string{"first", "second", "again"}) || input.Assets[0].Asset != input.Assets[2].Asset || input.Assets[0].Asset == input.Assets[1].Asset {
 		t.Fatalf("asset occurrences reordered, collapsed, or changed: %s", request.Payload)
 	}
-	// --in consumes exactly its following value; '=' in that filename stays a
+	// --input consumes exactly its following value; '=' in that filename stays a
 	// filename, while later payload terms still override its scalar values.
 	infile := filepath.Join(root, "request=seed.json")
 	must(t, os.WriteFile(infile, []byte(`{"prompt":"from file","steps":2}`), 0600))
-	request, _, out = submitRun(t, root, "interleaved-in", "run", "proof/assets/prepare", "--in", infile, "steps=7",
+	request, _, out = submitRun(t, root, "interleaved-in", "run", "proof/assets/prepare", "--input", infile, "steps=7",
 		"--asset", images[0], "--rental-only", "--json")
 	if request == nil || submittedPayload(t, request)["prompt"] != "from file" || submittedPayload(t, request)["steps"] != float64(7) {
 		t.Fatalf("flag value or scalar override changed: %s", out)

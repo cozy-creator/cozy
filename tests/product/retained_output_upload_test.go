@@ -106,9 +106,11 @@ func serveCheckpoints(t *testing.T, peer *fakeRentalHub) *checkpointHub {
 			}
 		}
 		h.finalized[body.ID] = r.PathValue("operation")
-		_ = json.NewEncoder(w).Encode(map[string]any{"publish_id": r.PathValue("operation"), "checkpoint_id": body.ID,
+		result := map[string]any{"publish_id": r.PathValue("operation"), "checkpoint_id": body.ID,
 			"manifest": map[string]any{"sha256": strings.TrimPrefix(body.ID, "sha256:"), "length": body.Length},
-			"objects":  objects, "bytes": total, "state": "checkpointed"})
+			"objects":  objects, "bytes": total, "state": "checkpointed"}
+		_ = json.NewEncoder(w).Encode(map[string]any{"operation": r.PathValue("operation"), "state": "completed",
+			"status_url": r.URL.Path, "result": result})
 	})
 	return h
 }

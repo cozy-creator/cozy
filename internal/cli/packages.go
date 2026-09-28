@@ -72,7 +72,7 @@ func explicitPackageDirectory(value string) bool {
 func handleDirectoryInstall(ctx *Context) *exit.Error {
 	path := strings.TrimSpace(ctx.Inv.Args[0])
 	if ctx.Inv.Value("--version") != "" {
-		return exit.Usagef("an explicit package directory does not take registry or legacy source options").
+		return exit.Usagef("an explicit package directory does not take --version").
 			WithRemedy("use `cozy package install %s` by itself", path)
 	}
 	pack, problem := packagepublish.PrepareLocalFrom(path)

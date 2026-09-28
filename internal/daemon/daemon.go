@@ -30,9 +30,6 @@ import (
 )
 
 type State struct {
-	// SingleHub is the one origin a daemon from before multi-hub support serves.
-	// A multi-hub daemon publishes none: every request names its own hub.
-	SingleHub     string
 	Addr          string // the local client API address the live owner published
 	Socket        string // the worker-protocol unix socket the live owner published
 	PID           int
@@ -78,8 +75,6 @@ func Probe(cfg config.Config) State {
 			continue
 		}
 		switch key {
-		case "tensorhub":
-			st.SingleHub = value
 		case "addr":
 			st.Addr = value
 			addrPublished = true

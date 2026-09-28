@@ -10,8 +10,7 @@ import (
 
 // RentalInventory is the daemon's reconciled fleet read model. It contains
 // public rental facts and activity, never records schema, credentials, certificate
-// paths, or acquisition request bodies. Additive fields allow older clients to
-// keep reading a newer daemon without opening its SQLite database.
+// paths, or acquisition request bodies.
 type RentalInventory struct {
 	MachinesRunning      int             `json:"machines_running"`
 	HourlySpendUSDMicros int64           `json:"hourly_spend_usd_micros"`
@@ -43,9 +42,8 @@ type HubRentals struct {
 }
 
 // Current removes proven-absent rentals from the fleet projection without
-// changing retained history or the Hub-reconciled spend totals. Applying it on
-// both sides of the API also supports older daemons that include terminal rows.
-// A Hub-unknown host record is not proven absent and stays.
+// changing retained history or the Hub-reconciled spend totals. A Hub-unknown host
+// record is not proven absent and stays.
 func (inventory RentalInventory) Current() RentalInventory {
 	current := func(rows []RentalSummary) []RentalSummary {
 		return slices.DeleteFunc(slices.Clone(rows), func(row RentalSummary) bool {

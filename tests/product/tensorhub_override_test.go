@@ -11,10 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
-	"github.com/cozy-creator/cozy/internal/home"
 )
 
 func TestTensorhubFlagOverridesFileAndEnvironment(t *testing.T) {
@@ -69,39 +67,6 @@ func TestTensorhubFlagOverridesFileAndEnvironment(t *testing.T) {
 	}
 }
 
-// A daemon from before multi-hub support serves only the hub it started with. A command
-// for another hub must refuse rather than have its work silently use the old one.
-func TestSingleHubDaemonRefusesAnotherHub(t *testing.T) {
-	var submitted atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			submitted.Add(1)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-	root := t.TempDir()
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
-	fatal(t, problem)
-	defer held.Release()
-	record, err := os.OpenFile(layout.Daemon, os.O_WRONLY|os.O_APPEND, 0)
-	must(t, err)
-	_, err = record.WriteString("tensorhub=https://local-hub.invalid\n")
-	must(t, err)
-	must(t, record.Close())
-	_, problem = api.Mint(layout)
-	fatal(t, problem)
-	code, out := runCozy(t, root, "--tensorhub=https://other-hub.invalid", "run", "list", "--json")
-	if code == 0 || !strings.Contains(out, "daemon.single_hub") {
-		t.Fatalf("cross-Hub work reached a single-hub daemon: %d %s", code, out)
-	}
-	if submitted.Load() != 0 {
-		t.Fatalf("cross-Hub command submitted %d API calls", submitted.Load())
-	}
-}
-
 // `up` with a one-command hub starts the one daemon on the configured default, and that
 // daemon then serves commands for any hub.
 func TestTensorhubFlagDoesNotBindTheDaemon(t *testing.T) {
@@ -118,7 +83,7 @@ func TestTensorhubFlagDoesNotBindTheDaemon(t *testing.T) {
 		t.Fatalf("daemon startup failed: %v %s", err, out)
 	}
 	state := daemon.Probe(config.Config{Home: root})
-	if !state.Up || state.SingleHub != "" {
+	if !state.Up {
 		t.Fatalf("daemon did not start as a multi-hub daemon: %+v", state)
 	}
 	for _, args := range [][]string{{"run", "list", "--json"}, {"--tensorhub=" + server.URL, "run", "list", "--json"}} {

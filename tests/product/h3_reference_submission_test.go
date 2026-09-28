@@ -103,7 +103,7 @@ func submitH3Reference(t *testing.T, release string) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: h3-contract-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	startDaemonProcess(t, root)
 	args := []string{"run", "paul/minimax-h3/reference_media_to_video", "model.model=paul/minimax-h3@1.0.0-rc.1/bf16-full",
-		"--in", payloadPath, "--asset", "references.0.image=" + image0, "--asset", "references.1.image=" + image1,
+		"--input", payloadPath, "--asset", "references.0.image=" + image0, "--asset", "references.1.image=" + image1,
 		"--rental-only", "--out", filepath.Join(root, "output"), "--idempotency-key", "h3-output-contract-proof", "--json", "--full"}
 	code, output := runCozy(t, root, args...)
 	// Capacity is deliberately unavailable; the front door still accepts and

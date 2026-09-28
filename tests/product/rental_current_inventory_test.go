@@ -3,7 +3,6 @@ package producttest
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,67 +10,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/records"
 )
-
-func TestRentalListOmitsEndedRowsFromOlderDaemon(t *testing.T) {
-	layout, lock, pid, done := compatibilityOwner(t)
-	states := []string{"ready", "acquiring", "degraded", "release_requested", "future_state", ""}
-	inventory := api.RentalInventory{MachinesRunning: len(states) * 3,
-		HourlySpendUSDMicros: int64(len(states) * 3 * 100_000)}
-	var visible, ended []string
-	for group, rows := range map[string]*[]api.RentalSummary{
-		"local": &inventory.Rentals, "remote": &inventory.Unrecorded, "pending": &inventory.Pending,
-	} {
-		for _, state := range append(append([]string(nil), states...), "failed", "released") {
-			name := group + "-" + state
-			*rows = append(*rows, api.RentalSummary{ID: name, MachineName: name, State: state,
-				HourlyRateUSDMicros: 100_000, AcceleratorCount: 1})
-			if state == "failed" || state == "released" {
-				ended = append(ended, name)
-			} else {
-				visible = append(visible, name)
-			}
-		}
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/local/rentals" {
-			_ = json.NewEncoder(w).Encode(inventory)
-		}
-	}))
-	defer server.Close()
-	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "schema=999\n")
-	for _, format := range []string{"--json", "--no-watch"} {
-		output, err := compatibilityCLI(t, layout.Root, "rental", "list", format, "--full")
-		if err != nil {
-			t.Fatalf("current inventory failed: %v %s", err, output)
-		}
-		for _, name := range ended {
-			if strings.Contains(output, name) {
-				t.Fatalf("provider-absent rental %s still listed: %s", name, output)
-			}
-		}
-		for _, name := range visible {
-			if !strings.Contains(output, name) {
-				t.Fatalf("possibly-billing rental %s hidden: %s", name, output)
-			}
-		}
-		if format == "--json" {
-			var doc struct {
-				Count int              `json:"machines_running"`
-				Rate  int64            `json:"hourly_spend_usd_micros"`
-				Rows  []map[string]any `json:"rentals"`
-			}
-			must(t, json.Unmarshal([]byte(output), &doc))
-			if doc.Count != inventory.MachinesRunning || doc.Rate != inventory.HourlySpendUSDMicros || len(doc.Rows) != len(visible) {
-				t.Fatalf("filtered inventory changed reconciled totals: %s", output)
-			}
-		}
-	}
-	select {
-	case <-done:
-		t.Fatal("listing stopped the older daemon owner")
-	default:
-	}
-}
 
 func TestRentalInventoryOmitsEndedMachinesButPreservesRunHistory(t *testing.T) {
 	root, hubURL, hub := rentalEndRoot(t, "rental-current-inventory")

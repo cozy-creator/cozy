@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func TestRentalListUsesDaemonAPIWithoutOpeningSQLite(t *testing.T) {
@@ -67,53 +65,6 @@ func TestRentalInventoryHumanDrainingKeepsRawStates(t *testing.T) {
 	output, err = compatibilityCLI(t, layout.Root, "rental", "list", "--json")
 	if err != nil || strings.Count(output, `"state":"release_requested"`) != 2 || strings.Contains(output, `"state":"draining"`) {
 		t.Fatalf("human projection changed raw API states: %v %s", err, output)
-	}
-}
-
-func TestRentalListOldDaemonFallbackRequiresCompatibleStore(t *testing.T) {
-	for _, newer := range []bool{false, true} {
-		t.Run(map[bool]string{false: "compatible", true: "newer-store"}[newer], func(t *testing.T) {
-			layout, lock, pid, done := compatibilityOwner(t)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/" {
-					return
-				}
-				w.WriteHeader(http.StatusNotFound)
-				_, _ = w.Write([]byte(`{"error":{"code":"unknown_route","message":"older daemon"}}`))
-			}))
-			defer server.Close()
-			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/v1/rentals" {
-					t.Errorf("unexpected Hub route: %s", r.URL.Path)
-				}
-				_, _ = w.Write([]byte(`{"rentals":[]}`))
-			}))
-			defer hub.Close()
-			must(t, os.WriteFile(filepath.Join(layout.Root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: test\n"), 0600))
-			st, problem := records.Open(layout.DB)
-			fatal(t, problem)
-			st.Close()
-			if newer {
-				db, err := sql.Open("sqlite", layout.DB)
-				must(t, err)
-				_, err = db.Exec(`PRAGMA user_version=999`)
-				must(t, err)
-				db.Close()
-			}
-			publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
-			output, err := compatibilityCLI(t, layout.Root, "rental", "list", "--json")
-			if newer && !strings.Contains(output, "records written by a newer Creator (v999); running in compatibility mode, upgrade for full features") {
-				t.Fatalf("a newer store was not read in compatibility mode: %v %s", err, output)
-			}
-			if err != nil || !strings.Contains(output, `"machines_running":0`) {
-				t.Fatalf("compatible old daemon fallback failed: %v %s", err, output)
-			}
-			select {
-			case <-done:
-				t.Fatal("fallback stopped the owner")
-			default:
-			}
-		})
 	}
 }
 

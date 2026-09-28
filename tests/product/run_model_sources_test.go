@@ -245,7 +245,7 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 	root, mu, posts, digest, manifest := runModelCatalog(t)
 	input := filepath.Join(root, "quantize.json")
 	must(t, os.WriteFile(input, []byte(`{"steps":7}`), 0600))
-	args := []string{"run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--in", input, "--upload-to", "proof/output", "--rental-only", "--json", "--full", "--idempotency-key", "published-model-job"}
+	args := []string{"run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--input", input, "--upload-to", "proof/output", "--rental-only", "--json", "--full", "--idempotency-key", "published-model-job"}
 	startDaemonProcess(t, root)
 	code, out := runCozy(t, root, args...)
 	if code != 0 {

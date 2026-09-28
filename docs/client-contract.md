@@ -314,11 +314,9 @@ URLs but remain local-scope rows in the same guarded route table.
 
 Client API compatibility is independent of the daemon's SQLite schema. Updating
 the CLI never authorizes stopping a live owner. `cozy rental list` reads the
-daemon's inventory, including its idle-release policy; additive fields are ignored
-by older clients. A daemon returning `unknown_route` for this new inventory route
-can use the CLI's prior local reader only when the database is exactly compatible.
-Otherwise the command returns a schema requirement while the owner keeps running.
-Only a daemon holding the root lock may migrate an older database.
+daemon's inventory, including its idle-release policy; unknown fields are ignored.
+A daemon that lacks a route answers `unknown_route`; restart it to pick up the
+installed build. Records at an older schema are refused, never migrated.
 
 | route | scope | auth | notes |
 |---|---|---|---|

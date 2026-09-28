@@ -210,12 +210,6 @@ type modelFinalizationFailure struct {
 var modelFinalizePollInterval = 2 * time.Second
 
 func decodeModelFinalization(raw []byte) (CheckpointPublication, modelFinalizationView, *exit.Error) {
-	// Older hubs completed this request synchronously. Keep that response shape
-	// readable while all current hubs use the durable async envelope below.
-	var direct CheckpointPublication
-	if err := json.Unmarshal(raw, &direct); err == nil && direct.PublishID != "" {
-		return direct, modelFinalizationView{State: "completed"}, nil
-	}
 	var view modelFinalizationView
 	if err := json.Unmarshal(raw, &view); err != nil {
 		return CheckpointPublication{}, modelFinalizationView{}, exit.Named(exit.Internal,
@@ -538,12 +532,6 @@ func (c *Client) ReleaseReads(ctx context.Context, ref Ref, release, lane string
 			"/lanes/" + url.PathEscape(lane) + "/reads",
 		body: map[string]any{"object_ids": ids},
 	}, &out)
-	if e != nil && (e.Name == "hub.untyped_refusal" || e.Name == "route.not_found") {
-		return nil, exit.Named(exit.Unavailable, "hub.no_read_plane",
-			"the hub at %s serves no object-read route: POST %s answered %q", c.base,
-			"…/releases/{release}/lanes/{lane}/reads", e.Name).
-			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol")
-	}
 	return out.Reads, e
 }
 

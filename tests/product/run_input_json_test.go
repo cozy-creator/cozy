@@ -52,7 +52,7 @@ func TestRunInputJSONFileAndAliasPreserveNestedPayload(t *testing.T) {
 	var expected any
 	must(t, json.Unmarshal([]byte(payload), &expected))
 	expected.(map[string]any)["steps"] = float64(7)
-	for _, flag := range []string{"--input", "--in"} {
+	for _, flag := range []string{"--input"} {
 		for _, inline := range []bool{false, true} {
 			args := []string{"run", "proof/input/prepare", "steps=7"}
 			if inline {

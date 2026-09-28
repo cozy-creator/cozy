@@ -478,7 +478,7 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 
 // quoteRental asks the Hub what this exact request will lock. Its disk and declared
 // workload choose the machine, so this, not the default-disk listing, is the rate the
-// renter consents to. A Hub without quotes keeps the listed rate.
+// renter consents to.
 func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHash, creatorKey string,
 	workload hub.DeclaredWorkload, development *hub.RentalDevelopment, image string, listed int64,
 ) (int64, *exit.Error) {
@@ -489,9 +489,6 @@ func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHas
 	hctx, cancel := hub.Context()
 	defer cancel()
 	quote, e := c.QuoteRental(hctx, body)
-	if e != nil && e.ErrName() == "hub.untyped_refusal" {
-		return listed, nil
-	}
 	if e != nil {
 		return 0, e
 	}
@@ -1045,33 +1042,10 @@ func handleRentalList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	var legacy *records.Store
-	var legacyFleet *managedRentals
-	defer func() {
-		if legacy != nil {
-			legacy.Close()
-		}
-	}()
 	var last time.Time
 	fetch := func(call context.Context) (output.List, *exit.Error) {
 		reconcile := last.IsZero() || time.Since(last) >= pollCadence
-		var inventory api.RentalInventory
-		if legacy == nil {
-			inventory, problem = client.RentalInventory(call, reconcile, allHubs)
-			// Older daemons have no inventory route. Their compatible local store
-			// remains a migration bridge; a schema mismatch refuses without
-			// replacing the owner. All other API errors stay authoritative.
-			if problem != nil && problem.Code == exit.NotFound && problem.ErrName() == "unknown_route" {
-				var layout home.Layout
-				layout, legacy, problem = rentalStores(ctx)
-				if problem == nil {
-					legacyFleet = &managedRentals{ctx: ctx, layout: layout, store: legacy}
-				}
-			}
-		}
-		if legacy != nil {
-			inventory, problem = readRentalInventory(legacy, legacyFleet, ctx.Cfg.HubURL, allHubs, reconcile)
-		}
+		inventory, problem := client.RentalInventory(call, reconcile, allHubs)
 		if problem != nil {
 			return output.List{}, problem
 		}
@@ -1100,7 +1074,6 @@ func handleRentalList(ctx *Context) *exit.Error {
 
 // renderRentalList formats the daemon's public read model; it never opens SQLite.
 func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs bool) output.List {
-	inventory = inventory.Current()
 	count, burn := inventory.MachinesRunning, inventory.HourlySpendUSDMicros
 	rows, unrecorded := inventory.Rentals, inventory.Unrecorded
 	list := output.List{

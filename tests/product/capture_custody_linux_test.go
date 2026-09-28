@@ -120,7 +120,7 @@ def main():
 	defer store.Close()
 	bad := filepath.Join(root, "bad.json")
 	must(t, os.WriteFile(bad, []byte(`[]`), 0600))
-	if code, _, _ := runCozyStreams(t, root, "run", script, "--in", bad, "--json"); code == 0 {
+	if code, _, _ := runCozyStreams(t, root, "run", script, "--input", bad, "--json"); code == 0 {
 		t.Fatal("invalid payload was accepted")
 	}
 	writer, problem := install.Lock(layout)
@@ -131,7 +131,7 @@ def main():
 	must(t, os.WriteFile(gate, []byte("wait"), 0600))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, cozyBin, "run", script, "--in", fifo, "--await", "--json")
+	command := exec.CommandContext(ctx, cozyBin, "run", script, "--input", fifo, "--await", "--json")
 	command.Env = childEnv(t, root)
 	var log bytes.Buffer
 	command.Stdout, command.Stderr = &log, &log
