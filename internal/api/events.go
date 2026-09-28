@@ -103,21 +103,35 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 		machineOwned = problem == nil && link != nil
 	}
 
-	// What a queued request is doing, immediately, so a first render is current.
-	if requestID != "" && !machineOwned {
-		if row, problem := s.store.RequestRow(requestID); problem == nil && row != nil && s.publicStatusOf(*row) == "queued" {
-			if phase, ok := s.orchestrator.QueuePhase(requestID); ok {
-				writeEvent(w, 0, liveEnvelope(phase.Frame(requestID)))
-				flusher.Flush()
-			}
+	// What a queued request is doing, immediately so a first render is current, and again
+	// whenever it changes (a rental's boot moving) so a watcher sees the wait move. The
+	// phase is live state: it is never a durable row.
+	shown := ""
+	phase := func() {
+		if requestID == "" {
+			return
 		}
+		frame, ok := s.waitFrame(requestID)
+		if !ok {
+			return
+		}
+		key := frameKey(frame)
+		if key == shown {
+			return
+		}
+		shown = key
+		writeEvent(w, 0, liveEnvelope(frame))
+		flusher.Flush()
 	}
+	phase()
 
 	ctx := r.Context()
 	beat := time.NewTicker(heartbeat)
 	defer beat.Stop()
 	poll := time.NewTicker(pollInterval)
 	defer poll.Stop()
+	observe := time.NewTicker(phaseInterval)
+	defer observe.Stop()
 
 	for {
 		// DURABLE FIRST, and drained to exhaustion: a terminal must never be delivered
@@ -161,8 +175,48 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 			fmt.Fprint(w, ": beat\n\n")
 			flusher.Flush()
 		case <-poll.C:
+		case <-observe.C:
+			phase()
 		}
 	}
+}
+
+// phaseInterval is how often a stream re-reads a queued request's phase: the cadence the
+// daemon itself samples a booting rental at.
+const phaseInterval = time.Second
+
+// waitFrame is a queued request's current phase: its own preparation, or the boot of the
+// rental it is pinned to.
+func (s *Server) waitFrame(requestID string) (orchestrator.Frame, bool) {
+	row, problem := s.store.RequestRow(requestID)
+	if problem != nil || row == nil || s.publicStatusOf(*row) != "queued" {
+		return orchestrator.Frame{}, false
+	}
+	link, problem := s.store.MachineExecution(requestID)
+	if problem != nil || link == nil {
+		phase, ok := s.orchestrator.QueuePhase(requestID)
+		return phase.Frame(requestID), ok
+	}
+	phase, ok := s.orchestrator.PhaseOf(requestID)
+	if !ok {
+		phase, ok = s.orchestrator.RentalPhase(link.MachineID)
+	}
+	return phase.Frame(requestID), ok
+}
+
+// frameKey is what a phase frame says, less the clocks a watcher ages by itself.
+func frameKey(frame orchestrator.Frame) string {
+	value, _ := frame.Value.(map[string]any)
+	kept := make(map[string]any, len(value))
+	for key, field := range value {
+		switch key {
+		case "elapsed_ms", "sample_age_ms", "remaining_ms", "rate_bytes_per_second":
+		default:
+			kept[key] = field
+		}
+	}
+	data, _ := json.Marshal(kept)
+	return string(data)
 }
 
 // Envelope is the ONE event shape on the wire. Every event — durable or live — has the

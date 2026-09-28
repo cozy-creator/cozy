@@ -155,6 +155,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 				ProviderHostID: row.Failure.ProviderHostID, ProviderState: row.Failure.ProviderState,
 				ContainerState: row.Failure.ContainerState,
 			},
+			Boot:                  live[row.ID].Boot,
 			BaseWorkerImageDigest: live[row.ID].BaseWorkerImageDigest,
 			BaseWorkerImageTag:    live[row.ID].BaseWorkerImageTag,
 			HubUnknown:            census.hubUnknown[row.ID],
@@ -181,7 +182,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			AcceleratorModel: seen.AcceleratorModel, AcceleratorCount: seen.AcceleratorCount,
 			HourlyRateUSDMicros: seen.HourlyRateUSDMicros, Address: seen.Address,
 			MediaAddress: seen.MediaAddress, Hub: origin, RentedAt: seen.CreatedAt,
-			ProviderState: seen.ProviderState, ContainerState: seen.ContainerState,
+			Boot:                  seen.Boot,
 			BaseWorkerImageDigest: seen.BaseWorkerImageDigest, BaseWorkerImageTag: seen.BaseWorkerImageTag,
 		})
 	}

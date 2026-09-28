@@ -15,6 +15,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -772,21 +773,25 @@ type Lifecycle struct {
 	// whatever advancement that phase actually has. Absent for anything that has left
 	// the queue, and absent field by field for a phase whose producer measured nothing:
 	// a missing rate means "not measured", never zero.
-	Phase            string                               `json:"phase,omitempty"`
-	PhaseMachine     string                               `json:"phase_machine,omitempty"`
-	WaitingFor       *orchestrator.WaitingRun             `json:"waiting_for,omitempty"`
-	PhaseDetail      string                               `json:"phase_detail,omitempty"`
-	PhaseModels      []orchestrator.ModelDownloadProgress `json:"phase_models,omitempty"`
-	RentalProgress   *orchestrator.RentalProgress         `json:"rental_progress,omitempty"`
-	PhaseElapsedMS   *int64                               `json:"phase_elapsed_ms,omitempty"`
-	PhaseMovedBytes  *int64                               `json:"phase_moved_bytes,omitempty"`
-	PhaseTotalBytes  *int64                               `json:"phase_total_bytes,omitempty"`
-	PhaseRate        *float64                             `json:"phase_rate_bytes_per_second,omitempty"`
-	PhaseSampleAgeMS *int64                               `json:"phase_sample_age_ms,omitempty"`
-	PhaseRemainingMS *int64                               `json:"phase_remaining_ms,omitempty"`
-	ResponseURL      string                               `json:"response_url"`
-	Metrics          map[string]any                       `json:"metrics,omitempty"`
-	ErrorType        string                               `json:"error_type,omitempty"`
+	Phase          string                               `json:"phase,omitempty"`
+	PhaseMachine   string                               `json:"phase_machine,omitempty"`
+	WaitingFor     *orchestrator.WaitingRun             `json:"waiting_for,omitempty"`
+	PhaseDetail    string                               `json:"phase_detail,omitempty"`
+	PhaseModels    []orchestrator.ModelDownloadProgress `json:"phase_models,omitempty"`
+	RentalProgress *orchestrator.RentalProgress         `json:"rental_progress,omitempty"`
+	// RentalBoot is the boot of the rental a queued request waits on, as its Hub last said.
+	RentalBoot *hub.RentalBoot `json:"rental_boot,omitempty"`
+	// WaitReason is why a queued request last said it waits (its newest park), verbatim.
+	WaitReason       string         `json:"wait_reason,omitempty"`
+	PhaseElapsedMS   *int64         `json:"phase_elapsed_ms,omitempty"`
+	PhaseMovedBytes  *int64         `json:"phase_moved_bytes,omitempty"`
+	PhaseTotalBytes  *int64         `json:"phase_total_bytes,omitempty"`
+	PhaseRate        *float64       `json:"phase_rate_bytes_per_second,omitempty"`
+	PhaseSampleAgeMS *int64         `json:"phase_sample_age_ms,omitempty"`
+	PhaseRemainingMS *int64         `json:"phase_remaining_ms,omitempty"`
+	ResponseURL      string         `json:"response_url"`
+	Metrics          map[string]any `json:"metrics,omitempty"`
+	ErrorType        string         `json:"error_type,omitempty"`
 	// ErrorCode is the originating component's stable code (for example a pod's
 	// `insufficient_storage`) when the failure did not originate in Creator.
 	ErrorCode      string `json:"error_code,omitempty"`
@@ -927,8 +932,13 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
 			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}
-		if phase, ok := s.orchestrator.PhaseOf(row.ID); ok && life.Status == "queued" {
-			fillPhase(&life, phase)
+		if life.Status == "queued" {
+			if phase, ok := s.orchestrator.PhaseOf(row.ID); ok {
+				fillPhase(&life, phase)
+			} else if phase, ok := s.orchestrator.RentalPhase(link.MachineID); ok {
+				fillPhase(&life, phase)
+			}
+			s.fillWait(&life)
 		}
 		s.fillLifecycleProgress(&life, row)
 		s.fillGPUWait(&life, row)
@@ -970,6 +980,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		if phase, ok := s.orchestrator.QueuePhase(row.ID); ok {
 			fillPhase(&life, phase)
 		}
+		s.fillWait(&life)
 	}
 	s.fillLifecycleProgress(&life, row)
 	life.OutputExport = s.outputExportOf(row.ID)
@@ -1213,7 +1224,7 @@ func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
 // transfer, the bytes moved and the rate.
 func fillPhase(life *Lifecycle, phase orchestrator.PhaseObservation) {
 	life.Phase, life.PhaseMachine = phase.Name, phase.Machine
-	life.PhaseDetail, life.RentalProgress = phase.Detail, phase.Rental
+	life.PhaseDetail, life.RentalProgress, life.RentalBoot = phase.Detail, phase.Rental, phase.Boot
 	life.PhaseModels = phase.Models
 	if !phase.At.IsZero() {
 		age := phase.SampleAge().Milliseconds()
@@ -1239,6 +1250,13 @@ func fillPhase(life *Lifecycle, phase orchestrator.PhaseObservation) {
 			ms := remaining.Milliseconds()
 			life.PhaseRemainingMS = &ms
 		}
+	}
+}
+
+// fillWait names why a queued request waits, from its own newest park.
+func (s *Server) fillWait(life *Lifecycle) {
+	if wait, problem := s.store.CurrentWait(life.RequestID); problem == nil && wait != nil {
+		life.WaitReason = wait.Reason
 	}
 }
 

@@ -69,21 +69,14 @@ func waitingPlacement(payload map[string]any) bool {
 // Manual rentals observe the same Hub lifecycle facts as a run's acquisition.
 // The shared renderer owns elapsed clocks and terminal history for both commands.
 func (p *RunProgress) rentalAcquisition(r hub.Rental) {
-	name := orchestrator.PhaseOfHubRental(r.State, r.ProviderState, r.ContainerState, r.Failure != nil)
-	if name == "" {
+	value, ok := orchestrator.RentalFrameValue(r)
+	if !ok {
 		if !r.Attachable() {
 			return
 		}
-		name = "connecting"
+		value = map[string]any{"phase": "connecting", "machine": r.Name}
 	}
-	p.On(localapi.Event{Type: "request.phase", Payload: map[string]any{
-		"value": map[string]any{"phase": name, "machine": r.Name,
-			"rental": map[string]any{"accelerator_model": r.AcceleratorModel,
-				"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros,
-				"base_worker_image_digest": r.BaseWorkerImageDigest,
-				"base_worker_image_tag":    r.BaseWorkerImageTag, "base_worker_profile": r.BaseWorkerProfile},
-		},
-	}})
+	p.On(localapi.Event{Type: "request.phase", Payload: map[string]any{"value": jsonValue(value)}})
 }
 
 func (p *RunProgress) sparsePhase(e localapi.Event) {
@@ -93,6 +86,11 @@ func (p *RunProgress) sparsePhase(e localapi.Event) {
 		return
 	}
 	key := "phase:" + name
+	if boot := bootOf(fields); boot != nil {
+		// A new attempt or a new stage is news; a boot log line or a clock is not.
+		key = fmt.Sprint("boot:", boot.Attempt, boot.State, boot.Activity, boot.Container, boot.Started(),
+			boot.HostAnsweredAt.IsZero())
+	}
 	if key != p.sparseStage {
 		p.sparseStarted = eventTime(e)
 	} else if p.now().Sub(p.sparseAt) < 5*time.Second {

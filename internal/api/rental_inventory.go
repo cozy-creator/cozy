@@ -72,8 +72,8 @@ type RentalSummary struct {
 	BoughtFor           string          `json:"bought_for,omitempty"`
 	Activity            *RentalActivity `json:"activity,omitempty"`
 	Operation           string          `json:"operation,omitempty"`
-	ProviderState       string          `json:"provider_state,omitempty"`
-	ContainerState      string          `json:"container_state,omitempty"`
+	// Boot is the pod's boot while the Hub still acquires it.
+	Boot *hub.RentalBoot `json:"boot,omitempty"`
 	// RuntimeUpdate is the state of a Runtime update holding this rental's work.
 	RuntimeUpdate string `json:"runtime_update,omitempty"`
 	// The worker image the hub froze for this rental, from its live listing.

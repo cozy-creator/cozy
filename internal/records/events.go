@@ -575,3 +575,35 @@ func (s *Store) MachineTriage(requestID string) (json.RawMessage, *exit.Error) {
 	}
 	return json.RawMessage(bundle), nil
 }
+
+// Wait is why a queued request last said it waits: a park or queue event's reason, the
+// wait cause, and the machine it waits on.
+type Wait struct {
+	Reason    string `json:"reason"`
+	Cause     string `json:"wait"`
+	WaitingOn string `json:"waiting_on"`
+}
+
+// CurrentWait is the request's newest park or queue event when nothing has moved it on
+// since (a preparation stage, an acceptance or a terminal); nil otherwise.
+func (s *Store) CurrentWait(requestID string) (*Wait, *exit.Error) {
+	var kind, body string
+	err := s.db.QueryRow(`SELECT type,payload FROM request_events WHERE request_id=?
+		AND type IN ('request.parked','request.queued','request.preparing','request.accepted',
+		  'request.completed','request.failed','request.canceled')
+		ORDER BY seq DESC LIMIT 1`, requestID).Scan(&kind, &body)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read the wait of %s: %s", requestID, err)
+	}
+	if kind != "request.parked" && kind != "request.queued" {
+		return nil, nil
+	}
+	var wait Wait
+	if err := json.Unmarshal([]byte(body), &wait); err != nil || wait.Reason == "" {
+		return nil, nil
+	}
+	return &wait, nil
+}

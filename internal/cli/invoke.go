@@ -874,7 +874,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
 			"remaining_ms", "execution_ms", "error_type", "error_code", "error", "retaining", "retry_available"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
-			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "phase_elapsed_ms",
+			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "rental_boot", "wait_reason", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "progress_unit", "progress_rate", "remaining_ms", "queued_ms", "execution_ms", "attempts",
@@ -917,7 +917,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"queued":           seconds(life.QueuedMS),
 			"execution":        seconds(life.ExecutionMS),
 			"attempts":         strconv.Itoa(life.Attempts), "created": life.CreatedAt,
-			"reason": failureReason(life),
+			"reason": reasonCell(life),
 		})
 		typed := map[string]any{
 			"number": life.Number, "id": life.RequestID, "kind": kind,
@@ -970,6 +970,12 @@ func runListRows(rows []api.Lifecycle) output.List {
 			if life.PhaseRemainingMS != nil {
 				typed["phase_remaining_ms"] = *life.PhaseRemainingMS
 			}
+		}
+		if life.RentalBoot != nil {
+			typed["rental_boot"] = life.RentalBoot
+		}
+		if life.WaitReason != "" {
+			typed["wait_reason"] = life.WaitReason
 		}
 		if life.CanceledBy != "" {
 			typed["canceled_by"] = life.CanceledBy
@@ -1025,17 +1031,29 @@ func runListRows(rows []api.Lifecycle) output.List {
 	return list
 }
 
-// failureReason is the list cell for a run that ended without its result: the recorded
-// cause, cut to one line. `cozy run watch <number>` shows it whole.
-func failureReason(life api.Lifecycle) string {
-	if life.Error == "" || life.Status == "completed" || life.Status == "in_progress" || life.Status == "queued" {
-		return ""
+// reasonCell is why a run is where it is, cut to one line: for a queued run what it waits
+// on (its rental's boot, else its newest park), for a run that ended without its result the
+// recorded cause. `cozy run show <number>` shows it whole.
+func reasonCell(life api.Lifecycle) string {
+	reason := ""
+	switch {
+	case life.Status == "queued" && life.RentalBoot != nil:
+		reason = describeBoot(bootMachine(life), life.RentalBoot, time.Now()).facts()
+	case life.Status == "queued":
+		reason = life.WaitReason
+	case life.Status != "completed" && life.Status != "in_progress":
+		reason = life.Error
 	}
-	reason := strings.Join(strings.Fields(life.Error), " ")
+	reason = strings.Join(strings.Fields(reason), " ")
 	if runes := []rune(reason); len(runes) > failureReasonCell {
 		reason = string(runes[:failureReasonCell-1]) + "…"
 	}
 	return reason
+}
+
+// bootMachine is the machine a queued run's rental boot is for.
+func bootMachine(life api.Lifecycle) string {
+	return either(life.PhaseMachine, either(life.Machine, life.RentalID))
 }
 
 const failureReasonCell = 72
@@ -1063,6 +1081,10 @@ func phaseValue(life api.Lifecycle) string { return PhaseCell(life) }
 func PhaseCell(life api.Lifecycle) string {
 	if life.Phase == "" {
 		return ""
+	}
+	if life.RentalBoot != nil {
+		w := describeBoot(bootMachine(life), life.RentalBoot, time.Now())
+		return joinParts(w.subject(bootMachine(life)), w.elapsed)
 	}
 	if life.Phase == orchestrator.PhaseGPUWait {
 		detail := life.PhaseDetail
@@ -1137,6 +1159,9 @@ func progressValue(life api.Lifecycle) string {
 		return phaseValue(life)
 	}
 	if life.Status == "queued" {
+		if life.RentalBoot != nil {
+			return phaseValue(life)
+		}
 		if life.RequestedRental != "" && (life.Phase == "" || life.Phase == orchestrator.WaitRental ||
 			life.Phase == orchestrator.WaitSlotBusy || life.Phase == orchestrator.WaitQueueAhead) {
 			name := either(life.RequestedMachine, life.RequestedRental)
@@ -2152,6 +2177,9 @@ func HumanWaitLine(payload map[string]any) string {
 		}
 		return "  waiting in line"
 	case orchestrator.WaitRental:
+		if on != "" {
+			return "  waiting for " + on
+		}
 		return "  waiting for a rental machine"
 	case orchestrator.WaitModelTransfer:
 		return "  downloading the model"
@@ -2175,6 +2203,10 @@ func HumanPhaseLine(value any) string {
 	if name == orchestrator.WaitSlotBusy || name == orchestrator.WaitQueueAhead {
 		return HumanWaitLine(map[string]any{"wait": name, "waiting_on": fields["machine"],
 			"waiting_for": fields["waiting_for"]})
+	}
+	if boot := bootOf(fields); boot != nil {
+		machine, _ := fields["machine"].(string)
+		return "  " + describeBoot(machine, boot, time.Now()).line(machine)
 	}
 	line := "  " + strings.ReplaceAll(preparationLabel(name), "_", " ")
 	if machine, _ := fields["machine"].(string); machine != "" {

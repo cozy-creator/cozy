@@ -1079,7 +1079,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
 			"hourly_rate_usd_micros", "failure_code", "base_worker_image_digest", "base_worker_image_tag",
 			"provider", "provider_resource_id", "provider_host_id", "provider_state",
-			"container_state"},
+			"container_state", "boot"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
 			"Current spend per hour: " + usdPerHourBare(burn)},
@@ -1100,6 +1100,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		list.Aggregates = append(list.Aggregates, output.Field{K: "live", V: jsonFact{true}})
 	}
 	haveFailure, haveHubUnknown, haveUpdate := false, false, false
+	now := time.Now()
 	for _, r := range rows {
 		activity := api.RentalActivity{}
 		if r.Activity != nil {
@@ -1113,7 +1114,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if eligible {
 			idleText = idleClock(time.Since(since)) + " / " + idleClock(due.Sub(since))
 		}
-		state := humanRentalState(r.State)
+		state := rentalStateCell(r.State, r.Boot, now)
 		switch r.RuntimeUpdate {
 		case "":
 		case "unusable":
@@ -1154,6 +1155,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 		if r.Unverified {
 			typed["unverified"] = true
+		}
+		if r.Boot != nil {
+			typed["boot"] = r.Boot
 		}
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub, "runtime_update": r.RuntimeUpdate,
@@ -1217,7 +1221,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"gpus":    gpuCell(seen.AcceleratorModel, seen.AcceleratorCount),
 			// Billed to this account, attached to another Creator home: its work is not
 			// observable here, which the RUNNING/QUEUED dashes also say.
-			"state":   humanRentalState(seen.State) + " (other client)",
+			"state":   rentalStateCell(seen.State, seen.Boot, now) + " (other client)",
 			"failure": "—", "uptime": rentalUptime(seen.RentedAt),
 			"running": "—", "queued": "—", "idle": "—",
 			"rental": seen.ID, "bought for": "—",
@@ -1225,7 +1229,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"address":     seen.Address, "media": seen.MediaAddress, "hub": seen.Hub,
 			"rented": orNone(seen.RentedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": either(seen.BaseWorkerImageTag, seen.BaseWorkerImageDigest), "provider": "", "provider resource": "", "provider host": "",
-			"provider state": seen.ProviderState, "container state": seen.ContainerState,
+			"provider state": "", "container state": "",
 			"$/hour": rentalHourlyRate(seen.HourlyRateUSDMicros),
 		})
 		typed := map[string]any{
@@ -1235,6 +1239,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 		if gpus, ok := gpuCount(seen.AcceleratorModel, seen.AcceleratorCount); ok {
 			typed["gpus"] = gpus
+		}
+		if seen.Boot != nil {
+			typed["boot"] = seen.Boot
 		}
 		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,
 			"address": seen.Address, "media_address": seen.MediaAddress,
@@ -1360,6 +1367,20 @@ func hubRentalsView(cfg config.Config, list *output.List, inventory api.RentalIn
 	if len(others) > 0 {
 		list.Aggregates = append(list.Aggregates, output.Field{K: "other_hubs", V: jsonFact{others}})
 	}
+}
+
+// rentalStateCell is a rental's state, or while the Hub boots it, where and how far:
+// "booting · AP-IN-1 · container not started · boot log active 17s ago".
+func rentalStateCell(state string, boot *hub.RentalBoot, now time.Time) string {
+	if boot == nil {
+		return humanRentalState(state)
+	}
+	w := describeBoot("", boot, now)
+	attempt := ""
+	if boot.Attempt > 1 {
+		attempt = fmt.Sprintf("attempt %d", boot.Attempt)
+	}
+	return joinParts("booting", attempt, w.where, w.stage, w.activity, w.replan)
 }
 
 // rentalHourlyRate uses the known rental rate; a missing quote is not free.

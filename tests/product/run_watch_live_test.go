@@ -115,9 +115,68 @@ Run 1514 · paul/minimax-h3/long_form · darkness · running · 8s
   ▸ waiting for GPU (needs 1, 4 in use by this run's other calls) · 6s`},
 }
 
+// Run 1558 waited on nonomiya (4× H100 SXM) while the Hub booted it, and `queued` said
+// nothing more. Its stream is reconstructed from that record and the rental's boot, with a
+// measured replan onto another host: the phase frames the daemon streams while a run is
+// parked on a booting rental, then the install, the start and the weights.
+var liveFrames1558 = []struct{ at, frame string }{
+	{"10:30:01", `
+Run 1558 · paul/minimax-h3/long_form · nonomiya · queued · 1s
+  ▸ waiting for nonomiya to boot · AP-IN-1 · 6m0s
+    container not started · boot log active 17s ago
+    4 × NVIDIA H100 80GB HBM3 · $11.96/hour
+    image: torch2.14.0-cu130-cp312-linux-x86-runtime0.18.73`},
+	{"10:30:12", `
+Run 1558 · paul/minimax-h3/long_form · nonomiya · queued · 12s
+  ▸ waiting for nonomiya to boot · AP-IN-1 · 6m11s
+    container not started · boot log active 4s ago
+    4 × NVIDIA H100 80GB HBM3 · $11.96/hour
+    image: torch2.14.0-cu130-cp312-linux-x86-runtime0.18.73`},
+	{"10:31:31", `
+Run 1558 · paul/minimax-h3/long_form · nonomiya · queued · 1m31s
+  ▸ boot attempt 2 of rental nonomiya · 7m30s
+    replanned from AP-IN-1 after 7m (no progress past the observed 4.9m max)
+    finding another host
+    4 × NVIDIA H100 80GB HBM3 · $11.96/hour
+    image: torch2.14.0-cu130-cp312-linux-x86-runtime0.18.73`},
+	{"10:32:00", `
+Run 1558 · paul/minimax-h3/long_form · nonomiya · queued · 2m0s
+  ▸ boot attempt 2 of rental nonomiya · now EU-RO-1 · 7m59s
+    replanned from AP-IN-1 after 7m (no progress past the observed 4.9m max)
+    pulling image · boot log active 11s ago
+    4 × NVIDIA H100 80GB HBM3 · $11.96/hour
+    image: torch2.14.0-cu130-cp312-linux-x86-runtime0.18.73`},
+	{"10:33:40", `
+Run 1558 · paul/minimax-h3/long_form · nonomiya · queued · 3m40s
+  ▸ boot attempt 2 of rental nonomiya · now EU-RO-1 · 9m39s
+    replanned from AP-IN-1 after 7m (no progress past the observed 4.9m max)
+    starting supervisor (20s)
+    4 × NVIDIA H100 80GB HBM3 · $11.96/hour
+    image: torch2.14.0-cu130-cp312-linux-x86-runtime0.18.73`},
+	{"10:34:30", `
+Run 1558 · paul/minimax-h3/long_form · nonomiya · queued · 4m30s
+  ▸ boot attempt 2 of rental nonomiya · now EU-RO-1 · 10m29s
+    replanned from AP-IN-1 after 7m (no progress past the observed 4.9m max)
+    starting Runtime (15s)
+    4 × NVIDIA H100 80GB HBM3 · $11.96/hour
+    image: torch2.14.0-cu130-cp312-linux-x86-runtime0.18.73`},
+	{"10:35:10", `
+Run 1558 · paul/minimax-h3/long_form · nonomiya · preparing · 5m10s
+  ✓ boot attempt 2 of rental nonomiya · now EU-RO-1  11m2s
+  ▸ installing paul/minimax-h3@1.22.0 · 7s`},
+	{"10:36:15", `
+Run 1558 · paul/minimax-h3/long_form · nonomiya · running · 6m15s
+  ✓ boot attempt 2 of rental nonomiya · now EU-RO-1  11m2s
+  ✓ installing paul/minimax-h3@1.22.0                28s
+  ✓ starting                                         9s
+  ▸ Creating reference Hero · Downloading model weights · 35s
+    ██████░░░░░░░░░░░░░░  30%  9.3GiB / 30.8GiB · 327.0MiB/s · ETA ~1m8s`},
+}
+
 func TestLiveRunViewGoldenFrames(t *testing.T) {
 	goldenFrames(t, "1510", "darkness", liveFrames1510)
 	goldenFrames(t, "1514", "darkness", liveFrames1514)
+	goldenFrames(t, "1558", "nonomiya", liveFrames1558)
 
 	events := recordedRun(t, "run-1504")
 	sink := &renderBuffer{}

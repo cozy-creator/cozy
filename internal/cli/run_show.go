@@ -278,8 +278,13 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		ErrorType: life.ErrorType, Error: life.Error,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS, ExecutionMS: life.ExecutionMS,
 		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
-	if life.Phase == orchestrator.PhaseGPUWait || life.Phase == orchestrator.PhaseOwnerReconciliation {
+	switch {
+	case life.Phase == orchestrator.PhaseGPUWait || life.Phase == orchestrator.PhaseOwnerReconciliation:
 		report.Waiting = PhaseCell(life)
+	case life.Status == "queued" && life.RentalBoot != nil:
+		report.Waiting = describeBoot(bootMachine(life), life.RentalBoot, time.Now()).line(bootMachine(life))
+	case life.Status == "queued" && life.WaitReason != "":
+		report.Waiting = "waiting: " + life.WaitReason
 	}
 	report.Result = life.Result
 	for index, product := range life.Products {

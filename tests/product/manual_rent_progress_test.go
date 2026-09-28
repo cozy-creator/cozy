@@ -81,15 +81,23 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 					case <-time.After(10 * time.Second):
 						t.Fatal("CLI did not submit its rental request")
 					}
+					now := time.Now().UTC()
+					boot := map[string]any{"attempt": 1, "state": "booting", "datacenter": "US-TX-3",
+						"activity": "pulling_image", "started_at": now.Add(-40 * time.Second),
+						"last_progress_at": now.Add(-2 * time.Second), "boot_log_at": now.Add(-2 * time.Second),
+						"observed_at": now}
 					stand.mu.Lock()
-					stand.rentals[id]["provider_state"] = "RUNNING"
-					stand.rentals[id]["container_state"] = "PULLING"
+					stand.rentals[id]["state"] = "booting"
+					stand.rentals[id]["boot"] = boot
 					stand.mu.Unlock()
 					stage++
-				case stage == 1 && strings.Contains(text, "pulling image on"):
-					stand.set(id, "container_state", "RUNNING")
+				case stage == 1 && strings.Contains(text, "pulling image"):
+					now := time.Now().UTC()
+					stand.set(id, "boot", map[string]any{"attempt": 1, "state": "booting", "datacenter": "US-TX-3",
+						"container": "running", "runtime_observed": true, "started_at": now.Add(-50 * time.Second),
+						"last_progress_at": now, "observed_at": now})
 					stage++
-				case stage == 2 && strings.Contains(text, "booting on"):
+				case stage == 2 && strings.Contains(text, "starting Runtime"):
 					stand.setState(id, "failed", "fixture boot completed without a worker")
 					stage++
 				}
@@ -109,7 +117,8 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 				}
 				return
 			}
-			for _, want := range []string{"acquiring", "NVIDIA H100 NVL · $3.19/hour", "image: " + tag, "pulling image on", "booting on"} {
+			for _, want := range []string{"acquiring", "NVIDIA H100 NVL · $3.19/hour", "image: " + tag, "US-TX-3", "pulling image",
+				"boot log active", "starting Runtime"} {
 				if !strings.Contains(log, want) {
 					t.Fatalf("manual rent omitted %q: %q", want, log)
 				}
@@ -122,10 +131,11 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 			}
 			if mode == "terminal" {
 				plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(log, "")
-				if !strings.Contains(log, "\r\033[K") || !strings.Contains(plain, "✓ acquiring") || !strings.Contains(plain, "✗ booting on") {
+				if !strings.Contains(log, "\r\033[K") || !strings.Contains(plain, "✓ acquiring") ||
+					!regexp.MustCompile(`✗ waiting for \S+ to boot · US-TX-3`).MatchString(plain) {
 					t.Fatalf("manual rent did not retain completed stages and final failure: %q", log)
 				}
-			} else if strings.ContainsAny(log, "\r\033") || strings.Count(log, "pulling image on") != 1 {
+			} else if strings.ContainsAny(log, "\r\033") || strings.Count(log, "pulling image") != 1 {
 				t.Fatalf("redirected boot was not sparse plain text: %q", log)
 			}
 		})

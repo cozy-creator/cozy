@@ -6,6 +6,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/cli"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
@@ -80,34 +81,34 @@ func TestAPhaseWithNoCountersStillNamesItself(t *testing.T) {
 	}
 }
 
-// TestTheProviderDrawsTheProvisioningBoundary. The split between "waiting in the
-// provider's queue" and "the container is up and coming to life" is the difference
-// between a delay we cannot fix and one we can — a 9 GB image pull. It is therefore
-// drawn where the PROVIDER draws it, and a hub that says nothing yields the coarse
-// phase rather than a guess.
+// TestTheProviderDrawsTheProvisioningBoundary. The split between "waiting on the
+// provider's host" and "the container is up and coming to life" is the difference between
+// a delay we cannot fix and one we can. It is drawn where the PROVIDER draws it — a started
+// container — from the boot the Hub reports, and a Hub that reports no boot yields the
+// coarse phase rather than a guess.
 func TestTheProviderDrawsTheProvisioningBoundary(t *testing.T) {
+	booting := func(boot hub.RentalBoot) *hub.RentalBoot { return &boot }
 	for _, c := range []struct {
-		state, provider, container string
-		retrying                   bool
-		want                       string
+		name   string
+		rental hub.Rental
+		want   string
 	}{
-		{"pending_acquisition", "", "", false, orchestrator.PhaseAcquiring},
-		{"pending_acquisition", "CREATED", "", false, orchestrator.PhaseProvisioning},
-		{"pending_acquisition", "RUNNING", "PULLING", false, orchestrator.PhasePullingImage},
-		{"pending_acquisition", "RUNNING", "RUNNING", false, orchestrator.PhaseBooting},
-		{"pending_acquisition", "RUNNING", "", false, orchestrator.PhaseBooting},
-		// A rental back in pending_acquisition carrying a failure is buying AGAIN. It
-		// outranks every other reading: an operator must not be shown a first attempt's
-		// vocabulary for a second attempt's spend. Measured on run 207 — 32.1s of a
-		// 227.9s wait was one datacenter declining, and the request silently moved.
-		{"pending_acquisition", "", "", true, orchestrator.PhaseReplanning},
-		{"pending_acquisition", "RUNNING", "RUNNING", true, orchestrator.PhaseReplanning},
-		{"ready", "RUNNING", "RUNNING", false, ""},
-		{"failed", "EXITED", "EXITED", true, ""},
+		{"no attempt yet", hub.Rental{State: "pending_acquisition"}, orchestrator.PhaseAcquiring},
+		{"creating the pod", hub.Rental{State: "acquiring", Boot: booting(hub.RentalBoot{Attempt: 1, State: "obligated"})}, orchestrator.PhaseProvisioning},
+		{"no container yet", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting"})}, orchestrator.PhaseProvisioning},
+		{"created container", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting", Container: "created"})}, orchestrator.PhaseProvisioning},
+		{"image pull read from the boot log", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting", Activity: "pulling_image"})}, orchestrator.PhasePullingImage},
+		{"started container", hub.Rental{State: "booting", Boot: booting(hub.RentalBoot{Attempt: 1, State: "booting", Container: "running", RuntimeObserved: true})}, orchestrator.PhaseBooting},
+		// A rental back in acquisition after a refused attempt is buying AGAIN. Measured on
+		// run 207 — 32.1s of a 227.9s wait was one datacenter declining, and the request
+		// silently moved.
+		{"replanning", hub.Rental{State: "pending_acquisition", Boot: booting(hub.RentalBoot{Attempt: 2, State: "replanning"})}, orchestrator.PhaseReplanning},
+		{"refused, no boot", hub.Rental{State: "pending_acquisition", Failure: &hub.RentalFailure{Code: "x"}}, orchestrator.PhaseReplanning},
+		{"ready", hub.Rental{State: "ready"}, ""},
+		{"failed", hub.Rental{State: "failed", Failure: &hub.RentalFailure{Code: "x"}}, ""},
 	} {
-		if got := orchestrator.PhaseOfHubRental(c.state, c.provider, c.container, c.retrying); got != c.want {
-			t.Errorf("PhaseOfHubRental(%q,%q,%q,retrying=%t) = %q, want %q",
-				c.state, c.provider, c.container, c.retrying, got, c.want)
+		if got := orchestrator.PhaseOfHubRental(c.rental); got != c.want {
+			t.Errorf("%s: PhaseOfHubRental = %q, want %q", c.name, got, c.want)
 		}
 	}
 }

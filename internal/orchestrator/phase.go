@@ -6,10 +6,12 @@ package orchestrator
 // This is live display state; it never settles, routes, bills, or cancels work.
 
 import (
+	"cmp"
 	"sort"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/hub"
 )
 
 // The phase vocabulary. Ordered as a request traverses it, though nothing depends on the
@@ -29,7 +31,7 @@ const (
 	// PhaseProvisioning: the provider holds the request and has not reported the
 	// container running. This is the provider's queue, and it is not ours to shorten.
 	PhaseProvisioning = "provisioning"
-	// PhasePullingImage: the provider explicitly reports a container image pull.
+	// PhasePullingImage: the Hub read the provider's boot log as a container image pull.
 	PhasePullingImage = "pulling_image"
 	// PhaseBooting: the paid pod exists and has not yet reported itself attachable.
 	PhaseBooting = "booting"
@@ -61,12 +63,14 @@ const PreparationRateMaxAge = 10 * time.Second
 // a link degrading while it degrades. Reporting one number for both jobs would make it
 // wrong for one of them.
 type PhaseObservation struct {
-	Name       string
-	Since      time.Time
-	At         time.Time
-	Machine    string
-	Detail     string
-	Rental     *RentalProgress
+	Name    string
+	Since   time.Time
+	At      time.Time
+	Machine string
+	Detail  string
+	Rental  *RentalProgress
+	// Boot is the rental's boot while it is acquired, as its Hub last reported it.
+	Boot       *hub.RentalBoot
 	Models     []ModelDownloadProgress
 	WaitingFor *WaitingRun
 	// HasBytes is false for a phase whose producer declared no counters. Moved and Total
@@ -130,6 +134,7 @@ type phaseState struct {
 	machine     string
 	detail      string
 	rental      *RentalProgress
+	boot        *hub.RentalBoot
 	models      map[string]modelDownloadState
 	hasBytes    bool
 	moved       uint64
@@ -158,6 +163,7 @@ type PhaseSample struct {
 	Machine  string
 	Detail   string
 	Rental   *RentalProgress
+	Boot     *hub.RentalBoot
 	Models   []ModelDownloadProgress
 	HasBytes bool
 	Moved    uint64
@@ -192,6 +198,7 @@ func (p *phases) observe(subject string, sample PhaseSample) {
 		rental := *sample.Rental
 		state.rental = &rental
 	}
+	state.boot = sample.Boot
 	if sample.HasBytes {
 		moved := sample.Moved
 		if sample.Total > 0 {
@@ -226,6 +233,10 @@ func (p *phases) snapshot(subject string) (PhaseObservation, bool) {
 	if state.rental != nil {
 		rental := *state.rental
 		out.Rental = &rental
+	}
+	if state.boot != nil {
+		boot := *state.boot
+		out.Boot = &boot
 	}
 	out.Models = state.modelSnapshots(time.Now())
 	if state.hasBytes {
@@ -278,6 +289,9 @@ func (p PhaseObservation) wire() map[string]any {
 	if p.Rental != nil {
 		out["rental"] = p.Rental
 	}
+	if p.Boot != nil {
+		out["boot"] = p.Boot
+	}
 	if len(p.Models) > 0 {
 		out["models"] = p.Models
 	}
@@ -314,6 +328,9 @@ func (c *Orchestrator) QueuePhase(requestID string) (PhaseObservation, bool) {
 	if observed, ok := c.PhaseOf(requestID); ok {
 		return c.phaseRental(requestID, observed), true
 	}
+	if observed, ok := c.RentalPhase(cmp.Or(row.Worker, row.RequestedRental)); ok {
+		return observed, true
+	}
 	wait := WaitWorkerStart
 	if row.Rental && row.Worker == "" {
 		wait = WaitRental
@@ -341,65 +358,97 @@ func (c *Orchestrator) PhaseOf(requestID string) (PhaseObservation, bool) {
 	return c.phases.snapshot(requestID)
 }
 
-// PhaseOfHubRental maps what the hub says about a rental onto this vocabulary, and only
-// what it says. The empty answer means "this rental is not in a preparation phase" — a
-// ready pod has left acquisition, and a failed one is a terminal the request settles on.
+// PhaseOfHubRental maps what the Hub says about a rental onto this vocabulary, and only
+// what it says. The empty answer means "this rental is not being acquired": a ready pod has
+// left acquisition, and a failed one is a terminal the request settles on.
 //
 // THE BOUNDARY THAT MATTERS IS `provisioning` -> `booting`, and it is drawn where the
-// PROVIDER draws it. Before the provider reports the container running, the pod is waiting
-// in someone else's queue and nothing we ship can change how long that takes. After it,
-// the time is the container image coming down and the supervisor coming up, both of which
-// are ours. Collapsing the two — which is what one `pending_acquisition` edge does — makes
-// a 9 GB image pull and a provider stock-out look identical, and they have opposite
-// remedies.
-//
-// A hub that reports no provider words yields `acquiring` and stops there. That is not a
-// degraded rendering to apologize for: it is the honest one. Splitting it further would
-// mean deciding a phase from elapsed time, which is the thing this whole lane exists to
-// avoid.
-func PhaseOfHubRental(state, providerState, containerState string, retrying bool) string {
-	if strings.TrimSpace(state) != "pending_acquisition" {
+// PROVIDER draws it: a started container. Before it, the pod waits on someone else's host
+// and nothing we ship changes how long that takes; after it, the time is our supervisor and
+// Runtime coming up. A Hub that reports no boot yields `acquiring` and stops there rather
+// than deciding a phase from elapsed time.
+func PhaseOfHubRental(r hub.Rental) string {
+	switch r.State {
+	case "pending_acquisition", "acquiring", "booting":
+	default:
 		return ""
 	}
-	// A rental back in pending_acquisition CARRYING A FAILURE is on its second (or later)
-	// ordinal: the first one was bought, paid for, and refused. That is not the same
-	// wait as the first attempt and must not render as one.
-	if retrying {
+	boot := r.Boot
+	switch {
+	// A rental back in acquisition after a refused attempt is buying AGAIN, not waiting
+	// on its first host: measured on run 207, 32.1s of a 227.9s wait was one datacenter
+	// declining, and the request silently moved.
+	case boot == nil && r.Failure != nil, boot != nil && boot.State == "replanning":
 		return PhaseReplanning
-	}
-	if strings.TrimSpace(providerState) == "" {
-		// Nothing bought yet. This is the hub's own placement and selection, and it is
-		// NOT a rounding error: four consecutive runs on one SKU spent between 4.6s and
-		// 25.3s here, before the provider was asked at all. Naming it is the only way
-		// anyone learns it exists.
+	case boot == nil:
 		return PhaseAcquiring
-	}
-	switch strings.ToUpper(strings.TrimSpace(containerState)) {
-	case "PULLING", "PULLING_IMAGE", "IMAGE_PULLING":
-		return PhasePullingImage
-	}
-	if providerRunning(providerState, containerState) {
+	case boot.Started():
 		return PhaseBooting
+	case boot.Activity == PhasePullingImage:
+		return PhasePullingImage
 	}
 	return PhaseProvisioning
 }
 
-// providerRunning reads the provider's own two words for "this container is executing".
-// The comparison is case-insensitive and covers the spellings providers actually use;
-// anything else is read as not-yet-running, which keeps an unrecognised word on the
-// pessimistic side of the boundary rather than announcing a boot that has not started.
-func providerRunning(providerState, containerState string) bool {
-	running := func(word string) bool {
-		switch strings.ToUpper(strings.TrimSpace(word)) {
-		case "RUNNING", "RUNNING_HEALTHY", "EXITED", "TERMINATED":
-			return true
+// RentalSample is a Hub view of a rental still being acquired as one phase sample, or false
+// once it has left acquisition.
+func RentalSample(r hub.Rental) (PhaseSample, bool) {
+	name := PhaseOfHubRental(r)
+	if name == "" {
+		return PhaseSample{}, false
+	}
+	detail := r.Detail
+	if r.Failure != nil && r.Failure.Code != "" {
+		detail = r.Failure.Code
+		if r.Failure.ProviderHostID != "" {
+			detail += " on " + r.Failure.ProviderHostID
 		}
-		return false
 	}
-	if strings.TrimSpace(containerState) != "" {
-		return running(containerState)
+	sample := PhaseSample{Name: name, Machine: r.Name, Detail: detail, Rental: &RentalProgress{
+		AcceleratorModel: r.AcceleratorModel, AcceleratorCount: r.AcceleratorCount,
+		HourlyRateUSDMicros: r.HourlyRateUSDMicros, BaseWorkerImageDigest: r.BaseWorkerImageDigest,
+		BaseWorkerImageTag: r.BaseWorkerImageTag, BaseWorkerProfile: r.BaseWorkerProfile,
+	}}
+	if r.Boot != nil {
+		boot := *r.Boot
+		sample.Boot = &boot
 	}
-	return running(providerState)
+	return sample, true
+}
+
+// RentalFrameValue is the live frame a Hub view of a rental in acquisition renders as.
+func RentalFrameValue(r hub.Rental) (map[string]any, bool) {
+	sample, ok := RentalSample(r)
+	if !ok {
+		return nil, false
+	}
+	return PhaseObservation{Name: sample.Name, Machine: sample.Machine, Detail: sample.Detail,
+		Rental: sample.Rental, Boot: sample.Boot}.wire(), true
+}
+
+// rentalSubject keys a rental's acquisition among the phase subjects (request and worker ids).
+func rentalSubject(id string) string { return "rental:" + id }
+
+// ObserveRental records what the Hub last said about a rental: its acquisition phase while
+// it is being acquired, and nothing once it has left acquisition. Work pinned to the rental
+// reads it (RentalPhase) while it waits.
+func (c *Orchestrator) ObserveRental(r hub.Rental) {
+	if sample, ok := RentalSample(r); ok {
+		c.phases.observe(rentalSubject(r.ID), sample)
+		return
+	}
+	c.phases.forget(rentalSubject(r.ID))
+}
+
+// ForgetRental drops a rental's acquisition, for a rental this host no longer holds.
+func (c *Orchestrator) ForgetRental(id string) { c.phases.forget(rentalSubject(id)) }
+
+// RentalPhase is the acquisition of the rental a waiting request is pinned to.
+func (c *Orchestrator) RentalPhase(id string) (PhaseObservation, bool) {
+	if id == "" {
+		return PhaseObservation{}, false
+	}
+	return c.phases.snapshot(rentalSubject(id))
 }
 
 // phaseRental fills the display from the existing rental row when preparation has
