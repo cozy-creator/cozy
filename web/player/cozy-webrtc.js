@@ -7,7 +7,7 @@ export const PROTOCOL = "cozy/1";
 const PREFIX = "cozy+webrtc+v1/";
 const HEADER = 12; // a binary message is [u32 stream][u64 offset][payload]
 const FATAL = new Set(["auth", "expired", "revoked", "scope", "not_found", "runtime_update_required",
-  "identity", "link", "webrtc", "mse", "codec", "media", "integrity", "protocol", "closed", "bad_request", "limit"]);
+  "identity", "link", "webrtc", "mse", "codec", "media", "protocol", "closed", "bad_request", "limit"]);
 
 export class CozyError extends Error {
   constructor(code, message, fatal = FATAL.has(code)) { super(message); this.code = code; this.fatal = fatal; }
@@ -271,14 +271,13 @@ export class Player extends EventTarget {
   pos = 0;
   final = null;
   error = null;
-  stats = {bytes: 0, gets: 0, connects: 0, resets: 0, type: "", verified: null}; // bytes: what the follows received
-  #video; #link; #options; #media; #session = null; #running = false; #held;
+  stats = {bytes: 0, gets: 0, connects: 0, resets: 0, type: ""}; // bytes: what the follows received
+  #video; #link; #options; #media; #session = null; #running = false;
   #follow = 0; #get = 0; #seekTo = null; #waiting = [];
 
-  constructor(video, link, {window = 8 << 20, ahead = 30, verify = false} = {}) {
+  constructor(video, link, {window = 8 << 20, ahead = 30} = {}) {
     super();
     this.#video = video; this.#link = link; this.#options = {window, ahead};
-    this.#held = verify ? [] : null; // what the follow delivered, to check against the final sha256
     video.disableRemotePlayback = true; // ManagedMediaSource never opens without it
     video.addEventListener("seeking", () => this.#seek(false));
     video.addEventListener("waiting", () => this.gap() || this.#seek(true));
@@ -371,7 +370,6 @@ export class Player extends EventTarget {
     this.stats.resets++;
     this.entries = this.entries.filter(e => e.seq >= m.seq);
     this.pos = 0;
-    this.#held &&= [];
     session.cancel(this.#get);
     this.#get = 0;
     this.#seekTo = null;
@@ -391,22 +389,15 @@ export class Player extends EventTarget {
     if (skip) session.release(skip);
     bytes = bytes.subarray(skip);
     if (!bytes.length) return;
-    this.#held?.push(bytes.slice());
     this.pos += bytes.length;
     this.seq = Math.max(this.seq, this.entries.findLast(e => e.length <= this.pos)?.seq ?? 0);
     if (this.#get) this.#waiting.push([bytes, session]); else this.#media.push(bytes, session);
   }
 
-  async #end(m) {
+  #end(m) {
     this.final = {status: m.status, length: m.length ?? this.pos, sha256: m.sha256};
     this.#media.pump();
     if (m.status && m.status !== "completed") this.#status("partial", `The run ${m.status}; this is what it published.`);
-    if (this.#held && m.sha256) {
-      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", concat(this.#held)));
-      this.stats.verified = Array.from(digest, b => b.toString(16).padStart(2, "0")).join("") === m.sha256;
-      if (!this.stats.verified) this.fail(new CozyError("integrity", "The bytes received do not match the run's final sha256."));
-    }
-    this.#held = null;
   }
 
   // A seek outside what is buffered, or a stall at a hole in it: fetch the revision that holds
@@ -431,7 +422,6 @@ export class Player extends EventTarget {
     session.cancel(this.#get);
     this.#drop();
     this.#media.discontinuity();
-    this.#held = null;
     this.stats.gets++;
     let at = e.from;
     this.#get = session.get(this.#target({offset: e.from, length: e.length - e.from}), {
