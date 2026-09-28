@@ -320,7 +320,7 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, and activity; `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
 | `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | explicit acknowledged fixed fifteen-minute reset; request ID only |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | drop the daemon's kept connection to one rented machine |
-| `GET /v1/local/rentals/{rental_id}/lanes` | local | yes | which submission lanes the claimed worker's Runtime takes: release-root jobs and provider-source Models |
+| `GET /v1/local/machines/{machine}/describe` | local | yes | a published release's interface as one machine reads it at its own Hub (the newest release when none is named) |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
 | `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |
 | `POST /v1/local/rentals/{rental_id}/runtime-update` | local | yes | start or rejoin a durable per-rental Runtime update; the CLI may disconnect without canceling it |

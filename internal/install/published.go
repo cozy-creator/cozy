@@ -87,9 +87,3 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 	return packageInterface, empty, runtimeBin, environment, nil
 }
 
-type packagePreparation struct {
-	Package          string        `json:"package"`
-	Release          string        `json:"release"`
-	PackageInterface ExactDocument `json:"package_interface"`
-	PlacementSet     ExactDocument `json:"placement_set"`
-}

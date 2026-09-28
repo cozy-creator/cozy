@@ -36,11 +36,10 @@ import (
 
 // Resolver is the Cozy daemon's package resolver.
 type Resolver struct {
-	mu          sync.Mutex
-	refreshMu   sync.Mutex
-	selectionMu sync.Mutex
-	store       *records.Store
-	cfg         config.Config
+	mu        sync.Mutex
+	refreshMu sync.Mutex
+	store     *records.Store
+	cfg       config.Config
 	// placements contain only control-plane facts. Keeping this cache distinct is the
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement

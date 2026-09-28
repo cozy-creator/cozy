@@ -12,6 +12,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -58,7 +59,7 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 		ID     string `json:"id"`
 		Rental string `json:"rental"`
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &accepted) != nil || accepted.Rental != records.LocalMachine || accepted.ID == "" {
+	if code != 0 || json.Unmarshal([]byte(out), &accepted) != nil || accepted.Rental != machines.Local || accepted.ID == "" {
 		t.Fatalf("local model download was not accepted for this computer's machine [exit %d]\n%s", code, out)
 	}
 	layout, problem := home.Open(root)

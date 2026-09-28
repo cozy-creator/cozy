@@ -163,17 +163,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// worker, including after a daemon restart.
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
-	installs := rental.NewInstallQueue(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
-		if row.RentalID != records.LocalMachine {
-			machine, problem := st.RentalRow(row.RentalID)
-			if problem != nil {
-				return problem
-			}
-			if machine == nil {
-				return exit.Named(exit.Unavailable, "rental.ended", "installation rental no longer exists")
-			}
-		}
-
+	installs := machineset.NewInstalls(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
 		models := orchestrator.DownloadModelRefs(row.Selection.Models)
 		if len(models) != len(row.Selection.Models) {
 			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")

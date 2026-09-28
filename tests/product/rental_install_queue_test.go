@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -62,7 +63,7 @@ func waitRentalInstall(t *testing.T, store *records.Store, id, state string) *re
 		}
 	}
 }
-func runRentalInstallQueue(t *testing.T, q *rental.InstallQueue) func() {
+func runRentalInstallQueue(t *testing.T, q *machines.Installs) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -92,7 +93,7 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 		<-ctx.Done()
 		return exit.New(exit.Canceled, "controller disconnected")
 	}
-	q := rental.NewInstallQueue(store, prepare, io.Discard)
+	q := machines.NewInstalls(store, prepare, io.Discard)
 	accepted, problem := q.Accept(machine.ID, selection)
 	rentalInstallCheck(t, problem)
 	replayed, problem := q.Accept(machine.ID, selection)
@@ -142,7 +143,7 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	resumed, problem := records.Open(layout.DB)
 	rentalInstallCheck(t, problem)
 	defer resumed.Close()
-	q2 := rental.NewInstallQueue(resumed, func(_ context.Context, row records.RentalInstall) *exit.Error {
+	q2 := machines.NewInstalls(resumed, func(_ context.Context, row records.RentalInstall) *exit.Error {
 		calls.Add(1)
 		if !reflect.DeepEqual(row.Selection, selection) || row.WorkerBootID != "boot-proof" {
 			t.Errorf("recovery changed immutable inputs: %+v", row)
@@ -169,7 +170,7 @@ func TestRentalInstallQueueRetainsTypedTerminalFailures(t *testing.T) {
 			machine := rentalInstallMachine("converging")
 			rentalInstallCheck(t, store.RecordRental(machine))
 			selection := records.RentalInstallSelection{Models: []records.ModelRef{{Model: "paul/minimax-h3", Release: "1.0.0", Lane: "fp8", Manifest: "sha256:" + strings.Repeat("a", 64), ManifestLength: 321, CatalogRepository: "paul/minimax-h3"}}}
-			q := rental.NewInstallQueue(store, func(context.Context, records.RentalInstall) *exit.Error {
+			q := machines.NewInstalls(store, func(context.Context, records.RentalInstall) *exit.Error {
 				if state != "worker-refused" {
 					t.Error("terminal rental received work")
 				}
@@ -212,7 +213,7 @@ func TestRentalInstallAdmissionAndStatusAPIWhileBooting(t *testing.T) {
 	rentalInstallCheck(t, problem)
 	defer owner.Close(time.Second)
 	credential := secret.New("installation-test-only")
-	q := rental.NewInstallQueue(store, func(context.Context, records.RentalInstall) *exit.Error {
+	q := machines.NewInstalls(store, func(context.Context, records.RentalInstall) *exit.Error {
 		t.Error("admission attempted a worker call")
 		return nil
 	}, io.Discard)
@@ -252,7 +253,7 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 	entered := make(chan string, 4)
 	release := make(chan struct{})
 	var calls, active atomic.Int32
-	q := rental.NewInstallQueue(store, func(ctx context.Context, row records.RentalInstall) *exit.Error {
+	q := machines.NewInstalls(store, func(ctx context.Context, row records.RentalInstall) *exit.Error {
 		if active.Add(1) != 1 {
 			t.Error("one rental received concurrent installations")
 		}

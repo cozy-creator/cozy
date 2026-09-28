@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -38,7 +39,7 @@ type managedRentals struct {
 	// an external capacity edge: queued machine executions must be re-asked
 	// immediately rather than waiting for the next poll or a new CLI request.
 	wakeQueue func()
-	installs  *rental.InstallQueue
+	installs  *machines.Installs
 	// forget drops the daemon's kept connection to a machine whose rental ended.
 	forget func(string)
 	// said holds the last line printed about each rental, so the fleet speaks once per change.

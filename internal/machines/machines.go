@@ -26,7 +26,7 @@ import (
 )
 
 // Local names this computer's machine. Every other machine name is a rental id.
-const Local = records.LocalMachine
+const Local = "local"
 
 // IsLocal answers whether a machine name is this computer's.
 func IsLocal(name string) bool { return name == Local }

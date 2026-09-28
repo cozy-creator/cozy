@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -70,30 +71,20 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := r.PathValue("rental_id")
-	// This computer's machine installs from the daemon's own hub; a rental from the one it
-	// was bought from.
-	if id != records.LocalMachine {
-		machine, problem := s.store.RentalRow(id)
-		if problem != nil {
-			s.refuseTyped(w, r, problem)
-			return
-		}
-		if machine == nil {
-			s.refuseTyped(w, r, exit.New(exit.NotFound, "rental %s is not recorded on this host", id))
-			return
-		}
-		// The selection was resolved on the command's hub; the rental can only install
-		// what its own hub serves.
-		selected, problem := s.submissionHub(r, id)
-		if problem == nil {
-			if origin, invalid := config.HubOrigin(machine.Hub); invalid == nil && origin != selected {
-				problem = rentalHubMismatch(id, machine.Hub, selected)
+	// The selection was resolved on the command's hub; a machine installs only what its own
+	// hub serves.
+	machineHub, problem := machines.InstallHub(s.store, id)
+	if problem == nil && machineHub != "" {
+		selected, refused := s.submissionHub(r, id)
+		if problem = refused; problem == nil {
+			if origin, invalid := config.HubOrigin(machineHub); invalid == nil && origin != selected {
+				problem = rentalHubMismatch(id, machineHub, selected)
 			}
 		}
-		if problem != nil {
-			s.refuseTyped(w, r, problem)
-			return
-		}
+	}
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
 	}
 
 	if s.rentalInstall == nil {

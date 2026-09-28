@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -256,7 +257,7 @@ func handleMachineModelDownload(ctx *Context) *exit.Error {
 	if machine != "" {
 		adoptRentalHub(ctx, machine)
 	} else {
-		machine = records.LocalMachine
+		machine = machines.Local
 	}
 	if len(ctx.Inv.Args) > 1 && strings.TrimSpace(ctx.Inv.Args[1]) != "" {
 		return exit.Usagef("--rental downloads into the worker store and takes no local destination")

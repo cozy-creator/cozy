@@ -104,7 +104,7 @@ func publishParityRelease(t *testing.T, h *machineHub, root string) {
 	files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(wheel) }))
 	t.Cleanup(files.Close)
 	sum := sha256.Sum256(wheel)
-	runtime := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "cozy-runtime")
+	runtime := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "cozy-runtime") //cozy:allow the fixture describes its package as the publisher would
 	iface, err := exec.Command(runtime, "--json", "--dir", project, "describe").Output()
 	must(t, err)
 	closure, err := exec.Command("uv", "export", "--project", project, "--frozen", "--format", "requirements-txt",

@@ -893,13 +893,8 @@ def check_python_seat() -> list[str]:
             bad.append(
                 f"internal/packagepublish/package.go: [python] publication injects {forbidden[:-1]}"
             )
-    for required in (
-        '"prepare-package"',
-        '"--environment-python"',
-        "MaterializePublishedEnvironment",
-    ):
-        if required not in text:
-            bad.append(f"{path}: [python] missing full uv environment handoff {required!r}")
+    if "MaterializePublishedEnvironment" not in text:
+        bad.append(f"{path}: [python] missing the release's frozen uv environment")
     install = pathlib.Path("internal/install/install.go").read_text()
     retired_inventory = text + "\n" + "\n".join(
         pathlib.Path(name).read_text()
