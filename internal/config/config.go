@@ -1002,3 +1002,9 @@ func remove(root *yaml.Node, key string) {
 		}
 	}
 }
+
+// RuntimeYAML is the Runtime's runtime.yaml for a machine.gpu_budget value: gpu.budget,
+// verbatim.
+func RuntimeYAML(gpuBudget any) ([]byte, error) {
+	return yaml.Marshal(map[string]any{"gpu": map[string]any{"budget": gpuBudget}})
+}

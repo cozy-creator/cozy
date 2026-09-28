@@ -23,13 +23,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
-	"go.yaml.in/yaml/v3"
 )
 
 // Host is this computer's machine: the literal pod-supervisor a rented pod runs, launched
@@ -694,7 +694,7 @@ func (h *Host) writeRuntimeConfig() *exit.Error {
 		}
 		return nil
 	}
-	body, err := yaml.Marshal(map[string]any{"gpu": map[string]any{"budget": h.GPUBudget}})
+	body, err := config.RuntimeYAML(h.GPUBudget)
 	if err == nil {
 		err = os.MkdirAll(filepath.Dir(path), 0o755)
 	}
