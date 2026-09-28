@@ -3590,9 +3590,9 @@ pub fn transfer_streams(wanted: usize) -> usize {
 /// plan against the real store, the 16-way walk presigning `wanted` as it reaches it, and
 /// the completion proof, all in the compiled core.
 ///
-/// `credential` is the one spelling (`bearer <token>`, or empty for anonymous — which is
-/// what a rented pod uses, the hub's closure and presign routes taking no credential),
-/// scoped to the hub's host. `timeout` is the caller's deadline or None for none —
+/// `credential` is the one spelling (`bearer <token>`, `worker <id> <token>` — a machine's
+/// worker capability, which reads its owner's unpublished checkpoints — or empty for
+/// anonymous, published only), scoped to the hub's host. `timeout` is the caller's deadline or None for none —
 /// nothing below invents a number of seconds. `sample_seconds` is the liveness ledger's
 /// RESOLUTION (configuration, never a verdict); leave it defaulted outside tests.
 #[pyfunction]

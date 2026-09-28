@@ -39,8 +39,8 @@
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
 //!
 //! The ONE transport (tfs-048/tfs-049/tfs-050). The credential is `--credential-file` or
-//! TFS_CREDENTIAL (`bearer <token>`, or empty for anonymous), never bare argv; a
-//! URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
+//! TFS_CREDENTIAL (`bearer <token>`, `worker <id> <token>`, or empty for anonymous), never
+//! bare argv; a URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
 //! --streams-start <n> --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>.
 //! `--streams` is the most objects in flight (default 128, memory-bounded); the walk starts
 //! at `--streams-start` (default 16) and doubles while measured goodput follows.

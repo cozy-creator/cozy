@@ -36,9 +36,10 @@
 //! **The credential arrives as a provider trait, never a credential type**, so one
 //! implementation serves whatever a caller holds. It is asked per host, so a credential
 //! stays scoped to the hosts its provider names and cannot leak onto a presigned object
-//! host or a redirect target. A rented pod holds nothing at all: the hub's closure and
-//! presign routes are PUBLIC (tensorhub owner ruling 2026-09-03, which deleted the signed
-//! DownloadDelegation these calls used to present), so the pod fetches as `Anonymous`.
+//! host or a redirect target. Published checkpoints need none; a machine reads its
+//! owner's unpublished checkpoints by presenting its worker capability
+//! (`worker <id> <token>` → `x-cozy-worker-id` + `x-cozy-worker-token`), which the hub
+//! scopes to the machine owner's account.
 
 use crate::canon::{self, as_arr, as_obj, as_str, as_uint, Value};
 use crate::err::{refuse, Code, Refusal, Result};
@@ -103,9 +104,10 @@ impl CredentialProvider for ScopedHeaders {
 /// The ONE credential spelling every surface passes (tfs-050): exactly one scoped value,
 /// handed explicitly — a file, one deliberately-set variable — never inherited.
 ///
-/// - `bearer <token>` → `authorization: Bearer <token>`
-/// - empty            → anonymous, which is what a rented pod uses: the hub's closure and
-///   presign routes take no credential.
+/// - `bearer <token>`      → `authorization: Bearer <token>`
+/// - `worker <id> <token>` → `x-cozy-worker-id` + `x-cozy-worker-token`: a machine's
+///   worker capability, which the hub's closure and presign read as its owner's grant
+/// - empty                 → anonymous: published checkpoints only.
 pub fn credential_from_spec(spec: &str, hosts: Vec<String>) -> Result<ScopedHeaders> {
     let spec = spec.trim();
     if spec.is_empty() {
@@ -114,16 +116,20 @@ pub fn credential_from_spec(spec: &str, hosts: Vec<String>) -> Result<ScopedHead
             headers: Vec::new(),
         });
     }
-    let mut parts = spec.split_whitespace();
-    let headers = match (parts.next(), parts.next()) {
-        (Some("bearer"), Some(token)) if parts.next().is_none() => {
+    let parts: Vec<&str> = spec.split_whitespace().collect();
+    let headers = match parts.as_slice() {
+        ["bearer", token] => {
             vec![("authorization".to_string(), format!("Bearer {token}"))]
         }
+        ["worker", id, token] => vec![
+            ("x-cozy-worker-id".to_string(), id.to_string()),
+            ("x-cozy-worker-token".to_string(), token.to_string()),
+        ],
         _ => {
             return refuse(
                 Code::CREDENTIAL_REQUIRED,
-                "a credential is `bearer <token>` or empty — one scoped value, passed \
-                 explicitly",
+                "a credential is `bearer <token>`, `worker <id> <token>` or empty — one \
+                 scoped value, passed explicitly",
             )
         }
     };

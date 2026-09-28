@@ -192,9 +192,8 @@ fn deadline_of(flags: &Flags) -> Deadline {
 
 /// The ONE credential spelling, reaching the child explicitly (tfs-050): `--credential-file
 /// <path>` or the deliberately-set `TFS_CREDENTIAL` — never argv (world-readable in /proc),
-/// never the inherited environment at large. The value is `bearer <token>`, scoped to
-/// exactly the named hosts, or empty for anonymous — which is what a rented pod passes,
-/// the hub's closure and presign routes taking no credential at all.
+/// never the inherited environment at large. The value is `bearer <token>` or
+/// `worker <id> <token>`, scoped to exactly the named hosts, or empty for anonymous.
 fn credential_of(
     flags: &Flags,
     hosts: Vec<String>,

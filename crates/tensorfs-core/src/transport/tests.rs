@@ -3,7 +3,7 @@
 //! no hub. The ledger tests run at millisecond resolution: the cadence is configuration,
 //! the RULE under test is production's.
 
-use super::hub::{Anonymous, HostToken};
+use super::hub::{credential_from_spec, Anonymous, HostToken};
 use super::ledger::{Deadline, Ledger};
 use super::policy::{self, blocked, SourcePolicy};
 use super::pull::{absolute_location, fetch_url, pull, ObjectSource, PullRequest};
@@ -2132,6 +2132,56 @@ fn credential_headers_reach_the_hub_and_not_the_object_host() {
         }
     }
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_worker_capability_reaches_the_hub_calls_as_its_two_headers() {
+    let root = temporary("worker-cred");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(1, 4 * 1024));
+    let checkpoint_for = Arc::clone(&checkpoint);
+    let base_slot: Arc<Mutex<String>> = Arc::default();
+    let dispatch_base = Arc::clone(&base_slot);
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let base = dispatch_base.lock().unwrap().clone();
+        let machine = request.header("x-cozy-worker-id") == Some("om-machine")
+            && request.header("x-cozy-worker-token") == Some("worker-token");
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", _) if !machine => status(
+                401,
+                br#"{"error":{"code":"worker.unauthorized","message":"m"}}"#,
+            ),
+            ("POST", "/v1/tensorfs/closure") => ok_json(&closure_value(&checkpoint_for, &base)),
+            ("POST", "/v1/tensorfs/presign") => ok_json(&presign_value(&request.body, &base)),
+            ("GET", path) => match checkpoint_for.bodies.get(&path["/obj/".len()..]) {
+                Some(body) => status(200, body),
+                None => status(404, b"absent"),
+            },
+            _ => status(404, b"no route"),
+        }
+    });
+    let origin = origin(dispatch);
+    *base_slot.lock().unwrap() = origin.base.clone();
+    let policy = SourcePolicy::default();
+    let credential =
+        credential_from_spec("worker om-machine worker-token", vec!["127.0.0.1".into()]).unwrap();
+    let mut request = PullRequest::new(&store, &origin.base, "acme/model", &credential, &policy);
+    request.sample_seconds = 0.025;
+    pull(&request).unwrap();
+    let anonymous_root = temporary("worker-cred-anon");
+    let anonymous = Store::init(&anonymous_root).unwrap();
+    let mut refused = PullRequest::new(&anonymous, &origin.base, "acme/model", &Anonymous, &policy);
+    refused.sample_seconds = 0.025;
+    assert!(pull(&refused)
+        .unwrap_err()
+        .detail
+        .contains("worker.unauthorized"));
+    for spec in ["worker om-machine", "worker a b c", "machine a b"] {
+        let refusal = credential_from_spec(spec, vec![]).err().unwrap();
+        assert_eq!(refusal.code, Code::CREDENTIAL_REQUIRED, "{spec}");
+    }
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(anonymous_root);
 }
 
 // ---------------------------------------------------------------- the predicate
