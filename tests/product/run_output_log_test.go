@@ -76,81 +76,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 			must(t, removeAllForce(root))
 		}
 	})
-	project := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(fmt.Sprintf(`[project]
-name="output-log-proof"
-version="0.0.1"
-requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime[media]>=%s"]
-[tool.uv.sources]
-cozy-runtime={path=%q}
-[project.entry-points."cozy.application"]
-default="proof:app"
-[build-system]
-requires=["hatchling"]
-build-backend="hatchling.build"
-[tool.hatch.build.targets.wheel]
-only-include=["proof.py"]
-`, runtimeFixtureVersion(t, wheel), wheel)), 0o600))
-	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject=\"proof:app\"\n"), 0o600))
-	must(t, os.WriteFile(filepath.Join(project, "proof.py"), []byte(`import time
-from fractions import Fraction
-from pathlib import Path
-from typing import Annotated
-import msgspec
-from cozy_runtime.author import (App, AssetBound, Context, DecodedAudioChunk, DecodedAudioFormat,
-    DecodedMediaHeader, DecodedVideoFormat, DecodedVideoFrame, ImageAsset, ImageFrame, Outputs, VideoAsset)
-app = App()
-class Request(msgspec.Struct):
-    gate: str
-RATE, PER, TICK = 48000, 2000, Fraction(1, 24)
-AUDIO = DecodedAudioFormat(2, RATE, "stereo", ("FL", "FR"), Fraction(1, RATE))
-def silence(samples, start):
-    return DecodedAudioChunk(2, samples, RATE, "stereo", ("FL", "FR"), (bytes(samples * 4),) * 2, start, Fraction(1, RATE))
-def segment(out, k, frames):
-    """One H3-shaped segment: fragmented MP4, H.264 and AAC, 12 frames."""
-    video = DecodedVideoFormat(64, 48, TICK, Fraction(1), Fraction(24), 1, 1, 1, 1)
-    def events():
-        yield DecodedMediaHeader(video=video, audio=AUDIO)
-        for f in range(frames):
-            yield DecodedVideoFrame(64, 48, bytes([(9 * f + 70 * k) % 256, 90, 160]) * (64 * 48), f, 1, TICK, Fraction(1), 1, 1, 1, 1)
-            yield silence(PER, f * PER)
-    return out.save_video_stream(events()).video
-class Film(msgspec.Struct):
-    video: Annotated[VideoAsset, AssetBound(media_types=("video/mp4",))]
-@app.job(emits_media=True)
-def film(ctx: Context, payload: Request, out: Outputs) -> Film:
-    """Three segments joined as they land: each revision is the video so far."""
-    join = out.join_video(AUDIO)
-    written = 0
-    for k in (1, 2, 3):
-        while not (Path(payload.gate) / f"go-{k}").exists():
-            ctx.raise_if_cancelled()
-            time.sleep(0.02)
-        revision = join.append(segment(out, k, 12), lambda frames, at=written: [silence(frames * PER, at)], last=k == 3)
-        written += 12 * PER
-        out.publish("video", revision, label=f"Video (segments 1-{k} of 3)")
-    return Film(join.finish().video)
-class Grown(msgspec.Struct):
-    image: Annotated[ImageAsset, AssetBound(media_types=("image/png",))]
-    frames: list[ImageAsset]
-@app.job(emits_media=True)
-def grow(ctx: Context, payload: Request, out: Outputs) -> Grown:
-    """Three revisions of image and one frame each, each after its gate file appears."""
-    frames = []
-    for k in (1, 2, 3):
-        while not (Path(payload.gate) / f"go-{k}").exists():
-            ctx.raise_if_cancelled()
-            time.sleep(0.02)
-        pixel = bytes([60 * k, 255 - 60 * k, 30])
-        image = out.save_image(ImageFrame(8, 8, pixel * 64), format="png")
-        out.publish("image", image, label=f"Revision {k} of 3")
-        frame = out.save_image(ImageFrame(2, 2, pixel * 4), format="png")
-        out.publish("frames", frame, label=f"Frame {k}")
-        frames.append(frame)
-    return Grown(image=image, frames=frames)
-`), 0o600))
-	uv("lock", "--project", project)
+	project := outputLogProof(t, wheel)
 	cozy := func(args ...string) *exec.Cmd {
 		command := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 		command.Env = childEnv(t, root, "PATH="+path)
@@ -401,4 +327,89 @@ func landed(t *testing.T, what string, done func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 	}
+}
+
+// outputLogProof is a package whose jobs publish as they go: grow (three revisions of an image
+// and a list of frames) and film (a 3-segment video joined as it lands), each step waiting
+// for its gate file. wheel is the Runtime it runs on.
+func outputLogProof(t *testing.T, wheel string) string {
+	t.Helper()
+	project := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(fmt.Sprintf(`[project]
+name="output-log-proof"
+version="0.0.1"
+requires-python=">=3.12,<3.13"
+dependencies=["cozy-runtime[media]>=%s"]
+[tool.uv.sources]
+cozy-runtime={path=%q}
+[project.entry-points."cozy.application"]
+default="proof:app"
+[build-system]
+requires=["hatchling"]
+build-backend="hatchling.build"
+[tool.hatch.build.targets.wheel]
+only-include=["proof.py"]
+`, runtimeFixtureVersion(t, wheel), wheel)), 0o600))
+	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject=\"proof:app\"\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(project, "proof.py"), []byte(`import time
+from fractions import Fraction
+from pathlib import Path
+from typing import Annotated
+import msgspec
+from cozy_runtime.author import (App, AssetBound, Context, DecodedAudioChunk, DecodedAudioFormat,
+    DecodedMediaHeader, DecodedVideoFormat, DecodedVideoFrame, ImageAsset, ImageFrame, Outputs, VideoAsset)
+app = App()
+class Request(msgspec.Struct):
+    gate: str
+RATE, PER, TICK = 48000, 2000, Fraction(1, 24)
+AUDIO = DecodedAudioFormat(2, RATE, "stereo", ("FL", "FR"), Fraction(1, RATE))
+def silence(samples, start):
+    return DecodedAudioChunk(2, samples, RATE, "stereo", ("FL", "FR"), (bytes(samples * 4),) * 2, start, Fraction(1, RATE))
+def segment(out, k, frames):
+    """One H3-shaped segment: fragmented MP4, H.264 and AAC, 12 frames."""
+    video = DecodedVideoFormat(64, 48, TICK, Fraction(1), Fraction(24), 1, 1, 1, 1)
+    def events():
+        yield DecodedMediaHeader(video=video, audio=AUDIO)
+        for f in range(frames):
+            yield DecodedVideoFrame(64, 48, bytes([(9 * f + 70 * k) % 256, 90, 160]) * (64 * 48), f, 1, TICK, Fraction(1), 1, 1, 1, 1)
+            yield silence(PER, f * PER)
+    return out.save_video_stream(events()).video
+class Film(msgspec.Struct):
+    video: Annotated[VideoAsset, AssetBound(media_types=("video/mp4",))]
+@app.job(emits_media=True)
+def film(ctx: Context, payload: Request, out: Outputs) -> Film:
+    """Three segments joined as they land: each revision is the video so far."""
+    join = out.join_video(AUDIO)
+    written = 0
+    for k in (1, 2, 3):
+        while not (Path(payload.gate) / f"go-{k}").exists():
+            ctx.raise_if_cancelled()
+            time.sleep(0.02)
+        revision = join.append(segment(out, k, 12), lambda frames, at=written: [silence(frames * PER, at)], last=k == 3)
+        written += 12 * PER
+        out.publish("video", revision, label=f"Video (segments 1-{k} of 3)")
+    return Film(join.finish().video)
+class Grown(msgspec.Struct):
+    image: Annotated[ImageAsset, AssetBound(media_types=("image/png",))]
+    frames: list[ImageAsset]
+@app.job(emits_media=True)
+def grow(ctx: Context, payload: Request, out: Outputs) -> Grown:
+    """Three revisions of image and one frame each, each after its gate file appears."""
+    frames = []
+    for k in (1, 2, 3):
+        while not (Path(payload.gate) / f"go-{k}").exists():
+            ctx.raise_if_cancelled()
+            time.sleep(0.02)
+        pixel = bytes([60 * k, 255 - 60 * k, 30])
+        image = out.save_image(ImageFrame(8, 8, pixel * 64), format="png")
+        out.publish("image", image, label=f"Revision {k} of 3")
+        frame = out.save_image(ImageFrame(2, 2, pixel * 4), format="png")
+        out.publish("frames", frame, label=f"Frame {k}")
+        frames.append(frame)
+    return Grown(image=image, frames=frames)
+`), 0o600))
+	if out, err := exec.Command("/usr/bin/nice", "-n", "19", "uv", "lock", "--project", project).CombinedOutput(); err != nil {
+		t.Fatalf("uv lock: %v %s", err, out)
+	}
+	return project
 }
