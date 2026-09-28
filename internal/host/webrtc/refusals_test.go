@@ -79,7 +79,8 @@ func TestHelloAdmitsOnlyAValidCapability(t *testing.T) {
 
 func TestRequestsOutsideTheGrantAreRefused(t *testing.T) {
 	h := newHarness(t)
-	h.m.Append("7", "video", -1, segment(1000, 1), 1_000_000, true)
+	h.m.Append(7, "video", -1, segment(1000, 1), 1_000_000)
+	h.m.End(7, "completed")
 	c := h.dial()
 	h.send(c, map[string]any{"t": "hello", "v": 1, "cap": h.grant(func(g *capability.Grant) { g.Outputs = []string{"references/2"} })})
 	h.expect(c, "welcome")
@@ -122,7 +123,7 @@ func TestRevokingTheKeyEndsItsSessions(t *testing.T) {
 	c := h.open(64 << 20)
 	h.follow(c, 0, 0)
 	var f follower
-	h.m.Append("7", "video", -1, segment(50_000, 1), 1_000_000, false)
+	h.m.Append(7, "video", -1, segment(50_000, 1), 1_000_000)
 	h.until(c, &f, func() bool { return len(f.got) == 50_000 })
 	h.m.Revoke(h.key.Public().(ed25519.PublicKey))
 	if m := h.expect(c, "bye"); m.Code != "revoked" {
@@ -194,7 +195,8 @@ func isReset(err error) bool { return err != nil && strings.Contains(err.Error()
 
 func TestTheNinthConnectionFromOneIPEvictsTheOldestPending(t *testing.T) {
 	h := newHarness(t)
-	h.m.Append("7", "video", -1, segment(1000, 1), 1_000_000, true)
+	h.m.Append(7, "video", -1, segment(1000, 1), 1_000_000)
+	h.m.End(7, "completed")
 	c := h.open(1 << 20) // authenticated: never evicted for pending ones
 	var pending []net.Conn
 	for range 8 { // 1 + 7 fill the IP's 8; the 8th pending arrival is the 9th connection

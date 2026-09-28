@@ -71,7 +71,7 @@ type item struct {
 	msg      any
 	last     bool // the stream ends with this message
 	body     io.ReaderAt
-	from, to uint64
+	from, to int64
 }
 
 type request struct {
@@ -80,8 +80,8 @@ type request struct {
 	Run    string          `json:"run"`
 	Output string          `json:"output"`
 	Index  *int            `json:"index"`
-	Offset uint64          `json:"offset"`
-	Length uint64          `json:"length"`
+	Offset int64           `json:"offset"`
+	Length int64           `json:"length"`
 	After  uint64          `json:"after"`
 	ETag   string          `json:"etag"`
 	Bytes  uint64          `json:"bytes"`
@@ -103,7 +103,7 @@ type (
 		Output       string          `json:"output"`
 		Index        *int            `json:"index,omitempty"`
 		Rev          uint64          `json:"rev"`
-		Length       uint64          `json:"length"`
+		Length       int64           `json:"length"`
 		AppendedFrom *uint64         `json:"appended_from,omitempty"`
 		DurationUS   uint64          `json:"duration_us,omitempty"`
 		SHA256       string          `json:"sha256,omitempty"`
@@ -114,8 +114,8 @@ type (
 		T      string          `json:"t"`
 		ID     json.RawMessage `json:"id"`
 		Stream uint32          `json:"stream"`
-		Offset uint64          `json:"offset"`
-		Length uint64          `json:"length"`
+		Offset int64           `json:"offset"`
+		Length int64           `json:"length"`
 		ETag   string          `json:"etag"`
 	}
 	resetMsg struct {
@@ -127,7 +127,7 @@ type (
 		T      string          `json:"t"`
 		ID     json.RawMessage `json:"id"`
 		Status string          `json:"status,omitempty"`
-		Length *uint64         `json:"length,omitempty"`
+		Length *int64          `json:"length,omitempty"`
 		SHA256 string          `json:"sha256,omitempty"`
 	}
 	errorMsg struct {
@@ -274,9 +274,11 @@ func (c *session) request(req request) {
 		index = *req.Index
 	}
 	fail := func(code, message string) { c.queue(errorMsg{"error", req.ID, code, message}) }
+	run, err := strconv.ParseUint(req.Run, 10, 64)
 	switch {
-	case len(req.ID) == 0 || string(req.ID) == "null" || req.Output == "" || req.Index != nil && index < 0:
-		fail("bad_request", "a request needs an id, an output and a non-negative index when it has one")
+	case len(req.ID) == 0 || string(req.ID) == "null" || err != nil || req.Output == "" || req.Index != nil && index < 0 ||
+		req.Offset < 0 || req.Length < 0:
+		fail("bad_request", "a request needs an id, a run number, an output, and no negative index, offset or length")
 		return
 	case !c.grant.Allows(req.Run, req.Output, index):
 		fail("scope", capability.ErrScope.Error())
@@ -299,9 +301,9 @@ func (c *session) request(req request) {
 	c.streams = append(c.streams, st)
 	c.mu.Unlock()
 	if st.get {
-		c.get(st, req, index)
+		c.get(st, run, req, index)
 	} else {
-		go c.follow(st, req, index)
+		go c.follow(st, run, req, index)
 	}
 }
 
@@ -338,8 +340,8 @@ func (c *session) stop(st *stream, msg any) {
 }
 
 // get serves one byte range of an output's current bytes; a stale etag gets `changed`.
-func (c *session) get(st *stream, req request, index int) {
-	snap, err := c.srv.cfg.Source.Open(req.Run, req.Output, index)
+func (c *session) get(st *stream, run uint64, req request, index int) {
+	snap, err := c.srv.cfg.Source.Open(run, req.Output, index)
 	if err != nil {
 		c.stop(st, sourceError(st.id, err))
 		return
@@ -369,14 +371,14 @@ func (c *session) get(st *stream, req request, index int) {
 }
 
 // follow streams an output from the client's cursor (after, offset) as the log announces its
-// revisions, until its final revision or the run's terminal. The pod never reads past the
-// length the latest entry committed.
-func (c *session) follow(st *stream, req request, index int) {
+// revisions, until the run's terminal. The pod never reads past the length the latest entry
+// committed.
+func (c *session) follow(st *stream, run uint64, req request, index int) {
 	src := c.srv.cfg.Source
 	after, held := req.After, req.Offset
 	var pending []outputs.Entry
 	for {
-		batch, err := src.Entries(st.ctx, req.Run, after)
+		batch, err := src.Entries(st.ctx, run, after)
 		if err != nil {
 			c.stop(st, sourceError(st.id, err))
 			return
@@ -394,7 +396,7 @@ func (c *session) follow(st *stream, req request, index int) {
 		}
 		if len(pending) > 0 {
 			last := pending[len(pending)-1]
-			snap, err := src.Open(req.Run, req.Output, index)
+			snap, err := src.Open(run, req.Output, index)
 			if err != nil {
 				c.stop(st, sourceError(st.id, err))
 				return
@@ -411,16 +413,13 @@ func (c *session) follow(st *stream, req request, index int) {
 			var items []item
 			items, held = emit(st, pending, snap, held)
 			pending = nil
-			if last.SHA256 != "" {
-				items = append(items, item{msg: endMsg{"end", st.id, "completed", &last.Length, last.SHA256}, last: true})
-			}
-			if !c.push(st, items...) || last.SHA256 != "" {
+			if !c.push(st, items...) {
 				return
 			}
 		}
 		if terminal != nil {
 			end := endMsg{T: "end", ID: st.id, Status: terminal.Status}
-			if snap, err := src.Open(req.Run, req.Output, index); err == nil {
+			if snap, err := src.Open(run, req.Output, index); err == nil {
 				closeBody(snap.Body)
 				end.Length, end.SHA256 = &snap.Length, snap.SHA256
 			}
@@ -432,7 +431,7 @@ func (c *session) follow(st *stream, req request, index int) {
 
 // emit turns the followed output's new entries into what the client lacks: a reset when a
 // replacement voids the bytes it holds, the entries still current, then the bytes past held.
-func emit(st *stream, pending []outputs.Entry, snap outputs.Snapshot, held uint64) ([]item, uint64) {
+func emit(st *stream, pending []outputs.Entry, snap outputs.Snapshot, held int64) ([]item, int64) {
 	from, replaced := 0, false
 	for i, e := range pending {
 		if e.AppendedFrom == nil {
@@ -482,8 +481,8 @@ type work struct {
 	msg    any
 	st     *stream
 	body   io.ReaderAt
-	from   uint64
-	n      int
+	from   int64
+	n      int64
 	finish bool // the body is done after this chunk
 }
 
@@ -508,12 +507,12 @@ func (c *session) send() {
 			}
 		} else {
 			binary.BigEndian.PutUint32(buf, w.st.number)
-			binary.BigEndian.PutUint64(buf[4:], w.from)
-			n, readErr := w.body.ReadAt(buf[header:header+w.n], int64(w.from))
+			binary.BigEndian.PutUint64(buf[4:], uint64(w.from))
+			n, readErr := w.body.ReadAt(buf[header:header+w.n], w.from)
 			if w.finish {
 				closeBody(w.body)
 			}
-			if n < w.n {
+			if int64(n) < w.n {
 				c.stop(w.st, sourceError(w.st.id, readErr))
 				continue
 			}
@@ -560,10 +559,10 @@ func (c *session) next() (work, bool) {
 			}
 			if st := c.pick(); st != nil && c.sent < c.credit && c.windowOpen() {
 				it := &st.items[0]
-				n := min(maxMessage-header, it.to-it.from, c.credit-c.sent)
-				w := work{st: st, body: it.body, from: it.from, n: int(n)}
+				n := min(maxMessage-header, it.to-it.from, int64(min(c.credit-c.sent, maxMessage)))
+				w := work{st: st, body: it.body, from: it.from, n: n}
 				it.from += n
-				c.sent += n
+				c.sent += uint64(n)
 				if it.from == it.to {
 					w.finish = true
 					st.items = st.items[1:]
