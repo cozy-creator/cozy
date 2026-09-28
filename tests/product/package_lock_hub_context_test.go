@@ -21,7 +21,7 @@ import (
 // project with an account dependency locks against the account index of the Hub the name
 // selects, as the account signed in there by that same name.
 func TestPackageLockUsesTheNamedHubContextsLogin(t *testing.T) {
-	if _, err := exec.LookPath("cozy-runtime"); err != nil {
+	if _, err := exec.LookPath("cozy-runtime"); err != nil { //cozy:allow the host's own tool, as in host_runtime_test.go
 		t.Skip("package lock selects its Python through the host cozy-runtime tool")
 	}
 	const dependency = "ctx-dep"
