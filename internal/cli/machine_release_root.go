@@ -158,7 +158,7 @@ func (m *machineRuns) sendReleaseRoot(ctx context.Context, request records.Reque
 			}
 		default:
 			if slices.Contains(codeOf, "execution_workspace_changed") {
-				m.workspaces.Delete(connection.Name + "\x00" + connection.Claim.WorkerBootId)
+				connection.KeepWorkspace(nil)
 			}
 			return m.submissionRefused(request.ID, trailer, err)
 		}

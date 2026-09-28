@@ -550,6 +550,9 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 						return problem
 					}
 					_ = control.Close()
+					// The worker boot is the same; its Runtime is not. The next call claims
+					// it again and reads the capabilities it now has.
+					u.machines.machines.Forget(row.RentalID)
 					// The worker finished and answered maintenance control, so it is healthy.
 					// The pair it reports is recorded as observed; a spelling or version it
 					// chose differently never keeps a paid rental closed.
