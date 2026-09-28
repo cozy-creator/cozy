@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,6 +73,11 @@ func (h *Host) path(name string) string { return filepath.Join(h.dir, name) }
 // The image layout the Host and Runtime share, rooted.
 func (h *Host) binary() string { return filepath.Join(h.Root(), "usr/local/bin/pod-supervisor") }
 func (h *Host) python() string { return filepath.Join(h.Root(), "opt/cozy/python") }
+
+// wheels holds exactly the Runtime and TensorFS wheels the machine installed from (none after
+// a published install): the Runtime's --find-links for a package's SDK. A pod's image links
+// /opt/cozy/wheels to /var/lib/cozy/dev/current, the pair dev/update.py last installed.
+func (h *Host) wheels() string { return filepath.Join(h.Root(), "opt/cozy/wheels") }
 func (h *Host) readinessEnvelope() string {
 	return filepath.Join(h.Root(), "run/cozy/bootstrap/readiness-envelope.json")
 }
@@ -154,8 +160,16 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 			return nil, exit.Internalf("cannot lay out the machine root: %s", err)
 		}
 	}
-	if err := copyExecutable(source.Host, h.binary()); err != nil {
+	if err := copyFile(source.Host, h.binary(), 0o755); err != nil {
 		return nil, exit.Internalf("cannot install the machine Host: %s", err)
+	}
+	var wheels []string
+	if source.RuntimeWheel != "" {
+		wheels = []string{source.RuntimeWheel, source.TensorFSWheel}
+	}
+	wheels, err := h.keepWheels(wheels)
+	if err != nil {
+		return nil, exit.Internalf("cannot keep the machine's wheels: %s", err)
 	}
 	// A venv is not relocatable, so it is rebuilt in place.
 	if err := os.RemoveAll(h.python()); err != nil {
@@ -168,8 +182,8 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 	// The worker's base is the CPU image's: the Runtime with its media extra. Every
 	// package environment carries its own framework closure.
 	requirements := []string{hostruntime.Distribution + "[media]>=" + RuntimeFloor}
-	if source.RuntimeWheel != "" {
-		requirements = []string{hostruntime.Distribution + "[media] @ file://" + source.RuntimeWheel, source.TensorFSWheel}
+	if len(wheels) > 0 {
+		requirements = []string{hostruntime.Distribution + "[media] @ file://" + wheels[0], wheels[1]}
 	}
 	python := filepath.Join(h.python(), "bin/python")
 	install := exec.CommandContext(ctx, uv, append([]string{"pip", "install", "--no-config", "--python", python}, requirements...)...)
@@ -640,22 +654,53 @@ func fileDigest(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func copyExecutable(source, target string) error {
+// keepWheels makes the wheel directory hold exactly these files, each written to a temporary
+// name and renamed into place, and answers the kept paths the environment installs from.
+func (h *Host) keepWheels(sources []string) ([]string, error) {
+	dir := h.wheels()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	kept := make([]string, len(sources))
+	for i, source := range sources {
+		kept[i] = filepath.Join(dir, filepath.Base(source))
+		if err := copyFile(source, kept[i], 0o644); err != nil {
+			return nil, err
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !slices.Contains(kept, filepath.Join(dir, entry.Name())) {
+			if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return kept, nil
+}
+
+func copyFile(source, target string, mode os.FileMode) error {
 	input, err := os.Open(source)
 	if err != nil {
 		return err
 	}
 	defer input.Close()
 	staged := target + ".new"
-	output, err := os.OpenFile(staged, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	output, err := os.OpenFile(staged, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err == nil {
+		_, err = io.Copy(output, input)
+		if err == nil {
+			err = output.Sync()
+		}
+		if closeErr := output.Close(); err == nil {
+			err = closeErr
+		}
+	}
 	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(output, input); err != nil {
-		output.Close()
-		return err
-	}
-	if err := output.Close(); err != nil {
+		_ = os.Remove(staged)
 		return err
 	}
 	return os.Rename(staged, target)
