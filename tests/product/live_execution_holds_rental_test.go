@@ -1,9 +1,12 @@
 package producttest
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -143,4 +146,73 @@ func TestAcceptedExecutionHoldsTheRentalAgainstTheHostIdleRelease(t *testing.T) 
 	if renewals, _, _ := host.state(); renewals > settled+1 {
 		t.Fatalf("the Host deadline was renewed %d more time(s) after the run ended", renewals-settled)
 	}
+}
+
+// Accepted work keeps holding its rental across a daemon restart: the new daemon rebuilds
+// what is live from its records, keeps it off its own idle clock, and keeps renewing the
+// Host's deadline (hakufu, runs 1431 and 1432 submitted before a daemon restart).
+func TestAcceptedExecutionHoldsTheRentalAcrossADaemonRestart(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machine := &runtimeMachine{}
+	host := &hostIdleClock{window: 20 * time.Second}
+	root, layout := rentedLadderHome(t, h, &fakePod{machine: machine, keepalive: host.keepalive}, nil)
+	first := startDaemonProcess(t, root)
+	const key = "held-across-a-restart"
+	if code, out := cozyWithin(t, root, time.Minute, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", key); code != 0 {
+		t.Fatalf("the run was refused [exit %d]: %s", code, out)
+	}
+	eventually(t, root, "the machine accepting the run", func() bool { return machine.submitted() != nil })
+	host.start()
+	eventually(t, root, "the first renewal", func() bool {
+		renewals, _, _ := host.state()
+		return renewals >= 1
+	})
+	// A release time the log announced before the run arrived is withdrawn once it runs.
+	eventually(t, root, "the idle announcement withdrawn", func() bool {
+		log, err := os.ReadFile(filepath.Join(root, "daemon.log"))
+		return err == nil && (!strings.Contains(string(log), "(tessa) idle since") ||
+			strings.Contains(string(log), "(tessa) has work again; no idle release is scheduled"))
+	})
+
+	must(t, first.cmd.Process.Signal(syscall.SIGTERM))
+	<-first.exited
+	before, _, _ := host.state()
+	startDaemonProcess(t, root)
+
+	for end := time.Now().Add(3 * host.window); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+		if _, _, lapsed := host.state(); !lapsed.IsZero() {
+			t.Fatalf("the Host's idle deadline %s lapsed across the daemon restart:\n%s", lapsed.Format(time.RFC3339Nano),
+				tail(filepath.Join(root, "daemon.log")))
+		}
+	}
+	if renewals, _, _ := host.state(); renewals < before+2 {
+		t.Fatalf("the restarted daemon renewed the Host deadline %d time(s) over three windows", renewals-before)
+	}
+	host.mu.Lock()
+	replays, early := host.replays, host.early
+	host.mu.Unlock()
+	if replays != 0 || early != 0 {
+		t.Fatalf("renewals replayed %d request id(s) and came %d time(s) before half the window", replays, early)
+	}
+	var list struct {
+		Rentals []struct {
+			Machine   string `json:"machine"`
+			Running   int    `json:"running"`
+			IdleSince string `json:"idle_since_at"`
+		} `json:"rentals"`
+	}
+	_, raw := cozyWithin(t, root, time.Minute, "rental", "list", "--json")
+	if json.Unmarshal([]byte(raw), &list) != nil || len(list.Rentals) != 1 || list.Rentals[0].Running != 1 || list.Rentals[0].IdleSince != "" {
+		t.Fatalf("the restarted daemon does not hold the rental for its executing run:\n%s", raw)
+	}
+
+	machine.finish()
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	eventually(t, root, "the run settling", func() bool {
+		row, problem := store.RequestByIdempotencyKey(key)
+		return problem == nil && row != nil && row.State == "succeeded"
+	})
 }

@@ -973,7 +973,10 @@ func (m *managedRentals) observeLocked(row records.Rental) (string, *pendingRele
 	}
 	due, eligible := idle.ReleaseAt()
 	if !eligible {
-		delete(m.said, row.ID)
+		if m.said[row.ID] != "" {
+			// The idle line said a release time; a reader must not keep believing it.
+			m.sayLocked(row.ID, fmt.Sprintf("rental %s (%s) has work again; no idle release is scheduled", row.ID, row.MachineName))
+		}
 		if idle.Running > 0 {
 			m.holdLocked(row)
 		}

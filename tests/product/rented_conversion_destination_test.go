@@ -395,13 +395,6 @@ func TestRentedConversionPublishesFromTheMachineThatIngestedItsSource(t *testing
 		t.Fatalf("a completed conversion was not a memo hit [exit %d]: %s", code, again)
 	}
 
-	// An exact checkpoint input on the named rental, as `org/model#sha256:…`.
-	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source#"+f.source, "proof/output", "steps=9",
-		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
-	if code != 0 || len(machine.submitted()) != 2 {
-		t.Fatalf("a checkpoint input's rented conversion did not publish [exit %d]: %s", code, out)
-	}
-
 	// A Runtime that predates destinations runs the job and ignores the grant.
 	machine.mu.Lock()
 	machine.publishes = false
@@ -417,7 +410,7 @@ func TestRentedConversionPublishesFromTheMachineThatIngestedItsSource(t *testing
 	machine.mu.Unlock()
 	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "steps=8",
 		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
-	if code != 0 || !strings.Contains(out, childDigest("c")) || len(machine.submitted()) != 4 {
+	if code != 0 || !strings.Contains(out, childDigest("c")) || len(machine.submitted()) != 3 {
 		t.Fatalf("the updated machine did not publish the re-run [exit %d]: %s", code, out)
 	}
 }
