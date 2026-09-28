@@ -584,11 +584,11 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
             .collect::<Vec<_>>()
             .join(",");
         let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
-        let mut prepared = match source_core::prepare_with_registry(
+        let mut prepared = match source_core::prepare(
             &target,
             &unnamed(&srcs),
             &CarrierSet::default(),
-            &reg,
+            Some(&reg),
             variant,
         ) {
             Ok(prepared) => prepared,
@@ -849,17 +849,22 @@ fn prepare_closed_source_plan(
     if closed.registry != BUILTIN_REGISTRY {
         flags.push(("registry".to_string(), closed.registry.clone()));
     }
+    let as_is = closed.converter == convert::IDENTITY;
+    if as_is {
+        flags.push(("source-profile".to_string(), source_core::AS_IS.to_string()));
+    }
     for (component, source) in &closed.sources {
         flags.push((
             "source".to_string(),
             format!("{component}={}", source.path.to_string_lossy()),
         ));
     }
-    let mut prepared = source_core::prepare_with_registry(
+    // The plan was re-derived above, so its converter is the planner's: as-is has no registry.
+    let mut prepared = source_core::prepare(
         &closed.target,
         &closed.sources,
         &closed.set,
-        &registry,
+        (!as_is).then_some(&registry),
         None,
     )
     .map_err(bail)?;
@@ -989,15 +994,17 @@ pub(crate) fn construction_order(f: &Flags) -> Result<Vec<(String, String)>, Exi
 
 /// Headers in, plan out. The one function `plan`, `run` and the worker all go through, so
 /// a preview and a run cannot disagree about what was going to happen.
+/// `--source-profile as-is/1` stores the sources as they are, unclassified.
 fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
     let sources = sources(f)?;
     let registry = load_registry(f)?;
     let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
-    source_core::prepare_with_registry(
+    let as_is = flag(f, "source-profile") == Some(source_core::AS_IS);
+    source_core::prepare(
         target,
         &unnamed(&sources),
         &CarrierSet::default(),
-        &registry,
+        (!as_is).then_some(&registry),
         variant,
     )
     .map_err(bail)
@@ -1206,6 +1213,7 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
                 | "tenant"
                 | "isolation-tier"
                 | "checkpoint-bytes"
+                | "source-profile"
         ) {
             argv.push(format!("--{k}"));
             argv.push(v.clone());

@@ -394,12 +394,38 @@ fn source_plan_uses_the_compiled_product_registry_by_default() {
         .arg(&unknown)
         .output()
         .unwrap();
-    // An unrecognized carrier is a hint miss, not a refusal: it is stored as it is.
+    // An unrecognized carrier is a hint miss, not a refusal: it plans, previews and runs as-is.
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{error}");
     let plan = String::from_utf8(output.stdout).unwrap();
     assert!(plan.contains(r#""profile":"as-is/1""#), "{plan}");
     assert!(plan.contains(r#""converter":"identity/1""#), "{plan}");
+    let (plan_path, store) = (root.join("source-plan.json"), root.join("store"));
+    fs::write(&plan_path, plan.trim_end()).unwrap();
+    let tfs = |args: &[&std::ffi::OsStr]| {
+        let run = Command::new(env!("CARGO_BIN_EXE_tfs"))
+            .args(args)
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&run.stderr).to_string();
+        assert!(run.status.success(), "{args:?}: {said}");
+        String::from_utf8_lossy(&run.stdout).to_string()
+    };
+    tfs(&[
+        "ingest".as_ref(),
+        "plan".as_ref(),
+        "--source-plan".as_ref(),
+        plan_path.as_ref(),
+    ]);
+    tfs(&["store".as_ref(), "init".as_ref(), store.as_ref()]);
+    let ran = tfs(&[
+        "ingest".as_ref(),
+        "run".as_ref(),
+        store.as_ref(),
+        "--source-plan".as_ref(),
+        plan_path.as_ref(),
+    ]);
+    assert!(ran.contains("candidate    manifest sha256:"), "{ran}");
     let _ = fs::remove_dir_all(root);
 }
 

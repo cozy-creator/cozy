@@ -511,18 +511,9 @@ pub fn plan_tensor_schema(plan: &Plan) -> Value {
 /// `sources` carries each component's CARRIER, not its path: a path alone cannot say what
 /// the file is, and this is the second place — after the plan's own header pass — that
 /// would otherwise read a CAS-resident index as a safetensors file.
-pub fn prepare_with_registry(
-    target: &str,
-    sources: &[(String, CarrierInput)],
-    set: &CarrierSet,
-    registry: &FingerprintRegistry,
-    spec_variant: Option<usize>,
-) -> Result<Prepared> {
-    prepare(target, sources, set, Some(registry), spec_variant)
-}
-
+///
 /// With no registry every source is stored as-is through [`convert::IDENTITY`].
-fn prepare(
+pub fn prepare(
     target: &str,
     sources: &[(String, CarrierInput)],
     set: &CarrierSet,
@@ -699,7 +690,7 @@ fn plan_source_prepared(
         }
     }
     // The selection is the directory. Built once, before a single header is read, so the
-    // plan's header pass and `prepare_with_registry`'s cannot disagree about which file a
+    // plan's header pass and `prepare`'s cannot disagree about which file a
     // `weight_map` value names.
     let set = CarrierSet::of(carriers);
     let mut headers = Vec::with_capacity(carriers.len());
