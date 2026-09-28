@@ -34,6 +34,14 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	}
 	body.Package = strings.TrimSpace(body.Package)
 	body.Release = strings.TrimSpace(body.Release)
+	if body.Hub == "" {
+		hub, problem := s.hubOf(r)
+		if problem != nil {
+			s.refuseTyped(w, r, problem)
+			return
+		}
+		body.Hub = hub
+	}
 	if body.Package != "" {
 		if _, problem := canonicalPackageRef(body.Package); problem != nil {
 			s.refuseTyped(w, r, problem)

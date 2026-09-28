@@ -110,6 +110,6 @@ func TestPublishedMachineRoutingOwnsEveryRentedJob(t *testing.T) {
 	}
 }
 
-func (publishedRouteObserver) Describe(context.Context, string, string, string) (api.DescribedRelease, *exit.Error) {
+func (publishedRouteObserver) Describe(context.Context, string, string, string, string) (api.DescribedRelease, *exit.Error) {
 	return api.DescribedRelease{}, nil
 }

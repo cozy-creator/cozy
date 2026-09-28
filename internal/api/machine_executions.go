@@ -26,7 +26,7 @@ type MachineExecutions interface {
 	PruneOperationCache(ctx context.Context, machine string) (uint32, uint64, bool, *exit.Error)
 	// Describe is a published release as one machine reads it at its own Hub: the release
 	// (the newest when none is named) and its interface.
-	Describe(ctx context.Context, machine, pkg, release string) (DescribedRelease, *exit.Error)
+	Describe(ctx context.Context, machine, hub, pkg, release string) (DescribedRelease, *exit.Error)
 	// Forget drops this daemon's kept connection to a machine, before its credentials go.
 	Forget(machine string)
 	// ForgetPackage tells every machine this daemon knows that a package's releases or owner
@@ -72,7 +72,12 @@ func (s *Server) describeRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query()
-	described, problem := s.machineExecutions.Describe(r.Context(), r.PathValue("machine"), query.Get("package"), query.Get("release"))
+	hub, problem := s.hubOf(r)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	described, problem := s.machineExecutions.Describe(r.Context(), r.PathValue("machine"), hub, query.Get("package"), query.Get("release"))
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return

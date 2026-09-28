@@ -260,3 +260,18 @@ func machineInstallations(root string) string {
 func machineJournal(root string) string {
 	return filepath.Join(machineStore(root), ".cozy-workspace", "journal.sqlite3")
 }
+
+// registerMachineAt records root's machine as registered with one more hub, beside any
+// other: a machine keeps one registration per hub.
+func registerMachineAt(t *testing.T, root, hub string, environment map[string]string) {
+	t.Helper()
+	path := filepath.Join(root, "machine", "registrations.json")
+	all := map[string]map[string]any{}
+	if raw, err := os.ReadFile(path); err == nil {
+		must(t, json.Unmarshal(raw, &all))
+	}
+	all[hub] = map[string]any{"hub": hub, "id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t), "environment": environment}
+	raw, err := json.Marshal(all)
+	must(t, err)
+	must(t, os.WriteFile(path, raw, 0o600))
+}

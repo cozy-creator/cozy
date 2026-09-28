@@ -208,9 +208,10 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 }
 
 type registration struct {
-	Hub         string `json:"hub"`
-	ID          string `json:"id"`
-	WorkerToken string `json:"worker_token"`
+	Hub         string            `json:"hub"`
+	ID          string            `json:"id"`
+	WorkerToken string            `json:"worker_token"`
+	Environment map[string]string `json:"environment,omitempty"`
 }
 
 // hostRecord is one launched Host, as a rental row records its pod.
@@ -319,9 +320,10 @@ func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.C
 	if problem != nil {
 		return nil, problem
 	}
-	environment, problem := h.environment()
-	if problem != nil {
-		return nil, problem
+	environment := registered.Environment
+	if len(environment) == 0 {
+		return nil, exit.Named(exit.Unavailable, "machine.environment_unavailable", "this machine's registration with %s recorded no hub environment", hubOrigin).
+			WithRemedy("re-register it: remove %s and run it again", h.path("registrations.json"))
 	}
 	owner, problem := rental.OwnerIdentityAt(h.path("owner.pem"))
 	if problem != nil {
@@ -467,11 +469,9 @@ func (h *Host) Status() (Status, *exit.Error) {
 		return Status{}, problem
 	}
 	out := Status{Installed: installed}
-	if raw, err := os.ReadFile(h.path("registration.json")); err == nil {
-		var registered registration
-		if json.Unmarshal(raw, &registered) == nil {
-			out.MachineID, out.Hub = registered.ID, registered.Hub
-		}
+	registered, problem := h.registrations()
+	if problem != nil {
+		return Status{}, problem
 	}
 	record, problem := h.record()
 	if problem != nil {
@@ -479,6 +479,11 @@ func (h *Host) Status() (Status, *exit.Error) {
 	}
 	if record != nil {
 		out.PID, out.Running = record.PID, h.alive(record.PID)
+		out.MachineID, out.Hub = registered[record.Hub].ID, record.Hub
+	} else if len(registered) == 1 {
+		for hub, one := range registered {
+			out.MachineID, out.Hub = one.ID, hub
+		}
 	}
 	return out, nil
 }
@@ -497,14 +502,37 @@ func (h *Host) Pin() (*workertls.Pin, *exit.Error) {
 	return pin, nil
 }
 
-func (h *Host) registration(ctx context.Context, hubOrigin string, client *hub.Client) (registration, *exit.Error) {
-	var registered registration
-	if raw, err := os.ReadFile(h.path("registration.json")); err == nil {
-		if json.Unmarshal(raw, &registered) == nil && registered.Hub == hubOrigin && registered.ID != "" {
-			return registered, nil
+// registrations are this machine's registrations, one per hub, keyed by origin. A machine
+// registers once with each hub it runs work of; moving between hubs never registers again.
+// A registration from before this record (registration.json and environment.json) is one of them.
+func (h *Host) registrations() (map[string]registration, *exit.Error) {
+	out := map[string]registration{}
+	raw, err := os.ReadFile(h.path("registrations.json"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, exit.Internalf("cannot read the machine's registrations: %s", err)
+	}
+	if err == nil && json.Unmarshal(raw, &out) != nil {
+		return nil, exit.New(exit.Conflict, "the machine's registrations are unreadable")
+	}
+	var legacy registration
+	if raw, err := os.ReadFile(h.path("registration.json")); err == nil && json.Unmarshal(raw, &legacy) == nil && legacy.ID != "" {
+		if _, known := out[legacy.Hub]; !known {
+			if raw, err := os.ReadFile(h.path("environment.json")); err == nil {
+				_ = json.Unmarshal(raw, &legacy.Environment)
+			}
+			out[legacy.Hub] = legacy
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return registration{}, exit.Internalf("cannot read the machine registration: %s", err)
+	}
+	return out, nil
+}
+
+func (h *Host) registration(ctx context.Context, hubOrigin string, client *hub.Client) (registration, *exit.Error) {
+	all, problem := h.registrations()
+	if problem != nil {
+		return registration{}, problem
+	}
+	if registered, ok := all[hubOrigin]; ok && registered.ID != "" {
+		return registered, nil
 	}
 	if client == nil {
 		return registration{}, exit.Named(exit.Credential, "machine.registration_required", "this machine is not registered with %s", hubOrigin)
@@ -513,29 +541,14 @@ func (h *Host) registration(ctx context.Context, hubOrigin string, client *hub.C
 	if problem != nil {
 		return registration{}, problem.WithRemedy("sign in with `cozy auth login`; a machine is registered to the user who owns it")
 	}
-	registered = registration{Hub: hubOrigin, ID: machine.ID, WorkerToken: machine.WorkerToken}
-	environment, _ := json.Marshal(machine.Environment)
-	if err := writePrivate(h.path("environment.json"), environment); err != nil {
-		return registration{}, exit.Internalf("cannot record the machine environment: %s", err)
-	}
-	raw, _ := json.Marshal(registered)
-	if err := writePrivate(h.path("registration.json"), raw); err != nil {
+	registered := registration{Hub: hubOrigin, ID: machine.ID, WorkerToken: machine.WorkerToken, Environment: machine.Environment}
+	all[hubOrigin] = registered
+	raw, _ := json.Marshal(all)
+	if err := writePrivate(h.path("registrations.json"), raw); err != nil {
 		return registration{}, exit.Internalf("cannot record the machine registration: %s", err)
 	}
 	return registered, nil
 }
-
-// environment is the hub-authored half of the grant, as the hub answered the registration.
-func (h *Host) environment() (map[string]string, *exit.Error) {
-	var environment map[string]string
-	raw, err := os.ReadFile(h.path("environment.json"))
-	if err != nil || json.Unmarshal(raw, &environment) != nil || len(environment) == 0 {
-		return nil, exit.Named(exit.Unavailable, "machine.environment_unavailable", "this machine's registration recorded no hub environment").
-			WithRemedy("re-register it: remove %s and run it again", h.path("registration.json"))
-	}
-	return environment, nil
-}
-
 func (h *Host) secret(name string) (string, *exit.Error) {
 	if raw, err := os.ReadFile(h.path(name)); err == nil && len(raw) == 43 {
 		return string(raw), nil

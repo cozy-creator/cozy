@@ -26,6 +26,8 @@ type RentalInstallSelection struct {
 	Package string     `json:"package,omitempty"`
 	Release string     `json:"release,omitempty"`
 	Models  []ModelRef `json:"models,omitempty"`
+	// Hub is the Tensorhub the selection is read at: this computer's machine prepares it there.
+	Hub string `json:"hub,omitempty"`
 }
 
 type RentalInstall struct {
