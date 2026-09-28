@@ -63,6 +63,9 @@ type reportStage struct {
 	Count       int     `json:"count,omitempty"`
 	Bytes       int64   `json:"bytes,omitempty"`
 	Detail      string  `json:"detail,omitempty"`
+	// Ranks are a GPU call's own ranks, from its release: a child call's attention kernels
+	// live only here, never in the root's triage.
+	Ranks []reportRank `json:"ranks,omitempty"`
 }
 
 type reportSteps struct {
@@ -187,6 +190,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			if index, ok := granted[key]; ok {
 				at, _ := time.Parse(time.RFC3339Nano, event.At)
 				report.Stages[index].MS = float64(at.UnixMilli() - report.Stages[index].StartUnixMS)
+				report.Stages[index].Ranks = releasedRanks(event.Payload["ranks"])
 			}
 		case "machine.resolved":
 			report.Resolved = event.Payload
@@ -305,6 +309,10 @@ func phaseStage(payload map[string]any) (reportStage, bool) {
 			row.Detail += " at " + units.Bytes(int64(rate)) + "/s"
 		}
 	}
+	if detail, _ := fields["detail"].(string); row.Detail == "" && detail != "" {
+		// What the phase found: an executor start's legs, each kernel's compile state.
+		row.Detail = detail
+	}
 	if completed, ok := fields["completed"].(bool); ok && !completed {
 		row.Detail = strings.TrimPrefix(row.Detail+"; did not complete", "; ")
 	}
@@ -416,6 +424,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 			if stage.Kind == "inference" && stage.Count > 1 {
 				detail = strings.TrimPrefix(detail+fmt.Sprintf(", %d×", stage.Count), ", ")
 			}
+			if stage.Kind == "phase" {
+				detail = output.Elide(detail, 120, mode.Full)
+			}
 			fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n", stage.Name, stage.Kind, offset(stage.StartUnixMS),
 				span(stage.MS), detail)
 		}
@@ -447,20 +458,33 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 				output.Elide(dash(rank.UUID), 17, mode.Full), rank.PID, start, took, rankAttention(rank))
 		}
 		table.Flush()
-		emitKernels(w, table, r.Ranks, mode.Full)
+		emitKernels(w, table, "attention kernels", r.Ranks, mode.Full)
+	}
+	for _, stage := range r.Stages {
+		emitKernels(w, table, "attention kernels, "+stage.Name, stage.Ranks, mode.Full)
 	}
 	return nil
+}
+
+// releasedRanks reads a GPU release's ranks tolerantly; an older machine sends none.
+func releasedRanks(value any) []reportRank {
+	raw, err := json.Marshal(value)
+	var ranks []reportRank
+	if err != nil || json.Unmarshal(raw, &ranks) != nil {
+		return nil
+	}
+	return ranks
 }
 
 // emitKernels prints each rank's attention kernels: the one that served, and for every other
 // kernel of its chains why it did not (still compiling, failed, absent, unsupported), with
 // its compile time on this machine.
-func emitKernels(w io.Writer, table *tabwriter.Writer, ranks []reportRank, full bool) {
+func emitKernels(w io.Writer, table *tabwriter.Writer, title string, ranks []reportRank, full bool) {
 	header := false
 	for _, rank := range ranks {
 		for _, kernel := range rank.Attention.Kernels {
 			if !header {
-				fmt.Fprintln(w, "\nattention kernels")
+				fmt.Fprintln(w, "\n"+title)
 				fmt.Fprintln(table, "RANK\tKERNEL\tSTATE\tCOMPILE\tDETAIL")
 				header = true
 			}

@@ -74,6 +74,44 @@ func TestRunShowPrintsEachRanksAttentionKernels(t *testing.T) {
 	}
 }
 
+// A GPU call's kernels are its own: a long_form run's H3 segments are child calls, whose ranks
+// reach Creator only in their GPU releases, never in the root's triage. Run 1525 served SDPA
+// there with nothing on screen saying why. Each call prints its kernels, and the warm's phase
+// prints what it started compiling.
+func TestRunShowPrintsEachGPUCallsKernelsAndTheWarmsCompiles(t *testing.T) {
+	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "h3-run-1183-attribution.json"))
+	must(t, err)
+	o := hostOwner(t, "run-show-call-kernels")
+	id := succeededWithTriage(t, o, bundle)
+	defer publicationControlAPI(t, o)()
+	warm := "rank 0: sol-attn compiling, sageattention compiling (3%), flash-attn3 unsupported, sdpa ready"
+	fatal(t, o.store.AppendEvent(id, "request.log", 1, map[string]any{"name": "Starting kernel compiles",
+		"value": "info", "fields": map[string]any{"phase": "Starting kernel compiles", "completed": true,
+			"started_unix_ms": 1790592484035, "elapsed_ms": 969.9, "detail": warm}}))
+	call := "call-748e50c5d0661d690230326fbad94dbeb43dd235#1"
+	fatal(t, o.store.AppendEvent(id, "machine.gpu.grant", 1, map[string]any{"key": call, "ordinals": []any{0}}))
+	kernels := []any{
+		map[string]any{"kernel": "sageattention", "state": "compiling", "progress": 0.61, "served": false},
+		map[string]any{"kernel": "sdpa", "state": "ready", "served": false},
+		map[string]any{"kernel": "sol-attn", "state": "ready", "served": true, "compile_ms": 11586.9},
+	}
+	fatal(t, o.store.AppendEvent(id, "machine.gpu.release", 1, map[string]any{"key": call,
+		"ordinals": []any{0}, "cause": "exited", "ranks": []any{map[string]any{"rank": 0,
+			"ordinal": 0, "arch": "sm_120", "attention": map[string]any{"observed": "sol-attn",
+				"kernels": kernels}}}}))
+	code, human := runCozy(t, o.root, "run", "show", id)
+	t.Logf("cozy run show:\n%s", human)
+	at := strings.Index(human, "attention kernels, GPU "+call)
+	if code != 0 || at < 0 || !strings.Contains(human, warm) {
+		t.Fatalf("run show [%d] lacks the call's kernels or the warm's compiles:\n%s", code, human)
+	}
+	for _, want := range []string{"sol-attn       served", "11.6s", "sageattention  compiling (61%)"} {
+		if !strings.Contains(human[at:], want) {
+			t.Fatalf("the call's kernels lack %q:\n%s", want, human[at:])
+		}
+	}
+}
+
 // succeededWithTriage records one settled attempt that kept `bundle`, the way the
 // orchestrator's terminal transaction does.
 func succeededWithTriage(t *testing.T, o *owner, bundle []byte) string {
