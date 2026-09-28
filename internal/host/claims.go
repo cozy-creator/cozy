@@ -136,3 +136,9 @@ func (c *claims) answer(message proto.Message, client *pb.Claim) {
 		}
 	})
 }
+
+func (c *claims) authorizedKeys() []ed25519.PublicKey {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]ed25519.PublicKey(nil), c.authorized...)
+}

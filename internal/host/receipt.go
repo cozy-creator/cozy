@@ -12,10 +12,13 @@ import (
 	"sync"
 )
 
+// ReceiptDomain separates the readiness receipt's HMAC from any other use of its key.
+const ReceiptDomain = "cozy.pod-readiness/1\x00"
+
 // The readiness receipt is the Hub's proof that this machine booted: the payload the Runtime
 // measured, sealed once under the per-attempt key and served at /v1/bootstrap/receipt.
 const (
-	receiptDomain   = "cozy.pod-readiness/1\x00"
+	receiptDomain   = ReceiptDomain
 	maxReceiptBytes = 64 << 10
 )
 

@@ -33,7 +33,7 @@ func (l *listeners) close() {
 
 func (m *Machine) listen() (*listeners, error) {
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{m.id.Leaf}}
-	endpoint, err := net.Listen("tcp", net.JoinHostPort(m.grant.ListenHost, strconv.Itoa(m.grant.WorkerPort)))
+	endpoint, err := listen(m.grant.ListenHost, m.grant.WorkerPort)
 	if err != nil {
 		return nil, fmt.Errorf("bind the machine endpoint: %w", err)
 	}
@@ -41,7 +41,7 @@ func (m *Machine) listen() (*listeners, error) {
 	if mediaPort == 0 {
 		mediaHost = "127.0.0.1"
 	}
-	media, err := net.Listen("tcp", net.JoinHostPort(mediaHost, strconv.Itoa(mediaPort)))
+	media, err := listen(mediaHost, mediaPort)
 	if err != nil {
 		endpoint.Close()
 		return nil, fmt.Errorf("bind the receipt listener: %w", err)
@@ -52,6 +52,8 @@ func (m *Machine) listen() (*listeners, error) {
 	routes := http.NewServeMux()
 	routes.HandleFunc("GET /v1/bootstrap/receipt", m.serveReceipt)
 	routes.HandleFunc("GET /v1/health", serveHealth)
+	routes.HandleFunc("GET /v1/runs/{run}/outputs/{output}", m.serveOutput)
+	routes.HandleFunc("GET /v1/runs/{run}/outputs/{output}/{index}", m.serveOutput)
 	main := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
 			grpcServer.ServeHTTP(w, r)

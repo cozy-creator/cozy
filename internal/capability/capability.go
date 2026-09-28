@@ -38,12 +38,17 @@ func KeyID(key ed25519.PublicKey) string {
 
 // Mint signs a grant.
 func Mint(key ed25519.PrivateKey, g Grant) (string, error) {
-	g.Key = KeyID(key.Public().(ed25519.PublicKey))
+	return MintSigned(key.Public().(ed25519.PublicKey), func(message []byte) []byte { return ed25519.Sign(key, message) }, g)
+}
+
+// MintSigned signs a grant with a key held elsewhere, such as a device identity.
+func MintSigned(public ed25519.PublicKey, sign func([]byte) []byte, g Grant) (string, error) {
+	g.Key = KeyID(public)
 	payload, err := json.Marshal(g)
 	if err != nil {
 		return "", err
 	}
-	signature := ed25519.Sign(key, append([]byte(domain), payload...))
+	signature := sign(append([]byte(domain), payload...))
 	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature), nil
 }
 
@@ -54,8 +59,8 @@ var (
 )
 
 // Verify admits a token for machine at now, signed by one of keys. binding is the client's
-// DTLS certificate fingerprint on WebRTC and empty on HTTPS, which so refuses any bound
-// capability.
+// DTLS certificate fingerprint on WebRTC and empty on HTTPS: a capability that names a binding
+// holds only there, and one that names none holds anywhere.
 func Verify(token, machine string, keys []ed25519.PublicKey, now time.Time, binding string) (Grant, error) {
 	var g Grant
 	encoded, sig, ok := strings.Cut(token, ".")
@@ -73,7 +78,7 @@ func Verify(token, machine string, keys []ed25519.PublicKey, now time.Time, bind
 	if !slices.ContainsFunc(keys, func(k ed25519.PublicKey) bool { return KeyID(k) == g.Key && ed25519.Verify(k, signed, signature) }) {
 		return g, ErrInvalid
 	}
-	if g.Machine != machine || g.Binding != binding {
+	if g.Machine != machine || g.Binding != "" && g.Binding != binding {
 		return g, ErrInvalid
 	}
 	if now.Unix() >= g.Expires {

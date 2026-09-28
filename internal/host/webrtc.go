@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"strconv"
 
 	"github.com/cozy-creator/cozy/internal/host/outputs"
 )
@@ -25,7 +24,7 @@ func (m *Machine) serveWebRTC(ctx context.Context) error {
 	if m.grant.WebRTCPort == 0 || ServeWebRTC == nil {
 		return nil
 	}
-	listener, err := net.Listen("tcp", net.JoinHostPort(m.grant.ListenHost, strconv.Itoa(m.grant.WebRTCPort)))
+	listener, err := listen(m.grant.ListenHost, m.grant.WebRTCPort)
 	if err != nil {
 		return fmt.Errorf("bind the WebRTC port: %w", err)
 	}
