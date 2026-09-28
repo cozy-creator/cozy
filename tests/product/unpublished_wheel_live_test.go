@@ -46,6 +46,7 @@ func TestUnpublishedWheelCompositionTracksExecutableNotCaller(t *testing.T) {
 	runUV("pip", "install", "--python", filepath.Join(control, "bin", "python"), runtimeInstall)
 	root, err := os.MkdirTemp("", "cozy-wheel-")
 	must(t, err)
+	unpressuredMachine(t, root)
 	path := filepath.Join(control, "bin")
 	for _, item := range childEnv(t, root) {
 		if strings.HasPrefix(item, "PATH=") {

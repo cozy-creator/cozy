@@ -15,7 +15,8 @@ import (
 )
 
 // The same A/B author files used by the real rental proof run here through the
-// ordinary local CLI. No Docker, PodHost replacement, native ACK or cache is faked.
+// ordinary local CLI on this computer's machine, whose Store keeps the results. No Docker,
+// PodHost replacement, native ACK or cache is faked.
 func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	integration(t)
 	control := filepath.Join(t.TempDir(), "control")
@@ -39,6 +40,7 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	uv(install...)
 	root, err := os.MkdirTemp("", "cozy-native-memo-")
 	must(t, err)
+	unpressuredMachine(t, root)
 	path := filepath.Join(control, "bin")
 	for _, item := range childEnv(t, root) {
 		if strings.HasPrefix(item, "PATH=") {
@@ -93,7 +95,7 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			t.Fatal("native result has no exact artifact")
 		}
 		command := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "private_child_read.py"),
-			artifact.Manifest.Digest, strconv.Itoa(value), filepath.Join(root, "tensorfs"))
+			artifact.Manifest.Digest, strconv.Itoa(value), machineStore(root))
 		out, err := command.CombinedOutput()
 		if err != nil {
 			t.Fatalf("native tensor after restart and GC: %v %s", err, out)

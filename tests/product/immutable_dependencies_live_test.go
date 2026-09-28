@@ -12,20 +12,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// uv pip's backend setting does not configure uv lock. Pin the fixture's lock
-// index explicitly so CPU CI never snapshots the multi-gigabyte CUDA closure.
-func servingTorchIndex() string {
-	if !*servingCPUFixture {
-		return ""
-	}
-	return `torch={index="fixture-torch"}
-[[tool.uv.index]]
-name="fixture-torch"
-url="https://download.pytorch.org/whl/cpu"
-explicit=true
-`
-}
-
 // Real CPU tensor jobs exercise immutable dependency capture without pretending
 // that a CPU runner qualifies CUDA serving. Both independent scripts run via CLI.
 func TestEditedScriptsReuseImmutableDependencies(t *testing.T) {
@@ -130,9 +116,9 @@ async def main(ctx):
 			}
 		}
 	}
-	// Runtime installs each captured script as an ordinary uv installation; the public
+	// The machine installs each captured script as an ordinary uv installation; the public
 	// NumPy wheel's bytes come from uv's cache, so every installation links one inode.
-	installations := filepath.Join(root, "runtime", "environments", "installations")
+	installations := machineInstallations(root)
 	libraries, err := filepath.Glob(filepath.Join(installations, "*", "venv", "lib", "python3.12", "site-packages", "numpy", "_core", "_multiarray_umath*.so"))
 	must(t, err)
 	if len(libraries) < 2 {

@@ -108,7 +108,7 @@ jobs:
       # The runner's service cgroup is not delegated; Runtime's executor containment needs its own subtree.
       - name: Product tests
         run: |
-          args=(-j 3 -serving-cpu-fixture -machine-host="$MACHINE_HOST" -require-machine-host
+          args=(-j 3 -machine-host="$MACHINE_HOST" -require-machine-host
             -script-runtime-wheel="$RUNTIME_WHEEL" -child-runtime-wheel="$RUNTIME_WHEEL")
           [ "$FULL" = true ] || args+=(-test.short)
           sudo systemd-run --wait --pipe --collect \

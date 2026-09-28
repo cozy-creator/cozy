@@ -134,27 +134,18 @@ object = "assets_app:app"
 			photoBytes, err := os.ReadFile(photo)
 			must(t, err)
 			photoDigest := sha256.Sum256(photoBytes)
+			// Serving and jobs alike freeze their inputs into a request-owned stage at
+			// admission, so later edits of the original cannot reach the machine.
 			for _, asset := range row.Assets {
-				if function == "collect" {
-					// Local inference borrows the caller's file in place.
-					if asset.LocalPath != photo {
-						t.Fatalf("input was copied instead of borrowed: %s", asset.LocalPath)
-					}
-					continue
-				}
-				// A machine job freezes its inputs into a request-owned stage at admission,
-				// so later edits of the original cannot reach Runtime.
 				if asset.Snapshot == nil || !strings.HasPrefix(asset.LocalPath, filepath.Join(root, "tmp", row.ID)+string(filepath.Separator)) ||
 					asset.Digest != "sha256:"+hex.EncodeToString(photoDigest[:]) {
-					t.Fatalf("machine job input was not frozen in its request stage: %+v", asset)
+					t.Fatalf("%s input was not frozen in its request stage: %+v", function, asset)
 				}
 			}
-			if function == "main" {
-				inputs, problem := store.MachineInputs(row.ID)
-				fatal(t, problem)
-				if len(inputs) != 2 {
-					t.Fatalf("machine job recorded %d input receipts, want 2", len(inputs))
-				}
+			inputs, problem := store.MachineInputs(row.ID)
+			fatal(t, problem)
+			if len(inputs) != 2 {
+				t.Fatalf("%s recorded %d machine input receipts, want 2", function, len(inputs))
 			}
 			if _, err := os.Stat(filepath.Join(root, "inputs")); !os.IsNotExist(err) {
 				t.Fatalf("submission created an input store: %v", err)
