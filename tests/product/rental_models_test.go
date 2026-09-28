@@ -78,6 +78,7 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"error":{"code":"proof.no_paid_create","message":"request captured; no rental created"}}`))
 	})
+	mux.HandleFunc("POST /v1/rental-quotes", listedRentalQuote(mux))
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	base := scratchBase

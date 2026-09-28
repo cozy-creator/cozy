@@ -62,6 +62,7 @@ func proveUnavailableRentalListing(t *testing.T, unavailableStatus int) {
 		purchases.Add(1)
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
+	mux.HandleFunc("POST /v1/rental-quotes", listedRentalQuote(mux))
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	root := t.TempDir()

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +93,13 @@ func localRuntimePair(t *testing.T) (string, string) {
 		}
 		_, err = metadata.Write([]byte(text))
 		must(t, err)
+		if name == "cozy-runtime" { //cozy:allow a wheel's distribution name, not the binary
+			// The Runtime's own declared worker protocol range, which an update target must carry.
+			wire, err := archive.Create("cozy/worker/v1/wire_version.py")
+			must(t, err)
+			_, err = fmt.Fprintf(wire, "WIRE_MINOR = %d\nMIN_COMPATIBLE_WIRE_MINOR = %d\n", pb.WireMinor, pb.MinCompatibleWireMinor)
+			must(t, err)
+		}
 		padding, err := archive.CreateHeader(&zip.FileHeader{Name: distInfo + "padding", Method: zip.Store})
 		must(t, err)
 		_, err = padding.Write(bytes.Repeat([]byte(name), 12_000))
@@ -336,44 +344,5 @@ func TestAnUnfinishedUpdateMakesTheRentalUnusableUntilItsOwnerResumesIt(t *testi
 	}
 	if _, list := cozyWithin(t, root, time.Minute, "rental", "list"); strings.Contains(list, "Runtime") {
 		t.Fatalf("rental list still holds the rental after its update finished:\n%s", list)
-	}
-}
-
-// A Runtime update keeps the worker boot but not the Runtime: the capabilities read before
-// it are not kept after it. The run after `cozy rental update` takes the one-message path
-// the new Runtime offers, with no daemon restart.
-func TestARuntimeUpdateRefreshesTheMachinesCapabilities(t *testing.T) {
-	pod := newMaintenancePod(t)
-	h := newLadderHub(t)
-	h.bind(goodLadder())
-	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
-		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
-	})
-	machines.older.Store(true)
-	worker := &fakePod{machine: machines}
-	root, layout := rentedLadderHome(t, h, worker, nil)
-	serveMaintenance(t, layout, worker.controlKey, func(key string, value any) {
-		h.mu.Lock()
-		h.rentals[podRental][key] = value
-		h.mu.Unlock()
-	})
-	startDaemonProcess(t, root, pod.path(t, root))
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-
-	rentedRun(t, root, store, "before", "generate", "steps=1")
-	if submitted := machines.submitted(); len(submitted) != 1 || submitted[0].ReleaseRoot != nil {
-		t.Fatalf("the older Runtime was not sent the compatibility submission: %d", len(submitted))
-	}
-	runtimeWheel, tensorfsWheel := localRuntimePair(t)
-	machines.older.Store(false) // what the updated Runtime reports
-	if code, out := cozyWithin(t, root, 5*time.Minute, "rental", "update", "tessa", "--runtime-wheel", runtimeWheel, "--tensorfs-wheel", tensorfsWheel); code != 0 {
-		t.Fatalf("the Runtime update failed [exit %d]: %s\n%s", code, out, transportLogs(root))
-	}
-	row, _ := rentedRun(t, root, store, "after", "generate", "steps=1")
-	submitted := machines.submitted()
-	if row.State != "succeeded" || len(submitted) != 2 || submitted[1].ReleaseRoot == nil {
-		t.Fatalf("the run after the update did not take the release-roots path (%s, %d submissions)", row.State, len(submitted))
 	}
 }

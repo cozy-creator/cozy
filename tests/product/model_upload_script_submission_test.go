@@ -34,7 +34,7 @@ import (
 // civitaiIngestScript is the one bounded-disk upload call a rented Civitai ingest submits.
 const civitaiIngestScript = `# /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime>=0.18.51,<1", "tensorfs>=0.3.60,<0.4"]
+# dependencies = ["cozy-runtime>=0.18.67,<1", "tensorfs>=0.3.73,<0.4"]
 # ///
 from cozy_runtime.author.sources import upload_civitai, upload_huggingface
 

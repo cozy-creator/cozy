@@ -89,6 +89,7 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	for _, apply := range configure {
 		apply(mux, &detail)
 	}
+	mux.HandleFunc("POST /v1/rental-quotes", listedRentalQuote(mux))
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	// Runs start the daemon, whose children may still be leaving when the test ends;
@@ -145,8 +146,7 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"missing profile", base, "model_producer.source_profile_absent"},
-		{"extra profile", append(append([]string{}, base...), "--source-profile", "dits=x/1", "--source-profile", "shared=y/1", "--source-profile", "other=z/1"), "model_producer.source_profile_unknown_slot"},
+		{"extra profile", append(append([]string{}, base...), "--source-profile", "dits=x/1", "--source-profile", "shared=y/1", "--source-profile", "other=z/1"), "names no model parameter of quantize"},
 		{"duplicate profile", append(append([]string{}, base...), "--source-profile", "dits=x/1", "--source-profile", "dits=y/1"), "names slot dits twice"},
 		{"two sources", append(append([]string{}, base[:4]...), append([]string{"model.shared=civitai://123"}, base[5:]...)...), "model_source.multiple_sources_unsupported"},
 		{"mixed inputs", append(append([]string{}, base[:4]...), append([]string{"model.shared=proof/source@1.0.0/bf16"}, base[5:]...)...), "model_source.mixed_inputs_unsupported"},

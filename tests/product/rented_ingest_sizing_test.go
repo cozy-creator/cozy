@@ -108,6 +108,7 @@ func rentalCapture(t *testing.T) (string, func(*testing.T, []byte, int) hub.Rent
 		mu.Unlock()
 		http.NotFound(w, r)
 	})
+	mux.HandleFunc("POST /v1/rental-quotes", listedRentalQuote(mux))
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	root, err := os.MkdirTemp(scratchBase, "ingest-sizing-")

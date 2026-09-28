@@ -65,7 +65,7 @@ type fakeRentalHub struct {
 	packageReleases map[string]any
 	skus            []map[string]any
 	rent            func(map[string]any) map[string]any
-	// quote answers POST /v1/rental-quotes; nil is a Hub without quotes.
+	// quote answers POST /v1/rental-quotes; nil quotes the listed price of the SKU asked for.
 	quote func(map[string]any) (int, string)
 	// spendCap stands in for Tensorhub's owner fleet cap: a paid ask whose SKU
 	// total would take the live rentals' burn past it is refused, buying nothing.
@@ -153,9 +153,13 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		h.mu.Lock()
 		quote := h.quote
 		h.mu.Unlock()
+		if quote == nil {
+			listedRentalQuote(mux)(w, r)
+			return
+		}
 		var request map[string]any
-		if quote == nil || json.NewDecoder(r.Body).Decode(&request) != nil {
-			http.NotFound(w, r)
+		if json.NewDecoder(r.Body).Decode(&request) != nil {
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		status, body := quote(request)

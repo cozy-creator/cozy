@@ -304,6 +304,7 @@ func newOrgLadderHub(t *testing.T, org string, authored ...[]launch.ModelDefault
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(accepted)
 	})
+	mux.HandleFunc("POST /v1/rental-quotes", listedRentalQuote(mux))
 	h.server = httptest.NewServer(mux)
 	t.Cleanup(h.server.Close)
 	return h

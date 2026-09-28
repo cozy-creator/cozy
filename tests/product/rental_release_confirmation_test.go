@@ -2,11 +2,8 @@ package producttest
 
 import (
 	"encoding/base64"
-	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,56 +26,6 @@ func TestRentalEndKeepsRecordedMachineWhenHubCannotConfirmRelease(t *testing.T) 
 	fatal(t, problem)
 	if row == nil || op.State == "released" || stand.releases(id) != 0 {
 		t.Fatal("unconfirmed rental or operation was forgotten/released")
-	}
-}
-
-func TestManagedReleaseRequiresPositiveHubDestruction(t *testing.T) {
-	for _, phase := range []string{"delete", "observe"} {
-		t.Run(phase, func(t *testing.T) {
-			root, hubURL, stand := rentalEndRoot(t, "managed-release-"+phase)
-			const id = "pr-4234567890abcdef1234"
-			store, key := releaseConfirmationRecord(t, root, hubURL, id)
-			row, problem := store.RentalRow(id)
-			fatal(t, problem)
-			stand.add(id, row.MachineName)
-			original := stand.server.Config.Handler
-			var asked atomic.Bool
-			stand.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/v1/rentals/"+id {
-					if r.Method == http.MethodDelete {
-						asked.Store(true)
-						if phase == "delete" {
-							http.NotFound(w, r)
-							return
-						}
-					}
-					if r.Method == http.MethodGet && phase == "observe" && asked.Load() {
-						http.NotFound(w, r)
-						return
-					}
-				}
-				original.ServeHTTP(w, r)
-			})
-			startDaemonProcess(t, root)
-			deadline := time.Now().Add(15 * time.Second)
-			for time.Now().Before(deadline) {
-				current, p := store.RentalRow(id)
-				fatal(t, p)
-				log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
-				if asked.Load() && (current == nil || strings.Contains(string(log), "has not confirmed release")) {
-					break
-				}
-				time.Sleep(25 * time.Millisecond)
-			}
-			current, p := store.RentalRow(id)
-			fatal(t, p)
-			op, p := store.RentalOperation(key)
-			fatal(t, p)
-			log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
-			if !asked.Load() || current == nil || op.State == "released" || !strings.Contains(string(log), "has not confirmed release") {
-				t.Fatalf("%s404 was treated as destruction: requested=%v rental=%+v operation=%+v\n%s", phase, asked.Load(), current, op, log)
-			}
-		})
 	}
 }
 

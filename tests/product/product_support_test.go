@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -547,4 +548,46 @@ func stat(path string) (int64, error) {
 		return 0, err
 	}
 	return info.Size(), nil
+}
+
+// listedRentalQuote answers POST /v1/rental-quotes on a stand-in Hub the way Tensorhub does
+// when the request's disk changes nothing: the listed rate of the SKU and width asked for,
+// read from the stand-in's own GET /v1/rental-skus.
+func listedRentalQuote(listing http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			SKU   string `json:"sku"`
+			Count int    `json:"accelerator_count"`
+			Disk  int    `json:"container_disk_gb"`
+		}
+		if json.NewDecoder(r.Body).Decode(&request) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		recorder := httptest.NewRecorder()
+		listing.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/rental-skus", nil))
+		var rows []struct {
+			Name   string `json:"name"`
+			Widths []struct {
+				Count   int   `json:"accelerator_count"`
+				Price   int64 `json:"price_usd_micros_per_hour"`
+				Storage int64 `json:"storage_usd_micros_per_hour"`
+			} `json:"widths"`
+		}
+		_ = json.Unmarshal(recorder.Body.Bytes(), &rows)
+		for _, row := range rows {
+			for _, width := range row.Widths {
+				if row.Name == request.SKU && (request.Count == 0 || request.Count == width.Count) {
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"name": row.Name, "accelerator_count": width.Count,
+						"price_usd_micros_per_hour": width.Price, "storage_usd_micros_per_hour": width.Storage,
+						"container_disk_gb": request.Disk})
+					return
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"rental.sku_not_found","message":"no such rental SKU"}}`))
+	}
 }
