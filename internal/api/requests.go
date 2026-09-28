@@ -56,6 +56,8 @@ type Submission struct {
 	// OutputDirectory is the caller's --out. Empty means the package's own store under
 	// outputs/, which every run exports to.
 	OutputDirectory string `json:"output_directory,omitempty"`
+	// NoPartials writes only the final files, never a `.partial` revision file.
+	NoPartials bool `json:"no_partials,omitempty"`
 	// AttentionKernel is an optional developer execution-path pin.
 	AttentionKernel string `json:"attention_kernel,omitempty"`
 	AttemptKey      string `json:"-"`
@@ -295,7 +297,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		RentalRequired:      sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental:     sub.RequestedRental, RentNew: sub.RentNew,
 		Models: models, NeedsAccelerator: recorded.NeedsAccelerator,
-		OutputDirectory: sub.OutputDirectory,
+		OutputDirectory: sub.OutputDirectory, NoPartials: sub.NoPartials,
 		// Replays compare the caller's requested execution path with the original.
 		AttentionKernel: sub.AttentionKernel,
 	}
@@ -438,6 +440,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
 		AttentionKernel: sub.AttentionKernel,
 		OutputDirectory: sub.OutputDirectory,
+		NoPartials:      sub.NoPartials,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental, hub); problem != nil {
 		return out, problem
@@ -519,11 +522,12 @@ func (s *Server) installedRelease(pkg, release, installID string) (string, *exit
 func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
 	paths := launch.AssetPaths(entrypoint.Result)
 	// Jobs export every declared asset, including generic files. Native model
-	// artifacts and weight outputs remain separate and have no asset paths.
-	if len(paths) == 0 && (out.Kind == "job" || len(out.Outputs) == 0) {
+	// artifacts and weight outputs remain separate and have no asset paths. A list of
+	// assets exports each product published into it.
+	if len(paths) == 0 && len(launch.AssetLists(entrypoint.Result)) == 0 && (out.Kind == "job" || len(out.Outputs) == 0) {
 		return nil
 	}
-	intent := &records.OutputExportIntent{Directory: out.OutputDirectory}
+	intent := &records.OutputExportIntent{Directory: out.OutputDirectory, Partials: !out.NoPartials}
 	if intent.Directory == "" {
 		intent.Directory = s.layout.PackageOutputs(out.Package)
 	}
@@ -532,7 +536,13 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 		return exit.Named(exit.Validation, "output_export_directory_malformed",
 			"output directory must be one canonical absolute path")
 	}
-	if out.Kind != "job" && len(paths) != len(out.Outputs) {
+	fixed := 0
+	for _, outputID := range out.Outputs {
+		if !strings.HasSuffix(outputID, ".*") {
+			fixed++
+		}
+	}
+	if out.Kind != "job" && len(paths) != fixed {
 		return exit.Named(exit.Validation, "output_export_set_mismatch",
 			"package result declares %d asset paths for %d granted outputs", len(paths), len(out.Outputs))
 	}
@@ -655,7 +665,7 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 		out.LocalInstallationID = revision.ID
 	}
 	if len(out.Outputs) == 0 {
-		out.Outputs = launch.AssetPaths(entrypoint.Result)
+		out.Outputs = launch.OutputSlots(entrypoint.Result)
 	}
 	if problem := s.deriveOutputExport(entrypoint, &out); problem != nil {
 		return out, problem
@@ -790,8 +800,12 @@ type Lifecycle struct {
 	CanceledBy string     `json:"canceled_by,omitempty"`
 	Result     any        `json:"result,omitempty"`
 	Outputs    []MediaRef `json:"outputs"`
-	Triage     *TriageRef `json:"triage,omitempty"`
-	Rental     bool       `json:"rental,omitempty"`
+	// Products are the run's output log in order: what it has made so far, as it made it.
+	Products []records.Product `json:"products,omitempty"`
+	// Stream is the run's capability path for a standard player (append `<output>.m3u8`).
+	Stream string     `json:"stream,omitempty"`
+	Triage *TriageRef `json:"triage,omitempty"`
+	Rental bool       `json:"rental,omitempty"`
 	// Machine names the selected or executing venue. Queued status does not imply
 	// that the machine has accepted an attempt; it may still be preparing this request.
 	// After execution, the recorded machine survives rental cleanup.
@@ -909,7 +923,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS,
-			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs,
+			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Products: state.Products, Stream: state.Stream,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
 			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}

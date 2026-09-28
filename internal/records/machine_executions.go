@@ -86,9 +86,12 @@ const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT EXISTS(S
  (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked') AND (length(e.submission)>0 OR r.state!='canceled')) OR
  (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))`
 
-// Recipient custody (staged inputs, collected models and files) outlives the execution.
-// It is owed to the machine, but it is bytes on its disk, not a worker state to preserve.
-const machineExecutionOwed = `((NOT ` + machineExecutionLost + ` AND (` + machineInputOwed + ` OR ` + machineModelRetentionOwed + ` OR ` + machineFileResultOwed + `)) OR ` + machineExecutionLive + `)`
+// Recipient custody (staged inputs, collected models) outlives the execution. It is owed to
+// the machine, but it is bytes on its disk, not a worker state to preserve. A finished run's
+// output log is owed until this client holds its products and acknowledges the terminal.
+const machineExecutionOwed = `((NOT ` + machineExecutionLost + ` AND (` + machineInputOwed + ` OR ` + machineModelRetentionOwed + ` OR ` + machineLogOwed + `)) OR ` + machineExecutionLive + `)`
+
+const machineLogOwed = `(length(e.receipt)>0 AND e.collected=0 AND r.state IN ('succeeded','failed','canceled'))`
 
 func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 	var owed bool
@@ -417,6 +420,12 @@ func machineWorkActive(state string) bool {
 // ObserveMachineExecution commits one authenticated page and its cursor together.
 // Request rows and event ordinals are projections; the attempts table stays empty.
 func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionState, page *pb.MachineExecutionEventPage) *exit.Error {
+	return s.ObserveMachinePage(id, state, page, nil)
+}
+
+// ObserveMachinePage is ObserveMachineExecution for a page whose products this client now
+// holds: each `product` entry is recorded as the Product `held` names for its sequence.
+func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, page *pb.MachineExecutionEventPage, held map[uint64]Product) *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin machine observation: %s", err)
@@ -484,6 +493,16 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 		if event.Kind == "running" {
 			kind = "request.accepted"
 		}
+		if event.Kind == "product" {
+			product, ok := held[event.Sequence]
+			if !ok {
+				return exit.New(exit.Conflict, "a run's product was observed before this client held its bytes")
+			}
+			kind = ProductType
+			if payload, err = json.Marshal(product); err != nil {
+				return exit.Internalf("cannot record a product: %s", err)
+			}
+		}
 		if event.Kind == "progress" || event.Kind == "log" {
 			var progress struct {
 				Type    string          `json:"type"`
@@ -535,7 +554,9 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 			return exit.Internalf("cannot record machine work completion: %s", err)
 		}
 	}
-	if previous.State != state.State && (state.State == "paused" || state.State == "canceled") {
+	// A canceled run's terminal event comes with its outcome (RecordMachineOutcome): the
+	// run's result is the fold of its products, collected like any other terminal.
+	if previous.State != state.State && state.State == "paused" {
 		if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, id, "request."+state.State, state.AttemptOrdinal, `{"machine_execution":true}`, now()); err != nil {
 			return exit.Internalf("cannot record observed machine control completion: %s", err)
 		}

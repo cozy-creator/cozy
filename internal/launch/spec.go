@@ -94,7 +94,7 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 	outputs := map[string][]string{}
 	for i := range f.PackageInterface.Entrypoints {
 		ep := &f.PackageInterface.Entrypoints[i]
-		outputs[ep.Name] = AssetPaths(ep.Result)
+		outputs[ep.Name] = OutputSlots(ep.Result)
 	}
 	return orchestrator.PlacementFromExact(f.Install.Package, f.Install.ID,
 		f.Install.PlacementSetDigest, data, outputs)

@@ -70,10 +70,6 @@ func (m *reconcilingMachine) ListMachineExecutionEvents(_ context.Context, query
 	return page, nil
 }
 
-func (m *reconcilingMachine) CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	return nil, status.Error(codes.FailedPrecondition, "still running")
-}
-
 func (m *reconcilingMachine) AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
 	return nil, status.Error(codes.FailedPrecondition, "still running")
 }

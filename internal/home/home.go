@@ -169,6 +169,12 @@ func (l Layout) PublicationRoot(org, requestID string) string {
 	return filepath.Join(l.Publications, org, "_job-"+requestID)
 }
 
+// Products is the owner's copy of one run's output log: each product and part, named by
+// its sha256.
+func (l Layout) Products(org, requestID string) string {
+	return filepath.Join(l.PublicationRoot(org, requestID), "products")
+}
+
 // PublicationStage is where ONE attempt of a job is granted to write. It is under the
 // publication root but is not the addressable publication: `.staging` is outside the
 // output-id namespace (an output id is a declared result FIELD PATH and cannot begin with

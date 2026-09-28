@@ -34,7 +34,7 @@ func (m *machineRuns) bindServingPlan(request records.Request, installationID st
 func machineJobPlan(ctx context.Context, connection *machineConnection, request records.Request, installationID string, job *launch.Entrypoint) (*orchestrator.JobPlan, *exit.Error) {
 	plan := &orchestrator.JobPlan{
 		Function: request.Entrypoint, DescriptorID: job.DescriptorID, InstallationID: installationID,
-		Outputs: launch.AssetPaths(job.Result), NeedsAccelerator: request.NeedsAccelerator,
+		Outputs: launch.OutputSlots(job.Result), NeedsAccelerator: request.NeedsAccelerator,
 		RSSCap: orchestrator.DefaultJobRSSCap, AcceleratorDeclared: job.Accelerator != nil,
 		CPUSlotModelInputs: true,
 	}

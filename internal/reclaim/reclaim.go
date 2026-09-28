@@ -341,14 +341,9 @@ func publicationRoot(l home.Layout, st *records.Store, root, requestID string) (
 		return 0, false, problem
 	}
 	if publication == nil {
-		files, problem := st.MachineFileResults(requestID)
-		if problem != nil {
+		// A run's product store is the daemon's copy of its output log.
+		if products, problem := st.Products(requestID); problem != nil || len(products) > 0 {
 			return 0, false, problem
-		}
-		for _, file := range files {
-			if file.Copied {
-				return 0, false, nil
-			}
 		}
 		freed, problem := removeTree(root)
 		return freed, problem == nil, problem

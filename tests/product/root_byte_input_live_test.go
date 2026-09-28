@@ -97,10 +97,10 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 	if code != 0 {
 		t.Fatalf("collect after original edit/client exit [%d]: %s\n%s", code, out, productWorkerLogs(root))
 	}
-	files, problem := store.MachineFileResults(request.ID)
+	products, problem := store.Products(request.ID)
 	fatal(t, problem)
-	if len(files) != 1 || !files[0].Copied {
-		t.Fatal("root did not collect its returned input Tree")
+	if len(products) != 1 {
+		t.Fatal("root did not report its returned input Tree")
 	}
 	exported, problem := store.OutputExportOf(request.ID)
 	fatal(t, problem)

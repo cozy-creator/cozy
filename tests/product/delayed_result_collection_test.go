@@ -26,7 +26,6 @@ import (
 type machineExecutionPeer interface {
 	GetMachineExecution(context.Context, *pb.MachineExecutionQuery) (*pb.MachineExecutionState, error)
 	ListMachineExecutionEvents(context.Context, *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error)
-	CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error)
 	AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error)
 }
 
@@ -45,17 +44,13 @@ func (m *finishedMachine) GetMachineExecution(context.Context, *pb.MachineExecut
 	return proto.Clone(m.state).(*pb.MachineExecutionState), nil
 }
 
-func (m *finishedMachine) ListMachineExecutionEvents(context.Context, *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error) {
-	return &pb.MachineExecutionEventPage{}, nil
-}
-
-func (m *finishedMachine) CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
+func (m *finishedMachine) ListMachineExecutionEvents(_ context.Context, query *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.ready.IsZero() {
 		m.ready = time.Now().Add(3 * time.Second)
 	}
-	return proto.Clone(m.outcome).(*pb.AttemptOutcome), nil
+	return outcomePage(query.After, 1, m.state.State, proto.Clone(m.outcome).(*pb.AttemptOutcome)), nil
 }
 
 func (m *finishedMachine) AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
@@ -111,7 +106,7 @@ func proveDelayedResultCollection(t *testing.T, minor uint32) {
 	must(t, err)
 	machine := &finishedMachine{
 		state: &pb.MachineExecutionState{RequestId: request.ID, WorkerId: podWorkerID, WorkerBootId: podBootID,
-			ExecutionWorkspaceId: "persistent-workspace", Generation: 1, AttemptOrdinal: 1, State: "succeeded"},
+			ExecutionWorkspaceId: "persistent-workspace", Generation: 1, AttemptOrdinal: 1, State: "succeeded", Sequence: 1},
 		outcome: &pb.AttemptOutcome{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecDigest: receipt.InvocationSpecDigest,
 			OutcomeId: "delayed-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body},
 	}

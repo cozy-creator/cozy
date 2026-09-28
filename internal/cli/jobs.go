@@ -106,7 +106,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		RetainWork:   strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
-		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory,
+		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory, NoPartials: ctx.Inv.Bool("--no-partials"),
 		PlannedSourceBytes: ctx.ingestBytes, AttentionKernel: overrides.AttentionKernel}
 	if deadline%time.Millisecond != 0 {
 		sub.TimeoutMS++
@@ -427,8 +427,9 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
-	if lines.liveMode() {
-		if state, e := c.Job(jobID); e == nil {
+	if state, e := c.Job(jobID); e == nil {
+		lines.streamFrom(c, state.Stream)
+		if lines.liveMode() {
 			lines.describeJob(state)
 		}
 	}
@@ -505,7 +506,9 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 
 func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event) *exit.Error {
 	state.Status = publicObservedStatus(state.Status)
-	if machine := state.MachineExecution; machine != nil && state.Status == "completed" && !machine.Collected {
+	// A machine run's result is the fold of its products, whatever its terminal.
+	ended := state.Status == "completed" || state.MachineExecution != nil && (state.Status == "failed" || state.Status == "canceled")
+	if machine := state.MachineExecution; machine != nil && machine.Accepted && ended && !machine.Collected {
 		collected, problem := awaitMachineCollection(ctx, state)
 		if problem != nil {
 			return problem
@@ -513,14 +516,14 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		state = collected
 		state.Status = publicObservedStatus(state.Status)
 	}
-	if state.Status == "completed" && state.OutputExport != nil {
+	if ended && state.OutputExport != nil {
 		client, problem := dial(ctx)
 		if problem != nil {
 			return problem
 		}
 		life, problem := waitOutputExport(client, api.Lifecycle{
 			RequestID: state.JobID, Status: state.Status, OutputExport: state.OutputExport,
-			MachineExecution: state.MachineExecution,
+			MachineExecution: state.MachineExecution, Products: state.Products,
 		})
 		if problem != nil {
 			return problem
@@ -635,6 +638,14 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if hint := modelPublishHint(state); hint != "" {
 		err.WithNext(hint)
 	}
+	// What it made before it ended is its result: keep it in view.
+	if saved := exportedOutputs(api.Lifecycle{OutputExport: state.OutputExport, Outputs: state.Outputs}); len(saved) > 0 {
+		kept := make([]string, 0, len(saved))
+		for _, file := range saved {
+			kept = append(kept, file.Path)
+		}
+		err.Message += "; kept " + strings.Join(kept, ", ")
+	}
 	return err
 }
 
@@ -740,7 +751,7 @@ func settled(status string) bool {
 // collection; only an unmet observation that stays unchanged for the whole stall budget
 // is reported, and the run and its retained result are untouched either way.
 func awaitMachineCollection(ctx *Context, state api.JobState) (api.JobState, *exit.Error) {
-	if !custodyOwed(state.MachineExecution, state.Status) {
+	if !custodyOwed(state.MachineExecution, state.Status, len(state.Products)) {
 		return state, nil
 	}
 	client, problem := dial(ctx)

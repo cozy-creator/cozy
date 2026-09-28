@@ -47,10 +47,6 @@ func (m *rebootingMachine) ListMachineExecutionEvents(context.Context, *pb.Machi
 	return &pb.MachineExecutionEventPage{}, nil
 }
 
-func (m *rebootingMachine) CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	return nil, status.Error(codes.FailedPrecondition, "still running")
-}
-
 func (m *rebootingMachine) AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
 	return nil, status.Error(codes.FailedPrecondition, "still running")
 }

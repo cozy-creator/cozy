@@ -173,17 +173,12 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	if row.State == "failed" || row.State == "blocked" {
 		state.ErrorType, state.ErrorCode, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
+	// The run's output log as this client holds it; its result is the fold once collected.
+	state.Products, _ = s.store.Products(row.ID)
+	state.Stream = StreamPath(row)
 	if outputs, problem := s.store.VisibleOutputs(row.ID); problem == nil {
 		for _, output := range outputs {
-			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MediaID: output.MediaID, URL: "/v1/media/" + output.MediaID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
-		}
-	}
-	// The files this client received from the machine, each once.
-	if files, problem := s.store.MachineFileResults(row.ID); problem == nil && len(state.Outputs) == 0 {
-		for _, file := range files {
-			if output := file.Output; file.Copied && output.OutputID != "" {
-				state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MediaID: output.MediaID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
-			}
+			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
 		}
 	}
 	if row.ModelTransfer != nil {

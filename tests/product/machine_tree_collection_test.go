@@ -118,3 +118,13 @@ func TestTreeCollectionRejectsMalformedClosureAndExportsIndependentBytes(t *test
 		t.Fatal("changed member custody exported")
 	}
 }
+
+// requireResultUsable fails unless every declared output of the result was read.
+func requireResultUsable(t *testing.T, schema json.RawMessage, envelope *pb.ResultEnvelope) {
+	t.Helper()
+	drift, problem := launch.ValidateMachineResult(schema, envelope)
+	fatal(t, problem)
+	if len(drift.Failed) > 0 {
+		t.Fatalf("a valid result was refused: %v", drift.Warnings())
+	}
+}

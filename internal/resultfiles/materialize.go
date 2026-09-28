@@ -19,20 +19,18 @@ func Materialize(source, directory, digest, mediaType string, length int64) (str
 	if problem != nil {
 		return "", problem
 	}
+	return MaterializeParts([]string{source}, directory, name, digest, length)
+}
+
+// MaterializeParts writes `name` in `directory` as the sources concatenated, verified
+// against `digest` and `length`, and replaces any file of that name atomically: a reader
+// opening it sees the whole previous bytes or the whole new ones.
+func MaterializeParts(sources []string, directory, name, digest string, length int64) (string, *exit.Error) {
 	if length < 0 || length == math.MaxInt64 {
 		return "", exit.Named(exit.Validation, "output_export_length_invalid", "output length is invalid")
 	}
 	if problem := Preflight(directory); problem != nil {
 		return "", problem
-	}
-	input, err := os.Open(source)
-	if err != nil {
-		return "", exit.Internalf("cannot open accepted output: %s", err)
-	}
-	defer input.Close()
-	info, err := input.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() != length {
-		return "", exit.Named(exit.Conflict, "output_export_source_changed", "accepted output changed before export")
 	}
 	root, err := os.OpenRoot(directory)
 	if err != nil {
@@ -46,9 +44,18 @@ func Materialize(source, directory, digest, mediaType string, length int64) (str
 	}
 	defer func() { output.Close(); _ = root.Remove(temporary) }()
 	hash := sha256.New()
-	written, err := io.Copy(io.MultiWriter(output, hash), io.LimitReader(input, length+1))
-	if err != nil {
-		return "", exit.Internalf("cannot export accepted output: %s", err)
+	var written int64
+	for _, source := range sources {
+		input, err := os.Open(source)
+		if err != nil {
+			return "", exit.Internalf("cannot open accepted output: %s", err)
+		}
+		copied, err := io.Copy(io.MultiWriter(output, hash), io.LimitReader(input, length-written+1))
+		input.Close()
+		if err != nil {
+			return "", exit.Internalf("cannot export accepted output: %s", err)
+		}
+		written += copied
 	}
 	if written != length || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
 		return "", exit.Named(exit.Conflict, "output_export_source_changed", "accepted output changed before export")

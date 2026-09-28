@@ -88,7 +88,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 		}
 	}
 	out = orchestrator.Submission{Kind: "serving", Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
-		Payload: append([]byte(nil), payload...), Outputs: launch.AssetPaths(job.Result),
+		Payload: append([]byte(nil), payload...), Outputs: launch.OutputSlots(job.Result),
 		NeedsAccelerator: launch.AcceleratorRequired(strings.Split(install.Closure, "\n")), Org: parent.Org}
 	if job.Kind == "job" {
 		jobs, problem := r.JobsInstall(install.ID)

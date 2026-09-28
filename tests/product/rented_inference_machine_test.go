@@ -131,9 +131,14 @@ func (m *runtimeMachine) finish() {
 	if m.failure != "" {
 		m.state.State = "failed"
 	}
+	m.state.Sequence++
+	m.events = append(m.events, outcomeEvent(m.state.Sequence, m.state.State, m.outcome()))
 }
 
 func (m *runtimeMachine) status() pb.OutcomeStatus {
+	if m.state.State == "canceled" {
+		return pb.OutcomeStatus_OUTCOME_STATUS_CANCELED
+	}
 	if m.failure == "" {
 		return pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED
 	}
@@ -141,6 +146,9 @@ func (m *runtimeMachine) status() pb.OutcomeStatus {
 }
 
 func (m *runtimeMachine) cause() *pb.OutcomeCause {
+	if m.state.State == "canceled" {
+		return &pb.OutcomeCause{Code: pb.CauseCode_CAUSE_CODE_CLIENT_CANCEL, Origin: pb.CauseOrigin_CAUSE_ORIGIN_WORKER}
+	}
 	if m.failure == "" {
 		return nil
 	}
@@ -179,9 +187,8 @@ func (m *runtimeMachine) ReadMachineExecutionTriage(_ context.Context, query *pb
 		Length: uint64(len(m.triage))}, BundleCanonicalBytes: m.triage}, nil
 }
 
-func (m *runtimeMachine) CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// outcome is the run's exact terminal, carried by the log's last entry.
+func (m *runtimeMachine) outcome() *pb.AttemptOutcome {
 	spec, _ := canonical.Spell(m.receipt.InvocationSpecDigest)
 	body, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{RequestId: m.state.RequestId, AttemptOrdinal: 1,
 		InvocationSpecDigest: spec, Status: m.status(),
@@ -189,10 +196,10 @@ func (m *runtimeMachine) CollectMachineExecution(context.Context, *pb.MachineExe
 		TriageBundle: &pb.TriageBundleRef{SubjectId: "trb-rented", WriteReceiptDigest: canonical.Digest(m.triage),
 			Length: uint64(len(m.triage))}, SafeMessage: m.failure, Cause: m.cause()})
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 	return &pb.AttemptOutcome{RequestId: m.state.RequestId, AttemptOrdinal: 1, InvocationSpecDigest: m.receipt.InvocationSpecDigest,
-		OutcomeId: "rented-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body}, nil
+		OutcomeId: "rented-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body}
 }
 
 func (m *runtimeMachine) AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {

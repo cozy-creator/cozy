@@ -121,7 +121,8 @@ func (m *heldMachine) ControlMachineExecution(_ context.Context, command *pb.Mac
 		m.state.Generation++
 		m.state.State = "canceled"
 		m.record("control", []byte(`{"action":"cancel","generation":1}`))
-		m.record("retention_released", []byte(`{"collected":false}`))
+		m.state.Sequence++
+		m.events = append(m.events, outcomeEvent(m.state.Sequence, "canceled", m.outcome()))
 	}
 	m.commands[command.CommandId] = true
 	m.once.Do(func() { close(m.canceled) })
@@ -133,7 +134,9 @@ func (m *heldMachine) ControlMachineExecution(_ context.Context, command *pb.Mac
 func TestRentedCancelDoesNotWaitBehindAnObservation(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
-	machine := &heldMachine{runtimeMachine: &runtimeMachine{}, commands: map[string]bool{}, canceled: make(chan struct{})}
+	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "runtime-bundle.json"))
+	must(t, err)
+	machine := &heldMachine{runtimeMachine: &runtimeMachine{triage: bundle}, commands: map[string]bool{}, canceled: make(chan struct{})}
 	root := startRentedFixture(t, h, func(blocker string) machineExecutionPeer { machine.blocker = blocker; return machine }, "")
 	if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json"); code != 0 {
 		t.Fatalf("the rented run was refused [exit %d]: %s", code, out)
@@ -222,10 +225,6 @@ func (m *acceptingMachines) GetMachineExecution(_ context.Context, query *pb.Mac
 
 func (m *acceptingMachines) ListMachineExecutionEvents(context.Context, *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error) {
 	return &pb.MachineExecutionEventPage{}, nil
-}
-
-func (m *acceptingMachines) CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	return nil, status.Error(codes.FailedPrecondition, "still running")
 }
 
 func (m *acceptingMachines) AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {

@@ -95,6 +95,8 @@ type Submission struct {
 	// OutputDirectory is the caller's explicit --out; empty means the package's store.
 	// It is part of the submission's identity, where the derived intent below is not.
 	OutputDirectory string
+	// NoPartials writes only the final files, never a run's `.partial` revision files.
+	NoPartials bool
 	// AttentionKernel is an optional developer execution-path pin. It affects only the
 	// InvocationSpec and is intentionally excluded from placement and model resolution.
 	AttentionKernel string

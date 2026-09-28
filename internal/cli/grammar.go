@@ -439,6 +439,7 @@ type RunExecuteCmd struct {
 	Target          string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
 	Input           []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
 	Out             string   `help:"Output directory." type:"path" predictor:"dir"`
+	NoPartials      bool     `help:"Write only the final files: no <n>-<output>.partial file while the run goes on."`
 	Timeout         string   `help:"Request deadline."`
 	PayloadFile     string   `name:"input" help:"Read the whole payload from a JSON file, e.g. --input=request.json; inline fields override file values." type:"path"`
 	Assets          []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
@@ -466,7 +467,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 	}
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
-		"--await", c.Await,
+		"--await", c.Await, "--no-partials", c.NoPartials,
 		"--rental-only", c.RentalOnly, "--rent-new", c.RentNew, "--describe", c.Describe), values(
 		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,

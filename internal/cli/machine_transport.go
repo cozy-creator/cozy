@@ -107,20 +107,12 @@ func (c *machineConnection) releaseModel(ctx context.Context, request *pb.Derive
 	return c.Host.ReleaseDerivedRetention(ctx, &pb.DerivedRetentionCall{Claim: c.Claim, Request: request})
 }
 
-func (c *machineConnection) retainBytes(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
-	return c.Host.RetainByteTree(ctx, &pb.NativeByteRetentionCall{Claim: c.Claim, Request: request})
-}
-
-func (c *machineConnection) releaseBytes(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
-	return c.Host.ReleaseByteTree(ctx, &pb.NativeByteRetentionCall{Claim: c.Claim, Request: request})
-}
-
 func (c *machineConnection) importInputTree(ctx context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error) {
 	return c.Host.ImportInputTree(ctx)
 }
 
-func (c *machineConnection) readBytes(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
-	return c.Host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: c.Claim, Source: source, Object: object})
+func (c *machineConnection) readBytes(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref, offset uint64) (machineByteStream, error) {
+	return c.Host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: c.Claim, Source: source, Object: object, Offset: offset})
 }
 
 // prepare installs one captured revision: its wheels move from this client to the machine

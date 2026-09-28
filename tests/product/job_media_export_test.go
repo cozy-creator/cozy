@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -137,21 +138,21 @@ def picture(payload:Request,out:Outputs)->Picture:
 		}
 		outputs, problem := store.VisibleOutputs(request.ID)
 		fatal(t, problem)
-		if len(outputs) != 1 || outputs[0].Path == target {
-			t.Fatal("user copy replaced internal publication custody")
-		}
-		files, problem := store.MachineFileResults(request.ID)
+		products, problem := store.Products(request.ID)
 		fatal(t, problem)
-		if len(files) != 1 || !files[0].Copied || files[0].State != "released" || files[0].Source.Digest != outputs[0].Digest {
-			t.Fatal("collected image has no exact copied receipt and released recipient hold")
+		if len(outputs) != 1 || len(products) != 1 || products[0].Digest != outputs[0].Digest {
+			t.Fatalf("the image did not arrive as the run's one product: %+v %+v", products, outputs)
 		}
+		layout, problem := home.Open(root)
+		fatal(t, problem)
+		custody := filepath.Join(layout.Products(request.Org, request.ID), strings.TrimPrefix(products[0].Digest, "sha256:"))
 		attempts, problem := store.Attempts(request.ID)
 		fatal(t, problem)
 		if len(attempts) != 0 {
 			t.Fatal("file collection created a Creator execution attempt")
 		}
 		must(t, os.WriteFile(target, []byte("user edit"), 0600))
-		internal, err := os.ReadFile(outputs[0].Path)
+		internal, err := os.ReadFile(custody)
 		must(t, err)
 		if string(internal) != string(data) {
 			t.Fatal("editing exported media changed internal custody")

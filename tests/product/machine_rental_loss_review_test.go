@@ -2,8 +2,6 @@ package producttest
 
 import (
 	"bytes"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -30,53 +28,6 @@ func TestDestroyedUnacceptedExecutionCannotReturnToCanceling(t *testing.T) {
 	fatal(t, problem)
 	if after.State == "canceling" || owed || len(blocked) != 0 {
 		t.Fatalf("late cancellation revived destroyed execution: before=%s after=%s owes_work=%v shutdown=%+v", before.State, after.State, owed, blocked)
-	}
-}
-
-func TestEndedRentalExposesOnlyVerifiedLocalFileCopies(t *testing.T) {
-	for _, copied := range []bool{false, true} {
-		t.Run(map[bool]string{false: "uncopied", true: "copied"}[copied], func(t *testing.T) {
-			store, request, receipt := machineObserverFixture(t)
-			observedLossOutcome(t, store, request, receipt, nil)
-			path := filepath.Join(t.TempDir(), "received.txt")
-			data := []byte("locally retained output\n")
-			must(t, os.WriteFile(path, data, 0600))
-			digest, _ := canonical.Spell(canonical.Digest(data))
-			file := records.MachineFileResult{OutcomeID: "loss-outcome", RetentionID: childDigest("8"),
-				Source: records.ByteOutput{RequestID: request.ID, Attempt: 1, OutputID: "file", Digest: digest, Length: int64(len(data)), MimeType: "text/plain", ProducerRootID: childDigest("5"), ReceiptDigest: childDigest("6"), ManifestID: childDigest("7"), ManifestLength: 123, ContentBytes: int64(len(data))},
-				Output: records.Output{OutputID: "file", MediaID: "local-media", Path: path, Digest: digest, Length: int64(len(data)), MimeType: "text/plain"}}
-			_, problem := store.FreezeMachineFileResult(request.ID, file)
-			fatal(t, problem)
-			if copied {
-				fatal(t, store.AdvanceMachineFileResult(request.ID, file.RetentionID, "copied"))
-			}
-			before, problem := store.MachineExecution(request.ID)
-			fatal(t, problem)
-			_, problem = store.ForgetRental("pr-owned-machine")
-			fatal(t, problem)
-			outputs, problem := store.VisibleOutputs(request.ID)
-			fatal(t, problem)
-			media, id, attempt, problem := store.Media(file.Output.MediaID)
-			fatal(t, problem)
-			if copied {
-				if len(outputs) != 1 || outputs[0] != file.Output || media == nil || *media != file.Output || id != request.ID || attempt != 1 {
-					t.Fatalf("verified local file vanished with remote ACK: outputs=%+v media=%+v", outputs, media)
-				}
-			} else if len(outputs) != 0 || media != nil {
-				t.Fatal("an incomplete/unverified local file gained custody because its machine disappeared")
-			}
-			after, problem := store.MachineExecution(request.ID)
-			fatal(t, problem)
-			files, problem := store.MachineFileResults(request.ID)
-			fatal(t, problem)
-			wantState := "pending"
-			if copied {
-				wantState = "copied"
-			}
-			if after.Collected || !bytes.Equal(before.Outcome, after.Outcome) || len(files) != 1 || files[0].State != wantState || files[0].Copied != copied {
-				t.Fatal("local visibility fabricated remote collection/release or changed the exact terminal")
-			}
-		})
 	}
 }
 

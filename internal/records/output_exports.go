@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS request_output_exports (
   safe_error       TEXT    NOT NULL DEFAULT '',
   published_paths  TEXT    NOT NULL DEFAULT '[]',
   updated_at       TEXT    NOT NULL,
+  partials         INTEGER NOT NULL DEFAULT 1,
   CHECK (state IN ('pending','exporting','published','failed','skipped'))
 )`
 
@@ -38,6 +39,8 @@ type OutputExportEntry struct {
 type OutputExportIntent struct {
 	Directory string              `json:"directory"`
 	Outputs   []OutputExportEntry `json:"outputs"`
+	// Partials writes a single output's current revision as `<n>-<output>.partial.<ext>`.
+	Partials bool `json:"partials"`
 }
 
 // OutputExport is the durable daemon-owned publication obligation and its settlement.
@@ -74,8 +77,8 @@ func recordOutputExportTx(tx *sql.Tx, requestID string, intent *OutputExportInte
 		return nil
 	}
 	if _, err := tx.Exec(`INSERT INTO request_output_exports(request_id,directory,
-		outputs,state,updated_at) VALUES(?,?,?, 'pending', ?)`, requestID, intent.Directory,
-		outputs, now()); err != nil {
+		outputs,state,updated_at,partials) VALUES(?,?,?, 'pending', ?, ?)`, requestID, intent.Directory,
+		outputs, now(), intent.Partials); err != nil {
 		return exit.Internalf("cannot record output export for %s: %s", requestID, err)
 	}
 	return nil
@@ -85,7 +88,7 @@ func recordOutputExportTx(tx *sql.Tx, requestID string, intent *OutputExportInte
 // callable with no result files).
 func (s *Store) OutputExportOf(requestID string) (*OutputExport, *exit.Error) {
 	row, err := scanOutputExport(s.db.QueryRow(`SELECT request_id,directory,outputs,
-		state,attempts,error_code,safe_error,published_paths,updated_at
+		state,attempts,error_code,safe_error,published_paths,updated_at,partials
 		FROM request_output_exports WHERE request_id=?`, requestID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -99,7 +102,7 @@ func (s *Store) OutputExportOf(requestID string) (*OutputExport, *exit.Error) {
 // OutputExportsOwed is every non-settled export of a request that has ended.
 func (s *Store) OutputExportsOwed() ([]OutputExport, *exit.Error) {
 	rows, err := s.db.Query(`SELECT e.request_id,e.directory,e.outputs,
-		e.state,e.attempts,e.error_code,e.safe_error,e.published_paths,e.updated_at
+		e.state,e.attempts,e.error_code,e.safe_error,e.published_paths,e.updated_at,e.partials
 		FROM request_output_exports e JOIN requests r ON r.id=e.request_id
 		WHERE e.state IN ('pending','exporting','failed')
 		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')
@@ -123,7 +126,7 @@ func scanOutputExport(row interface{ Scan(...any) error }) (OutputExport, error)
 	var out OutputExport
 	var outputs, paths string
 	err := row.Scan(&out.RequestID, &out.Directory, &outputs, &out.State,
-		&out.Attempts, &out.ErrorCode, &out.SafeError, &paths, &out.UpdatedAt)
+		&out.Attempts, &out.ErrorCode, &out.SafeError, &paths, &out.UpdatedAt, &out.Partials)
 	if err == nil {
 		err = json.Unmarshal([]byte(outputs), &out.Outputs)
 	}

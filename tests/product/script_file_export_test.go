@@ -178,21 +178,15 @@ async def main()->Annotated[FileAsset,AssetBound(max_bytes=1024,media_types=("ap
 			if export == nil || export.State != "published" || len(export.Outputs) != 1 || export.Outputs[0].OutputID != tc.slot || export.Outputs[0].MediaType != tc.media {
 				t.Fatalf("file export was not recorded/settled: %+v", export)
 			}
-			files, problem := store.MachineFileResults(request.ID)
+			products, problem := store.Products(request.ID)
 			fatal(t, problem)
-			if len(files) != 1 || !files[0].Copied || files[0].State != "released" || files[0].Output.Path == target {
-				t.Fatalf("native custody was not independently copied: %+v", files)
+			if len(products) != 1 || products[0].Digest != file["digest"] {
+				t.Fatalf("the file did not arrive as the run's one product: %+v", products)
 			}
 			attempts, problem := store.Attempts(request.ID)
 			fatal(t, problem)
 			if len(attempts) != 0 {
 				t.Fatal("Creator invented an execution attempt")
-			}
-			must(t, os.WriteFile(target, []byte("user edit"), 0600))
-			internal, err := os.ReadFile(files[0].Output.Path)
-			must(t, err)
-			if !bytes.Equal(internal, data) {
-				t.Fatal("editing the user copy changed retained native result")
 			}
 		})
 	}
