@@ -256,6 +256,8 @@ def grow(ctx: Context, payload: Request, out: Outputs) -> Grown:
 	if _, err := os.Stat(last.Path); !os.IsNotExist(err) {
 		t.Fatalf("the partial file outlived its run: %v", err)
 	}
+	// The machine itself serves the image, the current bytes of its third revision.
+	machineServesOutput(t, root, "image", last.Digest, 3)
 
 	// Canceled after its second revision, the run keeps that revision as its result.
 	gate = filepath.Join(t.TempDir(), "canceled")

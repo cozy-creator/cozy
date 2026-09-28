@@ -13,11 +13,12 @@ import (
 // Snapshot is one consistent view of an output's current bytes. SHA256 is set only once the
 // output is final.
 type Snapshot struct {
-	Body   io.ReaderAt // the current bytes: one store object, or the parts in order
-	Length int64
-	Rev    uint64 // the 1-based ordinal of this (output, index)'s product entries in the log
-	SHA256 string
-	Final  bool
+	Body      io.ReaderAt // the current bytes: one store object, or the parts in order
+	Length    int64
+	Rev       uint64 // the 1-based ordinal of this (output, index)'s product entries in the log
+	SHA256    string
+	Final     bool
+	MediaType string
 }
 
 // Entry is one entry of a run's log.

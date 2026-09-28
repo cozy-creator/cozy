@@ -131,7 +131,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 }
 
 func freeLoopback() (string, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := listen("127.0.0.1", 0)
 	if err != nil {
 		return "", err
 	}
