@@ -15,8 +15,7 @@ Catch one (`except errors.ShortRead`) or the family::
         log(e.code, e.detail)      # "SHORT_READ", "...is 512 B on disk, the reference..."
 
 `CODES` maps the frozen wire name to its class for callers that dispatch on the wire name
-rather than on the type, and `__getattr__` accepts that spelling too — dynamically, because
-a wire name is data.
+rather than on the type.
 """
 
 from __future__ import annotations
@@ -333,11 +332,3 @@ __all__ = [
     "ZeroElement",
 ]
 
-
-def __getattr__(name: str) -> type[Refusal]:
-    """A refusal by its WIRE spelling: `SHORT_READ`. The `ShortRead` spelling is a real
-    attribute above and never reaches here."""
-    cls = CODES.get(name)
-    if cls is not None:
-        return cls
-    raise AttributeError(f"tensorfs.errors has no refusal named {name!r}")
