@@ -1,0 +1,98 @@
+[
+  {
+    "requirement": "pydantic-core>=2.46.4",
+    "accepted": true
+  },
+  {
+    "requirement": "pydantic-core>=2.46.4,<3",
+    "accepted": true
+  },
+  {
+    "requirement": "pydantic-core>=2.46.4,<2.47",
+    "accepted": true
+  },
+  {
+    "requirement": "foo==2.*",
+    "accepted": true
+  },
+  {
+    "requirement": "foo==2.46.*",
+    "accepted": true
+  },
+  {
+    "requirement": "foo~=2.46",
+    "accepted": true
+  },
+  {
+    "requirement": "foo~=2.46.4",
+    "accepted": true
+  },
+  {
+    "requirement": "foo>=2.46.4,<3.0.0",
+    "accepted": true
+  },
+  {
+    "requirement": "foo>=2.46.4,<2.47.0",
+    "accepted": true
+  },
+  {
+    "requirement": "cozy-runtime[media]>=0.18.4",
+    "accepted": true
+  },
+  {
+    "requirement": "foo",
+    "accepted": true
+  },
+  {
+    "requirement": "foo>1.2.3",
+    "accepted": true
+  },
+  {
+    "requirement": "foo>=1; python_version >= '3.12'",
+    "accepted": true
+  },
+  {
+    "requirement": "pydantic-core==2.46.4",
+    "accepted": false
+  },
+  {
+    "requirement": "foo==2.46",
+    "accepted": false
+  },
+  {
+    "requirement": "foo==2",
+    "accepted": false
+  },
+  {
+    "requirement": "foo===2.46.4",
+    "accepted": false
+  },
+  {
+    "requirement": "foo==2.46.4.*",
+    "accepted": false
+  },
+  {
+    "requirement": "foo<=2.46.4",
+    "accepted": false
+  },
+  {
+    "requirement": "foo<=2.46",
+    "accepted": false
+  },
+  {
+    "requirement": "foo<2.46.5",
+    "accepted": false
+  },
+  {
+    "requirement": "foo>=1,<2.46.5",
+    "accepted": false
+  },
+  {
+    "requirement": "foo~=2.46.4.1",
+    "accepted": false
+  },
+  {
+    "requirement": "foo!=2.46.4",
+    "accepted": false
+  }
+]

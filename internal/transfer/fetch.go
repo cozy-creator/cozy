@@ -1,0 +1,463 @@
+package transfer
+
+// The fetch half: a hub-held manifest into the local canonical store.
+//
+// It is cl-009's transactional install with a different source. The shape is the
+// same and so are the guarantees: nothing is visible until it is verified, a killed
+// run leaves the prior state runnable, and a re-run converges. What differs is where
+// the journal lives — an install's journal is the records database, a fetch's is the
+// store's own verification records, which is why this keeps no state of its own.
+//
+// The walk is DECLARE-FIRST in reverse, and it needs no route that lists a
+// manifest's blobs, because the artifact declares itself:
+//
+//	round 1  the manifest, admitted only if it hashes to the id asked for
+//	round 2  every direct blob, including the CozyTensors header
+//	round 3  the transitive closure TensorFS computes from the resident header
+//
+// After round 2 the byte plane can compute the whole object set locally, so round 3
+// asks the hub for bytes and never for an inventory. A hub that lied about any of it
+// is caught by the same digests the publisher declared.
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/tfs"
+	"github.com/cozy-creator/cozy/internal/units"
+)
+
+// Acquire serializes one exact Manifest transfer across processes. TensorFS's
+// repository row is the durable completion fact; the flock only elects the live mover.
+// A waiter always re-reads that row before deciding whether any network work remains.
+func (f *Fetch) Acquire(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.Error) {
+	var out Fetched
+	if f.ManifestID == "" || f.Ref.String() == "/" || f.Scratch == "" {
+		return out, exit.Internalf("model acquisition lacks an exact manifest, ref, or scratch root")
+	}
+	if err := os.MkdirAll(f.Scratch, 0o700); err != nil {
+		return out, exit.Internalf("cannot create model acquisition scratch: %s", err)
+	}
+	if f.Locks == "" {
+		return out, exit.Internalf("model acquisition lacks a lock directory")
+	}
+	if err := os.MkdirAll(f.Locks, 0o700); err != nil {
+		return out, exit.Internalf("cannot create model acquisition locks: %s", err)
+	}
+	lockPath := filepath.Join(f.Locks, strings.TrimPrefix(f.ManifestID, "sha256:")+".lock")
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return out, exit.Internalf("cannot open model acquisition lock: %s", err)
+	}
+	defer file.Close()
+	if err := flock.Wait(ctx, file); err != nil {
+		return out, exit.Named(exit.Canceled, "model_acquisition_canceled",
+			"waiting for the active model download stopped: %s", err)
+	}
+	defer flock.Release(file)
+	if row.Release == "" {
+		length, problem := f.Tool.RetainedCheckpoint(f.Ref.Org, f.Ref.Name, row.ManifestID, f.Scratch)
+		if problem != nil {
+			return out, problem
+		}
+		if length > 0 {
+			return Fetched{ManifestID: row.ManifestID, ManifestLength: length, HeaderID: row.HeaderID, MS: map[string]int64{}}, nil
+		}
+		return f.Run(ctx, row)
+	}
+	releases, problem := f.Tool.Releases(filepath.Join(f.Scratch, "resident-releases.jsonl"))
+	if problem != nil {
+		return out, problem
+	}
+	for _, release := range releases {
+		resident := "sha256:" + release.ManifestSHA256
+		if release.Org != f.Ref.Org || release.Name != f.Ref.Name ||
+			release.Version != row.Release || release.Lane != row.Lane || resident != row.ManifestID {
+			continue
+		}
+		return Fetched{ManifestID: resident, ManifestLength: release.ManifestLength,
+			Release: release.Version, Lane: release.Lane, MS: map[string]int64{}}, nil
+	}
+	return f.Run(ctx, row)
+}
+
+// Fetch is one manifest pulled into the local store.
+type Fetch struct {
+	Tool       *tfs.Tool
+	Hub        *hub.Client
+	Spec       string
+	Lane       string
+	Ref        hub.Ref
+	ManifestID string
+	Progress   func(string)
+	Scratch    string
+	// Locks is the caller-supplied model-acquisition flock directory (the Creator
+	// layout's `tmp/locks`). It is never derived from the TensorFS root: the Store is
+	// an independent home this process does not write beside (proto-030).
+	Locks string
+
+	// seen is what THIS run already handled. The rounds overlap by construction —
+	// the closure names the documents round 2 fetched — and counting an object twice
+	// would report a fresh fetch as partly deduplicated, which is a lie about the
+	// only number anyone reads.
+	seen map[string]bool
+}
+
+// Fetched is what a fetch did.
+type Fetched struct {
+	ManifestID     string
+	ManifestLength int64
+	HeaderID       string
+	Release        string
+	Lane           string
+	Objects        int
+	Bytes          int64
+	// Moved is blob payload that came off the object plane; Held is verified blob
+	// payload skipped. The small manifest control document is not mixed into blob
+	// accounting or shown as model download progress.
+	Moved    int64
+	Held     int64
+	Admitted int
+	Skipped  int
+	Rounds   int
+	MS       map[string]int64
+}
+
+func (f *Fetch) say(format string, args ...any) {
+	if f.Progress != nil {
+		f.Progress(fmt.Sprintf(format, args...))
+	}
+}
+
+// Resolve asks Tensorhub's typed model resolver for exactly one manifest. Cozy
+// never lists candidates or invents a default release locally.
+func (f *Fetch) Resolve(ctx context.Context) (hub.ModelManifest, *exit.Error) {
+	resolved, e := f.Hub.ResolveModel(ctx, f.Spec, f.Lane)
+	if e != nil {
+		return hub.ModelManifest{}, e
+	}
+	ref, parseErr := hub.ParseRef(resolved.Model)
+	if parseErr != nil || resolved.ManifestID == "" || resolved.HeaderID == "" {
+		return hub.ModelManifest{}, exit.Internalf(
+			"model resolution for %q returned an invalid model, manifest, or header", f.Spec)
+	}
+	if (resolved.Release == "") != (resolved.Lane == "") {
+		return hub.ModelManifest{}, exit.Named(exit.Usage, "model.release_required",
+			"%q resolves an incomplete release/lane pair", f.Spec).
+			WithRemedy("select a checkpoint digest or one exact release lane")
+	}
+	f.Ref, f.ManifestID = ref, resolved.ManifestID
+	return hub.ModelManifest{
+		Org: ref.Org, Name: ref.Name, Release: resolved.Release, Lane: resolved.Lane,
+		ManifestID: resolved.ManifestID, HeaderID: resolved.HeaderID,
+		Components: resolved.Components, Objects: resolved.Objects, Bytes: resolved.Bytes,
+	}, nil
+}
+
+// Run installs the manifest transactionally: verified writes, then one repository
+// commit after the whole closure verifies.
+func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.Error) {
+	out := Fetched{ManifestID: row.ManifestID, HeaderID: row.HeaderID,
+		Release: row.Release, Lane: row.Lane, MS: map[string]int64{}}
+	f.seen = map[string]bool{}
+	if err := os.MkdirAll(f.Scratch, 0o700); err != nil {
+		return out, exit.Internalf("cannot create the transfer scratch at %s: %s", f.Scratch, err)
+	}
+	// Round 1 — the manifest. It proves its own identity before entering the typed
+	// manifest namespace.
+	t0 := time.Now()
+	var doc []byte
+	var e *exit.Error
+	if row.Release == "" {
+		doc, e = f.Hub.CheckpointManifest(ctx, f.Ref, row.ManifestID)
+	} else {
+		doc, e = f.Hub.ReleaseManifest(ctx, f.Ref, row.Release, row.Lane)
+	}
+	if e != nil {
+		return out, e
+	}
+	out.ManifestLength = int64(len(doc))
+	path := filepath.Join(f.Scratch, "manifest.bin")
+	if err := os.WriteFile(path, doc, 0o644); err != nil {
+		return out, exit.Internalf("cannot stage the manifest: %s", err)
+	}
+	_, e = f.Tool.AdmitManifest(path, row.ManifestID, int64(len(doc)))
+	if e != nil {
+		return out, e
+	}
+	out.MS["manifest"] = since(t0)
+	out.Rounds = 1
+
+	// Round 2 — what the manifest names directly: the header, the encoding specs and
+	// their vectors, the configs. With these resident the closure below is computable
+	// locally, which is why no route needs to list a manifest's blobs.
+	entries, headerID, e := f.Tool.ManifestEntries(path, filepath.Join(f.Scratch, "direct.jsonl"))
+	if e != nil {
+		return out, e
+	}
+	out.HeaderID = headerID
+	t0 = time.Now()
+	if e := f.round(ctx, row, "documents", entries, &out); e != nil {
+		return out, e
+	}
+	out.MS["documents"] = since(t0)
+	out.Rounds = 2
+
+	// Round 3 — the transitive closure, computed by the byte plane from documents it
+	// now holds. This is the tensors.
+	t0 = time.Now()
+	objects, e := f.Tool.ManifestObjects(row.ManifestID, filepath.Join(f.Scratch, "objects.jsonl"))
+	if e != nil {
+		return out, e
+	}
+	out.Objects = len(objects)
+	for _, o := range objects {
+		out.Bytes += o.Length
+	}
+	if e := f.round(ctx, row, "objects", objects, &out); e != nil {
+		return out, e
+	}
+	out.MS["objects"] = since(t0)
+	out.Rounds = 3
+
+	// The proof. Every declared byte is verified before the native repository
+	// retains this checkpoint, with a release label only when one was selected.
+	t0 = time.Now()
+	if e := f.Tool.VerifyManifest(row.ManifestID); e != nil {
+		return out, e
+	}
+	out.MS["verify"] = since(t0)
+
+	if row.Release == "" {
+		e = f.Tool.CommitCheckpoint(f.Ref.Org, f.Ref.Name, row.ManifestID, int64(len(doc)), f.Scratch)
+	} else {
+		e = f.Tool.CommitRelease(f.Ref.Org, f.Ref.Name, row.Release, row.Lane, row.ManifestID, int64(len(doc)), f.Scratch)
+	}
+	if e != nil {
+		return out, e
+	}
+	f.say("Model files ready: %s", f.Ref.String())
+	return out, nil
+}
+
+// round fetches and installs one set of objects. Presence is not the predicate:
+// `tfs fill` skips only objects with a VALID verification record, rehashes a
+// present-but-unverified one, and quarantines a corrupt squatter — so a resumed
+// fetch converges on verified state rather than on whatever files happen to exist.
+func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, objects []tfs.Object, out *Fetched) *exit.Error {
+	var want []tfs.Object
+	for _, o := range objects {
+		if f.seen[o.ID] {
+			continue // this run already moved or skipped it; counting it twice would lie
+		}
+		f.seen[o.ID] = true
+		held, e := f.Tool.Held(o.ID)
+		if e != nil {
+			return e
+		}
+		if held {
+			out.Held += o.Length
+			out.Skipped++
+			continue
+		}
+		want = append(want, o)
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	var remaining, downloaded int64
+	for _, object := range want {
+		remaining += object.Length
+	}
+	if name == "objects" {
+		f.say("Downloading %s: %s remaining", f.Ref.String(), size(remaining))
+	}
+	lastProgress := time.Now()
+
+	dir := filepath.Join(f.Scratch, "in")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return exit.Internalf("cannot create the fetch scratch: %s", err)
+	}
+	const batchObjects = 64
+	for start := 0; start < len(want); start += batchObjects {
+		end := min(start+batchObjects, len(want))
+		batch := want[start:end]
+		ids := make([]string, 0, len(batch))
+		for _, o := range batch {
+			ids = append(ids, o.ID)
+		}
+		// The Hub custody-checks and signs every requested object before it sends
+		// headers. Acquire only the grants this install batch will consume: a large
+		// closure must not become one closure-sized silent control-plane call, and
+		// later grants must not age while earlier objects move.
+		var reads []hub.Read
+		var e *exit.Error
+		if row.Release == "" {
+			reads, e = f.Hub.CheckpointReads(ctx, f.Ref, row.ManifestID, ids)
+		} else {
+			reads, e = f.Hub.ReleaseReads(ctx, f.Ref, row.Release, row.Lane, ids)
+		}
+		if e != nil {
+			return e
+		}
+		at := map[string]hub.Read{}
+		for _, r := range reads {
+			at[r.ObjectID] = r
+		}
+
+		var plan strings.Builder
+		for _, o := range batch {
+			r, ok := at[o.ID]
+			if !ok {
+				return exit.Named(exit.NotFound, "hub.object_unavailable",
+					"the hub granted no read for %s", short1(o.ID)).
+					WithRemedy("the manifest's catalog row and its object custody disagree; the hub owns that reconciliation")
+			}
+			dst := filepath.Join(dir, strings.TrimPrefix(o.ID, "sha256:"))
+			n, e := download(ctx, r.URL, dst, o.Length)
+			if e != nil {
+				// A stopped or broken batch still admits the objects that fully arrived,
+				// so the next run moves only what never landed.
+				if plan.Len() > 0 {
+					if problem := f.install(plan.String(), out); problem != nil {
+						return problem
+					}
+				}
+				return e
+			}
+			out.Moved += n
+			downloaded += n
+			if name == "objects" && (downloaded == remaining || time.Since(lastProgress) >= time.Second) {
+				f.say("Downloading %s: %s of %s", f.Ref.String(), size(downloaded), size(remaining))
+				lastProgress = time.Now()
+			}
+			fmt.Fprintf(&plan, "%s %d %s\n", strings.TrimPrefix(o.ID, "sha256:"), o.Length, dst)
+		}
+		// A killed transfer keeps every completed batch in TensorFS's verified
+		// journal. The next run asks only for objects the store does not hold.
+		if e := f.install(plan.String(), out); e != nil {
+			return e
+		}
+	}
+	_ = os.RemoveAll(dir)
+	return nil
+}
+
+func (f *Fetch) install(plan string, out *Fetched) *exit.Error {
+	res, e := f.Tool.Fill([]byte(plan), filepath.Join(f.Scratch, "fill.plan"))
+	if e != nil {
+		return e
+	}
+	if res.Refused > 0 {
+		return exit.Named(exit.Validation, "fetch.object_refused",
+			"the byte plane refused %d of %d fetched objects", res.Refused, res.Put+res.Skipped+res.Refused).
+			WithRemedy("a refused object did not hash to the identity the manifest declares; nothing was installed under a name it did not earn")
+	}
+	out.Admitted += res.Put
+	out.Skipped += res.Skipped
+	return nil
+}
+
+// download streams one object into a file. It never holds one whole in RAM: an
+// object runs to the hub's per-object ceiling and this process is a CLI. A transport
+// failure is retried the same bounded way an upload is — the URL is signed, so
+// asking again is asking the same question — and the file is truncated on each
+// attempt so a half-received body never becomes the input to the next one.
+func download(ctx context.Context, url, dst string, length int64) (int64, *exit.Error) {
+	var n int64
+	exhausted, err := retryStorage(ctx, func(int) (bool, error) {
+		got, retryable, e := fetchOnce(ctx, url, dst, length)
+		if e != nil {
+			return retryable, e
+		}
+		n = got
+		return false, nil
+	})
+	if err == nil {
+		return n, nil
+	}
+	if !exhausted {
+		return 0, err.(*exit.Error)
+	}
+	return 0, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, err).
+		WithRemedy("re-run to resume: objects already verified in the store are skipped")
+}
+
+func fetchOnce(ctx context.Context, url, dst string, length int64) (int64, bool, *exit.Error) {
+	// Bounded by BYTES ARRIVING, not by a clock: a download that is slow is not a
+	// download that has stopped, and the two used to be the same 30-minute number.
+	m := &mover{}
+	rctx, cancel := m.context(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, false, exit.Internalf("the read grant's URL is not usable: %s", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, true, exit.Unavailablef("%s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return 0, retryableStorageStatus(resp.StatusCode),
+			storageRefusal(resp.StatusCode, short1(filepath.Base(dst)), raw)
+	}
+	f, err := os.Create(dst)
+	if err != nil {
+		return 0, false, exit.Internalf("cannot stage a fetched object: %s", err)
+	}
+	defer f.Close()
+	// The read is bounded by the length the manifest DECLARES. A source streaming
+	// more than it should is stopped here; whether the bytes hash correctly is the
+	// byte plane's question, one step later.
+	n, err := io.Copy(f, m.reader(io.LimitReader(resp.Body, length+1)))
+	if err != nil {
+		return 0, true, exit.Unavailablef("the transfer broke after %s: %s", size(n), err)
+	}
+	if n != length {
+		return 0, false, exit.Named(exit.Validation, "download.length_mismatch",
+			"the granted object delivered %d bytes; its exact ref declares %d", n, length)
+	}
+	return n, false, nil
+}
+
+func short1(id string) string {
+	h := strings.TrimPrefix(id, "sha256:")
+	if len(h) > 12 {
+		return "sha256:" + h[:12] + "…"
+	}
+	return id
+}
+
+func size(n int64) string { return units.Bytes(n) }
+
+// Timing renders a phase breakdown in one line, longest phase last so the eye lands
+// on where the time went. Phases are named by what they DID, not by which call was
+// made — "upload 19.6s" is the answer to "why did that take 20 seconds".
+func Timing(ms map[string]int64) string {
+	keys := make([]string, 0, len(ms))
+	for k := range ms {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return ms[keys[i]] < ms[keys[j]] })
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if v := ms[k]; v >= 1000 {
+			parts = append(parts, fmt.Sprintf("%s %.1fs", k, float64(v)/1000))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s %dms", k, v))
+		}
+	}
+	return strings.Join(parts, " · ")
+}

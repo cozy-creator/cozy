@@ -1,0 +1,458 @@
+package install
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/records"
+)
+
+// EnvironmentReceipt is the environment record: exactly what produced this install's venv.
+type EnvironmentReceipt struct {
+	Python   string
+	UV       string
+	Platform string
+	Extra    string
+	Packages int
+	Closure  string
+	Warnings []string
+}
+
+// MaterializeEnvironment is the ONE code-executing step, and it runs only after the source has
+// been verified. Local source is the author's project, so `uv sync` relocks a lock its
+// pyproject has moved past (a version bump) and uv's resolution alone refuses real conflicts.
+// Published releases keep their frozen lock (MaterializePublishedEnvironment).
+func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *exit.Error) {
+	return materializeEnvironment(sourceDir, venvDir, true)
+}
+
+func materializeEnvironment(sourceDir, venvDir string, editable bool) (*EnvironmentReceipt, *exit.Error) {
+	python, problem := hostruntime.ProjectPython(context.Background(), sourceDir)
+	if problem != nil {
+		return nil, problem
+	}
+	env := &EnvironmentReceipt{
+		Platform: runtime.GOOS + "/" + runtime.GOARCH,
+		UV:       toolVersion("uv", "--version"),
+	}
+	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
+
+	args := []string{"sync", "--no-dev", "--no-default-groups", "--no-progress", "--python", python.Executable}
+	if !editable {
+		args = append(args, "--no-editable")
+	}
+	if env.Extra != "" {
+		args = append(args, "--extra", env.Extra)
+	}
+	cmd := exec.Command("uv", args...)
+	cmd.Dir = sourceDir
+	cmd.Env = config.Frozen().Tool(
+		"UV_PROJECT_ENVIRONMENT=" + venvDir,
+	)
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		return nil, exit.Named(exit.Structural, "package_sync_refused",
+			"`uv %s` could not resolve or install this project for this host", strings.Join(args, " ")).
+			WithRemedy("uv said: %s", condense(out.String())).
+			WithNext("cozy help package install")
+	}
+
+	env.Python = pythonVersion(venvDir)
+	env.Packages, env.Closure = closure(venvDir)
+	if env.Python == "" || env.Packages == 0 {
+		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
+	}
+	return env, nil
+}
+
+// MaterializePublishedEnvironment recreates the frozen environment from the exact
+// published metadata alone (wire 30): registry dependencies from the committed lock's
+// export, the release's own wheels hash-pinned against the org's public index. No wheel
+// file is ever staged; every artifact must match a hash the export names
+// (`--require-hashes`), so the indexes have no authority over bytes. The export it writes
+// — index directives plus sorted exact rows — is retained at
+// `<install>/locked-requirements.txt`: it is the exact document Runtime preparation
+// consumes and re-consumes at model selection.
+func MaterializePublishedEnvironment(sourceDir, venvDir string,
+	published *PublishedSource,
+) (*EnvironmentReceipt, *exit.Error) {
+	lock := filepath.Join(sourceDir, "uv.lock")
+	_, err := os.Stat(lock)
+	if err != nil {
+		return nil, exit.Named(exit.Structural, "lock_missing",
+			"the published release carries no uv.lock").
+			WithRemedy("publish the exact uv.lock that freezes the package environment")
+	}
+	if published.IndexURL == "" {
+		return nil, exit.Internalf("published package source names no org index")
+	}
+	python, problem := hostruntime.ProjectPython(context.Background(), sourceDir)
+	if problem != nil {
+		return nil, problem
+	}
+	env := &EnvironmentReceipt{
+		Platform: runtime.GOOS + "/" + runtime.GOARCH,
+		UV:       toolVersion("uv", "--version"),
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_python_incompatible",
+		"the package Python requirement cannot select an interpreter",
+		"venv", "--python", python.Executable, "--no-progress", venvDir); problem != nil {
+		return nil, problem
+	}
+	body, problem := exportPublishedRequirements(sourceDir, published)
+	if problem != nil {
+		return nil, problem
+	}
+	requirements := filepath.Join(filepath.Dir(venvDir), "locked-requirements.txt")
+	if err := os.WriteFile(requirements, body, 0o600); err != nil {
+		return nil, exit.Internalf("cannot retain locked requirements: %s", err)
+	}
+	// The export already applied the package's uv settings at lock time. Installing from
+	// its source directory would let uv re-read them, and a constraint-dependencies row
+	// is an unpinned requirement --require-hashes refuses.
+	installRoot := filepath.Dir(venvDir)
+	if problem := runUV(installRoot, config.Frozen().Tool(), "locked_environment_refused",
+		"the exact locked closure is incompatible with the selected Python environment",
+		"pip", "install", "--no-deps", "--require-hashes", "--python",
+		home.VenvPython(venvDir), "--requirements", requirements); problem != nil {
+		return nil, problem
+	}
+	if problem := runUV(installRoot, config.Frozen().Tool(), "package_requirement_incompatible",
+		"the installed package requirements are not satisfied", "pip", "check", "--python",
+		home.VenvPython(venvDir)); problem != nil {
+		return nil, problem
+	}
+	env.Python = pythonVersion(venvDir)
+	env.Packages, env.Closure = closure(venvDir)
+	if env.Python == "" || env.Packages == 0 {
+		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
+	}
+	return env, nil
+}
+
+// PublishedRequirements prepares a dependency on the worker without installing a
+// second execution environment in Creator or changing an active package pin.
+func PublishedRequirements(published *PublishedSource) ([]byte, *exit.Error) {
+	if problem := validatePublished(records.PackageInstall{Package: published.Package, Version: published.Release}, published); problem != nil {
+		return nil, problem
+	}
+	root, err := os.MkdirTemp("", "cozy-published-requirements-")
+	if err != nil {
+		return nil, exit.Internalf("cannot stage published requirements: %s", err)
+	}
+	defer os.RemoveAll(root)
+	for name, document := range map[string]ExactDocument{"pyproject.toml": published.Pyproject, "uv.lock": published.UVLock} {
+		if err := os.WriteFile(filepath.Join(root, name), document.Bytes, 0o600); err != nil {
+			return nil, exit.Internalf("cannot retain published metadata: %s", err)
+		}
+	}
+	return exportPublishedRequirements(root, published)
+}
+
+func exportPublishedRequirements(sourceDir string, published *PublishedSource) ([]byte, *exit.Error) {
+	appended := append([]PublishedWheel{published.ProjectWheel}, published.Wheels...)
+	appended = append(appended, published.LocalWheels...)
+	temporary, err := os.CreateTemp("", "cozy-locked-export-")
+	if err != nil {
+		return nil, exit.Internalf("cannot stage locked requirements: %s", err)
+	}
+	exported := temporary.Name()
+	temporary.Close()
+	defer os.Remove(exported)
+	// Export the committed registry closure without the rows the release's own wheels
+	// supply; those rows are re-added below as exact org-index pins.
+	args := []string{"export", "--frozen", "--no-dev", "--no-default-groups", "--no-emit-project",
+		"--format", "requirements.txt", "--output-file", exported, "--no-progress",
+		"--no-python-downloads"}
+	seen := map[string]bool{}
+	for _, wheel := range appended {
+		name := strings.TrimSpace(wheel.Distribution)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		args = append(args, "--no-emit-package", name)
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
+		"the published lock cannot export its exact registry closure", args...); problem != nil {
+		return nil, problem
+	}
+
+	raw, err := os.ReadFile(exported)
+	if err != nil {
+		return nil, exit.Internalf("cannot read locked requirements: %s", err)
+	}
+	return LockedRequirements(raw, published.IndexURL, appended)
+}
+
+// runtimeScratchHome is the COZY_HOME every install-time cozy-runtime invocation gets:
+// a per-user OS cache directory, never the Creator home. What the runtime derives there
+// (its JIT-kernel proof cache) is reusable derived state, and the audited top-level
+// `~/.cozy/jit-cache` — 19 empty directories — was exactly this scratch landing in the
+// product home (cl-116).
+func runtimeScratchHome() string {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "cozy", "runtime-install")
+}
+
+// LockedRequirements renders the same exact wheel inventory for an installed
+// package or a worker-local dependency; it never resolves names or versions. A universal
+// lock forks a distribution by environment marker, so one name may repeat under different
+// markers: every such row is kept, and the installer selects the row whose marker matches
+// its target. Identical rows are one row, and the release's own wheel pins replace any
+// exported row of the same name.
+func LockedRequirements(raw []byte, indexURL string, wheels []PublishedWheel) ([]byte, *exit.Error) {
+	type locked struct{ name, text string }
+	var rows []locked
+	seen := map[string]bool{}
+	pending := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasSuffix(line, "\\") {
+			pending += strings.TrimSuffix(line, "\\") + " "
+			continue
+		}
+		row := strings.TrimSpace(pending + line)
+		pending = ""
+		if row == "" || strings.HasPrefix(row, "#") || strings.HasPrefix(row, "-") {
+			continue
+		}
+		name := normalizedRequirementName(row)
+		if name == "" {
+			return nil, exit.Internalf("the exported registry closure row %q names no distribution", row)
+		}
+		text := strings.Join(strings.Fields(row), " ")
+		if !seen[text] {
+			seen[text] = true
+			rows = append(rows, locked{name, text})
+		}
+	}
+	own := map[string]string{}
+	for _, wheel := range wheels {
+		name := normalizedRequirementName(wheel.Distribution)
+		if name == "" || wheel.Version == "" || !strings.HasPrefix(wheel.Digest, "sha256:") {
+			return nil, exit.Internalf("published wheel fact %q is incomplete", wheel.Distribution)
+		}
+		text := name + "==" + wheel.Version + " --hash=" + wheel.Digest
+		if prior, named := own[name]; named && prior != text {
+			return nil, exit.Named(exit.Conflict, "package_wheel_ambiguous",
+				"published package names two different wheels for distribution %q", wheel.Distribution)
+		}
+		own[name] = text
+	}
+	kept := rows[:0]
+	for _, row := range rows {
+		if _, replaced := own[row.name]; !replaced {
+			kept = append(kept, row)
+		}
+	}
+	for name, text := range own {
+		kept = append(kept, locked{name, text})
+	}
+	sort.Slice(kept, func(i, j int) bool {
+		if kept[i].name != kept[j].name {
+			return kept[i].name < kept[j].name
+		}
+		return kept[i].text < kept[j].text
+	})
+	var out strings.Builder
+	out.WriteString("--index-url https://pypi.org/simple\n")
+	out.WriteString("--extra-index-url " + indexURL + "\n")
+	for _, row := range kept {
+		out.WriteString(row.text + "\n")
+	}
+	return []byte(out.String()), nil
+}
+
+var requirementName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*`)
+var requirementNormalize = regexp.MustCompile(`[-_.]+`)
+
+func normalizedRequirementName(row string) string {
+	name := requirementName.FindString(strings.TrimSpace(row))
+	return requirementNormalize.ReplaceAllString(strings.ToLower(name), "-")
+}
+
+func runUV(dir string, env []string, code, message string, args ...string) *exit.Error {
+	cmd := exec.Command("uv", args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		return exit.Named(exit.Validation, code, "%s: %s", message, condense(out.String())).
+			WithRemedy("fix the named requirement or wheel and publish a new locked release").
+			WithNext("cozy help package install")
+	}
+	return nil
+}
+
+// Disk measures one install exactly once, at install: the ALLOCATED bytes only this
+// tree holds, and the allocated bytes it shares with a name outside it. `cozy package
+// list` reads these numbers back out of the record — it never walks 122k files.
+//
+// Each inode is measured ONCE, however many names inside the tree reach it, and an
+// inode whose every link lives inside the tree is EXCLUSIVE — its digest file plus a
+// named view die together, so calling it shared double-counted ~26 GB on the audited
+// home (cl-116). Only an inode with a link outside the walk is shared. Exclusive is
+// therefore also the observed post-delete delta a removal reports.
+func Disk(dir string) (exclusive, shared int64) {
+	type counted struct {
+		links     uint64
+		seen      uint64
+		allocated int64
+	}
+	inodes := map[inodeKey]*counted{}
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		key, links, allocated, ok := inode(info)
+		if !ok {
+			exclusive += info.Size()
+			return nil
+		}
+		if row := inodes[key]; row != nil {
+			row.seen++
+			return nil
+		}
+		inodes[key] = &counted{links: links, seen: 1, allocated: allocated}
+		return nil
+	})
+	for _, row := range inodes {
+		if row.seen >= row.links {
+			exclusive += row.allocated
+			continue
+		}
+		shared += row.allocated
+	}
+	return
+}
+
+var extraName = regexp.MustCompile(`^\s*(cu\d{2,4})\s*=`)
+
+// pickCUDAExtra chooses the declared CUDA extra this host's driver can actually
+// run: the highest declared cuXYZ at or below the driver's CUDA version. No
+// accelerator, or nothing declared, selects no extra — never a guess.
+func pickCUDAExtra(sourceDir string, warn *[]string) string {
+	declared := declaredExtras(filepath.Join(sourceDir, "pyproject.toml"))
+	if len(declared) == 0 {
+		return ""
+	}
+	host := hostCUDA()
+	if host == 0 {
+		*warn = append(*warn, fmt.Sprintf(
+			"no CUDA driver reported; installing without a CUDA extra (declared: %s)", strings.Join(declared, ", ")))
+		return ""
+	}
+	best, bestN := "", 0
+	for _, name := range declared {
+		n, err := strconv.Atoi(strings.TrimPrefix(name, "cu"))
+		if err != nil {
+			continue
+		}
+		if n <= host && n > bestN {
+			best, bestN = name, n
+		}
+	}
+	if best == "" {
+		*warn = append(*warn, fmt.Sprintf(
+			"this host's CUDA %d.%d is below every declared extra (%s); installing without one",
+			host/10, host%10, strings.Join(declared, ", ")))
+	}
+	return best
+}
+
+func declaredExtras(pyproject string) []string {
+	f, err := os.Open(pyproject)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var out []string
+	in := false
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if t := strings.TrimSpace(line); strings.HasPrefix(t, "[") {
+			in = t == "[project.optional-dependencies]"
+			continue
+		}
+		if in {
+			if m := extraName.FindStringSubmatch(line); m != nil {
+				out = append(out, m[1])
+			}
+		}
+	}
+	return out
+}
+
+var cudaVersion = regexp.MustCompile(`CUDA Version:\s*(\d+)\.(\d+)`)
+
+// hostCUDA is the driver's maximum CUDA version as cuXYZ digits (13.0 -> 130).
+func hostCUDA() int {
+	cmd := exec.Command("nvidia-smi")
+	// The allowlisted tool environment, like every other spawn: a probe that inherited
+	// the full parent environment (TENSORHUB_TOKEN included) was the one production
+	// spawn invisible to the env fence (cl-026).
+	cmd.Env = config.Frozen().Tool()
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	m := cudaVersion.FindSubmatch(out)
+	if m == nil {
+		return 0
+	}
+	major, _ := strconv.Atoi(string(m[1]))
+	minor, _ := strconv.Atoi(string(m[2]))
+	return major*10 + minor
+}
+
+func toolVersion(name string, args ...string) string {
+	return strings.TrimSpace(strings.TrimPrefix(runOut(name, args...), name+" "))
+}
+
+func runOut(name string, args ...string) string {
+	cmd := exec.Command(name, args...)
+	cmd.Env = config.Frozen().Tool()
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+// condense flattens a tool's output into one remedy line, keeping its own words.
+func condense(s string) string {
+	var kept []string
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) > 6 {
+		kept = kept[len(kept)-6:]
+	}
+	return strings.Join(kept, " | ")
+}

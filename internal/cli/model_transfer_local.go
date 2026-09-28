@@ -1,0 +1,286 @@
+package cli
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/modelsource"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/tfs"
+	"github.com/cozy-creator/cozy/internal/transfer"
+)
+
+type localPreparedSource struct {
+	manifestID     string
+	manifestLength int64
+	plan           *tfs.SourcePlan
+}
+
+// prepareLocalTransferSources stages the source under root — the request's own
+// `tmp/<request-id>/`, claimed and released by the caller — and leaves its CozyTensors in
+// the CAS. Nothing here outlives the caller's Release.
+func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root string,
+	intent records.ModelTransferIntent, slots map[string]string,
+) (map[string]localPreparedSource, *exit.Error) {
+	tool, _, problem := localTensorFS(ctx)
+	if problem != nil {
+		return nil, problem
+	}
+	if strings.HasPrefix(intent.Source, "local/") {
+		name := strings.TrimPrefix(intent.Source, "local/")
+		alias, problem := tool.ResolveLocal(name)
+		if problem != nil {
+			return nil, problem
+		}
+		return samePreparedSource(slots, localPreparedSource{manifestID: alias.ManifestDigest,
+			manifestLength: alias.ManifestLength}), nil
+	}
+	if catalogModelSpelling(intent.Source) {
+		layout, problem := home.Open(ctx.Cfg.Home)
+		if problem != nil {
+			return nil, problem
+		}
+		fetch := &transfer.Fetch{Tool: tool, Hub: client(ctx), Spec: intent.Source,
+			Lane: intent.InputLane, Progress: progress(ctx), Locks: layout.AcquisitionLocks()}
+		// The run's own context: a cancel stops the Hub fetch between and within objects.
+		row, problem := fetch.Resolve(runCtx)
+		if problem == nil && row.ManifestID != intent.SourceSelection {
+			// The release lane moved after acceptance; fetch the accepted manifest by digest.
+			model, _, _ := strings.Cut(intent.Source, "@")
+			fetch.Spec, fetch.Lane = model+"@"+intent.SourceSelection, ""
+			row, problem = fetch.Resolve(runCtx)
+		}
+		if problem != nil {
+			return nil, problem
+		}
+		fetch.Scratch = filepath.Join(root, "fetch")
+		fetched, problem := fetch.Acquire(runCtx, row)
+		if problem != nil {
+			return nil, problem
+		}
+		return samePreparedSource(slots, localPreparedSource{manifestID: fetched.ManifestID,
+			manifestLength: fetched.ManifestLength}), nil
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, exit.Internalf("cannot resolve current directory: %s", err)
+	}
+	parsed, problem := modelsource.Parse(intent.Source, cwd)
+	if problem != nil {
+		return nil, problem
+	}
+	selected, headerFiles, resolver, problem := stageLocalTransferHeaders(runCtx, ctx, parsed, root)
+	if problem != nil {
+		return nil, problem
+	}
+	_, members, problem := planLocalSourceProfiles(tool, ctx, slots, headerFiles,
+		parsed.Kind != modelsource.LocalFile, filepath.Join(root, "header-plans"))
+	if problem != nil {
+		return nil, problem
+	}
+	if parsed.Kind != modelsource.LocalFile {
+		selected, problem = selected.Select(members)
+		if problem != nil {
+			return nil, problem
+		}
+		headerFiles, problem = resolver.Stage(runCtx, selected, filepath.Join(root, "files"), false,
+			progress(ctx))
+		if problem != nil {
+			return nil, problem
+		}
+	}
+	carriers := sourceCarriers(headerFiles, parsed.Kind != modelsource.LocalFile)
+	out := map[string]localPreparedSource{}
+	for _, slot := range sortedMapKeys(slots) {
+		path := filepath.Join(root, "full-plan-"+slot+".json")
+		var full tfs.SourcePlan
+		if profile := slots[slot]; profile != "" {
+			full, problem = tool.PlanSourceProfile(ctx.Cfg.TensorFSRegistry, profile, carriers, path)
+		} else {
+			full, problem = tool.PlanSource(ctx.Cfg.TensorFSRegistry, carriers, path)
+		}
+		if problem != nil {
+			return nil, problem
+		}
+		manifestID, problem := tool.RunSource(runCtx, path)
+		if problem != nil {
+			return nil, problem
+		}
+		manifestPath := filepath.Join(root, "manifest-"+slot)
+		if problem := tool.Manifest(manifestID, manifestPath); problem != nil {
+			return nil, problem
+		}
+		info, err := os.Stat(manifestPath)
+		if err != nil || info.Size() <= 0 {
+			return nil, exit.Internalf("prepared source Manifest %s is unreadable", manifestID)
+		}
+		copyPlan := full
+		out[slot] = localPreparedSource{manifestID: manifestID,
+			manifestLength: info.Size(), plan: &copyPlan}
+	}
+	return out, nil
+}
+
+func samePreparedSource(slots map[string]string, source localPreparedSource) map[string]localPreparedSource {
+	out := make(map[string]localPreparedSource, len(slots))
+	for slot := range slots {
+		out[slot] = source
+	}
+	return out
+}
+
+func stageLocalTransferHeaders(runCtx context.Context, ctx *Context, source modelsource.Source,
+	root string,
+) (modelsource.Plan, []modelsource.StagedFile, *modelsource.Resolver, *exit.Error) {
+	if source.Kind == modelsource.LocalFile {
+		plan, staged, problem := modelsource.StageLocal(runCtx, source, filepath.Join(root, "files"))
+		return plan, []modelsource.StagedFile{staged}, nil, problem
+	}
+	token := ctx.Cfg.HuggingFaceToken
+	if source.Kind == modelsource.Civitai {
+		token = ctx.Cfg.CivitaiToken
+	}
+	resolver, problem := modelsource.NewResolver(source.Kind, token)
+	if problem != nil {
+		return modelsource.Plan{}, nil, nil, problem
+	}
+	plan, problem := resolver.Resolve(runCtx, source)
+	if problem != nil {
+		return modelsource.Plan{}, nil, nil, problem
+	}
+	staged, problem := resolver.Stage(runCtx, plan, filepath.Join(root, "headers"), true, progress(ctx))
+	return plan, staged, resolver, problem
+}
+
+// planLocalSourceProfiles plans each slot over the source's carriers, narrowed as TensorFS's
+// select_members narrows a Civitai version: the primary alone, unless it plans nothing
+// reviewed and its companions compose a reviewed model with it (an SDXL primary stays alone).
+func planLocalSourceProfiles(tool *tfs.Tool, ctx *Context, slots map[string]string,
+	files []modelsource.StagedFile, labelled bool, root string,
+) (map[string]tfs.SourcePlan, []string, *exit.Error) {
+	own := slices.DeleteFunc(slices.Clone(files), func(file modelsource.StagedFile) bool { return file.Companion })
+	plans, selected, problem := planCarriers(tool, ctx, slots, own, labelled, filepath.Join(root, "own"))
+	if len(own) < len(files) && (problem != nil || asIs(plans)) {
+		composed, members, composedProblem := planCarriers(tool, ctx, slots, files, labelled, filepath.Join(root, "companions"))
+		primary := slices.ContainsFunc(members, func(member string) bool {
+			return slices.ContainsFunc(own, func(file modelsource.StagedFile) bool { return file.Member == member })
+		})
+		if composedProblem == nil && !asIs(composed) && primary {
+			plans, selected, problem = composed, members, nil
+		}
+	}
+	if problem != nil {
+		return nil, nil, problem
+	}
+	for _, slot := range sortedMapKeys(slots) {
+		if plans[slot].Profile == tfs.AsIsProfile {
+			fmt.Fprintf(ctx.Err, "note: %s (%s)\n", tfs.AsIsNote, strings.Join(sourcePlanMembers(plans[slot], files), ", "))
+		}
+	}
+	return plans, selected, nil
+}
+
+func asIs(plans map[string]tfs.SourcePlan) bool {
+	for _, plan := range plans {
+		if plan.Profile == tfs.AsIsProfile {
+			return true
+		}
+	}
+	return false
+}
+
+// planCarriers plans each slot over exactly these carriers: its plans and the members they use.
+func planCarriers(tool *tfs.Tool, ctx *Context, slots map[string]string,
+	files []modelsource.StagedFile, labelled bool, root string,
+) (map[string]tfs.SourcePlan, []string, *exit.Error) {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, nil, exit.Internalf("cannot create source-plan staging: %s", err)
+	}
+	carriers := sourceCarriers(files, labelled)
+	plans := map[string]tfs.SourcePlan{}
+	members := map[string]bool{}
+	for _, slot := range sortedMapKeys(slots) {
+		path := filepath.Join(root, slot+".json")
+		var plan tfs.SourcePlan
+		var problem *exit.Error
+		if profile := slots[slot]; profile != "" {
+			plan, problem = tool.PlanSourceProfile(ctx.Cfg.TensorFSRegistry, profile, carriers, path)
+		} else {
+			plan, problem = tool.PlanSource(ctx.Cfg.TensorFSRegistry, carriers, path)
+		}
+		if problem != nil {
+			return nil, nil, problem
+		}
+		if problem := tool.PreviewSource(path); problem != nil {
+			return nil, nil, problem
+		}
+		plans[slot] = plan
+		for _, member := range sourcePlanMembers(plan, files) {
+			members[member] = true
+		}
+	}
+	selected := make([]string, 0, len(members))
+	for member := range members {
+		selected = append(selected, member)
+	}
+	sort.Strings(selected)
+	return plans, selected, nil
+}
+
+func sortedMapKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sourceCarriers(files []modelsource.StagedFile, labelled bool) []tfs.SourceCarrier {
+	carriers := make([]tfs.SourceCarrier, 0, len(files))
+	for _, file := range files {
+		// TensorFS needs the complete physical set, including each index's shards.
+		carrier := tfs.SourceCarrier{Path: file.Path}
+		if labelled {
+			carrier.Member = file.Member
+		}
+		carriers = append(carriers, carrier)
+	}
+	return carriers
+}
+
+func sourcePlanMembers(plan tfs.SourcePlan, staged []modelsource.StagedFile) []string {
+	byPath := make(map[string]string, len(staged))
+	for _, file := range staged {
+		byPath[file.Path] = file.Member
+	}
+	members := make([]string, 0, len(plan.Sources))
+	for _, source := range plan.Sources {
+		member := source.SourceMember
+		if member == "" {
+			member = byPath[source.Path]
+		}
+		members = append(members, member)
+	}
+	return members
+}
+
+func localFinalizationSelection(requestID, slot string) string {
+	sum := sha256.Sum256([]byte("cozy-local-model-finalization/1\x00" + requestID + "\x00" + slot))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func shortTransferID(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:8])
+}

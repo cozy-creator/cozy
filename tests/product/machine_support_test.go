@@ -1,0 +1,262 @@
+package producttest
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
+	"flag"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machines"
+)
+
+var (
+	machineHostBinary    = flag.String("machine-host", "", "pod-supervisor binary every test root's local machine runs")
+	requireMachineHost   = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
+	machineRuntimeWheel  = flag.String("machine-runtime-wheel", "", "Runtime wheel the test machines run; default: the published Runtime")
+	machineTensorFSWheel = flag.String("machine-tensorfs-wheel", "", "TensorFS wheel paired with -machine-runtime-wheel")
+)
+
+// One installed machine layout for the whole run; each root's machine links its executables,
+// as a pod's image is shared and its / is its own.
+var machineTemplate struct {
+	once    sync.Once
+	dir     string
+	problem *exit.Error
+}
+
+func machineTemplateDir(t *testing.T) string {
+	t.Helper()
+	machineTemplate.once.Do(func() {
+		machineTemplate.dir = filepath.Join(scratchBase, "machine-template")
+		uv, err := exec.LookPath("uv")
+		if err != nil {
+			machineTemplate.problem = exit.New(exit.NotFound, "uv lays out the test machines: %s", err)
+			return
+		}
+		source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}
+		_, machineTemplate.problem = machines.NewHost(machineTemplate.dir, "", nil).Install(context.Background(), source, uv)
+	})
+	fatal(t, machineTemplate.problem)
+	return machineTemplate.dir
+}
+
+// provisionMachine gives a test root this computer's machine when the run names a Host. A
+// root on the suite's unanswered default hub is also registered, as `cozy auth login` plus a
+// first run would register it, with the suite's worker doors as its hub; a root naming its
+// own stand-in hub registers through that hub.
+func provisionMachine(t *testing.T, root string) {
+	t.Helper()
+	provisionMachineIn(t, root, "")
+}
+
+// unpressuredMachine gives root its machine on a filesystem the machine's own Runtime finds
+// free of storage pressure. Under pressure the Runtime evicts every unused memo entry, as it
+// should; a test of memo reuse needs the headroom a user's machine would have.
+func unpressuredMachine(t *testing.T, root string) {
+	t.Helper()
+	if *machineHostBinary == "" {
+		return
+	}
+	python := filepath.Join(machineTemplateDir(t), "root", "opt", "cozy", "python", "bin", "python")
+	for _, parent := range []string{os.TempDir(), "/dev/shm"} {
+		out, err := exec.Command(python, "-I", "-c", `import sys
+from pathlib import Path
+from cozy_runtime.internal.local_storage_admission import pressure_target
+print(pressure_target(Path(sys.argv[1])))`, parent).Output()
+		if err == nil && strings.TrimSpace(string(out)) == "0" {
+			provisionMachineIn(t, root, parent)
+			return
+		}
+	}
+	t.Fatal("every filesystem for the machine is under storage pressure; its Runtime would evict the memo entries this test reuses")
+}
+
+func provisionMachineIn(t *testing.T, root, parent string) {
+	t.Helper()
+	if *machineHostBinary == "" {
+		return
+	}
+	dir := filepath.Join(root, "machine")
+	if _, err := os.Lstat(dir); err == nil {
+		return
+	}
+	template := machineTemplateDir(t)
+	// The machine lives at a short path, as a pod's does at /: a test root's own path would
+	// push the Runtime's executor sockets past the kernel's socket path bound.
+	short, err := os.MkdirTemp(parent, "cm")
+	must(t, err)
+	must(t, os.MkdirAll(root, 0o700))
+	must(t, os.Symlink(short, dir))
+	t.Cleanup(func() {
+		reapMachineRuntimeRoot(root)
+		if !t.Failed() {
+			_ = removeAllForce(short)
+		}
+	})
+	for _, link := range []string{"usr/local/bin/pod-supervisor", "usr/local/bin/tfs", "usr/local/bin/uv", "opt/cozy/bin/cozy-runtime-worker", "opt/cozy/python"} {
+		target, err := filepath.EvalSymlinks(filepath.Join(template, "root", link))
+		must(t, err)
+		path := filepath.Join(dir, "root", link)
+		must(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		if strings.HasSuffix(link, "pod-supervisor") {
+			// Its own path, so the running Host is found and stopped by this root's teardown.
+			if os.Link(target, path) != nil {
+				raw, err := os.ReadFile(target)
+				must(t, err)
+				must(t, os.WriteFile(path, raw, 0o755))
+			}
+			continue
+		}
+		must(t, os.Symlink(target, path))
+	}
+	if raw, _ := os.ReadFile(filepath.Join(root, config.FileName)); !strings.Contains(string(raw), "tensorhub_url") {
+		registerMachine(t, root, testDefaultHub, suiteWorkerDoors(t))
+	}
+	installed, err := os.ReadFile(filepath.Join(template, "installed.json"))
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), installed, 0o600))
+}
+
+// registerMachine records root's machine as registered with hub, as a signed-in first run
+// would, its Host calling the doors environment names.
+func registerMachine(t *testing.T, root, hub string, environment map[string]string) {
+	t.Helper()
+	dir := filepath.Join(root, "machine")
+	registration, _ := json.Marshal(map[string]string{"hub": hub, "id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t)})
+	doors, _ := json.Marshal(environment)
+	must(t, os.WriteFile(filepath.Join(dir, "registration.json"), registration, 0o600))
+	must(t, os.WriteFile(filepath.Join(dir, "environment.json"), doors, 0o600))
+}
+
+// suiteWorkerDoors is the hub a pre-registered test machine's Host calls: its idle release
+// and cache reports, accepted.
+var workerDoors struct {
+	once        sync.Once
+	environment map[string]string
+}
+
+func suiteWorkerDoors(t *testing.T) map[string]string {
+	t.Helper()
+	workerDoors.once.Do(func() {
+		server, ca := hubTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		workerDoors.environment = map[string]string{"TENSORHUB_ORIGIN": server.URL, "TENSORHUB_PUBLIC_ORIGIN": server.URL,
+			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)}
+	})
+	return workerDoors.environment
+}
+
+// hubTLSServer serves handler as a Hub with a private CA does: the CA signs a 127.0.0.1 leaf
+// and a grant names the CA's DER. uv, like any WebPKI client, refuses a CA as a leaf.
+func hubTLSServer(t *testing.T, handler http.Handler) (*httptest.Server, []byte) {
+	t.Helper()
+	certificate := func(template, parent *x509.Certificate, key *ecdsa.PrivateKey, signer *ecdsa.PrivateKey) []byte {
+		template.NotBefore, template.NotAfter = time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+		der, err := x509.CreateCertificate(rand.Reader, template, parent, &key.PublicKey, signer)
+		must(t, err)
+		return der
+	}
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	must(t, err)
+	caTemplate := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test Hub CA"},
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	caDER := certificate(caTemplate, caTemplate, caKey, caKey)
+	ca, err := x509.ParseCertificate(caDER)
+	must(t, err)
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	must(t, err)
+	leaf := certificate(&x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)}, KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}, ca, leafKey, caKey)
+	server := httptest.NewUnstartedServer(handler)
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leaf}, PrivateKey: leafKey}}}
+	server.StartTLS()
+	return server, caDER
+}
+
+// skipWithoutMachine turns a local execution this run cannot host into a skip: the suite
+// gives each root a machine only when it is told which Host binary to run. A run that
+// requires the Host (CI) fails instead.
+func skipWithoutMachine(t *testing.T, code int, output string) {
+	t.Helper()
+	if code == 0 || *machineHostBinary != "" || !strings.Contains(output, "machine.not_installed") {
+		return
+	}
+	if *requireMachineHost {
+		t.Fatalf("local execution needs this computer's machine and the run has no -machine-host:\n%s", output)
+	}
+	t.Skip("local execution runs on this computer's machine; pass -machine-host=<pod-supervisor>")
+}
+
+// A run that requires the machine Host proves it has one before any test relies on it.
+func TestMachineHostIsPresentWhenRequired(t *testing.T) {
+	if !*requireMachineHost {
+		t.Skip("the run does not require the machine Host")
+	}
+	if *machineHostBinary == "" {
+		t.Fatal("-require-machine-host without -machine-host: local execution tests cannot run")
+	}
+	if info, err := os.Stat(*machineHostBinary); err != nil || info.Mode()&0o111 == 0 {
+		t.Fatalf("-machine-host %s is not an executable: %v", *machineHostBinary, err)
+	}
+	machineTemplateDir(t)
+}
+
+// stubMachine gives root an installed, registered machine whose Host is script: a sentinel
+// that proves a launch was attempted without running one.
+func stubMachine(t *testing.T, root, script string) {
+	t.Helper()
+	dir := filepath.Join(root, "machine")
+	binary := filepath.Join(dir, "root", "usr", "local", "bin", "pod-supervisor")
+	must(t, os.MkdirAll(filepath.Dir(binary), 0o755))
+	must(t, os.WriteFile(binary, []byte(script), 0o700)) //cozy:allow sentinel Host proves whether a launch was attempted
+	for name, body := range map[string]string{
+		"installed.json":    `{"host":{"name":"pod-supervisor"}}`,
+		"registration.json": `{"hub":"` + testDefaultHub + `","id":"om-stub","worker_token":"` + strings.Repeat("A", 43) + `"}`,
+		"environment.json":  `{"TENSORHUB_ORIGIN":"https://hub.invalid"}`,
+	} {
+		must(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600))
+	}
+}
+
+// machineStore is this computer's machine's TensorFS Store: where its Runtime keeps every
+// model, checkpoint and result, as a pod's does at /var/lib/tensorfs.
+func machineStore(root string) string {
+	return filepath.Join(root, "machine", "root", "var", "lib", "tensorfs")
+}
+
+// machineInstallations holds the package environments this computer's machine prepared.
+func machineInstallations(root string) string {
+	return filepath.Join(root, "machine", "root", "var", "lib", "cozy", "installs", "installations")
+}
+
+// machineJournal is this computer's machine's execution journal: the Runtime's workspace in
+// the machine's own TensorFS Store.
+func machineJournal(root string) string {
+	return filepath.Join(machineStore(root), ".cozy-workspace", "journal.sqlite3")
+}

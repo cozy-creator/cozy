@@ -1,0 +1,479 @@
+// Package client is the CLI's client of the LOCAL CLIENT API (cl-010). It exists so
+// invoke and down commands are the API's FIRST
+// CLIENT rather than a parallel implementation the HTTP surface later wraps: every one of
+// them speaks the routes in `docs/client-contract.md` over a real socket, exactly as
+// cl-007's UI and cozy.art do.
+//
+// Three things this package deliberately does NOT do:
+//
+//   - It does not define the contract's shapes. `api.Submission`, `api.Handle`,
+//     `api.Lifecycle`, `api.MediaRef` ARE the contract, and a client struct that
+//     re-declared them would be a second spelling that drifts.
+//   - It does not invent a refusal vocabulary. Every non-2xx answer is the typed
+//     envelope, and `api.CodeOf` (the server's own status mapping, inverted beside it)
+//     turns it back into a shared-matrix exit code with the server's name kept.
+//   - It does not hold a credential of its own. `api.ClientCredential` reads the 0600
+//     handoff file, and `api.Authorize` is the one place it becomes a header.
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/secret"
+)
+
+// Client is one CLI process's connection to the running Cozy daemon.
+type Client struct {
+	base  string
+	token secret.Value
+	http  *http.Client
+	// hub is the Tensorhub origin this command addresses; every request names it.
+	hub string
+	// allHubs widens history reads from the command's hub to every hub.
+	allHubs bool
+	// cfg locates the daemon record, so a following client can find a restarted daemon.
+	cfg config.Config
+	// reattached is set on a following client: it is told once per re-attachment.
+	reattached func()
+}
+
+// reattachPoll is how often a following client re-reads the daemon record while no
+// daemon answers. It is a sampling rate, not a deadline: the wait ends only when a
+// daemon answers or the caller stops.
+const reattachPoll = 250 * time.Millisecond
+
+// Following returns this client re-attaching across a daemon restart: a read or an event
+// stream that loses the daemon waits until a daemon answers again, adopts its address and
+// credential, and continues. reattached is called once each time that happens.
+func (c *Client) Following(reattached func()) *Client {
+	following := *c
+	following.reattached = reattached
+	return &following
+}
+
+// reattach waits for a live daemon's record and credential and adopts them. It returns
+// false only when the caller stops.
+func (c *Client) reattach(ctx context.Context) bool {
+	for {
+		if st := daemon.Probe(c.cfg); st.Up && st.Addr != "" {
+			if next, e := Open(c.cfg, st); e == nil {
+				c.base, c.token = next.base, next.token
+				return true
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(reattachPoll):
+		}
+	}
+}
+
+// lostDaemon answers whether a failed exchange means the daemon went away: the
+// connection failed, or, once a restart is suspected, the new daemon does not yet
+// accept the credential this client last read.
+func lostDaemon(problem *exit.Error, recovering bool) bool {
+	return problem != nil && (problem.ErrName() == "daemon_unreachable" || recovering && problem.ErrName() == "unauthenticated")
+}
+
+// AllHubs widens this client's run history to every hub's runs.
+func (c *Client) AllHubs() *Client {
+	wide := *c
+	wide.allHubs = true
+	return &wide
+}
+
+// Open reads the running daemon's address and its 0600 credential. It never probes:
+// the caller already passed the shared exit-9 gate, and a second probe here would be a
+// second spelling of "is it up".
+func Open(cfg config.Config, st daemon.State) (*Client, *exit.Error) {
+	l, e := home.Open(cfg.Home)
+	if e != nil {
+		return nil, e
+	}
+	token, e := api.ClientCredential(l)
+	if e != nil {
+		return nil, e
+	}
+	return &Client{
+		base:  "http://" + st.Addr,
+		token: token,
+		// No client-wide clock decides whether a local request stalled.
+		// Explicit caller deadlines cancel their request; worker liveness and measured
+		// no-progress facts decide operational failure.
+		http: &http.Client{},
+		hub:  cfg.HubURL,
+		cfg:  cfg,
+	}, nil
+}
+
+// Addr is the daemon address this client talks to, for rendering.
+func (c *Client) Addr() string { return strings.TrimPrefix(c.base, "http://") }
+
+// RentalInventory is this command's hub's fleet, or every hub's when allHubs.
+func (c *Client) RentalInventory(ctx context.Context, reconcile, allHubs bool) (api.RentalInventory, *exit.Error) {
+	var inventory api.RentalInventory
+	query := url.Values{}
+	if !reconcile {
+		query.Set("reconcile", "false")
+	}
+	if allHubs {
+		query.Set("hubs", "all")
+	}
+	path := "/v1/local/rentals"
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	problem := c.callContext(ctx, http.MethodGet, path, nil, &inventory)
+	return inventory, problem
+}
+
+func (c *Client) request(method, path string, body any, headers ...string) (*http.Request, *exit.Error) {
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, exit.Internalf("cannot render the request body: %s", err)
+		}
+		reader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, c.base+path, reader)
+	if err != nil {
+		return nil, exit.Internalf("cannot build a request for %s: %s", path, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.hub != "" {
+		req.Header.Set(api.HubHeader, c.hub)
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
+	// No Origin header: the CLI is not a browser, and the API admits an absent Origin
+	// precisely because a non-browser client is the only caller that legitimately omits
+	// one. Sending a fabricated one would be the client pretending to be a page.
+	api.Authorize(req, c.token)
+	return req, nil
+}
+
+// call issues one request and decodes `out`, or turns the typed envelope into a typed
+// CLI error. Every refusal a caller sees came from the server, spelled the server's way.
+func (c *Client) call(method, path string, body, out any, headers ...string) *exit.Error {
+	return c.callContext(context.Background(), method, path, body, out, headers...)
+}
+
+func (c *Client) callContext(ctx context.Context, method, path string, body, out any,
+	headers ...string,
+) *exit.Error {
+	recovering := false
+	for {
+		problem := c.exchange(ctx, method, path, body, out, headers...)
+		if c.reattached == nil || method != http.MethodGet || !lostDaemon(problem, recovering) {
+			if recovering && problem == nil {
+				c.reattached()
+			}
+			return problem
+		}
+		if !c.reattach(ctx) {
+			return problem
+		}
+		recovering = true
+	}
+}
+
+func (c *Client) exchange(ctx context.Context, method, path string, body, out any,
+	headers ...string,
+) *exit.Error {
+	req, e := c.request(method, path, body, headers...)
+	if e != nil {
+		return e
+	}
+	req = req.WithContext(ctx)
+	res, err := c.http.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return exit.New(exit.Canceled, "the Cozy daemon request was canceled: %s", ctx.Err())
+		}
+		return c.unreachable(err)
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
+	if err != nil {
+		return exit.Internalf("the Cozy daemon answer could not be read: %s", err)
+	}
+	if res.StatusCode >= 300 {
+		return Refusal(res.StatusCode, data)
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return exit.Internalf("the Cozy daemon answered %s with a body this client cannot read: %s",
+			path, err)
+	}
+	return nil
+}
+
+// unreachable is what a dead or dying daemon looks like from a client's seat: not a
+// refusal document, a transport failure. It carries the SAME remedy every server-backed
+// verb's exit-9 gate carries, because it is the same condition arriving later.
+func (c *Client) unreachable(err error) *exit.Error {
+	return exit.Named(exit.Unavailable, "daemon_unreachable", "the Cozy daemon stopped answering on %s: %s", c.Addr(), err).
+		WithRemedy("it may have stopped mid-request; retry or run `cozy up`").
+		WithNext("cozy up", "cozy run list")
+}
+
+// Refusal turns one typed error envelope into a typed CLI error. The NAME is the
+// server's own (`override_unresolved`, `bundle_corrupt`, `not_found`); the CODE is the
+// shared matrix code the server's status mapped out of. A body that is not an envelope
+// is reported as what it was, never as a guess.
+func Refusal(status int, data []byte) *exit.Error {
+	var doc struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Remedy  string `json:"remedy"`
+		} `json:"error"`
+	}
+	code := api.CodeOf(status)
+	if json.Unmarshal(data, &doc) != nil || doc.Error.Code == "" {
+		body := strings.TrimSpace(string(data))
+		if len(body) > 200 {
+			body = body[:200] + "…"
+		}
+		return exit.Named(code, "untyped_answer",
+			"the Cozy daemon answered %d with no typed envelope: %s", status, body)
+	}
+	e := exit.Named(code, doc.Error.Code, "%s", doc.Error.Message)
+	if doc.Error.Remedy != "" {
+		e.WithRemedy("%s", doc.Error.Remedy)
+	}
+	return e
+}
+
+// ---------------------------------------------------------------- the contract CORE
+
+// Submit posts one request under an idempotency key. `replay` is the server's own
+// answer, never inferred from equal ids.
+func (c *Client) Submit(sub api.Submission, key string) (api.Handle, *exit.Error) {
+	var h api.Handle
+	e := c.call("POST", "/v1/requests", sub, &h, "Idempotency-Key", key)
+	return h, e
+}
+
+// Request reads one request's lifecycle document.
+// Triage fetches one attempt's kept triage bundle — raw bytes, already verified by the
+// daemon against the terminal's own reference before it was stored (cl-116).
+func (c *Client) Triage(attemptKey string) ([]byte, *exit.Error) {
+	req, e := c.request(http.MethodGet, "/v1/local/attempts/"+url.PathEscape(attemptKey)+"/triage", nil)
+	if e != nil {
+		return nil, e
+	}
+	res, err := c.http.Do(req)
+	if err != nil {
+		return nil, c.unreachable(err)
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	if err != nil {
+		return nil, exit.Internalf("the triage bundle could not be read: %s", err)
+	}
+	if res.StatusCode >= 300 {
+		return nil, Refusal(res.StatusCode, data)
+	}
+	return data, nil
+}
+
+// Evidence reads one run's durable events and its last attempt's kept triage bundle.
+func (c *Client) Evidence(id string) (api.Evidence, *exit.Error) {
+	var evidence api.Evidence
+	e := c.call("GET", "/v1/local/requests/"+url.PathEscape(id)+"/evidence", nil, &evidence)
+	return evidence, e
+}
+
+func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
+	var life api.Lifecycle
+	e := c.call("GET", "/v1/requests/"+id, nil, &life)
+	return life, e
+}
+
+// RecordedRequest reads the request as the daemon recorded it, without observing its
+// machine first.
+func (c *Client) RecordedRequest(id string) (api.Lifecycle, *exit.Error) {
+	var life api.Lifecycle
+	e := c.call("GET", "/v1/requests/"+id+"?observe=false", nil, &life)
+	return life, e
+}
+
+// Requests lists ordinary invocations and jobs through the one request lifecycle
+// authority. Kind distinguishes their execution expectation without creating a
+// second public inventory.
+func (c *Client) Requests(ctx context.Context, status, packageName string, limit int) ([]api.Lifecycle, *exit.Error) {
+	return c.RequestsBefore(ctx, status, packageName, limit, 0)
+}
+
+func (c *Client) RequestsBefore(ctx context.Context, status, packageName string, limit int, before int64) ([]api.Lifecycle, *exit.Error) {
+	var out struct {
+		Requests []api.Lifecycle `json:"requests"`
+	}
+	path := fmt.Sprintf("/v1/requests?limit=%d", limit)
+	if c.allHubs {
+		path += "&hubs=all"
+	}
+	if before > 0 {
+		path += fmt.Sprintf("&before=%d", before)
+	}
+	if status != "" {
+		path += "&status=" + url.QueryEscape(status)
+	}
+	if packageName != "" {
+		path += "&package=" + url.QueryEscape(packageName)
+	}
+	problem := c.callContext(ctx, http.MethodGet, path, nil, &out)
+	return out.Requests, problem
+}
+
+// Cancel REQUESTS cancellation. The attempt's own journaled terminal settles it, so this
+// returns as soon as the request is recorded and the caller keeps watching the stream.
+// Cancel is an ATTRIBUTED act (cl-108): the actor names who is canceling — a person's
+// explicit `cozy run cancel`, a caller-authored deadline — and rides the durable record.
+func (c *Client) Cancel(id, actor string) *exit.Error {
+	return c.call("POST", "/v1/requests/"+id+"/cancel", map[string]string{"actor": actor}, nil)
+}
+
+// ------------------------------------------------------------ the LOCAL extension
+
+// DescribeRelease asks one machine ("local" or a rental id) for a published release's interface.
+func (c *Client) DescribeRelease(machine, pkg, release string) (api.DescribedRelease, *exit.Error) {
+	var described api.DescribedRelease
+	query := url.Values{"package": {pkg}, "release": {release}}
+	problem := c.call(http.MethodGet, "/v1/local/machines/"+url.PathEscape(machine)+"/describe?"+query.Encode(), nil, &described)
+	return described, problem
+}
+
+func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Error) {
+	var result api.RentalPruneResult
+	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prune", map[string]any{}, &result)
+	return result, problem
+}
+
+// PrepareRentalPackage asks the daemon to materialize one exact package release
+// (and optional model checkpoints) on the named rental.  The worker's desired
+// package set and preparation ledger make repeats idempotent.
+func (c *Client) PrepareRentalPackage(rentalID string, request api.RentalPackagePrepareRequest) (api.RentalPackagePrepareResult, *exit.Error) {
+	var result api.RentalPackagePrepareResult
+	problem := c.call("POST", "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prepare", request, &result)
+	return result, problem
+}
+
+func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateRequest) (api.RuntimeUpdate, *exit.Error) {
+	var result api.RuntimeUpdate
+	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", request, &result)
+	return result, problem
+}
+
+func (c *Client) RentalRuntimeUpdate(rentalID string) (api.RuntimeUpdate, *exit.Error) {
+	var result api.RuntimeUpdate
+	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", nil, &result)
+	return result, problem
+}
+
+func (c *Client) PruneLocalCache() (api.CachePruneResult, *exit.Error) {
+	var result api.CachePruneResult
+	problem := c.call(http.MethodPost, "/v1/local/cache/prune", map[string]any{}, &result)
+	return result, problem
+}
+
+// DetachRental drops the daemon's kept connection to one rented machine.
+func (c *Client) DetachRental(rentalID string) (bool, *exit.Error) {
+	var out struct {
+		Changed bool `json:"changed"`
+	}
+	e := c.call(http.MethodDelete,
+		"/v1/local/rentals/"+url.PathEscape(rentalID)+"/claim", nil, &out)
+	return out.Changed, e
+}
+
+// Down performs the daemon-side lifecycle fence. Normal disconnect refuses only
+// daemon-dependent work; force overrides that guard without cancellation. Under
+// all=true, the daemon requests cancellation
+// and returns the exact paid obligations the caller must terminate and confirm through
+// Tensorhub before retrying. ShuttingDown=true means cooperative down was accepted.
+func (c *Client) Down(all, force bool) (api.DownResult, *exit.Error) {
+	var out api.DownResult
+	body := map[string]bool{"all": all}
+	if force {
+		body["force"] = true
+	}
+	e := c.call(http.MethodPost, "/v1/local/daemon/down", body, &out)
+	return out, e
+}
+
+// ------------------------------------------------------------------ the JOB family
+
+// SubmitJob posts one bounded job under an idempotency key. It never answers "busy":
+// no capacity is a queued STATE, and the handle says which.
+func (c *Client) SubmitJob(sub api.JobSubmission, key string) (api.JobHandle, *exit.Error) {
+	var h api.JobHandle
+	e := c.call("POST", "/v1/local/jobs", sub, &h, "Idempotency-Key", key)
+	return h, e
+}
+
+// Job reads one job's state document.
+func (c *Client) Job(id string) (api.JobState, *exit.Error) {
+	return c.JobContext(context.Background(), id)
+}
+
+// RecordedJob is RecordedRequest for a job.
+func (c *Client) RecordedJob(id string) (api.JobState, *exit.Error) {
+	var state api.JobState
+	e := c.call("GET", "/v1/local/jobs/"+id+"?observe=false", nil, &state)
+	return state, e
+}
+
+func (c *Client) JobContext(ctx context.Context, id string) (api.JobState, *exit.Error) {
+	var state api.JobState
+	e := c.callContext(ctx, "GET", "/v1/local/jobs/"+id, nil, &state)
+	return state, e
+}
+
+// UploadJobOutput uploads a job's retained output from the rental holding it to a private
+// checkpoint in destination; the answer carries the upload's state.
+// ForgetPackage tells the machines the daemon knows that a package changed.
+func (c *Client) ForgetPackage(pkg string) (api.ForgottenPackage, *exit.Error) {
+	var out api.ForgottenPackage
+	e := c.call(http.MethodPost, "/v1/local/machines/forget-package", map[string]any{"package": pkg}, &out)
+	return out, e
+}
+
+func (c *Client) UploadJobOutput(id, output, destination string) (api.JobState, *exit.Error) {
+	var state api.JobState
+	problem := c.call("POST", "/v1/local/jobs/"+id+"/uploads", api.OutputUploadRequest{Output: output, Destination: destination}, &state)
+	return state, problem
+}
+
+// CancelJob REQUESTS cancellation. A running job's own journaled terminal settles it; a
+// queued one leaves the queue and settles here. The actor names who is canceling.
+func (c *Client) CancelJob(id, actor string) *exit.Error {
+	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", map[string]string{"actor": actor}, nil)
+}
+
+func (c *Client) KeepRentalAlive(id, requestID string) (api.RentalKeepaliveResult, *exit.Error) {
+	var result api.RentalKeepaliveResult
+	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(id)+"/keepalive", api.RentalKeepaliveRequest{RequestID: requestID}, &result)
+	return result, problem
+}

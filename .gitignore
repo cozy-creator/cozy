@@ -1,0 +1,15 @@
+target/
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+/cozy
+*.exe
+
+# Agent task and ownership notes stay out of history
+.task/
+.task-owners/
+.task-owner*.md
+.worktree-owner*.md
+.owner-agent/
