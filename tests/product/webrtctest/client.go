@@ -20,10 +20,11 @@ import (
 // Client is a full ICE agent reaching a machine as a browser does: active ICE-TCP, with the
 // machine's answer synthesized from its address and fingerprint.
 type Client struct {
-	pc   *pion.PeerConnection
-	dc   datachannel.ReadWriteCloser
-	in   chan Message
-	Cert string // this client's DTLS certificate, "sha-256 AB:…", which a bound capability names
+	pc    *pion.PeerConnection
+	dc    datachannel.ReadWriteCloser
+	in    chan Message
+	Cert  string // this client's DTLS certificate, "sha-256 AB:…", which a bound capability names
+	Ufrag string // the ICE credential it chose, ufrag = pwd
 }
 
 // Message is one message from the machine: a cozy/1 record, or binary data.
@@ -81,7 +82,7 @@ func Dial(ctx context.Context, addr netip.AddrPort, fingerprint string, opts Opt
 	if err != nil {
 		return nil, err
 	}
-	c := &Client{pc: pc, in: make(chan Message, 64), Cert: "sha-256 " + strings.ToUpper(fingerprints[0].Value)}
+	c := &Client{pc: pc, in: make(chan Message, 64), Cert: "sha-256 " + strings.ToUpper(fingerprints[0].Value), Ufrag: Ufrag()}
 	if err := c.connect(ctx, addr, fingerprint, opts.Oversend); err != nil {
 		pc.Close()
 		return nil, err
@@ -111,7 +112,7 @@ func (c *Client) connect(ctx context.Context, addr netip.AddrPort, fingerprint s
 		return err
 	}
 	<-gathered
-	answer := Answer(offer.SDP, addr, fingerprint, Ufrag())
+	answer := Answer(offer.SDP, addr, fingerprint, c.Ufrag)
 	if oversend {
 		answer = strings.Replace(answer, "max-message-size:65536", "max-message-size:1048576", 1)
 	}

@@ -179,7 +179,6 @@ func (h *mediaHarness) follow(c *webrtctest.Client, after, offset uint64) {
 	h.send(c, map[string]any{"t": "follow", "id": "v", "run": "7", "output": "video", "after": after, "offset": offset})
 }
 
-
 func TestWebRTCFollowStreamsEachAppendAsItLands(t *testing.T) {
 	h := newMediaHarness(t)
 	c := h.open(64 << 20)
@@ -222,6 +221,12 @@ func TestWebRTCFollowResumesAfterTheConnectionDies(t *testing.T) {
 	h.m.Append(7, "video", -1, seg[1], 1_000_000)
 	h.until(c, &f, func() bool { return uint64(len(f.got)) == held })
 	r.kill()
+
+	// A browser reconnects TCP with the dropped session's ufrag: closed unanswered, so its
+	// PeerConnection fails and it starts afresh. Once the machine has seen the drop.
+	for !ufragRefused(t, h, c.Ufrag) {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	h.m.Append(7, "video", -1, seg[2], 1_000_000)
 	h.m.End(7, "completed")

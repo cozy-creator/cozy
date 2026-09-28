@@ -191,6 +191,20 @@ func TestWebRTCSTUNAnswersOnlyTheClientChosenCredential(t *testing.T) {
 	}
 }
 
+// ufragRefused says whether a new connection's Binding request under ufrag is closed
+// unanswered; false means it was answered.
+func ufragRefused(t *testing.T, h *mediaHarness, ufrag string) bool {
+	conn := iceTCPConn(t, h)
+	defer conn.Close()
+	sendBinding(t, conn, ufrag+":browser", ufrag)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := conn.Read(make([]byte, 1))
+	if n == 0 && !errors.Is(err, io.EOF) && !connReset(err) {
+		t.Fatalf("a reused ufrag got neither an answer nor a close: %v", err)
+	}
+	return n == 0
+}
+
 func connReset(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "connection reset")
 }

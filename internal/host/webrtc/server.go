@@ -34,17 +34,21 @@ const (
 	maxStreams    = 8
 	maxHello      = 8 << 10
 	maxMessage    = 64 << 10
+	endedUfrags   = 4096
 )
 
 type server struct {
 	cfg      Config
 	mu       sync.Mutex
-	sessions []*session // in arrival order
+	sessions []*session     // in arrival order
+	live     map[string]int // connections per ufrag
+	ended    map[string]bool
+	endedAt  []string // ended ufrags, oldest first, at most endedUfrags
 }
 
 // Serve answers clients on ln until ctx ends; authenticated sessions then get bye{shutdown}.
 func Serve(ctx context.Context, ln net.Listener, cfg Config) error {
-	s := &server{cfg: cfg}
+	s := &server{cfg: cfg, live: map[string]int{}, ended: map[string]bool{}}
 	stop := context.AfterFunc(ctx, func() {
 		ln.Close()
 		s.mu.Lock()
@@ -109,6 +113,36 @@ func (s *server) oldestPending(ip netip.Addr) *session {
 		}
 	}
 	return nil
+}
+
+// A ufrag names one session for its whole life. After a dropped TCP connection a browser
+// reconnects to the same candidate with the same ufrag and resumes DTLS records no new
+// session could read; closing that connection unanswered fails its PeerConnection, so the
+// client reconnects afresh and resumes at its cursor. The most recent ended ufrags are kept
+// by capacity, never by time.
+func (s *server) claim(ufrag string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended[ufrag] {
+		return false
+	}
+	s.live[ufrag]++
+	return true
+}
+
+func (s *server) release(ufrag string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live[ufrag]--; s.live[ufrag] > 0 {
+		return
+	}
+	delete(s.live, ufrag)
+	if len(s.endedAt) == endedUfrags {
+		delete(s.ended, s.endedAt[0])
+		s.endedAt = s.endedAt[1:]
+	}
+	s.ended[ufrag] = true
+	s.endedAt = append(s.endedAt, ufrag)
 }
 
 // authenticate admits a session under its key, which must still be authorized, and evicts
