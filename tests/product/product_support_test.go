@@ -45,7 +45,7 @@ func fullRun(t *testing.T, why string) {
 }
 
 // The two binaries the suite drives as real processes, built once by TestMain.
-var cozyBin, fakeWorkerBin string
+var cozyBin string
 
 // scratchBase is this process's own scratch root. Named roots live under it, so two
 // concurrent runs of the same test never share a COZY_HOME or its database.
@@ -91,14 +91,11 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	cozyBin = filepath.Join(dir, "cozy")
-	fakeWorkerBin = filepath.Join(dir, "cozy-fakeworker")
-	for _, b := range [][2]string{{cozyBin, "."}, {fakeWorkerBin, "./tests/support/fakeworker"}} {
-		build := exec.Command("go", "build", "-o", b[0], b[1])
-		build.Dir = "../.."
-		if out, err := build.CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "building %s: %v\n%s", b[1], err, out)
-			os.Exit(1)
-		}
+	build := exec.Command("go", "build", "-o", cozyBin, ".")
+	build.Dir = "../.."
+	if out, err := build.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "building cozy: %v\n%s", err, out)
+		os.Exit(1)
 	}
 	// Every daemon this run causes to exist dies with it. Layer 3 first, so the roots a
 	// test registers are known to a process that outlives a SIGKILL of this one.

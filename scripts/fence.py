@@ -214,10 +214,10 @@ PY_ALLOW = {
 }
 
 # (cl-028) The PRODUCT-TEST HOME is the only place an //cozy:allow door may exempt a listen
-# or a runtime indirection. `tests/product` drives the product and `tests/support/fakeworker`
-# is the independent protocol peer it spawns; both bind sockets by design. Product code gets no
-# door for either — a doored non-loopback bind in the product would be the LAN door arriving as a comment.
-DRIVER_DIRS = ("tests/product/", "tests/support/fakeworker/")
+# or a runtime indirection. `tests/product` drives the product and binds sockets by design.
+# Product code gets no door for either — a doored non-loopback bind in the product would be
+# the LAN door arriving as a comment.
+DRIVER_DIRS = ("tests/product/",)
 DRIVER_DIR = " / ".join(DRIVER_DIRS)
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

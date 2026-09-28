@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -21,10 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -516,78 +513,6 @@ func TestPackageUpdateAllUsesEachInstallsHub(t *testing.T) {
 	if code != 0 || !strings.Contains(out, `"hub":"b"`) || !strings.Contains(out, `"hub":"a"`) {
 		t.Fatalf("package list does not show each install's hub: %d %s", code, out)
 	}
-}
-
-// The operator tools judge a rental and its request on the hub they belong to, not on
-// the hub this process happens to be configured for.
-func TestOperatorToolsUseTheRecordsHub(t *testing.T) {
-	t.Run("development hold", func(t *testing.T) {
-		f := developmentFixtureAt(t)
-		address, stop := serveIdleHoldPeer(t, f.peer, f.cert, "127.0.0.1:0")
-		defer stop()
-		f.attach(t, address)
-		elsewhere := f.cfg
-		elsewhere.HubURL = "https://another-hub.invalid"
-		eligible, problem := cli.InspectStoredDevelopmentHold(elsewhere, f.rentalID, f.peer.bootID)
-		fatal(t, problem)
-		if eligible.State != "eligible" {
-			t.Fatalf("development hold refused a rental from another hub: %+v", eligible)
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		updates := make(chan cli.DevelopmentHoldResult, 16)
-		finished := make(chan *exit.Error, 1)
-		go func() {
-			finished <- cli.HoldStoredDevelopmentWorker(ctx, elsewhere, f.rentalID, f.peer.bootID, io.Discard,
-				func(value cli.DevelopmentHoldResult) { updates <- value })
-		}()
-		awaitDevelopmentState(t, updates, "holding")
-		cancel()
-		select {
-		case problem := <-finished:
-			fatal(t, problem)
-		case <-time.After(10 * time.Second):
-			t.Fatal("hold did not stop")
-		}
-	})
-	t.Run("source custody", func(t *testing.T) {
-		root := t.TempDir()
-		store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-		fatal(t, problem)
-		defer store.Close()
-		const rentalHub, rentalID, boot = "http://rental-hub.invalid", "pr-c4c4c4c4c4c4c4c4c4c4", "custody-boot"
-		fatal(t, store.RecordRental(records.Rental{ID: rentalID, MachineName: "charlie", State: "ready", Hub: rentalHub,
-			AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, ExpectedWorkerBootID: boot}))
-		header := []byte(`{"weight_map":{"x":"shard.safetensors"}}`)
-		submit := func(id, hub string) {
-			t.Helper()
-			intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: "proof/model",
-				Source: "hf://proof/source@" + strings.Repeat("4", 40), SourceSelection: "sha256:" + strings.Repeat("2", 64),
-				SourceProfiles: map[string]string{"shared": "hf/minimax-h3/shared-bf16/1"},
-				SourceFiles: []records.ModelTransferSourceFile{{Member: "model.safetensors.index.json",
-					SHA256: strings.Repeat("1", 64), Length: int64(len(header)), Header: header}},
-				Outputs: []records.ModelTransferOutput{{Name: "model"}}}
-			_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: "sha256:" + strings.Repeat("c", 64),
-				Package: "proof/producer", Entrypoint: "produce", Kind: "job", Payload: []byte("{}"), Outputs: "[]",
-				WeightsOutputs: "[]", Worker: rentalID, Rental: true, ModelTransfer: intent, Hub: hub})
-			fatal(t, problem)
-			fatal(t, store.BeginModelTransferMaterialization(id))
-			fatal(t, store.ObserveModelSourceCheckpoints(id, intent.SourceSelection, boot, []records.ModelCheckpoint{{Slot: "shared",
-				HeadID: "sha256:" + strings.Repeat("3", 64), HeadLength: 500, PlanDigest: "sha256:" + strings.Repeat("4", 64), Index: 1, Bytes: 64}}))
-		}
-		submit("job-custody-own-hub", rentalHub)
-		elsewhere := config.Config{Home: root, HubURL: "https://another-hub.invalid"}
-		result, problem := cli.InspectStoredSourceCustody(elsewhere, "job-custody-own-hub", rentalID, boot)
-		fatal(t, problem)
-		if len(result.Checkpoints) != 1 {
-			t.Fatalf("source custody inspection lost its progress: %+v", result)
-		}
-		submit("job-custody-crossed", "http://request-hub.invalid")
-		if _, problem := cli.InspectStoredSourceCustody(elsewhere, "job-custody-crossed", rentalID, boot); problem == nil ||
-			!strings.Contains(problem.Message, "belongs to http://request-hub.invalid but its rental to "+rentalHub) {
-			t.Fatalf("a request and rental on different hubs were accepted: %v", problem)
-		}
-	})
 }
 
 // A local run of a published install reads its model bindings from the hub it was

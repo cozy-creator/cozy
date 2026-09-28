@@ -1,8 +1,6 @@
 package launch
 
 import (
-	"context"
-
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
@@ -15,12 +13,4 @@ func BuiltinOperationsTool(root, scratch string, env []string) (RuntimeCLI, *exi
 		return RuntimeCLI{}, problem
 	}
 	return RuntimeCLI{Bin: bin, Dir: root, Home: scratch, Env: env}, nil
-}
-
-func (r RuntimeCLI) RuntimeVersion(ctx context.Context) (string, *exit.Error) {
-	var answer struct {
-		Distribution string `json:"distribution"`
-	}
-	problem := r.callContext(ctx, &answer, "version")
-	return answer.Distribution, problem
 }

@@ -167,14 +167,6 @@ func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			// Owner presence uses the same Claim/snapshot lane; no wire minor refuses it.
-			idle, problem := orchestrator.DialIdleControl(ctx, remote, sign, nil)
-			if idle != nil {
-				idle.Close()
-			}
-			if (problem == nil) != row.accepted {
-				t.Fatalf("idle control accepted=%t problem=%v", row.accepted, problem)
-			}
 			control, problem := orchestrator.DialMaintenanceControl(ctx, remote, sign, nil)
 			if control != nil {
 				control.Close()

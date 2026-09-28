@@ -319,8 +319,7 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/requests/{id}/evidence` | local | yes | one run's durable events and its last attempt's kept triage bundle; the `cozy run show` source |
 | `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, and activity; `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
 | `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | explicit acknowledged fixed fifteen-minute reset; request ID only |
-| `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
-| `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
+| `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | drop the daemon's kept connection to one rented machine |
 | `GET /v1/local/rentals/{rental_id}/lanes` | local | yes | which submission lanes the claimed worker's Runtime takes: release-root jobs and provider-source Models |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
 | `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |

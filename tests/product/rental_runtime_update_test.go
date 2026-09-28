@@ -21,9 +21,9 @@ import (
 )
 
 func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T) {
-	f := developmentFixtureAt(t)
+	f := updateFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
-	update, problem := f.store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "", nil)
+	update, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, "", nil)
 	fatal(t, problem)
 	update.Selection = []byte(`{"wheels":[]}`)
 	update.State = "updating"
@@ -60,7 +60,7 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 }
 
 func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testing.T) {
-	f := developmentFixtureAt(t)
+	f := updateFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
 	c, problem := orchestrator.Open(orchestrator.Options{Store: f.store, Layout: f.layout, Rentals: rental.Resolver(f.layout, f.store)})
 	fatal(t, problem)
@@ -117,7 +117,7 @@ func TestRentalDependencyVerdictIsSharedByRootAndServingPreparation(t *testing.T
 }
 
 func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
-	f := developmentFixtureAt(t)
+	f := updateFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
 	candidate := filepath.Join(f.layout.Tmp, "runtime-candidate-proof", "cozy_runtime.whl")
 	planned := filepath.Join(f.layout.Tmp, "runtime-updates", "operation", "cozy_runtime.whl")
@@ -128,7 +128,7 @@ func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 	}
 	selection, err := json.Marshal(map[string]any{"local_runtime": map[string]any{"path": candidate, "digest": "sha256:exact", "length": 22}, "local_tensorfs": map[string]any{"path": tensorfs, "digest": "sha256:tensorfs", "length": 22}})
 	must(t, err)
-	initial, problem := f.store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "", selection)
+	initial, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, "", selection)
 	fatal(t, problem)
 	f.store.Close()
 	reopened, problem := records.Open(f.layout.DB)
@@ -162,7 +162,7 @@ func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 // The real CLI/daemon snapshots before any remote maintenance. The independent
 // peer is deliberately unavailable: this test needs no worker or wheel install.
 func TestRentalRuntimeUpdateCLIFreezesLocalCandidate(t *testing.T) {
-	f := developmentFixtureAt(t)
+	f := updateFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
 	must(t, os.WriteFile(filepath.Join(f.layout.Root, "config.yaml"), []byte("tensorhub_url: http://127.0.0.1:1\ntensorhub_token: local-update-proof\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	source := filepath.Join(t.TempDir(), "cozy_runtime-0.18.25.dev1-cp312-abi3-manylinux_2_28_x86_64.whl")

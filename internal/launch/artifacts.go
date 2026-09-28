@@ -76,11 +76,6 @@ func Binary(inst records.PackageInstall) string {
 	return home.VenvTool(filepath.Join(inst.Dir, "venv"), "cozy-runtime")
 }
 
-// json runs one verb and decodes its `--json` document.
-func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
-	return r.callContext(context.Background(), out, verb...)
-}
-
 func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {
 	return r.callInputContext(ctx, nil, out, verb...)
 }

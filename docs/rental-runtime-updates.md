@@ -51,8 +51,8 @@ does not purchase or replace a rental.
 
 The existing developer Host wrapper already provides exact-wheel validation,
 cooperative replacement, rollback, retained readiness and an operator SSH path.
-Use that implementation with the daemon's per-rental control hold. Do not spawn
-the standalone developmenthold helper or stop the whole Creator daemon. Existing
+Use that implementation with the daemon's per-rental control hold; never stop the
+whole Creator daemon. Existing
 ordinary images without this maintenance contract must give a clear unsupported
 image error. New private rental defaults need an explicit maintenance-capable
 image/access contract; shared worker image policy remains independent.

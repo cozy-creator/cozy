@@ -28,20 +28,12 @@ type IdleControl struct {
 
 func (s *IdleControl) Close() error { s.cancel(); return s.connection.Close() }
 
-func DialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
+// DialMaintenanceControl opens a Claim-only lane for Runtime repair.
+func DialMaintenanceControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
 	control, problem := dialIdleControl(parent, remote, sign, retained)
 	if problem != nil && problem.ErrName() == "rental.control_reconnect" {
 		// A cold Host transfers its workspace ledger to Runtime once and then
 		// requires a new Claim. Never accept that first, unrecovered snapshot.
-		return dialIdleControl(parent, remote, sign, retained)
-	}
-	return control, problem
-}
-
-// DialMaintenanceControl opens the same Claim/snapshot lane for Runtime repair.
-func DialMaintenanceControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
-	control, problem := dialIdleControl(parent, remote, sign, retained)
-	if problem != nil && problem.ErrName() == "rental.control_reconnect" {
 		return dialIdleControl(parent, remote, sign, retained)
 	}
 	return control, problem
@@ -177,8 +169,8 @@ func validateIdleSnapshot(snap *pb.WorkerSnapshot, rentalID string, retained *re
 	return nil
 }
 
-// Only the development holder supplies its locked local authority. Generic idle
-// and source-custody lanes still require an empty held-attempt census. Retention
+// Runtime maintenance supplies its local records; without them the lane requires an
+// empty held-attempt census. Retention
 // keeps completed outcomes in the workspace; accepting their exact settled
 // identity neither releases bytes nor opens the snapshot dispatch barrier.
 // Both snapshot censuses carry HeldAttempt outcome ID/digest; those must match
