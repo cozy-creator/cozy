@@ -541,6 +541,9 @@ func (h *Host) registration(ctx context.Context, hubOrigin string, client *hub.C
 	if problem != nil {
 		return registration{}, problem.WithRemedy("sign in with `cozy auth login`; a machine is registered to the user who owns it")
 	}
+	if len(machine.Ignored) > 0 {
+		h.note(fmt.Sprintf("the hub %s sent settings this machine does not read: %s; ignored", hubOrigin, strings.Join(machine.Ignored, ", ")))
+	}
 	registered := registration{Hub: hubOrigin, ID: machine.ID, WorkerToken: machine.WorkerToken, Environment: machine.Environment}
 	all[hubOrigin] = registered
 	raw, _ := json.Marshal(all)
@@ -718,4 +721,14 @@ func (h *Host) writeRuntimeConfig() *exit.Error {
 		return exit.Internalf("cannot write the machine's Runtime config: %s", err)
 	}
 	return nil
+}
+
+// note appends one line to the machine's log, where its Host writes.
+func (h *Host) note(line string) {
+	log, err := os.OpenFile(h.path("host.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer log.Close()
+	fmt.Fprintln(log, "cozy:", line)
 }

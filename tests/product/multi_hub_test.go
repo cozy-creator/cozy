@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,8 +24,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 // hubWitness is everything one stand-in Tensorhub was sent: which bearers reached it
@@ -685,5 +688,30 @@ func TestLocalRunReadsTheCommandsHub(t *testing.T) {
 	must(t, json.Unmarshal(raw, &registered))
 	if len(registered) != 2 {
 		t.Fatalf("the machine holds %d registrations, not one per hub: %s", len(registered), raw)
+	}
+}
+
+// A newer hub may hand a registered machine settings this CLI does not know. Registration
+// still succeeds: the hub's facts are kept and anything else is ignored, never refused.
+func TestMachineRegistrationToleratesNewHubSettings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/machines" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t),
+			"environment": map[string]string{"TENSORHUB_ORIGIN": "https://hub.example", "TENSORHUB_FUTURE_FACT": "1",
+				"COZY_WEBRTC_INTERNAL_PORT": "8445", "SOME_NEW_SETTING": "x"}})
+	}))
+	t.Cleanup(server.Close)
+	machine, problem := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "").RegisterMachine(context.Background())
+	fatal(t, problem)
+	if machine.Environment["TENSORHUB_ORIGIN"] != "https://hub.example" || machine.Environment["TENSORHUB_FUTURE_FACT"] != "1" {
+		t.Fatalf("the hub's facts were not kept: %v", machine.Environment)
+	}
+	if _, passed := machine.Environment["COZY_WEBRTC_INTERNAL_PORT"]; passed || strings.Join(machine.Ignored, ",") != "COZY_WEBRTC_INTERNAL_PORT,SOME_NEW_SETTING" {
+		t.Fatalf("settings the machine does not read reached it or went unnamed: %v ignored %v", machine.Environment, machine.Ignored)
 	}
 }
