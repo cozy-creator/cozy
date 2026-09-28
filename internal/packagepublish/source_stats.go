@@ -28,3 +28,23 @@ func RecordSourceStats(installDir string, stats map[string]SourceStamp) *exit.Er
 	}
 	return nil
 }
+
+// InvocationSourceUnchanged reports whether a run's snapshot install was captured from
+// exactly this live tree: its files and its local dependencies, by size and modification.
+func InvocationSourceUnchanged(installDir string, live map[string]SourceStamp) bool {
+	raw, err := os.ReadFile(filepath.Join(installDir, "invocation-source-stats.json"))
+	var prior map[string]SourceStamp
+	return err == nil && len(raw) <= 16<<20 && json.Unmarshal(raw, &prior) == nil && reflect.DeepEqual(prior, live)
+}
+
+// RecordInvocationSource names the live tree a run's snapshot install was captured from.
+func RecordInvocationSource(installDir string, live map[string]SourceStamp) *exit.Error {
+	raw, err := json.Marshal(live)
+	if err != nil {
+		return exit.Internalf("cannot encode the snapshot's source: %s", err)
+	}
+	if err := os.WriteFile(filepath.Join(installDir, "invocation-source-stats.json"), raw, 0600); err != nil {
+		return exit.Internalf("cannot retain the snapshot's source: %s", err)
+	}
+	return nil
+}
