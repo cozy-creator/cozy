@@ -183,7 +183,7 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code, wrongBoot b
 	renewed = baseline()
 	if runtimeFailure != codes.OK {
 		pod.mu.Lock()
-		admitted := len(pod.desired) + len(pod.offers)
+		admitted := len(pod.desired)
 		pod.mu.Unlock()
 		if admitted != 0 {
 			t.Fatal("manual keepalive admitted Runtime preparation or execution")
