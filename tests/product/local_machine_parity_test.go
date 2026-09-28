@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -44,6 +45,7 @@ type machineHub struct {
 	provider string // the rental's machine root, as its provider booted it
 	mu       sync.Mutex
 	machines map[string]string
+	grants   map[string]string // more of the grant, as a Hub adds a port for an image that serves it
 }
 
 func newMachineHub(t *testing.T) *machineHub {
@@ -79,10 +81,12 @@ func newMachineHub(t *testing.T) *machineHub {
 
 // environment is the hub-known half of a Host's grant, as a rental's pod receives it.
 func (h *machineHub) environment() map[string]string {
-	return map[string]string{
+	env := map[string]string{
 		"TENSORHUB_ORIGIN": h.worker.URL, "TENSORHUB_PUBLIC_ORIGIN": h.worker.URL,
 		"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(h.ca),
 	}
+	maps.Copy(env, h.grants)
+	return env
 }
 
 func randomToken(t *testing.T) string {
