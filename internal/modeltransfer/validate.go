@@ -53,11 +53,6 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		// identities to the Hub's closure union measurement, for jobs as well
 		// as serving. Private operation-local manifests have no such authority.
 		for _, model := range spec.Models {
-			// A choice on a named rental is resolved to a Hub checkpoint before it runs: by
-			// the machine (release roots) or by the daemon at dispatch (prepared path).
-			if model.Choice && spec.RequestedRental != "" {
-				continue
-			}
 			if !model.Downloadable() {
 				return exit.Named(exit.Validation, "model_transfer.prepared_rental_required",
 					"operation-local model inputs require an explicitly selected prepared rental").
