@@ -111,24 +111,25 @@ type Rental struct {
 // RentalBoot is one boot attempt as the Hub observed it: which attempt, where, how far the
 // provider has brought the container, and when its boot log last moved. State is the
 // attempt's (obligated, ambiguous, booting) or "replanning" between a failed attempt and
-// the next; ReplannedFrom is the failed attempt this one replaces. Activity is the Hub's
-// reading of the provider boot log before a container runs (pulling_image,
-// creating_container, starting_container, stopping_container). ContainerStartedAt is the
-// provider running the container, HostAnsweredAt the pod's supervisor first answering.
-// Times are on this host's clock: the decoder shifts them by the Hub's reading of its own.
+// the next; ReplannedFrom is the failed attempt this one replaces. Phase is the boot phase
+// the Hub times (container: provider running to a started container; host: to the pod's
+// supervisor answering; runtime: to the Runtime's receipt), begun at PhaseStartedAt.
+// Activity is the Hub's reading of the provider boot log in the container phase
+// (pulling_image, creating_container, starting_container, stopping_container). Times are on
+// this host's clock: the decoder shifts them by the Hub's reading of its own.
 type RentalBoot struct {
-	Attempt            int            `json:"attempt"`
-	State              string         `json:"state"`
-	Datacenter         string         `json:"datacenter,omitempty"`
-	Container          string         `json:"container,omitempty"`
-	RuntimeObserved    bool           `json:"runtime_observed,omitempty"`
-	Activity           string         `json:"activity,omitempty"`
-	StartedAt          time.Time      `json:"started_at,omitzero"`
-	LastProgressAt     time.Time      `json:"last_progress_at,omitzero"`
-	BootLogAt          time.Time      `json:"boot_log_at,omitzero"`
-	ContainerStartedAt time.Time      `json:"container_started_at,omitzero"`
-	HostAnsweredAt     time.Time      `json:"host_answered_at,omitzero"`
-	ReplannedFrom      *ReplannedBoot `json:"replanned_from,omitempty"`
+	Attempt         int            `json:"attempt"`
+	State           string         `json:"state"`
+	Datacenter      string         `json:"datacenter,omitempty"`
+	Container       string         `json:"container,omitempty"`
+	RuntimeObserved bool           `json:"runtime_observed,omitempty"`
+	Phase           string         `json:"phase,omitempty"`
+	PhaseStartedAt  time.Time      `json:"phase_started_at,omitzero"`
+	Activity        string         `json:"activity,omitempty"`
+	StartedAt       time.Time      `json:"started_at,omitzero"`
+	LastProgressAt  time.Time      `json:"last_progress_at,omitzero"`
+	BootLogAt       time.Time      `json:"boot_log_at,omitzero"`
+	ReplannedFrom   *ReplannedBoot `json:"replanned_from,omitempty"`
 }
 
 // ReplannedBoot is a failed attempt the rental replaced with another host. ObservedMaxMS is
@@ -144,7 +145,7 @@ type ReplannedBoot struct {
 
 // Started is a container the provider has started: the pod's own boot is under way.
 func (b *RentalBoot) Started() bool {
-	return b.RuntimeObserved || b.Container == "running" || !b.ContainerStartedAt.IsZero()
+	return b.RuntimeObserved || b.Container == "running" || b.Phase == "host" || b.Phase == "runtime"
 }
 
 // wireBoot is the Hub's boot on the Hub's clock, read at observed_at.
@@ -171,8 +172,7 @@ func (w *wireBoot) local(now time.Time) *RentalBoot {
 	shift(&boot.StartedAt)
 	shift(&boot.LastProgressAt)
 	shift(&boot.BootLogAt)
-	shift(&boot.ContainerStartedAt)
-	shift(&boot.HostAnsweredAt)
+	shift(&boot.PhaseStartedAt)
 	if from := boot.ReplannedFrom; from != nil {
 		moved := *from
 		shift(&moved.StartedAt)

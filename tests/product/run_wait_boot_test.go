@@ -44,7 +44,8 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 	// boot log advances while the host works, and stops when it goes silent.
 	started := time.Now().Add(-6 * time.Minute)
 	var mu sync.Mutex
-	boot := map[string]any{"attempt": 1, "state": "booting", "datacenter": "AP-IN-1", "started_at": started}
+	boot := map[string]any{"attempt": 1, "state": "booting", "datacenter": "AP-IN-1", "started_at": started,
+		"phase": "container", "phase_started_at": started}
 	logging := true
 	stop := make(chan struct{})
 	defer close(stop)
@@ -176,11 +177,11 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 	// The container starts, then the pod's supervisor answers; the boot log is no longer read.
 	mu.Lock()
 	boot["container"], boot["runtime_observed"] = "running", true
-	boot["container_started_at"] = time.Now().UTC()
+	boot["phase"], boot["phase_started_at"] = "host", time.Now().UTC()
 	mu.Unlock()
 	drawn("the started container", regexp.MustCompile(`(?m)^    starting supervisor \(\d+s\)\n`))
 	mu.Lock()
-	boot["host_answered_at"] = time.Now().UTC()
+	boot["phase"], boot["phase_started_at"] = "runtime", time.Now().UTC()
 	mu.Unlock()
 	until("run list naming the answering host", func() bool {
 		_, human = list()
@@ -191,7 +192,8 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 	// the rental and continues on the replacement.
 	mu.Lock()
 	boot = map[string]any{"attempt": 2, "state": "booting", "datacenter": "EU-RO-1", "activity": "pulling_image",
-		"started_at": time.Now().UTC().Add(-40 * time.Second),
+		"started_at": time.Now().UTC().Add(-40 * time.Second), "phase": "container",
+		"phase_started_at": time.Now().UTC().Add(-35 * time.Second),
 		"replanned_from": map[string]any{"attempt": 1, "datacenter": "AP-IN-1", "started_at": started,
 			"ended_at": started.Add(5 * time.Minute), "failure_code": "provider_never_started", "observed_max_ms": 294_000}}
 	logging = true
