@@ -241,7 +241,9 @@ function esds(b, box) {
   const tag = () => { const t = b[p++]; for (let i = 0; i < 4 && b[p++] & 0x80; i++); return t; };
   if (tag() !== 3) return "mp4a.40.2";
   const flags = b[p + 2];
-  p += 3 + (flags & 0x80 ? 2 : 0) + (flags & 0x40 ? 1 + b[p + 3] : 0) + (flags & 0x20 ? 2 : 0);
+  p += flags & 0x80 ? 5 : 3; // ES_ID, flags, dependsOn_ES_ID
+  if (flags & 0x40) p += 1 + b[p]; // URL
+  if (flags & 0x20) p += 2; // OCR_ES_ID
   if (tag() !== 4) return "mp4a.40.2";
   const oti = b[p];
   p += 13;
@@ -515,7 +517,7 @@ class Media {
     if (!buffer || buffer.updating || source.readyState === "closed") return;
     // The duration the log announces, so a seek may target what is not yet fetched.
     const known = player.entries.at(-1)?.t1 ?? 0;
-    if (source.readyState === "open" && !(source.duration >= known)) source.duration = known;
+    if (known > 0 && source.readyState === "open" && !(source.duration >= known)) source.duration = known;
     if (!this.#queue.length) {
       if (player.finished && source.readyState === "open") source.endOfStream();
       return;
