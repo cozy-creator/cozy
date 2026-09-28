@@ -4,6 +4,7 @@
 package machines
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"strings"
@@ -97,10 +98,10 @@ func (m *Machine) RentalID() string {
 // Resolver finds machines by name.
 type Resolver struct {
 	Host *Host
-	// HubOrigin is the hub this computer's machine is registered with, and Hub a client
-	// for it as the signed-in user.
+	// HubOrigin is the hub this computer's machine belongs to unless a call names another,
+	// and Hub a client for an origin as the signed-in user.
 	HubOrigin string
-	Hub       func() *hub.Client
+	Hub       func(origin string) *hub.Client
 	// Rentals reads a rental's dial identity; RentalHub is the client for the hub it was
 	// bought from; UseRental holds it against release while in use.
 	Rentals       func(string) (*orchestrator.RemoteTarget, *exit.Error)
@@ -158,14 +159,21 @@ type target struct {
 // Dial connects to a machine and authenticates as its owner; holder names what the caller
 // is doing there, which a rental's maintenance refusal names. The caller closes it.
 func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *exit.Error) {
+	return r.DialAt(ctx, name, "", holder)
+}
+
+// DialAt is Dial for work of one hub: this computer's machine moves to that hub, as a run of
+// an install reads the release at the hub the install came from. "" is the default hub.
+func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string) (*Machine, *exit.Error) {
 	machine := &Machine{Name: name}
 	var t target
 	if IsLocal(name) {
+		origin = cmp.Or(origin, r.HubOrigin)
 		var client *hub.Client
 		if r.Hub != nil {
-			client = r.Hub()
+			client = r.Hub(origin)
 		}
-		launch, problem := r.Host.Ensure(ctx, r.HubOrigin, client)
+		launch, problem := r.Host.Ensure(ctx, origin, client)
 		if problem != nil {
 			return nil, problem
 		}

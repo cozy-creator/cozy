@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"strconv"
@@ -32,10 +33,48 @@ type machineConnection struct {
 	progress   *transfer.Progress
 }
 
-// connect opens the machine a run executes on; holder is what the run is doing there,
-// which a rental's maintenance refusal names.
+// connect opens a machine for work of the default hub; holder is what the caller is doing
+// there, which a rental's maintenance refusal names.
 func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machineConnection, *exit.Error) {
-	machine, problem := m.machines.Dial(ctx, name, holder)
+	return m.connectAt(ctx, name, "", holder)
+}
+
+// connectFor opens the machine a run executes on, at the run's hub: a run of an install
+// reads its release at the hub the install came from.
+func (m *machineRuns) connectFor(ctx context.Context, request records.Request, name, doing string) (*machineConnection, *exit.Error) {
+	if machines.IsLocal(name) {
+		if problem := m.localHubFree(request); problem != nil {
+			return nil, problem
+		}
+	}
+	return m.connectAt(ctx, name, request.Hub, m.runHolder(request, doing))
+}
+
+// localHubFree keeps this computer's machine at its hub while it holds another hub's work:
+// moving its Host ends everything it holds. The run waits for that work to end.
+func (m *machineRuns) localHubFree(request records.Request) *exit.Error {
+	hub := cmp.Or(request.Hub, m.machines.HubOrigin)
+	status, problem := m.machines.Host.Status()
+	if problem != nil || !status.Running || status.Hub == hub {
+		return nil
+	}
+	active, problem := m.store.ActiveRequests()
+	if problem != nil {
+		return problem
+	}
+	for _, other := range active {
+		if other.ID == request.ID || other.Worker != machines.Local || cmp.Or(other.Hub, m.machines.HubOrigin) == hub {
+			continue
+		}
+		if link, problem := m.store.MachineExecution(other.ID); problem == nil && link != nil && len(link.Submission) > 0 {
+			return exit.Unavailablef("this computer's machine is running work for %s; it moves to %s when that work ends", status.Hub, hub)
+		}
+	}
+	return nil
+}
+
+func (m *machineRuns) connectAt(ctx context.Context, name, hub, holder string) (*machineConnection, *exit.Error) {
+	machine, problem := m.machines.DialAt(ctx, name, hub, holder)
 	if problem != nil {
 		return nil, problem
 	}

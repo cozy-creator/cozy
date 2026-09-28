@@ -537,6 +537,15 @@ func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
 	_, problem = store.Activate(install)
 	fatal(t, problem)
 	store.Close()
+	// This computer's machine is registered with the install's hub, as a signed-in first run
+	// there leaves it: its Host reads that hub's catalog at the hub's worker doors.
+	provisionMachine(t, root)
+	if *machineHostBinary != "" {
+		doors, ca := hubTLSServer(t, hubA.Config.Handler)
+		t.Cleanup(doors.Close)
+		registerMachine(t, root, hubA.URL, map[string]string{"TENSORHUB_ORIGIN": doors.URL, "TENSORHUB_PUBLIC_ORIGIN": doors.URL,
+			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)})
+	}
 	// The machine resolves the call's Models; the release it runs is read from the hub the
 	// install came from, never from the current one.
 	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")

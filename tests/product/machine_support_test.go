@@ -129,14 +129,22 @@ func provisionMachineIn(t *testing.T, root, parent string) {
 		must(t, os.Symlink(target, path))
 	}
 	if raw, _ := os.ReadFile(filepath.Join(root, config.FileName)); !strings.Contains(string(raw), "tensorhub_url") {
-		registration, _ := json.Marshal(map[string]string{"hub": testDefaultHub, "id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t)})
-		environment, _ := json.Marshal(suiteWorkerDoors(t))
-		must(t, os.WriteFile(filepath.Join(dir, "registration.json"), registration, 0o600))
-		must(t, os.WriteFile(filepath.Join(dir, "environment.json"), environment, 0o600))
+		registerMachine(t, root, testDefaultHub, suiteWorkerDoors(t))
 	}
 	installed, err := os.ReadFile(filepath.Join(template, "installed.json"))
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), installed, 0o600))
+}
+
+// registerMachine records root's machine as registered with hub, as a signed-in first run
+// would, its Host calling the doors environment names.
+func registerMachine(t *testing.T, root, hub string, environment map[string]string) {
+	t.Helper()
+	dir := filepath.Join(root, "machine")
+	registration, _ := json.Marshal(map[string]string{"hub": hub, "id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t)})
+	doors, _ := json.Marshal(environment)
+	must(t, os.WriteFile(filepath.Join(dir, "registration.json"), registration, 0o600))
+	must(t, os.WriteFile(filepath.Join(dir, "environment.json"), doors, 0o600))
 }
 
 // suiteWorkerDoors is the hub a pre-registered test machine's Host calls: its idle release

@@ -116,7 +116,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	found := &machineset.Resolver{
 		Host: machineset.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child()), HubOrigin: ctx.Cfg.HubURL,
-		Hub:     func() *hub.Client { return client(ctx) },
+		Hub:     func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
 		UseRental:     func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
 		ObserveRental: rental.ObserveWorker(st),

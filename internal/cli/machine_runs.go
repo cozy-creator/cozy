@@ -110,7 +110,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				if current.State == "canceled" && len(link.Submission) == 0 {
 					if link.MachineID != "" {
 						var connection *machineConnection
-						connection, problem = m.connect(m.ctx, link.MachineID, m.runHolder(*current, "releasing its inputs"))
+						connection, problem = m.connectFor(m.ctx, *current, link.MachineID, "releasing its inputs")
 						if problem == nil {
 							problem = m.releaseMachineInputs(m.ctx, *current, connection)
 							connection.Close()
@@ -309,7 +309,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 	}
 	began := time.Now()
-	connection, problem := m.connect(ctx, link.MachineID, m.runHolder(request, "preparing its submission"))
+	connection, problem := m.connectFor(ctx, request, link.MachineID, "preparing its submission")
 	if problem != nil {
 		return problem
 	}
@@ -619,7 +619,7 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 	if link == nil || len(link.Receipt) == 0 || proto.Unmarshal(link.Receipt, &receipt) != nil {
 		return nil, nil, nil, exit.Unavailablef("waiting for durable machine acceptance")
 	}
-	connection, problem := m.connect(ctx, link.MachineID, m.runHolder(request, "reading or collecting its execution"))
+	connection, problem := m.connectFor(ctx, request, link.MachineID, "reading or collecting its execution")
 	if problem != nil {
 		return nil, nil, nil, problem
 	}
