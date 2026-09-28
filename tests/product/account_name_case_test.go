@@ -26,7 +26,10 @@ type accountHub struct {
 	registered []string
 }
 
-func newAccountHub(t *testing.T) *httptest.Server {
+func newAccountHub(t *testing.T) *httptest.Server { return newAccountHubWith(t, nil) }
+
+// newAccountHubWith is the account stand-in with more routes: extra adds them to its mux.
+func newAccountHubWith(t *testing.T, extra func(*http.ServeMux)) *httptest.Server {
 	hub := &accountHub{challenges: map[string][]byte{}, keys: map[string]ed25519.PublicKey{},
 		owners: map[string]string{}, accounts: map[string]string{}}
 	mux := http.NewServeMux()
@@ -78,6 +81,46 @@ func newAccountHub(t *testing.T) *httptest.Server {
 			"device_key": map[string]string{"id": "key-" + body.ID, "label": "proof"},
 		})
 	})
+	// A later command signs in with the enrolled machine key: the same user as enrollment.
+	mux.HandleFunc("POST /v1/auth/device-keys/login/begin", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			DeviceKeyID string `json:"device_key_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		id := strings.TrimPrefix(body.DeviceKeyID, "key-")
+		challenge := make([]byte, 32)
+		_, _ = rand.Read(challenge)
+		hub.mu.Lock()
+		_, known := hub.keys[id]
+		hub.challenges["login-"+id] = challenge
+		hub.mu.Unlock()
+		if !known {
+			reply(w, 401, problem("auth.unknown_key", "unknown machine key"))
+			return
+		}
+		reply(w, 200, map[string]string{"challenge_id": "login-" + id, "challenge": base64.RawURLEncoding.EncodeToString(challenge),
+			"expires_at": time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339Nano)})
+	})
+	mux.HandleFunc("POST /v1/auth/device-keys/login/finish", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ChallengeID string `json:"challenge_id"`
+			Signature   string `json:"signature"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		id := strings.TrimPrefix(body.ChallengeID, "login-")
+		hub.mu.Lock()
+		challenge, public := hub.challenges[body.ChallengeID], hub.keys[id]
+		hub.mu.Unlock()
+		signature, _ := base64.RawURLEncoding.DecodeString(body.Signature)
+		if public == nil || !ed25519.Verify(public, append([]byte("authkit.device-key-login/1\x00"), challenge...), signature) {
+			reply(w, 401, problem("auth.login_refused", "machine login proof refused"))
+			return
+		}
+		reply(w, 200, map[string]any{
+			"token_set":  map[string]any{"access_token": "user-" + id, "token_type": "Bearer", "expires_in": 900},
+			"device_key": map[string]string{"id": "key-" + id, "label": "proof"},
+		})
+	})
 	mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, r *http.Request) {
 		hub.mu.Lock()
 		name, ok := hub.accounts[r.Header.Get("Authorization")]
@@ -112,6 +155,9 @@ func newAccountHub(t *testing.T) *httptest.Server {
 		reply(w, 200, map[string]any{"model": map[string]string{"org": "paul", "name": "sdxl",
 			"created_at": "2026-09-26T00:00:00Z"}, "releases": []any{}})
 	})
+	if extra != nil {
+		extra(mux)
+	}
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server
