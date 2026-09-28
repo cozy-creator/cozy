@@ -14,17 +14,17 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// TestHostRuntimeWireFence is cl-086's follow-up as behaviour. The owner's host carried a
-// 0.0.29 cozy-runtime (wire minor 16) under a minor-22 daemon: the worker launched, never
-// came READY, and `cozy run` sat `queued` with nothing said. A host tool that cannot serve
-// no longer stops the daemon (rentals and the Hub need none): `cozy up` names the upgrade,
-// and only what needs the host tool refuses by name, with the reinstall. Every arm is the
-// real binary against a real root; the tool is a stand-in that answers only `version`.
+// TestHostRuntimeWireFence: the host tool answers typed CLI verbs and speaks no worker wire, so
+// any wire minor, older or newer, serves; a release below ToolFloor or another wire package
+// does not. A host tool that cannot serve never stops the daemon (rentals and the Hub need
+// none): `cozy up` names the upgrade, and only what needs the host tool refuses by name, with
+// the reinstall. Every arm is the real binary against a real root; the tool is a stand-in
+// that answers only `version`.
 func TestHostRuntimeWireFence(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtimes are POSIX shell scripts")
 	}
-	install := fmt.Sprintf("supporting cozy.worker.v1+minor.%d or newer", pb.MinCompatibleWireMinor)
+	install := "install cozy-runtime " + hostruntime.ToolFloor + " or newer"
 	upNames := func(t *testing.T, root, path, code string, says ...string) {
 		t.Helper()
 		exit, out := runCozyPath(t, root, path, "up")
@@ -41,11 +41,10 @@ func TestHostRuntimeWireFence(t *testing.T) {
 		}
 	}
 
-	// (a) An older minor cannot serve: the daemon starts, and `cozy up` names the upgrade.
-	root, path := hostRuntimeRoot(t, "older", stubRuntime(t, "0.0.29", pb.MinCompatibleWireMinor-1))
+	// (a) Another wire package cannot serve: the daemon starts, and `cozy up` names the upgrade.
+	root, path := hostRuntimeRoot(t, "foreign", strings.ReplaceAll(stubRuntime(t, hostruntime.ToolFloor, pb.WireMinor), "cozy.worker.v1", "cozy.worker.v0"))
 	upNames(t, root, path, "host_runtime_wire_mismatch",
-		fmt.Sprintf("release 0.0.29 and speaks cozy.worker.v1+minor.%d", pb.MinCompatibleWireMinor-1),
-		fmt.Sprintf("needs cozy.worker.v1+minor.%d or newer", pb.MinCompatibleWireMinor))
+		"speaks cozy.worker.v0+minor.", "this Cozy speaks cozy.worker.v1")
 
 	// (a′) The wire is right but the release predates static describe (cl-175).
 	root, path = hostRuntimeRoot(t, "below-floor", stubRuntime(t, "0.4.0", pb.WireMinor))
@@ -64,11 +63,10 @@ func TestHostRuntimeWireFence(t *testing.T) {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
 
-	// Publication is optional: a machine with the no-effects execution floor
-	// remains usable even when this client vendors publication's newer schema.
-	root, path = hostRuntimeRoot(t, "execution-floor", stubRuntime(t, "9.9.9", pb.MinCompatibleWireMinor))
-	if code, out := runCozyPath(t, root, path, "up"); code != 0 {
-		t.Fatalf("the no-effects Runtime floor was refused [exit %d]\n%s", code, out)
+	// (c′) Version skew: an older wire minor at ToolFloor serves too.
+	root, path = hostRuntimeRoot(t, "older-minor", stubRuntime(t, hostruntime.ToolFloor, pb.MinCompatibleWireMinor-1))
+	if code, out := runCozyPath(t, root, path, "up"); code != 0 || strings.Contains(out, "local runs refuse") {
+		t.Fatalf("an older wire minor was refused [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyPath(t, root, path, "down"); code != 0 {
 		t.Fatalf("down [exit %d]\n%s", code, out)
