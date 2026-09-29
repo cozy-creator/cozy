@@ -216,8 +216,6 @@ func decodeModelFinalization(raw []byte) (CheckpointPublication, modelFinalizati
 			"hub.model_finalization_invalid", "Tensorhub returned incomplete model finalization state")
 	}
 	switch view.State {
-	case "queued", "running":
-		return CheckpointPublication{}, view, nil
 	case "completed":
 		if len(view.Result) == 0 {
 			return CheckpointPublication{}, view, exit.Named(exit.Structural,
@@ -240,8 +238,8 @@ func decodeModelFinalization(raw []byte) (CheckpointPublication, modelFinalizati
 		}
 		return CheckpointPublication{}, view, failure
 	default:
-		return CheckpointPublication{}, view, exit.Named(exit.Structural,
-			"hub.model_finalization_invalid", "Tensorhub returned unknown model finalization state %q", view.State)
+		// Queued, running, or a state a newer Hub added: still pending.
+		return CheckpointPublication{}, view, nil
 	}
 }
 

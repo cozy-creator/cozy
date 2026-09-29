@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -17,15 +18,21 @@ import (
 )
 
 // Tensorhub, TensorFS and older or newer Creators are peers that evolve independently.
-// An additive field, an unsorted list or one unusable row must not refuse the document,
-// and a GPU product without a host-RAM figure is still rentable: placement fits GPUs only.
+// An additive field or state, an unsorted list, an absent list or one unusable row must not
+// refuse the document, and a GPU product without a host-RAM figure is still rentable:
+// placement fits GPUs only.
 func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 	mux := http.NewServeMux()
+	var finalizationReads atomic.Int32
 	mux.HandleFunc("POST /v1/models/proof/model/publications/op-1/finalize", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{"operation":"op-1","state":"queued","status_url":"/x","queued_at":"2026-09-26T00:00:00Z"}`))
 	})
 	mux.HandleFunc("GET /v1/models/proof/model/publications/op-1/finalization", func(w http.ResponseWriter, _ *http.Request) {
+		if finalizationReads.Add(1) == 1 {
+			_, _ = w.Write([]byte(`{"operation":"op-1","state":"replicating"}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"operation":"op-1","state":"completed","attempts":2,"result":{"publish_id":"pub-1",` +
 			`"checkpoint_id":"ckpt-1","manifest":{"sha256":"` + strings.Repeat("a", 64) + `","length":9,"media_type":"x"},` +
 			`"objects":3,"bytes":27,"state":"committed","duplicate":false,"retained_until":"later"}}`))
@@ -34,6 +41,9 @@ func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 		_, _ = w.Write([]byte(`{"release":{"release":"1.0.0","package_interface_digest":"sha256:x","package_interface_length":2,` +
 			`"provenance":{"builder":"future"}},"package_interface":{},"requirements":["torch>=2","","numpy","torch>=2"],` +
 			`"requires_python":">=3.12","python_version":"3.12.12","signatures":[]}`))
+	})
+	mux.HandleFunc("GET /v1/packages/proof/bare/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"release":{"release":"1.0.0"},"package_interface":{}}`))
 	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`[
@@ -63,6 +73,11 @@ func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 	fatal(t, problem)
 	if !slices.Equal(requirements, []string{"numpy", "torch>=2"}) {
 		t.Fatalf("requirements were not normalized: %q", requirements)
+	}
+	bare, problem := client.PackageRelease(t.Context(), hub.Ref{Org: "proof", Name: "bare"}, "1.0.0")
+	fatal(t, problem)
+	if requirements, problem := bare.Requirements(); problem != nil || len(requirements) != 0 {
+		t.Fatalf("a release without requirements: %q %v", requirements, problem)
 	}
 
 	skus, problem := client.RentalSKUs(t.Context())
