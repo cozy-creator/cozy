@@ -88,8 +88,8 @@ func (h *Host) readinessEnvelope() string {
 	return filepath.Join(h.Root(), "run/cozy/bootstrap/readiness-envelope.json")
 }
 
-// RuntimeFloor is the oldest published Runtime proven as a rooted machine worker.
-const RuntimeFloor = "0.18.53"
+// RuntimeFloor is the first Runtime with the single-agent supervisor launch contract.
+const RuntimeFloor = "0.18.85"
 
 // Source is a machine agent and optional paired development Runtime and TensorFS wheels.
 // Pinned retains an explicitly selected agent instead of adopting a published one.
@@ -112,9 +112,6 @@ type Installed struct {
 	InstalledAt time.Time         `json:"installed_at"`
 	HostPinned  bool              `json:"host_pinned,omitempty"`
 }
-
-// CozyModule identifies the old embedded machine server during migration.
-const CozyModule = "github.com/cozy-creator/cozy"
 
 // HostModule is the Go main module a Host binary was built from, "" when it is not Go.
 func HostModule(path string) string {
@@ -344,30 +341,20 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 	return &installed, nil
 }
 
+// Only the legacy identity is read during adoption. Worker tokens and Hub settings
+// are deliberately not decoded into the new lifecycle.
 type registration struct {
-	Hub         string            `json:"hub"`
-	ID          string            `json:"id"`
-	WorkerToken string            `json:"worker_token"`
-	Environment map[string]string `json:"environment,omitempty"`
+	Hub string `json:"hub"`
+	ID  string `json:"id"`
 }
 
-// hostRecord is one launched Host, as a rental row records its pod.
 type hostRecord struct {
 	PID        int    `json:"pid"`
-	Hub        string `json:"hub"`
 	WorkerID   string `json:"worker_id"`
 	WorkerPort int    `json:"worker_port"`
 	MediaPort  int    `json:"media_port"`
 	ReceiptKey string `json:"receipt_key"`
-	// Hubs are the hubs it holds a registration for, each with the origin its Runtime
-	// reads that hub at; WireMinor is the top of its protocol range once dialed.
-	Hubs      map[string]string `json:"hubs,omitempty"`
-	WireMinor uint32            `json:"wire_minor,omitempty"`
 }
-
-// HubPerRunWire is the wire minor from which a machine reads each run at the hub the run
-// names (ReleaseRoot.hub and the rest), instead of only at the hub it was launched for.
-const HubPerRunWire = 67
 
 type cachedLaunch struct {
 	*Launch
@@ -440,42 +427,6 @@ func (h *Host) remember(launch *Launch, record hostRecord) *Launch {
 		h.cached = &cachedLaunch{Launch: launch, record: record}
 	}
 	return launch
-}
-
-// Dialed records the running Host's protocol range, which says whether it reads a run's
-// hub where it is.
-func (h *Host) Dialed(ctx context.Context, pid int, wireMinor uint32) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if cached := h.cached; cached != nil && cached.PID == pid && cached.record.WireMinor == wireMinor {
-		return
-	}
-	unlock, problem := h.lock(ctx)
-	if problem != nil {
-		return
-	}
-	defer unlock()
-	record, problem := h.record()
-	if problem != nil || record == nil || record.PID != pid {
-		return
-	}
-	if record.WireMinor != wireMinor {
-		record.WireMinor = wireMinor
-		raw, _ := json.Marshal(record)
-		if writePrivate(h.path("host.json"), raw) != nil {
-			return
-		}
-	}
-	if h.cached != nil && h.cached.PID == pid {
-		h.cached.record = *record
-	}
-}
-
-// Serves remains true for every Hub: changing catalog/account context never moves a
-// persistent machine or stops accepted work.
-func (h *Host) Serves(_ string, _ bool) bool {
-	record, problem := h.record()
-	return problem == nil && record != nil && h.alive(record.PID)
 }
 
 // await reads the recorded Host's readiness receipt, waiting while it boots.
@@ -678,7 +629,6 @@ func (h *Host) stopLocked(ctx context.Context) *exit.Error {
 type Status struct {
 	Installed *Installed
 	MachineID string
-	Hub       string
 	PID       int
 	Running   bool
 }
@@ -718,9 +668,8 @@ func (h *Host) Pin() (*workertls.Pin, *exit.Error) {
 	return pin, nil
 }
 
-// registrations are this machine's registrations, one per hub, keyed by origin. A machine
-// registers once with each hub it runs work of; moving between hubs never registers again.
-// A registration from before this record (registration.json and environment.json) is one of them.
+// registrations reads legacy identities for one-time adoption. It neither reads legacy
+// worker capabilities nor contacts the registry that issued them.
 func (h *Host) registrations() (map[string]registration, *exit.Error) {
 	out := map[string]registration{}
 	raw, err := os.ReadFile(h.path("registrations.json"))
@@ -733,9 +682,6 @@ func (h *Host) registrations() (map[string]registration, *exit.Error) {
 	var legacy registration
 	if raw, err := os.ReadFile(h.path("registration.json")); err == nil && json.Unmarshal(raw, &legacy) == nil && legacy.ID != "" {
 		if _, known := out[legacy.Hub]; !known {
-			if raw, err := os.ReadFile(h.path("environment.json")); err == nil {
-				_ = json.Unmarshal(raw, &legacy.Environment)
-			}
 			out[legacy.Hub] = legacy
 		}
 	}

@@ -68,6 +68,14 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 	if launch.WorkerID != "om-preserved" || launch.Reads != "" {
 		t.Fatal("offline adoption changed machine identity or required a Hub")
 	}
+	resolver := &machines.Resolver{Host: machine}
+	connected, problem := resolver.Dial(ctx, machines.Local, "inspecting an offline machine")
+	fatal(t, problem)
+	if connected.HubID() != "" || !connected.Owned() {
+		t.Fatal("owned machine authentication acquired a rental/registry identity")
+	}
+	_ = connected.Close()
+	resolver.Forget(machines.Local)
 	environment, err := os.ReadFile("/proc/" + strconv.Itoa(launch.PID) + "/environ")
 	must(t, err)
 	for _, forbidden := range []string{"COZY_WORKER_AUTH_TOKEN=", "TENSORHUB_ORIGIN=", "obsolete-local-worker-capability"} {

@@ -71,12 +71,26 @@ cozy up
 # open http://127.0.0.1:8818/ (or the returned fallback URL when 8818 is occupied)
 ```
 
-`up` backgrounds one lightweight per-user Cozy daemon: web UI, local API, durable records, local
-worker manager, and private-rental sessions. It does not attach a log stream or load a package or
+`up` backgrounds one lightweight per-user Cozy daemon: web UI, local API, submission
+records, output following, and private-rental sessions. It does not attach a log stream or load a package or
 model. Repeating `up` returns the same healthy URL with `changed: false`; concurrent callers
 converge on one daemon. A startup failure is returned directly as a bounded diagnostic and does
 not create a persistent log. Commands that require the daemon may ensure the same process is
 running automatically.
+
+The machine server is the separate `cozy-machine` executable, built in `cozy-runtime`.
+`cozy machine install` installs its independently versioned public release and a Runtime
+Python environment. The same agent and machine API run on a laptop and a rented pod;
+restarting the personal controller leaves accepted machine work running. `cozy machine stop`
+explicitly stops the local machine. Agent replacement waits for confirmed idle state and
+retains the machine identity, execution journal, installed packages, and outputs.
+
+An owned machine boots offline and is never registered with Tensorhub. Tensorhub allocates
+and releases rentals. Catalog, storage, and explicitly authorized publication access use
+account grants bound to the machine certificate; these grants do not give Tensorhub a
+lifecycle role on the laptop. Local code and observation of existing work do not need a
+Hub grant. Machine-agent releases use `machine-vVERSION` tags and `machine-agent.json` with
+artifact hashes; ordinary Cozy releases and their `latest` installer stay separate.
 
 ## Packages
 

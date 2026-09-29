@@ -117,9 +117,7 @@ func machineServesOutput(t *testing.T, root, output, digest string, revisions in
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	host := machines.NewHost(layout.Machine, "", nil)
-	state, problem := host.Status()
-	fatal(t, problem)
-	found := &machines.Resolver{Host: host, HubOrigin: state.Hub,
+	found := &machines.Resolver{Host: host,
 		UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
 		RentalKey: func(string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentity{}, nil }}
 	machine, problem := found.Dial(context.Background(), machines.Local, "run outputs")

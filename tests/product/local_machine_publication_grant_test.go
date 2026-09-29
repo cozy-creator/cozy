@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,7 +17,7 @@ import (
 // A run on this computer's machine that may publish (`cozy model upload` without a rental,
 // or any job with --allow-upload) asks Tensorhub for the same machine authorization a rental
 // gets: the owned machine's id and its Host's own certificate, never a rental id.
-func TestLocalMachinePublicationGrantNamesTheOwnedMachine(t *testing.T) {
+func TestLocalMachinePublicationGrantBindsCertificateWithoutRegistration(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: the pod-supervisor this computer's machine runs")
 	}
@@ -72,12 +71,9 @@ def main() -> dict[str, str]:
 		t.Fatalf("want one machine authorization, got %d [exit %d]\n%s", len(grants), code, out)
 	}
 	grant, _ := grants[0]["requested_grant"].(map[string]any)
-	h.mu.Lock()
 	machineID, _ := grant["machine_id"].(string)
-	_, registered := h.machines[machineID]
-	h.mu.Unlock()
-	if !strings.HasPrefix(machineID, "om-") || !registered || grant["rental_id"] != nil {
-		t.Fatalf("the grant does not name this computer's registered machine: %v", grants[0])
+	if machineID != "" || grant["rental_id"] != nil {
+		t.Fatal("local publication grant acquired a registry/rental identity")
 	}
 	leaf, err := base64.RawURLEncoding.DecodeString(grants[0]["delegate_certificate_der_b64url"].(string))
 	if err != nil {

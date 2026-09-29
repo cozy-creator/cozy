@@ -41,8 +41,8 @@ type Machine struct {
 	Claim     *pb.Claim
 	Protocol  *pb.ProtocolInfoResult
 	WireMinor uint32
-	// Hub is the hub each run of this use names (ReleaseRoot.hub, wire 67): the origin the
-	// machine reads another hub it is registered at by. "" is the machine's own hub.
+	// Hub is the delegated catalog origin this request names in ReleaseRoot.hub.
+	// An empty value is work that needs no Hub.
 	Hub string
 	// CertificateDER is the pinned leaf, the identity publication authority binds, and
 	// CertificateDigest its sha256.
@@ -51,7 +51,7 @@ type Machine struct {
 
 	claimAck *pb.ClaimAck
 	hub      *hub.Client
-	hubID    string // the hub's identity for the machine: a rental id or an owned machine id
+	hubID    string // the rental identity; empty for an independently owned machine
 	owned    bool
 	release  func()
 	kept     bool // the connection is the Resolver's, kept for the machine's next call
@@ -81,7 +81,7 @@ func (m *Machine) Close() error {
 	return err
 }
 
-// HubID is the hub's identity for this machine: a rental id, or an owned machine's id.
+// HubID is the rental identity; independently owned machines have no Hub identity.
 func (m *Machine) HubID() string { return m.hubID }
 
 // Account is the signed-in owner's client at the hub this machine belongs to.
@@ -165,24 +165,15 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 	return r.DialAt(ctx, name, "", holder, true)
 }
 
-// DialAt is Dial for work of one hub, as a run of an install reads the release at the hub the
-// install came from; "" is the default hub. When every call of the work names its hub
-// (named, and Machine.Hub), this computer's machine serves any hub it is registered at where
-// it is; otherwise, or when it cannot, it moves to that hub.
+// DialAt selects a catalog/account context without changing the machine's lifecycle.
+// Every accepted run and every API call stays on the same local or rented endpoint.
 func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
-	machine, problem := r.dialAt(ctx, name, origin, holder, named)
-	if problem == nil && machine.Hub != "" && machine.WireMinor < HubPerRunWire {
-		// Its range fell below reading a run's hub (a Runtime replaced in place): it moves.
-		machine.Close()
-		return r.dialAt(ctx, name, origin, holder, false)
-	}
-	return machine, problem
+	return r.dialAt(ctx, name, origin, holder, named)
 }
 
 func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
 	machine := &Machine{Name: name}
 	var t target
-	pid := 0
 	if IsLocal(name) {
 		accountOrigin := cmp.Or(origin, r.HubOrigin)
 		var client *hub.Client
@@ -204,7 +195,6 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 		machine.hub, machine.owned, machine.Hub = client, true, launch.Reads
 		t = target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
 			lifetime: fmt.Sprint(launch.PID)}
-		pid = launch.PID
 	} else {
 		release, problem := r.UseRental(name, holder)
 		if problem != nil {
@@ -281,9 +271,6 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 			machine.release()
 		}
 		return nil, problem
-	}
-	if machine.owned {
-		r.Host.Dialed(ctx, pid, machine.WireMinor)
 	}
 	r.mu.Lock()
 	r.claimed[boot] = true

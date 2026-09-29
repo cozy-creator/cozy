@@ -8,8 +8,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
-	"encoding/json"
 	"flag"
 	"math/big"
 	"net"
@@ -23,7 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machines"
 )
@@ -31,6 +28,7 @@ import (
 var (
 	machineHostBinary    = flag.String("machine-host", "", "a cozy build every test root's local machine runs as its Host")
 	requireMachineHost   = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
+	machineRuntimePython = flag.String("machine-runtime-python", "", "Development interpreter for the standalone agent public-view media fixture")
 	machineRuntimeWheel  = flag.String("machine-runtime-wheel", "", "Runtime wheel the test machines run; default: the published Runtime")
 	machineTensorFSWheel = flag.String("machine-tensorfs-wheel", "", "TensorFS wheel paired with -machine-runtime-wheel")
 )
@@ -43,7 +41,7 @@ var machineTemplate struct {
 	problem *exit.Error
 }
 
-func machineTemplateDir(t *testing.T) string {
+func machineTemplateDir(t testing.TB) string {
 	t.Helper()
 	machineTemplate.once.Do(func() {
 		machineTemplate.dir = filepath.Join(scratchBase, "machine-template")
@@ -55,7 +53,9 @@ func machineTemplateDir(t *testing.T) string {
 		source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel, Pinned: true}
 		_, machineTemplate.problem = machines.NewHost(machineTemplate.dir, "", nil).Install(context.Background(), source, uv)
 	})
-	fatal(t, machineTemplate.problem)
+	if machineTemplate.problem != nil {
+		t.Fatal(machineTemplate.problem)
+	}
 	return machineTemplate.dir
 }
 
@@ -130,47 +130,9 @@ func provisionMachineIn(t *testing.T, root, parent string) {
 		}
 		must(t, os.Symlink(target, path))
 	}
-	if raw, _ := os.ReadFile(filepath.Join(root, config.FileName)); !strings.Contains(string(raw), "tensorhub_url") {
-		registerMachine(t, root, testDefaultHub, suiteWorkerDoors(t))
-	}
 	installed, err := os.ReadFile(filepath.Join(template, "installed.json"))
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), installed, 0o600))
-}
-
-// registerMachine records root's machine as registered with hub, as a signed-in first run
-// would, its Host calling the doors environment names.
-func registerMachine(t *testing.T, root, hub string, environment map[string]string) {
-	t.Helper()
-	dir := filepath.Join(root, "machine")
-	registration, _ := json.Marshal(map[string]string{"hub": hub, "id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t)})
-	doors, _ := json.Marshal(environment)
-	must(t, os.WriteFile(filepath.Join(dir, "registration.json"), registration, 0o600))
-	must(t, os.WriteFile(filepath.Join(dir, "environment.json"), doors, 0o600))
-}
-
-// suiteWorkerDoors is the hub a pre-registered test machine's Host calls: its idle release
-// and cache reports, accepted.
-var workerDoors struct {
-	once        sync.Once
-	environment map[string]string
-}
-
-func suiteWorkerDoors(t *testing.T) map[string]string {
-	t.Helper()
-	workerDoors.once.Do(func() {
-		server, ca := hubTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
-				w.WriteHeader(http.StatusNoContent)
-			default:
-				http.NotFound(w, r)
-			}
-		}))
-		workerDoors.environment = map[string]string{"TENSORHUB_ORIGIN": server.URL, "TENSORHUB_PUBLIC_ORIGIN": server.URL,
-			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)}
-	})
-	return workerDoors.environment
 }
 
 // hubTLSServer serves handler as a Hub with a private CA does: the CA signs a 127.0.0.1 leaf
@@ -261,19 +223,4 @@ func machineInstallations(root string) string {
 // the machine's own TensorFS Store.
 func machineJournal(root string) string {
 	return filepath.Join(machineStore(root), ".cozy-workspace", "journal.sqlite3")
-}
-
-// registerMachineAt records root's machine as registered with one more hub, beside any
-// other: a machine keeps one registration per hub.
-func registerMachineAt(t *testing.T, root, hub string, environment map[string]string) {
-	t.Helper()
-	path := filepath.Join(root, "machine", "registrations.json")
-	all := map[string]map[string]any{}
-	if raw, err := os.ReadFile(path); err == nil {
-		must(t, json.Unmarshal(raw, &all))
-	}
-	all[hub] = map[string]any{"hub": hub, "id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t), "environment": environment}
-	raw, err := json.Marshal(all)
-	must(t, err)
-	must(t, os.WriteFile(path, raw, 0o600))
 }

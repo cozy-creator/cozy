@@ -442,7 +442,7 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 	defer resp.Body.Close()
 	if cl.trustRoot != nil && resp.TLS != nil && len(resp.TLS.VerifiedChains) > 0 {
 		chain := resp.TLS.VerifiedChains[0]
-		if len(chain) > 1 {
+		if len(chain) > 0 {
 			*cl.trustRoot = append([]byte(nil), chain[len(chain)-1].Raw...)
 		}
 	}

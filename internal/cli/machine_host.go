@@ -72,7 +72,7 @@ func handleMachineShow(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	fields := []output.Field{{K: "root", V: host.Root()}, {K: "machine", V: status.MachineID}, {K: "hub", V: status.Hub},
+	fields := []output.Field{{K: "root", V: host.Root()}, {K: "machine", V: status.MachineID},
 		{K: "running", V: status.Running}, {K: "pid", V: status.PID}}
 	if status.Installed != nil {
 		fields = append(fields, output.Field{K: "host", V: status.Installed.Host.Name},

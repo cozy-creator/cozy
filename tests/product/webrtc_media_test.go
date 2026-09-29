@@ -5,13 +5,31 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/tests/product/webrtctest"
+	"github.com/pion/stun/v4"
 )
+
+func serveMachineMedia(t testing.TB, host string, machine *webrtctest.Machine) webrtctest.Server {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host=<standalone cozy-machine>")
+	}
+	python := *machineRuntimePython
+	if python == "" {
+		python = filepath.Join(machineTemplateDir(t), "root/opt/cozy/python/bin/python")
+	}
+	return webrtctest.Serve(t, host, machine, *machineHostBinary, python)
+}
 
 // Every test runs a real listener on loopback and a real pion ICE-TCP client over real TCP;
 // outputs are real files, appended in place or replaced by rename, before their entries.
@@ -25,11 +43,14 @@ type mediaHarness struct {
 }
 
 func newMediaHarness(t testing.TB) *mediaHarness {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host=<standalone cozy-machine>")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
 	public, key, _ := ed25519.GenerateKey(rand.Reader)
 	m := webrtctest.NewMachine(t.TempDir(), public)
-	return &mediaHarness{t: t, ctx: ctx, m: m, srv: webrtctest.Serve(t, "127.0.0.1", m), key: key}
+	return &mediaHarness{t: t, ctx: ctx, m: m, srv: serveMachineMedia(t, "127.0.0.1", m), key: key}
 }
 
 // grant mints a capability for run 7 of this machine, valid for an hour unless edit says otherwise.
@@ -264,4 +285,21 @@ func TestWebRTCFollowResetsWhenTheOutputIsReplaced(t *testing.T) {
 	if f.end.Status != "canceled" || f.end.Length != uint64(len(replaced)) || f.end.SHA256 != digestOf(replaced) {
 		t.Fatalf("end %s", f.end.Raw)
 	}
+}
+
+// A resumed client chooses a new ICE credential after the previous session ended.
+func ufragRefused(t *testing.T, h *mediaHarness, ufrag string) bool {
+	conn, err := net.Dial("tcp", h.srv.Addr.String())
+	must(t, err)
+	defer conn.Close()
+	message, err := stun.Build(stun.TransactionID, stun.BindingRequest, stun.NewUsername(ufrag+":browser"), stun.NewShortTermIntegrity(ufrag), stun.Fingerprint)
+	must(t, err)
+	_, err = conn.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(message.Raw))), message.Raw...))
+	must(t, err)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := conn.Read(make([]byte, 1))
+	if n == 0 && !errors.Is(err, io.EOF) && (err == nil || !strings.Contains(err.Error(), "connection reset")) {
+		t.Fatalf("reused credential neither answered nor closed: %v", err)
+	}
+	return n == 0
 }

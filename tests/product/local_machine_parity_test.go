@@ -22,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -44,13 +45,12 @@ type machineHub struct {
 	ca       []byte // the worker doors' private CA
 	provider string // the rental's machine root, as its provider booted it
 	mu       sync.Mutex
-	machines map[string]string
 	grants   map[string]string // more of the grant, as a Hub adds a port for an image that serves it
 }
 
 func newMachineHub(t *testing.T) *machineHub {
 	t.Helper()
-	h := &machineHub{fakeRentalHub: newFakeRentalHub(t, 0), machines: map[string]string{}}
+	h := &machineHub{fakeRentalHub: newFakeRentalHub(t, 0)}
 	h.worker, h.ca = hubTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
@@ -64,14 +64,14 @@ func newMachineHub(t *testing.T) *machineHub {
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorized := r.Header.Get("Authorization") == "Bearer rental-idle-test"
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines" && authorized:
-			id, token := "om-"+randomToken(t)[:22], randomToken(t)
-			h.mu.Lock()
-			h.machines[id] = token
-			h.mu.Unlock()
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "worker_token": token, "environment": h.environment()})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines":
+			t.Error("owned machine attempted Hub registration")
+			http.Error(w, "registration is not a local machine lifecycle", http.StatusGone)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access" && authorized:
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "execution-test-access", "expires_at": time.Now().Add(time.Hour),
+				"environment": map[string]string{"TENSORHUB_ORIGIN": h.server.URL, "TENSORHUB_PUBLIC_ORIGIN": h.server.URL}})
+		case strings.HasPrefix(r.URL.Path, "/v1/tensorfs/"):
+			h.worker.Config.Handler.ServeHTTP(w, r)
 		default:
 			served.ServeHTTP(w, r)
 		}
@@ -106,7 +106,7 @@ func virtualInventory(t *testing.T, root string) {
 	must(t, os.WriteFile(worker, []byte("#!"+python+`
 import sys
 from cozy_runtime.cli import runtime_worker
-sys.exit(runtime_worker.main([], gpus=[{"device_index": i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
+sys.exit(runtime_worker.main(sys.argv[1:], gpus=[{"device_index": i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
     "driver_version": "0.0", "memory_bytes": 8 << 30, "pci_bus_id": f"00000000:0{i}:00.0"} for i in range(4)]))
 `), 0o755))
 }
@@ -135,7 +135,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	must(t, os.WriteFile(filepath.Join(dir, "environment.json"), environment, 0o600))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	launch, problem := host.Ensure(ctx, "provider", nil, false)
+	launch, problem := host.Ensure(ctx, "", nil, false)
 	if problem != nil {
 		log, _ := os.ReadFile(filepath.Join(dir, "host.log"))
 		t.Fatalf("the provider Host did not boot: %s\n%s", problem.Message, log)
@@ -156,7 +156,7 @@ func parityProjectOn(t *testing.T, source machines.Source) string {
 	t.Helper()
 	project := filepath.Join(t.TempDir(), "machine-parity")
 	must(t, os.MkdirAll(project, 0o700))
-	runtime := "cozy-runtime>=" + machines.RuntimeFloor
+	runtime := "cozy-runtime>=" + hostruntime.ToolFloor
 	sources := ""
 	if source.RuntimeWheel != "" {
 		sources = fmt.Sprintf("[tool.uv.sources]\ncozy-runtime={path=%q}\ntensorfs={path=%q}\n", source.RuntimeWheel, source.TensorFSWheel)
