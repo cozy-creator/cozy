@@ -107,6 +107,9 @@ type Installed struct {
 	TensorFS    installedArtifact `json:"tensorfs"`
 	InstalledAt time.Time         `json:"installed_at"`
 	HostPinned  bool              `json:"host_pinned,omitempty"`
+	// Pending is an operator-facing candidate. It is deliberately not persisted as
+	// installed metadata until the machine reports terminal succeeded activation.
+	Pending *RuntimeUpdateState `json:"-"`
 }
 
 // startupPolicy preserves an explicitly installed Host or wheel pair.

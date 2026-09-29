@@ -20,6 +20,8 @@ func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.
 		workspace.SubmissionClose = true
 		if p.submissionClose != nil {
 			workspace.SubmissionClose = *p.submissionClose
+		} else if current, ok := p.machine.(interface{ SubmissionClosureAvailable() bool }); ok {
+			workspace.SubmissionClose = current.SubmissionClosureAvailable()
 		}
 	}
 	if err == nil && request.Describe != nil && workspace.DescribedRelease == nil {
