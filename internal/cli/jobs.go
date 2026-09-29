@@ -303,7 +303,7 @@ func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 		{K: "function", V: state.Function},
 		{K: "status", V: status},
 		{K: "queued", V: seconds(state.QueuedMS)},
-		{K: "execution", V: seconds(state.ExecutionMS)},
+		{K: "execution", V: executionValue(state.ExecutionMS, state.ExecutionKnown, state.MachineExecution != nil)},
 	}
 	if state.CanceledBy != "" {
 		fields = append(fields, output.Field{K: "canceled_by", V: state.CanceledBy})

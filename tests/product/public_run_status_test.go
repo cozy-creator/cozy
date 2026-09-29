@@ -121,7 +121,7 @@ func TestPublicRunStatusFreezesStoppedExecutionAtOriginalEvent(t *testing.T) {
 	must(t, err)
 	defer publicationControlAPI(t, o)()
 	for range 2 {
-		if got, want := listedMachineExecutionMS(t, o.root, request.ID), ended.UnixMilli()-1000; got != want {
+		if got, want := listedMachineTiming(t, o.root, request.ID).AttemptWallMS, ended.UnixMilli()-1000; got != want {
 			t.Fatalf("manual stop execution_ms=%d, want original event duration %d", got, want)
 		}
 	}

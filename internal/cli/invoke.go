@@ -902,15 +902,15 @@ func runListRows(rows []api.Lifecycle) output.List {
 		Name:     "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution", "reason"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
 			"progress", "phase", "progress_stage", "stage_fraction", "overall_fraction",
-			"position", "total", "queued", "execution", "attempts", "created", "reason", "hub"},
+			"position", "total", "queued", "execution", "attempt_wall", "attempts", "created", "reason", "hub"},
 		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
-			"remaining_ms", "execution_ms", "error_type", "error_code", "error", "retaining", "retry_available"},
+			"remaining_ms", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining", "retry_available"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "rental_boot", "wait_reason", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
-			"position", "total", "progress_unit", "progress_rate", "remaining_ms", "queued_ms", "execution_ms", "attempts",
+			"position", "total", "progress_unit", "progress_rate", "remaining_ms", "queued_ms", "execution_ms", "execution_known", "attempt_wall_ms", "attempts",
 			"created_at", "error_type", "error_code", "error", "triage", "retaining", "retry_available", "hub"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
@@ -948,7 +948,8 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"position":         integerValue(life.Position),
 			"total":            integerValue(life.Total),
 			"queued":           seconds(life.QueuedMS),
-			"execution":        seconds(life.ExecutionMS),
+			"execution":        executionValue(life.ExecutionMS, life.ExecutionKnown, life.MachineExecution != nil),
+			"attempt_wall":     seconds(life.AttemptWallMS),
 			"attempts":         strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 			"reason": reasonCell(life),
 		})
@@ -957,6 +958,12 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
 			"status": life.Status, "queued_ms": life.QueuedMS, "execution_ms": life.ExecutionMS,
 			"attempts": life.Attempts, "created_at": life.CreatedAt,
+		}
+		if life.MachineExecution != nil {
+			typed["execution_known"], typed["attempt_wall_ms"] = life.ExecutionKnown, life.AttemptWallMS
+			if !life.ExecutionKnown {
+				typed["execution_ms"] = nil
+			}
 		}
 		if life.Hub != "" {
 			list.Rows[len(list.Rows)-1]["hub"], typed["hub"] = life.Hub, life.Hub
@@ -2444,7 +2451,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	// Two facts, never one sum: how long the request waited, and how long it ran.
 	fields = append(fields,
 		output.Field{K: "queued", V: seconds(life.QueuedMS)},
-		output.Field{K: "execution", V: seconds(life.ExecutionMS)},
+		output.Field{K: "execution", V: executionValue(life.ExecutionMS, life.ExecutionKnown, life.MachineExecution != nil)},
 		output.Field{K: "submit_ms", V: submitted.Milliseconds()})
 	if wallMS, known := recordedRunWall(life.CreatedAt, terminal); known {
 		fields = append(fields, output.Field{K: "wall_ms", V: wallMS})
@@ -3111,3 +3118,10 @@ func eventText(e *localapi.Event, key string) string {
 
 // seconds spells a millisecond count as the CLI's duration cell.
 func seconds(ms int64) string { return fmt.Sprintf("%.1fs", float64(ms)/1000) }
+
+func executionValue(ms int64, known, machine bool) string {
+	if machine && !known {
+		return "—"
+	}
+	return seconds(ms)
+}

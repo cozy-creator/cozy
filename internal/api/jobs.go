@@ -827,6 +827,8 @@ type JobState struct {
 	Stage            string               `json:"stage,omitempty"`
 	QueuedMS         int64                `json:"queued_ms"`
 	ExecutionMS      int64                `json:"execution_ms"`
+	ExecutionKnown   bool                 `json:"execution_known"`
+	AttemptWallMS    int64                `json:"attempt_wall_ms,omitempty"`
 	Metrics          map[string]any       `json:"metrics,omitempty"`
 	ErrorType        string               `json:"error_type,omitempty"`
 	ErrorCode        string               `json:"error_code,omitempty"`
