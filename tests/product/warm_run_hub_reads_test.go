@@ -107,6 +107,13 @@ def touch(payload: TouchRequest, source: Probe) -> TouchResult:
 func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root)
+	// This proof measures content reuse after the machine can describe releases.
+	// A still-booting Runtime legitimately falls back to the account catalog,
+	// which this fixture deliberately does not serve.
+	machine := machines.NewHost(filepath.Join(root, "machine"), machineStore(root), nil)
+	launch, problem := machine.Ensure(t.Context(), "", nil, true)
+	fatal(t, problem)
+	awaitScopedMachine(t, machine, launch)
 	var mu sync.Mutex
 	var seen []string
 	count := func(hub string, handler http.Handler) http.Handler {
