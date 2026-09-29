@@ -182,7 +182,8 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 	// Without wheels, the published Runtime and the TensorFS it depends on.
 	// The worker's base is the CPU image's: the Runtime with its media extra. Every
 	// package environment carries its own framework closure.
-	requirements := []string{hostruntime.Distribution + "[media]>=" + RuntimeFloor}
+	// An explicit install means the newest release: refresh just these two from the index, not uv's cache.
+	requirements := []string{"--refresh-package", hostruntime.Distribution, "--refresh-package", "tensorfs", hostruntime.Distribution + "[media]>=" + RuntimeFloor}
 	if len(wheels) > 0 {
 		requirements = []string{hostruntime.Distribution + "[media] @ file://" + wheels[0], wheels[1]}
 	}
