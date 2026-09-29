@@ -454,7 +454,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if problem := connection.ValidateNewWork(); problem != nil {
 		return problem
 	}
-	workspace, problem := newExecutionWorkspace(ctx, connection)
+	workspace, problem := newExecutionWorkspace(ctx, connection, request.ID)
 	if problem != nil {
 		if len(link.Submission) > 0 && problem.ErrName() == "machine.submission_closure_required" {
 			return pendingClosureUnavailable("the connected machine does not support the required submission-closure contract")
@@ -489,7 +489,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if built.PublicationAuthorizationId, problem = m.publicationAuthorization(ctx, request.ID, link.MachineID, connection); problem != nil {
 			return problem
 		}
-		if problem := m.store.RecordMachineSubmission(request.ID, built); problem != nil {
+		if problem := m.recordSubmission(request.ID, built); problem != nil {
 			return problem
 		}
 		link.Submission, _ = proto.Marshal(built)
@@ -510,7 +510,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return problem
 		}
 		var built *pb.MachineExecutionSubmit
-		capture, problem := m.resolver.CaptureMachineExecution(request)
+		capture, problem := m.captureForSubmission(request)
 		if problem != nil {
 			return problem
 		}
@@ -587,7 +587,10 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		submission = built
 	}
 	if !replaying {
-		if _, problem := m.resolver.capturedResultInterface(request); problem != nil {
+		began := time.Now()
+		_, problem := m.resolver.capturedResultInterface(request)
+		m.submissionStage(request.ID, "result interface read", "", began)
+		if problem != nil {
 			return problem
 		}
 	}
@@ -643,7 +646,7 @@ func (m *machineRuns) pinToMachine(ctx context.Context, request records.Request,
 	if pinned {
 		return request, nil
 	}
-	workspace, problem := newExecutionWorkspace(ctx, connection)
+	workspace, problem := newExecutionWorkspace(ctx, connection, request.ID)
 	if problem != nil {
 		return request, problem
 	}
@@ -684,18 +687,20 @@ func (m *machineRuns) recordPlacement(request records.Request, decision orchestr
 // freezeMachineSubmission persists authenticated journal identity with the exact
 // offer before any Submit RPC. Only a never-transmitted submission may discover it.
 func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *machineConnection, requestID, machine string, submission *pb.MachineExecutionSubmit) *exit.Error {
-	workspace, problem := newExecutionWorkspace(ctx, connection)
+	workspace, problem := newExecutionWorkspace(ctx, connection, requestID)
 	if problem != nil {
 		return problem
 	}
 	submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
-	return m.store.RecordMachineSubmission(requestID, submission)
+	return m.recordSubmission(requestID, submission)
 }
 
 // New submissions require durable reconciliation through the complete machine route.
 // Retained work keeps its frozen identity until authoritative reconciliation.
-func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
+func newExecutionWorkspace(ctx context.Context, connection *machineConnection, request string) (*pb.MachineExecutionWorkspace, *exit.Error) {
+	began := time.Now()
 	workspace, available, problem := executionWorkspaceReply(ctx, connection)
+	connection.runs.submissionStage(request, "workspace lookup", "", began)
 	if problem != nil {
 		return nil, problem
 	}
@@ -715,10 +720,12 @@ func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (
 	// any real offer. Closing this key cannot create or cancel an execution.
 	probe := records.NewID("closure-probe")
 	var header, trailer metadata.MD
+	began = time.Now()
 	closed, err := connection.Host.CloseMachineSubmission(ctx, &pb.MachineSubmissionClose{
 		Claim: connection.Claim, SubmissionId: probe, RequestId: probe,
 		ExpectedExecutionWorkspaceId: workspace.ExecutionWorkspaceId,
 	}, grpc.Header(&header), grpc.Trailer(&trailer))
+	connection.runs.submissionStage(request, "submission closure probe", "", began)
 	if runtimeUnavailable(header, trailer) {
 		return nil, waitForRuntime()
 	}
