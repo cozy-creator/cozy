@@ -45,12 +45,16 @@ func TestMachinePrepareRefusalReachesRunListAndWatch(t *testing.T) {
 		run = page.Invocations[0]
 		return run.Status == "failed"
 	})
-	if run.ErrorType != "machine_execution.refused" || !strings.Contains(run.Error, "wheel_download_failed: "+refusedWheel) {
+	if run.ErrorType != "machine_execution.refused" || run.Error != "Runtime refused machine execution: wheel_download_failed: "+refusedWheel {
 		t.Fatalf("listed failure lost its cause: %+v", run)
 	}
 	code, out := runCozy(t, root, "run", "list", "--no-watch")
-	if code != 0 || !strings.Contains(out, "Runtime refused machine execution: wheel_download_failed") {
-		t.Fatalf("human run list shows no reason [%d]:\n%s", code, out)
+	if code != 0 || !strings.Contains(out, "wheel_download_failed: runtime compatibility check failed (Internal):") || strings.Contains(out, "Runtime refused machine execution:") {
+		t.Fatalf("human run list lost the cause or retained its wrapper [%d]:\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "run", "show", strconv.FormatInt(run.Number, 10), "--json")
+	if code != 0 || !strings.Contains(out, run.Error) {
+		t.Fatalf("run show changed the full diagnostic [%d]: %s", code, out)
 	}
 	code, out = runCozy(t, root, "run", "watch", strconv.FormatInt(run.Number, 10), "--json")
 	var watched struct {

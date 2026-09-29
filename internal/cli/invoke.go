@@ -1075,7 +1075,8 @@ func reasonCell(life api.Lifecycle) string {
 	case life.Status == "queued":
 		reason = life.WaitReason
 	case life.Status != "completed" && life.Status != "in_progress":
-		reason = life.Error
+		// The list already identifies the failed run; keep its specific cause.
+		reason = strings.TrimPrefix(life.Error, "Runtime refused machine execution: ")
 	}
 	reason = strings.Join(strings.Fields(reason), " ")
 	if runes := []rune(reason); len(runes) > failureReasonCell {
