@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/machines"
 )
@@ -27,7 +29,7 @@ func TestStartupUpdatePreservesExplicitInstallArtifacts(t *testing.T) {
 			t.Cleanup(func() { _ = host.Stop(context.Background()) })
 			binary := filepath.Join(host.Root(), "usr/local/bin/cozy-machine")
 			must(t, os.MkdirAll(filepath.Dir(binary), 0755))
-			must(t, os.WriteFile(binary, []byte("#!/bin/sh\ncat \"$COZY_MACHINE_ROOT/etc/cozy/software-policy.json\" > \"$COZY_MACHINE_ROOT/startup-policy\"\nexit 0\n"), 0700))
+			must(t, os.WriteFile(binary, []byte("#!/bin/sh\ntrap 'printf \"%s\\n\" \"$?\" > \"$COZY_MACHINE_ROOT/startup-exit\"' EXIT\ncat \"$COZY_MACHINE_ROOT/etc/cozy/software-policy.json\" > \"$COZY_MACHINE_ROOT/startup-policy\"\n"), 0700))
 			var installed map[string]any
 			must(t, json.Unmarshal([]byte(test.metadata), &installed))
 			artifact, ok := installed["host"].(map[string]any)
@@ -50,6 +52,26 @@ func TestStartupUpdatePreservesExplicitInstallArtifacts(t *testing.T) {
 				t.Fatalf("launch overwrote machine config: %s %v", after, err)
 			}
 
+			// A shell fixture runs as /bin/sh, so the agent's executable identity
+			// check can return before its writes finish. Wait for its own observed
+			// completion, using the test context rather than a guessed delay.
+			for {
+				exited, err := os.ReadFile(filepath.Join(host.Root(), "startup-exit"))
+				if err == nil && len(exited) > 0 {
+					if strings.TrimSpace(string(exited)) != "0" {
+						t.Fatalf("startup witness process failed: %q (launch: %v)", exited, problem)
+					}
+					break
+				}
+				if err != nil && !os.IsNotExist(err) {
+					t.Fatalf("cannot observe startup witness completion: %v", err)
+				}
+				select {
+				case <-t.Context().Done():
+					t.Fatalf("startup witness did not finish: %v (launch: %v)", t.Context().Err(), problem)
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
 			witness, err := os.ReadFile(filepath.Join(host.Root(), "startup-policy"))
 			if err != nil {
 				t.Fatalf("agent process wrote no policy witness: %v (launch: %v)", err, problem)

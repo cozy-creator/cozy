@@ -125,9 +125,21 @@ func virtualInventory(t *testing.T, root string) {
 	must(t, os.Remove(worker))
 	must(t, os.WriteFile(worker, []byte("#!"+python+`
 import sys
+from dataclasses import replace
+from cozy_runtime.internal import hostfacts
 from cozy_runtime.cli import runtime_worker
-sys.exit(runtime_worker.main(sys.argv[1:], gpus=[{"device_index": i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
-    "driver_version": "0.0", "memory_bytes": 8 << 30, "pci_bus_id": f"00000000:0{i}:00.0"} for i in range(4)]))
+inventory = [{"device_index": i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
+    "driver_version": "0.0", "memory_bytes": 8 << 30, "pci_bus_id": f"00000000:0{i}:00.0"} for i in range(4)]
+measure = hostfacts.measure
+def fixture_measure(expected_backend=""):
+    if expected_backend != "cuda":
+        return measure(expected_backend)
+    # Model-default selection and readiness must see the same synthetic devices.
+    # CPU host facts stay real; this fixture never asks the physical GPU driver.
+    return replace(measure("none"), gpu_name=inventory[0]["device_name"], gpu_count=len(inventory),
+        gpu_sm=0, vram_total_bytes=inventory[0]["memory_bytes"], driver_version=inventory[0]["driver_version"], backend="cuda")
+hostfacts.measure = fixture_measure
+sys.exit(runtime_worker.main(sys.argv[1:], gpus=inventory))
 `), 0o755))
 }
 

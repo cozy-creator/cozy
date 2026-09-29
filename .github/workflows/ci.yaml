@@ -108,6 +108,10 @@ jobs:
         run: |
           python3 scripts/ci-machine-agent.py "$RUNTIME_WHEEL" "$RUNNER_TEMP/cozy-machine"
           echo "MACHINE_HOST=$RUNNER_TEMP/cozy-machine" >> "$GITHUB_ENV"
+      - name: Media test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
       # The runner's service cgroup is not delegated; Runtime's executor containment needs its own subtree.
       - name: Product tests
         run: |
