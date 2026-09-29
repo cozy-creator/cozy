@@ -26,6 +26,11 @@ func TestSameInstallationDynamicModelUsesAvailableScopedHub(t *testing.T) {
 }
 
 func localChildOwnerModel(t *testing.T, sameInstallation bool) {
+	// Serving this Model executes its components on a measured accelerator.
+	// Synthetic inventory covers routing; it does not qualify numerical execution.
+	if _, count := hostAccelerators(); count == 0 {
+		t.Skip("requires a real NVIDIA device for serving Model defaults; run this hardware gate separately")
+	}
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root)
 	h.mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, _ *http.Request) {

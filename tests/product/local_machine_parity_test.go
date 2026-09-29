@@ -135,12 +135,60 @@ def fixture_measure(expected_backend=""):
     if expected_backend != "cuda":
         return measure(expected_backend)
     # Model-default selection and readiness must see the same synthetic devices.
-    # CPU host facts stay real; this fixture never asks the physical GPU driver.
-    return replace(measure("none"), gpu_name=inventory[0]["device_name"], gpu_count=len(inventory),
-        gpu_sm=0, vram_total_bytes=inventory[0]["memory_bytes"], driver_version=inventory[0]["driver_version"], backend="cuda")
+    # Numerical backend/architecture and other host facts remain actually measured.
+    facts = measure(expected_backend)
+    inventory_fields = {"gpu_name", "vram_total_bytes", "driver_version"}
+    return replace(facts, gpu_name=inventory[0]["device_name"], gpu_count=len(inventory),
+        vram_total_bytes=inventory[0]["memory_bytes"], driver_version=inventory[0]["driver_version"],
+        unreadable=tuple(name for name in facts.unreadable if name not in inventory_fields))
 hostfacts.measure = fixture_measure
 sys.exit(runtime_worker.main(sys.argv[1:], gpus=inventory))
 `), 0o755))
+}
+
+// The routing fixture may replace inventory facts, but numerical identity must
+// stay absent or present exactly as the real measurement reports it.
+func TestVirtualInventoryPreservesMeasuredNumericalIdentity(t *testing.T) {
+	if *machineHostBinary == "" {
+		t.Skip("requires the selected Runtime SDK to inspect its fixture entrypoint")
+	}
+	python := filepath.Join(machineTemplateDir(t), "root/opt/cozy/python/bin/python")
+	root := t.TempDir()
+	worker := filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker")
+	must(t, os.MkdirAll(filepath.Dir(worker), 0755))
+	must(t, os.WriteFile(worker, nil, 0755))
+	virtualInventory(t, root)
+	script := `import runpy, sys
+from cozy_runtime.cli import runtime_worker
+from cozy_runtime.internal import hostfacts
+for backend, architecture in [("", 0), ("cuda", 89)]:
+    calls = []
+    def measure(expected_backend=""):
+        calls.append(expected_backend)
+        return hostfacts.HostFacts(backend=backend, gpu_sm=architecture,
+            host_ram_total_bytes=12345, vcpu_count=7, unreadable=("gpu_name", "driver_version", "backend_version"))
+    hostfacts.measure = measure
+    def main(argv, *, gpus):
+        facts = hostfacts.measure("cuda")
+        assert len(gpus) == facts.gpu_count == 4
+        assert facts.gpu_name == gpus[0]["device_name"] == "Virtual Accelerator"
+        assert facts.vram_total_bytes == gpus[0]["memory_bytes"] == 8 << 30
+        assert facts.driver_version == gpus[0]["driver_version"] == "0.0"
+        assert (facts.backend, facts.gpu_sm) == (backend, architecture)
+        assert (facts.host_ram_total_bytes, facts.vcpu_count) == (12345, 7)
+        assert facts.unreadable == ("backend_version",)
+        assert hostfacts.measure("none").unreadable == ("gpu_name", "driver_version", "backend_version")
+        assert calls == ["cuda", "none"]
+        return 0
+    runtime_worker.main = main
+    try:
+        runpy.run_path(sys.argv[1], run_name="__main__")
+    except SystemExit as exit:
+        assert exit.code == 0
+`
+	if output, err := exec.Command(python, "-I", "-c", script, worker).CombinedOutput(); err != nil {
+		t.Fatalf("virtual inventory changed measured numerical identity: %v\n%s", err, output)
+	}
 }
 
 // providerHost boots the same Host binary as a rental's provider would: under its own root,
