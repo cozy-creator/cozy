@@ -223,10 +223,10 @@ func TestMachineCancellationPreservesAmbiguousAcceptance(t *testing.T) {
 	}
 	row, problem := store.RequestRow(request.ID)
 	fatal(t, problem)
-	if row.State != "canceling" {
-		t.Fatalf("ambiguous submission was falsely settled: %s", row.State)
+	if row.State != "canceled" {
+		t.Fatalf("a run no machine accepted waited on one: %s", row.State)
 	}
-	// The delayed receipt is still recorded, so the same real execution can be
+	// A receipt that still arrives is recorded, so the same real execution is
 	// canceled remotely instead of silently abandoning a running job.
 	fatal(t, store.AcceptMachineExecution(request.ID, receipt))
 	link, problem := store.MachineExecution(request.ID)

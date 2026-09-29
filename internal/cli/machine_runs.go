@@ -104,14 +104,16 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				return
 			}
 			if len(link.Receipt) == 0 && (records.Settled(current.State) || records.RetainedState(current.State)) &&
-				!(current.State == "canceled" && len(link.Submission) == 0) {
+				current.State != "canceled" {
 				// Restart resumes observation, not withdrawn or failed execution
 				// intent. A receipt can reconcile a real outcome; absent one, do
 				// not turn a stopped request into a new Submit RPC.
 				return
 			}
 			if len(link.Receipt) == 0 {
-				if current.State == "canceled" && len(link.Submission) == 0 {
+				if current.State == "canceled" {
+					// Canceled before any machine accepted it: nothing is submitted again. Only
+					// input bytes staged on its machine are owed, and only while there are any.
 					if link.MachineID != "" {
 						var connection *machineConnection
 						connection, problem = m.connectFor(m.ctx, *current, link.MachineID, "releasing its inputs")
