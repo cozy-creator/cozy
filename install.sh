@@ -39,7 +39,7 @@ now="$("$stage/cozy" -v)" || fail "the new cozy does not run; nothing was replac
 # A standalone tensorfs tool would still claim tfs: its later upgrade would relink an unpinned
 # tfs, and its uninstall would delete the one cozy-runtime installs.
 if uv tool list 2>/dev/null | grep -q '^tensorfs '; then uv tool uninstall tensorfs; fi
-host_tools() { uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.67'; }
+host_tools() { uv tool install --force --refresh-package cozy-runtime --refresh-package tensorfs --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.67'; }
 host_tools || fail "host tool installation failed; cozy was not replaced"
 tools="$(uv tool dir --bin)"
 
