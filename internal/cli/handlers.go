@@ -3,43 +3,15 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"runtime/debug"
 
+	"github.com/cozy-creator/cozy/internal/build"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
-// Build identity may be stamped with -ldflags -X. The Go VCS stamp supplies
-// the client revision sent to Tensorhub when an explicit commit is absent.
-var (
-	tag    = "0.0.0-dev"
-	commit = ""
-)
+func version() string { return build.Version }
 
-func version() string { return tag }
-
-func buildStamp() (string, bool) {
-	revision, dirty := commit, false
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, setting := range info.Settings {
-			switch setting.Key {
-			case "vcs.revision":
-				if revision == "" {
-					revision = setting.Value
-				}
-			case "vcs.modified":
-				dirty = setting.Value == "true"
-			}
-		}
-	}
-	if revision == "" {
-		revision = "unknown"
-	}
-	if len(revision) > 12 {
-		revision = revision[:12]
-	}
-	return revision, dirty
-}
+func buildStamp() (string, bool) { return build.Revision() }
 
 // emit is the only success-document seam.
 func emit(ctx *Context, document output.Document) *exit.Error {

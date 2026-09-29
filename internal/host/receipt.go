@@ -10,6 +10,8 @@ import (
 	"os"
 	"slices"
 	"sync"
+
+	"github.com/cozy-creator/cozy/internal/build"
 )
 
 // ReceiptDomain separates the readiness receipt's HMAC from any other use of its key.
@@ -69,10 +71,11 @@ func (r *receipt) Envelope() []byte {
 	return r.sealed
 }
 
-// seal publishes the Runtime's payload: the worker port becomes the public one and, for a
-// Hub that froze an auth document, the observed auth repeats it. Everything else passes
-// through, including members this daemon does not know. A later Runtime of the same boot
-// must attest the same facts; the original envelope is kept byte for byte.
+// seal publishes the Runtime's payload: the worker port becomes the public one, the machine
+// names its own release (machine_version, the cozy binary's stamp) and, for a Hub that froze
+// an auth document, the observed auth repeats it. Everything else passes through, including
+// members this daemon does not know. A later Runtime of the same boot must attest the same
+// facts; the original envelope is kept byte for byte.
 func (r *receipt) seal(raw []byte, workerPort int, observed *OwnerAuth, webrtc map[string]any) error {
 	payload, err := rewritePayload(raw, workerPort, observed, webrtc)
 	if err != nil {
@@ -110,6 +113,9 @@ func rewritePayload(raw []byte, workerPort int, observed *OwnerAuth, webrtc map[
 	}
 	var err error
 	if members["worker_internal_port"], err = json.Marshal(workerPort); err != nil {
+		return nil, err
+	}
+	if members["machine_version"], err = json.Marshal(build.Version); err != nil {
 		return nil, err
 	}
 	if observed == nil { // the Hub froze no auth document: the daemon's own key is no fact about this boot

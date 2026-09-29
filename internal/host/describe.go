@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/build"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -25,11 +26,14 @@ func (m *Machine) describeMachine(stream grpc.ServerStream) error {
 		return err
 	}
 	hostname, _ := os.Hostname()
-	host := &pb.MachineHost{Version: Version, WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor,
+	host := &pb.MachineHost{Version: build.Version, WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor,
 		Platform: runtime.GOOS + "/" + runtime.GOARCH, OsRelease: osRelease(), Hostname: hostname, Phase: m.phase(),
 		Hubs:            []*pb.MachineHub{{Origin: m.grant.HubOrigin, MachineId: m.grant.WorkerID}},
 		Filesystems:     []*pb.MachineFilesystem{filesystem(m.layout.Store), filesystem(m.layout.Root)},
 		StartedAtUnixMs: uint64(m.started.UnixMilli())}
+	for _, other := range m.grant.Hubs {
+		host.Hubs = append(host.Hubs, &pb.MachineHub{Origin: other.Origin, MachineId: other.WorkerID})
+	}
 	if !m.idle.releasedNow() {
 		host.IdleDeadlineUnixMs = uint64(m.idle.deadline().UnixMilli())
 	}
