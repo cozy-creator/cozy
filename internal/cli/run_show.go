@@ -24,11 +24,13 @@ import (
 // daemon's records (durable events and the kept triage bundle); JSON also carries both
 // sources whole.
 type runReport struct {
-	Number      int64  `json:"number"`
-	RequestID   string `json:"request_id"`
-	Status      string `json:"status"`
-	Target      string `json:"target"`
-	Machine     string `json:"machine,omitempty"`
+	Number    int64  `json:"number"`
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"`
+	Target    string `json:"target"`
+	Machine   string `json:"machine,omitempty"`
+	// Runtime is the cozy-runtime (and TensorFS) the run's own executor loaded.
+	Runtime     string `json:"runtime,omitempty"`
 	CreatedAt   string `json:"created_at"`
 	QueuedMS    int64  `json:"queued_ms"`
 	ExecutionMS int64  `json:"execution_ms"`
@@ -100,7 +102,8 @@ type reportCall struct {
 	Label       string        `json:"label,omitempty"`
 	Status      string        `json:"status,omitempty"` // empty until Runtime records it settled
 	Error       string        `json:"error,omitempty"`
-	GPUs        []reportGPU   `json:"gpus,omitempty"` // its grants' cards, then its release's records
+	Runtime     string        `json:"runtime,omitempty"` // the SDK its executor loaded
+	GPUs        []reportGPU   `json:"gpus,omitempty"`    // its grants' cards, then its release's records
 	StartUnixMS int64         `json:"start_unix_ms,omitempty"`
 	MS          float64       `json:"ms"`
 	Stages      []reportStage `json:"stages"`
@@ -417,6 +420,16 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			c.Steps = stepSummaries(record.Steps)
 		case "machine.resolved":
 			report.Resolved = event.Payload
+		case "machine.executor":
+			var loaded executorEvent
+			if json.Unmarshal(event.Payload, &loaded) != nil || loaded.Runtime == "" {
+				continue
+			}
+			if loaded.Request == life.RequestID || loaded.Request == "" {
+				report.Runtime = loaded.String()
+			} else {
+				call(loaded.Request).Runtime = loaded.String()
+			}
 		case "machine.warning", "request.warning":
 			var warning warningEvent
 			if json.Unmarshal(event.Payload, &warning) == nil {
@@ -774,6 +787,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	if r.Machine != "" {
 		fmt.Fprintf(w, "  on %s", r.Machine)
 	}
+	if r.Runtime != "" {
+		fmt.Fprintf(w, "  %s", r.Runtime)
+	}
 	if r.Waiting != "" {
 		fmt.Fprintf(w, "\n%s", r.Waiting)
 	}
@@ -819,11 +835,11 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		return nil
 	}
 	fmt.Fprintf(w, "\ncalls (%d)\n", r.childCalls())
-	fmt.Fprintln(table, "#\tCALL\tFUNCTION\tSTATUS\tGPUS\tSTART\tTIME\tSTEPS\tATTENTION")
+	fmt.Fprintln(table, "#\tCALL\tFUNCTION\tSTATUS\tGPUS\tSTART\tTIME\tSTEPS\tRUNTIME\tATTENTION")
 	for _, c := range r.Calls {
-		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.Number, clip(c.name(), 40), dash(c.Function),
+		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.Number, clip(c.name(), 40), dash(c.Function),
 			dash(c.Status), dash(gpuList(c.GPUs)), offset(c.StartUnixMS), span(c.MS), dash(stepsCell(c.Steps)),
-			dash(clip(served(c.GPUs), 40)))
+			dash(c.Runtime), dash(clip(served(c.GPUs), 40)))
 	}
 	table.Flush()
 	if !mode.Full {
@@ -878,6 +894,9 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 	}
 	if len(c.GPUs) > 0 {
 		fmt.Fprintf(w, " · GPUs %s", gpuList(c.GPUs))
+	}
+	if c.Runtime != "" {
+		fmt.Fprintf(w, " · %s", c.Runtime)
 	}
 	fmt.Fprintln(w)
 	if c.Error != "" {
@@ -1074,4 +1093,18 @@ func gpuAttention(gpu reportGPU) string {
 		return gpu.Attention.Requested + " → " + seen
 	}
 	return seen
+}
+
+// executorEvent is the SDK an attempt's executor loaded, as the Runtime recorded it.
+type executorEvent struct {
+	Request  string `json:"request"`
+	Runtime  string `json:"runtime_version"`
+	TensorFS string `json:"tensorfs_version"`
+}
+
+func (e executorEvent) String() string {
+	if e.TensorFS == "" {
+		return "cozy-runtime " + e.Runtime
+	}
+	return "cozy-runtime " + e.Runtime + " · tensorfs " + e.TensorFS
 }
