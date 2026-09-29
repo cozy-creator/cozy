@@ -131,6 +131,7 @@ func TestAcceptedMachineUpdateObservationReturnsPendingActivation(t *testing.T) 
 	})
 	state, problem := client.AwaitUpdateOrPending(t.Context(), "accepted-operation")
 	if problem != nil || state == nil || state.Update == nil || !state.Update.PendingActivation() ||
+		state.Runtime != "0.18.88" || state.Update.From.Runtime != "0.18.88" ||
 		state.Update.To.Runtime != "0.18.89" || calls.Load() != 1 {
 		t.Fatalf("pending activation was not returned as a durable candidate: calls=%d state=%+v problem=%v", calls.Load(), state, problem)
 	}

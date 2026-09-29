@@ -149,8 +149,8 @@ func pendingUpdateConflict(update *RuntimeUpdateState) *exit.Error {
 }
 
 // pendingInstalled reports the active pair and candidate operation without
-// persisting the candidate as installed. The next machine install observes the
-// same operation until Runtime activates or rolls it back.
+// persisting the candidate as installed. Further installs wait until Runtime
+// activates the candidate or rolls it back.
 func pendingInstalled(state *RuntimeState) *Installed {
 	return &Installed{
 		Host:       installedArtifact{Name: "cozy-machine " + state.Agent.Version, SHA256: state.Agent.SHA256, Module: AgentModule},
