@@ -76,6 +76,20 @@ def echo(payload: RefuseInput) -> EchoOutput:
     return EchoOutput(payload.why)
 
 
+class Label(msgspec.Struct, forbid_unknown_fields=True):
+    text: str
+
+
+class LabelsInput(msgspec.Struct, forbid_unknown_fields=True):
+    labels: list[Label]
+
+
+@app.entrypoint
+def labels(payload: LabelsInput) -> EchoOutput:
+    """A nested request: a list of structs."""
+    return EchoOutput(",".join(label.text for label in payload.labels))
+
+
 class VideoTransportInput(msgspec.Struct, forbid_unknown_fields=True):
     prompt: str
     first_frame: Annotated[ImageAsset, AssetBound(max_bytes=8 << 20, max_decoded_bytes=16 << 20)]

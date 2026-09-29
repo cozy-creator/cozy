@@ -198,7 +198,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if e := validateInvocationPayload(ctx, target.Package, ep, input); e != nil {
+	input, ignored, e := validateInvocationPayload(ctx, target.Package, ep, input)
+	if e != nil {
 		return e
 	}
 	selectedRental, e := requestedRental(ctx)
@@ -251,6 +252,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Models:          models,
 		OutputDirectory: outputDirectory,
 		AttentionKernel: overrides.AttentionKernel,
+		Ignored:         ignored,
 	}, key)
 	releaseSnapshotReader(target)
 	if e != nil {
@@ -1744,7 +1746,9 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	defer p.mu.Unlock()
 	kind := strings.TrimPrefix(e.Type, "request.")
 	if kind == "warning" {
-		p.notice(e, warningLine(e.Payload))
+		if !p.ctx.warned(e.Payload) {
+			p.notice(e, warningLine(e.Payload))
+		}
 		return true
 	}
 	if strings.HasPrefix(e.Type, "output_item.") {
@@ -2685,21 +2689,25 @@ func requestKey(supplied string) string {
 	return "idem-" + hex.EncodeToString(b[:])
 }
 
+// validateInvocationPayload applies the same validation and argument help to serving
+// functions and jobs, before either path resolves or acquires a model. It answers the
+// payload without its undeclared fields, and warns once naming them.
+func validateInvocationPayload(ctx *Context, pkg string, ep *launch.Entrypoint, input json.RawMessage) (json.RawMessage, []string, *exit.Error) {
+	cleaned, ignored, problem := launch.ValidatePayload(pkg, ep, input)
+	if len(ignored) > 0 {
+		ctx.warn(launch.IgnoredWarning(pkg+"/"+ep.Name, ignored))
+	}
+	if problem != nil && !ctx.Mode().JSON {
+		problem.Message += "\n\n" + launch.DescribeArguments(ep)
+	}
+	return cleaned, ignored, problem
+}
+
 // finalizeInputPayload closes the one intentional client-side default that changes
 // output identity: an omitted top-level integer `seed`. Its value is derived from the
 // already-minted idempotency key, so a normal invocation gets fresh entropy while an
 // explicit-key retry reconstructs byte-identical input instead of conflicting with its
 // recorded request. An explicitly supplied seed is never changed.
-// The same validation and argument help apply to serving functions and jobs,
-// before either path resolves or acquires a model.
-func validateInvocationPayload(ctx *Context, pkg string, ep *launch.Entrypoint, input json.RawMessage) *exit.Error {
-	problem := launch.ValidatePayload(pkg, ep, input)
-	if problem != nil && !ctx.Mode().JSON {
-		problem.Message += "\n\n" + launch.DescribeArguments(ep)
-	}
-	return problem
-}
-
 func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 	idempotencyKey string,
 ) (json.RawMessage, *exit.Error) {

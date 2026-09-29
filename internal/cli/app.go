@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/mattn/go-isatty"
 )
 
@@ -56,6 +57,38 @@ type Context struct {
 	AccountAuth    *accountauth.Manager
 	namespace      packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
 	ingestBytes    int64                          // planned source bytes a native ingest declares for its rental
+	warnings       *[]records.Warning             // this command's, shared by its scoped copies
+}
+
+// warn says one warning now on stderr for a person and in the command's JSON document for a
+// program; the run's own event stream never repeats it.
+func (c *Context) warn(warning records.Warning) {
+	if c.warnings == nil {
+		c.warnings = new([]records.Warning)
+	}
+	*c.warnings = append(*c.warnings, warning)
+	if !c.Mode().JSON {
+		fmt.Fprintf(c.Err, "warning: %s\n", warning.Message)
+	}
+}
+
+func (c *Context) said() []records.Warning {
+	if c.warnings == nil {
+		return nil
+	}
+	return *c.warnings
+}
+
+// warned is whether this command already said an event's warning: its code or, uncoded, its text.
+func (c *Context) warned(event map[string]any) bool {
+	code, _ := event["code"].(string)
+	message, _ := event["message"].(string)
+	for _, said := range c.said() {
+		if code != "" && said.Code == code || code == "" && said.Message == strings.TrimSpace(message) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Context) Mode() output.Mode { return c.Inv.Mode }
@@ -93,6 +126,7 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 			Values: values, Mode: r.Mode,
 		},
 		Out: r.Out, Err: r.Err, Cfg: r.Cfg, AccountAuth: accountauth.New(r.Cfg),
+		warnings: new([]records.Warning),
 	}
 	if daemon {
 		state, _, problem := ensureDaemon(ctx)
@@ -103,6 +137,12 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 	}
 	problem := h(ctx)
 	r.exitCode = ctx.exitCode
+	if said := ctx.said(); problem != nil && len(said) > 0 {
+		if problem.Details == nil {
+			problem.Details = map[string]any{}
+		}
+		problem.Details["warnings"] = said
+	}
 	return problem
 }
 

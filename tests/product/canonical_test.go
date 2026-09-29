@@ -302,10 +302,10 @@ func TestPackageInterface(t *testing.T) {
 	if ep.Request.Fields[0].Wire != "required" || ep.Request.Fields[1].Wire != "required" {
 		t.Fatalf("absent wire did not derive required: %+v", ep.Request.Fields)
 	}
-	if launch.ValidatePayload("probe/probe", ep, []byte(`{"strength":0,"mode":"fast"}`)) == nil {
+	if payloadProblem("probe/probe", ep, []byte(`{"strength":0,"mode":"fast"}`)) == nil {
 		t.Error("gt:0 admitted 0")
 	}
-	if e := launch.ValidatePayload("probe/probe", ep, []byte(`{"strength":0.25,"mode":"quality"}`)); e != nil {
+	if e := payloadProblem("probe/probe", ep, []byte(`{"strength":0.25,"mode":"quality"}`)); e != nil {
 		t.Errorf("a valid payload was refused: %s", e.Message)
 	}
 	// Whitespace and key order are NOT identity; a meaning change is.
@@ -358,10 +358,10 @@ func TestPackageInterface(t *testing.T) {
 		}
 		ep, problem := doc.Function("run")
 		fatal(t, problem)
-		if e := launch.ValidatePayload("probe/probe", ep, []byte(`{"strength":0.25,"mode":"quality"}`)); e != nil {
+		if e := payloadProblem("probe/probe", ep, []byte(`{"strength":0.25,"mode":"quality"}`)); e != nil {
 			t.Errorf("%s: a valid payload was refused: %s", name, e.Message)
 		}
-		if launch.ValidatePayload("probe/probe", ep, []byte(`{"strength":0,"mode":"fast"}`)) == nil {
+		if payloadProblem("probe/probe", ep, []byte(`{"strength":0,"mode":"fast"}`)) == nil {
 			t.Errorf("%s: the readable gt:0 bound was dropped", name)
 		}
 	}
