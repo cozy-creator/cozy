@@ -17,7 +17,6 @@ import (
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // AgentModule is the standalone machine server, built from the Runtime repository.
@@ -26,13 +25,11 @@ const AgentModule = "github.com/cozy-creator/cozy-runtime/machine-agent"
 const agentReleases = "https://api.github.com/repos/cozy-creator/cozy/releases"
 
 type agentManifest struct {
-	Name         string `json:"name"`
-	Version      string `json:"version"`
-	WireMinor    uint32 `json:"wire_minor"`
-	MinimumMinor uint32 `json:"minimum_wire_minor"`
-	Artifacts    []struct {
-		OS, Arch, URL, SHA256 string
-	} `json:"artifacts"`
+	Version   string `json:"version"`
+	Platforms map[string]struct {
+		URL    string `json:"url"`
+		SHA256 string `json:"sha256"`
+	} `json:"platforms"`
 }
 
 type agentRelease struct {
@@ -66,7 +63,7 @@ func (h *Host) publishedAgent(ctx context.Context, client *http.Client, releases
 		}
 		for _, release := range batch {
 			if !release.Draft && !release.Prerelease && strings.HasPrefix(release.Tag, "machine-v") {
-				if _, err := pep440.Parse(strings.TrimPrefix(release.Tag, "machine-v")); err == nil {
+				if version, err := pep440.Parse(strings.TrimPrefix(release.Tag, "machine-v")); err == nil && !version.IsPreRelease() {
 					releases = append(releases, release)
 				}
 			}
@@ -95,16 +92,10 @@ func (h *Host) publishedAgent(ctx context.Context, client *http.Client, releases
 		if err := agentJSON(ctx, client, manifestURL, &manifest); err != nil {
 			return "", err
 		}
-		if manifest.Name != "cozy-machine" || "machine-v"+manifest.Version != release.Tag || manifest.MinimumMinor > manifest.WireMinor {
+		if "machine-v"+manifest.Version != release.Tag {
 			return "", fmt.Errorf("%s has an invalid machine manifest", release.Tag)
 		}
-		if manifest.WireMinor < pb.MinCompatibleWireMinor || manifest.MinimumMinor > pb.WireMinor {
-			continue
-		}
-		for _, artifact := range manifest.Artifacts {
-			if artifact.OS != runtime.GOOS || artifact.Arch != runtime.GOARCH {
-				continue
-			}
+		if artifact, ok := manifest.Platforms[runtime.GOOS+"-"+runtime.GOARCH]; ok {
 			want, err := hex.DecodeString(artifact.SHA256)
 			if err != nil || len(want) != sha256.Size || strings.ToLower(artifact.SHA256) != artifact.SHA256 {
 				return "", fmt.Errorf("%s has an invalid artifact digest", release.Tag)

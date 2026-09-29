@@ -874,26 +874,29 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	})
 }
 
-func TestMachineRegistrationToleratesNewHubSettings(t *testing.T) {
+func TestExecutionAccessToleratesNewHubSettings(t *testing.T) {
+	_, ca := hubTLSServer(t, http.NotFoundHandler())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/machines" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/execution-access" {
 			http.NotFound(w, r)
 			return
 		}
+		if r.Header.Get("Authorization") != "Bearer fixture" {
+			t.Error("execution grant did not use the account credential")
+		}
+		var body map[string]any
+		if json.NewDecoder(r.Body).Decode(&body) != nil || body["delegate_certificate_der_b64url"] != base64.RawURLEncoding.EncodeToString(ca) {
+			t.Error("execution grant was not certificate-bound")
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t),
-			"environment": map[string]string{"TENSORHUB_ORIGIN": "https://hub.example", "TENSORHUB_FUTURE_FACT": "1",
-				"COZY_WEBRTC_INTERNAL_PORT": "8445", "SOME_NEW_SETTING": "x"}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "delegated-execution-only", "expires_at": time.Now().Add(time.Hour),
+			"environment": map[string]string{"TENSORHUB_ORIGIN": "https://hub.example", "TENSORHUB_FUTURE_FACT": "1", "COZY_WEBRTC_INTERNAL_PORT": "8445", "SOME_NEW_SETTING": "x"}})
 	}))
 	t.Cleanup(server.Close)
-	machine, problem := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "").RegisterMachine(context.Background())
+	access, problem := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "").AuthorizeExecutionAccess(context.Background(), ca)
 	fatal(t, problem)
-	if machine.Environment["TENSORHUB_ORIGIN"] != "https://hub.example" || machine.Environment["TENSORHUB_FUTURE_FACT"] != "1" {
-		t.Fatalf("the hub's facts were not kept: %v", machine.Environment)
-	}
-	if _, passed := machine.Environment["COZY_WEBRTC_INTERNAL_PORT"]; passed || strings.Join(machine.Ignored, ",") != "COZY_WEBRTC_INTERNAL_PORT,SOME_NEW_SETTING" {
-		t.Fatalf("settings the machine does not read reached it or went unnamed: %v ignored %v", machine.Environment, machine.Ignored)
+	if len(access.Environment) != 1 || access.Environment["TENSORHUB_ORIGIN"] != "https://hub.example" {
+		t.Fatalf("non-access environment reached the machine: %v", access.Environment)
 	}
 }
 

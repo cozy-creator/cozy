@@ -39,16 +39,15 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		}
 		*target = absolute
 	}
-	// The machine's Host is this cozy binary; --host pins another cozy build, for development.
+	// The machine agent is released independently from the CLI.
 	if source.Pinned = source.Host != ""; !source.Pinned {
-		self, err := machines.Self()
-		if err != nil {
-			return exit.Internalf("cannot locate the cozy binary: %s", err)
+		source.Host, problem = host.PublishedAgent(context.Background())
+		if problem != nil {
+			return problem
 		}
-		source.Host = self
-	} else if module := machines.HostModule(source.Host); module != machines.CozyModule {
-		return exit.Usagef("--host %s is not a cozy binary (%s): the machine's Host is cozy itself", source.Host, cmp.Or(module, "not a Go program")).
-			WithRemedy("omit --host to install this cozy")
+	} else if module := machines.HostModule(source.Host); module != machines.AgentModule {
+		return exit.Usagef("--host %s is not a cozy-machine binary (%s)", source.Host, cmp.Or(module, "not a Go program")).
+			WithRemedy("omit --host to install the published machine agent")
 	}
 	uv, err := exec.LookPath("uv")
 	if err != nil {

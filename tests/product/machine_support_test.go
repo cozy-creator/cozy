@@ -114,12 +114,12 @@ func provisionMachineIn(t *testing.T, root, parent string) {
 	})
 	// Everything `cozy machine install` lays out, the wheels it keeps included: a dev Runtime
 	// installs its own SDK into a package's environment from them.
-	for _, link := range []string{"usr/local/bin/pod-supervisor", "usr/local/bin/tfs", "usr/local/bin/uv", "opt/cozy/bin/cozy-runtime-worker", "opt/cozy/python", "opt/cozy/wheels"} {
+	for _, link := range []string{"usr/local/bin/cozy-machine", "usr/local/bin/tfs", "usr/local/bin/uv", "opt/cozy/bin/cozy-runtime-worker", "opt/cozy/python", "opt/cozy/wheels"} {
 		target, err := filepath.EvalSymlinks(filepath.Join(template, "root", link))
 		must(t, err)
 		path := filepath.Join(dir, "root", link)
 		must(t, os.MkdirAll(filepath.Dir(path), 0o755))
-		if strings.HasSuffix(link, "pod-supervisor") {
+		if strings.HasSuffix(link, "cozy-machine") {
 			// Its own path, so the running Host is found and stopped by this root's teardown.
 			if os.Link(target, path) != nil {
 				raw, err := os.ReadFile(target)

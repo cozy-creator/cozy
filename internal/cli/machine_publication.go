@@ -22,7 +22,7 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 		return "", problem
 	}
 	machineID := connection.HubID()
-	if machineID == "" || len(connection.CertificateDER) == 0 || len(connection.CertificateDigest) != sha256.Size {
+	if (!connection.Owned() && machineID == "") || len(connection.CertificateDER) == 0 || len(connection.CertificateDigest) != sha256.Size {
 		return "", exit.Named(exit.Structural, "publication.machine_identity_required", "publication authority requires the machine's pinned certificate identity")
 	}
 	account := connection.Account()

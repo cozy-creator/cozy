@@ -184,10 +184,10 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 	var t target
 	pid := 0
 	if IsLocal(name) {
-		origin = cmp.Or(origin, r.HubOrigin)
+		accountOrigin := cmp.Or(origin, r.HubOrigin)
 		var client *hub.Client
 		if r.Hub != nil {
-			client = r.Hub(origin)
+			client = r.Hub(accountOrigin)
 		}
 		launch, problem := r.Host.Ensure(ctx, origin, client, named)
 		if problem != nil {
@@ -201,7 +201,7 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 		if problem != nil {
 			return nil, problem
 		}
-		machine.hub, machine.hubID, machine.owned, machine.Hub = client, launch.WorkerID, true, launch.Reads
+		machine.hub, machine.owned, machine.Hub = client, true, launch.Reads
 		t = target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
 			lifetime: fmt.Sprint(launch.PID)}
 		pid = launch.PID
@@ -247,7 +247,7 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 		if kept := r.kept[name]; kept != nil && kept.identity == identity {
 			r.mu.Unlock()
 			use := *kept.Machine
-			use.release, use.kept, use.Hub = machine.release, true, machine.Hub
+			use.release, use.kept, use.Hub, use.hub = machine.release, true, machine.Hub, machine.hub
 			return &use, nil
 		}
 		dialing := r.dialing[identity]

@@ -14,13 +14,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,12 +32,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/userunit"
 	"github.com/cozy-creator/cozy/internal/workertls"
+	"github.com/google/uuid"
 )
 
-// Host is this computer's machine: the literal pod-supervisor a rented pod runs, launched
-// detached under a root laid out as the pod's `/`. It outlives the daemon as a pod outlives
-// its controller, and it exits by itself after the same fixed idle period; the next use
-// launches it again.
+// Host installs and discovers the independent machine agent. Its process and durable
+// execution state outlive the personal controller, using the same server as a rented pod.
 type Host struct {
 	dir string
 	// store is the box's one TensorFS store, the location this machine's Host uses for
@@ -74,7 +71,13 @@ func (h *Host) Root() string            { return filepath.Join(h.dir, "root") }
 func (h *Host) path(name string) string { return filepath.Join(h.dir, name) }
 
 // The image layout the Host and Runtime share, rooted.
-func (h *Host) binary() string { return filepath.Join(h.Root(), "usr/local/bin/pod-supervisor") }
+func (h *Host) binary() string {
+	path := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	return filepath.Join(h.Root(), "usr/local/bin/pod-supervisor") // pre-agent installations
+}
 func (h *Host) python() string { return filepath.Join(h.Root(), "opt/cozy/python") }
 
 // wheels holds exactly the Runtime and TensorFS wheels the machine installed from (none after
@@ -88,10 +91,8 @@ func (h *Host) readinessEnvelope() string {
 // RuntimeFloor is the oldest published Runtime proven as a rooted machine worker.
 const RuntimeFloor = "0.18.53"
 
-// Source is one cohort's worker artifacts: the Host binary and the Runtime and TensorFS
-// wheels a pod image carries. Without wheels, the published Runtime is installed. The Host is
-// the cozy binary itself; Pinned keeps a Host named for development in place of the cozy that
-// runs this machine later (Adopt).
+// Source is a machine agent and optional paired development Runtime and TensorFS wheels.
+// Pinned retains an explicitly selected agent instead of adopting a published one.
 type Source struct {
 	Host, RuntimeWheel, TensorFSWheel string
 	Pinned                            bool
@@ -112,7 +113,7 @@ type Installed struct {
 	HostPinned  bool              `json:"host_pinned,omitempty"`
 }
 
-// CozyModule is the Go module of the cozy binary, which is also every machine's Host.
+// CozyModule identifies the old embedded machine server during migration.
 const CozyModule = "github.com/cozy-creator/cozy"
 
 // HostModule is the Go main module a Host binary was built from, "" when it is not Go.
@@ -124,53 +125,22 @@ func HostModule(path string) string {
 	return info.Main.Path
 }
 
-// Self is the cozy binary this process runs, the Host it installs and adopts.
-func Self() (string, error) {
-	self, err := os.Executable()
-	return strings.TrimSuffix(self, " (deleted)"), err
-}
-
-var selfDigest = sync.OnceValue(func() string {
-	self, err := Self()
-	if err != nil {
-		return ""
-	}
-	digest, _ := fileDigest(self)
-	return digest
-})
-
-// placeHost puts a Host binary where the launcher runs it. The cozy binary is kept as
-// usr/local/bin/cozy and runs as pod-supervisor, the name the launch contract starts it by;
-// any other Host is pod-supervisor itself.
+// placeHost atomically installs the independent agent without changing machine state.
 func (h *Host) placeHost(source string) (installedArtifact, error) {
 	digest, err := fileDigest(source)
 	if err != nil {
 		return installedArtifact{}, err
 	}
 	artifact := installedArtifact{Name: filepath.Base(source), SHA256: digest, Module: HostModule(source)}
-	bin := filepath.Join(h.Root(), "usr/local/bin")
-	if err := os.MkdirAll(bin, 0o755); err != nil {
+	target := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return artifact, err
 	}
-	if artifact.Module != CozyModule {
-		_ = os.Remove(filepath.Join(bin, "cozy"))
-		return artifact, copyFile(source, h.binary(), 0o755)
-	}
-	if err := copyFile(source, filepath.Join(bin, "cozy"), 0o755); err != nil {
-		return artifact, err
-	}
-	link := h.binary() + ".new"
-	_ = os.Remove(link)
-	if err := os.Symlink("cozy", link); err != nil {
-		return artifact, err
-	}
-	return artifact, os.Rename(link, h.binary())
+	return artifact, copyFile(source, target, 0o755)
 }
 
-// Adopt makes this cozy binary the machine's Host when the installed Host is another program
-// (the tensorhub pod-supervisor, before one binary) or another cozy build, unless a
-// development install pinned it. A running Host is replaced only when the machine is idle, stopped by
-// its recorded PID; the next use launches this one. Runs, installs and the TensorFS store stay.
+// Adopt migrates an idle legacy installation to the separately released agent. The
+// identity, Runtime journal, outputs, Python environment and TensorFS store stay in place.
 func (h *Host) Adopt(ctx context.Context, idle bool) (bool, *exit.Error) {
 	if !h.Outdated() {
 		return false, nil
@@ -186,20 +156,34 @@ func (h *Host) Adopt(ctx context.Context, idle bool) (bool, *exit.Error) {
 	if problem != nil {
 		return false, problem
 	}
-	if running := record != nil && h.alive(record.PID); running && !idle {
+	if running := record != nil && h.alive(record.PID); running && (!idle || !h.runtimeIdle()) {
 		return false, nil
 	}
 	return h.adoptLocked(ctx)
 }
 
-// Outdated says whether Adopt would replace the installed Host: it is not this cozy, and no
-// development install pinned it.
-func (h *Host) Outdated() bool {
-	installed, problem := h.Installed()
-	if problem != nil || installed == nil || installed.HostPinned || selfDigest() == "" {
+// runtimeIdle requires a fresh explicit Runtime observation. Missing/stale evidence never
+// authorizes replacing a process that may be serving another controller's accepted work.
+func (h *Host) runtimeIdle() bool {
+	path := filepath.Join(h.Root(), "run/cozy/bootstrap/worker-activity")
+	info, err := os.Stat(path)
+	if err != nil || time.Since(info.ModTime()) > 10*time.Second || info.ModTime().After(time.Now().Add(10*time.Second)) {
 		return false
 	}
-	return installed.Host.SHA256 != selfDigest()
+	raw, err := os.ReadFile(path)
+	var state struct {
+		ActiveWork *bool    `json:"active_work"`
+		Holding    []string `json:"holding"`
+	}
+	return err == nil && json.Unmarshal(raw, &state) == nil && state.ActiveWork != nil && !*state.ActiveWork && len(state.Holding) == 0
+}
+
+// Outdated only identifies the legacy embedded Host. Agent upgrades are explicit;
+// updating the CLI does not replace a running machine server.
+func (h *Host) Outdated() bool {
+	installed, problem := h.Installed()
+	return problem == nil && installed != nil && !installed.HostPinned &&
+		cmp.Or(installed.Host.Module, HostModule(h.binary())) != AgentModule
 }
 
 func (h *Host) adoptLocked(ctx context.Context) (bool, *exit.Error) {
@@ -210,24 +194,23 @@ func (h *Host) adoptLocked(ctx context.Context) (bool, *exit.Error) {
 	if problem != nil {
 		return false, problem
 	}
-	module := cmp.Or(installed.Host.Module, HostModule(h.binary()))
-	self, err := Self()
-	if err != nil {
-		return false, nil
+	source, problem := h.PublishedAgent(ctx)
+	if problem != nil {
+		return false, problem
 	}
 	if problem := h.stopLocked(ctx); problem != nil {
 		return false, problem
 	}
-	was := installed.Host.Name
-	if installed.Host, err = h.placeHost(self); err != nil {
-		return false, exit.Internalf("cannot install cozy as the machine Host: %s", err)
+	artifact, err := h.placeHost(source)
+	if err != nil {
+		return false, exit.Internalf("cannot install the machine agent: %s", err)
 	}
-	installed.HostPinned = false
+	installed.Host, installed.HostPinned = artifact, false
 	raw, _ := json.MarshalIndent(installed, "", "  ")
 	if err := writePrivate(h.path("installed.json"), raw); err != nil {
 		return false, exit.Internalf("cannot record the machine installation: %s", err)
 	}
-	h.note(fmt.Sprintf("the machine's Host is now %s (was %s %s)", self, was, module))
+	h.note("adopted independent machine agent; retained machine identity and execution state")
 	return true, nil
 }
 
@@ -248,7 +231,7 @@ func (h *Host) Installed() (*Installed, *exit.Error) {
 
 // Install lays the root out as a pod image does: the Host, a Python 3.12 environment
 // holding the Runtime and TensorFS wheels, and the three executables the image bakes. A
-// running Host is stopped first; the next use launches the new one.
+// running idle agent is stopped first; the next use launches the new one.
 func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installed, *exit.Error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -257,6 +240,15 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		return nil, problem
 	}
 	defer unlock()
+	if record, problem := h.record(); problem != nil {
+		return nil, problem
+	} else if record != nil && h.alive(record.PID) && !h.runtimeIdle() {
+		return nil, exit.Named(exit.Conflict, "machine.busy", "the machine is running work or has not confirmed that it is idle").
+			WithRemedy("wait for accepted work to finish before installing; use machine stop only to explicitly stop the machine")
+	}
+	if _, problem := h.identity(); problem != nil {
+		return nil, problem
+	}
 	installed := Installed{InstalledAt: time.Now().UTC()}
 	if source.Host == "" || (source.RuntimeWheel == "") != (source.TensorFSWheel == "") ||
 		source.RuntimeWheel != "" && (!strings.HasSuffix(source.RuntimeWheel, ".whl") || !strings.HasSuffix(source.TensorFSWheel, ".whl")) {
@@ -377,17 +369,6 @@ type hostRecord struct {
 // names (ReleaseRoot.hub and the rest), instead of only at the hub it was launched for.
 const HubPerRunWire = 67
 
-// serves says whether the Host runs hub's work where it is: at its own hub, or, for work
-// whose every call names its hub (named), at another it holds a registration for once it
-// reads a run's hub. reads is what such a call names.
-func (r *hostRecord) serves(hub string, named bool) (reads string, ok bool) {
-	if r.Hub == hub {
-		return "", true
-	}
-	reads = r.Hubs[hub]
-	return reads, named && reads != "" && r.WireMinor >= HubPerRunWire
-}
-
 type cachedLaunch struct {
 	*Launch
 	record hostRecord
@@ -414,37 +395,44 @@ func (l *Launch) at(reads string) *Launch {
 	return &out
 }
 
-// Ensure answers the running Host, launching it when none runs. hubOrigin is the hub whose
-// work it is asked for, client speaks to that hub as the signed-in user, and named says that
-// work names its hub on every call. A Host that cannot do that work where it is moves there.
-func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client, named bool) (*Launch, *exit.Error) {
+// Ensure starts the machine independently of any Hub. A named Hub receives a scoped
+// execution credential only after the agent proves its TLS identity; it never owns this
+// machine's identity or lifecycle. Empty hubOrigin is entirely offline.
+func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client, _ bool) (*Launch, *exit.Error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if cached := h.cached; cached != nil && h.alive(cached.PID) {
-		if reads, ok := cached.record.serves(hubOrigin, named); ok {
-			return cached.at(reads), nil
-		}
-	}
 	unlock, problem := h.lock(ctx)
 	if problem != nil {
 		return nil, problem
 	}
 	defer unlock()
-	record, problem := h.record()
-	if problem != nil {
-		return nil, problem
+	var launch *Launch
+	if cached := h.cached; cached != nil && h.alive(cached.PID) {
+		launch = cached.Launch
 	}
-	if record != nil && h.alive(record.PID) {
-		if reads, ok := record.serves(hubOrigin, named); !ok {
-			// One root holds one Host: the machine moves to the selected hub.
-			if problem := h.stopLocked(ctx); problem != nil {
+	if launch == nil {
+		record, problem := h.record()
+		if problem != nil {
+			return nil, problem
+		}
+		if record != nil && h.alive(record.PID) {
+			launch, problem = h.await(ctx, record)
+			if problem != nil {
 				return nil, problem
 			}
-		} else if launch, problem := h.await(ctx, record); problem == nil || h.alive(record.PID) {
-			return h.remember(launch, *record).at(reads), problem
+			h.remember(launch, *record)
+		} else {
+			launch, problem = h.launchLocked(ctx)
+			if problem != nil {
+				return nil, problem
+			}
 		}
 	}
-	return h.launchLocked(ctx, hubOrigin, client)
+	if hubOrigin == "" {
+		return launch.at(""), nil
+	}
+	reads, problem := h.attachAccess(ctx, launch, hubOrigin, client)
+	return launch.at(reads), problem
 }
 
 func (h *Host) remember(launch *Launch, record hostRecord) *Launch {
@@ -483,14 +471,11 @@ func (h *Host) Dialed(ctx context.Context, pid int, wireMinor uint32) {
 	}
 }
 
-// Serves says whether the running Host does hub's work without moving; false when none runs.
-func (h *Host) Serves(hub string, named bool) bool {
+// Serves remains true for every Hub: changing catalog/account context never moves a
+// persistent machine or stops accepted work.
+func (h *Host) Serves(_ string, _ bool) bool {
 	record, problem := h.record()
-	if problem != nil || record == nil || !h.alive(record.PID) {
-		return false
-	}
-	_, ok := record.serves(hub, named)
-	return ok
+	return problem == nil && record != nil && h.alive(record.PID)
 }
 
 // await reads the recorded Host's readiness receipt, waiting while it boots.
@@ -528,8 +513,12 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 	}
 }
 
-func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.Client) (*Launch, *exit.Error) {
-	// Nothing runs: the cozy binary takes over from any other Host first.
+func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
+	id, problem := h.identity()
+	if problem != nil {
+		return nil, problem
+	}
+	// Nothing runs: migrate the legacy embedded Host before the next launch.
 	if _, problem := h.adoptLocked(ctx); problem != nil {
 		return nil, problem
 	}
@@ -540,19 +529,6 @@ func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.C
 	if installed == nil {
 		return nil, exit.Named(exit.Structural, "machine.not_installed", "this computer has no machine installed").
 			WithRemedy("cozy machine install")
-	}
-	registered, problem := h.registration(ctx, hubOrigin, client)
-	if problem != nil {
-		return nil, problem
-	}
-	all, problem := h.registrations()
-	if problem != nil {
-		return nil, problem
-	}
-	environment := registered.Environment
-	if len(environment) == 0 {
-		return nil, exit.Named(exit.Unavailable, "machine.environment_unavailable", "this machine's registration with %s recorded no hub environment", hubOrigin).
-			WithRemedy("re-register it: remove %s and run it again", h.path("registrations.json"))
 	}
 	owner, problem := rental.OwnerIdentityAt(h.path("owner.pem"))
 	if problem != nil {
@@ -578,42 +554,18 @@ func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.C
 	base := append([]string{
 		"COZY_MACHINE_ROOT=" + h.Root(),
 		"COZY_LISTEN_HOST=127.0.0.1",
-		"COZY_WORKER_ID=" + registered.ID,
-		"COZY_WORKER_AUTH_TOKEN=" + registered.WorkerToken,
+		"COZY_WORKER_ID=" + id,
+		"COZY_MACHINE_LIFETIME=persistent",
 		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL=" + base64.RawURLEncoding.EncodeToString(key),
 		"COZY_RECORD_OWNER_AUTH_JSON=" + string(auth),
 	}, h.inherited...)
 	if h.store != "" {
 		base = append(base, "COZY_TENSORFS_ROOT="+h.store)
 	}
-	names := make([]string, 0, len(environment))
-	for name := range environment {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		base = append(base, name+"="+environment[name])
-	}
-	// Every other registration rides along: a machine that reads a run's hub (wire 67)
-	// serves each of them without moving; an older one ignores them.
-	held := map[string]string{hubOrigin: environment["TENSORHUB_ORIGIN"]}
-	var others []map[string]any
-	for _, origin := range slices.Sorted(maps.Keys(all)) {
-		other := all[origin]
-		if origin == hubOrigin || other.ID == "" || other.Environment["TENSORHUB_ORIGIN"] == "" {
-			continue
-		}
-		held[origin] = other.Environment["TENSORHUB_ORIGIN"]
-		others = append(others, map[string]any{"worker_id": other.ID, "worker_token": other.WorkerToken, "environment": other.Environment})
-	}
-	if len(others) > 0 {
-		raw, _ := json.Marshal(others)
-		base = append(base, "COZY_MACHINE_HUBS_JSON="+string(raw))
-	}
 	// Free ports are chosen, not reserved: a port taken before the Host binds it ends
 	// that Host before readiness, and the next launch chooses again.
 	for attempt := 0; ; attempt++ {
-		launch, record, problem := h.start(ctx, base, key, hostRecord{Hub: hubOrigin, WorkerID: registered.ID, Hubs: held})
+		launch, record, problem := h.start(ctx, base, key, hostRecord{WorkerID: id})
 		if problem == nil || problem.ErrName() != "machine.host_port_taken" || attempt == 2 {
 			return h.remember(launch, record), problem
 		}
@@ -737,20 +689,16 @@ func (h *Host) Status() (Status, *exit.Error) {
 		return Status{}, problem
 	}
 	out := Status{Installed: installed}
-	registered, problem := h.registrations()
-	if problem != nil {
-		return Status{}, problem
-	}
 	record, problem := h.record()
 	if problem != nil {
 		return Status{}, problem
 	}
 	if record != nil {
-		out.PID, out.Running = record.PID, h.alive(record.PID)
-		out.MachineID, out.Hub = registered[record.Hub].ID, record.Hub
-	} else if len(registered) == 1 {
-		for hub, one := range registered {
-			out.MachineID, out.Hub = one.ID, hub
+		out.PID, out.Running, out.MachineID = record.PID, h.alive(record.PID), record.WorkerID
+	}
+	if out.MachineID == "" {
+		if raw, err := os.ReadFile(h.path("machine-id")); err == nil {
+			out.MachineID = strings.TrimSpace(string(raw))
 		}
 	}
 	return out, nil
@@ -794,32 +742,50 @@ func (h *Host) registrations() (map[string]registration, *exit.Error) {
 	return out, nil
 }
 
-func (h *Host) registration(ctx context.Context, hubOrigin string, client *hub.Client) (registration, *exit.Error) {
-	all, problem := h.registrations()
-	if problem != nil {
-		return registration{}, problem
+// identity is locally allocated once. Import the last active legacy identity on adoption
+// so old records retain their machine, without retaining its Hub worker capability.
+func (h *Host) identity() (string, *exit.Error) {
+	if raw, err := os.ReadFile(h.path("machine-id")); err == nil {
+		id := strings.TrimSpace(string(raw))
+		if id == "" || len(id) > 128 || strings.ContainsAny(id, "/?#% \t\r\n") {
+			return "", exit.New(exit.Conflict, "the machine identity is unreadable")
+		}
+		return id, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", exit.Internalf("cannot read machine identity: %s", err)
 	}
-	if registered, ok := all[hubOrigin]; ok && registered.ID != "" {
-		return registered, nil
+	id := ""
+	if record, problem := h.record(); problem != nil {
+		return "", problem
+	} else if record != nil {
+		id = record.WorkerID
 	}
-	if client == nil {
-		return registration{}, exit.Named(exit.Credential, "machine.registration_required", "this machine is not registered with %s", hubOrigin)
+	if id == "" {
+		all, problem := h.registrations()
+		if problem != nil {
+			return "", problem
+		}
+		keys := make([]string, 0, len(all))
+		for key := range all {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			if all[key].ID != "" {
+				id = all[key].ID
+				break
+			}
+		}
 	}
-	machine, problem := client.RegisterMachine(ctx)
-	if problem != nil {
-		return registration{}, problem.WithRemedy("sign in with `cozy auth login`; a machine is registered to the user who owns it")
+	if id == "" {
+		id = "machine-" + uuid.NewString()
 	}
-	if len(machine.Ignored) > 0 {
-		h.note(fmt.Sprintf("the hub %s sent settings this machine does not read: %s; ignored", hubOrigin, strings.Join(machine.Ignored, ", ")))
+	if err := writePrivate(h.path("machine-id"), []byte(id+"\n")); err != nil {
+		return "", exit.Internalf("cannot record machine identity: %s", err)
 	}
-	registered := registration{Hub: hubOrigin, ID: machine.ID, WorkerToken: machine.WorkerToken, Environment: machine.Environment}
-	all[hubOrigin] = registered
-	raw, _ := json.Marshal(all)
-	if err := writePrivate(h.path("registrations.json"), raw); err != nil {
-		return registration{}, exit.Internalf("cannot record the machine registration: %s", err)
-	}
-	return registered, nil
+	return id, nil
 }
+
 func (h *Host) secret(name string) (string, *exit.Error) {
 	if raw, err := os.ReadFile(h.path(name)); err == nil && len(raw) == 43 {
 		return string(raw), nil
@@ -859,8 +825,13 @@ func (h *Host) alive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	binary, err := filepath.EvalSymlinks(h.binary())
-	return err == nil && strings.TrimSuffix(target, " (deleted)") == binary
+	for _, name := range []string{"cozy-machine", "pod-supervisor", "cozy"} {
+		binary, err := filepath.EvalSymlinks(filepath.Join(h.Root(), "usr/local/bin", name))
+		if err == nil && strings.TrimSuffix(target, " (deleted)") == binary {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Host) lock(ctx context.Context) (func(), *exit.Error) {
