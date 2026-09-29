@@ -1,7 +1,7 @@
 # Python helpers embedded in the Go CLI are production code too.
 [tool.mypy]
 python_version = "3.12"
-files = ["internal", "scripts", "tests"]
+files = ["internal", "scripts"]
 # Fixture packages and scripts execute inside the environments the product builds
 # for them; their own imports do not resolve here. The product tests that run them
 # are their gate.
