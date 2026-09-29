@@ -59,7 +59,10 @@ type Submission struct {
 	OutputDirectory string `json:"output_directory,omitempty"`
 	// AttentionKernel is an optional developer execution-path pin.
 	AttentionKernel string `json:"attention_kernel,omitempty"`
-	AttemptKey      string `json:"-"`
+	// Ignored names the undeclared fields the client dropped from Input; the run records
+	// them as its warning.
+	Ignored    []string `json:"ignored_fields,omitempty"`
+	AttemptKey string   `json:"-"`
 }
 
 // Handle is the 202 answer: the request's id and where to go next. Verbatim from the
@@ -182,6 +185,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
+		spec.Warnings = ignoredWarnings(sub.Package, sub.Function, sub.Ignored)
 		// The DAEMON is the process that publishes --out, so the daemon probes the
 		// destination — here, where the path is finally resolved, before an input is
 		// bound or a row recorded. A doomed export refuses in milliseconds instead
@@ -676,7 +680,9 @@ func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission)
 	if problem := entrypoint.RequirePublic(); problem != nil {
 		return problem
 	}
-	if e := launch.ValidatePayload(out.Package, entrypoint, out.Payload); e != nil {
+	// Undeclared fields pass through: the Runtime that decodes the request drops them and
+	// records its warning, as the CLI did for the ones it dropped before submitting.
+	if _, _, e := launch.ValidatePayload(out.Package, entrypoint, out.Payload); e != nil {
 		return e
 	}
 	for index := range out.Assets {
@@ -695,6 +701,13 @@ func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission)
 		asset.MaxBytes = assetSpec.MaxBytes
 	}
 	return launch.ValidateAssetCounts(entrypoint, out.Assets)
+}
+
+func ignoredWarnings(pkg, function string, ignored []string) []records.Warning {
+	if len(ignored) == 0 {
+		return nil
+	}
+	return []records.Warning{launch.IgnoredWarning(pkg+"/"+function, ignored)}
 }
 
 func placementPlan(placement orchestrator.DesiredPlacement, function string) (string, []string, *exit.Error) {

@@ -443,6 +443,13 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 
 // --------------------------------------------------------------------------- requests
 
+// Warning is one fact about a run that did not fail it.
+type Warning struct {
+	Code    string   `json:"code,omitempty"`
+	Message string   `json:"message"`
+	Fields  []string `json:"fields,omitempty"`
+}
+
 type Request struct {
 	// Hub is the Tensorhub origin this request belongs to. Every hub operation for it
 	// (resolution, rental acquisition, transfer, publication) addresses this origin.
@@ -490,6 +497,8 @@ type Request struct {
 	// this request, before any scheduler can create a local attempt.
 	MachineExecutionObserver bool   `json:"-"`
 	DeadlineUnixMS           uint64 `json:"-"` // frozen submission event is its durable source
+	// Warnings are admission-only: each becomes one request.warning event with the row.
+	Warnings []Warning `json:"-"`
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
 	// retained operation namespace shared by explicitly related revisions.
 	RetryOf                string
@@ -1604,6 +1613,15 @@ func (s *Store) SubmitWithEvent(r Request, event map[string]any) (Request, bool,
 	if fresh && event != nil {
 		if err := appendEventTx(tx, recorded.ID, "run.created", 0, event); err != nil {
 			return Request{}, false, exit.Internalf("cannot freeze request submission intent: %s", err)
+		}
+	}
+	for _, warning := range r.Warnings {
+		if !fresh {
+			break
+		}
+		payload := map[string]any{"code": warning.Code, "message": warning.Message, "fields": warning.Fields}
+		if err := appendEventTx(tx, recorded.ID, "request.warning", 0, payload); err != nil {
+			return Request{}, false, exit.Internalf("cannot record a request warning: %s", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

@@ -79,7 +79,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 	} else if json.Unmarshal(payload, &arguments) != nil {
 		return out, "", exit.New(exit.Validation, "child input is not an object")
 	}
-	if problem := launch.ValidatePayload(install.Package, job, payload); problem != nil {
+	if _, _, problem := launch.ValidatePayload(install.Package, job, payload); problem != nil {
 		return out, "", problem
 	}
 	if revision != "" {

@@ -31,7 +31,7 @@ func TestMultipleOfInterfaceAndExactPayload(t *testing.T) {
 			if entry.Request.Fields[0].Constraints.MultipleOf == nil {
 				t.Fatal("multiple_of was dropped")
 			}
-			problem = launch.ValidatePayload("paul/example", entry, json.RawMessage(`{"value":`+example.value+`}`))
+			problem = payloadProblem("paul/example", entry, json.RawMessage(`{"value":`+example.value+`}`))
 			if (problem == nil) != example.valid {
 				t.Fatalf("valid=%v problem=%v", example.valid, problem)
 			}
@@ -52,7 +52,7 @@ func TestMultipleOfUnreadableBoundIsLeftToRuntime(t *testing.T) {
 		}
 		entry, problem := surface.Function("generate")
 		fatal(t, problem)
-		if problem := launch.ValidatePayload("paul/example", entry, json.RawMessage(`{"value":7}`)); problem != nil {
+		if problem := payloadProblem("paul/example", entry, json.RawMessage(`{"value":7}`)); problem != nil {
 			t.Fatalf("multiple_of %s refused the request: %s", value, problem.Message)
 		}
 	}

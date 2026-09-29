@@ -75,6 +75,9 @@ type Submission struct {
 	// It is the only machine-class decision retained on a request.
 	NeedsAccelerator bool
 
+	// Warnings are recorded with the request, one request.warning event each.
+	Warnings []records.Warning
+
 	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
 	// through Options.Rentals). Empty = any local worker.
 	Worker          string
@@ -288,6 +291,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, RentNew: s.RentNew, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer, PlannedSourceBytes: s.PlannedSourceBytes,
+		Warnings: s.Warnings,
 	}
 	event := map[string]any{
 		"retain_work": s.RetainWork,

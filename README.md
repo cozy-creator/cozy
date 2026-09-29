@@ -270,6 +270,10 @@ nested lists such as `segments`, from a JSON or YAML file (`.yaml`/`.yml`; YAML 
 `yes` stays a string). Inline arguments override file values; use `field:=<json>` for a
 nested inline value. `--input-tree` separately binds a job input directory.
 
+A field the function does not declare, at any depth, is dropped with one warning naming it
+(`--json` and `cozy run show` carry it as `warnings`). Types, required fields and bounds are
+still checked.
+
 Schema-declared media fields in a request file can contain local filenames, for example
 `"image": "./characters/hero.png"` inside `references`. Relative paths resolve beside
 the file; absolute paths and `~/` also work. Creator verifies and transfers them

@@ -15,6 +15,14 @@ func buildStamp() (string, bool) { return build.Revision() }
 
 // emit is the only success-document seam.
 func emit(ctx *Context, document output.Document) *exit.Error {
+	if record, ok := document.(output.Record); ok && ctx.Mode().JSON && len(ctx.said()) > 0 {
+		warnings := output.Field{K: "warnings", V: ctx.said()}
+		record.Fields = append(record.Fields, warnings)
+		if len(record.AllFields) > 0 {
+			record.AllFields = append(record.AllFields, warnings)
+		}
+		document = record
+	}
 	if err := document.Emit(ctx.Out, ctx.Mode()); err != nil {
 		var problem *output.Error
 		if errors.As(err, &problem) && problem.Class == output.Usage {
