@@ -249,17 +249,17 @@ development versions, and versions newer than the registry unchanged. Each packa
 is reported as updated, current, failed, or skipped; a failure leaves its previous
 install active and does not stop other packages.
 
-`--input=request.json` reads the whole payload, including nested lists such as `shots`,
-from a JSON file. Inline arguments override file values; use `field:=<json>` for a
-nested inline value. `--in` remains an alias. `--input-tree` separately binds a job
-input directory.
+`--input=request.json` or `--input=~/request.yaml` reads the whole payload, including
+nested lists such as `segments`, from a JSON or YAML file (`.yaml`/`.yml`; YAML 1.2, so
+`yes` stays a string). Inline arguments override file values; use `field:=<json>` for a
+nested inline value. `--input-tree` separately binds a job input directory.
 
-Schema-declared media fields in a JSON request can contain local filenames, for example
+Schema-declared media fields in a request file can contain local filenames, for example
 `"image": "./characters/hero.png"` inside `references`. Relative paths resolve beside
-the JSON file; absolute paths and `~/` also work. Creator verifies and transfers them
+the file; absolute paths and `~/` also work. Creator verifies and transfers them
 through the same asset bindings as `--asset references.0.image=/path/to/hero.png`.
 Ordinary description/prompt strings are never interpreted as files. Supplying the same
-field in JSON and with `--asset` is an error. These inputs accept local files, not URLs.
+field in the file and with `--asset` is an error. These inputs accept local files, not URLs.
 
 `--upload-to` uploads each declared weight output as an owner-only immutable checkpoint;
 it publishes no release. A rented job run without it keeps those outputs retained on its

@@ -18,7 +18,11 @@ import (
 
 func runInputJSONRoot(t *testing.T) string {
 	t.Helper()
-	raw := []byte(`{"application":"fixture:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"name":"prepare","publishes":false,"request":{"fields":[{"name":"shots","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"}]}}},{"name":"steps","type":"int"}]},"result":{"fields":[]}}]}`)
+	raw := []byte(`{"application":"fixture:app","format":"cozy.package.interface/1",` +
+		`"entrypoints":[{"name":"long_form","request":{"fields":[{"name":"style","type":"str"},{"name":"mode","type":"str"},{"name":"seed","type":"int"},` +
+		`{"name":"references","type":{"list":{"fields":[{"name":"name","type":"str"},{"name":"kind","type":"str"},{"name":"description","type":"str"}]}}},` +
+		`{"name":"segments","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"duration_s","type":"float"}]}}}]},"result":{"fields":[]}}],` +
+		`"jobs":[{"name":"prepare","publishes":false,"request":{"fields":[{"name":"shots","type":{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"}]}}},{"name":"steps","type":"int"}]},"result":{"fields":[]}}]}`)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail
@@ -85,7 +89,76 @@ func TestRunInputJSONFileAndAliasPreserveNestedPayload(t *testing.T) {
 
 func TestRunHelpUsesInputJSONName(t *testing.T) {
 	code, out := runCozy(t, t.TempDir(), "run", "proof/input/prepare", "--help")
-	if code != 0 || !strings.Contains(out, "--input=") || !strings.Contains(out, "JSON file") || !strings.Contains(out, "--input-tree=") {
+	if code != 0 || !strings.Contains(out, "--input=") || !strings.Contains(out, "YAML") || !strings.Contains(out, "--input-tree=") {
 		t.Fatalf("input help: %d %s", code, out)
+	}
+}
+
+// The same long-form request as JSON and as YAML submits the same body: YAML 1.2 keeps
+// `yes` a string, a seed past 2^53 stays exact, anchors expand, and `~/` follows $HOME.
+func TestRunInputYAMLSubmitsTheJSONBody(t *testing.T) {
+	root := runInputJSONRoot(t)
+	home := t.TempDir()
+	jsonPath := filepath.Join(root, "long.json")
+	must(t, os.WriteFile(jsonPath, []byte(`{"style":"Soft watercolor.","mode":"yes","seed":9007199254740993,`+
+		`"references":[{"name":"Ada","kind":"character","description":"A courier in a green coat."},`+
+		`{"name":"Harbor","kind":"scene","description":"A courier in a green coat."}],`+
+		`"segments":[{"prompt":"<Ada> walks the pier.","duration_s":10},{"prompt":"Gulls lift off.\nThe tide turns.","duration_s":7.5}]}`), 0600))
+	yamlText := `# a long-form request
+style: Soft watercolor.
+mode: yes
+seed: 9007199254740993
+references:
+  - name: Ada
+    kind: character
+    description: &coat A courier in a green coat.
+  - {name: Harbor, kind: scene, description: *coat}
+segments:
+  - prompt: <Ada> walks the pier.
+    duration_s: 10
+  - prompt: |-
+      Gulls lift off.
+      The tide turns.
+    duration_s: 7.5
+`
+	must(t, os.WriteFile(filepath.Join(home, "long.yaml"), []byte(yamlText), 0600))
+	must(t, os.WriteFile(filepath.Join(home, "long.request"), []byte(yamlText), 0600))
+	withHome := []string{"HOME=" + home}
+	submit := func(key string, args ...string) string {
+		t.Helper()
+		args = append(append([]string{"run", "proof/input/long_form"}, args...), "--rental-only", "--json")
+		request, _, out := submitRunWith(t, root, key, withHome, args...)
+		if request == nil {
+			t.Fatalf("%s was not submitted: %s", key, out)
+		}
+		return string(request.Payload)
+	}
+	fromJSON := submit("long-json", "--input="+jsonPath)
+	fromYAML := submit("long-yaml", "--input=~/long.yaml")
+	if fromYAML != fromJSON || !strings.Contains(fromYAML, `"mode":"yes"`) || !strings.Contains(fromYAML, `"seed":9007199254740993`) {
+		t.Fatalf("YAML body differs from JSON:\n%s\n%s", fromYAML, fromJSON)
+	}
+	overridden := submit("long-override", "--input=~/long.request", "mode=no", "seed=7")
+	if !strings.Contains(overridden, `"mode":"no"`) || !strings.Contains(overridden, `"seed":7`) || !strings.Contains(overridden, "Gulls lift off.") {
+		t.Fatalf("inline fields did not override the YAML file: %s", overridden)
+	}
+
+	ten := func(item string) string { return "[" + strings.TrimSuffix(strings.Repeat(item+", ", 10), ", ") + "]\n" }
+	laughs := "a: &a " + ten("x") + "b: &b " + ten("*a") + "c: &c " + ten("*b") + "d: &d " + ten("*c") + "e: &e " + ten("*d")
+	for file, want := range map[string]struct {
+		text, code string
+		line       int
+	}{
+		"syntax.yaml": {"style: ok\nmode: [open\nseed: 1\n", "input.yaml_syntax", 2},
+		"two.yaml":    {"style: a\n---\nstyle: b\n", "input.yaml_documents", 2},
+		"key.yaml":    {"style: a\n1: b\n", "input.yaml_key", 2},
+		"laughs.yaml": {laughs, "input.yaml_aliases", 5},
+	} {
+		path := filepath.Join(root, file)
+		must(t, os.WriteFile(path, []byte(want.text), 0600))
+		code, out := runCozy(t, root, "run", "proof/input/long_form", "--input="+path, "--rental-only", "--json")
+		if code == 0 || !strings.Contains(out, want.code) || !strings.Contains(out, fmt.Sprintf("%s:%d:", path, want.line)) {
+			t.Fatalf("%s: %d %s", file, code, out)
+		}
 	}
 }

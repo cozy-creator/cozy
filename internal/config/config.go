@@ -539,6 +539,19 @@ func DefaultHome() string {
 	return filepath.Join(home, ".cozy")
 }
 
+// ExpandHome expands a leading `~` or `~/` against $HOME, as a shell does; a flag like
+// `--input=~/x` reaches argv unexpanded.
+func ExpandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, path[1:]), nil
+}
+
 // resolveTensorFSRoot turns the configured TensorFS root into an absolute path, or
 // derives the product default `~/.tensorfs`. There is deliberately no `~/.cozy/cas`
 // fallback and no compatibility lookup (proto-030).
