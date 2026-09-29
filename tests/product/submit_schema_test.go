@@ -216,15 +216,15 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	injected.Offer.RequestId = "schema-past-client"
 	injected.PayloadCanonicalBytes = []byte(`{"size":"big"}`)
 	injected.Claim = machine.Claim
-	var accepted *pb.MachineExecutionReceipt
+	var injectedReceipt *pb.MachineExecutionReceipt
 	for {
-		accepted, err = machine.Host.SubmitMachineExecution(ctx, injected)
+		injectedReceipt, err = machine.Host.SubmitMachineExecution(ctx, injected)
 		if status.Code(err) == codes.Unavailable && ctx.Err() == nil {
 			time.Sleep(100 * time.Millisecond)
 			continue // asynchronous preparation, under the unchanged test deadline
 		}
 		must(t, err)
-		if accepted == nil || accepted.RequestId != injected.Offer.RequestId || accepted.ExecutionWorkspaceId != injected.ExpectedExecutionWorkspaceId {
+		if injectedReceipt == nil || injectedReceipt.RequestId != injected.Offer.RequestId || injectedReceipt.ExecutionWorkspaceId != injected.ExpectedExecutionWorkspaceId {
 			t.Fatal("Runtime did not journal the injected request under its exact identity")
 		}
 		break

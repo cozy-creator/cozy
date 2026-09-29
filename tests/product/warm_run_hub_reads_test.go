@@ -101,9 +101,9 @@ def touch(payload: TouchRequest, source: Probe) -> TouchResult:
 	return project
 }
 
-// A warm run of a published release makes no Hub request, from the CLI or from the machine:
+// A warm run of a published release makes no Hub content request, from the CLI or machine:
 // the machine read the owner's binding and resolved its lane at its own Hub on the cold run
-// and kept both. On this computer's machine and on a rental, with the real Host and Runtime.
+// and kept both. Rental authority still refreshes independently of content reuse.
 func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root)
@@ -111,7 +111,8 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	var seen []string
 	count := func(hub string, handler http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !strings.HasPrefix(r.URL.Path, "/v1/rentals") { // the fleet's own reconciliation
+			authority := r.Method == http.MethodGet && r.URL.Path == "/v1/worker/rental/authorized-keys"
+			if !strings.HasPrefix(r.URL.Path, "/v1/rentals") && !authority {
 				mu.Lock()
 				seen = append(seen, hub+" "+r.Method+" "+r.URL.Path)
 				mu.Unlock()
