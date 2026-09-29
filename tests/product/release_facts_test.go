@@ -12,8 +12,8 @@ import (
 )
 
 // `cozy rental update` reads the pinned PodHost's protocol range over the real TLS
-// probe and refuses a Runtime whose declared wire minimum that host does not reach, or
-// that declares no readable range.
+// probe and refuses a Runtime whose declared wire minimum that host does not reach. A
+// range the wheel does not state readably proceeds: the Host gates each operation.
 func TestRuntimeUpdateRefusesRuntimeAheadOfHost(t *testing.T) {
 	for _, test := range []struct {
 		host   uint32
@@ -24,8 +24,8 @@ func TestRuntimeUpdateRefusesRuntimeAheadOfHost(t *testing.T) {
 		{60, &rental.RuntimeWire{WireMinor: 61, MinimumWireMinor: 60}, ""},
 		{61, &rental.RuntimeWire{WireMinor: 61, MinimumWireMinor: 61}, ""},
 		{61, &rental.RuntimeWire{WireMinor: 62, MinimumWireMinor: 62}, "rental.runtime_update_host_too_old"},
-		{61, nil, "rental.runtime_update_range_unreadable"},
-		{61, &rental.RuntimeWire{WireMinor: 60, MinimumWireMinor: 61}, "rental.runtime_update_range_unreadable"},
+		{61, nil, ""},
+		{61, &rental.RuntimeWire{WireMinor: 60, MinimumWireMinor: 61}, ""},
 	} {
 		public, _, err := ed25519.GenerateKey(rand.Reader)
 		must(t, err)
