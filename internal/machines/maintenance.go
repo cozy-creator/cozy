@@ -3,8 +3,10 @@ package machines
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"slices"
@@ -80,10 +82,17 @@ func (c *Maintenance) Do(ctx context.Context, method, path string, body io.Reade
 	request.Header.Set("Authorization", "Cozy-Cap "+token)
 	response, err := c.Client.Do(request)
 	if err != nil {
+		var verification *tls.CertificateVerificationError
+		if errors.As(err, &verification) {
+			return 0, exit.Named(exit.Credential, "machine.certificate_untrusted", "the machine did not prove its pinned identity: %s", err)
+		}
 		return 0, exit.Unavailablef("the machine did not answer: %s", err)
 	}
 	defer response.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	raw, readError := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if readError != nil && response.StatusCode/100 == 2 {
+		return response.StatusCode, exit.Unavailablef("the machine's response was interrupted: %s", readError)
+	}
 	if response.StatusCode/100 != 2 {
 		var refusal struct{ Code, Message string }
 		if json.Unmarshal(raw, &refusal) == nil && refusal.Code == "runtime_starting" {
@@ -157,6 +166,40 @@ func (c *Maintenance) AwaitUpdateAdmission(ctx context.Context) (*RuntimeState, 
 		select {
 		case <-ctx.Done():
 			return nil, exit.Named(exit.Canceled, "machine.readiness_observation_lost", "Runtime readiness observation ended")
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// AwaitUpdate observes one accepted operation across application replacement.
+// Readiness and transport gaps are observations, never authority to submit again.
+func (c *Maintenance) AwaitUpdate(ctx context.Context, operation string) (*RuntimeState, *exit.Error) {
+	detached := func() (*RuntimeState, *exit.Error) {
+		return nil, exit.Named(exit.Canceled, "machine.update_observation_lost", "update %s continues on the machine; observation ended: %s", operation, ctx.Err())
+	}
+	for {
+		if ctx.Err() != nil {
+			return detached()
+		}
+		state, problem := c.State(ctx)
+		if ctx.Err() != nil {
+			return detached()
+		}
+		if problem != nil {
+			if problem.Code != exit.Unavailable {
+				return nil, exit.Named(problem.Code, "machine.update_observation_lost", "update %s continues on the machine; observation ended: %s", operation, problem)
+			}
+		} else {
+			if state.Update == nil || state.Update.Operation != operation {
+				return nil, exit.Named(exit.Unavailable, "machine.update_observation_lost", "update %s is no longer the machine's current operation; its outcome must be inspected before another install", operation)
+			}
+			if updateTerminal(state.Update.State) {
+				return state, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return detached()
 		case <-time.After(time.Second):
 		}
 	}
