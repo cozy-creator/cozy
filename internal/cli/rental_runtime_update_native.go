@@ -165,6 +165,19 @@ func (u *rentalRuntimeUpdates) followNative(ctx context.Context, row *records.Ru
 			return exit.Named(exit.Unavailable, "machine.update_observation_lost", "update %s is no longer the machine's current operation; inspect its outcome before another update", operation)
 		} else if update := state.Update; update != nil && update.Operation == operation {
 			switch update.State {
+			case "prepared", "waiting_activation":
+				// The candidate is durable and the old pair remains active while
+				// current work drains. Keep the daemon's hold and continue observing;
+				// this is a successful admission of the update, not activation.
+				if row.State != "waiting_activation" {
+					row.State = "waiting_activation"
+					row.Error = ""
+					row.Result, _ = json.Marshal(map[string]any{"native": true, "update": update,
+						"observed": map[string]any{"runtime": map[string]string{"distribution": state.Runtime}, "tensorfs": state.TensorFS, "agent": state.Agent, "bootstrap": state.Bootstrap}})
+					if save := u.machines.store.SaveRuntimeUpdate(*row); save != nil {
+						return save
+					}
+				}
 			case "succeeded", "rolled_back", "failed":
 				// The worker boot is the same; its Runtime is not. The next call claims it again.
 				u.machines.machines.Forget(row.RentalID)

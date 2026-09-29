@@ -114,6 +114,28 @@ func TestAcceptedMachineUpdateObservationKeepsTerminalFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestAcceptedMachineUpdateObservationReturnsPendingActivation(t *testing.T) {
+	client, calls := updateObservationPeer(t, func(w http.ResponseWriter, _ *http.Request, _ int32) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"phase": "ready", "capabilities": []string{machines.RuntimeUpdateCapability},
+			"runtime": "0.18.88", "tensorfs": "0.3.78",
+			"agent":     map[string]any{"version": "0.18.88", "sha256": strings.Repeat("a", 64), "selection": "bundled"},
+			"bootstrap": map[string]any{"abi": machines.BootstrapCapability},
+			"update": map[string]any{
+				"operation": "accepted-operation", "state": "waiting_activation",
+				"from": map[string]string{"runtime": "0.18.88", "tensorfs": "0.3.78"},
+				"to":   map[string]string{"runtime": "0.18.89", "tensorfs": "0.3.78"},
+			},
+		})
+	})
+	state, problem := client.AwaitUpdateOrPending(t.Context(), "accepted-operation")
+	if problem != nil || state == nil || state.Update == nil || !state.Update.PendingActivation() ||
+		state.Update.To.Runtime != "0.18.89" || calls.Load() != 1 {
+		t.Fatalf("pending activation was not returned as a durable candidate: calls=%d state=%+v problem=%v", calls.Load(), state, problem)
+	}
+}
+
 func TestAcceptedMachineUpdateObservationRejectsPermanentLoss(t *testing.T) {
 	for _, arm := range []string{"auth", "invalid JSON", "another operation", "missing operation", "wrong certificate"} {
 		t.Run(arm, func(t *testing.T) {

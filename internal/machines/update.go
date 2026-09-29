@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -35,6 +36,12 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 		return nil, problem
 	}
 	if state.Update != nil && !updateTerminal(state.Update.State) {
+		if state.Update.PendingActivation() {
+			if problem := pendingSourceMatches(state, source); problem != nil {
+				return nil, problem
+			}
+			return pendingInstalled(state), nil
+		}
 		return nil, exit.Named(exit.Conflict, "machine.update_in_progress", "the machine is already completing update %s", state.Update.Operation)
 	}
 	agent := "bundled"
@@ -107,9 +114,15 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 			return nil, problem
 		}
 	}
-	state, problem = client.AwaitUpdate(ctx, operation)
+	state, problem = client.AwaitUpdateOrPending(ctx, operation)
 	if problem != nil {
 		return nil, problem
+	}
+	if state.Update.PendingActivation() {
+		if problem := pendingSourceMatches(state, source); problem != nil {
+			return nil, problem
+		}
+		return pendingInstalled(state), nil
 	}
 	if update := state.Update; update.State != "succeeded" {
 		return nil, exit.Named(exit.Failed, "machine.update_failed", "update %s: %s; machine now runs Runtime %s / TensorFS %s", operation, update.Error, state.Runtime, state.TensorFS)
@@ -136,6 +149,54 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 		return nil, exit.Internalf("updated Runtime but cannot retain installation metadata: %s", err)
 	}
 	return installed, nil
+}
+
+func pendingSourceMatches(state *RuntimeState, source Source) *exit.Error {
+	if state == nil || state.Update == nil || !state.Update.PendingActivation() {
+		return nil
+	}
+	if source.Host != "" {
+		digest, err := fileDigest(source.Host)
+		if err != nil {
+			return exit.New(exit.NotFound, "cannot read the selected agent: %s", err)
+		}
+		if digest != state.Agent.SHA256 {
+			return exit.Named(exit.Conflict, "machine.update_in_progress", "a different agent candidate is already prepared for update %s", state.Update.Operation)
+		}
+	}
+	for _, candidate := range []struct {
+		name, path, version string
+	}{{hostruntime.Distribution, source.RuntimeWheel, state.Update.To.Runtime}, {"tensorfs", source.TensorFSWheel, state.Update.To.TensorFS}} {
+		if candidate.path == "" {
+			continue
+		}
+		if got := wheelVersion(candidate.path); got == "" || got != candidate.version {
+			return exit.Named(exit.Conflict, "machine.update_in_progress", "a different %s candidate is already prepared for update %s", candidate.name, state.Update.Operation)
+		}
+	}
+	return nil
+}
+
+func wheelVersion(path string) string {
+	base := strings.TrimSuffix(filepath.Base(path), ".whl")
+	parts := strings.Split(base, "-")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[1]
+}
+
+// pendingInstalled reports the active pair and candidate operation without
+// persisting the candidate as installed. The next machine install observes the
+// same operation until Runtime activates or rolls it back.
+func pendingInstalled(state *RuntimeState) *Installed {
+	return &Installed{
+		Host:       installedArtifact{Name: "cozy-machine " + state.Agent.Version, SHA256: state.Agent.SHA256, Module: AgentModule},
+		Runtime:    installedArtifact{Name: hostruntime.Distribution + " " + state.Runtime},
+		TensorFS:   installedArtifact{Name: "tensorfs " + state.TensorFS},
+		HostPinned: state.Agent.Selection == "explicit",
+		Pending:    state.Update,
+	}
 }
 
 func (h *Host) maintenanceFor(launch *Launch) (*Maintenance, *exit.Error) {
