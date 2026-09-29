@@ -367,6 +367,7 @@ type cachedLaunch struct {
 type Launch struct {
 	Addr, MediaAddr  string
 	WorkerID, BootID string
+	AgentVersion     string
 	Leaf             []byte
 	GPUs             []ReceiptGPU
 	PID              int
@@ -447,7 +448,7 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 				return nil, exit.Internalf("cannot record the machine's TLS leaf: %s", err)
 			}
 			return &Launch{Addr: "127.0.0.1:" + strconv.Itoa(record.WorkerPort), MediaAddr: "127.0.0.1:" + strconv.Itoa(record.MediaPort),
-				WorkerID: record.WorkerID, BootID: receipt.PodBootID, Leaf: leaf, GPUs: receipt.RuntimeGPUs, PID: record.PID}, nil
+				WorkerID: record.WorkerID, BootID: receipt.PodBootID, AgentVersion: receipt.MachineVersion, Leaf: leaf, GPUs: receipt.RuntimeGPUs, PID: record.PID}, nil
 		}
 		if refused := (*receiptRefusal)(nil); errors.As(err, &refused) {
 			return nil, exit.New(exit.Credential, "the machine Host's readiness receipt did not verify: %s", err)

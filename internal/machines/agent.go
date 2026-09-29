@@ -22,6 +22,11 @@ import (
 // AgentModule is the standalone machine server, built from the Runtime repository.
 const AgentModule = "github.com/cozy-creator/cozy-runtime/machine-agent"
 
+// AgentFloor is the first agent that keeps delegated Hub authority bound to one principal.
+const AgentFloor = "0.1.1"
+
+var agentFloor = pep440.MustParse(AgentFloor)
+
 const agentReleases = "https://api.github.com/repos/cozy-creator/cozy/releases"
 
 type agentManifest struct {
@@ -63,7 +68,7 @@ func (h *Host) publishedAgent(ctx context.Context, client *http.Client, releases
 		}
 		for _, release := range batch {
 			if !release.Draft && !release.Prerelease && strings.HasPrefix(release.Tag, "machine-v") {
-				if version, err := pep440.Parse(strings.TrimPrefix(release.Tag, "machine-v")); err == nil && !version.IsPreRelease() {
+				if version, err := pep440.Parse(strings.TrimPrefix(release.Tag, "machine-v")); err == nil && !version.IsPreRelease() && version.Compare(agentFloor) >= 0 {
 					releases = append(releases, release)
 				}
 			}

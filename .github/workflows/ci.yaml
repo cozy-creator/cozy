@@ -100,7 +100,7 @@ jobs:
             test -x "$COZY_TEST_POD_SUPERVISOR"
             echo "MACHINE_HOST=$COZY_TEST_POD_SUPERVISOR" >> "$GITHUB_ENV"
           else
-            release=machine-v0.1.0
+            release=machine-v0.1.1
             curl -fsSLo "$RUNNER_TEMP/machine-agent.json" "https://github.com/cozy-creator/cozy/releases/download/$release/machine-agent.json"
             read -r url sha < <(jq -r '.platforms["linux-amd64"] | "\(.url) \(.sha256)"' "$RUNNER_TEMP/machine-agent.json")
             curl -fsSLo "$RUNNER_TEMP/cozy-machine" "$url"

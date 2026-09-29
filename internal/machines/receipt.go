@@ -37,6 +37,7 @@ type receipt struct {
 	WorkerInternalPort      int          `json:"worker_internal_port"`
 	TLSCertificateDERBase64 string       `json:"tls_certificate_der_base64"`
 	RuntimeGPUs             []ReceiptGPU `json:"runtime_gpus"`
+	MachineVersion          string       `json:"machine_version"`
 }
 
 // receiptRefusal is a receipt that answered and did not verify: waiting cannot fix it.

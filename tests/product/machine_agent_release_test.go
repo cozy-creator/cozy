@@ -43,6 +43,7 @@ func TestMachineAgentReleaseDiscoveryAndDigest(t *testing.T) {
 	digest := sha256.Sum256(binary)
 	var downloads atomic.Int32
 	var pageTwo atomic.Int32
+	var oldOnly atomic.Bool
 	badDigest := false
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -63,6 +64,10 @@ func TestMachineAgentReleaseDiscoveryAndDigest(t *testing.T) {
 						value[key] = v
 					}
 					return value
+				}
+				if oldOnly.Load() {
+					_ = json.NewEncoder(w).Encode([]any{release("0.1.0", nil)})
+					return
 				}
 				_ = json.NewEncoder(w).Encode([]any{release("1.9.0", nil), release("9.0.0", map[string]any{"draft": true}), release("8.0.0", map[string]any{"prerelease": true}), release("2.0.0", nil)})
 			} else {
@@ -103,5 +108,10 @@ func TestMachineAgentReleaseDiscoveryAndDigest(t *testing.T) {
 	badDigest = true
 	if _, problem := host.PublishedAgent(context.Background()); problem == nil {
 		t.Fatal("changed digest accepted incompatible artifact bytes")
+	}
+	oldOnly.Store(true)
+	before := downloads.Load()
+	if _, problem := host.PublishedAgent(context.Background()); problem == nil || downloads.Load() != before {
+		t.Fatal("discovery downloaded an agent without delegated-principal protection")
 	}
 }

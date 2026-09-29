@@ -98,6 +98,8 @@ Cached execution access belongs to the current device key or operator credential
 out or switching credentials cannot reuse another account's cached grant. The agent retains
 one delegated account per Hub: that account can renew access, while a different account
 receives an explicit conflict so retained jobs keep their original authority.
+Delegated Hub access requires machine agent 0.1.1 or newer; an older installation receives
+an explicit request to run `cozy machine install` once its work is idle.
 
 ## Packages
 

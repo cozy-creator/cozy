@@ -14,6 +14,7 @@ import (
 	"os"
 	"time"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -33,6 +34,15 @@ type executionAccess struct {
 // leaf, account credential and expiry, and replayed after a restart. Account credentials never
 // cross the machine boundary. The cache is private and is never rendered as run data.
 func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, account *hub.Client) (string, *exit.Error) {
+	installed, problem := h.Installed()
+	if problem != nil {
+		return "", problem
+	}
+	version, err := pep440.Parse(launch.AgentVersion)
+	if installed == nil || installed.Host.Module != AgentModule || err != nil || version.Compare(agentFloor) < 0 {
+		return "", exit.Named(exit.Structural, "machine.agent_update_required", "delegated Hub access requires the independent cozy-machine %s or newer; this server reports %q", AgentFloor, launch.AgentVersion).
+			WithRemedy("wait for the machine to be idle, then run `cozy machine install`")
+	}
 	credential := ""
 	if account != nil {
 		credential = account.CredentialIdentity()
@@ -56,9 +66,6 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 		access, problem := account.AuthorizeExecutionAccess(ctx, launch.Leaf)
 		if problem != nil {
 			return "", problem
-		}
-		if account.CredentialIdentity() != credential {
-			return "", exit.Named(exit.Credential, "machine.execution_account_changed", "the Tensorhub login changed while execution access was authorized; retry with the current account")
 		}
 		grant = executionAccess{Origin: access.Environment["TENSORHUB_ORIGIN"], Token: access.Token, ExpiresAt: access.ExpiresAt.Unix(), Environment: access.Environment, Certificate: certificate, Credential: credential}
 		if len(access.TrustRoot) > 0 {
