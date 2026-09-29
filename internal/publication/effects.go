@@ -32,11 +32,12 @@ type UploadRequest struct {
 	Destination string                `json:"destination"`
 }
 
+// DecodeEffect reads one effect request by the members this cozy knows; a newer Runtime's
+// others are ignored.
 func DecodeEffect(raw []byte, value any) *exit.Error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
 	if decoder.Decode(value) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return exit.New(exit.Validation, "publication effect request does not match its closed interface")
+		return exit.New(exit.Validation, "publication effect request is not one JSON object of its interface")
 	}
 	return nil
 }
