@@ -230,7 +230,8 @@ func (h *Host) Installed() (*Installed, *exit.Error) {
 
 // Install lays the root out as a pod image does: the Host, a Python 3.12 environment
 // holding the Runtime and TensorFS wheels, and the three executables the image bakes. A
-// running idle agent is stopped first; the next use launches the new one.
+// running idle agent is stopped first; the next use launches the new one. Existing
+// base packages (including the machine's PyTorch/CUDA closure) remain installed.
 func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installed, *exit.Error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -246,6 +247,10 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 			WithRemedy("wait for accepted work to finish before installing; use machine stop only to explicitly stop the machine")
 	}
 	if _, problem := h.identity(); problem != nil {
+		return nil, problem
+	}
+	previous, problem := h.Installed()
+	if problem != nil {
 		return nil, problem
 	}
 	installed := Installed{InstalledAt: time.Now().UTC()}
@@ -267,11 +272,11 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		}
 		*artifact.out = installedArtifact{Name: filepath.Base(artifact.path), SHA256: digest}
 	}
+	if _, err := fileDigest(source.Host); err != nil {
+		return nil, exit.New(exit.NotFound, "cannot read the machine agent: %s", err)
+	}
 	if problem := h.stopLocked(ctx); problem != nil {
 		return nil, problem
-	}
-	if err := os.Remove(h.path("installed.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, exit.Internalf("cannot retire the previous machine installation: %s", err)
 	}
 	root := h.Root()
 	for _, dir := range []string{"usr/local/bin", "opt/cozy/bin"} {
@@ -279,38 +284,37 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 			return nil, exit.Internalf("cannot lay out the machine root: %s", err)
 		}
 	}
-	host, err := h.placeHost(source.Host)
-	if err != nil {
-		return nil, exit.Internalf("cannot install the machine Host: %s", err)
-	}
-	installed.Host = host
 	var wheels []string
 	if source.RuntimeWheel != "" {
 		wheels = []string{source.RuntimeWheel, source.TensorFSWheel}
 	}
-	wheels, err = h.keepWheels(wheels)
-	if err != nil {
-		return nil, exit.Internalf("cannot keep the machine's wheels: %s", err)
-	}
-	// A venv is not relocatable, so it is rebuilt in place.
-	if err := os.RemoveAll(h.python()); err != nil {
-		return nil, exit.Internalf("cannot replace the machine Python environment: %s", err)
-	}
-	if output, err := exec.CommandContext(ctx, uv, "venv", "--no-config", "--no-project", "--python", "3.12", h.python()).CombinedOutput(); err != nil {
-		return nil, exit.New(exit.Structural, "cannot create the machine Python environment: %s", tail(output))
+	python := filepath.Join(h.python(), "bin/python")
+	if _, err := os.Lstat(h.python()); errors.Is(err, os.ErrNotExist) {
+		if output, err := exec.CommandContext(ctx, uv, "venv", "--no-config", "--no-project", "--python", "3.12", h.python()).CombinedOutput(); err != nil {
+			return nil, exit.New(exit.Structural, "cannot create the machine Python environment: %s", tail(output))
+		}
+	} else if err != nil {
+		return nil, exit.Internalf("cannot read the machine Python environment: %s", err)
+	} else if output, err := exec.CommandContext(ctx, python, "-I", "-c", "import sys; assert sys.version_info[:2] == (3, 12); assert sys.prefix != sys.base_prefix").CombinedOutput(); err != nil {
+		return nil, exit.New(exit.Structural, "the existing machine Python environment is unusable; it was preserved: %s", tail(output))
 	}
 	// Without wheels, the published Runtime and the TensorFS it depends on.
 	// The worker's base is the CPU image's: the Runtime with its media extra. Every
-	// package environment carries its own framework closure.
-	// An explicit install means the newest release: refresh just these two from the index, not uv's cache.
-	requirements := []string{"--refresh-package", hostruntime.Distribution, "--refresh-package", "tensorfs", hostruntime.Distribution + "[media]>=" + RuntimeFloor}
+	// package environment carries its own framework closure. Existing machine base
+	// packages are retained: installing a Runtime is not an environment sync.
+	// An explicit published install selects the newest pair even in an existing venv.
+	requirements := []string{"--upgrade-package", hostruntime.Distribution, "--upgrade-package", "tensorfs", hostruntime.Distribution + "[media]>=" + RuntimeFloor}
 	if len(wheels) > 0 {
 		requirements = []string{hostruntime.Distribution + "[media] @ file://" + wheels[0], wheels[1]}
 	}
-	python := filepath.Join(h.python(), "bin/python")
-	install := exec.CommandContext(ctx, uv, append([]string{"pip", "install", "--no-config", "--python", python}, requirements...)...)
-	if output, err := install.CombinedOutput(); err != nil {
-		return nil, exit.New(exit.Structural, "cannot install the Runtime and TensorFS: %s", tail(output))
+	if err := installMachinePair(ctx, uv, python, requirements); err != nil {
+		if previous != nil {
+			if rollback := h.restorePair(ctx, uv, previous); rollback != nil {
+				return nil, exit.New(exit.Structural, "%s; restoring the previous Runtime and TensorFS failed: %s; retained installation records and wheels for repair", err, rollback)
+			}
+			return nil, exit.New(exit.Structural, "%s; restored the previous Runtime and TensorFS", err)
+		}
+		return nil, exit.New(exit.Structural, "%s", err)
 	}
 	for distribution, artifact := range map[string]*installedArtifact{hostruntime.Distribution: &installed.Runtime, "tensorfs": &installed.TensorFS} {
 		if artifact.Name != "" {
@@ -335,6 +339,14 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		if err := os.Symlink(target, path); err != nil {
 			return nil, exit.Internalf("cannot link %s: %s", link, err)
 		}
+	}
+	host, err := h.placeHost(source.Host)
+	if err != nil {
+		return nil, exit.Internalf("cannot install the machine Host: %s", err)
+	}
+	installed.Host = host
+	if _, err := h.keepWheels(wheels); err != nil {
+		return nil, exit.Internalf("cannot keep the machine's wheels: %s", err)
 	}
 	raw, _ := json.MarshalIndent(installed, "", "  ")
 	if err := writePrivate(h.path("installed.json"), raw); err != nil {
