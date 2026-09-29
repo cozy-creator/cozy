@@ -422,13 +422,17 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	began := time.Now()
 	var connection *machineConnection
 	if len(link.Submission) > 0 {
-		// Replay uses only persisted authority. Its source installation and the
-		// client's current default Hub may have changed since the offer was frozen.
+		// Ownership authenticates replay even after the current Hub login expires.
+		// The frozen Hub remains operation scope; Runtime checks its durable
+		// acceptance before deciding whether a fresh grant is relevant.
 		origin := frozen.Hub
 		if frozen.ReleaseRoot != nil {
 			origin = frozen.ReleaseRoot.Hub
 		}
-		connection, problem = m.connectAtHub(ctx, link.MachineID, origin, m.runHolder(request, "replaying its submission"))
+		connection, problem = m.connect(ctx, link.MachineID, m.runHolder(request, "replaying its submission"))
+		if connection != nil {
+			connection.Hub = origin
+		}
 	} else {
 		connection, problem = m.connectFor(ctx, request, link.MachineID, "preparing its submission")
 	}
