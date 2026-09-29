@@ -107,25 +107,12 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 			return nil, problem
 		}
 	}
-	for {
-		state, problem = client.State(ctx)
-		if problem != nil {
-			return nil, exit.Named(exit.Unavailable, "machine.update_observation_lost", "update %s continues on the machine; observation ended: %s", operation, problem)
-		}
-		if state.Update == nil || state.Update.Operation != operation {
-			return nil, exit.Named(exit.Unavailable, "machine.update_observation_lost", "update %s is no longer the machine's current operation; its outcome must be inspected before another install", operation)
-		}
-		if update := state.Update; update != nil && update.Operation == operation && updateTerminal(update.State) {
-			if update.State != "succeeded" {
-				return nil, exit.Named(exit.Failed, "machine.update_failed", "update %s: %s; machine now runs Runtime %s / TensorFS %s", operation, update.Error, state.Runtime, state.TensorFS)
-			}
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return nil, exit.Named(exit.Canceled, "machine.update_observation_lost", "update %s continues on the machine", operation)
-		case <-time.After(time.Second):
-		}
+	state, problem = client.AwaitUpdate(ctx, operation)
+	if problem != nil {
+		return nil, problem
+	}
+	if update := state.Update; update.State != "succeeded" {
+		return nil, exit.Named(exit.Failed, "machine.update_failed", "update %s: %s; machine now runs Runtime %s / TensorFS %s", operation, update.Error, state.Runtime, state.TensorFS)
 	}
 	if state.Agent.Selection != agent || state.Agent.SHA256 == "" {
 		return nil, exit.Named(exit.Structural, "machine.agent_selection_unconfirmed", "update %s completed without confirming the selected running agent", operation)
