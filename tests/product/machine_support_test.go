@@ -112,7 +112,9 @@ func provisionMachineIn(t *testing.T, root, parent string) {
 			_ = removeAllForce(short)
 		}
 	})
-	for _, link := range []string{"usr/local/bin/pod-supervisor", "usr/local/bin/tfs", "usr/local/bin/uv", "opt/cozy/bin/cozy-runtime-worker", "opt/cozy/python"} {
+	// Everything `cozy machine install` lays out, the wheels it keeps included: a dev Runtime
+	// installs its own SDK into a package's environment from them.
+	for _, link := range []string{"usr/local/bin/pod-supervisor", "usr/local/bin/tfs", "usr/local/bin/uv", "opt/cozy/bin/cozy-runtime-worker", "opt/cozy/python", "opt/cozy/wheels"} {
 		target, err := filepath.EvalSymlinks(filepath.Join(template, "root", link))
 		must(t, err)
 		path := filepath.Join(dir, "root", link)

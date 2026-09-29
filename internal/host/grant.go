@@ -17,9 +17,6 @@ import (
 	"strings"
 )
 
-// Version is the machine role's release, reported to clients.
-const Version = "0.17.0"
-
 // Grant is the machine's launch contract: the environment a Hub or this computer's launcher
 // gives it. Only the names read here matter; any other is logged and ignored, so a newer Hub
 // cannot stop an older machine from booting.

@@ -13,11 +13,11 @@ tag="$1"; shift
 cd "$(dirname "$0")/.."
 out="dist/$tag"
 rm -rf "$out" && mkdir -p "$out/bin"
-cli=github.com/cozy-creator/cozy/internal/cli
+build=github.com/cozy-creator/cozy/internal/build
 for target; do
   os="${target%/*}" arch="${target#*/}"
   GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -o "$out/bin/cozy" \
-    -ldflags "-s -w -X $cli.tag=${tag#v} -X $cli.commit=$(git rev-parse HEAD)" .
+    -ldflags "-s -w -X $build.Version=${tag#v} -X $build.Commit=$(git rev-parse HEAD)" .
   tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$out/bin" -cf - cozy |
     gzip -n -9 >"$out/cozy-$os-$arch.tar.gz"
 done

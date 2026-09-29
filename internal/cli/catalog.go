@@ -24,7 +24,7 @@ func client(ctx *Context) *hub.Client {
 	if auth == nil {
 		auth = accountauth.New(ctx.Cfg)
 	}
-	return hub.New(ctx.Cfg, "cozy/"+tag+"+"+rev).
+	return hub.New(ctx.Cfg, "cozy/"+version()+"+"+rev).
 		WithTokenSource(auth)
 }
 
