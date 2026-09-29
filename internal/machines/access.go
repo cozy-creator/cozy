@@ -26,12 +26,20 @@ type executionAccess struct {
 	Environment map[string]string `json:"environment"`
 	CA          string            `json:"ca_der_b64url,omitempty"`
 	Certificate string            `json:"certificate_sha256"`
+	Credential  string            `json:"credential_identity"`
 }
 
 // attachAccess runs after authenticated readiness. Cached grants are scoped to a Hub,
-// leaf and expiry, and replayed into the agent after a restart. Account credentials never
+// leaf, account credential and expiry, and replayed after a restart. Account credentials never
 // cross the machine boundary. The cache is private and is never rendered as run data.
 func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, account *hub.Client) (string, *exit.Error) {
+	credential := ""
+	if account != nil {
+		credential = account.CredentialIdentity()
+	}
+	if credential == "" {
+		return "", exit.Named(exit.Credential, "machine.execution_access_required", "running work from %s requires account-authorized execution access", origin)
+	}
 	all := map[string]executionAccess{}
 	raw, err := os.ReadFile(h.path("execution-access.json"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -43,23 +51,22 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	digest := sha256.Sum256(launch.Leaf)
 	certificate := hex.EncodeToString(digest[:])
 	grant := all[origin]
-	if grant.Certificate != certificate || grant.ExpiresAt <= time.Now().Add(time.Minute).Unix() || grant.Token == "" {
-		if account == nil {
-			return "", exit.Named(exit.Credential, "machine.execution_access_required", "running work from %s requires account-authorized execution access", origin)
-		}
+	refresh := grant.Certificate != certificate || grant.Credential != credential || grant.ExpiresAt <= time.Now().Add(time.Minute).Unix() || grant.Token == ""
+	if refresh {
 		access, problem := account.AuthorizeExecutionAccess(ctx, launch.Leaf)
 		if problem != nil {
 			return "", problem
 		}
-		grant = executionAccess{Origin: access.Environment["TENSORHUB_ORIGIN"], Token: access.Token, ExpiresAt: access.ExpiresAt.Unix(), Environment: access.Environment, Certificate: certificate}
+		if account.CredentialIdentity() != credential {
+			return "", exit.Named(exit.Credential, "machine.execution_account_changed", "the Tensorhub login changed while execution access was authorized; retry with the current account")
+		}
+		grant = executionAccess{Origin: access.Environment["TENSORHUB_ORIGIN"], Token: access.Token, ExpiresAt: access.ExpiresAt.Unix(), Environment: access.Environment, Certificate: certificate, Credential: credential}
 		if len(access.TrustRoot) > 0 {
 			grant.CA = base64.RawURLEncoding.EncodeToString(access.TrustRoot)
 		}
-		all[origin] = grant
-		raw, _ = json.Marshal(all)
-		if err := writePrivate(h.path("execution-access.json"), raw); err != nil {
-			return "", exit.Internalf("cannot retain execution access: %s", err)
-		}
+	}
+	if account.CredentialIdentity() != credential {
+		return "", exit.Named(exit.Credential, "machine.execution_account_changed", "the Tensorhub login changed while execution access was authorized; retry with the current account")
 	}
 	owner, problem := h.Owner()
 	if problem != nil {
@@ -98,6 +105,12 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 		return "", exit.Unavailablef("machine execution access response was interrupted")
 	}
 	if response.StatusCode/100 != 2 {
+		var refused struct {
+			Error struct{ Code string } `json:"error"`
+		}
+		if response.StatusCode == http.StatusConflict && json.Unmarshal(raw, &refused) == nil && refused.Error.Code == "hub_access_principal_conflict" {
+			return "", exit.Named(exit.Conflict, "machine.execution_access_principal_conflict", "this machine holds execution access for another account at %s; renew access using the original account", origin)
+		}
 		return "", exit.Named(exit.Credential, "machine.execution_access_refused", "the machine refused execution access (HTTP %d)", response.StatusCode)
 	}
 	var reply struct {
@@ -106,6 +119,13 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	}
 	if json.Unmarshal(raw, &reply) != nil || reply.Origin != grant.Origin || reply.ExpiresAt != grant.ExpiresAt {
 		return "", exit.New(exit.Conflict, "the machine did not acknowledge execution access")
+	}
+	if refresh {
+		all[origin] = grant
+		raw, _ = json.Marshal(all)
+		if err := writePrivate(h.path("execution-access.json"), raw); err != nil {
+			return "", exit.Internalf("cannot retain execution access: %s", err)
+		}
 	}
 	return grant.Environment["TENSORHUB_ORIGIN"], nil
 }

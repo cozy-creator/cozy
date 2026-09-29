@@ -100,7 +100,12 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 			return
 		}
 		accesses.Add(1)
-		if r.Header.Get("Authorization") != "Bearer account-only" {
+		principal := "account-first"
+		switch r.Header.Get("Authorization") {
+		case "Bearer account-only":
+		case "Bearer second-account":
+			principal = "account-second"
+		default:
 			t.Error("account credential did not stay on the Hub request")
 		}
 		var body struct {
@@ -110,7 +115,8 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 		if json.NewDecoder(r.Body).Decode(&body) != nil || body.Leaf != base64.RawURLEncoding.EncodeToString(launch.Leaf) || body.TTL <= 0 || body.TTL > 604800 {
 			t.Error("execution access was not bounded and pinned to the agent leaf")
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": "execution-only", "expires_at": time.Now().Add(time.Hour).UTC().Truncate(time.Second),
+		delegated := executionGrantToken(server.URL, principal, accesses.Load())
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": delegated, "expires_at": time.Now().Add(time.Hour).UTC().Truncate(time.Second),
 			"environment": map[string]string{"TENSORHUB_ORIGIN": server.URL, "TENSORHUB_PUBLIC_ORIGIN": server.URL}})
 	}))
 	defer server.Close()
@@ -120,15 +126,52 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 	if withAccess.PID != launch.PID || withAccess.WorkerID != launch.WorkerID || withAccess.Reads != server.URL {
 		t.Fatal("attaching Hub access moved the machine")
 	}
-	_, problem = machine.Ensure(ctx, server.URL, nil, true)
+	_, problem = machine.Ensure(ctx, server.URL, client, true)
 	fatal(t, problem)
 	if accesses.Load() != 1 || registrations.Load() != 0 {
 		t.Fatalf("wanted one scoped access and no registration; got %d and %d", accesses.Load(), registrations.Load())
 	}
 	accessFile, err := os.ReadFile(filepath.Join(machine.Root(), "var/lib/cozy/machine/hub-access.json"))
 	must(t, err)
-	if bytes.Contains(accessFile, []byte("account-only")) || !bytes.Contains(accessFile, []byte("execution-only")) {
+	firstGrant := executionGrantToken(server.URL, "account-first", 1)
+	if bytes.Contains(accessFile, []byte("account-only")) || !bytes.Contains(accessFile, []byte(firstGrant)) {
 		t.Error("machine did not retain only delegated access")
+	}
+	for _, signedOut := range []*hub.Client{nil, hub.New(config.Config{HubURL: server.URL}, "signed-out")} {
+		if _, problem := machine.Ensure(ctx, server.URL, signedOut, true); problem == nil || problem.ErrName() != "machine.execution_access_required" {
+			t.Fatalf("signed-out access replayed a cached account grant: %v", problem)
+		}
+	}
+	other := client.WithToken(secret.New("second-account"), "test")
+	_, problem = machine.Ensure(ctx, server.URL, other, true)
+	if problem == nil || problem.ErrName() != "machine.execution_access_principal_conflict" {
+		t.Fatalf("switching accounts did not preserve the existing machine principal: %v", problem)
+	}
+	accessFile, err = os.ReadFile(filepath.Join(machine.Root(), "var/lib/cozy/machine/hub-access.json"))
+	must(t, err)
+	if accesses.Load() != 2 || !bytes.Contains(accessFile, []byte(firstGrant)) {
+		t.Fatal("switching accounts silently reused or replaced the preceding delegated grant")
+	}
+	_, problem = machine.Ensure(ctx, server.URL, client, true)
+	fatal(t, problem)
+	if accesses.Load() != 2 {
+		t.Fatal("a refused account switch changed the working account's cached grant")
+	}
+	// Older caches named no credential. Refresh them under the current account even if
+	// the leaf and expiry match, and allow a fresh token for the same delegated principal.
+	cachePath := filepath.Join(dir, "execution-access.json")
+	cached, err := os.ReadFile(cachePath)
+	must(t, err)
+	var legacy map[string]map[string]any
+	must(t, json.Unmarshal(cached, &legacy))
+	delete(legacy[server.URL], "credential_identity")
+	cached, err = json.Marshal(legacy)
+	must(t, err)
+	must(t, os.WriteFile(cachePath, cached, 0600))
+	_, problem = machine.Ensure(ctx, server.URL, client, true)
+	fatal(t, problem)
+	if accesses.Load() != 3 {
+		t.Fatal("a legacy unbound cache was reused without current account authorization")
 	}
 	fatal(t, machine.Stop(ctx))
 	restarted := machines.NewHost(dir, "", nil)
@@ -154,7 +197,15 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 	}
 	log, err := os.ReadFile(filepath.Join(dir, "host.log"))
 	must(t, err)
-	if strings.Contains(string(log), "account-only") || strings.Contains(string(log), "execution-only") || strings.Contains(string(log), "obsolete-local-worker-capability") {
+	if strings.Contains(string(log), "account-only") || strings.Contains(string(log), firstGrant) || strings.Contains(string(log), "obsolete-local-worker-capability") {
 		t.Error("machine log contains a credential")
 	}
+}
+
+// The isolated Hub fixture supplies a syntactic delegated JWT. The real Hub verifies its
+// authority; the agent only needs its stable issuer/account identity to guard replacement.
+func executionGrantToken(issuer, principal string, serial int32) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"typ":"delegated-access+jwt"}`))
+	body, _ := json.Marshal(map[string]any{"iss": issuer, "delegated_sub": principal, "permissions": []string{"cozy.execution-access"}, "jti": serial})
+	return header + "." + base64.RawURLEncoding.EncodeToString(body) + "." + base64.RawURLEncoding.EncodeToString([]byte("fixture-signature"))
 }

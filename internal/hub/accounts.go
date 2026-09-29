@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 // Account is the one public Tensorhub namespace owned by the authenticated user.
@@ -42,18 +43,27 @@ func (c *Client) CurrentAccount(ctx context.Context) (Account, *exit.Error) {
 // accountPath keeps the account of this client's credential: its machine key, else its
 // operator token. With neither there is no account to keep.
 func (c *Client) accountPath() string {
-	identity := ""
-	if key, ok := c.tokens.(interface{ Identity() string }); ok {
-		identity = key.Identity()
-	}
-	if identity == "" && c.token.Present() {
-		identity = "token:" + c.token.Digest()
-	}
+	identity := c.CredentialIdentity()
 	if c.releases == "" || identity == "" {
 		return ""
 	}
 	name := sha256.Sum256([]byte(c.base + "\x00" + identity))
 	return filepath.Join(filepath.Dir(c.releases), "auth", "accounts", hex.EncodeToString(name[:16])+".json")
+}
+
+// CredentialIdentity binds cached authority to the current long-lived device key or
+// operator token. Refreshing a short bearer does not change it; signing out does.
+func (c *Client) CredentialIdentity() string {
+	identity := ""
+	if key, ok := c.tokens.(interface{ Identity() string }); ok {
+		identity = key.Identity()
+	} else if c.tokens != nil {
+		return "" // an opaque short-bearer source cannot name a reusable authority
+	}
+	if identity == "" && c.token.Present() {
+		identity = "token:" + secret.HashHex(c.token)
+	}
+	return identity
 }
 
 // RegisterAccount gives the authenticated user its one immutable account name.

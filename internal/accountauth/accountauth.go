@@ -222,13 +222,17 @@ func (m *Manager) CredentialPresent() bool {
 func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.session.AccessToken.Present() && m.session.ExpiresAt.After(m.now().Add(30*time.Second)) {
-		return m.session, nil
-	}
 	stored, private, problem := m.load()
 	if problem != nil {
+		m.session = Session{}
 		return Session{}, problem
 	}
+	// Another CLI process may have signed out or installed a different device key.
+	// Cached bearers belong only to the key still present on disk.
+	if m.session.DeviceKeyID == stored.DeviceKeyID && m.session.AccessToken.Present() && m.session.ExpiresAt.After(m.now().Add(30*time.Second)) {
+		return m.session, nil
+	}
+	m.session = Session{}
 	var begun struct {
 		ChallengeID string `json:"challenge_id"`
 		Challenge   string `json:"challenge"`
