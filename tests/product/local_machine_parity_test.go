@@ -37,9 +37,8 @@ const (
 	parityPackage = "local/machine-parity"
 )
 
-// machineHub stands in for Tensorhub on both sides of a machine: the account API the daemon
-// calls (the rental hub plus owned-machine registration) and, over TLS, the worker doors
-// every Host calls.
+// machineHub stands in for Tensorhub's account API and, over TLS, its rental worker API.
+// An owned machine receives scoped execution access without joining the rental registry.
 type machineHub struct {
 	*fakeRentalHub
 	worker   *httptest.Server
@@ -257,7 +256,7 @@ func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.St
 func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string, home.Layout, *records.Store) {
 	t.Helper()
 	if source.Host == "" {
-		t.Skip("requires -machine-host: the pod-supervisor both machines run")
+		t.Skip("requires -machine-host: the standalone agent both machines run")
 	}
 	uv, err := exec.LookPath("uv")
 	if err != nil {
@@ -309,10 +308,10 @@ func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string
 	return h, root, layout, store
 }
 
-// One product body, run on this computer's machine and on a rental: the literal same Host
+// One product body, run on this computer's machine and on a rental: the literal same agent
 // binary with a real Runtime worker measuring a virtual four-device inventory. The local
-// machine is registered and launched by the daemon; the rental is the same binary a
-// provider booted, pinned and attached. Only the machine name and address may differ.
+// machine uses its own identity; the rental is the same binary a provider booted, pinned
+// and attached. Only the machine name and address may differ.
 func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	h, root, layout, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
@@ -362,23 +361,17 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	}
 	t.Logf("journals: %v", journals["local"])
 
-	// A stopped machine launches again on its next call under a fresh receipt key, keeping
-	// its root and boot: the Host's idle exit and relaunch. The Runtime counts every Control
-	// Claim in its ownership record: the relaunched Runtime runs the call on the Claim the
-	// daemon already holds, with no second Control Claim.
+	// A stopped agent launches again on its next call, keeping its machine root and boot.
+	// The single supervisor needs no durable Runtime ownership history on either launch.
 	bootID := filepath.Join(root, "machine", "root", "run/cozy/bootstrap/pod-boot-id")
 	before, err := os.ReadFile(bootID)
 	must(t, err)
-	streams := func() int {
-		var ownership struct {
-			Epoch int `json:"control_stream_epoch"`
+	noHistory := func() {
+		if _, err := os.Stat(filepath.Join(root, "machine", "root", "run/cozy/worker/ownership.json")); !os.IsNotExist(err) {
+			t.Fatalf("single-agent Runtime retained ownership history: %v", err)
 		}
-		raw, err := os.ReadFile(filepath.Join(root, "machine", "root", "run/cozy/worker/ownership.json"))
-		must(t, err)
-		must(t, json.Unmarshal(raw, &ownership))
-		return ownership.Epoch
 	}
-	claimsBefore := streams()
+	noHistory()
 	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 		t.Fatalf("machine stop [exit %d]\n%s", code, out)
 	}
@@ -388,9 +381,7 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	if after, err := os.ReadFile(bootID); err != nil || string(after) != string(before) {
 		t.Fatalf("the relaunched machine is another boot (%q, was %q): %v", after, before, err)
 	}
-	if relaunchClaims := streams() - claimsBefore; relaunchClaims != 0 {
-		t.Fatalf("the relaunch took %d Control Claims; a boot is Claimed once", relaunchClaims)
-	}
+	noHistory()
 
 	// Both machines report the Runtime's measured inventory through the same Host call.
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,

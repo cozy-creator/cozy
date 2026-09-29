@@ -26,7 +26,7 @@ import (
 )
 
 var (
-	machineHostBinary    = flag.String("machine-host", "", "a cozy build every test root's local machine runs as its Host")
+	machineHostBinary    = flag.String("machine-host", "", "the standalone cozy-machine executable each test machine runs")
 	requireMachineHost   = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
 	machineRuntimePython = flag.String("machine-runtime-python", "", "Development interpreter for the standalone agent public-view media fixture")
 	machineRuntimeWheel  = flag.String("machine-runtime-wheel", "", "Runtime wheel the test machines run; default: the published Runtime")
@@ -59,10 +59,9 @@ func machineTemplateDir(t testing.TB) string {
 	return machineTemplate.dir
 }
 
-// provisionMachine gives a test root this computer's machine when the run names a Host. A
-// root on the suite's unanswered default hub is also registered, as `cozy auth login` plus a
-// first run would register it, with the suite's worker doors as its hub; a root naming its
-// own stand-in hub registers through that hub.
+// provisionMachine gives a test root an independent machine when the run names an agent.
+// Its local identity needs no Hub registration; each request delegates only the Hub access
+// its execution requires.
 func provisionMachine(t *testing.T, root string) {
 	t.Helper()
 	provisionMachineIn(t, root, "")
@@ -174,7 +173,7 @@ func skipWithoutMachine(t *testing.T, code int, output string) {
 	if *requireMachineHost {
 		t.Fatalf("local execution needs this computer's machine and the run has no -machine-host:\n%s", output)
 	}
-	t.Skip("local execution runs on this computer's machine; pass -machine-host=<cozy build>")
+	t.Skip("local execution runs on this computer's machine; pass -machine-host=<standalone cozy-machine>")
 }
 
 // A run that requires the machine Host proves it has one before any test relies on it.
