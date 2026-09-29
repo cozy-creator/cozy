@@ -26,6 +26,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -382,8 +383,12 @@ func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release s
 		return api.DescribedRelease{}, problem
 	}
 	defer connection.Close()
+	var header, trailer metadata.MD
 	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{
-		Claim: connection.Claim, Describe: &pb.PackageSelection{Package: pkg, Release: release, Hub: connection.Hub}})
+		Claim: connection.Claim, Describe: &pb.PackageSelection{Package: pkg, Release: release, Hub: connection.Hub}}, grpc.Header(&header), grpc.Trailer(&trailer))
+	if runtimeUnavailable(header, trailer) {
+		return api.DescribedRelease{}, waitForRuntime()
+	}
 	if err != nil {
 		return api.DescribedRelease{}, machineTransport(err)
 	}
