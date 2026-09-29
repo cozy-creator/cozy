@@ -82,8 +82,7 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
 // than a status projection. A failed or paused root remains live after its small
 // error result is collected, and cancellation alone never proves native cleanup.
-const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT EXISTS(SELECT 1 FROM request_events released
- WHERE released.request_id=r.id AND released.type='machine.retention_released') AND (
+const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT ` + machineRetentionReleased + ` AND (
  (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked','canceled')) OR
  (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))`
 
@@ -92,7 +91,11 @@ const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT EXISTS(S
 // output log is owed until this client holds its products and acknowledges the terminal.
 const machineExecutionOwed = `((NOT ` + machineExecutionLost + ` AND (` + machineInputOwed + ` OR ` + machineModelRetentionOwed + ` OR ` + machineLogOwed + `)) OR ` + machineExecutionLive + `)`
 
-const machineLogOwed = `(length(e.receipt)>0 AND e.collected=0 AND r.state IN ('succeeded','failed','canceled'))`
+// Runtime's explicit release waives its log too: nothing of the execution is owed after it.
+const machineLogOwed = `(length(e.receipt)>0 AND e.collected=0 AND r.state IN ('succeeded','failed','canceled') AND NOT ` + machineRetentionReleased + `)`
+
+const machineRetentionReleased = `EXISTS(SELECT 1 FROM request_events released
+ WHERE released.request_id=r.id AND released.type='machine.retention_released')`
 
 func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 	var owed bool

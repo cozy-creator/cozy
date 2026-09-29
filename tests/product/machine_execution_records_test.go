@@ -80,6 +80,14 @@ func TestMachineCancellationAfterDeadlineReleasesRetainedWork(t *testing.T) {
 	fatal(t, o.store.ObserveMachineExecution(request.ID, state, &pb.MachineExecutionEventPage{NextAfter: 1, HeadSequence: 1,
 		Events: []*pb.MachineExecutionEvent{{Sequence: 1, AttemptOrdinal: 1, AtMs: 1001, Kind: "terminal", BodyCanonicalBytes: []byte(`{}`)}},
 	}))
+	// The observer records a canceled run's terminal with its outcome, as for any terminal.
+	invocation, err := canonical.Spell(receipt.InvocationSpecDigest)
+	must(t, err)
+	body, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{RequestId: request.ID, AttemptOrdinal: 1,
+		InvocationSpecDigest: invocation, Status: pb.OutcomeStatus_OUTCOME_STATUS_CANCELED})
+	must(t, err)
+	fatal(t, o.store.RecordMachineOutcome(request.ID, &pb.AttemptOutcome{RequestId: request.ID, AttemptOrdinal: 1,
+		InvocationSpecDigest: receipt.InvocationSpecDigest, OutcomeId: "deadline", OutcomeDigest: digest, OutcomeCanonicalBytes: body}))
 	machine := &retentionReleaseMachine{store: o.store, state: state}
 	defer publicationControlAPI(t, o, func(options *api.Options) { options.MachineExecutions = machine })()
 	code, out := runCozy(t, o.root, "run", "cancel", request.ID, "--json")

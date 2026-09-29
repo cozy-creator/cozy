@@ -368,8 +368,12 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 	}
 	if action == "cancel" && records.Settled(row.State) && !row.RetainWork {
 		// Already terminal and holding nothing a cancel would release: the same answer
-		// again, without asking the machine.
-		return true, nil
+		// again, without asking the machine. A completed run's collection releases what it
+		// holds; any other ended run its Runtime still retains is released by this cancel.
+		owed, problem := s.store.MachineExecutionOwesWork(row.ID)
+		if problem != nil || !owed || row.State == "succeeded" {
+			return true, problem
+		}
 	}
 	if action == "cancel" && len(link.Receipt) == 0 {
 		_, problem = s.store.CancelMachineBeforeAcceptance(row.ID)

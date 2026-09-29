@@ -38,17 +38,25 @@ CREATE TABLE IF NOT EXISTS request_events (
 )`, `
 CREATE INDEX IF NOT EXISTS request_events_by_request ON request_events(request_id, seq)`, `
 CREATE INDEX IF NOT EXISTS request_events_before_responses ON request_events(type)
-  WHERE type IN ('request.submitted','request.accepted','request.completed','request.failed','request.canceled')`}
+  WHERE type IN ` + beforeResponses}
+
+// beforeResponses is the lifecycle event names recorded before the Responses-style ones.
+const beforeResponses = `('request.submitted','request.accepted','request.completed','request.failed','request.canceled')`
 
 // renameLifecycleEvents gives rows recorded before the Responses-style names their names:
 // run.created, run.in_progress, run.completed, run.failed, run.canceled. The partial index
-// holds exactly the rows still to rename, so once they are renamed this costs nothing.
+// holds exactly the rows still to rename. Only an open that finds one writes: every other
+// open only reads, so it never waits on another process's write.
 func renameLifecycleEvents(db *sql.DB) error {
+	var pending bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE type IN ` + beforeResponses + `)`).Scan(&pending); err != nil || !pending {
+		return err
+	}
 	_, err := db.Exec(`UPDATE request_events SET type=CASE type
   WHEN 'request.submitted' THEN 'run.created' WHEN 'request.accepted' THEN 'run.in_progress'
   WHEN 'request.completed' THEN 'run.completed' WHEN 'request.failed' THEN 'run.failed'
   ELSE 'run.canceled' END
-  WHERE type IN ('request.submitted','request.accepted','request.completed','request.failed','request.canceled')`)
+  WHERE type IN ` + beforeResponses)
 	return err
 }
 
