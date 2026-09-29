@@ -15,7 +15,11 @@ func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.
 	}
 	workspace, err := machine.GetMachineExecutionWorkspace(ctx, request)
 	if err == nil {
-		workspace.RunOutputLog = true // every fake machine is a wire-65 Runtime
+		workspace.RunOutputLog = true
+		workspace.SubmissionClose = true
+		if p.submissionClose != nil {
+			workspace.SubmissionClose = *p.submissionClose
+		}
 	}
 	if err == nil && request.Describe != nil && workspace.DescribedRelease == nil {
 		// The machine reads a release at its own Hub; this pod's Hub is the fixture's.
