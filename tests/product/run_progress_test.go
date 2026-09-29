@@ -282,7 +282,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 		Position        *int64   `json:"position"`
 		Total           *int64   `json:"total"`
 		RemainingMS     *int64   `json:"remaining_ms"`
-		ExecutionMS     int64    `json:"execution_ms"`
+		ExecutionMS     *int64   `json:"execution_ms"`
+		ExecutionKnown  bool     `json:"execution_known"`
 	}
 	list := func(full bool) progressRow {
 		t.Helper()
@@ -306,7 +307,13 @@ func TestRunProgressSurfaces(t *testing.T) {
 				t.Fatalf("machine run list retained presentation value %s\n%s", presentation, out)
 			}
 		}
-		return document.Invocations[0]
+		row := document.Invocations[0]
+		// Progress remains observable even when an older Runtime did not measure
+		// cooperative execution. Unknown timing must stay explicit in either view.
+		if row.ExecutionKnown != (row.ExecutionMS != nil) || row.ExecutionMS != nil && *row.ExecutionMS < 0 {
+			t.Fatalf("run list has inconsistent measured timing: %+v", row)
+		}
+		return row
 	}
 	// THE HUMAN CELL IS ONE NUMBER AND THE STAGE. The machine projection above keeps
 	// stage and overall apart because a caller may want either; the LIST CELL is read
@@ -332,13 +339,12 @@ func TestRunProgressSurfaces(t *testing.T) {
 		live.OverallFraction == nil || *live.OverallFraction <= 0 ||
 		live.Position == nil || live.Total == nil || *live.Position <= 0 ||
 		*live.Total <= 0 || *live.Position > *live.Total ||
-		live.RemainingMS == nil || *live.RemainingMS <= 0 || live.ExecutionMS <= 0 {
+		live.RemainingMS == nil || *live.RemainingMS <= 0 {
 		t.Fatalf("live run does not distinguish overall and stage progress: %+v", live)
 	}
 	// Default JSON is the same typed machine projection with fewer diagnostic
 	// identity/timing fields; it never falls back to the human progress cell.
-	if compact := list(false); compact.StageFraction == nil || compact.OverallFraction == nil ||
-		compact.ExecutionMS <= 0 {
+	if compact := list(false); compact.StageFraction == nil || compact.OverallFraction == nil {
 		t.Fatalf("default JSON list lost its numeric progress projection: %+v", compact)
 	}
 	if code, out := runCozy(t, root, "run", "watch", strconv.FormatInt(live.Number, 10), "--json"); code != 0 ||
