@@ -133,7 +133,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					// input bytes staged on its machine are owed, and only while there are any.
 					if link.MachineID != "" {
 						var connection *machineConnection
-						connection, problem = m.connectFor(m.ctx, *current, link.MachineID, "releasing its inputs")
+						connection, problem = m.connect(m.ctx, link.MachineID, m.runHolder(*current, "releasing its inputs"))
 						if problem == nil {
 							problem = m.releaseMachineInputs(m.ctx, *current, connection)
 							connection.Close()
@@ -204,7 +204,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					_, _ = m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
 					return
 				}
-				if unsent || latest != nil && row != nil && len(latest.Receipt) == 0 {
+				if row != nil && !records.Settled(row.State) && (unsent || latest != nil && len(latest.Receipt) == 0) {
 					// Unsent and acceptance-unknown work both expose what reconciliation awaits.
 					parked := map[string]any{"reason": problem.Message, "wait": orchestrator.WaitRental}
 					if row.Machine != "" {
@@ -230,7 +230,7 @@ func (m *machineRuns) closePendingSubmission(ctx context.Context, request record
 	if proto.Unmarshal(link.Submission, &frozen) != nil || frozen.Offer == nil || frozen.ExpectedExecutionWorkspaceId == "" {
 		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "pending cancellation has no intact submission identity")
 	}
-	connection, problem := m.connectFor(ctx, request, link.MachineID, "closing its pending submission")
+	connection, problem := m.connect(ctx, link.MachineID, m.runHolder(request, "closing its pending submission"))
 	if problem != nil {
 		return problem
 	}
@@ -535,12 +535,10 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 				problem = connection.prepare(ctx, request.ID, revision)
 			}
 			if problem != nil {
-				// The root's preparation precedes its submission, so a machine that refuses
-				// it never took the run: the refusal ends it rather than being asked again.
+				// The frozen submission may have reached the machine on an earlier pass.
+				// Resolve its acceptance before treating a new preparation refusal as final.
 				if refusedPreparation(problem) {
-					if recordProblem := m.store.RefuseMachineSubmission(request.ID, problem.ErrName(), problem.Message); recordProblem != nil {
-						return recordProblem
-					}
+					return m.settleSubmissionRefusal(ctx, connection, request.ID, problem)
 				}
 				return problem
 			}
@@ -649,17 +647,7 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 	var trailer metadata.MD
 	receipt, err := connection.Host.SubmitMachineExecution(ctx, submission, grpc.Trailer(&trailer))
 	if err != nil {
-		for _, code := range trailer.Get("cozy-error-code") {
-			if code == "execution_workspace_changed" || code == "execution_workspace_required" {
-				return exit.Named(exit.Conflict, "machine_execution.workspace_changed", "execution workspace no longer matches the frozen submission; prior acceptance remains unresolved")
-			}
-		}
-		for _, code := range trailer.Get("cozy-error-code") {
-			if code == "execution_submission_refused" {
-				return m.unaccepted(ctx, connection, requestID, err)
-			}
-		}
-		return machineTransport(err)
+		return m.submissionRefused(ctx, connection, requestID, trailer, err)
 	}
 	if receipt == nil || receipt.WorkerId != connection.Claim.WorkerId || receipt.WorkerBootId == "" {
 		return exit.New(exit.Conflict, "execution was accepted by an unexpected worker")
@@ -670,12 +658,10 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 	return nil
 }
 
-// unaccepted is a submission the machine proved it never accepted. A definitive refusal
-// fails the run; a transient failure only means it is safe to send again, and the run
-// keeps trying while its machine lives.
-func (m *machineRuns) unaccepted(ctx context.Context, connection *machineConnection, requestID string, err error) *exit.Error {
-	problem := machineTransport(err)
-	if problem.Code == exit.Unavailable {
+// A refusal alone does not prove nonacceptance: close the frozen key before ending
+// the run, or recover the accepted receipt if another transmission already committed.
+func (m *machineRuns) settleSubmissionRefusal(ctx context.Context, connection *machineConnection, requestID string, problem *exit.Error) *exit.Error {
+	if problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
 		return problem
 	}
 	link, recordProblem := m.store.MachineExecution(requestID)
@@ -693,7 +679,7 @@ func (m *machineRuns) unaccepted(ctx context.Context, connection *machineConnect
 	if closed.Receipt != nil {
 		return m.store.AcceptMachineExecution(requestID, closed.Receipt)
 	}
-	if recordProblem := m.store.RefuseMachineSubmission(requestID, problem.ErrName(), problem.Message); recordProblem != nil {
+	if recordProblem := m.store.RefuseMachineSubmission(requestID, problem.ErrName(), problem.Message, closed); recordProblem != nil {
 		return recordProblem
 	}
 	return problem
@@ -738,7 +724,7 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 	if link == nil || len(link.Receipt) == 0 || proto.Unmarshal(link.Receipt, &receipt) != nil {
 		return nil, nil, nil, exit.Unavailablef("waiting for durable machine acceptance")
 	}
-	connection, problem := m.connectFor(ctx, request, link.MachineID, "reading or collecting its execution")
+	connection, problem := m.connect(ctx, link.MachineID, m.runHolder(request, "reading or collecting its execution"))
 	if problem != nil {
 		return nil, nil, nil, problem
 	}

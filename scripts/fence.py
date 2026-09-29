@@ -85,7 +85,6 @@ DENY_PROMPT_CALLS = [
 # the frozen typed value.
 ENV_READERS = {
     "internal/config/config.go": "the cozy CLI's entrypoint reader",
-    "internal/host/main.go": "a machine's grant, read once at the machine role's entrypoint",
 }
 ENV_READER = " / ".join(sorted(ENV_READERS))
 DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "syscall.Environ"]
@@ -97,7 +96,7 @@ DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "
 DENY_STORE = ["state.json", "status.json", "workers.json", "sessions.json", "pidfile", ".pidfile"]
 # Files another component owns that one Creator file reads, never keeps: the Runtime's
 # guarded-restart verdict, which the machine's Runtime update waits on.
-STORE_READS = {"internal/host/maintenance.go": "restart-status.json"}
+STORE_READS = {}
 
 # (cl-011) A credential-shaped flag NAME. `--token-stdin` and `--no-browser` are not
 # credential values; `--token <t>` is, and argv is world-readable on this planet.
@@ -150,7 +149,6 @@ CORS_ABSOLUTE = "internal/api/"
 # The Cozy binary binds once, on loopback, for its local client API.
 LISTEN_SITES = {
     "internal/api/listen.go": "the owner's local client API — loopback only",
-    "internal/host/listen.go": "a machine's endpoint — TLS with its pinned leaf, every call a Claim or capability",
 }
 LISTEN_SITE = " / ".join(sorted(LISTEN_SITES))
 # (cl-028 tightening) ANY net.Listen* call, not only the literal-"tcp" spelling: a bind
@@ -361,7 +359,7 @@ DOCUMENT_KINDS: dict[str, str] = {}
 HMAC_DOMAINS = {
     "cozy.rental_request/1": "internal/cli/rentals.go",
     # The pod-supervisor readiness receipt; Tensorhub reads a pod's under the same domain.
-    "cozy.pod-readiness/1": "internal/host/receipt.go",
+    "cozy.pod-readiness/1": "internal/machines/receipt.go",
 }
 # Kinds another repo authors and this one only reads: the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.package.", "cozy.runtime.", "tensorhub.",

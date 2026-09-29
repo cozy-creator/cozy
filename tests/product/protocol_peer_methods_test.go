@@ -47,6 +47,15 @@ func (p *fakePod) SubmitMachineExecution(ctx context.Context, request *pb.Machin
 	}
 	return p.UnimplementedWorkerControlServer.SubmitMachineExecution(ctx, request)
 }
+func (p *fakePod) CloseMachineSubmission(ctx context.Context, request *pb.MachineSubmissionClose) (*pb.MachineSubmissionClosure, error) {
+	if machine, ok := p.machine.(interface {
+		CloseMachineSubmission(context.Context, *pb.MachineSubmissionClose) (*pb.MachineSubmissionClosure, error)
+	}); ok {
+		return machine.CloseMachineSubmission(ctx, request)
+	}
+	return p.UnimplementedWorkerControlServer.CloseMachineSubmission(ctx, request)
+}
+
 func (p *fakePod) GetMachineExecution(ctx context.Context, request *pb.MachineExecutionQuery) (*pb.MachineExecutionState, error) {
 	if p.machine != nil {
 		return p.machine.GetMachineExecution(ctx, request)

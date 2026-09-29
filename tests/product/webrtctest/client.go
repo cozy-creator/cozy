@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/host/webrtc"
 	"github.com/pion/datachannel"
 	"github.com/pion/ice/v4"
 	pion "github.com/pion/webrtc/v4"
@@ -128,7 +127,7 @@ func (c *Client) connect(ctx context.Context, addr netip.AddrPort, fingerprint s
 }
 
 // Ufrag is a client-chosen ICE credential, ufrag = pwd; base32 is within ICE's alphabet.
-func Ufrag() string { return webrtc.UfragPrefix + rand.Text()[:22] }
+func Ufrag() string { return "cozy+webrtc+v1/" + rand.Text()[:22] }
 
 // Answer synthesizes the machine's SDP answer to an offer, as the player page does.
 func Answer(offer string, addr netip.AddrPort, fingerprint, ufrag string) string {

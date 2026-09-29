@@ -27,32 +27,30 @@ func TestMachinePublicationIntentIsExplicitBoundedAndCertificatePinned(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	grant, problem := hub.PrepareMachinePublicationGrant("local", "om-proof", der, []string{"alice/z", "alice/a", "alice/z"}, now, now.Add(24*time.Hour))
+	grant, problem := hub.PrepareMachinePublicationGrant("local", "", der, []string{"alice/z", "alice/a", "alice/z"}, now, now.Add(24*time.Hour))
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if grant.AuthorizationID == "" || grant.Machine != "local" || grant.MachineID != "om-proof" || grant.CertificateDER != base64.RawURLEncoding.EncodeToString(der) || grant.ExpiresAtUnix != now.Add(24*time.Hour).Unix() {
+	if grant.AuthorizationID == "" || grant.Machine != "local" || grant.MachineID != "" || grant.CertificateDER != base64.RawURLEncoding.EncodeToString(der) || grant.ExpiresAtUnix != now.Add(24*time.Hour).Unix() {
 		t.Fatalf("grant changed its exact machine or lifetime: %+v", grant)
 	}
 	if !reflect.DeepEqual(grant.Repositories, []hub.PublicationRepository{{Org: "alice", Name: "a"}, {Org: "alice", Name: "z"}}) {
 		t.Fatalf("scope is not exact and deduplicated: %+v", grant.Repositories)
 	}
 	for _, names := range [][]string{nil, {"local/model"}, {"alice/model@v1"}, {"alice/../model"}} {
-		if _, problem := hub.PrepareMachinePublicationGrant("local", "om-proof", der, names, now, now.Add(time.Hour)); problem == nil {
+		if _, problem := hub.PrepareMachinePublicationGrant("local", "", der, names, now, now.Add(time.Hour)); problem == nil {
 			t.Fatalf("invalid scope admitted: %v", names)
 		}
 	}
 	for _, until := range []time.Time{now, now.Add(49 * time.Hour), now.Add(8 * 24 * time.Hour)} {
-		if _, problem := hub.PrepareMachinePublicationGrant("local", "om-proof", der, []string{"alice/a"}, now, until); problem == nil {
+		if _, problem := hub.PrepareMachinePublicationGrant("local", "", der, []string{"alice/a"}, now, until); problem == nil {
 			t.Fatalf("invalid lifetime admitted: %v", until)
 		}
 	}
-	for _, machine := range []struct {
-		id   string
-		leaf []byte
-	}{{"", der}, {"om-proof", []byte("not a certificate")}} {
-		if _, problem := hub.PrepareMachinePublicationGrant("local", machine.id, machine.leaf, []string{"alice/a"}, now, now.Add(time.Hour)); problem == nil {
-			t.Fatalf("a grant without one machine identity and valid leaf was prepared: %q", machine.id)
-		}
+	if _, problem := hub.PrepareMachinePublicationGrant("", "", der, []string{"alice/a"}, now, now.Add(time.Hour)); problem == nil {
+		t.Fatal("missing machine name was accepted")
+	}
+	if _, problem := hub.PrepareMachinePublicationGrant("local", "", []byte("not a certificate"), []string{"alice/a"}, now, now.Add(time.Hour)); problem == nil {
+		t.Fatal("invalid certificate was accepted")
 	}
 }

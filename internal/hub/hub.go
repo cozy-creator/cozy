@@ -242,6 +242,8 @@ type call struct {
 	raw *[]byte
 	// status receives the answer's HTTP status; with raw, a refusal's exact bytes too.
 	status *int
+	// trustRoot receives the root of an already verified TLS chain for delegation to an agent.
+	trustRoot *[]byte
 }
 
 // WithToken returns a copy of the client carrying a credential supplied for this
@@ -438,6 +440,12 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 		return 0, TransportFailure(c.base, err)
 	}
 	defer resp.Body.Close()
+	if cl.trustRoot != nil && resp.TLS != nil && len(resp.TLS.VerifiedChains) > 0 {
+		chain := resp.TLS.VerifiedChains[0]
+		if len(chain) > 0 {
+			*cl.trustRoot = append([]byte(nil), chain[len(chain)-1].Raw...)
+		}
+	}
 	if progress != nil {
 		progress.start()
 		defer progress.stop()

@@ -154,10 +154,13 @@ type playerMachine struct {
 }
 
 func newPlayerMachine(t *testing.T, ip string) *playerMachine {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host=<standalone cozy-machine>")
+	}
 	public, key, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	m := webrtctest.NewMachine(t.TempDir(), public)
-	server := webrtctest.Serve(t, ip, m)
+	server := serveMachineMedia(t, ip, m)
 	return &playerMachine{t: t, machine: m, server: server, relay: newPlayerRelay(t, ip, server.Addr.String()), key: key}
 }
 
@@ -303,6 +306,9 @@ func playerEval(t *testing.T, page playwright.Page, expression string) any {
 // home's device key; the link plays in a browser. Each view that cannot serve says why, and
 // no link is printed.
 func TestRunPlayPrintsALinkThatPlays(t *testing.T) {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host=<standalone cozy-machine>")
+	}
 	ip := "127.0.0.1"
 	if *playerBrowsers != "" {
 		ip = playerLANAddress(t)
@@ -310,7 +316,7 @@ func TestRunPlayPrintsALinkThatPlays(t *testing.T) {
 	public, key, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	machine := webrtctest.NewMachine(t.TempDir(), public)
-	server := webrtctest.Serve(t, ip, machine)
+	server := serveMachineMedia(t, ip, machine)
 	var mu sync.Mutex
 	view := map[string]any{}
 	hub := httptest.NewServer(machineKeyLogin("dk-play", public, "play-test", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"strconv"
@@ -44,35 +43,28 @@ func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machin
 // connectFor opens the machine a run executes on, for the run's hub: a run of an install
 // reads its release at the hub the install came from.
 func (m *machineRuns) connectFor(ctx context.Context, request records.Request, name, doing string) (*machineConnection, *exit.Error) {
-	named := namesHub(request)
-	if machines.IsLocal(name) {
-		if problem := m.localHubFree(request, named); problem != nil {
+	origin := request.Hub
+	// A captured local program can start without a Hub account or network. Explicit
+	// publication, catalog models and published code need delegated execution access.
+	localCode := request.LocalInstallationID != "" || strings.HasPrefix(request.Package, "local/")
+	if localCode && request.ModelTransfer == nil && len(request.Models) == 0 {
+		consent, problem := m.store.RequestPublicationRepositories(request.ID)
+		if problem != nil {
 			return nil, problem
 		}
+		if len(consent) == 0 {
+			origin = ""
+		}
 	}
-	return m.connectAt(ctx, name, request.Hub, m.runHolder(request, doing), named)
-}
-
-// namesHub says whether every call of a run names its hub (wire 67), so a machine registered
-// there serves it wherever it is: a published inference root. A local package's install, a
-// captured run and a job's publication read the machine's own hub, so the machine moves.
-func namesHub(request records.Request) bool {
-	return request.LocalInstallationID == "" && !strings.HasPrefix(request.Package, "local/") &&
-		!request.IsJob() && request.ModelTransfer == nil
+	return m.connectAt(ctx, name, origin, m.runHolder(request, doing), true)
 }
 
 // connectAtHub opens a machine for a published release read at hub.
 func (m *machineRuns) connectAtHub(ctx context.Context, name, hub, holder string) (*machineConnection, *exit.Error) {
-	if machines.IsLocal(name) {
-		if problem := m.localHubFree(records.Request{Hub: hub}, true); problem != nil {
-			return nil, problem
-		}
-	}
 	return m.connectAt(ctx, name, hub, holder, true)
 }
 
-// adoptLocalHost makes this cozy the machine's Host when it runs another (an older build, or
-// the tensorhub pod-supervisor), once no run's work is on the machine.
+// adoptLocalHost migrates the embedded Host once no accepted run is active.
 func (m *machineRuns) adoptLocalHost(ctx context.Context) {
 	if !m.machines.Host.Outdated() {
 		return
@@ -93,30 +85,6 @@ func (m *machineRuns) adoptLocalHost(ctx context.Context) {
 	} else if adopted {
 		m.machines.Forget(machines.Local)
 	}
-}
-
-// localHubFree keeps this computer's machine at its hub while it holds another hub's work
-// and cannot do this work where it is: moving its Host ends everything it holds. The work
-// waits for that to end.
-func (m *machineRuns) localHubFree(request records.Request, named bool) *exit.Error {
-	hub := cmp.Or(request.Hub, m.machines.HubOrigin)
-	status, problem := m.machines.Host.Status()
-	if problem != nil || !status.Running || status.Hub == hub || m.machines.Host.Serves(hub, named) {
-		return nil
-	}
-	active, problem := m.store.ActiveRequests()
-	if problem != nil {
-		return problem
-	}
-	for _, other := range active {
-		if other.ID == request.ID || other.Worker != machines.Local || cmp.Or(other.Hub, m.machines.HubOrigin) == hub {
-			continue
-		}
-		if link, problem := m.store.MachineExecution(other.ID); problem == nil && link != nil && len(link.Submission) > 0 {
-			return exit.Unavailablef("this computer's machine is running work for %s; it moves to %s when that work ends", status.Hub, hub)
-		}
-	}
-	return nil
 }
 
 func (m *machineRuns) connectAt(ctx context.Context, name, hub, holder string, named bool) (*machineConnection, *exit.Error) {

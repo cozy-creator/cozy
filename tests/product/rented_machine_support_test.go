@@ -32,6 +32,7 @@ type terminalMachines struct {
 	mu     sync.Mutex
 	finish func(payload map[string]any) *pb.AttemptOutcomeBody
 	runs   map[string]*terminalRun
+	closed map[string]bool
 	order  []string
 }
 
@@ -42,7 +43,7 @@ type terminalRun struct {
 }
 
 func newTerminalMachines(finish func(map[string]any) *pb.AttemptOutcomeBody) *terminalMachines {
-	return &terminalMachines{finish: finish, runs: map[string]*terminalRun{}}
+	return &terminalMachines{finish: finish, runs: map[string]*terminalRun{}, closed: map[string]bool{}}
 }
 
 func (m *terminalMachines) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
@@ -71,6 +72,9 @@ func (m *terminalMachines) SubmitMachineExecution(ctx context.Context, submit *p
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := submit.Offer.RequestId
+	if m.closed[submit.SubmissionId] {
+		return nil, status.Error(codes.FailedPrecondition, "submission closed")
+	}
 	if m.runs[id] == nil {
 		var payload map[string]any
 		if err := json.Unmarshal(submit.PayloadCanonicalBytes, &payload); err != nil {
@@ -98,6 +102,19 @@ func (m *terminalMachines) SubmitMachineExecution(ctx context.Context, submit *p
 	return &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: submit.SubmissionId, CaptureDigest: capture,
 		InvocationSpecDigest: invocation, AcceptedAtMs: uint64(time.Now().UnixMilli()),
 		WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}, nil
+}
+
+func (m *terminalMachines) CloseMachineSubmission(_ context.Context, q *pb.MachineSubmissionClose) (*pb.MachineSubmissionClosure, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := &pb.MachineSubmissionClosure{RequestId: q.RequestId, SubmissionId: q.SubmissionId, ExecutionWorkspaceId: q.ExpectedExecutionWorkspaceId}
+	if run := m.runs[q.RequestId]; run != nil {
+		capture, invocation := minted(run.submit)
+		out.Receipt = &pb.MachineExecutionReceipt{RequestId: q.RequestId, SubmissionId: run.submit.SubmissionId, ExecutionWorkspaceId: "rented-workspace", WorkerId: run.submit.Claim.WorkerId, WorkerBootId: run.submit.Claim.WorkerBootId, CaptureDigest: capture, InvocationSpecDigest: invocation, AcceptedAtMs: 100}
+	} else {
+		m.closed[q.SubmissionId] = true
+	}
+	return out, nil
 }
 
 func (m *terminalMachines) run(id string) (*terminalRun, error) {

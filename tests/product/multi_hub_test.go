@@ -24,7 +24,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/host"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -530,12 +529,44 @@ func TestPackageUpdateAllUsesEachInstallsHub(t *testing.T) {
 
 // A local run of a published install reads its model bindings from the hub it was
 // installed from, not from whichever hub is current.
+// fixtureExecutionAccess delegates only catalog/storage requests to a machine leaf.
+// The fixture deliberately exposes no owned-machine registration or lifecycle API.
+func fixtureExecutionAccess(t *testing.T, server *httptest.Server, worker http.Handler) string {
+	t.Helper()
+	token := "execution-" + randomToken(t)
+	account := server.Config.Handler
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/machines":
+			t.Error("owned machine attempted registration")
+			http.Error(w, "no machine registry", http.StatusGone)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access":
+			var body struct {
+				Leaf string `json:"delegate_certificate_der_b64url"`
+			}
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body.Leaf == "" {
+				http.Error(w, "missing leaf", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": time.Now().Add(time.Hour), "environment": map[string]string{"TENSORHUB_ORIGIN": server.URL, "TENSORHUB_PUBLIC_ORIGIN": server.URL}})
+		case r.Header.Get("Authorization") == "Bearer "+token:
+			worker.ServeHTTP(w, r)
+		default:
+			account.ServeHTTP(w, r)
+		}
+	})
+	return "Bearer " + token
+}
+
 func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
+	if *machineHostBinary == "" {
+		t.Skip("requires independent machine agent")
+	}
 	root := t.TempDir()
 	var askedA, askedB sync.Map
 	hubA, hubB := packageCardHub(t, &askedA), packageCardHub(t, &askedB)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName),
-		[]byte("tensorhub_url: b\nport: 0\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
+		[]byte("tensorhub_url: b\nport: 0\ntensorhub_token: two-hubs\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
@@ -550,15 +581,8 @@ func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
 	_, problem = store.Activate(install)
 	fatal(t, problem)
 	store.Close()
-	// This computer's machine is registered with the install's hub, as a signed-in first run
-	// there leaves it: its Host reads that hub's catalog at the hub's worker doors.
 	provisionMachine(t, root)
-	if *machineHostBinary != "" {
-		doors, ca := hubTLSServer(t, hubA.Config.Handler)
-		t.Cleanup(doors.Close)
-		registerMachine(t, root, hubA.URL, map[string]string{"TENSORHUB_ORIGIN": doors.URL, "TENSORHUB_PUBLIC_ORIGIN": doors.URL,
-			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)})
-	}
+	fixtureExecutionAccess(t, hubA, hubA.Config.Handler)
 	// The machine resolves the call's Models; the release it runs is read from the hub the
 	// install came from, never from the current one.
 	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")
@@ -667,15 +691,8 @@ func TestLocalRunReadsTheCommandsHub(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName),
 		[]byte("tensorhub_url: a\nport: 0\ntensorhub_token: two-hubs\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
 	provisionMachine(t, root)
-	for _, hub := range []struct {
-		origin  string
-		handler http.Handler
-	}{{hubA.URL, catalog(&machineA, false)}, {hubB.URL, catalog(&machineB, true)}} {
-		doors, ca := hubTLSServer(t, hub.handler)
-		t.Cleanup(doors.Close)
-		registerMachineAt(t, root, hub.origin, map[string]string{"TENSORHUB_ORIGIN": doors.URL, "TENSORHUB_PUBLIC_ORIGIN": doors.URL,
-			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)})
-	}
+	fixtureExecutionAccess(t, hubA, catalog(&machineA, false))
+	fixtureExecutionAccess(t, hubB, catalog(&machineB, true))
 	code, out := runCozy(t, root, "run", "proof/beta/generate", "--tensorhub", "b", "--json")
 	if strings.Contains(out, "not a published release") || strings.Contains(out, "not a published package") {
 		t.Fatalf("the machine read the release at another hub than the command's: %d %s", code, out)
@@ -692,22 +709,20 @@ func TestLocalRunReadsTheCommandsHub(t *testing.T) {
 			return true
 		})
 	}
-	var registered map[string]json.RawMessage
-	raw, err := os.ReadFile(filepath.Join(root, "machine", "registrations.json"))
+	if _, err := os.Stat(filepath.Join(root, "machine", "registrations.json")); !os.IsNotExist(err) {
+		t.Fatal("new machine wrote Hub registrations")
+	}
+	var grants map[string]json.RawMessage
+	raw, err := os.ReadFile(filepath.Join(root, "machine", "execution-access.json"))
 	must(t, err)
-	must(t, json.Unmarshal(raw, &registered))
-	if len(registered) != 2 {
-		t.Fatalf("the machine holds %d registrations, not one per hub: %s", len(registered), raw)
+	must(t, json.Unmarshal(raw, &grants))
+	if len(grants) != 1 || grants[hubB.URL] == nil {
+		t.Fatal("machine retained credentials for a Hub it did not use")
 	}
 }
 
-// A newer hub may hand a registered machine settings this CLI does not know. Registration
-// still succeeds: the hub's facts are kept and anything else is ignored, never refused.
-// This computer's machine holds a registration at each hub it has run work of. A run of hub
-// b after one of hub a reads its release at b's doors, and a model of hub b lands from b's
-// doors, each with b's registration; hub a is asked nothing of either. A machine whose range
-// reaches wire 67 serves both hubs where it is: the Host that served a serves b. An older
-// one moves to b instead.
+// One persistent agent serves distinct Hub grants without restarting, and never uses
+// one account's access credential for another catalog.
 func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine reads the releases")
@@ -721,12 +736,12 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	catalog := func(d *door, pkg string) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			d.asked.Store(r.URL.Path, true)
-			if worker := r.Header.Get("X-Cozy-Worker-ID"); worker != "" {
+			if worker := r.Header.Get("Authorization"); worker != "" {
 				d.workers.Store(worker, true)
 			}
 			switch {
 			case r.URL.Path == "/v1/tensorfs/closure":
-				d.fetchedAs.Store(r.Header.Get("X-Cozy-Worker-ID"), true)
+				d.fetchedAs.Store(r.Header.Get("Authorization"), true)
 				// Bytes that are not the model: TensorFS fetches them and refuses what arrives.
 				_ = json.NewEncoder(w).Encode(map[string]any{"complete": true, "lane": "", "model": "proof/model",
 					"manifest":            map[string]any{"length": 128, "sha256": strings.TrimPrefix(manifest, "sha256:")},
@@ -783,24 +798,11 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 		[]byte("tensorhub_url: a\nport: 0\ntensorhub_token: two-hubs\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
 	provisionMachine(t, root)
 	var doorA, doorB door
-	for _, hub := range []struct {
-		origin  string
-		handler http.Handler
-	}{{hubA.URL, catalog(&doorA, "proof/alpha")}, {hubB.URL, catalog(&doorB, "proof/beta")}} {
-		doors, ca := hubTLSServer(t, hub.handler)
-		t.Cleanup(doors.Close)
-		registerMachineAt(t, root, hub.origin, map[string]string{"TENSORHUB_ORIGIN": doors.URL, "TENSORHUB_PUBLIC_ORIGIN": doors.URL,
-			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)})
-	}
-	var registered map[string]struct {
-		ID string `json:"id"`
-	}
-	raw, err := os.ReadFile(filepath.Join(root, "machine", "registrations.json"))
-	must(t, err)
-	must(t, json.Unmarshal(raw, &registered))
+	accessA := fixtureExecutionAccess(t, hubA, catalog(&doorA, "proof/alpha"))
+	accessB := fixtureExecutionAccess(t, hubB, catalog(&doorB, "proof/beta"))
+	_ = accessA
 	launched := func() (record struct {
-		PID       int    `json:"pid"`
-		WireMinor uint32 `json:"wire_minor"`
+		PID int `json:"pid"`
 	}) {
 		raw, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
 		must(t, err)
@@ -813,7 +815,7 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 		t.Fatalf("the machine did not read hub a's release: %d %s", code, out)
 	}
 	first := launched()
-	if first.PID == 0 || first.WireMinor == 0 {
+	if first.PID == 0 {
 		t.Fatalf("the launched Host's record names no process or protocol range: %+v", first)
 	}
 	code, out = runCozy(t, root, "run", "proof/beta/generate", "--tensorhub", "b", "--json")
@@ -829,9 +831,8 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 		})
 	}
 	second := launched()
-	if (second.PID == first.PID) != (first.WireMinor >= 67) {
-		t.Fatalf("a machine at wire %d moved (Host %d, then %d): it moves exactly when it cannot read a run's hub",
-			first.WireMinor, first.PID, second.PID)
+	if second.PID != first.PID {
+		t.Fatalf("changing Hubs restarted the machine (%d then %d)", first.PID, second.PID)
 	}
 	code, out = runCozy(t, root, "model", "download", "proof/model#"+manifest, "--tensorhub", "b", "--json")
 	var accepted struct{ ID string }
@@ -851,8 +852,8 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 			t.Fatal("the machine never settled the model download")
 		}
 	}
-	if _, as := doorB.fetchedAs.Load(registered[hubB.URL].ID); !as {
-		t.Fatal("the machine did not fetch hub b's model at b's doors with its registration there")
+	if _, as := doorB.fetchedAs.Load(accessB); !as {
+		t.Fatal("the machine did not fetch hub b's model at b's doors with its delegated execution credential")
 	}
 	if _, asked := doorA.asked.Load("/v1/tensorfs/closure"); asked {
 		t.Fatal("hub a's doors were asked for hub b's model")
@@ -863,65 +864,40 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	if third := launched(); third.PID != second.PID {
 		t.Fatalf("the machine moved for a model of the hub it served (Host %d, then %d)", second.PID, third.PID)
 	}
-	if _, seen := doorB.workers.Load(registered[hubB.URL].ID); !seen {
+	if _, seen := doorB.workers.Load(accessB); !seen {
 		t.Fatalf("hub b's doors were not read as the machine's registration there: %d %s", code, out)
 	}
 	doorB.workers.Range(func(worker, _ any) bool {
-		if worker != registered[hubB.URL].ID {
+		if worker != accessB {
 			t.Fatalf("hub b's doors were read as %s, not as the machine's registration there", worker)
 		}
 		return true
 	})
 }
 
-func TestMachineRegistrationToleratesNewHubSettings(t *testing.T) {
+func TestExecutionAccessToleratesNewHubSettings(t *testing.T) {
+	certServer, ca := hubTLSServer(t, http.NotFoundHandler())
+	t.Cleanup(certServer.Close)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/machines" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/execution-access" {
 			http.NotFound(w, r)
 			return
 		}
+		if r.Header.Get("Authorization") != "Bearer fixture" {
+			t.Error("execution grant did not use the account credential")
+		}
+		var body map[string]any
+		if json.NewDecoder(r.Body).Decode(&body) != nil || body["delegate_certificate_der_b64url"] != base64.RawURLEncoding.EncodeToString(ca) {
+			t.Error("execution grant was not certificate-bound")
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t),
-			"environment": map[string]string{"TENSORHUB_ORIGIN": "https://hub.example", "TENSORHUB_FUTURE_FACT": "1",
-				"COZY_WEBRTC_INTERNAL_PORT": "8445", "SOME_NEW_SETTING": "x"}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "delegated-execution-only", "expires_at": time.Now().Add(time.Hour),
+			"environment": map[string]string{"TENSORHUB_ORIGIN": "https://hub.example", "TENSORHUB_FUTURE_FACT": "1", "COZY_WEBRTC_INTERNAL_PORT": "8445", "SOME_NEW_SETTING": "x"}})
 	}))
 	t.Cleanup(server.Close)
-	machine, problem := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "").RegisterMachine(context.Background())
+	access, problem := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "").AuthorizeExecutionAccess(context.Background(), ca)
 	fatal(t, problem)
-	if machine.Environment["TENSORHUB_ORIGIN"] != "https://hub.example" || machine.Environment["TENSORHUB_FUTURE_FACT"] != "1" {
-		t.Fatalf("the hub's facts were not kept: %v", machine.Environment)
-	}
-	if _, passed := machine.Environment["COZY_WEBRTC_INTERNAL_PORT"]; passed || strings.Join(machine.Ignored, ",") != "COZY_WEBRTC_INTERNAL_PORT,SOME_NEW_SETTING" {
-		t.Fatalf("settings the machine does not read reached it or went unnamed: %v ignored %v", machine.Environment, machine.Ignored)
-	}
-}
-
-// The launcher hands the machine every other registration in COZY_MACHINE_HUBS_JSON. One the
-// machine cannot read is named and skipped; it never stops the machine from booting.
-func TestMachineGrantReadsOtherHubsTolerantly(t *testing.T) {
-	key := make([]byte, 32)
-	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
-	hub := func(origin, id, token string) map[string]any {
-		return map[string]any{"worker_id": id, "worker_token": token, "future": true,
-			"environment": map[string]string{"TENSORHUB_ORIGIN": origin, "TENSORHUB_PUBLIC_ORIGIN": origin,
-				"TENSORHUB_OBJECT_STORAGE_HOSTS": "objects.b.example"}}
-	}
-	others, err := json.Marshal([]any{hub("https://b.example", "om-b", token), hub("https://c.example", "om-c", "short"),
-		hub("https://a.example", "om-a2", token), hub("http://d.example", "om-d", token), "not a registration"})
-	must(t, err)
-	base := []string{"COZY_MACHINE_ROOT=/", "COZY_WORKER_ID=om-a", "COZY_WORKER_AUTH_TOKEN=" + token,
-		"COZY_WORKER_INTERNAL_PORT=8443", "TENSORHUB_ORIGIN=https://a.example",
-		"COZY_AUTHORIZED_KEYS=" + base64.RawURLEncoding.EncodeToString(key)}
-	grant, err := host.ReadGrant(append(base, "COZY_MACHINE_HUBS_JSON="+string(others)))
-	must(t, err)
-	if len(grant.Hubs) != 1 || grant.Hubs[0].Origin != "https://b.example" || grant.Hubs[0].WorkerID != "om-b" ||
-		strings.Join(grant.Hubs[0].ObjectHosts, ",") != "objects.b.example" || len(grant.Skipped) != 4 {
-		t.Fatalf("other hubs read as %+v, skipped %q", grant.Hubs, grant.Skipped)
-	}
-	grant, err = host.ReadGrant(append(base, "COZY_MACHINE_HUBS_JSON={"))
-	must(t, err)
-	if len(grant.Hubs) != 0 || len(grant.Skipped) != 1 {
-		t.Fatalf("an unreadable list read as %+v, skipped %q", grant.Hubs, grant.Skipped)
+	if len(access.Environment) != 1 || access.Environment["TENSORHUB_ORIGIN"] != "https://hub.example" {
+		t.Fatalf("non-access environment reached the machine: %v", access.Environment)
 	}
 }

@@ -3,25 +3,31 @@ package producttest
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -35,22 +41,21 @@ const (
 	parityPackage = "local/machine-parity"
 )
 
-// machineHub stands in for Tensorhub on both sides of a machine: the account API the daemon
-// calls (the rental hub plus owned-machine registration) and, over TLS, the worker doors
-// every Host calls.
+// machineHub stands in for Tensorhub's account API and, over TLS, its rental worker API.
+// An owned machine receives scoped execution access without joining the rental registry.
 type machineHub struct {
 	*fakeRentalHub
 	worker   *httptest.Server
-	ca       []byte // the worker doors' private CA
-	provider string // the rental's machine root, as its provider booted it
+	access   *httptest.Server // local account-delegated content API, separate from account calls
+	ca       []byte           // the worker doors' private CA
+	provider string           // the rental's machine root, as its provider booted it
 	mu       sync.Mutex
-	machines map[string]string
 	grants   map[string]string // more of the grant, as a Hub adds a port for an image that serves it
 }
 
 func newMachineHub(t *testing.T) *machineHub {
 	t.Helper()
-	h := &machineHub{fakeRentalHub: newFakeRentalHub(t, 0), machines: map[string]string{}}
+	h := &machineHub{fakeRentalHub: newFakeRentalHub(t, 0)}
 	h.worker, h.ca = hubTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
@@ -60,18 +65,22 @@ func newMachineHub(t *testing.T) *machineHub {
 		}
 	}))
 	t.Cleanup(h.worker.Close)
+	h.access = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.worker.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(h.access.Close)
 	served := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorized := r.Header.Get("Authorization") == "Bearer rental-idle-test"
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines" && authorized:
-			id, token := "om-"+randomToken(t)[:22], randomToken(t)
-			h.mu.Lock()
-			h.machines[id] = token
-			h.mu.Unlock()
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "worker_token": token, "environment": h.environment()})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines":
+			t.Error("owned machine attempted Hub registration")
+			http.Error(w, "registration is not a local machine lifecycle", http.StatusGone)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access" && authorized:
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "execution-test-access", "expires_at": time.Now().Add(time.Hour),
+				"environment": map[string]string{"TENSORHUB_ORIGIN": h.access.URL, "TENSORHUB_PUBLIC_ORIGIN": h.server.URL}})
+		case strings.HasPrefix(r.URL.Path, "/v1/tensorfs/"):
+			h.worker.Config.Handler.ServeHTTP(w, r)
 		default:
 			served.ServeHTTP(w, r)
 		}
@@ -106,7 +115,7 @@ func virtualInventory(t *testing.T, root string) {
 	must(t, os.WriteFile(worker, []byte("#!"+python+`
 import sys
 from cozy_runtime.cli import runtime_worker
-sys.exit(runtime_worker.main([], gpus=[{"device_index": i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
+sys.exit(runtime_worker.main(sys.argv[1:], gpus=[{"device_index": i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
     "driver_version": "0.0", "memory_bytes": 8 << 30, "pci_bus_id": f"00000000:0{i}:00.0"} for i in range(4)]))
 `), 0o755))
 }
@@ -118,10 +127,14 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	identity, problem := rental.PendingCreatorIdentity(layout, "parity-rental")
 	fatal(t, problem)
 	// Short roots: a Runtime's executor socket lives under the machine root.
-	dir, err := os.MkdirTemp("", "czr")
+	providerHome, err := os.MkdirTemp("", "czr")
 	must(t, err)
-	t.Cleanup(func() { _ = removeAllForce(dir) })
+	claimScratch(providerHome)
+	dir := filepath.Join(providerHome, "machine")
+	t.Cleanup(func() { _ = removeAllForce(providerHome) })
+	trackDaemonRoot(t, providerHome)
 	host := machines.NewHost(dir, "", nil)
+	host.WebRTCPort, _ = strconv.Atoi(h.grants["COZY_WEBRTC_INTERNAL_PORT"])
 	source.Pinned = true // the Host under test, never replaced by the test binary
 	_, problem = host.Install(context.Background(), source, uv)
 	fatal(t, problem)
@@ -129,21 +142,56 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	key, err := os.ReadFile(layout.PendingRentalCreatorIdentity("parity-rental"))
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(dir, "owner.pem"), key, 0o600))
-	registration, _ := json.Marshal(map[string]string{"hub": "provider", "id": parityWorker, "worker_token": randomToken(t)})
-	must(t, os.WriteFile(filepath.Join(dir, "registration.json"), registration, 0o600))
-	environment, _ := json.Marshal(h.environment())
-	must(t, os.WriteFile(filepath.Join(dir, "environment.json"), environment, 0o600))
+	// A provider passes the rental grant directly to the same executable. Local Host.Ensure
+	// intentionally ignores legacy registration/environment files and always boots persistent.
+	free := func() int {
+		listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow choose fixture provider ports
+		must(t, err)
+		port := listener.Addr().(*net.TCPAddr).Port
+		must(t, listener.Close())
+		return port
+	}
+	workerPort, mediaPort := free(), free()
+	for mediaPort == workerPort {
+		mediaPort = free()
+	}
+	receiptKey, mediaToken := randomToken(t), randomToken(t)
+	mediaHash := sha256.Sum256([]byte(mediaToken))
+	auth, err := json.Marshal(map[string]any{"control_public_key_ed25519_b64url": identity.PublicKey(),
+		"media_token_sha256": []string{hex.EncodeToString(mediaHash[:])}})
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(dir, "media-token"), []byte(mediaToken), 0600))
+	environment := h.environment()
+	maps.Copy(environment, map[string]string{
+		"COZY_MACHINE_ROOT": host.Root(), "COZY_MACHINE_LIFETIME": "rental", "COZY_LISTEN_HOST": "127.0.0.1",
+		"COZY_WORKER_ID": parityWorker, "COZY_WORKER_AUTH_TOKEN": randomToken(t),
+		"COZY_WORKER_INTERNAL_PORT": strconv.Itoa(workerPort), "COZY_MEDIA_INTERNAL_PORT": strconv.Itoa(mediaPort),
+		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL": receiptKey, "COZY_RECORD_OWNER_AUTH_JSON": string(auth),
+	})
+	command := exec.Command(filepath.Join(host.Root(), "usr/local/bin/cozy-machine"))
+	command.Dir = host.Root()
+	for name, value := range environment {
+		command.Env = append(command.Env, name+"="+value)
+	}
+	log, err := os.OpenFile(filepath.Join(dir, "host.log"), os.O_CREATE|os.O_WRONLY, 0600)
+	must(t, err)
+	command.Stdout, command.Stderr = log, log
+	must(t, command.Start())
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	t.Cleanup(func() { _ = command.Process.Signal(syscall.SIGTERM); <-done; _ = log.Close() })
+	record, err := json.Marshal(map[string]any{"pid": command.Process.Pid, "worker_id": parityWorker,
+		"worker_port": workerPort, "media_port": mediaPort, "receipt_key": receiptKey})
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(dir, "host.json"), record, 0600))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	launch, problem := host.Ensure(ctx, "provider", nil, false)
+	launch, problem := host.Ensure(ctx, "", nil, false)
 	if problem != nil {
 		log, _ := os.ReadFile(filepath.Join(dir, "host.log"))
 		t.Fatalf("the provider Host did not boot: %s\n%s", problem.Message, log)
 	}
-	t.Cleanup(func() { _ = host.Stop(context.Background()) })
-	token, err := os.ReadFile(filepath.Join(dir, "media-token"))
-	must(t, err)
-	return launch, identity, string(token), host.Root()
+	return launch, identity, mediaToken, host.Root()
 }
 
 func parityProject(t *testing.T) string {
@@ -156,7 +204,7 @@ func parityProjectOn(t *testing.T, source machines.Source) string {
 	t.Helper()
 	project := filepath.Join(t.TempDir(), "machine-parity")
 	must(t, os.MkdirAll(project, 0o700))
-	runtime := "cozy-runtime>=" + machines.RuntimeFloor
+	runtime := "cozy-runtime>=" + hostruntime.ToolFloor
 	sources := ""
 	if source.RuntimeWheel != "" {
 		sources = fmt.Sprintf("[tool.uv.sources]\ncozy-runtime={path=%q}\ntensorfs={path=%q}\n", source.RuntimeWheel, source.TensorFSWheel)
@@ -255,7 +303,7 @@ func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.St
 func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string, home.Layout, *records.Store) {
 	t.Helper()
 	if source.Host == "" {
-		t.Skip("requires -machine-host: the pod-supervisor both machines run")
+		t.Skip("requires -machine-host: the standalone agent both machines run")
 	}
 	uv, err := exec.LookPath("uv")
 	if err != nil {
@@ -307,10 +355,10 @@ func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string
 	return h, root, layout, store
 }
 
-// One product body, run on this computer's machine and on a rental: the literal same Host
+// One product body, run on this computer's machine and on a rental: the literal same agent
 // binary with a real Runtime worker measuring a virtual four-device inventory. The local
-// machine is registered and launched by the daemon; the rental is the same binary a
-// provider booted, pinned and attached. Only the machine name and address may differ.
+// machine uses its own identity; the rental is the same binary a provider booted, pinned
+// and attached. Only the machine name and address may differ.
 func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	h, root, layout, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
@@ -360,23 +408,17 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	}
 	t.Logf("journals: %v", journals["local"])
 
-	// A stopped machine launches again on its next call under a fresh receipt key, keeping
-	// its root and boot: the Host's idle exit and relaunch. The Runtime counts every Control
-	// Claim in its ownership record: the relaunched Runtime runs the call on the Claim the
-	// daemon already holds, with no second Control Claim.
+	// A stopped agent launches again on its next call, keeping its machine root and boot.
+	// The single supervisor needs no durable Runtime ownership history on either launch.
 	bootID := filepath.Join(root, "machine", "root", "run/cozy/bootstrap/pod-boot-id")
 	before, err := os.ReadFile(bootID)
 	must(t, err)
-	streams := func() int {
-		var ownership struct {
-			Epoch int `json:"control_stream_epoch"`
+	noHistory := func() {
+		if _, err := os.Stat(filepath.Join(root, "machine", "root", "run/cozy/worker/ownership.json")); !os.IsNotExist(err) {
+			t.Fatalf("single-agent Runtime retained ownership history: %v", err)
 		}
-		raw, err := os.ReadFile(filepath.Join(root, "machine", "root", "run/cozy/worker/ownership.json"))
-		must(t, err)
-		must(t, json.Unmarshal(raw, &ownership))
-		return ownership.Epoch
 	}
-	claimsBefore := streams()
+	noHistory()
 	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 		t.Fatalf("machine stop [exit %d]\n%s", code, out)
 	}
@@ -386,9 +428,7 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	if after, err := os.ReadFile(bootID); err != nil || string(after) != string(before) {
 		t.Fatalf("the relaunched machine is another boot (%q, was %q): %v", after, before, err)
 	}
-	if relaunchClaims := streams() - claimsBefore; relaunchClaims != 0 {
-		t.Fatalf("the relaunch took %d Control Claims; a boot is Claimed once", relaunchClaims)
-	}
+	noHistory()
 
 	// Both machines report the Runtime's measured inventory through the same Host call.
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,

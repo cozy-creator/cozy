@@ -859,17 +859,28 @@ func (s *Store) CompleteMachineSubmissionClosure(id string, closure *pb.MachineS
 	return nil
 }
 
-// RefuseMachineSubmission is called only for Runtime's explicit guarantee that
-// this request was not accepted. An arbitrary RPC failure is never that proof.
-func (s *Store) RefuseMachineSubmission(id, code, detail string) *exit.Error {
+// RefuseMachineSubmission ends unsent work or retains the machine's durable closure
+// proof before ending a frozen submission. An arbitrary RPC failure is never proof.
+func (s *Store) RefuseMachineSubmission(id, code, detail string, closure *pb.MachineSubmissionClosure) *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot record machine submission refusal: %s", err)
 	}
 	defer tx.Rollback()
-	var receipt []byte
-	if err := tx.QueryRow(`SELECT receipt FROM machine_executions WHERE request_id=?`, id).Scan(&receipt); err != nil || len(receipt) != 0 {
+	link, err := scanMachineExecution(tx.QueryRow(`SELECT `+machineExecutionColumns+` FROM machine_executions WHERE request_id=?`, id))
+	if err != nil || link == nil || len(link.Receipt) != 0 {
 		return exit.New(exit.Conflict, "machine refusal contradicts accepted execution")
+	}
+	if len(link.Submission) > 0 {
+		var submitted pb.MachineExecutionSubmit
+		if closure == nil || closure.Receipt != nil || proto.Unmarshal(link.Submission, &submitted) != nil || submitted.Offer == nil || closure.RequestId != id || closure.RequestId != submitted.Offer.RequestId || closure.SubmissionId != submitted.SubmissionId || closure.ExecutionWorkspaceId != submitted.ExpectedExecutionWorkspaceId {
+			return exit.New(exit.Conflict, "machine refusal has no matching submission closure")
+		}
+		if !link.SubmissionClosed {
+			if err := appendEventTx(tx, id, "machine.submission_closed", 0, map[string]any{"submission_id": closure.SubmissionId, "execution_workspace_id": closure.ExecutionWorkspaceId}); err != nil {
+				return exit.Internalf("cannot retain refusal closure evidence: %s", err)
+			}
+		}
 	}
 	if _, err := tx.Exec(`UPDATE requests SET state='refused',retain_work=0 WHERE id=?`, id); err != nil {
 		return exit.Internalf("cannot retain machine refusal state: %s", err)

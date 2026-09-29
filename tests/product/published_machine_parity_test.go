@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
@@ -66,8 +67,9 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 			mu.Lock()
 			calls := append([]string(nil), seen...)
 			mu.Unlock()
-			// This computer's machine registers with its hub once, on its first launch.
-			if venue.name == "local" && key == "cold" && len(calls) == 1 && calls[0] == "POST /v1/machines" {
+			// Its first published call explicitly delegates content access; identity and
+			// lifecycle remain local, and subsequent calls reuse the bounded grant.
+			if venue.name == "local" && key == "cold" && len(calls) == 1 && calls[0] == "POST /v1/execution-access" {
 				calls = nil
 			}
 			if len(calls) != 0 {
@@ -89,7 +91,7 @@ func publishParityRelease(t *testing.T, h *machineHub, root, project string) {
 	if head, tail, sourced := strings.Cut(string(raw), "[tool.uv.sources]"); sourced {
 		_, rest, _ := strings.Cut(tail, "[build-system]")
 		must(t, os.WriteFile(pyproject, []byte(head+"[build-system]"+rest), 0o600))
-		if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
+		if out, err := exec.Command("uv", "lock", "--refresh-package", hostruntime.Distribution, "--project", project).CombinedOutput(); err != nil {
 			t.Fatalf("locking the published parity release: %v\n%s", err, out)
 		}
 	}

@@ -30,7 +30,7 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 	}
 	runtime, tensorfs := *machineRuntimeWheel, *machineTensorFSWheel
 	if runtime == "" {
-		runtime, tensorfs = publishedWheel(t, hostruntime.Distribution, oldestRuntime), publishedWheel(t, "tensorfs", "0.3.74")
+		runtime, tensorfs = publishedWheel(t, hostruntime.Distribution, machines.RuntimeFloor), publishedWheel(t, "tensorfs", "0.3.78")
 	}
 	h := newMachineHub(t)
 	root, err := os.MkdirTemp("", "czw")
@@ -50,8 +50,10 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 	dir := filepath.Join(root, "machine", "root", "opt", "cozy", "wheels")
 	install := func(wheels ...string) {
 		t.Helper()
-		// The Host is this cozy; without -machine-host it is installed and never launched.
 		args := []string{"machine", "install"}
+		if *machineHostBinary != "" {
+			args = append(args, "--host", *machineHostBinary)
+		}
 		if len(wheels) > 0 {
 			args = append(args, "--runtime-wheel", wheels[0], "--tensorfs-wheel", wheels[1])
 		}
@@ -75,8 +77,12 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 			t.Fatalf("%s holds %v, want exactly %v", dir, held, want)
 		}
 		host := filepath.Join(root, "machine", "root", "usr", "local", "bin")
-		if link, _ := os.Readlink(filepath.Join(host, "pod-supervisor")); link != "cozy" || fileSHA(t, filepath.Join(host, "cozy")) != fileSHA(t, cozyBin) {
-			t.Fatalf("the machine's Host is not this cozy: pod-supervisor -> %q", link)
+		agent := filepath.Join(host, "cozy-machine")
+		if machines.HostModule(agent) != machines.AgentModule {
+			t.Fatal("the installed machine server is not the independent agent")
+		}
+		if *machineHostBinary != "" && fileSHA(t, agent) != fileSHA(t, *machineHostBinary) {
+			t.Fatal("the installed machine agent differs from the selected artifact")
 		}
 	}
 	install(localBuild(t, runtime, "test1"), tensorfs)
@@ -103,6 +109,11 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 		}
 	}
 
+	// This test deliberately removed the SDK wheel needed for preparation. Stop the
+	// fixture before replacing its installation; a failed preparation is not idle proof.
+	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
+		t.Fatalf("machine stop before reinstall [exit %d]\n%s", code, out)
+	}
 	install()
 }
 
@@ -205,7 +216,7 @@ app = App()
 def sdk(payload: Ask) -> SDK:
     return SDK(runtime=importlib.metadata.version("`+hostruntime.Distribution+`"))
 `), 0o600))
-	if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
+	if out, err := exec.Command("uv", "lock", "--refresh-package", hostruntime.Distribution, "--project", project).CombinedOutput(); err != nil {
 		t.Fatalf("locking %s: %v\n%s", name, err, out)
 	}
 	return project

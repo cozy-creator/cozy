@@ -24,9 +24,8 @@ import (
 // machine keeps its pair as an image does, in var/lib/cozy/dev/current.
 func TestTheMachineUpdatesItsOwnRuntime(t *testing.T) {
 	from, tensorfs := *machineRuntimeWheel, *machineTensorFSWheel
-	recorded := from != "" // a Runtime this old records no executor; a build under test does
 	if from == "" {
-		from, tensorfs = publishedWheel(t, hostruntime.Distribution, "0.18.77"), publishedWheel(t, "tensorfs", "0.3.78")
+		from, tensorfs = publishedWheel(t, hostruntime.Distribution, machines.RuntimeFloor), publishedWheel(t, "tensorfs", "0.3.78")
 	}
 	to := localBuild(t, from, "updated")
 	source := machines.Source{Host: *machineHostBinary, RuntimeWheel: from, TensorFSWheel: tensorfs}
@@ -82,9 +81,6 @@ func TestTheMachineUpdatesItsOwnRuntime(t *testing.T) {
 			}
 		}
 		t.Logf("run %s: the executor loaded cozy-runtime %q (the machine runs %s)", key, loaded, installed())
-		if !recorded {
-			return
-		}
 		_, shown := runCozy(t, root, "run", "show", request.ID)
 		if loaded != want || !strings.Contains(shown, "cozy-runtime "+want) {
 			t.Fatalf("the executor loaded cozy-runtime %q, not %s:\n%s", loaded, want, shown)
@@ -103,7 +99,7 @@ func TestTheMachineUpdatesItsOwnRuntime(t *testing.T) {
 	}
 
 	code, out = update("--runtime-wheel", brokenBuild(t, to), "--tensorfs-wheel", tensorfs)
-	if code == 0 || !strings.Contains(out, "exited before it was ready") || !strings.HasPrefix(installed(), version(to)+" ") ||
+	if code == 0 || !strings.Contains(out, "rental.runtime_update_failed") || !strings.HasPrefix(installed(), version(to)+" ") ||
 		!strings.Contains(kept(), filepath.Base(to)) {
 		t.Fatalf("a broken Runtime did not roll back to %s [exit %d]: runs %s, keeps %s\n%s", version(to), code, installed(), kept(), out)
 	}
@@ -115,8 +111,8 @@ func TestTheMachineUpdatesItsOwnRuntime(t *testing.T) {
 	}
 	run(version(from))
 
-	code, out = update("--runtime-version", "0.18.78", "--tensorfs-version", "0.3.78")
-	if code != 0 || installed() != "0.18.78 0.3.78" || !strings.Contains(kept(), "cozy_runtime-0.18.78-") {
+	code, out = update("--runtime-version", machines.RuntimeFloor, "--tensorfs-version", "0.3.78")
+	if code != 0 || installed() != machines.RuntimeFloor+" 0.3.78" || !strings.Contains(kept(), "cozy_runtime-"+machines.RuntimeFloor+"-") {
 		t.Fatalf("the machine did not install the named versions [exit %d]: runs %s, keeps %s\n%s", code, installed(), kept(), out)
 	}
 }

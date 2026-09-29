@@ -22,7 +22,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/host/webrtc"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -138,7 +137,7 @@ func followOnMachine(t *testing.T, dir string, run uint64, output string, port i
 			must(t, err)
 			return token
 		}}
-	m.c, err = webrtctest.Dial(ctx, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)), webrtc.Fingerprint(leaf.Bytes), webrtctest.Options{})
+	m.c, err = webrtctest.Dial(ctx, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)), webrtctest.Fingerprint(leaf.Bytes), webrtctest.Options{})
 	must(t, err)
 	t.Cleanup(func() { m.c.Close() })
 	m.h.send(m.c, map[string]any{"t": "hello", "v": 1, "cap": m.mint(capability.Grant{})})

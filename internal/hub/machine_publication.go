@@ -36,7 +36,7 @@ type MachinePublicationGrantIntent struct {
 // PrepareMachinePublicationGrant binds explicit repositories to one machine's exact Host
 // leaf for at most seven days and never past the leaf's own validity.
 func PrepareMachinePublicationGrant(machine, machineID string, leaf []byte, repositories []string, now, expires time.Time) (MachinePublicationGrantIntent, *exit.Error) {
-	if machine == "" || machineID == "" {
+	if machine == "" {
 		return MachinePublicationGrantIntent{}, exit.New(exit.Conflict, "publication authority requires one machine identity")
 	}
 	certificate, err := x509.ParseCertificate(leaf)
@@ -90,7 +90,7 @@ func NormalizePublicationRepositories(repositories []string) ([]string, *exit.Er
 // initial short token is deliberately discarded here and never sent to Python.
 func (c *Client) AuthorizeMachinePublication(ctx context.Context, intent MachinePublicationGrantIntent) *exit.Error {
 	id, err := uuid.Parse(intent.AuthorizationID)
-	if err != nil || id == uuid.Nil || id.String() != intent.AuthorizationID || intent.MachineID == "" {
+	if err != nil || id == uuid.Nil || id.String() != intent.AuthorizationID || intent.Machine == "" {
 		return exit.New(exit.Validation, "publication authorization intent is malformed")
 	}
 	ttl := min(int64(900), intent.ExpiresAtUnix-time.Now().Unix()-1)

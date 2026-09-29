@@ -22,8 +22,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
-// A machine whose daemon advertises runtime-update/1 updates its own Runtime (internal/host/
-// update.go): this daemon stages the wheels on it, or names versions it fetches, asks for the
+// A machine agent advertising runtime-update/1 updates its own Runtime: this controller
+// stages the wheels on it, or names versions it fetches, asks for the
 // update and follows it to its end. A machine that does not keeps the SSH maintenance path.
 
 const nativeUpdateCapability = "runtime-update/1"

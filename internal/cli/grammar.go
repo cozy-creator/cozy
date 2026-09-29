@@ -12,7 +12,7 @@ type CLI struct {
 
 	Package PackageCmd `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
 	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
-	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
+	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Sign in to Tensorhub with this device key."`
 	Hub     HubCmd     `cmd:"" group:"Authentication" help:"Choose which Tensorhub commands use; one daemon serves them all."`
 	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
@@ -33,7 +33,7 @@ type MachineCmd struct {
 }
 
 type MachineInstallCmd struct {
-	Host          string `name:"host" predictor:"file" help:"Development only: run this cozy build as the machine's Host; default: this cozy."`
+	Host          string `name:"host" predictor:"file" help:"Development only: install this cozy-machine executable; default: the published machine agent."`
 	RuntimeWheel  string `name:"runtime-wheel" predictor:"file" help:"The cohort's Runtime wheel; default: the published Runtime."`
 	TensorFSWheel string `name:"tensorfs-wheel" predictor:"file" help:"The cohort's TensorFS wheel, with --runtime-wheel."`
 }
@@ -77,8 +77,8 @@ func (c *DaemonLogCmd) Run(r *Runtime) error {
 }
 
 type AuthCmd struct {
-	Login               AuthLoginCmd               `cmd:"" help:"Register or authenticate this machine by email."`
-	Logout              AuthLogoutCmd              `cmd:"" help:"Revoke this machine and erase its local key."`
+	Login               AuthLoginCmd               `cmd:"" help:"Sign in to Tensorhub by email with this device key."`
+	Logout              AuthLogoutCmd              `cmd:"" help:"Sign out and revoke this device key."`
 	RevokeOtherMachines AuthRevokeOtherMachinesCmd `cmd:"" help:"Revoke every other machine after email verification."`
 	Current             AuthCurrent                `cmd:"" default:"1" hidden:""`
 }
