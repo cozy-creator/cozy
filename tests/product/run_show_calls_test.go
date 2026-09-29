@@ -142,7 +142,7 @@ func TestRunShowKeepsEveryCallPastAProgressFlood(t *testing.T) {
 	code, human := runCozy(t, root, "run", "show", "1")
 	t.Logf("cozy run show 1:\n%s", human)
 	for index := range segments {
-		row := regexp.MustCompile(fmt.Sprintf(`(?m)^%d +Segment %d of %d +motion_segment_turbo +succeeded +4-7 .* denoise 8× 8.6s +sageattention$`,
+		row := regexp.MustCompile(fmt.Sprintf(`(?m)^%d +Segment %d of %d +motion_segment_turbo +succeeded +4-7 .* denoise 8× 8.6s +- +sageattention$`,
 			index+1, index+1, segments))
 		if code != 0 || !strings.Contains(human, "calls (10)") || !row.MatchString(human) {
 			t.Fatalf("run show [%d] lacks segment %d's call row:\n%s", code, index+1, human)
