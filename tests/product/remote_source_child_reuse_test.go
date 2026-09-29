@@ -129,13 +129,9 @@ async def main(payload: Input) -> Result:
 	defer held.Release()
 	_, problem = api.Mint(layout)
 	fatal(t, problem)
-	var firstChild *records.PackageInstall
-	for run := 0; run < 3; run++ {
-		began := time.Now()
-		remote := "--rental-only"
-		if run == 2 {
-			remote = "--rent-new"
-		}
+	var firstRoot, firstChild *records.PackageInstall
+	queue := func(remote string) (*records.PackageInstall, *records.PackageInstall) {
+		t.Helper()
 		code, out := runCozy(t, layout.Root, "run", "local/source-parent/main", remote, "--json", "--full")
 		if code != 0 || !strings.Contains(out, `"queued"`) {
 			t.Fatalf("durable queued CLI [%d]: %s", code, out)
@@ -150,46 +146,68 @@ async def main(payload: Input) -> Result:
 		fatal(t, problem)
 		bindings, problem := store.ChildBindings(row.InstallID)
 		fatal(t, problem)
-		var childInstall *records.PackageInstall
 		for _, binding := range bindings {
 			if binding.Module == "source_child" {
-				childInstall, problem = store.Install(binding.ChildInstallID)
+				childInstall, problem := store.Install(binding.ChildInstallID)
 				fatal(t, problem)
+				return rootInstall, childInstall
 			}
 		}
-		if childInstall == nil {
-			t.Fatal("source child lost its accepted binding")
+		t.Fatal("source child lost its accepted binding")
+		return nil, nil
+	}
+	for run := 0; run < 3; run++ {
+		began := time.Now()
+		remote := "--rental-only"
+		if run == 2 {
+			remote = "--rent-new"
 		}
+		rootInstall, childInstall := queue(remote)
 		if strings.Contains(childInstall.Closure, "source-parent==") {
 			t.Fatal("child inherited its caller's dependency closure")
 		}
 		if run == 0 {
-			firstChild = childInstall
+			firstRoot, firstChild = rootInstall, childInstall
 			if _, err := os.Stat(filepath.Join(firstChild.Dir, "venv", "pyvenv.cfg")); err != nil {
 				t.Fatal("initial child did not retain its own preparation environment", err)
 			}
 			// A completed caller's GC keeps the newest local environment for its
 			// package/version; the child's recorded environment remains usable for
 			// metadata reads under the next capture's writer lock.
-			fatal(t, store.SettleRequest(row.ID, "canceled"))
-			_, problem = install.Reclaim(layout, store, row.InstallID)
+			mu.Lock()
+			first := queued[len(queued)-1].ID
+			mu.Unlock()
+			fatal(t, store.SettleRequest(first, "canceled"))
+			_, problem = install.Reclaim(layout, store, rootInstall.ID)
 			fatal(t, problem)
-			if prior, problem := store.Install(row.InstallID); problem != nil || prior == nil {
+			if prior, problem := store.Install(rootInstall.ID); problem != nil || prior == nil {
 				t.Fatalf("newest local caller environment was not retained: %v", problem)
 			}
 			continue
 		}
-		if childInstall.ID == firstChild.ID {
-			t.Fatal("new invocation reused a mutable installation identity")
+		// An unchanged tree runs the snapshot it already has: nothing is captured or rebuilt.
+		if rootInstall.ID != firstRoot.ID || childInstall.ID != firstChild.ID {
+			t.Fatalf("an unchanged tree was captured again: root %s (was %s), child %s (was %s)",
+				rootInstall.ID, firstRoot.ID, childInstall.ID, firstChild.ID)
 		}
-		for _, installation := range []*records.PackageInstall{rootInstall, childInstall} {
+		t.Logf("repeat public CLI queued durable run in %s on its existing snapshot", time.Since(began))
+	}
+	// A changed caller is captured anew, and its unchanged child's environment is reused.
+	source, err := os.ReadFile(filepath.Join(parent, "source_parent.py"))
+	must(t, err)
+	write(parent, "source_parent.py", strings.Replace(string(source), "value: int = 1", "value: int = 2", 1))
+	rootInstall, childInstall := queue("--rental-only")
+	if rootInstall.ID == firstRoot.ID {
+		t.Fatal("a changed caller reused its previous snapshot")
+	}
+	if childInstall.Closure != firstChild.Closure {
+		t.Fatal("child environment reuse changed its selected dependencies")
+	}
+	for _, installation := range []*records.PackageInstall{rootInstall, childInstall} {
+		if installation.ID != firstChild.ID {
 			if _, err := os.Stat(filepath.Join(installation.Dir, "venv")); !os.IsNotExist(err) {
 				t.Fatalf("remote run rebuilt local environment for %s: %v", installation.Package, err)
 			}
 		}
-		if childInstall.Closure != firstChild.Closure {
-			t.Fatal("child environment reuse changed its selected dependencies")
-		}
-		t.Logf("repeat public CLI queued durable run in %s with no new root or child venv", time.Since(began))
 	}
 }
