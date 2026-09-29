@@ -1,5 +1,5 @@
 // Package capability is the signed grant a client presents to one machine: an authorized
-// key's permission to read a run's outputs until an expiry. It travels only in the
+// key's permission to read a run's outputs, or to maintain the machine, until an expiry. It travels only in the
 // `Authorization: Cozy-Cap` header or a WebRTC session's hello. A machine verifies it offline
 // and stores no bearer.
 package capability
@@ -19,11 +19,15 @@ import (
 
 const domain = "cozy-capability/1\x00"
 
+// Maintenance is the action that replaces a machine's Runtime.
+const Maintenance = "runtime-update"
+
 // Grant is what a capability allows. A member this verifier does not know refuses the whole
 // capability: a restriction an older machine cannot read must not be dropped.
 type Grant struct {
 	Machine string   `json:"m"`           // the machine's worker id
-	Run     string   `json:"r"`           // the run's number on that machine
+	Run     string   `json:"r,omitempty"` // the run's number on that machine
+	Action  string   `json:"a,omitempty"` // or a maintenance action (Maintenance), never both
 	Outputs []string `json:"p,omitempty"` // "name" (every index) or "name/i"; empty: every output
 	Expires int64    `json:"e"`           // unix seconds
 	Key     string   `json:"k"`           // the signer: KeyID of its public key
@@ -71,7 +75,7 @@ func Verify(token, machine string, keys []ed25519.PublicKey, now time.Time, bind
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&g) != nil || decoder.More() || g.Machine == "" || g.Run == "" || g.Expires == 0 {
+	if decoder.Decode(&g) != nil || decoder.More() || g.Machine == "" || (g.Run == "") == (g.Action == "") || g.Expires == 0 {
 		return Grant{}, ErrInvalid
 	}
 	signed := append([]byte(domain), payload...)
@@ -98,3 +102,6 @@ func (g Grant) Allows(run, output string, index int) bool {
 	}
 	return slices.Contains(g.Outputs, output) || index >= 0 && slices.Contains(g.Outputs, output+"/"+strconv.Itoa(index))
 }
+
+// Permits says whether the grant allows one maintenance action.
+func (g Grant) Permits(action string) bool { return g.Run == "" && g.Action == action }

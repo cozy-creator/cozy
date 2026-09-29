@@ -51,6 +51,8 @@ type Machine struct {
 	wake       chan struct{}
 	preparing  sync.WaitGroup
 	active     int
+	inUpdate   bool // a Runtime update holds the machine: no Runtime launches but its own
+	updates    runtimeUpdates
 }
 
 // Run boots the machine and serves until ctx ends or a rental's release is accepted.
@@ -91,6 +93,7 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 			return err
 		}
 	}
+	m.openUpdates()
 	m.tfs = &tensorFS{bin: layout.TFS, store: layout.Store, repoCache: g.RepoCacheRoot, observe: m.observeCache}
 	if m.childAddr, err = freeLoopback(); err != nil {
 		return err
@@ -169,7 +172,7 @@ func (m *Machine) prepareLauncher() error {
 				return err
 			}
 		}
-		g, err := startGuardian(m.layout.Runtime, env, m.log)
+		g, err := startGuardian(m.layout.Runtime, m.layout.Root, env, m.log)
 		if err != nil {
 			return err
 		}
@@ -184,7 +187,7 @@ func (m *Machine) prepareLauncher() error {
 			return err
 		}
 	} else {
-		m.launcher = directLauncher{path: m.layout.Runtime, env: env, out: m.log}
+		m.launcher = &directLauncher{path: m.layout.Runtime, root: m.layout.Root, env: env, out: m.log}
 	}
 	return nil
 }
@@ -309,6 +312,9 @@ func (m *Machine) runtime(ctx context.Context) (*grpc.ClientConn, error) {
 		p, ready := m.proc, m.ready
 		m.mu.Unlock()
 		if p == nil || p.exited() {
+			if m.updating() {
+				return nil, unavailable("runtime_updating", "this machine is updating its Runtime; ask again when it is done")
+			}
 			if m.restarts.gone() {
 				return nil, unavailable("runtime_gone", "this machine's Runtime exited twice without completing work; the machine is known idle")
 			}
@@ -384,7 +390,7 @@ func (m *Machine) supervise(ctx context.Context) error {
 		if err := m.restarts.observe(busy, err); err != nil {
 			return err
 		}
-		if m.preparations() {
+		if m.preparations() || m.updating() {
 			busy, err = true, nil
 		}
 		deadline, observeErr := m.idle.observe(now, busy, err == nil)
@@ -414,7 +420,7 @@ func (m *Machine) supervise(ctx context.Context) error {
 			m.mu.Lock()
 			idle := m.proc == nil
 			m.mu.Unlock()
-			if idle && !m.restarts.gone() && (m.owned || !m.idle.releasedNow()) {
+			if idle && !m.updating() && !m.restarts.gone() && (m.owned || !m.idle.releasedNow()) {
 				m.launchOrIdle()
 			}
 		}
@@ -434,8 +440,9 @@ func (m *Machine) relaunchAfter(p *runtimeProcess) error {
 		return nil
 	}
 	m.proc = nil
+	updating := m.inUpdate
 	m.mu.Unlock()
-	if p.stopped.Load() {
+	if p.stopped.Load() || updating { // the update relaunches it itself
 		return nil
 	}
 	again, err := m.restarts.exited()

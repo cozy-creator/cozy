@@ -11,8 +11,10 @@ import (
 type RuntimeUpdate = records.RuntimeUpdate
 
 type RuntimeUpdateRequest struct {
-	RuntimeWheel  string `json:"runtime_wheel,omitempty"`
-	TensorFSWheel string `json:"tensorfs_wheel,omitempty"`
+	RuntimeWheel    string `json:"runtime_wheel,omitempty"`
+	TensorFSWheel   string `json:"tensorfs_wheel,omitempty"`
+	RuntimeVersion  string `json:"runtime_version,omitempty"`
+	TensorFSVersion string `json:"tensorfs_version,omitempty"`
 }
 
 func (s *Server) startRuntimeUpdate(w http.ResponseWriter, r *http.Request) {
