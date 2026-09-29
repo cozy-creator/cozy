@@ -1,11 +1,13 @@
 package producttest
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,9 +46,9 @@ func (m *acceptingMachine) SubmitMachineExecution(_ context.Context, submission 
 		ExecutionWorkspaceId: submission.ExpectedExecutionWorkspaceId}, nil
 }
 
-// A submission recorded before workspace fencing carries no workspace identity. It is
-// submitted into the machine's current workspace instead of being refused forever.
-func TestUnfencedRecordedSubmissionUsesTheCurrentWorkspace(t *testing.T) {
+// A historical submission without a workspace remains unresolved. Rebinding it to
+// a replacement journal could execute the same intent twice.
+func TestUnfencedRecordedSubmissionNeverRebindsToCurrentWorkspace(t *testing.T) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -105,13 +107,20 @@ func TestUnfencedRecordedSubmissionUsesTheCurrentWorkspace(t *testing.T) {
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	startDaemonProcess(t, root)
 
-	waitFor(t, root, "the unfenced submission's acceptance", func() bool {
-		link, problem := store.MachineExecution(request.ID)
-		return problem == nil && link != nil && len(link.Receipt) > 0
+	waitFor(t, root, "the unfenced submission's reconciliation warning", func() bool {
+		_, shown := runCozy(t, root, "run", "show", request.ID, "--json")
+		return strings.Contains(shown, "recorded submission has no workspace identity")
 	})
+	link, problem := store.MachineExecution(request.ID)
+	fatal(t, problem)
+	owed, problem := store.MachineExecutionOwesWork(request.ID)
+	fatal(t, problem)
+	if len(link.Receipt) != 0 || link.SubmissionClosed || !owed || !bytes.Equal(link.Submission, recorded) {
+		t.Fatal("unfenced submission was rewritten or falsely settled")
+	}
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
-	if machine.submitted == nil || machine.submitted.ExpectedExecutionWorkspaceId != "current-workspace" {
-		t.Fatalf("the submission did not default to the current workspace: %+v", machine.submitted)
+	if machine.submitted != nil {
+		t.Fatal("unfenced submission reached a replacement journal")
 	}
 }

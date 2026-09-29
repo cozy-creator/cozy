@@ -214,7 +214,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					_ = m.store.AppendEvent(request.ID, "request.parked", 0, parked)
 				}
 			}
-			if problem != nil && problem.ErrName() == "machine_execution.closure_unavailable" {
+			if problem != nil && (problem.ErrName() == "machine_execution.closure_unavailable" || problem.ErrName() == "machine_execution.workspace_required") {
 				// A retired peer cannot acquire this capability by retrying a work/control
 				// call. Preserve uncertainty; an explicit reconnect after upgrade resumes it.
 				return
@@ -330,6 +330,15 @@ func (m *machineRuns) machineWorkOwed(request string) (bool, *exit.Error) {
 }
 
 func (m *machineRuns) submit(request records.Request, link *records.MachineExecution) (out *exit.Error) {
+	if len(link.Submission) > 0 {
+		var frozen pb.MachineExecutionSubmit
+		if err := proto.Unmarshal(link.Submission, &frozen); err != nil {
+			return exit.Internalf("recorded machine submission is unreadable: %s", err)
+		}
+		if frozen.ExpectedExecutionWorkspaceId == "" {
+			return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; preserve it until its machine is reconciled or retired")
+		}
+	}
 	ctx, stop := context.WithCancel(m.ctx)
 	m.mu.Lock()
 	m.submitting[request.ID] = stop
@@ -407,7 +416,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	workspace, problem := newExecutionWorkspace(ctx, connection)
 	if problem != nil {
 		if len(link.Submission) > 0 && problem.ErrName() == "machine.submission_closure_required" {
-			return pendingClosureUnavailable(problem.Message)
+			return pendingClosureUnavailable("the connected machine does not support the required submission-closure contract")
 		}
 		return problem
 	}
@@ -453,9 +462,6 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if len(link.Submission) > 0 {
 		if err := proto.Unmarshal(link.Submission, submission); err != nil {
 			return exit.Internalf("recorded machine submission is unreadable: %s", err)
-		}
-		if submission.ExpectedExecutionWorkspaceId == "" {
-			return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; preserve it until its machine is reconciled or retired")
 		}
 	} else {
 		authorization, problem := m.publicationAuthorization(ctx, request.ID, link.MachineID, connection)
@@ -677,7 +683,7 @@ func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (
 
 func pendingClosureUnavailable(detail string) *exit.Error {
 	return exit.Named(exit.Unavailable, "machine_execution.closure_unavailable",
-		"acceptance remains unresolved: this machine requires an agent and Runtime with durable submission closure (%s)", detail).
+		"acceptance remains unresolved: this machine requires an agent and Runtime with durable submission closure (%s); upgrade it, then run `cozy down` and `cozy up` to reconnect", detail).
 		WithRemedy("upgrade the machine, then run `cozy down` and `cozy up` to reconnect; the frozen submission and cancellation intent are retained")
 }
 

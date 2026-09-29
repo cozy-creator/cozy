@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"context"
+	"strings"
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -56,6 +57,10 @@ func (p *fakePod) CloseMachineSubmission(ctx context.Context, request *pb.Machin
 		CloseMachineSubmission(context.Context, *pb.MachineSubmissionClose) (*pb.MachineSubmissionClosure, error)
 	}); ok {
 		return machine.CloseMachineSubmission(ctx, request)
+	}
+	// Peers that only exercise accepted work still support the unused admission probe.
+	if strings.HasPrefix(request.RequestId, "closure-probe-") && request.RequestId == request.SubmissionId {
+		return &pb.MachineSubmissionClosure{RequestId: request.RequestId, SubmissionId: request.SubmissionId, ExecutionWorkspaceId: request.ExpectedExecutionWorkspaceId}, nil
 	}
 	return p.UnimplementedWorkerControlServer.CloseMachineSubmission(ctx, request)
 }
