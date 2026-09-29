@@ -50,9 +50,11 @@ type MachineExecution struct {
 	PendingControl       []byte
 	CancelRequested      bool
 	Collected            bool
+	SubmissionClosed     bool
 }
 
-const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected`
+const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected,
+ EXISTS(SELECT 1 FROM request_events closed WHERE closed.request_id=machine_executions.request_id AND closed.type='machine.submission_closed')`
 
 type MachinePackageTransferProgress struct {
 	Operation string
@@ -83,6 +85,8 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 // than a status projection. A failed or paused root remains live after its small
 // error result is collected, and cancellation alone never proves native cleanup.
 const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT ` + machineRetentionReleased + ` AND (
+ (length(e.receipt)=0 AND e.cancel_requested=1 AND length(e.submission)>0 AND NOT EXISTS
+ (SELECT 1 FROM request_events closed WHERE closed.request_id=r.id AND closed.type='machine.submission_closed')) OR
  (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked','canceled')) OR
  (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))`
 
@@ -244,7 +248,7 @@ func (s *Store) RequestExecutionTiming(id string) (int64, uint64, *exit.Error) {
 func scanMachineExecution(row interface{ Scan(...any) error }) (*MachineExecution, error) {
 	var value MachineExecution
 	err := row.Scan(&value.RequestID, &value.MachineID, &value.Submission, &value.Receipt,
-		&value.ObservedState, &value.RemoteCursor, &value.Outcome, &value.PendingControl, &value.CancelRequested, &value.Collected)
+		&value.ObservedState, &value.RemoteCursor, &value.Outcome, &value.PendingControl, &value.CancelRequested, &value.Collected, &value.SubmissionClosed)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -775,9 +779,9 @@ func (s *Store) CompleteMachineControl(id string, command []byte) *exit.Error {
 	return nil
 }
 
-// CancelMachineBeforeAcceptance ends a run no machine has accepted: canceled at once, with no
-// wait on a machine that may never answer (one still booting, preparing or gone). The intent
-// stays recorded, so a receipt that still arrives cancels the execution it names.
+// CancelMachineBeforeAcceptance cancels unsent intent immediately. A recorded
+// submission may already be accepted: its cancellation remains pending until
+// the machine closes the key or returns a receipt for normal execution control.
 func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -801,16 +805,58 @@ func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 	if _, err := tx.Exec(`UPDATE machine_executions SET cancel_requested=1 WHERE request_id=?`, id); err != nil {
 		return false, exit.Internalf("cannot retain machine cancellation intent: %s", err)
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state='canceled',retain_work=0 WHERE id=?`, id); err != nil {
+	state, scope := "canceled", "before_machine_submission"
+	if len(link.Submission) > 0 && !link.SubmissionClosed {
+		state, scope = "canceling", "machine_acceptance_unknown"
+	}
+	if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, state, id); err != nil {
 		return false, exit.Internalf("cannot project pending machine cancellation: %s", err)
 	}
-	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,0,?,?)`, id, StateEvent("canceled"), `{"scope":"before_machine_acceptance"}`, now()); err != nil {
+	if err := appendEventTx(tx, id, StateEvent(state), 0, map[string]any{"scope": scope}); err != nil {
 		return false, exit.Internalf("cannot record pending machine cancellation event: %s", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, exit.Internalf("cannot commit machine cancellation intent: %s", err)
 	}
 	return true, nil
+}
+
+// CompleteMachineSubmissionClosure records the machine's durable promise that a
+// key neither was nor can later be accepted. The original offer stays as history.
+func (s *Store) CompleteMachineSubmissionClosure(id string, closure *pb.MachineSubmissionClosure) *exit.Error {
+	if closure == nil || closure.Receipt != nil {
+		return exit.New(exit.Conflict, "an accepted execution requires machine cancellation")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot record submission closure: %s", err)
+	}
+	defer tx.Rollback()
+	link, err := scanMachineExecution(tx.QueryRow(`SELECT `+machineExecutionColumns+` FROM machine_executions WHERE request_id=?`, id))
+	if err != nil {
+		return exit.Internalf("cannot read closing submission: %s", err)
+	}
+	var submitted pb.MachineExecutionSubmit
+	if link == nil || len(link.Receipt) > 0 || !link.CancelRequested || proto.Unmarshal(link.Submission, &submitted) != nil || submitted.Offer == nil ||
+		closure.RequestId != id || closure.RequestId != submitted.Offer.RequestId || closure.SubmissionId != submitted.SubmissionId || closure.ExecutionWorkspaceId != submitted.ExpectedExecutionWorkspaceId {
+		return exit.New(exit.Conflict, "submission closure differs from the pending cancellation")
+	}
+	if link.SubmissionClosed {
+		return nil
+	}
+	if err := appendEventTx(tx, id, "machine.submission_closed", 0, map[string]any{"submission_id": closure.SubmissionId, "execution_workspace_id": closure.ExecutionWorkspaceId}); err != nil {
+		return exit.Internalf("cannot retain closure evidence: %s", err)
+	}
+	if _, err := tx.Exec(`UPDATE requests SET state='canceled',retain_work=0 WHERE id=?`, id); err != nil {
+		return exit.Internalf("cannot settle closed submission: %s", err)
+	}
+	if err := appendEventTx(tx, id, StateEvent("canceled"), 0, map[string]any{"scope": "machine_submission_closed"}); err != nil {
+		return exit.Internalf("cannot retain closure cancellation: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit submission closure: %s", err)
+	}
+	return nil
 }
 
 // RefuseMachineSubmission is called only for Runtime's explicit guarantee that

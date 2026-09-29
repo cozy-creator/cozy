@@ -721,12 +721,14 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	if e := c.CancelJob(jobID, "cozy job cancel"); e != nil {
 		return e
 	}
-	// BLOCK UNTIL THE CANCELED TERMINAL. The request was made; the attempt's own
-	// journaled terminal is what settles it, so this watches the durable stream to it.
-	if _, e := c.Watch(jobID, 0, func(localapi.Event) bool { return true }); e != nil {
-		return e
+	// Cancellation is durable intent. Waiting for its effective outcome is explicit;
+	// an unavailable machine must not turn the default command into an endless wait.
+	if ctx.Inv.Bool("--await") {
+		if _, e := c.Watch(jobID, 0, func(localapi.Event) bool { return true }); e != nil {
+			return e
+		}
 	}
-	final, e := c.Job(jobID)
+	final, e := c.RecordedJob(jobID)
 	if e != nil {
 		return e
 	}
