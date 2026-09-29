@@ -94,6 +94,11 @@ lifecycle role on the laptop. Local code and observation of existing work do not
 Hub grant. Machine-agent releases use `machine-vVERSION` tags and `machine-agent.json` with
 artifact hashes; ordinary Cozy releases and their `latest` installer stay separate.
 
+Cached execution access belongs to the current device key or operator credential. Signing
+out or switching credentials cannot reuse another account's cached grant. The agent retains
+one delegated account per Hub: that account can renew access, while a different account
+receives an explicit conflict so retained jobs keep their original authority.
+
 ## Packages
 
 Search the Tensorhub catalog, install a package, and inspect local installations:
