@@ -32,9 +32,22 @@ func TestAMachineStoppedMidJobRunsAJobOnItsNextBoot(t *testing.T) {
 		}
 		_, shown := runCozy(t, root, "run", "show", row.ID, "--json")
 		var run struct {
-			ExecutionMS int64 `json:"execution_ms"`
+			Status string `json:"status"`
+			Events []struct {
+				Type string `json:"type"`
+			} `json:"events"`
 		}
-		return json.Unmarshal([]byte(shown), &run) == nil && run.ExecutionMS > 0
+		if json.Unmarshal([]byte(shown), &run) != nil || run.Status != "in_progress" {
+			return false
+		}
+		// Dispatch is the lifecycle fact. Older SDKs report unknown execution
+		// duration, and this sleeping handler has no periodic timing samples.
+		for _, event := range run.Events {
+			if event.Type == "machine.running" {
+				return true
+			}
+		}
+		return false
 	})
 	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 		t.Fatalf("machine stop [exit %d]\n%s", code, out)
