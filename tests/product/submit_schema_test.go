@@ -123,23 +123,25 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	if code != 1 || !strings.Contains(out, "video_transport.prompt is not an asset field") {
 		t.Fatalf("--asset PROMPT did not fold onto prompt [exit %d]\n%s", code, out)
 	}
-	// A genuinely unknown name is never guessed at: it refuses with the contract in hand.
+	// A genuinely unknown name is never guessed at: it is dropped with a warning, and the
+	// field it may have meant is still required.
 	code, out = runCozy(t, root, "run", video, "prompts=x")
-	if code != 1 || !strings.Contains(out, `no request field "prompts"`) ||
-		!strings.Contains(out, "prompt, first_frame") {
-		t.Fatalf("an unknown name did not refuse with the declared fields [exit %d]\n%s", code, out)
+	if code != 1 || !strings.Contains(out, "warning: ignored unknown field prompts — not in "+video+"'s interface") ||
+		!strings.Contains(out, "provide required arguments: [prompt: str") {
+		t.Fatalf("an unknown name did not warn beside the required fields [exit %d]\n%s", code, out)
 	}
 
 	// The same law for a WIRE-DRIVEN client: no CLI composed this payload, and the daemon
-	// still refuses an unknown field by name before anything is recorded.
+	// still refuses a mistyped field by name before anything is recorded. An undeclared
+	// field beside it is not one of the problems.
 	daemon := attachDaemon(t, root)
 	wire := daemon.call(t, "POST", "/v1/requests", map[string]any{
 		"package": localWeightlessRef, "function": "tile",
-		"input": map[string]any{"bogus": 1},
+		"input": map[string]any{"bogus": 1, "size": "big"},
 	}, "Idempotency-Key", "schema-wire-1")
 	if wire.Status != http.StatusBadRequest || wire.code() != "request_payload_invalid" ||
-		!strings.Contains(string(wire.Body), `unknown field \"bogus\"`) {
-		t.Fatalf("a wire-driven unknown field was not refused typed: %s", wire.brief())
+		!strings.Contains(string(wire.Body), `size does not match declared int`) || strings.Contains(string(wire.Body), "bogus") {
+		t.Fatalf("a wire-driven mistyped field was not refused typed: %s", wire.brief())
 	}
 
 	// NOTHING was recorded by any refusal: zero request rows, and the refused submissions
@@ -184,7 +186,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	}
 	requestID, _, problem := o.c.Submit(orchestrator.Submission{
 		IdemKey: "schema-past-client", Package: localWeightlessRef, Entrypoint: "tile",
-		PlanID: prepared.PlanID, Payload: []byte(`{"bogus":1}`),
+		PlanID: prepared.PlanID, Payload: []byte(`{"size":"big"}`),
 		Outputs:   strings.FieldsFunc(prepared.Outputs, func(r rune) bool { return r == ',' }),
 		InstallID: prepared.InstallID, Release: prepared.Release,
 		LocalInstallationID: prepared.LocalInstallationID,

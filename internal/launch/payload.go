@@ -32,8 +32,8 @@ import (
 // install, so this costs microseconds and no subprocess: cozy-creator.md's
 // "payload validation is client-side from the recorded schema, near-instant".
 //
-// An undeclared key refuses HERE, before a request is recorded and long before a model
-// loads, because a typo should cost a millisecond.
+// An undeclared key is carried only to be dropped by ValidatePayload, which names it in the
+// run's one warning (owner, 2026-09-28): an unknown field never refuses a run.
 
 // KernelAxes is the execution-path override's vocabulary of AXES (cr-125), and it is one:
 // attention. A GEMM or fusion pin is not here because no measurement has asked for one. The
@@ -181,9 +181,6 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 			if e != nil {
 				return nil, RunKeys{}, e
 			}
-			if e := declared(ep, key); e != nil {
-				return nil, RunKeys{}, e
-			}
 			document[key] = json.RawMessage(raw)
 			continue
 		}
@@ -192,8 +189,9 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 			if e != nil {
 				return nil, RunKeys{}, e
 			}
-			if e := declared(ep, key); e != nil {
-				return nil, RunKeys{}, e
+			if _, known := ep.TypeOfField(key); !known {
+				document[key], _ = json.Marshal(raw)
+				continue
 			}
 			if after, isFile := strings.CutPrefix(raw, "@"); isFile {
 				rendered, _ := ep.TypeOfField(key)
@@ -493,14 +491,15 @@ func modelOverrideSlot(ep *Entrypoint, asked string) (*Slot, *exit.Error) {
 		WithRemedy("%s declares: %s", ep.Name, strings.Join(params, ", "))
 }
 
-// ValidatePayload checks one already-rendered request object against the exact PackageInterface
-// schema — the daemon-submit half of the same recorded-schema gate ParsePayload applies
-// while building a CLI payload. It fires BEFORE a request row exists or an idempotency
-// key is recorded (cl-105): every offending field is named in ONE typed
-// `request_payload_invalid` refusal whose remedy is the callable's usage line. A
-// PackageInterface the validator itself cannot read stays a structural refusal: that is a host
-// fault, not a payload fault.
-func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) *exit.Error {
+// ValidatePayload checks one already-rendered request object against the exact
+// PackageInterface schema and answers it without the fields that schema does not declare,
+// at any depth, with their paths. An undeclared field is a warning, never a refusal (owner,
+// 2026-09-28); types, required fields and bounds stay strict, and every offending field is
+// named in ONE typed `request_payload_invalid` refusal whose remedy is the callable's usage
+// line. It fires BEFORE a request row exists or an idempotency key is recorded (cl-105). A
+// payload with nothing to drop is answered byte for byte; a refused one still names what it
+// would have dropped.
+func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) (json.RawMessage, []string, *exit.Error) {
 	target := ep.Name
 	if pkg != "" {
 		target = pkg + "/" + ep.Name
@@ -514,62 +513,99 @@ func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) *exit.
 	decoder.UseNumber()
 	var document map[string]any
 	if err := decoder.Decode(&document); err != nil || document == nil {
-		return refuse([]string{"the payload is not one JSON object"})
+		return nil, nil, refuse([]string{"the payload is not one JSON object"})
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return refuse([]string{"the payload carries trailing JSON"})
+		return nil, nil, refuse([]string{"the payload carries trailing JSON"})
 	}
-	var problems []string
+	var problems, missing, ignored, nested []string
 	known := map[string]bool{}
-	var missing []string
 	for _, field := range ep.Request.Fields {
 		known[field.Name] = true
-		if field.Wire == "required" {
-			if _, ok := document[field.Name]; !ok {
-				missing = append(missing, fieldSignature(&field))
-			}
+		if _, ok := document[field.Name]; !ok && field.Wire == "required" {
+			missing = append(missing, fieldSignature(&field))
 		}
 	}
-	if len(missing) > 0 {
-		problems = append(problems, "missing required "+fieldWord(len(missing))+" "+
-			strings.Join(missing, "; "))
-	}
-	var unknown []string
 	for name := range document {
 		if !known[name] {
-			unknown = append(unknown, strconv.Quote(name))
+			ignored = append(ignored, name)
+			delete(document, name)
 		}
-	}
-	if len(unknown) > 0 {
-		sort.Strings(unknown)
-		problems = append(problems, "unknown "+fieldWord(len(unknown))+" "+
-			strings.Join(unknown, ", ")+" (it declares: "+
-			strings.Join(ep.RequestFields(), ", ")+")")
 	}
 	for _, field := range ep.Request.Fields {
 		value, ok := document[field.Name]
 		if !ok {
 			continue
 		}
-		if problem := validateField(field, value, field.Name); problem != nil {
+		if problem := validateFieldReading(field, value, field.Name, &reading{ignored: &nested}); problem != nil {
 			if problem.Code != exit.Validation {
-				return problem
+				return nil, nil, problem
 			}
 			problems = append(problems, problem.Message)
 		}
 	}
-	if len(problems) > 0 {
-		if len(missing) > 0 {
-			message := "provide required arguments: [" + strings.Join(missing, "; ") + "]"
-			if len(problems) > 1 {
-				message += "; " + strings.Join(problems[1:], "; ")
-			}
-			return exit.Named(exit.Validation, "request_payload_invalid", "%s", message).
-				WithRemedy("%s", UsageLine(target, ep))
-		}
-		return refuse(problems)
+	for _, path := range nested {
+		ignored = append(ignored, drop(document, path))
 	}
-	return nil
+	sort.Strings(ignored)
+	if len(missing) > 0 {
+		message := "provide required arguments: [" + strings.Join(missing, "; ") + "]"
+		if len(problems) > 0 {
+			message += "; " + strings.Join(problems, "; ")
+		}
+		return nil, ignored, exit.Named(exit.Validation, "request_payload_invalid", "%s", message).
+			WithRemedy("%s", UsageLine(target, ep))
+	}
+	if len(problems) > 0 {
+		return nil, ignored, refuse(problems)
+	}
+	if len(ignored) == 0 {
+		return payload, nil, nil
+	}
+	var cleaned bytes.Buffer
+	encoder := json.NewEncoder(&cleaned)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(document); err != nil {
+		return nil, nil, exit.Internalf("cannot render the payload without its undeclared fields: %s", err)
+	}
+	return bytes.TrimSpace(cleaned.Bytes()), ignored, nil
+}
+
+// drop deletes one undeclared field, named by its validator path (`references.2.foo`), from
+// the decoded document, and answers that path as a person reads it: `references[2].foo`.
+// Only struct fields and list items are descended, so a segment under a list is its index.
+func drop(document map[string]any, path string) string {
+	parts := strings.Split(path, ".")
+	shown := parts[0]
+	var node any = document
+	for i, part := range parts {
+		switch value := node.(type) {
+		case map[string]any:
+			if i == len(parts)-1 {
+				delete(value, part)
+			}
+			node = value[part]
+			if i > 0 {
+				shown += "." + part
+			}
+		case []any:
+			index, _ := strconv.Atoi(part)
+			if index >= 0 && index < len(value) {
+				node = value[index]
+			}
+			shown += "[" + part + "]"
+		}
+	}
+	return shown
+}
+
+// IgnoredWarning is the run's one warning for the undeclared fields ValidatePayload dropped.
+func IgnoredWarning(target string, ignored []string) records.Warning {
+	return records.Warning{
+		Code: "request_fields_ignored", Fields: ignored,
+		Message: fmt.Sprintf("ignored unknown %s %s — not in %s's interface",
+			fieldWord(len(ignored)), strings.Join(ignored, ", "), target),
+	}
 }
 
 func fieldWord(n int) string {
@@ -579,15 +615,10 @@ func fieldWord(n int) string {
 	return "fields"
 }
 
-func validateField(field Field, value any, path string) *exit.Error {
-	return validateFieldInto(field, value, path, nil)
-}
-
 // reading is what one validation collects beside its verdict. assets gathers the asset
 // positions it passed; ignored, when set, turns an undeclared nested field into an ignored
-// path instead of a refusal. That is how a peer's RESULT is read: a newer package or
-// Runtime may add fields this host does not declare. A caller's request never sets it,
-// because there an undeclared key is a typo.
+// path instead of a refusal. A request and a peer's RESULT are both read that way: a newer
+// caller, package or Runtime may name fields this host does not declare.
 type reading struct {
 	assets  *[]string
 	ignored *[]string
@@ -888,20 +919,11 @@ func canonicalFieldKey(ep *Entrypoint, key string) (string, *exit.Error) {
 	return key, nil
 }
 
-func declared(ep *Entrypoint, key string) *exit.Error {
-	if _, ok := ep.TypeOfField(key); ok {
-		return nil
-	}
-	return exit.New(exit.Validation, "%s declares no request field %q", ep.Name, key).
-		WithRemedy("it declares: %s", strings.Join(ep.RequestFields(), ", ")).
-		WithNext("cozy package list --full")
-}
-
 // typed spells one scalar the way the field's rendered schema declares it.
 func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 	rendered, ok := ep.TypeOfField(key)
 	if !ok {
-		return nil, declared(ep, key)
+		return nil, exit.Internalf("%s declares no request field %q", ep.Name, key)
 	}
 	if value, handled, problem := typedUnion(ep, key, rendered, raw); handled {
 		return value, problem

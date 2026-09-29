@@ -72,6 +72,8 @@ type JobSubmission struct {
 	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
 	// AttentionKernel is an optional developer execution-path pin; the job's calls inherit it.
 	AttentionKernel string `json:"attention_kernel,omitempty"`
+	// Ignored names the undeclared fields the client dropped from Input.
+	Ignored []string `json:"ignored_fields,omitempty"`
 }
 
 // JobHandle is the 202 answer.
@@ -230,6 +232,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		var lease *install.Lease
 		defer func() { lease.Release() }()
 		spec, inputDeclaration, e = s.resolveJob(r.Context(), selectedHub, sub, &lease)
+		spec.Warnings = ignoredWarnings(sub.Package, sub.Function, sub.Ignored)
 		if e == nil && spec.OutputExport != nil {
 			e = resultfiles.Preflight(spec.OutputExport.Directory)
 		}

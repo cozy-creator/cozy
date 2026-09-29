@@ -40,7 +40,7 @@ func TestDeclaredAssetsPreserveOccurrencesLabelsAndNamedFields(t *testing.T) {
 	must(t, err)
 	payload, assets, problem := launch.ParseAssets(ep, []byte(`{"prompt":"<Picture1> and <Picture2>"}`), []string{" 艾丽丝 =~/" + relative, path, "POSTER=" + path}, nil, nil)
 	fatal(t, problem)
-	fatal(t, launch.ValidatePayload("proof/assets", ep, payload))
+	fatal(t, payloadProblem("proof/assets", ep, payload))
 	var doc struct {
 		Prompt string `json:"prompt"`
 		Assets []struct{ Asset, Label string }
@@ -102,12 +102,12 @@ func TestDeclaredAssetsDefaultEmptyCollection(t *testing.T) {
 	if len(bindings) != 0 || !strings.Contains(string(payload), `"assets":[]`) {
 		t.Fatalf("missing declared Assets did not become an empty collection: %s %+v", payload, bindings)
 	}
-	if problem := launch.ValidatePayload("proof/assets", ep, payload); problem == nil {
+	if problem := payloadProblem("proof/assets", ep, payload); problem == nil {
 		t.Fatal("empty required image collection ignored the authored minimum count")
 	}
 	// A zero-reference callable uses the same payload builder and schema owner.
 	ep.Request.Fields[1].Constraints.MinLength = nil
-	fatal(t, launch.ValidatePayload("proof/assets", ep, payload))
+	fatal(t, payloadProblem("proof/assets", ep, payload))
 	explicit := []byte(`{"prompt":"text only","assets":[{"asset":"` + retainedAssetRef + `","label":"last"}]}`)
 	payload, bindings, problem = launch.ParseAssets(ep, explicit, nil, nil, nil)
 	fatal(t, problem)
@@ -158,7 +158,7 @@ func TestDeclaredAssetsCountsAndFidelity(t *testing.T) {
 	must(t, file.Close())
 	payload, bindings, problem := launch.ParseAssets(ep, []byte(`{"prompt":"same"}`), []string{"alice=" + photo, "poster=" + photo}, []string{"alice=high"}, nil)
 	fatal(t, problem)
-	fatal(t, launch.ValidatePayload("proof/assets", ep, payload))
+	fatal(t, payloadProblem("proof/assets", ep, payload))
 	if len(bindings) != 2 || !strings.Contains(string(payload), `"fidelity":"high"`) {
 		t.Fatalf("named field consumed a collection count or fidelity was lost: %s", payload)
 	}

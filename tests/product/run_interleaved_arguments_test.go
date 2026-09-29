@@ -144,8 +144,9 @@ func TestInterleavedRunPreservesAssetsPayloadAndLiteralTail(t *testing.T) {
 	if request == nil || submittedPayload(t, request)["prompt"] != "--looks-like-a-flag" || submittedPayload(t, request)["steps"] != float64(9) {
 		t.Fatalf("literal tail became options: %s", out)
 	}
-	code, out := runCozy(t, root, append(append([]string{}, base...), "prompt=literal", "--", "--model.model=literal")...)
-	if code == 0 || !strings.Contains(out, `no request field`) || !strings.Contains(out, `--model.model`) {
-		t.Fatalf("literal dashed model argument became an override: %d %s", code, out)
+	request, _, out = submitRun(t, root, "interleaved-dashed", append(append([]string{}, base...), "prompt=literal", "--", "--model.model=literal")...)
+	if request == nil || len(request.Models) != 0 || submittedPayload(t, request)["--model.model"] != nil ||
+		!strings.Contains(out, `"fields":["--model.model"]`) {
+		t.Fatalf("literal dashed model argument became an override: %s", out)
 	}
 }

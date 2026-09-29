@@ -38,13 +38,13 @@ type runReport struct {
 	Waiting     string `json:"waiting,omitempty"`
 	ErrorType   string `json:"error_type,omitempty"`
 	Error       string `json:"error,omitempty"`
-	// Warnings are what the machine reported about the run without failing it.
-	Warnings []reportWarning `json:"warnings,omitempty"`
-	Stages   []reportStage   `json:"stages"`
-	Steps    []reportSteps   `json:"steps,omitempty"`
-	Degree   int             `json:"degree,omitempty"`
-	GPUs     []reportGPU     `json:"gpus,omitempty"`
-	Calls    []reportCall    `json:"calls,omitempty"`
+	// Warnings are what the run reported without failing: its admission's and its machine's.
+	Warnings []records.Warning `json:"warnings,omitempty"`
+	Stages   []reportStage     `json:"stages"`
+	Steps    []reportSteps     `json:"steps,omitempty"`
+	Degree   int               `json:"degree,omitempty"`
+	GPUs     []reportGPU       `json:"gpus,omitempty"`
+	Calls    []reportCall      `json:"calls,omitempty"`
 	// Resolved is what the machine installed and which checkpoint each Model slot ran: the
 	// run's reproducible identity, recorded by the machine that chose it.
 	Resolved json.RawMessage     `json:"resolved,omitempty"`
@@ -59,11 +59,6 @@ type runReport struct {
 	// CollectionPending names why a finished result still waits on its machine.
 	CollectionPending string `json:"collection_pending,omitempty"`
 	CollectionError   string `json:"collection_error,omitempty"`
-}
-
-type reportWarning struct {
-	Code    string `json:"code,omitempty"`
-	Message string `json:"message"`
 }
 
 type reportStage struct {
@@ -261,11 +256,6 @@ type logEvent struct {
 	} `json:"fields"`
 }
 
-type warningEvent struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
 type outputsEvent struct {
 	Outputs       []json.RawMessage `json:"outputs"`
 	Bytes         int64             `json:"bytes"`
@@ -431,9 +421,9 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				call(loaded.Request).Runtime = loaded.String()
 			}
 		case "machine.warning", "request.warning":
-			var warning warningEvent
+			var warning records.Warning
 			if json.Unmarshal(event.Payload, &warning) == nil {
-				report.Warnings = append(report.Warnings, reportWarning(warning))
+				report.Warnings = append(report.Warnings, warning)
 			}
 		case "request.preparing":
 			var preparing preparingEvent

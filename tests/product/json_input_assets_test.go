@@ -48,7 +48,7 @@ func TestJSONAssetFilesUseOrdinaryBindings(t *testing.T) {
 	if len(assets) != 1 || assets[0].FieldPath != "references.0.image" || assets[0].LocalPath != imagePath || assets[0].MediaType != "image/png" || assets[0].MaxBytes != 4096 {
 		t.Fatalf("wrong asset grant: %+v", assets)
 	}
-	if problem := launch.ValidatePayload("proof/h3", ep, resolved); problem != nil {
+	if problem := payloadProblem("proof/h3", ep, resolved); problem != nil {
 		t.Fatal(problem)
 	}
 	if strings.Contains(string(resolved), imagePath) || !strings.Contains(string(resolved), assets[0].Digest) {
