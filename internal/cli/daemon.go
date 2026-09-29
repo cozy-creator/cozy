@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/userunit"
 )
 
 const daemonProcessName = "cozy-daemon"
@@ -205,11 +206,16 @@ func startDaemon(ctx *Context) (*daemonChild, *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot open the null diagnostics sink: %s", err)
 	}
-	command := exec.Command(self)
-	command.Args[0] = daemonProcessName
 	// The daemon serves every hub and each request names its own. Its default is the
 	// configured hub, never a one-command --tensorhub selection.
-	command.Env = ctx.Cfg.Child("COZY_HOME="+ctx.Cfg.Home, "TENSORHUB_URL="+ctx.Cfg.ConfiguredHubURL)
+	env := ctx.Cfg.Child("COZY_HOME="+ctx.Cfg.Home, "TENSORHUB_URL="+ctx.Cfg.ConfiguredHubURL)
+	if userunit.Available() {
+		discard.Close()
+		return startDaemonUnit(ctx, self, env)
+	}
+	command := exec.Command(self)
+	command.Args[0] = daemonProcessName
+	command.Env = env
 	command.Stdout = discard
 	diagnostics, err := command.StderrPipe()
 	if err != nil {
@@ -242,6 +248,58 @@ func startDaemon(ctx *Context) (*daemonChild, *exit.Error) {
 		pid: command.Process.Pid, done: done,
 		closeDiagnostics: func() { closeOnce.Do(func() { _ = diagnostics.Close() }) },
 	}, nil
+}
+
+// DaemonUnit is the systemd user unit a home's daemon runs as: cozy-daemon for ~/.cozy.
+func DaemonUnit(home string) string {
+	return userunit.Name(daemonProcessName, home, home == config.DefaultHome())
+}
+
+// startDaemonUnit runs the daemon as its own user unit, outside the caller's scope and
+// cgroup: ending the session that started it never ends it, and `cozy down` ends the unit.
+// A unit already running is the daemon, starting. Its startup refusal is its stderr, kept in
+// daemon-startup.log.
+func startDaemonUnit(ctx *Context, self string, env []string) (*daemonChild, *exit.Error) {
+	// The daemon entry is named by argv0; a unit runs its command's own name.
+	entry := filepath.Join(ctx.Cfg.Home, daemonProcessName)
+	if target, err := os.Readlink(entry); err != nil || target != self {
+		next := entry + ".new"
+		_ = os.Remove(next)
+		if err := os.Symlink(self, next); err != nil {
+			return nil, exit.Internalf("cannot name the daemon entry: %s", err)
+		}
+		if err := os.Rename(next, entry); err != nil {
+			return nil, exit.Internalf("cannot name the daemon entry: %s", err)
+		}
+	}
+	unit, startup := DaemonUnit(ctx.Cfg.Home), filepath.Join(ctx.Cfg.Home, "daemon-startup.log")
+	if _, err := userunit.Start(userunit.Spec{Unit: unit, Argv: []string{entry}, Env: env, Stderr: startup, Fresh: true}); err != nil {
+		return nil, exit.Internalf("cannot start the Cozy daemon unit: %s", err)
+	}
+	done, stop := make(chan daemonExit, 1), make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+			if state := userunit.Property(unit, "ActiveState"); state == "active" || state == "activating" {
+				continue
+			}
+			raw, _ := os.ReadFile(startup)
+			result := daemonExit{code: exit.Internal, diagnostic: strings.TrimSpace(string(raw[:min(len(raw), maxDaemonStartupDiagnostic)]))}
+			// A unit that ended in a word refused; one that ended silently found another owner.
+			if result.diagnostic != "" {
+				result.err = errors.New("the Cozy daemon unit ended")
+			}
+			done <- result
+			return
+		}
+	}()
+	var closeOnce sync.Once
+	return &daemonChild{pid: userunit.MainPID(unit), done: done,
+		closeDiagnostics: func() { closeOnce.Do(func() { close(stop) }) }}, nil
 }
 
 func readBoundedDiagnostic(reader io.Reader) string {
