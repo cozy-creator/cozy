@@ -32,8 +32,9 @@ import (
 )
 
 // Inherited is the complete set of environment variables a package process
-// may inherit. Launchers impose every other value explicitly.
-var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+// may inherit. Launchers impose every other value explicitly. XDG_RUNTIME_DIR is where the
+// user's systemd manager answers, which the daemon and machine run their own units under.
+var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "XDG_RUNTIME_DIR"}
 
 const (
 	// DefaultHubName names DefaultHubURL, the one Tensorhub most installations use.
@@ -530,6 +531,12 @@ func resolveHome() (string, *exit.Error) {
 		return "", exit.Internalf("no home directory and COZY_HOME is unset: %s", err)
 	}
 	return filepath.Join(home, ".cozy"), nil
+}
+
+// DefaultHome is the home Cozy uses when none is named: ~/.cozy.
+func DefaultHome() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cozy")
 }
 
 // resolveTensorFSRoot turns the configured TensorFS root into an absolute path, or

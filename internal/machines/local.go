@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -31,6 +30,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/userunit"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
@@ -498,19 +498,15 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, record host
 	}
 	defer log.Close()
 	offset, _ := log.Seek(0, io.SeekEnd)
-	command := exec.Command(h.binary())
-	command.Env, command.Dir = env, h.Root()
-	command.Stdout, command.Stderr = log, log
-	detach(command)
-	if err := command.Start(); err != nil {
+	pid, err := h.spawn(env, log)
+	if err != nil {
 		return nil, record, exit.Internalf("cannot start the machine Host: %s", err)
 	}
-	go func() { _ = command.Wait() }()
-	record.PID, record.WorkerPort, record.MediaPort = command.Process.Pid, workerPort, mediaPort
+	record.PID, record.WorkerPort, record.MediaPort = pid, workerPort, mediaPort
 	record.ReceiptKey = base64.RawURLEncoding.EncodeToString(key)
 	raw, _ := json.Marshal(record)
 	if err := writePrivate(h.path("host.json"), raw); err != nil {
-		_ = command.Process.Signal(syscall.SIGTERM)
+		_ = terminate(pid)
 		return nil, record, exit.Internalf("cannot record the machine Host: %s", err)
 	}
 	launch, problem := h.await(ctx, &record)
@@ -522,9 +518,36 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, record host
 		return nil, record, exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness: %s", output)
 	}
 	if problem != nil && problem.Code == exit.Credential {
-		_ = command.Process.Signal(syscall.SIGTERM)
+		_ = terminate(pid)
 	}
 	return launch, record, problem
+}
+
+// spawn starts the Host detached from whatever started this process: as its own user unit
+// where user systemd runs (it outlives the daemon's unit and any session scope), else in
+// its own session. Its output appends to host.log.
+func (h *Host) spawn(env []string, log *os.File) (int, error) {
+	if userunit.Available() {
+		unit := userunit.Name("cozy-machine", h.dir, false)
+		_ = userunit.Stop(unit) // a Host this record does not name
+		if _, err := userunit.Start(userunit.Spec{Unit: unit, Argv: []string{h.binary()}, Env: env, Dir: h.Root(),
+			Stdout: log.Name(), Stderr: log.Name()}); err != nil {
+			return 0, err
+		}
+		if pid := userunit.MainPID(unit); pid > 0 {
+			return pid, nil
+		}
+		return 0, fmt.Errorf("the machine Host unit %s started no process", unit)
+	}
+	command := exec.Command(h.binary())
+	command.Env, command.Dir = env, h.Root()
+	command.Stdout, command.Stderr = log, log
+	detach(command)
+	if err := command.Start(); err != nil {
+		return 0, err
+	}
+	go func() { _ = command.Wait() }()
+	return command.Process.Pid, nil
 }
 
 // Stop ends the running Host. Its Store, installs and identity remain under the root.
