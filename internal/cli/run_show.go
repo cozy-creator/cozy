@@ -87,6 +87,9 @@ type reportSteps struct {
 // label, the GPUs it held, its timeline and its per-step times. Runtime records a call
 // on the run's journal when it settles; until then only its phases and grants show.
 type reportCall struct {
+	callTiming
+	Phase       string `json:"phase,omitempty"`
+	timingAt    int64
 	Number      int           `json:"number"` // its place in the run's call order, from 1
 	Request     string        `json:"request"`
 	Parent      string        `json:"parent,omitempty"`
@@ -269,6 +272,7 @@ const publicationModule = "cozy_runtime.author.publication"
 // callEvent is Runtime's record of one settled call (machine_calls.CallRecord): a child
 // call, or an effect such as a checkpoint upload.
 type callEvent struct {
+	callTiming
 	Request      string                 `json:"request"`
 	Parent       string                 `json:"parent"`
 	Index        int                    `json:"index"`
@@ -380,16 +384,33 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				c.GPUs = seat(c.GPUs, gpuRecords(release.GPUs, release.Ranks), true)
 			}
 			delete(granted, release.Key)
+		case "machine.call.phase":
+			var phase callPhaseEvent
+			if json.Unmarshal(event.Payload, &phase) != nil || phase.Request == "" || !phase.valid() {
+				continue
+			}
+			c := call(phase.Request)
+			if !phase.follows(c.Attempt, c.timingAt, c.Phase) {
+				continue
+			}
+			c.Parent, c.Index, c.Attempt, c.Module, c.Function, c.Label = phase.Parent, phase.Index, phase.Attempt, phase.Module, phase.Export, phase.Label
+			c.Phase, c.Status, c.callTiming, c.timingAt = phase.Phase, phase.Status, phase.callTiming, phase.AtUnixMS
+			c.StartUnixMS, c.MS = phase.CalledUnixMS, float64(max(phase.AtUnixMS-phase.CalledUnixMS, 0))
 		case "machine.call":
 			var record callEvent
 			if json.Unmarshal(event.Payload, &record) != nil || record.Request == "" {
 				continue
 			}
 			c := call(record.Request)
+			if record.Attempt < c.Attempt {
+				continue
+			}
 			c.Parent, c.Index, c.Attempt, c.Module, c.Function = record.Parent, record.Index, record.Attempt, record.Module, record.Export
 			c.Label, c.Status, c.Error = record.Label, record.Status, record.Error
 			c.StartUnixMS = record.CalledUnixMS
 			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
+			c.callTiming = record.callTiming
+			c.Phase, c.timingAt = "terminal", at.UnixMilli()
 			c.timed = nil
 			for name, track := range record.Stages {
 				stage := reportStage{Name: name, Kind: "inference",
@@ -825,13 +846,18 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		return nil
 	}
 	fmt.Fprintf(w, "\ncalls (%d)\n", r.childCalls())
-	fmt.Fprintln(table, "#\tCALL\tFUNCTION\tSTATUS\tGPUS\tSTART\tTIME\tSTEPS\tRUNTIME\tATTENTION")
+	fmt.Fprintln(table, "#\tCALL\tFUNCTION\tSTATUS\tGPUS\tSTART\tWALL\tSTEPS\tRUNTIME\tATTENTION")
 	for _, c := range r.Calls {
 		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.Number, clip(c.name(), 40), dash(c.Function),
-			dash(c.Status), dash(gpuList(c.GPUs)), offset(c.StartUnixMS), span(c.MS), dash(stepsCell(c.Steps)),
+			dash(c.state()), dash(gpuList(c.GPUs)), offset(c.StartUnixMS), span(c.MS), dash(stepsCell(c.Steps)),
 			dash(c.Runtime), dash(clip(served(c.GPUs), 40)))
 	}
 	table.Flush()
+	for _, c := range r.Calls {
+		if c.callTiming.present() {
+			fmt.Fprintf(w, "  call %d: %s\n", c.Number, callTimingText(callPhaseEvent{Phase: "terminal", callTiming: c.callTiming}, time.Time{}, true))
+		}
+	}
 	if !mode.Full {
 		fmt.Fprintf(w, "\n`cozy run show %s --call <#>` shows one call's stages, steps, GPUs and attention kernels; --full shows every call's.\n",
 			runReference(r.Number, r.RequestID))
@@ -877,7 +903,10 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 	if c.Function != "" {
 		fmt.Fprintf(w, "  %s", c.Function)
 	}
-	fmt.Fprintf(w, "  %s  %s\n", dash(c.Status), span(c.MS))
+	fmt.Fprintf(w, "  %s  wall %s\n", dash(c.state()), span(c.MS))
+	if c.callTiming.present() {
+		fmt.Fprintln(w, callTimingText(callPhaseEvent{Phase: "terminal", callTiming: c.callTiming}, time.Time{}, true))
+	}
 	fmt.Fprintf(w, "request %s", c.Request)
 	if c.Parent != "" {
 		fmt.Fprintf(w, " · parent %s · index %d · attempt %d", c.Parent, c.Index, c.Attempt)
@@ -894,6 +923,13 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 	}
 	emitTimeline(w, table, c.Stages, c.Steps, offset, full)
 	emitGPUs(w, table, c.GPUs, offset, full)
+}
+
+func (c reportCall) state() string {
+	if c.Status != "" {
+		return c.Status
+	}
+	return c.Phase
 }
 
 // name is the call's label, else its request id's first eight digits.

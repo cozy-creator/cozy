@@ -60,30 +60,30 @@ Run 1510 · paul/minimax-h3/long_form · darkness · running · 5m15s
   ✓ waiting for a rental machine       1m39s
   ✓ installing paul/minimax-h3@1.19.0  27s
   ✓ starting                           8s
-  ▸ Creating reference Reina · Downloading model weights · 3m2s
-  ▸ Creating reference Hero · 3m2s
-  ▸ Creating reference background · 3m2s
-  ▸ generate_image · Downloading model weights · 1m48s
+  ▸ Creating reference Reina · Downloading model weights · wall 3m2s
+  ▸ Creating reference Hero · wall 3m2s
+  ▸ Creating reference background · wall 3m2s
+  ▸ generate_image · Downloading model weights · wall 1m48s
     ██████░░░░░░░░░░░░░░  30%  step 9943972608/33118370151`},
 	{"09:21:19.2", `
 Run 1510 · paul/minimax-h3/long_form · darkness · running · 8m23s
   ✓ waiting for a rental machine                1m39s
   ✓ installing paul/minimax-h3@1.19.0           27s
   ✓ starting                                    8s
-  ✓ generate_image · Downloading model weights  4m29s
-  ▸ Creating reference Reina · generating image · 6m9s
+  ✓ generate_image · Downloading model weights  wall 4m29s
+  ▸ Creating reference Reina · generating image · wall 6m9s
     ████████████░░░░░░░░  60%  step 24/40 · 0.21s/step avg · ETA ~3s
-  ▸ Creating reference Hero · saving image · 6m9s
-  ▸ Creating reference background · generating image · 6m9s
+  ▸ Creating reference Hero · saving image · wall 6m9s
+  ▸ Creating reference background · generating image · wall 6m9s
     ██████████░░░░░░░░░░  50%  step 20/40 · 0.21s/step avg · ETA ~4s`},
 	{"09:26:27.8", `
 Run 1510 · paul/minimax-h3/long_form · darkness · running · 13m31s
   … 3 earlier
-  ✓ generate_image · Downloading model weights  4m29s
-  ✓ Creating reference Reina                    6m13s
-  ✓ Creating reference Hero                     6m5s
-  ✓ Creating reference background               6m14s
-  ▸ Segment 1 of 9 · denoising · 5m4s
+  ✓ generate_image · Downloading model weights  wall 4m29s
+  ✓ Creating reference Reina                    wall 6m13s
+  ✓ Creating reference Hero                     wall 6m5s
+  ✓ Creating reference background               wall 6m14s
+  ▸ Segment 1 of 9 · denoising · wall 5m4s
     ██████████████████░░  88%  step 7/8 · 8.63s/step avg · ETA ~9s
   overall █░░░░░░░░░░░░░░░░░░░   6%`},
 }
@@ -92,25 +92,25 @@ Run 1510 · paul/minimax-h3/long_form · darkness · running · 13m31s
 const settled1504 = `
 Run 1504 · paul/minimax-h3/long_form · lafter · completed · 6m55s
   ✓ starting                                    7s
-  ✓ generate_image · Downloading model weights  2m7s
-  ✓ Creating reference traveler                 2m42s
-  ✓ Segment 1 of 2                              1m59s
-  ✓ Segment 2 of 2                              2m4s
-  ✓ Assembling video                            1s`
+  ✓ generate_image · Downloading model weights  wall 2m7s
+  ✓ Creating reference traveler                 wall 2m42s
+  ✓ Segment 1 of 2                              wall 1m59s
+  ✓ Segment 2 of 2                              wall 2m4s
+  ✓ Assembling video                            wall 1s`
 
 // Run 1514: four references on the machine's four GPUs, a fifth waiting behind its own run.
 var liveFrames1514 = []struct{ at, frame string }{
 	{"09:54:30", `
 Run 1514 · paul/minimax-h3/long_form · darkness · running · 8s
   ✓ starting  0.6s
-  ▸ Creating reference White1 · generating image · 7s
+  ▸ Creating reference White1 · generating image · wall 7s
     ██████████████░░░░░░  70%  step 28/40 · 0.21s/step avg · ETA ~3s
-  ▸ Creating reference White2 · generating image · 7s
+  ▸ Creating reference White2 · generating image · wall 7s
     ████████████░░░░░░░░  60%  step 24/40 · 0.21s/step avg · ETA ~3s
-  ▸ Creating reference White3 · generating image · 7s
+  ▸ Creating reference White3 · generating image · wall 7s
     ██████████░░░░░░░░░░  50%  step 20/40 · 0.21s/step avg · ETA ~4s
-  ▸ Creating reference Hero · Checking model inputs · 7s
-  ▸ Creating reference Background · generating image · 7s
+  ▸ Creating reference Hero · Checking model inputs · wall 7s
+  ▸ Creating reference Background · generating image · wall 7s
     ██████████░░░░░░░░░░  50%  step 20/40 · 0.20s/step avg · ETA ~4s
   ▸ waiting for GPU (needs 1, 4 in use by this run's other calls) · 6s`},
 }
@@ -169,7 +169,7 @@ Run 1558 · paul/minimax-h3/long_form · nonomiya · running · 6m15s
   ✓ boot attempt 2 of rental nonomiya · now EU-RO-1  11m2s
   ✓ installing paul/minimax-h3@1.22.0                28s
   ✓ starting                                         9s
-  ▸ Creating reference Hero · Downloading model weights · 35s
+  ▸ Creating reference Hero · Downloading model weights · wall 35s
     ██████░░░░░░░░░░░░░░  30%  9.3GiB / 30.8GiB · 327.0MiB/s · ETA ~1m8s`},
 }
 
@@ -350,16 +350,16 @@ var liveFrames1560 = []struct{ at, frame string }{
 	{"19:50:00", `
 Run 1560 · paul/minimax-h3/long_form · jaguarman · running · 2m54s
   ✓ starting  2s
-  ▸ Creating reference Subject-1 · 2m52s
-  ▸ Creating reference Subject-2 · 2m52s
-  ▸ Creating reference Subject-3 · 2m52s
-  ▸ Creating reference Subject-4 · 2m52s
-  ▸ Creating reference Background · Downloading model weights · 2m52s
-  ▸ generate_image · Downloading model weights · 2m31s
+  ▸ Creating reference Subject-1 · wall 2m52s
+  ▸ Creating reference Subject-2 · wall 2m52s
+  ▸ Creating reference Subject-3 · wall 2m52s
+  ▸ Creating reference Subject-4 · wall 2m52s
+  ▸ Creating reference Background · Downloading model weights · wall 2m52s
+  ▸ generate_image · Downloading model weights · wall 2m31s
     ████████████░░░░░░░░  61%  step 20234983479/33118370151`},
 }
 
-// Run 1560 as today's Runtime narrates it: its recorded download samples say they count
+// Run 1560 with legacy model-wait narration: its recorded download samples say they count
 // bytes, with the rate since the previous sample, and each call held for its callee's
 // weights says which step waits, from its call until its callee's preparation ended (the
 // recorded "Checking model compatibility").
@@ -372,38 +372,38 @@ Run 1560 · paul/minimax-h3/long_form · jaguarman · running · 2m54s
   ▸ Creating reference Subject-3 · waiting for generate_image weights
   ▸ Creating reference Subject-4 · waiting for generate_image weights
   ▸ Creating reference Background · waiting for generate_image weights
-  ▸ Downloading motion_segment_turbo model weights · 2m49s
+  ▸ Downloading motion_segment_turbo model weights · wall 2m49s
     ████░░░░░░░░░░░░░░░░  20%  18.6GiB / 93.0GiB · 137.5MiB/s · ETA ~9m14s
-  ▸ Downloading generate_image model weights · 2m31s
+  ▸ Downloading generate_image model weights · wall 2m31s
     ████████████░░░░░░░░  61%  18.8GiB / 30.8GiB · 149.5MiB/s · ETA ~1m22s`},
 	{"19:58:49", `
 Run 1560 · paul/minimax-h3/long_form · jaguarman · running · 11m43s
   … 3 earlier
-  ✓ Creating reference Subject-2   28s
-  ✓ Creating reference Subject-3   15s
-  ✓ Creating reference Subject-4   28s
-  ✓ Creating reference Background  28s
-  ▸ Downloading motion_segment_turbo model weights · 11m38s
+  ✓ Creating reference Subject-2   wall 5m35s
+  ✓ Creating reference Subject-3   wall 5m22s
+  ✓ Creating reference Subject-4   wall 5m35s
+  ✓ Creating reference Background  wall 5m35s
+  ▸ Downloading motion_segment_turbo model weights · wall 11m38s
     ████████████████░░░░  81%  75.4GiB / 93.0GiB · 106.6MiB/s · ETA ~2m49s
   ▸ Segment 1 of 9 · waiting for motion_segment_turbo weights
   overall ░░░░░░░░░░░░░░░░░░░░   1%`},
 	{"20:05:37", `
 Run 1560 · paul/minimax-h3/long_form · jaguarman · completed · 18m31s
   ✓ starting                                                  2s
-  ✓ Downloading generate_image model weights · 30.8GiB        4m33s
-  ✓ Creating reference Subject-1                              21s
-  ✓ Creating reference Subject-2                              28s
-  ✓ Creating reference Subject-3                              15s
-  ✓ Creating reference Subject-4                              28s
-  ✓ Creating reference Background                             28s
-  ✓ Downloading motion_segment_turbo model weights · 93.0GiB  14m48s
-  ✓ Downloading motion_segment_turbo model weights · 1.5GiB   2m6s
-  ✓ Segment 1 of 9                                            1m5s
-  ✓ Segment 2 of 9                                            9s
-  ✓ Assembling video                                          1s`},
+  ✓ Downloading generate_image model weights · 30.8GiB        wall 4m33s
+  ✓ Creating reference Subject-1                              wall 5m29s
+  ✓ Creating reference Subject-2                              wall 5m35s
+  ✓ Creating reference Subject-3                              wall 5m22s
+  ✓ Creating reference Subject-4                              wall 5m35s
+  ✓ Creating reference Background                             wall 5m35s
+  ✓ Downloading motion_segment_turbo model weights · 93.0GiB  wall 14m48s
+  ✓ Downloading motion_segment_turbo model weights · 1.5GiB   wall 2m6s
+  ✓ Segment 1 of 9                                            wall 12m42s
+  ✓ Segment 2 of 9                                            wall 9s
+  ✓ Assembling video                                          wall 1s`},
 }
 
-func TestADownloadIsItsOwnLineAndStepsAreTimedWithoutIt(t *testing.T) {
+func TestLegacyDownloadsAreSeparateAndUnmeasuredStepsShowWallTime(t *testing.T) {
 	goldenFrames(t, "1560", "jaguarman", liveFrames1560)
 	events := narratedByTodaysRuntime(t, recordedRun(t, "run-1560"))
 	goldenStream(t, "1560", "jaguarman", events, liveFrames1560Narrated)
