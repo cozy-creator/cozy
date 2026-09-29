@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -213,6 +214,11 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					_ = m.store.AppendEvent(request.ID, "request.parked", 0, parked)
 				}
 			}
+			if problem != nil && (problem.ErrName() == "machine_execution.closure_unavailable" || problem.ErrName() == "machine_execution.workspace_required") {
+				// A retired peer cannot acquire this capability by retrying a work/control
+				// call. Preserve uncertainty; an explicit reconnect after upgrade resumes it.
+				return
+			}
 			select {
 			case <-m.ctx.Done():
 				return
@@ -237,6 +243,9 @@ func (m *machineRuns) closePendingSubmission(ctx context.Context, request record
 	defer connection.Close()
 	closed, problem := closeSubmission(ctx, connection, &frozen)
 	if problem != nil {
+		if problem.ErrName() == "machine_execution.workspace_changed" {
+			return m.loseSubmissionWorkspace(request.ID, link.MachineID)
+		}
 		return problem
 	}
 	if closed.Receipt != nil {
@@ -246,10 +255,14 @@ func (m *machineRuns) closePendingSubmission(ctx context.Context, request record
 }
 
 func closeSubmission(ctx context.Context, connection *machineConnection, frozen *pb.MachineExecutionSubmit) (*pb.MachineSubmissionClosure, *exit.Error) {
+	var trailer metadata.MD
 	closed, err := connection.Host.CloseMachineSubmission(ctx, &pb.MachineSubmissionClose{Claim: connection.Claim,
-		SubmissionId: frozen.SubmissionId, RequestId: frozen.Offer.RequestId, ExpectedExecutionWorkspaceId: frozen.ExpectedExecutionWorkspaceId})
-	if status.Code(err) == codes.Unimplemented {
-		return nil, exit.Named(exit.Unavailable, "machine_execution.closure_unavailable", "acceptance remains unresolved: this machine cannot close a submission key; update its Runtime or reconcile its termination")
+		SubmissionId: frozen.SubmissionId, RequestId: frozen.Offer.RequestId, ExpectedExecutionWorkspaceId: frozen.ExpectedExecutionWorkspaceId}, grpc.Trailer(&trailer))
+	if executionWorkspaceChanged(err, trailer) {
+		return nil, exit.Named(exit.Conflict, "machine_execution.workspace_changed", "the machine no longer holds the frozen submission's execution workspace")
+	}
+	if submissionClosureUnavailable(err) {
+		return nil, pendingClosureUnavailable(status.Convert(err).Message())
 	}
 	if err != nil {
 		return nil, machineTransport(err)
@@ -317,6 +330,15 @@ func (m *machineRuns) machineWorkOwed(request string) (bool, *exit.Error) {
 }
 
 func (m *machineRuns) submit(request records.Request, link *records.MachineExecution) (out *exit.Error) {
+	if len(link.Submission) > 0 {
+		var frozen pb.MachineExecutionSubmit
+		if err := proto.Unmarshal(link.Submission, &frozen); err != nil {
+			return exit.Internalf("recorded machine submission is unreadable: %s", err)
+		}
+		if frozen.ExpectedExecutionWorkspaceId == "" {
+			return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; preserve it until its machine is reconciled or retired")
+		}
+	}
 	ctx, stop := context.WithCancel(m.ctx)
 	m.mu.Lock()
 	m.submitting[request.ID] = stop
@@ -391,6 +413,14 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if problem := connection.ValidateNewWork(); problem != nil {
 		return problem
 	}
+	workspace, problem := newExecutionWorkspace(ctx, connection)
+	if problem != nil {
+		if len(link.Submission) > 0 && problem.ErrName() == "machine.submission_closure_required" {
+			return pendingClosureUnavailable("the connected machine does not support the required submission-closure contract")
+		}
+		return problem
+	}
+	connection.KeepWorkspace(workspace)
 	rooted := len(link.Submission) == 0 && m.releaseRoot(request)
 	prepared := false // the root's unpublished installation is on the machine this pass
 	if rooted {
@@ -432,15 +462,6 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if len(link.Submission) > 0 {
 		if err := proto.Unmarshal(link.Submission, submission); err != nil {
 			return exit.Internalf("recorded machine submission is unreadable: %s", err)
-		}
-		if submission.ExpectedExecutionWorkspaceId == "" {
-			// A submission recorded before workspace fencing defaults to the machine's
-			// current workspace; the receipt then pins the one that accepted it.
-			workspace, problem := currentExecutionWorkspace(ctx, connection)
-			if problem != nil {
-				return problem
-			}
-			submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
 		}
 	} else {
 		authorization, problem := m.publicationAuthorization(ctx, request.ID, link.MachineID, connection)
@@ -607,12 +628,78 @@ func (m *machineRuns) recordPlacement(request records.Request, decision orchestr
 // freezeMachineSubmission persists authenticated journal identity with the exact
 // offer before any Submit RPC. Only a never-transmitted submission may discover it.
 func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *machineConnection, requestID, machine string, submission *pb.MachineExecutionSubmit) *exit.Error {
-	workspace, problem := currentExecutionWorkspace(ctx, connection)
+	workspace, problem := newExecutionWorkspace(ctx, connection)
 	if problem != nil {
 		return problem
 	}
 	submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
 	return m.store.RecordMachineSubmission(requestID, submission)
+}
+
+// New submissions require durable reconciliation through the complete machine route.
+// Retained work keeps its frozen identity until authoritative reconciliation.
+func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
+	workspace, problem := currentExecutionWorkspace(ctx, connection)
+	if problem != nil {
+		return nil, problem
+	}
+	if !workspace.SubmissionClose {
+		return nil, exit.Named(exit.Structural, "machine.submission_closure_required",
+			"this machine does not support durable submission closure; no submission was sent").
+			WithRemedy("use a machine image with a closure-capable machine agent and Runtime, or update this machine before submitting again")
+	}
+	if connection.closureWorkspace == workspace.ExecutionWorkspaceId {
+		return workspace, nil
+	}
+	// Older machine agents can forward a newer Runtime's capability bit while omitting the
+	// closure route. Exercise that route with an unused identity before freezing
+	// any real offer. Closing this key cannot create or cancel an execution.
+	probe := records.NewID("closure-probe")
+	var trailer metadata.MD
+	closed, err := connection.Host.CloseMachineSubmission(ctx, &pb.MachineSubmissionClose{
+		Claim: connection.Claim, SubmissionId: probe, RequestId: probe,
+		ExpectedExecutionWorkspaceId: workspace.ExecutionWorkspaceId,
+	}, grpc.Trailer(&trailer))
+	if executionWorkspaceChanged(err, trailer) {
+		connection.KeepWorkspace(nil)
+		return nil, exit.Named(exit.Unavailable, "machine_execution.workspace_changed", "the machine replaced its workspace before submission; checking its new workspace")
+	}
+	if err != nil {
+		problem := machineTransport(err)
+		if submissionClosureUnavailable(err) {
+			problem = exit.Named(exit.Structural, "machine.submission_closure_required",
+				"this machine cannot reconcile submissions through its machine agent and Runtime; no submission was sent: %s", status.Convert(err).Message()).
+				WithRemedy("use a machine image with a closure-capable machine agent and Runtime")
+		}
+		return nil, problem
+	}
+	if closed == nil || closed.RequestId != probe || closed.SubmissionId != probe ||
+		closed.ExecutionWorkspaceId != workspace.ExecutionWorkspaceId || closed.Receipt != nil {
+		return nil, exit.New(exit.Conflict, "machine did not close the unused submission probe; no submission was sent")
+	}
+	connection.closureWorkspace = workspace.ExecutionWorkspaceId
+	return workspace, nil
+}
+
+func pendingClosureUnavailable(detail string) *exit.Error {
+	return exit.Named(exit.Unavailable, "machine_execution.closure_unavailable",
+		"acceptance remains unresolved: this machine requires an agent and Runtime with durable submission closure (%s); upgrade it, then run `cozy down` and `cozy up` to reconnect", detail).
+		WithRemedy("upgrade the machine, then run `cozy down` and `cozy up` to reconnect; the frozen submission and cancellation intent are retained")
+}
+
+func submissionClosureUnavailable(err error) bool {
+	return status.Code(err) == codes.Unimplemented ||
+		status.Code(err) == codes.FailedPrecondition && strings.HasPrefix(status.Convert(err).Message(), pb.CapabilityUnavailableCode+":")
+}
+
+func executionWorkspaceChanged(err error, trailer metadata.MD) bool {
+	return err != nil && (slices.Contains(trailer.Get("cozy-error-code"), "execution_workspace_changed") ||
+		strings.HasPrefix(status.Convert(err).Message(), "execution_workspace_changed:"))
+}
+
+func (m *machineRuns) loseSubmissionWorkspace(requestID, machine string) *exit.Error {
+	return m.store.LoseMachineExecution(requestID, machine,
+		"the machine no longer holds this run's frozen execution workspace; its prior acceptance cannot be recovered and the submission will not be sent to the replacement journal")
 }
 
 func currentExecutionWorkspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
@@ -674,7 +761,10 @@ func (m *machineRuns) settleSubmissionRefusal(ctx context.Context, connection *m
 	}
 	closed, closeProblem := closeSubmission(ctx, connection, &frozen)
 	if closeProblem != nil {
-		return closeProblem
+		if closeProblem.ErrName() == "machine_execution.workspace_changed" {
+			return m.loseSubmissionWorkspace(requestID, link.MachineID)
+		}
+		return unresolvedSubmission(problem, closeProblem)
 	}
 	if closed.Receipt != nil {
 		return m.store.AcceptMachineExecution(requestID, closed.Receipt)
@@ -683,6 +773,18 @@ func (m *machineRuns) settleSubmissionRefusal(ctx context.Context, connection *m
 		return recordProblem
 	}
 	return problem
+}
+
+// Keep the actual refusal alongside reconciliation's failure. In particular, a missing
+// closure RPC is not proof that this frozen submission was never accepted.
+func unresolvedSubmission(refused, reconciliation *exit.Error) *exit.Error {
+	problem := *reconciliation
+	problem.Message = fmt.Sprintf("submission refused: %s; %s", refused.Message, reconciliation.Message)
+	problem.Details = map[string]any{
+		"submission_refusal_code": refused.ErrName(), "submission_refusal": refused.Message,
+		"reconciliation_code": reconciliation.ErrName(), "reconciliation": reconciliation.Message,
+	}
+	return &problem
 }
 
 // supplySourceCredentials hands Runtime the owner's provider credentials again, by the identical

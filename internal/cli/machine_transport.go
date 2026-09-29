@@ -28,10 +28,11 @@ import (
 // prepared on it. Every call below is the same PodHost call whichever machine answers it.
 type machineConnection struct {
 	*machines.Machine
-	runs       *machineRuns
-	installed  map[string]*pb.InstalledPackage
-	placements map[string]*pb.DesiredPlacementSet // each captured revision's code-only placement
-	progress   *transfer.Progress
+	runs             *machineRuns
+	installed        map[string]*pb.InstalledPackage
+	placements       map[string]*pb.DesiredPlacementSet // each captured revision's code-only placement
+	closureWorkspace string                             // workspace whose end-to-end closure route this connection proved
+	progress         *transfer.Progress
 }
 
 // connect opens a machine for work that reads no hub; holder is what the caller is doing
