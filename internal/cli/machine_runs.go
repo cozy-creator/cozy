@@ -340,10 +340,23 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		return problem
 	}
 	rooted := len(link.Submission) == 0 && m.releaseRoot(request)
+	prepared := false // the root's unpublished installation is on the machine this pass
 	if rooted {
 		workspace, problem := m.workspace(ctx, connection)
 		if problem != nil {
 			return problem
+		}
+		// Unpublished code reaches the machine before its submission is recorded, as a
+		// capture's does: an upload refused or canceled leaves the run unsent.
+		if request.LocalInstallationID != "" {
+			revision, problem := m.capturedRevision(request)
+			if problem == nil {
+				problem = connection.prepare(ctx, request.ID, revision)
+			}
+			if problem != nil {
+				return problem
+			}
+			prepared = true
 		}
 		built, problem := m.releaseRootSubmission(ctx, request, connection)
 		if problem != nil {
@@ -464,7 +477,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	}
 	began = time.Now()
 	if submission.ReleaseRoot != nil {
-		if submission.ReleaseRoot.InstallationId != "" {
+		if submission.ReleaseRoot.InstallationId != "" && !prepared {
 			revision, problem := m.capturedRevision(request)
 			if problem == nil {
 				problem = connection.prepare(ctx, request.ID, revision)
