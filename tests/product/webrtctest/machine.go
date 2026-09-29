@@ -199,7 +199,12 @@ func Serve(t testing.TB, host string, m *Machine, agent, python string) Server {
 		t.Fatalf("media fixture unexpectedly has a Runtime entrypoint: %v", err)
 	}
 	command := exec.Command(agent)
-	command.Env = []string{"COZY_MACHINE_ROOT=" + m.root, "COZY_MACHINE_LIFETIME=persistent", "COZY_LISTEN_HOST=" + host, "COZY_WORKER_ID=wk-test",
+	listenHost := host
+	if host != "127.0.0.1" {
+		// The browser needs a LAN candidate; the agent accepts wildcard or loopback binds.
+		listenHost = "0.0.0.0"
+	}
+	command.Env = []string{"COZY_MACHINE_ROOT=" + m.root, "COZY_MACHINE_LIFETIME=persistent", "COZY_LISTEN_HOST=" + listenHost, "COZY_WORKER_ID=wk-test",
 		"COZY_WORKER_INTERNAL_PORT=" + strconv.Itoa(worker), "COZY_WEBRTC_INTERNAL_PORT=" + strconv.Itoa(webrtc), "COZY_AUTHORIZED_KEYS=" + strings.Join(keys, ",")}
 	log, err := os.OpenFile(filepath.Join(m.root, "fixture-agent.log"), os.O_CREATE|os.O_WRONLY, 0600)
 	check(err)
