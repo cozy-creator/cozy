@@ -93,6 +93,15 @@ func (m *runtimeMachine) longForm(segments, positions int) {
 				"min_ms": 8600.0, "max_ms": 8600.0, "started_unix_ms": now + 3100, "series": series}}})
 		m.record("call", record)
 	}
+	// Its film uploads as a checkpoint: an effect call, recorded on the root like a child's.
+	upload, _ := json.Marshal(map[string]any{"request": fmt.Sprintf("call-%040x", segments), "parent": m.state.RequestId,
+		"index": segments, "attempt": 1, "module": "cozy_runtime.author.publication", "export": "upload_checkpoint",
+		"label": "Upload checkpoint to proof/film", "status": "succeeded", "error": "", "called_unix_ms": now,
+		"stages": map[string]any{
+			"Uploading checkpoint":  map[string]any{"count": 1, "total_ms": 2000.0, "started_unix_ms": now, "bytes": 64 << 20},
+			"Publishing checkpoint": map[string]any{"count": 1, "total_ms": 1500.0, "started_unix_ms": now + 2000}},
+		"steps": map[string]any{}})
+	m.record("call", upload)
 }
 
 // A long_form's record keeps every segment call however much its prefetch narrates: the
@@ -135,14 +144,25 @@ func TestRunShowKeepsEveryCallPastAProgressFlood(t *testing.T) {
 	for index := range segments {
 		row := regexp.MustCompile(fmt.Sprintf(`(?m)^%d +Segment %d of %d +motion_segment_turbo +succeeded +4-7 .* denoise 8× 8.6s +sageattention$`,
 			index+1, index+1, segments))
-		if code != 0 || !strings.Contains(human, "calls (9)") || !row.MatchString(human) {
+		if code != 0 || !strings.Contains(human, "calls (10)") || !row.MatchString(human) {
 			t.Fatalf("run show [%d] lacks segment %d's call row:\n%s", code, index+1, human)
 		}
 	}
 	code, out := runCozy(t, root, "run", "show", "1", "--json")
 	var shown shownRun
-	if code != 0 || json.Unmarshal([]byte(out), &shown) != nil || len(shown.Calls) != segments {
-		t.Fatalf("run show --json [%d] does not carry %d calls:\n%.2000s", code, segments, out)
+	// Call 0 is the run's own execution, then its segments, then its upload.
+	if code != 0 || json.Unmarshal([]byte(out), &shown) != nil || len(shown.Calls) != segments+2 ||
+		shown.Calls[0].Number != 0 || shown.Calls[0].Label != "this run" || shown.Calls[0].Function != "generate" {
+		t.Fatalf("run show --json [%d] does not carry its execution and %d calls:\n%.2000s", code, segments+1, out)
+	}
+	upload := shown.Calls[segments+1]
+	if upload.Number != segments+1 || upload.Function != "upload_checkpoint" || len(upload.Stages) != 2 ||
+		upload.Stages[0].Name != "Uploading checkpoint" || upload.Stages[0].Kind != "transfer" {
+		t.Fatalf("the checkpoint upload is not a call with its transfer: %+v", upload)
+	}
+	if !regexp.MustCompile(`(?m)^10 +Upload checkpoint to proof/film +upload_checkpoint +succeeded +- `).MatchString(human) ||
+		!regexp.MustCompile(`(?m)^0 +this run +generate +succeeded `).MatchString(human) {
+		t.Fatalf("run show lacks the run's own row or its upload's:\n%s", human)
 	}
 	var narrated []string
 	for _, event := range shown.Events {
@@ -153,7 +173,7 @@ func TestRunShowKeepsEveryCallPastAProgressFlood(t *testing.T) {
 	if len(narrated) != 1 || !strings.Contains(narrated[0], fmt.Sprintf(`"position":%d`, positions-1)) {
 		t.Fatalf("the record holds %d prefetch samples, not its one latest: %.500v", len(narrated), narrated)
 	}
-	for _, call := range shown.Calls {
+	for _, call := range shown.Calls[1 : segments+1] {
 		if call.Status != "succeeded" || fmt.Sprint(call.GPUs) != fmt.Sprintf("[{4 %d} {5 0} {6 0} {7 0}]", 4000+call.Number-1) ||
 			len(call.Steps) != 1 || call.Steps[0].Count != 8 || len(call.Steps[0].Series) != 8 || len(call.Stages) != 4 {
 			t.Fatalf("call %d lost its record: %+v", call.Number, call)
@@ -162,14 +182,19 @@ func TestRunShowKeepsEveryCallPastAProgressFlood(t *testing.T) {
 
 	code, one := runCozy(t, root, "run", "show", "1", "--call", "segment 3 of 9")
 	t.Logf("cozy run show 1 --call 'segment 3 of 9':\n%s", one)
-	for _, want := range []string{"call 3 of 9  Segment 3 of 9  motion_segment_turbo  succeeded",
+	for _, want := range []string{"call 3 of 10  Segment 3 of 9  motion_segment_turbo  succeeded",
 		"Checking model inputs  phase", "decode_video", "GPUs 4-7", "GPU  ARCH",
 		"steps denoise: 8 in 1m8.8s; first 8.6s, then mean 8.6s", "GPUs (1)"} {
 		if code != 0 || !strings.Contains(one, want) {
 			t.Fatalf("run show --call [%d] lacks %q:\n%s", code, want, one)
 		}
 	}
-	if code, out := runCozy(t, root, "run", "show", "1", "--call", "10"); code == 0 || !strings.Contains(out, "has 9 call(s)") {
+	code, one = runCozy(t, root, "run", "show", "1", "--call", "10")
+	if code != 0 || !regexp.MustCompile(`(?m)^Uploading checkpoint +transfer +\+\S+ +2\.0s +64\.0MiB, 32\.0MiB/s$`).MatchString(one) ||
+		!regexp.MustCompile(`(?m)^Publishing checkpoint +phase +\+\S+ +1\.5s`).MatchString(one) {
+		t.Fatalf("run show --call 10 [%d] lacks the upload's bytes and rate:\n%s", code, one)
+	}
+	if code, out := runCozy(t, root, "run", "show", "1", "--call", "11"); code == 0 || !strings.Contains(out, "has 10 call(s)") {
 		t.Fatalf("an absent call number was not refused [%d]:\n%s", code, out)
 	}
 }
@@ -220,10 +245,10 @@ func TestRunShowListsEachChildCallOfALocalRun(t *testing.T) {
 	}
 	code, out = runCozy(t, root, "run", "show", request.ID, "--json")
 	var shown shownRun
-	if code != 0 || json.Unmarshal([]byte(out), &shown) != nil || len(shown.Calls) != 3 {
+	if code != 0 || json.Unmarshal([]byte(out), &shown) != nil || len(shown.Calls) != 4 || shown.Calls[0].Number != 0 {
 		t.Fatalf("run show --json [%d]:\n%.2000s", code, out)
 	}
-	for _, call := range shown.Calls {
+	for _, call := range shown.Calls[1:] {
 		kinds := map[string]string{}
 		for _, stage := range call.Stages {
 			kinds[stage.Name] = stage.Kind

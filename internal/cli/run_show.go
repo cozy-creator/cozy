@@ -165,6 +165,8 @@ type triageTrack struct {
 	StartedUnixMS int64        `json:"started_unix_ms"`
 	Series        [][2]float64 `json:"series"`
 	SeriesDropped int          `json:"series_dropped"`
+	// Bytes is what the span moved: an effect's upload.
+	Bytes int64 `json:"bytes"`
 }
 
 type triageSetup struct {
@@ -268,7 +270,11 @@ type outputsEvent struct {
 	MS            int64             `json:"ms"`
 }
 
-// callEvent is Runtime's record of one settled child call (machine_calls.CallRecord).
+// publicationModule is the module of Runtime's effect calls (upload, publish, assessment).
+const publicationModule = "cozy_runtime.author.publication"
+
+// callEvent is Runtime's record of one settled call (machine_calls.CallRecord): a child
+// call, or an effect such as a checkpoint upload.
 type callEvent struct {
 	Request      string                 `json:"request"`
 	Parent       string                 `json:"parent"`
@@ -342,9 +348,14 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	granted := map[string]grant{}        // an open GPU grant's stage, by its key
 	phases := map[string][]reportStage{} // phase records naming a child request, by it
 	fetched := false                     // the Runtime recorded each model's pull itself
+	var started time.Time                // when the machine began the run's own execution
 	for _, event := range evidence.Events {
 		at, _ := time.Parse(time.RFC3339Nano, event.At)
 		switch event.Type {
+		case "run.in_progress":
+			if started.IsZero() {
+				started = at
+			}
 		case "machine.gpu.grant":
 			// Runtime's device lease for one call attempt, held until the matching release.
 			var lease gpuEvent
@@ -388,8 +399,20 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
 			c.timed = nil
 			for name, track := range record.Stages {
-				c.timed = append(c.timed, reportStage{Name: name, Kind: "inference",
-					StartUnixMS: track.StartedUnixMS, MS: track.TotalMS, Count: track.Count})
+				stage := reportStage{Name: name, Kind: "inference",
+					StartUnixMS: track.StartedUnixMS, MS: track.TotalMS, Count: track.Count}
+				if record.Module == publicationModule {
+					stage.Kind = "phase" // an effect runs no model
+				}
+				if track.Bytes > 0 {
+					// An effect's upload: what it moved, and how fast.
+					stage.Kind, stage.Bytes = "transfer", track.Bytes
+					stage.Detail = units.Bytes(track.Bytes)
+					if track.TotalMS > 0 {
+						stage.Detail += fmt.Sprintf(", %s/s", units.Bytes(int64(float64(track.Bytes)/(track.TotalMS/1000))))
+					}
+				}
+				c.timed = append(c.timed, stage)
 			}
 			c.Steps = stepSummaries(record.Steps)
 		case "machine.resolved":
@@ -491,6 +514,27 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		}
 		return a.Request < b.Request
 	})
+	// The run's own execution is call 0: what it ran, on which GPUs, for how long. Its calls
+	// keep their numbers from 1.
+	if !started.IsZero() {
+		status := life.Status
+		if status == "completed" {
+			status = "succeeded" // a call's status is Runtime's word, as its calls' rows say it
+		}
+		root := reportCall{Request: life.RequestID, Module: life.Package, Function: life.Function, Label: "this run",
+			Status: status, GPUs: report.GPUs, StartUnixMS: started.UnixMilli(), MS: float64(life.ExecutionMS),
+			Steps: report.Steps, Stages: []reportStage{}}
+		for _, stage := range report.Stages {
+			if stage.Kind == "inference" {
+				root.Stages = append(root.Stages, stage)
+			}
+		}
+		for i := range report.Calls {
+			report.Calls[i].Number = i + 1
+		}
+		report.Calls = append([]reportCall{root}, report.Calls...)
+		return report
+	}
 	for i := range report.Calls {
 		report.Calls[i].Number = i + 1
 	}
@@ -535,11 +579,13 @@ func seat(held, rows []reportGPU, records bool) []reportGPU {
 // `call-`, or a unique prefix), its label, or its function when only one call ran it.
 func (r runReport) call(selector string) (reportCall, *exit.Error) {
 	if number, err := strconv.Atoi(strings.TrimPrefix(selector, "#")); err == nil {
-		if number >= 1 && number <= len(r.Calls) {
-			return r.Calls[number-1], nil
+		for _, c := range r.Calls {
+			if c.Number == number {
+				return c, nil
+			}
 		}
 		return reportCall{}, exit.New(exit.NotFound, "run %s has %d call(s); there is no call %d",
-			runReference(r.Number, r.RequestID), len(r.Calls), number)
+			runReference(r.Number, r.RequestID), r.childCalls(), number)
 	}
 	id := "call-" + strings.TrimPrefix(selector, "call-")
 	for _, match := range []func(reportCall) bool{
@@ -772,7 +818,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	if len(r.Calls) == 0 {
 		return nil
 	}
-	fmt.Fprintf(w, "\ncalls (%d)\n", len(r.Calls))
+	fmt.Fprintf(w, "\ncalls (%d)\n", r.childCalls())
 	fmt.Fprintln(table, "#\tCALL\tFUNCTION\tSTATUS\tGPUS\tSTART\tTIME\tSTEPS\tATTENTION")
 	for _, c := range r.Calls {
 		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.Number, clip(c.name(), 40), dash(c.Function),
@@ -787,9 +833,17 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	}
 	for _, c := range r.Calls {
 		fmt.Fprintln(w)
-		c.emit(w, table, len(r.Calls), offset, true)
+		c.emit(w, table, r.childCalls(), offset, true)
 	}
 	return nil
+}
+
+// childCalls counts the calls the run made, not its own execution (call 0).
+func (r runReport) childCalls() int {
+	if len(r.Calls) > 0 && r.Calls[0].Number == 0 {
+		return len(r.Calls) - 1
+	}
+	return len(r.Calls)
 }
 
 // callReport is one call of a run (`cozy run show <run> --call <call>`).
@@ -807,7 +861,7 @@ func (c callReport) Emit(w io.Writer, mode output.Mode) error {
 		fmt.Fprintf(w, "  on %s", c.run.Machine)
 	}
 	fmt.Fprintln(w)
-	c.emit(w, tabwriter.NewWriter(w, 0, 0, 2, ' ', 0), len(c.run.Calls), c.run.offsets(), mode.Full)
+	c.emit(w, tabwriter.NewWriter(w, 0, 0, 2, ' ', 0), c.run.childCalls(), c.run.offsets(), mode.Full)
 	return nil
 }
 
