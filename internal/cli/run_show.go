@@ -30,14 +30,16 @@ type runReport struct {
 	Target    string `json:"target"`
 	Machine   string `json:"machine,omitempty"`
 	// Runtime is the cozy-runtime (and TensorFS) the run's own executor loaded.
-	Runtime     string `json:"runtime,omitempty"`
-	CreatedAt   string `json:"created_at"`
-	QueuedMS    int64  `json:"queued_ms"`
-	ExecutionMS int64  `json:"execution_ms"`
-	WallMS      int64  `json:"wall_ms,omitempty"`
-	Waiting     string `json:"waiting,omitempty"`
-	ErrorType   string `json:"error_type,omitempty"`
-	Error       string `json:"error,omitempty"`
+	Runtime        string `json:"runtime,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	QueuedMS       int64  `json:"queued_ms"`
+	ExecutionMS    *int64 `json:"execution_ms"`
+	ExecutionKnown bool   `json:"execution_known"`
+	AttemptWallMS  int64  `json:"attempt_wall_ms,omitempty"`
+	WallMS         int64  `json:"wall_ms,omitempty"`
+	Waiting        string `json:"waiting,omitempty"`
+	ErrorType      string `json:"error_type,omitempty"`
+	Error          string `json:"error,omitempty"`
 	// Warnings are what the run reported without failing: its admission's and its machine's.
 	Warnings []records.Warning `json:"warnings,omitempty"`
 	Stages   []reportStage     `json:"stages"`
@@ -315,8 +317,13 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	report := runReport{Number: life.Number, RequestID: life.RequestID, Status: life.Status,
 		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Machine: life.Machine,
 		ErrorType: life.ErrorType, Error: life.Error,
-		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS, ExecutionMS: life.ExecutionMS,
+		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS,
+		ExecutionKnown: life.ExecutionKnown || life.MachineExecution == nil, AttemptWallMS: life.AttemptWallMS,
 		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
+	if report.ExecutionKnown {
+		measured := life.ExecutionMS
+		report.ExecutionMS = &measured
+	}
 	switch {
 	case life.Phase == orchestrator.PhaseGPUWait || life.Phase == orchestrator.PhaseOwnerReconciliation:
 		report.Waiting = PhaseCell(life)
@@ -814,7 +821,11 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 			fmt.Fprintf(w, "\nwarning: %s", warning.Message)
 		}
 	}
-	fmt.Fprintf(w, "\nqueued %s · execution %s", span(float64(r.QueuedMS)), span(float64(r.ExecutionMS)))
+	execution := "—"
+	if r.ExecutionMS != nil {
+		execution = span(float64(*r.ExecutionMS))
+	}
+	fmt.Fprintf(w, "\nqueued %s · execution %s", span(float64(r.QueuedMS)), execution)
 	if r.WallMS > 0 {
 		fmt.Fprintf(w, " · wall %s", span(float64(r.WallMS)))
 	}

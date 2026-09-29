@@ -33,7 +33,7 @@ func TestCompletedRunWatchUsesRecordedWallTime(t *testing.T) {
 					id = "job-recorded-wall"
 				}
 				life := api.Lifecycle{Number: 1, Kind: kind, RequestID: id, Status: "completed", Package: "proof/wall", Function: "run", CreatedAt: stamp.start, QueuedMS: 1234, ExecutionMS: 60000}
-				job := api.JobState{Number: 1, JobID: id, Status: "completed", Package: life.Package, Function: life.Function, CreatedAt: stamp.start, QueuedMS: life.QueuedMS, ExecutionMS: life.ExecutionMS, MachineExecution: &api.MachineExecutionView{Accepted: true, Collected: true}}
+				job := api.JobState{Number: 1, JobID: id, Status: "completed", Package: life.Package, Function: life.Function, CreatedAt: stamp.start, QueuedMS: life.QueuedMS, ExecutionMS: life.ExecutionMS, ExecutionKnown: true, MachineExecution: &api.MachineExecutionView{Accepted: true, Collected: true}}
 				event := api.Envelope{Type: "run.completed", RequestID: id, SequenceNumber: 7, At: stamp.end}
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch r.URL.Path {

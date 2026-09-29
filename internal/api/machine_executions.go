@@ -267,7 +267,12 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 				intervals = append(intervals, records.MachineExecutionInterval{Attempt: current, FinishedAt: s.store.StoppedEventAt(row)})
 			}
 		}
-		state.ExecutionMS = machineExecutionMS(row, link, intervals, terminal, time.Now().UnixMilli())
+		state.AttemptWallMS = machineAttemptWallMS(row, link, intervals, terminal, time.Now().UnixMilli())
+	}
+	if measured, known, problem := s.store.MachineRunExecutionMS(row.ID, max(row.Ordinal, 1), state.Status == "in_progress"); problem != nil {
+		view.ObservationError = problem.Message
+	} else {
+		state.ExecutionMS, state.ExecutionKnown = measured, known
 	}
 	return state
 }
@@ -276,7 +281,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 // just as local attempts count dispatch-to-close. Paused/retry gaps and delayed
 // result collection are outside those intervals. An active interval alone uses
 // the current clock; a terminal interval never grows when read back later.
-func machineExecutionMS(row records.Request, link *records.MachineExecution, intervals []records.MachineExecutionInterval, terminal *pb.AttemptOutcomeBody, now int64) int64 {
+func machineAttemptWallMS(row records.Request, link *records.MachineExecution, intervals []records.MachineExecutionInterval, terminal *pb.AttemptOutcomeBody, now int64) int64 {
 	var receipt pb.MachineExecutionReceipt
 	if proto.Unmarshal(link.Receipt, &receipt) != nil || receipt.RequestId != row.ID ||
 		receipt.AcceptedAtMs == 0 || receipt.AcceptedAtMs > math.MaxInt64 {

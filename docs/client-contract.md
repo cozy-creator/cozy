@@ -521,3 +521,17 @@ the run identity and local status. An unfinished local intent becomes abandoned;
 prior terminal outcomes remain unchanged. Submission, acceptance, control and
 outcome evidence are retained, and late real facts cannot reopen the abandoned
 local intent. This action does not make a remote cancellation or lifecycle request.
+
+### Machine run duration
+
+Machine lifecycle and job documents carry `execution_known` beside `execution_ms`.
+Execution is measured cooperative author work across the root and its children, with
+concurrent work counted once. Preparation and a fully blocked workflow do not count.
+The CLI prints `—` (JSON `null`) when Runtime did not measure this duration, including
+older retained runs. Live totals advance only when a new measured snapshot arrives.
+
+`attempt_wall_ms` preserves the separate admission-to-outcome intervals, excluding
+paused/retry gaps. `wall_ms` in a detailed run report remains the overall elapsed run
+duration. `queued_ms` describes the existing controller queue; asynchronous waits are
+not relabeled as GPU queue time. A retry contributes execution only when each attempt
+has a complete measurement. Missing observations never become zero-duration proof.

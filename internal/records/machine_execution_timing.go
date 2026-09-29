@@ -1,6 +1,61 @@
 package records
 
-import "github.com/cozy-creator/cozy/internal/exit"
+import (
+	"encoding/json"
+	"math"
+
+	"github.com/cozy-creator/cozy/internal/exit"
+)
+
+// MachineRunExecutionMS consumes cumulative Runtime observations. A wall interval
+// cannot recover cooperative execution for an older producer or a missing attempt.
+// Live values stay at the latest measurement: observing a stalled/offline machine
+// must not start a client-side execution clock.
+func (s *Store) MachineRunExecutionMS(id string, current int64, running bool) (int64, bool, *exit.Error) {
+	rows, err := s.db.Query(`SELECT attempt,payload FROM request_events
+ WHERE request_id=? AND type='machine.run.timing' ORDER BY seq`, id)
+	if err != nil {
+		return 0, false, exit.Internalf("cannot read measured machine timing: %s", err)
+	}
+	defer rows.Close()
+	type measurement struct {
+		Attempt     int64    `json:"attempt"`
+		ExecutionMS *float64 `json:"execution_ms"`
+		Terminal    bool     `json:"terminal"`
+	}
+	latest := map[int64]measurement{}
+	for rows.Next() {
+		var attempt int64
+		var raw []byte
+		if err := rows.Scan(&attempt, &raw); err != nil {
+			return 0, false, exit.Internalf("cannot read measured machine timing: %s", err)
+		}
+		var value measurement
+		if json.Unmarshal(raw, &value) != nil || value.Attempt != attempt {
+			value = measurement{}
+		}
+		latest[attempt] = value
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, exit.Internalf("cannot finish measured machine timing: %s", err)
+	}
+	var total float64
+	if current <= 0 || int64(len(latest)) != current {
+		return 0, false, nil
+	}
+	for attempt := int64(1); attempt <= current; attempt++ {
+		value := latest[attempt]
+		if value.ExecutionMS == nil || *value.ExecutionMS < 0 || math.IsNaN(*value.ExecutionMS) || math.IsInf(*value.ExecutionMS, 0) ||
+			(!value.Terminal && (attempt != current || !running)) {
+			return 0, false, nil
+		}
+		total += *value.ExecutionMS
+	}
+	if total >= math.MaxInt64 {
+		return 0, false, nil
+	}
+	return int64(math.Round(total)), true, nil
+}
 
 type MachineExecutionInterval struct {
 	Attempt               int64

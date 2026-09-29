@@ -766,6 +766,8 @@ type Lifecycle struct {
 	Attempts         int                   `json:"attempts"`
 	QueuedMS         int64                 `json:"queued_ms"`
 	ExecutionMS      int64                 `json:"execution_ms"`
+	ExecutionKnown   bool                  `json:"execution_known"`
+	AttemptWallMS    int64                 `json:"attempt_wall_ms,omitempty"`
 	ProgressStage    string                `json:"progress_stage,omitempty"`
 	StageFraction    *float64              `json:"stage_fraction,omitempty"`
 	OverallFraction  *float64              `json:"overall_fraction,omitempty"`
@@ -936,8 +938,9 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		}
 		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
-			ExecutionMS: state.ExecutionMS,
-			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Output: state.Output,
+			ExecutionMS: state.ExecutionMS, ExecutionKnown: state.ExecutionKnown,
+			AttemptWallMS: state.AttemptWallMS, QueuedMS: state.QueuedMS,
+			Result: state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Output: state.Output,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
 			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}
