@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -41,7 +42,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 		t.Skip("requires -player-browsers and Playwright (go run github.com/playwright-community/playwright-go/cmd/playwright install firefox webkit)")
 	}
 	film := playerFilm(t)
-	completed := playerCompletedFilms(t, film)
+	completed, largeLive := playerMP4Variants(t, film)
 	ip := playerLANAddress(t)
 	pages := httptest.NewServer(http.FileServer(http.Dir(filepath.Join("..", "..", "web", "player"))))
 	defer pages.Close()
@@ -66,7 +67,8 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			must(t, err)
 			defer browser.Close()
 			m := newPlayerMachine(t, ip)
-			open := func(link string) playwright.Page {
+			open := func(t *testing.T, link string) playwright.Page {
+				t.Helper()
 				page, err := browser.NewPage()
 				must(t, err)
 				t.Cleanup(func() { page.Close() })
@@ -78,7 +80,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 
 			t.Run("live", func(t *testing.T) {
 				m.machine.Append(7, "video", -1, film[0], 500_000)
-				page := open(m.link(nil, "video"))
+				page := open(t, m.link(nil, "video"))
 				playerWait(t, page, "segment 1 plays", `playing(0.5, 10)`)
 				_, err := page.Reload() // a reload mid-run follows from the start again
 				must(t, err)
@@ -111,7 +113,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 				}
 				m.machine.End(8, "completed")
 				// A small window and lookahead: the film's end is not held when the seek lands.
-				page := open(m.link(func(g *capability.Grant) { g.Run = "8" }, "video"))
+				page := open(t, m.link(func(g *capability.Grant) { g.Run = "8" }, "video"))
 				result := playerEval(t, page, `(async () => {
 					const {play, parseLink} = await import("./cozy-webrtc.js");
 					player().close();
@@ -133,11 +135,11 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			})
 
 			for i, movie := range completed {
-				t.Run([]string{"completed end moov", "completed faststart"}[i], func(t *testing.T) {
+				t.Run([]string{"completed end moov", "completed faststart", "completed large header"}[i], func(t *testing.T) {
 					run := uint64(20 + i)
 					m.machine.Replace(run, "video", -1, movie, 1_500_000)
 					m.machine.End(run, "completed")
-					page := open(m.link(func(g *capability.Grant) { g.Run = fmt.Sprint(run) }, "video"))
+					page := open(t, m.link(func(g *capability.Grant) { g.Run = fmt.Sprint(run) }, "video"))
 					if i == 1 {
 						playerEval(t, page, `(() => { globalThis.MediaSource = undefined; globalThis.ManagedMediaSource = undefined; return true; })()`)
 					}
@@ -151,27 +153,59 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 							await until(() => !v.seeking && Math.abs(v.currentTime - time) < 0.05 && v.readyState >= 2);
 						}
 						return {type: player().stats.type, bytes: player().stats.bytes, gets: player().stats.gets,
-							credited: sent.filter(m => m.t === "credit").at(-1).bytes >= player().stats.bytes, error: player().error?.message};
+							credited: credit() >= player().stats.bytes,
+							boundedCredit: credit() <= player().stats.bytes + 65536, error: player().error?.message};
 					})()`)
 					r := result.(map[string]any)
 					if r["type"] != "video/mp4" || fmt.Sprint(r["bytes"]) != fmt.Sprint(len(movie)) ||
-						fmt.Sprint(r["gets"]) != "0" || r["credited"] != true || r["error"] != nil {
+						fmt.Sprint(r["gets"]) != "0" || r["credited"] != true || r["boundedCredit"] != true || r["error"] != nil {
 						t.Fatalf("completed MP4 did not finish through its small credit window and seek natively: %v", r)
 					}
 				})
 			}
 
+			t.Run("large live header", func(t *testing.T) {
+				m.machine.Begin(24)
+				page := open(t, m.link(func(g *capability.Grant) { g.Run = "24" }, "video"))
+				playerEval(t, page, `(async () => {
+					const {play, parseLink} = await import("./cozy-webrtc.js");
+					player().close(); window.cozyPlayer = play(video(), parseLink(location.hash), {window: 65536});
+					video().play().catch(() => {});
+					return true;
+				})()`)
+				m.machine.Append(24, "video", -1, largeLive[0], 500_000)
+				playerWait(t, page, "large-header live preview plays", `playing(0.5, 10)`)
+				for _, fragment := range largeLive[1:] {
+					m.machine.Append(24, "video", -1, fragment, 500_000)
+				}
+				m.machine.End(24, "completed")
+				playerWait(t, page, "large-header fragmented film ends", `video().ended && decoded(1.5, 36)`)
+				result := playerEval(t, page, `({mse: player().stats.type.includes("codecs="), bytes: player().stats.bytes,
+					boundedCredit: credit() <= player().stats.bytes + 65536})`)
+				r := result.(map[string]any)
+				if r["mse"] != true || r["boundedCredit"] != true || fmt.Sprint(r["bytes"]) != fmt.Sprint(len(bytes.Join(largeLive, nil))) {
+					t.Fatalf("large live header stalled, changed playback mode or returned credits twice: %v", r)
+				}
+			})
+
+			t.Run("completed bad header", func(t *testing.T) {
+				m.machine.Replace(25, "video", -1, []byte("unrecognized MP4 header"), 1_500_000)
+				m.machine.End(25, "completed")
+				page := open(t, m.link(func(g *capability.Grant) { g.Run = "25" }, "video"))
+				playerWait(t, page, "the completed invalid file reports a media error", `player().error?.code === "media" && player().error.message.includes("MP4 header")`)
+			})
+
 			t.Run("live becomes completed file", func(t *testing.T) {
-				m.machine.Append(22, "video", -1, film[0], 500_000)
-				page := open(m.link(func(g *capability.Grant) { g.Run = "22" }, "video"))
+				m.machine.Append(23, "video", -1, film[0], 500_000)
+				page := open(t, m.link(func(g *capability.Grant) { g.Run = "23" }, "video"))
 				playerWait(t, page, "the live preview plays", `playing(0.5, 10)`)
 				old := playerEval(t, page, `(async () => {
 					video().pause(); video().currentTime = 0.25;
 					await until(() => !video().seeking);
 					return video().src;
 				})()`)
-				m.machine.Replace(22, "video", -1, completed[0], 1_500_000)
-				m.machine.End(22, "completed")
+				m.machine.Replace(23, "video", -1, completed[0], 1_500_000)
+				m.machine.End(23, "completed")
 				playerWait(t, page, "the finalized file replaces the live stream", `player().finished && player().stats.resets === 1 && player().stats.type === "video/mp4" && video().readyState >= 2`)
 				result := playerEval(t, page, `({positionHeld: Math.abs(video().currentTime - 0.25) < 0.05, paused: video().paused, revoked: window.revokedURLs, error: player().error?.message})`)
 				r := result.(map[string]any)
@@ -191,7 +225,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 				{"another output", m.link(func(g *capability.Grant) { g.Outputs = []string{"video"} }, "references"), "does not grant this output"},
 			} {
 				t.Run(arm.name, func(t *testing.T) {
-					page := open(arm.link)
+					page := open(t, arm.link)
 					playerWait(t, page, "the page says "+arm.says, fmt.Sprintf(`document.getElementById("status").textContent.includes(%q)`, arm.says))
 				})
 			}
@@ -303,17 +337,26 @@ func playerFilm(t *testing.T) [][]byte {
 	return [][]byte{append(header, pieces[0]...), pieces[1], pieces[2]}
 }
 
-func playerCompletedFilms(t *testing.T, fragments [][]byte) [][]byte {
+func playerMP4Variants(t *testing.T, fragments [][]byte) ([][]byte, [][]byte) {
 	t.Helper()
 	directory := t.TempDir()
 	source := filepath.Join(directory, "fragments.mp4")
 	must(t, os.WriteFile(source, bytes.Join(fragments, nil), 0600))
+	metadata := filepath.Join(directory, "metadata.txt")
+	must(t, os.WriteFile(metadata, []byte(";FFMETADATA1\ncomment="+strings.Repeat("header metadata ", 8192)+"\n"), 0600))
 	var movies [][]byte
-	for _, faststart := range []bool{false, true} {
-		target := filepath.Join(directory, fmt.Sprintf("completed-%t.mp4", faststart))
-		args := []string{"-v", "error", "-nostdin", "-i", source, "-map", "0", "-c", "copy"}
-		if faststart {
+	var live [][]byte
+	for variant := range 4 {
+		target := filepath.Join(directory, fmt.Sprintf("variant-%d.mp4", variant))
+		args := []string{"-v", "error", "-nostdin", "-i", source}
+		if variant >= 2 {
+			args = append(args, "-f", "ffmetadata", "-i", metadata, "-map_metadata", "1")
+		}
+		args = append(args, "-map", "0", "-c", "copy")
+		if variant == 1 || variant == 2 {
 			args = append(args, "-movflags", "+faststart")
+		} else if variant == 3 {
+			args = append(args, "-movflags", "+frag_keyframe+empty_moov+default_base_moof+skip_trailer")
 		}
 		if out, err := exec.Command("ffmpeg", append(args, target)...).CombinedOutput(); err != nil {
 			t.Fatalf("finalize browser fixture: %v %s", err, out)
@@ -323,9 +366,30 @@ func playerCompletedFilms(t *testing.T, fragments [][]byte) [][]byte {
 		if len(movie) <= 65536 {
 			t.Fatal("completed MP4 must exceed the browser test's credit window")
 		}
-		movies = append(movies, movie)
+		if variant >= 2 {
+			moov := 0
+			for at := 0; at+8 <= len(movie); {
+				size := int(binary.BigEndian.Uint32(movie[at:]))
+				if size < 8 || at+size > len(movie) {
+					t.Fatal("invalid MP4 fixture box")
+				}
+				if string(movie[at+4:at+8]) == "moov" {
+					moov = size
+				}
+				at += size
+			}
+			if moov <= 65536 {
+				t.Fatal("metadata must make the valid moov exceed the credit window")
+			}
+		}
+		if variant == 3 {
+			header, pieces := fmp4Fragments(movie)
+			live = append([][]byte{append(header, pieces[0]...)}, pieces[1:]...)
+		} else {
+			movies = append(movies, movie)
+		}
 	}
-	return movies
+	return movies, live
 }
 
 // playerLANAddress is this computer's first non-loopback IPv4 address: Chrome gathers no candidate
@@ -356,12 +420,19 @@ window.RTCPeerConnection = function (...args) {
 };
 RTCPeerConnection.prototype = PC.prototype;
 const send = RTCDataChannel.prototype.send;
-RTCDataChannel.prototype.send = function (m) { if (typeof m === "string") sent.push(JSON.parse(m)); return send.call(this, m); };`
+const channels = new WeakMap(); let nextChannel = 0;
+RTCDataChannel.prototype.send = function (m) {
+  if (!channels.has(this)) channels.set(this, ++nextChannel);
+  if (typeof m === "string") sent.push({...JSON.parse(m), channel: channels.get(this)});
+  return send.call(this, m);
+};`
 
 // The page helpers every wait and evaluation may use.
 const playerHelpers = `const video = () => document.getElementById("video"), player = () => window.cozyPlayer;
 const frames = () => video().getVideoPlaybackQuality().totalVideoFrames;
 const ranges = () => Array.from({length: video().buffered.length}, (_, i) => [video().buffered.start(i), video().buffered.end(i)]);
+const credit = () => { const channel = sent.filter(m => m.t === "follow").at(-1)?.channel;
+  return sent.filter(m => m.t === "credit" && m.channel === channel).at(-1)?.bytes ?? 0; };
 // Headless WebKit on Linux counts about half the frames it shows, so there the playhead is the evidence.
 const decoded = (end, n) => navigator.vendor.startsWith("Apple") ? video().currentTime >= end - 0.1 : frames() >= n;
 const playing = (end, n) => ranges().some(([, e]) => e >= end - 0.05) && decoded(end, n) && !player().error;

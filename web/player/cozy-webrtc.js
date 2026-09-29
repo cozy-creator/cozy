@@ -340,7 +340,9 @@ export class Player extends EventTarget {
     for (let failures = 0; !this.error && (!this.finished || this.#seekTo);) {
       this.#status(failures ? "reconnecting" : "connecting");
       try {
-        this.#session = await connect(this.#link, {cap: this.#link.cap, window: this.#options.window});
+        const session = await connect(this.#link, {cap: this.#link.cap, window: this.#options.window});
+        if (this.error) { session.close(this.error); break; }
+        this.#session = session;
         this.stats.connects++;
         failures = 0;
         this.#status("connected", this.#session.welcome.machine);
@@ -514,19 +516,20 @@ class Media {
 
   // What is queued is dropped, and the parser restarts at a box boundary.
   discontinuity() {
-    for (const {bytes, session} of this.#queue) session.release(bytes.length);
+    this.#release(this.#queue);
     this.#queue = [];
-    for (const {bytes, session} of this.#appending) session.release(bytes.length);
+    this.#release(this.#appending);
     this.#appending = [];
     if (this.#buffer && this.#source.readyState === "open") this.#buffer.abort();
   }
 
   push(bytes, session) {
+    const chunk = {bytes, session, credited: false};
     if (this.native) {
-      this.#retain(bytes, session);
+      this.#retain(chunk);
       return this.pump();
     }
-    this.#queue.push({bytes, session});
+    this.#queue.push(chunk);
     if (!this.#buffer && !this.#opening) this.#open();
     this.pump();
   }
@@ -534,8 +537,14 @@ class Media {
   #open() {
     const header = concat(this.#queue.map(q => q.bytes));
     this.#layout ??= mp4Layout(header);
+    if (!this.#layout) {
+      // A valid moov can exceed the transport window. These retained bytes are already
+      // bounded by the announced length; return credits once, even if MSE later uses them.
+      this.#release(this.#queue);
+      return;
+    }
     if (this.native) {
-      for (const {bytes, session} of this.#queue) this.#retain(bytes, session);
+      for (const chunk of this.#queue) this.#retain(chunk);
       this.#queue = [];
       return;
     }
@@ -553,7 +562,7 @@ class Media {
       this.#buffer.mode = "segments";
       this.#buffer.addEventListener("updateend", () => {
         if (buffer !== this.#buffer) return;
-        for (const {bytes, session} of this.#appending) session.release(bytes.length);
+        this.#release(this.#appending);
         this.#appending = [];
         this.#player.gap();
         this.pump();
@@ -563,10 +572,17 @@ class Media {
     if (this.#source.readyState === "open") open(); else this.#source.addEventListener("sourceopen", open, {once: true});
   }
 
-  #retain(bytes, session) {
-    this.#file.push(new Blob([bytes]));
-    this.#fileBytes += bytes.length;
-    session.release(bytes.length); // Native playback needs the complete file, including an end moov.
+  #release(chunks) {
+    for (const chunk of chunks) if (!chunk.credited) {
+      chunk.credited = true;
+      chunk.session.release(chunk.bytes.length);
+    }
+  }
+
+  #retain(chunk) {
+    this.#file.push(new Blob([chunk.bytes]));
+    this.#fileBytes += chunk.bytes.length;
+    this.#release([chunk]); // Native playback needs the complete file, including an end moov.
   }
 
   #playFile() {
@@ -591,6 +607,10 @@ class Media {
   }
 
   pump() {
+    if (this.#player.error) return;
+    if (!this.#layout && this.#player.finished && this.#player.entries.length) {
+      return this.#player.fail(new CozyError("media", "The completed output has no recognizable MP4 header."));
+    }
     if (this.native) return this.#playFile();
     const buffer = this.#buffer, source = this.#source, player = this.#player, video = player.video;
     if (!buffer || buffer.updating || source.readyState === "closed") return;
