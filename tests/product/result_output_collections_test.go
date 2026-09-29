@@ -10,9 +10,9 @@ func TestResultCollectionsRequireFixedNativeOutputPaths(t *testing.T) {
 	for _, arm := range []struct {
 		name, result, refusedPath string
 	}{
-		{"file-list", `{"list":{"asset":"file"}}`, "value[]"},
+		{"file-list", `{"list":{"asset":"file"}}`, ""}, // a list output: one `value.*` grant covers its items
 		{"tree-list", `{"list":{"input":"tree"}}`, "value[]"},
-		{"nested-list", `{"fields":[{"name":"images","type":{"list":{"asset":"image"}}}]}`, "value.images[]"},
+		{"nested-list", `{"fields":[{"name":"images","type":{"list":{"asset":"image"}}}]}`, ""},
 		{"list-struct", `{"list":{"fields":[{"name":"file","type":{"asset":"file"}}]}}`, "value[].file"},
 		{"file-map", `{"map":{"key":"str","value":{"asset":"file"}}}`, "value[value]"},
 		{"optional-file", `{"union":[{"asset":"file"},"null"]}`, "value"},
