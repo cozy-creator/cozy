@@ -307,61 +307,6 @@ func (f *conversionFixture) start(t *testing.T) {
 	startDaemonProcess(t, f.root)
 }
 
-// published asserts the one machine submission carried the destination on its weights
-// output with the destination as its only publication grant, and that the run recorded
-// the checkpoint Runtime published; it returns that request.
-func (f *conversionFixture) published(t *testing.T, out string) *records.Request {
-	t.Helper()
-	var state struct {
-		ModelOutputs map[string]string `json:"model_outputs"`
-	}
-	must(t, json.Unmarshal([]byte(out), &state))
-	submissions := f.machine.submitted()
-	if len(submissions) != 1 {
-		t.Fatalf("the conversion was submitted %d times", len(submissions))
-	}
-	submission := submissions[0]
-	var outputs []string
-	for _, access := range submission.Offer.Grant.Outputs {
-		outputs = append(outputs, access.OutputId+"="+access.Url)
-	}
-	if strings.Join(outputs, ",") != "fp8=model://proof/output" || submission.PublicationAuthorizationId == "" {
-		t.Fatalf("the submission does not carry the destination and its grant: outputs=%v authorization=%q", outputs, submission.PublicationAuthorizationId)
-	}
-	var spec pb.InvocationSpec
-	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
-	models := map[string]string{}
-	for _, input := range spec.Inputs {
-		models[input.InputId] = input.Digest
-	}
-	if models["model:source"] != f.source {
-		t.Fatalf("the input model is not the Hub checkpoint the pod reuses: %v", models)
-	}
-	f.mu.Lock()
-	if len(f.grants) != 1 || !strings.Contains(mustJSON(t, f.grants[0]), `"repositories":[{"name":"output","org":"proof"}]`) ||
-		!strings.Contains(mustJSON(t, f.grants[0]), `"machine_id":"`+podRental+`"`) || strings.Contains(mustJSON(t, f.grants[0]), `"rental_id"`) {
-		t.Fatalf("the destination is not the machine's only publication grant: %v", f.grants)
-	}
-	f.mu.Unlock()
-	store, problem := records.Open(f.layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-	request, problem := store.RequestRow(submission.Offer.RequestId)
-	fatal(t, problem)
-	transfer, problem := store.ModelTransferOf(request.ID)
-	fatal(t, problem)
-	repositories, problem := store.RequestPublicationRepositories(request.ID)
-	fatal(t, problem)
-	if !strings.HasPrefix(request.IdemKey, "conversion-") || transfer == nil || transfer.State != "completed" ||
-		transfer.Checkpoints["fp8"] != childDigest("c") || strings.Join(repositories, ",") != "proof/output" {
-		t.Fatalf("the conversion record is not a keyed, settled destination: %+v %+v %v", request, transfer, repositories)
-	}
-	if state.ModelOutputs["fp8"] != childDigest("c") {
-		t.Fatalf("the run does not report the published checkpoint: %s", out)
-	}
-	return request
-}
-
 func mustJSON(t *testing.T, value any) string {
 	t.Helper()
 	raw, err := json.Marshal(value)
@@ -422,20 +367,32 @@ func installLocalPackage(t *testing.T, layout home.Layout, store *records.Store,
 	return surface.Raw
 }
 
-// An unpublished package's conversion on the same rental is the same machine execution:
-// its captured code is installed on the pod, and the submission carries the destination.
+// An unpublished package's conversion on the same rental is one release root naming its
+// installation: its captured code is installed on the pod, and the root carries the job, its
+// input and the destination, with the destination's grant.
 func TestRentedConversionOfAnUnpublishedPackagePublishesFromTheMachine(t *testing.T) {
 	f := newConversionFixture(t)
-	surface := installConversionPackage(t, f.layout, f.store)
-	servePrivateCode(t, f, surface)
+	f.machine.jobRoots = true
+	prepared := servePrivateCode(t, f, installConversionPackage(t, f.layout, f.store))
 	f.start(t)
 	code, out := runCozy(t, f.root, "run", "local/conversion-proof/quantize", "proof/source@1.0.0/bf16", "proof/output",
-		"steps=7", "--rental=tessa", "--await", "--json")
-	if code != 0 {
+		"steps=7", "--rental=tessa", "--await", "--json", "--idempotency-key", "unpublished-conversion")
+	if code != 0 || !strings.Contains(out, childDigest("c")) {
 		t.Fatalf("the unpublished conversion did not publish [exit %d]: %s\n%s", code, out, tail(filepath.Join(f.root, "daemon.log")))
 	}
-	if request := f.published(t, out); request.LocalInstallationID == "" {
-		t.Fatalf("the unpublished conversion did not run its captured code: %+v", request)
+	store, problem := records.Open(f.layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	request, problem := store.RequestByIdempotencyKey("unpublished-conversion")
+	fatal(t, problem)
+	submissions := f.machine.submitted()
+	if len(submissions) != 1 || submissions[0].ReleaseRoot == nil || submissions[0].PublicationAuthorizationId == "" {
+		t.Fatalf("the unpublished conversion is not one release root with its grant: %+v", submissions)
+	}
+	if root := submissions[0].ReleaseRoot; request.LocalInstallationID == "" || root.InstallationId != request.LocalInstallationID ||
+		root.Release != "" || !root.Job || root.WeightsDestination != "proof/output" || len(root.Models) == 0 || prepared.Load() == 0 {
+		t.Fatalf("the unpublished conversion does not name its installation, input and destination: installation %q, prepared %d, root %+v",
+			request.LocalInstallationID, prepared.Load(), root)
 	}
 }
 

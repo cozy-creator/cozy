@@ -22,7 +22,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -341,16 +340,15 @@ func (p *rentedIngestPod) upload(args ...string) (int, string) {
 }
 
 // submittedScript is the one ingest script the pod was asked to run, from the installation
-// it prepared and the machine submission that names it.
+// it prepared and the release root that names it.
 func (p *rentedIngestPod) submittedScript(t *testing.T) string {
 	t.Helper()
 	waitFor(t, p.root, "the ingest's machine submission", func() bool { return p.machine.submitted() != nil })
-	var capture pb.MachineExecutionCapture
-	must(t, canonical.Unmarshal(p.machine.submitted().CaptureCanonicalBytes, &capture))
+	root := p.machine.submitted().ReleaseRoot
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.prepared) != 1 || capture.RootInstallationId != p.prepared[0].LocalPackageSet.Package.InstallationId {
-		t.Fatalf("the submission does not run the uploaded installation: prepared %d, root %q", len(p.prepared), capture.RootInstallationId)
+	if len(p.prepared) != 1 || root == nil || root.InstallationId != p.prepared[0].LocalPackageSet.Package.InstallationId {
+		t.Fatalf("the submission is not a root naming the uploaded installation: prepared %d, root %+v", len(p.prepared), root)
 	}
 	script, err := tarMember(p.received["source.tar"], "cozy_script.py")
 	must(t, err)
