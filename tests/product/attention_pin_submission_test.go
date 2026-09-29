@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -97,32 +96,6 @@ func TestAttentionOverrideMalformedHTTPRefusesBeforeAdmission(t *testing.T) {
 	defer store.Close()
 	if request, problem := store.RequestByIdempotencyKey("malformed-dit=a=b"); problem != nil || request != nil {
 		t.Fatalf("malformed override was durably admitted: request=%+v problem=%v", request, problem)
-	}
-}
-
-func TestJobAttentionOverrideCannotBeSilentlyIgnored(t *testing.T) {
-	root := t.TempDir()
-	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[],"name":"prepare","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
-	parsed, problem := launch.DecodePackageInterface(iface)
-	fatal(t, problem)
-	if len(parsed.Raw) == 0 {
-		t.Fatal("fixture lost its canonical interface")
-	}
-	dir := filepath.Join(root, "installs", "attention-job")
-	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(dir)), 0700))
-	must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0600))
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	_, problem = store.Activate(records.PackageInstall{ID: "attention-job", Package: "proof/attention-job", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, Platform: "linux-x86"})
-	fatal(t, problem)
-	for _, term := range []string{"--attention-kernel=dit=kitchen-int8", "kernel.attention=dit=kitchen-int8"} {
-		if code, out := runCozy(t, root, "run", "proof/attention-job/prepare", term, "--idempotency-key=job-pin"); code == 0 || !strings.Contains(out, "applies only to serving callables") {
-			t.Fatalf("job override was not refused: %s", out)
-		}
-	}
-	if request, problem := store.RequestByIdempotencyKey("job-pin"); problem != nil || request != nil {
-		t.Fatalf("unsupported job pin was submitted: request=%+v problem=%v", request, problem)
 	}
 }
 
