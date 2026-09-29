@@ -47,7 +47,7 @@ func TestOldAgentCannotReceiveDelegatedAuthority(t *testing.T) {
 						"worker_internal_port":       machine.Listener.Addr().(*net.TCPAddr).Port,
 						"tls_certificate_der_base64": base64.StdEncoding.EncodeToString(machine.TLS.Certificates[0].Certificate[0])})
 					mac := hmac.New(sha256.New, key)
-					_, _ = mac.Write([]byte("cozy.pod-readiness/1\x00"))
+					_, _ = mac.Write([]byte(machines.ReadinessReceiptDomain))
 					_, _ = mac.Write(payload)
 					_ = json.NewEncoder(w).Encode(map[string]any{"payload": payload, "hmac_sha256": hex.EncodeToString(mac.Sum(nil))})
 					return

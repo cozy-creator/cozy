@@ -19,8 +19,8 @@ import (
 // The readiness receipt, read as Tensorhub reads a pod's: the envelope over the media plane,
 // authenticated under the key the launcher minted, naming the TLS leaf that served it.
 const (
-	receiptDomain   = "cozy.pod-readiness/1\x00"
-	maxReceiptBytes = 64 << 10
+	ReadinessReceiptDomain = "cozy.pod-readiness/1\x00"
+	maxReceiptBytes        = 64 << 10
 )
 
 // ReceiptGPU is one device the Runtime measured, as the receipt names it.
@@ -90,7 +90,7 @@ func readReceipt(ctx context.Context, mediaPort int, key []byte) (receipt, []byt
 	}
 	want, err := hex.DecodeString(envelope.HMACSHA256)
 	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(receiptDomain))
+	mac.Write([]byte(ReadinessReceiptDomain))
 	mac.Write(envelope.Payload)
 	if err != nil || !hmac.Equal(mac.Sum(nil), want) {
 		return receipt{}, nil, &receiptRefusal{"the receipt is not authenticated by this launch's key"}
