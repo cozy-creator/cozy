@@ -375,15 +375,20 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 			return true, problem
 		}
 	}
-	if action == "cancel" && len(link.Receipt) == 0 {
-		_, problem = s.store.CancelMachineBeforeAcceptance(row.ID)
+	accepted := len(link.Receipt) > 0
+	if action == "cancel" && !accepted {
+		// Acceptance recorded since the read above is found where the cancel is recorded.
+		accepted, problem = s.store.CancelMachineBeforeAcceptance(row.ID)
 		if problem == nil && s.machineExecutions != nil {
 			s.machineExecutions.Withdraw(row.ID)
 		}
-	} else if s.machineExecutions == nil {
-		problem = exit.Unavailablef("this client cannot control Runtime-owned execution")
-	} else {
-		problem = s.machineExecutions.Control(ctx, row, action)
+	}
+	if problem == nil && (accepted || action != "cancel") {
+		if s.machineExecutions == nil {
+			problem = exit.Unavailablef("this client cannot control Runtime-owned execution")
+		} else {
+			problem = s.machineExecutions.Control(ctx, row, action)
+		}
 	}
 	// Machine execution controls used to leave no durable actor when they came
 	// through the machine-owned route. That made a cancellation look like it

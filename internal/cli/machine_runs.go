@@ -105,12 +105,6 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 			if problem != nil || link == nil {
 				return
 			}
-			if len(link.Receipt) == 0 && len(link.Submission) > 0 && link.CancelRequested && !link.SubmissionClosed && current.State == "canceled" {
-				if _, problem := m.store.CancelMachineBeforeAcceptance(request.ID); problem != nil {
-					return
-				}
-				continue
-			}
 			if len(link.Receipt) == 0 && len(link.Submission) == 0 && link.CancelRequested && current.State == "canceling" {
 				// An older cozy left this cancel waiting on a machine that never accepted the run.
 				if _, problem := m.store.CancelMachineBeforeAcceptance(request.ID); problem != nil {
