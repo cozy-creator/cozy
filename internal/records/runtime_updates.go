@@ -39,7 +39,7 @@ func (r RuntimeUpdate) Active() bool { return r.State != "succeeded" && r.State 
 
 // InProgress is an update the daemon is still carrying out.
 func (r RuntimeUpdate) InProgress() bool {
-	return r.State == "preparing" || r.State == "updating" || r.State == "reconciling"
+	return r.State == "preparing" || r.State == "updating" || r.State == "reconciling" || r.State == "waiting_activation"
 }
 
 // RuntimeUpdateHold is why a rental takes no work because of its Runtime update, or nil.
@@ -113,7 +113,7 @@ func (s *Store) BeginRuntimeUpdate(rental, boot, request string, selection json.
 
 func (s *Store) SaveRuntimeUpdate(r RuntimeUpdate) *exit.Error {
 	switch r.State {
-	case "preparing", "updating", "reconciling", "unusable", "succeeded", "failed":
+	case "preparing", "updating", "reconciling", "waiting_activation", "unusable", "succeeded", "failed":
 	default:
 		return exit.New(exit.Validation, "invalid Runtime update state")
 	}
