@@ -216,7 +216,7 @@ app = App()
 def sdk(payload: Ask) -> SDK:
     return SDK(runtime=importlib.metadata.version("`+hostruntime.Distribution+`"))
 `), 0o600))
-	if out, err := exec.Command("uv", "lock", "--refresh-package", "cozy-runtime", "--project", project).CombinedOutput(); err != nil {
+	if out, err := exec.Command("uv", "lock", "--refresh-package", hostruntime.Distribution, "--project", project).CombinedOutput(); err != nil {
 		t.Fatalf("locking %s: %v\n%s", name, err, out)
 	}
 	return project

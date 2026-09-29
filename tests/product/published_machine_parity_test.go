@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
@@ -90,7 +91,7 @@ func publishParityRelease(t *testing.T, h *machineHub, root, project string) {
 	if head, tail, sourced := strings.Cut(string(raw), "[tool.uv.sources]"); sourced {
 		_, rest, _ := strings.Cut(tail, "[build-system]")
 		must(t, os.WriteFile(pyproject, []byte(head+"[build-system]"+rest), 0o600))
-		if out, err := exec.Command("uv", "lock", "--refresh-package", "cozy-runtime", "--project", project).CombinedOutput(); err != nil {
+		if out, err := exec.Command("uv", "lock", "--refresh-package", hostruntime.Distribution, "--project", project).CombinedOutput(); err != nil {
 			t.Fatalf("locking the published parity release: %v\n%s", err, out)
 		}
 	}
