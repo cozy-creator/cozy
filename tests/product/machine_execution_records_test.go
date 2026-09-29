@@ -231,8 +231,8 @@ func TestMachineCancellationPreservesAmbiguousAcceptance(t *testing.T) {
 	}
 	row, problem := store.RequestRow(request.ID)
 	fatal(t, problem)
-	if row.State != "canceled" {
-		t.Fatalf("a run no machine accepted waited on one: %s", row.State)
+	if row.State != "canceling" {
+		t.Fatalf("unknown acceptance was projected as stopped: %s", row.State)
 	}
 	// A receipt that still arrives is recorded, so the same real execution is
 	// canceled remotely instead of silently abandoning a running job.

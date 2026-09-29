@@ -3,6 +3,7 @@ package cli
 import (
 	"path/filepath"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -11,7 +12,10 @@ func requestedOutputDirectory(ctx *Context) (string, *exit.Error) {
 	if requested == "" {
 		return "", nil
 	}
-	absolute, err := filepath.Abs(requested)
+	absolute, err := config.ExpandHome(requested)
+	if err == nil {
+		absolute, err = filepath.Abs(absolute)
+	}
 	if err != nil {
 		return "", exit.Usagef("cannot resolve --out %q: %s", requested, err)
 	}

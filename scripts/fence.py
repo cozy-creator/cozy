@@ -56,6 +56,8 @@ from collections.abc import Iterator
 SCAN = ["go.mod", "main.go", "cmd/**/*.go", "internal/**/*.go", "tests/**/*.go"]
 
 DENY_DEPS = ["tensorhub-v2", "varena"]
+# One YAML library, imported only by internal/config (config files, runtime.yaml, and
+# YAMLToJSON for `run --input`).
 YAML_IMPORT = "go.yaml.in/yaml/v3"
 
 # The canonical carriers TensorFS parses. A second reader here would drift from the one
@@ -464,8 +466,8 @@ def check_sources() -> list[str]:
             for d in DENY_DEPS:
                 if re.search(r"(?<![\w.-])" + re.escape(d) + r"(?![\w-])", s, re.I):
                     bad.append(f"{p}:{i}: [deps] forbidden dependency '{d}': {s}")
-            if p.suffix == ".go" and YAML_IMPORT in s and str(p) != "internal/config/config.go":
-                bad.append(f"{p}:{i}: [deps] YAML parsing belongs only to centralized config: {s}")
+            if p.suffix == ".go" and YAML_IMPORT in s and p.parent != pathlib.Path("internal/config"):
+                bad.append(f"{p}:{i}: [deps] YAML parsing belongs only to the config package: {s}")
             for d in DENY_STORE:
                 if d in s.lower() and STORE_READS.get(str(p), "\0") not in s:
                     bad.append(f"{p}:{i}: [store] lifecycle sidecar '{d}' — the one SQLite "

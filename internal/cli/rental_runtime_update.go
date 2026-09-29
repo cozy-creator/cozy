@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -244,12 +245,9 @@ func (u *rentalRuntimeUpdates) connectionSelection(ctx context.Context, row reco
 	if key == "" {
 		key = filepath.Join(m.context.Cfg.Home, "auth", "rental-ssh.pub")
 	}
-	if strings.HasPrefix(key, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return selection, exit.New(exit.Credential, "cannot resolve rental SSH identity")
-		}
-		key = filepath.Join(home, strings.TrimPrefix(key, "~/"))
+	key, err = config.ExpandHome(key)
+	if err != nil {
+		return selection, exit.New(exit.Credential, "cannot resolve rental SSH identity")
 	}
 	if !filepath.IsAbs(key) {
 		key = filepath.Join(m.context.Cfg.Home, key)

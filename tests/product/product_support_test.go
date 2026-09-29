@@ -370,6 +370,12 @@ func (s *daemonProcess) callBytes(t *testing.T, method, path string, body []byte
 // inventing a second child-env mechanism, and the env fence says there is one reader.
 func runCozy(t *testing.T, root string, args ...string) (int, string) {
 	t.Helper()
+	return runCozyWith(t, root, nil, args...)
+}
+
+// runCozyWith is runCozy with extra child environment, such as another HOME.
+func runCozyWith(t *testing.T, root string, imposed []string, args ...string) (int, string) {
+	t.Helper()
 	// Machine results are one stdout document; awaited JSONL progress is stderr.
 	// Dedicated stream proofs validate that channel independently.
 	for _, arg := range args {
@@ -377,12 +383,12 @@ func runCozy(t *testing.T, root string, args ...string) (int, string) {
 			break
 		}
 		if arg == "--json" {
-			code, stdout, _ := runCozyStreams(t, root, args...)
+			code, stdout, _ := runCozyStreamsWith(t, root, imposed, args...)
 			return code, stdout
 		}
 	}
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-	cmd.Env = childEnv(t, root)
+	cmd.Env = childEnv(t, root, imposed...)
 	data, _ := cmd.CombinedOutput()
 	code := 0
 	if cmd.ProcessState != nil {
@@ -394,8 +400,13 @@ func runCozy(t *testing.T, root string, args ...string) (int, string) {
 
 func runCozyStreams(t *testing.T, root string, args ...string) (int, string, string) {
 	t.Helper()
+	return runCozyStreamsWith(t, root, nil, args...)
+}
+
+func runCozyStreamsWith(t *testing.T, root string, imposed []string, args ...string) (int, string, string) {
+	t.Helper()
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-	cmd.Env = childEnv(t, root)
+	cmd.Env = childEnv(t, root, imposed...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	_ = cmd.Run()

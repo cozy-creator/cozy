@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -266,12 +267,9 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 				WithRemedy("a job's typed model/dataset input arrives as a materialized tree").
 				WithNext("cozy run <target> --input-tree cozy/sdxl@lane=/path/to/store")
 		}
-		if dir == "~" || strings.HasPrefix(dir, "~/") {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return nil, exit.New(exit.NotFound, "cannot resolve input directory home: %s", err)
-			}
-			dir = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(dir, "~"), "/"))
+		dir, err := config.ExpandHome(dir)
+		if err != nil {
+			return nil, exit.New(exit.NotFound, "cannot resolve input directory home: %s", err)
 		}
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
@@ -723,12 +721,14 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	if e := c.CancelJob(jobID, "cozy job cancel"); e != nil {
 		return e
 	}
-	// BLOCK UNTIL THE CANCELED TERMINAL. The request was made; the attempt's own
-	// journaled terminal is what settles it, so this watches the durable stream to it.
-	if _, e := c.Watch(jobID, 0, func(localapi.Event) bool { return true }); e != nil {
-		return e
+	// Cancellation is durable intent. Waiting for its effective outcome is explicit;
+	// an unavailable machine must not turn the default command into an endless wait.
+	if ctx.Inv.Bool("--await") {
+		if _, e := c.Watch(jobID, 0, func(localapi.Event) bool { return true }); e != nil {
+			return e
+		}
 	}
-	final, e := c.Job(jobID)
+	final, e := c.RecordedJob(jobID)
 	if e != nil {
 		return e
 	}

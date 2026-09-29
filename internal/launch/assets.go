@@ -3,12 +3,12 @@ package launch
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -133,18 +133,10 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []st
 			maxBytes = inputasset.MaxBytes
 		}
 
-		if source == "~" || strings.HasPrefix(source, "~/") {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset home: %s", err)
-			}
-			if source == "~" {
-				source = home
-			} else {
-				source = filepath.Join(home, strings.TrimPrefix(source, "~/"))
-			}
+		absolute, err := config.ExpandHome(source)
+		if err == nil {
+			absolute, err = filepath.Abs(absolute)
 		}
-		absolute, err := filepath.Abs(source)
 		if err != nil {
 			return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset %s: %s", source, err)
 		}
