@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -16,15 +15,17 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// A machine names its release as `cozy --version` of its own binary does, in DescribeMachine
-// and in its sealed readiness receipt: one stamp, never a separate Host version.
-func TestTheMachineReportsItsCozyRelease(t *testing.T) {
+// A machine names its independent agent release in --version, DescribeMachine, and its
+// sealed readiness receipt. The personal controller's version is not the machine version.
+func TestTheMachineReportsItsAgentRelease(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: the machine reports its own release")
 	}
 	out, err := exec.Command(*machineHostBinary, "--version").Output()
 	must(t, err)
-	want := strings.TrimSpace(string(out))
+	var version struct{ Version string }
+	must(t, json.Unmarshal(out, &version))
+	want := version.Version
 	root := t.TempDir()
 	provisionMachine(t, root)
 	layout, problem := home.Open(root)

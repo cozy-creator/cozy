@@ -59,7 +59,7 @@ func TestAgentAdoptionRequiresObservedIdle(t *testing.T) {
 // Old ownership history is not authority over the new one-agent Runtime launch.
 func TestLegacyControlHistoryDoesNotBlockStandaloneAgent(t *testing.T) {
 	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host: a cozy build the machine runs as its Host")
+		t.Skip("requires -machine-host: the standalone agent the machine runs")
 	}
 	uv, err := exec.LookPath("uv")
 	if err != nil {

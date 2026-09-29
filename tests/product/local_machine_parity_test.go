@@ -3,11 +3,14 @@ package producttest
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -42,8 +46,9 @@ const (
 type machineHub struct {
 	*fakeRentalHub
 	worker   *httptest.Server
-	ca       []byte // the worker doors' private CA
-	provider string // the rental's machine root, as its provider booted it
+	access   *httptest.Server // local account-delegated content API, separate from account calls
+	ca       []byte           // the worker doors' private CA
+	provider string           // the rental's machine root, as its provider booted it
 	mu       sync.Mutex
 	grants   map[string]string // more of the grant, as a Hub adds a port for an image that serves it
 }
@@ -60,6 +65,10 @@ func newMachineHub(t *testing.T) *machineHub {
 		}
 	}))
 	t.Cleanup(h.worker.Close)
+	h.access = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.worker.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(h.access.Close)
 	served := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorized := r.Header.Get("Authorization") == "Bearer rental-idle-test"
@@ -69,7 +78,7 @@ func newMachineHub(t *testing.T) *machineHub {
 			http.Error(w, "registration is not a local machine lifecycle", http.StatusGone)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access" && authorized:
 			_ = json.NewEncoder(w).Encode(map[string]any{"token": "execution-test-access", "expires_at": time.Now().Add(time.Hour),
-				"environment": map[string]string{"TENSORHUB_ORIGIN": h.server.URL, "TENSORHUB_PUBLIC_ORIGIN": h.server.URL}})
+				"environment": map[string]string{"TENSORHUB_ORIGIN": h.access.URL, "TENSORHUB_PUBLIC_ORIGIN": h.server.URL}})
 		case strings.HasPrefix(r.URL.Path, "/v1/tensorfs/"):
 			h.worker.Config.Handler.ServeHTTP(w, r)
 		default:
@@ -118,9 +127,12 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	identity, problem := rental.PendingCreatorIdentity(layout, "parity-rental")
 	fatal(t, problem)
 	// Short roots: a Runtime's executor socket lives under the machine root.
-	dir, err := os.MkdirTemp("", "czr")
+	providerHome, err := os.MkdirTemp("", "czr")
 	must(t, err)
-	t.Cleanup(func() { _ = removeAllForce(dir) })
+	claimScratch(providerHome)
+	dir := filepath.Join(providerHome, "machine")
+	t.Cleanup(func() { _ = removeAllForce(providerHome) })
+	trackDaemonRoot(t, providerHome)
 	host := machines.NewHost(dir, "", nil)
 	host.WebRTCPort, _ = strconv.Atoi(h.grants["COZY_WEBRTC_INTERNAL_PORT"])
 	source.Pinned = true // the Host under test, never replaced by the test binary
@@ -130,10 +142,48 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	key, err := os.ReadFile(layout.PendingRentalCreatorIdentity("parity-rental"))
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(dir, "owner.pem"), key, 0o600))
-	registration, _ := json.Marshal(map[string]string{"hub": "provider", "id": parityWorker, "worker_token": randomToken(t)})
-	must(t, os.WriteFile(filepath.Join(dir, "registration.json"), registration, 0o600))
-	environment, _ := json.Marshal(h.environment())
-	must(t, os.WriteFile(filepath.Join(dir, "environment.json"), environment, 0o600))
+	// A provider passes the rental grant directly to the same executable. Local Host.Ensure
+	// intentionally ignores legacy registration/environment files and always boots persistent.
+	free := func() int {
+		listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow choose fixture provider ports
+		must(t, err)
+		port := listener.Addr().(*net.TCPAddr).Port
+		must(t, listener.Close())
+		return port
+	}
+	workerPort, mediaPort := free(), free()
+	for mediaPort == workerPort {
+		mediaPort = free()
+	}
+	receiptKey, mediaToken := randomToken(t), randomToken(t)
+	mediaHash := sha256.Sum256([]byte(mediaToken))
+	auth, err := json.Marshal(map[string]any{"control_public_key_ed25519_b64url": identity.PublicKey(),
+		"media_token_sha256": []string{hex.EncodeToString(mediaHash[:])}})
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(dir, "media-token"), []byte(mediaToken), 0600))
+	environment := h.environment()
+	maps.Copy(environment, map[string]string{
+		"COZY_MACHINE_ROOT": host.Root(), "COZY_MACHINE_LIFETIME": "rental", "COZY_LISTEN_HOST": "127.0.0.1",
+		"COZY_WORKER_ID": parityWorker, "COZY_WORKER_AUTH_TOKEN": randomToken(t),
+		"COZY_WORKER_INTERNAL_PORT": strconv.Itoa(workerPort), "COZY_MEDIA_INTERNAL_PORT": strconv.Itoa(mediaPort),
+		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL": receiptKey, "COZY_RECORD_OWNER_AUTH_JSON": string(auth),
+	})
+	command := exec.Command(filepath.Join(host.Root(), "usr/local/bin/cozy-machine"))
+	command.Dir = host.Root()
+	for name, value := range environment {
+		command.Env = append(command.Env, name+"="+value)
+	}
+	log, err := os.OpenFile(filepath.Join(dir, "host.log"), os.O_CREATE|os.O_WRONLY, 0600)
+	must(t, err)
+	command.Stdout, command.Stderr = log, log
+	must(t, command.Start())
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	t.Cleanup(func() { _ = command.Process.Signal(syscall.SIGTERM); <-done; _ = log.Close() })
+	record, err := json.Marshal(map[string]any{"pid": command.Process.Pid, "worker_id": parityWorker,
+		"worker_port": workerPort, "media_port": mediaPort, "receipt_key": receiptKey})
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(dir, "host.json"), record, 0600))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	launch, problem := host.Ensure(ctx, "", nil, false)
@@ -141,10 +191,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 		log, _ := os.ReadFile(filepath.Join(dir, "host.log"))
 		t.Fatalf("the provider Host did not boot: %s\n%s", problem.Message, log)
 	}
-	t.Cleanup(func() { _ = host.Stop(context.Background()) })
-	token, err := os.ReadFile(filepath.Join(dir, "media-token"))
-	must(t, err)
-	return launch, identity, string(token), host.Root()
+	return launch, identity, mediaToken, host.Root()
 }
 
 func parityProject(t *testing.T) string {

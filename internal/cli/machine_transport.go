@@ -47,7 +47,7 @@ func (m *machineRuns) connectFor(ctx context.Context, request records.Request, n
 	// A captured local program can start without a Hub account or network. Explicit
 	// publication, catalog models and published code need delegated execution access.
 	localCode := request.LocalInstallationID != "" || strings.HasPrefix(request.Package, "local/")
-	if localCode && !request.IsJob() && request.ModelTransfer == nil && len(request.Models) == 0 {
+	if localCode && request.ModelTransfer == nil && len(request.Models) == 0 {
 		consent, problem := m.store.RequestPublicationRepositories(request.ID)
 		if problem != nil {
 			return nil, problem

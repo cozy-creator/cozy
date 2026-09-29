@@ -210,8 +210,8 @@ func awaitMachineReceipt(t *testing.T, store *records.Store, requestID string) *
 		}
 		row, problem := store.RequestRow(requestID)
 		fatal(t, problem)
-		if row != nil && records.Settled(row.State) {
-			t.Fatalf("run %s settled %s before Runtime accepted it", requestID, row.State)
+		if row != nil && (records.Settled(row.State) || records.RetainedState(row.State)) {
+			t.Fatalf("run %s became %s before Runtime accepted it", requestID, row.State)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
