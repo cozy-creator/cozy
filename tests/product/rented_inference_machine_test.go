@@ -108,7 +108,7 @@ func (m *runtimeMachine) CloseMachineSubmission(_ context.Context, q *pb.Machine
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := &pb.MachineSubmissionClosure{RequestId: q.RequestId, SubmissionId: q.SubmissionId, ExecutionWorkspaceId: q.ExpectedExecutionWorkspaceId}
-	if m.receipt != nil {
+	if m.receipt != nil && m.receipt.RequestId == q.RequestId && m.receipt.SubmissionId == q.SubmissionId {
 		out.Receipt = proto.Clone(m.receipt).(*pb.MachineExecutionReceipt)
 	} else {
 		if m.closed == nil {

@@ -29,7 +29,9 @@ func (m *permanentSubmitRefusal) SubmitMachineExecution(ctx context.Context, req
 	return nil, status.Error(codes.FailedPrecondition, "hub_access_absent: this machine has no execution access for the requested Hub")
 }
 func (m *permanentSubmitRefusal) CloseMachineSubmission(ctx context.Context, request *pb.MachineSubmissionClose) (*pb.MachineSubmissionClosure, error) {
-	m.closed.Add(1)
+	if !strings.HasPrefix(request.SubmissionId, "closure-probe-") {
+		m.closed.Add(1)
+	}
 	return m.terminalMachines.CloseMachineSubmission(ctx, request)
 }
 

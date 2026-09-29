@@ -115,6 +115,16 @@ type Installed struct {
 	HostPinned  bool              `json:"host_pinned,omitempty"`
 }
 
+// startupEnvironment preserves an explicitly installed Host or wheel pair.
+// The published agent hash alone does not pin the installation.
+func (i Installed) startupEnvironment() []string {
+	mode := "auto"
+	if i.HostPinned || i.Runtime.SHA256 != "" || i.TensorFS.SHA256 != "" {
+		mode = "off"
+	}
+	return []string{"COZY_STARTUP_UPDATE=" + mode}
+}
+
 // HostModule is the Go main module a Host binary was built from, "" when it is not Go.
 func HostModule(path string) string {
 	info, err := buildinfo.ReadFile(path)
@@ -525,6 +535,7 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL=" + base64.RawURLEncoding.EncodeToString(key),
 		"COZY_RECORD_OWNER_AUTH_JSON=" + string(auth),
 	}, h.inherited...)
+	base = append(base, installed.startupEnvironment()...)
 	if h.store != "" {
 		base = append(base, "COZY_TENSORFS_ROOT="+h.store)
 	}
