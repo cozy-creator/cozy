@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,10 +17,13 @@ import (
 // A cancel never waits on a machine that has not accepted the run. A run whose submission
 // reached this computer's machine, which then never boots again, and one sent to a rental
 // whose pod died, both end canceled the moment they are canceled (runs 1583, 1589 sat in
-// "canceling" until a machine that never came back, or a preparation, answered).
+// "canceling" until a machine that never came back, or a preparation, answered). One an
+// older cozy left in "canceling" ends canceled once the daemon starts.
 func TestACancelBeforeAcceptanceEndsTheRunAtOnce(t *testing.T) {
-	for _, machine := range []string{machines.Local, "pr-deadpoddeadpoddead0"} {
-		t.Run(map[bool]string{true: "local machine never boots", false: "rental died"}[machine == machines.Local], func(t *testing.T) {
+	for _, arm := range []struct{ name, machine string }{{"local machine never boots", machines.Local},
+		{"rental died", "pr-deadpoddeadpoddead0"}, {"left canceling by an older cozy", machines.Local}} {
+		machine := arm.machine
+		t.Run(arm.name, func(t *testing.T) {
 			root := t.TempDir()
 			must(t, os.WriteFile(filepath.Join(root, config.FileName),
 				[]byte("tensorhub_url: http://127.0.0.1:1\ntensorhub_token: unreachable\n"), 0o600))
@@ -42,11 +46,26 @@ func TestACancelBeforeAcceptanceEndsTheRunAtOnce(t *testing.T) {
 				ExpectedExecutionWorkspaceId: "workspace", Offer: &pb.AttemptOffer{RequestId: request.ID},
 				PayloadCanonicalBytes: []byte(`{}`), ReleaseRoot: &pb.ReleaseRoot{Package: "proof/stuck", Release: "1.0.0", Entrypoint: "generate"}}))
 			store.Close()
-			startDaemonProcess(t, root)
-
+			left := arm.name == "left canceling by an older cozy"
+			if left {
+				// What cozy before this fix recorded for such a cancel.
+				db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))
+				must(t, err)
+				_, err = db.Exec(`UPDATE machine_executions SET cancel_requested=1 WHERE request_id=?`, request.ID)
+				must(t, err)
+				_, err = db.Exec(`UPDATE requests SET state='canceling' WHERE id=?`, request.ID)
+				must(t, err)
+				must(t, db.Close())
+			}
 			began := time.Now()
-			code, out := runCozy(t, root, "run", "cancel", request.ID, "--json")
-			if code != 0 || !strings.Contains(out, `"canceled"`) {
+			startDaemonProcess(t, root)
+			if left {
+				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+					if code, out := runCozy(t, root, "run", "show", request.ID, "--json"); code == 0 && strings.Contains(out, `"status":"canceled"`) {
+						break
+					}
+				}
+			} else if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 || !strings.Contains(out, `"canceled"`) {
 				t.Fatalf("cancel did not end the run [exit %d]: %s", code, out)
 			}
 			store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
