@@ -355,6 +355,13 @@ func (c *Client) Cancel(id, actor string) *exit.Error {
 	return c.call("POST", "/v1/requests/"+id+"/cancel", map[string]string{"actor": actor}, nil)
 }
 
+// Abandon ends local tracking only; it makes no request to the remote machine.
+func (c *Client) Abandon(id, actor string) (api.LocalAbandonment, *exit.Error) {
+	var result api.LocalAbandonment
+	problem := c.call("POST", "/v1/local/requests/"+url.PathEscape(id)+"/abandon", map[string]string{"actor": actor}, &result)
+	return result, problem
+}
+
 // ------------------------------------------------------------ the LOCAL extension
 
 // DescribeRelease asks one machine ("local" or a rental id) for a published release's interface.

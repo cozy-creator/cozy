@@ -102,7 +102,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				return
 			}
 			link, problem := m.store.MachineExecution(request.ID)
-			if problem != nil || link == nil {
+			if problem != nil || link == nil || link.Abandoned {
 				return
 			}
 			if len(link.Receipt) == 0 && len(link.Submission) == 0 && link.CancelRequested && current.State == "canceling" {
@@ -220,6 +220,11 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 // closePendingSubmission resolves cancellation without retransmitting work.
 // A missing receipt is uncertainty; a durable closed key is a nonacceptance proof.
 func (m *machineRuns) closePendingSubmission(ctx context.Context, request records.Request, link *records.MachineExecution) *exit.Error {
+	if latest, problem := m.store.MachineExecution(request.ID); problem != nil {
+		return problem
+	} else if latest != nil && latest.Abandoned {
+		return exit.Named(exit.Conflict, "request.abandoned", "local submission intent was abandoned")
+	}
 	var frozen pb.MachineExecutionSubmit
 	if proto.Unmarshal(link.Submission, &frozen) != nil || frozen.Offer == nil || frozen.ExpectedExecutionWorkspaceId == "" {
 		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "pending cancellation has no intact submission identity")
@@ -294,15 +299,27 @@ func (m *machineRuns) Resume() {
 // observer's next pass releases whatever of it reached the machine.
 func (m *machineRuns) Withdraw(request string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if stop := m.submitting[request]; stop != nil {
+	stop := m.submitting[request]
+	m.mu.Unlock()
+	if stop != nil {
 		stop()
+	}
+	if link, problem := m.store.MachineExecution(request); problem == nil && link != nil && link.Abandoned {
+		observation := m.observation(request)
+		observation.mu.Lock()
+		if observation.yield != nil {
+			observation.yield(errObservationYielded)
+		}
+		observation.mu.Unlock()
 	}
 }
 
 // machineWorkOwed is whether the execution still owes work or custody, or holds a sent
 // publication only its owner can settle.
 func (m *machineRuns) machineWorkOwed(request string) (bool, *exit.Error) {
+	if link, problem := m.store.MachineExecution(request); problem != nil || link != nil && link.Abandoned {
+		return false, problem
+	}
 	if owed, problem := m.store.MachineExecutionOwesWork(request); problem != nil || owed {
 		return owed, problem
 	}
@@ -321,6 +338,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		m.mu.Unlock()
 		stop()
 	}()
+	if latest, problem := m.store.MachineExecution(request.ID); problem != nil {
+		return problem
+	} else if latest != nil && latest.Abandoned {
+		return exit.Named(exit.Conflict, "request.abandoned", "local submission intent was abandoned")
+	}
 	_, deadline, problem := m.store.RequestExecutionTiming(request.ID)
 	if problem != nil {
 		return problem
@@ -629,6 +651,11 @@ func currentExecutionWorkspace(ctx context.Context, connection *machineConnectio
 }
 
 func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, frozen *pb.MachineExecutionSubmit) *exit.Error {
+	if latest, problem := m.store.MachineExecution(requestID); problem != nil {
+		return problem
+	} else if latest != nil && latest.Abandoned {
+		return exit.Named(exit.Conflict, "request.abandoned", "local submission intent was abandoned")
+	}
 	if frozen.ExpectedExecutionWorkspaceId == "" {
 		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; its acceptance cannot safely be retried")
 	}
@@ -713,6 +740,9 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 	link, problem := m.store.MachineExecution(request.ID)
 	if problem != nil {
 		return nil, nil, nil, problem
+	}
+	if link != nil && link.Abandoned {
+		return nil, nil, nil, exit.Named(exit.Conflict, "request.abandoned", "this run was abandoned locally; no further remote control or observation is started")
 	}
 	var receipt pb.MachineExecutionReceipt
 	if link == nil || len(link.Receipt) == 0 || proto.Unmarshal(link.Receipt, &receipt) != nil {
@@ -846,6 +876,13 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 }
 
 func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress, request records.Request, connection *machineConnection, link *records.MachineExecution, query *pb.MachineExecutionQuery) *exit.Error {
+	latest, problem := m.store.MachineExecution(request.ID)
+	if problem != nil {
+		return problem
+	}
+	if latest != nil && latest.Abandoned {
+		return nil
+	}
 	connection.progress = progress
 	if len(link.PendingControl) > 0 {
 		if _, problem := m.flushMachineControl(ctx, connection, link); problem != nil {
@@ -1136,6 +1173,13 @@ func (m *machineRuns) observeAfterControl(ctx context.Context, progress *transfe
 }
 
 func (m *machineRuns) flushMachineControl(ctx context.Context, connection *machineConnection, link *records.MachineExecution) (pb.MachineExecutionAction, *exit.Error) {
+	latest, problem := m.store.MachineExecution(link.RequestID)
+	if problem != nil {
+		return 0, problem
+	}
+	if latest != nil && latest.Abandoned {
+		return 0, exit.Named(exit.Conflict, "request.abandoned", "pending control was retained as evidence after local abandonment")
+	}
 	var command pb.MachineExecutionControl
 	if proto.Unmarshal(link.PendingControl, &command) != nil || command.Execution == nil {
 		return 0, exit.Internalf("recorded machine control is unreadable")

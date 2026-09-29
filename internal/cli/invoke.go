@@ -755,6 +755,9 @@ func assertedRungs(binding *hub.PackageBindingRow, ref hub.Ref, selected *hub.Mo
 }
 
 func handleRunCancel(ctx *Context) *exit.Error {
+	if ctx.Inv.Bool("--abandon") {
+		return handleRunAbandon(ctx)
+	}
 	id := ctx.Inv.Args[0]
 	if strings.HasPrefix(id, "job-") {
 		return handleJobCancel(ctx)
@@ -800,6 +803,24 @@ func handleRunCancel(ctx *Context) *exit.Error {
 		defaults = append(defaults, "canceled_by")
 	}
 	return emit(ctx, compactRecord(fields, defaults...))
+}
+
+func handleRunAbandon(ctx *Context) *exit.Error {
+	if ctx.Inv.Bool("--await") {
+		return exit.Usagef("--abandon is local only and cannot be combined with --await; it does not confirm remote cancellation")
+	}
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	result, problem := client.Abandon(ctx.Inv.Args[0], "cozy run cancel --abandon")
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, output.Record{Fields: []output.Field{
+		{K: "id", V: result.ID}, {K: "number", V: result.Number}, {K: "status", V: result.Status}, {K: "changed", V: result.Changed},
+		{K: "abandoned_locally", V: true}, {K: "remote_stop_confirmed", V: false}, {K: "rental_released", V: false},
+	}, Notes: []string{"Local abandonment does not confirm remote work stopped or end any rental."}})
 }
 
 func handleRunList(ctx *Context) *exit.Error {
