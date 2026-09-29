@@ -40,9 +40,10 @@ function credential() {
   return PREFIX + Array.from(crypto.getRandomValues(new Uint8Array(22)), b => alphabet[b % 62]).join("");
 }
 
-/** What this browser lacks to play a MIME type (or anything, without one), or null. */
+/** Connection prerequisites, or MSE support for a fragmented MIME type, or null. */
 export function unsupported(type) {
   if (!globalThis.RTCPeerConnection) return new CozyError("webrtc", "This browser has no WebRTC.");
+  if (!type) return null; // A completed MP4 uses the browser's native file player.
   const Source = globalThis.ManagedMediaSource ?? globalThis.MediaSource;
   if (!Source) return new CozyError("mse", "This browser cannot play streamed video: it has no Media Source Extensions.");
   if (type && !Source.isTypeSupported(type)) return new CozyError("codec", `This browser cannot decode ${type}.`);
@@ -234,6 +235,16 @@ export function initType(b) {
   return null;
 }
 
+/** A regular MP4 can put moov after a large mdat; identify it before the credit window fills. */
+export function mp4Layout(b) {
+  for (const box of boxes(b, 0, b.length)) {
+    if (box.type === "mdat") return "file";
+    if (box.end > b.length) return null;
+    if (box.type === "moov") return [...boxes(b, box.body, box.end)].some(c => c.type === "mvex") ? "fragmented" : "file";
+  }
+  return null;
+}
+
 // mp4a.<objectTypeIndication>[.<audioObjectType>] from esds' descriptors.
 function esds(b, box) {
   if (!box) return "mp4a.40.2";
@@ -282,6 +293,9 @@ export class Player extends EventTarget {
     video.addEventListener("seeking", () => this.#seek(false));
     video.addEventListener("waiting", () => this.gap() || this.#seek(true));
     video.addEventListener("timeupdate", () => this.#media.pump());
+    video.addEventListener("error", () => {
+      if (!this.error && this.#media.native && video.error) this.fail(new CozyError("media", video.error.message || "The browser could not decode the completed video."));
+    });
     this.#media = new Media(this);
     this.#run();
   }
@@ -308,6 +322,7 @@ export class Player extends EventTarget {
     if (this.error) return;
     this.error = error;
     this.#session?.close();
+    this.#media.close();
     this.#status("error", error.message);
   }
 
@@ -358,6 +373,7 @@ export class Player extends EventTarget {
 
   #entry(m) {
     if (this.entries.some(e => e.seq === m.seq)) return;
+    if (!Number.isSafeInteger(m.length) || m.length < 0) return this.fail(new CozyError("protocol", "The output has an invalid byte length."));
     // duration_us is the output's whole duration at this revision.
     const t0 = m.appended_from != null ? this.entries.findLast(e => e.length === m.appended_from)?.t1 ?? 0 : 0;
     this.entries.push({seq: m.seq, from: m.appended_from ?? 0, length: m.length, t0, t1: (m.duration_us ?? 0) / 1e6});
@@ -370,6 +386,7 @@ export class Player extends EventTarget {
     this.stats.resets++;
     this.entries = this.entries.filter(e => e.seq >= m.seq);
     this.pos = 0;
+    this.final = null;
     session.cancel(this.#get);
     this.#get = 0;
     this.#seekTo = null;
@@ -389,6 +406,10 @@ export class Player extends EventTarget {
     if (skip) session.release(skip);
     bytes = bytes.subarray(skip);
     if (!bytes.length) return;
+    if (this.pos + bytes.length > (this.entries.at(-1)?.length ?? 0)) {
+      session.release(bytes.length);
+      return this.fail(new CozyError("protocol", "The machine sent bytes beyond the output's declared length."));
+    }
     this.pos += bytes.length;
     this.seq = Math.max(this.seq, this.entries.findLast(e => e.length <= this.pos)?.seq ?? 0);
     if (this.#get) this.#waiting.push([bytes, session]); else this.#media.push(bytes, session);
@@ -403,6 +424,7 @@ export class Player extends EventTarget {
   // A seek outside what is buffered, or a stall at a hole in it: fetch the revision that holds
   // the time. A stall at the live edge waits for the follow.
   #seek(stalled) {
+    if (this.#media.native) return; // The complete Blob is already local and natively seekable.
     const t = this.#video.currentTime, buffered = this.#video.buffered;
     for (let i = 0; i < buffered.length; i++) if (buffered.start(i) <= t && t < buffered.end(i)) return;
     if (stalled && !(buffered.length && buffered.end(buffered.length - 1) > t + 0.5)) return;
@@ -445,53 +467,92 @@ export class Player extends EventTarget {
   }
 }
 
-// One MediaSource and SourceBuffer. Bytes are appended in arrival order and handed back to their
-// session's window once appended, so the machine never runs further ahead than the window.
+// Live fragments use MSE and return credits after append. Completed files retain Blob chunks
+// within the announced length and return credits while collecting, including a trailing moov.
 class Media {
   #player; #source = null; #url = ""; #buffer = null; #opening = false; #queue = []; #appending = [];
+  #layout = null; #file = []; #fileBytes = 0; #fileReady = false; #resume = null; #loaded = null;
 
   constructor(player) { this.#player = player; this.restart(); }
 
   get ready() { return this.#buffer !== null; }
   get pending() { return this.#queue.length > 0 || this.#buffer?.updating; }
+  get native() { return this.#layout === "file"; }
 
   restart() {
-    this.discontinuity();
+    const video = this.#player.video;
+    const resume = this.#url ? {time: video.currentTime, playing: !video.paused && !video.ended} : null;
+    this.close();
+    this.#resume = resume;
     const Source = globalThis.ManagedMediaSource ?? globalThis.MediaSource;
     if (!Source) return;
-    URL.revokeObjectURL(this.#url);
     this.#source = new Source();
-    this.#buffer = null;
-    this.#opening = false;
     this.#source.addEventListener("startstreaming", () => this.pump());
     this.#url = URL.createObjectURL(this.#source);
     this.#player.video.src = this.#url;
+  }
+
+  close() {
+    this.discontinuity();
+    const video = this.#player.video;
+    if (this.#url && video.src === this.#url) {
+      video.removeAttribute("src");
+      video.load();
+    }
+    URL.revokeObjectURL(this.#url);
+    this.#url = "";
+    this.#source = null;
+    this.#buffer = null;
+    this.#opening = false;
+    this.#layout = null;
+    this.#file = [];
+    this.#fileBytes = 0;
+    this.#fileReady = false;
+    if (this.#loaded) this.#player.video.removeEventListener("loadedmetadata", this.#loaded);
+    this.#loaded = null;
   }
 
   // What is queued is dropped, and the parser restarts at a box boundary.
   discontinuity() {
     for (const {bytes, session} of this.#queue) session.release(bytes.length);
     this.#queue = [];
+    for (const {bytes, session} of this.#appending) session.release(bytes.length);
+    this.#appending = [];
     if (this.#buffer && this.#source.readyState === "open") this.#buffer.abort();
   }
 
   push(bytes, session) {
+    if (this.native) {
+      this.#retain(bytes, session);
+      return this.pump();
+    }
     this.#queue.push({bytes, session});
     if (!this.#buffer && !this.#opening) this.#open();
     this.pump();
   }
 
   #open() {
-    const type = initType(concat(this.#queue.map(q => q.bytes)));
+    const header = concat(this.#queue.map(q => q.bytes));
+    this.#layout ??= mp4Layout(header);
+    if (this.native) {
+      for (const {bytes, session} of this.#queue) this.#retain(bytes, session);
+      this.#queue = [];
+      return;
+    }
+    const type = this.#layout === "fragmented" && initType(header);
     if (!type) return;
     const problem = unsupported(type);
     if (problem) return this.#player.fail(problem);
     this.#player.stats.type = type;
     this.#opening = true;
+    const source = this.#source;
     const open = () => {
+      if (source !== this.#source) return;
       this.#buffer = this.#source.addSourceBuffer(type);
+      const buffer = this.#buffer;
       this.#buffer.mode = "segments";
       this.#buffer.addEventListener("updateend", () => {
+        if (buffer !== this.#buffer) return;
         for (const {bytes, session} of this.#appending) session.release(bytes.length);
         this.#appending = [];
         this.#player.gap();
@@ -502,7 +563,35 @@ class Media {
     if (this.#source.readyState === "open") open(); else this.#source.addEventListener("sourceopen", open, {once: true});
   }
 
+  #retain(bytes, session) {
+    this.#file.push(new Blob([bytes]));
+    this.#fileBytes += bytes.length;
+    session.release(bytes.length); // Native playback needs the complete file, including an end moov.
+  }
+
+  #playFile() {
+    const player = this.#player, entry = player.entries.at(-1);
+    if (this.#fileReady || !entry || this.#fileBytes !== entry.length) return;
+    this.#fileReady = true;
+    const video = player.video, resume = this.#resume;
+    URL.revokeObjectURL(this.#url);
+    this.#source = null;
+    this.#url = URL.createObjectURL(new Blob(this.#file, {type: "video/mp4"}));
+    this.#file = [];
+    player.stats.type = "video/mp4";
+    if (resume) {
+      this.#loaded = () => {
+        this.#loaded = null;
+        video.currentTime = Math.min(resume.time, video.duration);
+        if (resume.playing) video.play().catch(() => {}); else video.pause();
+      };
+      video.addEventListener("loadedmetadata", this.#loaded, {once: true});
+    }
+    video.src = this.#url;
+  }
+
   pump() {
+    if (this.native) return this.#playFile();
     const buffer = this.#buffer, source = this.#source, player = this.#player, video = player.video;
     if (!buffer || buffer.updating || source.readyState === "closed") return;
     // The duration the log announces, so a seek may target what is not yet fetched.

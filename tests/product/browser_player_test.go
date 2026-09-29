@@ -41,6 +41,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 		t.Skip("requires -player-browsers and Playwright (go run github.com/playwright-community/playwright-go/cmd/playwright install firefox webkit)")
 	}
 	film := playerFilm(t)
+	completed := playerCompletedFilms(t, film)
 	ip := playerLANAddress(t)
 	pages := httptest.NewServer(http.FileServer(http.Dir(filepath.Join("..", "..", "web", "player"))))
 	defer pages.Close()
@@ -53,6 +54,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			switch name {
 			case "chrome": // Playwright's own Chromium has no H.264 or AAC
 				options.Channel = playwright.String("chrome")
+				options.Args = []string{"--disable-gpu"}
 			case "firefox":
 				kind = pw.Firefox
 			case "webkit":
@@ -120,13 +122,67 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 					v.currentTime = 1.25;
 					v.play().catch(() => {});
 					await until(() => !v.seeking && v.currentTime > 1.3);
-					return {gets: player().stats.gets, skipped: !ranges().some(([s, e]) => s < 1 && e > 0.5), buffered: ranges()};
+					// The midpoint avoids counting AAC padding at the first fragment's edge as the second fragment.
+					return {gets: player().stats.gets, skipped: !ranges().some(([s, e]) => s <= 0.75 && e > 0.75), buffered: ranges()};
 				})()`)
 				// The last segment came by get, and the one before it was never fetched.
 				if r := result.(map[string]any); fmt.Sprint(r["gets"]) != "1" || r["skipped"] != true {
 					t.Fatalf("the seek was not served by one get: %v", r)
 				}
 				playerWait(t, page, "the seeked film ends", `video().ended`)
+			})
+
+			for i, movie := range completed {
+				t.Run([]string{"completed end moov", "completed faststart"}[i], func(t *testing.T) {
+					run := uint64(20 + i)
+					m.machine.Replace(run, "video", -1, movie, 1_500_000)
+					m.machine.End(run, "completed")
+					page := open(m.link(func(g *capability.Grant) { g.Run = fmt.Sprint(run) }, "video"))
+					if i == 1 {
+						playerEval(t, page, `(() => { globalThis.MediaSource = undefined; globalThis.ManagedMediaSource = undefined; return true; })()`)
+					}
+					result := playerEval(t, page, `(async () => {
+						const {play, parseLink} = await import("./cozy-webrtc.js");
+						player().close(); const v = video(); v.autoplay = false;
+						window.cozyPlayer = play(v, parseLink(location.hash), {window: 65536});
+						await until(() => player().finished && v.readyState >= 1);
+						for (const time of [1.2, 0.2, 0.8]) {
+							v.currentTime = time;
+							await until(() => !v.seeking && Math.abs(v.currentTime - time) < 0.05 && v.readyState >= 2);
+						}
+						return {type: player().stats.type, bytes: player().stats.bytes, gets: player().stats.gets,
+							credited: sent.filter(m => m.t === "credit").at(-1).bytes >= player().stats.bytes, error: player().error?.message};
+					})()`)
+					r := result.(map[string]any)
+					if r["type"] != "video/mp4" || fmt.Sprint(r["bytes"]) != fmt.Sprint(len(movie)) ||
+						fmt.Sprint(r["gets"]) != "0" || r["credited"] != true || r["error"] != nil {
+						t.Fatalf("completed MP4 did not finish through its small credit window and seek natively: %v", r)
+					}
+				})
+			}
+
+			t.Run("live becomes completed file", func(t *testing.T) {
+				m.machine.Append(22, "video", -1, film[0], 500_000)
+				page := open(m.link(func(g *capability.Grant) { g.Run = "22" }, "video"))
+				playerWait(t, page, "the live preview plays", `playing(0.5, 10)`)
+				old := playerEval(t, page, `(async () => {
+					video().pause(); video().currentTime = 0.25;
+					await until(() => !video().seeking);
+					return video().src;
+				})()`)
+				m.machine.Replace(22, "video", -1, completed[0], 1_500_000)
+				m.machine.End(22, "completed")
+				playerWait(t, page, "the finalized file replaces the live stream", `player().finished && player().stats.resets === 1 && player().stats.type === "video/mp4" && video().readyState >= 2`)
+				result := playerEval(t, page, `({positionHeld: Math.abs(video().currentTime - 0.25) < 0.05, paused: video().paused, revoked: window.revokedURLs, error: player().error?.message})`)
+				r := result.(map[string]any)
+				if r["paused"] != true || r["positionHeld"] != true ||
+					!strings.Contains(fmt.Sprint(r["revoked"]), fmt.Sprint(old)) || r["error"] != nil {
+					t.Fatalf("finalization lost the playhead/pause or retained the old URL: %v", r)
+				}
+				closed := playerEval(t, page, `(() => { const url = video().src; player().close(); return {revoked: revokedURLs.includes(url), src: video().getAttribute("src")}; })()`)
+				if c := closed.(map[string]any); c["revoked"] != true || c["src"] != nil {
+					t.Fatalf("closing the file player retained its object URL: %v", c)
+				}
 			})
 
 			for _, arm := range []struct{ name, link, says string }{
@@ -247,6 +303,31 @@ func playerFilm(t *testing.T) [][]byte {
 	return [][]byte{append(header, pieces[0]...), pieces[1], pieces[2]}
 }
 
+func playerCompletedFilms(t *testing.T, fragments [][]byte) [][]byte {
+	t.Helper()
+	directory := t.TempDir()
+	source := filepath.Join(directory, "fragments.mp4")
+	must(t, os.WriteFile(source, bytes.Join(fragments, nil), 0600))
+	var movies [][]byte
+	for _, faststart := range []bool{false, true} {
+		target := filepath.Join(directory, fmt.Sprintf("completed-%t.mp4", faststart))
+		args := []string{"-v", "error", "-nostdin", "-i", source, "-map", "0", "-c", "copy"}
+		if faststart {
+			args = append(args, "-movflags", "+faststart")
+		}
+		if out, err := exec.Command("ffmpeg", append(args, target)...).CombinedOutput(); err != nil {
+			t.Fatalf("finalize browser fixture: %v %s", err, out)
+		}
+		movie, err := os.ReadFile(target)
+		must(t, err)
+		if len(movie) <= 65536 {
+			t.Fatal("completed MP4 must exceed the browser test's credit window")
+		}
+		movies = append(movies, movie)
+	}
+	return movies
+}
+
 // playerLANAddress is this computer's first non-loopback IPv4 address: Chrome gathers no candidate
 // on loopback, so it pairs with nothing there.
 func playerLANAddress(t *testing.T) string {
@@ -264,6 +345,9 @@ func playerLANAddress(t *testing.T) string {
 // playerRecorder runs before the page: it keeps every PeerConnection state and every message
 // the page sends, for the test to read.
 const playerRecorder = `window.pcStates = []; window.sent = [];
+window.revokedURLs = [];
+const revoke = URL.revokeObjectURL.bind(URL);
+URL.revokeObjectURL = function (url) { revokedURLs.push(url); revoke(url); };
 const PC = RTCPeerConnection;
 window.RTCPeerConnection = function (...args) {
   const pc = new PC(...args);
