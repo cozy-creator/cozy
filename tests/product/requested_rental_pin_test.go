@@ -17,11 +17,13 @@ import (
 func requestedRentalRequest(id, rentalID string) records.Request {
 	return records.Request{ID: id, IdemKey: id, BodyDigest: "sha256:" + strings.Repeat("a", 64),
 		Package: "proof/requested", Entrypoint: "generate", Payload: []byte("{}"),
-		Rental: true, RequestedRental: rentalID}
+		Rental: true, RequestedRental: rentalID, MachineExecutionObserver: true}
 }
 
 // `cozy run --rental <name>` records requested_rental and leaves worker empty until the
-// scheduler assigns the run. Those runs are the rental's queue in the inventory.
+// scheduler assigns the run. Those runs are the rental's queue in the inventory. They are
+// recorded once the daemon runs: at its start it places every recorded run, and ends work
+// no machine execution holds.
 func TestRentalInventoryCountsRequestedRentalQueue(t *testing.T) {
 	root, hubURL, hub := rentalEndRoot(t, "rental-requested-queue")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -32,6 +34,7 @@ func TestRentalInventoryCountsRequestedRentalQueue(t *testing.T) {
 	fatal(t, store.RecordRental(records.Rental{ID: rentalID, MachineName: "loran", State: "ready",
 		Hub: hubURL, AcceleratorCount: 1, HourlyRateUSDMicros: 100_000,
 		ReadyAt: time.Now().UTC().Format(time.RFC3339Nano)}))
+	live := startDaemonProcess(t, root)
 	var ids []string
 	for i := 0; i < 4; i++ {
 		request := requestedRentalRequest(fmt.Sprintf("req-loran-%d", i), rentalID)
@@ -39,7 +42,6 @@ func TestRentalInventoryCountsRequestedRentalQueue(t *testing.T) {
 		fatal(t, problem)
 		ids = append(ids, request.ID)
 	}
-	live := startDaemonProcess(t, root)
 	response := live.call(t, "GET", "/v1/local/rentals", nil)
 	if response.Status != http.StatusOK {
 		t.Fatalf("inventory API failed: %s", response.brief())
