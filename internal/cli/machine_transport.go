@@ -247,8 +247,16 @@ func (c *machineConnection) readBytes(ctx context.Context, source *pb.NativeByte
 
 // prepare installs one captured revision: its wheels move from this client to the machine
 // through the Host's verified upload, then the Host prepares its environment.
-func (c *machineConnection) prepare(ctx context.Context, request string, revision localpackage.Installation) *exit.Error {
+func (c *machineConnection) prepare(ctx context.Context, request string, revision localpackage.Installation) (result *exit.Error) {
 	m := c.runs
+	began, path := time.Now(), "reopen"
+	defer func() {
+		detail := revision.Package + "; " + path + "; elapsed total including nested preparation stages"
+		if result != nil {
+			detail += "; refused"
+		}
+		m.submissionStage(request, "package preparation total", detail, began)
+	}()
 	// Wire 69 carries the selected Hub on this operation; older peers would drop it.
 	if c.Hub != "" && c.WireMinor < 69 {
 		return exit.Named(exit.Structural, "machine.local_package_hub_required", "this machine must support explicit Hub selection for unpublished package dependencies; update its agent and Runtime")
@@ -282,6 +290,7 @@ func (c *machineConnection) prepare(ctx context.Context, request string, revisio
 				return retainWorkerInstallation(c, revision, event.InstalledPackage)
 			}
 		}
+		path = "upload and prepare"
 		if transfer.Operation != operation || transfer.Uploaded {
 			if problem := m.store.AppendEvent(request, "machine.package_upload_started", 0, map[string]any{"worker_boot_id": c.Claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
 				return problem
@@ -293,6 +302,9 @@ func (c *machineConnection) prepare(ctx context.Context, request string, revisio
 		if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": c.Claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
 			return problem
 		}
+	}
+	if path == "reopen" {
+		path = "prepare uploaded installation"
 	}
 	stream, err := c.Host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: c.Claim, LocalPackageSet: selected, Hub: c.Hub})
 	if err != nil {
