@@ -97,7 +97,7 @@ var Routes = []Route{
 		"prune unused operation-cache entries in this machine's Runtime workspace",
 		"`cozy cache prune`"},
 	{"POST", "/v1/local/daemon/down", Local, true, true, false, "",
-		"safely stop, or under explicit --all request cancellation before confirmed rental teardown",
+		"stop, leaving work in flight running; under explicit --all request cancellation before confirmed rental teardown",
 		"cl-045 `cozy down [--all]`"},
 
 	// ---- the JOB family (cl-004), LOCAL by design: the hub's job plane is th-008's,

@@ -57,7 +57,6 @@ func handleUp(ctx *Context) *exit.Error {
 
 func handleDown(ctx *Context) *exit.Error {
 	all := ctx.Inv.Bool("--all")
-	force := ctx.Inv.Bool("--force")
 	state := daemon.Probe(ctx.Cfg)
 	if !state.Up {
 		if !all {
@@ -83,14 +82,24 @@ func handleDown(ctx *Context) *exit.Error {
 		return problem
 	}
 	if !all {
-		result, problem := client.Down(false, force)
+		result, problem := client.Down(false)
 		if problem != nil {
 			return problem
 		}
 		if !result.ShuttingDown {
-			return exit.Internalf("safe down returned without a shutdown decision")
+			return exit.Internalf("down returned without a shutdown decision")
 		}
-		return finishDaemonDown(ctx, nil)
+		// NAME WHAT KEEPS RUNNING. Machines and rentals own the work; nothing here stopped
+		// it, and the next command's daemon picks each one up where it was.
+		var running []string
+		for _, identity := range result.Active {
+			running = append(running, identity.Kind+" "+identity.ID+" ("+identity.State+")")
+		}
+		if len(running) == 0 {
+			return finishDaemonDown(ctx, nil)
+		}
+		return finishDaemonDown(ctx, []output.Field{{K: "in_flight", V: running}},
+			"the work in flight continues; the next cozy command reattaches")
 	}
 	return downAll(ctx, client)
 }
@@ -121,7 +130,7 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 		refused = append(refused, line)
 	}
 	for {
-		result, problem := client.Down(true, false)
+		result, problem := client.Down(true)
 		if problem != nil {
 			// The daemon itself refused or is unreachable. Nothing further can be asked of
 			// it here, so report honestly rather than pretending a teardown happened.
@@ -275,13 +284,13 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 	return blockers, nil
 }
 
-func finishDaemonDown(ctx *Context, extra []output.Field) *exit.Error {
+func finishDaemonDown(ctx *Context, extra []output.Field, notes ...string) *exit.Error {
 	deadline := time.Now().Add(2 * orchestrator.StopGrace)
 	for time.Now().Before(deadline) {
 		if !daemon.Probe(ctx.Cfg).Up {
 			fields := []output.Field{{K: "daemon", V: "stopped"}, {K: "changed", V: true}}
 			fields = append(fields, extra...)
-			return emit(ctx, output.Record{Fields: fields})
+			return emit(ctx, output.Record{Fields: fields, Notes: notes})
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

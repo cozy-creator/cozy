@@ -24,10 +24,10 @@ func TestDestroyedUnacceptedExecutionCannotReturnToCanceling(t *testing.T) {
 	fatal(t, problem)
 	owed, problem := store.MachineExecutionOwesWork(request.ID)
 	fatal(t, problem)
-	blocked, problem := store.ClientShutdownObligations()
+	held, problem := store.Obligations()
 	fatal(t, problem)
-	if after.State == "canceling" || owed || len(blocked) != 0 {
-		t.Fatalf("late cancellation revived destroyed execution: before=%s after=%s owes_work=%v shutdown=%+v", before.State, after.State, owed, blocked)
+	if after.State == "canceling" || owed || len(held) != 0 {
+		t.Fatalf("late cancellation revived destroyed execution: before=%s after=%s owes_work=%v obligations=%+v", before.State, after.State, owed, held)
 	}
 }
 
@@ -87,12 +87,12 @@ func TestEndedSucceededArtifactRequestDoesNotKeepShutdownBlocked(t *testing.T) {
 	fatal(t, store.RecordMachineControl(request.ID, &pb.MachineExecutionControl{Execution: &pb.MachineExecutionQuery{RequestId: request.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId}, CommandId: "cancel-retained-result", ExpectedGeneration: 1, Action: pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL}))
 	_, problem = store.ForgetRental("pr-owned-machine")
 	fatal(t, problem)
-	blocked, problem := store.ClientShutdownObligations()
+	held, problem := store.Obligations()
 	fatal(t, problem)
 	after, problem := store.RequestRow(request.ID)
 	fatal(t, problem)
-	if len(blocked) != 0 {
-		t.Fatalf("destroyed successful retained work still blocks shutdown: retain=%v state=%s obligations=%+v", after.RetainWork, after.State, blocked)
+	if len(held) != 0 {
+		t.Fatalf("destroyed successful retained work still holds the daemon: retain=%v state=%s obligations=%+v", after.RetainWork, after.State, held)
 	}
 	if after.State != "succeeded" {
 		t.Fatal("loss rewrote the historical successful execution")

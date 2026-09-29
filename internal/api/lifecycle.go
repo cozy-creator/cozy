@@ -7,25 +7,23 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// LifecycleIdentity is one durable obligation that prevents a safe daemon down.
-// Kind distinguishes ordinary invocations, run-once jobs, provider rentals, and paid
-// acquisition operations no rental row stands for yet.
+// LifecycleIdentity is one durable obligation: an invocation, job, rental, paid
+// acquisition, installation or output export, by id and state.
 type LifecycleIdentity struct {
 	Kind  string `json:"kind"`
 	ID    string `json:"id"`
 	State string `json:"state"`
 }
 
-// DownResult is the daemon-side half of client disconnect or explicit teardown.
-// Normal/forced disconnect preserves requests, Runtime executions and rentals.
-// Under --all, a false result tells the caller exactly what cancellation was requested
-// and which paid obligations must be ended through Tensorhub before retrying.
+// DownResult answers `cozy down`. Plain down names the work in flight, which continues
+// without the daemon. Under --all, a false result tells the caller exactly what
+// cancellation was requested and which paid obligations must be ended through Tensorhub
+// before retrying.
 type DownResult struct {
 	ShuttingDown          bool                `json:"shutting_down"`
 	CancellationRequested []LifecycleIdentity `json:"cancellation_requested"`
@@ -44,9 +42,9 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 		s.ok(w, r, http.StatusAccepted, DownResult{ShuttingDown: true})
 		return
 	}
+	// An older client also sends "force"; every plain down is that disconnect now.
 	var body struct {
-		All   bool `json:"all"`
-		Force bool `json:"force"`
+		All bool `json:"all"`
 	}
 	data, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -57,12 +55,7 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != io.EOF {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			`this route takes {"all":true|false,"force":true|false}; flags are optional and mutually exclusive`, "send one closed down request")
-		return
-	}
-
-	if body.All && body.Force {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "all and force are mutually exclusive", "choose disconnect or destructive teardown")
+			`this route takes {"all":true|false}`, "send one closed down request")
 		return
 	}
 	if !body.All {
@@ -70,17 +63,11 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 			s.refuse(w, r, http.StatusConflict, "conflict", "this server was built with no shutdown hook", "")
 			return
 		}
-		held, problem := s.orchestrator.PrepareClientShutdown(body.Force)
-		if problem != nil {
-			s.refuseTyped(w, r, problem)
-			return
-		}
-		if len(held) > 0 {
-			s.refuseTyped(w, r, exit.Named(exit.Conflict, "active_work", "daemon shutdown refused: work requires this daemon online: %s", strings.Join(held, ", ")).WithRemedy("wait for the named work, or use `cozy down --force` to disconnect without canceling work or ending rentals"))
-			return
-		}
+		// The daemon only submits, follows and collects. Machines and rentals run the
+		// work, and the next daemon resumes every run, upload and control from its records.
+		s.orchestrator.CloseAdmission()
 		s.shuttingDown = true
-		s.ok(w, r, http.StatusAccepted, DownResult{ShuttingDown: true})
+		s.ok(w, r, http.StatusAccepted, DownResult{ShuttingDown: true, Active: s.inFlight()})
 		go s.shutdown()
 		return
 	}
@@ -91,66 +78,64 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requested := []LifecycleIdentity{}
-	if body.All {
-		// `--all` IS A GUARANTEED TEARDOWN, NOT A BEST-EFFORT ONE (owner ruling
-		// 2026-09-04): "you should be able to cozy down --all or force it to shut down
-		// (cancel all requests, shutdown all rentals and close)". It is the verb a person
-		// reaches for BECAUSE reconciliation is not working, so it may not refuse for the
-		// same reason plain `down` did — which is exactly what happened live: one request
-		// whose pod had been destroyed made both verbs fail with "the stream that holds
-		// req-b2df33d1…#1 is gone", and the daemon could not be stopped by any documented
-		// means. It had to be killed.
-		//
-		// So: one failure never aborts the rest. Every request is tried, what could not be
-		// closed cleanly is REPORTED rather than swallowed, and the pass still ends in a
-		// shutdown decision.
-		var refused []string
-		for _, identity := range active {
-			row, read := s.store.RequestRow(identity.ID)
-			if read != nil || row == nil {
-				if read != nil {
-					refused = append(refused, identity.ID+": "+read.Message)
-				}
-				continue
+	// `--all` IS A GUARANTEED TEARDOWN, NOT A BEST-EFFORT ONE (owner ruling
+	// 2026-09-04): "you should be able to cozy down --all or force it to shut down
+	// (cancel all requests, shutdown all rentals and close)". It is the verb a person
+	// reaches for BECAUSE reconciliation is not working, so it may not refuse for the
+	// same reason plain `down` did — which is exactly what happened live: one request
+	// whose pod had been destroyed made both verbs fail with "the stream that holds
+	// req-b2df33d1…#1 is gone", and the daemon could not be stopped by any documented
+	// means. It had to be killed.
+	//
+	// So: one failure never aborts the rest. Every request is tried, what could not be
+	// closed cleanly is REPORTED rather than swallowed, and the pass still ends in a
+	// shutdown decision.
+	var refused []string
+	for _, identity := range active {
+		row, read := s.store.RequestRow(identity.ID)
+		if read != nil || row == nil {
+			if read != nil {
+				refused = append(refused, identity.ID+": "+read.Message)
 			}
-			changed, cancelProblem := s.cancelForDown(r.Context(), *row)
-			if cancelProblem != nil {
-				refused = append(refused, identity.ID+": "+cancelProblem.Message)
-				continue
-			}
-			if changed {
-				requested = append(requested, identity)
-			}
+			continue
 		}
-		// Re-read rather than trusting the pre-pass sample: what a client is told is still
-		// holding the daemon has to be what IS.
-		remaining, remainingRentals, problem := s.downBlockers()
-		if problem != nil {
-			remaining, remainingRentals = active, rentals
+		changed, cancelProblem := s.cancelForDown(r.Context(), *row)
+		if cancelProblem != nil {
+			refused = append(refused, identity.ID+": "+cancelProblem.Message)
+			continue
 		}
-		// THE FIXPOINT, and it always terminates. If this pass CHANGED something, there is
-		// more to do and the caller gets another turn — rental destruction belongs to
-		// Tensorhub/provider ownership, so the CLI ends the named pods and calls back, and
-		// requests cancelled here settle through their own durable terminals.
-		if len(requested) > 0 || s.newDownRentals(remainingRentals) {
-			s.ok(w, r, http.StatusAccepted, DownResult{
-				CancellationRequested: requested, Active: remaining,
-				Rentals: remainingRentals, Refused: refused,
-			})
-			return
+		if changed {
+			requested = append(requested, identity)
 		}
-		// No new cancellation remains, and accepted cleanup has finished or used
-		// its shutdown grace. Report any still-unsettled rows; they remain durable
-		// for the next boot. An unreachable peer cannot prevent explicit teardown.
-		if s.shutdown != nil && (len(remaining) > 0 || len(remainingRentals) > 0) {
-			s.shuttingDown = true
-			s.ok(w, r, http.StatusAccepted, DownResult{
-				ShuttingDown: true, Active: remaining,
-				Rentals: remainingRentals, Refused: refused,
-			})
-			go s.shutdown()
-			return
-		}
+	}
+	// Re-read rather than trusting the pre-pass sample: what a client is told is still
+	// holding the daemon has to be what IS.
+	remaining, remainingRentals, problem := s.downBlockers()
+	if problem != nil {
+		remaining, remainingRentals = active, rentals
+	}
+	// THE FIXPOINT, and it always terminates. If this pass CHANGED something, there is
+	// more to do and the caller gets another turn — rental destruction belongs to
+	// Tensorhub/provider ownership, so the CLI ends the named pods and calls back, and
+	// requests cancelled here settle through their own durable terminals.
+	if len(requested) > 0 || s.newDownRentals(remainingRentals) {
+		s.ok(w, r, http.StatusAccepted, DownResult{
+			CancellationRequested: requested, Active: remaining,
+			Rentals: remainingRentals, Refused: refused,
+		})
+		return
+	}
+	// No new cancellation remains, and accepted cleanup has finished or used
+	// its shutdown grace. Report any still-unsettled rows; they remain durable
+	// for the next boot. An unreachable peer cannot prevent explicit teardown.
+	if s.shutdown != nil && (len(remaining) > 0 || len(remainingRentals) > 0) {
+		s.shuttingDown = true
+		s.ok(w, r, http.StatusAccepted, DownResult{
+			ShuttingDown: true, Active: remaining,
+			Rentals: remainingRentals, Refused: refused,
+		})
+		go s.shutdown()
+		return
 	}
 
 	if s.shutdown == nil {
@@ -186,8 +171,25 @@ func (s *Server) StopUnlessManaging(managing func() ([]string, *exit.Error)) ([]
 	return nil, nil
 }
 
-// downBlockers is the destructive --all census. Explicit client disconnect uses
-// PrepareClientShutdown instead, and never sends cancellation or rental release.
+// inFlight is the work a plain down leaves running: runs, acquisitions, installations
+// and exports, but not idle rentals or retained work at rest. A run's own export is the
+// run. It is a report; a census that cannot be read stops nothing.
+func (s *Server) inFlight() []LifecycleIdentity {
+	obligations, _ := s.store.Obligations() // kinds in order: a run precedes its export
+	var out []LifecycleIdentity
+	listed := map[string]bool{}
+	for _, o := range obligations {
+		if o.Kind == "attempt" || o.Kind == "rental" || listed[o.ID] ||
+			o.State == "paused" || o.State == "blocked" || o.State == "succeeded" {
+			continue
+		}
+		listed[o.ID] = true
+		out = append(out, LifecycleIdentity{Kind: o.Kind, ID: o.ID, State: o.State})
+	}
+	return out
+}
+
+// downBlockers is the destructive --all census.
 func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
 	obligations, problem := s.store.Obligations()
 	if problem != nil {

@@ -97,7 +97,9 @@ func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
 	}
 }
 
-func TestDaemonForceDisconnectDoesNotCancelPreparation(t *testing.T) {
+// An unaccepted handoff does not hold `cozy down`: the daemon stops, names it in flight,
+// and leaves its submission exactly as it was for the next daemon to send.
+func TestDaemonDownDoesNotCancelPreparation(t *testing.T) {
 	root := t.TempDir()
 	startDaemonProcess(t, root)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -107,22 +109,15 @@ func TestDaemonForceDisconnectDoesNotCancelPreparation(t *testing.T) {
 	before, problem := store.MachineExecution(request.ID)
 	fatal(t, problem)
 	code, out := runCozy(t, root, "down", "--json")
-	if code == 0 || !strings.Contains(out, "active_work") || !strings.Contains(out, request.ID) {
-		t.Fatalf("unaccepted handoff did not hold normal down [%d]: %s", code, out)
-	}
-	if code, out = runCozy(t, root, "down", "--all", "--force", "--json"); code == 0 {
-		t.Fatal("destructive and disconnect modes combined")
-	}
-	code, out = runCozy(t, root, "down", "--force", "--json")
-	if code != 0 {
-		t.Fatalf("force disconnect [%d]: %s", code, out)
+	if code != 0 || !strings.Contains(out, `"daemon":"stopped"`) || !strings.Contains(out, request.ID) {
+		t.Fatalf("down did not stop and name the unaccepted handoff [%d]: %s", code, out)
 	}
 	after, problem := store.MachineExecution(request.ID)
 	fatal(t, problem)
 	current, problem := store.RequestRow(request.ID)
 	fatal(t, problem)
 	if current.State != request.State || after.CancelRequested || !bytes.Equal(before.Submission, after.Submission) || len(after.Receipt) != 0 {
-		t.Fatalf("force changed execution intent: %+v %+v", current, after)
+		t.Fatalf("down changed execution intent: %+v %+v", current, after)
 	}
 	// A stopped daemon is an idempotent no-op even with incomplete durable work.
 	code, out = runCozy(t, root, "down", "--json")
@@ -196,7 +191,7 @@ exit 2
 		t.Fatalf("canary up [%d]: %s", code, out)
 	}
 	waitUntil(t, "fresh queued execution reaches Runtime", func() bool { _, err := os.Stat(marker); return err == nil })
-	if code, out := runCozyPath(t, canary, bin, "down", "--force", "--json"); code != 0 {
+	if code, out := runCozyPath(t, canary, bin, "down", "--json"); code != 0 {
 		t.Fatalf("canary down [%d]: %s", code, out)
 	}
 	must(t, os.Remove(marker))
@@ -419,33 +414,22 @@ func TestDaemonDownFencesConcurrentMachineIntake(t *testing.T) {
 					t.Fatal("shutdown admitted hidden work")
 				}
 			} else {
-				if down.Code != http.StatusConflict || !strings.Contains(down.Body.String(), "active_work") {
-					t.Fatalf("committed intake was not protected: %d %s", down.Code, down.Body.String())
-				}
-				select {
-				case <-stopped:
-					t.Fatal("refused down stopped daemon")
-				default:
-				}
+				// Committed intake is durable: down stops at once and names it in flight.
 				result := <-replied
-				if result.Code != http.StatusAccepted {
-					t.Fatalf("initial intake %d %s", result.Code, result.Body.String())
-				}
 				committed, problem := o.store.RequestByIdempotencyKey("shutdown-race")
 				fatal(t, problem)
-				if committed == nil {
-					t.Fatal("initial intake has no durable request")
+				if result.Code != http.StatusAccepted || committed == nil {
+					t.Fatalf("initial intake %d %s", result.Code, result.Body.String())
 				}
-				forced := call("/v1/local/daemon/down", map[string]bool{"force": true})
-				if forced.Code != http.StatusAccepted {
-					t.Fatalf("force %d %s", forced.Code, forced.Body.String())
+				if down.Code != http.StatusAccepted || !strings.Contains(down.Body.String(), committed.ID) {
+					t.Fatalf("down over committed intake: %d %s", down.Code, down.Body.String())
 				}
 				<-stopped
 				close(release)
 				row, problem := o.store.RequestByIdempotencyKey("shutdown-race")
 				fatal(t, problem)
 				if row == nil || row.State != committed.State || row.BodyDigest != committed.BodyDigest {
-					t.Fatalf("force changed the committed request: before=%+v after=%+v", committed, row)
+					t.Fatalf("down changed the committed request: before=%+v after=%+v", committed, row)
 				}
 				if _, problem := o.c.ActivateRecordedRequest(*row); problem == nil || starts.Load() != 1 {
 					t.Fatal("post-shutdown machine activation crossed the closing fence")
@@ -474,42 +458,6 @@ func TestMachineRestartOwedPolicySeparatesFailedIntentFromAcceptedOutcome(t *tes
 	fatal(t, problem)
 	if observed.State != "succeeded" {
 		t.Fatal("real accepted outcome could not reconcile")
-	}
-}
-
-func TestDaemonDownRequiresMachineReceiptForIndependentExecution(t *testing.T) {
-	for _, location := range []string{"local", "remote"} {
-		t.Run(location, func(t *testing.T) {
-			o := hostOwner(t, "shutdown-legacy-"+location)
-			rental := ""
-			if location == "remote" {
-				rental = "pr-legacy"
-			}
-			request := recordPrivateTransaction(t, o.store, "legacy-"+location, rental)
-			instance, session := "legacy-worker", "legacy-boot"
-			fatal(t, o.store.SpawnWorker(records.WorkerProcess{InstanceID: instance, Package: request.Package, WorkerID: location}))
-			ordinal, problem := o.store.Dispatch(records.Attempt{RequestID: request.ID, SessionID: session, InstanceID: instance, InvocationDigest: childDigest("7"), InvocationCanonical: []byte(`{}`)})
-			fatal(t, problem)
-			fatal(t, o.store.OfferDispatch(request.ID, ordinal, session))
-			fatal(t, o.store.Accepted(request.ID, ordinal, session))
-			before, problem := o.store.RequestRow(request.ID)
-			fatal(t, problem)
-			held, problem := o.c.PrepareClientShutdown(false)
-			fatal(t, problem)
-			if len(held) == 0 || !strings.Contains(strings.Join(held, " "), request.ID) {
-				t.Fatalf("legacy %s acceptance was mistaken for independence: %v", location, held)
-			}
-			held, problem = o.c.PrepareClientShutdown(true)
-			fatal(t, problem)
-			if len(held) != 0 {
-				t.Fatal("explicit force did not override the dependency guard")
-			}
-			after, problem := o.store.RequestRow(request.ID)
-			fatal(t, problem)
-			if after.State != before.State || after.Ordinal != before.Ordinal || after.BodyDigest != before.BodyDigest {
-				t.Fatal("force canceled or rewrote the legacy request")
-			}
-		})
 	}
 }
 

@@ -45,14 +45,14 @@ func (p *editablePod) upload(stream grpc.BidiStreamingServer[pb.LocalPackageUplo
 		return err
 	}
 	p.mu.Lock()
-	call := p.calls
+	call, block := p.calls, p.block
 	p.calls++
 	p.mu.Unlock()
 	if call < len(p.refuse) && p.refuse[call] != nil {
 		return p.refuse[call]
 	}
-	if p.block != nil {
-		close(p.block)
+	if block != nil {
+		close(block)
 		<-stream.Context().Done()
 		close(p.released)
 		return stream.Context().Err()
@@ -120,7 +120,26 @@ app.job(main)
 	return root, store
 }
 
-// uploadCounts is how many upload calls and preparations the pod took.
+// unblock lets the next upload through.
+func (p *editablePod) unblock() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.block = nil
+}
+
+// closed is whether signal has closed.
+func closed(signal chan struct{}) func() bool {
+	return func() bool {
+		select {
+		case <-signal:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// counts is how many upload calls and preparations the pod took.
 func (p *editablePod) counts() (int, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -185,16 +204,6 @@ func TestRentedEditableUploadCancelEndsTheUpload(t *testing.T) {
 	root, store := rentedEditable(t, pod)
 	if code, out := runCozy(t, root, "run", "local/upload-proof/main", "steps=1", "--rental=tessa", "--json", "--idempotency-key", "cancel"); code != 0 {
 		t.Fatalf("the rented run was refused [exit %d]: %s", code, out)
-	}
-	closed := func(signal chan struct{}) func() bool {
-		return func() bool {
-			select {
-			case <-signal:
-				return true
-			default:
-				return false
-			}
-		}
 	}
 	waitFor(t, root, "the editable package's upload", closed(pod.block))
 	if code, out := runCozy(t, root, "run", "cancel", "1", "--json"); code != 0 {

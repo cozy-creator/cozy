@@ -30,41 +30,10 @@ func (c *Orchestrator) Managing() ([]string, *exit.Error) {
 	return held, nil
 }
 
-// PrepareClientShutdown closes scheduling admission only when explicit client
-// disconnect is safe, or when the caller explicitly overrides the dependency
-// guard. Durable retention and idle policy keep their existing stronger rules.
-func (c *Orchestrator) PrepareClientShutdown(force bool) ([]string, *exit.Error) {
+// CloseAdmission stops new work for a client down. Nothing in flight holds the daemon:
+// machines run the work, and the next daemon resumes it from durable records.
+func (c *Orchestrator) CloseAdmission() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closing {
-		return nil, nil
-	}
-	var held []string
-	if !force {
-		obligations, problem := c.opt.Store.ClientShutdownObligations()
-		if problem != nil {
-			return nil, problem
-		}
-		for _, obligation := range obligations {
-			held = append(held, obligation.String())
-		}
-		for id := range c.starting {
-			held = append(held, "launch "+id)
-		}
-		for id := range c.transferRunning {
-			held = append(held, "transfer "+id)
-		}
-		for id := range c.outputExporting {
-			held = append(held, "output export "+id)
-		}
-		for id := range c.rentalMaintenance {
-			held = append(held, "rental maintenance "+id)
-		}
-		if len(held) > 0 {
-			sort.Strings(held)
-			return held, nil
-		}
-	}
 	c.closing = true
-	return nil, nil
+	c.mu.Unlock()
 }

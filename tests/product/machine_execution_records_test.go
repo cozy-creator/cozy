@@ -137,32 +137,6 @@ func TestMachineRetryUsesRetainedAuthorityAfterErrorCollection(t *testing.T) {
 	}
 }
 
-func TestExplicitClientShutdownRequiresDurableMachineAcceptance(t *testing.T) {
-	store, request, receipt := machineObserverFixture(t)
-	for _, accepted := range []bool{false, true} {
-		if accepted {
-			fatal(t, store.AcceptMachineExecution(request.ID, receipt))
-		}
-		blocked, problem := store.ClientShutdownObligations()
-		fatal(t, problem)
-		if (len(blocked) == 0) != accepted {
-			t.Fatalf("explicit disconnect ignored durable acceptance: accepted=%v obligations=%+v", accepted, blocked)
-		}
-		all, problem := store.Obligations()
-		fatal(t, problem)
-		if len(all) == 0 {
-			t.Fatal("explicit disconnect weakened automatic idle retention")
-		}
-	}
-	command := &pb.MachineExecutionControl{Execution: &pb.MachineExecutionQuery{RequestId: request.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId}, CommandId: "pause-before-disconnect", ExpectedGeneration: 1, Action: pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_PAUSE}
-	fatal(t, store.RecordMachineControl(request.ID, command))
-	blocked, problem := store.ClientShutdownObligations()
-	fatal(t, problem)
-	if len(blocked) == 0 {
-		t.Fatal("explicit disconnect abandoned a pending control")
-	}
-}
-
 func TestMachineAcceptanceCannotChangeDestinationOrCapture(t *testing.T) {
 	store, request, receipt := machineObserverFixture(t)
 	if problem := store.LinkMachineExecution(request.ID, "pr-another-machine"); problem == nil {

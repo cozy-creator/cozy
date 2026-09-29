@@ -20,7 +20,7 @@ func TestLocalGPUInventoryKeepsEveryReadableDevice(t *testing.T) {
 		"if [ \"$#\" -eq 0 ]; then printf 'CUDA Version: 13.0\\n'; exit 0; fi\n"+
 		"printf '%s\\n' '0, NVIDIA GeForce RTX 4090, 20000, 24564, 580.82.09, 8.9' "+
 		"'1, NVIDIA Future Accelerator, 90000, 98304, 580.82.09, [N/A]' 'unreadable'\n"), 0o700))
-	t.Cleanup(func() { _, _ = runCozyPath(t, root, path, "down", "--force", "--json") })
+	t.Cleanup(func() { _, _ = runCozyPath(t, root, path, "down", "--json") })
 	code, out := runCozyPath(t, root, path, "up", "--json")
 	if code != 0 {
 		t.Fatalf("cozy up [exit %d]: %s", code, out)
