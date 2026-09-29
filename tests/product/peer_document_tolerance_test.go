@@ -45,6 +45,17 @@ func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 	mux.HandleFunc("GET /v1/packages/proof/bare/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"release":{"release":"1.0.0"},"package_interface":{}}`))
 	})
+	rental := func(id, name string) string {
+		return `{"rental_id":"` + id + `","name":"` + name + `","state":"ready","accelerator_count":1,` +
+			`"hourly_rate_usd_micros":1000,"future":{"x":1}}`
+	}
+	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"rentals":[` + rental("pr-aa11", "My_Pod") + `,` +
+			rental("pr-bb22", "") + `,` + rental("../bad", "twine") + `]}`))
+	})
+	mux.HandleFunc("GET /v1/rentals/pr-cc33", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(rental("pr-cc33", "a name far longer than any machine alias can be")))
+	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`[
 			{"name":"cpu","accelerator_model":"CPU","widths":[{"accelerator_count":1,"price_usd_micros_per_hour":1000}],"region":"future"},
@@ -78,6 +89,23 @@ func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 	fatal(t, problem)
 	if requirements, problem := bare.Requirements(); problem != nil || len(requirements) != 0 {
 		t.Fatalf("a release without requirements: %q %v", requirements, problem)
+	}
+
+	// A rental's name is an alias: an odd one is folded or replaced by the id, never a
+	// refusal that hides or abandons a pod this account is billed for.
+	rentals, problem := client.Rentals(t.Context())
+	fatal(t, problem)
+	var named []string
+	for _, row := range rentals {
+		named = append(named, row.ID+"="+row.Name)
+	}
+	if !slices.Equal(named, []string{"pr-aa11=my-pod", "pr-bb22=pr-bb22"}) {
+		t.Fatalf("rental listing hid or misnamed a billing pod: %v", named)
+	}
+	attached, problem := client.Rental(t.Context(), "pr-cc33")
+	fatal(t, problem)
+	if attached.Name != "pr-cc33" {
+		t.Fatalf("an unusable rental name was not replaced by the id: %+v", attached.Name)
 	}
 
 	skus, problem := client.RentalSKUs(t.Context())

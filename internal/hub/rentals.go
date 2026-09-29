@@ -295,9 +295,21 @@ func validateRentalID(id string) *exit.Error {
 	return nil
 }
 
+// machineName is the Hub's name folded to one a machine can carry, else the id's: a name
+// is an alias, never the rental's identity, so an odd one never costs the pod.
+func (w wireRental) machineName() string {
+	for _, name := range []string{w.Name, w.ID} {
+		name = strings.NewReplacer("_", "-", " ", "-").Replace(strings.ToLower(strings.TrimSpace(name)))
+		if rentalid.ValidMachineName(name) {
+			return name
+		}
+	}
+	return ""
+}
+
 func (w wireRental) rental() Rental {
 	return Rental{
-		Development: w.Development, SSHAddress: w.SSHAddress, ID: w.ID, Name: w.Name, State: w.State,
+		Development: w.Development, SSHAddress: w.SSHAddress, ID: w.ID, Name: w.machineName(), State: w.State,
 		AcceleratorModel: w.AcceleratorModel, AcceleratorCount: w.AcceleratorCount,
 		Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, Failure: w.Failure, MediaAddress: w.MediaAddress,
@@ -663,11 +675,6 @@ func (w wireRental) named(what string) *exit.Error {
 			"the hub %s without a positive locked Cozy retail hourly rate", what).
 			WithRemedy("upgrade Tensorhub before accepting a rental")
 	}
-	if !rentalid.ValidMachineName(w.Name) {
-		return exit.Named(exit.Conflict, "hub.rental_name_invalid",
-			"the hub %s with invalid private rental name %q", what, w.Name).
-			WithRemedy("Tensorhub must return the exact safe name Creator sent at rental creation")
-	}
 	// THE WIDTH IS NOT OPTIONAL. It decides the device envelope this host grants the pod's
 	// worker and the degree it pins a group placement to, so a rental that will not say how
 	// many accelerators it delivers cannot be attached at all — and reading its silence as
@@ -692,9 +699,9 @@ func (w wireRental) named(what string) *exit.Error {
 // own nothing", so the two are separated here rather than collapsed into an empty
 // slice. Nothing else is inferred from an absent route.
 //
-// Identity is validated per row and a row that cannot be named is DROPPED rather
-// than failing the listing: a hub that serves one malformed row must not thereby
-// hide the ten good ones, which is the same lesson as the release path's (cl-193).
+// Only a row whose id is unusable is DROPPED, rather than failing the listing: a hub that
+// serves one malformed row must not thereby hide the ten good ones (cl-193). An odd name
+// is folded or replaced by the id, since a billing pod must stay nameable.
 func (c *Client) Rentals(ctx context.Context) ([]Rental, *exit.Error) {
 	var out struct {
 		Rentals []wireRental `json:"rentals"`
@@ -706,7 +713,7 @@ func (c *Client) Rentals(ctx context.Context) ([]Rental, *exit.Error) {
 	}
 	rentals := make([]Rental, 0, len(out.Rentals))
 	for _, wire := range out.Rentals {
-		if !rentalid.Valid(wire.ID) || !rentalid.ValidMachineName(wire.Name) {
+		if !rentalid.Valid(wire.ID) {
 			continue
 		}
 		rentals = append(rentals, wire.rental())
