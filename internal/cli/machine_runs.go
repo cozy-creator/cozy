@@ -821,6 +821,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	}
 	progress.Advance(1)
 	cursor := uint64(link.RemoteCursor)
+	reread := cursor // where the state was last read again
 	var terminal *pb.AttemptOutcome
 	for {
 		page, err := connection.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor, Limit: 128})
@@ -848,19 +849,20 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 			return exit.New(exit.Conflict, "machine event cursor made no progress")
 		}
 		cursor = page.NextAfter
-		if page.NextAfter >= page.HeadSequence {
+		if page.NextAfter < page.HeadSequence {
+			continue
+		}
+		// The pages ran past the state read: the machine journaled more meanwhile, as a run's
+		// last products and its outcome land together. Read the state again and page on to
+		// it: nothing is collected before every entry up to its outcome is recorded. Pages that
+		// find nothing past the state read again end it.
+		if state.Sequence >= cursor || cursor == reread {
 			break
 		}
-	}
-	if state.Sequence < cursor {
-		// The pages ran past the state read (its outcome was journaled in between): read it
-		// again, or the held read that follows waits for an event after the last one.
 		if state, err = connection.Host.GetMachineExecution(ctx, query); err != nil {
 			return machineTransport(err)
 		}
-		if problem := m.store.ObserveMachineExecution(request.ID, state, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, state.Sequence)}); problem != nil {
-			return problem
-		}
+		reread = cursor
 	}
 	if problem := m.reconcilePublications(ctx, request.ID, request.Hub, connection, query); problem != nil {
 		return problem

@@ -82,9 +82,10 @@ func TestRunShowListsEachModelDownloadAndTheWaitItHeld(t *testing.T) {
 		downloads["download proof/image"] != "30.8GiB at 115.5MiB/s; for generate_image, held Creating reference Background" {
 		t.Fatalf("run show downloads %v:\n%s", downloads, shown)
 	}
-	if len(report.Calls) != 1 || report.Calls[0].Request != "call-segment-1" || len(report.Calls[0].Stages) != 1 ||
-		report.Calls[0].Stages[0].Kind != "wait" ||
-		!strings.Contains(report.Calls[0].Stages[0].Detail, "motion_segment_turbo weights, in Segment 1 of 9") {
+	// Call 0 is the run itself; the held call follows it.
+	if len(report.Calls) != 2 || report.Calls[0].Request != row.ID || report.Calls[1].Request != "call-segment-1" ||
+		len(report.Calls[1].Stages) != 1 || report.Calls[1].Stages[0].Kind != "wait" ||
+		!strings.Contains(report.Calls[1].Stages[0].Detail, "motion_segment_turbo weights, in Segment 1 of 9") {
 		t.Fatalf("the held call's wait is not among its stages: %+v", report.Calls)
 	}
 	if _, human := runCozy(t, root, "run", "show", row.ID); !strings.Contains(human, "download proof/motion") ||
