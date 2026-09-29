@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -63,16 +64,16 @@ type runtimeUpdateSelection struct {
 	LocalTensorFS *runtimeUpdateWheel `json:"local_tensorfs,omitempty"`
 	// Published versions to install instead of local wheels; a machine that updates itself
 	// fetches them (rental_runtime_update_native.go), and records its operation in Native.
-	RuntimeVersion  string        `json:"runtime_version,omitempty"`
-	TensorFSVersion string        `json:"tensorfs_version,omitempty"`
-	Native          *nativeUpdate `json:"native,omitempty"`
-	Target        runtimeUpdateTarget `json:"target"`
-	Directory     string              `json:"directory"`
-	Stage         string              `json:"stage"`
-	Host          string              `json:"host"`
-	SSHArguments  []string            `json:"ssh_arguments"`
-	SFTPArguments []string            `json:"sftp_arguments"`
-	Selection     json.RawMessage     `json:"selection,omitempty"`
+	RuntimeVersion  string              `json:"runtime_version,omitempty"`
+	TensorFSVersion string              `json:"tensorfs_version,omitempty"`
+	Native          *nativeUpdate       `json:"native,omitempty"`
+	Target          runtimeUpdateTarget `json:"target"`
+	Directory       string              `json:"directory"`
+	Stage           string              `json:"stage"`
+	Host            string              `json:"host"`
+	SSHArguments    []string            `json:"ssh_arguments"`
+	SFTPArguments   []string            `json:"sftp_arguments"`
+	Selection       json.RawMessage     `json:"selection,omitempty"`
 }
 
 func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
@@ -93,6 +94,16 @@ func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath, runtimeVersion
 	}
 	if row == nil || row.State != "ready" {
 		return nil, exit.New(exit.Conflict, "this rental is not ready; no machine was purchased or changed")
+	}
+	hctx, cancel := hub.Context()
+	remote, hubProblem := client(m.fleet.atRental(id)).Rental(hctx, id)
+	cancel()
+	// Only the Hub's answer can refuse here, and only for a machine that cannot update itself;
+	// an unanswered read leaves the refusal to the update.
+	if hubProblem == nil && !remote.Development && !u.updatesItself(id) {
+		return nil, exit.Named(exit.Conflict, "rental.maintenance_unavailable",
+			"%s was rented without SSH maintenance, so its Runtime cannot be updated in place; nothing was changed", row.MachineName).
+			WithRemedy("rent a replacement with SSH maintenance, the default (omit --development=false), or on a current image")
 	}
 	current, problem := m.store.RuntimeUpdate(id)
 	if problem != nil {
@@ -221,12 +232,7 @@ func (u *rentalRuntimeUpdates) connectionSelection(ctx context.Context, row reco
 	if problem != nil {
 		return selection, problem
 	}
-	if !remote.Development {
-		return selection, exit.Named(exit.Conflict, "rental.maintenance_unavailable",
-			"%s was rented without SSH maintenance and its machine predates in-place Runtime updates; nothing was changed", row.RentalID).
-			WithRemedy("rent a replacement on a current image")
-	}
-	if !remote.Ready() || remote.WorkerBootID != row.BootID {
+	if !remote.Development || !remote.Ready() || remote.WorkerBootID != row.BootID {
 		return selection, exit.New(exit.Conflict, "this rental has no compatible private maintenance endpoint")
 	}
 	host, port, err := net.SplitHostPort(remote.SSHAddress)

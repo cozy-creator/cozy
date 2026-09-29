@@ -49,11 +49,11 @@ type machineRuntimeState struct {
 }
 
 type machineMaintenance struct {
-	base       string
-	client     *http.Client
-	machine    string
-	public     ed25519.PublicKey
-	sign       func([]byte) []byte
+	base    string
+	client  *http.Client
+	machine string
+	public  ed25519.PublicKey
+	sign    func([]byte) []byte
 }
 
 func (u *rentalRuntimeUpdates) maintenance(identity *orchestrator.WorkerConnection) (*machineMaintenance, *exit.Error) {
@@ -112,6 +112,22 @@ func (c *machineMaintenance) state(ctx context.Context) (*machineRuntimeState, *
 		return nil, nil
 	}
 	return &state, nil
+}
+
+// updatesItself says whether a rental's machine answers that it updates its own Runtime.
+func (u *rentalRuntimeUpdates) updatesItself(id string) bool {
+	target, problem := u.machines.machines.Rentals(id)
+	if problem != nil || target == nil || target.Connection == nil {
+		return false
+	}
+	machine, problem := u.maintenance(target.Connection)
+	if problem != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	state, _ := machine.state(ctx)
+	return state != nil
 }
 
 // updateNative stages the requested pair on the machine and asks it to update itself.
