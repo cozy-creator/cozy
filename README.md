@@ -413,6 +413,11 @@ Cancellation records intent and returns the observed state. If a sent submission
 acceptance is unknown, it remains `canceling` until the machine closes its key or
 confirms the execution outcome. Use `cozy run cancel <id> --await` to wait for that
 confirmation. Work never submitted cancels immediately.
+If the machine cannot be reconciled, `cozy run cancel <id> --abandon` permanently
+ends local tracking while retaining the original submission and any real receipts
+or outcomes. This does **not** confirm remote work stopped or end any rental.
+The abandoned run cannot be resubmitted or resumed; late real facts remain history
+without reopening it. `--abandon` cannot be combined with `--await`.
 An unchanged deterministic failure is not automatically retried. `--await` returns when a
 transaction blocks or pauses, and the ordinary run view explains the stopped state.
 
