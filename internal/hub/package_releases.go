@@ -121,12 +121,8 @@ func (d PackageReleaseDetail) Requirements() ([]string, *exit.Error) {
 }
 
 // Constraints returns the release's execution dependencies and interpreter floor,
-// which Tensorhub derives from the committed wheel environment.
+// which Tensorhub derives from the committed wheel environment; absent, it has none.
 func (d PackageReleaseDetail) Constraints() ([]string, string, *exit.Error) {
-	if d.ExecutionRequirements == nil {
-		return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
-			"Tensorhub returned no package requirements")
-	}
 	requirements := slices.DeleteFunc(slices.Clone(d.ExecutionRequirements), func(r string) bool { return r == "" })
 	slices.Sort(requirements)
 	return slices.Compact(requirements), d.RequiresPython, nil
@@ -222,10 +218,7 @@ func (c *Client) WaitPackageRelease(ctx context.Context, ref Ref, release string
 		if state.State == "failed" {
 			return state, state.failure()
 		}
-		if state.State != "queued" && state.State != "verifying" && state.State != "retrying" {
-			return state, exit.Named(exit.Structural, "hub.package_release_invalid",
-				"Tensorhub returned unknown package finalization state %q", state.State)
-		}
+		// Queued, verifying, retrying, or a state a newer Hub added: still pending.
 		timer := time.NewTimer(packageFinalizePollInterval)
 		select {
 		case <-ctx.Done():
