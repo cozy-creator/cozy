@@ -479,18 +479,19 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 		nextState = current
 	}
 	var previous pb.MachineExecutionState
+	// A snapshot older than the recorded one projects nothing, but its page's entries are
+	// history all the same: they are recorded, never dropped with the snapshot.
+	stale := false
 	if len(link.ObservedState) > 0 {
 		if proto.Unmarshal(link.ObservedState, &previous) != nil {
 			return exit.Internalf("recorded machine state is unreadable")
 		}
-		if state.Sequence < previous.Sequence || state.Generation < previous.Generation {
-			return nil
-		}
-		if state.Generation == previous.Generation && state.AttemptOrdinal < previous.AttemptOrdinal {
+		stale = state.Sequence < previous.Sequence || state.Generation < previous.Generation
+		if !stale && state.Generation == previous.Generation && state.AttemptOrdinal < previous.AttemptOrdinal {
 			return exit.New(exit.Conflict, "machine observation regressed its attempt ordinal")
 		}
 	}
-	if observedMachineRequestState(state.State) == "" && previous.State != state.State {
+	if !stale && observedMachineRequestState(state.State) == "" && previous.State != state.State {
 		notes = append(notes, fmt.Sprintf("the machine reports state %q, which this Creator does not know; the run is followed as it was", printableNote(state.State)))
 	}
 	cursor := uint64(link.RemoteCursor)
@@ -573,6 +574,23 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 			return exit.Internalf("cannot record a machine note: %s", err)
 		}
 	}
+	if retentionReleased {
+		if _, err := tx.Exec(`UPDATE machine_executions SET pending_control=x'',cancel_requested=0 WHERE request_id=?`, id); err != nil {
+			return exit.Internalf("cannot record Runtime retention release: %s", err)
+		}
+		if _, err := tx.Exec(`UPDATE requests SET retain_work=0 WHERE id=?`, id); err != nil {
+			return exit.Internalf("cannot project Runtime retention release: %s", err)
+		}
+	}
+	if stale {
+		if _, err := tx.Exec(`UPDATE machine_executions SET remote_cursor=? WHERE request_id=?`, cursor, id); err != nil {
+			return exit.Internalf("cannot update machine observation cursor: %s", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return exit.Internalf("cannot commit machine observation: %s", err)
+		}
+		return nil
+	}
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(state)
 	if err != nil {
 		return exit.Internalf("cannot retain machine state: %s", err)
@@ -589,14 +607,6 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 		if err := appendEventTx(tx, id, MachineResultCollected, int64(state.AttemptOrdinal),
 			map[string]any{"machine_execution": true, "state": state.State}); err != nil {
 			return exit.Internalf("cannot record machine result collection: %s", err)
-		}
-	}
-	if retentionReleased {
-		if _, err := tx.Exec(`UPDATE machine_executions SET pending_control=x'',cancel_requested=0 WHERE request_id=?`, id); err != nil {
-			return exit.Internalf("cannot record Runtime retention release: %s", err)
-		}
-		if _, err := tx.Exec(`UPDATE requests SET retain_work=0 WHERE id=?`, id); err != nil {
-			return exit.Internalf("cannot project Runtime retention release: %s", err)
 		}
 	}
 	// Finish the local idle clock atomically with dropping the active request

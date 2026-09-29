@@ -245,6 +245,73 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	// The machine itself serves the image, the current bytes of its third revision.
 	machineServesOutput(t, root, "image", last.Digest, 3)
 
+	// Run 1591's shape: --input, --await, --json and --out, for a run that publishes and ends
+	// at once, its last revisions and its outcome landing together. --await returns once each
+	// output is in the folder at its final revision, and names each saved file.
+	gate = filepath.Join(t.TempDir(), "at-once")
+	must(t, os.MkdirAll(gate, 0o700))
+	for k := 1; k <= 3; k++ {
+		must(t, os.WriteFile(filepath.Join(gate, fmt.Sprintf("go-%d", k)), nil, 0o600))
+	}
+	input, out := filepath.Join(t.TempDir(), "input.json"), filepath.Join(t.TempDir(), "out")
+	must(t, os.WriteFile(input, []byte(fmt.Sprintf(`{"gate":%q}`, gate)), 0o600))
+	awaited, err := cozy("run", "local/output-log-proof/grow", "--input", input, "--await", "--json", "--out", out).Output()
+	if err != nil {
+		t.Fatalf("the awaited run exited %v:\n%s", err, awaited)
+	}
+	var result struct {
+		Saved []struct{ Path, Digest string } `json:"saved"`
+	}
+	must(t, json.Unmarshal(awaited, &result))
+	files, err := os.ReadDir(out)
+	must(t, err)
+	if len(result.Saved) != 4 || len(files) != 4 {
+		t.Fatalf("the awaited run saved %d files and its folder holds %d, want its 4 outputs:\n%s", len(result.Saved), len(files), awaited)
+	}
+	for _, saved := range result.Saved {
+		data, err := os.ReadFile(saved.Path)
+		if err != nil || filepath.Dir(saved.Path) != out || digestOf(data) != saved.Digest {
+			t.Fatalf("%s is not its output's final revision: %v", saved.Path, err)
+		}
+	}
+
+	// A folder that refuses the outputs once the run is under way: --await exits non-zero,
+	// naming each output it could not deliver and the machine that keeps its bytes. Once the
+	// folder takes them again, watching the run delivers them.
+	gate = filepath.Join(t.TempDir(), "refused")
+	must(t, os.MkdirAll(gate, 0o700))
+	refused := filepath.Join(t.TempDir(), "refused-out")
+	must(t, os.WriteFile(input, []byte(fmt.Sprintf(`{"gate":%q}`, gate)), 0o600))
+	command = cozy("run", "local/output-log-proof/grow", "--input", input, "--await", "--json", "--out", refused)
+	var refusal bytes.Buffer
+	command.Stdout = &refusal
+	must(t, command.Start())
+	landed(t, "the refused run's folder", func() bool { _, err := os.Stat(refused); return err == nil })
+	must(t, os.Chmod(refused, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(refused, 0o700) })
+	for k := 1; k <= 3; k++ {
+		must(t, os.WriteFile(filepath.Join(gate, fmt.Sprintf("go-%d", k)), nil, 0o600))
+	}
+	if err := command.Wait(); err == nil || !strings.Contains(refusal.String(), `"code":"run.outputs_undelivered"`) ||
+		!strings.Contains(refusal.String(), `"bytes_on":"machine local"`) || !strings.Contains(refusal.String(), "/image") {
+		t.Fatalf("an awaited run whose folder refused its outputs exited %v:\n%s", err, refusal.String())
+	}
+	var undelivered struct {
+		Error struct {
+			Details struct {
+				Number int64 `json:"number"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	must(t, json.Unmarshal(refusal.Bytes(), &undelivered))
+	must(t, os.Chmod(refused, 0o700))
+	if watched, err := cozy("run", "watch", fmt.Sprint(undelivered.Error.Details.Number), "--json").Output(); err != nil {
+		t.Fatalf("watching the run once its folder took the outputs exited %v:\n%s", err, watched)
+	}
+	if files, err := os.ReadDir(refused); err != nil || len(files) != 4 {
+		t.Fatalf("the restored folder holds %d files, want the run's 4 outputs: %v", len(files), err)
+	}
+
 	// Canceled after its second revision, the run keeps that revision as its result.
 	gate = filepath.Join(t.TempDir(), "canceled")
 	command, stderr, request = start(gate)
@@ -376,7 +443,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	for _, row := range requests {
 		export, problem := store.OutputExportOf(row.ID)
 		fatal(t, problem)
-		if export != nil {
+		if export != nil && export.Directory == directory {
 			finals = append(finals, export.PublishedPaths...)
 		}
 	}

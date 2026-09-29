@@ -327,12 +327,13 @@ func TestProductPath(t *testing.T) {
 	}
 	must(t, os.Chmod(incidentDir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(incidentDir, 0o755) })
-	// The run completed on its machine, which keeps the file: the refused destination is
-	// named as the reason its collection is pending, never a run failure or a silent hang.
+	// The run completed on its machine, which keeps the file: watching it ends non-zero, naming
+	// the output it could not deliver, the refused destination and the machine holding it.
 	code, out, stderr = runCozyStreams(t, root, "run", "watch", idMatch[1], "--json")
-	if code != 0 || !strings.Contains(out, "collection pending: output_destination_unwritable") ||
-		!strings.Contains(out, "permission denied") {
-		t.Fatalf("a destination that died after submit was not reported as owed collection [exit %d]\nstdout:\n%s\nstderr:\n%s", code, out, stderr)
+	if code == 0 || !strings.Contains(out, `"code":"run.outputs_undelivered"`) ||
+		!strings.Contains(out, "output_destination_unwritable") || !strings.Contains(out, "permission denied") ||
+		!strings.Contains(out, `"bytes_on":"machine local"`) {
+		t.Fatalf("a destination that died after submit was not reported as undelivered [exit %d]\nstdout:\n%s\nstderr:\n%s", code, out, stderr)
 	}
 	// The run's record says the same, as text and as JSON.
 	if code, out = runCozy(t, root, "run", "show", idMatch[1]); code != 0 ||

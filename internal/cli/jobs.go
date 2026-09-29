@@ -583,19 +583,18 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if machine := state.MachineExecution; machine != nil && machine.Retained != "" {
 		rec.Notes = append(rec.Notes, fmt.Sprintf("its result stays on %s: %s", machine.Machine, machine.Retained))
 	}
-	if machine := state.MachineExecution; machine != nil && !machine.Collected && machine.CollectionRefused != "" {
-		rec.Notes = append(rec.Notes, collectionPendingNote(machine, state.Number))
-	}
 	if len(state.RetainedOutputs) > 0 {
 		machine := state.RetainedOutputs[0].Machine
 		rec.Notes = append(rec.Notes, fmt.Sprintf("retained outputs stay on %s until `cozy rental end %s`; "+
 			"`cozy run upload` sends one to a private checkpoint without running again", machine, machine))
 	}
-	if export := state.OutputExport; export != nil && export.State == "failed" {
-		rec.Notes = append(rec.Notes, fmt.Sprintf("output export to %s failed (%s): %s; accepted output bytes remain in internal custody",
-			export.Directory, export.ErrorCode, export.Error))
-	}
 	code := exit.JobTerminal(mapTerminal(status))
+	if code == exit.OK {
+		if problem := undelivered(api.Lifecycle{Number: state.Number, RequestID: state.JobID, OutputExport: state.OutputExport,
+			MachineExecution: state.MachineExecution, Output: state.Output}); problem != nil {
+			return problem
+		}
+	}
 	if code == exit.OK && state.ModelDestination != "" && state.ErrorType != "" {
 		return exit.Named(exit.Conflict, state.ErrorType, "job %s completed without uploading to %s: %s",
 			state.JobID, state.ModelDestination, state.Error)

@@ -1314,13 +1314,6 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 	return emit(ctx, rec)
 }
 
-// collectionPendingNote says where a finished result waits and why it cannot be collected.
-func collectionPendingNote(view *api.MachineExecutionView, number int64) string {
-	return fmt.Sprintf("the result stays on machine %s until it can be collected: %s — "+
-		"fix the cause; the daemon collects it on its next observation (`cozy run watch %d`)",
-		view.Machine, view.ObservationError, number)
-}
-
 // custodyOwed is whether a finished machine run's result has yet to settle where it stays.
 func collectedOrCollecting(life api.Lifecycle) bool {
 	view := life.MachineExecution
@@ -2358,20 +2351,12 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		// The DEADLINE is why this ended, and the shared matrix has a code for it.
 		status = "deadline"
 	}
-	// A SUCCEEDED run whose export failed is a completed run with an export still owed —
-	// the daemon retries the durable obligation — and it must never wear a run-failure
-	// verdict. The status says both facts; the exit code stays the run terminal's own.
-	export := life.OutputExport
-	exportOwed := export != nil && export.State == "failed" && mapTerminal(status) == "succeeded"
+	if mapTerminal(status) == "succeeded" {
+		if problem := undelivered(life); problem != nil {
+			return problem
+		}
+	}
 	shownStatus := life.Status
-	if exportOwed {
-		shownStatus = life.Status + " (export pending: " + export.ErrorCode + ")"
-	}
-	pending := life.MachineExecution
-	collectionOwed := pending != nil && pending.CollectionRefused != "" && !pending.Collected && mapTerminal(status) == "succeeded"
-	if collectionOwed {
-		shownStatus = life.Status + " (collection pending: " + pending.CollectionRefused + ")"
-	}
 	if life.Status == "canceled" && life.CanceledBy != "" {
 		shownStatus = humanCancellationStatus(life.CanceledBy)
 	} else if life.Status == "canceled" {
@@ -2401,15 +2386,6 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		fields = append(fields, output.Field{K: "outputs", V: outs})
 	}
 	notes := []string{}
-	if collectionOwed {
-		notes = append(notes, collectionPendingNote(pending, life.Number))
-	}
-	if exportOwed {
-		notes = append(notes, fmt.Sprintf(
-			"output export to %s failed (%s): %s — fix the recorded destination and repeat "+
-				"the same idempotency key; the daemon retries this durable export",
-			export.Directory, export.ErrorCode, export.Error))
-	}
 	if len(saved) > 0 {
 		paths := make([]string, 0, len(saved))
 		opaque := false
@@ -2501,6 +2477,45 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if life.Triage != nil {
 		e.WithRemedy("%s", triageRemedy(ctx, life.Triage, terminal))
 	}
+	return e
+}
+
+// undelivered is why a completed run's outputs are not all in its folder, each at its final
+// revision with its sha256 verified; nil once they are. A caller that awaited the run learns
+// which outputs are missing and where their bytes still are, never a bare success.
+func undelivered(life api.Lifecycle) *exit.Error {
+	export := life.OutputExport
+	if export == nil {
+		return nil
+	}
+	written := map[string]bool{}
+	if export.State == "published" {
+		for _, path := range export.Paths {
+			written[path] = true
+		}
+	}
+	var missing, names []string
+	for _, item := range life.Output {
+		if !written[item.Path] {
+			missing, names = append(missing, item.ID), append(names, item.Name)
+		}
+	}
+	if len(missing) == 0 && export.State == "published" {
+		return nil
+	}
+	named := "its outputs are"
+	if names = slices.Compact(names); len(names) > 0 {
+		named = strings.Join(names, ", ") + map[bool]string{true: " is", false: " are"}[len(missing) == 1]
+	}
+	cause, where := strings.Trim(export.ErrorCode+": "+export.Error, ": "), fmt.Sprintf("this computer's record of run %d", life.Number)
+	if view := life.MachineExecution; view != nil && !view.Collected {
+		cause = strings.Trim(view.CollectionRefused+": "+cmp.Or(view.ObservationError, view.Retained), ": ")
+		where = "machine " + view.Machine
+	}
+	e := exit.Named(exit.Unavailable, "run.outputs_undelivered", "run %d completed, but %s not in %s: %s — its bytes stay on %s; fix the cause and `cozy run watch %d` delivers them",
+		life.Number, named, export.Directory, cmp.Or(cause, "not collected yet"), where, life.Number)
+	e.Details = map[string]any{"number": life.Number, "request_id": life.RequestID, "missing": missing,
+		"directory": export.Directory, "cause": cause, "bytes_on": where}
 	return e
 }
 
