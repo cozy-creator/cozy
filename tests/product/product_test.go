@@ -512,8 +512,8 @@ func activeInstall(t *testing.T, root, packageRef string) records.PackageInstall
 }
 
 // weightlessProject is a fresh copy of the editable weightless package. It is built once per
-// process, vendoring the host Runtime's exact wheel: -script-runtime-wheel when given,
-// otherwise the host's released version from PyPI.
+// process: an explicit SDK artifact is pinned by sha256; the default released
+// host SDK is pinned by its embedded source commit and PyPI download hash.
 func weightlessProject(t *testing.T) string {
 	t.Helper()
 	weightless.once.Do(func() { weightless.source, weightless.err = buildWeightless(t) })
@@ -537,21 +537,21 @@ func buildWeightless(t *testing.T) (string, error) {
 		return "", err
 	}
 	env := childEnv(t, dir)
-	distribution, commit, err := hostRuntimeIdentity(env)
-	if err != nil {
-		return "", err
-	}
 	project := filepath.Join(dir, "source")
 	args := []string{"-n", "19", "python3", "tests/product/testdata/build-weightless.py",
-		"--out", dir, "--source-out", project, "--expect-commit", commit}
+		"--out", dir, "--source-out", project}
 	if *privateScriptRuntimeWheel != "" {
 		wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 		if err != nil {
 			return "", err
 		}
-		args = append(args, "--runtime-wheel", wheel)
+		args = append(args, "--runtime-wheel", wheel, "--expect-sha256", fileSHA(t, wheel))
 	} else {
-		args = append(args, "--runtime-version", distribution)
+		distribution, commit, err := hostRuntimeIdentity(env)
+		if err != nil {
+			return "", err
+		}
+		args = append(args, "--runtime-version", distribution, "--expect-commit", commit)
 	}
 	if *tensorfsFixtureWheel != "" {
 		args = append(args, "--tensorfs-wheel", *tensorfsFixtureWheel)
@@ -573,4 +573,15 @@ func productWorkerLogs(root string) string {
 		out.WriteString("worker log " + filepath.Base(filepath.Dir(path)) + ":\n" + string(data) + "\n")
 	}
 	return out.String()
+}
+
+func TestWeightlessExplicitArtifactRefusesDigestMismatch(t *testing.T) {
+	wheel := filepath.Join(t.TempDir(), "cozy_runtime-0.18.87-py3-none-any.whl")
+	must(t, os.WriteFile(wheel, []byte("not the selected artifact"), 0600))
+	command := exec.Command("python3", "testdata/build-weightless.py", "--runtime-wheel", wheel,
+		"--expect-sha256", strings.Repeat("0", 64), "--out", t.TempDir())
+	out, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "does not match the explicit sha256") {
+		t.Fatalf("mismatched development artifact accepted: %v %s", err, out)
+	}
 }

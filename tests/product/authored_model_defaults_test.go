@@ -249,7 +249,17 @@ func TestAuthoredDefaultsMatchRuntimeCorpus(t *testing.T) {
 				if problem != nil {
 					return
 				}
-				slot := iface.Entrypoints[0].Models[0]
+				callable, problem := iface.Function("generate")
+				if problem != nil {
+					if valid {
+						t.Fatalf("Creator refused a valid callable ladder: %v", problem)
+					}
+					return // malformed callable is refused without hiding other functions
+				}
+				if len(callable.Models) != 1 {
+					t.Fatal("admission lost the authored Model slot")
+				}
+				slot := callable.Models[0]
 				if slot.DefaultBinding == nil {
 					if valid || len(slot.DefaultLadder) != 0 {
 						t.Fatal("admission did not retain the lowered default")

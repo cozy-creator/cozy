@@ -376,6 +376,7 @@ func runCozy(t *testing.T, root string, args ...string) (int, string) {
 // runCozyWith is runCozy with extra child environment, such as another HOME.
 func runCozyWith(t *testing.T, root string, imposed []string, args ...string) (int, string) {
 	t.Helper()
+	prepareExplicitInstall(t, root, args)
 	// Machine results are one stdout document; awaited JSONL progress is stderr.
 	// Dedicated stream proofs validate that channel independently.
 	for _, arg := range args {
@@ -405,6 +406,7 @@ func runCozyStreams(t *testing.T, root string, args ...string) (int, string, str
 
 func runCozyStreamsWith(t *testing.T, root string, imposed []string, args ...string) (int, string, string) {
 	t.Helper()
+	prepareExplicitInstall(t, root, args)
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 	cmd.Env = childEnv(t, root, imposed...)
 	var stdout, stderr bytes.Buffer
@@ -540,5 +542,14 @@ func listedRentalQuote(listing http.Handler) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":{"code":"rental.sku_not_found","message":"no such rental SKU"}}`))
+	}
+}
+
+// Explicit installation exercises real bootstrap into this root. Auto-provisioning
+// the shared template first would turn it into an update of every test's interpreter.
+func prepareExplicitInstall(t *testing.T, root string, args []string) {
+	t.Helper()
+	if len(args) >= 2 && args[0] == "machine" && args[1] == "install" {
+		must(t, os.MkdirAll(filepath.Join(root, "machine"), 0700))
 	}
 }

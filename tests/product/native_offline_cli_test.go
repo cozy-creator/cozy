@@ -123,7 +123,7 @@ def observed(writer, *args, **kwargs):
     return native(ObservedWriter(writer), *args, **kwargs)
 derived.serve_derived = observed
 from cozy_runtime.cli import runtime_worker
-sys.exit(runtime_worker.main([]))
+sys.exit(runtime_worker.main(sys.argv[1:]))
 `, filepath.Join(machineRoot, "opt", "cozy", "python", "bin", "python"), barrier.URL)), 0o755)) //cozy:allow isolated Runtime fault instrumentation; all invocation still uses the ordinary CLI and worker protocol
 	project := copyPrivateTensorProject(t, root, "")
 	script := filepath.Join(project, "recipe.py")
@@ -154,7 +154,7 @@ sys.exit(runtime_worker.main([]))
 	if len(first) != 2 || first[0].State != "succeeded" || first[0].Executions != 1 {
 		t.Fatalf("unexpected before-disconnect work: %+v", first)
 	}
-	identity, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
+	identity, err := os.ReadFile(filepath.Join(root, "machine", "agent.json"))
 	must(t, err)
 	run("down")
 	if daemonOnRoot(root) != 0 {
@@ -208,7 +208,7 @@ sys.exit(runtime_worker.main([]))
 	run("run", "watch", parent.ID)
 	after, problem := store.MachineExecution(parent.ID)
 	fatal(t, problem)
-	nowIdentity, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
+	nowIdentity, err := os.ReadFile(filepath.Join(root, "machine", "agent.json"))
 	must(t, err)
 	if !after.Collected || after.CancelRequested || !bytes.Equal(before.Receipt, after.Receipt) || !bytes.Equal(before.Submission, after.Submission) || !bytes.Equal(identity, nowIdentity) {
 		t.Fatal("reattachment replaced/canceled/resubmitted accepted execution")

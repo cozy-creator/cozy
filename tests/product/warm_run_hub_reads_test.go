@@ -101,7 +101,7 @@ def touch(payload: TouchRequest, source: Probe) -> TouchResult:
 	return project
 }
 
-// A warm run of a published release makes no Hub request, from the CLI or from the machine:
+// A warm run makes no catalog/data Hub request; rental key-authority refresh remains live.
 // the machine read the owner's binding and resolved its lane at its own Hub on the cold run
 // and kept both. On this computer's machine and on a rental, with the real Host and Runtime.
 func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
@@ -109,11 +109,21 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	resolved := seedProbe(t, h, root)
 	var mu sync.Mutex
 	var seen []string
+	renewals := 0
 	count := func(hub string, handler http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !strings.HasPrefix(r.URL.Path, "/v1/rentals") { // the fleet's own reconciliation
+				h.mu.Lock()
+				worker, token := h.authorityWorker, h.authorityToken
+				h.mu.Unlock()
+				authority := hub == "machine" && r.Method == http.MethodGet && r.URL.Path == "/v1/worker/rental/authorized-keys" && r.URL.RawQuery == "" &&
+					worker != "" && token != "" && r.Header.Get("X-Cozy-Worker-ID") == worker && r.Header.Get("X-Cozy-Worker-Token") == token
 				mu.Lock()
-				seen = append(seen, hub+" "+r.Method+" "+r.URL.Path)
+				if authority {
+					renewals++
+				} else {
+					seen = append(seen, hub+" "+r.Method+" "+r.URL.Path)
+				}
 				mu.Unlock()
 			}
 			handler.ServeHTTP(w, r)
@@ -140,7 +150,7 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	}{{"local", nil}, {"rental", []string{"--rental=tessa"}}} {
 		for _, key := range []string{"cold", "warm"} {
 			mu.Lock()
-			seen = nil
+			seen, renewals = nil, 0
 			mu.Unlock()
 			code, out := runCozy(t, root, append([]string{"run", parityPublished + "/touch", "value=1", "--await", "--json"}, venue.args...)...)
 			if code != 0 || !strings.Contains(out, `"value":2`) {
@@ -148,7 +158,11 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			}
 			mu.Lock()
 			calls := append([]string(nil), seen...)
+			refreshed := renewals
 			mu.Unlock()
+			if venue.name == "rental" && refreshed == 0 {
+				t.Fatal("rental ran without current worker-key authority refresh")
+			}
 			t.Logf("%s run on %s: %v", key, venue.name, calls)
 			if key == "cold" && !strings.Contains(strings.Join(calls, "\n"), "machine GET /v1/models/resolve") {
 				t.Fatalf("the cold run on %s never resolved its Model at the machine's Hub: %v", venue.name, calls)
@@ -170,14 +184,18 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {
 		for _, key := range []string{"changed", "warm again"} {
 			mu.Lock()
-			seen = nil
+			seen, renewals = nil, 0
 			mu.Unlock()
 			if code, out := runCozy(t, root, append([]string{"run", parityPublished + "/touch", "value=1", "--await", "--json"}, args...)...); code != 0 || !strings.Contains(out, `"value":2`) {
 				t.Fatalf("%s touch on %s [exit %d]\n%s", key, venue, code, out)
 			}
 			mu.Lock()
 			calls := strings.Join(seen, "\n")
+			refreshed := renewals
 			mu.Unlock()
+			if venue != "local" && refreshed == 0 {
+				t.Fatal("rental ran without current worker-key authority refresh")
+			}
 			read := strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/bindings") && strings.Contains(calls, "machine GET /v1/models/resolve")
 			if (key == "changed") != read || key == "warm again" && calls != "" {
 				t.Fatalf("the %s run on %s read: %q", key, venue, calls)
@@ -196,14 +214,18 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {
 		for _, key := range []string{"cold", "warm"} {
 			mu.Lock()
-			seen = nil
+			seen, renewals = nil, 0
 			mu.Unlock()
 			if code, out := runCozy(t, root, append([]string{"run", "local/machine-parity/touch", "value=1", "--await", "--json"}, args...)...); code != 0 || !strings.Contains(out, `"value":2`) {
 				t.Fatalf("%s local/ touch on %s [exit %d]\n%s", key, venue, code, out)
 			}
 			mu.Lock()
 			calls := strings.Join(seen, "\n")
+			refreshed := renewals
 			mu.Unlock()
+			if venue != "local" && refreshed == 0 {
+				t.Fatal("rental ran without current worker-key authority refresh")
+			}
 			t.Logf("%s local/ run on %s: %q", key, venue, calls)
 			if key == "cold" && !strings.Contains(calls, "machine GET /v1/models/resolve") || key == "warm" && calls != "" {
 				t.Fatalf("the %s local/ run on %s read: %q", key, venue, calls)

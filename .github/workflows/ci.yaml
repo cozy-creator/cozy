@@ -77,13 +77,15 @@ jobs:
           for target in darwin/arm64 windows/amd64; do
             GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null .
           done
-      # The released Runtime at exactly the floor this Cozy enforces (hostruntime.ToolFloor).
+      # One published native Runtime supplies both the SDK and machine agent.
+      # Qualification intentionally fails until the released pair supports our contracts.
       - name: Runtime and Python
         id: toolchain
         run: |
-          floor=$(sed -n 's/^const ToolFloor = "\(.*\)"$/\1/p' internal/hostruntime/hostruntime.go)
-          read -r url sha < <(curl -fsS "https://pypi.org/pypi/cozy-runtime/$floor/json" |
-            jq -r '.urls[] | select(.filename | endswith("py3-none-any.whl")) | "\(.url) \(.digests.sha256)"')
+          read -r url sha < <(curl -fsS https://pypi.org/pypi/cozy-runtime/json |
+            jq -er '[.urls[] | select(.yanked == false) | select(.filename | endswith("cp312-abi3-manylinux_2_28_x86_64.whl"))] |
+              if length == 1 then .[0] | "\(.url) \(.digests.sha256)" else error("expected one native Runtime wheel") end')
+          test -n "$url" && test -n "$sha"
           wheel="$RUNNER_TEMP/${url##*/}"
           curl -fsSLo "$wheel" "$url"
           echo "$sha  $wheel" | sha256sum -c
@@ -92,27 +94,27 @@ jobs:
           uv tool install --python 3.12 cozy-eval
           uv tool dir --bin >> "$GITHUB_PATH"
           echo "RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
-      # The same separately released machine server runs locally and on providers.
-      # Development runs can supply a built agent; shipping CI verifies immutable public bytes.
-      - name: Machine agent
+          # Fetch the exact TensorFS version selected alongside this Runtime.
+          tensorfs_version=$("$(uv tool dir)/cozy-runtime/bin/python" -c 'from importlib.metadata import version; print(version("tensorfs"))')
+          read -r url sha < <(curl -fsS "https://pypi.org/pypi/tensorfs/$tensorfs_version/json" |
+            jq -er '[.urls[] | select(.yanked == false) | select(.filename | contains("cp312-abi3-manylinux") and endswith("x86_64.whl"))] |
+              if length == 1 then .[0] | "\(.url) \(.digests.sha256)" else error("expected one native TensorFS wheel") end')
+          test -n "$url" && test -n "$sha"
+          tensorfs_wheel="$RUNNER_TEMP/${url##*/}"
+          curl -fsSLo "$tensorfs_wheel" "$url"
+          echo "$sha  $tensorfs_wheel" | sha256sum -c
+          echo "TENSORFS_WHEEL=$tensorfs_wheel" >> "$GITHUB_ENV"
+      - name: Bundled machine agent
         run: |
-          if [ -n "${COZY_TEST_POD_SUPERVISOR:-}" ]; then
-            test -x "$COZY_TEST_POD_SUPERVISOR"
-            echo "MACHINE_HOST=$COZY_TEST_POD_SUPERVISOR" >> "$GITHUB_ENV"
-          else
-            release=machine-v0.1.1
-            curl -fsSLo "$RUNNER_TEMP/machine-agent.json" "https://github.com/cozy-creator/cozy/releases/download/$release/machine-agent.json"
-            read -r url sha < <(jq -r '.platforms["linux-amd64"] | "\(.url) \(.sha256)"' "$RUNNER_TEMP/machine-agent.json")
-            curl -fsSLo "$RUNNER_TEMP/cozy-machine" "$url"
-            echo "$sha  $RUNNER_TEMP/cozy-machine" | sha256sum -c
-            chmod 755 "$RUNNER_TEMP/cozy-machine"
-            echo "MACHINE_HOST=$RUNNER_TEMP/cozy-machine" >> "$GITHUB_ENV"
-          fi
+          python3 scripts/ci-machine-agent.py "$RUNTIME_WHEEL" "$RUNNER_TEMP/cozy-machine"
+          echo "MACHINE_HOST=$RUNNER_TEMP/cozy-machine" >> "$GITHUB_ENV"
       # The runner's service cgroup is not delegated; Runtime's executor containment needs its own subtree.
       - name: Product tests
         run: |
           args=(-j 3 -machine-host="$MACHINE_HOST" -require-machine-host
-            -script-runtime-wheel="$RUNTIME_WHEEL" -child-runtime-wheel="$RUNTIME_WHEEL")
+            -machine-runtime-wheel="$RUNTIME_WHEEL" -machine-tensorfs-wheel="$TENSORFS_WHEEL"
+            -script-runtime-wheel="$RUNTIME_WHEEL" -child-runtime-wheel="$RUNTIME_WHEEL"
+            -child-tensorfs-wheel="$TENSORFS_WHEEL" -tensorfs-fixture-wheel="$TENSORFS_WHEEL")
           [ "$FULL" = true ] || args+=(-test.short)
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-product-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \

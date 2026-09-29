@@ -1,7 +1,9 @@
 package producttest
 
 import (
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -11,13 +13,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
-// oldestRuntime is the oldest released Runtime this Creator serves (the run output log, 0.18.73).
-const oldestRuntime = "0.18.73"
+// retiredRuntime predates the wheel-owned agent and stable bootstrap contracts.
+const retiredRuntime = "0.18.73"
 
 // publishedWheel is one distribution's released linux x86_64 wheel from PyPI, verified by its
 // digest and kept for the run: the bytes `cozy machine install` puts on a machine.
@@ -66,67 +69,45 @@ func sha256Hex(raw []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Version skew is allowed: this Creator runs unpublished and published packages, one of them
-// with an org-relative Model default, on machines running the oldest Runtime it serves, both
-// this computer's and a rental, with the real Host. The packages lock the published Runtime.
-func TestTheOldestServedRuntimeRunsUnpublishedAndPublishedPackages(t *testing.T) {
-	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host: the pod-supervisor both machines run")
+// A retired SDK is not a supported machine installation just because its wire
+// range overlaps. The real CLI refuses missing bootstrap capability before any
+// machine process or execution exists; older read/cancel contracts stay separate.
+func TestRetiredRuntimeBootstrapRefusesBeforeAnyWork(t *testing.T) {
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Skip("uv lays out the isolated machine")
 	}
-	source := machines.Source{Host: *machineHostBinary, RuntimeWheel: publishedWheel(t, hostruntime.Distribution, oldestRuntime),
-		TensorFSWheel: publishedWheel(t, "tensorfs", "0.3.74")}
-	h, root, _, _ := parityMachinesOn(t, source)
-	python := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "python")
-	var resolved string
-	for _, store := range []string{filepath.Join(root, "tensorfs"), filepath.Join(h.provider, "var", "lib", "tensorfs")} {
-		out, err := exec.Command(python, "-I", "-c", seedCheckpoint, store).CombinedOutput()
-		if err != nil {
-			t.Fatalf("seeding %s: %v\n%s", store, err, out)
+	runtime := publishedWheel(t, hostruntime.Distribution, retiredRuntime)
+	tensorfs := publishedWheel(t, "tensorfs", "0.3.74")
+	root := t.TempDir()
+	// Do not let the test helper auto-provision a current fixture into this
+	// intentionally empty machine root; this command tests first installation.
+	must(t, os.Mkdir(filepath.Join(root, "machine"), 0700))
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, cozyBin, "machine", "install", "--runtime-wheel", runtime, "--tensorfs-wheel", tensorfs, "--json")
+	command.Env = childEnv(t, root)
+	out, err := command.CombinedOutput()
+	if ctx.Err() != nil || err == nil || !strings.Contains(string(out), "machine.agent_update_required") || !strings.Contains(string(out), machines.BootstrapCapability) {
+		t.Fatalf("retired bootstrap did not refuse its missing capability: %v %s", err, out)
+	}
+	for _, name := range []string{"installed.json", "agent.json", "owner.pem"} {
+		if _, err := os.Stat(filepath.Join(root, "machine", name)); !os.IsNotExist(err) {
+			t.Fatalf("refused bootstrap created %s", name)
 		}
-		resolved = strings.TrimSpace(string(out))
 	}
-	h.mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"name":"proof"}`))
-	})
-	doors := h.worker.Config.Handler
-	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/models/resolve" && r.URL.Query().Get("ref") == "proof/probe@1.0.0" && r.URL.Query().Get("lane") == "bf16" {
-			var body map[string]any
-			must(t, json.Unmarshal([]byte(resolved), &body))
-			body["model"], body["release"], body["lane"] = "proof/probe", "1.0.0", "bf16"
-			_ = json.NewEncoder(w).Encode(body)
-			return
-		}
-		doors.ServeHTTP(w, r)
-	})
-
-	released := machines.Source{}
-	if code, out := runCozy(t, root, "package", "install", parityProjectOn(t, released), "--editable"); code != 0 {
-		t.Fatalf("editable install [exit %d]\n%s", code, out)
+	path := filepath.Join(root, "creator.sqlite")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return
 	}
-	probe := probeProjectOn(t, released, "probe@1.0.0/bf16")
-	pyproject := filepath.Join(probe, "pyproject.toml")
-	raw, err := os.ReadFile(pyproject)
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
 	must(t, err)
-	must(t, os.WriteFile(pyproject, []byte(strings.Replace(string(raw), `name="machine-parity"`, `name="skew-probe"`, 1)), 0o600))
-	if out, err := exec.Command("uv", "lock", "--project", probe).CombinedOutput(); err != nil {
-		t.Fatalf("locking the probe: %v\n%s", err, out)
+	defer db.Close()
+	var tables, accepted int
+	must(t, db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='machine_executions'").Scan(&tables))
+	if tables != 0 {
+		must(t, db.QueryRow("SELECT count(*) FROM machine_executions WHERE length(submission)>0 OR length(receipt)>0").Scan(&accepted))
 	}
-	if code, out := runCozy(t, root, "package", "install", probe, "--editable"); code != 0 {
-		t.Fatalf("editable probe install [exit %d]\n%s", code, out)
-	}
-	publishParityRelease(t, h, root, parityProjectOn(t, released))
-	for venue, args := range map[string][]string{"local": nil, "rental": {"--rental=tessa"}} {
-		for _, call := range []struct{ target, input, want string }{
-			{"local/machine-parity/add", "value=41", `"value":42`},
-			{"local/machine-parity/echo", "value=41", `"value":82`},
-			{"local/skew-probe/touch", "value=1", `"value":2`},
-			{parityPublished + "/add", "value=41", `"value":42`},
-		} {
-			code, out := runCozy(t, root, append([]string{"run", call.target, call.input, "--await", "--json"}, args...)...)
-			if code != 0 || !strings.Contains(out, call.want) {
-				t.Fatalf("%s on the %s %s machine [exit %d]\n%s", call.target, oldestRuntime, venue, code, out)
-			}
-		}
+	if accepted != 0 {
+		t.Fatal("unsupported bootstrap froze or accepted work")
 	}
 }

@@ -86,17 +86,27 @@ func handleAuthLogout(ctx *Context) *exit.Error {
 	if forgotten := manager.Forget(); forgotten != nil {
 		return forgotten
 	}
-	if err := machines.ForgetExecutionAccess(home.Paths(ctx.Cfg.Home).Machine); err != nil {
-		return exit.Internalf("cannot erase this machine's execution access: %s", err)
+	machine := machines.NewHost(home.Paths(ctx.Cfg.Home).Machine, "", nil)
+	hctx, cancel = hub.Context()
+	pending, cleanupProblem := machine.ForgetExecutionAccess(hctx, ctx.Cfg.HubURL)
+	cancel()
+	if cleanupProblem != nil && !pending {
+		return cleanupProblem
 	}
 	record := compactRecord([]output.Field{
 		{K: "status", V: "logged out"},
 		{K: "email", V: session.Email},
 		{K: "hub", V: ctx.Cfg.HubURL},
 	}, "status", "email")
+	if pending {
+		note := "This Hub's client cache is erased; machine-side access removal is queued until the current agent is reachable and idle."
+		if cleanupProblem != nil {
+			note += " " + cleanupProblem.Message
+		}
+		record.Notes = append(record.Notes, note)
+	}
 	if problem != nil && problem.ErrName() != "auth.machine_key_missing" {
-		record.Notes = append(record.Notes, "Tensorhub did not confirm revoking this machine key ("+problem.Message+
-			"); the local credential is erased. `cozy auth revoke-other-machines` from another login revokes it server-side")
+		record.Notes = append(record.Notes, "Tensorhub did not confirm revoking this machine key; the local credential is erased. `cozy auth revoke-other-machines` from another login revokes it server-side")
 	}
 	return emit(ctx, record)
 }

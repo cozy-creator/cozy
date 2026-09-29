@@ -49,7 +49,7 @@ func machineOutputs(t *testing.T, root, run, output string) (outputReader, strin
 	var record struct {
 		WorkerPort int `json:"worker_port"`
 	}
-	raw, err := os.ReadFile(filepath.Join(layout.Machine, "host.json"))
+	raw, err := os.ReadFile(filepath.Join(layout.Machine, "agent.json"))
 	must(t, err)
 	must(t, json.Unmarshal(raw, &record))
 	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
@@ -142,9 +142,9 @@ func machineServesOutput(t *testing.T, root, output, digest string, revisions in
 	return run
 }
 
-// machineServesOutputAsleep stops the machine's Runtime, leaving the machine up, and reads a
-// finished run's output again: the machine serves it from the log it kept and the TensorFS
-// store, starts no Runtime, and leaves its idle deadline where it was.
+// machineServesOutputAsleep makes this fixture's Runtime structurally unavailable
+// while its machine remains up. Finished output reads still serve their bytes/ranges
+// from retained state and neither relaunch Runtime nor renew the idle ledger.
 func machineServesOutputAsleep(t *testing.T, root, run, output, digest string, revisions int) {
 	t.Helper()
 	if run == "" {
@@ -154,28 +154,48 @@ func machineServesOutputAsleep(t *testing.T, root, run, output, digest string, r
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	var record struct {
-		PID int `json:"pid"`
+		PID        int `json:"pid"`
+		WorkerPort int `json:"worker_port"`
 	}
-	raw, err := os.ReadFile(filepath.Join(layout.Machine, "host.json"))
+	raw, err := os.ReadFile(filepath.Join(layout.Machine, "agent.json"))
 	must(t, err)
 	must(t, json.Unmarshal(raw, &record))
-	log := filepath.Join(layout.Machine, "host.log")
-	// A Runtime that keeps exiting without work is not relaunched, and the machine stays up.
-	for kills := 0; !strings.Contains(readText(log), "is not relaunched"); kills++ {
-		if kills == 6 {
-			t.Fatalf("the machine kept relaunching its Runtime:\n%s", readText(log))
-		}
-		var pid int
-		landed(t, "a Runtime to stop", func() bool {
-			pid = runtimeChild(record.PID)
-			return pid != 0 || strings.Contains(readText(log), "is not relaunched")
-		})
-		if pid != 0 {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-			landed(t, "the Runtime's exit", func() bool { return runtimeChild(record.PID) != pid })
-		}
+	host := machines.NewHost(layout.Machine, "", nil)
+	state, problem := host.Status()
+	fatal(t, problem)
+	pin, problem := host.Pin()
+	fatal(t, problem)
+	owner, problem := host.Owner()
+	fatal(t, problem)
+	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
+	must(t, err)
+	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
+	defer transport.CloseIdleConnections()
+	maintenance := &machines.Maintenance{Base: fmt.Sprintf("https://127.0.0.1:%d", record.WorkerPort), Machine: state.MachineID, Public: ed25519.PublicKey(public), Sign: owner.Sign, Client: &http.Client{Transport: transport, Timeout: 5 * time.Second}}
+	// Ordinary SIGKILL is recoverable. Instead, arrange the documented launch
+	// refusal while keeping version/capability probes and read helpers functional.
+	entry := filepath.Join(host.Root(), "opt/cozy/bin/cozy-runtime-worker")
+	original := entry + ".output-proof-original"
+	witness := filepath.Join(host.Root(), "tmp/output-proof-runtime-refused")
+	must(t, os.Rename(entry, original))
+	t.Cleanup(func() { _ = os.Remove(entry); must(t, os.Rename(original, entry)) })
+	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
+	wrapper := "#!/bin/sh\nif [ \"$#\" -eq 0 ]; then\n : > " + quote(witness) + "\n exit 6\nfi\nexec " + quote(original) + " \"$@\"\n"
+	must(t, os.WriteFile(entry, []byte(wrapper), 0755))
+	var pid int
+	landed(t, "the fixture Runtime to stop", func() bool { pid = runtimeChild(record.PID); return pid != 0 })
+	command, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	must(t, err)
+	if !strings.Contains(string(command), filepath.Join(host.Root(), "opt/cozy")+"/") {
+		t.Fatal("selected Runtime does not belong to this fixture")
 	}
-	idle := filepath.Join(layout.Machine, "root", "var/lib/cozy/machine/idle.json")
+	must(t, syscall.Kill(pid, syscall.SIGKILL))
+	landed(t, "structural Runtime refusal with the authenticated machine still available", func() bool {
+		observed, problem := maintenance.State(t.Context())
+		_, witnessErr := os.Stat(witness)
+		return problem == nil && observed.Phase == "failed" && runtimeChild(record.PID) == 0 && witnessErr == nil
+	})
+	idle := filepath.Join(host.Root(), "var/lib/cozy/machine/idle.json")
 	before := readText(idle)
 	reader, _ := machineOutputs(t, root, run, output)
 	checkOutput(t, reader, digest, revisions)
@@ -185,7 +205,7 @@ func machineServesOutputAsleep(t *testing.T, root, run, output, digest string, r
 	if after := readText(idle); after != before {
 		t.Fatalf("reading a finished run's output moved the idle ledger:\n%s\n%s", before, after)
 	}
-	t.Logf("run %s's %s served with the machine's Runtime stopped", run, output)
+	t.Logf("run %s's %s served while Runtime was unavailable for structural repair", run, output)
 }
 
 // runtimeChild is the Runtime the machine process runs, or 0.

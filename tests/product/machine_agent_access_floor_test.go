@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -26,16 +27,17 @@ import (
 func TestOldAgentCannotReceiveDelegatedAuthority(t *testing.T) {
 	for _, release := range []struct {
 		version, module string
+		capabilities    []string
 		safe            bool
-	}{{"", machines.AgentModule, false}, {"0.1.0", machines.AgentModule, false}, {"0.1.1", machines.AgentModule, true},
-		{"0.2.0+dev", machines.AgentModule, true}, {"0.1.14", "github.com/cozy-creator/cozy", false}} {
+	}{{"", machines.AgentModule, nil, false}, {"9.0.0", machines.AgentModule, nil, false}, {"0.1.0", machines.AgentModule, []string{machines.HubAccessCapability}, true},
+		{"0.2.0+dev", machines.AgentModule, []string{machines.HubAccessCapability}, true}, {"0.1.14", "github.com/cozy-creator/cozy", nil, false}} {
 		t.Run(release.version, func(t *testing.T) {
 			version := release.version
 			var minted, attached atomic.Int32
 			var account *httptest.Server
 			account = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				minted.Add(1)
-				_ = json.NewEncoder(w).Encode(map[string]any{"token": "scoped-fixture", "expires_at": time.Now().Add(time.Hour),
+				_ = json.NewEncoder(w).Encode(map[string]any{"token": executionGrantToken(account.URL, "fixture-account", 1), "expires_at": time.Now().Add(time.Hour),
 					"environment": map[string]string{"TENSORHUB_ORIGIN": account.URL}})
 			}))
 			defer account.Close()
@@ -43,7 +45,7 @@ func TestOldAgentCannotReceiveDelegatedAuthority(t *testing.T) {
 			var machine *httptest.Server
 			machine = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/v1/bootstrap/receipt" {
-					payload, _ := json.Marshal(map[string]any{"pod_boot_id": "fixture-boot", "machine_version": version,
+					payload, _ := json.Marshal(map[string]any{"pod_boot_id": "fixture-boot", "machine_version": version, "machine_capabilities": release.capabilities,
 						"worker_internal_port":       machine.Listener.Addr().(*net.TCPAddr).Port,
 						"tls_certificate_der_base64": base64.StdEncoding.EncodeToString(machine.TLS.Certificates[0].Certificate[0])})
 					mac := hmac.New(sha256.New, key)
@@ -68,16 +70,23 @@ func TestOldAgentCannotReceiveDelegatedAuthority(t *testing.T) {
 			defer machine.Close()
 			dir := t.TempDir()
 			host := machines.NewHost(dir, "", nil)
+			_, ownerProblem := host.Owner()
+			fatal(t, ownerProblem)
 			binary := filepath.Join(host.Root(), "usr/local/bin/cozy-machine")
-			self, err := os.Executable()
+			self, err := exec.LookPath("sleep")
 			must(t, err)
 			must(t, os.MkdirAll(filepath.Dir(binary), 0755))
-			must(t, os.Symlink(self, binary))
+			data, err := os.ReadFile(self)
+			must(t, err)
+			must(t, os.WriteFile(binary, data, 0755))
+			process := exec.Command(binary, "3600")
+			must(t, process.Start())
+			t.Cleanup(func() { _ = process.Process.Kill(); _ = process.Wait() })
 			port := machine.Listener.Addr().(*net.TCPAddr).Port
-			record, err := json.Marshal(map[string]any{"pid": os.Getpid(), "worker_id": "fixture-machine", "worker_port": port,
+			record, err := json.Marshal(map[string]any{"pid": process.Process.Pid, "worker_id": "fixture-machine", "worker_port": port,
 				"media_port": port, "receipt_key": base64.RawURLEncoding.EncodeToString(key)})
 			must(t, err)
-			must(t, os.WriteFile(filepath.Join(dir, "host.json"), record, 0600))
+			must(t, os.WriteFile(filepath.Join(dir, "agent.json"), record, 0600))
 			installed, err := json.Marshal(map[string]any{"host": map[string]string{"name": "cozy-machine", "module": release.module}, "host_pinned": true})
 			must(t, err)
 			must(t, os.WriteFile(filepath.Join(dir, "installed.json"), installed, 0600))
