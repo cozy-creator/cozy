@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -145,14 +146,16 @@ func reapMachineRuntimeRoot(root string) bool {
 	if resolved, err := filepath.EvalSymlinks(machine); err == nil {
 		machine = resolved
 	}
-	host := filepath.Join(machine, "root", "usr", "local", "bin", "pod-supervisor")
+	// The Host runs as pod-supervisor, a symlink to the cozy it installed or a Host binary itself.
+	bin := filepath.Join(machine, "root", "usr", "local", "bin")
+	hosts := []string{filepath.Join(bin, "pod-supervisor"), filepath.Join(bin, "cozy")}
 	var owned []int
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil {
 			continue
 		}
-		if exe, err := os.Readlink("/proc/" + entry.Name() + "/exe"); err != nil || strings.TrimSuffix(exe, " (deleted)") != host {
+		if exe, err := os.Readlink("/proc/" + entry.Name() + "/exe"); err != nil || !slices.Contains(hosts, strings.TrimSuffix(exe, " (deleted)")) {
 			continue
 		}
 		process, _ := os.FindProcess(pid)

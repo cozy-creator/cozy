@@ -238,7 +238,7 @@ func stubMachine(t *testing.T, root, script string) {
 	must(t, os.MkdirAll(filepath.Dir(binary), 0o755))
 	must(t, os.WriteFile(binary, []byte(script), 0o700)) //cozy:allow sentinel Host proves whether a launch was attempted
 	for name, body := range map[string]string{
-		"installed.json":    `{"host":{"name":"pod-supervisor"}}`,
+		"installed.json":    `{"host":{"name":"pod-supervisor"},"host_pinned":true}`,
 		"registration.json": `{"hub":"` + testDefaultHub + `","id":"om-stub","worker_token":"` + strings.Repeat("A", 43) + `"}`,
 		"environment.json":  `{"TENSORHUB_ORIGIN":"https://hub.invalid"}`,
 	} {
