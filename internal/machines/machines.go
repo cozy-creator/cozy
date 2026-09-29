@@ -407,7 +407,7 @@ func (m *Machine) ValidateNewWork() *exit.Error {
 		return orchestrator.ValidateWorkerProtocol(m.Protocol, m.Name)
 	}
 	if problem := orchestrator.ValidateWorkerProtocol(m.Protocol, ""); problem != nil {
-		return problem.WithRemedy("install the current worker cohort: cozy machine install --host <pod-supervisor>")
+		return problem.WithRemedy("install the current worker cohort: cozy machine install")
 	}
 	return nil
 }
@@ -430,7 +430,7 @@ func Transport(err error) *exit.Error {
 // RuntimeUpdate names how the owner updates a machine's Runtime.
 func RuntimeUpdate(name string) string {
 	if IsLocal(name) {
-		return "run `cozy machine install --host <pod-supervisor>` first"
+		return "run `cozy machine install` first"
 	}
 	return "run `cozy rental update " + name + "` first"
 }

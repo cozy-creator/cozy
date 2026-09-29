@@ -33,7 +33,7 @@ type MachineCmd struct {
 }
 
 type MachineInstallCmd struct {
-	Host          string `name:"host" predictor:"file" help:"The cohort's pod-supervisor binary."`
+	Host          string `name:"host" predictor:"file" help:"Development only: run this cozy build as the machine's Host; default: this cozy."`
 	RuntimeWheel  string `name:"runtime-wheel" predictor:"file" help:"The cohort's Runtime wheel; default: the published Runtime."`
 	TensorFSWheel string `name:"tensorfs-wheel" predictor:"file" help:"The cohort's TensorFS wheel, with --runtime-wheel."`
 }

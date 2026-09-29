@@ -29,7 +29,7 @@ import (
 )
 
 var (
-	machineHostBinary    = flag.String("machine-host", "", "pod-supervisor binary every test root's local machine runs")
+	machineHostBinary    = flag.String("machine-host", "", "a cozy build every test root's local machine runs as its Host")
 	requireMachineHost   = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
 	machineRuntimeWheel  = flag.String("machine-runtime-wheel", "", "Runtime wheel the test machines run; default: the published Runtime")
 	machineTensorFSWheel = flag.String("machine-tensorfs-wheel", "", "TensorFS wheel paired with -machine-runtime-wheel")
@@ -52,7 +52,7 @@ func machineTemplateDir(t *testing.T) string {
 			machineTemplate.problem = exit.New(exit.NotFound, "uv lays out the test machines: %s", err)
 			return
 		}
-		source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}
+		source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel, Pinned: true}
 		_, machineTemplate.problem = machines.NewHost(machineTemplate.dir, "", nil).Install(context.Background(), source, uv)
 	})
 	fatal(t, machineTemplate.problem)
@@ -212,7 +212,7 @@ func skipWithoutMachine(t *testing.T, code int, output string) {
 	if *requireMachineHost {
 		t.Fatalf("local execution needs this computer's machine and the run has no -machine-host:\n%s", output)
 	}
-	t.Skip("local execution runs on this computer's machine; pass -machine-host=<pod-supervisor>")
+	t.Skip("local execution runs on this computer's machine; pass -machine-host=<cozy build>")
 }
 
 // A run that requires the machine Host proves it has one before any test relies on it.

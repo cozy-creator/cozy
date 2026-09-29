@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"os/exec"
 	"path/filepath"
@@ -38,8 +39,16 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		}
 		*target = absolute
 	}
-	if source.Host == "" {
-		return exit.Usagef("--host is required: the worker cohort's pod-supervisor binary")
+	// The machine's Host is this cozy binary; --host pins another cozy build, for development.
+	if source.Pinned = source.Host != ""; !source.Pinned {
+		self, err := machines.Self()
+		if err != nil {
+			return exit.Internalf("cannot locate the cozy binary: %s", err)
+		}
+		source.Host = self
+	} else if module := machines.HostModule(source.Host); module != machines.CozyModule {
+		return exit.Usagef("--host %s is not a cozy binary (%s): the machine's Host is cozy itself", source.Host, cmp.Or(module, "not a Go program")).
+			WithRemedy("omit --host to install this cozy")
 	}
 	uv, err := exec.LookPath("uv")
 	if err != nil {

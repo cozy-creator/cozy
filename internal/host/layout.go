@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -68,6 +69,10 @@ func prepare(g *Grant, l Layout) (*Identity, error) {
 		}
 	}
 	bootID, err := persistent(filepath.Join(l.State, "boot-id"), func() ([]byte, error) {
+		// A root the tensorhub Host booted keeps that lifetime; its Runtime's history names it.
+		if raw, err := os.ReadFile(l.boot("pod-boot-id")); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+			return bytes.TrimSpace(raw), nil
+		}
 		raw := make([]byte, 32)
 		_, err := rand.Read(raw)
 		return []byte(base64.RawURLEncoding.EncodeToString(raw)), err
