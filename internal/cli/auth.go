@@ -8,7 +8,9 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
@@ -83,6 +85,9 @@ func handleAuthLogout(ctx *Context) *exit.Error {
 	}
 	if forgotten := manager.Forget(); forgotten != nil {
 		return forgotten
+	}
+	if err := machines.ForgetExecutionAccess(home.Paths(ctx.Cfg.Home).Machine); err != nil {
+		return exit.Internalf("cannot erase this machine's execution access: %s", err)
 	}
 	record := compactRecord([]output.Field{
 		{K: "status", V: "logged out"},

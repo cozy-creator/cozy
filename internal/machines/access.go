@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
@@ -19,6 +20,17 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 )
+
+const executionAccessFile = "execution-access.json"
+
+// ForgetExecutionAccess erases machineDir's cached execution access for every Hub. Each
+// grant is bound to the login that minted it; the next run after a login mints its own.
+func ForgetExecutionAccess(machineDir string) error {
+	if err := os.Remove(filepath.Join(machineDir, executionAccessFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
 
 type executionAccess struct {
 	Origin      string            `json:"origin"`
@@ -51,7 +63,7 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 		return "", exit.Named(exit.Credential, "machine.execution_access_required", "running work from %s requires account-authorized execution access", origin)
 	}
 	all := map[string]executionAccess{}
-	raw, err := os.ReadFile(h.path("execution-access.json"))
+	raw, err := os.ReadFile(h.path(executionAccessFile))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", exit.Internalf("cannot read execution access cache: %s", err)
 	}
@@ -130,7 +142,7 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	if refresh {
 		all[origin] = grant
 		raw, _ = json.Marshal(all)
-		if err := writePrivate(h.path("execution-access.json"), raw); err != nil {
+		if err := writePrivate(h.path(executionAccessFile), raw); err != nil {
 			return "", exit.Internalf("cannot retain execution access: %s", err)
 		}
 	}
