@@ -94,3 +94,11 @@ func TestPackageReopenRecordsElapsedTimeAndPreservesRefusal(t *testing.T) {
 		})
 	}
 }
+
+func TestSubmissionTimingNeedsNoRecorder(t *testing.T) {
+	// A protocol-only connection can have no run recorder. Observation must not
+	// turn a completed RPC into a panic in such a caller.
+	var absent *machineRuns
+	absent.submissionStage("req", "workspace lookup", "", time.Now())
+	(&machineRuns{}).submissionStage("req", "workspace lookup", "", time.Now())
+}
