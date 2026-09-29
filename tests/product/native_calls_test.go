@@ -6,8 +6,22 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+// A newer Runtime's effect request carries members this cozy does not read: the effect is
+// still resolved by the members it does.
+func TestPublicationEffectsFromANewerRuntimeAreRead(t *testing.T) {
+	for operation, raw := range map[string]string{
+		"publish_release":   `{"destination":"alice/model","release":"v1","lanes":{},"visibility":"public"}`,
+		"upload_checkpoint": `{"destination":"alice/model","artifact":{},"resumable":true}`,
+	} {
+		if ref, problem := publication.EffectDestination(operation, []byte(raw)); problem != nil || ref.String() != "alice/model" {
+			t.Fatalf("%s from a newer Runtime: %v", operation, problem)
+		}
+	}
+}
 
 func TestAcceptedPublicationCallRefusesChangedInputsBeforeReexecution(t *testing.T) {
 	for _, phase := range []string{"accepted", "frozen", "executing"} {
