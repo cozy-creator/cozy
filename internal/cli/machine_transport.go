@@ -71,6 +71,30 @@ func (m *machineRuns) connectAtHub(ctx context.Context, name, hub, holder string
 	return m.connectAt(ctx, name, hub, holder, true)
 }
 
+// adoptLocalHost makes this cozy the machine's Host when it runs another (an older build, or
+// the tensorhub pod-supervisor), once no run's work is on the machine.
+func (m *machineRuns) adoptLocalHost(ctx context.Context) {
+	if !m.machines.Host.Outdated() {
+		return
+	}
+	active, problem := m.store.ActiveRequests()
+	if problem != nil {
+		return
+	}
+	idle := true
+	for _, request := range active {
+		if link, problem := m.store.MachineExecution(request.ID); request.Worker == machines.Local && problem == nil && link != nil && len(link.Submission) > 0 {
+			idle = false
+			break
+		}
+	}
+	if adopted, problem := m.machines.Host.Adopt(ctx, idle); problem != nil {
+		fmt.Fprintf(m.context.Out, "the machine keeps its Host: %s\n", problem.Message)
+	} else if adopted {
+		m.machines.Forget(machines.Local)
+	}
+}
+
 // localHubFree keeps this computer's machine at its hub while it holds another hub's work
 // and cannot do this work where it is: moving its Host ends everything it holds. The work
 // waits for that to end.
@@ -96,6 +120,9 @@ func (m *machineRuns) localHubFree(request records.Request, named bool) *exit.Er
 }
 
 func (m *machineRuns) connectAt(ctx context.Context, name, hub, holder string, named bool) (*machineConnection, *exit.Error) {
+	if machines.IsLocal(name) {
+		m.adoptLocalHost(ctx)
+	}
 	machine, problem := m.machines.DialAt(ctx, name, hub, holder, named)
 	if problem != nil {
 		return nil, problem

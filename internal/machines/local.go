@@ -2,9 +2,11 @@ package machines
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -87,14 +89,18 @@ func (h *Host) readinessEnvelope() string {
 const RuntimeFloor = "0.18.53"
 
 // Source is one cohort's worker artifacts: the Host binary and the Runtime and TensorFS
-// wheels a pod image carries. Without wheels, the published Runtime is installed.
+// wheels a pod image carries. Without wheels, the published Runtime is installed. The Host is
+// the cozy binary itself; Pinned keeps a Host named for development in place of the cozy that
+// runs this machine later (Adopt).
 type Source struct {
 	Host, RuntimeWheel, TensorFSWheel string
+	Pinned                            bool
 }
 
 type installedArtifact struct {
 	Name   string `json:"name"`
 	SHA256 string `json:"sha256"`
+	Module string `json:"module,omitempty"` // a Host's Go main module
 }
 
 // Installed names the artifacts the root holds.
@@ -103,6 +109,126 @@ type Installed struct {
 	Runtime     installedArtifact `json:"runtime"`
 	TensorFS    installedArtifact `json:"tensorfs"`
 	InstalledAt time.Time         `json:"installed_at"`
+	HostPinned  bool              `json:"host_pinned,omitempty"`
+}
+
+// CozyModule is the Go module of the cozy binary, which is also every machine's Host.
+const CozyModule = "github.com/cozy-creator/cozy"
+
+// HostModule is the Go main module a Host binary was built from, "" when it is not Go.
+func HostModule(path string) string {
+	info, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return info.Main.Path
+}
+
+// Self is the cozy binary this process runs, the Host it installs and adopts.
+func Self() (string, error) {
+	self, err := os.Executable()
+	return strings.TrimSuffix(self, " (deleted)"), err
+}
+
+var selfDigest = sync.OnceValue(func() string {
+	self, err := Self()
+	if err != nil {
+		return ""
+	}
+	digest, _ := fileDigest(self)
+	return digest
+})
+
+// placeHost puts a Host binary where the launcher runs it. The cozy binary is kept as
+// usr/local/bin/cozy and runs as pod-supervisor, the name the launch contract starts it by;
+// any other Host is pod-supervisor itself.
+func (h *Host) placeHost(source string) (installedArtifact, error) {
+	digest, err := fileDigest(source)
+	if err != nil {
+		return installedArtifact{}, err
+	}
+	artifact := installedArtifact{Name: filepath.Base(source), SHA256: digest, Module: HostModule(source)}
+	bin := filepath.Join(h.Root(), "usr/local/bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		return artifact, err
+	}
+	if artifact.Module != CozyModule {
+		_ = os.Remove(filepath.Join(bin, "cozy"))
+		return artifact, copyFile(source, h.binary(), 0o755)
+	}
+	if err := copyFile(source, filepath.Join(bin, "cozy"), 0o755); err != nil {
+		return artifact, err
+	}
+	link := h.binary() + ".new"
+	_ = os.Remove(link)
+	if err := os.Symlink("cozy", link); err != nil {
+		return artifact, err
+	}
+	return artifact, os.Rename(link, h.binary())
+}
+
+// Adopt makes this cozy binary the machine's Host when the installed Host is another program
+// (the tensorhub pod-supervisor, before one binary) or another cozy build, unless a
+// development install pinned it. A running Host is replaced only when the machine is idle, stopped by
+// its recorded PID; the next use launches this one. Runs, installs and the TensorFS store stay.
+func (h *Host) Adopt(ctx context.Context, idle bool) (bool, *exit.Error) {
+	if !h.Outdated() {
+		return false, nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	unlock, problem := h.lock(ctx)
+	if problem != nil {
+		return false, problem
+	}
+	defer unlock()
+	record, problem := h.record()
+	if problem != nil {
+		return false, problem
+	}
+	if running := record != nil && h.alive(record.PID); running && !idle {
+		return false, nil
+	}
+	return h.adoptLocked(ctx)
+}
+
+// Outdated says whether Adopt would replace the installed Host: it is not this cozy, and no
+// development install pinned it.
+func (h *Host) Outdated() bool {
+	installed, problem := h.Installed()
+	if problem != nil || installed == nil || installed.HostPinned || selfDigest() == "" {
+		return false
+	}
+	return installed.Host.SHA256 != selfDigest()
+}
+
+func (h *Host) adoptLocked(ctx context.Context) (bool, *exit.Error) {
+	if !h.Outdated() {
+		return false, nil
+	}
+	installed, problem := h.Installed()
+	if problem != nil {
+		return false, problem
+	}
+	module := cmp.Or(installed.Host.Module, HostModule(h.binary()))
+	self, err := Self()
+	if err != nil {
+		return false, nil
+	}
+	if problem := h.stopLocked(ctx); problem != nil {
+		return false, problem
+	}
+	was := installed.Host.Name
+	if installed.Host, err = h.placeHost(self); err != nil {
+		return false, exit.Internalf("cannot install cozy as the machine Host: %s", err)
+	}
+	installed.HostPinned = false
+	raw, _ := json.MarshalIndent(installed, "", "  ")
+	if err := writePrivate(h.path("installed.json"), raw); err != nil {
+		return false, exit.Internalf("cannot record the machine installation: %s", err)
+	}
+	h.note(fmt.Sprintf("the machine's Host is now %s (was %s %s)", self, was, module))
+	return true, nil
 }
 
 func (h *Host) Installed() (*Installed, *exit.Error) {
@@ -136,10 +262,11 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		source.RuntimeWheel != "" && (!strings.HasSuffix(source.RuntimeWheel, ".whl") || !strings.HasSuffix(source.TensorFSWheel, ".whl")) {
 		return nil, exit.New(exit.Validation, "the machine install names the Host binary, and both wheels or neither")
 	}
+	installed.HostPinned = source.Pinned
 	for _, artifact := range []struct {
 		path string
 		out  *installedArtifact
-	}{{source.Host, &installed.Host}, {source.RuntimeWheel, &installed.Runtime}, {source.TensorFSWheel, &installed.TensorFS}} {
+	}{{source.RuntimeWheel, &installed.Runtime}, {source.TensorFSWheel, &installed.TensorFS}} {
 		if artifact.path == "" {
 			continue
 		}
@@ -161,14 +288,16 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 			return nil, exit.Internalf("cannot lay out the machine root: %s", err)
 		}
 	}
-	if err := copyFile(source.Host, h.binary(), 0o755); err != nil {
+	host, err := h.placeHost(source.Host)
+	if err != nil {
 		return nil, exit.Internalf("cannot install the machine Host: %s", err)
 	}
+	installed.Host = host
 	var wheels []string
 	if source.RuntimeWheel != "" {
 		wheels = []string{source.RuntimeWheel, source.TensorFSWheel}
 	}
-	wheels, err := h.keepWheels(wheels)
+	wheels, err = h.keepWheels(wheels)
 	if err != nil {
 		return nil, exit.Internalf("cannot keep the machine's wheels: %s", err)
 	}
@@ -397,13 +526,17 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 }
 
 func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.Client) (*Launch, *exit.Error) {
+	// Nothing runs: the cozy binary takes over from any other Host first.
+	if _, problem := h.adoptLocked(ctx); problem != nil {
+		return nil, problem
+	}
 	installed, problem := h.Installed()
 	if problem != nil {
 		return nil, problem
 	}
 	if installed == nil {
 		return nil, exit.Named(exit.Structural, "machine.not_installed", "this computer has no machine installed").
-			WithRemedy("cozy machine install --host <pod-supervisor>")
+			WithRemedy("cozy machine install")
 	}
 	registered, problem := h.registration(ctx, hubOrigin, client)
 	if problem != nil {

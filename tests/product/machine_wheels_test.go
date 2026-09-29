@@ -3,7 +3,6 @@ package producttest
 import (
 	"archive/zip"
 	"bytes"
-	"cmp"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
@@ -51,8 +50,8 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 	dir := filepath.Join(root, "machine", "root", "opt", "cozy", "wheels")
 	install := func(wheels ...string) {
 		t.Helper()
-		// Without -machine-host the Host is installed and never launched.
-		args := []string{"machine", "install", "--host", cmp.Or(*machineHostBinary, cozyBin)}
+		// The Host is this cozy; without -machine-host it is installed and never launched.
+		args := []string{"machine", "install"}
 		if len(wheels) > 0 {
 			args = append(args, "--runtime-wheel", wheels[0], "--tensorfs-wheel", wheels[1])
 		}
@@ -74,6 +73,10 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 		slices.Sort(want)
 		if !slices.Equal(held, want) {
 			t.Fatalf("%s holds %v, want exactly %v", dir, held, want)
+		}
+		host := filepath.Join(root, "machine", "root", "usr", "local", "bin")
+		if link, _ := os.Readlink(filepath.Join(host, "pod-supervisor")); link != "cozy" || fileSHA(t, filepath.Join(host, "cozy")) != fileSHA(t, cozyBin) {
+			t.Fatalf("the machine's Host is not this cozy: pod-supervisor -> %q", link)
 		}
 	}
 	install(localBuild(t, runtime, "test1"), tensorfs)
