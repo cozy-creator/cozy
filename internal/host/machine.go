@@ -193,6 +193,10 @@ func (m *Machine) prepareLauncher() error {
 }
 
 func (m *Machine) launch() error {
+	// The payload is this launch's readiness: an earlier Runtime's must not stand for it.
+	if err := os.Remove(m.layout.boot("readiness-payload")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	p, err := m.launcher.launch()
 	if err != nil {
 		return err
