@@ -26,6 +26,11 @@ func TestCallPhaseProgressSeparatesWaitingPreparationAndExecution(t *testing.T) 
 		t.Fatal(got)
 	}
 	phase("call-one", "Render item", "preparing", 1, 90, 90, 0, 0)
+	phase("call-one", "Render item", "paused", 1, 100, 90, 10, 0)
+	if got := frame(1000); !strings.Contains(got, "Render item · paused · execution 0.0s") || strings.Contains(got, "✓ Render item") {
+		t.Fatal(got)
+	}
+	phase("call-one", "Render item", "preparing", 1, 110, 90, 20, 0)
 	if got := frame(120); !strings.Contains(got, "Render item · preparing 30s") {
 		t.Fatal(got)
 	}

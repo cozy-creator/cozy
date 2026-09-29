@@ -1032,8 +1032,8 @@ func callTimingText(call callPhaseEvent, at time.Time, complete bool) string {
 	switch phase {
 	case "running", "terminal":
 		phase, label = "running", "execution"
-	case "finalizing":
-		phase, label = "running", "finalizing · execution"
+	case "finalizing", "paused":
+		phase, label = "running", call.Phase+" · execution"
 	}
 	elapsed, known := call.duration(phase, at)
 	text := label
