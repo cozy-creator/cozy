@@ -514,6 +514,9 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 		if refused := (*receiptRefusal)(nil); errors.As(err, &refused) {
 			return nil, exit.New(exit.Credential, "the machine Host's readiness receipt did not verify: %s", err)
 		}
+		if gone := (*runtimeGone)(nil); errors.As(err, &gone) {
+			return nil, exit.Named(exit.Structural, "machine.runtime_gone", "%s", gone)
+		}
 		if !h.alive(record.PID) {
 			return nil, exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness")
 		}

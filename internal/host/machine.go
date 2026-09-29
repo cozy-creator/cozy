@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/proto"
 )
@@ -33,6 +34,7 @@ type Machine struct {
 	idle     *idle
 	restarts *restarts
 	log      io.Writer
+	words    *lastWords // the Runtime's output, remembering its last refusal
 	started  time.Time
 	owned    bool // an owned machine keeps serving after it releases; a rental ends
 
@@ -166,13 +168,14 @@ func (m *Machine) runtimeEnvironment() []string {
 // becomes the machine uid; everything after this runs unprivileged.
 func (m *Machine) prepareLauncher() error {
 	env := m.runtimeEnvironment()
+	m.words = &lastWords{Writer: m.log}
 	if os.Geteuid() == 0 {
 		if m.grant.Development && m.grant.DeveloperKey != "" {
 			if err := startSSH(m.grant.DeveloperKey, m.log); err != nil {
 				return err
 			}
 		}
-		g, err := startGuardian(m.layout.Runtime, m.layout.Root, env, m.log)
+		g, err := startGuardian(m.layout.Runtime, m.layout.Root, env, m.words)
 		if err != nil {
 			return err
 		}
@@ -187,7 +190,7 @@ func (m *Machine) prepareLauncher() error {
 			return err
 		}
 	} else {
-		m.launcher = &directLauncher{path: m.layout.Runtime, root: m.layout.Root, env: env, out: m.log}
+		m.launcher = &directLauncher{path: m.layout.Runtime, root: m.layout.Root, env: env, out: m.words}
 	}
 	return nil
 }
@@ -320,7 +323,7 @@ func (m *Machine) runtime(ctx context.Context) (*grpc.ClientConn, error) {
 				return nil, unavailable("runtime_updating", "this machine is updating its Runtime; ask again when it is done")
 			}
 			if m.restarts.gone() {
-				return nil, unavailable("runtime_gone", "this machine's Runtime exited twice without completing work; the machine is known idle")
+				return nil, refusal(codes.FailedPrecondition, "runtime_gone", m.runtimeGone())
 			}
 			m.poke()
 			select {
@@ -341,6 +344,19 @@ func (m *Machine) runtime(ctx context.Context) (*grpc.ClientConn, error) {
 }
 
 // poke asks the supervisor to launch a Runtime a call needs.
+// runtimeGone says why the Runtime cannot start. An owned machine then forgets it, so the
+// next run launches the Runtime again; a rental stays known idle.
+func (m *Machine) runtimeGone() string {
+	reason := "this machine's Runtime exited twice without completing work"
+	if words := m.words.last(); words != "" {
+		reason += ": " + words
+	}
+	if m.owned {
+		_ = m.restarts.clear()
+	}
+	return reason
+}
+
 func (m *Machine) poke() {
 	select {
 	case m.wake <- struct{}{}:

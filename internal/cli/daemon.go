@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -263,7 +264,7 @@ func startDaemonUnit(ctx *Context, self string, env []string) (*daemonChild, *ex
 	// The daemon entry is named by argv0; a unit runs its command's own name.
 	entry := filepath.Join(ctx.Cfg.Home, daemonProcessName)
 	if target, err := os.Readlink(entry); err != nil || target != self {
-		next := entry + ".new"
+		next := entry + ".new" + strconv.Itoa(os.Getpid()) // concurrent starts each rename their own
 		_ = os.Remove(next)
 		if err := os.Symlink(self, next); err != nil {
 			return nil, exit.Internalf("cannot name the daemon entry: %s", err)

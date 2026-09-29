@@ -102,3 +102,59 @@ func TestTheMachineCutsOverToTheCozyHost(t *testing.T) {
 		t.Fatalf("the machine's runs are not all listed after the cutover [exit %d]: %s", code, out)
 	}
 }
+
+// A machine whose Runtime cannot start (here a control history from another boot, as a Host
+// cutover once left it) fails the run with the Runtime's reason instead of waiting forever.
+// Once that is repaired, the next run wakes the same Host's Runtime.
+func TestARunFailsWhenTheMachinesRuntimeCannotStart(t *testing.T) {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host: a cozy build the machine runs as its Host")
+	}
+	uv, err := exec.LookPath("uv")
+	if err != nil {
+		t.Skip("uv lays out the machine root")
+	}
+	h := newMachineHub(t)
+	root, err := os.MkdirTemp("", "czg")
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
+		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		_ = removeAllForce(root)
+	})
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel, Pinned: true}
+	_, problem = machines.NewHost(layout.Machine, "", nil).Install(context.Background(), source, uv)
+	fatal(t, problem)
+	virtualInventory(t, filepath.Join(layout.Machine, "root"))
+	if code, out := runCozy(t, root, "package", "install", parityProjectOn(t, source), "--editable"); code != 0 {
+		t.Fatalf("editable install [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", parityPackage+"/add", "value=41", "--await", "--json"); code != 0 {
+		t.Fatalf("the first run [exit %d]: %s", code, out)
+	}
+	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
+		t.Fatalf("machine stop [exit %d]: %s", code, out)
+	}
+	path := filepath.Join(layout.Machine, "root/run/cozy/worker/ownership.json")
+	var history map[string]any
+	original, err := os.ReadFile(path)
+	must(t, err)
+	must(t, json.Unmarshal(original, &history))
+	history["worker_boot_id"] = strings.Repeat("A", 43)
+	raw, err := json.Marshal(history)
+	must(t, err)
+	must(t, os.WriteFile(path, raw, 0o600))
+
+	code, out := runCozy(t, root, "run", parityPackage+"/add", "value=41", "--await", "--json")
+	if code == 0 || !strings.Contains(out, "machine.runtime_gone") || !strings.Contains(out, "worker_ownership_invalid") {
+		t.Fatalf("a run on a machine whose Runtime cannot start did not fail with its reason [exit %d]: %s", code, out)
+	}
+	must(t, os.WriteFile(path, original, 0o600))
+	if code, out := runCozy(t, root, "run", parityPackage+"/add", "value=41", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":42`) {
+		t.Fatalf("the next run did not wake the repaired machine [exit %d]: %s", code, out)
+	}
+}

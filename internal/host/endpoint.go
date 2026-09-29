@@ -2,6 +2,7 @@ package host
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -84,12 +85,21 @@ func (m *Machine) listen() (*listeners, error) {
 	return l, nil
 }
 
-// serveReceipt answers 425 until the envelope is sealed. Any answer tells the Hub the
-// machine is up; the sealed envelope tells it the Runtime is ready.
+// serveReceipt answers 425 until the envelope is sealed, launching a stopped Runtime as a call
+// would, and 503 once the Runtime cannot start. Any answer tells the Hub the machine is up;
+// the sealed envelope tells it the Runtime is ready.
 func (m *Machine) serveReceipt(w http.ResponseWriter, _ *http.Request) {
 	envelope := m.receipt.Envelope()
 	w.Header().Set("Cache-Control", "no-store")
+	if envelope == nil && m.restarts.gone() {
+		body, _ := json.Marshal(map[string]any{"error": map[string]string{"code": "machine.runtime_gone", "message": m.runtimeGone()}})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write(body)
+		return
+	}
 	if envelope == nil {
+		m.poke()
 		http.Error(w, `{"error":{"code":"media.bootstrap_pending","message":"the machine is booting"}}`, http.StatusTooEarly)
 		return
 	}

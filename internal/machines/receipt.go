@@ -46,6 +46,11 @@ type receiptRefusal struct{ reason string }
 
 func (r *receiptRefusal) Error() string { return r.reason }
 
+// runtimeGone is a Host whose Runtime cannot start: no readiness will come.
+type runtimeGone struct{ reason string }
+
+func (r *runtimeGone) Error() string { return r.reason }
+
 var receiptClient = &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
 	// The leaf is unknown until the receipt names it; it is compared with the served one below.
 	TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
@@ -66,6 +71,12 @@ func readReceipt(ctx context.Context, mediaPort int, key []byte) (receipt, []byt
 		return receipt{}, nil, err
 	}
 	if response.StatusCode != http.StatusOK {
+		var answer struct {
+			Error struct{ Code, Message string }
+		}
+		if json.Unmarshal(body, &answer) == nil && answer.Error.Code == "machine.runtime_gone" {
+			return receipt{}, nil, &runtimeGone{answer.Error.Message}
+		}
 		return receipt{}, nil, fmt.Errorf("receipt answered %d", response.StatusCode)
 	}
 	if len(body) > maxReceiptBytes || response.TLS == nil || len(response.TLS.PeerCertificates) == 0 {

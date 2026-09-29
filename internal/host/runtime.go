@@ -54,6 +54,33 @@ type launcher interface {
 // is killed (#871). A Runtime that is still moving is never killed.
 const stallWindow = 5 * time.Second
 
+// lastWords passes the Runtime's output through and keeps its last refusal line.
+type lastWords struct {
+	io.Writer
+	mu   sync.Mutex
+	line string
+}
+
+func (l *lastWords) Write(p []byte) (int, error) {
+	for _, line := range strings.Split(string(p), "\n") {
+		if strings.HasPrefix(line, "error(") {
+			l.mu.Lock()
+			l.line = strings.TrimSpace(line)
+			l.mu.Unlock()
+		}
+	}
+	return l.Writer.Write(p)
+}
+
+func (l *lastWords) last() string {
+	if l == nil {
+		return ""
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.line
+}
+
 type directLauncher struct {
 	path, root string // the Runtime entrypoint and the machine root
 	env        []string
