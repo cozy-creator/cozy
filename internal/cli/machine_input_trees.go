@@ -238,7 +238,7 @@ func (m *machineRuns) releaseMachineInputs(ctx context.Context, request records.
 			return problem
 		}
 		var state pb.MachineExecutionState
-		if link != nil && len(link.Submission) > 0 && !link.Collected &&
+		if link != nil && len(link.Receipt) > 0 && !link.Collected &&
 			(proto.Unmarshal(link.ObservedState, &state) != nil || !machineEnded(state.State)) {
 			return nil
 		}

@@ -84,7 +84,7 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 // error result is collected, and cancellation alone never proves native cleanup.
 const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT EXISTS(SELECT 1 FROM request_events released
  WHERE released.request_id=r.id AND released.type='machine.retention_released') AND (
- (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked') AND (length(e.submission)>0 OR r.state!='canceled')) OR
+ (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked','canceled')) OR
  (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))`
 
 // Recipient custody (staged inputs, collected models) outlives the execution. It is owed to
@@ -762,9 +762,9 @@ func (s *Store) CompleteMachineControl(id string, command []byte) *exit.Error {
 	return nil
 }
 
-// CancelMachineBeforeAcceptance distinguishes an unsent local intent from a
-// submission whose reply may have been lost. The latter must reconcile its exact
-// receipt and cancel Runtime; the client cannot claim it never executed.
+// CancelMachineBeforeAcceptance ends a run no machine has accepted: canceled at once, with no
+// wait on a machine that may never answer (one still booting, preparing or gone). The intent
+// stays recorded, so a receipt that still arrives cancels the execution it names.
 func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -785,17 +785,13 @@ func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 	if link == nil || len(link.Receipt) > 0 {
 		return false, nil
 	}
-	state := "canceling"
-	if len(link.Submission) == 0 {
-		state = "canceled"
-	}
 	if _, err := tx.Exec(`UPDATE machine_executions SET cancel_requested=1 WHERE request_id=?`, id); err != nil {
 		return false, exit.Internalf("cannot retain machine cancellation intent: %s", err)
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=CASE WHEN ?='canceled' THEN 0 ELSE retain_work END WHERE id=?`, state, state, id); err != nil {
+	if _, err := tx.Exec(`UPDATE requests SET state='canceled',retain_work=0 WHERE id=?`, id); err != nil {
 		return false, exit.Internalf("cannot project pending machine cancellation: %s", err)
 	}
-	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,0,?,?)`, id, StateEvent(state), `{"scope":"before_machine_acceptance"}`, now()); err != nil {
+	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,0,?,?)`, id, StateEvent("canceled"), `{"scope":"before_machine_acceptance"}`, now()); err != nil {
 		return false, exit.Internalf("cannot record pending machine cancellation event: %s", err)
 	}
 	if err := tx.Commit(); err != nil {
