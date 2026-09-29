@@ -466,7 +466,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if problem != nil {
 			return problem
 		}
-		built.PublicationAuthorizationId, built.OwnerMemo = authorization, true
+		built.PublicationAuthorizationId, built.OwnerMemo, built.Account = authorization, true, m.runAccount(request)
 		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, link.MachineID, built); problem != nil {
 			return problem
 		}

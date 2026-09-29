@@ -42,6 +42,23 @@ operation.commit_release(None, "1.0.0", "bf16", manifest, len(raw))
 print(json.dumps({"manifest_id": manifest, "manifest_length": len(raw)}))
 `
 
+// seedProbe lands proof/probe@1.0.0/bf16 in the stores of both parity machines and answers the
+// Hub's resolution of it.
+func seedProbe(t *testing.T, h *machineHub, root string) map[string]any {
+	t.Helper()
+	python := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "python")
+	var resolved map[string]any
+	for _, store := range []string{filepath.Join(root, "tensorfs"), filepath.Join(h.provider, "var", "lib", "tensorfs")} {
+		out, err := exec.Command(python, "-I", "-c", seedCheckpoint, store).CombinedOutput()
+		if err != nil {
+			t.Fatalf("seeding %s: %v\n%s", store, err, out)
+		}
+		must(t, json.Unmarshal(out, &resolved))
+	}
+	resolved["model"], resolved["release"], resolved["lane"] = "proof/probe", "1.0.0", "bf16"
+	return resolved
+}
+
 // probeProject is the parity package with a CPU job reading one Model slot by its authored
 // default lane: a derive-only Manifest capability, so the job never loads it.
 func probeProject(t *testing.T, lane string) string {
@@ -89,15 +106,7 @@ def touch(payload: TouchRequest, source: Probe) -> TouchResult:
 // and kept both. On this computer's machine and on a rental, with the real Host and Runtime.
 func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
-	python := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "python")
-	var resolved string
-	for _, store := range []string{filepath.Join(root, "tensorfs"), filepath.Join(h.provider, "var", "lib", "tensorfs")} {
-		out, err := exec.Command(python, "-I", "-c", seedCheckpoint, store).CombinedOutput()
-		if err != nil {
-			t.Fatalf("seeding %s: %v\n%s", store, err, out)
-		}
-		resolved = strings.TrimSpace(string(out))
-	}
+	resolved := seedProbe(t, h, root)
 	var mu sync.Mutex
 	var seen []string
 	count := func(hub string, handler http.Handler) http.Handler {
@@ -118,10 +127,7 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 		case r.URL.Path == "/v1/packages/"+parityPublished+"/bindings":
 			_, _ = w.Write([]byte(binding))
 		case r.URL.Path == "/v1/models/resolve" && r.URL.Query().Get("ref") == "proof/probe@1.0.0" && r.URL.Query().Get("lane") == "bf16":
-			var body map[string]any
-			must(t, json.Unmarshal([]byte(resolved), &body))
-			body["model"], body["release"], body["lane"] = "proof/probe", "1.0.0", "bf16"
-			_ = json.NewEncoder(w).Encode(body)
+			_ = json.NewEncoder(w).Encode(resolved)
 		default:
 			doors.ServeHTTP(w, r)
 		}

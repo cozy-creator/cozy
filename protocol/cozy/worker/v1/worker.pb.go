@@ -3256,7 +3256,11 @@ type MachineExecutionSubmit struct {
 	ReleaseRoot *ReleaseRoot `protobuf:"bytes,13,opt,name=release_root,json=releaseRoot,proto3" json:"release_root,omitempty"`
 	// The record owner answers this execution's memo.lookup events.
 	// False: a local miss computes at once; Runtime never waits on the owner.
-	OwnerMemo     bool `protobuf:"varint,14,opt,name=owner_memo,json=ownerMemo,proto3" json:"owner_memo,omitempty"`
+	OwnerMemo bool `protobuf:"varint,14,opt,name=owner_memo,json=ownerMemo,proto3" json:"owner_memo,omitempty"`
+	// The account that owns the run. Unpublished code (local/) has no org, so the org-relative
+	// Model defaults of it and of every unpublished callee resolve under this account. Empty:
+	// such a default is refused. A published package's org is its own.
+	Account       string `protobuf:"bytes,15,opt,name=account,proto3" json:"account,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3373,6 +3377,13 @@ func (x *MachineExecutionSubmit) GetOwnerMemo() bool {
 		return x.OwnerMemo
 	}
 	return false
+}
+
+func (x *MachineExecutionSubmit) GetAccount() string {
+	if x != nil {
+		return x.Account
+	}
+	return ""
 }
 
 type ReleaseRoot struct {
@@ -22304,7 +22315,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fmemory_bytes\x18\x04 \x01(\x04R\vmemoryBytes\x12\x1c\n" +
 	"\n" +
 	"pci_bus_id\x18\x05 \x01(\tR\bpciBusId\x12%\n" +
-	"\x0edriver_version\x18\x06 \x01(\tR\rdriverVersion\"\xe3\x05\n" +
+	"\x0edriver_version\x18\x06 \x01(\tR\rdriverVersion\"\xfd\x05\n" +
 	"\x16MachineExecutionSubmit\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12#\n" +
 	"\rsubmission_id\x18\x02 \x01(\tR\fsubmissionId\x12%\n" +
@@ -22319,7 +22330,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x12source_credentials\x18\f \x03(\v2 .cozy.worker.v1.SourceCredentialR\x11sourceCredentials\x12>\n" +
 	"\frelease_root\x18\r \x01(\v2\x1b.cozy.worker.v1.ReleaseRootR\vreleaseRoot\x12\x1d\n" +
 	"\n" +
-	"owner_memo\x18\x0e \x01(\bR\townerMemoJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\x99\x05\n" +
+	"owner_memo\x18\x0e \x01(\bR\townerMemo\x12\x18\n" +
+	"\aaccount\x18\x0f \x01(\tR\aaccountJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\x99\x05\n" +
 	"\vReleaseRoot\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12\x1e\n" +
