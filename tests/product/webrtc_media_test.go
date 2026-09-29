@@ -50,6 +50,7 @@ func newMediaHarness(t testing.TB) *mediaHarness {
 	t.Cleanup(cancel)
 	public, key, _ := ed25519.GenerateKey(rand.Reader)
 	m := webrtctest.NewMachine(t.TempDir(), public)
+	m.Begin(7)
 	return &mediaHarness{t: t, ctx: ctx, m: m, srv: serveMachineMedia(t, "127.0.0.1", m), key: key}
 }
 

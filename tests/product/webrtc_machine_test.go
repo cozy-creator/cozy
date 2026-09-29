@@ -40,9 +40,9 @@ func grantWebRTC(t *testing.T, h *machineHub) int {
 	return port
 }
 
-// machineListens is what a running machine Host shows of its WebRTC grant: the port its
-// sealed receipt names (0: none), and every TCP port its process listens on beside its
-// worker and media ports.
+// machineListens checks the stable bootstrap's public child: the receipt's WebRTC
+// grant (0: none), and every TCP listener beyond its worker and receipt ports.
+// Runtime is a sibling process; neither its private ports nor other processes count.
 func machineListens(t *testing.T, dir string) (receipt int, others []int) {
 	t.Helper()
 	var record struct {
@@ -68,30 +68,70 @@ func machineListens(t *testing.T, dir string) (receipt int, others []int) {
 	if payload.WebRTC != nil {
 		receipt = payload.WebRTC.Port
 	}
+	children := []int{}
+	entries, err := os.ReadDir("/proc")
+	must(t, err)
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		stat, _ := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		fields := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
+		command, _ := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		name, _, _ := strings.Cut(string(command), "\x00")
+		if len(fields) > 1 && fields[1] == strconv.Itoa(record.PID) && name == "cozy-machine-request-plane" {
+			children = append(children, pid)
+		}
+	}
+	if len(children) != 1 {
+		t.Fatalf("stable bootstrap %d has public request-plane children %v", record.PID, children)
+	}
+	if ports := processListenerPorts(t, record.PID); len(ports) != 0 {
+		t.Fatalf("stable bootstrap %d unexpectedly owns public listeners %v", record.PID, ports)
+	}
+	ports := processListenerPorts(t, children[0])
+	for _, required := range []int{record.WorkerPort, record.MediaPort} {
+		if required != 0 && !slices.Contains(ports, required) {
+			t.Fatalf("public child %d does not own granted endpoint %d: %v", children[0], required, ports)
+		}
+	}
+	for _, port := range ports {
+		if port != record.WorkerPort && port != record.MediaPort {
+			others = append(others, port)
+		}
+	}
+	t.Logf("stable bootstrap %d owns no public socket; request plane %d owns %v", record.PID, children[0], ports)
+	return receipt, others
+}
+
+func processListenerPorts(t *testing.T, pid int) []int {
+	t.Helper()
 	sockets := map[string]bool{}
-	fds, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", record.PID))
+	fds, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
 	must(t, err)
 	for _, fd := range fds {
-		if link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", record.PID, fd.Name())); err == nil && strings.HasPrefix(link, "socket:[") {
+		if link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd.Name())); err == nil && strings.HasPrefix(link, "socket:[") {
 			sockets[strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")] = true
 		}
 	}
+	ports := []int{}
 	for _, table := range []string{"tcp", "tcp6"} {
-		raw, _ := os.ReadFile(fmt.Sprintf("/proc/%d/net/%s", record.PID, table))
+		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/%s", pid, table))
+		must(t, err)
 		for _, line := range strings.Split(string(raw), "\n") {
 			fields := strings.Fields(line)
-			if len(fields) < 10 || fields[3] != "0A" || !sockets[fields[9]] { // 0A: LISTEN
+			if len(fields) < 10 || fields[3] != "0A" || !sockets[fields[9]] {
 				continue
 			}
 			_, hex, _ := strings.Cut(fields[1], ":")
-			port, _ := strconv.ParseUint(hex, 16, 16)
-			if p := int(port); p != record.WorkerPort && p != record.MediaPort {
-				others = append(others, p)
-			}
+			port, err := strconv.ParseUint(hex, 16, 16)
+			must(t, err)
+			ports = append(ports, int(port))
 		}
 	}
-	slices.Sort(others)
-	return receipt, others
+	slices.Sort(ports)
+	return slices.Compact(ports)
 }
 
 // machineFollow follows one output of a machine over WebRTC, as a browser holding a link
