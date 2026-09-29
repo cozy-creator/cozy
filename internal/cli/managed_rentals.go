@@ -649,7 +649,8 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 		AcceleratorModel: sku.AcceleratorModel, AcceleratorCount: sku.AcceleratorCount,
 		HourlyRateUSDMicros: sku.PriceUSDMicrosPerHour, ManagedRequestID: req.ID,
 		State: "pending_acquisition", Hub: m.origin(req.Hub)}
-	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", orchestrator.MachineLabel(sku.Name, sku.AcceleratorCount), skuRate(sku), pinText(c))
+	fmt.Fprintf(m.ctx.Out, "rentals: renting %s%s at %s (%s)\n", orchestrator.MachineLabel(sku.Name, sku.AcceleratorCount),
+		machineShape(sku.VCPUCount, sku.MemoryGB), skuRate(sku), pinText(c))
 	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
 	m.mu.Unlock()
 	m.owner.AwaitRental(req.ID, purchase.machine)
@@ -1430,7 +1431,7 @@ func (m *managedRentals) totalsLocked(origin string) (int, int64, *exit.Error) {
 			return 0, 0, exit.Named(exit.Unavailable, "rental.rate_unknown",
 				"rental %s has no observed rate; account spend is unknown", seen.ID)
 		}
-		burn += seen.HourlyRateUSDMicros
+		burn += costPerHour(seen.HourlyRateUSDMicros, seen.ComputeUSDMicrosPerHour, seen.StorageUSDMicrosPerHour)
 	}
 	return len(census.live), burn, nil
 }
@@ -1439,17 +1440,36 @@ func usdPerHour(micros int64) string {
 	return usdPerHourBare(micros) + "/hour"
 }
 
-// skuRate is a SKU's pre-spend rate the way a human must read it (th-126):
-// the estimated total the pod will bill, decomposed into the GPU list rate and
-// the spec-derived storage adder. A SKU whose hub itemizes no storage renders
-// as the plain rate.
+// skuRate is a SKU's pre-spend rate the way a human must read it (th-126).
 func skuRate(sku hub.RentalSKU) string {
-	if sku.StorageUSDMicrosPerHour <= 0 {
-		return usdPerHour(sku.PriceUSDMicrosPerHour)
+	return rateBreakdown(sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour)
+}
+
+// rateBreakdown is an hourly cost the way a human reads it: the total the pod bills, split
+// into the machine's compute and its disk's storage when the Hub itemizes storage.
+func rateBreakdown(compute, storage int64) string {
+	if storage <= 0 {
+		return usdPerHour(compute)
 	}
-	return usdPerHour(sku.PriceUSDMicrosPerHour+sku.StorageUSDMicrosPerHour) +
-		" (" + usdPerHourBare(sku.PriceUSDMicrosPerHour) + " gpu + " +
-		usdPerHourBare(sku.StorageUSDMicrosPerHour) + " storage)"
+	return usdPerHour(compute+storage) + " (compute " + usdPerHourBare(compute) + " + storage " +
+		usdPerHourBare(storage) + ")"
+}
+
+// costPerHour is what a rental costs an hour: the Hub's compute plus storage where it splits
+// them, else its hourly rate (an older Hub's, or a fresh rental's compute quote alone).
+func costPerHour(hourly, compute, storage int64) int64 {
+	if compute > 0 {
+		return compute + storage
+	}
+	return hourly
+}
+
+// machineShape names a machine's vCPUs and memory where the Hub states them.
+func machineShape(vcpu, memoryGB int) string {
+	if vcpu <= 0 || memoryGB <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d vCPU, %d GB)", vcpu, memoryGB)
 }
 
 // usdPerHourBare is the dollar figure alone, for a line that already says "per hour".

@@ -113,6 +113,11 @@ type Rental struct {
 	// WebRTC is a ready machine-image rental's browser-media listener: the address a
 	// browser dials over ICE-TCP and the pinned leaf's "sha-256 AB:…". Nil otherwise.
 	WebRTC *RentalWebRTC
+	// ComputeUSDMicrosPerHour and StorageUSDMicrosPerHour are what the rental costs an
+	// hour, its machine and its disk, from its create on; VCPUCount and MemoryGB are the
+	// machine's shape where the Hub states one. Zero from a Hub older than the facts.
+	ComputeUSDMicrosPerHour, StorageUSDMicrosPerHour int64
+	VCPUCount, MemoryGB                              int
 }
 
 type RentalWebRTC struct {
@@ -264,6 +269,11 @@ type wireRental struct {
 	SpendUSDMicros        int64          `json:"spend_usd_micros"`
 	SpendBasis            string         `json:"spend_basis"`
 	WebRTC                *RentalWebRTC  `json:"webrtc,omitempty"`
+	// The rental's hourly cost, split, and its machine's shape.
+	ComputeUSDMicrosPerHour int64 `json:"compute_usd_micros_per_hour"`
+	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
+	VCPUCount               int   `json:"vcpu_count"`
+	MemoryGB                int   `json:"memory_gb"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -304,6 +314,9 @@ func (w wireRental) rental() Rental {
 		SpendUSDMicros:        w.SpendUSDMicros,
 		SpendBasis:            w.SpendBasis,
 		WebRTC:                w.WebRTC,
+		// The hourly cost's split and the machine's shape.
+		ComputeUSDMicrosPerHour: w.ComputeUSDMicrosPerHour, StorageUSDMicrosPerHour: w.StorageUSDMicrosPerHour,
+		VCPUCount: w.VCPUCount, MemoryGB: w.MemoryGB,
 	}
 }
 
@@ -478,6 +491,10 @@ type RentalSKU struct {
 	// display and the fleet spend admission total the two; the locked quote
 	// stays the GPU rate alone. Zero from a hub that itemizes none.
 	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
+	// VCPUCount and MemoryGB are the shape of the machine this count is priced at, where the
+	// hub states one (CPU): the same product can be priced at another tier later.
+	VCPUCount int `json:"vcpu_count,omitempty"`
+	MemoryGB  int `json:"memory_gb,omitempty"`
 }
 
 // RentalProduct is one catalog row as the hub publishes it: a product and its widths.
@@ -497,6 +514,8 @@ type RentalWidth struct {
 	AcceleratorCount        int   `json:"accelerator_count"`
 	PriceUSDMicrosPerHour   int64 `json:"price_usd_micros_per_hour"`
 	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
+	VCPUCount               int   `json:"vcpu_count,omitempty"`
+	MemoryGB                int   `json:"memory_gb,omitempty"`
 }
 
 // Machines flattens the product into one RentalSKU per width.
@@ -507,7 +526,8 @@ func (p RentalProduct) Machines() []RentalSKU {
 			AcceleratorCount: width.AcceleratorCount, PythonProvisionableMinors: p.PythonProvisionableMinors,
 			PythonInterpreters: p.PythonInterpreters, BaseWorkerProfile: p.BaseWorkerProfile,
 			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB,
-			PriceUSDMicrosPerHour: width.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: width.StorageUSDMicrosPerHour})
+			PriceUSDMicrosPerHour: width.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: width.StorageUSDMicrosPerHour,
+			VCPUCount: width.VCPUCount, MemoryGB: width.MemoryGB})
 	}
 	return out
 }
@@ -528,7 +548,8 @@ func RentalProducts(skus []RentalSKU) []RentalProduct {
 				VRAMGB: sku.VRAMGB})
 		}
 		out[i].Widths = append(out[i].Widths, RentalWidth{AcceleratorCount: sku.AcceleratorCount,
-			PriceUSDMicrosPerHour: sku.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: sku.StorageUSDMicrosPerHour})
+			PriceUSDMicrosPerHour: sku.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: sku.StorageUSDMicrosPerHour,
+			VCPUCount: sku.VCPUCount, MemoryGB: sku.MemoryGB})
 	}
 	for i := range out {
 		sort.Slice(out[i].Widths, func(a, b int) bool {
@@ -802,6 +823,8 @@ type RentalQuote struct {
 	PriceUSDMicrosPerHour   int64 `json:"price_usd_micros_per_hour"`
 	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
 	ContainerDiskGB         int   `json:"container_disk_gb"`
+	VCPUCount               int   `json:"vcpu_count,omitempty"`
+	MemoryGB                int   `json:"memory_gb,omitempty"`
 }
 
 // QuoteRental prices the exact body a rental POST would send.

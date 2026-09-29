@@ -479,10 +479,15 @@ func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHas
 	if e != nil {
 		return 0, e
 	}
-	if quote.PriceUSDMicrosPerHour != listed && ctx.Err != nil && !ctx.Mode().JSON {
-		fmt.Fprintf(ctx.Err, "%s with a %d GB disk is %s + %s storage (the default-disk listing is %s)\n",
-			orchestrator.MachineLabel(skuName, gpus), quote.ContainerDiskGB, rentalPrice(quote.PriceUSDMicrosPerHour),
-			rentalPrice(quote.StorageUSDMicrosPerHour), rentalPrice(listed))
+	if ctx.Err != nil && !ctx.Mode().JSON {
+		// The machine it names is the one bought: a product can be priced at another tier.
+		line := fmt.Sprintf("%s%s with a %d GB disk: %s", orchestrator.MachineLabel(skuName, gpus),
+			machineShape(quote.VCPUCount, quote.MemoryGB), quote.ContainerDiskGB,
+			rateBreakdown(quote.PriceUSDMicrosPerHour, quote.StorageUSDMicrosPerHour))
+		if quote.PriceUSDMicrosPerHour != listed {
+			line += " (the default-disk listing is " + rentalPrice(listed) + ")"
+		}
+		fmt.Fprintln(ctx.Err, line)
 	}
 	return quote.PriceUSDMicrosPerHour, nil
 }
@@ -728,7 +733,8 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 			storage = append(storage, label+rentalPrice(width.StorageUSDMicrosPerHour))
 		}
 		rows = append(rows, map[string]string{
-			"name": product.Name, acceleratorColumn: acceleratorName(product.AcceleratorModel),
+			"name": product.Name, acceleratorColumn: acceleratorName(product.AcceleratorModel) +
+				machineShape(product.Widths[0].VCPUCount, product.Widths[0].MemoryGB),
 			"accelerator model": product.AcceleratorModel,
 			"gpus":              joinInts(product.Counts()),
 			"compute":           computeCapabilityText(product.ComputeCapability),
@@ -1076,7 +1082,7 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		if row["rental"] != subject && row["machine"] != subject {
 			continue
 		}
-		fields, all, value := append([]string{"rental"}, list.Fields...), list.AllFields,
+		fields, all, value := append([]string{"rental"}, append(list.Fields, "compute", "storage")...), list.AllFields,
 			func(name string) (any, bool) { return row[name], true }
 		if mode := ctx.Mode(); !mode.Human || mode.JSON {
 			fields, all = list.TypedFields, list.TypedAllFields
@@ -1104,7 +1110,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	list := output.List{
 		Name:   "rentals",
 		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "uptime", "running", "queued", "idle"},
-		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "failure", "uptime", "running", "queued", "idle",
+		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "compute", "storage", "spent", "failure", "uptime", "running", "queued", "idle",
 			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
 			"idle_since", "release_due", "image", "provider", "provider resource",
 			"provider host", "provider state", "container state"},
@@ -1112,11 +1118,13 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
 		TypedFields: []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
-			"spend_usd_micros", "spend_basis"},
+			"spend_usd_micros", "spend_basis", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour",
+			"vcpu_count", "memory_gb"},
 		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
-			"hourly_rate_usd_micros", "spend_usd_micros", "spend_basis", "failure_code",
+			"hourly_rate_usd_micros", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour", "vcpu_count", "memory_gb",
+			"spend_usd_micros", "spend_basis", "failure_code",
 			"base_worker_image_digest", "base_worker_image_tag",
 			"provider", "provider_resource_id", "provider_host_id", "provider_state",
 			"container_state", "boot"},
@@ -1174,7 +1182,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"running": strconv.Itoa(activity.Running), "queued": strconv.Itoa(activity.Queued),
 			"idle":   idleText,
 			"rental": r.ID, "bought for": orNone(r.BoughtFor),
-			"accelerator": acceleratorLabel(r.AcceleratorModel, r.AcceleratorCount),
+			"accelerator": acceleratorLabel(r.AcceleratorModel, r.AcceleratorCount) + machineShape(r.VCPUCount, r.MemoryGB),
 			"address":     r.Address,
 			"media":       r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
@@ -1182,7 +1190,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"image": either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": r.Failure.Provider,
 			"provider resource": r.Failure.ProviderResourceID, "provider host": r.Failure.ProviderHostID,
 			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
-			"$/hour": rentalHourlyRate(r.HourlyRateUSDMicros), "spent": rentalSpend(r),
+			"$/hour":  rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour)),
+			"compute": costCell(r.ComputeUSDMicrosPerHour), "storage": costCell(r.StorageUSDMicrosPerHour),
+			"spent": rentalSpend(r),
 		})
 		typed := map[string]any{
 			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
@@ -1265,12 +1275,14 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"failure": "—", "uptime": rentalUptime(seen.RentedAt),
 			"running": "—", "queued": "—", "idle": "—",
 			"rental": seen.ID, "bought for": "—",
-			"accelerator": acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount),
+			"accelerator": acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount) + machineShape(seen.VCPUCount, seen.MemoryGB),
 			"address":     seen.Address, "media": seen.MediaAddress, "hub": seen.Hub,
 			"rented": orNone(seen.RentedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": either(seen.BaseWorkerImageTag, seen.BaseWorkerImageDigest), "provider": "", "provider resource": "", "provider host": "",
 			"provider state": "", "container state": "",
-			"$/hour": rentalHourlyRate(seen.HourlyRateUSDMicros), "spent": rentalSpend(seen),
+			"$/hour":  rentalHourlyRate(costPerHour(seen.HourlyRateUSDMicros, seen.ComputeUSDMicrosPerHour, seen.StorageUSDMicrosPerHour)),
+			"compute": costCell(seen.ComputeUSDMicrosPerHour), "storage": costCell(seen.StorageUSDMicrosPerHour),
+			"spent": rentalSpend(seen),
 		})
 		typed := map[string]any{
 			"machine": seen.MachineName, "state": seen.State, "rental_id": seen.ID,
@@ -1448,6 +1460,20 @@ func spendFields(typed map[string]any, r api.RentalSummary) {
 	if r.SpendBasis != "" {
 		typed["spend_usd_micros"], typed["spend_basis"] = r.SpendUSDMicros, r.SpendBasis
 	}
+	for key, value := range map[string]int64{"compute_usd_micros_per_hour": r.ComputeUSDMicrosPerHour,
+		"storage_usd_micros_per_hour": r.StorageUSDMicrosPerHour, "vcpu_count": int64(r.VCPUCount), "memory_gb": int64(r.MemoryGB)} {
+		if value > 0 {
+			typed[key] = value
+		}
+	}
+}
+
+// costCell is one part of an hourly cost; "-" where the Hub does not split it.
+func costCell(micros int64) string {
+	if micros <= 0 {
+		return "-"
+	}
+	return usdPerHourBare(micros)
 }
 
 // accruedSpend is the listed rentals' total for the spend line, and as JSON facts only when

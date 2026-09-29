@@ -161,6 +161,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			BaseWorkerImageTag:    live[row.ID].BaseWorkerImageTag,
 			HubUnknown:            census.hubUnknown[row.ID],
 		}
+		costOf(&summary, live[row.ID])
 		if update, problem := st.RuntimeUpdate(row.ID); problem != nil {
 			return result, problem
 		} else if update != nil && update.Active() {
@@ -187,6 +188,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			Boot:                  seen.Boot,
 			BaseWorkerImageDigest: seen.BaseWorkerImageDigest, BaseWorkerImageTag: seen.BaseWorkerImageTag,
 		})
+		costOf(&result.Unrecorded[len(result.Unrecorded)-1], seen)
 	}
 	open, problem := st.ActiveRentalOperations()
 	if problem != nil {
@@ -208,4 +210,10 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		})
 	}
 	return result, nil
+}
+
+// costOf carries the Hub's split of a rental's hourly cost and its machine's shape.
+func costOf(summary *api.RentalSummary, seen hub.Rental) {
+	summary.ComputeUSDMicrosPerHour, summary.StorageUSDMicrosPerHour = seen.ComputeUSDMicrosPerHour, seen.StorageUSDMicrosPerHour
+	summary.VCPUCount, summary.MemoryGB = seen.VCPUCount, seen.MemoryGB
 }

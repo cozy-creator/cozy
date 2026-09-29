@@ -89,6 +89,12 @@ type RentalSummary struct {
 	// SpendUSDMicros and SpendBasis are the Hub's accrued spend; a blank basis is unknown.
 	SpendUSDMicros int64  `json:"spend_usd_micros,omitempty"`
 	SpendBasis     string `json:"spend_basis,omitempty"`
+	// ComputeUSDMicrosPerHour and StorageUSDMicrosPerHour split what the rental costs an
+	// hour, and VCPUCount and MemoryGB are its machine's shape; zero where the Hub does not say.
+	ComputeUSDMicrosPerHour int64 `json:"compute_usd_micros_per_hour,omitempty"`
+	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour,omitempty"`
+	VCPUCount               int   `json:"vcpu_count,omitempty"`
+	MemoryGB                int   `json:"memory_gb,omitempty"`
 }
 
 // Activity is absent for machines known only to the Hub: this daemon cannot

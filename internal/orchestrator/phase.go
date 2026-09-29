@@ -93,6 +93,11 @@ type RentalProgress struct {
 	BaseWorkerImageDigest string `json:"base_worker_image_digest,omitempty"`
 	BaseWorkerImageTag    string `json:"base_worker_image_tag,omitempty"`
 	BaseWorkerProfile     string `json:"base_worker_profile,omitempty"`
+	// The Hub's split of the hourly cost, and the machine's shape where it states one.
+	ComputeUSDMicrosPerHour int64 `json:"compute_usd_micros_per_hour,omitempty"`
+	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour,omitempty"`
+	VCPUCount               int   `json:"vcpu_count,omitempty"`
+	MemoryGB                int   `json:"memory_gb,omitempty"`
 }
 
 // Elapsed is how long this phase has been the current one.
@@ -408,6 +413,8 @@ func RentalSample(r hub.Rental) (PhaseSample, bool) {
 		AcceleratorModel: r.AcceleratorModel, AcceleratorCount: r.AcceleratorCount,
 		HourlyRateUSDMicros: r.HourlyRateUSDMicros, BaseWorkerImageDigest: r.BaseWorkerImageDigest,
 		BaseWorkerImageTag: r.BaseWorkerImageTag, BaseWorkerProfile: r.BaseWorkerProfile,
+		ComputeUSDMicrosPerHour: r.ComputeUSDMicrosPerHour, StorageUSDMicrosPerHour: r.StorageUSDMicrosPerHour,
+		VCPUCount: r.VCPUCount, MemoryGB: r.MemoryGB,
 	}}
 	if r.Boot != nil {
 		boot := *r.Boot
