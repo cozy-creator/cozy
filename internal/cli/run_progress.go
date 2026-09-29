@@ -225,7 +225,14 @@ func rentalRows(fields map[string]any) []string {
 		if count, ok := number(rental["accelerator_count"]); ok && count > 1 {
 			row = fmt.Sprintf("    %.0f × %s", count, model)
 		}
-		if price, ok := number(rental["hourly_rate_usd_micros"]); ok && price >= 0 {
+		vcpu, _ := number(rental["vcpu_count"])
+		memory, _ := number(rental["memory_gb"])
+		row += machineShape(int(vcpu), int(memory))
+		compute, _ := number(rental["compute_usd_micros_per_hour"])
+		storage, _ := number(rental["storage_usd_micros_per_hour"])
+		if compute > 0 {
+			row += " · " + rateBreakdown(int64(compute), int64(storage))
+		} else if price, ok := number(rental["hourly_rate_usd_micros"]); ok && price >= 0 {
 			row += fmt.Sprintf(" · $%.2f/hour", price/1_000_000)
 		}
 		rows = append(rows, row)
