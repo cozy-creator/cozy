@@ -30,46 +30,46 @@ func TestCallPhaseProgressSeparatesWaitingPreparationAndExecution(t *testing.T) 
 	if got := frame(1000); !strings.Contains(got, "Render item · paused · execution 0.0s") || strings.Contains(got, "✓ Render item") {
 		t.Fatal(got)
 	}
-	phase("call-one", "Render item", "preparing", 1, 110, 90, 20, 0)
-	if got := frame(120); !strings.Contains(got, "Render item · preparing 30s") {
+	phase("call-one", "Render item", "preparing", 1, 110, 90, 10, 0)
+	if got := frame(120); !strings.Contains(got, "Render item · preparing 20s") {
 		t.Fatal(got)
 	}
-	phase("call-one", "Render item", "running", 1, 120, 90, 30, 0)
+	phase("call-one", "Render item", "running", 1, 120, 90, 20, 0)
 	if got := frame(125); !strings.Contains(got, "Render item · execution 5s") {
 		t.Fatal(got)
 	}
-	phase("call-one", "Render item", "preparing", 1, 126, 90, 30, 6)
-	if got := frame(140); !strings.Contains(got, "Render item · preparing 44s") {
+	phase("call-one", "Render item", "preparing", 1, 126, 90, 20, 6)
+	if got := frame(140); !strings.Contains(got, "Render item · preparing 34s") {
 		t.Fatal(got)
 	}
-	phase("call-one", "Render item", "running", 1, 150, 90, 54, 6)
+	phase("call-one", "Render item", "running", 1, 150, 90, 44, 6)
 	if got := frame(152); !strings.Contains(got, "Render item · execution 8s") {
 		t.Fatal(got)
 	}
 	// Duplicated, old and future-unknown phase observations do not restart clocks.
-	phase("call-one", "Render item", "running", 1, 150, 90, 54, 6)
+	phase("call-one", "Render item", "running", 1, 150, 90, 44, 6)
 	phase("call-one", "Render item", "queued", 1, 90, 90, 0, 0)
 	phase("call-one", "Render item", "future_phase", 1, 151, 1000, 0, 0)
 	if got := frame(152); !strings.Contains(got, "Render item · execution 8s") {
 		t.Fatal(got)
 	}
-	phase("call-one", "Render item", "finalizing", 1, 155, 90, 54, 11)
+	phase("call-one", "Render item", "finalizing", 1, 155, 90, 44, 11)
 	if got := frame(500); !strings.Contains(got, "Render item · finalizing · execution 11s") || strings.Contains(got, "execution 5m") {
 		t.Fatal(got)
 	}
 	// Dispatch and finalization can share a millisecond with the next transition.
-	phase("call-one", "Render item", "terminal", 1, 155, 90, 54, 11)
+	phase("call-one", "Render item", "terminal", 1, 155, 90, 44, 11)
 	got := frame(999)
-	if strings.Count(got, "✓ Render item") != 1 || !strings.Contains(got, "execution 11s · queued 1m30s · preparation 54s · wall 2m35s") {
+	if strings.Count(got, "✓ Render item") != 1 || !strings.Contains(got, "execution 11s · queued 1m30s · preparation 44s · wall 2m35s") {
 		t.Fatal(got)
 	}
-	phase("call-one", "Render item", "terminal", 1, 156, 90, 54, 11)
-	phase("call-one", "Render item", "running", 1, 157, 90, 54, 20)
+	phase("call-one", "Render item", "terminal", 1, 156, 90, 44, 11)
+	phase("call-one", "Render item", "running", 1, 157, 90, 44, 20)
 	if got := frame(999); strings.Count(got, "✓ Render item") != 1 || strings.Contains(got, "execution 20s") {
 		t.Fatal(got)
 	}
 	phase("call-one", "Render item", "queued", 2, 160, 0, 0, 0)
-	phase("call-one", "Render item", "terminal", 1, 170, 90, 54, 11)
+	phase("call-one", "Render item", "terminal", 1, 170, 90, 44, 11)
 	if got := frame(165); !strings.Contains(got, "Render item · queued 5s") || strings.Contains(got, "✓ Render item") {
 		t.Fatal(got)
 	}
