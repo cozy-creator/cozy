@@ -63,12 +63,7 @@ func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records
 		if _, problem := m.capturedRevision(request); problem != nil {
 			return nil, problem
 		}
-		root.Release, root.InstallationId = "", request.LocalInstallationID
-		// Unpublished code has no org: its org-relative Model defaults name the caller's
-		// account, which the machine needs only for such a default and refuses without.
-		if caller, problem := m.resolver.namespaceAt(request.Hub); problem == nil {
-			root.Owner = caller.Account
-		}
+		root.Release, root.InstallationId, root.Owner = "", request.LocalInstallationID, m.runAccount(request)
 	}
 	if request.IsJob() {
 		root.Job, root.PublicationGrant = true, home.ScratchRepo(request.Org, request.ID)
@@ -115,7 +110,18 @@ func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records
 	}
 	return &pb.MachineExecutionSubmit{SubmissionId: records.MachineSubmissionID(request.IdemKey),
 		Offer: &pb.AttemptOffer{RequestId: request.ID}, PayloadCanonicalBytes: request.Payload,
-		ReleaseRoot: root}, nil
+		ReleaseRoot: root, Account: root.Owner}, nil
+}
+
+// runAccount is the account owning the run at its Hub. Unpublished code has no org: the
+// org-relative Model defaults of it and of its unpublished callees name this account, which
+// the machine needs only for such a default and refuses without.
+func (m *machineRuns) runAccount(request records.Request) string {
+	caller, problem := m.resolver.namespaceAt(request.Hub)
+	if problem != nil {
+		return ""
+	}
+	return caller.Account
 }
 
 // sendReleaseRoot replays the one frozen submission until the machine answers a receipt; while
