@@ -89,7 +89,7 @@ func TestLiveProgressKeepsFinishedStagesAndMeasuredRates(t *testing.T) {
 func TestLiveProgressClockStopsWhenWatcherDetaches(t *testing.T) {
 	p, buf := progressSink(output.Mode{Human: true, Live: true}, false)
 	p.On(liveEvent("progress", map[string]any{"stage": "condition_media"}))
-	waitUntil(t, "quiet stage elapsed clock", func() bool { return strings.Contains(buf.String(), "conditioning · 1s") })
+	waitUntil(t, "quiet stage elapsed clock", func() bool { return strings.Contains(buf.String(), "conditioning · wall 1s") })
 	p.Done()
 	before := len(buf.String())
 	time.Sleep(1100 * time.Millisecond)
@@ -122,11 +122,11 @@ func TestReattachedProgressUsesRecordedStageBoundaries(t *testing.T) {
 	}
 	p.On(replay("progress", 15*time.Second, 3, map[string]any{"stage": "condition_text"}))
 	p.On(replay("progress", 25*time.Second, 4, map[string]any{"stage": "denoise", "position": 1, "total": 30, "step_ms": 15000}))
-	if transition := liveFrame(p, start.Add(25*time.Second)); !regexp.MustCompile(`✓ conditioning +10s`).MatchString(transition) {
+	if transition := liveFrame(p, start.Add(25*time.Second)); !regexp.MustCompile(`✓ conditioning +wall 10s`).MatchString(transition) {
 		t.Fatalf("finished stage used reattach walltime instead of recorded boundary: %q", transition)
 	}
 	p.On(replay("completed", 40*time.Second, 5, nil))
-	if terminal := liveFrame(p, time.Now()); !regexp.MustCompile(`✓ denoising +15s`).MatchString(terminal) || strings.Contains(terminal, "19m") {
+	if terminal := liveFrame(p, time.Now()); !regexp.MustCompile(`✓ denoising +wall 15s`).MatchString(terminal) || strings.Contains(terminal, "19m") {
 		t.Fatalf("terminal stage did not freeze at its recorded completion: %q", terminal)
 	}
 }

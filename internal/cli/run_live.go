@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -28,6 +29,7 @@ type liveView struct {
 	run, target, machine, status string
 	executing                    bool
 	ended                        time.Time
+	calls                        map[string]*liveStage
 	phase                        *liveStage   // the preparation lane: one wait or phase at a time
 	scopes                       []*liveStage // execution stages, in the order they started
 	done                         []liveDone
@@ -37,8 +39,7 @@ type liveView struct {
 	hasETA                       bool
 	held                         map[string][]any // this run's GPU grants: call key -> ordinals
 	waits                        []gpuWait
-	stalls                       map[string]*stall        // steps held for their callee's weights
-	stalled                      map[string]time.Duration // each step's closed holds, summed
+	stalls                       map[string]*stall // steps held for their callee's weights
 
 	shown   []string // rows on screen
 	cells   []int    // their widths, to erase them after a resize
@@ -51,6 +52,7 @@ type liveView struct {
 // path ("Segment 2 of 9" in "Segment 2 of 9 / denoise"); the rest is its current leaf.
 type liveStage struct {
 	key, label, leaf string
+	call             *callPhaseEvent
 	scope            bool
 	announced        bool           // reported at the root, not only as a child's scope
 	whole            bool           // a child's own scope whose count completed: it is over
@@ -76,8 +78,8 @@ type gpuWait struct {
 	since                time.Time
 }
 
-// stall is a step held for its callee's model preparation: its clock stops while the
-// download it waits on runs on its own line.
+// stall names the model preparation a legacy step awaits. These partial wait spans
+// cannot account for the call's other preparation or queue time.
 type stall struct {
 	count      int
 	since      time.Time
@@ -207,6 +209,10 @@ func (p *RunProgress) onLive(e localapi.Event) {
 		v.enter("starting", e, at, "running")
 	case "progress":
 		p.liveProgress(fields, at)
+	case "machine.call.phase":
+		p.liveCallPhase(e)
+	case "machine.call":
+		p.finishLiveCall(e)
 	case "run.completed":
 		p.settle("completed", at)
 		return
@@ -257,24 +263,61 @@ func (p *RunProgress) liveProgress(fields map[string]any, at time.Time) {
 		return // Runtime's words for a gpu.wait, which this view reads typed
 	}
 	scope, _, nested := strings.Cut(name, " / ")
-	s := v.open(scope)
+	key := scope
+	var s *liveStage
+	request, _ := fields["call_request"].(string)
+	if request != "" {
+		key = "call:" + request
+		s = v.calls[request]
+		if s != nil && s.call != nil {
+			if attempt, known := number(fields["call_attempt"]); known && int64(attempt) != s.call.Attempt {
+				return
+			}
+		}
+	} else {
+		for _, candidate := range v.calls {
+			if candidate.call != nil && candidate.call.Label == scope {
+				if s != nil {
+					return
+				} // a label cannot identify two calls, including a late completed one
+				s = candidate
+			}
+		}
+	}
+	if s == nil {
+		s = v.open(key)
+	}
+	if s != nil && s.call != nil && s.call.Phase == "terminal" {
+		return
+	}
 	if s == nil {
 		if !nested {
 			v.supersede(at)
 		}
-		s = &liveStage{key: scope, label: stageLabel(scope), scope: true, started: at, position: -1}
+		s = &liveStage{key: key, label: stageLabel(scope), scope: true, started: at, position: -1}
 		v.scopes = append(v.scopes, s)
 	} else if s.announced && !nested {
 		v.sequenced(s)
 	}
+	if request != "" {
+		if v.calls == nil {
+			v.calls = map[string]*liveStage{}
+		}
+		v.calls[request] = s
+	}
 	leaf := ""
 	if nested {
 		leaf = strings.TrimPrefix(stageLabel(name), s.label+" · ")
+		if s.call != nil {
+			if _, nestedLeaf, found := strings.Cut(leaf, " · "+s.label+" · "); found {
+				leaf = nestedLeaf
+			}
+		}
 	}
 	s.announced = s.announced || !nested
 	if leaf != s.leaf {
 		*s = liveStage{key: s.key, label: s.label, leaf: leaf, scope: true, announced: s.announced,
-			started: s.started, position: -1}
+			started: s.started, position: -1, call: s.call}
 	}
 	s.measure(fields)
 	s.last = at
@@ -345,7 +388,7 @@ func (v *liveView) stall(fields map[string]any, at time.Time) {
 		return
 	}
 	if v.stalls == nil {
-		v.stalls, v.stalled = map[string]*stall{}, map[string]time.Duration{}
+		v.stalls = map[string]*stall{}
 	}
 	held := v.stalls[step]
 	switch fields["event"] {
@@ -361,19 +404,18 @@ func (v *liveView) stall(fields map[string]any, at time.Time) {
 			return
 		}
 		if held.count--; held.count <= 0 {
-			v.stalled[step] += max(at.Sub(held.since), 0)
 			delete(v.stalls, step)
 		}
 	}
 }
 
-// ran is how long a stage has executed by at: its time open less its time held for weights.
+// ran uses the producer's execution measurement, or a legacy stage's wall time.
 func (v *liveView) ran(s *liveStage, at time.Time) time.Duration {
-	held := v.stalled[s.key]
-	if open := v.stalls[s.key]; open != nil {
-		held += max(at.Sub(open.since), 0)
+	if s.call != nil {
+		elapsed, _ := s.call.duration("running", at)
+		return elapsed
 	}
-	return max(at.Sub(s.started)-held, 0)
+	return max(at.Sub(s.started), 0)
 }
 
 // download is a child's own scope downloading its weights, read as the download itself.
@@ -407,7 +449,7 @@ func (v *liveView) close(at time.Time, failed bool, spare func(*liveStage) bool)
 		}
 	}
 	for _, s := range slices.Clone(v.scopes) {
-		if spare != nil && spare(s) {
+		if s.call != nil || spare != nil && spare(s) {
 			continue
 		}
 		end := s.last
@@ -424,6 +466,15 @@ func (v *liveView) retireAll(at time.Time, failed bool) {
 		v.phase = nil
 	}
 	v.close(at, failed, nil)
+	for _, s := range slices.Clone(v.scopes) {
+		// A run ending without this call's terminal record gives no final call
+		// measurement. Do not charge the missing interval to execution.
+		if s.call != nil {
+			s.call.Phase, s.call.AtUnixMS = "terminal", at.UnixMilli()
+			s.call.callTiming = callTiming{}
+		}
+		v.retire(s, at, failed)
+	}
 }
 
 func (v *liveView) retire(s *liveStage, end time.Time, failed bool) {
@@ -542,7 +593,7 @@ func (p *RunProgress) frame(at time.Time, width, height int) []string {
 		active = append(active, v.phase.phaseRows(at, width)...)
 	}
 	for _, s := range v.scopes {
-		active = append(active, s.rows(v.ran(s, at), v.stalls[s.key], width)...)
+		active = append(active, s.rows(v.ran(s, at), v.stalls[s.key], width, at)...)
 	}
 	for _, w := range v.waits {
 		if !v.ended.IsZero() {
@@ -621,16 +672,26 @@ func doneRows(done []liveDone, width int) []string {
 			mark = "✗"
 		}
 		label := clampLine(d.label, column+1)
-		rows = append(rows, "  "+mark+" "+label+strings.Repeat(" ", column-textCells(label))+"  "+shortDuration(d.took))
+		timing := shortDuration(d.took)
+		if d.stage != nil {
+			timing = "wall " + timing
+		}
+		if d.stage != nil && d.stage.call != nil {
+			timing = callTimingText(*d.stage.call, time.UnixMilli(d.stage.call.AtUnixMS), true)
+		}
+		rows = append(rows, "  "+mark+" "+label+strings.Repeat(" ", column-textCells(label))+"  "+timing)
 	}
 	return rows
 }
 
-// rows are an open stage's line and bar. A step held for weights shows what it waits for
-// and no clock: its time is the download's, on the download's own line.
-func (s *liveStage) rows(ran time.Duration, held *stall, width int) []string {
+// rows are an open stage's line and bar. A legacy step held for weights names its wait;
+// producer phase measurements keep preparation and execution clocks separate.
+func (s *liveStage) rows(ran time.Duration, held *stall, width int, at time.Time) []string {
 	line := "  ▸ " + s.label
-	if held != nil {
+	if s.call != nil && s.call.Phase != "running" {
+		return []string{line + " · " + callTimingText(*s.call, at, false)}
+	}
+	if held != nil && s.call == nil {
 		return []string{line + " · waiting for " + strings.TrimSpace(held.entrypoint+" weights")}
 	}
 	if download, ok := s.download(); ok {
@@ -638,7 +699,11 @@ func (s *liveStage) rows(ran time.Duration, held *stall, width int) []string {
 	} else if s.leaf != "" {
 		line += " · " + s.leaf
 	}
-	rows := []string{line + " · " + shortDuration(ran)}
+	timing := "wall " + shortDuration(ran)
+	if s.call != nil {
+		timing = callTimingText(*s.call, at, false)
+	}
+	rows := []string{line + " · " + timing}
 	if !s.hasFraction {
 		return rows
 	}
@@ -871,4 +936,121 @@ func (p *RunProgress) paint(row string) string {
 		empty += len("░")
 	}
 	return row[:start] + "\033[36m" + row[start:filled] + reset + "\033[2m" + row[filled:empty] + reset + row[empty:]
+}
+
+// Phase observations own a call's clock; labels are only its human presentation.
+func (p *RunProgress) liveCallPhase(e localapi.Event) {
+	phase, ok := readCallPhase(e)
+	if !ok {
+		return
+	}
+	p.applyCallPhase(phase, false)
+}
+
+func (p *RunProgress) applyCallPhase(phase callPhaseEvent, final bool) {
+	v := &p.view
+	if v.calls == nil {
+		v.calls = map[string]*liveStage{}
+	}
+	s := v.calls[phase.Request]
+	if s != nil {
+		if prior := s.call; prior != nil {
+			if final && phase.Attempt == prior.Attempt {
+				// The settled call is authoritative, including absent measurements.
+				// Its envelope clock may trail a producer's monotonic phase stamp.
+				phase.AtUnixMS = max(phase.AtUnixMS, prior.AtUnixMS)
+			} else if !phase.follows(prior.Attempt, prior.AtUnixMS, prior.Phase) {
+				return
+			}
+		}
+	} else {
+		for _, candidate := range v.scopes {
+			if candidate.key == phase.Label && candidate.call == nil {
+				s = candidate
+				break
+			}
+		}
+		if s == nil {
+			s = &liveStage{key: "call:" + phase.Request, label: stageLabel(phase.Label), scope: true, announced: true, position: -1}
+			v.scopes = append(v.scopes, s)
+		}
+		v.calls[phase.Request] = s
+	}
+	v.executing, v.status = true, "running"
+	if v.phase != nil {
+		v.retire(v.phase, time.UnixMilli(phase.AtUnixMS), false)
+		v.phase = nil
+	}
+	if phase.Label != "" {
+		s.label = stageLabel(phase.Label)
+	}
+	if s.label == "" {
+		s.label = phase.Export
+	}
+	if s.label == "" {
+		s.label = phase.Request
+	}
+	if s.call != nil && phase.Attempt > s.call.Attempt {
+		v.done = slices.DeleteFunc(v.done, func(done liveDone) bool { return done.stage == s })
+		if !slices.Contains(v.scopes, s) {
+			v.scopes = append(v.scopes, s)
+		}
+		s.leaf = ""
+		s.hasFraction, s.counted, s.whole = false, false, false
+	}
+	s.call = &phase
+	s.started = time.UnixMilli(phase.CalledUnixMS)
+	s.last = time.UnixMilli(phase.AtUnixMS)
+	if phase.Phase == "terminal" {
+		s.whole = true
+		for i := range v.done {
+			if v.done[i].stage == s {
+				v.done[i].took = v.ran(s, s.last)
+				v.done[i].failed = phase.Status == "failed" || phase.Status == "canceled"
+				return
+			}
+		}
+		v.retire(s, s.last, phase.Status == "failed" || phase.Status == "canceled")
+	}
+}
+
+func (p *RunProgress) finishLiveCall(e localapi.Event) {
+	raw, err := json.Marshal(e.Payload)
+	if err != nil {
+		return
+	}
+	var call callEvent
+	if json.Unmarshal(raw, &call) != nil || call.Request == "" || (!call.callTiming.present() && p.view.calls[call.Request] == nil) {
+		return
+	}
+	phase := callPhaseEvent{Request: call.Request, Parent: call.Parent, Index: call.Index, Attempt: call.Attempt, Module: call.Module, Export: call.Export, Label: call.Label, Phase: "terminal", Status: call.Status, AtUnixMS: eventTime(e).UnixMilli(), CalledUnixMS: call.CalledUnixMS, callTiming: call.callTiming}
+	p.applyCallPhase(phase, true)
+}
+
+func callTimingText(call callPhaseEvent, at time.Time, complete bool) string {
+	phase, label := call.Phase, call.Phase
+	switch phase {
+	case "running", "terminal":
+		phase, label = "running", "execution"
+	case "finalizing":
+		phase, label = "running", "finalizing · execution"
+	}
+	elapsed, known := call.duration(phase, at)
+	text := label
+	if known {
+		text += " " + shortDuration(elapsed)
+	} else {
+		text += " —"
+	}
+	if complete {
+		for _, part := range []struct{ phase, label string }{{"queued", "queued"}, {"preparing", "preparation"}} {
+			if elapsed, ok := call.duration(part.phase, at); ok && elapsed > 0 {
+				text += " · " + part.label + " " + shortDuration(elapsed)
+			}
+		}
+		if call.CalledUnixMS > 0 {
+			text += " · wall " + shortDuration(max(at.Sub(time.UnixMilli(call.CalledUnixMS)), 0))
+		}
+	}
+	return text
 }
