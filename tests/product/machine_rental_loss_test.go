@@ -42,10 +42,10 @@ func TestEndedRentalSettlesMachineControlWithoutInventingOutcome(t *testing.T) {
 			if owed {
 				t.Fatal("destroyed machine still owes an unreachable execution acknowledgement")
 			}
-			blocked, problem := store.ClientShutdownObligations()
+			held, problem := store.Obligations()
 			fatal(t, problem)
-			if len(blocked) != 0 {
-				t.Fatalf("ended machine still blocks observer shutdown: %+v", blocked)
+			if len(held) != 0 {
+				t.Fatalf("ended machine still holds the daemon: %+v", held)
 			}
 			after, problem := store.MachineExecution(request.ID)
 			fatal(t, problem)

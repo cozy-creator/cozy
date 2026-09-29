@@ -408,17 +408,15 @@ func (c *Client) DetachRental(rentalID string) (bool, *exit.Error) {
 	return out.Changed, e
 }
 
-// Down performs the daemon-side lifecycle fence. Normal disconnect refuses only
-// daemon-dependent work; force overrides that guard without cancellation. Under
-// all=true, the daemon requests cancellation
-// and returns the exact paid obligations the caller must terminate and confirm through
-// Tensorhub before retrying. ShuttingDown=true means cooperative down was accepted.
-func (c *Client) Down(all, force bool) (api.DownResult, *exit.Error) {
+// Down stops the daemon. A plain down never cancels work and names what is in flight.
+// Under all=true, the daemon requests cancellation and returns the exact paid obligations
+// the caller must terminate and confirm through Tensorhub before retrying.
+// ShuttingDown=true means the daemon is stopping.
+func (c *Client) Down(all bool) (api.DownResult, *exit.Error) {
 	var out api.DownResult
-	body := map[string]bool{"all": all}
-	if force {
-		body["force"] = true
-	}
+	// "force" is what a daemon from before this release needs to stop without refusing
+	// over work (the first down after an upgrade reaches one); a current daemon ignores it.
+	body := map[string]bool{"all": all, "force": !all}
 	e := c.call(http.MethodPost, "/v1/local/daemon/down", body, &out)
 	return out, e
 }

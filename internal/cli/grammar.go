@@ -20,7 +20,7 @@ type CLI struct {
 	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
 	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
-	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
+	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui; running work continues."`
 	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
 
 	Completion CompletionCmd `cmd:"" group:"Lifecycle" help:"Print a bash, zsh or fish tab-completion script."`
@@ -669,12 +669,11 @@ func (c *UpCmd) Run(r *Runtime) error {
 }
 
 type DownCmd struct {
-	All   bool `help:"Cancel all work, end all rentals, then stop Cozy." xor:"down-mode"`
-	Force bool `help:"Disconnect without canceling work or ending rentals; daemon-owned local work may be interrupted." xor:"down-mode"`
+	All bool `help:"Cancel all work, end all rentals, then stop Cozy."`
 }
 
 func (c *DownCmd) Run(r *Runtime) error {
-	return r.call(handleDown, nil, bools("--all", c.All, "--force", c.Force), nil, false)
+	return r.call(handleDown, nil, bools("--all", c.All), nil, false)
 }
 
 // SSHInfo reads current provider mapping from Hub; it stores no endpoint locally.

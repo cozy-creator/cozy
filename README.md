@@ -18,7 +18,7 @@ The installer checks the release against its `SHA256SUMS`, puts `cozy` in `~/.lo
 one uv tool environment, the host tools Cozy drives: `cozy-runtime` and TensorFS's `tfs`.
 `COZY_VERSION=v0.1.0` picks a release. Rerun it to upgrade: the new binary replaces the old by
 rename, so a running daemon keeps its binary and its work; the new one starts after the next
-`cozy down`, which refuses while work is active. From source: `go build -o ~/.local/bin/cozy .`
+`cozy down`; work in flight continues and the next command reattaches. From source: `go build -o ~/.local/bin/cozy .`
 (Go 1.26+; Windows: `scripts\install.ps1 -Binary .\cozy.exe`). Tab completion is installed
 automatically for bash and fish, and for zsh when `~/.local/share/zsh/site-functions` is on
 `fpath`; otherwise add `source <(cozy completion zsh)` to `~/.zshrc` after `compinit`.
@@ -634,7 +634,7 @@ Each rental has one local Ed25519 Creator key and one separate media bearer. Bot
 removed when the rental ends, and a lost Creator key requires a new rental.
 
 Rentals continue billing until Tensorhub confirms their termination. `cozy rental end`
-and `cozy down --all` request termination; normal or forced client disconnect does not.
+and `cozy down --all` request termination; a plain `cozy down` does not.
 
 ## Release GPU memory or stop Cozy
 
@@ -642,19 +642,16 @@ These commands have deliberately different scopes:
 
 ```sh
 cozy machine stop # stop this computer's machine and free its GPU; the next run relaunches it
-cozy down         # disconnect; guards work that still needs this daemon online
-cozy down --force # disconnect anyway; never cancel jobs or end rentals
+cozy down         # stop the daemon; runs, uploads and rentals continue
 cozy down --all   # cancel all work, end all rentals, then stop the daemon
 ```
 
-None deletes installed package or model bytes. Normal and forced disconnect preserve
-retained paused/blocked/completed work and rental records. Idle rented machines still
-shut down after 15 minutes; `cozy rental keepalive <name>` explicitly resets that
-deadline once. Accepted detached local and remote Runtime executions continue and
-reconnect on `cozy up`. Unfinished handoffs,
-controls, and daemon-owned execution can still block normal shutdown. `--force` may
-interrupt legacy daemon-owned local work; it uses existing recovery on restart.
-`--all` remains explicit cancellation and rental teardown. See
+None deletes installed package or model bytes. `cozy down` never refuses over work: it
+names what is in flight, and this computer's machine and every rental keep running it.
+The next command starts the daemon, which resumes each submission, upload, control and
+output collection from its records. Idle rented machines still shut down after 15
+minutes; `cozy rental keepalive <name>` explicitly resets that deadline once. `--all`
+remains explicit cancellation and rental teardown. See
 [daemon shutdown](docs/daemon-shutdown.md).
 
 The daemon's own words — the orchestrator's frame-by-frame account — are in

@@ -1,31 +1,23 @@
-# Daemon shutdown and retained execution
+# Daemon shutdown
 
-`cozy down` stops the Creator client daemon without canceling requests or ending
-rentals. Retained paused, blocked, and completed work does not require the client
-to stay online. Durable terminal receipts awaiting acknowledgement also survive disconnect.
-Its records, outputs, and rental holds remain available after
-`cozy up`. Remote rentals continue billing until explicitly ended with
-`cozy rental end` (or destructive `cozy down --all`).
+`cozy down` stops the client daemon and nothing else. It never refuses over work in
+flight and never cancels it: it names what is in flight, and this computer's machine
+and every rental keep running it. Rentals keep billing until `cozy rental end` (or
+`cozy down --all`).
 
-A durable Runtime acceptance receipt permits both detached local and remote
-execution to continue independently. Reconnection reads the same execution and
-workspace; it does not submit another execution or cancel the existing one.
-Preparation without acceptance, unfinished input transfer, pending execution
-control, and legacy daemon-coordinated work can still require
-the daemon. A legacy remote attempt acceptance is not a machine-execution receipt
-and does not prove independence from Creator's child/effect broker. Normal shutdown
-names those dependencies and refuses.
+The daemon only submits, follows and collects. Everything it holds is durable, so the
+next command's daemon picks each piece up where it was:
 
-`cozy down --force` overrides that dependency guard and disconnects the client.
-It does not send request cancellation or rental deletion. Legacy local execution
-owned by the daemon may be interrupted and uses the existing recovery rules on
-restart; force does not promise that every process continues.
+- a submission not yet accepted is prepared again (an interrupted upload resumes by
+  content) and sent under the same frozen identity, which a machine answers once;
+- an accepted run is observed from its durable cursor, and its outputs are collected
+  into the outputs folder;
+- a pending cancel or pause is sent again under the same command id;
+- output exports and uploads, model transfers, rental acquisitions, installations and
+  Runtime updates resume from their rows.
 
-`cozy down --all` retains its separate destructive meaning: cancel work and end
-rentals. Automatic idle shutdown continues to use the full retention and resource
-obligations rather than the explicit disconnect policy.
+Startup does not submit a failed, paused, blocked, canceled, refused, or completed
+execution merely because the client restarted.
 
-Startup resumes accepted execution observation and unfinished runnable submissions. It
-does not submit a failed, paused, blocked, canceled, refused, or completed execution merely
-because the client restarted. A previously accepted receipt may reconcile an outcome
-that completed while the client was absent; that is distinct from starting new work.
+`cozy down --all` keeps its destructive meaning: cancel work and end rentals. The idle
+exit still waits until nothing is left to manage.
