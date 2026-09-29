@@ -527,8 +527,10 @@ local intent. This action does not make a remote cancellation or lifecycle reque
 Machine lifecycle and job documents carry `execution_known` beside `execution_ms`.
 Execution is measured cooperative author work across the root and its children, with
 concurrent work counted once. Preparation and a fully blocked workflow do not count.
-The CLI prints `—` (JSON `null`) when Runtime did not measure this duration, including
-older retained runs. Live totals advance only when a new measured snapshot arrives.
+`cozy run list` and detailed `run show` print `—` with `execution_ms: null` in their
+JSON when Runtime did not measure this duration, including older retained runs.
+The API's numeric field remains zero with `execution_known: false`; formatted watch
+output uses `execution: "—"`. Live totals advance only with a new measured snapshot.
 
 `attempt_wall_ms` preserves the separate admission-to-outcome intervals, excluding
 paused/retry gaps. `wall_ms` in a detailed run report remains the overall elapsed run
