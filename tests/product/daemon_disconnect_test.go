@@ -182,7 +182,7 @@ exit 2
 			_, problem = store.CancelQueuedRequest(request.ID, map[string]any{"reason": "fixture"})
 			fatal(t, problem)
 		case "refused":
-			fatal(t, store.RefuseMachineSubmission(request.ID, "fixture.refused", "not accepted"))
+			fatal(t, store.RefuseMachineSubmission(request.ID, "fixture.refused", "not accepted", nil))
 		}
 		return store, request
 	}

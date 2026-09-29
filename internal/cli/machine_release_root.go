@@ -198,15 +198,13 @@ func (m *machineRuns) observeRootDownload(request string, trailer metadata.MD) *
 	return event
 }
 
-// submissionRefused names a failed release-root submission; a definitive refusal is recorded.
+// submissionRefused resolves permanent refusals through the durable submission key.
 func (m *machineRuns) submissionRefused(ctx context.Context, connection *machineConnection, requestID string, trailer metadata.MD, err error) *exit.Error {
 	for _, code := range trailer.Get("cozy-error-code") {
 		switch code {
 		case "execution_workspace_changed", "execution_workspace_required":
 			return exit.Named(exit.Conflict, "machine_execution.workspace_changed", "execution workspace no longer matches the frozen submission; prior acceptance remains unresolved")
-		case "execution_submission_refused":
-			return m.unaccepted(ctx, connection, requestID, err)
 		}
 	}
-	return machineTransport(err)
+	return m.settleSubmissionRefusal(ctx, connection, requestID, machineTransport(err))
 }

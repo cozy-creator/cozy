@@ -51,7 +51,8 @@ type runtimeMachine struct {
 	failure     string                       // a failed terminal's safe message; empty succeeds
 	code        pb.CauseCode                 // the failure's cause; AUTHOR_EXCEPTION when unset
 	refusal     string                       // a release root this Runtime cannot prepare
-	older       bool                         // a Runtime from before release roots
+	closed      map[string]bool
+	older       bool // a Runtime from before release roots
 }
 
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
@@ -69,6 +70,9 @@ var runtimeExecutionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$`
 func (m *runtimeMachine) SubmitMachineExecution(ctx context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed[submit.SubmissionId] {
+		return nil, status.Error(codes.FailedPrecondition, "submission closed")
+	}
 	if m.refusal != "" && submit.ReleaseRoot != nil {
 		// Nothing was journaled: the refusal is definitive.
 		_ = grpc.SetTrailer(ctx, metadata.Pairs("cozy-error-code", "execution_submission_refused"))
@@ -98,6 +102,21 @@ func (m *runtimeMachine) SubmitMachineExecution(ctx context.Context, submit *pb.
 	m.record("running", []byte(`{}`))
 	m.record("gpu.wait", wait)
 	return m.receipt, nil
+}
+
+func (m *runtimeMachine) CloseMachineSubmission(_ context.Context, q *pb.MachineSubmissionClose) (*pb.MachineSubmissionClosure, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := &pb.MachineSubmissionClosure{RequestId: q.RequestId, SubmissionId: q.SubmissionId, ExecutionWorkspaceId: q.ExpectedExecutionWorkspaceId}
+	if m.receipt != nil {
+		out.Receipt = proto.Clone(m.receipt).(*pb.MachineExecutionReceipt)
+	} else {
+		if m.closed == nil {
+			m.closed = map[string]bool{}
+		}
+		m.closed[q.SubmissionId] = true
+	}
+	return out, nil
 }
 
 func (m *runtimeMachine) record(kind string, body []byte) {
