@@ -780,10 +780,12 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if problem := client.Cancel(id, "cozy run cancel"); problem != nil {
 		return problem
 	}
-	if _, problem := client.Watch(id, 0, func(localapi.Event) bool { return true }); problem != nil {
-		return problem
+	if ctx.Inv.Bool("--await") {
+		if _, problem := client.Watch(id, 0, func(localapi.Event) bool { return true }); problem != nil {
+			return problem
+		}
 	}
-	after, problem := client.Request(id)
+	after, problem := client.RecordedRequest(id)
 	if problem != nil {
 		return problem
 	}

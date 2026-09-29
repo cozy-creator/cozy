@@ -22,7 +22,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/transfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -103,7 +105,13 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 			if problem != nil || link == nil {
 				return
 			}
-			if len(link.Receipt) == 0 && link.CancelRequested && current.State == "canceling" {
+			if len(link.Receipt) == 0 && len(link.Submission) > 0 && link.CancelRequested && !link.SubmissionClosed && current.State == "canceled" {
+				if _, problem := m.store.CancelMachineBeforeAcceptance(request.ID); problem != nil {
+					return
+				}
+				continue
+			}
+			if len(link.Receipt) == 0 && len(link.Submission) == 0 && link.CancelRequested && current.State == "canceling" {
 				// An older cozy left this cancel waiting on a machine that never accepted the run.
 				if _, problem := m.store.CancelMachineBeforeAcceptance(request.ID); problem != nil {
 					return
@@ -118,7 +126,9 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				return
 			}
 			if len(link.Receipt) == 0 {
-				if current.State == "canceled" {
+				if link.CancelRequested && len(link.Submission) > 0 && !link.SubmissionClosed {
+					problem = m.closePendingSubmission(m.ctx, *current, link)
+				} else if current.State == "canceled" {
 					// Canceled before any machine accepted it: nothing is submitted again. Only
 					// input bytes staged on its machine are owed, and only while there are any.
 					if link.MachineID != "" {
@@ -194,8 +204,8 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					_, _ = m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
 					return
 				}
-				if unsent {
-					// A run still waiting to reach its machine says why, as a queued run does.
+				if unsent || latest != nil && row != nil && len(latest.Receipt) == 0 {
+					// Unsent and acceptance-unknown work both expose what reconciliation awaits.
 					parked := map[string]any{"reason": problem.Message, "wait": orchestrator.WaitRental}
 					if row.Machine != "" {
 						parked["waiting_on"] = row.Machine
@@ -211,6 +221,48 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 		}
 	}()
 	return nil
+}
+
+// closePendingSubmission resolves cancellation without retransmitting work.
+// A missing receipt is uncertainty; a durable closed key is a nonacceptance proof.
+func (m *machineRuns) closePendingSubmission(ctx context.Context, request records.Request, link *records.MachineExecution) *exit.Error {
+	var frozen pb.MachineExecutionSubmit
+	if proto.Unmarshal(link.Submission, &frozen) != nil || frozen.Offer == nil || frozen.ExpectedExecutionWorkspaceId == "" {
+		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "pending cancellation has no intact submission identity")
+	}
+	connection, problem := m.connectFor(ctx, request, link.MachineID, "closing its pending submission")
+	if problem != nil {
+		return problem
+	}
+	defer connection.Close()
+	closed, problem := closeSubmission(ctx, connection, &frozen)
+	if problem != nil {
+		return problem
+	}
+	if closed.Receipt != nil {
+		return m.store.AcceptMachineExecution(request.ID, closed.Receipt)
+	}
+	return m.store.CompleteMachineSubmissionClosure(request.ID, closed)
+}
+
+func closeSubmission(ctx context.Context, connection *machineConnection, frozen *pb.MachineExecutionSubmit) (*pb.MachineSubmissionClosure, *exit.Error) {
+	closed, err := connection.Host.CloseMachineSubmission(ctx, &pb.MachineSubmissionClose{Claim: connection.Claim,
+		SubmissionId: frozen.SubmissionId, RequestId: frozen.Offer.RequestId, ExpectedExecutionWorkspaceId: frozen.ExpectedExecutionWorkspaceId})
+	if status.Code(err) == codes.Unimplemented {
+		return nil, exit.Named(exit.Unavailable, "machine_execution.closure_unavailable", "acceptance remains unresolved: this machine cannot close a submission key; update its Runtime or reconcile its termination")
+	}
+	if err != nil {
+		return nil, machineTransport(err)
+	}
+	if closed == nil || closed.SubmissionId != frozen.SubmissionId || closed.RequestId != frozen.Offer.RequestId || closed.ExecutionWorkspaceId != frozen.ExpectedExecutionWorkspaceId {
+		return nil, exit.New(exit.Conflict, "machine returned another submission's closure")
+	}
+	if closed.Receipt != nil {
+		if closed.Receipt.WorkerId != connection.Claim.WorkerId {
+			return nil, exit.New(exit.Conflict, "submission receipt names another machine")
+		}
+	}
+	return closed, nil
 }
 
 func (m *machineRuns) Resume() {
@@ -604,7 +656,7 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 		}
 		for _, code := range trailer.Get("cozy-error-code") {
 			if code == "execution_submission_refused" {
-				return m.unaccepted(requestID, err)
+				return m.unaccepted(ctx, connection, requestID, err)
 			}
 		}
 		return machineTransport(err)
@@ -621,10 +673,25 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 // unaccepted is a submission the machine proved it never accepted. A definitive refusal
 // fails the run; a transient failure only means it is safe to send again, and the run
 // keeps trying while its machine lives.
-func (m *machineRuns) unaccepted(requestID string, err error) *exit.Error {
+func (m *machineRuns) unaccepted(ctx context.Context, connection *machineConnection, requestID string, err error) *exit.Error {
 	problem := machineTransport(err)
 	if problem.Code == exit.Unavailable {
 		return problem
+	}
+	link, recordProblem := m.store.MachineExecution(requestID)
+	if recordProblem != nil {
+		return recordProblem
+	}
+	var frozen pb.MachineExecutionSubmit
+	if link == nil || proto.Unmarshal(link.Submission, &frozen) != nil || frozen.Offer == nil || frozen.ExpectedExecutionWorkspaceId == "" {
+		return exit.New(exit.Conflict, "refused submission has no retained identity")
+	}
+	closed, closeProblem := closeSubmission(ctx, connection, &frozen)
+	if closeProblem != nil {
+		return closeProblem
+	}
+	if closed.Receipt != nil {
+		return m.store.AcceptMachineExecution(requestID, closed.Receipt)
 	}
 	if recordProblem := m.store.RefuseMachineSubmission(requestID, problem.ErrName(), problem.Message); recordProblem != nil {
 		return recordProblem

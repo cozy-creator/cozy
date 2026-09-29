@@ -14,12 +14,10 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// A cancel never waits on a machine that has not accepted the run. A run whose submission
-// reached this computer's machine, which then never boots again, and one sent to a rental
-// whose pod died, both end canceled the moment they are canceled (runs 1583, 1589 sat in
-// "canceling" until a machine that never came back, or a preparation, answered). One an
-// older cozy left in "canceling" ends canceled once the daemon starts.
-func TestACancelBeforeAcceptanceEndsTheRunAtOnce(t *testing.T) {
+// A frozen submission may already have run despite a lost acceptance reply.
+// Cancellation remains visible and pending until its machine closes the key or
+// returns an accepted receipt; unreachable is not proof of nonexecution.
+func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 	for _, arm := range []struct{ name, machine string }{{"local machine never boots", machines.Local},
 		{"rental died", "pr-deadpoddeadpoddead0"}, {"left canceling by an older cozy", machines.Local}} {
 		machine := arm.machine
@@ -41,7 +39,7 @@ func TestACancelBeforeAcceptanceEndsTheRunAtOnce(t *testing.T) {
 				Rental: rented, RequestedRental: map[bool]string{true: machine}[rented]})
 			fatal(t, problem)
 			fatal(t, store.LinkMachineExecution(request.ID, machine))
-			// The machine was preparing the release when it went away: sent, never accepted.
+			// The machine was preparing the release when it went away: sent, acceptance unknown.
 			fatal(t, store.RecordMachineSubmission(request.ID, &pb.MachineExecutionSubmit{SubmissionId: "stuck-cancel",
 				ExpectedExecutionWorkspaceId: "workspace", Offer: &pb.AttemptOffer{RequestId: request.ID},
 				PayloadCanonicalBytes: []byte(`{}`), ReleaseRoot: &pb.ReleaseRoot{Package: "proof/stuck", Release: "1.0.0", Entrypoint: "generate"}}))
@@ -61,11 +59,11 @@ func TestACancelBeforeAcceptanceEndsTheRunAtOnce(t *testing.T) {
 			startDaemonProcess(t, root)
 			if left {
 				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-					if code, out := runCozy(t, root, "run", "show", request.ID, "--json"); code == 0 && strings.Contains(out, `"status":"canceled"`) {
+					if code, out := runCozy(t, root, "run", "show", request.ID, "--json"); code == 0 && strings.Contains(out, `"status":"canceling"`) {
 						break
 					}
 				}
-			} else if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 || !strings.Contains(out, `"canceled"`) {
+			} else if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 || !strings.Contains(out, `"canceling"`) {
 				t.Fatalf("cancel did not end the run [exit %d]: %s", code, out)
 			}
 			store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
@@ -75,16 +73,16 @@ func TestACancelBeforeAcceptanceEndsTheRunAtOnce(t *testing.T) {
 			fatal(t, problem)
 			owed, problem := store.MachineExecutionOwesWork(request.ID)
 			fatal(t, problem)
-			if row.State != "canceled" || owed || time.Since(began) > 10*time.Second {
+			if row.State != "canceling" || !owed || time.Since(began) > 10*time.Second {
 				t.Fatalf("the run is %s (owes the machine: %v) %s after its cancel", row.State, owed, time.Since(began))
 			}
-			// It stays canceled: the daemon neither submits it again nor waits on the machine.
+			// It stays pending: the daemon tries closure, never retransmits the submission.
 			time.Sleep(2 * time.Second)
 			row, problem = store.RequestRow(request.ID)
 			fatal(t, problem)
 			link, problem := store.MachineExecution(request.ID)
 			fatal(t, problem)
-			if row.State != "canceled" || len(link.Receipt) != 0 || !link.CancelRequested {
+			if row.State != "canceling" || len(link.Receipt) != 0 || !link.CancelRequested {
 				t.Fatalf("after its cancel the run is %s (receipt %d bytes, intent kept %v)", row.State, len(link.Receipt), link.CancelRequested)
 			}
 		})

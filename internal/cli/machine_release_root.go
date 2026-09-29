@@ -175,7 +175,7 @@ func (m *machineRuns) sendReleaseRoot(ctx context.Context, request records.Reque
 			if slices.Contains(codeOf, "execution_workspace_changed") {
 				connection.KeepWorkspace(nil)
 			}
-			return m.submissionRefused(request.ID, trailer, err)
+			return m.submissionRefused(ctx, connection, request.ID, trailer, err)
 		}
 	}
 }
@@ -199,13 +199,13 @@ func (m *machineRuns) observeRootDownload(request string, trailer metadata.MD) *
 }
 
 // submissionRefused names a failed release-root submission; a definitive refusal is recorded.
-func (m *machineRuns) submissionRefused(requestID string, trailer metadata.MD, err error) *exit.Error {
+func (m *machineRuns) submissionRefused(ctx context.Context, connection *machineConnection, requestID string, trailer metadata.MD, err error) *exit.Error {
 	for _, code := range trailer.Get("cozy-error-code") {
 		switch code {
 		case "execution_workspace_changed", "execution_workspace_required":
 			return exit.Named(exit.Conflict, "machine_execution.workspace_changed", "execution workspace no longer matches the frozen submission; prior acceptance remains unresolved")
 		case "execution_submission_refused":
-			return m.unaccepted(requestID, err)
+			return m.unaccepted(ctx, connection, requestID, err)
 		}
 	}
 	return machineTransport(err)

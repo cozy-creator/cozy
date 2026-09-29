@@ -382,6 +382,10 @@ while retaining that state; `cozy run resume <id>` runs the exact captured revis
 Changed code or parameters are captured by a new run, optionally linked with `--retry`.
 `cozy run cancel <id>` abandons the retained
 work, releasing only resources with no other owner. Retained rentals continue billing.
+Cancellation records intent and returns the observed state. If a sent submission's
+acceptance is unknown, it remains `canceling` until the machine closes its key or
+confirms the execution outcome. Use `cozy run cancel <id> --await` to wait for that
+confirmation. Work never submitted cancels immediately.
 An unchanged deterministic failure is not automatically retried. `--await` returns when a
 transaction blocks or pauses, and the ordinary run view explains the stopped state.
 
