@@ -48,6 +48,8 @@ type Host struct {
 	inherited []string
 	// GPUBudget is `machine.gpu_budget`, written for the Runtime at every launch.
 	GPUBudget any
+	// WebRTCPort is explicitly configured by the machine operator, never by a Hub grant.
+	WebRTCPort int
 }
 
 func NewHost(dir, store string, environ []string) *Host {
@@ -512,6 +514,9 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 	}, h.inherited...)
 	if h.store != "" {
 		base = append(base, "COZY_TENSORFS_ROOT="+h.store)
+	}
+	if h.WebRTCPort != 0 {
+		base = append(base, "COZY_WEBRTC_INTERNAL_PORT="+strconv.Itoa(h.WebRTCPort))
 	}
 	// Free ports are chosen, not reserved: a port taken before the Host binds it ends
 	// that Host before readiness, and the next launch chooses again.

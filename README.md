@@ -82,7 +82,9 @@ The machine server is the separate `cozy-machine` executable, built in `cozy-run
 `cozy machine install` installs its independently versioned public release and a Runtime
 Python environment. The same agent and machine API run on a laptop and a rented pod;
 restarting the personal controller leaves accepted machine work running. `cozy machine stop`
-explicitly stops the local machine. Agent replacement waits for confirmed idle state and
+explicitly stops the local machine. Optional `machine.webrtc_port` in the Cozy config
+enables its WebRTC media listener; Hub grants cannot change machine listening ports.
+Agent replacement waits for confirmed idle state and
 retains the machine identity, execution journal, installed packages, and outputs.
 
 An owned machine boots offline and is never registered with Tensorhub. Tensorhub allocates

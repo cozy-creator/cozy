@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -122,6 +123,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	must(t, err)
 	t.Cleanup(func() { _ = removeAllForce(dir) })
 	host := machines.NewHost(dir, "", nil)
+	host.WebRTCPort, _ = strconv.Atoi(h.grants["COZY_WEBRTC_INTERNAL_PORT"])
 	source.Pinned = true // the Host under test, never replaced by the test binary
 	_, problem = host.Install(context.Background(), source, uv)
 	fatal(t, problem)

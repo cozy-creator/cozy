@@ -81,6 +81,8 @@ type Config struct {
 	// MachineGPUBudget caps the GPU memory this computer's machine may use, verbatim from
 	// `machine.gpu_budget`: its Runtime reads it as gpu.budget. Nil leaves the GPUs uncapped.
 	MachineGPUBudget any
+	// MachineWebRTCPort enables the owned agent media listener; zero leaves it disabled.
+	MachineWebRTCPort int
 
 	Tfs       string
 	TfsSource string
@@ -452,6 +454,7 @@ func load() (Config, *exit.Error) {
 		HubName:                  hubName,
 		Hubs:                     hubs,
 		MachineGPUBudget:         file.gpuBudget,
+		MachineWebRTCPort:        file.machineWebRTCPort,
 		HubToken:                 hubToken,
 		ConfiguredHubURL:         hubURL,
 		HubURLSource:             sourceOf("tensorhub_url", file, environment, "default"),
@@ -587,7 +590,8 @@ type resolver struct {
 	// conflicting names behaviour settings the file gives two different values.
 	conflicting map[string]bool
 	// gpuBudget is `machine.gpu_budget`, verbatim: a size, a byte count, or a per-GPU map.
-	gpuBudget any
+	gpuBudget         any
+	machineWebRTCPort int
 }
 
 func (r *resolver) Resolve(_ *kong.Context, _ *kong.Path, flag *kong.Flag) (any, error) {
@@ -775,12 +779,18 @@ func fileYAML(reader io.Reader) (*resolver, error) {
 				return nil, fmt.Errorf("line %d value for \"machine\" is not a mapping", value.Line)
 			}
 			for j := 0; j < len(value.Content); j += 2 {
-				if value.Content[j].Value != "gpu_budget" {
-					out.ignored = append(out.ignored, "machine."+value.Content[j].Value)
-					continue
-				}
-				if err := value.Content[j+1].Decode(&out.gpuBudget); err != nil {
-					return nil, fmt.Errorf("line %d machine.gpu_budget: %s", value.Line, err)
+				field, setting := value.Content[j], value.Content[j+1]
+				switch field.Value {
+				case "gpu_budget":
+					if err := setting.Decode(&out.gpuBudget); err != nil {
+						return nil, fmt.Errorf("line %d machine.gpu_budget: %s", setting.Line, err)
+					}
+				case "webrtc_port":
+					if err := setting.Decode(&out.machineWebRTCPort); err != nil || out.machineWebRTCPort < 0 || out.machineWebRTCPort > 65535 {
+						return nil, fmt.Errorf("line %d machine.webrtc_port must be 0..65535", setting.Line)
+					}
+				default:
+					out.ignored = append(out.ignored, "machine."+field.Value)
 				}
 			}
 			continue

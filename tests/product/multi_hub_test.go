@@ -876,7 +876,8 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 }
 
 func TestExecutionAccessToleratesNewHubSettings(t *testing.T) {
-	_, ca := hubTLSServer(t, http.NotFoundHandler())
+	certServer, ca := hubTLSServer(t, http.NotFoundHandler())
+	t.Cleanup(certServer.Close)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/execution-access" {
 			http.NotFound(w, r)

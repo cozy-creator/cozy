@@ -19,6 +19,7 @@ func localMachineHost(ctx *Context) (*machines.Host, *exit.Error) {
 	}
 	host := machines.NewHost(layout.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child())
 	host.GPUBudget = ctx.Cfg.MachineGPUBudget
+	host.WebRTCPort = ctx.Cfg.MachineWebRTCPort
 	return host, nil
 }
 
