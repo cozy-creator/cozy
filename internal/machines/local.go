@@ -46,7 +46,7 @@ type Host struct {
 	cached *cachedLaunch
 	// inherited are the locale and trust-store values a Host may carry from its launcher.
 	inherited []string
-	// GPUBudget is `machine.gpu_budget`, written for the Runtime at every launch.
+	// GPUBudget seeds a new machine config. Existing machine settings belong to its owner.
 	GPUBudget any
 	// WebRTCPort is explicitly configured by the machine operator, never by a Hub grant.
 	WebRTCPort int
@@ -73,13 +73,7 @@ func (h *Host) Root() string            { return filepath.Join(h.dir, "root") }
 func (h *Host) path(name string) string { return filepath.Join(h.dir, name) }
 
 // The image layout the Host and Runtime share, rooted.
-func (h *Host) binary() string {
-	path := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
-	if _, err := os.Stat(path); err == nil {
-		return path
-	}
-	return filepath.Join(h.Root(), "usr/local/bin/pod-supervisor") // pre-agent installations
-}
+func (h *Host) binary() string { return filepath.Join(h.Root(), "usr/local/bin/cozy-machine") }
 func (h *Host) python() string { return filepath.Join(h.Root(), "opt/cozy/python") }
 
 // wheels holds exactly the Runtime and TensorFS wheels the machine installed from (none after
@@ -93,7 +87,7 @@ func (h *Host) readinessEnvelope() string {
 // RuntimeFloor is the first Runtime with the single-agent supervisor launch contract.
 const RuntimeFloor = "0.18.85"
 
-// Source is a machine agent and optional paired development Runtime and TensorFS wheels.
+// Source optionally pins an agent and paired development Runtime and TensorFS wheels.
 // Pinned retains an explicitly selected agent instead of adopting a published one.
 type Source struct {
 	Host, RuntimeWheel, TensorFSWheel string
@@ -115,14 +109,22 @@ type Installed struct {
 	HostPinned  bool              `json:"host_pinned,omitempty"`
 }
 
-// startupEnvironment preserves an explicitly installed Host or wheel pair.
+// startupPolicy preserves an explicitly installed Host or wheel pair.
 // The published agent hash alone does not pin the installation.
-func (i Installed) startupEnvironment() []string {
+func (i Installed) startupPolicy() []byte {
 	mode := "auto"
+	agent := "bundled"
+	if i.HostPinned {
+		agent = "explicit"
+	}
 	if i.HostPinned || i.Runtime.SHA256 != "" || i.TensorFS.SHA256 != "" {
 		mode = "off"
 	}
-	return []string{"COZY_STARTUP_UPDATE=" + mode}
+	body, _ := json.Marshal(struct {
+		Mode  string `json:"startup_update"`
+		Agent string `json:"agent"`
+	}{mode, agent})
+	return body
 }
 
 // HostModule is the Go main module a Host binary was built from, "" when it is not Go.
@@ -187,12 +189,18 @@ func (h *Host) runtimeIdle() bool {
 	return err == nil && json.Unmarshal(raw, &state) == nil && state.ActiveWork != nil && !*state.ActiveWork && len(state.Holding) == 0
 }
 
-// Outdated only identifies the legacy embedded Host. Agent upgrades are explicit;
-// updating the CLI does not replace a running machine server.
+// Outdated identifies legacy Hosts and unpinned copies shadowing a wheel-owned
+// agent. Adoption still requires an idle machine; CLI updates do not replace it.
 func (h *Host) Outdated() bool {
 	installed, problem := h.Installed()
-	return problem == nil && installed != nil && !installed.HostPinned &&
-		cmp.Or(installed.Host.Module, HostModule(h.binary())) != AgentModule
+	if problem != nil || installed == nil || installed.HostPinned {
+		return false
+	}
+	if bundle, err := os.Stat(h.bundledAgent()); err == nil && HostModule(h.bundledAgent()) == AgentModule {
+		current, err := os.Stat(h.binary())
+		return err != nil || !os.SameFile(bundle, current)
+	}
+	return cmp.Or(installed.Host.Module, HostModule(h.binary())) != AgentModule
 }
 
 func (h *Host) adoptLocked(ctx context.Context) (bool, *exit.Error) {
@@ -203,14 +211,18 @@ func (h *Host) adoptLocked(ctx context.Context) (bool, *exit.Error) {
 	if problem != nil {
 		return false, problem
 	}
-	source, problem := h.PublishedAgent(ctx)
+	source, problem := h.defaultAgent(ctx)
 	if problem != nil {
 		return false, problem
 	}
-	if problem := h.stopLocked(ctx); problem != nil {
-		return false, problem
+
+	var artifact installedArtifact
+	var err error
+	if source == h.bundledAgent() {
+		artifact, err = h.linkAgent()
+	} else {
+		artifact, err = h.placeHost(source)
 	}
-	artifact, err := h.placeHost(source)
 	if err != nil {
 		return false, exit.Internalf("cannot install the machine agent: %s", err)
 	}
@@ -250,25 +262,39 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		return nil, problem
 	}
 	defer unlock()
-	if record, problem := h.record(); problem != nil {
-		return nil, problem
-	} else if record != nil && h.alive(record.PID) && !h.runtimeIdle() {
-		return nil, exit.Named(exit.Conflict, "machine.busy", "the machine is running work or has not confirmed that it is idle").
-			WithRemedy("wait for accepted work to finish before installing; use machine stop only to explicitly stop the machine")
-	}
-	if _, problem := h.identity(); problem != nil {
+	record, problem := h.record()
+	if problem != nil {
 		return nil, problem
 	}
 	previous, problem := h.Installed()
 	if problem != nil {
 		return nil, problem
 	}
-	installed := Installed{InstalledAt: time.Now().UTC()}
-	if source.Host == "" || (source.RuntimeWheel == "") != (source.TensorFSWheel == "") ||
-		source.RuntimeWheel != "" && (!strings.HasSuffix(source.RuntimeWheel, ".whl") || !strings.HasSuffix(source.TensorFSWheel, ".whl")) {
-		return nil, exit.New(exit.Validation, "the machine install names the Host binary, and both wheels or neither")
+	if previous == nil && record != nil && h.alive(record.PID) {
+		return nil, exit.Named(exit.Conflict, "machine.installation_unreadable", "the running machine has no installation metadata; repair it through its maintenance API without replacing its process")
 	}
+	installed := Installed{InstalledAt: time.Now().UTC()}
+	if (source.RuntimeWheel == "") != (source.TensorFSWheel == "") ||
+		source.RuntimeWheel != "" && (!strings.HasSuffix(source.RuntimeWheel, ".whl") || !strings.HasSuffix(source.TensorFSWheel, ".whl")) {
+		return nil, exit.New(exit.Validation, "the machine install names both wheels or neither, with an optional Host binary")
+	}
+	if source.Host != "" && !compatibleAgent(ctx, source.Host) {
+		return nil, exit.Named(exit.Structural, "machine.agent_update_required", "the selected agent must advertise %s, %s and %s", HubAccessCapability, RuntimeUpdateCapability, BootstrapCapability)
+	}
+	if previous != nil {
+		return h.updateLocked(ctx, source)
+	}
+	release, problem := h.bootstrapLease()
+	if problem != nil {
+		return nil, problem
+	}
+	defer release()
+	if _, problem := h.identity(); problem != nil {
+		return nil, problem
+	}
+
 	installed.HostPinned = source.Pinned
+	hostName := filepath.Base(source.Host)
 	for _, artifact := range []struct {
 		path string
 		out  *installedArtifact
@@ -282,11 +308,28 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		}
 		*artifact.out = installedArtifact{Name: filepath.Base(artifact.path), SHA256: digest}
 	}
-	if _, err := fileDigest(source.Host); err != nil {
-		return nil, exit.New(exit.NotFound, "cannot read the machine agent: %s", err)
+	if source.Host != "" {
+		if _, err := fileDigest(source.Host); err != nil {
+			return nil, exit.New(exit.NotFound, "cannot read the machine agent: %s", err)
+		}
 	}
-	if problem := h.stopLocked(ctx); problem != nil {
-		return nil, problem
+	retain := source.Host
+	if retain != "" {
+		// Preserve an explicitly selected executable before its wheel is replaced.
+		bundle, bundleErr := os.Stat(h.bundledAgent())
+		current, currentErr := os.Stat(retain)
+		if bundleErr == nil && currentErr == nil && os.SameFile(bundle, current) {
+			file, err := os.CreateTemp(h.dir, ".agent-before-*")
+			if err != nil {
+				return nil, exit.Internalf("cannot retain the current agent: %s", err)
+			}
+			file.Close()
+			defer os.Remove(file.Name())
+			if err := copyFile(retain, file.Name(), 0755); err != nil {
+				return nil, exit.Internalf("cannot retain the current agent: %s", err)
+			}
+			source.Host = file.Name()
+		}
 	}
 	root := h.Root()
 	for _, dir := range []string{"usr/local/bin", "opt/cozy/bin"} {
@@ -318,12 +361,6 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		requirements = []string{hostruntime.Distribution + "[media] @ file://" + wheels[0], wheels[1]}
 	}
 	if err := installMachinePair(ctx, uv, python, requirements); err != nil {
-		if previous != nil {
-			if rollback := h.restorePair(ctx, uv, previous); rollback != nil {
-				return nil, exit.New(exit.Structural, "%s; restoring the previous Runtime and TensorFS failed: %s; retained installation records and wheels for repair", err, rollback)
-			}
-			return nil, exit.New(exit.Structural, "%s; restored the previous Runtime and TensorFS", err)
-		}
 		return nil, exit.New(exit.Structural, "%s", err)
 	}
 	for distribution, artifact := range map[string]*installedArtifact{hostruntime.Distribution: &installed.Runtime, "tensorfs": &installed.TensorFS} {
@@ -350,7 +387,25 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 			return nil, exit.Internalf("cannot link %s: %s", link, err)
 		}
 	}
-	host, err := h.placeHost(source.Host)
+	selected := source.Host
+	if selected == "" {
+		selected, problem = h.defaultAgent(ctx)
+		if problem != nil {
+			return nil, problem
+		}
+	}
+	var host installedArtifact
+	var err error
+	if source.Host == "" && selected == h.bundledAgent() {
+		host, err = h.linkAgent()
+	} else {
+		host, err = h.placeHost(selected)
+		if source.Host == "" {
+			host.Name = "cozy-machine"
+		} else {
+			host.Name = hostName
+		}
+	}
 	if err != nil {
 		return nil, exit.Internalf("cannot install the machine Host: %s", err)
 	}
@@ -358,8 +413,10 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 	if _, err := h.keepWheels(wheels); err != nil {
 		return nil, exit.Internalf("cannot keep the machine's wheels: %s", err)
 	}
-	raw, _ := json.MarshalIndent(installed, "", "  ")
-	if err := writePrivate(h.path("installed.json"), raw); err != nil {
+	if err := writePrivate(filepath.Join(h.Root(), "etc/cozy/software-policy.json"), installed.startupPolicy()); err != nil {
+		return nil, exit.Internalf("cannot record the initial software policy: %s", err)
+	}
+	if err := h.recordInstalled(installed); err != nil {
 		return nil, exit.Internalf("cannot record the machine installation: %s", err)
 	}
 	return &installed, nil
@@ -378,6 +435,7 @@ type hostRecord struct {
 	WorkerPort int    `json:"worker_port"`
 	MediaPort  int    `json:"media_port"`
 	ReceiptKey string `json:"receipt_key"`
+	StartTicks uint64 `json:"start_ticks,omitempty"`
 }
 
 type cachedLaunch struct {
@@ -390,6 +448,7 @@ type Launch struct {
 	Addr, MediaAddr  string
 	WorkerID, BootID string
 	AgentVersion     string
+	Capabilities     []string
 	Leaf             []byte
 	GPUs             []ReceiptGPU
 	PID              int
@@ -411,15 +470,21 @@ func (l *Launch) at(reads string) *Launch {
 // execution credential only after the agent proves its TLS identity; it never owns this
 // machine's identity or lifecycle. Empty hubOrigin is entirely offline.
 func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client, _ bool) (*Launch, *exit.Error) {
-	h.mu.Lock()
+	if !h.mu.TryLock() {
+		return nil, exit.Named(exit.Unavailable, "machine.busy", "another command is changing the local machine")
+	}
 	defer h.mu.Unlock()
-	unlock, problem := h.lock(ctx)
+	unlock, problem := h.acquireLock(ctx, false)
 	if problem != nil {
 		return nil, problem
 	}
 	defer unlock()
+	return h.ensureLocked(ctx, hubOrigin, client)
+}
+
+func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.Client) (*Launch, *exit.Error) {
 	var launch *Launch
-	if cached := h.cached; cached != nil && h.alive(cached.PID) {
+	if cached := h.cached; cached != nil && h.alive(cached.PID) && (cached.record.StartTicks == 0 || cached.record.StartTicks == processStartTicks(cached.PID)) {
 		launch = cached.Launch
 	}
 	if launch == nil {
@@ -440,6 +505,7 @@ func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client,
 			}
 		}
 	}
+	h.ResumeExecutionAccessCleanup(ctx, launch)
 	if hubOrigin == "" {
 		return launch.at(""), nil
 	}
@@ -470,7 +536,7 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 				return nil, exit.Internalf("cannot record the machine's TLS leaf: %s", err)
 			}
 			return &Launch{Addr: "127.0.0.1:" + strconv.Itoa(record.WorkerPort), MediaAddr: "127.0.0.1:" + strconv.Itoa(record.MediaPort),
-				WorkerID: record.WorkerID, BootID: receipt.PodBootID, AgentVersion: receipt.MachineVersion, Leaf: leaf, GPUs: receipt.RuntimeGPUs, PID: record.PID}, nil
+				WorkerID: record.WorkerID, BootID: receipt.PodBootID, AgentVersion: receipt.MachineVersion, Capabilities: receipt.MachineCapabilities, Leaf: leaf, GPUs: receipt.RuntimeGPUs, PID: record.PID}, nil
 		}
 		if refused := (*receiptRefusal)(nil); errors.As(err, &refused) {
 			return nil, exit.New(exit.Credential, "the machine Host's readiness receipt did not verify: %s", err)
@@ -490,6 +556,17 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 }
 
 func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
+	if userunit.Available() && userunit.MainPID(userunit.Name("cozy-machine-agent", h.dir, false)) > 0 {
+		return nil, exit.Named(exit.Conflict, "machine.process_untracked", "a machine agent already owns this root but its authenticated launch record is missing; preserve it for repair")
+	}
+	// A directly launched agent or surviving Runtime may have no client record.
+	// Observe its kernel ownership before touching receipt or launch metadata.
+	release, problem := h.bootstrapLease()
+	if problem != nil {
+		return nil, problem
+	}
+	release()
+
 	id, problem := h.identity()
 	if problem != nil {
 		return nil, problem
@@ -527,15 +604,20 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 	if err := os.Remove(h.readinessEnvelope()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, exit.Internalf("cannot retire the previous readiness receipt: %s", err)
 	}
+	if err := writePrivate(h.path("receipt-key"), []byte(base64.RawURLEncoding.EncodeToString(key))); err != nil {
+		return nil, exit.Internalf("cannot retain the machine receipt key: %s", err)
+	}
 	base := append([]string{
 		"COZY_MACHINE_ROOT=" + h.Root(),
 		"COZY_LISTEN_HOST=127.0.0.1",
 		"COZY_WORKER_ID=" + id,
 		"COZY_MACHINE_LIFETIME=persistent",
-		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL=" + base64.RawURLEncoding.EncodeToString(key),
+		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE=" + h.path("receipt-key"),
 		"COZY_RECORD_OWNER_AUTH_JSON=" + string(auth),
 	}, h.inherited...)
-	base = append(base, installed.startupEnvironment()...)
+	if err := h.writeStartupPolicy(*installed); err != nil {
+		return nil, exit.Internalf("cannot record the machine update policy: %s", err)
+	}
 	if h.store != "" {
 		base = append(base, "COZY_TENSORFS_ROOT="+h.store)
 	}
@@ -571,9 +653,10 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, record host
 		return nil, record, exit.Internalf("cannot start the machine Host: %s", err)
 	}
 	record.PID, record.WorkerPort, record.MediaPort = pid, workerPort, mediaPort
+	record.StartTicks = processStartTicks(pid)
 	record.ReceiptKey = base64.RawURLEncoding.EncodeToString(key)
 	raw, _ := json.Marshal(record)
-	if err := writePrivate(h.path("host.json"), raw); err != nil {
+	if err := writePrivate(h.path("agent.json"), raw); err != nil {
 		_ = terminate(pid)
 		return nil, record, exit.Internalf("cannot record the machine Host: %s", err)
 	}
@@ -596,11 +679,16 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, record host
 // its own session. Its output appends to host.log.
 func (h *Host) spawn(env []string, log *os.File) (int, error) {
 	if userunit.Available() {
-		unit := userunit.Name("cozy-machine", h.dir, false)
-		_ = userunit.Stop(unit) // a Host this record does not name
-		if _, err := userunit.Start(userunit.Spec{Unit: unit, Argv: []string{h.binary()}, Env: env, Dir: h.Root(),
-			Stdout: log.Name(), Stderr: log.Name()}); err != nil {
+		unit := userunit.Name("cozy-machine-agent", h.dir, false)
+		if userunit.MainPID(unit) > 0 {
+			return 0, fmt.Errorf("the machine unit is already running without a verified record")
+		}
+		already, err := userunit.Start(userunit.Spec{Unit: unit, Argv: []string{h.binary()}, Env: env, Dir: h.Root(), Stdout: log.Name(), Stderr: log.Name()})
+		if err != nil {
 			return 0, err
+		}
+		if already {
+			return 0, fmt.Errorf("the machine unit was started by another owner; no launch record was replaced")
 		}
 		if pid := userunit.MainPID(unit); pid > 0 {
 			return pid, nil
@@ -648,7 +736,7 @@ func (h *Host) stopLocked(ctx context.Context) *exit.Error {
 			}
 		}
 	}
-	if err := os.Remove(h.path("host.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(h.path("agent.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return exit.Internalf("cannot retire the machine Host record: %s", err)
 	}
 	return nil
@@ -777,7 +865,21 @@ func (h *Host) secret(name string) (string, *exit.Error) {
 }
 
 func (h *Host) record() (*hostRecord, *exit.Error) {
-	raw, err := os.ReadFile(h.path("host.json"))
+	if userunit.Available() && userunit.MainPID(userunit.Name("cozy-machine", h.dir, false)) > 0 {
+		return nil, exit.Named(exit.Conflict, "machine.legacy_process_running", "the retired machine unit still owns this root; stop it with the original CLI after its accepted work finishes")
+	}
+
+	// A namespace cut must not start a second process over an occupied root.
+	// This is a safety census only: no legacy request or credential is honored.
+	if raw, err := os.ReadFile(h.path("host.json")); err == nil {
+		var old hostRecord
+		if json.Unmarshal(raw, &old) == nil && h.legacyAlive(old.PID) {
+			return nil, exit.Named(exit.Conflict, "machine.legacy_process_running", "a retired machine process still owns this root; stop it with the original CLI after its accepted work finishes")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, exit.Internalf("cannot inspect the previous machine record: %s", err)
+	}
+	raw, err := os.ReadFile(h.path("agent.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -787,6 +889,9 @@ func (h *Host) record() (*hostRecord, *exit.Error) {
 	var record hostRecord
 	if json.Unmarshal(raw, &record) != nil {
 		return nil, nil
+	}
+	if record.StartTicks != 0 && record.StartTicks != processStartTicks(record.PID) {
+		record.PID = 0
 	}
 	return &record, nil
 }
@@ -800,16 +905,97 @@ func (h *Host) alive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	for _, name := range []string{"cozy-machine", "pod-supervisor", "cozy"} {
-		binary, err := filepath.EvalSymlinks(filepath.Join(h.Root(), "usr/local/bin", name))
-		if err == nil && strings.TrimSuffix(target, " (deleted)") == binary {
+	target = strings.TrimSuffix(target, " (deleted)")
+	for _, relative := range []string{"usr/local/bin/cozy-machine", "opt/cozy/python/bin/cozy-machine"} {
+		path := filepath.Join(h.Root(), relative)
+		if target == path {
+			return true
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err == nil && target == resolved && strings.HasPrefix(resolved, h.Root()+string(filepath.Separator)) {
 			return true
 		}
 	}
 	return false
 }
 
-func (h *Host) lock(ctx context.Context) (func(), *exit.Error) {
+// Legacy identity is only a refusal census, never permission to signal a PID.
+func (h *Host) legacyAlive(pid int) bool {
+	if h.alive(pid) {
+		return true
+	}
+	if pid <= 0 {
+		return false
+	}
+	target, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe")
+	if err != nil {
+		return false
+	}
+	target = strings.TrimSuffix(target, " (deleted)")
+	for _, relative := range []string{"usr/local/bin/pod-supervisor", "usr/local/bin/cozy"} {
+		path := filepath.Join(h.Root(), relative)
+		if target == path {
+			return true
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		cwd, cwdErr := os.Readlink("/proc/" + strconv.Itoa(pid) + "/cwd")
+		if err == nil && target == resolved && cwdErr == nil && cwd == h.Root() {
+			return true
+		}
+	}
+	return false
+}
+
+func processStartTicks(pid int) uint64 {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0
+	}
+	end := strings.LastIndexByte(string(raw), ')')
+	if end < 0 {
+		return 0
+	}
+	fields := strings.Fields(string(raw[end+1:]))
+	if len(fields) <= 19 {
+		return 0
+	}
+	ticks, _ := strconv.ParseUint(fields[19], 10, 64)
+	return ticks
+}
+
+// A missing client record cannot override kernel-owned machine/Runtime leases.
+func (h *Host) bootstrapLease() (func(), *exit.Error) {
+	var files []*os.File
+	release := func() {
+		for _, file := range files {
+			_ = flock.Release(file)
+			_ = file.Close()
+		}
+	}
+	for _, relative := range []string{"var/lib/cozy/machine/agent.lock", "run/cozy/worker/worker.lock"} {
+		path := filepath.Join(h.Root(), relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			release()
+			return nil, exit.Internalf("cannot inspect machine ownership: %s", err)
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			release()
+			return nil, exit.Internalf("cannot inspect machine ownership: %s", err)
+		}
+		if err := flock.Exclusive(file); err != nil {
+			file.Close()
+			release()
+			return nil, exit.Named(exit.Conflict, "machine.busy", "a live machine or Runtime owns this root; bootstrap cannot replace its software")
+		}
+		files = append(files, file)
+	}
+	return release, nil
+}
+
+func (h *Host) lock(ctx context.Context) (func(), *exit.Error) { return h.acquireLock(ctx, true) }
+
+func (h *Host) acquireLock(ctx context.Context, wait bool) (func(), *exit.Error) {
 	if err := os.MkdirAll(h.dir, 0o700); err != nil {
 		return nil, exit.Internalf("cannot create the machine directory: %s", err)
 	}
@@ -817,7 +1003,11 @@ func (h *Host) lock(ctx context.Context) (func(), *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot open the machine lock: %s", err)
 	}
-	if err := flock.Wait(ctx, file); err != nil {
+	err = flock.Exclusive(file)
+	if err != nil && wait {
+		err = flock.Wait(ctx, file)
+	}
+	if err != nil {
 		file.Close()
 		return nil, exit.Named(exit.Unavailable, "machine.busy", "another command is changing the local machine")
 	}
@@ -888,8 +1078,14 @@ func copyFile(source, target string, mode os.FileMode) error {
 		return err
 	}
 	defer input.Close()
-	staged := target + ".new"
-	output, err := os.OpenFile(staged, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	output, err := os.CreateTemp(filepath.Dir(target), ".copy-*")
+	if err != nil {
+		return err
+	}
+	staged := output.Name()
+	defer os.Remove(staged)
+	defer output.Close()
+	err = output.Chmod(mode)
 	if err == nil {
 		_, err = io.Copy(output, input)
 		if err == nil {
@@ -945,15 +1141,13 @@ func logSince(path string, offset int64) string {
 	return fmt.Sprint(strings.Join(lines, "\n"))
 }
 
-// writeRuntimeConfig gives the Runtime this computer's GPU budget: gpu.budget in the machine
-// root's etc/cozy/runtime.yaml, or no file when none is configured.
+// writeRuntimeConfig seeds an absent machine config. Launch never overwrites operator settings.
 func (h *Host) writeRuntimeConfig() *exit.Error {
 	path := filepath.Join(h.Root(), "etc/cozy/runtime.yaml")
-	if h.GPUBudget == nil {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return exit.Internalf("cannot clear the machine's Runtime config: %s", err)
-		}
+	if _, err := os.Stat(path); err == nil || h.GPUBudget == nil {
 		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return exit.Internalf("cannot inspect the machine's Runtime config: %s", err)
 	}
 	body, err := config.RuntimeYAML(h.GPUBudget)
 	if err == nil {
@@ -976,4 +1170,16 @@ func (h *Host) note(line string) {
 	}
 	defer log.Close()
 	fmt.Fprintln(log, "cozy:", line)
+}
+
+// Only an explicit installation changes the operator's update policy. A missing
+// policy is seeded from existing installation provenance once.
+func (h *Host) writeStartupPolicy(installed Installed) error {
+	path := filepath.Join(h.Root(), "etc/cozy/software-policy.json")
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writePrivate(path, installed.startupPolicy())
 }

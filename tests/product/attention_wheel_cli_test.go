@@ -145,20 +145,35 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 		if code != 0 || !strings.Contains(out, "wheel-proof|"+candidate+"|0.1.0") {
 			t.Fatalf("executed wrong wheel %s [%d]: %s\n%s", candidate, code, out, productWorkerLogs(root))
 		}
-		// A CPU scalar has no attention site. An explicit pin must reach
-		// Runtime and refuse there rather than silently succeeding unused.
+		// A pin belongs to the whole run. A scalar may succeed without a site,
+		// but Runtime must durably warn that no call applied the requested pin.
 		code, out = runCozy(t, root, "run", localWeightlessRef+"/echo", "why=wheel-proof",
 			"kernel.attention=sdpa", "--idempotency-key="+key+"-pin", "--await", "--json")
-		if code == 0 || !strings.Contains(out, "attention_kernel_unsupported") {
-			t.Fatalf("unused attention pin did not reach Runtime refusal [%d]: %s", code, out)
+		if code != 0 || !strings.Contains(out, "wheel-proof|"+candidate+"|0.1.0") {
+			t.Fatalf("unmatched run pin prevented the scalar result [%d]: %s", code, out)
 		}
 		store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 		fatal(t, problem)
 		request, problem := store.RequestByIdempotencyKey(key + "-pin")
 		fatal(t, problem)
-		store.Close()
 		if request == nil || request.AttentionKernel != "sdpa" {
+			store.Close()
 			t.Fatalf("executing request lost attention pin: %+v", request)
+		}
+		events, problem := store.EventsAfter(request.ID, 0, 256)
+		store.Close()
+		fatal(t, problem)
+		warned := false
+		for _, event := range events {
+			if event.Type == "machine.attention.applied" {
+				t.Fatal("scalar falsely claimed an applied attention pin")
+			}
+			if event.Type == "machine.warning" && event.Payload["code"] == "attention_pin_unapplied" {
+				warned = event.Payload["message"] == "attention pin sdpa was never applied"
+			}
+		}
+		if !warned {
+			t.Fatal("scalar success silently lost the whole-run unused-pin warning")
 		}
 		install := activeInstall(t, root, localWeightlessRef)
 		revision, problem := localpackage.Stage(t.Context(), home.Layout{LocalPackages: filepath.Join(root, "local-packages")}, install)

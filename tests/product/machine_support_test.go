@@ -30,6 +30,7 @@ var (
 	requireMachineHost   = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
 	machineRuntimePython = flag.String("machine-runtime-python", "", "Development interpreter for the standalone agent public-view media fixture")
 	machineRuntimeWheel  = flag.String("machine-runtime-wheel", "", "Runtime wheel the test machines run; default: the published Runtime")
+	machineUpdateWheel   = flag.String("machine-update-wheel", "", "Candidate Runtime wheel with a distinct bundled agent for local update proof")
 	machineTensorFSWheel = flag.String("machine-tensorfs-wheel", "", "TensorFS wheel paired with -machine-runtime-wheel")
 )
 
@@ -190,27 +191,23 @@ func TestMachineHostIsPresentWhenRequired(t *testing.T) {
 	machineTemplateDir(t)
 }
 
-// stubMachine gives root an installed, registered machine whose Host is script: a sentinel
+// stubMachine gives root an installed current machine whose agent is script: a sentinel
 // that proves a launch was attempted without running one.
 func stubMachine(t *testing.T, root, script string) {
 	t.Helper()
 	dir := filepath.Join(root, "machine")
-	binary := filepath.Join(dir, "root", "usr", "local", "bin", "pod-supervisor")
+	binary := filepath.Join(dir, "root", "usr", "local", "bin", "cozy-machine")
 	must(t, os.MkdirAll(filepath.Dir(binary), 0o755))
 	must(t, os.WriteFile(binary, []byte(script), 0o700)) //cozy:allow sentinel Host proves whether a launch was attempted
-	for name, body := range map[string]string{
-		"installed.json":    `{"host":{"name":"pod-supervisor"},"host_pinned":true}`,
-		"registration.json": `{"hub":"` + testDefaultHub + `","id":"om-stub","worker_token":"` + strings.Repeat("A", 43) + `"}`,
-		"environment.json":  `{"TENSORHUB_ORIGIN":"https://hub.invalid"}`,
-	} {
-		must(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600))
-	}
+	metadata := `{"host":{"name":"cozy-machine","module":"` + machines.AgentModule + `"},"host_pinned":true}`
+	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), []byte(metadata), 0600))
+
 }
 
-// machineStore is this computer's machine's TensorFS Store: where its Runtime keeps every
-// model, checkpoint and result, as a pod's does at /var/lib/tensorfs.
+// machineStore matches the isolated TENSORFS_HOME supplied by childEnv to every
+// ordinary CLI invocation in these product fixtures.
 func machineStore(root string) string {
-	return filepath.Join(root, "machine", "root", "var", "lib", "tensorfs")
+	return filepath.Join(root, "tensorfs")
 }
 
 // machineInstallations holds the package environments this computer's machine prepared.

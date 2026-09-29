@@ -41,8 +41,8 @@ func grantWebRTC(t *testing.T, h *machineHub) int {
 }
 
 // machineListens is what a running machine Host shows of its WebRTC grant: the port its
-// sealed receipt names (0: none), and every TCP port its process listens on beside its
-// worker and media ports.
+// sealed receipt names (0: none), and the TCP listeners owned by its verified
+// bootstrap parent and application child, beside the worker and media ports.
 func machineListens(t *testing.T, dir string) (receipt int, others []int) {
 	t.Helper()
 	var record struct {
@@ -50,7 +50,7 @@ func machineListens(t *testing.T, dir string) (receipt int, others []int) {
 		WorkerPort int `json:"worker_port"`
 		MediaPort  int `json:"media_port"`
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "host.json"))
+	raw, err := os.ReadFile(filepath.Join(dir, "agent.json"))
 	must(t, err)
 	must(t, json.Unmarshal(raw, &record))
 	var envelope struct {
@@ -68,30 +68,95 @@ func machineListens(t *testing.T, dir string) (receipt int, others []int) {
 	if payload.WebRTC != nil {
 		receipt = payload.WebRTC.Port
 	}
-	sockets := map[string]bool{}
-	fds, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", record.PID))
+	host := machines.NewHost(dir, "", nil)
+	status, problem := host.Status()
+	fatal(t, problem)
+	if !status.Running || status.PID != record.PID {
+		t.Fatal("receipt fixture does not own the recorded live bootstrap")
+	}
+	parentStart := mediaProcessStart(t, record.PID)
+	software, problem := host.ReadSoftware(t.Context())
+	fatal(t, problem)
+	if software == nil || len(software.Agent.SHA256) != 64 {
+		t.Fatal("authenticated application identity is unavailable")
+	}
+	processes := map[int]string{record.PID: parentStart}
+	entries, err := os.ReadDir("/proc")
 	must(t, err)
-	for _, fd := range fds {
-		if link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", record.PID, fd.Name())); err == nil && strings.HasPrefix(link, "socket:[") {
-			sockets[strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")] = true
+	applications := 0
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		fields := strings.Fields(string(raw[strings.LastIndexByte(string(raw), ')')+1:]))
+		if len(fields) < 20 || fields[0] == "Z" || fields[1] != strconv.Itoa(record.PID) {
+			continue
+		}
+		argv, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil || strings.SplitN(string(argv), "\x00", 2)[0] != "cozy-machine-request-plane" {
+			continue
+		}
+		if fileSHA(t, filepath.Join("/proc", entry.Name(), "exe")) != software.Agent.SHA256 {
+			t.Fatal("direct request-plane child differs from authenticated running application")
+		}
+		processes[pid] = fields[19]
+		applications++
+	}
+	if applications != 1 {
+		t.Fatalf("expected one verified application child, found %d", applications)
+	}
+	sockets := map[string]bool{}
+	for pid := range processes {
+		fds, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+		must(t, err)
+		for _, fd := range fds {
+			if link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd.Name())); err == nil && strings.HasPrefix(link, "socket:[") {
+				sockets[strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")] = true
+			}
 		}
 	}
+	// Both verified processes share this network namespace; count each inode once.
 	for _, table := range []string{"tcp", "tcp6"} {
-		raw, _ := os.ReadFile(fmt.Sprintf("/proc/%d/net/%s", record.PID, table))
+		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/%s", record.PID, table))
+		must(t, err)
 		for _, line := range strings.Split(string(raw), "\n") {
 			fields := strings.Fields(line)
-			if len(fields) < 10 || fields[3] != "0A" || !sockets[fields[9]] { // 0A: LISTEN
+			if len(fields) < 10 || fields[3] != "0A" || !sockets[fields[9]] {
 				continue
 			}
 			_, hex, _ := strings.Cut(fields[1], ":")
-			port, _ := strconv.ParseUint(hex, 16, 16)
+			port, err := strconv.ParseUint(hex, 16, 16)
+			must(t, err)
 			if p := int(port); p != record.WorkerPort && p != record.MediaPort {
 				others = append(others, p)
 			}
 		}
 	}
+	for pid, start := range processes {
+		current := mediaProcessStart(t, pid)
+		if current != start {
+			t.Fatal("socket census raced process identity replacement")
+		}
+	}
 	slices.Sort(others)
 	return receipt, others
+}
+
+// Kernel start ticks prevent a reused PID from authorizing a socket inventory.
+func mediaProcessStart(t *testing.T, pid int) string {
+	t.Helper()
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	must(t, err)
+	fields := strings.Fields(string(raw[strings.LastIndexByte(string(raw), ')')+1:]))
+	if len(fields) < 20 || fields[0] == "Z" {
+		t.Fatal("socket owner is not a live process")
+	}
+	return fields[19]
 }
 
 // machineFollow follows one output of a machine over WebRTC, as a browser holding a link
@@ -121,7 +186,7 @@ func followOnMachine(t *testing.T, dir string, run uint64, output string, port i
 	var record struct {
 		WorkerPort int `json:"worker_port"`
 	}
-	raw, err = os.ReadFile(filepath.Join(dir, "host.json"))
+	raw, err = os.ReadFile(filepath.Join(dir, "agent.json"))
 	must(t, err)
 	must(t, json.Unmarshal(raw, &record))
 	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())

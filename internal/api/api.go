@@ -236,6 +236,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/requests":                                 s.submit,
 		"GET /v1/requests":                                  s.listRequests,
 		"GET /v1/requests/{id}":                             s.getRequest,
+		"POST /v1/local/requests/{id}/abandon":              s.abandonRequest,
 		"POST /v1/requests/{id}/cancel":                     s.cancelRequest,
 		"GET /v1/requests/{id}/events":                      s.requestEvents,
 		"GET /v1/media/{media_id}":                          s.media,

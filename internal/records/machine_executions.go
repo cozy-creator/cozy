@@ -50,11 +50,13 @@ type MachineExecution struct {
 	PendingControl       []byte
 	CancelRequested      bool
 	Collected            bool
+	Abandoned            bool
 	SubmissionClosed     bool
 }
 
 const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected,
- EXISTS(SELECT 1 FROM request_events closed WHERE closed.request_id=machine_executions.request_id AND closed.type='machine.submission_closed')`
+ EXISTS(SELECT 1 FROM request_events closed WHERE closed.request_id=machine_executions.request_id AND closed.type='machine.submission_closed'),
+ NOT (` + machineExecutionAdmissionOpen + `)`
 
 type MachinePackageTransferProgress struct {
 	Operation string
@@ -84,8 +86,9 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
 // than a status projection. A failed or paused root remains live after its small
 // error result is collected, and cancellation alone never proves native cleanup.
+// Local abandonment stops observation; it cannot waive remote lifecycle custody.
 const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT ` + machineRetentionReleased + ` AND (
- (length(e.receipt)=0 AND e.cancel_requested=1 AND length(e.submission)>0 AND NOT EXISTS
+ (length(e.receipt)=0 AND (e.cancel_requested=1 OR ` + machineExecutionAbandoned + `) AND length(e.submission)>0 AND NOT EXISTS
  (SELECT 1 FROM request_events closed WHERE closed.request_id=r.id AND closed.type='machine.submission_closed')) OR
  (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked','canceled')) OR
  (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))`
@@ -103,7 +106,7 @@ const machineRetentionReleased = `EXISTS(SELECT 1 FROM request_events released
 
 func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 	var owed bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND `+machineExecutionOwed+`)`, id).Scan(&owed)
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND NOT `+machineExecutionAbandoned+` AND `+machineExecutionOwed+`)`, id).Scan(&owed)
 	if err != nil {
 		return false, exit.Internalf("cannot inspect Runtime execution obligations: %s", err)
 	}
@@ -121,7 +124,7 @@ const (
 // CustodyEvent reports whether an event settles, for now, where a finished result is.
 func CustodyEvent(eventType string) bool {
 	switch eventType {
-	case MachineResultCollected, MachineCollectionRefused, MachineResultRetainedType, "client.machine_lost":
+	case MachineResultCollected, MachineCollectionRefused, MachineResultRetainedType, "client.machine_lost", "client.machine_abandoned":
 		return true
 	}
 	return false
@@ -248,7 +251,7 @@ func (s *Store) RequestExecutionTiming(id string) (int64, uint64, *exit.Error) {
 func scanMachineExecution(row interface{ Scan(...any) error }) (*MachineExecution, error) {
 	var value MachineExecution
 	err := row.Scan(&value.RequestID, &value.MachineID, &value.Submission, &value.Receipt,
-		&value.ObservedState, &value.RemoteCursor, &value.Outcome, &value.PendingControl, &value.CancelRequested, &value.Collected, &value.SubmissionClosed)
+		&value.ObservedState, &value.RemoteCursor, &value.Outcome, &value.PendingControl, &value.CancelRequested, &value.Collected, &value.SubmissionClosed, &value.Abandoned)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -289,7 +292,7 @@ func (s *Store) LinkMachineExecution(id, machine string) *exit.Error {
 	if machine == "" || len(machine) > 256 {
 		return exit.New(exit.Validation, "machine execution requires one bounded machine identity")
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET machine_id=? WHERE request_id=? AND (machine_id='' OR machine_id=?) AND NOT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed'))`, machine, id, machine, machine)
+	result, err := s.db.Exec(`UPDATE machine_executions SET machine_id=? WHERE request_id=? AND (machine_id='' OR machine_id=?) AND NOT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed')) AND `+machineExecutionAdmissionOpen, machine, id, machine, machine)
 	if err != nil {
 		return exit.Internalf("cannot record machine execution destination: %s", err)
 	}
@@ -334,7 +337,7 @@ func (s *Store) RecordMachineSubmission(id string, submission *pb.MachineExecuti
 	if err != nil || len(raw) > 8<<20 {
 		return exit.New(exit.Validation, "machine submission exceeds its bounded envelope")
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET submission=? WHERE request_id=? AND machine_id!='' AND (length(submission)=0 OR submission=?) AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state!='canceled') AND NOT EXISTS(SELECT 1 FROM rentals WHERE id=machine_executions.machine_id AND state IN ('release_requested','released','failed'))`, raw, id, raw, id)
+	result, err := s.db.Exec(`UPDATE machine_executions SET submission=? WHERE request_id=? AND machine_id!='' AND (length(submission)=0 OR submission=?) AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state!='canceled') AND NOT EXISTS(SELECT 1 FROM rentals WHERE id=machine_executions.machine_id AND state IN ('release_requested','released','failed')) AND `+machineExecutionAdmissionOpen, raw, id, raw, id)
 	if err != nil {
 		return exit.Internalf("cannot retain machine submission: %s", err)
 	}
@@ -472,14 +475,15 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 	}
 	// The machine is an independently upgraded peer: a state this client does not know is
 	// neither terminal nor a refusal. The run keeps its projection, says so once, and its
-	// events are recorded as ever; it never wedges on a word.
+	// events are recorded as ever; it never wedges on a word. A canceled run stays canceled:
+	// a machine that accepted it before the cancel was known can only end it.
 	nextState := observedMachineRequestState(state.State)
 	var notes []string
-	if nextState == "" {
-		var current string
-		if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, id).Scan(&current); err != nil {
-			return exit.Internalf("cannot read the run's state: %s", err)
-		}
+	var current string
+	if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, id).Scan(&current); err != nil {
+		return exit.Internalf("cannot read the run's state: %s", err)
+	}
+	if nextState == "" || current == "canceled" || link.Abandoned {
 		nextState = current
 	}
 	var previous pb.MachineExecutionState
@@ -533,7 +537,7 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 		if event.Kind == "retention_released" {
 			retentionReleased = true
 		}
-		if event.Kind == "running" {
+		if event.Kind == "running" && current != "canceled" && !link.Abandoned {
 			kind = "run.in_progress"
 		}
 		if event.Kind == "product" {
@@ -578,7 +582,7 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 			return exit.Internalf("cannot record a machine note: %s", err)
 		}
 	}
-	if retentionReleased {
+	if retentionReleased && !link.Abandoned {
 		if _, err := tx.Exec(`UPDATE machine_executions SET pending_control=x'',cancel_requested=0 WHERE request_id=?`, id); err != nil {
 			return exit.Internalf("cannot record Runtime retention release: %s", err)
 		}
@@ -599,7 +603,7 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 	if err != nil {
 		return exit.Internalf("cannot retain machine state: %s", err)
 	}
-	resetOutcome := previous.AttemptOrdinal != 0 && previous.AttemptOrdinal != state.AttemptOrdinal
+	resetOutcome := !link.Abandoned && previous.AttemptOrdinal != 0 && previous.AttemptOrdinal != state.AttemptOrdinal
 	if _, err := tx.Exec(`UPDATE machine_executions SET observed_state=?,remote_cursor=?,collected=?,outcome=CASE WHEN ? THEN x'' ELSE outcome END WHERE request_id=?`, raw, cursor, state.Collected, resetOutcome, id); err != nil {
 		return exit.Internalf("cannot update machine observation cursor: %s", err)
 	}
@@ -626,7 +630,7 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 	}
 	// A canceled run's terminal event comes with its outcome (RecordMachineOutcome): the
 	// run's result is the fold of its products, collected like any other terminal.
-	if previous.State != state.State && state.State == "paused" {
+	if !link.Abandoned && previous.State != state.State && state.State == "paused" {
 		if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, id, "request."+state.State, state.AttemptOrdinal, `{"machine_execution":true}`, now()); err != nil {
 			return exit.Internalf("cannot record observed machine control completion: %s", err)
 		}
@@ -668,6 +672,12 @@ func (s *Store) RecordMachineOutcome(id string, outcome *pb.AttemptOutcome) *exi
 		return exit.New(exit.Conflict, "machine outcome is not bounded")
 	}
 	if len(link.Outcome) > 0 {
+		if link.Abandoned && !bytes.Equal(link.Outcome, raw) {
+			var prior pb.AttemptOutcome
+			if proto.Unmarshal(link.Outcome, &prior) == nil && prior.AttemptOrdinal != outcome.AttemptOrdinal {
+				return recordAbandonedOutcome(tx, id, outcome.AttemptOrdinal, hex.EncodeToString(outcome.OutcomeDigest), raw)
+			}
+		}
 		if !bytes.Equal(link.Outcome, raw) {
 			return exit.New(exit.Conflict, "machine returned a different terminal for the observed attempt")
 		}
@@ -679,6 +689,9 @@ func (s *Store) RecordMachineOutcome(id string, outcome *pb.AttemptOutcome) *exi
 	}
 	if n, _ := result.RowsAffected(); n != 1 {
 		return exit.New(exit.Conflict, "machine execution changed during result collection")
+	}
+	if link.Abandoned {
+		return recordAbandonedOutcome(tx, id, outcome.AttemptOrdinal, hex.EncodeToString(outcome.OutcomeDigest), raw)
 	}
 	kind := "run.failed"
 	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
@@ -703,7 +716,9 @@ func (s *Store) RecordMachineOutcome(id string, outcome *pb.AttemptOutcome) *exi
 		facts["error"] = body.SafeMessage
 	}
 	payload, _ := json.Marshal(facts)
-	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, id, kind, outcome.AttemptOrdinal, string(payload), now()); err != nil {
+	// A run already announced canceled keeps that terminal; the machine's end is its `machine.outcome` entry.
+	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) SELECT ?,?,?,?,?
+ WHERE NOT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='run.canceled')`, id, kind, outcome.AttemptOrdinal, string(payload), now(), id); err != nil {
 		return exit.Internalf("cannot record machine terminal observation: %s", err)
 	}
 	// Runtime's measured memory sizes the next selection exactly as a local attempt's does.
@@ -729,6 +744,9 @@ func (s *Store) RecordMachineControl(id string, command *pb.MachineExecutionCont
 	if problem != nil {
 		return problem
 	}
+	if link != nil && link.Abandoned {
+		return exit.Named(exit.Conflict, "request.abandoned", "this run was abandoned locally; it cannot be resumed or submitted again")
+	}
 	var receipt pb.MachineExecutionReceipt
 	if link == nil || proto.Unmarshal(link.Receipt, &receipt) != nil || command == nil || command.Execution == nil ||
 		command.Execution.RequestId != id || command.Execution.ExpectedExecutionWorkspaceId != receipt.ExecutionWorkspaceId ||
@@ -741,7 +759,7 @@ func (s *Store) RecordMachineControl(id string, command *pb.MachineExecutionCont
 	if err != nil {
 		return exit.Internalf("cannot encode machine control: %s", err)
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET pending_control=?,cancel_requested=CASE WHEN ? THEN 1 ELSE cancel_requested END WHERE request_id=? AND (length(pending_control)=0 OR pending_control=?)`, raw, command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL, id, raw)
+	result, err := s.db.Exec(`UPDATE machine_executions SET pending_control=?,cancel_requested=CASE WHEN ? THEN 1 ELSE cancel_requested END WHERE request_id=? AND (length(pending_control)=0 OR pending_control=?) AND `+machineExecutionAdmissionOpen, raw, command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL, id, raw)
 	if err != nil {
 		return exit.Internalf("cannot retain machine control: %s", err)
 	}
@@ -765,13 +783,13 @@ func (s *Store) CompleteMachineControl(id string, command []byte) *exit.Error {
 			return nil // acknowledgement is not proof that native retention was released
 		}
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET pending_control=x'',cancel_requested=CASE WHEN ? THEN 0 ELSE cancel_requested END WHERE request_id=? AND pending_control=?`, decoded.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL, id, command)
+	result, err := s.db.Exec(`UPDATE machine_executions SET pending_control=x'',cancel_requested=CASE WHEN ? THEN 0 ELSE cancel_requested END WHERE request_id=? AND pending_control=? AND `+machineExecutionAdmissionOpen, decoded.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL, id, command)
 	if err != nil {
 		return exit.Internalf("cannot acknowledge machine control: %s", err)
 	}
 	if n, _ := result.RowsAffected(); n != 1 {
 		current, problem := s.MachineExecution(id)
-		if problem == nil && current != nil && len(current.PendingControl) == 0 {
+		if problem == nil && current != nil && (len(current.PendingControl) == 0 || current.Abandoned) {
 			return nil
 		}
 		return exit.New(exit.Conflict, "machine control acknowledgement changed its command")
@@ -779,9 +797,10 @@ func (s *Store) CompleteMachineControl(id string, command []byte) *exit.Error {
 	return nil
 }
 
-// CancelMachineBeforeAcceptance cancels unsent intent immediately. A recorded
-// submission may already be accepted: its cancellation remains pending until
-// the machine closes the key or returns a receipt for normal execution control.
+// CancelMachineBeforeAcceptance records cancel intent in the transaction that reads acceptance.
+// Unsent intent is canceled at once; a sent submission's cancel stays pending until the machine
+// closes the key or returns a receipt. It reports a receipt recorded since the caller's read,
+// whose cancel the caller sends as any accepted run's. A finished run is never reopened.
 func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -799,26 +818,41 @@ func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 	if err != nil {
 		return false, exit.Internalf("cannot read machine cancellation intent: %s", err)
 	}
-	if link == nil || len(link.Receipt) > 0 {
+	if link != nil && link.Abandoned {
+		return false, nil
+	}
+	if link == nil {
 		return false, nil
 	}
 	if _, err := tx.Exec(`UPDATE machine_executions SET cancel_requested=1 WHERE request_id=?`, id); err != nil {
 		return false, exit.Internalf("cannot retain machine cancellation intent: %s", err)
 	}
-	state, scope := "canceled", "before_machine_submission"
-	if len(link.Submission) > 0 && !link.SubmissionClosed {
-		state, scope = "canceling", "machine_acceptance_unknown"
-	}
-	if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, state, id); err != nil {
-		return false, exit.Internalf("cannot project pending machine cancellation: %s", err)
-	}
-	if err := appendEventTx(tx, id, StateEvent(state), 0, map[string]any{"scope": scope}); err != nil {
-		return false, exit.Internalf("cannot record pending machine cancellation event: %s", err)
+	if len(link.Receipt) == 0 {
+		state, scope := "canceled", "before_machine_submission"
+		if len(link.Submission) > 0 && !link.SubmissionClosed {
+			state, scope = "canceling", "machine_acceptance_unknown"
+		}
+		if err := projectCancellationTx(tx, id, state, scope); err != nil {
+			return false, exit.Internalf("cannot project pending machine cancellation: %s", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, exit.Internalf("cannot commit machine cancellation intent: %s", err)
 	}
-	return true, nil
+	return len(link.Receipt) > 0, nil
+}
+
+// projectCancellationTx moves an unfinished run to `state` with its event. A finished run
+// keeps its terminal: what settles after it is a note, never a second status.
+func projectCancellationTx(tx *sql.Tx, id, state, scope string) error {
+	projected, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, state, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := projected.RowsAffected(); n != 1 {
+		return nil
+	}
+	return appendEventTx(tx, id, StateEvent(state), 0, map[string]any{"scope": scope})
 }
 
 // CompleteMachineSubmissionClosure records the machine's durable promise that a
@@ -847,11 +881,8 @@ func (s *Store) CompleteMachineSubmissionClosure(id string, closure *pb.MachineS
 	if err := appendEventTx(tx, id, "machine.submission_closed", 0, map[string]any{"submission_id": closure.SubmissionId, "execution_workspace_id": closure.ExecutionWorkspaceId}); err != nil {
 		return exit.Internalf("cannot retain closure evidence: %s", err)
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state='canceled',retain_work=0 WHERE id=?`, id); err != nil {
+	if err := projectCancellationTx(tx, id, "canceled", "machine_submission_closed"); err != nil {
 		return exit.Internalf("cannot settle closed submission: %s", err)
-	}
-	if err := appendEventTx(tx, id, StateEvent("canceled"), 0, map[string]any{"scope": "machine_submission_closed"}); err != nil {
-		return exit.Internalf("cannot retain closure cancellation: %s", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit submission closure: %s", err)
@@ -882,6 +913,12 @@ func (s *Store) RefuseMachineSubmission(id, code, detail string, closure *pb.Mac
 			}
 		}
 	}
+	if link.Abandoned {
+		if err := tx.Commit(); err != nil {
+			return exit.Internalf("cannot retain late closure evidence: %s", err)
+		}
+		return nil
+	}
 	if _, err := tx.Exec(`UPDATE requests SET state='refused',retain_work=0 WHERE id=?`, id); err != nil {
 		return exit.Internalf("cannot retain machine refusal state: %s", err)
 	}
@@ -897,7 +934,7 @@ func (s *Store) RefuseMachineSubmission(id, code, detail string, closure *pb.Mac
 func (s *Store) RejectMachineControl(id string, command []byte) *exit.Error {
 	// Unlike an acknowledgement, a rejected cancellation must retain its desire
 	// so acceptance-reconciliation can retry it against the current generation.
-	_, err := s.db.Exec(`UPDATE machine_executions SET pending_control=x'' WHERE request_id=? AND pending_control=?`, id, command)
+	_, err := s.db.Exec(`UPDATE machine_executions SET pending_control=x'' WHERE request_id=? AND pending_control=? AND `+machineExecutionAdmissionOpen, id, command)
 	if err != nil {
 		return exit.Internalf("cannot record rejected machine control: %s", err)
 	}

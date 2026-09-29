@@ -281,7 +281,7 @@ def main():
 	if submission.ExpectedExecutionWorkspaceId == "" || submission.ExpectedExecutionWorkspaceId != receipt.ExecutionWorkspaceId {
 		t.Fatal("ordinary CLI did not freeze the authenticated Runtime workspace before acceptance")
 	}
-	runtimeProcess, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
+	runtimeProcess, err := os.ReadFile(filepath.Join(root, "machine", "agent.json"))
 	must(t, err)
 	status, out = runCozy(t, root, "down", "--json")
 	if status != 0 {
@@ -290,7 +290,7 @@ def main():
 	if daemon.Probe(config.Config{Home: root}).Up {
 		t.Fatal("client stayed online")
 	}
-	currentProcess, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
+	currentProcess, err := os.ReadFile(filepath.Join(root, "machine", "agent.json"))
 	must(t, err)
 	if !bytes.Equal(runtimeProcess, currentProcess) {
 		t.Fatal("disconnect replaced the Runtime process identity")
@@ -303,7 +303,7 @@ def main():
 	if status != 0 {
 		t.Fatalf("reattach collection [%d]: %s", status, out)
 	}
-	currentProcess, err = os.ReadFile(filepath.Join(root, "machine", "host.json"))
+	currentProcess, err = os.ReadFile(filepath.Join(root, "machine", "agent.json"))
 	must(t, err)
 	if !bytes.Equal(runtimeProcess, currentProcess) {
 		t.Fatal("reattachment replaced the independently running Runtime")

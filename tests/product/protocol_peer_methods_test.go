@@ -16,8 +16,11 @@ func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.
 	}
 	workspace, err := machine.GetMachineExecutionWorkspace(ctx, request)
 	if err == nil {
-		workspace.RunOutputLog = true // ordinary peers support current admission capabilities
+		workspace.RunOutputLog = true
 		workspace.SubmissionClose = true
+		if p.submissionClose != nil {
+			workspace.SubmissionClose = *p.submissionClose
+		}
 	}
 	if err == nil && request.Describe != nil && workspace.DescribedRelease == nil {
 		// The machine reads a release at its own Hub; this pod's Hub is the fixture's.
@@ -55,6 +58,7 @@ func (p *fakePod) CloseMachineSubmission(ctx context.Context, request *pb.Machin
 	}); ok {
 		return machine.CloseMachineSubmission(ctx, request)
 	}
+	// Peers that only exercise accepted work still support the unused admission probe.
 	if strings.HasPrefix(request.RequestId, "closure-probe-") && request.RequestId == request.SubmissionId {
 		return &pb.MachineSubmissionClosure{RequestId: request.RequestId, SubmissionId: request.SubmissionId, ExecutionWorkspaceId: request.ExpectedExecutionWorkspaceId}, nil
 	}

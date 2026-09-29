@@ -4,13 +4,18 @@ package webrtctest
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -23,6 +28,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/capability"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	_ "modernc.org/sqlite"
 )
@@ -103,9 +109,9 @@ func (m *Machine) product(run uint64, name string, index int, data []byte, durat
 	}
 	raw, err := canonical.Bytes(product)
 	check(err)
-	return m.event(run, "product", raw, nil)
+	return m.event(run, "product", raw, nil, "")
 }
-func (m *Machine) event(run uint64, kind string, body, outcome []byte) Entry {
+func (m *Machine) event(run uint64, kind string, body, outcome []byte, terminalState string) Entry {
 	m.sequence[run]++
 	seq := m.sequence[run]
 	request := fmt.Sprintf("fixture-%d", run)
@@ -116,7 +122,7 @@ func (m *Machine) event(run uint64, kind string, body, outcome []byte) Entry {
 	check(err)
 	state, finished := "running", 0
 	if outcome != nil {
-		state, finished = "succeeded", 200
+		state, finished = terminalState, 200
 	}
 	_, err = tx.Exec(`UPDATE runs SET sequence=?,state=?,finished_at_ms=? WHERE run_number=?`, seq, state, finished, run)
 	check(err)
@@ -129,16 +135,19 @@ func (m *Machine) event(run uint64, kind string, body, outcome []byte) Entry {
 func (m *Machine) End(run uint64, status string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	value := pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED
-	if status == "failed" {
-		value = pb.OutcomeStatus_OUTCOME_STATUS_FAILED
-	}
-	if status == "canceled" {
-		value = pb.OutcomeStatus_OUTCOME_STATUS_CANCELED
+	value, state := pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "succeeded"
+	switch status {
+	case "completed":
+	case "failed":
+		value, state = pb.OutcomeStatus_OUTCOME_STATUS_FAILED, "failed"
+	case "canceled":
+		value, state = pb.OutcomeStatus_OUTCOME_STATUS_CANCELED, "canceled"
+	default:
+		panic("unexpected fixture outcome: " + status)
 	}
 	body, err := canonical.Bytes(&pb.AttemptOutcomeBody{Status: value})
 	check(err)
-	m.event(run, "outcome", []byte(`{}`), body)
+	m.event(run, "outcome", []byte(`{}`), body, state)
 }
 
 type Server struct {
@@ -164,10 +173,17 @@ func Serve(t testing.TB, host string, m *Machine, agent, python string) Server {
 		return port
 	}
 	worker, webrtc := free(), free()
-	keys := make([]string, len(m.keys))
-	for i, key := range m.keys {
-		keys[i] = base64.RawURLEncoding.EncodeToString(key)
+	// The fixture owns a separate readiness capability; it never substitutes an
+	// open TCP listener for authenticated request-plane initialization.
+	readyPublic, readyKey, err := ed25519.GenerateKey(rand.Reader)
+	check(err)
+	keys := make([]string, 0, len(m.keys)+1)
+	for _, key := range m.keys {
+		keys = append(keys, base64.RawURLEncoding.EncodeToString(key))
 	}
+	keys = append(keys, base64.RawURLEncoding.EncodeToString(readyPublic))
+	readyToken, err := capability.Mint(readyKey, capability.Grant{Machine: "wk-test", Action: capability.Maintenance, Expires: time.Now().Add(time.Hour).Unix()})
+	check(err)
 	command := exec.Command(agent)
 	command.Env = []string{"COZY_MACHINE_ROOT=" + m.root, "COZY_MACHINE_LIFETIME=persistent", "COZY_LISTEN_HOST=" + host, "COZY_WORKER_ID=wk-test",
 		"COZY_WORKER_INTERNAL_PORT=" + strconv.Itoa(worker), "COZY_WEBRTC_INTERNAL_PORT=" + strconv.Itoa(webrtc), "COZY_AUTHORIZED_KEYS=" + strings.Join(keys, ",")}
@@ -192,7 +208,26 @@ func Serve(t testing.TB, host string, m *Machine, agent, python string) Server {
 			if leaf, _ := pem.Decode(raw); leaf != nil {
 				if conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(webrtc)), time.Second); err == nil {
 					conn.Close()
-					return Server{Addr: netip.AddrPortFrom(netip.MustParseAddr(host), uint16(webrtc)), Fingerprint: Fingerprint(leaf.Bytes), Machine: "wk-test"}
+					certificate, err := x509.ParseCertificate(leaf.Bytes)
+					check(err)
+					roots := x509.NewCertPool()
+					roots.AddCert(certificate)
+					transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "cozy-worker", MinVersion: tls.VersionTLS12}}
+					client := &http.Client{Transport: transport, Timeout: time.Second}
+					request, err := http.NewRequest(http.MethodGet, "https://"+net.JoinHostPort(host, strconv.Itoa(worker))+"/v1/machine/runtime", nil)
+					check(err)
+					request.Header.Set("Authorization", "Cozy-Cap "+readyToken)
+					response, err := client.Do(request)
+					ready := false
+					if err == nil {
+						_, _ = io.Copy(io.Discard, response.Body)
+						response.Body.Close()
+						ready = response.StatusCode == http.StatusOK
+					}
+					transport.CloseIdleConnections()
+					if ready {
+						return Server{Addr: netip.AddrPortFrom(netip.MustParseAddr(host), uint16(webrtc)), Fingerprint: Fingerprint(leaf.Bytes), Machine: "wk-test"}
+					}
 				}
 			}
 		}
