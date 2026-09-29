@@ -17,6 +17,12 @@ import (
 // optimistic observation ends on that terminal instead of waiting out its window.
 func submitRun(t *testing.T, root, key string, args ...string) (*records.Request, int, string) {
 	t.Helper()
+	return submitRunWith(t, root, key, nil, args...)
+}
+
+// submitRunWith is submitRun with extra child environment, such as another HOME.
+func submitRunWith(t *testing.T, root, key string, imposed []string, args ...string) (*records.Request, int, string) {
+	t.Helper()
 	// The key goes ahead of any literal `--` tail.
 	command := append([]string{}, args...)
 	at := slices.Index(command, "--")
@@ -27,7 +33,7 @@ func submitRun(t *testing.T, root, key string, args ...string) (*records.Request
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	env := childEnv(t, root)
+	env := childEnv(t, root, imposed...)
 	cancel := func(request *records.Request) {
 		if request != nil && !records.Settled(request.State) {
 			cmd := exec.Command(cozyBin, "run", "cancel", request.ID)
@@ -50,7 +56,7 @@ func submitRun(t *testing.T, root, key string, args ...string) (*records.Request
 			}
 		}
 	}()
-	code, out := runCozy(t, root, command...)
+	code, out := runCozyWith(t, root, imposed, command...)
 	close(submitted)
 	<-canceled
 	request, problem := store.RequestByIdempotencyKey(key)

@@ -3,6 +3,7 @@ package launch
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -67,14 +69,13 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 	keys := RunKeys{Models: map[string]string{}, Overlays: map[string][]ModelOverlay{}}
 
 	if infile != "" {
-		data, err := os.ReadFile(infile)
-		if err != nil {
-			return nil, RunKeys{}, exit.New(exit.NotFound, "--input %s: %s", infile, err).
-				WithRemedy("--input takes one JSON file holding the whole payload")
+		file, data, problem := payloadFile(infile)
+		if problem != nil {
+			return nil, RunKeys{}, problem
 		}
 		var loaded map[string]json.RawMessage
 		if err := json.Unmarshal(data, &loaded); err != nil {
-			return nil, RunKeys{}, exit.New(exit.Validation, "--input %s does not hold one JSON object: %s", infile, err)
+			return nil, RunKeys{}, exit.New(exit.Validation, "--input %s does not hold one object: %s", infile, err)
 		}
 		// Field names fold onto the declared spelling, as terms do; an exact spelling wins.
 		folded := make(map[string]json.RawMessage, len(loaded))
@@ -89,7 +90,7 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		}
 		data, _ = json.Marshal(folded)
 		// Only declared media fields are filenames; ordinary prompt strings are untouched.
-		data, problem := mapAssetFilenames(ep, data, func(path, source string) (any, *exit.Error) {
+		data, problem = mapAssetFilenames(ep, data, func(path, source string) (any, *exit.Error) {
 			if strings.Contains(source, "://") {
 				// Defer refusal until after inline overrides replace file values.
 				return source, nil
@@ -97,7 +98,7 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 			if filepath.IsAbs(source) || source == "~" || strings.HasPrefix(source, "~/") {
 				return source, nil
 			}
-			absolute, err := filepath.Abs(filepath.Join(filepath.Dir(infile), source))
+			absolute, err := filepath.Abs(filepath.Join(filepath.Dir(file), source))
 			if err != nil {
 				return nil, exit.New(exit.Validation, "cannot resolve %s: %s", path, err)
 			}
@@ -250,6 +251,33 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		return nil, RunKeys{}, exit.Internalf("cannot render the payload: %s", err)
 	}
 	return data, keys, nil
+}
+
+// payloadFile reads `--input` as the JSON text it holds, or its YAML converted: YAML by a
+// .yaml/.yml name, JSON by .json, otherwise JSON when it parses as JSON.
+func payloadFile(infile string) (string, []byte, *exit.Error) {
+	path, err := config.ExpandHome(infile)
+	var data []byte
+	if err == nil {
+		data, err = os.ReadFile(path)
+	}
+	if err != nil {
+		return "", nil, exit.New(exit.NotFound, "--input %s: %s", infile, err).
+			WithRemedy("--input takes one JSON or YAML file holding the whole payload")
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".json" || ext != ".yaml" && ext != ".yml" && json.Valid(data) {
+		return path, data, nil
+	}
+	data, bad := config.YAMLToJSON(data)
+	if bad != nil {
+		where := path
+		if bad.Line > 0 {
+			where = fmt.Sprintf("%s:%d", path, bad.Line)
+		}
+		return "", nil, exit.Named(exit.Validation, "input.yaml_"+bad.Kind, "--input %s: %s", where, bad.Reason)
+	}
+	return path, data, nil
 }
 
 // ModelOverlay is the canonical ordered adapter selection carried beside one model

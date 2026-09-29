@@ -439,9 +439,9 @@ type RunCmd struct {
 type RunExecuteCmd struct {
 	Target          string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
 	Input           []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
-	Out             string   `help:"Output directory." type:"path" predictor:"dir"`
+	Out             string   `help:"Output directory." predictor:"dir"`
 	Timeout         string   `help:"Request deadline."`
-	PayloadFile     string   `name:"input" help:"Read the whole payload from a JSON file, e.g. --input=request.json; inline fields override file values." type:"path"`
+	PayloadFile     string   `name:"input" predictor:"file" help:"Read the whole payload from a JSON or YAML file, e.g. --input=~/request.yaml; inline fields override file values."`
 	Assets          []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	AssetFidelity   []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
 	LoRAs           []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`

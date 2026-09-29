@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -266,12 +267,9 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 				WithRemedy("a job's typed model/dataset input arrives as a materialized tree").
 				WithNext("cozy run <target> --input-tree cozy/sdxl@lane=/path/to/store")
 		}
-		if dir == "~" || strings.HasPrefix(dir, "~/") {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return nil, exit.New(exit.NotFound, "cannot resolve input directory home: %s", err)
-			}
-			dir = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(dir, "~"), "/"))
+		dir, err := config.ExpandHome(dir)
+		if err != nil {
+			return nil, exit.New(exit.NotFound, "cannot resolve input directory home: %s", err)
 		}
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -62,12 +63,9 @@ func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.Re
 			return nil, problem
 		}
 	}
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, exit.Usagef("cannot resolve the SSH public-key home directory")
-		}
-		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	path, err := config.ExpandHome(path)
+	if err != nil {
+		return nil, exit.Usagef("cannot resolve the SSH public-key home directory")
 	}
 	file, err := os.Open(path)
 	if err != nil {
