@@ -189,6 +189,11 @@ func TestRetainedOutputUploadsFromItsRentalWithoutRunningAgain(t *testing.T) {
 	servePodClosure(t, f, tensor)
 	startDaemonProcess(t, f.root)
 	f.settle(t)
+	// The importing client holds only retained-byte custody, not the source
+	// installation. Upload must use its explicit publication Hub without replaying it.
+	if f.request.InstallID != "" {
+		t.Fatal("retained-output fixture unexpectedly owns source installation")
+	}
 
 	type uploaded struct {
 		State       string   `json:"state"`

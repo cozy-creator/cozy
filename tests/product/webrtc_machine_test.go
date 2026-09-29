@@ -50,7 +50,7 @@ func machineListens(t *testing.T, dir string) (receipt int, others []int) {
 		WorkerPort int `json:"worker_port"`
 		MediaPort  int `json:"media_port"`
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "host.json"))
+	raw, err := os.ReadFile(filepath.Join(dir, "agent.json"))
 	must(t, err)
 	must(t, json.Unmarshal(raw, &record))
 	var envelope struct {
@@ -121,7 +121,7 @@ func followOnMachine(t *testing.T, dir string, run uint64, output string, port i
 	var record struct {
 		WorkerPort int `json:"worker_port"`
 	}
-	raw, err = os.ReadFile(filepath.Join(dir, "host.json"))
+	raw, err = os.ReadFile(filepath.Join(dir, "agent.json"))
 	must(t, err)
 	must(t, json.Unmarshal(raw, &record))
 	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())

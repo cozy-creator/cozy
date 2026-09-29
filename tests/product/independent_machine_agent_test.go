@@ -144,7 +144,7 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 	}
 	other := client.WithToken(secret.New("second-account"), "test")
 	_, problem = machine.Ensure(ctx, server.URL, other, true)
-	if problem == nil || problem.ErrName() != "machine.execution_access_principal_conflict" {
+	if problem == nil || problem.ErrName() != "machine.execution_access_cleanup_pending" {
 		t.Fatalf("switching accounts did not preserve the existing machine principal: %v", problem)
 	}
 	accessFile, err = os.ReadFile(filepath.Join(machine.Root(), "var/lib/cozy/machine/hub-access.json"))
@@ -154,8 +154,8 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 	}
 	_, problem = machine.Ensure(ctx, server.URL, client, true)
 	fatal(t, problem)
-	if accesses.Load() != 2 {
-		t.Fatal("a refused account switch changed the working account's cached grant")
+	if accesses.Load() != 3 {
+		t.Fatal("queued revocation replayed cached bytes instead of fresh same-principal authorization")
 	}
 	// Older caches named no credential. Refresh them under the current account even if
 	// the leaf and expiry match, and allow a fresh token for the same delegated principal.
@@ -170,8 +170,8 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 	must(t, os.WriteFile(cachePath, cached, 0600))
 	_, problem = machine.Ensure(ctx, server.URL, client, true)
 	fatal(t, problem)
-	if accesses.Load() != 3 {
-		t.Fatal("a legacy unbound cache was reused without current account authorization")
+	if accesses.Load() != 4 {
+		t.Fatal("an unbound cache was reused without current account authorization")
 	}
 	fatal(t, machine.Stop(ctx))
 	restarted := machines.NewHost(dir, "", nil)
@@ -206,6 +206,6 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 // authority; the agent only needs its stable issuer/account identity to guard replacement.
 func executionGrantToken(issuer, principal string, serial int32) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"typ":"delegated-access+jwt"}`))
-	body, _ := json.Marshal(map[string]any{"iss": issuer, "delegated_sub": principal, "permissions": []string{"cozy.execution-access"}, "jti": serial})
+	body, _ := json.Marshal(map[string]any{"iss": issuer, "delegated_sub": principal, "permissions": []string{"cozy.execution-access"}, "jti": serial, "attributes": map[string]any{"execution_device_key_id": "fixture-device"}})
 	return header + "." + base64.RawURLEncoding.EncodeToString(body) + "." + base64.RawURLEncoding.EncodeToString([]byte("fixture-signature"))
 }

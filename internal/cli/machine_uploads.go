@@ -176,7 +176,7 @@ func (m *machineRuns) uploadOnce(requestID string, upload records.OutputUpload) 
 		TensorfsReceiptDigest: retained.hold.ReceiptDigest, RetentionId: retained.hold.RetentionID}
 	manifest := &pb.Ref{Digest: digest, Length: uint64(retained.artifact.Manifest.Length)}
 	ctx := m.ctx
-	connection, problem := m.connectFor(ctx, *request, retained.machine, "uploading its "+upload.Output)
+	connection, problem := m.connectAtHub(ctx, retained.machine, request.Hub, "uploading its "+upload.Output)
 	if problem != nil {
 		return "", problem
 	}

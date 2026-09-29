@@ -13,6 +13,7 @@
       "path": "/var/lib/cozy/installs/.stage-local-package-request-01/wheels/source.tar"
     }
   ],
+  "hub": "https://hub.example",
   "install_root": "/var/lib/cozy/installs/local-package-request-01",
   "operation_id": "local-package-request-01",
   "package": {

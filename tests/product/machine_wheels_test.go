@@ -25,6 +25,10 @@ import (
 // directory, a package on the machine runs the machine's local build, and without the build's
 // wheel the machine refuses rather than put PyPI's Runtime in its place.
 func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
+	if *machineHostBinary == "" || *machineRuntimeWheel == "" || *machineTensorFSWheel == "" {
+		t.Skip("requires the current bundled agent and Runtime/TensorFS cohort; old published peers are deliberately unsupported")
+	}
+
 	if _, err := exec.LookPath("uv"); err != nil {
 		t.Skip("uv lays out the machine root")
 	}
@@ -109,12 +113,16 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 		}
 	}
 
-	// This test deliberately removed the SDK wheel needed for preparation. Stop the
-	// fixture before replacing its installation; a failed preparation is not idle proof.
+	// Restore the exact wheel this negative arm removed. The updater must retain
+	// the installed version for rollback before it can replace the pair.
+	installedWheel, err := os.ReadFile(build)
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(dir, filepath.Base(build)), installedWheel, 0644))
+	// Stop this fixture after its deliberately failed preparation.
 	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 		t.Fatalf("machine stop before reinstall [exit %d]\n%s", code, out)
 	}
-	install()
+	install(runtime, tensorfs)
 }
 
 func fileSHA(t *testing.T, path string) string {
@@ -148,6 +156,7 @@ func localBuild(t *testing.T, wheel, label string) string {
 	}
 	for _, entry := range archive.File {
 		name := strings.Replace(entry.Name, from, to, 1)
+		name = strings.Replace(name, parts[0]+"-"+parts[1]+".data/", parts[0]+"-"+version+".data/", 1)
 		if name == to+"RECORD" {
 			continue
 		}

@@ -117,7 +117,11 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 		t.Fatalf("native root inputs did not reach the managed reader: %+v", children)
 	}
 	var intakes, attempts int
-	must(t, journal.QueryRow("SELECT count(*) FROM input_tree_intakes WHERE request=? AND state='released'", request.ID).Scan(&intakes))
+	// The watcher returns after durable collection; native intake release follows it.
+	landed(t, "both root input intakes to be released", func() bool {
+		must(t, journal.QueryRow("SELECT count(*) FROM input_tree_intakes WHERE request=? AND state='released'", request.ID).Scan(&intakes))
+		return intakes == 2
+	})
 	must(t, journal.QueryRow("SELECT count(*) FROM attempts").Scan(&attempts))
 	if intakes != 2 || attempts != 2 {
 		t.Fatalf("root intake fabricated an execution or lost exact cleanup: intakes=%d attempts=%d", intakes, attempts)
