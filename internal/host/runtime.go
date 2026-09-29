@@ -29,6 +29,7 @@ type runtimeProcess struct {
 	err     error
 	stopped atomic.Bool // this daemon asked it to stop
 	stop    func()      // cooperative: EOF on fd 3, then SIGKILL once it stops moving
+	pid     int         // known where this process started it
 }
 
 func (p *runtimeProcess) exited() bool {
@@ -40,10 +41,12 @@ func (p *runtimeProcess) exited() bool {
 	}
 }
 
-// launcher starts Runtimes. A root machine launches through a root guardian so this daemon
-// can drop privilege; any other machine launches directly.
+// launcher starts Runtimes and maintains them (maintenance.go) as the Runtime's own user. A
+// root machine launches through a root guardian so this daemon can drop privilege; any other
+// machine launches directly.
 type launcher interface {
 	launch() (*runtimeProcess, error)
+	maintain(op string, args []string) (string, error)
 	close()
 }
 
@@ -52,14 +55,23 @@ type launcher interface {
 const stallWindow = 5 * time.Second
 
 type directLauncher struct {
-	path string
-	env  []string
-	out  io.Writer
+	path, root string // the Runtime entrypoint and the machine root
+	env        []string
+	out        io.Writer
+	mu         sync.Mutex
+	current    *runtimeProcess
 }
 
-func (d directLauncher) close() {}
+func (d *directLauncher) close() {}
 
-func (d directLauncher) launch() (*runtimeProcess, error) {
+func (d *directLauncher) maintain(op string, args []string) (string, error) {
+	d.mu.Lock()
+	p := d.current
+	d.mu.Unlock()
+	return maintain(d.root, p, op, args)
+}
+
+func (d *directLauncher) launch() (*runtimeProcess, error) {
 	stopRead, stopWrite, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -87,6 +99,7 @@ func (d directLauncher) launch() (*runtimeProcess, error) {
 		spawned[pid] = true
 		spawnMu.Unlock()
 		stopRead.Close()
+		p.pid = pid
 		p.stop = func() {
 			p.stopped.Store(true)
 			closeStop()
@@ -104,6 +117,9 @@ func (d directLauncher) launch() (*runtimeProcess, error) {
 	if err := <-started; err != nil {
 		return nil, fmt.Errorf("start the Runtime: %w", err)
 	}
+	d.mu.Lock()
+	d.current = p
+	d.mu.Unlock()
 	return p, nil
 }
 
@@ -156,23 +172,27 @@ const guardianProcessName = "cozy-machine-guardian"
 func GuardianProcess(argv0 string) bool { return filepath.Base(argv0) == guardianProcessName }
 
 type guardianCommand struct {
-	Op string `json:"op"` // launch | stop
+	Op   string   `json:"op"` // launch | stop | a maintenance op (maintenance.go)
+	Args []string `json:"args,omitempty"`
 }
 
 type guardianStatus struct {
-	Phase string `json:"phase"` // started | exited | refused
-	Error string `json:"error,omitempty"`
+	Phase  string `json:"phase"` // started | exited | refused | maintained
+	Error  string `json:"error,omitempty"`
+	Answer string `json:"answer,omitempty"` // a maintenance op's answer
 }
 
 type guardianLauncher struct {
-	control *os.File
-	mu      sync.Mutex
-	current *runtimeProcess
-	started chan error
-	cmd     *exec.Cmd
+	control  *os.File
+	mu       sync.Mutex
+	current  *runtimeProcess
+	started  chan error
+	answered chan guardianStatus
+	calls    sync.Mutex // one maintenance op at a time
+	cmd      *exec.Cmd
 }
 
-func startGuardian(runtimePath string, env []string, out io.Writer) (*guardianLauncher, error) {
+func startGuardian(runtimePath, root string, env []string, out io.Writer) (*guardianLauncher, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -187,7 +207,7 @@ func startGuardian(runtimePath string, env []string, out io.Writer) (*guardianLa
 		controlWrite.Close()
 		return nil, err
 	}
-	cmd := &exec.Cmd{Path: self, Args: []string{guardianProcessName, runtimePath}, Env: env,
+	cmd := &exec.Cmd{Path: self, Args: []string{guardianProcessName, runtimePath, root}, Env: env,
 		ExtraFiles: []*os.File{controlRead, statusWrite}, Stdout: out, Stderr: out}
 	if err := cmd.Start(); err != nil {
 		controlRead.Close()
@@ -228,11 +248,20 @@ func (g *guardianLauncher) read(status io.ReadCloser) {
 				close(g.current.done)
 				g.current = nil
 			}
+		case "maintained":
+			if g.answered != nil {
+				g.answered <- s
+				g.answered = nil
+			}
 		}
 		g.mu.Unlock()
 	}
 	status.Close()
 	g.mu.Lock()
+	if g.answered != nil {
+		g.answered <- guardianStatus{Error: "the Runtime guardian exited"}
+		g.answered = nil
+	}
 	if g.started != nil {
 		g.started <- errors.New("the Runtime guardian exited")
 		g.started = nil
@@ -267,23 +296,43 @@ func (g *guardianLauncher) launch() (*runtimeProcess, error) {
 	return p, nil
 }
 
+// maintain runs one maintenance op in the guardian, as root.
+func (g *guardianLauncher) maintain(op string, args []string) (string, error) {
+	g.calls.Lock()
+	defer g.calls.Unlock()
+	answered := make(chan guardianStatus, 1)
+	g.mu.Lock()
+	g.answered = answered
+	g.mu.Unlock()
+	body, _ := json.Marshal(guardianCommand{Op: op, Args: args})
+	if _, err := g.control.Write(append(body, '\n')); err != nil {
+		return "", err
+	}
+	s := <-answered
+	if s.Error != "" {
+		return s.Answer, errors.New(s.Error)
+	}
+	return s.Answer, nil
+}
+
 func (g *guardianLauncher) close() {
 	g.control.Close()
 	_ = g.cmd.Wait()
 }
 
 // RunGuardian is the guardian process: it launches the Runtime at args[1], with its own
-// environment, on "launch", stops it on "stop", and stops it and exits when its control pipe
-// closes. It adopts the orphans of the Runtime's process tree and reaps them.
+// environment, on "launch", stops it on "stop", runs a maintenance op on the machine rooted at
+// args[2] as root, and stops the Runtime and exits when its control pipe closes. It adopts the
+// orphans of the Runtime's process tree and reaps them.
 func RunGuardian(args []string) int {
-	if len(args) != 2 {
+	if len(args) != 3 {
 		return 2
 	}
 	syscall.CloseOnExec(3)
 	syscall.CloseOnExec(4)
 	control, status := os.NewFile(3, "control"), os.NewFile(4, "status")
 	report := func(s guardianStatus) { body, _ := json.Marshal(s); _, _ = status.Write(append(body, '\n')) }
-	direct := directLauncher{path: args[1], out: os.Stderr}
+	direct := &directLauncher{path: args[1], root: args[2], out: os.Stderr}
 	adoptOrphans()
 	var mu sync.Mutex
 	var current *runtimeProcess
@@ -320,6 +369,15 @@ func RunGuardian(args []string) int {
 			}()
 		case "stop":
 			go stop()
+		default:
+			go func(c guardianCommand) {
+				answer, err := direct.maintain(c.Op, c.Args)
+				s := guardianStatus{Phase: "maintained", Answer: answer}
+				if err != nil {
+					s.Error = err.Error()
+				}
+				report(s)
+			}(c)
 		}
 	}
 	stop()

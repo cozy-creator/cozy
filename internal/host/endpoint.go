@@ -54,6 +54,9 @@ func (m *Machine) listen() (*listeners, error) {
 	routes.HandleFunc("GET /v1/health", serveHealth)
 	routes.HandleFunc("GET /v1/runs/{run}/outputs/{output}", m.serveOutput)
 	routes.HandleFunc("GET /v1/runs/{run}/outputs/{output}/{index}", m.serveOutput)
+	routes.HandleFunc("GET /v1/machine/runtime", m.serveRuntimeState)
+	routes.HandleFunc("PUT /v1/machine/runtime/wheels/{file}", m.serveStageWheel)
+	routes.HandleFunc("POST /v1/machine/runtime/update", m.serveUpdate)
 	main := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
 			grpcServer.ServeHTTP(w, r)

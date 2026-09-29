@@ -21,7 +21,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -62,6 +61,11 @@ type runtimeUpdateTarget struct {
 type runtimeUpdateSelection struct {
 	LocalRuntime  *runtimeUpdateWheel `json:"local_runtime,omitempty"`
 	LocalTensorFS *runtimeUpdateWheel `json:"local_tensorfs,omitempty"`
+	// Published versions to install instead of local wheels; a machine that updates itself
+	// fetches them (rental_runtime_update_native.go), and records its operation in Native.
+	RuntimeVersion  string        `json:"runtime_version,omitempty"`
+	TensorFSVersion string        `json:"tensorfs_version,omitempty"`
+	Native          *nativeUpdate `json:"native,omitempty"`
 	Target        runtimeUpdateTarget `json:"target"`
 	Directory     string              `json:"directory"`
 	Stage         string              `json:"stage"`
@@ -72,12 +76,15 @@ type runtimeUpdateSelection struct {
 }
 
 func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
-	return u.start(id, options.RuntimeWheel, options.TensorFSWheel)
+	return u.start(id, options.RuntimeWheel, options.TensorFSWheel, options.RuntimeVersion, options.TensorFSVersion)
 }
 
-func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath string) (*records.RuntimeUpdate, *exit.Error) {
+func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath, runtimeVersion, tensorfsVersion string) (*records.RuntimeUpdate, *exit.Error) {
 	if tensorfsPath != "" && wheelPath == "" {
 		return nil, exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
+	}
+	if wheelPath != "" && runtimeVersion != "" || tensorfsPath != "" && tensorfsVersion != "" {
+		return nil, exit.New(exit.Validation, "name a wheel or a version, not both")
 	}
 	m := u.machines
 	row, problem := m.store.RentalRow(id)
@@ -86,15 +93,6 @@ func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath string) (*recor
 	}
 	if row == nil || row.State != "ready" {
 		return nil, exit.New(exit.Conflict, "this rental is not ready; no machine was purchased or changed")
-	}
-	hctx, cancel := hub.Context()
-	remote, hubProblem := client(m.fleet.atRental(id)).Rental(hctx, id)
-	cancel()
-	// Only the Hub's answer can refuse here; an unanswered read leaves the refusal to the update.
-	if hubProblem == nil && !remote.Development {
-		return nil, exit.Named(exit.Conflict, "rental.maintenance_unavailable",
-			"%s was rented without SSH maintenance, so its Runtime cannot be updated in place; nothing was changed", row.MachineName).
-			WithRemedy("rent a replacement with SSH maintenance, the default (omit --development=false)")
 	}
 	current, problem := m.store.RuntimeUpdate(id)
 	if problem != nil {
@@ -128,8 +126,9 @@ func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath string) (*recor
 	}
 	if current == nil || !current.Active() {
 		var selection json.RawMessage
-		if candidate != nil {
-			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate, LocalTensorFS: tensorfs})
+		if candidate != nil || runtimeVersion != "" || tensorfsVersion != "" {
+			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate, LocalTensorFS: tensorfs,
+				RuntimeVersion: runtimeVersion, TensorFSVersion: tensorfsVersion})
 		}
 		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, "", selection)
 		if problem == nil && snapshot != nil {
@@ -222,7 +221,12 @@ func (u *rentalRuntimeUpdates) connectionSelection(ctx context.Context, row reco
 	if problem != nil {
 		return selection, problem
 	}
-	if !remote.Development || !remote.Ready() || remote.WorkerBootID != row.BootID {
+	if !remote.Development {
+		return selection, exit.Named(exit.Conflict, "rental.maintenance_unavailable",
+			"%s was rented without SSH maintenance and its machine predates in-place Runtime updates; nothing was changed", row.RentalID).
+			WithRemedy("rent a replacement on a current image")
+	}
+	if !remote.Ready() || remote.WorkerBootID != row.BootID {
 		return selection, exit.New(exit.Conflict, "this rental has no compatible private maintenance endpoint")
 	}
 	host, port, err := net.SplitHostPort(remote.SSHAddress)
@@ -314,10 +318,35 @@ func (u *rentalRuntimeUpdates) transport(ctx context.Context, selection runtimeU
 
 func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeUpdate, identity *orchestrator.WorkerConnection) *exit.Error {
 	var selection runtimeUpdateSelection
-	if len(row.Selection) > 0 {
-		if json.Unmarshal(row.Selection, &selection) != nil {
-			return exit.New(exit.Structural, "recorded Runtime update selection is unreadable")
+	if len(row.Selection) > 0 && json.Unmarshal(row.Selection, &selection) != nil {
+		return exit.New(exit.Structural, "recorded Runtime update selection is unreadable")
+	}
+	if selection.Native != nil || len(selection.Selection) == 0 {
+		// A machine that updates itself is asked to; only one that does not is reached over SSH.
+		machine, problem := u.maintenance(identity)
+		if problem != nil {
+			return problem
 		}
+		native := selection.Native != nil
+		if !native {
+			state, problem := machine.state(ctx)
+			if problem != nil {
+				return problem
+			}
+			if native = state != nil; native {
+				if problem := u.updateNative(ctx, row, &selection, machine); problem != nil {
+					return problem
+				}
+			}
+		}
+		if native {
+			return u.followNative(ctx, row, identity, machine)
+		}
+	}
+	if selection.RuntimeVersion != "" || selection.TensorFSVersion != "" {
+		return exit.New(exit.Validation, "--runtime-version needs a machine that updates its own Runtime; this one takes --runtime-wheel")
+	}
+	if len(row.Selection) > 0 {
 		if row.State == "updating" || row.State == "reconciling" {
 			if row.Error != "" {
 				if _, problem := u.transport(ctx, selection, "resume"); unsent(problem) {
@@ -433,7 +462,8 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 			return exit.New(exit.Validation, "cannot resolve local TensorFS wheel: %s", err)
 		}
 	}
-	result, problem := c.UpdateRentalRuntime(row.ID, api.RuntimeUpdateRequest{RuntimeWheel: wheelPath, TensorFSWheel: tensorfsPath})
+	result, problem := c.UpdateRentalRuntime(row.ID, api.RuntimeUpdateRequest{RuntimeWheel: wheelPath, TensorFSWheel: tensorfsPath,
+		RuntimeVersion: ctx.Inv.Value("--runtime-version"), TensorFSVersion: ctx.Inv.Value("--tensorfs-version")})
 	if problem != nil {
 		return problem
 	}
@@ -466,8 +496,16 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	_ = json.Unmarshal(selection.Selection, &previous)
 	var state struct {
 		Unchanged bool `json:"unchanged"`
+		Update    struct {
+			From struct {
+				Runtime string `json:"runtime"`
+			} `json:"from"`
+		} `json:"update"`
 	}
 	_ = json.Unmarshal(result.Result, &state)
+	if previous.Observed.Runtime.Distribution == "" {
+		previous.Observed.Runtime.Distribution = state.Update.From.Runtime // the machine updated itself
+	}
 	status := "ready"
 	if state.Unchanged {
 		status = "already current"

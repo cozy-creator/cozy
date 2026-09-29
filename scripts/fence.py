@@ -93,6 +93,9 @@ DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "
 # check_sources, so this catches the sidecar being WRITTEN, not the word being said.
 # The SQLite database is the sole lifecycle authority.
 DENY_STORE = ["state.json", "status.json", "workers.json", "sessions.json", "pidfile", ".pidfile"]
+# Files another component owns that one Creator file reads, never keeps: the Runtime's
+# guarded-restart verdict, which the machine's Runtime update waits on.
+STORE_READS = {"internal/host/maintenance.go": "restart-status.json"}
 
 # (cl-011) A credential-shaped flag NAME. `--token-stdin` and `--no-browser` are not
 # credential values; `--token <t>` is, and argv is world-readable on this planet.
@@ -466,7 +469,7 @@ def check_sources() -> list[str]:
             if p.suffix == ".go" and YAML_IMPORT in s and str(p) != "internal/config/config.go":
                 bad.append(f"{p}:{i}: [deps] YAML parsing belongs only to centralized config: {s}")
             for d in DENY_STORE:
-                if d in s.lower():
+                if d in s.lower() and STORE_READS.get(str(p), "\0") not in s:
                     bad.append(f"{p}:{i}: [store] lifecycle sidecar '{d}' — the one SQLite "
                                f"database is the authority: {s}")
             # RAW, not stripped: a content key IS a string literal, so the identifier
