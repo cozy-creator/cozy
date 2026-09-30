@@ -56,7 +56,7 @@ func TestStandaloneHostPreparesOrderedPrivateLoRAView(t *testing.T) {
 		Hub: func(origin string) *hub.Client {
 			return hub.New(config.Config{HubURL: origin, HubToken: secret.New("rental-idle-test")}, "LoRA preparation proof")
 		}}
-	connection, problem := resolver.Dial(t.Context(), machines.Local, "LoRA preparation proof")
+	connection, problem := resolver.DialAt(t.Context(), machines.Local, h.server.URL, "LoRA preparation proof", true)
 	fatal(t, problem)
 	defer resolver.Forget(machines.Local)
 	var workspace *pb.MachineExecutionWorkspace
@@ -167,6 +167,11 @@ def scalar(payload:Request)->Result: return Result(42)
 @app.entrypoint
 def generate(payload:Request,model:Probe)->Result: return Result(0)
 `), 0600))
+	lock := exec.Command("uv", "lock", "--project", project, "--python", "3.12")
+	lock.Env = childEnv(t, root)
+	if out, err := lock.CombinedOutput(); err != nil {
+		t.Fatalf("lock private probe: %v\n%s", err, out)
+	}
 	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
 		t.Fatalf("install private probe [%d]: %s", code, out)
 	}
@@ -184,11 +189,16 @@ def generate(payload:Request,model:Probe)->Result: return Result(0)
 	// The daemon now owns Control; this independent reader reuses the same owner.
 	resolver.Held = func(string) bool { return true }
 	resolver.Forget(machines.Local)
-	connection, problem = resolver.Dial(t.Context(), machines.Local, "LoRA preparation readback")
+	connection, problem = resolver.DialAt(t.Context(), machines.Local, h.server.URL, "LoRA preparation readback", true)
 	fatal(t, problem)
+	transfer, problem := store.MachinePackageTransfer(row.ID, connection.Claim.WorkerBootId, row.LocalInstallationID)
+	fatal(t, problem)
+	if transfer.Operation == "" {
+		t.Fatal("normal CLI did not retain its source preparation operation")
+	}
 	const token = "fake-private-preparation-token-46a96b1e"
-	selected := &pb.DesiredPrivatePlacementSet{OperationId: "lora-private-proof", InstallationId: row.LocalInstallationID,
-		Hub: h.server.URL, Owner: "fixture-account", SourceCredentials: []*pb.SourceCredential{{
+	selected := &pb.DesiredPrivatePlacementSet{OperationId: transfer.Operation, InstallationId: row.LocalInstallationID,
+		Hub: connection.Hub, Owner: "fixture-account", SourceCredentials: []*pb.SourceCredential{{
 			Provider: pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_HUGGINGFACE, Credential: "bearer " + token}},
 		ModelChoices: []*pb.ModelChoice{{Parameter: "generate.models.model", Repository: "proof/base", Release: "1.0.0", Lane: "fp32",
 			Adapters: []*pb.DownloadAdapterRef{{Model: "proof/first", Release: "1.0.0", Lane: "fp32", Component: "transformer", SourceComponent: "adapter", Scale: "0.5"},
@@ -213,10 +223,12 @@ def generate(payload:Request,model:Probe)->Result: return Result(0)
 		t.Fatal("Runtime returned no prepared adapter view")
 	}
 	var placement pb.PlacementSet
-	_, err = canonical.Read(prepared.PlacementSetCanonicalBytes, &placement)
-	must(t, err)
+	must(t, canonical.Unmarshal(prepared.PlacementSetCanonicalBytes, &placement))
 	if len(placement.Placements) != 1 {
 		t.Fatal("private preparation returned additional installations")
+	}
+	if placement.Placements[0].InstallationId != row.LocalInstallationID {
+		t.Fatal("private preparation replaced its accepted root installation")
 	}
 	var slot *pb.Slot
 	for _, entry := range placement.Placements[0].Entrypoints {
@@ -252,21 +264,27 @@ def generate(payload:Request,model:Probe)->Result: return Result(0)
 	if bytes.Contains(prepared.PlacementSetCanonicalBytes, []byte(token)) {
 		t.Fatal("private preparation retained its source credential")
 	}
+	scan := func() {
+		t.Helper()
+		for _, directory := range []string{root, host.Root()} {
+			must(t, filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+				if err != nil || info.IsDir() || info.Mode()&os.ModeType != 0 {
+					return err
+				}
+				body, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				if bytes.Contains(body, []byte(token)) {
+					t.Errorf("private preparation credential persisted in %s", path)
+				}
+				return nil
+			}))
+		}
+	}
+	// Inspect live WAL files before shutdown can checkpoint or remove them.
+	scan()
 	_, _ = runCozy(t, root, "down")
 	fatal(t, host.Stop(t.Context()))
-	for _, directory := range []string{root, host.Root()} {
-		must(t, filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() || info.Mode()&os.ModeType != 0 {
-				return err
-			}
-			body, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			if bytes.Contains(body, []byte(token)) {
-				t.Errorf("private preparation credential persisted in %s", path)
-			}
-			return nil
-		}))
-	}
+	scan()
 }
