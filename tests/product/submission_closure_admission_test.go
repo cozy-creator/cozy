@@ -108,6 +108,18 @@ func TestNewRunRequiresClosureBeforeTransmission(t *testing.T) {
 				if len(link.Receipt) == 0 || machine.sent.Load() == 0 || machine.probes.Load() < 1 {
 					t.Fatalf("supported machine did not accept exactly one cached probe: sent=%d probes=%d", machine.sent.Load(), machine.probes.Load())
 				}
+				if mode == "supported" {
+					// The route is proven once per machine connection, not once per run.
+					if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", "closure-admission-2"); code != 0 {
+						t.Fatalf("second run: %d %s", code, out)
+					}
+					second, problem := store.RequestByIdempotencyKey("closure-admission-2")
+					fatal(t, problem)
+					waitFor(t, root, "second run's result", func() bool { row, _ := store.RequestRow(second.ID); return row != nil && row.State == want })
+					if probes := machine.probes.Load(); probes != 1 {
+						t.Fatalf("a second run on the same machine connection probed closure again: %d probes", probes)
+					}
+				}
 			} else {
 				if len(link.Submission) != 0 || len(link.Receipt) != 0 || machine.sent.Load() != 0 {
 					t.Fatal("unsupported machine received or froze real work")

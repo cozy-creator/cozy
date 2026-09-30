@@ -3,8 +3,10 @@ package producttest
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 	_ "modernc.org/sqlite"
 )
@@ -75,5 +77,60 @@ func TestRecordsOpenAcceptsADriftedShapeAndKeepsRentals(t *testing.T) {
 	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name IN ('future_rentals_state','future_ledger')`).Scan(&extras))
 	if note != "kept" || extras != 2 {
 		t.Fatalf("the database's own column, index or table was removed: note=%q objects=%d", note, extras)
+	}
+}
+
+// A home written before an index existed gets it on the next command, as a missing column
+// does. Without it every open's lifecycle-rename probe scanned all recorded events: on the
+// owner's 450k-event database each `cozy run` opened its records three times at ~300 ms.
+// An index the home's rows refuse (a unique one over duplicates) is named once and skipped:
+// the home worked without it before, and it still runs every command.
+func TestACommandRestoresTheIndexesAnOlderHomeLacks(t *testing.T) {
+	root := t.TempDir()
+	if code, out := runCozy(t, root, "package", "list", "--json"); code != 0 {
+		t.Fatalf("package list [exit %d]\n%s", code, out)
+	}
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	db, err := sql.Open("sqlite", layout.DB)
+	must(t, err)
+	defer db.Close()
+	indexes := []string{"request_events_before_responses", "request_events_memo"}
+	for _, statement := range []string{
+		`DROP INDEX request_events_before_responses`,
+		`DROP INDEX request_events_memo`,
+		`DROP INDEX requests_parent_call`,
+		`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,plan_id,payload,state,created_at,parent_request_id,parent_call_index)
+		 VALUES ('req-dup-1','dup-1','sha256:1','local/dup','main','',x'7b7d','succeeded','2026-09-01T00:00:00Z','req-parent',0),
+		        ('req-dup-2','dup-2','sha256:2','local/dup','main','',x'7b7d','succeeded','2026-09-01T00:00:00Z','req-parent',0)`,
+	} {
+		_, err := db.Exec(statement)
+		must(t, err)
+	}
+	code, stdout, stderr := runCozyStreams(t, root, "package", "list", "--json")
+	if code != 0 {
+		t.Fatalf("package list on the older home [exit %d]\n%s%s", code, stdout, stderr)
+	}
+	if strings.Count(stderr, "requests_parent_call") != 1 || !strings.Contains(stderr, "commands run without it") {
+		t.Fatalf("the refused unique index was not named once:\n%s", stderr)
+	}
+	for _, index := range append(indexes, "requests_parent_call") {
+		var present int
+		must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&present))
+		if want := index != "requests_parent_call"; (present == 1) != want {
+			t.Fatalf("index %s present=%d after the command", index, present)
+		}
+	}
+	var plan, detail string
+	var id, parent, unused int
+	rows, err := db.Query(`EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM request_events WHERE type IN ('request.submitted','request.accepted','request.completed','request.failed','request.canceled'))`)
+	must(t, err)
+	for rows.Next() {
+		must(t, rows.Scan(&id, &parent, &unused, &detail))
+		plan += detail + "\n"
+	}
+	must(t, rows.Close())
+	if !strings.Contains(plan, "request_events_before_responses") {
+		t.Fatalf("the open's lifecycle probe still scans every event:\n%s", plan)
 	}
 }

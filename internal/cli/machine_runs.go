@@ -484,7 +484,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		return problem
 	}
-	connection.KeepWorkspace(workspace)
+	connection.Seen.Workspace.Store(workspace)
 	if request.RequiresModelOverrides() && (connection.WireMinor < 70 || !workspace.ModelOverrides) {
 		code := exit.Structural
 		if len(link.Submission) > 0 {
@@ -495,23 +495,18 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			WithRemedy("update the machine agent and Runtime before retrying this request")
 	}
 	rooted := len(link.Submission) == 0 && m.releaseRoot(request)
-	prepared := false // the root's unpublished installation is on the machine this pass
 	if rooted {
 		workspace, problem := m.workspace(ctx, connection)
 		if problem != nil {
 			return problem
 		}
 		// Unpublished code reaches the machine before its submission is recorded, as a
-		// capture's does: an upload refused or canceled leaves the run unsent.
-		if request.LocalInstallationID != "" {
-			revision, problem := m.capturedRevision(request)
-			if problem == nil {
-				problem = connection.prepare(ctx, request.ID, revision)
-			}
-			if problem != nil {
+		// capture's does: an upload refused or canceled leaves the run unsent. Code this
+		// connection already prepared is held by the Runtime and is not prepared again.
+		if _, held := connection.Seen.Held.Load(request.LocalInstallationID); request.LocalInstallationID != "" && !held {
+			if problem := m.prepareRoot(ctx, request, connection); problem != nil {
 				return problem
 			}
-			prepared = true
 		}
 		built, problem := m.releaseRootSubmission(ctx, request, connection)
 		if problem != nil {
@@ -625,31 +620,20 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	}
 	began = time.Now()
 	if submission.ReleaseRoot != nil {
-		if !replaying && submission.ReleaseRoot.InstallationId != "" && !prepared {
-			revision, problem := m.capturedRevision(request)
-			if problem == nil {
-				problem = connection.prepare(ctx, request.ID, revision)
-			}
-			if problem != nil {
+		problem := m.sendReleaseRoot(ctx, request, connection, submission)
+		if problem != nil && problem.ErrName() == "machine_execution.installation_absent" && submission.ReleaseRoot.InstallationId != "" {
+			// Only the machine's specific missing-installation reply (its Runtime restarted, or
+			// a frozen submission meets a new boot) permits preparing the code again. An
+			// accepted root replays without it.
+			if problem := m.prepareRoot(ctx, request, connection); problem != nil {
 				// The frozen submission may have reached the machine on an earlier pass.
-				// Resolve its acceptance before treating a new preparation refusal as final.
+				// Resolve its acceptance before treating a preparation refusal as final.
 				if refusedPreparation(problem) {
 					return m.settleSubmissionRefusal(ctx, connection, request.ID, problem)
 				}
 				return problem
 			}
-		}
-		problem := m.sendReleaseRoot(ctx, request, connection, submission)
-		if replaying && problem != nil && problem.ErrName() == "machine_execution.installation_absent" && submission.ReleaseRoot.InstallationId != "" {
-			// Only the machine's specific missing-installation reply permits source
-			// recovery. An already accepted root replays without local preparation.
-			revision, prepareProblem := m.capturedRevision(request)
-			if prepareProblem == nil {
-				prepareProblem = connection.prepare(ctx, request.ID, revision)
-			}
-			if prepareProblem != nil {
-				return prepareProblem
-			}
+			began = time.Now()
 			problem = m.sendReleaseRoot(ctx, request, connection, submission)
 		}
 		if problem != nil {
@@ -744,7 +728,7 @@ func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (
 			"this machine does not support durable submission closure; no submission was sent").
 			WithRemedy("use a machine image with a closure-capable machine agent and Runtime, or update this machine before submitting again")
 	}
-	if connection.closureWorkspace == workspace.ExecutionWorkspaceId {
+	if _, proven := connection.Seen.Closure.Load(workspace.ExecutionWorkspaceId); proven {
 		return workspace, nil
 	}
 	// Older machine agents can forward a newer Runtime's capability bit while omitting the
@@ -760,7 +744,7 @@ func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (
 		return nil, waitForRuntime()
 	}
 	if executionWorkspaceChanged(err, trailer) {
-		connection.KeepWorkspace(nil)
+		connection.Seen.Workspace.Store(nil)
 		return nil, exit.Named(exit.Unavailable, "machine_execution.workspace_changed", "the machine replaced its workspace before submission; checking its new workspace")
 	}
 	if err != nil {
@@ -776,7 +760,7 @@ func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (
 		closed.ExecutionWorkspaceId != workspace.ExecutionWorkspaceId || closed.Receipt != nil {
 		return nil, exit.New(exit.Conflict, "machine did not close the unused submission probe; no submission was sent")
 	}
-	connection.closureWorkspace = workspace.ExecutionWorkspaceId
+	connection.Seen.Closure.Store(workspace.ExecutionWorkspaceId, true)
 	return workspace, nil
 }
 
@@ -1301,12 +1285,12 @@ func (m *machineRuns) awaitEvents(ctx context.Context, connection *machineConnec
 // workspace is the machine's execution workspace and capabilities, read once per claimed
 // connection; a submission its journal refuses as replaced reads it again.
 func (m *machineRuns) workspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
-	if held := connection.Workspace(); held != nil {
+	if held := connection.Seen.Workspace.Load(); held != nil {
 		return held, nil
 	}
 	workspace, problem := currentExecutionWorkspace(ctx, connection)
 	if problem == nil {
-		connection.KeepWorkspace(workspace)
+		connection.Seen.Workspace.Store(workspace)
 	}
 	return workspace, problem
 }

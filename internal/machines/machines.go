@@ -55,18 +55,15 @@ type Machine struct {
 	owned    bool
 	release  func()
 	kept     bool // the connection is the Resolver's, kept for the machine's next call
-	// workspace is what this claimed connection's Runtime reported of itself, shared by
-	// every use of the connection and gone with it (Resolver.Forget, a new lifetime).
-	workspace *atomic.Pointer[pb.MachineExecutionWorkspace]
+	// Seen is what this claimed connection learned of its Runtime, shared by every use of
+	// the connection and gone with it (Resolver.Forget, a new lifetime).
+	Seen *Lifetime
 }
 
-// Workspace is the execution workspace and capabilities this connection's Runtime
-// reported, or nil when none was read yet.
-func (m *Machine) Workspace() *pb.MachineExecutionWorkspace { return m.workspace.Load() }
-
-// KeepWorkspace records what the Runtime reported; nil asks it again next time.
-func (m *Machine) KeepWorkspace(workspace *pb.MachineExecutionWorkspace) {
-	m.workspace.Store(workspace)
+type Lifetime struct {
+	Workspace atomic.Pointer[pb.MachineExecutionWorkspace] // nil asks the Runtime again
+	Closure   sync.Map                                     // workspaces whose submission-closure route answered
+	Held      sync.Map                                     // unpublished installations prepared on this Runtime
 }
 
 // Close ends this use of the machine. A kept connection stays open for the next one.
@@ -299,7 +296,7 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 		return Transport(err)
 	}
 	m.Conn, m.Host, m.CertificateDER, m.CertificateDigest = connection, pb.NewPodHostClient(connection), t.pin.DER(), t.pin.Digest()
-	m.workspace = &atomic.Pointer[pb.MachineExecutionWorkspace]{}
+	m.Seen = &Lifetime{}
 	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
 	info, err := m.Host.ProtocolInfo(probe, &pb.ProtocolInfoRequest{})
 	cancel()

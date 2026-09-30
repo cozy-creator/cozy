@@ -193,22 +193,24 @@ func addColumn(name, kind string, notNull bool, fallback sql.NullString, primary
 
 // conform brings db up to the required shape: a missing table, column, index or trigger is
 // created. Nothing present is altered or dropped, so every row the database holds — its
-// rentals above all — survives.
-func conform(db schemaDB, required shape) error {
+// rentals above all — survives. A table or column that cannot be added is an error; an index
+// or trigger the rows refuse (a unique index over duplicates) is only named in unbuilt: the
+// database worked without it before.
+func conform(db schemaDB, required shape) (unbuilt []string, err error) {
 	present, err := presentObjects(db)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, table := range required.tables {
 		if !present[table.name] {
 			if _, err := db.Exec(table.ddl); err != nil {
-				return fmt.Errorf("create missing table %s: %w", table.name, err)
+				return nil, fmt.Errorf("create missing table %s: %w", table.name, err)
 			}
 			continue
 		}
 		have, err := tableColumns(db, table.name)
 		if err != nil {
-			return fmt.Errorf("inspect table %s: %w", table.name, err)
+			return nil, fmt.Errorf("inspect table %s: %w", table.name, err)
 		}
 		existing := make(map[string]bool, len(have))
 		for _, column := range have {
@@ -219,10 +221,10 @@ func conform(db schemaDB, required shape) error {
 				continue
 			}
 			if column.add == "" {
-				return fmt.Errorf("table %s lacks its key column %s", table.name, column.name)
+				return nil, fmt.Errorf("table %s lacks its key column %s", table.name, column.name)
 			}
 			if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %q ADD COLUMN %s", table.name, column.add)); err != nil {
-				return fmt.Errorf("add missing column %s.%s: %w", table.name, column.name, err)
+				return nil, fmt.Errorf("add missing column %s.%s: %w", table.name, column.name, err)
 			}
 		}
 	}
@@ -231,10 +233,10 @@ func conform(db schemaDB, required shape) error {
 			continue
 		}
 		if _, err := db.Exec(object.ddl); err != nil {
-			return fmt.Errorf("create missing %s %s: %w", object.kind, object.name, err)
+			unbuilt = append(unbuilt, fmt.Sprintf("%s %s (%s)", object.kind, object.name, err))
 		}
 	}
-	return nil
+	return unbuilt, nil
 }
 
 // missing names what a database lacks of the required shape, for a reader that may not

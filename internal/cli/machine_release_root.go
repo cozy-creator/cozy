@@ -54,6 +54,22 @@ func (m *machineRuns) capturedRevision(request records.Request) (localpackage.In
 	return capture.Installations[0], nil
 }
 
+// prepareRoot puts a root's unpublished installation on the machine: a reopen of what its disk
+// retains, else an upload. The first run of the code on a Runtime pays it, as its own stage.
+func (m *machineRuns) prepareRoot(ctx context.Context, request records.Request, connection *machineConnection) *exit.Error {
+	began := time.Now()
+	revision, problem := m.capturedRevision(request)
+	if problem == nil {
+		problem = connection.prepare(ctx, request.ID, revision)
+	}
+	if problem != nil {
+		return problem
+	}
+	connection.Seen.Held.Store(revision.ID, true)
+	m.submissionStage(request.ID, "package", revision.Package, began)
+	return nil
+}
+
 func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records.Request, connection *machineConnection) (*pb.MachineExecutionSubmit, *exit.Error) {
 	root := &pb.ReleaseRoot{Package: request.Package, Release: request.Release, Entrypoint: request.Entrypoint,
 		DeadlineUnixMs: uint64(max(request.DeadlineUnixMS, 0)), AttentionKernel: request.AttentionKernel, Hub: connection.Hub}
@@ -156,7 +172,7 @@ func (m *machineRuns) sendReleaseRoot(ctx context.Context, request records.Reque
 			// The Host bounds one admission; the machine keeps preparing: ask again.
 		default:
 			if slices.Contains(codeOf, "execution_workspace_changed") {
-				connection.KeepWorkspace(nil)
+				connection.Seen.Workspace.Store(nil)
 			}
 			return m.submissionRefused(ctx, connection, request.ID, trailer, err)
 		}
