@@ -545,7 +545,7 @@ fn run_copy(
                     for it in pieces {
                         let into = Dst(unsafe { bounces[b].ptr.add((it.offset - base - c0) as usize) });
                         let (source, batch, tally) = (source.clone(), batch.clone(), m.tally.clone());
-                        m.readers.submit(move || {
+                        m.readers.submit(true, move || {
                             let into = into;
                             // SAFETY: the bounce range belongs to this chunk until its copy
                             // event, which is recorded only after this batch completes.

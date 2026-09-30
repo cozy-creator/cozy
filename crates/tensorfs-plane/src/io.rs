@@ -1,21 +1,21 @@
 //! Source bytes: a TensorFS read lease (the GC hold and the verified door) plus per-object
-//! descriptors the plane opens through the store's own verification (`open_verified`). Every
-//! read first takes what the page cache already holds (`RWF_NOWAIT`); the rest comes by
-//! O_DIRECT into the destination when the item's alignment allows (cache fills: no second host
-//! copy), else through `tensorfs_core::read::read_into`. Each mode's bytes are counted.
+//! descriptors the plane opens through the store's own verification (`open_verified`). A
+//! pinned-tier fill copies what the page cache already holds and reads the rest by O_DIRECT
+//! into the destination (no second host copy), else through `tensorfs_core::read::read_into`.
+//! Each mode's bytes are counted.
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::meta::Meta;
-use tensorfs_core::read::{self, ObjectRange, ReadLease};
+use tensorfs_core::read::{self, ReadLease};
 use tensorfs_core::store::Store;
 
 use crate::layout::{Item, ItemSource, PART_ALIGN};
@@ -52,18 +52,34 @@ pub struct Source {
     direct_io: bool,
 }
 
-fn pread_nowait(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
-    let iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    // SAFETY: one iovec over a live caller buffer.
-    let n = unsafe { libc::preadv2(f.as_raw_fd(), &iov, 1, off as libc::off_t, libc::RWF_NOWAIT) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
+/// Whether the page cache holds every page of `[off, off+len)`, from `cachestat(2)`: a pure
+/// query (unlike an `RWF_NOWAIT` read, which starts readahead on a miss). `None` where the
+/// kernel lacks it (< 6.5): the caller treats the range as cold.
+fn cached(f: &File, off: u64, len: u64) -> Option<bool> {
+    #[repr(C)]
+    struct Range {
+        off: u64,
+        len: u64,
     }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Stat {
+        nr_cache: u64,
+        nr_dirty: u64,
+        nr_writeback: u64,
+        nr_evicted: u64,
+        nr_recently_evicted: u64,
+    }
+    const SYS_CACHESTAT: libc::c_long = 451;
+    let r = Range { off, len };
+    let mut st = Stat::default();
+    // SAFETY: the documented cachestat ABI; both structs outlive the call.
+    let rc = unsafe { libc::syscall(SYS_CACHESTAT, f.as_raw_fd(), &r, &mut st, 0) };
+    if rc != 0 {
+        return None;
+    }
+    let page = 4096u64;
+    Some(st.nr_cache >= (off + len).div_ceil(page) - off / page)
 }
 
 impl Source {
@@ -121,16 +137,16 @@ impl Source {
         Ok(f)
     }
 
-    /// Fill `item.len` bytes at `dst`. With `Mode::Cache` an aligned item may DMA up to the
-    /// next `PART_ALIGN` boundary past its end, which the layout reserves as padding.
+    /// Fill `item.len` bytes at `dst`. `Mode::Cache` reads a range the page cache fully
+    /// holds by copy and everything else by O_DIRECT when alignment allows, which may DMA up
+    /// to the next `PART_ALIGN` boundary past the item: the layout reserves that as padding.
     ///
     /// # Safety
     /// `dst` must be valid for writes of `align_up(item.len, PART_ALIGN)` bytes and not be
     /// read or written by anyone else until this returns.
     pub unsafe fn read_item(&self, item: &Item, dst: *mut u8, mode: Mode, tally: &IoTally) -> Result<()> {
-        let len = item.len as usize;
         // SAFETY: per the contract.
-        let buf = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+        let buf = unsafe { std::slice::from_raw_parts_mut(dst, item.len as usize) };
         let o = match &item.source {
             ItemSource::Inline(b) => {
                 buf.copy_from_slice(b);
@@ -143,107 +159,92 @@ impl Source {
         let lease = guard.as_ref().ok_or(Error::Closed)?;
         lease.covers(o)?;
         let fds = self.fds(&o.obj, tally)?;
-
-        let mut got = 0usize;
-        while got < len {
-            match pread_nowait(&fds.buffered, &mut buf[got..], o.off + got as u64) {
-                Ok(0) => break,
-                Ok(n) => got += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break, // EAGAIN (not cached) or no NOWAIT support: read the rest.
-            }
-        }
-        tally.cached_bytes.fetch_add(got as u64, Ordering::Relaxed);
-        if got == len {
-            return Ok(());
-        }
-
         let a = PART_ALIGN;
-        let start = o.off + got as u64;
-        let skip = start % a;
         let end = o.off + item.len;
-        let congruent = (dst as u64).wrapping_sub(o.off) % a == 0;
-        let tail_ok = end % a == 0 || item.part_end;
-        if let (Mode::Cache, Some(direct), true, true) = (mode, &fds.direct, congruent, tail_ok) {
-            let from = start - skip;
-            let to = end.div_ceil(a) * a;
-            // SAFETY: [dst+got-skip, dst+to-o.off) lies inside the part plus its padding:
-            // `skip` bytes before `start` are this item's (already filled, same content).
-            let dbuf = unsafe {
-                std::slice::from_raw_parts_mut(dst.add(got - skip as usize), (to - from) as usize)
-            };
-            let mut done = 0usize;
-            let need = (end - from) as usize;
-            while done < need {
-                // SAFETY: aligned destination, offset and length (O_DIRECT contract).
-                let n = unsafe {
-                    libc::pread(
-                        direct.as_raw_fd(),
-                        dbuf[done..].as_mut_ptr() as *mut libc::c_void,
-                        dbuf.len() - done,
-                        (from + done as u64) as libc::off_t,
-                    )
-                };
-                if n < 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(Error::Io(format!("O_DIRECT pread {}: {e}", o.obj.sha256)));
-                }
-                if n == 0 {
-                    return Err(Error::Io(format!(
-                        "{}: ended at {} of {end} bytes",
-                        o.obj.sha256,
-                        from + done as u64
-                    )));
-                }
-                // A short read before `need` continues from an aligned offset (O_DIRECT).
-                let next = done + n as usize;
-                let next = if next < need { next - next % a as usize } else { next };
-                if next <= done {
-                    return Err(Error::Io(format!("{}: O_DIRECT made no progress", o.obj.sha256)));
-                }
-                done = next;
+        let aligned = (dst as u64).wrapping_sub(o.off) % a == 0 && (end % a == 0 || item.part_end);
+        let direct = match (mode, &fds.direct) {
+            (Mode::Cache, Some(f)) if aligned && !cached(&fds.buffered, o.off, item.len).unwrap_or(false) => f,
+            _ => {
+                read::read_into(lease, o, buf)?;
+                let t = if mode == Mode::Buffered { &tally.buffered_bytes } else { &tally.cached_bytes };
+                t.fetch_add(item.len, Ordering::Relaxed);
+                return Ok(());
             }
-            tally.direct_bytes.fetch_add((len - got) as u64, Ordering::Relaxed);
-            return Ok(());
+        };
+        let from = o.off - o.off % a;
+        let need = (end - from) as usize;
+        // SAFETY: [dst - (o.off - from), dst + align_up(end) - o.off) lies inside this part
+        // plus its padding (`aligned` above; parts start on `a`).
+        let dbuf = unsafe {
+            std::slice::from_raw_parts_mut(dst.sub((o.off - from) as usize), (end.div_ceil(a) * a - from) as usize)
+        };
+        let mut done = 0usize;
+        while done < need {
+            // SAFETY: aligned destination, offset and length (the O_DIRECT contract).
+            let n = unsafe {
+                libc::pread(
+                    direct.as_raw_fd(),
+                    dbuf[done..].as_mut_ptr() as *mut libc::c_void,
+                    dbuf.len() - done,
+                    (from + done as u64) as libc::off_t,
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(Error::Io(format!("O_DIRECT pread {}: {e}", o.obj.sha256)));
+            }
+            // A short read before `need` resumes at an aligned offset; EOF before it is short.
+            let next = done + n as usize;
+            let next = if next < need { next - next % a as usize } else { next };
+            if next <= done {
+                return Err(Error::Io(format!("{}: O_DIRECT read ended at {}", o.obj.sha256, from + done as u64)));
+            }
+            done = next;
         }
-        read::read_into(
-            lease,
-            &ObjectRange {
-                obj: o.obj.clone(),
-                off: start,
-                len: (len - got) as u64,
-            },
-            &mut buf[got..],
-        )?;
-        tally.buffered_bytes.fetch_add((len - got) as u64, Ordering::Relaxed);
+        tally.direct_bytes.fetch_add(item.len, Ordering::Relaxed);
         Ok(())
     }
 }
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// Persistent reader threads fed by one queue.
+#[derive(Default)]
+struct Queues {
+    urgent: VecDeque<Job>,
+    background: VecDeque<Job>,
+    stop: bool,
+}
+
+/// Persistent reader threads. Urgent jobs (staging for a device copy someone waits on) run
+/// before background jobs (pinned-tier prefetch), so a large prefetch never starves a stream.
 pub struct Readers {
-    tx: Mutex<Option<Sender<Job>>>,
+    q: Arc<(Mutex<Queues>, Condvar)>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Readers {
     pub fn new(n: usize) -> Readers {
-        let (tx, rx) = channel::<Job>();
-        let rx = Arc::new(Mutex::new(rx));
+        let q = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
         let threads = (0..n.max(1))
             .map(|i| {
-                let rx = rx.clone();
+                let q = q.clone();
                 std::thread::Builder::new()
                     .name(format!("tfs-plane-read-{i}"))
                     .spawn(move || loop {
-                        let job = match rx.lock().unwrap().recv() {
-                            Ok(j) => j,
-                            Err(_) => return,
+                        let job = {
+                            let mut g = q.0.lock().unwrap();
+                            loop {
+                                if let Some(j) = g.urgent.pop_front().or_else(|| g.background.pop_front()) {
+                                    break j;
+                                }
+                                if g.stop {
+                                    return;
+                                }
+                                g = q.1.wait(g).unwrap();
+                            }
                         };
                         job();
                     })
@@ -251,19 +252,22 @@ impl Readers {
             })
             .collect();
         Readers {
-            tx: Mutex::new(Some(tx)),
+            q,
             threads: Mutex::new(threads),
         }
     }
 
-    pub fn submit(&self, job: impl FnOnce() + Send + 'static) {
-        if let Some(tx) = self.tx.lock().unwrap().as_ref() {
-            let _ = tx.send(Box::new(job));
-        }
+    pub fn submit(&self, urgent: bool, job: impl FnOnce() + Send + 'static) {
+        let mut g = self.q.0.lock().unwrap();
+        if urgent { &mut g.urgent } else { &mut g.background }.push_back(Box::new(job));
+        drop(g);
+        self.q.1.notify_one();
     }
 
+    /// Finish queued jobs, then stop the threads.
     pub fn shutdown(&self) {
-        self.tx.lock().unwrap().take();
+        self.q.0.lock().unwrap().stop = true;
+        self.q.1.notify_all();
         for t in self.threads.lock().unwrap().drain(..) {
             let _ = t.join();
         }

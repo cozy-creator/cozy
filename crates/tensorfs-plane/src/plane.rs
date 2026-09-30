@@ -610,7 +610,7 @@ impl Inner {
             inner.cv.notify_all();
         };
         if adopted || region.items.is_empty() {
-            self.readers.submit(move || done(Ok(())));
+            self.readers.submit(false, move || done(Ok(())));
             return Ok(());
         }
         let batch = Batch::new(region.items.len(), done);
@@ -619,7 +619,7 @@ impl Inner {
             // SAFETY: the region's host range is exclusively this fill's until it completes
             // (state Filling; the OFD fill lock keeps other processes from punching it).
             let dst = Dst(unsafe { host.base().add(it.offset as usize) });
-            self.readers.submit(move || {
+            self.readers.submit(false, move || {
                 let dst = dst;
                 batch.finish(unsafe { source.read_item(&it, dst.0, Mode::Cache, &tally) });
             });

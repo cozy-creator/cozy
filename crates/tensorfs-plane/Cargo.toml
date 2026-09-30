@@ -11,3 +11,5 @@ libc = "0.2"
 # libcuda is dlopen'd at first use: the workspace builds and tests with no CUDA toolkit.
 libloading = "0.9"
 thiserror = "2"
+
+[dev-dependencies]
