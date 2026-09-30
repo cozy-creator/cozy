@@ -557,7 +557,7 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 
 func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 	if userunit.Available() && userunit.MainPID(userunit.Name("cozy-machine-agent", h.dir, false)) > 0 {
-		return nil, exit.Named(exit.Conflict, "machine.process_untracked", "a machine agent already owns this root but its authenticated launch record is missing; preserve it for repair")
+		return nil, exit.Named(exit.Conflict, "machine.process_untracked", "a machine agent already owns this root but its recorded process identity could not be verified; preserve it for repair")
 	}
 	// A directly launched agent or surviving Runtime may have no client record.
 	// Observe its kernel ownership before touching receipt or launch metadata.
@@ -916,7 +916,30 @@ func (h *Host) alive(pid int) bool {
 			return true
 		}
 	}
-	return false
+	return h.recordedApplication(pid, target)
+}
+
+// The agent can re-exec its retained application before an update replaces the
+// selected launcher. That changes its executable path, not its recorded process.
+func (h *Host) recordedApplication(pid int, target string) bool {
+	retained := filepath.Join(h.Root(), "usr/local/lib/cozy-machine")
+	relative, err := filepath.Rel(retained, target)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(relative, string(filepath.Separator))
+	if len(parts) != 2 || parts[1] != "cozy-machine" || len(parts[0]) != sha256.Size*2 {
+		return false
+	}
+	if _, err := hex.DecodeString(parts[0]); err != nil {
+		return false
+	}
+	// Do not authorize a retained-path process solely because a pid or filename
+	// matches. An absent/stale launch record must still take the repair path.
+	raw, err := os.ReadFile(h.path("agent.json"))
+	var record hostRecord
+	return err == nil && json.Unmarshal(raw, &record) == nil && record.PID == pid &&
+		record.StartTicks != 0 && record.StartTicks == processStartTicks(pid)
 }
 
 // Legacy identity is only a refusal census, never permission to signal a PID.
