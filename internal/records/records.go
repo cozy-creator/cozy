@@ -183,7 +183,7 @@ func open(path string) (*Store, *exit.Error) {
 			db.Close()
 			return nil, e
 		}
-		compatibilityNotice.Do(func() {
+		schemaNotice.Do(func() {
 			fmt.Fprintf(os.Stderr, "records written by a newer Creator (v%d); running in compatibility mode, upgrade for full features\n", version)
 		})
 	}
@@ -241,7 +241,7 @@ func initialize(db *sql.DB, path string) *exit.Error {
 	if err != nil {
 		return exit.Internalf("cannot derive current records schema: %s", err)
 	}
-	if err := conform(tx, required); err != nil {
+	if _, err := conform(tx, required); err != nil {
 		return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
@@ -253,8 +253,8 @@ func initialize(db *sql.DB, path string) *exit.Error {
 	return nil
 }
 
-// compatibilityNotice names a newer database once per process.
-var compatibilityNotice sync.Once
+// schemaNotice names a newer or incompletely indexed database once per process.
+var schemaNotice sync.Once
 
 // verifyNewerSchema admits a newer Creator's database when every table and column this build
 // requires is present with a compatible type. It never changes the database.
@@ -287,18 +287,24 @@ func schemaChanged(path string, version int) *exit.Error {
 		WithRemedy("run the command again")
 }
 
-// verifySchema creates every required table, column and index the database lacks. An
-// index matters as much as a column: without one, a query scans every event ever recorded.
-// Extra columns, indexes and tables and differences in DDL text are accepted.
+// verifySchema creates every required table, column and index the database lacks: without an
+// index a query scans every event ever recorded. An index its rows refuse is named once and
+// skipped. Extra columns, indexes and tables and differences in DDL text are accepted.
 func verifySchema(db *sql.DB, path string) *exit.Error {
 	required, err := requiredCurrentShape()
 	if err != nil {
 		return exit.Internalf("cannot derive current records schema: %s", err)
 	}
-	if err := conform(db, required); err != nil {
+	unbuilt, err := conform(db, required)
+	if err != nil {
 		return exit.Named(exit.Conflict, "records.schema_incomplete",
 			"records database %s is incomplete and cannot be completed: %s", path, err).
 			WithRemedy("keep %s in place; its rows are intact — run the Cozy Creator build that wrote it", path)
+	}
+	if len(unbuilt) > 0 {
+		schemaNotice.Do(func() {
+			fmt.Fprintf(os.Stderr, "records database %s lacks %s; commands run without it, more slowly\n", path, strings.Join(unbuilt, ", "))
+		})
 	}
 	return nil
 }

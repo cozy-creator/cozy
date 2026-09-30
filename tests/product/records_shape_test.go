@@ -83,6 +83,8 @@ func TestRecordsOpenAcceptsADriftedShapeAndKeepsRentals(t *testing.T) {
 // A home written before an index existed gets it on the next command, as a missing column
 // does. Without it every open's lifecycle-rename probe scanned all recorded events: on the
 // owner's 450k-event database each `cozy run` opened its records three times at ~300 ms.
+// An index the home's rows refuse (a unique one over duplicates) is named once and skipped:
+// the home worked without it before, and it still runs every command.
 func TestACommandRestoresTheIndexesAnOlderHomeLacks(t *testing.T) {
 	root := t.TempDir()
 	if code, out := runCozy(t, root, "package", "list", "--json"); code != 0 {
@@ -94,18 +96,29 @@ func TestACommandRestoresTheIndexesAnOlderHomeLacks(t *testing.T) {
 	must(t, err)
 	defer db.Close()
 	indexes := []string{"request_events_before_responses", "request_events_memo"}
-	for _, index := range indexes {
-		_, err := db.Exec(`DROP INDEX ` + index)
+	for _, statement := range []string{
+		`DROP INDEX request_events_before_responses`,
+		`DROP INDEX request_events_memo`,
+		`DROP INDEX requests_parent_call`,
+		`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,plan_id,payload,state,created_at,parent_request_id,parent_call_index)
+		 VALUES ('req-dup-1','dup-1','sha256:1','local/dup','main','',x'7b7d','succeeded','2026-09-01T00:00:00Z','req-parent',0),
+		        ('req-dup-2','dup-2','sha256:2','local/dup','main','',x'7b7d','succeeded','2026-09-01T00:00:00Z','req-parent',0)`,
+	} {
+		_, err := db.Exec(statement)
 		must(t, err)
 	}
-	if code, out := runCozy(t, root, "package", "list", "--json"); code != 0 {
-		t.Fatalf("package list on the older home [exit %d]\n%s", code, out)
+	code, stdout, stderr := runCozyStreams(t, root, "package", "list", "--json")
+	if code != 0 {
+		t.Fatalf("package list on the older home [exit %d]\n%s%s", code, stdout, stderr)
 	}
-	for _, index := range indexes {
+	if strings.Count(stderr, "requests_parent_call") != 1 || !strings.Contains(stderr, "commands run without it") {
+		t.Fatalf("the refused unique index was not named once:\n%s", stderr)
+	}
+	for _, index := range append(indexes, "requests_parent_call") {
 		var present int
 		must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&present))
-		if present != 1 {
-			t.Fatalf("the command did not restore index %s", index)
+		if want := index != "requests_parent_call"; (present == 1) != want {
+			t.Fatalf("index %s present=%d after the command", index, present)
 		}
 	}
 	var plan, detail string
