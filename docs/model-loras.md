@@ -29,7 +29,7 @@ A composition's child serving function can be selected by its full model slot:
 
 ```sh
 cozy run paul/minimax-h3/long_form --input scene.yaml \
-  --lora 'motion_segment_turbo.models.model:ref2va_dit=paul/style@1.0.0,0.5'
+  --lora 'motion_segment_turbo.models.base_model:ref2va_dit=paul/style@1.0.0,0.5'
 ```
 
 `<function>.models.<parameter>` names that captured function in the root package.

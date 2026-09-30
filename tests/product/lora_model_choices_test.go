@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,64 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+// Provider credentials enter through the daemon's environment, then travel only
+// in the transient submission. The selected source remains an ordinary capture
+// fact; the credential must not become a replay, database, config or log fact.
+func TestLoRAProviderCredentialStaysOutOfDurableClientState(t *testing.T) {
+	const token = "fake-lora-source-token-9e3c7641"
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machine := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
+		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
+	})
+	machine.modelOverrides = true
+	root, layout := rentedLadderHome(t, h, &fakePod{machine: machine}, nil)
+	startDaemonProcess(t, root, "HF_TOKEN="+token)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	source := "hf://proof/style@" + strings.Repeat("c", 40)
+	row, output := rentedRun(t, root, store, "provider-adapter", "generate", "steps=1",
+		"--lora", "model:fl2va_dit="+source+",0.5")
+	if row.State != "succeeded" {
+		t.Fatalf("provider adapter request failed: %s\n%s", row.State, output)
+	}
+	submitted := machine.submitted()
+	if len(submitted) != 1 || submitted[0].ReleaseRoot == nil {
+		t.Fatal("provider adapter did not reach one machine submission")
+	}
+	want := []*pb.SourceCredential{{Provider: pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_HUGGINGFACE,
+		Credential: "bearer " + token}}
+	if !credentialsEqual(submitted[0].SourceCredentials, want) {
+		t.Fatal("provider adapter did not carry the configured credential on the wire")
+	}
+	choice := submitted[0].ReleaseRoot.Models
+	if len(choice) != 1 || len(choice[0].Adapters) != 1 || choice[0].Adapters[0].Source != source {
+		t.Fatal("provider adapter changed the captured source selection")
+	}
+	link, problem := store.MachineExecution(row.ID)
+	fatal(t, problem)
+	if link == nil || bytes.Contains(link.Submission, []byte(token)) || strings.Contains(output, token) {
+		t.Fatal("provider adapter credential became frozen submission or CLI output")
+	}
+	if code, out := runCozy(t, root, "down"); code != 0 {
+		t.Fatalf("daemon shutdown failed: %s", out)
+	}
+	must(t, filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || info.Mode()&os.ModeType != 0 {
+			return err
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(body, []byte(token)) {
+			t.Errorf("provider adapter credential was persisted in %s", path)
+		}
+		return nil
+	}))
+}
 
 func TestYAMLModelOverrideCarriesBaseAndAdaptersOnlyToItsNamedChild(t *testing.T) {
 	h := newLadderHub(t)
