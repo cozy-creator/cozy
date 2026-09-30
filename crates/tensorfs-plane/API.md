@@ -166,6 +166,7 @@ built once and cached by `ptr`: part `x` of region `r` is at `ptr + x.offset - r
 p.stats() -> {
   "host":    {"budget", "used", "ready_bytes", "registered_bytes", "memfd_bytes",
               "cached_bytes", "direct_bytes", "buffered_bytes", "inline_bytes", "direct_refused",
+              "disk_read_bytes",
               "fills", "fill_bytes", "fill_ns", "evictions", "evicted_bytes", "register_failed",
               "trims"},
   "devices": [{"ordinal", "uuid", "granularity", "exportable", "budget", "committed", "mapped",
@@ -196,7 +197,8 @@ p.events() -> [{"kind", "ws", "region", "device", "bytes", "ns", "detail"}]   # 
 
 `plane.PlaneError` (`.code`), subclasses: `BudgetExceeded`, `Shortfall`, `LeaseViolation`,
 `Poisoned`, `CudaError`, `CudaUnavailable`, `Invalid`, `IoError`, `Closed`. Source refusals
-surface as the usual `tensorfs.errors.*` classes.
+surface as the usual `tensorfs.errors.*` classes. `BudgetExceeded` with `pool == "device"`
+means the driver itself had no memory left (the budget exceeds what is free): lower it.
 
 **Poison is latched plane-wide**: an ambiguous driver outcome (a failed unmap or rollback, a
 driver mapping that disagrees with the books) or a lease dropped unreleased makes every later

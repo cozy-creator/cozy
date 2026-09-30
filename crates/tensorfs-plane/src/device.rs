@@ -226,9 +226,14 @@ impl Arena {
             let mut h: Handle = 0;
             // SAFETY: out-param; prop describes device memory of the bound context's device.
             let rc = unsafe { (d.mem_create)(&mut h, s as usize, &self.prop, 0) };
-            if let Err(e) = cuda::check("cuMemCreate", rc) {
+            if rc != cuda::SUCCESS {
                 self.put_idle(out);
-                return Err(e);
+                // The device itself is full (the budget exceeds what is free): capacity, not
+                // an ambiguous driver state.
+                if rc == cuda::ERROR_OUT_OF_MEMORY {
+                    return Err(Error::BudgetExceeded { pool: "device", requested: s, available: 0 });
+                }
+                return Err(cuda::check("cuMemCreate", rc).unwrap_err());
             }
             self.committed += s;
             out.push(Chunk { handle: h, size: s });
@@ -521,9 +526,12 @@ fn run_copy(
             let nchunks = len.div_ceil(cap) as usize;
             let mut inflight: VecDeque<(u64, usize, Arc<Waiter>)> = VecDeque::new();
             let mut next = 0usize;
+            // The slot's previous readers first: the stream waits, the host keeps reading.
+            wait_all(&waits)?;
             let mut first = true;
+            let mut failed = None;
             loop {
-                while inflight.len() < bounces.len() && next < nchunks {
+                while failed.is_none() && inflight.len() < bounces.len() && next < nchunks {
                     let b = next % bounces.len();
                     if let Some(last) = bounces[b].last.take() {
                         last.sync()?;
@@ -543,7 +551,7 @@ fn run_copy(
                         m.readers.submit(true, move || {
                             let into = into;
                             // SAFETY: the bounce range belongs to this chunk until its copy
-                            // event, which is recorded only after this batch completes.
+                            // event, recorded only after this batch completes.
                             batch.finish(unsafe { source.read_item(&it, into.0, Mode::Buffered, &tally) });
                         });
                     }
@@ -555,9 +563,14 @@ fn run_copy(
                 while g.is_none() {
                     g = w.cv.wait(g).unwrap();
                 }
-                g.take().unwrap()?;
+                // After a failure keep draining: readers may still write the bounces.
+                if let Err(e) = g.take().unwrap() {
+                    failed.get_or_insert(e);
+                }
+                if failed.is_some() {
+                    continue;
+                }
                 if first {
-                    wait_all(&waits)?;
                     start.record(stream)?;
                     first = false;
                 }
@@ -569,6 +582,12 @@ fn run_copy(
                 let e = m.events.get(false)?;
                 e.record(stream)?;
                 bounces[b].last = Some(e);
+            }
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if first {
+                start.record(stream)?;
             }
             ready.record(stream)?;
             Ok(Copied { ready, start, bytes: len, from_host: false })

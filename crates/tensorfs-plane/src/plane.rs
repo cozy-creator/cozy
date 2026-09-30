@@ -1445,6 +1445,7 @@ impl Plane {
             buffered_bytes: t.buffered_bytes.load(Ordering::Relaxed),
             inline_bytes: t.inline_bytes.load(Ordering::Relaxed),
             direct_refused: t.direct_refused.load(Ordering::Relaxed),
+            disk_read_bytes: disk_read_bytes(),
             ..Default::default()
         };
         let mut devs: Vec<DevStats> = self
@@ -1565,7 +1566,16 @@ pub struct HostStats {
     pub buffered_bytes: u64,
     pub inline_bytes: u64,
     pub direct_refused: u64,
+    /// Bytes this process caused the block layer to read (`/proc/self/io` read_bytes).
+    pub disk_read_bytes: u64,
     pub counters: HostCounters,
+}
+
+fn disk_read_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("read_bytes: ")?.trim().parse().ok()))
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Default)]
