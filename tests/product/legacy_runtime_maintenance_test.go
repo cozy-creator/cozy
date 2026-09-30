@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,7 +31,7 @@ type legacyMaintenancePeer struct {
 	pb.UnimplementedWorkerControlServer
 	mu                             sync.Mutex
 	arm, version, operation, state string
-	posts                          int
+	posts, puts                    int
 }
 
 type legacyProtocolPeer struct{ pb.UnimplementedPodHostServer }
@@ -37,6 +40,12 @@ func (p *legacyMaintenancePeer) postCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.posts
+}
+
+func (p *legacyMaintenancePeer) putCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.puts
 }
 
 func (*legacyProtocolPeer) ProtocolInfo(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
@@ -63,7 +72,7 @@ func TestLegacyRuntimeMaintenancePreservesAuthorityAndOperation(t *testing.T) {
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build maintenance command: %v\n%s", err, out)
 	}
-	for _, arm := range []string{"success", "rolled_back", "agent_changed", "wrong_machine", "foreign_pending"} {
+	for _, arm := range []string{"success", "rolled_back", "agent_changed", "wrong_machine", "foreign_pending", "stage", "stage_bad_receipt", "stage_foreign_pending"} {
 		t.Run(arm, func(t *testing.T) {
 			root := t.TempDir()
 			layout := home.Paths(root)
@@ -74,7 +83,7 @@ func TestLegacyRuntimeMaintenancePreservesAuthorityAndOperation(t *testing.T) {
 			must(t, err)
 			must(t, os.WriteFile(layout.RentalCreatorIdentity("pr-legacy-proof"), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: raw}), 0600))
 			peer := &legacyMaintenancePeer{arm: arm, version: "0.18.85"}
-			if arm == "foreign_pending" {
+			if arm == "foreign_pending" || arm == "stage_foreign_pending" {
 				peer.operation, peer.state = "someone-elses-update", "waiting"
 			}
 			g := grpc.NewServer()
@@ -94,6 +103,22 @@ func TestLegacyRuntimeMaintenancePreservesAuthorityAndOperation(t *testing.T) {
 				}
 				peer.mu.Lock()
 				defer peer.mu.Unlock()
+				if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/machine/runtime/wheels/") {
+					peer.puts++
+					body, err := io.ReadAll(r.Body)
+					if err != nil || string(body) != "verified wheel fixture" {
+						t.Errorf("staging changed the payload: %v", err)
+					}
+					hash := sha256.Sum256(body)
+					digest := hex.EncodeToString(hash[:])
+					if arm == "stage_bad_receipt" {
+						digest = strings.Repeat("0", 64)
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"file": filepath.Base(r.URL.Path), "sha256": digest, "length": len(body), "future_field": true,
+					})
+					return
+				}
 				if r.Method == http.MethodPost && r.URL.Path == "/v1/machine/runtime/update" {
 					var body struct {
 						Operation         string
@@ -132,11 +157,12 @@ func TestLegacyRuntimeMaintenancePreservesAuthorityAndOperation(t *testing.T) {
 			fatal(t, problem)
 			fatal(t, store.RecordRental(records.Rental{ID: "pr-legacy-proof", MachineName: "motonari", State: "ready", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: "https://hub.example", Address: strings.TrimPrefix(server.URL, "https://"), CertPath: cert, ExpectedWorkerID: "worker-legacy", ExpectedWorkerBootID: "boot-legacy"}))
 			store.Close()
-			invoke := func(apply bool) (string, error) {
+			invoke := func(apply bool, extra ...string) (string, error) {
 				args := []string{"--machine", "motonari", "--runtime-version", "0.18.89", "--tensorfs-version", "0.3.78"}
 				if apply {
 					args = append(args, "--apply", "--expect-agent-version", "0.1.0", "--expect-agent-started-unix-ms", "100")
 				}
+				args = append(args, extra...)
 				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 				defer cancel()
 				cmd := exec.CommandContext(ctx, binary, args...)
@@ -153,6 +179,47 @@ func TestLegacyRuntimeMaintenancePreservesAuthorityAndOperation(t *testing.T) {
 			}
 			if err != nil || !strings.Contains(out, `"status":"plan_only"`) || peer.postCount() != 0 {
 				t.Fatalf("default mode mutated: %v %s posts=%d", err, out, peer.postCount())
+			}
+			if strings.HasPrefix(arm, "stage") {
+				body := []byte("verified wheel fixture")
+				digest := sha256.Sum256(body)
+				hash := hex.EncodeToString(digest[:])
+				path := filepath.Join(t.TempDir(), "cozy_runtime-0.18.89-cp312-abi3-manylinux_2_28_x86_64.whl")
+				must(t, os.WriteFile(path, body, 0600))
+				identity := []string{"--expect-agent-version", "0.1.0", "--expect-agent-started-unix-ms", "100"}
+				if arm == "stage" {
+					for _, args := range [][]string{
+						{"--stage-wheel", hash + "=" + path},
+						append(append([]string{}, identity...), "--stage-wheel", strings.Repeat("0", 64)+"="+path),
+					} {
+						if out, err := invoke(false, args...); err == nil || peer.putCount() != 0 || peer.postCount() != 0 {
+							t.Fatalf("unverified staging reached machine: %v %s", err, out)
+						}
+					}
+					wrong := filepath.Join(t.TempDir(), "cozy_runtime-0.18.90-py3-none-any.whl")
+					must(t, os.WriteFile(wrong, body, 0600))
+					if out, err := invoke(false, append(identity, "--stage-wheel", hash+"="+wrong)...); err == nil || peer.putCount() != 0 {
+						t.Fatalf("another version was staged: %v %s", err, out)
+					}
+				}
+				out, err := invoke(false, append(identity, "--stage-wheel", hash+"="+path)...)
+				if arm == "stage_foreign_pending" {
+					if err == nil || peer.putCount() != 0 || peer.postCount() != 0 {
+						t.Fatalf("staging competed with a pending update: %v %s", err, out)
+					}
+					return
+				}
+				if arm == "stage_bad_receipt" {
+					if err == nil || !strings.Contains(out, "receipt differs") {
+						t.Fatalf("bad staging receipt was accepted: %v %s", err, out)
+					}
+				} else if err != nil || !strings.Contains(out, `"status":"staged_only"`) || !strings.Contains(out, `"installed":{"runtime":"0.18.85"`) {
+					t.Fatalf("stage-only changed installed Runtime: %v %s", err, out)
+				}
+				if peer.putCount() != 1 || peer.postCount() != 0 {
+					t.Fatalf("staging submitted an update: puts=%d posts=%d", peer.putCount(), peer.postCount())
+				}
+				return
 			}
 			out, err = invoke(true)
 			if arm == "foreign_pending" {
