@@ -191,6 +191,71 @@ async def main()->Annotated[FileAsset,AssetBound(max_bytes=1024,media_types=("ap
 		})
 	}
 
+	t.Run("multiple-final", func(t *testing.T) {
+		script := filepath.Join(project, "multiple-final.py")
+		producerModule := filepath.Join(producer, "file_producer.py")
+		producerCode, err := os.ReadFile(producerModule)
+		must(t, err)
+		producerCode = append(producerCode, []byte(`
+class FinalReport(msgspec.Struct, frozen=True):
+    metadata: Annotated[FileAsset, AssetBound(max_bytes=1024, media_types=("application/json",))]
+    native: Annotated[FileAsset, AssetBound(max_bytes=1024, media_types=("text/plain",))]
+    forwarded: Annotated[FileAsset, AssetBound(max_bytes=1024, media_types=("application/json",))]
+`)...)
+		must(t, os.WriteFile(producerModule, producerCode, 0600))
+		body := `from cozy_runtime.author import Outputs
+from file_producer import FinalReport, produce
+async def main(*, out:Outputs)->FinalReport:
+    child = await produce()
+    return FinalReport(
+        out.save_bytes(b'{"parent":true}\n', media_type="application/json"),
+        out.save_bytes(b"direct parent file\n", media_type="text/plain"),
+        child.facts,
+    )
+`
+		must(t, os.WriteFile(script, []byte(header+body), 0600))
+		directory := filepath.Join(root, "export-multiple-final")
+		result := run(t, "run", script, "--await", "--out", directory, "--idempotency-key", "three-final-files")
+		saved, ok := result["saved"].([]any)
+		if !ok || len(saved) != 3 {
+			t.Fatalf("final result did not export all three files: %+v", result)
+		}
+		wanted := map[string]bool{"{\"parent\":true}\n": true, "direct parent file\n": true, "{\"ok\":true}\n": true}
+		for _, item := range saved {
+			file := item.(map[string]any)
+			target, ok := file["path"].(string)
+			if !ok || filepath.Dir(target) != directory {
+				t.Fatalf("file missed the requested directory: %+v", file)
+			}
+			data, err := os.ReadFile(target)
+			must(t, err)
+			if !wanted[string(data)] {
+				t.Fatalf("unexpected or repeated output bytes: %q", data)
+			}
+			delete(wanted, string(data))
+			digest := sha256.Sum256(data)
+			if file["digest"] != "sha256:"+hex.EncodeToString(digest[:]) {
+				t.Fatal("exported bytes differ from the accepted product digest")
+			}
+		}
+		request, problem := store.RequestByIdempotencyKey("three-final-files")
+		fatal(t, problem)
+		if request == nil || request.State != "succeeded" {
+			t.Fatal("three-file run did not succeed")
+		}
+		waitFor(t, root, "three-file collection acknowledgment", func() bool {
+			collection, _ := store.MachineExecution(request.ID)
+			return collection != nil && collection.Collected
+		})
+		collection, problem := store.MachineExecution(request.ID)
+		fatal(t, problem)
+		export, problem := store.OutputExportOf(request.ID)
+		fatal(t, problem)
+		if collection == nil || !collection.Collected || export == nil || export.State != "published" || len(export.Outputs) != 3 {
+			t.Fatalf("await returned before normal collection: %+v %+v", collection, export)
+		}
+	})
+
 	t.Run("oversized-forwarded-image", func(t *testing.T) {
 		script := filepath.Join(project, "oversized-image.py")
 		body := `from typing import Annotated
