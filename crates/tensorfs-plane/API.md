@@ -1,4 +1,4 @@
-# tensorfs.plane — Python API (v2, 2026-09-30)
+# tensorfs.plane — Python API (v3, 2026-09-30)
 
 The weight plane moves bytes; cozy-runtime decides. The plane never measures free memory,
 never picks victims among equals, never reorders a schedule. It ships inside the `tensorfs`
@@ -11,7 +11,7 @@ wheel (`from tensorfs import plane`), so it takes TensorFS `Store`, `ReadLease` 
 - **Region**: a policy-declared group of tensors (a block from `paging.partition()`, plus
   `common`). The plane never infers regions.
 - **Layout**: every byte has ONE offset, the same in the pinned tier (memfd), the device VA
-  and inside a streaming slot. Regions start on 2 MiB; parts start on 4 KiB. A region moves in
+  and inside the streaming ring. Regions start on 2 MiB; parts start on 4 KiB. A region moves in
   one copy.
 - **Tier**: `"pinned"` or a CUDA ordinal (`int`).
 - **Stream**: a raw `CUstream` as `int` (`torch.cuda.current_stream().cuda_stream`; 0 = legacy
@@ -105,7 +105,7 @@ p.prioritise(ws, tier, regions=None, priority=0, pin=None)   # never moves a byt
 
 ```python
 lease = p.acquire(ws, device, region, stream, priority=None)
-lease.ptr, lease.nbytes, lease.region, lease.slot   # slot is None for resident leases
+lease.ptr, lease.nbytes, lease.region, lease.ring_offset   # ring_offset is None for resident leases
 lease.view()                 # ONE uint8 DLPack view of the region's bytes (see Views)
 lease.release()              # records the release event on the acquire stream (or pass stream=)
 with p.acquire(ws, device, region, stream) as lease: ...
@@ -121,35 +121,44 @@ garbage-collected unreleased POISONS the plane.
 ## Streaming (the hot path)
 
 ```python
-cur = p.stream(ws, device, order, window, repeat=1, priority=0, tag="denoise")  # repeat=0: cycle until close
+cur = p.stream(ws, device, order, window, repeat=1, priority=0, tag="denoise",
+               ring_bytes=None)  # repeat=0: cycle until close
 cur.home                     # per order index: True = served in place (resident at stream())
-cur.window, cur.slot_nbytes, cur.slot_ptrs
-cur.slot_view(i)             # uint8 DLPack view of slot i (keeps the cursor from closing)
+cur.window                   # most streamed positions queued ahead of the consumer
+cur.ring_ptr, cur.ring_nbytes
+cur.ring_view()              # uint8 DLPack view of the whole ring (keeps the cursor from closing)
 cur.position, cur.passes     # positions consumed; completed cycles over `order`
 for step in range(passes):
     for r in order:
         lease = cur.acquire(r, stream)
-        ...block forward on `stream`...  # bytes at lease.ptr (slot lease.slot, or resident)
+        ...block forward on `stream`...  # bytes at lease.ptr (ring_offset in the ring, or resident)
         lease.release()
-cur.close()                  # refuses while a lease or slot view is live; waits for copies
+cur.close()                  # refuses while a lease or ring view is live; waits for copies
 ```
 
-A cursor garbage-collected while its leases or slot views are live stops prefetching and
-closes itself when the last of them is released.
-
 - Regions resident (Ready, filling or queued) on the device at `stream()` are served in place
-  and held (not evictable) until `close()`; the rest stream through `window` slots of
-  `max(streamed span)` bytes (charged to the device budget; may evict below `priority`).
-- Copies run `window` positions ahead on the copy stream. Each waits on the release event of
-  the slot's previous user; `acquire` never blocks the host once the copy is queued.
+  and held (not evictable) until `close()`. The resident set can be any subset (a spread set,
+  not only a prefix); the rest streams in `order`.
+- Streamed regions go through a **byte ring**: one device range of `ring_bytes` (default
+  `window` × the largest streamed region; at least the largest), backed by slab-sized
+  handles and charged to the device budget (may evict below `priority`). Each position is
+  placed right after the previous one, wrapping to 0 when it does not fit before the end.
+  Regions of any size share it; the floor is the largest streamed region, not
+  `window × largest`.
+- Copies run up to `window` streamed positions ahead on the copy stream. Each waits on the
+  release events of exactly the earlier positions whose bytes it overwrites; `acquire` never
+  blocks the host once the copy is queued.
 - **Departures never raise.** `acquire(r)` for a region that is not the next one: if `r` is
   scheduled later within the next `len(order)` positions, the positions before it are
-  skipped (counted as `skipped`; their slots are handed on unread) and `r` is served at its
-  position; otherwise (not in `order`, or past the end) it is a demand `p.acquire` (a miss
-  when not resident) and the position does not move.
-- Holding `window` streamed leases at once and asking for one more raises (window exhausted).
-- To change the resident set or window mid-stage (e.g. after an OOM at a block boundary):
-  release, `close()`, change budgets, `stream()` again with the remaining order.
+  skipped (counted as `skipped`; queued bytes are handed on unread, unqueued ones take no
+  ring space) and `r` is served at its position; otherwise (not in `order`, or past the end)
+  it is a demand `p.acquire` (a miss when not resident) and the position does not move.
+- Holding leases over the whole ring and asking for a position that does not fit raises
+  (ring exhausted).
+- A cursor garbage-collected while its leases or ring views are live stops prefetching and
+  closes itself when the last of them is released.
+- To change the resident set, ring or window mid-stage (e.g. after an OOM at a block
+  boundary): release, `close()`, change budgets, `stream()` again with the remaining order.
 
 ## Views
 
@@ -160,11 +169,15 @@ v = ws.view(device)          # uint8 DLPack, shape [ws.nbytes]: the stable VA (r
 t = torch.from_dlpack(v)     # bytes valid only for resident regions under a lease
 v.stale                      # True if any region was unmapped since the view was made
 lv = lease.view()            # uint8 DLPack, shape [lease.nbytes], at lease.ptr (lv.stale as above)
+ring = torch.from_dlpack(cur.ring_view())   # once per cursor; a streamed region's bytes are
+                                            # ring[lease.ring_offset : + lease.nbytes]
 ```
 
-Views keep the VA alive (a weight set's: blocks `ws.close()`; a slot's: blocks
-`cur.close()`), never the pages. Addresses repeat (a region's home, a slot), so views can be
-built once and cached by `ptr`: part `x` of region `r` is at `ptr + x.offset - r.offset`.
+Views keep the VA alive (a weight set's: blocks `ws.close()`; a ring's: blocks `cur.close()`),
+never the pages. Part `x` of region `r` is at `ptr + x.offset - r.offset`. A resident region's
+address never moves, so its typed views are built once. A streamed region's ring offset
+depends on the placement: slice the one ring view per acquire (offsets repeat when regions
+are equal-sized).
 
 ## Telemetry (exact facts)
 
@@ -228,6 +241,10 @@ poisons (`BudgetExceeded`, `Shortfall` leave the plane usable).
 
 ## Changelog
 
+- v3 2026-09-30 (proving-cpu.md: fine regions, spread sets): streaming uses a byte ring
+  instead of fixed slots. `stream(..., ring_bytes=None)`; `cur.ring_ptr`, `cur.ring_nbytes`,
+  `cur.ring_view()` replace `slot_ptrs`, `slot_nbytes`, `slot_view(i)`; `lease.ring_offset`
+  replaces `lease.slot`.
 - v2.1 2026-09-30 (from proving-cpu.md): `BelowFloor` (a request above the whole budget);
   a dropped cursor with live leases closes itself when they are released.
 - v2 2026-09-30 (W3 requests R2–R19):

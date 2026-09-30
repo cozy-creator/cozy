@@ -3,7 +3,7 @@
 DLPack views on the consumer's own stream.
 
 A 1 + L region model (common + L linear layers, bf16) lives in a real store. The pinned tier
-holds it; a resident prefix is wanted on the device; the rest streams through a slot ring.
+holds it; a spread resident set is wanted on the device; the rest streams through the ring.
 Every step's output must equal the all-resident reference bit for bit. Prints step times
 (streamed vs resident), stalls and per-region GPU compute from `stats()`.
 
@@ -83,26 +83,31 @@ def main() -> int:
     p.set_pinned_budget(total)
     p.want(ws, "pinned").wait()
     span = reg[1]["span"]
-    budget = reg[0]["span"] + (a.resident + a.window) * span
+    budget = reg[0]["span"] + a.resident * span + a.window * span
     p.set_vram_budget(0, budget)
-    p.want(ws, 0, [0] + list(range(1, 1 + a.resident)), priority=10).wait()
+    # A spread resident set (every k-th layer), the rest streamed: the placement the
+    # proving model favours over a resident prefix.
+    step_k = max(1, a.layers // max(a.resident, 1))
+    resident = [1 + i for i in range(0, a.layers, step_k)][: a.resident]
+    p.want(ws, 0, [0] + resident, priority=10).wait()
     check("pinned tier registered", p.stats()["host"]["registered_bytes"] == p.stats()["host"]["ready_bytes"])
 
-    views: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
-    held = []
+    views: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    ring: list[torch.Tensor] = []
+
+    def typed(u8, r):
+        base = reg[r]["offset"]
+        wp, bp = parts[f"model/layer{r - 1}.w#value"], parts[f"model/layer{r - 1}.b#value"]
+        w = u8[wp["offset"] - base: wp["offset"] - base + wp["nbytes"]].view(torch.bfloat16).view(a.dim, a.dim)
+        return w, u8[bp["offset"] - base: bp["offset"] - base + bp["nbytes"]].view(torch.bfloat16)
 
     def weights(lease, r):
-        key = (lease.ptr, r)
-        if key not in views:
-            v = lease.view()
-            held.append(v)
-            u8 = torch.from_dlpack(v)
-            base = reg[r]["offset"]
-            wp, bp = parts[f"model/layer{r - 1}.w#value"], parts[f"model/layer{r - 1}.b#value"]
-            w = u8[wp["offset"] - base: wp["offset"] - base + wp["nbytes"]].view(torch.bfloat16).view(a.dim, a.dim)
-            b = u8[bp["offset"] - base: bp["offset"] - base + bp["nbytes"]].view(torch.bfloat16)
-            views[key] = (w, b)
-        return views[key]
+        if lease.ring_offset is None:  # resident: its address never moves, build once
+            if r not in views:
+                views[r] = typed(torch.from_dlpack(lease.view()), r)
+            return views[r]
+        o = lease.ring_offset  # streamed: slice the one ring view
+        return typed(ring[0][o: o + lease.nbytes], r)
 
     x0 = torch.randn(a.batch, a.dim, generator=torch.Generator().manual_seed(1)).bfloat16().to(dev)
     # Reference: every layer resident as ordinary tensors, same kernels, same stream.
@@ -124,7 +129,8 @@ def main() -> int:
 
     order = list(range(1, 1 + a.layers))
     cur = p.stream(ws, 0, order, a.window, repeat=0, priority=10, tag="smoke")
-    check("resident prefix served in place", cur.home == [i < a.resident for i in range(a.layers)], str(cur.home))
+    check("the resident set is served in place", cur.home == [1 + i in resident for i in range(a.layers)], str(cur.home))
+    ring.append(torch.from_dlpack(cur.ring_view()))
     exact = True
     times = []
     with torch.cuda.stream(s):
@@ -141,9 +147,9 @@ def main() -> int:
                 times.append(time.perf_counter() - t0)
             exact &= torch.equal(y, ref)
     check("every streamed step equals the resident reference bit for bit", exact)
-    # Views keep slots and the VA alive: drop every tensor over plane bytes before closing.
+    # Views keep the ring and the VA alive: drop every tensor over plane bytes before closing.
     del w, b
-    held.clear()
+    ring.clear()
     views.clear()
     cur.close()
     st = p.stats()
@@ -152,7 +158,8 @@ def main() -> int:
     t_stream = sum(times) / len(times)
     gbps = d0["host_copy_bytes"] / max(d0["host_copy_ns"], 1)
     print(f"step: resident {t_ref * 1e3:.2f} ms, streamed {t_stream * 1e3:.2f} ms "
-          f"({t_stream / t_ref:.3f}x), {a.layers - a.resident} of {a.layers} layers streamed, window {a.window}")
+          f"({t_stream / t_ref:.3f}x), {a.layers - len(resident)} of {a.layers} layers streamed, window {a.window}, "
+          f"ring {cur.ring_nbytes >> 20} MiB")
     print(f"copies {d0['copies']}, pinned->device {gbps:.2f} GB/s; late {stage['late']} of {stage['acquires']}, "
           f"stall {stage['stall_ns'] / 1e6:.2f} ms, skipped {stage['skipped']}")
     comp = sorted((x["region"], x["compute_ns"] / max(x["uses"], 1) / 1e6) for x in st["regions"] if x["tag"] == "smoke")

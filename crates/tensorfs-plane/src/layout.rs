@@ -1,5 +1,5 @@
 //! One byte layout per weight set, identical in every tier: host memfd offsets, device VA
-//! offsets and in-slot offsets are the same numbers. Regions start on the VMM granularity so
+//! offsets and offsets inside a streamed copy are the same numbers. Regions start on the VMM granularity so
 //! each maps independently; parts start on a 4 KiB boundary so O_DIRECT lands in place and a
 //! region moves in one copy.
 

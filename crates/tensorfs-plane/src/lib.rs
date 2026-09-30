@@ -11,7 +11,7 @@ pub mod io;
 pub mod layout;
 pub mod plane;
 
-pub use cursor::{Cursor, SlotView};
+pub use cursor::{Cursor, RingView};
 pub use plane::{Lease, Plane, PlaneConfig, Stats, Ticket, Tier, Trim, View, WsId};
 
 use thiserror::Error;

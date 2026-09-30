@@ -16,7 +16,7 @@ use tensorfs_plane::io::Source;
 use tensorfs_plane::layout::Layout;
 use tensorfs_plane::plane::{Event, LeaseView, Stats};
 use tensorfs_plane::{
-    Cursor, Error, Lease, Plane, PlaneConfig, SlotView, Ticket, Tier, Trim, View, WsId,
+    Cursor, Error, Lease, Plane, PlaneConfig, RingView, Ticket, Tier, Trim, View, WsId,
 };
 
 use crate::errors::to_py;
@@ -333,7 +333,7 @@ impl PyPlane {
         Ok(PyPlaneLease::new(lease, stream))
     }
 
-    #[pyo3(signature = (ws, device, order, window, repeat = 1, priority = 0, tag = "denoise"))]
+    #[pyo3(signature = (ws, device, order, window, repeat = 1, priority = 0, tag = "denoise", ring_bytes = None))]
     #[allow(clippy::too_many_arguments)]
     fn stream(
         &self,
@@ -345,13 +345,14 @@ impl PyPlane {
         repeat: u32,
         priority: i64,
         tag: &str,
+        ring_bytes: Option<u64>,
     ) -> PyResult<PyCursor> {
         let (id, plane) = (self.id(py, &ws)?, &self.plane);
         let cur = py
-            .detach(|| plane.stream(id, device, &order, window, repeat, priority, tag))
+            .detach(|| plane.stream(id, device, &order, window, repeat, priority, tag, ring_bytes))
             .or_raise(py)?;
-        let (home, window, slot_nbytes, slot_ptrs) = (cur.home.clone(), cur.window, cur.slot_nbytes, cur.slot_ptrs.clone());
-        Ok(PyCursor { home, window, slot_nbytes, slot_ptrs, cur })
+        let (home, window, ring_ptr, ring_nbytes) = (cur.home.clone(), cur.window, cur.ring_ptr, cur.ring_nbytes);
+        Ok(PyCursor { home, window, ring_ptr, ring_nbytes, cur })
     }
 
     fn stats<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyDict>> {
@@ -474,9 +475,9 @@ pub struct PyPlaneLease {
     nbytes: u64,
     #[pyo3(get)]
     region: u32,
-    /// The slot of a streamed lease; None for a resident one.
+    /// Where a streamed lease's bytes sit in the cursor's ring; None for a resident one.
     #[pyo3(get)]
-    slot: Option<u32>,
+    ring_offset: Option<u64>,
     /// The acquire stream: `release()` records there unless told otherwise.
     stream: u64,
     released: AtomicBool,
@@ -485,8 +486,8 @@ pub struct PyPlaneLease {
 
 impl PyPlaneLease {
     fn new(lease: Lease, stream: u64) -> Self {
-        let (ptr, nbytes, region, slot) = (lease.ptr, lease.nbytes, lease.region, lease.slot);
-        PyPlaneLease { ptr, nbytes, region, slot, stream, released: AtomicBool::new(false), lease }
+        let (ptr, nbytes, region, ring_offset) = (lease.ptr, lease.nbytes, lease.region, lease.ring_offset);
+        PyPlaneLease { ptr, nbytes, region, ring_offset, stream, released: AtomicBool::new(false), lease }
     }
 }
 
@@ -526,9 +527,9 @@ pub struct PyCursor {
     #[pyo3(get)]
     window: u32,
     #[pyo3(get)]
-    slot_nbytes: u64,
+    ring_ptr: u64,
     #[pyo3(get)]
-    slot_ptrs: Vec<u64>,
+    ring_nbytes: u64,
     cur: Cursor,
 }
 
@@ -553,13 +554,13 @@ impl PyCursor {
         Ok(PyPlaneLease::new(lease, stream))
     }
 
-    /// A uint8 DLPack view of slot `i`; it keeps the cursor from closing.
-    fn slot_view(&self, py: Python<'_>, i: u32) -> PyResult<PyDeviceView> {
-        let v = py.detach(|| self.cur.slot_view(i)).or_raise(py)?;
-        Ok(PyDeviceView { held: Arc::new(Viewed::Slot(v)) })
+    /// A uint8 DLPack view of the whole ring; it keeps the cursor from closing.
+    fn ring_view(&self, py: Python<'_>) -> PyResult<PyDeviceView> {
+        let v = py.detach(|| self.cur.ring_view()).or_raise(py)?;
+        Ok(PyDeviceView { held: Arc::new(Viewed::Ring(v)) })
     }
 
-    /// Refuses while a lease or slot view is live; waits for copies in flight.
+    /// Refuses while a lease or ring view is live; waits for copies in flight.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.cur.close()).or_raise(py)
     }
@@ -579,7 +580,7 @@ impl PyCursor {
 
 enum Viewed {
     Ws(View),
-    Slot(SlotView),
+    Ring(RingView),
     Lease(LeaseView),
 }
 
@@ -588,7 +589,7 @@ impl Viewed {
     fn span(&self) -> (u64, u64, i32) {
         match self {
             Viewed::Ws(v) => (v.ptr, v.nbytes, v.device()),
-            Viewed::Slot(s) => (s.ptr, s.nbytes, s.device),
+            Viewed::Ring(s) => (s.ptr, s.nbytes, s.device),
             Viewed::Lease(l) => (l.ptr, l.nbytes, l.device),
         }
     }
@@ -663,14 +664,14 @@ unsafe extern "C" fn capsule_destructor(capsule: *mut ffi::PyObject) {
 
 #[pymethods]
 impl PyDeviceView {
-    /// True if a region of the weight set was unmapped since the view was made (slot views:
-    /// False, slots stay mapped for the cursor's life).
+    /// True if a region of the weight set was unmapped since the view was made (ring views:
+    /// False, the ring stays mapped for the cursor's life).
     #[getter]
     fn stale(&self, py: Python<'_>) -> bool {
         py.detach(|| match &*self.held {
             Viewed::Ws(v) => v.stale(),
             Viewed::Lease(l) => l.stale(),
-            Viewed::Slot(_) => false,
+            Viewed::Ring(_) => false,
         })
     }
 

@@ -215,10 +215,14 @@ fn streaming_reuses_a_slot_only_after_its_reader_finished() {
     p.set_pinned_budget(1 << 30).unwrap();
     p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
     p.set_vram_budget(DEV, (2 * 72) << 20).unwrap();
+    assert!(matches!(
+        p.stream(ws, DEV, &[0, 1, 2], 2, 1, 0, "tiny", Some(1 << 20)),
+        Err(Error::Invalid(_))
+    ), "a ring smaller than the largest streamed region is refused");
     // Nothing resident: every position streams through 2 slots. Nothing syncs until the end:
     // each read is queued behind a stall, so a copy that reused its slot before the release
     // event would overwrite bytes the stalled read has not taken yet.
-    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 3, 0, "denoise").unwrap();
+    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 3, 0, "denoise", None).unwrap();
     assert_eq!(cur.home, vec![false, false, false]);
     let mut reads = Vec::new();
     for step in 0..3 {
@@ -261,7 +265,7 @@ fn streaming_serves_resident_regions_in_place_and_stays_exact_under_overlap() {
     p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
     p.set_vram_budget(DEV, 1 << 30).unwrap();
     p.want(ws, Tier::Device(DEV), Some(&[0]), 3, false).unwrap().wait().unwrap();
-    let cur = p.stream(ws, DEV, &[0, 1, 2], 1, 4, 0, "mixed").unwrap();
+    let cur = p.stream(ws, DEV, &[0, 1, 2], 1, 4, 0, "mixed", None).unwrap();
     assert_eq!(cur.home, vec![true, false, false]);
     assert!(matches!(p.drop_regions(ws, Tier::Device(DEV), Some(&[0])), Err(Error::LeaseViolation { .. })));
     let mut reads = Vec::new();
@@ -269,7 +273,7 @@ fn streaming_serves_resident_regions_in_place_and_stays_exact_under_overlap() {
         for r in 0..3u32 {
             // Queue every read without syncing: the copies race the reads if the events lie.
             let l = cur.acquire(r, s.raw()).unwrap();
-            assert_eq!(l.slot.is_none(), r == 0);
+            assert_eq!(l.ring_offset.is_none(), r == 0);
             s.stall(10);
             reads.push((r, s.read_async(l.ptr, l.nbytes)));
             l.release(s.raw()).unwrap();
@@ -281,9 +285,9 @@ fn streaming_serves_resident_regions_in_place_and_stays_exact_under_overlap() {
     }
     // Window 1 holds one streamed lease at a time.
     cur.close().unwrap();
-    let cur = p.stream(ws, DEV, &[1, 2], 1, 1, 0, "window").unwrap();
+    let cur = p.stream(ws, DEV, &[1, 2], 1, 1, 0, "window", None).unwrap();
     let a = cur.acquire(1, s.raw()).unwrap();
-    assert!(cur.acquire(2, s.raw()).is_err(), "window exhausted must refuse, not hang");
+    assert!(cur.acquire(2, s.raw()).is_err(), "an exhausted ring must refuse, not hang");
     a.release(s.raw()).unwrap();
     let b = cur.acquire(2, s.raw()).unwrap();
     b.release(s.raw()).unwrap();
@@ -327,7 +331,7 @@ fn departures_skip_ahead_or_demand_fill_and_cycles_run_until_close() {
     p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
     p.set_vram_budget(DEV, 1 << 30).unwrap();
     // repeat 0: the schedule cycles until close.
-    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 0, 0, "cfg").unwrap();
+    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 0, 0, "cfg", None).unwrap();
     let mut reads = Vec::new();
     let take = |r: u32, reads: &mut Vec<(u32, Pinned)>| {
         let l = cur.acquire(r, s.raw()).unwrap();
@@ -354,9 +358,9 @@ fn departures_skip_ahead_or_demand_fill_and_cycles_run_until_close() {
     let tag = st.tags.iter().find(|t| t.2 == "cfg").unwrap();
     assert_eq!(tag.3.skipped, 3);
     // A region the schedule does not name is a demand acquire (resident, a miss).
-    let cur = p.stream(ws, DEV, &[1, 2], 1, 1, 0, "narrow").unwrap();
+    let cur = p.stream(ws, DEV, &[1, 2], 1, 1, 0, "narrow", None).unwrap();
     let l = cur.acquire(0, s.raw()).unwrap();
-    assert!(l.slot.is_none());
+    assert!(l.ring_offset.is_none());
     let got = s.read(l.ptr, l.nbytes);
     check_region(&p, ws, 0, &got);
     l.release(s.raw()).unwrap();
@@ -380,14 +384,14 @@ fn a_dropped_cursor_closes_itself_and_floors_refuse_early() {
     let s = Stream::new();
     p.set_pinned_budget(1 << 30).unwrap();
     p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
-    // One 72 MiB slot does not fit a 64 MiB budget at all: nothing could help.
+    // A ring for the 70 MiB region does not fit a 64 MiB budget at all: nothing could help.
     p.set_vram_budget(DEV, MIB64).unwrap();
-    match p.stream(ws, DEV, &[0, 1, 2], 1, 1, 0, "floor") {
+    match p.stream(ws, DEV, &[0, 1, 2], 1, 1, 0, "floor", None) {
         Err(Error::BelowFloor { pool: "vram", .. }) => {}
         other => panic!("expected BelowFloor, got {:?}", other.err()),
     }
     p.set_vram_budget(DEV, 1 << 30).unwrap();
-    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 0, 0, "orphan").unwrap();
+    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 0, 0, "orphan", None).unwrap();
     let l = cur.acquire(0, s.raw()).unwrap();
     drop(cur);
     assert!(p.stats().devices[0].mapped > 0, "a live lease keeps the slots");

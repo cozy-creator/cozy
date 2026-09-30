@@ -1,15 +1,18 @@
 //! The streaming cursor: one stage's region schedule on one device.
 //!
-//! Regions resident at `stream()` are served in place and held for the cursor's life; the rest
-//! stream through a ring of `window` device slots. The k-th streamed position lands in slot
-//! `k % window`; its copy waits on the release event of position `k - window` (the slot's last
-//! reader) and records `ready[k]`. `acquire` enqueues `cuStreamWaitEvent(consumer, ready[k])`
-//! (no host block once the mover has recorded it); `release` records `freed[k]` and queues the
-//! copy for `k + window`.
+//! Regions resident at `stream()` are served in place and held for the cursor's life. The rest
+//! stream through a byte ring: one device range, backed by slab-sized handles, where each
+//! streamed position is placed right after the previous one (wrapping to 0 when it does not
+//! fit before the end). Its copy waits on the release events of exactly the earlier positions
+//! whose bytes it overwrites and records `ready[k]`. `acquire` enqueues
+//! `cuStreamWaitEvent(consumer, ready[k])` (no host block once the mover has recorded it);
+//! `release` records the position's release event and queues what now fits. Handle size, ring
+//! size and region size are independent: many fine regions share a ring of a few slabs, and
+//! the floor is the largest streamed region, not `window × largest`.
 //!
 //! The schedule is the caller's and is never reordered. A consumer that departs from it is
 //! served anyway: a region further ahead in the current cycle skips the positions before it
-//! (their slots are handed on unread); any other region is a demand acquire (a miss when not
+//! (their bytes are handed on unread); any other region is a demand acquire (a miss when not
 //! resident) and leaves the position unchanged.
 
 use std::collections::BTreeMap;
@@ -17,8 +20,19 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::device::{self, Chunk, CopyJob, CopySrc, Copied, EvRef};
+use crate::layout::{align_up, PART_ALIGN, REGION_ALIGN};
 use crate::plane::{devws, Core, DState, HState, Inner, Lease, LeaseKind, Plane, Timing, TimingKind, Trim, WsId};
 use crate::{Error, Result};
+
+/// One streamed position's bytes in the ring, until a later placement overwrites them.
+struct Place {
+    k: u64,
+    off: u64,
+    len: u64,
+    /// None while leased or unread; Some(ev): the bytes may be overwritten after `ev`
+    /// (None inside: at once).
+    freed: Option<Option<EvRef>>,
+}
 
 pub(crate) struct Cur {
     pub ws: WsId,
@@ -30,19 +44,21 @@ pub(crate) struct Cur {
     /// Per order index: rank among the streamed entries.
     rank: Vec<u64>,
     streamed: Vec<u32>,
+    /// Per streamed entry: bytes it occupies in the ring (4 KiB aligned).
+    sizes: Vec<u64>,
     /// Positions in the schedule; u64::MAX cycles until close.
     total: u64,
+    /// Most streamed positions queued ahead of the consumer.
     window: u64,
     pos: u64,
-    pub slot_base: u64,
-    pub slot_span: u64,
-    pub slots: Vec<Vec<Chunk>>,
+    pub ring_base: u64,
+    pub ring_len: u64,
+    ring_chunks: Vec<Chunk>,
+    head: u64,
+    placed: Vec<Place>,
     /// k -> Ok(ready event) once the mover recorded it, Err(cause) if the copy failed.
     ready: BTreeMap<u64, Result<EvRef>>,
-    /// k -> the event after which slot `k % window` is free (None: already free), kept until
-    /// the copy that reuses the slot is queued.
-    freed: BTreeMap<u64, Option<EvRef>>,
-    /// Streamed positions acquired-and-released or skipped.
+    /// Streamed positions released or skipped.
     done: u64,
     next_submit: u64,
     /// Queued copies the mover has not recorded yet.
@@ -74,25 +90,34 @@ impl Cur {
     }
 }
 
-/// Queue copies for every streamed position whose slot is free, in order.
+/// Queue copies for streamed positions, in order, while the window and the ring allow.
 fn pump(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     loop {
-        let cur = c.cursors.get(&id).ok_or(Error::Closed)?;
+        let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
         let k = cur.next_submit;
-        if cur.orphaned || k >= cur.streamed_total() || (k >= cur.window && !cur.freed.contains_key(&(k - cur.window))) {
+        if cur.orphaned || k >= cur.streamed_total() || k - cur.done >= cur.window {
             return Ok(());
         }
-        submit(inner, c, id, k)?;
+        let size = cur.sizes[(k % cur.streamed.len() as u64) as usize];
+        let off = if cur.head + size > cur.ring_len { 0 } else { cur.head };
+        let hit = |p: &Place| p.off < off + size && off < p.off + p.len;
+        if cur.placed.iter().any(|p| hit(p) && p.freed.is_none()) {
+            return Ok(()); // bytes still leased or unread: wait for their release
+        }
+        let waits: Vec<EvRef> = cur.placed.iter().filter(|p| hit(p)).filter_map(|p| p.freed.clone().flatten()).collect();
+        cur.placed.retain(|p| !hit(p));
+        cur.placed.push(Place { k, off, len: size, freed: None });
+        cur.head = off + size;
+        submit(inner, c, id, k, off, waits)?;
     }
 }
 
-/// Queue the copy for streamed position `k`; its slot is free after `freed[k - window]`.
-fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64) -> Result<()> {
+/// Queue the copy for streamed position `k` into the ring at `off`, after `waits`.
+fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Vec<EvRef>) -> Result<()> {
     let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
-    let (ws, d, window, mover) = (cur.ws, cur.dev, cur.window, cur.mover);
+    let (ws, d, mover) = (cur.ws, cur.dev, cur.mover);
     let r = cur.streamed[(k % cur.streamed.len() as u64) as usize];
-    let waits: Vec<EvRef> = if k >= window { cur.freed.remove(&(k - window)).flatten().into_iter().collect() } else { Vec::new() };
-    let dst = cur.slot_base + (k % window) * cur.slot_span;
+    let dst = cur.ring_base + off;
     cur.next_submit = k + 1;
     cur.inflight += 1;
     let w = c.ws_mut(ws)?;
@@ -160,18 +185,25 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64) -> Result<()> {
     Ok(())
 }
 
-/// A streamed lease ended: its slot is free after `ev`.
-pub(crate) fn release_slot(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, ev: EvRef) -> Result<()> {
+/// Mark position `k`'s ring bytes free after `freed`, count it done, and queue what fits.
+fn hand_on(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, freed: Option<EvRef>) -> Result<()> {
     let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
-    cur.freed.insert(k, Some(ev));
-    cur.live -= 1;
+    if let Some(p) = cur.placed.iter_mut().find(|p| p.k == k) {
+        p.freed = Some(freed);
+    }
     cur.done += 1;
-    pump(inner, c, id)?;
+    pump(inner, c, id)
+}
+
+/// A streamed lease ended: its bytes are reusable after `ev`.
+pub(crate) fn release_ring(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, ev: EvRef) -> Result<()> {
+    c.cursors.get_mut(&id).ok_or(Error::Closed)?.live -= 1;
+    hand_on(inner, c, id, k, Some(ev))?;
     reap(inner, c, id);
     Ok(())
 }
 
-/// Finish an orphaned cursor once nothing uses its slots.
+/// Finish an orphaned cursor once nothing uses its ring.
 fn reap(inner: &Arc<Inner>, c: &mut Core, id: u64) {
     let Some(cur) = c.cursors.get(&id) else { return };
     if cur.orphaned && cur.live == 0 && cur.views == 0 && cur.inflight == 0 {
@@ -181,23 +213,26 @@ fn reap(inner: &Arc<Inner>, c: &mut Core, id: u64) {
     }
 }
 
-/// Unmap a cursor's slots and return its holds. No lease, view or copy in flight remains.
+/// Unmap a cursor's ring and return its holds. No lease, view or copy in flight remains.
 fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     let cur = c.cursors.remove(&id).ok_or(Error::Closed)?;
     let d = cur.dev;
     let _g = inner.devices[d].bind()?;
-    for e in cur.ready.values().flatten().chain(cur.freed.values().flatten()) {
+    for e in cur.ready.values().flatten() {
         e.sync()?;
     }
-    for (i, ch) in cur.slots.into_iter().enumerate() {
-        if let Err(e) = device::unmap_span(cur.slot_base + i as u64 * cur.slot_span, cur.slot_span) {
-            return Err(c.poison(format!("slot unmap failed: {e}")));
+    for p in &cur.placed {
+        if let Some(Some(e)) = &p.freed {
+            e.sync()?;
         }
-        c.arenas[d].mapped -= cur.slot_span;
-        c.arenas[d].put_idle(ch);
     }
-    if cur.slot_span * cur.window > 0 {
-        device::free_va(cur.slot_base, cur.slot_span * cur.window)?;
+    if cur.ring_len > 0 {
+        if let Err(e) = device::unmap_span(cur.ring_base, cur.ring_len) {
+            return Err(c.poison(format!("ring unmap failed: {e}")));
+        }
+        c.arenas[d].mapped -= cur.ring_len;
+        c.arenas[d].put_idle(cur.ring_chunks);
+        device::free_va(cur.ring_base, cur.ring_len)?;
     }
     if let Ok(w) = c.ws_mut(cur.ws) {
         if let Some(dw) = w.devs[d].as_mut() {
@@ -212,47 +247,53 @@ fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     Ok(())
 }
 
-/// Hand position `k`'s slot on unread: free once its copy lands (or at once if never queued).
+/// Hand position `k` on unread: if queued, its bytes are free once its copy lands.
 fn skip<'a>(inner: &'a Arc<Inner>, mut c: MutexGuard<'a, Core>, id: u64, k: u64) -> Result<MutexGuard<'a, Core>> {
     let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
     if k >= cur.next_submit {
-        // Never queued: the slot is free when its previous reader was.
-        if k >= cur.window && !cur.freed.contains_key(&(k - cur.window)) {
-            return Err(Error::Invalid(format!("cannot skip streamed position {k}: slot {} is still leased", k % cur.window)));
-        }
-        let prev = if k >= cur.window { cur.freed.remove(&(k - cur.window)).flatten() } else { None };
-        cur.freed.insert(k, prev);
+        // Never queued: it takes no ring bytes.
         cur.next_submit = k + 1;
-    } else {
-        while !c.cursors.get(&id).ok_or(Error::Closed)?.ready.contains_key(&k) {
-            c = inner.cv.wait(c).unwrap();
-        }
-        let cur = c.cursors.get_mut(&id).unwrap();
-        let ev = cur.ready.remove(&k).unwrap().ok();
-        cur.freed.insert(k, ev);
+        cur.done += 1;
+        pump(inner, &mut c, id)?;
+        return Ok(c);
     }
-    c.cursors.get_mut(&id).unwrap().done += 1;
-    pump(inner, &mut c, id)?;
+    while !c.cursors.get(&id).ok_or(Error::Closed)?.ready.contains_key(&k) {
+        c = inner.cv.wait(c).unwrap();
+    }
+    let ev = c.cursors.get_mut(&id).unwrap().ready.remove(&k).unwrap().ok();
+    hand_on(inner, &mut c, id, k, ev)?;
     Ok(c)
 }
 
-/// A stage's streaming schedule. Close it (after releasing every lease) to return its slots
+/// A stage's streaming schedule. Close it (after releasing every lease) to return its ring
 /// and holds.
 pub struct Cursor {
     inner: Arc<Inner>,
     id: u64,
     pub window: u32,
-    pub slot_nbytes: u64,
-    pub slot_ptrs: Vec<u64>,
-    /// Per order index: served in place (true) or streamed through slots.
+    pub ring_ptr: u64,
+    pub ring_nbytes: u64,
+    /// Per order index: served in place (true) or streamed through the ring.
     pub home: Vec<bool>,
 }
 
 impl Plane {
-    /// Start streaming `order` (`repeat` times; 0 cycles until `close`) on device `ordinal`
-    /// through `window` slots. Slots may evict regions below `prio`. `tag` names the stage.
+    /// Start streaming `order` (`repeat` times; 0 cycles until `close`) on device `ordinal`,
+    /// queuing up to `window` streamed positions ahead through a ring of `ring_bytes` (default:
+    /// `window` × the largest streamed region). The ring may evict regions below `prio`.
+    /// `tag` names the stage.
     #[allow(clippy::too_many_arguments)]
-    pub fn stream(&self, ws: WsId, ordinal: i32, order: &[u32], window: u32, repeat: u32, prio: i64, tag: &str) -> Result<Cursor> {
+    pub fn stream(
+        &self,
+        ws: WsId,
+        ordinal: i32,
+        order: &[u32],
+        window: u32,
+        repeat: u32,
+        prio: i64,
+        tag: &str,
+        ring_bytes: Option<u64>,
+    ) -> Result<Cursor> {
         if order.is_empty() || window == 0 {
             return Err(Error::Invalid("stream needs a non-empty order and window >= 1".into()));
         }
@@ -280,9 +321,13 @@ impl Plane {
                 streamed.push(r);
             }
         }
-        let slot_span = streamed.iter().map(|&r| layout.regions[r as usize].span).max().unwrap_or(0);
-        let window = if streamed.is_empty() { 0 } else { window as u64 };
-        let need = slot_span * window;
+        let sizes: Vec<u64> = streamed.iter().map(|&r| align_up(layout.regions[r as usize].nbytes.max(1), PART_ALIGN)).collect();
+        let largest = sizes.iter().copied().max().unwrap_or(0);
+        let want = ring_bytes.unwrap_or(window as u64 * largest);
+        if want < largest {
+            return Err(Error::Invalid(format!("a {want}-byte ring cannot hold the largest streamed region ({largest} bytes)")));
+        }
+        let need = if streamed.is_empty() { 0 } else { align_up(want, REGION_ALIGN) };
         let (budget, mapped) = (c.arenas[d].budget, c.arenas[d].mapped);
         if need > budget {
             return Err(Error::BelowFloor { pool: "vram", need, budget });
@@ -300,38 +345,32 @@ impl Plane {
                 });
             }
         }
-        let slot_base = if need > 0 { device::reserve_va(need)? } else { 0 };
-        let mut slots = Vec::new();
-        for i in 0..window {
-            let sizes = c.arenas[d].chunk_sizes(slot_span);
-            let r = c.arenas[d].take(&sizes).and_then(|ch| match device::map_span(slot_base + i * slot_span, &ch, inner.devices[d].dev) {
+        let (ring_base, ring_chunks) = if need > 0 {
+            let base = device::reserve_va(need)?;
+            let sizes = c.arenas[d].chunk_sizes(need);
+            let mapped = c.arenas[d].take(&sizes).and_then(|ch| match device::map_span(base, &ch, inner.devices[d].dev) {
                 Ok(()) => Ok(ch),
                 Err(e) => {
                     c.arenas[d].put_idle(ch);
                     Err(e)
                 }
             });
-            match r {
+            match mapped {
                 Ok(ch) => {
-                    c.arenas[d].mapped += slot_span;
-                    slots.push(ch);
+                    c.arenas[d].mapped += need;
+                    (base, ch)
                 }
                 Err(e) => {
-                    for (j, ch) in slots.drain(..).enumerate() {
-                        if device::unmap_span(slot_base + j as u64 * slot_span, slot_span).is_err() {
-                            return Err(c.poison(format!("slot rollback unmap failed after {e}")));
-                        }
-                        c.arenas[d].mapped -= slot_span;
-                        c.arenas[d].put_idle(ch);
-                    }
-                    let _ = device::free_va(slot_base, need);
+                    let _ = device::free_va(base, need);
                     return Err(match e {
                         Error::Poisoned(p) => c.poison(p),
                         e => e,
                     });
                 }
             }
-        }
+        } else {
+            (0, Vec::new())
+        };
         let dw = devws(&mut c, ws, d)?;
         for (i, &r) in order.iter().enumerate() {
             if home[i] {
@@ -351,14 +390,16 @@ impl Plane {
                 home: home.clone(),
                 rank,
                 streamed,
+                sizes,
                 total: if repeat == 0 { u64::MAX } else { order.len() as u64 * repeat as u64 },
-                window,
+                window: window as u64,
                 pos: 0,
-                slot_base,
-                slot_span,
-                slots,
+                ring_base,
+                ring_len: need,
+                ring_chunks,
+                head: 0,
+                placed: Vec::new(),
                 ready: BTreeMap::new(),
-                freed: BTreeMap::new(),
                 done: 0,
                 next_submit: 0,
                 inflight: 0,
@@ -372,9 +413,9 @@ impl Plane {
         Ok(Cursor {
             inner: inner.clone(),
             id,
-            window: window as u32,
-            slot_nbytes: slot_span,
-            slot_ptrs: (0..window).map(|i| slot_base + i * slot_span).collect(),
+            window,
+            ring_ptr: ring_base,
+            ring_nbytes: need,
             home,
         })
     }
@@ -421,8 +462,7 @@ impl Cursor {
         };
         if k >= cur.next_submit {
             return Err(Error::Invalid(format!(
-                "window exhausted: streamed position {k} needs slot {} released first",
-                k % cur.window
+                "ring exhausted: streamed position {k} needs leased ring bytes released first"
             )));
         }
         let t0 = std::time::Instant::now();
@@ -441,27 +481,27 @@ impl Cursor {
         cur.ready.remove(&k);
         cur.pos += 1;
         cur.live += 1;
-        let slot = k % cur.window;
+        let off = cur.placed.iter().find(|x| x.k == k).expect("a queued position is placed").off;
         Ok(Lease {
             inner: inner.clone(),
-            ptr: cur.slot_base + slot * cur.slot_span,
+            ptr: cur.ring_base + off,
             nbytes,
             region: r,
-            slot: Some(slot as u32),
+            ring_offset: Some(off),
             ws,
             dev: d,
             tag,
             start: Mutex::new(Some(start)),
-            kind: LeaseKind::Slot { cursor: self.id, k },
+            kind: LeaseKind::Ring { cursor: self.id, k },
             released: AtomicBool::new(false),
         })
     }
 
-    pub fn slot_view(&self, i: u32) -> Result<SlotView> {
-        slot_view(&self.inner, self.id, i)
+    pub fn ring_view(&self) -> Result<RingView> {
+        ring_view(&self.inner, self.id)
     }
 
-    /// Return slots and holds. Refuses while a streamed lease or slot view is live; waits
+    /// Return the ring and holds. Refuses while a streamed lease or ring view is live; waits
     /// (targeted) for copies in flight and for the device to pass every release.
     pub fn close(&self) -> Result<()> {
         let inner = &self.inner;
@@ -472,10 +512,10 @@ impl Cursor {
                 op: "close cursor",
                 live: (cur.live + cur.views) as u64,
                 pending: 0,
-                what: "slot leases or slot views".into(),
+                what: "streamed leases or ring views".into(),
             });
         }
-        // Every queued copy must be recorded before its slot can be unmapped.
+        // Every queued copy must be recorded before the ring can be unmapped.
         while c.cursors[&self.id].inflight > 0 {
             c = inner.cv.wait(c).unwrap();
         }
@@ -496,8 +536,8 @@ impl Drop for Cursor {
     }
 }
 
-/// A slot's device bytes for zero-copy views. Keeps the cursor from closing.
-pub struct SlotView {
+/// The ring's device bytes for zero-copy views. Keeps the cursor from closing.
+pub struct RingView {
     inner: Arc<Inner>,
     id: u64,
     pub device: i32,
@@ -505,7 +545,7 @@ pub struct SlotView {
     pub nbytes: u64,
 }
 
-impl Drop for SlotView {
+impl Drop for RingView {
     fn drop(&mut self) {
         let mut c = self.inner.core.lock().unwrap();
         if let Some(k) = c.cursors.get_mut(&self.id) {
@@ -515,19 +555,16 @@ impl Drop for SlotView {
     }
 }
 
-pub(crate) fn slot_view(inner: &Arc<Inner>, id: u64, i: u32) -> Result<SlotView> {
+pub(crate) fn ring_view(inner: &Arc<Inner>, id: u64) -> Result<RingView> {
     let mut c = inner.core.lock().unwrap();
     let k = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
-    if i as u64 >= k.window {
-        return Err(Error::Invalid(format!("slot {i} of {}", k.window)));
-    }
     k.views += 1;
     let d = k.dev;
-    Ok(SlotView {
+    Ok(RingView {
         inner: inner.clone(),
         id,
         device: inner.devices[d].ordinal,
-        ptr: k.slot_base + i as u64 * k.slot_span,
-        nbytes: k.slot_span,
+        ptr: k.ring_base,
+        nbytes: k.ring_len,
     })
 }

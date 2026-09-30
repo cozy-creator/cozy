@@ -175,7 +175,7 @@ pub struct HostCounters {
 #[derive(Debug, Clone, Default)]
 pub struct TagCounters {
     pub acquires: u64,
-    /// Scheduled positions the consumer skipped (their slots were handed on unread).
+    /// Scheduled positions the consumer skipped (their ring bytes were handed on unread).
     pub skipped: u64,
     pub misses: u64,
     pub late: u64,
@@ -875,7 +875,7 @@ impl Inner {
             ptr: base + region.offset,
             nbytes: region.nbytes,
             region: r,
-            slot: None,
+            ring_offset: None,
             ws,
             dev: d,
             tag: tag.to_string(),
@@ -1537,7 +1537,7 @@ impl Plane {
             sets.push(s);
         }
         for k in c.cursors.values() {
-            devs[k.dev].reserved_va += k.slot_span * k.slots.len() as u64;
+            devs[k.dev].reserved_va += k.ring_len;
         }
         let tags = c
             .tags
@@ -1712,7 +1712,7 @@ impl Ticket {
 
 pub(crate) enum LeaseKind {
     Home,
-    Slot { cursor: u64, k: u64 },
+    Ring { cursor: u64, k: u64 },
 }
 
 /// Use of one region's bytes on one consumer stream. `release(stream)` exactly once; dropping
@@ -1722,8 +1722,8 @@ pub struct Lease {
     pub ptr: u64,
     pub nbytes: u64,
     pub region: u32,
-    /// The slot index for a streamed lease; None for a resident one.
-    pub slot: Option<u32>,
+    /// Where a streamed lease's bytes sit in its cursor's ring; None for a resident one.
+    pub ring_offset: Option<u64>,
     pub(crate) ws: WsId,
     pub(crate) dev: usize,
     pub(crate) tag: String,
@@ -1737,7 +1737,7 @@ impl Lease {
         self.inner.devices[self.dev].ordinal
     }
 
-    /// Record the release event on `stream`. The bytes (and a slot) are reusable once the
+    /// Record the release event on `stream`. The bytes (resident or in the ring) are reusable once the
     /// device passes it; the span from acquire to here is the region's GPU-timed use.
     pub fn release(&self, stream: u64) -> Result<()> {
         if self.released.swap(true, Ordering::SeqCst) {
@@ -1768,16 +1768,16 @@ impl Lease {
                 reg.pending.push(ev);
                 Ok(())
             }
-            LeaseKind::Slot { cursor, k } => crate::cursor::release_slot(&self.inner, &mut c, cursor, k, ev),
+            LeaseKind::Ring { cursor, k } => crate::cursor::release_ring(&self.inner, &mut c, cursor, k, ev),
         }
     }
 
     /// A zero-copy view of this lease's bytes. It keeps the weight set's VA (or the cursor's
-    /// slots) alive, not the bytes: they are valid only while a lease covers them.
+    /// ring) alive, not the bytes: they are valid only while a lease covers them.
     pub fn view(&self) -> Result<LeaseView> {
         let hold = match self.kind {
             LeaseKind::Home => Hold::Ws(self.inner.view(self.ws, self.dev)?),
-            LeaseKind::Slot { cursor, .. } => Hold::Slot(crate::cursor::slot_view(&self.inner, cursor, self.slot.unwrap())?),
+            LeaseKind::Ring { cursor, .. } => Hold::Ring(crate::cursor::ring_view(&self.inner, cursor)?),
         };
         Ok(LeaseView {
             ptr: self.ptr,
@@ -1799,7 +1799,7 @@ impl Drop for Lease {
 
 pub enum Hold {
     Ws(View),
-    Slot(crate::cursor::SlotView),
+    Ring(crate::cursor::RingView),
 }
 
 pub struct LeaseView {
@@ -1811,11 +1811,11 @@ pub struct LeaseView {
 
 impl LeaseView {
     /// A resident region's view is stale once any region of its weight set was unmapped;
-    /// a slot view never is (slots stay mapped for the cursor's life).
+    /// a ring view never is (the ring stays mapped for the cursor's life).
     pub fn stale(&self) -> bool {
         match &self.hold {
             Hold::Ws(v) => v.stale(),
-            Hold::Slot(_) => false,
+            Hold::Ring(_) => false,
         }
     }
 }
