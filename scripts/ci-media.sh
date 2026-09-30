@@ -27,6 +27,9 @@ case "$mode" in
     sudo apt-get "${apt_config[@]}" update
     sudo apt-get "${apt_config[@]}" -o Dir::State::status=/dev/null \
       --download-only --no-install-recommends --assume-yes install ffmpeg
+    # APT creates private lock/partial paths. Only this completed CI bundle is
+    # transferred to the invoking owner so the manifest and artifact can read it.
+    sudo chown -R "$(id -u):$(id -g)" "$media_bundle"
     printf '%s\t%s\t%s\n' "$ID" "$VERSION_ID" "$media_arch" > "$media_bundle/platform.tsv"
     : > "$media_bundle/packages.tsv"
     shopt -s nullglob
