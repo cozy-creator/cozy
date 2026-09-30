@@ -286,7 +286,7 @@ def main(work: Path):
     check("prioritise pins without moving a byte; a pin is never evicted implicitly",
           trim["evicted"] == [] and trim["over_budget_unreleasable"] == spans[1]
           and p.stats()["host"]["fills"] == fills, trim)
-    raises("a want past pinned bytes raises Shortfall", plane.Shortfall,
+    raises("a want above the whole pinned budget raises BelowFloor", plane.BelowFloor,
            lambda: p.want(ws, "pinned", regions=[0], priority=100))
     check("drop frees a pinned region", p.drop(ws, "pinned", [1]) == spans[1]
           and p.stats()["host"]["used"] == 0 and set_of(p, ws)["host_memfd_bytes"] < REGION_ALIGN)

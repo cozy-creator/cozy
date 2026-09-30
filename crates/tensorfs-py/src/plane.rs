@@ -25,6 +25,7 @@ use crate::store::{PyLease, PyPlan, PyStore};
 create_exception!(tensorfs.plane, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
 create_exception!(tensorfs.plane, BudgetExceeded, PlaneError);
 create_exception!(tensorfs.plane, Shortfall, PlaneError);
+create_exception!(tensorfs.plane, BelowFloor, PlaneError);
 create_exception!(tensorfs.plane, LeaseViolation, PlaneError);
 create_exception!(tensorfs.plane, Poisoned, PlaneError);
 create_exception!(tensorfs.plane, CudaError, PlaneError);
@@ -40,6 +41,7 @@ fn err(py: Python<'_>, e: Error) -> PyErr {
         Error::Source(r) => return to_py(py, r),
         Error::BudgetExceeded { .. } => BudgetExceeded::new_err(msg),
         Error::Shortfall { .. } => Shortfall::new_err(msg),
+        Error::BelowFloor { .. } => BelowFloor::new_err(msg),
         Error::LeaseViolation { .. } => LeaseViolation::new_err(msg),
         Error::Poisoned(_) => Poisoned::new_err(msg),
         Error::Cuda { .. } => CudaError::new_err(msg),
@@ -55,6 +57,11 @@ fn err(py: Python<'_>, e: Error) -> PyErr {
         let _ = v.setattr("need", *need);
         let _ = v.setattr("available", *available);
         let _ = v.setattr("blockers", blockers.clone());
+    }
+    if let Error::BelowFloor { pool, need, budget } = &e {
+        let _ = v.setattr("pool", *pool);
+        let _ = v.setattr("need", *need);
+        let _ = v.setattr("budget", *budget);
     }
     x
 }
@@ -734,7 +741,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPlaneLease>()?;
     m.add_class::<PyCursor>()?;
     m.add_class::<PyDeviceView>()?;
-    add_errors!(m; PlaneError, BudgetExceeded, Shortfall, LeaseViolation, Poisoned, CudaError,
+    add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
         CudaUnavailable, Invalid, IoError, Closed);
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.plane", &m)

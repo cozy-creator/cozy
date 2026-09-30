@@ -33,8 +33,8 @@ pub enum Error {
         available: u64,
     },
     #[error(
-        "shortfall in {pool}: need {need} bytes, {available} reclaimable at lower priority; \
-         blocked by {blockers:?}"
+        "shortfall in {pool}: need {need} bytes, {available} free; evicting lower priorities is \
+         not enough, blocked by {blockers:?}"
     )]
     Shortfall {
         pool: &'static str,
@@ -42,6 +42,8 @@ pub enum Error {
         available: u64,
         blockers: Vec<String>,
     },
+    #[error("below floor in {pool}: need {need} bytes, the whole budget is {budget}")]
+    BelowFloor { pool: &'static str, need: u64, budget: u64 },
     #[error("{op} refused: {live} live and {pending} pending lease(s) cover {what}")]
     LeaseViolation {
         op: &'static str,
@@ -69,6 +71,7 @@ impl Error {
             Error::CudaUnavailable(_) => "CUDA_UNAVAILABLE",
             Error::BudgetExceeded { .. } => "BUDGET_EXCEEDED",
             Error::Shortfall { .. } => "SHORTFALL",
+            Error::BelowFloor { .. } => "BELOW_FLOOR",
             Error::LeaseViolation { .. } => "LEASE_VIOLATION",
             Error::Poisoned(_) => "POISONED",
             Error::Invalid(_) => "INVALID",

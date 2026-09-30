@@ -50,6 +50,9 @@ pub(crate) struct Cur {
     live: u32,
     views: u32,
     mover: usize,
+    /// Dropped while leases or views were live: stops prefetching and closes itself when
+    /// the last of them and every copy in flight are gone.
+    orphaned: bool,
 }
 
 impl Cur {
@@ -76,7 +79,7 @@ fn pump(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     loop {
         let cur = c.cursors.get(&id).ok_or(Error::Closed)?;
         let k = cur.next_submit;
-        if k >= cur.streamed_total() || (k >= cur.window && !cur.freed.contains_key(&(k - cur.window))) {
+        if cur.orphaned || k >= cur.streamed_total() || (k >= cur.window && !cur.freed.contains_key(&(k - cur.window))) {
             return Ok(());
         }
         submit(inner, c, id, k)?;
@@ -141,6 +144,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64) -> Result<()> {
                 cur.inflight -= 1;
                 cur.ready.insert(k, res.map(|cp| cp.ready));
             }
+            reap(&inner2, &mut c, id);
             drop(c);
             inner2.cv.notify_all();
         }),
@@ -162,7 +166,50 @@ pub(crate) fn release_slot(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, ev
     cur.freed.insert(k, Some(ev));
     cur.live -= 1;
     cur.done += 1;
-    pump(inner, c, id)
+    pump(inner, c, id)?;
+    reap(inner, c, id);
+    Ok(())
+}
+
+/// Finish an orphaned cursor once nothing uses its slots.
+fn reap(inner: &Arc<Inner>, c: &mut Core, id: u64) {
+    let Some(cur) = c.cursors.get(&id) else { return };
+    if cur.orphaned && cur.live == 0 && cur.views == 0 && cur.inflight == 0 {
+        if let Err(e) = finish(inner, c, id) {
+            c.poison(format!("closing a dropped cursor failed: {e}"));
+        }
+    }
+}
+
+/// Unmap a cursor's slots and return its holds. No lease, view or copy in flight remains.
+fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
+    let cur = c.cursors.remove(&id).ok_or(Error::Closed)?;
+    let d = cur.dev;
+    let _g = inner.devices[d].bind()?;
+    for e in cur.ready.values().flatten().chain(cur.freed.values().flatten()) {
+        e.sync()?;
+    }
+    for (i, ch) in cur.slots.into_iter().enumerate() {
+        if let Err(e) = device::unmap_span(cur.slot_base + i as u64 * cur.slot_span, cur.slot_span) {
+            return Err(c.poison(format!("slot unmap failed: {e}")));
+        }
+        c.arenas[d].mapped -= cur.slot_span;
+        c.arenas[d].put_idle(ch);
+    }
+    if cur.slot_span * cur.window > 0 {
+        device::free_va(cur.slot_base, cur.slot_span * cur.window)?;
+    }
+    if let Ok(w) = c.ws_mut(cur.ws) {
+        if let Some(dw) = w.devs[d].as_mut() {
+            for (i, &r) in cur.order.iter().enumerate() {
+                if cur.home[i] {
+                    dw.regs[r as usize].holds -= 1;
+                }
+            }
+        }
+    }
+    c.arenas[d].trim()?;
+    Ok(())
 }
 
 /// Hand position `k`'s slot on unread: free once its copy lands (or at once if never queued).
@@ -237,6 +284,9 @@ impl Plane {
         let window = if streamed.is_empty() { 0 } else { window as u64 };
         let need = slot_span * window;
         let (budget, mapped) = (c.arenas[d].budget, c.arenas[d].mapped);
+        if need > budget {
+            return Err(Error::BelowFloor { pool: "vram", need, budget });
+        }
         if mapped + need > budget {
             let deficit = mapped + need - budget;
             let mut t = Trim::default();
@@ -315,6 +365,7 @@ impl Plane {
                 live: 0,
                 views: 0,
                 mover,
+                orphaned: false,
             },
         );
         pump(inner, &mut c, id)?;
@@ -424,36 +475,11 @@ impl Cursor {
                 what: "slot leases or slot views".into(),
             });
         }
-        let d = cur.dev;
         // Every queued copy must be recorded before its slot can be unmapped.
         while c.cursors[&self.id].inflight > 0 {
             c = inner.cv.wait(c).unwrap();
         }
-        let cur = c.cursors.remove(&self.id).unwrap();
-        let _g = inner.devices[d].bind()?;
-        for e in cur.ready.values().flatten().chain(cur.freed.values().flatten()) {
-            e.sync()?;
-        }
-        for (i, ch) in cur.slots.into_iter().enumerate() {
-            if let Err(e) = device::unmap_span(cur.slot_base + i as u64 * cur.slot_span, cur.slot_span) {
-                return Err(c.poison(format!("slot unmap failed: {e}")));
-            }
-            c.arenas[d].mapped -= cur.slot_span;
-            c.arenas[d].put_idle(ch);
-        }
-        if cur.slot_span * cur.window > 0 {
-            device::free_va(cur.slot_base, cur.slot_span * cur.window)?;
-        }
-        if let Ok(w) = c.ws_mut(cur.ws) {
-            if let Some(dw) = w.devs[d].as_mut() {
-                for (i, &r) in cur.order.iter().enumerate() {
-                    if cur.home[i] {
-                        dw.regs[r as usize].holds -= 1;
-                    }
-                }
-            }
-        }
-        c.arenas[d].trim()?;
+        finish(inner, &mut c, self.id)?;
         drop(c);
         inner.cv.notify_all();
         Ok(())
@@ -462,7 +488,11 @@ impl Cursor {
 
 impl Drop for Cursor {
     fn drop(&mut self) {
-        let _ = self.close();
+        if let Err(Error::LeaseViolation { .. }) = self.close() {
+            if let Some(k) = self.inner.core.lock().unwrap().cursors.get_mut(&self.id) {
+                k.orphaned = true;
+            }
+        }
     }
 }
 
@@ -477,9 +507,11 @@ pub struct SlotView {
 
 impl Drop for SlotView {
     fn drop(&mut self) {
-        if let Some(k) = self.inner.core.lock().unwrap().cursors.get_mut(&self.id) {
+        let mut c = self.inner.core.lock().unwrap();
+        if let Some(k) = c.cursors.get_mut(&self.id) {
             k.views -= 1;
         }
+        reap(&self.inner, &mut c, self.id);
     }
 }
 

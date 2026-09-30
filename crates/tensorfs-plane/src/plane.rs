@@ -551,6 +551,9 @@ impl Inner {
                 need += span;
             }
         }
+        if need > c.host_budget {
+            return Err(Error::BelowFloor { pool: "pinned", need, budget: c.host_budget });
+        }
         if c.host_used + need > c.host_budget {
             let deficit = c.host_used + need - c.host_budget;
             let mut t = Trim::default();
@@ -690,6 +693,9 @@ impl Inner {
             }
         }
         let a = &c.arenas[d];
+        if need > a.budget {
+            return Err(Error::BelowFloor { pool: "vram", need, budget: a.budget });
+        }
         if a.mapped + need > a.budget {
             let deficit = a.mapped + need - a.budget;
             let mut t = Trim::default();

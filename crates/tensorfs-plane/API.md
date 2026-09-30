@@ -87,7 +87,8 @@ ts = p.replicate(ws, devices, regions=None, priority=0, pin=False)  # [Ticket]
 ```
 
 - `want` may evict only strictly lower-priority, unpinned, unleased regions; otherwise it
-  raises `Shortfall` (need, available, blockers).
+  raises `Shortfall` (need, available, blockers: dropping or re-ranking them would help).
+  A request larger than the whole budget raises `BelowFloor` (need, budget: nothing helps).
 - `"pinned"`: fill the memfd from the store (page-cache bytes copied, the rest O_DIRECT),
   page-lock it (`cuMemHostRegister`, portable) when the plane has devices.
 - device: map the regions (slab-sized handles), then copy from the pinned tier if it holds the
@@ -132,6 +133,9 @@ for step in range(passes):
         lease.release()
 cur.close()                  # refuses while a lease or slot view is live; waits for copies
 ```
+
+A cursor garbage-collected while its leases or slot views are live stops prefetching and
+closes itself when the last of them is released.
 
 - Regions resident (Ready, filling or queued) on the device at `stream()` are served in place
   and held (not evictable) until `close()`; the rest stream through `window` slots of
@@ -197,7 +201,7 @@ p.events() -> [{"kind", "ws", "region", "device", "bytes", "ns", "detail"}]   # 
 
 ## Errors
 
-`plane.PlaneError` (`.code`), subclasses: `BudgetExceeded`, `Shortfall`, `LeaseViolation`,
+`plane.PlaneError` (`.code`), subclasses: `BudgetExceeded`, `Shortfall`, `BelowFloor`, `LeaseViolation`,
 `Poisoned`, `CudaError`, `CudaUnavailable`, `Invalid`, `IoError`, `Closed`. Source refusals
 surface as the usual `tensorfs.errors.*` classes. `BudgetExceeded` with `pool == "device"`
 means the driver itself had no memory left (the budget exceeds what is free): lower it.
@@ -224,6 +228,8 @@ poisons (`BudgetExceeded`, `Shortfall` leave the plane usable).
 
 ## Changelog
 
+- v2.1 2026-09-30 (from proving-cpu.md): `BelowFloor` (a request above the whole budget);
+  a dropped cursor with live leases closes itself when they are released.
 - v2 2026-09-30 (W3 requests R2–R19):
   - `p.source(store, lease)` + `register(name, source, plan, regions, host_fd=None)`: one lease
     per manifest.

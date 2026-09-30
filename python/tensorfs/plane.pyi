@@ -140,6 +140,11 @@ class Shortfall(PlaneError):
     available: int
     blockers: list[str]
 
+class BelowFloor(PlaneError):
+    pool: str
+    need: int
+    budget: int
+
 class LeaseViolation(PlaneError): ...
 class Poisoned(PlaneError): ...
 class CudaError(PlaneError): ...
