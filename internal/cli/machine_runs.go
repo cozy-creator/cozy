@@ -89,7 +89,29 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 	m.running[request.ID] = true
 	m.mu.Unlock()
 	go func() {
-		defer func() { m.mu.Lock(); delete(m.running, request.ID); delete(m.placed, request.ID); m.mu.Unlock() }()
+		defer func() {
+			m.mu.Lock()
+			delete(m.running, request.ID)
+			delete(m.placed, request.ID)
+			m.mu.Unlock()
+			// A control can be persisted after the final observation, while its
+			// Start still sees this goroutine running. Read after withdrawing our
+			// running marker so either that Start or this handoff owns the wakeup.
+			if m.ctx.Err() != nil {
+				return
+			}
+			link, problem := m.store.MachineExecution(request.ID)
+			if problem != nil || link == nil || link.Abandoned || !link.Collected || len(link.Receipt) == 0 || !link.CancelRequested && len(link.PendingControl) == 0 {
+				return
+			}
+			if owed, problem := m.machineWorkOwed(request.ID); problem != nil || !owed {
+				return
+			}
+			current, problem := m.store.RequestRow(request.ID)
+			if problem == nil && current != nil {
+				_ = m.Start(*current)
+			}
+		}()
 		lastError, delay := "", time.Second
 		for m.ctx.Err() == nil {
 			current, problem := m.store.RequestRow(request.ID)
@@ -157,12 +179,13 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				}
 				if problem == nil {
 					observed, e := m.store.MachineExecution(request.ID)
-					// A publication only its owner can settle keeps the execution observed.
+					// A durable cancellation stays observed through its native release
+					// acknowledgement, even when the original failed result was collected.
 					awaiting, awaitingProblem := m.store.MachinePublicationsAwaitingOwner(request.ID)
-					if e == nil && observed != nil && observed.Collected && awaitingProblem == nil && len(awaiting) == 0 {
+					if e == nil && observed != nil && observed.Collected && !observed.CancelRequested && len(observed.PendingControl) == 0 && awaitingProblem == nil && len(awaiting) == 0 {
 						return
 					}
-					if e == nil && observed != nil && len(observed.PendingControl) == 0 {
+					if e == nil && observed != nil && !observed.CancelRequested && len(observed.PendingControl) == 0 {
 						var state pb.MachineExecutionState
 						if proto.Unmarshal(observed.ObservedState, &state) == nil && state.State == "canceled" {
 							if owed, problem := m.machineWorkOwed(request.ID); problem == nil && !owed {
@@ -294,7 +317,7 @@ func (m *machineRuns) Resume() {
 		return
 	}
 	for _, link := range links {
-		if awaiting, problem := m.store.MachinePublicationsAwaitingOwner(link.RequestID); link.Collected && len(link.PendingControl) == 0 && (problem != nil || len(awaiting) == 0) {
+		if awaiting, problem := m.store.MachinePublicationsAwaitingOwner(link.RequestID); link.Collected && !link.CancelRequested && len(link.PendingControl) == 0 && (problem != nil || len(awaiting) == 0) {
 			continue
 		}
 		request, problem := m.store.RequestRow(link.RequestID)
