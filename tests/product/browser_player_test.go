@@ -219,6 +219,56 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 				}
 			})
 
+			t.Run("indexed revisions while running", func(t *testing.T) {
+				var movies [][]byte
+				for count := 1; count <= 2; count++ {
+					dir := t.TempDir()
+					source, target := filepath.Join(dir, "fragments.mp4"), filepath.Join(dir, "indexed.mp4")
+					must(t, os.WriteFile(source, bytes.Join(film[:count], nil), 0600))
+					if out, err := exec.Command("ffmpeg", "-v", "error", "-i", source, "-map", "0", "-c", "copy", target).CombinedOutput(); err != nil {
+						t.Fatalf("index partial browser fixture: %v %s", err, out)
+					}
+					movie, err := os.ReadFile(target)
+					must(t, err)
+					movies = append(movies, movie)
+				}
+				movies = append(movies, completed[0])
+				m.machine.Replace(26, "video", -1, movies[0], 500_000)
+				page := open(t, m.link(func(g *capability.Grant) { g.Run = "26" }, "video"))
+				playerWait(t, page, "indexed partial plays before run completion", `!player().finished && player().stats.type === "video/mp4" && video().readyState >= 2`)
+				old := playerEval(t, page, `(async () => {
+					video().pause(); video().currentTime = 0.2;
+					await until(() => !video().seeking);
+					return video().src;
+				})()`)
+				m.machine.Replace(26, "video", -1, movies[1], 1_000_000)
+				playerWait(t, page, "a longer indexed partial replaces the first", `!player().finished && player().stats.resets === 1 && video().readyState >= 2 && video().duration > 0.9`)
+				result := playerEval(t, page, `(async () => {
+					const retained = {paused: video().paused, position: video().currentTime, revoked: revokedURLs};
+					for (const time of [0.7, 0.1]) {
+						video().currentTime = time;
+						await until(() => !video().seeking && Math.abs(video().currentTime-time) < 0.05 && video().readyState >= 2);
+					}
+					video().playbackRate = 0.1;
+					await video().play();
+					return retained;
+				})()`)
+				if r := result.(map[string]any); r["paused"] != true ||
+					!strings.Contains(fmt.Sprint(r["revoked"]), fmt.Sprint(old)) ||
+					fmt.Sprint(r["position"]) != "0.2" {
+					t.Fatalf("indexed partial replacement lost paused position or old URL: %v", r)
+				}
+				m.machine.Replace(26, "video", -1, movies[2], 1_500_000)
+				playerWait(t, page, "playing state survives another indexed replacement", `!player().finished && player().stats.resets === 2 && video().readyState >= 2 && video().duration > 1.4 && !video().paused`)
+				m.machine.End(26, "completed")
+				playerWait(t, page, "the indexed revision settles without another reset", `player().finished && player().stats.resets === 2 && !player().error`)
+				playerEval(t, page, `(async () => {
+					video().pause(); video().currentTime = 1.2;
+					await until(() => !video().seeking && video().readyState >= 2);
+					return true;
+				})()`)
+			})
+
 			for _, arm := range []struct{ name, link, says string }{
 				{"wrong fingerprint", m.linkWith(func(q map[string]string) { q["f"] = strings.Repeat("ab", 32) }), "did not prove its identity"},
 				{"expired", m.link(func(g *capability.Grant) { g.Expires = time.Now().Add(-time.Minute).Unix() }, "video"), "expired"},
