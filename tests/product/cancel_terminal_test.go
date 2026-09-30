@@ -179,12 +179,16 @@ func TestCancelRacingAcceptanceReachesTheMachine(t *testing.T) {
 	}
 	select {
 	case out := <-finished:
-		if !strings.Contains(out, `"canceled"`) {
-			t.Fatalf("cozy run cancel did not report the canceled run: %s", out)
+		if !strings.Contains(out, `"canceled"`) && !strings.Contains(out, `"canceling"`) {
+			t.Fatalf("cozy run cancel did not acknowledge cancellation: %s", out)
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatalf("cozy run cancel did not return: %s", tail(filepath.Join(root, "daemon.log")))
 	}
+	waitFor(t, root, "authoritative cancellation after racing acceptance", func() bool {
+		var state string
+		return db.QueryRow(`SELECT state FROM requests WHERE id=?`, id).Scan(&state) == nil && state == "canceled"
+	})
 }
 
 // The store half of that race: the intent survives for the observer to send.
@@ -197,7 +201,7 @@ func TestCancelAfterAcceptanceKeepsItsIntent(t *testing.T) {
 	fatal(t, problem)
 	row, problem := store.RequestRow(request.ID)
 	fatal(t, problem)
-	if !accepted || !link.CancelRequested || row.State != request.State {
+	if !accepted || !link.CancelRequested || row.State != "canceling" {
 		t.Fatalf("a cancel after acceptance was lost (accepted %v, intent kept %v, run %s)", accepted, link.CancelRequested, row.State)
 	}
 }

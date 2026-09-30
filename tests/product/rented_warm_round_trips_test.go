@@ -177,12 +177,20 @@ func TestRentedCancelDoesNotWaitBehindAnObservation(t *testing.T) {
 			Status  string `json:"status"`
 			Changed bool   `json:"changed"`
 		}
-		if json.Unmarshal([]byte(out), &result) != nil || result.Status != "canceled" || !result.Changed {
-			t.Fatalf("cozy run cancel did not report the canceled run: %s", out)
+		if json.Unmarshal([]byte(out), &result) != nil || (result.Status != "canceling" && result.Status != "canceled") || !result.Changed {
+			t.Fatalf("cozy run cancel did not acknowledge cancellation: %s", out)
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatalf("cozy run cancel did not return after Runtime canceled: %s", tail(filepath.Join(root, "daemon.log")))
 	}
+	store, problem := records.Open(home.Paths(root).DB)
+	fatal(t, problem)
+	defer store.Close()
+	id := machine.submitted().Offer.RequestId
+	waitFor(t, root, "recorded authoritative cancellation", func() bool {
+		row, problem := store.RequestRow(id)
+		return problem == nil && row != nil && row.State == "canceled"
+	})
 	machine.mu.Lock()
 	sent := len(machine.commands)
 	machine.mu.Unlock()
