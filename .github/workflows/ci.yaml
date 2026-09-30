@@ -3,7 +3,7 @@ name: ci
 # Automatic: one ~1 min job on master pushes that touch Go. It compiles and vets the whole
 # module, which targeted local `go test ./pkg` runs do not.
 # On demand (fence, types, product suite):
-#   gh workflow run ci.yaml -R cozy-creator/cozy --ref <branch> [-f full=true]
+#   gh workflow run ci.yaml -R cozy-creator/cozy --ref <branch> [-f full=true] [-f runtime_version=0.18.96]
 # `full`, before a release, adds full-mode tests, the darwin/windows cross-compile and
 # release install/upgrade acceptance.
 on:
@@ -16,6 +16,10 @@ on:
         description: Also run full-mode tests, cross-compile and release acceptance
         type: boolean
         default: false
+      runtime_version:
+        description: Published Runtime release to qualify; empty selects latest
+        type: string
+        default: ''
 
 # Per event: a master push must not cancel a suite dispatched on master.
 concurrency:
@@ -48,6 +52,7 @@ jobs:
     timeout-minutes: 45
     env:
       FULL: ${{ inputs.full }}
+      RUNTIME_VERSION: ${{ inputs.runtime_version }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -82,9 +87,19 @@ jobs:
       - name: Runtime and Python
         id: toolchain
         run: |
-          read -r url sha < <(curl -fsS https://pypi.org/pypi/cozy-runtime/json |
-            jq -er '[.urls[] | select(.yanked == false) | select(.filename | endswith("cp312-abi3-manylinux_2_28_x86_64.whl"))] |
-              if length == 1 then .[0] | "\(.url) \(.digests.sha256)" else error("expected one native Runtime wheel") end')
+          runtime_api=https://pypi.org/pypi/cozy-runtime
+          if [ -n "$RUNTIME_VERSION" ]; then
+            [[ $RUNTIME_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'runtime_version must be a public release version' >&2; exit 2; }
+            runtime_api="$runtime_api/$RUNTIME_VERSION"
+          fi
+          runtime_metadata="$RUNNER_TEMP/runtime-release.json"
+          curl -fsS "$runtime_api/json" -o "$runtime_metadata"
+          if [ -n "$RUNTIME_VERSION" ]; then
+            jq -e --arg version "$RUNTIME_VERSION" '.info.version == $version' "$runtime_metadata"
+          fi
+          jq -r '"Runtime release: " + .info.version' "$runtime_metadata"
+          read -r url sha < <(jq -er '[.urls[] | select(.yanked == false) | select(.filename | endswith("cp312-abi3-manylinux_2_28_x86_64.whl"))] |
+            if length == 1 then .[0] | "\(.url) \(.digests.sha256)" else error("expected one native Runtime wheel") end' "$runtime_metadata")
           test -n "$url" && test -n "$sha"
           wheel="$RUNNER_TEMP/${url##*/}"
           curl -fsSLo "$wheel" "$url"
