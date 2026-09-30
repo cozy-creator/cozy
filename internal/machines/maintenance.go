@@ -33,15 +33,31 @@ type RuntimeState struct {
 		Version        string `json:"version"`
 		UpdateBoundary string `json:"update_boundary"`
 	} `json:"bootstrap"`
-	Update *struct {
-		Operation string `json:"operation"`
-		State     string `json:"state"`
-		Error     string `json:"error"`
-		From      struct {
-			Runtime  string `json:"runtime"`
-			TensorFS string `json:"tensorfs"`
-		} `json:"from"`
-	} `json:"update"`
+	Update *RuntimeUpdateState `json:"update"`
+}
+
+// RuntimePair is one immutable software pair. From remains active while To is a
+// candidate in prepared/waiting_activation states.
+type RuntimePair struct {
+	Runtime  string `json:"runtime"`
+	TensorFS string `json:"tensorfs"`
+}
+
+// RuntimeUpdateState is additive across bootstrap versions. Terminal succeeded is the
+// only state that activates To; prepared and waiting_activation are durable
+// candidate states that callers may report without claiming activation.
+type RuntimeUpdateState struct {
+	Operation        string      `json:"operation"`
+	State            string      `json:"state"`
+	Error            string      `json:"error"`
+	From             RuntimePair `json:"from"`
+	To               RuntimePair `json:"to"`
+	Pinned           bool        `json:"pinned,omitempty"`
+	PreviouslyPinned bool        `json:"previously_pinned,omitempty"`
+}
+
+func (u *RuntimeUpdateState) PendingActivation() bool {
+	return u != nil && (u.State == "prepared" || u.State == "waiting_activation")
 }
 
 type Maintenance struct {
@@ -174,6 +190,16 @@ func (c *Maintenance) AwaitUpdateAdmission(ctx context.Context) (*RuntimeState, 
 // AwaitUpdate observes one accepted operation across application replacement.
 // Readiness and transport gaps are observations, never authority to submit again.
 func (c *Maintenance) AwaitUpdate(ctx context.Context, operation string) (*RuntimeState, *exit.Error) {
+	return c.awaitUpdate(ctx, operation, false)
+}
+
+// AwaitUpdateOrPending observes until the operation activates or durably prepares
+// a candidate whose activation waits for current work to drain.
+func (c *Maintenance) AwaitUpdateOrPending(ctx context.Context, operation string) (*RuntimeState, *exit.Error) {
+	return c.awaitUpdate(ctx, operation, true)
+}
+
+func (c *Maintenance) awaitUpdate(ctx context.Context, operation string, pending bool) (*RuntimeState, *exit.Error) {
 	detached := func() (*RuntimeState, *exit.Error) {
 		return nil, exit.Named(exit.Canceled, "machine.update_observation_lost", "update %s continues on the machine; observation ended: %s", operation, ctx.Err())
 	}
@@ -193,7 +219,7 @@ func (c *Maintenance) AwaitUpdate(ctx context.Context, operation string) (*Runti
 			if state.Update == nil || state.Update.Operation != operation {
 				return nil, exit.Named(exit.Unavailable, "machine.update_observation_lost", "update %s is no longer the machine's current operation; its outcome must be inspected before another install", operation)
 			}
-			if updateTerminal(state.Update.State) {
+			if updateTerminal(state.Update.State) || pending && state.Update.PendingActivation() {
 				return state, nil
 			}
 		}

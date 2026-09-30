@@ -46,6 +46,11 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 	if row.ID != update.ID || row.State != "updating" {
 		t.Fatalf("update was not durable: %+v", row)
 	}
+	row.State = "waiting_activation"
+	fatal(t, reopened.SaveRuntimeUpdate(*row))
+	if _, problem := c.UseRental(f.rentalID, "run 9 preparing"); problem == nil || problem.ErrName() != "rental.maintenance" {
+		t.Fatalf("pending activation reopened dispatch: %v", problem)
+	}
 	row.State = "failed"
 	row.Error = "candidate rolled back"
 	fatal(t, reopened.SaveRuntimeUpdate(*row))

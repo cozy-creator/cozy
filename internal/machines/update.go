@@ -35,6 +35,9 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 		return nil, problem
 	}
 	if state.Update != nil && !updateTerminal(state.Update.State) {
+		if state.Update.PendingActivation() {
+			return nil, pendingUpdateConflict(state.Update)
+		}
 		return nil, exit.Named(exit.Conflict, "machine.update_in_progress", "the machine is already completing update %s", state.Update.Operation)
 	}
 	agent := "bundled"
@@ -107,9 +110,12 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 			return nil, problem
 		}
 	}
-	state, problem = client.AwaitUpdate(ctx, operation)
+	state, problem = client.AwaitUpdateOrPending(ctx, operation)
 	if problem != nil {
 		return nil, problem
+	}
+	if state.Update.PendingActivation() {
+		return pendingInstalled(state), nil
 	}
 	if update := state.Update; update.State != "succeeded" {
 		return nil, exit.Named(exit.Failed, "machine.update_failed", "update %s: %s; machine now runs Runtime %s / TensorFS %s", operation, update.Error, state.Runtime, state.TensorFS)
@@ -136,6 +142,23 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 		return nil, exit.Internalf("updated Runtime but cannot retain installation metadata: %s", err)
 	}
 	return installed, nil
+}
+
+func pendingUpdateConflict(update *RuntimeUpdateState) *exit.Error {
+	return exit.Named(exit.Conflict, "machine.update_in_progress", "Runtime update %s is awaiting activation; observe the existing candidate before starting another install", update.Operation)
+}
+
+// pendingInstalled reports the active pair and candidate operation without
+// persisting the candidate as installed. The next machine install observes the
+// same operation until Runtime activates or rolls it back.
+func pendingInstalled(state *RuntimeState) *Installed {
+	return &Installed{
+		Host:       installedArtifact{Name: "cozy-machine " + state.Agent.Version, SHA256: state.Agent.SHA256, Module: AgentModule},
+		Runtime:    installedArtifact{Name: hostruntime.Distribution + " " + state.Runtime},
+		TensorFS:   installedArtifact{Name: "tensorfs " + state.TensorFS},
+		HostPinned: state.Agent.Selection == "explicit",
+		Pending:    state.Update,
+	}
 }
 
 func (h *Host) maintenanceFor(launch *Launch) (*Maintenance, *exit.Error) {

@@ -254,9 +254,15 @@ func (m *machineRuns) closePendingSubmission(ctx context.Context, request record
 }
 
 func closeSubmission(ctx context.Context, connection *machineConnection, frozen *pb.MachineExecutionSubmit) (*pb.MachineSubmissionClosure, *exit.Error) {
-	var trailer metadata.MD
+	var header, trailer metadata.MD
 	closed, err := connection.Host.CloseMachineSubmission(ctx, &pb.MachineSubmissionClose{Claim: connection.Claim,
-		SubmissionId: frozen.SubmissionId, RequestId: frozen.Offer.RequestId, ExpectedExecutionWorkspaceId: frozen.ExpectedExecutionWorkspaceId}, grpc.Trailer(&trailer))
+		SubmissionId: frozen.SubmissionId, RequestId: frozen.Offer.RequestId, ExpectedExecutionWorkspaceId: frozen.ExpectedExecutionWorkspaceId}, grpc.Header(&header), grpc.Trailer(&trailer))
+	// A journal snapshot can carry an old workspace while the Runtime is booting or
+	// being replaced. Its metadata is the authority for this phase; do not turn the
+	// snapshot's closure error into a permanent workspace/capability verdict.
+	if runtimeUnavailable(header, trailer) {
+		return nil, waitForRuntime()
+	}
 	if executionWorkspaceChanged(err, trailer) {
 		return nil, exit.Named(exit.Conflict, "machine_execution.workspace_changed", "the machine no longer holds the frozen submission's execution workspace")
 	}
@@ -448,7 +454,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if problem := connection.ValidateNewWork(); problem != nil {
 		return problem
 	}
-	workspace, problem := newExecutionWorkspace(ctx, connection)
+	workspace, problem := newExecutionWorkspace(ctx, connection, request.ID)
 	if problem != nil {
 		if len(link.Submission) > 0 && problem.ErrName() == "machine.submission_closure_required" {
 			return pendingClosureUnavailable("the connected machine does not support the required submission-closure contract")
@@ -483,7 +489,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if built.PublicationAuthorizationId, problem = m.publicationAuthorization(ctx, request.ID, link.MachineID, connection); problem != nil {
 			return problem
 		}
-		if problem := m.store.RecordMachineSubmission(request.ID, built); problem != nil {
+		if problem := m.recordSubmission(request.ID, built); problem != nil {
 			return problem
 		}
 		link.Submission, _ = proto.Marshal(built)
@@ -504,7 +510,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return problem
 		}
 		var built *pb.MachineExecutionSubmit
-		capture, problem := m.resolver.CaptureMachineExecution(request)
+		capture, problem := m.captureForSubmission(request)
 		if problem != nil {
 			return problem
 		}
@@ -581,7 +587,10 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		submission = built
 	}
 	if !replaying {
-		if _, problem := m.resolver.capturedResultInterface(request); problem != nil {
+		began := time.Now()
+		_, problem := m.resolver.capturedResultInterface(request)
+		m.submissionStage(request.ID, "result interface read", "", began)
+		if problem != nil {
 			return problem
 		}
 	}
@@ -637,9 +646,9 @@ func (m *machineRuns) pinToMachine(ctx context.Context, request records.Request,
 	if pinned {
 		return request, nil
 	}
-	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{Claim: connection.Claim})
-	if err != nil {
-		return request, machineTransport(err)
+	workspace, problem := newExecutionWorkspace(ctx, connection, request.ID)
+	if problem != nil {
+		return request, problem
 	}
 	accelerator := ""
 	if len(workspace.Devices) > 0 {
@@ -678,20 +687,25 @@ func (m *machineRuns) recordPlacement(request records.Request, decision orchestr
 // freezeMachineSubmission persists authenticated journal identity with the exact
 // offer before any Submit RPC. Only a never-transmitted submission may discover it.
 func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *machineConnection, requestID, machine string, submission *pb.MachineExecutionSubmit) *exit.Error {
-	workspace, problem := newExecutionWorkspace(ctx, connection)
+	workspace, problem := newExecutionWorkspace(ctx, connection, requestID)
 	if problem != nil {
 		return problem
 	}
 	submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
-	return m.store.RecordMachineSubmission(requestID, submission)
+	return m.recordSubmission(requestID, submission)
 }
 
 // New submissions require durable reconciliation through the complete machine route.
 // Retained work keeps its frozen identity until authoritative reconciliation.
-func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
-	workspace, problem := currentExecutionWorkspace(ctx, connection)
+func newExecutionWorkspace(ctx context.Context, connection *machineConnection, request string) (*pb.MachineExecutionWorkspace, *exit.Error) {
+	began := time.Now()
+	workspace, available, problem := executionWorkspaceReply(ctx, connection)
+	connection.runs.submissionStage(request, "workspace lookup", "", began)
 	if problem != nil {
 		return nil, problem
+	}
+	if !available {
+		return nil, waitForRuntime()
 	}
 	if !workspace.SubmissionClose {
 		return nil, exit.Named(exit.Structural, "machine.submission_closure_required",
@@ -705,11 +719,16 @@ func newExecutionWorkspace(ctx context.Context, connection *machineConnection) (
 	// closure route. Exercise that route with an unused identity before freezing
 	// any real offer. Closing this key cannot create or cancel an execution.
 	probe := records.NewID("closure-probe")
-	var trailer metadata.MD
+	var header, trailer metadata.MD
+	began = time.Now()
 	closed, err := connection.Host.CloseMachineSubmission(ctx, &pb.MachineSubmissionClose{
 		Claim: connection.Claim, SubmissionId: probe, RequestId: probe,
 		ExpectedExecutionWorkspaceId: workspace.ExecutionWorkspaceId,
-	}, grpc.Trailer(&trailer))
+	}, grpc.Header(&header), grpc.Trailer(&trailer))
+	connection.runs.submissionStage(request, "submission closure probe", "", began)
+	if runtimeUnavailable(header, trailer) {
+		return nil, waitForRuntime()
+	}
 	if executionWorkspaceChanged(err, trailer) {
 		connection.KeepWorkspace(nil)
 		return nil, exit.Named(exit.Unavailable, "machine_execution.workspace_changed", "the machine replaced its workspace before submission; checking its new workspace")
@@ -752,23 +771,54 @@ func (m *machineRuns) loseSubmissionWorkspace(requestID, machine string) *exit.E
 		"the machine no longer holds this run's frozen execution workspace; its prior acceptance cannot be recovered and the submission will not be sent to the replacement journal")
 }
 
+func runtimeUnavailable(values ...metadata.MD) bool {
+	for _, value := range values {
+		if slices.Contains(value.Get("cozy-runtime-available"), "false") {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForRuntime() *exit.Error {
+	return exit.Named(exit.Unavailable, "machine.runtime_unavailable",
+		"the machine Runtime is temporarily unavailable; waiting for live submission capabilities")
+}
+
 func currentExecutionWorkspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
-	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{Claim: connection.Claim})
+	workspace, _, problem := executionWorkspaceReply(ctx, connection)
+	return workspace, problem
+}
+
+// Journal snapshots identify retained work, but do not describe a live Runtime's
+// mutation capabilities. Observation can use them; new admission must wait.
+func executionWorkspaceReply(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, bool, *exit.Error) {
+	var header, trailer metadata.MD
+	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{Claim: connection.Claim}, grpc.Header(&header), grpc.Trailer(&trailer))
+	available := !runtimeUnavailable(header, trailer)
 	if err != nil {
-		return nil, machineTransport(err)
+		if !available {
+			return nil, false, waitForRuntime()
+		}
+		return nil, true, machineTransport(err)
 	}
 	if workspace == nil || workspace.WorkerId != connection.Claim.WorkerId || workspace.WorkerBootId == "" ||
 		(connection.Claim.WorkerBootId != "" && workspace.WorkerBootId != connection.Claim.WorkerBootId) ||
 		workspace.ExecutionWorkspaceId == "" || len(workspace.ExecutionWorkspaceId) > 256 {
-		return nil, exit.New(exit.Conflict, "machine returned an invalid execution workspace identity")
+		if !available {
+			return nil, false, waitForRuntime()
+		}
+		return nil, true, exit.New(exit.Conflict, "machine returned an invalid execution workspace identity")
 	}
 	if !workspace.RunOutputLog {
-		// Definitive: the run fails with this, rather than waiting on a machine that cannot serve it.
-		return nil, exit.Named(exit.Structural, "machine.runtime_update_required",
+		if !available {
+			return nil, false, waitForRuntime()
+		}
+		return nil, true, exit.Named(exit.Structural, "machine.runtime_update_required",
 			"this machine's Runtime predates the run output log; runs need Runtime %s or newer", machineOutputLogRuntimeFloor).
 			WithRemedy("update the machine's Runtime: `cozy rental update <rental>`, or `cozy machine install` for this computer")
 	}
-	return workspace, nil
+	return workspace, available, nil
 }
 
 func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, frozen *pb.MachineExecutionSubmit) *exit.Error {
