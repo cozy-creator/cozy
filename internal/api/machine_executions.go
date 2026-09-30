@@ -19,6 +19,8 @@ import (
 
 type MachineExecutions interface {
 	Refresh(context.Context, records.Request) *exit.Error
+	// Cancel control only wakes delivery of recorded intent; it must not wait
+	// for remote I/O. Pause and resume retain synchronous control semantics.
 	Control(context.Context, records.Request, string) *exit.Error
 	// Withdraw stops a canceled request's submission work that has not reached Runtime.
 	Withdraw(string)
