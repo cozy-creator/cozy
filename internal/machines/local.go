@@ -44,7 +44,8 @@ type Host struct {
 	store  string
 	mu     sync.Mutex
 	cached *cachedLaunch
-	// inherited are the locale and trust-store values a Host may carry from its launcher.
+	// inherited are the locale, trust-store and GPU-visibility values a Host may carry from its
+	// launcher.
 	inherited []string
 	// GPUBudget seeds a new machine config. Existing machine settings belong to its owner.
 	GPUBudget any
@@ -62,7 +63,7 @@ func NewHost(dir, store string, environ []string) *Host {
 	for _, value := range environ {
 		name, _, _ := strings.Cut(value, "=")
 		switch name {
-		case "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR":
+		case "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR", "CUDA_VISIBLE_DEVICES":
 			h.inherited = append(h.inherited, value)
 		}
 	}

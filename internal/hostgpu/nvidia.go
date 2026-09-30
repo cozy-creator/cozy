@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 
 type GPU struct {
 	Index             int    `json:"index"`
+	UUID              string `json:"uuid,omitempty"`
 	Model             string `json:"model"`
 	VRAMFreeBytes     int64  `json:"vram_free_bytes"`
 	VRAMTotalBytes    int64  `json:"vram_total_bytes"`
@@ -35,10 +37,13 @@ type Inventory struct {
 var driverCUDA = regexp.MustCompile(`CUDA Version:\s*([0-9]+(?:\.[0-9]+)?)`)
 
 func Probe(cfg config.Config) Inventory {
+	if cfg.GPUsNamed && len(cfg.VisibleGPUs) == 0 {
+		return Inventory{} // GPUs hidden: no driver is asked
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "nvidia-smi",
-		"--query-gpu=index,name,memory.free,memory.total,driver_version,compute_cap",
+		"--query-gpu=index,name,memory.free,memory.total,driver_version,compute_cap,uuid",
 		"--format=csv,noheader,nounits")
 	cmd.Env = cfg.Tool()
 	raw, err := cmd.Output()
@@ -52,6 +57,11 @@ func Probe(cfg config.Config) Inventory {
 	gpus, err := parseGPUs(string(raw))
 	if err != nil {
 		return Inventory{Diagnostic: err.Error()}
+	}
+	if cfg.GPUsNamed {
+		gpus = slices.DeleteFunc(gpus, func(gpu GPU) bool {
+			return !slices.Contains(cfg.VisibleGPUs, strconv.Itoa(gpu.Index)) && !slices.Contains(cfg.VisibleGPUs, gpu.UUID)
+		})
 	}
 	version := readDriverCUDA(ctx, cfg)
 	for i := range gpus {
@@ -87,6 +97,9 @@ func parseGPUs(raw string) ([]GPU, error) {
 		}
 		if compute := strings.Trim(strings.TrimSpace(record[5]), "[]"); compute != "" && !strings.EqualFold(compute, "N/A") {
 			gpu.ComputeCapability, gpu.SM = compute, "sm_"+strings.ReplaceAll(compute, ".", "")
+		}
+		if len(record) > 6 {
+			gpu.UUID = strings.TrimSpace(record[6])
 		}
 		gpus = append(gpus, gpu)
 	}

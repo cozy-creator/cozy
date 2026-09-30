@@ -34,7 +34,8 @@ import (
 // Inherited is the complete set of environment variables a package process
 // may inherit. Launchers impose every other value explicitly. XDG_RUNTIME_DIR is where the
 // user's systemd manager answers, which the daemon and machine run their own units under.
-var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "XDG_RUNTIME_DIR"}
+// CUDA_VISIBLE_DEVICES is where this computer's machine may find GPUs: empty is none.
+var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "XDG_RUNTIME_DIR", "CUDA_VISIBLE_DEVICES"}
 
 const (
 	// DefaultHubName names DefaultHubURL, the one Tensorhub most installations use.
@@ -83,6 +84,10 @@ type Config struct {
 	MachineGPUBudget any
 	// MachineWebRTCPort enables the owned agent media listener; zero leaves it disabled.
 	MachineWebRTCPort int
+	// VisibleGPUs are CUDA_VISIBLE_DEVICES' entries (indices or UUIDs) when GPUsNamed: the
+	// only GPUs this computer may use. Named and empty is none.
+	VisibleGPUs []string
+	GPUsNamed   bool
 
 	Tfs       string
 	TfsSource string
@@ -478,6 +483,16 @@ func load() (Config, *exit.Error) {
 		PlayerURL:                strings.TrimSpace(input.PlayerURL),
 		Digest:                   digest,
 		inherited:                inherited,
+	}
+	for _, pair := range inherited {
+		if value, named := strings.CutPrefix(pair, "CUDA_VISIBLE_DEVICES="); named {
+			c.GPUsNamed = true
+			for _, entry := range strings.Split(value, ",") {
+				if entry = strings.TrimSpace(entry); entry != "" {
+					c.VisibleGPUs = append(c.VisibleGPUs, entry)
+				}
+			}
+		}
 	}
 	if !hubToken.Present() {
 		c.HubTokenSource = "unset"

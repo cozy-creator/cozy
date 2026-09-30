@@ -118,25 +118,47 @@ func randomToken(t *testing.T) string {
 
 // virtualInventory replaces the image's worker entry with the same `main` measuring a
 // virtual four-device inventory: the in-process launcher seam, never an environment switch.
+// When this test process hides the GPUs (CUDA_VISIBLE_DEVICES set and empty) the worker asks
+// no driver anything, as on a driverless host, and its virtual devices are ordinals no card has.
 func virtualInventory(t *testing.T, root string) {
+	t.Helper()
+	cfg, problem := config.Load()
+	fatal(t, problem)
+	virtualInventoryFor(t, root, cfg.GPUsNamed && len(cfg.VisibleGPUs) == 0)
+}
+
+func virtualInventoryFor(t *testing.T, root string, hidden bool) {
 	t.Helper()
 	python := filepath.Join(root, "opt/cozy/python/bin/python")
 	worker := filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker")
+	driverless := filepath.Join(root, "opt/cozy/driverless")
+	must(t, os.MkdirAll(driverless, 0o755))
+	must(t, os.WriteFile(filepath.Join(driverless, "nvidia-smi"), []byte("#!/bin/sh\necho 'GPUs are hidden' >&2\nexit 9\n"), 0o755))
 	must(t, os.Remove(worker))
 	must(t, os.WriteFile(worker, []byte("#!"+python+`
-import sys
+import os, sys
 from dataclasses import replace
-from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal import accel, hostfacts
 from cozy_runtime.cli import runtime_worker
-inventory = [{"device_index": i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
+HIDDEN = `+map[bool]string{false: "False", true: "True"}[hidden]+`
+first = 64 if HIDDEN else 0
+inventory = [{"device_index": first + i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
     "driver_version": "0.0", "memory_bytes": 8 << 30, "pci_bus_id": f"00000000:0{i}:00.0"} for i in range(4)]
+if HIDDEN:
+    accel._nvml_absent = True
+    os.environ["PATH"] = `+strconv.Quote(driverless)+` + os.pathsep + os.environ.get("PATH", "")
 measure = hostfacts.measure
 def fixture_measure(expected_backend=""):
     if expected_backend != "cuda":
         return measure(expected_backend)
     # Model-default selection and readiness must see the same synthetic devices.
-    # Numerical backend/architecture and other host facts remain actually measured.
-    facts = measure(expected_backend)
+    # Numerical backend/architecture and other host facts remain actually measured; with the
+    # GPUs hidden they are absent, as on a driverless host.
+    if HIDDEN:
+        facts = measure("none")
+        facts = replace(facts, backend="", gpu_sm=0, unreadable=tuple(sorted({*facts.unreadable, "gpu_sm"})))
+    else:
+        facts = measure(expected_backend)
     inventory_fields = {"gpu_name", "vram_total_bytes", "driver_version"}
     return replace(facts, gpu_name=inventory[0]["device_name"], gpu_count=len(inventory),
         vram_total_bytes=inventory[0]["memory_bytes"], driver_version=inventory[0]["driver_version"],
@@ -146,26 +168,29 @@ sys.exit(runtime_worker.main(sys.argv[1:], gpus=inventory))
 `), 0o755))
 }
 
-// The routing fixture may replace inventory facts, but numerical identity must
-// stay absent or present exactly as the real measurement reports it.
+// The routing fixture may replace inventory facts, but numerical identity must stay absent or
+// present exactly as the real measurement reports it. With the GPUs hidden nothing is measured
+// from a driver: identity is absent and the virtual devices cannot name a real card.
 func TestVirtualInventoryPreservesMeasuredNumericalIdentity(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires the selected Runtime SDK to inspect its fixture entrypoint")
 	}
 	python := filepath.Join(machineTemplateDir(t), "root/opt/cozy/python/bin/python")
-	root := t.TempDir()
-	worker := filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker")
-	must(t, os.MkdirAll(filepath.Dir(worker), 0755))
-	must(t, os.WriteFile(worker, nil, 0755))
-	virtualInventory(t, root)
-	script := `import runpy, sys
+	for _, hidden := range []bool{false, true} {
+		root := t.TempDir()
+		worker := filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker")
+		must(t, os.MkdirAll(filepath.Dir(worker), 0755))
+		must(t, os.WriteFile(worker, nil, 0755))
+		virtualInventoryFor(t, root, hidden)
+		script := `import runpy, shutil, subprocess, sys
 from cozy_runtime.cli import runtime_worker
-from cozy_runtime.internal import hostfacts
+from cozy_runtime.internal import accel, hostfacts
+hidden = sys.argv[2] == "hidden"
 for backend, architecture in [("", 0), ("cuda", 89)]:
     calls = []
     def measure(expected_backend=""):
         calls.append(expected_backend)
-        return hostfacts.HostFacts(backend=backend, gpu_sm=architecture,
+        return hostfacts.HostFacts(backend=backend if expected_backend == "cuda" else "none", gpu_sm=architecture,
             host_ram_total_bytes=12345, vcpu_count=7, unreadable=("gpu_name", "driver_version", "backend_version"))
     hostfacts.measure = measure
     def main(argv, *, gpus):
@@ -174,11 +199,19 @@ for backend, architecture in [("", 0), ("cuda", 89)]:
         assert facts.gpu_name == gpus[0]["device_name"] == "Virtual Accelerator"
         assert facts.vram_total_bytes == gpus[0]["memory_bytes"] == 8 << 30
         assert facts.driver_version == gpus[0]["driver_version"] == "0.0"
-        assert (facts.backend, facts.gpu_sm) == (backend, architecture)
         assert (facts.host_ram_total_bytes, facts.vcpu_count) == (12345, 7)
-        assert facts.unreadable == ("backend_version",)
         assert hostfacts.measure("none").unreadable == ("gpu_name", "driver_version", "backend_version")
-        assert calls == ["cuda", "none"]
+        if hidden:
+            assert (facts.backend, facts.gpu_sm, facts.unreadable) == ("", 0, ("backend_version", "gpu_sm"))
+            assert calls == ["none", "none"], calls
+            assert min(gpu["device_index"] for gpu in gpus) >= 64
+            assert accel._nvml_absent and accel._nvml_library() is None
+            assert subprocess.run([shutil.which("nvidia-smi"), "-L"], capture_output=True).returncode == 9
+        else:
+            assert (facts.backend, facts.gpu_sm) == (backend, architecture)
+            assert facts.unreadable == ("backend_version",)
+            assert calls == ["cuda", "none"]
+            assert [gpu["device_index"] for gpu in gpus] == [0, 1, 2, 3]
         return 0
     runtime_worker.main = main
     try:
@@ -186,8 +219,10 @@ for backend, architecture in [("", 0), ("cuda", 89)]:
     except SystemExit as exit:
         assert exit.code == 0
 `
-	if output, err := exec.Command(python, "-I", "-c", script, worker).CombinedOutput(); err != nil {
-		t.Fatalf("virtual inventory changed measured numerical identity: %v\n%s", err, output)
+		mode := map[bool]string{false: "visible", true: "hidden"}[hidden]
+		if output, err := exec.Command(python, "-I", "-c", script, worker, mode).CombinedOutput(); err != nil {
+			t.Fatalf("%s virtual inventory changed measured numerical identity: %v\n%s", mode, err, output)
+		}
 	}
 }
 
