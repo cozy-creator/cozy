@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,7 +21,7 @@ import (
 // rental transport. Only the Hub and provider are loopback fixtures. Preparation
 // installs packages with uv; it runs no inference and downloads no model weights.
 func TestPublishedInstallUsesEmbeddedInterfaceWithoutImport(t *testing.T) {
-	h, root, _, _ := parityMachines(t)
+	h, root, _, store := parityMachines(t)
 	imports := filepath.Join(t.TempDir(), "imports")
 	objects := map[string][]byte{}
 	files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -55,10 +54,18 @@ only-include = ["install_probe.py"]
 		must(t, os.WriteFile(filepath.Join(project, "install_probe.py"), []byte(fmt.Sprintf(`import time
 from pathlib import Path
 from cozy_runtime.author import App
+import msgspec
 time.sleep(4)
 with Path(%q).open("a") as stream:
     stream.write(%q + "\n")
 app = App()
+class Request(msgspec.Struct):
+    value: int = 1
+class Result(msgspec.Struct):
+    value: int
+@app.job
+def main(payload: Request) -> Result:
+    return Result(payload.value)
 `, imports, version)), 0600))
 		if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
 			t.Fatalf("locking fixture: %v\n%s", err, out)
@@ -115,9 +122,18 @@ app = App()
 	for _, version := range []string{"1.0.0", "1.0.1", "1.0.2", "1.0.2"} {
 		started := time.Now()
 		code, out := runCozy(t, root, "package", "install", "proof/install-interface-probe", "--version", version, "--rental=tessa", "--json")
-		if code != 0 || !strings.Contains(out, `"status":"installed"`) {
+		var accepted struct{ ID string }
+		if code != 0 || json.Unmarshal([]byte(out), &accepted) != nil || accepted.ID == "" {
 			t.Fatalf("install %s: %d %s", version, code, out)
 		}
+		eventually(t, root, "accepted installation settles", func() bool {
+			row, problem := store.RentalInstall(accepted.ID)
+			fatal(t, problem)
+			if row != nil && row.State == "failed" {
+				t.Fatalf("installation failed: %s %s", row.ErrorCode, row.Error)
+			}
+			return row != nil && row.State == "succeeded"
+		})
 		t.Logf("ordinary published install %s: %s", version, time.Since(started))
 		body, err := os.ReadFile(imports)
 		must(t, err)
