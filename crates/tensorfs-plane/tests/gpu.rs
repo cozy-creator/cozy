@@ -370,3 +370,36 @@ fn departures_skip_ahead_or_demand_fill_and_cycles_run_until_close() {
     cur.close().unwrap();
     p.close().unwrap();
 }
+
+#[test]
+#[ignore = "GPU"]
+fn a_dropped_cursor_closes_itself_and_floors_refuse_early() {
+    let fx = Fixture::new("gpu-orphan");
+    let p = plane();
+    let ws = fx.register(&p, None);
+    let s = Stream::new();
+    p.set_pinned_budget(1 << 30).unwrap();
+    p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    // One 72 MiB slot does not fit a 64 MiB budget at all: nothing could help.
+    p.set_vram_budget(DEV, MIB64).unwrap();
+    match p.stream(ws, DEV, &[0, 1, 2], 1, 1, 0, "floor") {
+        Err(Error::BelowFloor { pool: "vram", .. }) => {}
+        other => panic!("expected BelowFloor, got {:?}", other.err()),
+    }
+    p.set_vram_budget(DEV, 1 << 30).unwrap();
+    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 0, 0, "orphan").unwrap();
+    let l = cur.acquire(0, s.raw()).unwrap();
+    drop(cur);
+    assert!(p.stats().devices[0].mapped > 0, "a live lease keeps the slots");
+    l.release(s.raw()).unwrap();
+    s.sync();
+    // The last copy in flight reaps the cursor on the mover thread.
+    let mut rounds = 0;
+    while p.stats().devices[0].mapped != 0 {
+        rounds += 1;
+        assert!(rounds < 10_000, "orphaned cursor never closed");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(p.stats().poisoned.is_none());
+    p.close().unwrap();
+}
