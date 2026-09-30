@@ -36,14 +36,14 @@ func (m *machineRuns) releaseRoot(request records.Request) bool {
 	if sourced(request.Models) {
 		return true
 	}
-	capture, problem := m.resolver.CaptureMachineExecution(request)
+	capture, problem := m.captureForSubmission(request)
 	return problem == nil && len(capture.Installations) == 1
 }
 
 // capturedRevision is the unpublished installation a root names. A root carries that one
 // installation; one whose package calls other unpublished packages still goes by capture.
 func (m *machineRuns) capturedRevision(request records.Request) (localpackage.Installation, *exit.Error) {
-	capture, problem := m.resolver.CaptureMachineExecution(request)
+	capture, problem := m.captureForSubmission(request)
 	if problem != nil {
 		return localpackage.Installation{}, problem
 	}
