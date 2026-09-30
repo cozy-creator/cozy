@@ -352,9 +352,9 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 			kind == "request.preparing" && event.Payload["stage"] == "connect" {
 			continue
 		}
-		// Progress is lossy by design: the machine records it only while the run lives, so a
-		// frame that reaches it after the terminal is dropped on one venue and not the other.
-		if kind == "machine.progress" || kind == "request.progress" {
+		// Progress and timing are observations, not lifecycle transitions. Their
+		// sample count and position vary with scheduling on each venue.
+		if kind == "machine.progress" || kind == "request.progress" || kind == "machine.run.timing" {
 			continue
 		}
 		if kind == "request.preparing" {
