@@ -11,6 +11,7 @@
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use crate::cuda;
 use crate::layout::{Layout, PART_ALIGN};
@@ -32,6 +33,9 @@ pub struct HostMem {
     data: usize,
     map_len: usize,
     regions: usize,
+    /// Registered ranges (offset, context as an address): unregistered at drop at the latest,
+    /// since unmapping a registered range leaves the driver a stale pinned range at that VA.
+    registered: Mutex<Vec<(u64, usize)>>,
 }
 
 // The mapping is shared memory addressed by offsets; all mutation goes through the plane's
@@ -115,6 +119,7 @@ impl HostMem {
             data,
             map_len,
             regions,
+            registered: Mutex::new(Vec::new()),
         };
         let head = h.head();
         if fresh {
@@ -241,7 +246,12 @@ impl HostMem {
         if rc == cuda::ERROR_HOST_MEMORY_ALREADY_REGISTERED {
             return Ok(());
         }
-        cuda::check("cuMemHostRegister", rc)
+        cuda::check("cuMemHostRegister", rc)?;
+        let mut ctx: cuda::CUcontext = std::ptr::null_mut();
+        // SAFETY: out-param.
+        unsafe { (d.ctx_get_current)(&mut ctx) };
+        self.registered.lock().unwrap().push((off, ctx as usize));
+        Ok(())
     }
 
     pub fn unregister(&self, off: u64) -> Result<()> {
@@ -249,13 +259,21 @@ impl HostMem {
         // SAFETY: `off` is the start of a range this process registered.
         cuda::check("cuMemHostUnregister", unsafe {
             (d.mem_host_unregister)(self.ptr.add(off as usize) as *mut libc::c_void)
-        })
+        })?;
+        self.registered.lock().unwrap().retain(|r| r.0 != off);
+        Ok(())
     }
 }
 
 impl Drop for HostMem {
     fn drop(&mut self) {
-        // SAFETY: unmapping our own mapping; registered ranges were unregistered by the plane.
+        // A plane that never closed (poisoned) still owns registrations: end them first.
+        for (off, ctx) in std::mem::take(self.registered.get_mut().unwrap()) {
+            if let Ok(_g) = cuda::CtxGuard::enter(ctx as cuda::CUcontext) {
+                let _ = self.unregister(off);
+            }
+        }
+        // SAFETY: unmapping our own mapping, now unregistered.
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.map_len) };
     }
 }

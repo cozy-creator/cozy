@@ -343,6 +343,7 @@ fn departures_skip_ahead_or_demand_fill_and_cycles_run_until_close() {
     take(2, &mut reads); // skips position 1: its slot is handed on unread
     take(0, &mut reads); // the next cycle
     take(0, &mut reads); // again: skips 1 and 2 to the following cycle
+    // The loop starts at 0 while the schedule is at 1: two more skips.
     for _ in 0..5 {
         for r in 0..3 {
             take(r, &mut reads);
@@ -356,7 +357,7 @@ fn departures_skip_ahead_or_demand_fill_and_cycles_run_until_close() {
     cur.close().unwrap();
     let st = p.stats();
     let tag = st.tags.iter().find(|t| t.2 == "cfg").unwrap();
-    assert_eq!(tag.3.skipped, 3);
+    assert_eq!(tag.3.skipped, 5);
     // A region the schedule does not name is a demand acquire (resident, a miss).
     let cur = p.stream(ws, DEV, &[1, 2], 1, 1, 0, "narrow", None).unwrap();
     let l = cur.acquire(0, s.raw()).unwrap();

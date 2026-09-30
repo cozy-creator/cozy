@@ -90,7 +90,10 @@ ts = p.replicate(ws, devices, regions=None, priority=0, pin=False)  # [Ticket]
   raises `Shortfall` (need, available, blockers: dropping or re-ranking them would help).
   A request larger than the whole budget raises `BelowFloor` (need, budget: nothing helps).
 - `"pinned"`: fill the memfd from the store (page-cache bytes copied, the rest O_DIRECT),
-  page-lock it (`cuMemHostRegister`, portable) when the plane has devices.
+  page-lock it (`cuMemHostRegister`, portable) when the plane has devices. **Registration
+  serializes this process's CUDA driver** (G1: ~0.1 ms per MiB; other threads' kernel launches
+  wait meanwhile; unregister on eviction ~0.03 ms/MiB): want the pinned tier at admission or
+  between stages, never while this process computes. A host-only plane registers nothing.
 - device: map the regions (slab-sized handles), then copy from the pinned tier if it holds the
   region, after it if it is filling, else disk → staging buffers → device.
 - `replicate`: one pinned fill (if the pinned budget allows), then one copy per device.
