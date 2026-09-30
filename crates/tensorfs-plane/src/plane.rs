@@ -226,7 +226,7 @@ pub(crate) struct Core {
     pub regions: BTreeMap<(u32, usize, String, u32), RegionCounters>,
     pub events: VecDeque<Event>,
     pub events_dropped: u64,
-    pub timings: Vec<Timing>,
+    pub timings: VecDeque<Timing>,
 }
 
 pub(crate) struct DeviceRt {
@@ -289,13 +289,17 @@ impl Core {
     }
 }
 
-/// Fold resolved timing pairs into counters; keep the unresolved.
-fn resolve_timings(c: &mut Core) {
-    let mut keep = Vec::new();
-    for t in std::mem::take(&mut c.timings) {
+/// Fold resolved timing pairs into counters; keep the unresolved. `all: false` stops at the
+/// first pair still in flight (the hot-path sweep: a query or two per release).
+pub(crate) fn resolve_timings(c: &mut Core, all: bool) {
+    let mut keep = VecDeque::new();
+    while let Some(t) = c.timings.pop_front() {
         if !(t.b.done().unwrap_or(false)) {
-            keep.push(t);
-            continue;
+            keep.push_back(t);
+            if all {
+                continue;
+            }
+            break;
         }
         let ns = (t.b.since(&t.a).unwrap_or(0.0) as f64 * 1e6) as u64;
         match &t.kind {
@@ -334,6 +338,7 @@ fn resolve_timings(c: &mut Core) {
             }
         }
     }
+    keep.append(&mut c.timings);
     c.timings = keep;
 }
 
@@ -347,7 +352,7 @@ fn commit(reg: &mut DReg) -> Result<()> {
     Ok(())
 }
 
-fn prune(pending: &mut Vec<EvRef>) {
+pub(crate) fn prune(pending: &mut Vec<EvRef>) {
     pending.retain(|e| !e.done().unwrap_or(false));
 }
 
@@ -767,6 +772,7 @@ impl Inner {
                     let h = &mut w.hregs[r as usize];
                     h.holds -= 1;
                     if let Ok(cp) = &res {
+                        prune(&mut h.pending);
                         h.pending.push(cp.ready.clone());
                     }
                 }
@@ -776,7 +782,7 @@ impl Inner {
                     Ok(cp) => {
                         reg.state = DState::Filling(cp.ready.clone());
                         c.dstats[d].copies += 1;
-                        c.timings.push(Timing {
+                        c.timings.push_back(Timing {
                             dev: d,
                             ws: ws.0,
                             kind: TimingKind::Copy { from_host },
@@ -910,7 +916,7 @@ impl Inner {
             c.regions.entry((ws.0, d, tag.to_string(), r)).or_default().late += 1;
         }
         if let Some(a) = a {
-            c.timings.push(Timing {
+            c.timings.push_back(Timing {
                 dev: d,
                 ws: ws.0,
                 kind: TimingKind::Stall { tag: tag.to_string(), region: r },
@@ -1019,7 +1025,7 @@ impl Plane {
                     regions: BTreeMap::new(),
                     events: VecDeque::new(),
                     events_dropped: 0,
-                    timings: Vec::new(),
+                    timings: VecDeque::new(),
                 }),
                 cv: Condvar::new(),
             }),
@@ -1435,13 +1441,13 @@ impl Plane {
 
     pub fn events(&self) -> Vec<Event> {
         let mut c = self.lock();
-        resolve_timings(&mut c);
+        resolve_timings(&mut c, true);
         c.events.drain(..).collect()
     }
 
     pub fn stats(&self) -> Stats {
         let mut c = self.lock();
-        resolve_timings(&mut c);
+        resolve_timings(&mut c, true);
         let t = &self.inner.tally;
         let mut host = HostStats {
             budget: c.host_budget,
@@ -1733,8 +1739,9 @@ impl Lease {
         ev.record(stream as CUstream)?;
         let start = self.start.lock().unwrap().take();
         let mut c = self.inner.core.lock().unwrap();
+        resolve_timings(&mut c, false);
         if let Some(a) = start {
-            c.timings.push(Timing {
+            c.timings.push_back(Timing {
                 dev: self.dev,
                 ws: self.ws.0,
                 kind: TimingKind::Compute { tag: self.tag.clone(), region: self.region },

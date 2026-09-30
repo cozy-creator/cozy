@@ -119,6 +119,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64) -> Result<()> {
                     let h = &mut w.hregs[r as usize];
                     h.holds -= 1;
                     if let Ok(cp) = &res {
+                        crate::plane::prune(&mut h.pending);
                         h.pending.push(cp.ready.clone());
                     }
                 }
@@ -127,7 +128,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64) -> Result<()> {
             if let Ok(cp) = &res {
                 c.dstats[d].copies += 1;
                 c.tag(ws.0, d, &tag).streamed_bytes += cp.bytes;
-                c.timings.push(Timing {
+                c.timings.push_back(Timing {
                     dev: d,
                     ws: ws.0,
                     kind: TimingKind::Copy { from_host },
