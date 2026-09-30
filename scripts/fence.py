@@ -28,7 +28,7 @@ ALLOW = {
     "webpki": ("crates/tensorfs-core/Cargo.toml", "crates/tensorfs-core/src/transport/"),
 }
 SCAN = ["crates/*/Cargo.toml", "crates/*/src/**/*.rs"]
-RANK = {"tensorfs-core": 0, "tensorfs-py": 1}
+RANK = {"tensorfs-core": 0, "tensorfs-plane": 1, "tensorfs-py": 2}
 
 
 def rel(p):
