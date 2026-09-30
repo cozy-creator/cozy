@@ -233,8 +233,17 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 					movies = append(movies, movie)
 				}
 				movies = append(movies, completed[0])
+				for i, movie := range movies {
+					movies[i] = playerLargeMdat(t, movie, (i+1)*2<<20)
+				}
 				m.machine.Replace(26, "video", -1, movies[0], 500_000)
 				page := open(t, m.link(func(g *capability.Grant) { g.Run = "26" }, "video"))
+				playerEval(t, page, `(async () => {
+					const {play, parseLink} = await import("./cozy-webrtc.js");
+					player().close(); video().autoplay = false;
+					window.cozyPlayer = play(video(), parseLink(location.hash), {window: 65536});
+					return true;
+				})()`)
 				playerWait(t, page, "indexed partial plays before run completion", `!player().finished && player().stats.type === "video/mp4" && video().readyState >= 2`)
 				old := playerEval(t, page, `(async () => {
 					video().pause(); video().currentTime = 0.2;
@@ -281,6 +290,30 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Keep real sample bytes and their offsets unchanged, but move the trailing moov
+// beyond many credit windows. Unreferenced trailing bytes inside mdat are legal.
+func playerLargeMdat(t *testing.T, movie []byte, padding int) []byte {
+	t.Helper()
+	for at := 0; at+8 <= len(movie); {
+		size := int(binary.BigEndian.Uint32(movie[at:]))
+		if size < 8 || at+size > len(movie) {
+			t.Fatal("invalid indexed fixture box")
+		}
+		if kind := string(movie[at+4 : at+8]); kind == "moov" {
+			t.Fatal("fixture must put moov after mdat")
+		} else if kind == "mdat" {
+			out := make([]byte, len(movie)+padding)
+			copy(out, movie[:at+size])
+			copy(out[at+size+padding:], movie[at+size:])
+			binary.BigEndian.PutUint32(out[at:], uint32(size+padding))
+			return out
+		}
+		at += size
+	}
+	t.Fatal("indexed fixture has no mdat")
+	return nil
 }
 
 // playerMachine is a machine's real WebRTC listener serving files, reached through a relay
