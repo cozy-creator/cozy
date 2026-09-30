@@ -147,7 +147,9 @@ func capturedSourceAccountIndex(path string) (bool, *exit.Error) {
 		return false, exit.Named(exit.Validation, "machine_execution.source_metadata_missing", "cannot read captured source archive: %s", err)
 	}
 	defer file.Close()
-	archive := tar.NewReader(io.LimitReader(file, (1<<30)+1))
+	// The file itself, not a reader over it: members before pyproject.toml (vendored wheels
+	// sort first) are skipped by seeking instead of read.
+	archive := tar.NewReader(file)
 	for count := 0; count <= packagepublish.MaxSourceFiles; count++ {
 		header, err := archive.Next()
 		if err == io.EOF {
