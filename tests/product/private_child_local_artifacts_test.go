@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -190,6 +191,10 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	}
 	var removed uint32
 	var reclaimed uint64
+	journal, err := sql.Open("sqlite", "file:"+machineJournal(root)+"?mode=ro")
+	must(t, err)
+	defer journal.Close()
+	journal.SetMaxOpenConns(1)
 	for deadline := time.Now().Add(10 * time.Second); ; {
 		var result struct {
 			Removed uint32 `json:"removed_entries"`
@@ -199,11 +204,19 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		must(t, json.Unmarshal([]byte(run("cache", "prune")), &result))
 		removed += result.Removed
 		reclaimed += result.Bytes
-		if !result.Busy {
+		// Collection can finish while a child's temporary custody is still settling.
+		// A non-busy native GC may therefore skip A. Observe its exact cache mapping
+		// leaving before the fresh caller proves recomputation below.
+		var cached bool
+		must(t, journal.QueryRow("SELECT EXISTS(SELECT 1 FROM operation_cache WHERE lower(hex(key))=?)",
+			originalA.Computation).Scan(&cached))
+		if !result.Busy && !cached {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("native GC remained busy after all package workers stopped")
+			logNativeMemoCustody(t, journal)
+			t.Fatalf("native pruning did not remove unused A: cached=%t store_busy=%t entries=%d bytes=%d",
+				cached, result.Busy, removed, reclaimed)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -233,4 +246,30 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		}
 	}
 	t.Logf("local native memo cycles, daemon restarts and prune passed: entries=%d bytes=%d", removed, reclaimed)
+}
+
+// Bounded, read-only ownership facts for a failed pruning barrier; no result payloads
+// or delegated credentials enter the test log.
+func logNativeMemoCustody(t *testing.T, journal *sql.DB) {
+	t.Helper()
+	for _, query := range []struct{ name, sql string }{
+		{"memo", `SELECT json_group_array(json_object('id',id,'state',state,
+ 'source',json_extract(CAST(body AS TEXT),'$.source.request_id'),
+ 'holds',json_extract(CAST(body AS TEXT),'$.holds'))) FROM (SELECT * FROM operation_cache LIMIT 32)`},
+		{"readers", `SELECT json_group_array(json_object('consumer',consumer,'state',state,'cache',cache_id))
+ FROM (SELECT * FROM operation_lookups LIMIT 32)`},
+		{"holds", `SELECT json_group_array(json_object('id',id,'state',state,'transaction',transaction_id))
+ FROM (SELECT * FROM holds WHERE state<>'released' LIMIT 64)`},
+		{"recipients", `SELECT json_group_array(json_object('recipient',recipient,'path',path))
+ FROM (SELECT * FROM execution_model_holds LIMIT 64)`},
+		{"executions", `SELECT json_group_array(json_object('request',request,'state',state,'desired',desired,
+ 'collected',collected,'retention_waived',retention_waived)) FROM (SELECT * FROM executions LIMIT 32)`},
+	} {
+		var value string
+		if err := journal.QueryRow(query.sql).Scan(&value); err != nil {
+			t.Logf("native memo %s: %v", query.name, err)
+		} else {
+			t.Logf("native memo %s: %s", query.name, value)
+		}
+	}
 }
