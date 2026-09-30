@@ -338,7 +338,7 @@ installed build. Records at an older schema are refused, never migrated.
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
 | `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
 | `POST /v1/local/jobs/{id}/uploads` | local | yes | upload a run's retained output from the rental holding it as a private checkpoint; never rerun the producer |
-| `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
+| `POST /v1/local/jobs/{id}/cancel` | local | yes | persist cancellation and its actor before contacting the machine; accepted work remains canceling until its outcome is known |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
 | `GET /app.css` | local | no | embedded localhost web UI stylesheet |
 | `GET /app.js` | local | no | embedded localhost web UI script |
@@ -521,6 +521,19 @@ the run identity and local status. An unfinished local intent becomes abandoned;
 prior terminal outcomes remain unchanged. Submission, acceptance, control and
 outcome evidence are retained, and late real facts cannot reopen the abandoned
 local intent. This action does not make a remote cancellation or lifecycle request.
+
+### Machine execution cancellation
+
+`cozy run cancel` saves the cancellation intent and actor in one local transaction
+before connecting to the machine or reading its execution generation. Accepted work
+is shown as `canceling`; an unavailable machine cannot prevent that acknowledgement.
+The background observer delivers the generation-checked command and resumes delivery
+after a daemon restart. A lost reply reuses the recorded command identity.
+
+`--await` waits for the authoritative terminal outcome. Recording intent does not
+claim that remote execution has stopped, and a completed outcome remains unchanged.
+Watcher or API disconnection never creates cancellation intent. Pause and resume
+retain their existing generation-checked control behavior.
 
 ### Machine run duration
 
