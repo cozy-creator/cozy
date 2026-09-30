@@ -321,7 +321,7 @@ func (c *machineConnection) prepareModels(ctx context.Context, request records.R
 					"this machine's agent cannot forward private model overrides; update its agent and Runtime")
 			}
 			var problem *exit.Error
-			if choices, problem = orchestrator.ModelChoices(request, own); problem != nil {
+			if choices, problem = orchestrator.PrivateModelChoices(request); problem != nil {
 				return nil, problem
 			}
 		}

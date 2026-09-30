@@ -10,6 +10,25 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
+func TestPrivateLoRAChoicesCarryAnExactCallableWithoutBroadcasting(t *testing.T) {
+	request := records.Request{Package: "local/probe", Entrypoint: "generate", Models: []records.ModelRef{
+		{Package: "local/probe", Slot: "generate.models.model", Adapters: []records.ModelAdapterRef{{Model: "proof/style", Scale: "0.5"}}},
+		{Package: "local/probe", Slot: "another.models.model", Choice: true, Adapters: []records.ModelAdapterRef{{Model: "proof/other", Scale: "-0.25"}}},
+	}}
+	choices, problem := orchestrator.PrivateModelChoices(request)
+	fatal(t, problem)
+	if len(choices) != 1 || choices[0].Parameter != "generate.models.model" || len(choices[0].Adapters) != 1 || choices[0].Adapters[0].Model != "proof/style" {
+		t.Fatal("private preparation selected a bare slot or another captured callable")
+	}
+	// Release roots supply their entrypoint separately and retain the established
+	// bare root parameter. Qualifying a private RPC must not change that identity.
+	root, problem := orchestrator.ModelChoices(request, request.OwnModels())
+	fatal(t, problem)
+	if len(root) != 1 || root[0].Parameter != "model" {
+		t.Fatal("private preparation changed the release-root selection identity")
+	}
+}
+
 // A private preparation resolves open catalog choices once. Its concrete stack
 // must satisfy the selection, while the root still names the original base and
 // a composed view may legitimately supply an individual component.

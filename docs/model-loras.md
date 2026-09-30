@@ -25,6 +25,20 @@ comma suffix is omitted; zero and negative finite strengths are valid and are no
 normalized across the stack. Adapter alpha/rank scaling is additional to that
 request strength.
 
+The direct Turbo reference call uses `base_model`:
+
+```sh
+cozy run paul/minimax-h3/ref2va_turbo --input clip.yaml \
+  --lora 'base_model:ref2va_dit=your-account/style@1.0.0,0.5'
+```
+
+H3's checkpoint contains both `ref2va_dit` and `fl2va_dit`. Specify the intended
+component; a stack that fits both is ambiguous when the component is omitted.
+The generic stack currently supports compatible linear projection targets.
+Convolution weights and arbitrary non-linear parameter changes need their own
+supported implementation. Turbo keeps its existing distillation adapter while
+the requested stack applies to the selected base transformer.
+
 A composition's child serving function can be selected by its full model slot:
 
 ```sh
@@ -69,6 +83,11 @@ advertise `model_overrides`, and the Host must support wire70 so it forwards bot
 release-root and captured choices. Unsupported peers refuse this operation before submission;
 base-only requests remain supported. Job roots may select their captured serving
 children without declaring a Model argument of their own.
+
+An adapter's source workflow may require additional conditioning. Character Swap
+and Head Swap were trained for editing an existing video with guide conditioning;
+adding those weights to a fresh REF2VA run does not establish better face identity
+or supply the missing guide video.
 
 Runtime owns unmerged application and request cleanup. Base weights are never
 folded or rewritten per strength. The ordinary base, adapter checkpoints and scales

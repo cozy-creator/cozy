@@ -53,6 +53,21 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*pb.ModelChoice
 	return out, nil
 }
 
+// PrivateModelChoices attributes each slot because private preparation selects
+// an installation without naming a root entrypoint beside these choices.
+func PrivateModelChoices(request records.Request) ([]*pb.ModelChoice, *exit.Error) {
+	choices, problem := ModelChoices(request, request.OwnModels())
+	if problem != nil {
+		return nil, problem
+	}
+	for _, choice := range choices {
+		if !strings.Contains(choice.Parameter, ".models.") {
+			choice.Parameter = request.Entrypoint + ".models." + choice.Parameter
+		}
+	}
+	return choices, nil
+}
+
 func downloadAdapters(adapters []records.ModelAdapterRef) []*pb.DownloadAdapterRef {
 	out := make([]*pb.DownloadAdapterRef, 0, len(adapters))
 	for _, a := range adapters {
