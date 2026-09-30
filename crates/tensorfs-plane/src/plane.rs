@@ -420,7 +420,7 @@ impl Inner {
             if freed >= need {
                 break;
             }
-            freed += self.unmap_region(c, WsId(wi), d, r)?;
+            freed += self.unmap_region(c, WsId(wi), d, r, true)?;
             let name = c.ws(WsId(wi))?.name.clone();
             t.evicted.push((name, r));
         }
@@ -428,7 +428,8 @@ impl Inner {
     }
 
     /// Unmap one region (its leases are clear): wait for its pending events, unmap, recycle.
-    pub(crate) fn unmap_region(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, r: u32) -> Result<u64> {
+    /// `evict` counts it as an eviction (and emits the event); closing a weight set does not.
+    pub(crate) fn unmap_region(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, r: u32, evict: bool) -> Result<u64> {
         let ordinal = self.devices[d].ordinal;
         let w = c.ws_mut(ws)?;
         let region = w.layout.regions[r as usize].clone();
@@ -444,24 +445,27 @@ impl Inner {
             return Err(c.poison(format!("unmap of {name}#{r} failed: {e}")));
         }
         let w = c.ws_mut(ws)?;
-        w.evictions += 1;
-        w.evicted_bytes += region.span;
         let reg = &mut w.devs[d].as_mut().unwrap().regs[r as usize];
         let chunks = std::mem::take(&mut reg.chunks);
         reg.state = DState::Absent;
         c.arenas[d].mapped -= region.span;
         c.arenas[d].put_idle(chunks);
-        c.dstats[d].evictions += 1;
-        c.dstats[d].evicted_bytes += region.span;
-        c.event(Event {
-            kind: "evicted",
-            ws: Some(name),
-            region: Some(r),
-            device: Some(ordinal),
-            bytes: region.span,
-            ns: 0,
-            detail: String::new(),
-        });
+        if evict {
+            let w = c.ws_mut(ws)?;
+            w.evictions += 1;
+            w.evicted_bytes += region.span;
+            c.dstats[d].evictions += 1;
+            c.dstats[d].evicted_bytes += region.span;
+            c.event(Event {
+                kind: "evicted",
+                ws: Some(name),
+                region: Some(r),
+                device: Some(ordinal),
+                bytes: region.span,
+                ns: 0,
+                detail: String::new(),
+            });
+        }
         Ok(region.span)
     }
 
@@ -1263,7 +1267,7 @@ impl Plane {
                             what: format!("region {r} on device {o}"),
                         });
                     }
-                    freed += self.inner.unmap_region(&mut c, ws, d, r)?;
+                    freed += self.inner.unmap_region(&mut c, ws, d, r, true)?;
                 }
                 c.arenas[d].trim()?;
             }
@@ -1388,7 +1392,7 @@ impl Plane {
             }
             for r in 0..n {
                 if !c.ws(ws)?.devs[d].as_ref().unwrap().regs[r as usize].chunks.is_empty() {
-                    self.inner.unmap_region(&mut c, ws, d, r)?;
+                    self.inner.unmap_region(&mut c, ws, d, r, false)?;
                 }
             }
             let dw = c.ws_mut(ws)?.devs[d].take().unwrap();
