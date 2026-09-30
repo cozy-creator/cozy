@@ -145,32 +145,46 @@ func TestRentedPreparationTransportLossKeepsTheRunQueued(t *testing.T) {
 	}
 }
 
-// An older Runtime can still run base models, but cannot silently drop a stack.
+// Either an older Runtime or an older Host must refuse this operation. A new
+// Runtime's advertised capability cannot make an old Host preserve unknown fields.
 func TestALoRAStackRefusesAnOlderRuntimeBeforeSubmission(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
-	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
-		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
-	})
-	root, _ := rentedLadderMachine(t, h, &fakePod{machine: machines, preparedPlacement: modelBearingPlacement(t)}, nil)
-	var mu sync.Mutex
-	var seen []string
-	served := h.server.Config.Handler
-	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/v1/rentals") {
+	for _, oldHost := range []bool{false, true} {
+		t.Run(fmt.Sprintf("old-host=%t", oldHost), func(t *testing.T) {
+			h := newLadderHub(t)
+			h.bind(goodLadder())
+			machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
+				return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
+			})
+			pod := &fakePod{machine: machines, preparedPlacement: modelBearingPlacement(t)}
+			if oldHost {
+				pod.wireMinor, machines.modelOverrides = 69, true
+			}
+			root, _ := rentedLadderMachine(t, h, pod, nil)
+			var mu sync.Mutex
+			var seen []string
+			served := h.server.Config.Handler
+			h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/v1/rentals") {
+					mu.Lock()
+					seen = append(seen, r.Method+" "+r.URL.Path)
+					mu.Unlock()
+				}
+				served.ServeHTTP(w, r)
+			})
+			style := "proof/style#sha256:" + strings.Repeat("2", 64)
+			code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--lora", "model:fl2va_dit="+style+",0.5",
+				"--rental=tessa", "--json", "--await")
 			mu.Lock()
-			seen = append(seen, r.Method+" "+r.URL.Path)
+			reads := append([]string(nil), seen...)
 			mu.Unlock()
-		}
-		served.ServeHTTP(w, r)
-	})
-	style := "proof/style#sha256:" + strings.Repeat("2", 64)
-	code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--lora", "model:fl2va_dit="+style+",0.5",
-		"--rental=tessa", "--json", "--await")
-	mu.Lock()
-	defer mu.Unlock()
-	if code == 0 || !strings.Contains(out, "cannot apply the requested model overrides") || len(machines.submitted()) != 0 || len(seen) != 0 {
-		t.Fatalf("--lora was not refused up front [exit %d, %d submitted, hub %v]: %s", code, len(machines.submitted()), seen, out)
+			if code == 0 || !strings.Contains(out, "cannot apply the requested model overrides") || len(machines.submitted()) != 0 || len(reads) != 0 {
+				t.Fatalf("--lora was not refused up front [exit %d, %d submitted, hub %v]: %s", code, len(machines.submitted()), reads, out)
+			}
+			code, out = runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--await")
+			if code != 0 || len(machines.submitted()) != 1 {
+				t.Fatalf("base-only request stopped working on an older Runtime [exit %d]: %s", code, out)
+			}
+		})
 	}
 }
 

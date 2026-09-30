@@ -62,8 +62,8 @@ The API representation is an `adapters` list inside each selected model row. Eve
 row carries `component`, immutable `model`/`manifest` (and optional release/lane),
 `source_component`, and a canonical finite decimal `scale` string. Both ordinary
 and native retained bases keep their original custody. The executing Runtime must
-advertise `model_overrides`; private serving preparation also needs a wire70 Host
-that forwards the choices. Unsupported peers refuse this operation before submission;
+advertise `model_overrides`, and the Host must support wire70 so it forwards both
+release-root and captured choices. Unsupported peers refuse this operation before submission;
 base-only requests remain supported. Job roots may select their captured serving
 children without declaring a Model argument of their own.
 

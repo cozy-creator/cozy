@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"encoding/base64"
 	"encoding/json"
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -154,10 +156,20 @@ func ServingPlacement(setBytes []byte, installationID string, request records.Re
 		if row.Str("installation_id") != installationID {
 			continue
 		}
-		if problem := requireAdapterEcho(request.Models, placementModels(request.Package, row)); problem != nil {
+		observed := placementModels(request.Package, row)
+		observed = slices.DeleteFunc(observed, func(model ModelRef) bool {
+			return !strings.HasPrefix(model.BindingSlot(), request.Entrypoint+".models.")
+		})
+		selected, problem := resolvePreparedAdapters(request.OwnModels(), observed)
+		if problem != nil {
 			return nil, "", problem
 		}
-		if planID, ok := entrypointServes(row, logicalOf(request)); ok && validDigest(planID) {
+		if problem := requireAdapterEcho(selected, observed); problem != nil {
+			return nil, "", problem
+		}
+		logical := logicalOf(request)
+		logical.Models = selected
+		if planID, ok := entrypointServes(row, logical); ok && validDigest(planID) {
 			return row, planID, nil
 		}
 	}

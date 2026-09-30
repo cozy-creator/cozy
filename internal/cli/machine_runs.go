@@ -462,14 +462,14 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		return problem
 	}
 	connection.KeepWorkspace(workspace)
-	if request.RequiresModelOverrides() && !workspace.ModelOverrides {
+	if request.RequiresModelOverrides() && (connection.WireMinor < 70 || !workspace.ModelOverrides) {
 		code := exit.Structural
 		if len(link.Submission) > 0 {
 			code = exit.Unavailable // an already transmitted offer retains its uncertainty
 		}
 		return exit.Named(code, "model_overrides.unavailable",
-			"this machine's Runtime cannot apply the requested model overrides; no submission was sent").
-			WithRemedy("update the machine Runtime before retrying this request")
+			"this machine's agent or Runtime cannot apply the requested model overrides; no submission was sent").
+			WithRemedy("update the machine agent and Runtime before retrying this request")
 	}
 	rooted := len(link.Submission) == 0 && m.releaseRoot(request)
 	prepared := false // the root's unpublished installation is on the machine this pass

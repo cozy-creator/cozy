@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"cmp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -61,6 +63,48 @@ func hasModelAdapters(models []ModelRef) bool {
 		}
 	}
 	return false
+}
+
+// resolvePreparedAdapters verifies the machine's resolution of an open choice,
+// then uses its concrete stack for this placement check only. Warm reuse still
+// compares exact manifests through SameAdapters; the requested capture is unchanged.
+func resolvePreparedAdapters(requested, observed []ModelRef) ([]ModelRef, *exit.Error) {
+	out := append([]ModelRef(nil), requested...)
+	refuse := func() ([]ModelRef, *exit.Error) {
+		return nil, exit.Named(exit.Structural, "model_adapters_preparation_mismatch",
+			"worker preparation omitted or changed the requested LoRA stack")
+	}
+	if len(out) == 0 && hasModelAdapters(observed) {
+		return refuse()
+	}
+	for i, selected := range out {
+		index := slices.IndexFunc(observed, func(model ModelRef) bool { return model.BindingSlot() == selected.BindingSlot() })
+		if index < 0 {
+			if len(selected.Adapters) > 0 {
+				return refuse()
+			}
+			continue
+		}
+		actual := observed[index].Adapters
+		if len(selected.Adapters) != len(actual) {
+			return refuse()
+		}
+		for n, want := range selected.Adapters {
+			got := actual[n]
+			if got.Component == "" || want.Component != "" && want.Component != got.Component ||
+				cmp.Or(want.SourceComponent, "adapter") != cmp.Or(got.SourceComponent, "adapter") ||
+				cmp.Or(want.Scale, "1") != cmp.Or(got.Scale, "1") ||
+				want.Model != "" && want.Model != got.Model || want.Release != "" && want.Release != got.Release ||
+				want.Lane != "" && want.Lane != got.Lane || want.Manifest != "" && want.Manifest != got.Manifest {
+				return refuse()
+			}
+			if _, err := canonical.Raw(got.Manifest); err != nil || got.Model == "" {
+				return refuse()
+			}
+		}
+		out[i].Adapters = actual
+	}
+	return out, nil
 }
 
 func placementAdapters(slot canonical.Doc, models map[string]canonical.Doc) []records.ModelAdapterRef {

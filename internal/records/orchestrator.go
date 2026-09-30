@@ -693,7 +693,9 @@ func (m ModelRef) BindingSlot() string {
 // RequiresModelOverrides isolates the new operation from ordinary base selections.
 func (r Request) RequiresModelOverrides() bool {
 	for _, model := range r.Models {
-		if len(model.Adapters) > 0 || model.Choice && model.Callable != "" {
+		entrypoint, _, attributed := strings.Cut(model.BindingSlot(), ".models.")
+		child := model.Package != "" && model.Package != r.Package || attributed && entrypoint != r.Entrypoint
+		if len(model.Adapters) > 0 || model.Choice && child {
 			return true
 		}
 	}

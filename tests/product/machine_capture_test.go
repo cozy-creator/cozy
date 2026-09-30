@@ -7,13 +7,79 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/cli"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/secret"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+func TestCapturedChildModelChoicesSurviveReopenWithoutBroadeningScope(t *testing.T) {
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	for _, name := range []string{"parent", "motion", "image"} {
+		inst := records.PackageInstall{ID: name, Package: "local/" + name, Version: "1.0.0", SourceKind: "local", Dir: t.TempDir()}
+		fatal(t, store.RecordInstall(inst))
+		_, problem := localpackage.StageWheels(layout, inst, fixturePackageInterface,
+			[]string{installWheel(t, name, "1.0.0", "")}, nil)
+		fatal(t, problem)
+	}
+	fatal(t, store.RecordChildBindings([]records.ChildBinding{
+		{ParentInstallID: "parent", ChildInstallID: "motion", Module: "motion", Export: "generate", Entrypoint: "generate"},
+		{ParentInstallID: "parent", ChildInstallID: "image", Module: "image", Export: "generate", Entrypoint: "generate"},
+	}))
+	request := records.Request{ID: "job-adapted", IdemKey: "adapted", Kind: "job", State: "queued",
+		BodyDigest: childDigest("a"), Package: "local/parent", Release: "1.0.0", Entrypoint: "compose",
+		InstallID: "parent", LocalInstallationID: "parent", Payload: []byte(`{}`), Models: []records.ModelRef{{
+			Choice: true, Package: "local/motion", Callable: "local/motion/generate", Slot: "generate.models.model",
+			Adapters: []records.ModelAdapterRef{
+				{Component: "dit", Model: "proof/style", Release: "1.0.0", Scale: "0", SourceComponent: "adapter"},
+				{Component: "dit", Source: "hf://proof/style@0123456789abcdef0123456789abcdef01234567/style.safetensors",
+					Profiles: []string{"lora"}, Scale: "-0.25", SourceComponent: "adapter"},
+			},
+		}}}
+	request, _, problem = store.Submit(request)
+	fatal(t, problem)
+	cfg := config.Config{Home: root, HuggingFaceToken: secret.New("fixture-memory-only-secret")}
+	first, problem := cli.NewResolver(store, cfg).CaptureMachineExecution(request)
+	fatal(t, problem)
+	store.Close()
+	store, problem = records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	retained, problem := store.RequestRow(request.ID)
+	fatal(t, problem)
+	second, problem := cli.NewResolver(store, cfg).CaptureMachineExecution(*retained)
+	fatal(t, problem)
+	if !bytes.Equal(first.Canonical, second.Canonical) || !bytes.Equal(first.Digest, second.Digest) {
+		t.Fatal("reopening durable selections changed the capture")
+	}
+	var graph pb.MachineExecutionCapture
+	must(t, canonical.Unmarshal(second.Canonical, &graph))
+	if len(graph.Bindings) != 2 || len(graph.ModelChoices) != 1 ||
+		graph.ModelChoices[0].Parameter != "local/motion/generate.models.model" {
+		t.Fatalf("override escaped the selected child: %+v", &graph)
+	}
+	stack := graph.ModelChoices[0].Adapters
+	if len(stack) != 2 || stack[0].Scale != "0" || stack[1].Scale != "-0.25" ||
+		len(stack[1].Profiles) != 1 || bytes.Contains(second.Canonical, []byte("fixture-memory-only-secret")) {
+		t.Fatal("capture lost ordered source choices or retained a credential")
+	}
+	retained.Models[0].Adapters[0], retained.Models[0].Adapters[1] = retained.Models[0].Adapters[1], retained.Models[0].Adapters[0]
+	changed, problem := cli.NewResolver(store, cfg).CaptureMachineExecution(*retained)
+	fatal(t, problem)
+	if bytes.Equal(second.Digest, changed.Digest) {
+		t.Fatal("changing adapter order reused the same capture identity")
+	}
+}
 
 func TestMachineCaptureIncludesInvocableServingSelfBindings(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
