@@ -93,8 +93,8 @@ impl Source {
         }
     }
 
-    /// End the TensorFS lease. Only after every fill that reads through it has finished.
-    pub fn release(&self) -> Result<()> {
+    /// End the TensorFS lease. Runs when the last weight set and handle drop the source.
+    fn release(&self) -> Result<()> {
         self.fds.lock().unwrap().clear();
         match self.lease.write().unwrap().take() {
             Some(l) => Ok(l.release(&self.meta)?),
@@ -206,6 +206,14 @@ impl Source {
         }
         tally.direct_bytes.fetch_add(item.len, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        if let Err(e) = self.release() {
+            eprintln!("tensorfs-plane: read lease release failed: {e}");
+        }
     }
 }
 

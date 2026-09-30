@@ -1,4 +1,4 @@
-# tensorfs.plane — Python API (v1, 2026-09-30)
+# tensorfs.plane — Python API (v2, 2026-09-30)
 
 The weight plane moves bytes; cozy-runtime decides. The plane never measures free memory,
 never picks victims among equals, never reorders a schedule. It ships inside the `tensorfs`
@@ -38,14 +38,16 @@ Budgets start at 0: set them before `want`.
 ## Register
 
 ```python
+src = p.source(store, lease) # tensorfs.Store + tensorfs.ReadLease; the lease is CONSUMED
+                             #   (lease.live -> False) and ends when the last weight set using
+                             #   the source closes and `src` is dropped: one lease per manifest
 ws = p.register(
-    name,                    # content id for telemetry, e.g. f"{header_sha}/{component}/{route}"
-    store,                   # tensorfs.Store
-    lease,                   # tensorfs.ReadLease covering the plan; CONSUMED (lease.live -> False),
-                             #   the weight set releases it at ws.close()
+    name,                    # content id; every stats/events row names the weight set by it
+    src,                     # a plane.Source (shared by the manifest's components)
     plan,                    # tensorfs.ReadPlan (tensorfs.plan(header, traversal, components))
-    regions,                 # list[list[str]]: region r = tensor ids "component/key"; every plan
-                             #   tensor in exactly one region; a region's parts keep plan order
+    regions,                 # list[list[str]]: region r = tensor ids "component/key" (all roles)
+                             #   or exact parts "component/key#role"; every plan part in exactly
+                             #   one region; a region's parts keep plan order; no empty region
     host_fd=None,            # adopt a memfd holding this layout (another process's pinned tier)
 )
 ws.name, ws.nbytes           # nbytes = layout span (multiple of 2 MiB)
@@ -91,40 +93,56 @@ ts = p.replicate(ws, devices, regions=None, priority=0, pin=False)  # [Ticket]
 - device: map the regions (slab-sized handles), then copy from the pinned tier if it holds the
   region, after it if it is filling, else disk → staging buffers → device.
 - `replicate`: one pinned fill (if the pinned budget allows), then one copy per device.
+- A `want` of regions already resident only updates their priority/pin: no bytes move and
+  nothing is evicted. To re-prioritise without any chance of a fill, use:
+
+```python
+p.prioritise(ws, tier, regions=None, priority=0, pin=None)   # never moves a byte
+```
 
 ## Resident access
 
 ```python
-lease = p.acquire(ws, device, region, stream)
+lease = p.acquire(ws, device, region, stream, priority=None)
 lease.ptr, lease.nbytes, lease.region, lease.slot   # slot is None for resident leases
+lease.view()                 # ONE uint8 DLPack view of the region's bytes (see Views)
 lease.release()              # records the release event on the acquire stream (or pass stream=)
 with p.acquire(ws, device, region, stream) as lease: ...
 ```
 
 `acquire` enqueues `cuStreamWaitEvent(stream, fill_event)` when the fill is still in flight —
-no host block. A region not resident is filled on demand (counted as a miss). Release exactly
-once; a lease garbage-collected unreleased POISONS the weight set on that device.
+no host block. A region not resident is filled on demand (counted as a miss) at `priority`
+(when given, it becomes the region's priority first) and may evict only regions strictly
+below it; when nothing can go it raises `Shortfall` (need, available, blockers). Encode LRU
+among a stage's blocks as increasing priorities (e.g. a clock). Release exactly once; a lease
+garbage-collected unreleased POISONS the plane.
 
 ## Streaming (the hot path)
 
 ```python
-cur = p.stream(ws, device, order, window, repeat=1, priority=0, tag="denoise")
+cur = p.stream(ws, device, order, window, repeat=1, priority=0, tag="denoise")  # repeat=0: cycle until close
 cur.home                     # per order index: True = served in place (resident at stream())
 cur.window, cur.slot_nbytes, cur.slot_ptrs
 cur.slot_view(i)             # uint8 DLPack view of slot i (keeps the cursor from closing)
-for step in range(repeat):
+cur.position, cur.passes     # positions consumed; completed cycles over `order`
+for step in range(passes):
     for r in order:
-        lease = cur.acquire(r, stream)   # must be the next scheduled region, else ScheduleMismatch
+        lease = cur.acquire(r, stream)
         ...block forward on `stream`...  # bytes at lease.ptr (slot lease.slot, or resident)
         lease.release()
-cur.close()                  # refuses while a lease is live; waits for copies in flight
+cur.close()                  # refuses while a lease or slot view is live; waits for copies
 ```
 
-- Regions resident on the device at `stream()` are held (not evictable) until `close()`; the
-  rest stream through `window` slots of `max(streamed span)` bytes (charged to the device
-  budget; may evict below `priority`).
+- Regions resident (Ready, filling or queued) on the device at `stream()` are served in place
+  and held (not evictable) until `close()`; the rest stream through `window` slots of
+  `max(streamed span)` bytes (charged to the device budget; may evict below `priority`).
 - Copies run `window` positions ahead on the copy stream. Each waits on the release event of
   the slot's previous user; `acquire` never blocks the host once the copy is queued.
+- **Departures never raise.** `acquire(r)` for a region that is not the next one: if `r` is
+  scheduled later within the next `len(order)` positions, the positions before it are
+  skipped (counted as `skipped`; their slots are handed on unread) and `r` is served at its
+  position; otherwise (not in `order`, or past the end) it is a demand `p.acquire` (a miss
+  when not resident) and the position does not move.
 - Holding `window` streamed leases at once and asking for one more raises (window exhausted).
 - To change the resident set or window mid-stage (e.g. after an OOM at a block boundary):
   release, `close()`, change budgets, `stream()` again with the remaining order.
@@ -135,9 +153,12 @@ cur.close()                  # refuses while a lease is live; waits for copies i
 v = ws.view(device)          # uint8 DLPack, shape [ws.nbytes]: the stable VA (reserved once)
 t = torch.from_dlpack(v)     # bytes valid only for resident regions under a lease
 v.stale                      # True if any region was unmapped since the view was made
+lv = lease.view()            # uint8 DLPack, shape [lease.nbytes], at lease.ptr
 ```
 
-Views keep the VA alive (block `ws.close()`), never the pages.
+Views keep the VA alive (a weight set's: blocks `ws.close()`; a slot's: blocks
+`cur.close()`), never the pages. Addresses repeat (a region's home, a slot), so views can be
+built once and cached by `ptr`: part `x` of region `r` is at `ptr + x.offset - r.offset`.
 
 ## Telemetry (exact facts)
 
@@ -152,10 +173,12 @@ p.stats() -> {
                "copies", "host_copy_bytes", "host_copy_ns", "disk_copy_bytes", "disk_copy_ns",
                "misses", "evictions", "evicted_bytes", "trims"}],
   "sets":    [{"id", "name", "nbytes", "regions", "host_ready_bytes", "host_memfd_bytes",
-               "devices": [{"ordinal", "ready_bytes", "poisoned"}]}],
-  "stages":  [{"ws", "device", "tag", "acquires", "misses", "late", "late_bytes", "stall_ns",
-               "streamed_bytes"}],
+               "evictions", "evicted_bytes", "devices": [{"ordinal", "ready_bytes"}]}],
+  "stages":  [{"ws", "device", "tag", "acquires", "skipped", "misses", "late", "late_bytes",
+               "stall_ns", "streamed_bytes"}],
+  "regions": [{"ws", "device", "tag", "region", "uses", "compute_ns", "stall_ns", "late"}],
   "events_dropped": int,
+  "poisoned": str | None,
 }
 p.events() -> [{"kind", "ws", "region", "device", "bytes", "ns", "detail"}]   # drains
 ```
@@ -163,14 +186,47 @@ p.events() -> [{"kind", "ws", "region", "device", "bytes", "ns", "detail"}]   # 
 - Copy GB/s = `*_copy_bytes / *_copy_ns` (GPU-timed by events around each copy).
 - `late`: acquires whose copy had not completed when acquired; `stall_ns`: GPU-measured wait
   of the consumer stream on late copies plus any host wait for an unqueued copy.
+- `regions[].compute_ns`: GPU time from the end of the acquire's wait to the release event,
+  per region and stage tag (the cost model's cᵢ). Timing pairs resolve lazily: `stats()` never
+  syncs the device; unfinished pairs count at a later call.
+- `ws` in every row and event is the `name` given to `register`.
 - Event kinds: `fill_done`, `fill_failed`, `evicted`, `budget`, `late`, `register_failed`.
 
 ## Errors
 
 `plane.PlaneError` (`.code`), subclasses: `BudgetExceeded`, `Shortfall`, `LeaseViolation`,
-`Poisoned`, `ScheduleMismatch`, `CudaError`, `CudaUnavailable`, `Invalid`, `IoError`, `Closed`.
-Source refusals surface as the usual `tensorfs.errors.*` classes.
+`Poisoned`, `CudaError`, `CudaUnavailable`, `Invalid`, `IoError`, `Closed`. Source refusals
+surface as the usual `tensorfs.errors.*` classes.
+
+**Poison is latched plane-wide**: an ambiguous driver outcome (a failed unmap or rollback, a
+driver mapping that disagrees with the books) or a lease dropped unreleased makes every later
+call raise `Poisoned` with the first cause; the runtime replaces the executor. Capacity never
+poisons (`BudgetExceeded`, `Shortfall` leave the plane usable).
+
+## Host tier across processes
+
+- One memfd per weight set, laid out exactly like the weight set, with a state page at its
+  end: a layout digest and one Ready word per region. That page IS the shared index.
+- `register(..., host_fd=fd)` in another process (or a replacement executor) reopens the fd
+  (its own open file description), refuses a different layout digest, and adopts every
+  region whose Ready word is set on its next `want("pinned")` — registering it, reading
+  nothing (`stats()["host"]["fill_bytes"]` unchanged). The digest covers the plan's parts,
+  their object ranges and the region grouping: register with the same plan and regions.
+- A host-only `Plane(devices=[])` (never loads libcuda) can fill a tier before any executor
+  holds a GPU; executors adopt and register it.
+- Eviction punches the region's hole under an exclusive OFD lock that fills hold shared:
+  never while another process fills it. Contents are immutable, so a process still DMA-ing
+  from pages it registered before a punch reads the same bytes.
 
 ## Changelog
 
+- v2 2026-09-30 (W3 requests R2–R19):
+  - `p.source(store, lease)` + `register(name, source, plan, regions, host_fd=None)`: one lease
+    per manifest.
+  - `regions` accept exact part names.
+  - `acquire(..., priority=None)`; `p.prioritise(...)`.
+  - `stream(repeat=0)` cycles until close; `cur.passes`.
+  - Cursor departures skip ahead or demand-fill; `ScheduleMismatch` is gone.
+  - `lease.view()`; per-region GPU compute/stall ns in `stats()["regions"]`; `skipped` in
+    stages; per-set evictions; plane-wide poison latch.
 - v1 2026-09-30: first surface.

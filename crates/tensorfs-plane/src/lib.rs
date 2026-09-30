@@ -51,12 +51,6 @@ pub enum Error {
     },
     #[error("poisoned: {0}")]
     Poisoned(String),
-    #[error("schedule mismatch: cursor expects region {expected} at position {position}, got {got}")]
-    ScheduleMismatch {
-        position: u64,
-        expected: u32,
-        got: u32,
-    },
     #[error("invalid: {0}")]
     Invalid(String),
     #[error("io: {0}")]
@@ -77,7 +71,6 @@ impl Error {
             Error::Shortfall { .. } => "SHORTFALL",
             Error::LeaseViolation { .. } => "LEASE_VIOLATION",
             Error::Poisoned(_) => "POISONED",
-            Error::ScheduleMismatch { .. } => "SCHEDULE_MISMATCH",
             Error::Invalid(_) => "INVALID",
             Error::Io(_) => "IO",
             Error::Source(_) => "SOURCE",

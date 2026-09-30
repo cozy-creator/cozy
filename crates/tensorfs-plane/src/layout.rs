@@ -68,8 +68,9 @@ fn tensor_of(what: &str) -> &str {
 }
 
 impl Layout {
-    /// `regions[r]` names the tensors ("component/key") of region `r`. Every tensor of the plan
-    /// belongs to exactly one region; a region's parts keep the plan's (construction) order.
+    /// `regions[r]` names the tensors ("component/key", every role) or single parts
+    /// ("component/key#role") of region `r`. Every part of the plan belongs to exactly one
+    /// region; a region's parts keep the plan's (construction) order.
     pub fn build(plan: &ReadPlan, regions: &[Vec<String>]) -> Result<Layout> {
         let mut owner: HashMap<&str, u32> = HashMap::new();
         for (r, tensors) in regions.iter().enumerate() {
@@ -93,15 +94,18 @@ impl Layout {
         let mut seen: HashSet<&str> = HashSet::new();
         let mut per_region: Vec<Vec<usize>> = vec![Vec::new(); regions.len()];
         for (i, (what, _)) in parts.iter().enumerate() {
-            let t = tensor_of(what);
-            let r = *owner
-                .get(t)
-                .ok_or_else(|| Error::Invalid(format!("plan tensor {t:?} is in no region")))?;
-            seen.insert(t);
+            let (key, r) = match owner.get_key_value(*what).or_else(|| owner.get_key_value(tensor_of(what))) {
+                Some((k, r)) => (*k, *r),
+                None => return Err(Error::Invalid(format!("plan part {what:?} is in no region"))),
+            };
+            if owner.contains_key(*what) && owner.contains_key(tensor_of(what)) {
+                return Err(Error::Invalid(format!("{what:?} is named both as a part and by its tensor")));
+            }
+            seen.insert(key);
             per_region[r as usize].push(i);
         }
         if let Some(t) = owner.keys().find(|t| !seen.contains(*t)) {
-            return Err(Error::Invalid(format!("region tensor {t:?} is not in the plan")));
+            return Err(Error::Invalid(format!("region names {t:?}, which the plan does not carry")));
         }
 
         let mut out_parts = Vec::with_capacity(parts.len());

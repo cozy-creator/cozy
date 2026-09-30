@@ -130,7 +130,6 @@ pub(crate) struct DReg {
 pub(crate) struct DevWs {
     pub base: u64,
     pub regs: Vec<DReg>,
-    pub poisoned: Option<String>,
     pub views: u64,
     /// Bumped before any unmap: a view exported under an older epoch may name unmapped pages.
     pub epoch: u64,
@@ -143,6 +142,8 @@ pub(crate) struct Ws {
     pub host: Arc<HostMem>,
     pub hregs: Vec<HReg>,
     pub devs: Vec<Option<DevWs>>,
+    pub evictions: u64,
+    pub evicted_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,6 +174,8 @@ pub struct HostCounters {
 #[derive(Debug, Clone, Default)]
 pub struct TagCounters {
     pub acquires: u64,
+    /// Scheduled positions the consumer skipped (their slots were handed on unread).
+    pub skipped: u64,
     pub misses: u64,
     pub late: u64,
     pub late_bytes: u64,
@@ -182,7 +185,19 @@ pub struct TagCounters {
 
 pub(crate) enum TimingKind {
     Copy { from_host: bool },
-    Stall { tag: String },
+    /// The consumer stream's wait on a late copy.
+    Stall { tag: String, region: u32 },
+    /// The consumer's use of a region: end of the wait to the release event.
+    Compute { tag: String, region: u32 },
+}
+
+/// Per weight set × device × stage tag × region: GPU-timed facts for the cost model.
+#[derive(Debug, Clone, Default)]
+pub struct RegionCounters {
+    pub uses: u64,
+    pub compute_ns: u64,
+    pub stall_ns: u64,
+    pub late: u64,
 }
 
 pub(crate) struct Timing {
@@ -195,6 +210,9 @@ pub(crate) struct Timing {
 }
 
 pub(crate) struct Core {
+    /// Latched on the first ambiguous driver outcome or lost lease: every later call refuses
+    /// and the runtime replaces the executor.
+    pub poisoned: Option<String>,
     pub sets: Vec<Option<Ws>>,
     pub arenas: Vec<Arena>,
     pub host_budget: u64,
@@ -204,6 +222,7 @@ pub(crate) struct Core {
     pub dstats: Vec<DevCounters>,
     pub hstats: HostCounters,
     pub tags: BTreeMap<(u32, usize, String), TagCounters>,
+    pub regions: BTreeMap<(u32, usize, String, u32), RegionCounters>,
     pub events: VecDeque<Event>,
     pub events_dropped: u64,
     pub timings: Vec<Timing>,
@@ -242,6 +261,15 @@ pub(crate) struct Inner {
 }
 
 impl Core {
+    pub fn poison(&mut self, cause: String) -> Error {
+        Error::Poisoned(self.poisoned.get_or_insert(cause).clone())
+    }
+    pub fn check(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(p) => Err(Error::Poisoned(p.clone())),
+            None => Ok(()),
+        }
+    }
     pub fn ws(&self, id: WsId) -> Result<&Ws> {
         self.sets.get(id.0 as usize).and_then(Option::as_ref).ok_or(Error::Closed)
     }
@@ -280,9 +308,16 @@ fn resolve_timings(c: &mut Core) {
                     s.disk_copy_ns += ns;
                 }
             }
-            TimingKind::Stall { tag } => {
+            TimingKind::Compute { tag, region } => {
+                let k = (t.ws, t.dev, tag.clone(), *region);
+                let rc = c.regions.entry(k).or_default();
+                rc.uses += 1;
+                rc.compute_ns += ns;
+            }
+            TimingKind::Stall { tag, region } => {
                 let tag = tag.clone();
                 c.tag(t.ws, t.dev, &tag).stall_ns += ns;
+                c.regions.entry((t.ws, t.dev, tag.clone(), *region)).or_default().stall_ns += ns;
                 if ns > 0 {
                     let name = c.sets.get(t.ws as usize).and_then(Option::as_ref).map(|w| w.name.clone());
                     c.event(Event {
@@ -325,6 +360,9 @@ fn sync_all(pending: &mut Vec<EvRef>) -> Result<()> {
 // ---------------------------------------------------------------- the plane
 
 pub(crate) fn devws<'a>(c: &'a mut Core, ws: WsId, d: usize) -> Result<&'a mut DevWs> {
+    if let Some(p) = &c.poisoned {
+        return Err(Error::Poisoned(p.clone()));
+    }
     let w = c.ws_mut(ws)?;
     if w.devs[d].is_none() {
         let base = device::reserve_va(w.layout.nbytes)?;
@@ -342,16 +380,11 @@ pub(crate) fn devws<'a>(c: &'a mut Core, ws: WsId, d: usize) -> Result<&'a mut D
                     pending: Vec::new(),
                 })
                 .collect(),
-            poisoned: None,
             views: 0,
             epoch: 1,
         });
     }
-    let dw = w.devs[d].as_mut().unwrap();
-    if let Some(p) = &dw.poisoned {
-        return Err(Error::Poisoned(p.clone()));
-    }
-    Ok(dw)
+    Ok(w.devs[d].as_mut().unwrap())
 }
 
 
@@ -402,11 +435,12 @@ impl Inner {
         sync_all(&mut reg.pending)?;
         dw.epoch += 1;
         if let Err(e) = device::unmap_span(dw.base + region.offset, region.span) {
-            let cause = format!("unmap of region {r} failed: {e}");
-            dw.poisoned = Some(cause.clone());
-            return Err(Error::Poisoned(cause));
+            return Err(c.poison(format!("unmap of {name}#{r} failed: {e}")));
         }
-        let reg = &mut dw.regs[r as usize];
+        let w = c.ws_mut(ws)?;
+        w.evictions += 1;
+        w.evicted_bytes += region.span;
+        let reg = &mut w.devs[d].as_mut().unwrap().regs[r as usize];
         let chunks = std::mem::take(&mut reg.chunks);
         reg.state = DState::Absent;
         c.arenas[d].mapped -= region.span;
@@ -478,6 +512,8 @@ impl Inner {
             return Ok(None);
         }
         h.state = HState::Absent;
+        w.evictions += 1;
+        w.evicted_bytes += region.span;
         c.host_used -= region.span;
         c.hstats.evictions += 1;
         c.hstats.evicted_bytes += region.span;
@@ -678,8 +714,8 @@ impl Inner {
         let chunks = c.arenas[d].take(&sizes)?;
         let base = devws(c, ws, d)?.base;
         if let Err(e) = device::map_span(base + off, &chunks, self.devices[d].dev) {
-            if let Error::Poisoned(p) = &e {
-                devws(c, ws, d)?.poisoned = Some(p.clone());
+            if let Error::Poisoned(p) = e {
+                return Err(c.poison(p));
             }
             c.arenas[d].put_idle(chunks);
             return Err(e);
@@ -779,7 +815,7 @@ impl Inner {
 
     /// A stream-scoped lease on a resident region. A region not resident is filled on demand
     /// (a miss) at its last wanted priority. No host block unless the fill is not yet queued.
-    pub(crate) fn acquire_home(self: &Arc<Self>, ws: WsId, d: usize, r: u32, stream: u64, tag: &str) -> Result<Lease> {
+    pub(crate) fn acquire_home(self: &Arc<Self>, ws: WsId, d: usize, r: u32, stream: u64, tag: &str, prio: Option<i64>) -> Result<Lease> {
         let dev = &self.devices[d];
         let _g = dev.bind()?;
         let mut c = self.core.lock().unwrap();
@@ -787,6 +823,9 @@ impl Inner {
         {
             let dw = devws(&mut c, ws, d)?;
             let reg = &mut dw.regs[r as usize];
+            if let Some(p) = prio {
+                reg.prio = p;
+            }
             commit(reg)?;
             if matches!(reg.state, DState::Absent) {
                 let prio = reg.prio;
@@ -812,50 +851,89 @@ impl Inner {
             DState::Filling(ev) => Some(ev.clone()),
             _ => None,
         };
-        let late = match &pending {
-            Some(ev) => !ev.done()?,
-            None => false,
-        };
-        let stall = if late { Some((dev.events.get(true)?, dev.events.get(true)?)) } else { None };
-        let s = stream as CUstream;
-        if let Some(ev) = &pending {
-            if let Some((a, _)) = &stall {
-                a.record(s)?;
-            }
-            let drv = cuda::driver()?;
-            // SAFETY: consumer stream of this context; the event is live.
-            cuda::check("cuStreamWaitEvent", unsafe { (drv.stream_wait_event)(s, ev.raw(), 0) })?;
-            if let Some((_, b)) = &stall {
-                b.record(s)?;
-            }
-        }
-        let reg = &mut devws(&mut c, ws, d)?.regs[r as usize];
-        reg.live += 1;
-        let tc = c.tag(ws.0, d, tag);
-        tc.acquires += 1;
-        if late {
-            tc.late += 1;
-            tc.late_bytes += region.nbytes;
-        }
-        tc.stall_ns += host_wait;
-        if let Some((a, b)) = stall {
-            c.timings.push(Timing {
-                dev: d,
-                ws: ws.0,
-                kind: TimingKind::Stall { tag: tag.to_string() },
-                a,
-                b,
-                bytes: region.nbytes,
-            });
-        }
+        let start = self.begin_use(&mut c, d, ws, r, tag, stream, pending.as_ref(), host_wait, region.nbytes)?;
+        devws(&mut c, ws, d)?.regs[r as usize].live += 1;
         Ok(Lease {
             inner: self.clone(),
             ptr: base + region.offset,
             nbytes: region.nbytes,
             region: r,
             slot: None,
-            kind: LeaseKind::Home { ws, dev: d },
+            ws,
+            dev: d,
+            tag: tag.to_string(),
+            start: Mutex::new(Some(start)),
+            kind: LeaseKind::Home,
             released: AtomicBool::new(false),
+        })
+    }
+
+    /// Make the consumer stream wait for `ready` (no host block), measuring a late arrival
+    /// with a timing pair around the wait, then mark the start of the use. Returns that mark.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_use(
+        &self,
+        c: &mut Core,
+        d: usize,
+        ws: WsId,
+        r: u32,
+        tag: &str,
+        stream: u64,
+        ready: Option<&EvRef>,
+        host_wait: u64,
+        nbytes: u64,
+    ) -> Result<EvRef> {
+        let dev = &self.devices[d];
+        let s = stream as CUstream;
+        let late = match ready {
+            Some(ev) => !ev.done()?,
+            None => false,
+        };
+        let a = if late { Some(dev.events.get(true)?) } else { None };
+        if let Some(a) = &a {
+            a.record(s)?;
+        }
+        if let Some(ev) = ready {
+            let drv = cuda::driver()?;
+            // SAFETY: consumer stream of this context; the event is live.
+            cuda::check("cuStreamWaitEvent", unsafe { (drv.stream_wait_event)(s, ev.raw(), 0) })?;
+        }
+        let start = dev.events.get(true)?;
+        start.record(s)?;
+        let tc = c.tag(ws.0, d, tag);
+        tc.acquires += 1;
+        tc.stall_ns += host_wait;
+        if late {
+            tc.late += 1;
+            tc.late_bytes += nbytes;
+            c.regions.entry((ws.0, d, tag.to_string(), r)).or_default().late += 1;
+        }
+        if let Some(a) = a {
+            c.timings.push(Timing {
+                dev: d,
+                ws: ws.0,
+                kind: TimingKind::Stall { tag: tag.to_string(), region: r },
+                a,
+                b: start.clone(),
+                bytes: nbytes,
+            });
+        }
+        Ok(start)
+    }
+
+    pub(crate) fn view(self: &Arc<Self>, ws: WsId, d: usize) -> Result<View> {
+        let _g = self.devices[d].bind()?;
+        let mut c = self.core.lock().unwrap();
+        let nbytes = c.ws(ws)?.layout.nbytes;
+        let dw = devws(&mut c, ws, d)?;
+        dw.views += 1;
+        Ok(View {
+            inner: self.clone(),
+            ws,
+            dev: d,
+            ptr: dw.base,
+            nbytes,
+            epoch: dw.epoch,
         })
     }
 }
@@ -927,6 +1005,7 @@ impl Plane {
                 readers,
                 tally,
                 core: Mutex::new(Core {
+                    poisoned: None,
                     sets: Vec::new(),
                     arenas,
                     host_budget: 0,
@@ -936,6 +1015,7 @@ impl Plane {
                     dstats: vec![DevCounters::default(); n],
                     hstats: HostCounters::default(),
                     tags: BTreeMap::new(),
+                    regions: BTreeMap::new(),
                     events: VecDeque::new(),
                     events_dropped: 0,
                     timings: Vec::new(),
@@ -949,6 +1029,11 @@ impl Plane {
         self.inner.core.lock().unwrap()
     }
 
+    /// Err(Poisoned) once the plane has latched a poison.
+    pub fn check(&self) -> Result<()> {
+        self.lock().check()
+    }
+
     pub(crate) fn dev(&self, ordinal: i32) -> Result<usize> {
         self.inner
             .devices
@@ -957,39 +1042,29 @@ impl Plane {
             .ok_or_else(|| Error::Invalid(format!("device {ordinal} is not served by this plane")))
     }
 
-    /// Register one weight set. The plane takes the TensorFS lease (its GC hold and verified
-    /// door) and ends it at `close_ws`. `host_fd` adopts a memfd another process holds for the
-    /// same layout; otherwise the plane creates one.
-    #[allow(clippy::too_many_arguments)]
+    /// Wrap a TensorFS read lease as a byte source. The source owns the lease (its GC hold and
+    /// verified door) and ends it when the last weight set and handle using it are gone, so
+    /// one lease serves every component of a manifest.
+    pub fn source(&self, store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease) -> Arc<Source> {
+        Arc::new(Source::new(store, meta, lease, self.inner.cfg.direct_io))
+    }
+
+    /// Register one weight set: `plan`'s parts grouped into `regions`. `host_fd` adopts a
+    /// memfd another process holds for the same layout; otherwise the plane creates one.
     pub fn register(
         &self,
         name: &str,
-        store: Arc<Store>,
-        meta: Arc<Meta>,
-        lease: ReadLease,
+        source: Arc<Source>,
         plan: &ReadPlan,
         regions: &[Vec<String>],
         host_fd: Option<RawFd>,
     ) -> Result<WsId> {
-        let layout = match Layout::build(plan, regions) {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = lease.release(&meta);
-                return Err(e);
-            }
-        };
+        self.check()?;
+        let layout = Layout::build(plan, regions)?;
         let host = match host_fd {
-            Some(fd) => HostMem::adopt(fd, &layout),
-            None => HostMem::create(name, &layout),
+            Some(fd) => HostMem::adopt(fd, &layout)?,
+            None => HostMem::create(name, &layout)?,
         };
-        let host = match host {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = lease.release(&meta);
-                return Err(e);
-            }
-        };
-        let source = Arc::new(Source::new(store, meta, lease, self.inner.cfg.direct_io));
         let n = layout.regions.len();
         let ws = Ws {
             name: name.to_string(),
@@ -1008,6 +1083,8 @@ impl Plane {
                 })
                 .collect(),
             devs: (0..self.inner.devices.len()).map(|_| None).collect(),
+            evictions: 0,
+            evicted_bytes: 0,
         };
         let mut c = self.lock();
         c.sets.push(Some(ws));
@@ -1044,6 +1121,7 @@ impl Plane {
 
     pub fn set_pinned_budget(&self, bytes: u64) -> Result<Trim> {
         let mut c = self.lock();
+        c.check()?;
         c.host_budget = bytes;
         let mut t = Trim::default();
         if c.host_used > bytes {
@@ -1068,6 +1146,7 @@ impl Plane {
         let d = self.dev(ordinal)?;
         let _g = self.inner.devices[d].bind()?;
         let mut c = self.lock();
+        c.check()?;
         c.arenas[d].budget = bytes;
         let mut t = Trim::default();
         t.freed += c.arenas[d].trim()?;
@@ -1097,6 +1176,7 @@ impl Plane {
     /// ticket reports completion.
     pub fn want(&self, ws: WsId, tier: Tier, regions: Option<&[u32]>, prio: i64, pin: bool) -> Result<Ticket> {
         let mut c = self.lock();
+        c.check()?;
         let regions = Self::regions_or_all(&c, ws, regions)?;
         match tier {
             Tier::Pinned => self.inner.want_host(&mut c, ws, &regions, prio, pin)?,
@@ -1134,6 +1214,7 @@ impl Plane {
     /// Unmap (device) or unpin (pinned) `regions`; refuses while any is leased or held.
     pub fn drop_regions(&self, ws: WsId, tier: Tier, regions: Option<&[u32]>) -> Result<u64> {
         let mut c = self.lock();
+        c.check()?;
         let regions = Self::regions_or_all(&c, ws, regions)?;
         let mut freed = 0;
         match tier {
@@ -1184,28 +1265,51 @@ impl Plane {
 
     /// A stream-scoped lease on a resident region. A region not resident is filled on demand
     /// (a miss) at its last wanted priority. No host block unless the fill is not yet queued.
-    pub fn acquire(&self, ws: WsId, ordinal: i32, r: u32, stream: u64) -> Result<Lease> {
+    /// `prio`, when given, becomes the region's priority first (the demand fill evicts only
+    /// below it).
+    pub fn acquire(&self, ws: WsId, ordinal: i32, r: u32, stream: u64, prio: Option<i64>) -> Result<Lease> {
         let d = self.dev(ordinal)?;
-        self.inner.acquire_home(ws, d, r, stream, "")
+        self.inner.acquire_home(ws, d, r, stream, "", prio)
+    }
+
+    /// Set priority (and pin, when given) of regions in a tier without moving a byte. Regions
+    /// not resident there keep the value for their next fill.
+    pub fn prioritise(&self, ws: WsId, tier: Tier, regions: Option<&[u32]>, prio: i64, pin: Option<bool>) -> Result<()> {
+        let mut c = self.lock();
+        c.check()?;
+        let regions = Self::regions_or_all(&c, ws, regions)?;
+        let d = match tier {
+            Tier::Pinned => None,
+            Tier::Device(o) => Some(self.dev(o)?),
+        };
+        let w = c.ws_mut(ws)?;
+        for r in regions {
+            let (p, q) = match d {
+                None => {
+                    let h = &mut w.hregs[r as usize];
+                    (&mut h.prio, &mut h.pin)
+                }
+                Some(d) => match w.devs[d].as_mut() {
+                    Some(dw) => {
+                        let g = &mut dw.regs[r as usize];
+                        (&mut g.prio, &mut g.pin)
+                    }
+                    None => continue,
+                },
+            };
+            *p = prio;
+            if let Some(pin) = pin {
+                *q = pin;
+            }
+        }
+        Ok(())
     }
 
     /// The weight set's stable device VA (reserved on first use). Bytes are valid only for
     /// resident regions under a lease. The view blocks `close_ws`, not eviction.
     pub fn view(&self, ws: WsId, ordinal: i32) -> Result<View> {
         let d = self.dev(ordinal)?;
-        let _g = self.inner.devices[d].bind()?;
-        let mut c = self.lock();
-        let nbytes = c.ws(ws)?.layout.nbytes;
-        let dw = devws(&mut c, ws, d)?;
-        dw.views += 1;
-        Ok(View {
-            inner: self.inner.clone(),
-            ws,
-            dev: d,
-            ptr: dw.base,
-            nbytes,
-            epoch: dw.epoch,
-        })
+        self.inner.view(ws, d)
     }
 
     /// Driver truth: every chunk the books call mapped must be the driver's mapping at that VA.
@@ -1214,22 +1318,26 @@ impl Plane {
         let d = self.dev(ordinal)?;
         let _g = self.inner.devices[d].bind()?;
         let mut c = self.lock();
+        c.check()?;
         let layout = c.ws(ws)?.layout.clone();
-        let Some(dw) = c.ws_mut(ws)?.devs[d].as_mut() else { return Ok(0) };
+        let Some(dw) = c.ws(ws)?.devs[d].as_ref() else { return Ok(0) };
         let mut n = 0;
-        for (r, reg) in dw.regs.iter().enumerate() {
+        let mut bad = None;
+        'regions: for (r, reg) in dw.regs.iter().enumerate() {
             let mut at = dw.base + layout.regions[r].offset;
             for ch in &reg.chunks {
                 if device::driver_handle(at)? != Some(ch.handle) {
-                    let cause = format!("driver mapping at region {r} disagrees with the books");
-                    dw.poisoned = Some(cause.clone());
-                    return Err(Error::Poisoned(cause));
+                    bad = Some(r);
+                    break 'regions;
                 }
                 at += ch.size;
                 n += 1;
             }
         }
-        Ok(n)
+        match bad {
+            Some(r) => Err(c.poison(format!("the driver's mapping of region {r} disagrees with the books"))),
+            None => Ok(n),
+        }
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -1292,10 +1400,9 @@ impl Plane {
                 used += layout.regions[r].span;
             }
         }
-        let w = c.sets[ws.0 as usize].take().unwrap();
+        c.sets[ws.0 as usize].take();
         c.host_used -= used;
-        drop(c);
-        w.source.release()
+        Ok(())
     }
 
     pub fn close(&self) -> Result<()> {
@@ -1371,6 +1478,8 @@ impl Plane {
                 nbytes: w.layout.nbytes,
                 regions: w.layout.regions.len() as u32,
                 host_memfd_bytes: w.host.resident_bytes(),
+                evictions: w.evictions,
+                evicted_bytes: w.evicted_bytes,
                 ..Default::default()
             };
             for (r, h) in w.hregs.iter().enumerate() {
@@ -1399,7 +1508,7 @@ impl Plane {
                     }
                 }
                 devs[d].reserved_va += w.layout.nbytes;
-                s.devices.push((self.inner.devices[d].ordinal, ready, dw.poisoned.clone()));
+                s.devices.push((self.inner.devices[d].ordinal, ready));
             }
             sets.push(s);
         }
@@ -1414,12 +1523,22 @@ impl Plane {
                 (name, self.inner.devices[*d].ordinal, tag.clone(), t.clone())
             })
             .collect();
+        let regions = c
+            .regions
+            .iter()
+            .map(|((w, d, tag, r), rc)| {
+                let name = c.sets.get(*w as usize).and_then(Option::as_ref).map_or(String::new(), |x| x.name.clone());
+                (name, self.inner.devices[*d].ordinal, tag.clone(), *r, rc.clone())
+            })
+            .collect();
         Stats {
             host,
             devices: devs,
             sets,
             tags,
+            regions,
             events_dropped: c.events_dropped,
+            poisoned: c.poisoned.clone(),
         }
     }
 }
@@ -1474,8 +1593,10 @@ pub struct WsStats {
     pub regions: u32,
     pub host_ready_bytes: u64,
     pub host_memfd_bytes: u64,
-    /// (ordinal, resident Ready bytes, poison cause)
-    pub devices: Vec<(i32, u64, Option<String>)>,
+    /// (ordinal, resident Ready bytes)
+    pub devices: Vec<(i32, u64)>,
+    pub evictions: u64,
+    pub evicted_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1485,7 +1606,10 @@ pub struct Stats {
     pub sets: Vec<WsStats>,
     /// (weight set, ordinal, stage tag, counters)
     pub tags: Vec<(String, i32, String, TagCounters)>,
+    /// (weight set, ordinal, stage tag, region, counters)
+    pub regions: Vec<(String, i32, String, u32, RegionCounters)>,
     pub events_dropped: u64,
+    pub poisoned: Option<String>,
 }
 
 // ---------------------------------------------------------------- tickets, leases, views
@@ -1554,12 +1678,12 @@ impl Ticket {
 }
 
 pub(crate) enum LeaseKind {
-    Home { ws: WsId, dev: usize },
+    Home,
     Slot { cursor: u64, k: u64 },
 }
 
 /// Use of one region's bytes on one consumer stream. `release(stream)` exactly once; dropping
-/// an unreleased lease poisons its weight set on that device (or its cursor).
+/// an unreleased lease poisons the plane (its consumer may still run on those bytes).
 pub struct Lease {
     pub(crate) inner: Arc<Inner>,
     pub ptr: u64,
@@ -1567,55 +1691,88 @@ pub struct Lease {
     pub region: u32,
     /// The slot index for a streamed lease; None for a resident one.
     pub slot: Option<u32>,
+    pub(crate) ws: WsId,
+    pub(crate) dev: usize,
+    pub(crate) tag: String,
+    pub(crate) start: Mutex<Option<EvRef>>,
     pub(crate) kind: LeaseKind,
     pub(crate) released: AtomicBool,
 }
 
 impl Lease {
+    pub fn device(&self) -> i32 {
+        self.inner.devices[self.dev].ordinal
+    }
+
+    /// Record the release event on `stream`. The bytes (and a slot) are reusable once the
+    /// device passes it; the span from acquire to here is the region's GPU-timed use.
     pub fn release(&self, stream: u64) -> Result<()> {
         if self.released.swap(true, Ordering::SeqCst) {
             return Err(Error::Invalid("lease released twice".into()));
         }
+        let rt = &self.inner.devices[self.dev];
+        let _g = rt.bind()?;
+        let ev = rt.events.get(true)?;
+        ev.record(stream as CUstream)?;
+        let start = self.start.lock().unwrap().take();
+        let mut c = self.inner.core.lock().unwrap();
+        if let Some(a) = start {
+            c.timings.push(Timing {
+                dev: self.dev,
+                ws: self.ws.0,
+                kind: TimingKind::Compute { tag: self.tag.clone(), region: self.region },
+                a,
+                b: ev.clone(),
+                bytes: self.nbytes,
+            });
+        }
         match self.kind {
-            LeaseKind::Home { ws, dev } => {
-                let rt = &self.inner.devices[dev];
-                let _g = rt.bind()?;
-                let ev = rt.events.get(false)?;
-                ev.record(stream as CUstream)?;
-                let mut c = self.inner.core.lock().unwrap();
-                let reg = &mut c.ws_mut(ws)?.devs[dev].as_mut().ok_or(Error::Closed)?.regs[self.region as usize];
+            LeaseKind::Home => {
+                let reg = &mut c.ws_mut(self.ws)?.devs[self.dev].as_mut().ok_or(Error::Closed)?.regs[self.region as usize];
                 reg.live -= 1;
                 prune(&mut reg.pending);
                 reg.pending.push(ev);
                 Ok(())
             }
-            LeaseKind::Slot { cursor, k } => crate::cursor::release_slot(&self.inner, cursor, k, stream),
+            LeaseKind::Slot { cursor, k } => crate::cursor::release_slot(&self.inner, &mut c, cursor, k, ev),
         }
+    }
+
+    /// A zero-copy view of this lease's bytes. It keeps the weight set's VA (or the cursor's
+    /// slots) alive, not the bytes: they are valid only while a lease covers them.
+    pub fn view(&self) -> Result<LeaseView> {
+        let hold = match self.kind {
+            LeaseKind::Home => Hold::Ws(self.inner.view(self.ws, self.dev)?),
+            LeaseKind::Slot { cursor, .. } => Hold::Slot(crate::cursor::slot_view(&self.inner, cursor, self.slot.unwrap())?),
+        };
+        Ok(LeaseView {
+            ptr: self.ptr,
+            nbytes: self.nbytes,
+            device: self.device(),
+            _hold: hold,
+        })
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        if self.released.load(Ordering::SeqCst) {
-            return;
-        }
-        let mut c = self.inner.core.lock().unwrap();
-        let cause = format!("lease on region {} dropped without release(stream)", self.region);
-        match self.kind {
-            LeaseKind::Home { ws, dev } => {
-                if let Ok(w) = c.ws_mut(ws) {
-                    if let Some(dw) = w.devs[dev].as_mut() {
-                        dw.poisoned = Some(cause);
-                    }
-                }
-            }
-            LeaseKind::Slot { cursor, .. } => {
-                if let Some(k) = c.cursors.get_mut(&cursor) {
-                    k.poisoned = Some(cause);
-                }
-            }
+        if !self.released.load(Ordering::SeqCst) {
+            let cause = format!("lease on region {} dropped without release(stream)", self.region);
+            self.inner.core.lock().unwrap().poison(cause);
         }
     }
+}
+
+pub enum Hold {
+    Ws(View),
+    Slot(crate::cursor::SlotView),
+}
+
+pub struct LeaseView {
+    pub ptr: u64,
+    pub nbytes: u64,
+    pub device: i32,
+    _hold: Hold,
 }
 
 /// A weight set's device VA, for zero-copy views of resident regions.

@@ -143,7 +143,6 @@ pub struct Arena {
     pub mapped: u64,
     pub slab: u64,
     idle: BTreeMap<u64, Vec<Handle>>,
-    pub poisoned: Option<String>,
 }
 unsafe impl Send for Arena {}
 
@@ -156,7 +155,6 @@ impl Arena {
             mapped: 0,
             slab,
             idle: BTreeMap::new(),
-            poisoned: None,
         }
     }
 
@@ -195,9 +193,6 @@ impl Arena {
     /// released to make headroom; the rest are created. Refuses before any mutation when the
     /// budget cannot cover it. The caller's context must be current.
     pub fn take(&mut self, sizes: &[u64]) -> Result<Vec<Chunk>> {
-        if let Some(p) = &self.poisoned {
-            return Err(Error::Poisoned(p.clone()));
-        }
         let mut avail: BTreeMap<u64, usize> = self.idle.iter().map(|(s, v)| (*s, v.len())).collect();
         let mut create = 0u64;
         for s in sizes {
