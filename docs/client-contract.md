@@ -27,6 +27,7 @@ daemon.
 
 | route | scope | auth | notes |
 |---|---|---|---|
+| `GET /v1/capabilities` | core | yes | operation support; `model_overrides` covers ordered adapters and qualified captured-callable model selectors |
 | `POST /v1/requests` | core | yes | submit; `Idempotency-Key` required; 202 fresh / 200 replay |
 | `GET /v1/requests` | core | yes | listing, newest first; `?status=`, `?package=`, `?limit=` |
 | `GET /v1/requests/{id}` | core | yes | the lifecycle document |
@@ -35,6 +36,12 @@ daemon.
 | `GET /v1/media/{media_id}` | core | yes | bytes by opaque id; `HEAD`; one `Range` |
 
 ### Submit
+
+Clients requesting adapters or a qualified captured-callable override first require
+`model_overrides: true` from `/v1/capabilities`. A missing route or false/absent field
+refuses only that operation before submission and asks for a daemon update. Ordinary
+root checkpoint overrides require no new preflight. This capability describes durable
+client transport; the selected Host and Runtime are checked separately before execution.
 
 ```json
 POST /v1/requests

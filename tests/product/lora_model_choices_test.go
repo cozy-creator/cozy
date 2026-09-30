@@ -1,12 +1,57 @@
 package producttest
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+func TestYAMLModelOverrideCarriesBaseAndAdaptersOnlyToItsNamedChild(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	h.workflow = []byte(strings.Replace(string(workflowInterface),
+		`"models":[{"class":"Source","component_use":{},"path":"long_form.models.source"}]`, `"models":[]`, 1))
+	machine := newTerminalMachines(func(payload map[string]any) *pb.AttemptOutcomeBody {
+		if len(payload) != 0 {
+			t.Error("YAML model selection became an authored job argument")
+		}
+		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
+	})
+	machine.modelOverrides = true
+	root, layout := rentedLadderMachine(t, h, &fakePod{machine: machine}, nil)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	input := filepath.Join(t.TempDir(), "scene.yaml")
+	must(t, os.WriteFile(input, []byte(`models:
+  generate.models.model:
+    ref: proof/base@1.0.0/bf16
+    lora:
+      - ref: proof/style-a@1.0.0/default
+        weight: 0.50
+        component: fl2va_dit
+      - ref: proof/style-b@2.0.0/default
+        weight: -0.25
+        component: fl2va_dit
+`), 0600))
+	row, output := rentedRun(t, root, store, "yaml-adapters", "long_form", "--input", input)
+	if row.State != "succeeded" {
+		t.Fatalf("YAML model selection failed: %s\n%s", row.State, output)
+	}
+	submitted := machine.submitted()
+	if len(submitted) != 1 || submitted[0].ReleaseRoot == nil || len(submitted[0].ReleaseRoot.Models) != 1 {
+		t.Fatalf("YAML created additional model targets: %+v", submitted)
+	}
+	choice := submitted[0].ReleaseRoot.Models[0]
+	if choice.Parameter != "generate.models.model" || choice.Repository != "proof/base" || choice.Release != "1.0.0" || choice.Lane != "bf16" ||
+		len(choice.Adapters) != 2 || choice.Adapters[0].Scale != "0.5" || choice.Adapters[1].Scale != "-0.25" {
+		t.Fatalf("YAML changed the selected checkpoint or stack: %+v", choice)
+	}
+}
 
 // Real argv -> daemon persistence -> authenticated machine submission. The
 // machine fixture observes the transport; Runtime's own tests execute adapters.
@@ -33,7 +78,9 @@ func TestLoRAChoicesReachRootAndCapturedServingSlots(t *testing.T) {
 			if function == "long_form" {
 				slot, args = "generate.models.model", nil
 			}
-			args = append(args, "--lora", slot+":fl2va_dit=proof/style-a@1.0.0/default,0",
+			// Mix equivalent exact and short spellings in one stack. Grouping by
+			// the raw spelling would silently reverse these two adapters.
+			args = append(args, "--lora", ladderPackage+"/generate.models.model:fl2va_dit=proof/style-a@1.0.0/default,0",
 				"--lora", slot+":fl2va_dit=proof/style-b@2.0.0/default,-0.25")
 			row, output := rentedRun(t, root, store, "ordered-adapters", function, args...)
 			if row.State != "succeeded" {

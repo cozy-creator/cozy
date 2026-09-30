@@ -1,6 +1,7 @@
 package api
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -8,6 +9,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
+
+// Capabilities describes selection semantics this client endpoint can retain.
+// Execution support is checked separately against the selected machine.
+type Capabilities struct {
+	ModelOverrides bool `json:"model_overrides"`
+}
+
+func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
+	s.ok(w, r, http.StatusOK, Capabilities{ModelOverrides: true})
+}
 
 // validateModelAdapters validates selection syntax; the executing Runtime owns
 // compatibility, immutable resolution and the operation's capability check.

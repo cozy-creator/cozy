@@ -43,6 +43,9 @@ type Route struct {
 // Routes is THE surface. Order is the document's order.
 var Routes = []Route{
 	// ---- Cozy's implemented request-level CORE ----
+	{"GET", "/v1/capabilities", Core, true, false, false, "",
+		"advertise supported request selection semantics",
+		"`cozy run` model overrides"},
 	{"POST", "/v1/requests", Core, true, true, false, "Idempotency-Key",
 		"submit one request; 202 with the request handle",
 		"`cozy run`"},

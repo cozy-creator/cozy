@@ -45,6 +45,11 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*pb.ModelChoice
 		out = append(out, choice)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Parameter < out[j].Parameter })
+	for i := 1; i < len(out); i++ {
+		if out[i-1].Parameter == out[i].Parameter {
+			return nil, exit.Usagef("model slot %s was selected more than once", out[i].Parameter)
+		}
+	}
 	return out, nil
 }
 

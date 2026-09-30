@@ -233,6 +233,7 @@ func (s *Server) recordSubmission(spec orchestrator.Submission) (records.Request
 func (s *Server) Handler() (http.Handler, *exit.Error) {
 	mux := http.NewServeMux()
 	handlers := map[string]http.HandlerFunc{
+		"GET /v1/capabilities":                              s.capabilities,
 		"POST /v1/requests":                                 s.submit,
 		"GET /v1/requests":                                  s.listRequests,
 		"GET /v1/requests/{id}":                             s.getRequest,

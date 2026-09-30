@@ -40,10 +40,20 @@ func applyModelAdapters(ctx *Context, target Target, ep *launch.Entrypoint,
 	}
 	selected := make(map[string][]launch.ModelOverlay, len(overlays))
 	for slot, stack := range overlays {
-		selected[slot] = append([]launch.ModelOverlay(nil), stack...)
+		if len(stack) == 0 {
+			continue
+		}
+		choice := modelChoiceSlot(target, slot)
+		key := choice.Package + "/" + choice.BindingSlot()
+		if _, duplicate := selected[key]; duplicate {
+			return nil, exit.Usagef("model slot %s has more than one overlay-list spelling", key)
+		}
+		selected[key] = append([]launch.ModelOverlay(nil), stack...)
 	}
 	for _, flag := range flags {
-		selected[flag.Slot] = append(selected[flag.Slot], launch.ModelOverlay{
+		choice := modelChoiceSlot(target, flag.Slot)
+		key := choice.Package + "/" + choice.BindingSlot()
+		selected[key] = append(selected[key], launch.ModelOverlay{
 			Ref: flag.Ref, Weight: flag.Scale, Component: flag.Component,
 		})
 	}
