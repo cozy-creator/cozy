@@ -46,13 +46,37 @@ jobs:
           go-version-file: go.mod
       - run: go build ./... && go vet ./...
 
+  toolchain:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUNTIME_VERSION: ${{ inputs.runtime_version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.11'
+      - name: Resolve shared public toolchain
+        run: scripts/ci-toolchain.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cozy-ci-toolchain
+          path: ${{ runner.temp }}/cozy-ci-toolchain.json
+          retention-days: 7
+
   suite:
     if: github.event_name == 'workflow_dispatch'
+    needs: toolchain
+    name: suite (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       FULL: ${{ inputs.full }}
-      RUNTIME_VERSION: ${{ inputs.runtime_version }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -72,53 +96,44 @@ jobs:
           restore-keys: |
             ci-${{ hashFiles('go.sum') }}-
             ci-
-      - run: python3 scripts/fence.py
-      - run: go build ./... && go vet ./...
+      - if: matrix.shard == 0
+        run: python3 scripts/fence.py
+      - if: matrix.shard == 0
+        run: go build ./... && go vet ./...
       # Before a release only. One target per other GOOS: no file in this module is
       # GOARCH-specific, so linux/arm64 and darwin/amd64 compile the same sources.
       - name: Cross-compile darwin and windows
-        if: env.FULL == 'true'
+        if: env.FULL == 'true' && matrix.shard == 0
         run: |
           for target in darwin/arm64 windows/amd64; do
             GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null .
           done
       # One published native Runtime supplies both the SDK and machine agent.
       # Qualification intentionally fails until the released pair supports our contracts.
+      - uses: actions/download-artifact@v4
+        with:
+          name: cozy-ci-toolchain
+          path: ${{ runner.temp }}/toolchain
       - name: Runtime and Python
         id: toolchain
         run: |
-          runtime_api=https://pypi.org/pypi/cozy-runtime
-          if [ -n "$RUNTIME_VERSION" ]; then
-            [[ $RUNTIME_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'runtime_version must be a public release version' >&2; exit 2; }
-            runtime_api="$runtime_api/$RUNTIME_VERSION"
-          fi
-          runtime_metadata="$RUNNER_TEMP/runtime-release.json"
-          curl -fsS "$runtime_api/json" -o "$runtime_metadata"
-          if [ -n "$RUNTIME_VERSION" ]; then
-            jq -e --arg version "$RUNTIME_VERSION" '.info.version == $version' "$runtime_metadata"
-          fi
-          jq -r '"Runtime release: " + .info.version' "$runtime_metadata"
-          read -r url sha < <(jq -er '[.urls[] | select(.yanked == false) | select(.filename | endswith("cp312-abi3-manylinux_2_28_x86_64.whl"))] |
-            if length == 1 then .[0] | "\(.url) \(.digests.sha256)" else error("expected one native Runtime wheel") end' "$runtime_metadata")
-          test -n "$url" && test -n "$sha"
-          wheel="$RUNNER_TEMP/${url##*/}"
-          curl -fsSLo "$wheel" "$url"
-          echo "$sha  $wheel" | sha256sum -c
+          manifest="$RUNNER_TEMP/toolchain/cozy-ci-toolchain.json"
+          for package in runtime tensorfs; do
+            read -r url sha < <(jq -er --arg package "$package" '.[$package] | "\(.url) \(.sha256)"' "$manifest")
+            test -n "$url" && test -n "$sha"
+            wheel="$RUNNER_TEMP/${url##*/}"
+            curl -fsSLo "$wheel" "$url"
+            echo "$sha  $wheel" | sha256sum -c
+            if [ "$package" = runtime ]; then runtime_wheel="$wheel"; else tensorfs_wheel="$wheel"; fi
+          done
+          eval_version=$(jq -er .eval_version "$manifest")
           uv python install 3.12 3.13 3.14
-          uv tool install --python 3.12 --with-executables-from tensorfs "$wheel[media,model-execution]"
-          uv tool install --python 3.12 cozy-eval
+          uv tool install --python 3.12 --with "$tensorfs_wheel" --with-executables-from tensorfs "$runtime_wheel[media,model-execution]"
+          uv tool install --python 3.12 "cozy-eval==$eval_version"
           uv tool dir --bin >> "$GITHUB_PATH"
-          echo "RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
-          # Fetch the exact TensorFS version selected alongside this Runtime.
-          tensorfs_version=$("$(uv tool dir)/cozy-runtime/bin/python" -c 'from importlib.metadata import version; print(version("tensorfs"))')
-          read -r url sha < <(curl -fsS "https://pypi.org/pypi/tensorfs/$tensorfs_version/json" |
-            jq -er '[.urls[] | select(.yanked == false) | select(.filename | contains("cp312-abi3-manylinux") and endswith("x86_64.whl"))] |
-              if length == 1 then .[0] | "\(.url) \(.digests.sha256)" else error("expected one native TensorFS wheel") end')
-          test -n "$url" && test -n "$sha"
-          tensorfs_wheel="$RUNNER_TEMP/${url##*/}"
-          curl -fsSLo "$tensorfs_wheel" "$url"
-          echo "$sha  $tensorfs_wheel" | sha256sum -c
+          echo "RUNTIME_WHEEL=$runtime_wheel" >> "$GITHUB_ENV"
           echo "TENSORFS_WHEEL=$tensorfs_wheel" >> "$GITHUB_ENV"
+          echo "COZY_EVAL_VERSION=$eval_version" >> "$GITHUB_ENV"
       - name: Bundled machine agent
         run: |
           python3 scripts/ci-machine-agent.py "$RUNTIME_WHEEL" "$RUNNER_TEMP/cozy-machine"
@@ -130,27 +145,36 @@ jobs:
       # The runner's service cgroup is not delegated; Runtime's executor containment needs its own subtree.
       - name: Product tests
         run: |
-          args=(-j 3 -machine-host="$MACHINE_HOST" -require-machine-host
+          args=(--shard '${{ matrix.shard }}/3' --log-dir "$RUNNER_TEMP/product-logs"
+            -machine-host="$MACHINE_HOST" -require-machine-host
             -machine-runtime-wheel="$RUNTIME_WHEEL" -machine-tensorfs-wheel="$TENSORFS_WHEEL"
             -script-runtime-wheel="$RUNTIME_WHEEL" -child-runtime-wheel="$RUNTIME_WHEEL"
             -child-tensorfs-wheel="$TENSORFS_WHEEL" -tensorfs-fixture-wheel="$TENSORFS_WHEEL"
             -failure-diagnostics="$RUNNER_TEMP/product-diagnostics")
           [ "$FULL" = true ] || args+=(-test.short)
           sudo systemd-run --wait --pipe --collect \
-            --unit="cozy-product-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --unit="cozy-product-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.shard }}" \
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
-            scripts/product-tests.sh "${args[@]}"
+          scripts/product-tests.sh "${args[@]}"
+      - name: Preserve complete product logs and coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-logs-${{ matrix.shard }}
+          path: ${{ runner.temp }}/product-logs
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Preserve filtered product failure snapshots
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: product-failure-snapshots
+          name: product-failure-snapshots-${{ matrix.shard }}
           path: ${{ runner.temp }}/product-diagnostics/**/*.json
           if-no-files-found: ignore
           retention-days: 7
       - name: Release artifacts install and upgrade
-        if: env.FULL == 'true'
+        if: env.FULL == 'true' && matrix.shard == 0
         run: |
           scripts/release.sh "ci-$GITHUB_SHA" linux/amd64
           scripts/release.sh "ci-$GITHUB_SHA-next" linux/amd64
@@ -158,16 +182,31 @@ jobs:
             --prefix "$RUNNER_TEMP/prefix" --home "$RUNNER_TEMP/cozy-home"
       # Independent of the Go result, so one red check does not hide the other.
       - name: Python types
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.shard == 0 }}
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/types"
-          uv pip install --python "$RUNNER_TEMP/types/bin/python" packaging 'cozy-runtime>=0.18.28' 'cozy-eval>=0.7.2' 'tensorfs>=0.3.54'
+          uv pip install --python "$RUNNER_TEMP/types/bin/python" packaging "$RUNTIME_WHEEL" "cozy-eval==$COZY_EVAL_VERSION" "$TENSORFS_WHEEL"
           COZY_TYPECHECK_PYTHON="$RUNNER_TEMP/types/bin/python" sh scripts/typecheck.sh
+          sh scripts/typecheck.sh --strict scripts/ci-product-coverage.py
       # Saved from every master run that compiled, pass or fail.
-      - if: ${{ !cancelled() && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
+      - if: ${{ !cancelled() && matrix.shard == 0 && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
           key: ci-${{ hashFiles('go.sum') }}-${{ github.sha }}
+
+  coverage:
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
+    needs: suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: product-logs-*
+          path: ${{ runner.temp }}/product-coverage
+      - name: Audit complete product coverage
+        run: python3 scripts/ci-product-coverage.py "$RUNNER_TEMP/product-coverage" '${{ inputs.full }}'
