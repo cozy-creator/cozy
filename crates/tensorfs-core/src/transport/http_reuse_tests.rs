@@ -661,7 +661,10 @@ fn concurrent_pushes_to_one_origin_keep_their_sockets_across_signed_objects() {
                         &Origin::policy(),
                         &Anonymous,
                         Deadline::none(),
-                        &Ledger::with_resolution(Duration::from_millis(10)),
+                        // Test socket reuse at the production sampling cadence. A
+                        // 10ms cadence gives a 60ms silence floor and can retry an
+                        // otherwise healthy PUT when the fixture thread is delayed.
+                        &Ledger::new(),
                         "",
                     )
                     .unwrap();
