@@ -13,8 +13,10 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -22,12 +24,20 @@ import (
 // `cozy down` mid-run stops the daemon and nothing else. This computer's machine and the
 // rental — the same Host binary, each with a real Runtime — keep running the work, and
 // `cozy run watch` brings the daemon back, reattaches, and delivers the run's file, sha
-// verified. A run canceling when the daemon stops settles canceled after it comes back.
+// verified. Delivered cancellation survives handoff; undelivered intent is reconciled
+// without rewriting a successful outcome that won before cancellation arrived.
 func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
-	_, root, _, store := parityMachines(t)
+	h, root, layout, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", downProject(t), "--editable"); code != 0 {
 		t.Fatalf("installing the down package [exit %d]\n%s", code, out)
 	}
+	// Observe the authority directly while the personal daemon is down. This uses
+	// the same authenticated machine client as the parity inventory proof.
+	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
+		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
+		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
+	defer found.Forget(machines.Local)
+	defer found.Forget(parityRental)
 	for _, venue := range []struct {
 		name string
 		args []string
@@ -66,40 +76,99 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 				}
 			}
 			open := func(key string) { must(t, os.WriteFile(filepath.Join(gates, key), nil, 0o600)) }
+			name := map[string]string{"local": machines.Local, "rental": parityRental}[venue.name]
+			authorityState := func(row *records.Request) string {
+				link, problem := store.MachineExecution(row.ID)
+				fatal(t, problem)
+				var receipt pb.MachineExecutionReceipt
+				must(t, proto.Unmarshal(link.Receipt, &receipt))
+				machine, problem := found.Dial(t.Context(), name, "observe outcome while personal daemon is down")
+				fatal(t, problem)
+				defer machine.Close()
+				state, err := machine.Host.GetMachineExecution(t.Context(), &pb.MachineExecutionQuery{
+					Claim: machine.Claim, RequestId: row.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId})
+				must(t, err)
+				return state.State
+			}
+			watchCompleted := func(row *records.Request) {
+				code, out := runCozy(t, root, "run", "watch", row.ID, "--json")
+				var result struct {
+					Status string
+					Saved  []struct{ Output, Path, Digest string }
+				}
+				if code != 0 || json.Unmarshal([]byte(out), &result) != nil || result.Status != "completed" || len(result.Saved) != 1 {
+					t.Fatalf("watch did not deliver the run's output [exit %d]\n%s", code, out)
+				}
+				data, err := os.ReadFile(result.Saved[0].Path)
+				want := digestOf(downProofBytes(200000))
+				if err != nil || digestOf(data) != want || result.Saved[0].Digest != want {
+					t.Fatalf("the output file at %s is not the run's bytes (%v): %s", result.Saved[0].Path, err, out)
+				}
+			}
+			watchCanceled := func(request *records.Request) {
+				runCozy(t, root, "run", "watch", request.ID, "--json")
+				eventually(t, root, "the canceled run to settle", func() bool {
+					row, _ := store.RequestRow(request.ID)
+					link, _ := store.MachineExecution(request.ID)
+					return row != nil && row.State == "canceled" && link != nil && !link.CancelRequested && len(link.PendingControl) == 0
+				})
+			}
 
 			done := start("done")
 			down(done, "")
 			open("done")
-			code, out := runCozy(t, root, "run", "watch", done.ID, "--json")
-			var result struct {
-				Status string
-				Saved  []struct{ Output, Path, Digest string }
-			}
-			if code != 0 || json.Unmarshal([]byte(out), &result) != nil || result.Status != "completed" || len(result.Saved) != 1 {
-				t.Fatalf("watch did not deliver the run's output [exit %d]\n%s", code, out)
-			}
-			data, err := os.ReadFile(result.Saved[0].Path)
-			want := digestOf(downProofBytes(200000))
-			if err != nil || digestOf(data) != want || result.Saved[0].Digest != want {
-				t.Fatalf("the output file at %s is not the run's bytes (%v): %s", result.Saved[0].Path, err, out)
-			}
+			watchCompleted(done)
 
 			canceled := start("canceled")
 			if code, out := runCozy(t, root, "run", "cancel", canceled.ID, "--json"); code != 0 {
 				t.Fatalf("cancel [exit %d]\n%s", code, out)
 			}
-			eventually(t, root, "the run canceling", func() bool {
+			eventually(t, root, "Runtime acknowledging cancellation", func() bool {
 				row, _ := store.RequestRow(canceled.ID)
-				return row != nil && row.State == "canceling"
+				return row != nil && row.State == "canceling" && observed(store, canceled.ID) == "canceling"
 			})
 			down(canceled, "canceling")
 			open("canceled")
-			runCozy(t, root, "run", "watch", canceled.ID, "--json")
-			eventually(t, root, "the canceled run to settle", func() bool {
-				row, _ := store.RequestRow(canceled.ID)
-				link, _ := store.MachineExecution(canceled.ID)
-				return row != nil && row.State == "canceled" && link != nil && len(link.PendingControl) == 0
-			})
+			watchCanceled(canceled)
+
+			// Recreate the handoff boundary deterministically: persist intent with
+			// no daemon present to deliver it. Natural completion must keep its
+			// successful terminal and bytes; waiting work must receive the intent
+			// when observation restarts.
+			for _, natural := range []bool{true, false} {
+				key := map[bool]string{true: "completion-before-delivery", false: "intent-before-restart"}[natural]
+				pending := start(key)
+				down(pending, "")
+				accepted, problem := store.RequestMachineCancellation(pending.ID, "cozy job cancel")
+				fatal(t, problem)
+				link, problem := store.MachineExecution(pending.ID)
+				fatal(t, problem)
+				if !accepted || !link.CancelRequested || len(link.PendingControl) != 0 || authorityState(pending) != "running" {
+					t.Fatal("fixture did not retain an undelivered cancellation for a running execution")
+				}
+				if natural {
+					open(key)
+					eventually(t, root, "natural completion while the daemon is down", func() bool { return authorityState(pending) == "succeeded" })
+					if daemon.Probe(config.Config{Home: root}).Up {
+						t.Fatal("authority observation restarted the personal daemon")
+					}
+					found.Forget(name)
+					watchCompleted(pending)
+					eventually(t, root, "late cancellation reconciled without changing success", func() bool {
+						row, _ := store.RequestRow(pending.ID)
+						link, _ := store.MachineExecution(pending.ID)
+						return row != nil && row.State == "succeeded" && link != nil && !link.CancelRequested && len(link.PendingControl) == 0
+					})
+				} else {
+					found.Forget(name)
+					if code, out := runCozy(t, root, "up", "--json"); code != 0 {
+						t.Fatalf("restart observer [%d]: %s", code, out)
+					}
+					eventually(t, root, "delivery of retained cancellation after restart", func() bool { return observed(store, pending.ID) == "canceling" })
+					open(key)
+					watchCanceled(pending)
+				}
+			}
 			if link, _ := store.MachineExecution(done.ID); link == nil || link.MachineID != map[string]string{"local": machines.Local, "rental": parityRental}[venue.name] {
 				t.Fatalf("the run did not execute on its %s machine: %+v", venue.name, link)
 			}
