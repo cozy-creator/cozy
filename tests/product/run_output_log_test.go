@@ -378,8 +378,8 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		products, _ := store.Products(film.ID)
 		return products
 	}
-	// The first two revisions share immutable fragments. The third replaces that
-	// container while preserving the encoded video and its timeline.
+	// Current SDKs publish indexed snapshots throughout; older compatible SDKs
+	// append fragments until finalization. Both preserve one stable output path.
 	var takes [][]byte
 	take := func(k int) records.Product {
 		t.Helper()
@@ -400,10 +400,15 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		}
 		// Scalar products use op=set on every revision; AppendedFrom describes
 		// whether the stable file can retain its already-published byte prefix.
-		if k == 2 && (shown.Op != "set" || shown.AppendedFrom == nil || *shown.AppendedFrom != int64(len(takes[k-2])) || !bytes.HasPrefix(data, takes[k-2])) {
+		if indexedMP4(data) {
+			if shown.Op != "set" || shown.AppendedFrom != nil || len(shown.Parts) != 1 || shown.Parts[0].DurationUs != uint64(k)*500000 {
+				t.Fatalf("indexed revision %d did not replace its preview whole: %+v", k, shown)
+			}
+			assertIndexedFilm(t, data, takes, 12*k, 24)
+		} else if k == 2 && (shown.Op != "set" || shown.AppendedFrom == nil || *shown.AppendedFrom != int64(len(takes[k-2])) || !bytes.HasPrefix(data, takes[k-2])) {
 			t.Fatalf("film revision %d did not append in place to revision %d: %+v", k, k-1, shown)
 		}
-		if k < 3 && (len(shown.Parts) != k+1 || shown.Parts[0].DurationUs != 0 || shown.Parts[k].DurationUs != 500000) {
+		if !indexedMP4(data) && k < 3 && (len(shown.Parts) != k+1 || shown.Parts[0].DurationUs != 0 || shown.Parts[k].DurationUs != 500000) {
 			t.Fatalf("live film revision %d lost its init and half-second fragments: %+v", k, shown.Parts)
 		}
 		if k == 3 && (shown.Op != "set" || shown.AppendedFrom != nil || len(shown.Parts) != 1 || shown.Parts[0].DurationUs != 1500000) {

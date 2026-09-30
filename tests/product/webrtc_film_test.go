@@ -54,6 +54,23 @@ type indexedFilmPacket struct {
 	Hash     string `json:"data_hash"`
 }
 
+func indexedMP4(data []byte) bool {
+	moov := false
+	for at := 0; at+8 <= len(data); {
+		size := uint64(binary.BigEndian.Uint32(data[at:]))
+		kind := string(data[at+4 : at+8])
+		if size == 1 && at+16 <= len(data) {
+			size = binary.BigEndian.Uint64(data[at+8:])
+		}
+		if size < 8 || size > uint64(len(data)-at) || kind == "moof" {
+			return false
+		}
+		moov = moov || kind == "moov"
+		at += int(size)
+	}
+	return moov
+}
+
 // Finalization changes the container, not the video. Exercise the bytes delivered
 // to each consumer, including fresh seeks into predictive frames between keyframes.
 func assertIndexedFilm(t *testing.T, final []byte, previews [][]byte, frames, fps int) {
