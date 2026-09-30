@@ -287,23 +287,17 @@ func schemaChanged(path string, version int) *exit.Error {
 		WithRemedy("run the command again")
 }
 
-// verifySchema checks only that every required table and column exists, creating what is
-// missing. Extra columns, indexes and tables and differences in DDL text are accepted.
+// verifySchema creates every required table, column and index the database lacks. An
+// index matters as much as a column: without one, a query scans every event ever recorded.
+// Extra columns, indexes and tables and differences in DDL text are accepted.
 func verifySchema(db *sql.DB, path string) *exit.Error {
 	required, err := requiredCurrentShape()
 	if err != nil {
 		return exit.Internalf("cannot derive current records schema: %s", err)
 	}
-	lacking, err := missing(db, required)
-	if err != nil {
-		return exit.Internalf("cannot inspect records schema in %s: %s", path, err)
-	}
-	if len(lacking) == 0 {
-		return nil
-	}
 	if err := conform(db, required); err != nil {
 		return exit.Named(exit.Conflict, "records.schema_incomplete",
-			"records database %s lacks %s and it cannot be added: %s", path, strings.Join(lacking, ", "), err).
+			"records database %s is incomplete and cannot be completed: %s", path, err).
 			WithRemedy("keep %s in place; its rows are intact — run the Cozy Creator build that wrote it", path)
 	}
 	return nil

@@ -3048,7 +3048,7 @@ func leasedInstallFacts(ctx *Context, pkg string) (*launch.Facts, *install.Lease
 	}
 	defer store.Close()
 	for {
-		active, problem := installedPackage(ctx, pkg)
+		active, problem := installedPackage(store, pkg)
 		if problem != nil {
 			return nil, nil, problem
 		}
@@ -3068,17 +3068,8 @@ func leasedInstallFacts(ctx *Context, pkg string) (*launch.Facts, *install.Lease
 	}
 }
 
-func installedPackage(ctx *Context, pkg string) (*records.PackageInstall, *exit.Error) {
+func installedPackage(store *records.Store, pkg string) (*records.PackageInstall, *exit.Error) {
 	bare, major, hasMajor := splitMajor(pkg)
-	l, e := home.Open(ctx.Cfg.Home)
-	if e != nil {
-		return nil, e
-	}
-	store, e := records.Open(l.DB)
-	if e != nil {
-		return nil, e
-	}
-	defer store.Close()
 	pins, e := store.Pins(bare)
 	if e != nil {
 		return nil, e
