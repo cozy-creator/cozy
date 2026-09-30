@@ -16,6 +16,14 @@ and copy `agent_version` and `agent_started_unix_ms` from that reviewed plan int
 `--expect-agent-version` and `--expect-agent-started-unix-ms`. These preconditions
 also apply when resuming observation after a disconnect.
 
+Verified public wheels can be uploaded before the rental becomes idle with
+repeatable `--stage-wheel SHA256=PATH` arguments and the same reviewed agent
+identity flags. This only uses the authenticated wheel-staging endpoint; it does
+not submit an update, claim maintenance or alter the active Python environment.
+The helper verifies the local digest/version and the machine's returned receipt.
+Omit `--apply` to finish with `staged_only`. The later version-based update reuses
+the staged wheel when its filename and digest match the public package index.
+
 The command uses the existing rental key and pinned certificate. Its operation
 ID is stable for the rental, boot, and requested pair. Rerunning an interrupted
 command observes that operation; another pending operation refuses. Failed or
