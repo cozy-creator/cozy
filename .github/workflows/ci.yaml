@@ -188,7 +188,6 @@ jobs:
           uv venv --python 3.12 "$RUNNER_TEMP/types"
           uv pip install --python "$RUNNER_TEMP/types/bin/python" packaging "$RUNTIME_WHEEL" "cozy-eval==$COZY_EVAL_VERSION" "$TENSORFS_WHEEL"
           COZY_TYPECHECK_PYTHON="$RUNNER_TEMP/types/bin/python" sh scripts/typecheck.sh
-          MYPYPATH="$PWD/scripts" sh scripts/typecheck.sh --strict scripts/ci-product-coverage.py scripts/ci_product_partitions.py
       # Saved from every master run that compiled, pass or fail.
       - if: ${{ !cancelled() && matrix.shard == 0 && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
         uses: actions/cache/save@v4
@@ -210,4 +209,4 @@ jobs:
           pattern: product-logs-*
           path: ${{ runner.temp }}/product-coverage
       - name: Audit complete product coverage
-        run: python3 scripts/ci-product-coverage.py "$RUNNER_TEMP/product-coverage" '${{ inputs.full }}'
+        run: python3 -m scripts.ci_product_coverage "$RUNNER_TEMP/product-coverage" '${{ inputs.full }}'

@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 import sys
 
-from ci_product_partitions import measured, partition
+from scripts.ci_product_partitions import measured, partition
 
 
 def names(path: Path) -> list[str]:
@@ -56,5 +56,5 @@ def audit(root: Path, full: bool) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) != 3 or sys.argv[2] not in ("true", "false"):
-        raise SystemExit("usage: ci-product-coverage.py LOG_ROOT FULL")
+        raise SystemExit("usage: python -m scripts.ci_product_coverage LOG_ROOT FULL")
     audit(Path(sys.argv[1]), sys.argv[2] == "true")
