@@ -486,6 +486,9 @@ func (s *Store) ObserveMachinePage(id string, state *pb.MachineExecutionState, p
 	if nextState == "" || current == "canceled" || link.Abandoned {
 		nextState = current
 	}
+	if link.CancelRequested && !link.Abandoned && !Settled(nextState) {
+		nextState = "canceling"
+	}
 	var previous pb.MachineExecutionState
 	// A snapshot older than the recorded one projects nothing, but its page's entries are
 	// history all the same: they are recorded, never dropped with the snapshot.
@@ -797,11 +800,11 @@ func (s *Store) CompleteMachineControl(id string, command []byte) *exit.Error {
 	return nil
 }
 
-// CancelMachineBeforeAcceptance records cancel intent in the transaction that reads acceptance.
-// Unsent intent is canceled at once; a sent submission's cancel stays pending until the machine
-// closes the key or returns a receipt. It reports a receipt recorded since the caller's read,
-// whose cancel the caller sends as any accepted run's. A finished run is never reopened.
-func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
+// RequestMachineCancellation records intent and its actor before any remote I/O.
+// Unsent work is canceled here. Sent or accepted work remains canceling until its
+// machine proves the outcome. The return value reports recorded acceptance.
+// An empty actor is used only when reconciling an intent that is already durable.
+func (s *Store) RequestMachineCancellation(id, actor string) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, exit.Internalf("cannot record machine cancellation intent: %s", err)
@@ -834,6 +837,23 @@ func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 		}
 		if err := projectCancellationTx(tx, id, state, scope); err != nil {
 			return false, exit.Internalf("cannot project pending machine cancellation: %s", err)
+		}
+	} else if _, err := tx.Exec(`UPDATE requests SET state='canceling' WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, id); err != nil {
+		return false, exit.Internalf("cannot project requested machine cancellation: %s", err)
+	}
+	if actor != "" {
+		var recorded bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='request.cancel_requested')`, id).Scan(&recorded); err != nil {
+			return false, exit.Internalf("cannot inspect cancellation attribution: %s", err)
+		}
+		if !recorded {
+			var ordinal int64
+			if err := tx.QueryRow(`SELECT ordinal FROM requests WHERE id=?`, id).Scan(&ordinal); err != nil {
+				return false, exit.Internalf("cannot read canceled attempt: %s", err)
+			}
+			if err := appendEventTx(tx, id, "request.cancel_requested", ordinal, map[string]any{"actor": actor, "source": "machine_control"}); err != nil {
+				return false, exit.Internalf("cannot record cancellation attribution: %s", err)
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {

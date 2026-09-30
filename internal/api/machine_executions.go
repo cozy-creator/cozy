@@ -387,34 +387,22 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 			return true, problem
 		}
 	}
-	accepted := len(link.Receipt) > 0
-	if action == "cancel" && !accepted {
-		// Acceptance recorded since the read above is found where the cancel is recorded.
-		accepted, problem = s.store.CancelMachineBeforeAcceptance(row.ID)
-		if problem == nil && s.machineExecutions != nil {
-			s.machineExecutions.Withdraw(row.ID)
-		}
-	}
-	if problem == nil && (accepted || action != "cancel") {
-		if s.machineExecutions == nil {
-			problem = exit.Unavailablef("this client cannot control Runtime-owned execution")
-		} else {
-			problem = s.machineExecutions.Control(ctx, row, action)
-		}
-	}
-	// Machine execution controls used to leave no durable actor when they came
-	// through the machine-owned route. That made a cancellation look like it
-	// came from an observer disconnect. Record the successful explicit control
-	// at the API boundary; a watcher never reaches this handler.
-	if problem == nil && action == "cancel" {
+	if action == "cancel" {
 		if actor == "" {
 			actor = "an unnamed api client"
 		}
-		if e := s.store.AppendEvent(row.ID, "request.cancel_requested", int64(row.Ordinal), map[string]any{
-			"actor": actor, "source": "machine_control",
-		}); e != nil {
-			return true, e
+		if _, problem := s.store.RequestMachineCancellation(row.ID, actor); problem != nil {
+			return true, problem
 		}
+		// Control's cancel arm only wakes the existing observer. The durable
+		// request survives a closing daemon or an unavailable machine.
+		if s.machineExecutions != nil {
+			_ = s.machineExecutions.Control(ctx, row, action)
+		}
+		return true, nil
 	}
-	return true, problem
+	if s.machineExecutions == nil {
+		return true, exit.Unavailablef("this client cannot control Runtime-owned execution")
+	}
+	return true, s.machineExecutions.Control(ctx, row, action)
 }

@@ -185,7 +185,7 @@ func frozenSubmissionRecord(t *testing.T, store *records.Store, cancel bool, con
 	link, p := store.MachineExecution(request.ID)
 	fatal(t, p)
 	if cancel {
-		_, p = store.CancelMachineBeforeAcceptance(request.ID)
+		_, p = store.RequestMachineCancellation(request.ID, "")
 		fatal(t, p)
 	}
 	return request, bytes.Clone(link.Submission)
