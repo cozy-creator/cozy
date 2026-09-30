@@ -214,7 +214,7 @@ fn streaming_reuses_a_slot_only_after_its_reader_finished() {
     let s = Stream::new();
     p.set_pinned_budget(1 << 30).unwrap();
     p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
-    p.set_vram_budget(DEV, 2 * 72 << 20).unwrap();
+    p.set_vram_budget(DEV, (2 * 72) << 20).unwrap();
     // Nothing resident: every position streams through 2 slots. Nothing syncs until the end:
     // each read is queued behind a stall, so a copy that reused its slot before the release
     // event would overwrite bytes the stalled read has not taken yet.

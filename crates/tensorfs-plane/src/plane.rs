@@ -87,12 +87,13 @@ const EVENT_RING: usize = 4096;
 
 // ---------------------------------------------------------------- books
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) enum HState {
     Absent,
     Filling,
     Ready,
-    Invalid(String),
+    /// The fill failed; the typed cause is kept for every later reader.
+    Invalid(Error),
 }
 
 pub(crate) struct HReg {
@@ -113,7 +114,7 @@ pub(crate) enum DState {
     Queued,
     Filling(EvRef),
     Ready,
-    Invalid(String),
+    Invalid(Error),
 }
 
 pub(crate) struct DReg {
@@ -359,7 +360,7 @@ fn sync_all(pending: &mut Vec<EvRef>) -> Result<()> {
 
 // ---------------------------------------------------------------- the plane
 
-pub(crate) fn devws<'a>(c: &'a mut Core, ws: WsId, d: usize) -> Result<&'a mut DevWs> {
+pub(crate) fn devws(c: &mut Core, ws: WsId, d: usize) -> Result<&mut DevWs> {
     if let Some(p) = &c.poisoned {
         return Err(Error::Poisoned(p.clone()));
     }
@@ -612,7 +613,7 @@ impl Inner {
                     h.state = HState::Ready;
                     h.registered = registered;
                 }
-                Err(e) => h.state = HState::Invalid(e.to_string()),
+                Err(e) => h.state = HState::Invalid(e.clone()),
             }
             if res.is_err() {
                 c.host_used -= region.span;
@@ -637,7 +638,7 @@ impl Inner {
                 if let Err(e) = inner.submit_dev_fill(&mut c, ws, d, r) {
                     if let Some(Some(w)) = c.sets.get_mut(ws.0 as usize) {
                         if let Some(dw) = w.devs[d].as_mut() {
-                            dw.regs[r as usize].state = DState::Invalid(e.to_string());
+                            dw.regs[r as usize].state = DState::Invalid(e);
                         }
                     }
                 }
@@ -731,12 +732,12 @@ impl Inner {
         let w = c.ws_mut(ws)?;
         let region = w.layout.regions[r as usize].clone();
         let hstate = w.hregs[r as usize].state.clone();
-        if hstate == HState::Filling {
+        if matches!(hstate, HState::Filling) {
             w.hregs[r as usize].then.push(d);
             w.devs[d].as_mut().unwrap().regs[r as usize].state = DState::Queued;
             return Ok(());
         }
-        let from_host = hstate == HState::Ready;
+        let from_host = matches!(hstate, HState::Ready);
         let src = if from_host {
             w.hregs[r as usize].holds += 1;
             // SAFETY: inside the live mapping; the hold keeps the region from eviction.
@@ -785,7 +786,7 @@ impl Inner {
                         });
                     }
                     Err(e) => {
-                        reg.state = DState::Invalid(e.to_string());
+                        reg.state = DState::Invalid(e.clone());
                         c.event(Event {
                             kind: "fill_failed",
                             ws: Some(name),
@@ -807,7 +808,7 @@ impl Inner {
             if from_host {
                 w.hregs[r as usize].holds -= 1;
             }
-            w.devs[d].as_mut().unwrap().regs[r as usize].state = DState::Invalid(e.to_string());
+            w.devs[d].as_mut().unwrap().regs[r as usize].state = DState::Invalid(e.clone());
             return Err(e);
         }
         Ok(())
@@ -840,7 +841,7 @@ impl Inner {
             let dw = devws(&mut c, ws, d)?;
             match &dw.regs[r as usize].state {
                 DState::Queued => c = self.cv.wait(c).unwrap(),
-                DState::Invalid(e) => return Err(Error::Invalid(format!("region {r}: {e}"))),
+                DState::Invalid(e) => return Err(e.clone()),
                 DState::Absent => return Err(Error::Invalid(format!("region {r} was evicted before use"))),
                 _ => break,
             }
@@ -963,7 +964,7 @@ impl Plane {
                 (d.mem_get_allocation_granularity)(&mut g, &prop, cuda::MEM_GRANULARITY_MINIMUM)
             })?;
             let g = g as u64;
-            if g == 0 || REGION_ALIGN % g != 0 || cfg.slab_bytes % REGION_ALIGN != 0 {
+            if g == 0 || !REGION_ALIGN.is_multiple_of(g) || !cfg.slab_bytes.is_multiple_of(REGION_ALIGN) {
                 return Err(Error::Invalid(format!(
                     "device {ordinal}: granularity {g} and slab {} must divide into {REGION_ALIGN}",
                     cfg.slab_bytes
@@ -1046,7 +1047,7 @@ impl Plane {
     /// verified door) and ends it when the last weight set and handle using it are gone, so
     /// one lease serves every component of a manifest.
     pub fn source(&self, store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease) -> Arc<Source> {
-        Arc::new(Source::new(store, meta, lease, self.inner.cfg.direct_io))
+        Arc::new(Source::new(store, meta, lease, self.inner.cfg.direct_io, Arc::as_ptr(&self.inner) as usize))
     }
 
     /// Register one weight set: `plan`'s parts grouped into `regions`. `host_fd` adopts a
@@ -1060,6 +1061,9 @@ impl Plane {
         host_fd: Option<RawFd>,
     ) -> Result<WsId> {
         self.check()?;
+        if !source.made_by(Arc::as_ptr(&self.inner) as usize) {
+            return Err(Error::Invalid("the source was made by another plane".into()));
+        }
         let layout = Layout::build(plan, regions)?;
         let host = match host_fd {
             Some(fd) => HostMem::adopt(fd, &layout)?,
@@ -1222,7 +1226,7 @@ impl Plane {
                 for &r in &regions {
                     let h = &mut c.ws_mut(ws)?.hregs[r as usize];
                     h.pin = false;
-                    if h.holds > 0 || h.state == HState::Filling {
+                    if h.holds > 0 || matches!(h.state, HState::Filling) {
                         return Err(Error::LeaseViolation {
                             op: "drop",
                             live: h.holds as u64,
@@ -1230,7 +1234,7 @@ impl Plane {
                             what: format!("pinned region {r}"),
                         });
                     }
-                    if h.state != HState::Absent {
+                    if !matches!(h.state, HState::Absent) {
                         freed += self.inner.punch_region(&mut c, ws, r)?.unwrap_or(0);
                     }
                 }
@@ -1362,7 +1366,7 @@ impl Plane {
                     });
                 }
             }
-            if w.hregs.iter().any(|h| h.holds > 0 || h.state == HState::Filling) {
+            if w.hregs.iter().any(|h| h.holds > 0 || matches!(h.state, HState::Filling)) {
                 return Err(Error::LeaseViolation { op: "close", live: 1, pending: 0, what: "pinned tier in use".into() });
             }
             let queued = w.devs.iter().flatten().any(|dw| dw.regs.iter().any(|r| matches!(r.state, DState::Queued)));
@@ -1396,12 +1400,15 @@ impl Plane {
                 let _g = first.map(CtxGuard::enter).transpose()?;
                 host.unregister(layout.regions[r].offset)?;
             }
-            if h.state != HState::Absent {
+            if !matches!(h.state, HState::Absent) {
                 used += layout.regions[r].span;
             }
         }
-        c.sets[ws.0 as usize].take();
+        let w = c.sets[ws.0 as usize].take();
         c.host_used -= used;
+        drop(c);
+        // Outside the lock: the last weight set on a source ends its TensorFS lease (file I/O).
+        drop(w);
         Ok(())
     }
 
@@ -1484,7 +1491,7 @@ impl Plane {
                 ..Default::default()
             };
             for (r, h) in w.hregs.iter().enumerate() {
-                if h.state == HState::Ready {
+                if matches!(h.state, HState::Ready) {
                     s.host_ready_bytes += w.layout.regions[r].nbytes;
                     host.ready_bytes += w.layout.regions[r].nbytes;
                     if h.registered {
@@ -1653,7 +1660,7 @@ impl Ticket {
                     Tier::Pinned => match &w.hregs[r as usize].state {
                         HState::Ready => {}
                         HState::Filling => busy = true,
-                        HState::Invalid(e) => return Err(Error::Invalid(format!("region {r}: {e}"))),
+                        HState::Invalid(e) => return Err(e.clone()),
                         HState::Absent => return Err(Error::Invalid(format!("region {r} left the pinned tier"))),
                     },
                     Tier::Device(o) => {
@@ -1665,7 +1672,7 @@ impl Ticket {
                             DState::Ready => {}
                             DState::Queued => busy = true,
                             DState::Filling(ev) => evs.push(ev.clone()),
-                            DState::Invalid(e) => return Err(Error::Invalid(format!("region {r}: {e}"))),
+                            DState::Invalid(e) => return Err(e.clone()),
                             DState::Absent => return Err(Error::Invalid(format!("region {r} was evicted"))),
                         }
                     }
@@ -1759,7 +1766,7 @@ impl Lease {
             ptr: self.ptr,
             nbytes: self.nbytes,
             device: self.device(),
-            _hold: hold,
+            hold,
         })
     }
 }
@@ -1782,7 +1789,18 @@ pub struct LeaseView {
     pub ptr: u64,
     pub nbytes: u64,
     pub device: i32,
-    _hold: Hold,
+    hold: Hold,
+}
+
+impl LeaseView {
+    /// A resident region's view is stale once any region of its weight set was unmapped;
+    /// a slot view never is (slots stay mapped for the cursor's life).
+    pub fn stale(&self) -> bool {
+        match &self.hold {
+            Hold::Ws(v) => v.stale(),
+            Hold::Slot(_) => false,
+        }
+    }
 }
 
 /// A weight set's device VA, for zero-copy views of resident regions.

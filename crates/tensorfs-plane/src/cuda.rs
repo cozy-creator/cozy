@@ -258,6 +258,8 @@ pub struct CtxGuard {
 }
 
 impl CtxGuard {
+    // Driver handles are opaque: Rust never dereferences them.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn enter(ctx: CUcontext) -> Result<CtxGuard> {
         let d = driver()?;
         let mut prev: CUcontext = std::ptr::null_mut();

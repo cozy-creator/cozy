@@ -50,6 +50,7 @@ pub struct Source {
     store: Arc<Store>,
     fds: Mutex<HashMap<String, Arc<Fds>>>,
     direct_io: bool,
+    plane: usize,
 }
 
 /// Whether the page cache holds every page of `[off, off+len)`, from `cachestat(2)`: a pure
@@ -83,14 +84,19 @@ fn cached(f: &File, off: u64, len: u64) -> Option<bool> {
 }
 
 impl Source {
-    pub fn new(store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease, direct_io: bool) -> Source {
+    pub fn new(store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease, direct_io: bool, plane: usize) -> Source {
         Source {
             lease: RwLock::new(Some(lease)),
             meta,
             store,
             fds: Mutex::new(HashMap::new()),
             direct_io,
+            plane,
         }
+    }
+
+    pub(crate) fn made_by(&self, plane: usize) -> bool {
+        self.plane == plane
     }
 
     /// End the TensorFS lease. Runs when the last weight set and handle drop the source.
@@ -161,7 +167,7 @@ impl Source {
         let fds = self.fds(&o.obj, tally)?;
         let a = PART_ALIGN;
         let end = o.off + item.len;
-        let aligned = (dst as u64).wrapping_sub(o.off) % a == 0 && (end % a == 0 || item.part_end);
+        let aligned = (dst as u64).wrapping_sub(o.off).is_multiple_of(a) && (end.is_multiple_of(a) || item.part_end);
         let direct = match (mode, &fds.direct) {
             (Mode::Cache, Some(f)) if aligned && !cached(&fds.buffered, o.off, item.len).unwrap_or(false) => f,
             _ => {
@@ -282,11 +288,13 @@ impl Readers {
     }
 }
 
+type Done = Box<dyn FnOnce(Result<()>) + Send>;
+
 /// A set of jobs with one completion: the last finisher calls `done` with the first error.
 pub struct Batch {
     left: AtomicUsize,
     err: Mutex<Option<Error>>,
-    done: Mutex<Option<Box<dyn FnOnce(Result<()>) + Send>>>,
+    done: Mutex<Option<Done>>,
 }
 
 impl Batch {

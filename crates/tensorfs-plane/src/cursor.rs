@@ -38,7 +38,7 @@ pub(crate) struct Cur {
     pub slot_span: u64,
     pub slots: Vec<Vec<Chunk>>,
     /// k -> Ok(ready event) once the mover recorded it, Err(cause) if the copy failed.
-    ready: BTreeMap<u64, std::result::Result<EvRef, String>>,
+    ready: BTreeMap<u64, Result<EvRef>>,
     /// k -> the event after which slot `k % window` is free (None: already free), kept until
     /// the copy that reuses the slot is queued.
     freed: BTreeMap<u64, Option<EvRef>>,
@@ -94,7 +94,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64) -> Result<()> {
     cur.inflight += 1;
     let w = c.ws_mut(ws)?;
     let region = w.layout.regions[r as usize].clone();
-    let from_host = w.hregs[r as usize].state == HState::Ready;
+    let from_host = matches!(w.hregs[r as usize].state, HState::Ready);
     let src = if from_host {
         w.hregs[r as usize].holds += 1;
         // SAFETY: inside the live mapping; the hold keeps the region until the copy's event.
@@ -138,7 +138,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64) -> Result<()> {
             }
             if let Some(cur) = c.cursors.get_mut(&id) {
                 cur.inflight -= 1;
-                cur.ready.insert(k, res.map(|cp| cp.ready).map_err(|e| e.to_string()));
+                cur.ready.insert(k, res.map(|cp| cp.ready));
             }
             drop(c);
             inner2.cv.notify_all();
@@ -150,7 +150,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64) -> Result<()> {
         }
         let cur = c.cursors.get_mut(&id).unwrap();
         cur.inflight -= 1;
-        cur.ready.insert(k, Err(e.to_string()));
+        cur.ready.insert(k, Err(e));
     }
     Ok(())
 }
@@ -378,7 +378,7 @@ impl Cursor {
             let cur = c.cursors.get(&self.id).ok_or(Error::Closed)?;
             match cur.ready.get(&k) {
                 Some(Ok(e)) => break e.clone(),
-                Some(Err(e)) => return Err(Error::Invalid(format!("streamed copy of region {r} failed: {e}"))),
+                Some(Err(e)) => return Err(e.clone()),
                 None => c = inner.cv.wait(c).unwrap(),
             }
         };

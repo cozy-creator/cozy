@@ -16,7 +16,7 @@ pub use plane::{Lease, Plane, PlaneConfig, Stats, Ticket, Tier, Trim, View, WsId
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum Error {
     #[error("cuda driver: {op} failed with {name} ({code})")]
     Cuda {

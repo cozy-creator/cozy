@@ -21,7 +21,7 @@ wheel (`from tensorfs import plane`), so it takes TensorFS `Store`, `ReadLease` 
 
 ```python
 p = plane.Plane(
-    devices=[0],             # CUDA ordinals; [] = host tier only (libcuda never loaded)
+    devices=[0],             # required: CUDA ordinals; [] = host tier only (libcuda never loaded)
     readers=8,               # persistent reader threads
     copy_streams=1,          # copy streams (mover threads) per device
     slab_bytes=64 << 20,     # physical VRAM handle size (multiple of 2 MiB); 0 = one per region
@@ -150,10 +150,12 @@ cur.close()                  # refuses while a lease or slot view is live; waits
 ## Views
 
 ```python
+ws.verify(device) -> int     # driver truth: every chunk the books call mapped is the driver's
+                             #   mapping there (a request-boundary check); a mismatch poisons
 v = ws.view(device)          # uint8 DLPack, shape [ws.nbytes]: the stable VA (reserved once)
 t = torch.from_dlpack(v)     # bytes valid only for resident regions under a lease
 v.stale                      # True if any region was unmapped since the view was made
-lv = lease.view()            # uint8 DLPack, shape [lease.nbytes], at lease.ptr
+lv = lease.view()            # uint8 DLPack, shape [lease.nbytes], at lease.ptr (lv.stale as above)
 ```
 
 Views keep the VA alive (a weight set's: blocks `ws.close()`; a slot's: blocks

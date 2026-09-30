@@ -29,9 +29,13 @@ that broke, is typed to its rows here.
 
 from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
+from types import ModuleType
 from typing import Any, Literal, NotRequired, Self, TypedDict
 
 __version__: str
+
+#: `tensorfs._ext.plane`, typed in full by `plane.pyi` (the `tensorfs.plane` facade).
+plane: ModuleType
 
 StrPath = str | PathLike[str]
 

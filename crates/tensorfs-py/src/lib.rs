@@ -12,6 +12,7 @@ mod docs;
 mod ensure;
 mod errors;
 mod ingest;
+mod plane;
 mod store;
 
 use pyo3::prelude::*;
@@ -148,5 +149,6 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::PyLease>()?;
     m.add_class::<store::PyPlan>()?;
     m.add_class::<store::PyBatch>()?;
+    plane::install(m)?;
     Ok(())
 }

@@ -478,6 +478,7 @@ version = "0.3.83"
 dependencies = [
  "pyo3",
  "tensorfs-core",
+ "tensorfs-plane",
 ]
 
 [[package]]

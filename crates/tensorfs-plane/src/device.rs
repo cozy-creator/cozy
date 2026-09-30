@@ -49,6 +49,7 @@ impl Ev {
         // SAFETY: a live event.
         cuda::check("cuEventSynchronize", unsafe { (d.event_synchronize)(self.raw) })
     }
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // an opaque driver handle
     pub fn record(&self, stream: CUstream) -> Result<()> {
         let d = cuda::driver()?;
         // SAFETY: event and stream of the same context (the caller binds it).
@@ -164,7 +165,7 @@ impl Arena {
             return vec![span];
         }
         let mut v = vec![self.slab; (span / self.slab) as usize];
-        if span % self.slab != 0 {
+        if !span.is_multiple_of(self.slab) {
             v.push(span % self.slab);
         }
         v

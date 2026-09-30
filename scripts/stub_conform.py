@@ -42,6 +42,7 @@ import ast
 import inspect
 import pathlib
 import sys
+import types
 from typing import Any
 
 #: pyo3 renders an unrepresentable default as `...` in `__text_signature__`, and CPython
@@ -410,6 +411,18 @@ def main() -> int:
     if not hatches:
         compare(runtime, declared, "", faults)
     faults.extend(check_errors_reexports(_ext))
+    # A compiled submodule (`_ext.plane`) is typed by the stub of the facade module that
+    # re-exports it (`plane.pyi`), and is held to it the same way.
+    for name in sorted(n for n in runtime if isinstance(getattr(_ext, n), types.ModuleType)):
+        sub_path = stub_path.with_name(f"{name}.pyi")
+        if not sub_path.exists():
+            faults.append(f"{name}: the extension exports this submodule and {sub_path.name} is absent")
+            continue
+        sub_declared, sub_hatches = read_stub(sub_path)
+        sub_faults = [f"{hatch}: an escape hatch in the stub" for hatch in sub_hatches]
+        if not sub_hatches:
+            compare(read_extension(getattr(_ext, name)), sub_declared, "", sub_faults)
+        faults.extend(f"{name}.{fault}" for fault in sub_faults)
 
     if faults:
         print(f"_ext.pyi disagrees with the extension it ships beside, in {len(faults)} place(s):\n")
