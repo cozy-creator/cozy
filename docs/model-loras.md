@@ -61,6 +61,16 @@ overlay when needed. The authored function receives none of these controls.
 When combined, JSON/YAML and inline overlay lists come first; repeated `--lora`
 flags append in their command-line order, including equivalent slot spellings.
 
+The accepted normalized format pairs `<target>.lora_A.weight` with
+`<target>.lora_B.weight`, using A shaped `(rank, input)` and B shaped
+`(output, rank)`. Optional scalar `<target>.alpha` defaults to the rank. Factors
+must be finite plain `f16`, `bf16`, or `f32` tensors in one selected source
+component, with the same dtype for each A/B pair. Only optional `normalization`
+metadata may accompany them; additional
+inference configuration is refused. Use the original base plus the complete
+ordered stack: a base that already contains a composed adapter graph is refused.
+Raw community naming dialects need normalization into this format during ingest.
+
 For a foreign adapter, select its tensor file explicitly when the repository has
 multiple versions:
 

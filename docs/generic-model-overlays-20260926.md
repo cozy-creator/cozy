@@ -1,5 +1,20 @@
 # Generic weighted model-slot overlays
 
+## September 30, 2026: supersession
+
+The September 26 proposal below is retained as historical design evidence. Current
+usage and compatibility limits are in [LoRAs on model slots](model-loras.md).
+Runtime caches immutable composed views that retain the original base and adapter
+factor bytes; serving applies the ordered stack through unmerged PEFT linear
+projections. The restore/discard and generic bake requirements below are superseded.
+
+H3's native Turbo consumer hooks remain installed, but activation is scoped to
+each DiT forward and cleared afterward. Compatible generic stacks coexist with
+the native Turbo distillation binding. The permanently armed Turbo description
+and follow-up below describe the earlier implementation.
+
+## Historical September 26 proposal
+
 This note records the first bounded delivery of the generic overlay surface. It
 is a model-binding sidecar, not a callable payload field:
 
