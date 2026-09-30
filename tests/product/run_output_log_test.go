@@ -23,8 +23,8 @@ import (
 // A run reports its work as it happens, over the real CLI, daemon, Host and Runtime. The
 // package publishes three revisions of one output and one list item per revision. Each lands
 // in its item's one stable file in the outputs folder while the run goes on: the CLI names
-// the file once and each revision after, an image is replaced whole, a video is appended in
-// place, and the result is the fold of the log.
+// the file once and each revision after, live video is appended in place, and completion
+// replaces its fragmented preview with the indexed MP4. The result is the fold of the log.
 // Canceled after its second revision, a run keeps that revision as its result. The Hub is
 // asked nothing while the runs go on.
 func TestRunReportsProductsAsTheyArrive(t *testing.T) {
@@ -356,8 +356,8 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	if !done || events[len(events)-1].Type != "run.canceled" && !slices.ContainsFunc(events, func(e records.Event) bool { return e.Type == "run.canceled" }) {
 		t.Fatal("the canceled run's image was not done incomplete at revision 2 before run.canceled")
 	}
-	// A growing video is one file a player reads while the run goes on, appended in place;
-	// its last revision is the final MP4.
+	// A growing video has one stable path. Live revisions append; the final indexed
+	// MP4 replaces the preview and remains the last revision at that same path.
 	gate = filepath.Join(t.TempDir(), "film")
 	must(t, os.MkdirAll(gate, 0o700))
 	command = cozy("run", "local/output-log-proof/film", "gate="+gate, "--await")
@@ -378,8 +378,8 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		products, _ := store.Products(film.ID)
 		return products
 	}
-	// The video is one file rewritten in place: each revision's bytes begin with the last
-	// one's, and the file is only ever appended to.
+	// The first two revisions share immutable fragments. The third replaces that
+	// container while preserving the encoded video and its timeline.
 	var takes [][]byte
 	take := func(k int) records.Product {
 		t.Helper()
@@ -398,8 +398,16 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		if shown.Path != filepath.Join(directory, fmt.Sprintf("%d-video.mp4", film.Number)) || shown.Rev != uint32(k) || digestOf(data) != shown.Digest {
 			t.Fatalf("film revision %d is not its stable file whole: %+v", k, shown)
 		}
-		if k > 1 && (shown.AppendedFrom == nil || *shown.AppendedFrom != int64(len(takes[k-2])) || !bytes.HasPrefix(data, takes[k-2])) {
+		// Scalar products use op=set on every revision; AppendedFrom describes
+		// whether the stable file can retain its already-published byte prefix.
+		if k == 2 && (shown.Op != "set" || shown.AppendedFrom == nil || *shown.AppendedFrom != int64(len(takes[k-2])) || !bytes.HasPrefix(data, takes[k-2])) {
 			t.Fatalf("film revision %d did not append in place to revision %d: %+v", k, k-1, shown)
+		}
+		if k < 3 && (len(shown.Parts) != k+1 || shown.Parts[0].DurationUs != 0 || shown.Parts[k].DurationUs != 500000) {
+			t.Fatalf("live film revision %d lost its init and half-second fragments: %+v", k, shown.Parts)
+		}
+		if k == 3 && (shown.Op != "set" || shown.AppendedFrom != nil || len(shown.Parts) != 1 || shown.Parts[0].DurationUs != 1500000) {
+			t.Fatalf("the completed film did not replace its preview with one indexed MP4: %+v", shown)
 		}
 		takes = append(takes, data)
 		return shown
@@ -428,13 +436,14 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		t.Fatalf("the finished video file should play 3 segments: %d frames", count)
 	}
 	last = revisions()[2]
-	if len(last.Parts) != 4 || last.Parts[0].DurationUs != 0 || last.Parts[1].DurationUs != 500000 {
-		t.Fatalf("the last revision is not init plus three half-second fragments: %+v", last.Parts)
+	if len(last.Parts) != 1 || last.Parts[0].Digest != last.Digest || last.Parts[0].Length != last.Length {
+		t.Fatalf("the completed part does not name the final MP4: %+v", last.Parts)
 	}
 	movie, err := os.ReadFile(last.Path)
 	if err != nil || digestOf(movie) != last.Digest || !bytes.Equal(movie, takes[2]) {
 		t.Fatalf("the final MP4 is not the last revision: %v", err)
 	}
+	assertIndexedFilm(t, movie, takes[:2], 36, 24)
 	// The outputs folder holds only each run's items, each one stable file at its last
 	// revision: no partial files, no superseded revisions, no content-hash names.
 	var finals []string
@@ -519,7 +528,7 @@ AUDIO = DecodedAudioFormat(2, RATE, "stereo", ("FL", "FR"), Fraction(1, RATE))
 def silence(samples, start):
     return DecodedAudioChunk(2, samples, RATE, "stereo", ("FL", "FR"), (bytes(samples * 4),) * 2, start, Fraction(1, RATE))
 def segment(out, k, frames):
-    """One H3-shaped segment: fragmented MP4, H.264 and AAC, 12 frames."""
+    """One H3-shaped segment: H.264 and AAC, 12 frames."""
     video = DecodedVideoFormat(64, 48, TICK, Fraction(1), Fraction(24), 1, 1, 1, 1)
     def events():
         yield DecodedMediaHeader(video=video, audio=AUDIO)

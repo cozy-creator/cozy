@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -190,7 +191,12 @@ func followOnMachine(t *testing.T, dir string, run uint64, output string, port i
 // revision waits until the follower holds revision k whole.
 func (m *machineFollow) revision(k int) {
 	m.t.Helper()
-	m.h.until(m.c, &m.f, func() bool { return len(m.f.entries) >= k && uint64(len(m.f.got)) == m.f.entries[k-1].Length })
+	m.h.until(m.c, &m.f, func() bool {
+		// A replacement resets the old entry list, while its revision keeps growing.
+		return slices.ContainsFunc(m.f.entries, func(entry webrtctest.Message) bool {
+			return entry.Rev == uint64(k) && m.f.seq >= entry.Seq && uint64(len(m.f.got)) == entry.Length
+		})
+	})
 }
 
 // https reads the output with a capability over the machine endpoint and answers the status.
@@ -274,20 +280,33 @@ func TestWebRTCServesARentalsFilmAsItLands(t *testing.T) {
 	landed(t, "the film's first segment", func() bool { return products() == 1 })
 	media := followOnMachine(t, dir, 1, "video", port)
 	media.revision(1)
+	previews := [][]byte{append([]byte(nil), media.f.got...)}
+	if media.f.resets != 0 {
+		t.Fatal("the initial film unexpectedly reset the follower")
+	}
 	for k := 2; k <= 3; k++ {
 		must(t, os.WriteFile(filepath.Join(gate, fmt.Sprintf("go-%d", k)), nil, 0o600))
 		media.revision(k) // each segment reaches the browser as it lands
 		if got := countFrames(t, media.f.got); got != strconv.Itoa(12*k) {
 			t.Fatalf("after segment %d the WebRTC follower's copy decodes %s frames", k, got)
 		}
+		if k == 2 {
+			if media.f.resets != 0 || !bytes.HasPrefix(media.f.got, previews[0]) {
+				t.Fatal("the live preview replaced or changed its first fragment")
+			}
+			previews = append(previews, append([]byte(nil), media.f.got...))
+		} else if media.f.resets != 1 {
+			t.Fatalf("final indexed replacement caused %d resets; want one", media.f.resets)
+		}
 	}
 	if err := command.Wait(); err != nil {
 		t.Fatalf("the film run exited %v:\n%s", err, filmed.String())
 	}
 	media.h.until(media.c, &media.f, func() bool { return media.f.end != nil })
-	if end := media.f.end; end.Status != "completed" || end.SHA256 != digestOf(media.f.got) || media.f.resets != 0 {
+	if end := media.f.end; end.Status != "completed" || end.SHA256 != digestOf(media.f.got) || media.f.resets != 1 {
 		t.Fatalf("the WebRTC follower ended with %s after %d bytes and %d resets", end.Raw, len(media.f.got), media.f.resets)
 	}
+	assertIndexedFilm(t, media.f.got, previews, 36, 24)
 	if code := media.https(1, "video", media.mint(capability.Grant{Binding: media.c.Cert})); code != http.StatusForbidden {
 		t.Fatalf("a bound capability over HTTPS answered %d", code)
 	}
