@@ -191,7 +191,7 @@ func TestCancelRacingAcceptanceReachesTheMachine(t *testing.T) {
 func TestCancelAfterAcceptanceKeepsItsIntent(t *testing.T) {
 	store, request, receipt := machineObserverFixture(t)
 	fatal(t, store.AcceptMachineExecution(request.ID, receipt))
-	accepted, problem := store.CancelMachineBeforeAcceptance(request.ID)
+	accepted, problem := store.RequestMachineCancellation(request.ID, "")
 	fatal(t, problem)
 	link, problem := store.MachineExecution(request.ID)
 	fatal(t, problem)

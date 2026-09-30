@@ -28,7 +28,7 @@ func TestMachineAbandonmentPreservesUncertainEvidenceAndRental(t *testing.T) {
 				fatal(t, store.AcceptMachineExecution(request.ID, receipt))
 				fatal(t, store.RecordMachineControl(request.ID, &pb.MachineExecutionControl{Execution: &pb.MachineExecutionQuery{RequestId: request.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId}, CommandId: "pending-cancel", ExpectedGeneration: 1, Action: pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL}))
 			} else if mode == "unknown-canceling" {
-				_, problem := store.CancelMachineBeforeAcceptance(request.ID)
+				_, problem := store.RequestMachineCancellation(request.ID, "")
 				fatal(t, problem)
 			}
 			before, problem := store.MachineExecution(request.ID)
@@ -103,7 +103,7 @@ func TestMachineAbandonmentPreservesUncertainEvidenceAndRental(t *testing.T) {
 
 func TestMachineAbandonmentRetainsLateFactsWithoutReopening(t *testing.T) {
 	store, request, receipt := machineObserverFixture(t)
-	_, problem := store.CancelMachineBeforeAcceptance(request.ID)
+	_, problem := store.RequestMachineCancellation(request.ID, "")
 	fatal(t, problem)
 	_, problem = store.AbandonMachineExecution(request.ID, "owner")
 	fatal(t, problem)
@@ -164,7 +164,7 @@ func TestRunCancelAbandonCLIIsLocalAndSurvivesDaemonRestart(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	request, _ := machineObserverRecord(t, store)
-	_, problem = store.CancelMachineBeforeAcceptance(request.ID)
+	_, problem = store.RequestMachineCancellation(request.ID, "")
 	fatal(t, problem)
 	before, problem := store.MachineExecution(request.ID)
 	fatal(t, problem)
@@ -252,7 +252,7 @@ func TestRunCancelAbandonCLIIsLocalAndSurvivesDaemonRestart(t *testing.T) {
 
 func TestMachineAbandonmentKeepsLateClosureWithoutAnotherTerminal(t *testing.T) {
 	store, request, receipt := machineObserverFixture(t)
-	_, problem := store.CancelMachineBeforeAcceptance(request.ID)
+	_, problem := store.RequestMachineCancellation(request.ID, "")
 	fatal(t, problem)
 	_, problem = store.AbandonMachineExecution(request.ID, "owner")
 	fatal(t, problem)

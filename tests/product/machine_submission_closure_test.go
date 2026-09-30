@@ -9,7 +9,7 @@ import (
 
 func TestSubmissionClosureSettlesOnlyMatchingAbsentAcceptance(t *testing.T) {
 	store, request, receipt := machineObserverFixture(t)
-	_, problem := store.CancelMachineBeforeAcceptance(request.ID)
+	_, problem := store.RequestMachineCancellation(request.ID, "")
 	fatal(t, problem)
 	closed := &pb.MachineSubmissionClosure{RequestId: request.ID, SubmissionId: request.IdemKey, ExecutionWorkspaceId: receipt.ExecutionWorkspaceId}
 	for _, arm := range []string{"workspace", "submission", "receipt"} {

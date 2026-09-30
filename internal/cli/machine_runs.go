@@ -108,7 +108,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 			}
 			if len(link.Receipt) == 0 && len(link.Submission) == 0 && link.CancelRequested && current.State == "canceling" {
 				// An older cozy left this cancel waiting on a machine that never accepted the run.
-				if _, problem := m.store.CancelMachineBeforeAcceptance(request.ID); problem != nil {
+				if _, problem := m.store.RequestMachineCancellation(request.ID, ""); problem != nil {
 					return
 				}
 				continue
@@ -314,8 +314,8 @@ func (m *machineRuns) Resume() {
 	}
 }
 
-// Withdraw stops the submission work in flight for a request whose cancel is durable. The
-// observer's next pass releases whatever of it reached the machine.
+// Withdraw stops local submission/observation for a durable cancel or abandonment.
+// The observer's next pass delivers cancellation for any accepted execution.
 func (m *machineRuns) Withdraw(request string) {
 	m.mu.Lock()
 	stop := m.submitting[request]
@@ -323,7 +323,7 @@ func (m *machineRuns) Withdraw(request string) {
 	if stop != nil {
 		stop()
 	}
-	if link, problem := m.store.MachineExecution(request); problem == nil && link != nil && link.Abandoned {
+	if link, problem := m.store.MachineExecution(request); problem == nil && link != nil && (link.Abandoned || link.CancelRequested) {
 		observation := m.observation(request)
 		observation.mu.Lock()
 		if observation.yield != nil {
@@ -1294,9 +1294,13 @@ func (m *machineRuns) retainedResult(request records.Request, outcome *pb.Attemp
 	return problem
 }
 
-// Control sends the command on its own connection the moment it is durable; observing the
-// execution afterwards reuses that connection.
+// Control wakes delivery of a durable cancel without waiting on its machine.
+// Pause/resume retain their synchronous generation-checked control path.
 func (m *machineRuns) Control(parent context.Context, request records.Request, action string) *exit.Error {
+	if action == "cancel" {
+		m.Withdraw(request.ID)
+		return m.Start(request)
+	}
 	return m.control(parent, request, action, false)
 }
 

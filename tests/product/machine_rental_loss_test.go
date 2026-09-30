@@ -20,7 +20,7 @@ func TestEndedRentalSettlesMachineControlWithoutInventingOutcome(t *testing.T) {
 					CommandId: "cancel-before-loss", ExpectedGeneration: 1, Action: pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL,
 				}))
 			} else {
-				_, problem := store.CancelMachineBeforeAcceptance(request.ID)
+				_, problem := store.RequestMachineCancellation(request.ID, "")
 				fatal(t, problem)
 			}
 			before, problem := store.MachineExecution(request.ID)

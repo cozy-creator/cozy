@@ -198,7 +198,7 @@ func TestMachineObservationReplaysAcrossWorkerRestartWithoutLocalAttempts(t *tes
 
 func TestMachineCancellationPreservesAmbiguousAcceptance(t *testing.T) {
 	store, request, receipt := machineObserverFixture(t)
-	accepted, problem := store.CancelMachineBeforeAcceptance(request.ID)
+	accepted, problem := store.RequestMachineCancellation(request.ID, "")
 	fatal(t, problem)
 	if accepted {
 		t.Fatal("an unanswered submission was reported accepted")
@@ -342,7 +342,7 @@ func TestMachineCancellationBeforeTransmissionCreatesNoRemotePromise(t *testing.
 	request, _, problem := store.Submit(records.Request{ID: "job-unsent", IdemKey: "unsent", Package: "local/example", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("2"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "local"))
-	accepted, problem := store.CancelMachineBeforeAcceptance(request.ID)
+	accepted, problem := store.RequestMachineCancellation(request.ID, "")
 	fatal(t, problem)
 	if accepted {
 		t.Fatal("unsent intent was reported accepted")

@@ -19,7 +19,7 @@ func TestDestroyedUnacceptedExecutionCannotReturnToCanceling(t *testing.T) {
 	if before.State != "failed" {
 		t.Fatal(before.State)
 	}
-	_, _ = store.CancelMachineBeforeAcceptance(request.ID)
+	_, _ = store.RequestMachineCancellation(request.ID, "")
 	after, problem := store.RequestRow(request.ID)
 	fatal(t, problem)
 	owed, problem := store.MachineExecutionOwesWork(request.ID)

@@ -41,7 +41,7 @@ func TestMachineRetryAfterBlockedPreparationKeepsUnsentHistory(t *testing.T) {
 				t.Fatal("preparation did not become blocked")
 			}
 			if state == "canceled" {
-				_, problem = store.CancelMachineBeforeAcceptance(prior.ID)
+				_, problem = store.RequestMachineCancellation(prior.ID, "")
 				mustRetryNoError(t, problem)
 			}
 			retry, fresh, problem := store.Submit(records.Request{ID: "job-retry", IdemKey: "retry", Kind: "job", Package: prior.Package, Entrypoint: "main", Payload: []byte(`{}`), BodyDigest: "sha256:" + strings.Repeat("2", 64), RetainWork: true, RetryOf: prior.ID, MachineExecutionObserver: true})
