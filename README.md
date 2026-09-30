@@ -161,6 +161,11 @@ cozy package yank org/name --version 1.2.3
 
 Publishing builds the current working tree with `uv build --wheel`; Git, commits, and a clean tree
 are not publication inputs. Standard `[project].dependencies` remain the runtime authority. Cozy
+adds the freshly described interface to source-built project wheels so installation can read
+their callables without importing the package. Backend-provided interfaces, signed wheels,
+and explicit `--wheel` artifacts keep their original bytes. Wheel tags and implementation
+members are preserved; added metadata participates in the standard wheel `RECORD` and hash.
+Cozy
 recursively builds referenced local `[tool.uv.sources]` paths/workspace members as separate exact
 wheels in the same publication, including local dependencies activated through requested extras.
 It first asks Tensorhub whether the release is already committed, so a replay skips all wheel

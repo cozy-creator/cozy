@@ -170,12 +170,25 @@ func (p *Package) build(ctx context.Context, namespace *Namespace, prebuiltWheel
 		p.Root = ""
 		return problem
 	}
-	packageInterface, notice, problem := describe(ctx, p.Tree, root, account)
-	p.InterfaceNotice = notice
+	description, problem := describe(ctx, p.Tree, root, account)
+	p.InterfaceNotice = description.notice
 	if problem != nil {
 		p.Close()
 		p.Root = ""
 		return problem
+	}
+	// Source-built wheels carry the fresh, account-neutral interface. Runtime can
+	// read it without starting the package merely to discover its callables.
+	// Explicit --wheel inputs and backend-provided metadata retain their bytes.
+	if len(prebuiltWheels) == 0 {
+		for i, source := range projects {
+			target := filepath.Join(root, "described-wheels", filepath.Base(source))
+			if projects[i], problem = wheel.EmbedInterface(source, target, description.source); problem != nil {
+				p.Close()
+				p.Root = ""
+				return problem
+			}
+		}
 	}
 	sourceArchive := ""
 	if publish {
@@ -191,7 +204,7 @@ func (p *Package) build(ctx context.Context, namespace *Namespace, prebuiltWheel
 	}
 	p.ProjectWheels = projects
 	p.Wheel = projects[0]
-	p.SourceArchive, p.PackageInterface, p.DependencyWheels, p.Registry = sourceArchive, packageInterface, dependencies, registry
+	p.SourceArchive, p.PackageInterface, p.DependencyWheels, p.Registry = sourceArchive, description.path, dependencies, registry
 	p.Vendored = vendored
 	return nil
 }

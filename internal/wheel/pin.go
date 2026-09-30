@@ -8,11 +8,14 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"io"
+	"maps"
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -39,6 +42,20 @@ func Metadata(path string) ([]byte, *exit.Error) {
 // Every implementation/resource member keeps its original bytes. The new METADATA
 // and RECORD participate in the ordinary wheel hash; no extra runtime manifest exists.
 func PinDependencies(source, target string, requirements []string) *exit.Error {
+	raw, problem := Metadata(source)
+	if problem != nil {
+		return problem
+	}
+	raw, err := pinnedMetadata(raw, requirements)
+	if err != nil {
+		return wheelStructure("cannot seal private project requirements")
+	}
+	return rewriteMetadata(source, target, map[string][]byte{"METADATA": raw})
+}
+
+// rewriteMetadata derives a wheel in owned staging before its ordinary hash is frozen.
+// Unchanged members retain their compressed bytes, headers, tags and permissions.
+func rewriteMetadata(source, target string, updates map[string][]byte) *exit.Error {
 	if _, problem := InspectIdentity(source); problem != nil {
 		return problem
 	}
@@ -47,6 +64,15 @@ func PinDependencies(source, target string, requirements []string) *exit.Error {
 		return wheelStructure("cannot read project wheel")
 	}
 	defer reader.Close()
+	members := make(map[string][]byte, len(updates))
+	for _, member := range reader.File {
+		if distInfoMember(member.Name, "METADATA") {
+			prefix := strings.TrimSuffix(member.Name, "METADATA")
+			for name, value := range updates {
+				members[prefix+name] = value
+			}
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return exit.Internalf("cannot stage pinned project wheel")
 	}
@@ -74,15 +100,8 @@ func PinDependencies(source, target string, requirements []string) *exit.Error {
 		}
 		hash := sha256.New()
 		var size int64
-		if distInfoMember(member.Name, "METADATA") {
-			body, problem := wheelMember(member)
-			if problem != nil {
-				return problem
-			}
-			body, err = pinnedMetadata(body, requirements)
-			if err != nil {
-				return wheelStructure("cannot seal private project requirements")
-			}
+		if body, changed := members[member.Name]; changed {
+			delete(members, member.Name)
 			header := member.FileHeader
 			header.CRC32, header.CompressedSize, header.UncompressedSize, header.CompressedSize64, header.UncompressedSize64 = 0, 0, 0, 0, 0
 			out, createErr := writer.CreateHeader(&header)
@@ -115,6 +134,20 @@ func PinDependencies(source, target string, requirements []string) *exit.Error {
 	}
 	if recordName == "" {
 		return wheelStructure("private project wheel has no RECORD")
+	}
+	for _, name := range slices.Sorted(maps.Keys(members)) {
+		body := members[name]
+		out, err := writer.Create(name)
+		if err != nil {
+			return exit.Internalf("cannot write project metadata: %v", err)
+		}
+		if _, err := out.Write(body); err != nil {
+			return exit.Internalf("cannot write project metadata: %v", err)
+		}
+		digest := sha256.Sum256(body)
+		if err := csvWriter.Write([]string{name, "sha256=" + base64.RawURLEncoding.EncodeToString(digest[:]), strconv.Itoa(len(body))}); err != nil {
+			return exit.Internalf("cannot record project metadata: %v", err)
+		}
 	}
 	_ = csvWriter.Write([]string{recordName, "", ""})
 	csvWriter.Flush()
