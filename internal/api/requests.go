@@ -358,22 +358,7 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		sort.Slice(refs, func(i, j int) bool { return refs[i].Slot < refs[j].Slot })
 		models := make([]canonical.Value, 0, len(refs))
 		for _, model := range refs {
-			row := map[string]canonical.Value{
-				"package": model.Package, "slot": model.Slot, "model": model.Model,
-				"release": model.Release, "lane": model.Lane, "manifest": model.Manifest,
-				"manifest_length": model.ManifestLength,
-			}
-			if len(model.Adapters) > 0 {
-				adapters := make([]canonical.Value, 0, len(model.Adapters))
-				for _, adapter := range model.Adapters {
-					adapters = append(adapters, map[string]canonical.Value{
-						"component": adapter.Component, "model": adapter.Model, "release": adapter.Release,
-						"lane": adapter.Lane, "manifest": adapter.Manifest, "source_component": adapter.SourceComponent, "scale": adapter.Scale,
-					})
-				}
-				row["adapters"] = adapters
-			}
-			models = append(models, row)
+			models = append(models, modelSelectionIdentity(model))
 		}
 		doc["models"] = models
 	}

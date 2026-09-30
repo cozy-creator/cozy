@@ -5,11 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -71,25 +69,10 @@ func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records
 			root.WeightsDestination = request.ModelTransfer.Destination
 		}
 	}
-	for _, model := range request.Models {
-		parameter := model.Slot[strings.LastIndex(model.Slot, ".")+1:]
-		if model.Source != "" {
-			root.Models = append(root.Models, &pb.ModelChoice{Parameter: parameter, Source: model.Source,
-				Profiles: model.Profiles})
-			continue
-		}
-		choice := &pb.ModelChoice{Parameter: parameter,
-			Repository: model.Model, Release: model.Release, Lane: model.Lane}
-		if model.Manifest != "" {
-			digest, err := canonical.Raw(model.Manifest)
-			if err != nil {
-				return nil, exit.Named(exit.Validation, "model.manifest_invalid", "%s names no exact manifest", model.Slot)
-			}
-			choice.Manifest = &pb.Ref{Digest: digest, Length: uint64(max(model.ManifestLength, 0))}
-		}
-		root.Models = append(root.Models, choice)
+	var problem *exit.Error
+	if root.Models, problem = orchestrator.ModelChoices(request, request.Models); problem != nil {
+		return nil, problem
 	}
-	sort.Slice(root.Models, func(i, j int) bool { return root.Models[i].Parameter < root.Models[j].Parameter })
 	if request.Capture != "" {
 		root.Capture = &pb.ActivationCapture{}
 		if err := json.Unmarshal([]byte(request.Capture), root.Capture); err != nil {

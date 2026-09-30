@@ -119,9 +119,14 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	if !chosen {
+		children := capturedModelChoices(models)
 		if models, e = resolveJobModelInputs(ctx, target, job, overrides.Models); e != nil {
 			return e
 		}
+		models = append(models, children...)
+	}
+	if models, e = applyModelAdapters(ctx, target, job, models, overrides.Overlays); e != nil {
+		return e
 	}
 	sub.Models = models
 	if chosen && selectedRental == "" && rentalRequested(ctx) {

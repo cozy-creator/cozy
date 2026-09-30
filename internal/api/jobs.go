@@ -124,6 +124,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	passThrough := sub.ModelTransfer != nil && sub.Package == "" && sub.Function == ""
+	if problem := validateModelAdapters(sub.Models); problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
 	if !passThrough && (sub.Package == "" || sub.Function == "") {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
 			"a job submission names a package and a job function",
@@ -717,11 +721,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	sort.Slice(modelRefs, func(i, j int) bool { return modelRefs[i].Slot < modelRefs[j].Slot })
 	models := make([]canonical.Value, 0, len(modelRefs))
 	for _, model := range modelRefs {
-		models = append(models, map[string]canonical.Value{
-			"package": model.Package, "slot": model.Slot, "model": model.Model,
-			"release": model.Release, "lane": model.Lane, "manifest": model.Manifest,
-			"manifest_length": model.ManifestLength,
-		})
+		models = append(models, modelSelectionIdentity(model))
 	}
 	doc := map[string]canonical.Value{
 		"kind":            "job",

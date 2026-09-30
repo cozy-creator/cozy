@@ -22,6 +22,7 @@ import (
 // terminalMachines is Runtime on a rented pod: it accepts every submission and has already
 // run it to the terminal `finish` names for its payload.
 type terminalMachines struct {
+	modelOverrides bool
 	// unavailable is how many submissions the transport loses before one arrives.
 	unavailable atomic.Int32
 	attempts    atomic.Int32
@@ -47,7 +48,7 @@ func newTerminalMachines(finish func(map[string]any) *pb.AttemptOutcomeBody) *te
 }
 
 func (m *terminalMachines) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
-	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace", RunOutputLog: true}, nil
+	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace", RunOutputLog: true, ModelOverrides: m.modelOverrides}, nil
 }
 
 // minted is what a Runtime names a submission's capture and invocation by: the submitted

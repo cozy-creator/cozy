@@ -284,16 +284,20 @@ func payloadFile(infile string) (string, []byte, *exit.Error) {
 // compatibility claim. Weight is a canonical decimal string so request identity does
 // not depend on JSON number formatting.
 type ModelOverlay struct {
-	Ref       string `json:"ref"`
-	Weight    string `json:"weight"`
-	Component string `json:"component,omitempty"`
+	Ref             string   `json:"ref"`
+	Weight          string   `json:"weight"`
+	Component       string   `json:"component,omitempty"`
+	SourceComponent string   `json:"source_component,omitempty"`
+	Profiles        []string `json:"profiles,omitempty"`
 }
 
 func (o *ModelOverlay) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Ref       string          `json:"ref"`
-		Weight    json.RawMessage `json:"weight"`
-		Component string          `json:"component,omitempty"`
+		Ref             string          `json:"ref"`
+		Weight          json.RawMessage `json:"weight"`
+		Component       string          `json:"component,omitempty"`
+		SourceComponent string          `json:"source_component,omitempty"`
+		Profiles        []string        `json:"profiles,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -305,6 +309,7 @@ func (o *ModelOverlay) UnmarshalJSON(data []byte) error {
 		}
 	}
 	o.Ref, o.Weight, o.Component = raw.Ref, weight, raw.Component
+	o.SourceComponent, o.Profiles = raw.SourceComponent, raw.Profiles
 	return nil
 }
 
@@ -477,6 +482,12 @@ func modelOverrideSlot(ep *Entrypoint, asked string) (*Slot, *exit.Error) {
 	}
 	if match != nil {
 		return match, nil
+	}
+	if pkg, path, ok := CapturedModelSlot(asked); ok {
+		entrypoint, parameter, _ := strings.Cut(path, ".models.")
+		if pkg != "" || entrypoint != ep.Name {
+			return &Slot{Path: asked, Param: parameter}, nil
+		}
 	}
 	if len(ep.Models) == 0 {
 		return nil, exit.Named(exit.Usage, "model_slot_unknown",

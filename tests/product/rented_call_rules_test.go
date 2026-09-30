@@ -145,9 +145,8 @@ func TestRentedPreparationTransportLossKeepsTheRunQueued(t *testing.T) {
 	}
 }
 
-// No Runtime writes a placement's adapter stack yet (proto-062 R2b): --lora is refused
-// before anything is read at the Hub or sent to a machine, never dropped or refused late.
-func TestALoRAStackIsRefusedBeforeAnythingIsReadOrSent(t *testing.T) {
+// An older Runtime can still run base models, but cannot silently drop a stack.
+func TestALoRAStackRefusesAnOlderRuntimeBeforeSubmission(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
 	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
@@ -167,10 +166,10 @@ func TestALoRAStackIsRefusedBeforeAnythingIsReadOrSent(t *testing.T) {
 	})
 	style := "proof/style#sha256:" + strings.Repeat("2", 64)
 	code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--lora", "model:fl2va_dit="+style+",0.5",
-		"--rental=tessa", "--json")
+		"--rental=tessa", "--json", "--await")
 	mu.Lock()
 	defer mu.Unlock()
-	if code == 0 || !strings.Contains(out, `"model_adapters.not_applied"`) || len(machines.submitted()) != 0 || len(seen) != 0 {
+	if code == 0 || !strings.Contains(out, "cannot apply the requested model overrides") || len(machines.submitted()) != 0 || len(seen) != 0 {
 		t.Fatalf("--lora was not refused up front [exit %d, %d submitted, hub %v]: %s", code, len(machines.submitted()), seen, out)
 	}
 }

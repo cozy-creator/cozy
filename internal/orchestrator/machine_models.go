@@ -13,10 +13,14 @@ func PrivateRevisionModelRefs(request records.Request, pkg string) []*pb.Downloa
 	}
 	var models []ModelRef
 	for _, model := range request.Models {
+		if model.Choice && model.Callable != "" || model.Source != "" {
+			continue // machine-owned choices travel separately from materialized downloads
+		}
 		if model.Package == pkg || model.Package == "" && request.Package == pkg {
 			if model.Package == "" {
 				model.Package = pkg
 			}
+			model.Adapters = nil // Runtime resolves the requested stack before returning the binding
 			models = append(models, model)
 		}
 	}

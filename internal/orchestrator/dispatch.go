@@ -266,9 +266,6 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 				"cannot digest the local package request identity: %s", err)
 		}
 	}
-	if s.Kind == "job" && hasModelAdapters(s.Models) {
-		return records.Request{}, nil, exit.Usagef("model adapters apply only to serving requests")
-	}
 	id := s.RequestID
 	if id == "" {
 		id = records.NewID("req")

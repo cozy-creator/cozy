@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -311,7 +312,21 @@ func (c *machineConnection) prepare(ctx context.Context, request string, revisio
 // any model, including unused child defaults.
 func (c *machineConnection) prepareModels(ctx context.Context, request records.Request, revision localpackage.Installation) (*pb.DesiredPlacementSet, *exit.Error) {
 	models := orchestrator.PrivateRevisionModelRefs(request, revision.Package)
-	if len(models) == 0 {
+	var choices []*pb.ModelChoice
+	if revision.ID == request.LocalInstallationID {
+		own := request.OwnModels()
+		if slices.ContainsFunc(own, func(model records.ModelRef) bool { return len(model.Adapters) > 0 || model.Source != "" }) {
+			if c.WireMinor < 70 {
+				return nil, exit.Named(exit.Structural, "model_overrides.private_preparation_unavailable",
+					"this machine's agent cannot forward private model overrides; update its agent and Runtime")
+			}
+			var problem *exit.Error
+			if choices, problem = orchestrator.ModelChoices(request, own); problem != nil {
+				return nil, problem
+			}
+		}
+	}
+	if len(models) == 0 && len(choices) == 0 {
 		if request.IsJob() || revision.ID != request.LocalInstallationID {
 			return nil, nil
 		}
@@ -331,6 +346,10 @@ func (c *machineConnection) prepareModels(ctx context.Context, request records.R
 		return nil, problem
 	}
 	selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, InstallationId: revision.ID, DownloadDelegation: downloads}
+	if len(choices) > 0 {
+		selected.ModelChoices, selected.SourceCredentials = choices, c.runs.resolver.SourceCredentials()
+		selected.Hub, selected.Owner = c.Hub, c.runs.runAccount(request)
+	}
 	stream, err := c.Host.PreparePrivatePlacement(ctx, &pb.PreparePrivatePlacementCall{
 		Claim: c.Claim, PrivatePlacementSet: selected,
 	})

@@ -462,6 +462,15 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		return problem
 	}
 	connection.KeepWorkspace(workspace)
+	if request.RequiresModelOverrides() && !workspace.ModelOverrides {
+		code := exit.Structural
+		if len(link.Submission) > 0 {
+			code = exit.Unavailable // an already transmitted offer retains its uncertainty
+		}
+		return exit.Named(code, "model_overrides.unavailable",
+			"this machine's Runtime cannot apply the requested model overrides; no submission was sent").
+			WithRemedy("update the machine Runtime before retrying this request")
+	}
 	rooted := len(link.Submission) == 0 && m.releaseRoot(request)
 	prepared := false // the root's unpublished installation is on the machine this pass
 	if rooted {
@@ -636,8 +645,12 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 // pinToMachine fixes each model ladder's rung for the devices this machine measured. A
 // rental's placement decision already pinned its rung from the width it bought.
 func (m *machineRuns) pinToMachine(ctx context.Context, request records.Request, connection *machineConnection) (records.Request, *exit.Error) {
+	deferred := capturedModelChoices(request.Models)
+	materialized := slices.DeleteFunc(append([]records.ModelRef(nil), request.Models...), func(model records.ModelRef) bool {
+		return model.Choice && model.Callable != ""
+	})
 	pinned := true
-	for _, model := range request.Models {
+	for _, model := range materialized {
 		pinned = pinned && model.Pinned()
 	}
 	if pinned {
@@ -651,11 +664,12 @@ func (m *machineRuns) pinToMachine(ctx context.Context, request records.Request,
 	if len(workspace.Devices) > 0 {
 		accelerator = workspace.Devices[0].Name
 	}
-	models, _, ok := rental.Pin(request.Models, accelerator, len(workspace.Devices))
+	models, _, ok := rental.Pin(materialized, accelerator, len(workspace.Devices))
 	if !ok {
 		return request, exit.Named(exit.Structural, "machine_execution.model_rung_unavailable",
 			"no rung of this call's model ladder fits %d× %q on %s", len(workspace.Devices), accelerator, connection.Name)
 	}
+	models = append(models, deferred...)
 	if problem := m.store.PinMachineModels(request.ID, models); problem != nil {
 		return request, problem
 	}

@@ -26,19 +26,18 @@ short form `model.<slot>.lora=<ref>,weight=<number>`; the bare
 declared. The existing `--lora model-parameter:component=ref[,strength]` path
 remains the component-explicit compatibility form.
 
-Creator now parses and canonicalizes this sidecar without putting `lora` into a
-package request schema. The parsed `RunKeys.Overlays` is deliberately kept
-separate from the legacy exact `ModelRef.Adapters` rows until package metadata
-can prove the target component and weight range. A model overlay must never guess
-a component or use a manifest digest as a compatibility claim.
+Creator carries this sidecar as ordered `ModelRef.Adapters` and wire70
+`ModelChoice.adapters`, outside the package request schema. Runtime owns source
+resolution and compatibility against the actual base component and adapter factors.
+An omitted component is inferred only when one compatible target exists; ambiguity
+requires an explicit `component`. A manifest digest establishes bytes, not compatibility.
 
-The remaining admission seam is explicit. PackageInterface slots need an
-opt-in compatibility descriptor (adapter kind, base family, target components,
-capability range and per-component weight bounds), and the Hub model card needs
-the adapter's declared family/target/capability metadata. Current cards expose
-only repository family and lane components, which is insufficient to validate a
-generic adapter safely. Until that metadata is present, a generic overlay must
-refuse before transfer; explicit `turbo_lora` slots remain independent bindings.
+The `model_overrides` workspace capability gates adapter-bearing requests and exact
+captured-callable selectors. Published roots carry the choices in `ReleaseRoot.models`;
+unpublished captures retain them in `MachineExecutionCapture.model_choices` and its
+digest. Private serving preparation resolves the same choices before returning its
+fixed placement. The native/download base custody remains unchanged. Explicit
+`turbo_lora` model parameters remain independent bindings.
 
 Preparation must apply an accepted ordered overlay once to an isolated model
 construction before compile/graph capture. The base construction must be restored

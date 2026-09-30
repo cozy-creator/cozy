@@ -106,9 +106,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 			return problem
 		}
 	}
-	if callable.Kind == "job" && len(ctx.Inv.Values["--lora"]) > 0 {
-		return exit.Usagef("--lora applies only to serving callables")
-	}
 	if callable.Kind != "job" {
 		if len(ctx.Inv.Values["--allow-upload"]) > 0 {
 			return exit.Usagef("--allow-upload applies only to Runtime-owned job transactions")
@@ -174,12 +171,6 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if len(overrides.Overlays) > 0 {
-		return exit.Named(exit.Validation, "model_overlay_compatibility_unavailable",
-			"%s declares no generic adapter compatibility metadata for the requested model slot",
-			target.Function).
-			WithRemedy("use the component-explicit --lora model-parameter:component=reference[,strength] form until this slot publishes adapter compatibility")
-	}
 	if pin := ctx.Inv.Value("--attention-kernel"); pin != "" {
 		if overrides.AttentionKernel != "" && overrides.AttentionKernel != pin {
 			return exit.Usagef("attention kernel was pinned as both %s and %s", overrides.AttentionKernel, pin)
@@ -206,9 +197,6 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if loras, e := launch.ParseLoRAs(ep, ctx.Inv.Values["--lora"]); e != nil || len(loras) > 0 {
-		return cmp.Or(e, loraNotApplied())
-	}
 	if !managedRental {
 		packagePublishStatus(ctx, "Execution target: local machine")
 	} else if selectedRental != "" {
@@ -227,9 +215,14 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if !chosen || managedRental && selectedRental == "" {
 		// Choosing a machine to rent reads the ladders; so do editable code and provider
 		// sources.
+		children := capturedModelChoices(models)
 		if models, e = resolveInvocationModels(ctx, target, ep, overrides.Models); e != nil {
 			return e
 		}
+		models = append(models, children...)
+	}
+	if models, e = applyModelAdapters(ctx, target, ep, models, overrides.Overlays); e != nil {
+		return e
 	}
 	outputDirectory, e := requestedOutputDirectory(ctx)
 	if e != nil {
@@ -313,11 +306,26 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 		return nil, false, problem
 	}
 	var out []orchestrator.ModelRef
-	for _, slot := range ep.Models {
+	slots := append([]launch.Slot(nil), ep.Models...)
+	for selector := range overrides {
+		if slices.ContainsFunc(slots, func(slot launch.Slot) bool { return slot.Path == selector }) {
+			continue
+		}
+		if _, path, ok := launch.CapturedModelSlot(selector); ok {
+			_, parameter, _ := strings.Cut(path, ".models.")
+			slots = append(slots, launch.Slot{Path: selector, Param: parameter})
+		}
+	}
+	sort.Slice(slots, func(i, j int) bool { return slots[i].Path < slots[j].Path })
+	for _, slot := range slots {
 		raw, chosen := overrides[slot.Path]
 		parameter := slot.Path[strings.LastIndex(slot.Path, ".")+1:]
-		profile, profiled := profiles[parameter]
-		delete(profiles, parameter)
+		profileKey := parameter
+		if choice := modelChoiceSlot(target, slot.Path); choice.Callable != "" {
+			profileKey = slot.Path
+		}
+		profile, profiled := profiles[profileKey]
+		delete(profiles, profileKey)
 		if !chosen {
 			if profiled {
 				return nil, false, exit.Usagef("--source-profile %s=%s names no provider-source model", parameter, profile)
@@ -329,8 +337,8 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 			if problem != nil {
 				return nil, false, problem
 			}
-			row := orchestrator.ModelRef{Choice: true, Package: target.Package, Slot: slot.Path,
-				BindingPath: slot.Path, Source: source}
+			row := modelChoiceSlot(target, slot.Path)
+			row.Source = source
 			if profiled {
 				row.Profiles = []string{profile}
 			}
@@ -344,8 +352,9 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 		if problem != nil {
 			return nil, false, problem
 		}
-		out = append(out, orchestrator.ModelRef{Choice: true, Package: target.Package, Slot: slot.Path,
-			BindingPath: slot.Path, Model: model, CatalogRepository: model, Release: release, Lane: lane, Manifest: manifest})
+		row := modelChoiceSlot(target, slot.Path)
+		row.Model, row.CatalogRepository, row.Release, row.Lane, row.Manifest = model, model, release, lane, manifest
+		out = append(out, row)
 	}
 	for parameter := range profiles {
 		return nil, false, exit.Usagef("--source-profile %s names no model parameter of %s", parameter, target.Function)
@@ -356,7 +365,7 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 	if (strings.HasPrefix(target.Package, "local/") || target.Snapshot) && !oneSource(ep, out) {
 		calls, problem := callsUnpublished(ctx, target.InstallID)
 		if problem != nil || calls {
-			return nil, false, problem
+			return capturedModelChoices(out), false, problem
 		}
 	}
 	return out, true, nil

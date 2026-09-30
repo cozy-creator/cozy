@@ -652,15 +652,17 @@ type ModelRef struct {
 // ModelAdapterRef is an ordered, exact adapter checkpoint for one base component.
 // Scales are canonical decimal strings, so zero is distinct from omission.
 type ModelAdapterRef struct {
-	Component       string `json:"component"`
-	Model           string `json:"model"`
-	Release         string `json:"release,omitempty"`
-	Lane            string `json:"lane,omitempty"`
-	Manifest        string `json:"manifest"`
-	ManifestLength  int64  `json:"manifest_length,omitempty"`
-	SourceComponent string `json:"source_component"`
-	Scale           string `json:"scale"`
-	Bytes           int64  `json:"bytes,omitempty"`
+	Component       string   `json:"component"`
+	Model           string   `json:"model"`
+	Release         string   `json:"release,omitempty"`
+	Lane            string   `json:"lane,omitempty"`
+	Manifest        string   `json:"manifest"`
+	ManifestLength  int64    `json:"manifest_length,omitempty"`
+	SourceComponent string   `json:"source_component"`
+	Scale           string   `json:"scale"`
+	Bytes           int64    `json:"bytes,omitempty"`
+	Source          string   `json:"source,omitempty"`
+	Profiles        []string `json:"profiles,omitempty"`
 }
 
 // SameAdapters compares execution/custody identity, excluding sizing observations.
@@ -671,7 +673,8 @@ func SameAdapters(a, b []ModelAdapterRef) bool {
 	for i, left := range a {
 		right := b[i]
 		if left.Component != right.Component || left.Model != right.Model || left.Release != right.Release ||
-			left.Lane != right.Lane || left.Manifest != right.Manifest || left.SourceComponent != right.SourceComponent || left.Scale != right.Scale {
+			left.Lane != right.Lane || left.Manifest != right.Manifest || left.SourceComponent != right.SourceComponent || left.Scale != right.Scale ||
+			left.Source != right.Source || !slices.Equal(left.Profiles, right.Profiles) {
 			return false
 		}
 	}
@@ -685,6 +688,16 @@ func (m ModelRef) BindingSlot() string {
 		return m.BindingPath
 	}
 	return m.Slot
+}
+
+// RequiresModelOverrides isolates the new operation from ordinary base selections.
+func (r Request) RequiresModelOverrides() bool {
+	for _, model := range r.Models {
+		if len(model.Adapters) > 0 || model.Choice && model.Callable != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // OneSelectionPerSlot joins selections in precedence order and keeps the first for each

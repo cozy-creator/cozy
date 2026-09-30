@@ -353,9 +353,18 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
-	if choices(models) {
+	if choices(models) || len(capturedModelChoices(models)) > 0 {
 		// The machine that runs the call resolves its slots; the caller's own choices ride.
 		for _, model := range models {
+			if model.Choice && model.Callable != "" {
+				_, path, valid := launch.CapturedModelSlot(model.Package + "/" + model.BindingSlot())
+				callee, _, _ := strings.Cut(path, ".models.")
+				if !valid || model.Callable != model.Package+"/"+callee {
+					return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+						"captured model selection needs an exact callable slot")
+				}
+				continue // Runtime checks membership in the captured graph before acceptance
+			}
 			if model.Package != pkg || !slices.ContainsFunc(entrypoint.Models, func(slot launch.Slot) bool { return slot.Path == model.Slot }) {
 				return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
 					"model selection does not bind a slot of %s", function)
@@ -485,7 +494,7 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
-	if !deferredModels && len(models) != len(job.Models) {
+	if !deferredModels && len(models)-len(capturedModelChoices(models)) != len(job.Models) {
 		return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_incomplete",
 			"remote job %s requires exactly %d model Manifest binding(s)", function, len(job.Models))
 	}
