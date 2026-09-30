@@ -195,6 +195,13 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	must(t, err)
 	defer journal.Close()
 	journal.SetMaxOpenConns(1)
+	var initiallyCached bool
+	must(t, journal.QueryRow("SELECT EXISTS(SELECT 1 FROM operation_cache WHERE lower(hex(key))=?)",
+		originalA.Computation).Scan(&initiallyCached))
+	if !initiallyCached {
+		logNativeMemoCustody(t, journal)
+		t.Fatalf("unused A has no cache mapping before explicit pruning: %s", originalA.Computation)
+	}
 	for deadline := time.Now().Add(10 * time.Second); ; {
 		var result struct {
 			Removed uint32 `json:"removed_entries"`
