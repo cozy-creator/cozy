@@ -83,6 +83,12 @@ pub struct Event {
     pub detail: String,
 }
 
+impl Event {
+    fn new(kind: &'static str, ws: Option<String>, region: Option<u32>, device: Option<i32>, bytes: u64, ns: u64, detail: impl Into<String>) -> Event {
+        Event { kind, ws, region, device, bytes, ns, detail: detail.into() }
+    }
+}
+
 const EVENT_RING: usize = 4096;
 
 // ---------------------------------------------------------------- books
@@ -325,15 +331,7 @@ pub(crate) fn resolve_timings(c: &mut Core, all: bool) {
                 c.regions.entry((t.ws, t.dev, tag.clone(), *region)).or_default().stall_ns += ns;
                 if ns > 0 {
                     let name = c.sets.get(t.ws as usize).and_then(Option::as_ref).map(|w| w.name.clone());
-                    c.event(Event {
-                        kind: "late",
-                        ws: name,
-                        region: None,
-                        device: None,
-                        bytes: t.bytes,
-                        ns,
-                        detail: tag,
-                    });
+                    c.event(Event::new("late", name, None, None, t.bytes, ns, tag));
                 }
             }
         }
@@ -456,15 +454,7 @@ impl Inner {
             w.evicted_bytes += region.span;
             c.dstats[d].evictions += 1;
             c.dstats[d].evicted_bytes += region.span;
-            c.event(Event {
-                kind: "evicted",
-                ws: Some(name),
-                region: Some(r),
-                device: Some(ordinal),
-                bytes: region.span,
-                ns: 0,
-                detail: String::new(),
-            });
+            c.event(Event::new("evicted", Some(name), Some(r), Some(ordinal), region.span, 0, ""));
         }
         Ok(region.span)
     }
@@ -527,15 +517,7 @@ impl Inner {
         c.host_used -= region.span;
         c.hstats.evictions += 1;
         c.hstats.evicted_bytes += region.span;
-        c.event(Event {
-            kind: "evicted",
-            ws: Some(name),
-            region: Some(r),
-            device: None,
-            bytes: region.span,
-            ns: 0,
-            detail: "pinned".into(),
-        });
+        c.event(Event::new("evicted", Some(name), Some(r), None, region.span, 0, "pinned"));
         Ok(Some(region.span))
     }
 
@@ -591,7 +573,6 @@ impl Inner {
         let host2 = host.clone();
         let done = move |res: Result<()>| {
             let mut registered = false;
-            let mut res = res;
             if res.is_ok() {
                 if let Some(dev) = inner.devices.first() {
                     let reg = CtxGuard::enter(dev.ctx).and_then(|_g| {
@@ -601,15 +582,7 @@ impl Inner {
                     if let Err(e) = reg {
                         let mut c = inner.core.lock().unwrap();
                         c.hstats.register_failed += 1;
-                        c.event(Event {
-                            kind: "register_failed",
-                            ws: Some(name.clone()),
-                            region: Some(r),
-                            device: None,
-                            bytes: region.nbytes,
-                            ns: 0,
-                            detail: e.to_string(),
-                        });
+                        c.event(Event::new("register_failed", Some(name.clone()), Some(r), None, region.nbytes, 0, e.to_string()));
                     }
                 }
                 host2.set_ready(r, true);
@@ -634,18 +607,11 @@ impl Inner {
                 c.hstats.fill_bytes += region.nbytes;
                 c.hstats.fill_ns += ns;
             }
-            c.event(Event {
-                kind: if res.is_ok() { "fill_done" } else { "fill_failed" },
-                ws: Some(name.clone()),
-                region: Some(r),
-                device: None,
-                bytes: region.nbytes,
-                ns,
-                detail: match &mut res {
-                    Ok(()) => if adopted { "pinned<-adopted" } else { "pinned<-disk" }.into(),
-                    Err(e) => e.to_string(),
-                },
-            });
+            let (kind, detail) = match &res {
+                Ok(()) => ("fill_done", if adopted { "pinned<-adopted" } else { "pinned<-disk" }.to_string()),
+                Err(e) => ("fill_failed", e.to_string()),
+            };
+            c.event(Event::new(kind, Some(name.clone()), Some(r), None, region.nbytes, ns, detail));
             for d in then {
                 if let Err(e) = inner.submit_dev_fill(&mut c, ws, d, r) {
                     if let Some(Some(w)) = c.sets.get_mut(ws.0 as usize) {
@@ -803,15 +769,7 @@ impl Inner {
                     }
                     Err(e) => {
                         reg.state = DState::Invalid(e.clone());
-                        c.event(Event {
-                            kind: "fill_failed",
-                            ws: Some(name),
-                            region: Some(r),
-                            device: Some(ordinal),
-                            bytes: region.nbytes,
-                            ns: 0,
-                            detail: e.to_string(),
-                        });
+                        c.event(Event::new("fill_failed", Some(name), Some(r), Some(ordinal), region.nbytes, 0, e.to_string()));
                     }
                 }
                 drop(c);
@@ -1150,15 +1108,7 @@ impl Plane {
         }
         t.over_budget_unreleasable = c.host_used.saturating_sub(bytes);
         c.hstats.trims += 1;
-        c.event(Event {
-            kind: "budget",
-            ws: None,
-            region: None,
-            device: None,
-            bytes,
-            ns: 0,
-            detail: format!("pinned; freed {}", t.freed),
-        });
+        c.event(Event::new("budget", None, None, None, bytes, 0, format!("pinned; freed {}", t.freed)));
         Ok(t)
     }
 
@@ -1177,15 +1127,7 @@ impl Plane {
         }
         t.over_budget_unreleasable = c.arenas[d].committed.saturating_sub(bytes);
         c.dstats[d].trims += 1;
-        c.event(Event {
-            kind: "budget",
-            ws: None,
-            region: None,
-            device: Some(ordinal),
-            bytes,
-            ns: 0,
-            detail: format!("vram; freed {}", t.freed),
-        });
+        c.event(Event::new("budget", None, None, Some(ordinal), bytes, 0, format!("vram; freed {}", t.freed)));
         Ok(t)
     }
 
