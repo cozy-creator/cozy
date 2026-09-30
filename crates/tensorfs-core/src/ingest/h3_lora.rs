@@ -1,9 +1,12 @@
-//! Reviewed native H3 LoRA dialects -> canonical projection factors.
+//! Reviewed trainer H3 LoRA dialects -> canonical projection factors.
 //!
 //! These adapters omit base Q/K norm tensors, so this dialect declares the exact
 //! H3 geometry (56 heads of 128). Every target shape must agree before a plan is
-//! emitted. This is structural conversion, not permission to apply a FL2VA-trained
-//! adapter to REF2VA. Runtime owns that binding and never parses foreign keys.
+//! emitted. Trainer QKV factors use contiguous Q/K/V thirds: the original base
+//! checkpoint's head interleave is reordered before training, not exported again
+//! in adapter state dictionaries. This is structural conversion, not permission
+//! to apply a FL2VA-trained adapter to REF2VA. Runtime owns that binding and never
+//! parses foreign keys.
 
 use std::collections::BTreeMap;
 
@@ -229,10 +232,14 @@ pub(super) fn plan(
             let transform = if leaf == "attn.qkv_proj" {
                 shape[0] /= 3;
                 Some(Xform::QkvSplit {
-                    groups: H3_HEADS,
+                    groups: 1,
                     shares: [1, 1, 1],
                     take: take as u8,
-                    unit_bytes: checked_bytes(&b.key, &[H3_HEAD_DIM, a.shape[0]], b.dtype)?,
+                    unit_bytes: checked_bytes(
+                        &b.key,
+                        &[H3_HEADS * H3_HEAD_DIM, a.shape[0]],
+                        b.dtype,
+                    )?,
                 })
             } else if leaf == "mlp.fc1" {
                 Some(Xform::SwapHalves {

@@ -105,10 +105,10 @@ pub const CONVERTERS: [Converter; 8] = [
         reference: None,
     },
     Converter {
-        name: "h3.lora/1",
+        name: "h3.lora/2",
         dialect: "safetensors.h3_lora",
         class: Class::Permutation,
-        doc: "Native H3 LoRA A/B and Kohya down/up factors: split head-interleaved QKV B rows, swap SwiGLU B halves, preserve A and alpha without arithmetic.",
+        doc: "Trainer H3 LoRA A/B and Kohya down/up factors: split contiguous Q/K/V B thirds, swap SwiGLU B halves, preserve A and alpha without arithmetic. Original base checkpoint head interleaving belongs to h3.native/2, not this adapter state-dict dialect.",
         validated_on_real_bytes: false,
         normalization: None,
         lane: None,
@@ -1057,7 +1057,7 @@ fn plan_carrier(
     cands: &Candidates<'_>,
     p: &mut Plan,
 ) -> Result<()> {
-    if conv.name == "h3.lora/1" {
+    if conv.name == "h3.lora/2" {
         if allowed != ["plain/1"] {
             return refuse(
                 Code::UNKNOWN_ENCODING,
@@ -1913,14 +1913,12 @@ pub fn h3_geometry(
 /// The frozen golden cases for one converter: geometries whose reassembly is checked live,
 /// on real byte patterns, before the converter is allowed to touch an artifact.
 ///
-/// The RED companion is structural rather than a separate fixture: `Xform::reassembles`
-/// slices the source on the transform's own indexing and demands the three members put the
-/// source back bit-for-bit. A flat three-way split of a 56-group source passes every
-/// name/dtype/shape check and FAILS this, which is the whole point — the quarry pinned that
-/// error at ~90% numerically while nothing raised.
+/// `Xform::reassembles` checks that each declared transform preserves the source bytes.
+/// Both a contiguous split and a head-interleaved split can round-trip their own indexing;
+/// the producer's layout needs an independent projected-output test (see `h3_lora`).
 pub fn golden_cases(c: &Converter) -> Vec<(&'static str, Xform)> {
     match c.name {
-        "h3.lora/1" => vec![
+        "h3.lora/2" => vec![
             (
                 "H3 LoRA SwiGLU B rows",
                 Xform::SwapHalves {
@@ -1928,12 +1926,12 @@ pub fn golden_cases(c: &Converter) -> Vec<(&'static str, Xform)> {
                 },
             ),
             (
-                "H3 LoRA QKV B rows",
+                "H3 trainer LoRA contiguous QKV B thirds",
                 Xform::QkvSplit {
-                    groups: H3_HEADS,
+                    groups: 1,
                     shares: [1, 1, 1],
                     take: 0,
-                    unit_bytes: H3_HEAD_DIM * 16 * 2,
+                    unit_bytes: H3_HEADS * H3_HEAD_DIM * 16 * 2,
                 },
             ),
         ],

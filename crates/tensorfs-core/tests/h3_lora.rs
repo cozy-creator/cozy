@@ -84,7 +84,7 @@ fn write_source(root: &Path, kohya: bool, prefix: &str) -> transaction::SourceFi
 }
 fn plan(file: &transaction::SourceFile) -> tensorfs_core::err::Result<convert::Plan> {
     let mut p = convert::plan(
-        convert::converter("h3.lora/1")?,
+        convert::converter("h3.lora/2")?,
         &[Source::Carrier {
             component: "adapter".into(),
             file: 0,
@@ -121,6 +121,94 @@ fn root() -> PathBuf {
     ));
     fs::create_dir_all(&p).unwrap();
     p
+}
+
+#[test]
+fn trainer_fused_projection_and_converted_qkv_have_the_same_heads() {
+    // Upstream Musubi and Comfy compute B(A(x)) before chunking the output into
+    // three contiguous projections. Derive that result independently of Xform
+    // and compare every head element after the actual resumable ingest writer.
+    for kohya in [false, true] {
+        let root = root();
+        let file = write_source(&root, kohya, "blocks.0");
+        let carrier_bytes = fs::read(&file.path).unwrap();
+        let read = |suffix: &str| {
+            let tensor = file
+                .header
+                .tensors
+                .iter()
+                .find(|tensor| tensor.key.ends_with(suffix))
+                .unwrap();
+            let start = (file.header.data_start + tensor.begin) as usize;
+            let end = (file.header.data_start + tensor.end) as usize;
+            carrier_bytes[start..end]
+                .chunks_exact(4)
+                .map(|v| f32::from_le_bytes(v.try_into().unwrap()) as f64)
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = if kohya {
+            (
+                read("attn_qkv_proj.lora_down.weight"),
+                read("attn_qkv_proj.lora_up.weight"),
+            )
+        } else {
+            (
+                read("attn.qkv_proj.lora_A.weight"),
+                read("attn.qkv_proj.lora_B.weight"),
+            )
+        };
+        // A sparse but nontrivial input; both rank directions contribute.
+        let projected = a
+            .chunks_exact(5376)
+            .map(|row| row[0] * 0.25 - row[5375] * 0.125)
+            .collect::<Vec<_>>();
+        let fused = b
+            .chunks_exact(2)
+            .map(|row| row.iter().zip(&projected).map(|(b, a)| b * a).sum::<f64>())
+            .collect::<Vec<_>>();
+        let store = Store::init(&root.join("store")).unwrap();
+        let catalog = Catalog::open(store.root()).unwrap();
+        let writer = catalog
+            .resume_operation("projection-proof", "proof", "lora")
+            .unwrap();
+        let (_, out) = transaction::advance(
+            &store,
+            &plan(&file).unwrap(),
+            &[file],
+            &specs(),
+            &[],
+            "projection-proof",
+            transaction::Carriers::All,
+            None,
+        )
+        .unwrap();
+        let out = out.unwrap();
+        let tensors = &out.header.components[0].1;
+        for (part, expected) in ["q", "k", "v"].into_iter().zip(fused.chunks_exact(7168)) {
+            let key = format!("transformer_blocks.0.attn.to_{part}.lora_B.weight");
+            let tensor = &tensors.iter().find(|(name, _)| name == &key).unwrap().1;
+            let converted = bytes(&store, &tensor.parts[0].1);
+            for (head, rows) in converted.chunks_exact(128 * 2 * 4).enumerate() {
+                for (dim, row) in rows.chunks_exact(2 * 4).enumerate() {
+                    let actual = row
+                        .chunks_exact(4)
+                        .map(|v| f32::from_le_bytes(v.try_into().unwrap()) as f64)
+                        .zip(&projected)
+                        .map(|(b, a)| b * a)
+                        .sum::<f64>();
+                    assert_eq!(
+                        actual,
+                        expected[head * 128 + dim],
+                        "{key} head {head}, dim {dim}"
+                    );
+                }
+            }
+        }
+        drop(writer);
+        drop(catalog);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -192,7 +280,7 @@ fn both_dialects_permute_only_b_rows_and_resume_without_new_bytes() {
                             2
                         };
                         let row = i / 2;
-                        ((row / 128 * 3 + take) * 128 + row % 128) * 2 + i % 2
+                        (take * 7168 + row) * 2 + i % 2
                     } else if key.ends_with(".ff.net.0.proj.lora_B.weight") {
                         (i + 28672) % (28672 * 2)
                     } else {
@@ -225,6 +313,12 @@ fn both_dialects_permute_only_b_rows_and_resume_without_new_bytes() {
 
 #[test]
 fn bad_pair_shape_unknown_tensor_and_unreviewed_geometry_refuse_before_payload() {
+    // /1 encoded the wrong trainer layout. An old plan must refuse rather than
+    // silently reinterpret its immutable converter identity under new code.
+    assert_eq!(
+        convert::converter("h3.lora/1").unwrap_err().code,
+        Code::UNKNOWN_FIELD
+    );
     let root = root();
     let file = write_source(&root, false, "blocks.0");
     for (kind, want) in [
@@ -301,16 +395,16 @@ fn real_headers_match_by_structure_and_multiple_versions_require_file_selection(
             source::BUILTIN_REGISTRY_BYTES,
             std::slice::from_ref(&candidate),
             &[if member.contains("spatial") {
-                "h3/native-lora-a-b/1"
+                "h3/native-lora-a-b/2"
             } else {
-                "h3/native-lora-kohya/1"
+                "h3/native-lora-kohya/2"
             }
             .into()],
             &root.join("sparse"),
         )
         .unwrap();
         assert_eq!(result.plans.len(), 1);
-        assert_eq!(result.plans[0].converter, "h3.lora/1");
+        assert_eq!(result.plans[0].converter, "h3.lora/2");
         assert_eq!(
             result.plans[0].constructs,
             if member.contains("spatial") { 624 } else { 900 }
@@ -324,7 +418,7 @@ fn real_headers_match_by_structure_and_multiple_versions_require_file_selection(
         source::BUILTIN_REGISTRY,
         source::BUILTIN_REGISTRY_BYTES,
         &heads[..2],
-        &["h3/native-lora-a-b/1".into()],
+        &["h3/native-lora-a-b/2".into()],
         &root.join("sparse"),
     )
     .unwrap_err();
@@ -366,7 +460,7 @@ fn full_cli_conversion_mints_a_receipt_after_the_live_golden_suite() {
             "ingest".into(),
             "bank".into(),
             "safetensors.h3_lora".into(),
-            "h3.lora/1".into(),
+            "h3.lora/2".into(),
             "--source".into(),
             format!("adapter={}", file.path.display()),
             "--registry".into(),

@@ -299,9 +299,9 @@ impl Xform {
         Ok(())
     }
 
-    /// The inverse read-back, which is what makes the wrong split structurally
-    /// unproducible rather than merely documented: slice the source on the transform's own
-    /// indexing and the three members must reassemble the source bit-for-bit.
+    /// The inverse read-back proves that the transform loses or duplicates no bytes.
+    /// It uses the transform's own indexing, so it cannot establish the producer's
+    /// QKV layout: that needs an independent projection-output regression.
     pub fn reassembles(&self, src: &[u8]) -> Result<bool> {
         match self {
             Xform::Transpose {

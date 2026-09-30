@@ -59,10 +59,10 @@ def main() -> None:
             order = area / "order.json"
             order.write_text(json.dumps([["adapter", key] for key in canonical_keys(header)]))
             subprocess.run([
-                str(args.tfs.resolve()), "ingest", "bank", "safetensors.h3_lora", "h3.lora/1",
+                str(args.tfs.resolve()), "ingest", "bank", "safetensors.h3_lora", "h3.lora/2",
                 "--source", f"adapter={carrier}", "--registry", str(registry),
                 "--source-name", row["source"] + "/" + row["member"],
-                "--source-profile", "h3/native-lora-a-b/1" if row["logical_keys"] == 416 else "h3/native-lora-kohya/1", "--target", "adapter=plain/1",
+                "--source-profile", "h3/native-lora-a-b/2" if row["logical_keys"] == 416 else "h3/native-lora-kohya/2", "--target", "adapter=plain/1",
                 "--order", str(order),
             ], check=True)
         updated = json.loads(registry.read_text())
