@@ -23,6 +23,12 @@ import (
 // compared, and a contradiction is reported, never refused.
 const CommittedInterfacePath = "metadata/package-interface.json"
 
+type describedInterface struct {
+	path   string
+	source []byte // account-neutral metadata for the newly built wheel
+	notice string
+}
+
 // describe stages the tree's PackageInterface. The reading is THIS host's Runtime parsing the
 // source (hostruntime.Describe): package code is untrusted and nothing here imports it, so no
 // environment is built for the question. Both an unpublished revision and a publication ship
@@ -30,19 +36,19 @@ const CommittedInterfacePath = "metadata/package-interface.json"
 // something the copy names that the source no longer declares, or declares differently — is
 // returned as a notice; ordering and members only the fresh reading carries are not
 // contradictions. The staged publication names the account in every org-relative lane.
-func describe(ctx context.Context, tree, root, account string) (string, string, *exit.Error) {
+func describe(ctx context.Context, tree, root, account string) (describedInterface, *exit.Error) {
 	publish := account != ""
 	env := config.Frozen().Tool()
 	if _, problem := hostruntime.Path(env); problem != nil {
-		return "", "", problem
+		return describedInterface{}, problem
 	}
 	raw, problem := hostruntime.Describe(ctx, env, tree)
 	if problem != nil {
-		return "", "", exit.Named(exit.Validation, "package_interface_refused",
+		return describedInterface{}, exit.Named(exit.Validation, "package_interface_refused",
 			"cozy-runtime could not describe the package").WithRemedy("%s", problem.Message)
 	}
 	if len(raw) == 0 || len(raw) > 1<<20 || !json.Valid(raw) {
-		return "", "", exit.Named(exit.Structural, "package_interface_invalid",
+		return describedInterface{}, exit.Named(exit.Structural, "package_interface_invalid",
 			"cozy-runtime returned an invalid package interface")
 	}
 	notice := ""
@@ -55,17 +61,18 @@ func describe(ctx context.Context, tree, root, account string) (string, string, 
 			}
 		}
 	}
+	source := raw
 	if publish {
 		var problem *exit.Error
 		if raw, problem = QualifyInterface(raw, account); problem != nil {
-			return "", "", problem
+			return describedInterface{}, problem
 		}
 	}
 	path := filepath.Join(root, "package-interface.json")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", "", exit.Internalf("cannot stage package interface: %s", err)
+		return describedInterface{}, exit.Internalf("cannot stage package interface: %s", err)
 	}
-	return path, notice, nil
+	return describedInterface{path: path, source: source, notice: notice}, nil
 }
 
 // contradicts names the first thing the committed copy states that the fresh reading does
