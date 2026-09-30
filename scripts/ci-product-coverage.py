@@ -7,6 +7,8 @@ from collections import Counter
 from pathlib import Path
 import sys
 
+from ci_product_partitions import measured, partition
+
 
 def names(path: Path) -> list[str]:
     return path.read_text().splitlines()
@@ -17,6 +19,7 @@ def audit(root: Path, full: bool) -> None:
     if len(groups) != 3:
         raise ValueError(f"expected three product log groups, received {len(groups)}")
     expected = names(groups[0] / "all-tests.txt")
+    planned = partition(expected, measured(Path(__file__).with_name("product-test-durations.tsv")), 3)
     selected: list[str] = []
     outcomes: dict[str, str] = {}
     counts: Counter[str] = Counter()
@@ -24,8 +27,8 @@ def audit(root: Path, full: bool) -> None:
         if names(group / "all-tests.txt") != expected:
             raise ValueError(f"{group.name}: product test census differs")
         chosen = names(group / "selected-tests.txt")
-        if chosen != expected[index::3]:
-            raise ValueError(f"{group.name}: round-robin partition changed")
+        if chosen != planned[index]:
+            raise ValueError(f"{group.name}: measured partition assignment changed")
         finished: list[str] = []
         for line in names(group / "timings.tsv"):
             _, status, test = line.split("\t")

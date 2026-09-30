@@ -3,18 +3,20 @@
 # are named under os.TempDir(), and Unix socket paths must stay under 108 bytes).
 # Extra arguments go to every test binary.
 #
-#   scripts/product-tests.sh [-j N | --shard I/N] [--log-dir DIR] [test binary flags...]
-# --shard executes one zero-based partition of the same round-robin split as -j N.
+#   scripts/product-tests.sh [-j N | --shard I/N] [--durations FILE] [--log-dir DIR] [test binary flags...]
+# --durations balances cases by measured cost; --shard executes one zero-based group.
 set -euo pipefail
 
 jobs=1
 shard=""
 logs=""
+durations=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -j) jobs="$2"; shift 2 ;;
     --shard) shard="$2"; shift 2 ;;
     --log-dir) logs="$2"; shift 2 ;;
+    --durations) durations="$2"; shift 2 ;;
     *) break ;;
   esac
 done
@@ -27,6 +29,7 @@ if [ -n "$shard" ]; then
 else
   count=$jobs
 fi
+if [ -n "$durations" ]; then durations="$(realpath "$durations")"; fi
 if [ -n "$logs" ]; then
   mkdir -p "$logs"
   logs="$(cd "$logs" && pwd)"
@@ -41,7 +44,11 @@ cd "$root/tests/product"
 "$work/product.test" -test.list '^Test' | grep '^Test' > "$work/all"
 width=${#count}
 [ "$width" -ge 2 ] || width=2
-split -n "r/$count" -d -a "$width" "$work/all" "$work/part."
+if [ -n "$durations" ]; then
+  python3 "$root/scripts/ci_product_partitions.py" "$durations" "$work/all" "$count" "$work/part."
+else
+  split -n "r/$count" -d -a "$width" "$work/all" "$work/part."
+fi
 parts=("$work"/part.*)
 if [ -n "$shard" ]; then
   printf -v suffix "%0${width}d" "$index"
