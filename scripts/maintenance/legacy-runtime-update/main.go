@@ -13,11 +13,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -78,13 +82,62 @@ func read(ctx context.Context, client *machines.Maintenance) (observation, error
 	return state, nil
 }
 
+type stagedWheel struct {
+	File   string `json:"file"`
+	SHA256 string `json:"sha256"`
+	Length int64  `json:"length"`
+}
+
+func stageWheel(ctx context.Context, client *machines.Maintenance, pinned string, want pair) (stagedWheel, error) {
+	digest, path, found := strings.Cut(pinned, "=")
+	if !found || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(digest) {
+		return stagedWheel{}, errors.New("--stage-wheel requires the verified SHA256=PATH")
+	}
+	name := filepath.Base(path)
+	if !strings.HasSuffix(name, ".whl") || !(strings.HasPrefix(name, "cozy_runtime-"+want.Runtime+"-") || strings.HasPrefix(name, "tensorfs-"+want.TensorFS+"-")) {
+		return stagedWheel{}, errors.New("staged wheel must name the requested Runtime or TensorFS version")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return stagedWheel{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 256<<20 {
+		return stagedWheel{}, errors.New("staged wheel must be a nonempty regular file at or below 256 MiB")
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return stagedWheel{}, err
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != digest {
+		return stagedWheel{}, errors.New("staged wheel does not match its verified SHA256")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return stagedWheel{}, err
+	}
+	var result stagedWheel
+	if _, problem := client.Do(ctx, http.MethodPut, "/v1/machine/runtime/wheels/"+url.PathEscape(name), file, &result); problem != nil {
+		return stagedWheel{}, problem
+	}
+	if result.File != name || result.SHA256 != digest || result.Length != info.Size() {
+		return stagedWheel{}, errors.New("staged wheel receipt differs from the verified artifact")
+	}
+	return result, nil
+}
+
 func run(ctx context.Context) error {
 	name := flag.String("machine", "", "Existing rental name")
 	runtimeVersion := flag.String("runtime-version", "", "Exact published Runtime version")
 	tensorfsVersion := flag.String("tensorfs-version", "", "Exact published TensorFS version")
 	apply := flag.Bool("apply", false, "Submit or observe the stable update operation; default only reports the plan")
-	expectAgent := flag.String("expect-agent-version", "", "Agent version from the reviewed plan; required with --apply")
-	expectStarted := flag.Uint64("expect-agent-started-unix-ms", 0, "Agent start time from the reviewed plan; required with --apply")
+	expectAgent := flag.String("expect-agent-version", "", "Agent version from the reviewed plan; required with --apply or --stage-wheel")
+	expectStarted := flag.Uint64("expect-agent-started-unix-ms", 0, "Agent start time from the reviewed plan; required with --apply or --stage-wheel")
+	var uploads []string
+	flag.Func("stage-wheel", "Stage a verified SHA256=PATH without installing it (repeatable; requires reviewed agent identity)", func(value string) error {
+		uploads = append(uploads, value)
+		return nil
+	})
 	flag.Parse()
 	version := regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 	if *name == "" || !version.MatchString(*runtimeVersion) || !version.MatchString(*tensorfsVersion) || flag.NArg() != 0 {
@@ -159,14 +212,25 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if *apply && (*expectAgent == "" || *expectStarted == 0 || before.Host.Version != *expectAgent || before.Host.StartedAtUnixMs != *expectStarted) {
-		return errors.New("--apply requires matching --expect-agent-version and --expect-agent-started-unix-ms from the reviewed plan")
+	if (*apply || len(uploads) > 0) && (*expectAgent == "" || *expectStarted == 0 || before.Host.Version != *expectAgent || before.Host.StartedAtUnixMs != *expectStarted) {
+		return errors.New("--apply or --stage-wheel requires matching --expect-agent-version and --expect-agent-started-unix-ms from the reviewed plan")
 	}
 	state, err := read(ctx, client)
 	if err != nil {
 		return err
 	}
 	want := pair{*runtimeVersion, *tensorfsVersion}
+	if len(uploads) > 0 && state.Update != nil && !terminal(state.Update.State) {
+		return errors.New("a Runtime update is pending; no wheels staged")
+	}
+	var staged []stagedWheel
+	for _, upload := range uploads {
+		wheel, err := stageWheel(ctx, client, upload, want)
+		if err != nil {
+			return err
+		}
+		staged = append(staged, wheel)
+	}
 	sum := sha256.Sum256([]byte(row.ID + "\x00" + row.ExpectedWorkerID + "\x00" + row.ExpectedWorkerBootID + "\x00" + want.Runtime + "\x00" + want.TensorFS))
 	id := "legacy-runtime-" + hex.EncodeToString(sum[:12])
 	queued, running, problem := store.RentalRunCounts(row.ID)
@@ -178,9 +242,12 @@ func run(ctx context.Context) error {
 			"status": status, "machine": *name, "rental_id": row.ID, "worker_id": row.ExpectedWorkerID,
 			"boot_id": row.ExpectedWorkerBootID, "agent_version": before.Host.Version, "agent_started_unix_ms": before.Host.StartedAtUnixMs,
 			"installed": state.pair, "requested": want, "operation": id, "update": state.Update,
-			"queued": queued, "running": running, "agent_action": "preserve existing process; bootstrap migration remains separate"})
+			"queued": queued, "running": running, "staged_wheels": staged, "agent_action": "preserve existing process; bootstrap migration remains separate"})
 	}
 	if !*apply {
+		if len(staged) > 0 {
+			return emit("staged_only")
+		}
 		return emit("plan_only")
 	}
 	if state.Update != nil && !terminal(state.Update.State) && state.Update.Operation != id {
