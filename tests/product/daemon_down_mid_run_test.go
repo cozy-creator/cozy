@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
@@ -18,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -44,6 +47,14 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 	}{{"local", nil}, {"rental", []string{"--rental=tessa"}}} {
 		t.Run(venue.name, func(t *testing.T) {
 			gates := t.TempDir()
+			name := map[string]string{"local": machines.Local, "rental": parityRental}[venue.name]
+			var started []string
+			var observer *machines.Machine
+			t.Cleanup(func() {
+				if t.Failed() {
+					downFailureDiagnostics(t, root, venue.name, h.provider, store, observer, started)
+				}
+			})
 			// start runs `make` behind its own gate and returns once it runs on its machine.
 			start := func(key string) *records.Request {
 				args := append([]string{"run", "local/down-proof/make", "gate=" + filepath.Join(gates, key), "size=200000",
@@ -54,6 +65,9 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 				var row *records.Request
 				eventually(t, root, key+" running on its machine", func() bool {
 					row, _ = store.RequestByIdempotencyKey(venue.name + "-" + key)
+					if row != nil && (len(started) == 0 || started[len(started)-1] != row.ID) {
+						started = append(started, row.ID)
+					}
 					return row != nil && observed(store, row.ID) == "running"
 				})
 				return row
@@ -76,7 +90,6 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 				}
 			}
 			open := func(key string) { must(t, os.WriteFile(filepath.Join(gates, key), nil, 0o600)) }
-			name := map[string]string{"local": machines.Local, "rental": parityRental}[venue.name]
 			authorityState := func(row *records.Request) string {
 				link, problem := store.MachineExecution(row.ID)
 				fatal(t, problem)
@@ -84,6 +97,7 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 				must(t, proto.Unmarshal(link.Receipt, &receipt))
 				machine, problem := found.Dial(t.Context(), name, "observe outcome while personal daemon is down")
 				fatal(t, problem)
+				observer = machine
 				defer machine.Close()
 				state, err := machine.Host.GetMachineExecution(t.Context(), &pb.MachineExecutionQuery{
 					Claim: machine.Claim, RequestId: row.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId})
@@ -115,6 +129,10 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 			}
 
 			done := start("done")
+			found.Held = func(string) bool { return true }
+			var problem *exit.Error
+			observer, problem = found.Dial(t.Context(), name, "read-only cancellation diagnostics")
+			fatal(t, problem)
 			down(done, "")
 			open("done")
 			watchCompleted(done)
@@ -173,6 +191,103 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 				t.Fatalf("the run did not execute on its %s machine: %+v", venue.name, link)
 			}
 		})
+	}
+}
+
+// Failure snapshots deliberately select status/control facts. Neither database
+// copies, execution offers, event bodies nor credential-bearing records are kept.
+func downFailureDiagnostics(t *testing.T, root, venue, provider string, store *records.Store, observer *machines.Machine, ids []string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	facts := map[string]any{"venue": venue}
+	if observer != nil {
+		facts["observer_connection"] = observer.Conn.GetState().String()
+	}
+	rows := []map[string]any{}
+	for _, id := range ids {
+		row := map[string]any{"request": id}
+		request, problem := store.RequestRow(id)
+		if problem == nil && request != nil {
+			row["creator_state"] = request.State
+		}
+		link, problem := store.MachineExecution(id)
+		if problem == nil && link != nil {
+			row["cancel_requested"], row["collected"], row["cursor"] = link.CancelRequested, link.Collected, link.RemoteCursor
+			row["pending_control"] = len(link.PendingControl) != 0
+			row["pending_control_bytes"] = len(link.PendingControl)
+			var pending pb.MachineExecutionControl
+			if proto.Unmarshal(link.PendingControl, &pending) == nil {
+				row["pending_command"], row["pending_action"] = pending.CommandId, pending.Action.String()
+			}
+			var receipt pb.MachineExecutionReceipt
+			if observer != nil && proto.Unmarshal(link.Receipt, &receipt) == nil {
+				query := &pb.MachineExecutionQuery{Claim: observer.Claim, RequestId: id, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId}
+				state, err := observer.Host.GetMachineExecution(ctx, query)
+				if err != nil {
+					row["runtime_read_code"] = status.Code(err).String()
+				} else {
+					row["runtime_state"], row["runtime_sequence"], row["runtime_collected"] = state.State, state.Sequence, state.Collected
+					row["runtime_generation"], row["runtime_attempt"] = state.Generation, state.AttemptOrdinal
+					row["worker_boot"], row["workspace"] = state.WorkerBootId, state.ExecutionWorkspaceId
+				}
+				page, err := observer.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: uint64(max(link.RemoteCursor, 0)), Limit: 16})
+				if err != nil {
+					row["runtime_event_code"] = status.Code(err).String()
+				} else {
+					kinds := []string{}
+					for _, event := range page.Events {
+						kinds = append(kinds, event.Kind)
+					}
+					row["event_head"], row["event_kinds"] = page.HeadSequence, kinds
+				}
+			}
+		}
+		rows = append(rows, row)
+	}
+	facts["requests"] = rows
+	journal := machineJournal(root)
+	if venue == "rental" {
+		journal = filepath.Join(provider, "var/lib/tensorfs/.cozy-workspace/journal.sqlite3")
+	}
+	python := filepath.Join(root, "machine/root/opt/cozy/python/bin/python")
+	command := exec.CommandContext(ctx, python, append([]string{"-I", "-c", `import json,sqlite3,sys
+from pathlib import Path
+path=Path(sys.argv[1]); ids=sys.argv[2:]
+if not path.is_file(): print('{"journal":"absent"}'); raise SystemExit()
+c=sqlite3.connect('file:'+str(path)+'?mode=ro',uri=True); c.row_factory=sqlite3.Row
+out={}; marks=','.join('?' for _ in ids)
+for table,fields in [('executions','request,state,desired,retention_waived,collected,sequence,generation'),('attempts','request,ordinal,state,length(outcome) AS outcome_bytes')]:
+    out[table]=[dict(row) for row in c.execute('SELECT '+fields+' FROM '+table+' WHERE request IN ('+marks+') LIMIT 32',ids)] if ids else []
+out['commands']=[]
+if ids:
+    for row in c.execute('SELECT request,command,intent,length(response) AS response_bytes FROM execution_commands WHERE request IN ('+marks+') LIMIT 32',ids):
+        command={'request':row['request'],'command':row['command'],'response_bytes':row['response_bytes']}
+        try: command['action']=json.loads(row['intent']).get('action','')
+        except (ValueError,TypeError): command['action']='unreadable'
+        out['commands'].append(command)
+print(json.dumps(out,sort_keys=True))
+`, journal}, ids...)...)
+	if output, err := command.Output(); err == nil {
+		var data map[string]json.RawMessage
+		if json.Unmarshal(output, &data) == nil {
+			facts["journal"] = data
+		}
+	} else {
+		facts["journal_read"] = "unavailable"
+	}
+	encoded, err := json.MarshalIndent(facts, "", "  ")
+	if err != nil {
+		t.Log("cancellation snapshot unavailable")
+		return
+	}
+	t.Logf("cancellation status snapshot: %s", encoded)
+	if directory := *failureDiagnosticsDirectory; directory != "" {
+		if os.MkdirAll(directory, 0700) == nil {
+			if err := os.WriteFile(filepath.Join(directory, "down-mid-run-"+venue+".json"), encoded, 0600); err != nil {
+				t.Log("could not save cancellation snapshot")
+			}
+		}
 	}
 }
 

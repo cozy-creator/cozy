@@ -133,13 +133,22 @@ jobs:
           args=(-j 3 -machine-host="$MACHINE_HOST" -require-machine-host
             -machine-runtime-wheel="$RUNTIME_WHEEL" -machine-tensorfs-wheel="$TENSORFS_WHEEL"
             -script-runtime-wheel="$RUNTIME_WHEEL" -child-runtime-wheel="$RUNTIME_WHEEL"
-            -child-tensorfs-wheel="$TENSORFS_WHEEL" -tensorfs-fixture-wheel="$TENSORFS_WHEEL")
+            -child-tensorfs-wheel="$TENSORFS_WHEEL" -tensorfs-fixture-wheel="$TENSORFS_WHEEL"
+            -failure-diagnostics="$RUNNER_TEMP/product-diagnostics")
           [ "$FULL" = true ] || args+=(-test.short)
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-product-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
             scripts/product-tests.sh "${args[@]}"
+      - name: Preserve filtered product failure snapshots
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-failure-snapshots
+          path: ${{ runner.temp }}/product-diagnostics/**/*.json
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Release artifacts install and upgrade
         if: env.FULL == 'true'
         run: |
