@@ -44,6 +44,8 @@ compatible component exists. An adapter-only selection keeps the ordinary base
 model default. Provider references use the same machine-side source preparation
 as checkpoints; list optional reviewed `profiles` and `source_component` in each
 overlay when needed. The authored function receives none of these controls.
+When combined, JSON/YAML and inline overlay lists come first; repeated `--lora`
+flags append in their command-line order, including equivalent slot spellings.
 
 For a foreign adapter, select its tensor file explicitly when the repository has
 multiple versions:
@@ -58,9 +60,10 @@ a release label. A repository-only URL with several matching checkpoint files
 refuses and lists the candidates. Ingest recognizes reviewed tensor structures,
 not EXE files, workflow JSON or repository names.
 
-The API representation is an `adapters` list inside each selected model row. Every
-row carries `component`, immutable `model`/`manifest` (and optional release/lane),
-`source_component`, and a canonical finite decimal `scale` string. Both ordinary
+The API representation is an `adapters` list inside each selected model row. An
+input may name an open catalog selection or immutable provider source; Runtime
+resolves exact checkpoint identities before execution. Each stack entry retains
+its component, source component, and canonical finite decimal scale. Both ordinary
 and native retained bases keep their original custody. The executing Runtime must
 advertise `model_overrides`, and the Host must support wire70 so it forwards both
 release-root and captured choices. Unsupported peers refuse this operation before submission;

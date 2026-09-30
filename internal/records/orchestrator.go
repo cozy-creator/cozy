@@ -649,8 +649,9 @@ type ModelRef struct {
 	SharedSlots []string `json:"shared_slots,omitempty"`
 }
 
-// ModelAdapterRef is an ordered, exact adapter checkpoint for one base component.
-// Scales are canonical decimal strings, so zero is distinct from omission.
+// ModelAdapterRef is an ordered adapter selection for one base component. A
+// request may leave catalog resolution open or name a provider source; preparation
+// returns exact checkpoints. Scales are canonical decimal strings; zero is explicit.
 type ModelAdapterRef struct {
 	Component       string   `json:"component"`
 	Model           string   `json:"model"`
