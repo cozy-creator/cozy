@@ -42,8 +42,9 @@ func TestAMachineStoppedMidJobRunsAJobOnItsNextBoot(t *testing.T) {
 		}
 		// Dispatch is the lifecycle fact. Older SDKs report unknown execution
 		// duration, and this sleeping handler has no periodic timing samples.
+		// Creator normalizes the machine's running event to run.in_progress.
 		for _, event := range run.Events {
-			if event.Type == "machine.running" {
+			if event.Type == "run.in_progress" {
 				return true
 			}
 		}
