@@ -48,8 +48,10 @@ jobs:
 
   toolchain:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    # Authenticated full media acquisition includes observed mirror retries; this
+    # has the same external job budget as a product runner, without a new network kill.
+    timeout-minutes: 45
     env:
       RUNTIME_VERSION: ${{ inputs.runtime_version }}
     steps:
@@ -64,6 +66,14 @@ jobs:
           name: cozy-ci-toolchain
           path: ${{ runner.temp }}/cozy-ci-toolchain.json
           retention-days: 7
+      - name: Acquire shared Ubuntu media dependencies
+        run: scripts/ci-media.sh prepare "$RUNNER_TEMP/cozy-ci-media"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cozy-ci-media
+          path: ${{ runner.temp }}/cozy-ci-media
+          compression-level: 0
+          retention-days: 7
 
   suite:
     if: github.event_name == 'workflow_dispatch'
@@ -73,7 +83,7 @@ jobs:
       fail-fast: false
       matrix:
         shard: [0, 1, 2]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       FULL: ${{ inputs.full }}
@@ -138,10 +148,12 @@ jobs:
         run: |
           python3 scripts/ci-machine-agent.py "$RUNTIME_WHEEL" "$RUNNER_TEMP/cozy-machine"
           echo "MACHINE_HOST=$RUNNER_TEMP/cozy-machine" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: cozy-ci-media
+          path: ${{ runner.temp }}/cozy-ci-media
       - name: Media test tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+        run: scripts/ci-media.sh install "$RUNNER_TEMP/cozy-ci-media"
       # The runner's service cgroup is not delegated; Runtime's executor containment needs its own subtree.
       - name: Product tests
         run: |
