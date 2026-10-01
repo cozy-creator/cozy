@@ -11,8 +11,9 @@ const ENVELOPE: &str =
     r#"{"error":{"code":"checkpoint_not_found","message":"no such checkpoint"}}"#;
 
 /// A loopback hub under a self-signed authority that answers every call it can read with a
-/// typed 404. Every accepted peer is reported before its handshake.
-fn private_hub() -> (u16, String, mpsc::Receiver<SocketAddr>) {
+/// typed 404. Every accepted peer is reported before its handshake. The first `alerts`
+/// connections are answered with a fatal `internal_error` alert instead of a handshake.
+fn private_hub(alerts: usize) -> (u16, String, mpsc::Receiver<SocketAddr>) {
     let key = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
     let cert = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
     let private = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der())
@@ -31,9 +32,14 @@ fn private_hub() -> (u16, String, mpsc::Receiver<SocketAddr>) {
     let port = listener.local_addr().unwrap().port();
     let (peers, accepted) = mpsc::channel();
     std::thread::spawn(move || {
-        for socket in listener.incoming() {
-            let Ok(socket) = socket else { return };
+        for (index, socket) in listener.incoming().enumerate() {
+            let Ok(mut socket) = socket else { return };
             let _ = peers.send(socket.peer_addr().unwrap());
+            if index < alerts {
+                let _ = socket.read(&mut [0u8; 4096]);
+                let _ = socket.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x50]);
+                continue;
+            }
             let conn = rustls::ServerConnection::new(Arc::clone(&config)).unwrap();
             let mut stream = rustls::StreamOwned::new(conn, socket);
             let mut head = Vec::new();
@@ -95,7 +101,7 @@ fn an_untrusted_hub_is_refused_once_and_a_named_ca_reaches_it() {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
-    let (port, pem, accepted) = private_hub();
+    let (port, pem, accepted) = private_hub(0);
 
     let (ok, stderr) = fetch(&root, port, &[]);
     assert!(
@@ -120,5 +126,41 @@ fn an_untrusted_hub_is_refused_once_and_a_named_ca_reaches_it() {
     std::fs::write(&garbage, "not a certificate").unwrap();
     let (ok, stderr) = fetch(&root, port, &["--ca-file", garbage.to_str().unwrap()]);
     assert!(!ok && stderr.contains("REFUSED UNKNOWN_FORMAT"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer's alert is the link's weather, not a verdict on its certificate: the ask is made
+/// again and reaches the hub's own answer.
+#[test]
+fn a_tls_alert_from_the_peer_is_weather_and_asked_again() {
+    let dir = std::env::temp_dir().join(format!("tfs-hub-tls-alert-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.join("store");
+    let init = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["store", "init", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let (port, pem, _accepted) = private_hub(1);
+    let ca = dir.join("hub-ca.pem");
+    std::fs::write(&ca, pem).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ensure", root.to_str().unwrap(), "proof/model"])
+        .args(["--hub", &format!("https://127.0.0.1:{port}")])
+        .args([
+            "--ca-file",
+            ca.to_str().unwrap(),
+            "--sample-seconds",
+            "0.05",
+        ])
+        .env("TFS_CREDENTIAL", "")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"REF_NOT_FOUND\"") && stdout.contains("checkpoint_not_found"),
+        "{stdout}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

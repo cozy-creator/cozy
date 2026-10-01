@@ -593,10 +593,22 @@ fn tls_handshake(
             Ok(_) => {
                 advanced = Instant::now();
                 // A certificate or protocol verdict is this client's, and re-asking reaches
-                // it again: refused typed, never retried as weather. The alert goes out so
-                // the origin logs why.
+                // it again: refused typed, never retried as weather. The peer's own alert or
+                // a garbled record is the link's weather and is asked again. The alert goes
+                // out so the origin logs why.
                 if let Err(e) = conn.process_new_packets() {
                     let _ = conn.write_tls(sock);
+                    let verdict = matches!(
+                        e,
+                        rustls::Error::InvalidCertificate(_)
+                            | rustls::Error::NoCertificatesPresented
+                            | rustls::Error::UnsupportedNameType
+                            | rustls::Error::InvalidCertRevocationList(_)
+                            | rustls::Error::PeerIncompatible(_)
+                    );
+                    if !verdict {
+                        return refuse(fail, format!("{host}: TLS handshake failed: {e}"));
+                    }
                     return refuse(
                         Code::TLS_UNTRUSTED,
                         format!(
