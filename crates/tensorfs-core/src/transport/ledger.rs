@@ -375,7 +375,9 @@ impl Ledger {
     /// which is not a failed attempt, or — when it states none — this pull's patience,
     /// which is (`true`). The hub's rule, applied to every origin.
     pub(crate) fn retry_wait(&self, stated: Option<Duration>) -> (Duration, bool) {
-        match stated.filter(|wait| !wait.is_zero()) {
+        // A wait no clock can hold is no statement (and `Instant + wait` would panic).
+        let representable = |wait: &Duration| Instant::now().checked_add(*wait).is_some();
+        match stated.filter(|wait| !wait.is_zero() && representable(wait)) {
             Some(wait) => (wait, false),
             None => (self.patience(), true),
         }
@@ -383,7 +385,9 @@ impl Ledger {
 
     /// Sleep `wait` in sampling ticks; cancellation and the caller's deadline end it.
     pub(crate) fn pause(&self, wait: Duration, deadline: Deadline) -> Result<()> {
-        let until = Instant::now() + wait;
+        let until = Instant::now()
+            .checked_add(wait)
+            .unwrap_or_else(|| Instant::now() + self.patience());
         loop {
             self.check_running()?;
             let now = Instant::now();

@@ -945,6 +945,29 @@ fn httpdate(at: SystemTime) -> String {
     )
 }
 
+/// A Retry-After no clock can hold is no statement: it must not panic the pull, and the
+/// ask is judged like any unstated retryable answer.
+#[test]
+fn an_unrepresentable_retry_after_is_no_statement() {
+    let dir = temporary("retry-after-overflow");
+    let checkpoint = checkpoint(2, 64 << 10, 23);
+    let victim = blob(&checkpoint, 0);
+    let hub = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![on(
+                &victim,
+                1..=1,
+                with_header(status(503), "retry-after", &u64::MAX.to_string()),
+            )],
+            ..Config::default()
+        },
+    );
+    let root = store(&dir);
+    assert_landed(&Run::new(&hub, &root).ensure(), &hub, &root);
+    assert_eq!(hub.asks(&victim), 2, "{}", hub.log());
+}
+
 /// URLs that die before their GET. The hub's declared life either tells the truth (the
 /// client re-mints by age before asking) or disagrees with the object store's clock (the
 /// client learns only from the 403). One stream, each first ask slower than a URL's life,
