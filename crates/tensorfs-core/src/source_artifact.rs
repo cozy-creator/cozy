@@ -12,10 +12,11 @@ use crate::{
 };
 use fs2::FileExt;
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,47 +296,66 @@ pub fn import_tree(
     fault: &Fault,
 ) -> Result<TreeRoot> {
     check_roster(owner, tree)?;
+    let paths = import_paths(tree, files)?;
+    let mut writer = Writer::open(store, owner, tree.object_ref())?;
+    if !writer.completed()? {
+        for (member, entry) in tree.entries() {
+            let object = entry.blob();
+            writer.hold_expected(object)?;
+            import_member(store, object, paths[member.as_str()], fault)?;
+            writer.landed(object)?;
+        }
+    }
+    writer.finish(tree)
+}
+/// The local path of every member of an ordinary-file tree, refusing an inexact roster.
+pub(crate) fn import_paths<'a>(
+    tree: &Manifest,
+    files: &'a [(String, PathBuf)],
+) -> Result<BTreeMap<&'a str, &'a Path>> {
     if tree.header().is_some() {
         return refuse(Code::WRONG_TYPE, "import requires an ordinary-file tree");
     }
-    let paths: std::collections::BTreeMap<_, _> = files.iter().map(|(k, v)| (k, v)).collect();
+    let paths: BTreeMap<_, _> = files
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_path()))
+        .collect();
     if paths.len() != files.len()
         || paths.len() != tree.entries().len()
         || tree
             .entries()
             .iter()
-            .any(|(member, _)| !paths.contains_key(member))
+            .any(|(member, _)| !paths.contains_key(member.as_str()))
     {
         return refuse(
             Code::TRANSACTION_CONFLICT,
             "import paths differ from the exact manifest roster",
         );
     }
-    let mut writer = Writer::open(store, owner, tree.object_ref())?;
-    if !writer.completed()? {
-        for (member, entry) in tree.entries() {
-            let object = entry.blob();
-            writer.hold_expected(object)?;
-            if !matches!(store.record_valid(&object.sha256), Ok(row) if row.length == object.length)
-            {
-                let path = paths[member];
-                if !fs::symlink_metadata(path).map_err(io)?.is_file() {
-                    return refuse(Code::WRONG_TYPE, "import member must be a regular file");
-                }
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(crate::store::O_NOFOLLOW)
-                    .open(path)
-                    .map_err(io)?;
-                if !file.metadata().map_err(io)?.is_file() {
-                    return refuse(Code::WRONG_TYPE, "import member must be a regular file");
-                }
-                store.put_stream(&mut file, Some(object), fault)?;
-            }
-            writer.landed(object)?;
-        }
+    Ok(paths)
+}
+/// Admit one member's exact bytes from a regular file unless a verification record stands.
+pub(crate) fn import_member(
+    store: &Store,
+    object: &ObjectRef,
+    path: &Path,
+    fault: &Fault,
+) -> Result<()> {
+    if matches!(store.record_valid(&object.sha256), Ok(row) if row.length == object.length) {
+        return Ok(());
     }
-    writer.finish(tree)
+    if !fs::symlink_metadata(path).map_err(io)?.is_file() {
+        return refuse(Code::WRONG_TYPE, "import member must be a regular file");
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(crate::store::O_NOFOLLOW)
+        .open(path)
+        .map_err(io)?;
+    if !file.metadata().map_err(io)?.is_file() {
+        return refuse(Code::WRONG_TYPE, "import member must be a regular file");
+    }
+    store.put_stream(&mut file, Some(object), fault).map(|_| ())
 }
 /// Adopt only from a still-retained complete owner, before releasing the source owner.
 pub fn retain(store: &Store, source: &str, owner: &str) -> Result<TreeRoot> {

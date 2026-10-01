@@ -61,6 +61,14 @@ class CheckpointRoot(TypedDict):
     manifest_length: int
     released: bool
 
+class KeyedRoot(TypedDict):
+    space: str
+    key: str
+    manifest_digest: str
+    manifest_length: int
+    bytes: int
+    created_unix_ms: int
+
 class SelectedSource(TypedDict):
     canonical: str
     selection_sha256: str
@@ -465,6 +473,12 @@ class Store:
     def release_tree_root(self, owner: str) -> None: ...
     def release_tree_retention(self, source_owner: str, receipt_digest: str, owner: str) -> None: ...
     def adopt_source_progress(self, source_owner: str, owner: str) -> TreeRoot: ...
+    def put_keyed_root(
+        self, space: str, key: str, manifest_bytes: bytes, files: Sequence[tuple[str, StrPath]],
+    ) -> KeyedRoot: ...
+    def keyed_root(self, space: str, key: str) -> KeyedRoot | None: ...
+    def keyed_roots(self, space: str) -> list[KeyedRoot]: ...
+    def drop_keyed_root(self, space: str, key: str) -> bool: ...
     def resolve_source(
         self, source_uri: str, carriers: Sequence[str] = ..., *, profiles: Sequence[str] = ..., files: Sequence[str] = ..., credential: str = ...,
         huggingface: str | None = None, civitai: str | None = None, allow_local: bool = False,

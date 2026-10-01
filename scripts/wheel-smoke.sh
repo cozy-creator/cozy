@@ -51,6 +51,7 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/stub_conform.py
 "$work/venv/bin/python" scripts/source-artifacts.py
 "$work/venv/bin/python" scripts/import-tree.py
+"$work/venv/bin/python" scripts/keyed-roots.py
 "$work/venv/bin/python" scripts/trust-index.py
 "$work/venv/bin/python" scripts/fit-runs.py
 "$work/venv/bin/python" scripts/derived-resume.py

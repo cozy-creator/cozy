@@ -545,6 +545,20 @@ fn tree_root_dict<'p>(
     Ok(result)
 }
 
+fn keyed_root_dict<'p>(
+    py: Python<'p>,
+    root: &tensorfs_core::keyed_roots::KeyedRoot,
+) -> PyResult<Bound<'p, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("space", &root.space)?;
+    result.set_item("key", &root.key)?;
+    result.set_item("manifest_digest", root.manifest.id())?;
+    result.set_item("manifest_length", root.manifest.length)?;
+    result.set_item("bytes", root.bytes)?;
+    result.set_item("created_unix_ms", root.created_unix_ms)?;
+    Ok(result)
+}
+
 fn checkpoint_root_dict<'p>(
     py: Python<'p>,
     root: &tensorfs_core::checkpoint_root::CheckpointRoot,
@@ -842,6 +856,50 @@ impl PyStore {
 
     fn release_tree_root(&self, py: Python<'_>, owner: &str) -> PyResult<()> {
         py.detach(|| tensorfs_core::source_artifact::release(&self.store, owner))
+            .or_refuse(py)
+    }
+
+    /// Import an exact ordinary-file tree under a droppable root named by (space, key).
+    fn put_keyed_root<'p>(
+        &self,
+        py: Python<'p>,
+        space: &str,
+        key: &str,
+        manifest_bytes: &[u8],
+        files: Vec<(String, PathBuf)>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let tree = Manifest::parse(manifest_bytes).or_refuse(py)?;
+        let root = py
+            .detach(|| tensorfs_core::keyed_roots::put(&self.store, space, key, &tree, &files))
+            .or_refuse(py)?;
+        keyed_root_dict(py, &root)
+    }
+
+    fn keyed_root<'p>(
+        &self,
+        py: Python<'p>,
+        space: &str,
+        key: &str,
+    ) -> PyResult<Option<Bound<'p, PyDict>>> {
+        let root = py
+            .detach(|| tensorfs_core::keyed_roots::get(&self.store, space, key))
+            .or_refuse(py)?;
+        root.as_ref()
+            .map(|root| keyed_root_dict(py, root))
+            .transpose()
+    }
+
+    /// Every keyed root in `space`, oldest created first.
+    fn keyed_roots<'p>(&self, py: Python<'p>, space: &str) -> PyResult<Vec<Bound<'p, PyDict>>> {
+        let roots = py
+            .detach(|| tensorfs_core::keyed_roots::list(&self.store, space))
+            .or_refuse(py)?;
+        roots.iter().map(|root| keyed_root_dict(py, root)).collect()
+    }
+
+    /// Remove a keyed root, leaving nothing behind; true when one existed.
+    fn drop_keyed_root(&self, py: Python<'_>, space: &str, key: &str) -> PyResult<bool> {
+        py.detach(|| tensorfs_core::keyed_roots::remove(&self.store, space, key))
             .or_refuse(py)
     }
 

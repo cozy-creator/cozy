@@ -315,7 +315,7 @@ def relieve(store: Store, *, keep: Sequence[str] = ()) -> Relief:
 
 
 #: Feature names a caller detects instead of versions: ``"ensure/1"``, ``"get-range/1"``,
-#: ``"deliver/1"``, ``"pressure/1"``.
+#: ``"deliver/1"``, ``"pressure/1"``, ``"keyed-roots/1"``.
 CAPABILITIES: frozenset[str] = frozenset(_CAPABILITIES)
 
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype

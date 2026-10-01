@@ -141,6 +141,7 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
     holds.extend(crate::source_artifact::held_objects(store)?);
     holds.extend(crate::checkpoint_root::held_objects(store)?);
     holds.extend(crate::ensure::held_objects(store)?);
+    holds.extend(crate::keyed_roots::held_objects(store)?);
     // A full snapshot obligation wins over a runtime-only pin of the same manifest.
     holds.sort_by(|left, right| {
         left.key
@@ -187,6 +188,7 @@ pub(crate) fn unretained_manifests(store: &Store, wanted: &[ObjectRef]) -> Resul
         let mut named = crate::derived::rooted_manifests(store)?;
         named.extend(manifests(crate::source_artifact::held_objects(store)?));
         named.extend(manifests(crate::checkpoint_root::held_objects(store)?));
+        named.extend(manifests(crate::keyed_roots::held_objects(store)?));
         Ok(named)
     };
     let everything =
