@@ -110,6 +110,8 @@ p.prioritise(ws, tier, regions=None, priority=0, pin=None)   # never moves a byt
 lease = p.acquire(ws, device, region, stream, priority=None)
 lease.ptr, lease.nbytes, lease.region, lease.ring_offset   # ring_offset is None for resident leases
 lease.view()                 # ONE uint8 DLPack view of the region's bytes (see Views)
+lease.verify_bytes()         # diagnostic: parts whose device bytes differ from the source
+                             #   (waits for the copy, reads the store; debugging runs only)
 lease.release()              # records the release event on the acquire stream (or pass stream=)
 with p.acquire(ws, device, region, stream) as lease: ...
 ```

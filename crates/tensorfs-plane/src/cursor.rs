@@ -492,6 +492,7 @@ impl Cursor {
             dev: d,
             tag,
             start: Mutex::new(Some(start)),
+            fill: Some(ev),
             kind: LeaseKind::Ring { cursor: self.id, k },
             released: AtomicBool::new(false),
         })

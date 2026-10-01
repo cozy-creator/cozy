@@ -447,3 +447,90 @@ fn cutting_just_wanted_regions_waits_for_every_staged_chunk() {
         p.close().unwrap();
     }
 }
+
+/// W3 G4: a repeat run differed only where streamed copies came disk → staging → ring.
+/// Stream cyclically while the source of each copy changes under it: a Worker plane punches the
+/// memfd it shares (foreign eviction under our live registrations), our own pinned budget drops
+/// to zero with a cold page cache (every copy staged from disk), then the tier refills while
+/// streaming, then shrinks to one region. Every streamed read is checked against the source.
+fn mixed_source_stream(copy_streams: usize) {
+    let fx = Fixture::new("gpu-mixsrc");
+    let worker = host_only();
+    let wws = fx.register(&worker, None);
+    worker.set_pinned_budget(1 << 30).unwrap();
+    worker.want(wws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    let p = Plane::open(PlaneConfig {
+        devices: vec![DEV],
+        readers: 4,
+        copy_streams,
+        staging_buffers: 3,
+        staging_bytes: 16 << 20,
+        ..Default::default()
+    })
+    .unwrap();
+    let ws = fx.register(&p, Some(worker.host_fd(wws).unwrap()));
+    let spans: Vec<u64> = p.layout(ws).unwrap().regions.iter().map(|r| r.span).collect();
+    p.set_pinned_budget(1 << 30).unwrap();
+    p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    let s = Stream::new();
+    p.set_vram_budget(DEV, 1 << 30).unwrap();
+    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 0, 0, "mix", None).unwrap();
+    let mut bad = Vec::new();
+    for pass in 0..28u32 {
+        match pass {
+            4 => drop(worker.set_pinned_budget(0).unwrap()),
+            8..=10 => {
+                p.set_pinned_budget(0).unwrap();
+                fx.drop_cache();
+            }
+            16 => {
+                p.set_pinned_budget(1 << 30).unwrap();
+                p.want(ws, Tier::Pinned, None, 0, false).unwrap();
+            }
+            22 | 23 => drop(p.set_pinned_budget(spans[0]).unwrap()),
+            _ => {}
+        }
+        let mut reads = Vec::new();
+        for r in 0..3u32 {
+            let l = cur.acquire(r, s.raw()).unwrap();
+            if pass % 5 == 0 {
+                bad.extend(l.verify_bytes().unwrap().into_iter().map(|w| format!("pass {pass} verify {w}")));
+            }
+            s.stall(2);
+            reads.push((r, s.read_async(l.ptr, l.nbytes)));
+            l.release(s.raw()).unwrap();
+        }
+        s.sync();
+        let l = p.layout(ws).unwrap();
+        for (r, buf) in &reads {
+            let off = l.regions[*r as usize].offset;
+            for part in l.parts.iter().filter(|x| x.region == *r) {
+                let key = part.what.trim_start_matches("unet/").trim_end_matches("#value");
+                let n = TENSORS.iter().find(|(k, _)| *k == key).unwrap().1;
+                let at = (part.offset - off) as usize;
+                if buf.bytes()[at..at + n] != bytes_of(key, n)[..] {
+                    bad.push(format!("pass {pass} {}", part.what));
+                }
+            }
+        }
+    }
+    let st = p.stats();
+    let d = &st.devices[0].counters;
+    println!(
+        "copy_streams {copy_streams}: host copies {} B, disk-staged {} B, mismatches {}",
+        d.host_copy_bytes, d.disk_copy_bytes, bad.len()
+    );
+    assert!(bad.is_empty(), "streamed bytes differ from the source: {bad:?}");
+    assert!(d.host_copy_bytes > 0 && d.disk_copy_bytes > 0, "both sources must be exercised: {d:?}");
+    cur.close().unwrap();
+    s.sync();
+    p.close().unwrap();
+    worker.close().unwrap();
+}
+
+#[test]
+#[ignore = "GPU"]
+fn streaming_stays_exact_across_pinned_disk_and_foreign_punch() {
+    mixed_source_stream(1);
+    mixed_source_stream(2);
+}

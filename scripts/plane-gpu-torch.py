@@ -63,6 +63,7 @@ def main() -> int:
     ap.add_argument("--resident", type=int, default=4)
     ap.add_argument("--window", type=int, default=2)
     ap.add_argument("--steps", type=int, default=6)
+    ap.add_argument("--no-pinned", action="store_true", help="empty pinned tier: every streamed copy is disk-staged")
     a = ap.parse_args()
     root = Path(a.workdir or tempfile.mkdtemp(prefix="plane-gpu-")) / "store"
     store, manifest, tensors = build(root, a.layers, a.dim)
@@ -80,8 +81,9 @@ def main() -> int:
     reg = ws.regions
     parts = {x["what"]: x for x in ws.parts}
     total = sum(r["span"] for r in reg)
-    p.set_pinned_budget(total)
-    p.want(ws, "pinned").wait()
+    if not a.no_pinned:
+        p.set_pinned_budget(total)
+        p.want(ws, "pinned").wait()
     span = reg[1]["span"]
     budget = reg[0]["span"] + a.resident * span + a.window * span
     p.set_vram_budget(0, budget)
@@ -91,6 +93,8 @@ def main() -> int:
     resident = [1 + i for i in range(0, a.layers, step_k)][: a.resident]
     p.want(ws, 0, [0] + resident, priority=10).wait()
     check("pinned tier registered", p.stats()["host"]["registered_bytes"] == p.stats()["host"]["ready_bytes"])
+    check("streamed copies come from the intended source",
+          (p.stats()["host"]["ready_bytes"] == 0) == a.no_pinned)
 
     views: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     ring: list[torch.Tensor] = []
@@ -156,11 +160,11 @@ def main() -> int:
     stage = next(x for x in st["stages"] if x["tag"] == "smoke")
     d0 = st["devices"][0]
     t_stream = sum(times) / len(times)
-    gbps = d0["host_copy_bytes"] / max(d0["host_copy_ns"], 1)
+    gbps = (d0["host_copy_bytes"] + d0["disk_copy_bytes"]) / max(d0["host_copy_ns"] + d0["disk_copy_ns"], 1)
     print(f"step: resident {t_ref * 1e3:.2f} ms, streamed {t_stream * 1e3:.2f} ms "
           f"({t_stream / t_ref:.3f}x), {a.layers - len(resident)} of {a.layers} layers streamed, window {a.window}, "
           f"ring {cur.ring_nbytes >> 20} MiB")
-    print(f"copies {d0['copies']}, pinned->device {gbps:.2f} GB/s; late {stage['late']} of {stage['acquires']}, "
+    print(f"copies {d0['copies']} (pinned {d0['host_copy_bytes'] >> 20} MiB, disk-staged {d0['disk_copy_bytes'] >> 20} MiB), {gbps:.2f} GB/s; late {stage['late']} of {stage['acquires']}, "
           f"stall {stage['stall_ns'] / 1e6:.2f} ms, skipped {stage['skipped']}")
     comp = sorted((x["region"], x["compute_ns"] / max(x["uses"], 1) / 1e6) for x in st["regions"] if x["tag"] == "smoke")
     print("per-region GPU compute ms:", " ".join(f"{r}:{ms:.2f}" for r, ms in comp))

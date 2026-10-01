@@ -504,6 +504,12 @@ impl PyPlaneLease {
         Ok(PyDeviceView { held: Arc::new(Viewed::Lease(v)) })
     }
 
+    /// Diagnostic: parts whose device bytes differ from the source (waits for the copy and
+    /// reads the store; debugging runs only).
+    fn verify_bytes(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| self.lease.verify_bytes()).or_raise(py)
+    }
+
     #[pyo3(signature = (stream = None))]
     fn release(&self, py: Python<'_>, stream: Option<u64>) -> PyResult<()> {
         self.released.store(true, Ordering::SeqCst);

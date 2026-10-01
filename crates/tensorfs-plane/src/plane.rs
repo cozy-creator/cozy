@@ -838,6 +838,7 @@ impl Inner {
             dev: d,
             tag: tag.to_string(),
             start: Mutex::new(Some(start)),
+            fill: pending,
             kind: LeaseKind::Home,
             released: AtomicBool::new(false),
         })
@@ -1670,6 +1671,8 @@ pub struct Lease {
     pub(crate) dev: usize,
     pub(crate) tag: String,
     pub(crate) start: Mutex<Option<EvRef>>,
+    /// The copy this lease's bytes came from, when it was still in flight at acquire.
+    pub(crate) fill: Option<EvRef>,
     pub(crate) kind: LeaseKind,
     pub(crate) released: AtomicBool,
 }
@@ -1712,6 +1715,52 @@ impl Lease {
             }
             LeaseKind::Ring { cursor, k } => crate::cursor::release_ring(&self.inner, &mut c, cursor, k, ev),
         }
+    }
+
+    /// Diagnostic: compare this lease's device bytes with the source, part by part, and return
+    /// the parts that differ. Waits for the copy and reads the store: debugging runs only.
+    pub fn verify_bytes(&self) -> Result<Vec<String>> {
+        let rt = &self.inner.devices[self.dev];
+        let _g = rt.bind()?;
+        if let Some(ev) = &self.fill {
+            ev.sync()?;
+        }
+        let (layout, source) = {
+            let c = self.inner.core.lock().unwrap();
+            let w = c.ws(self.ws)?;
+            (w.layout.clone(), w.source.clone())
+        };
+        let region = &layout.regions[self.region as usize];
+        let d = cuda::driver()?;
+        let mut got = vec![0u8; region.nbytes as usize];
+        let mut s: CUstream = std::ptr::null_mut();
+        // SAFETY: a private stream; the copy reads the leased range into our buffer.
+        unsafe {
+            cuda::check("cuStreamCreate", (d.stream_create)(&mut s, cuda::STREAM_NON_BLOCKING))?;
+            let r = cuda::check(
+                "cuMemcpyDtoHAsync",
+                (d.memcpy_dtoh_async)(got.as_mut_ptr() as *mut libc::c_void, self.ptr, got.len(), s),
+            )
+            .and_then(|_| cuda::check("cuStreamSynchronize", (d.stream_synchronize)(s)));
+            (d.stream_destroy)(s);
+            r?;
+        }
+        let mut want = vec![0u8; region.nbytes as usize];
+        let tally = IoTally::default();
+        for it in &region.items {
+            // SAFETY: the item lies inside `want` (layout offsets relative to the region).
+            unsafe { source.read_item(it, want.as_mut_ptr().add((it.offset - region.offset) as usize), Mode::Buffered, &tally)? };
+        }
+        Ok(layout
+            .parts
+            .iter()
+            .filter(|p| p.region == self.region)
+            .filter(|p| {
+                let a = (p.offset - region.offset) as usize;
+                got[a..a + p.nbytes as usize] != want[a..a + p.nbytes as usize]
+            })
+            .map(|p| p.what.clone())
+            .collect())
     }
 
     /// A zero-copy view of this lease's bytes. It keeps the weight set's VA (or the cursor's
