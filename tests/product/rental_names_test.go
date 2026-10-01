@@ -22,7 +22,8 @@ import (
 // records the paid operation, against every rental row and unsettled operation it holds.
 func TestRentalMachineNames(t *testing.T) {
 	words := rentalid.Words()
-	if len(words) < 5000 || !sort.StringsAreSorted(words) {
+	// The generator keeps 5000; owner-removed names (scripts/genmachinewords reserved) trim a few.
+	if len(words) < 4900 || !sort.StringsAreSorted(words) {
 		t.Fatalf("the vocabulary holds %d words", len(words))
 	}
 	// One substitution shares a wildcard key; one insertion deletes to the other word.
