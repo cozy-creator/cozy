@@ -490,15 +490,20 @@ fn call(
             Err(Retryable { refusal, .. }) if refusal.code == Code::TRANSFER_FAILED => {
                 return Err(refusal)
             }
-            // A zero wait is a verdict: re-asking reaches the same answer.
+            // A zero wait is a verdict: re-asking reaches the same answer. A wait is spent in
+            // sampling ticks, so the caller's cancellation and deadline end it: a bare sleep
+            // here held a prefetch run 2322 had already cancelled for the whole 30 s floor.
             Err(Retryable { wait, refusal }) if !final_attempt && !wait.is_zero() => {
-                // A wait is spent out of the caller's budget, never past it.
-                let wait = match deadline.remaining()? {
-                    Some(left) => wait.min(left),
-                    None => wait,
-                };
                 last = Some(refusal);
-                std::thread::sleep(wait);
+                ledger.pause(wait, deadline)?;
+            }
+            // Still weather on the last ask: the hub said "not now" every time, never "no".
+            // Its own code stays in the detail; the verdict a caller retries on is the link's.
+            Err(Retryable { wait, refusal }) if !wait.is_zero() => {
+                return refuse(
+                    Code::HUB_UNREACHABLE,
+                    format!("{} — on all {attempt} asks", refusal.detail),
+                )
             }
             Err(Retryable { refusal, .. }) => return Err(refusal),
         }
@@ -539,6 +544,22 @@ fn call_once(
     let checked = policy.check(&url).map_err(Retryable::from)?;
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
     headers.extend(credential.headers(&checked.host));
+    // A hub that did not answer, or whose answer died on the wire, is weather, not a
+    // verdict: the same request may reach it on the next connection.
+    let weather = |refusal: Refusal| match refusal.code {
+        Code::HUB_UNREACHABLE => Retryable {
+            wait: ledger.patience(),
+            refusal: Refusal {
+                code: Code::HUB_UNREACHABLE,
+                detail: format!(
+                    "the hub at {base} did not answer {path} — {}; artifacts already in the \
+                     local store are usable offline",
+                    refusal.detail
+                ),
+            },
+        },
+        _ => Retryable::from(refusal),
+    };
     let response = crate::transport::http::request(
         client,
         &checked,
@@ -557,26 +578,11 @@ fn call_once(
         None,
         Code::HUB_UNREACHABLE,
     )
-    .map_err(|refusal| match refusal.code {
-        // A hub that did not answer at all is weather, not a verdict: the same request may
-        // reach it on the next connection.
-        Code::HUB_UNREACHABLE => Retryable {
-            wait: ledger.patience(),
-            refusal: Refusal {
-                code: Code::HUB_UNREACHABLE,
-                detail: format!(
-                    "the hub at {base} did not answer {path} — {}; artifacts already in the \
-                     local store are usable offline",
-                    refusal.detail
-                ),
-            },
-        },
-        _ => Retryable::from(refusal),
-    })?;
+    .map_err(weather)?;
     let status = response.status;
     let raw = response
         .read_capped(limits::DOC_MAX_BYTES)
-        .map_err(Retryable::from)?;
+        .map_err(weather)?;
     if (200..300).contains(&status) {
         return read_json(&raw, limits::DOC_MAX_BYTES).map_err(|refusal| {
             Retryable::from(Refusal {
@@ -603,7 +609,8 @@ fn call_once(
             refusal: Refusal {
                 code: Code::HUB_UNREACHABLE,
                 detail: format!(
-                    "{base}{path} answered HTTP {status} with no hub envelope, so the hub                      did not write it; artifacts already in the local store are usable offline"
+                    "{base}{path} answered HTTP {status} with no hub envelope, so the hub did not \
+                     write it; artifacts already in the local store are usable offline"
                 ),
             },
         });

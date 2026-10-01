@@ -631,7 +631,9 @@ impl<'a> Run<'a> {
     /// Run `ensure` on its own thread and watch its events. Fails the test only when the
     /// ensure stops making measured progress — never because a wall clock ran out.
     fn ensure(self) -> Outcome {
-        let quiet = sample() * 200 + self.allowance;
+        // A hang guard, not a verdict: the ledger may legitimately learn a patience of
+        // STALL_FACTOR times a slow ask's gap on a loaded box, so silence must outlast that.
+        let quiet = sample() * 1200 + self.allowance;
         let (tx, rx) = mpsc::channel::<Result<Ensured, Refusal>>();
         let events: Arc<Mutex<Vec<(Instant, Event)>>> = Arc::default();
         let overclaims: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -1092,6 +1094,7 @@ fn a_missing_object_is_a_typed_refusal_and_the_rest_stay_resident() {
 fn a_hub_that_resets_or_answers_without_its_envelope_is_weather_and_re_asked() {
     let mut failed = Vec::new();
     for fault in [
+        Fault::Reset(0),
         status(502),
         Fault::Status(404, Vec::new(), "ERR_NGROK_3200 tunnel not found".into()),
         enveloped(503, "catalog.unavailable"),
@@ -1119,6 +1122,25 @@ fn a_hub_that_resets_or_answers_without_its_envelope_is_weather_and_re_asked() {
         "weather was taken for a verdict:\n{}",
         failed.join("\n")
     );
+}
+
+/// A hub that keeps saying "unavailable" through every re-ask is still weather: the pull
+/// that already landed objects is re-attempted, never ended by a verdict the hub never gave.
+#[test]
+fn a_hub_unavailable_through_every_re_ask_is_weather_not_a_verdict() {
+    let dir = temporary("hub-exhausted");
+    let checkpoint = checkpoint(3, 64 << 10, 19);
+    let hub = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![on("presign", 2..=5, enveloped(503, "tensorfs.unavailable"))],
+            presign_max: 1,
+            ..Config::default()
+        },
+    );
+    let root = store(&dir);
+    let ensured = assert_landed(&Run::new(&hub, &root).ensure(), &hub, &root);
+    assert!(ensured.attempts >= 2, "{}", hub.log());
 }
 
 #[test]
@@ -1239,6 +1261,64 @@ fn a_closure_paged_across_many_asks_lands_whole() {
 }
 
 // ---------------------------------------------------------------- cancellation and resume
+
+/// Run 2322: a prefetch paused by real demand 0.2 s in still returned 30.6 s later, the
+/// ledger's whole floor, because the hub's retry wait slept through its cancellation.
+#[test]
+fn cancellation_ends_a_hub_wait_within_a_sample_not_after_it() {
+    let dir = temporary("cancel-hub-wait");
+    let checkpoint = checkpoint(1, 4096, 15);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let wait = format!(
+        "{{\"error\":{{\"code\":\"rate_limited\",\"message\":\"slow down\",\"remedy\":\"\"}},\
+         \"retry_after_unix\":{},\"server_time_unix\":{now}}}",
+        now + 30
+    );
+    let hub = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![on(
+                "closure",
+                1..=usize::MAX,
+                Fault::Status(429, Vec::new(), wait),
+            )],
+            ..Config::default()
+        },
+    );
+    let root = store(&dir);
+    let cancellation = PullCancellation::default();
+    let cancelled: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let (cancel, at, ledger) = (
+        cancellation.clone(),
+        Arc::clone(&cancelled),
+        Arc::clone(&hub.ledger),
+    );
+    std::thread::spawn(move || {
+        while !ledger.lock().unwrap().asks.contains_key("closure") {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(sample());
+        *at.lock().unwrap() = Some(Instant::now());
+        cancel.cancel();
+    });
+    let mut run = Run::new(&hub, &root);
+    run.cancellation = Some(cancellation);
+    run.allowance = Duration::from_secs(30);
+    let outcome = run.ensure();
+    let waited = cancelled.lock().unwrap().expect("cancelled").elapsed();
+    assert!(outcome.result.is_err());
+    // A cancelled wait costs at most a sample of resolution, never the wait itself.
+    let floor = sample() * tensorfs_core::transport::STILL_SAMPLES;
+    assert!(
+        waited < floor,
+        "cancellation took {waited:?}\n{}",
+        hub.log()
+    );
+    assert_eq!(hub.asks("closure"), 1, "a cancelled ensure asked again");
+}
 
 #[test]
 fn a_cancelled_pull_resumes_with_a_new_token_and_buys_only_what_is_missing() {
