@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,8 @@ type MachineExecutions interface {
 	Describe(ctx context.Context, machine, hub, pkg, release string) (DescribedRelease, *exit.Error)
 	// Software is the agent, Runtime and TensorFS releases one machine reports it runs.
 	Software(ctx context.Context, machine string) (MachineSoftware, *exit.Error)
+	// MachineLog is one log a machine keeps, at most its newest tailBytes when nonzero.
+	MachineLog(ctx context.Context, machine, log string, tailBytes uint64) (MachineLog, *exit.Error)
 	// Forget drops this daemon's kept connection to a machine, before its credentials go.
 	Forget(machine string)
 	// ForgetPackage tells every machine this daemon knows that a package's releases or owner
@@ -82,6 +85,36 @@ func (s *Server) machineSoftware(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ok(w, r, http.StatusOK, software)
+}
+
+// MachineLog is one log a machine keeps, oldest line first. Unavailable says why the machine
+// could not answer, for a machine whose agent predates the read: a note, never a failure.
+type MachineLog struct {
+	Log         string `json:"log"`
+	Text        string `json:"text"`
+	Unavailable string `json:"unavailable,omitempty"`
+}
+
+func (s *Server) machineLog(w http.ResponseWriter, r *http.Request) {
+	if s.machineExecutions == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+		return
+	}
+	var tail uint64
+	if text := r.URL.Query().Get("tail_bytes"); text != "" {
+		n, err := strconv.ParseUint(text, 10, 64)
+		if err != nil {
+			s.refuseTyped(w, r, exit.Usagef("tail_bytes is a byte count, not %q", text))
+			return
+		}
+		tail = n
+	}
+	log, problem := s.machineExecutions.MachineLog(r.Context(), r.PathValue("machine"), r.PathValue("log"), tail)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	s.ok(w, r, http.StatusOK, log)
 }
 
 // DescribedRelease is one published release's interface, as the machine that runs it read it.

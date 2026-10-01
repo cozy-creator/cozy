@@ -3,6 +3,7 @@ package cli
 import (
 	"archive/tar"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -445,6 +446,41 @@ func (m *machineRuns) Software(ctx context.Context, machine string) (api.Machine
 	}
 	return api.MachineSoftware{Agent: described.GetHost().GetVersion(), Runtime: described.GetRuntime().GetVersion(),
 		TensorFS: described.GetRuntime().GetTensorfsVersion(), RuntimeAbsent: described.GetRuntimeAbsent()}, nil
+}
+
+// machineLogs maps the log names clients use to the logs machines keep.
+var machineLogs = map[string]pb.MachineLog{"tensorfs": pb.MachineLog_MACHINE_LOG_TENSORFS_TRANSPORT}
+
+// MachineLog reads one log a machine keeps (wire 72). A machine whose agent predates the
+// read answers a note in Unavailable, never a failure.
+func (m *machineRuns) MachineLog(ctx context.Context, machine, log string, tailBytes uint64) (api.MachineLog, *exit.Error) {
+	kept, ok := machineLogs[log]
+	if !ok {
+		return api.MachineLog{}, exit.Named(exit.NotFound, "machine.log_unknown", "machines keep no log %q", log)
+	}
+	connection, problem := m.connect(ctx, machine, "reading its logs")
+	if problem != nil {
+		return api.MachineLog{}, problem
+	}
+	defer connection.Close()
+	out := api.MachineLog{Log: log}
+	stream, err := connection.Host.ReadMachineLog(ctx, &pb.MachineLogQuery{Claim: connection.Claim, Log: kept, TailBytes: tailBytes})
+	var text strings.Builder
+	for err == nil {
+		var chunk *pb.MachineLogChunk
+		if chunk, err = stream.Recv(); err == nil {
+			text.Write(chunk.GetData())
+		}
+	}
+	switch {
+	case errors.Is(err, io.EOF):
+		out.Text = text.String()
+		return out, nil
+	case status.Code(err) == codes.Unimplemented:
+		out.Unavailable = "this machine's agent predates reading its logs; a machine started on a newer agent has them"
+		return out, nil
+	}
+	return api.MachineLog{}, machineTransport(err)
 }
 
 // ForgetPackage tells each machine this daemon knows (this computer's while it runs, every

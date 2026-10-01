@@ -600,6 +600,7 @@ cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candid
 cozy rental list                   # current rented machines, live on a terminal
 cozy rental show otter             # one rental's facts, including accrued spend
 cozy rental logs otter -f          # the provider's boot log, followed while it boots
+cozy rental logs otter --tensorfs  # TensorFS's transport decisions: hedges, lane grants, wins, pull walks
 cozy run org/package/generate --rental=otter prompt="moonlit lake"
 cozy rental end otter
 ```
@@ -668,6 +669,7 @@ These commands have deliberately different scopes:
 
 ```sh
 cozy machine stop # stop this computer's machine and free its GPU; `cozy machine start` or the next run starts it
+cozy machine logs --tensorfs # this computer's TensorFS transport decisions
 cozy down         # stop the daemon; runs, uploads and rentals continue
 cozy down --all   # cancel all work, end all rentals, then stop the daemon
 ```

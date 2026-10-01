@@ -371,3 +371,7 @@ func (*retentionReleaseMachine) Describe(context.Context, string, string, string
 func (*retentionReleaseMachine) Software(context.Context, string) (api.MachineSoftware, *exit.Error) {
 	return api.MachineSoftware{}, nil
 }
+
+func (*retentionReleaseMachine) MachineLog(context.Context, string, string, uint64) (api.MachineLog, *exit.Error) {
+	return api.MachineLog{}, nil
+}

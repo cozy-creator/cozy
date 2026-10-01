@@ -117,3 +117,7 @@ func (publishedRouteObserver) Describe(context.Context, string, string, string, 
 func (publishedRouteObserver) Software(context.Context, string) (api.MachineSoftware, *exit.Error) {
 	return api.MachineSoftware{}, nil
 }
+
+func (publishedRouteObserver) MachineLog(context.Context, string, string, uint64) (api.MachineLog, *exit.Error) {
+	return api.MachineLog{}, nil
+}
