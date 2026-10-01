@@ -230,20 +230,23 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
     say(Phase::Resolving, 0, 0, 0.0, 0);
     let closure = transport::resolve_closure(&request.pull(request.store))?;
     let tick = Duration::from_secs_f64(EVENT_SECONDS);
+    let declared = closure.manifest.length + closure.objects.iter().map(|o| o.length).sum::<u64>();
     let flight = Flight::lead(
         request.store,
         &closure.manifest.sha256,
         request.cancellation.as_ref(),
         tick,
-        &|record| {
-            let record = record.unwrap_or_default();
-            say(
+        // Before the leader has written its record (it is still planning or admitting), the
+        // closure still says how big this is: never a 0/0 bar.
+        &|record| match record {
+            Some(record) => say(
                 Phase::Waiting,
                 record.bytes_done,
                 record.bytes_total,
                 0.0,
                 0,
-            );
+            ),
+            None => say(Phase::Waiting, 0, declared, 0.0, 0),
         },
     )?;
     // A killed pull strands its partial `put-` temps, and GC, the only other reaper, never

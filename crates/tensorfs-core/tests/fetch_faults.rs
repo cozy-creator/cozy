@@ -1205,6 +1205,38 @@ fn objects_a_flight_holds_survive_the_gc_its_admission_runs() {
     );
 }
 
+/// A follower whose leader has not yet written its record (still planning or admitting)
+/// still knows the closure's size: its bar is never 0/0.
+#[test]
+fn a_follower_waiting_on_a_record_less_leader_reports_the_closures_size() {
+    use fs2::FileExt;
+    let checkpoint = checkpoint(2, 64 << 10, 24);
+    let hub = hub(Arc::clone(&checkpoint), Config::default());
+    let root = store(&temporary("record-less-leader"));
+    let flights = root.join("tmp/ensure");
+    std::fs::create_dir_all(&flights).unwrap();
+    let lock = std::fs::File::create(flights.join(format!("{}.lock", checkpoint.manifest.sha256)))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        drop(lock);
+    });
+    let outcome = Run::new(&hub, &root).ensure();
+    release.join().unwrap();
+    assert_landed(&outcome, &hub, &root);
+    let waiting: Vec<&Event> = outcome
+        .events
+        .iter()
+        .filter(|e| e.phase == Phase::Waiting)
+        .collect();
+    assert!(!waiting.is_empty(), "the follower never waited");
+    assert!(
+        waiting.iter().all(|e| e.bytes_total == checkpoint.total()),
+        "{waiting:?}"
+    );
+}
+
 #[test]
 fn a_missing_object_is_a_typed_refusal_and_the_rest_stay_resident() {
     let dir = temporary("missing");
