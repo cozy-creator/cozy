@@ -148,7 +148,7 @@ only-include=["lora_host_probe.py"]
 	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject='lora_host_probe:app'\n"), 0600))
 	must(t, os.WriteFile(filepath.Join(project, "lora_host_probe.py"), []byte(`import msgspec
 import torch
-from cozy_runtime.author import AdapterCompatibility, App, Config, Loader, Model
+from cozy_runtime.author import AdapterCompatibility, App, Config, Context, Loader, Model, invocable
 class Pipeline:
     def __init__(self):
         transformer=torch.nn.Module()
@@ -164,8 +164,12 @@ class Result(msgspec.Struct): value:int
 app=App()
 @app.job
 def scalar(payload:Request)->Result: return Result(42)
-@app.entrypoint
+@invocable(defaults={'model':[{'gpu':'*','lane':'proof/base@1.0.0/fp32'}]})
 def generate(payload:Request,model:Probe)->Result: return Result(0)
+app.entrypoint(generate)
+@app.job
+async def child(ctx:Context,payload:Request)->Result:
+    return await generate(payload=payload)
 `), 0600))
 	lock := exec.Command("uv", "lock", "--project", project, "--python", "3.12")
 	lock.Env = childEnv(t, root)
@@ -185,6 +189,68 @@ def generate(payload:Request,model:Probe)->Result: return Result(0)
 	fatal(t, problem)
 	if row == nil || row.LocalInstallationID == "" {
 		t.Fatal("normal CLI did not retain its private installation identity")
+	}
+	// A normal local root prepares its selected stack before acceptance. First land a
+	// baseline, so an adapter run must not reuse the already-held base placement.
+	for _, arm := range []struct {
+		key, function, slot string
+		scales              []string
+	}{
+		{"baseline", "generate", "model", nil},
+		{"root-stack", "generate", "model", []string{"0.5", "-0.25"}},
+		{"root-reversed", "generate", "model", []string{"-0.25", "0.5"}},
+		{"root-baseline-after", "generate", "model", nil},
+		{"child-stack", "child", "generate.models.model", []string{"0.5", "-0.25"}},
+	} {
+		args := []string{"run", "local/lora-host-probe/" + arm.function, "--await", "--json", "--idempotency-key", arm.key}
+		if arm.function == "generate" {
+			args = append(args, "model.model=proof/base@1.0.0/fp32")
+		}
+		for i, scale := range arm.scales {
+			name := []string{"first", "second"}[i]
+			if arm.key == "root-reversed" {
+				name = []string{"second", "first"}[i]
+			}
+			args = append(args, "--lora", arm.slot+":transformer=proof/"+name+"@1.0.0/fp32,"+scale)
+		}
+		if code, out := runCozy(t, root, args...); code != 0 {
+			t.Fatalf("%s CLI serving [%d]: %s", arm.key, code, out)
+		}
+		request, problem := store.RequestByIdempotencyKey(arm.key)
+		fatal(t, problem)
+		if request == nil {
+			t.Fatal("normal CLI lost its request")
+		}
+		// Read the actual Runtime journal. The invocation's capture alone does not
+		// prove which placement was admitted and later handed to its executor.
+		read := exec.Command(python, "-I", "-c", `import json,sqlite3,sys
+from pathlib import Path
+root=Path(sys.argv[1]); db=sqlite3.connect('file:'+str(root/'.cozy-workspace/journal.sqlite3')+'?mode=ro',uri=True)
+row=db.execute('select preparation from executions where request=?',(sys.argv[2],)).fetchone()
+if sys.argv[3]=='child':
+    call=db.execute('select e.preparation from executions e join execution_calls c on e.request=c.child_request where c.parent_request=?',(sys.argv[2],)).fetchone()
+    if call is not None: row=call
+prepared=json.loads(row[0]); slots=[slot for installation in prepared['installations'].values() for entry in installation['placement'].get('entrypoints',[]) if entry['name']=='generate' for slot in entry.get('slots',[])]
+print(json.dumps([slot.get('adapters',[]) for slot in slots]))
+`, filepath.Join(root, "tensorfs"), request.ID, arm.function)
+		raw, err := read.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s retained preparation: %v\n%s", arm.key, err, raw)
+		}
+		var slots [][]*pb.ModelAdapter
+		must(t, json.Unmarshal(raw, &slots))
+		if len(slots) != 1 {
+			t.Fatalf("%s selected no exact serving slot: %s", arm.key, raw)
+		}
+		stack := slots[0]
+		if len(stack) != len(arm.scales) {
+			t.Fatalf("%s served %d adapters; requested %d", arm.key, len(stack), len(arm.scales))
+		}
+		for i, adapter := range stack {
+			if adapter.Scale != arm.scales[i] {
+				t.Fatalf("%s changed adapter %d strength: %s", arm.key, i, adapter.Scale)
+			}
+		}
 	}
 	// The daemon now owns Control; this independent reader reuses the same owner.
 	resolver.Held = func(string) bool { return true }
