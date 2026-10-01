@@ -175,6 +175,8 @@ class Probe(Model[Pipeline]):
     @uses_components('transformer')
     def score(self)->int:
         component=self.pipe.components['transformer']
+        if next(component.parameters()).device.type!='cuda' or not torch.cuda.is_initialized():
+            raise AssertionError('the serving qualifier must execute on its rented H100')
         x=torch.tensor([[1,2,3]],dtype=torch.float32,device=next(component.parameters()).device)
         return int(4*component.proj(x).sum().item())
 class Request(msgspec.Struct): pass
@@ -190,7 +192,10 @@ async def child(ctx:Context,payload:Request)->Result:
     return await generate(payload=payload)
 `), 0600))
 	lock := exec.Command("uv", "lock", "--project", project, "--python", "3.12")
-	lock.Env = append(childEnv(t, root), "UV_TORCH_BACKEND=cpu")
+	lock.Env = childEnv(t, root)
+	if !*machineLoRAServingGPU {
+		lock.Env = append(lock.Env, "UV_TORCH_BACKEND=cpu")
+	}
 	if out, err := lock.CombinedOutput(); err != nil {
 		t.Fatalf("lock private probe: %v\n%s", err, out)
 	}
