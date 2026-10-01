@@ -1291,6 +1291,70 @@ fn pull_records_the_release_it_resolved() {
 }
 
 #[test]
+fn ensure_records_source_after_cancellation_lands_the_last_object() {
+    let root = temporary("ensure-canceled-custody");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(3, 8 * 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let token = super::PullCancellation::default();
+    let landed = AtomicUsize::new(0);
+    let on_object = |_: &ObjectRef, _: u64, _: ObjectSource| {
+        if landed.fetch_add(1, Ordering::Relaxed) + 1 == checkpoint.bodies.len() {
+            // Every immutable object is admitted, but pull has not recorded the source.
+            token.cancel();
+        }
+    };
+    let mut canceled = request_for(&store, &origin.base, &policy);
+    canceled.cancellation = Some(token.clone());
+    canceled.on_object = Some(&on_object);
+    assert_eq!(pull(&canceled).unwrap_err().code, Code::TRANSFER_FAILED);
+    assert_eq!(landed.load(Ordering::Relaxed), checkpoint.bodies.len());
+    assert_eq!(
+        crate::checkpoint_root::check_source(&store, "acme/model", &checkpoint.manifest)
+            .unwrap_err()
+            .code,
+        Code::REPOSITORY_ABSENT
+    );
+    let (held, _) = FetchPlan::of(
+        &store,
+        "after-cancel",
+        &checkpoint.manifest,
+        &checkpoint.objects,
+    )
+    .unwrap();
+    assert!(held.wanted.is_empty(), "cancellation must retain all bytes");
+
+    // ensure supplies its resolved closure to pull. An empty wanted set must still
+    // complete the source record that the canceled flight never committed.
+    let refspec = format!("acme/model@r1@{}", checkpoint.manifest.id());
+    let mut resumed =
+        crate::ensure::Request::new(&store, &origin.base, &refspec, &Anonymous, &policy);
+    resumed.lane = "public";
+    resumed.cancellation = Some(super::PullCancellation::default());
+    let calls = origin.total_hits();
+    let presigns = origin.hits("/v1/tensorfs/presign");
+    let result = crate::ensure::ensure(&resumed).unwrap();
+    assert_eq!(result.bytes_held, held.declared_bytes());
+    assert_eq!(result.bytes_fetched, 0);
+    assert_eq!(origin.total_hits() - calls, 1, "only resolve the closure");
+    assert_eq!(origin.hits("/v1/tensorfs/presign"), presigns);
+    crate::checkpoint_root::check_source(&store, "acme/model", &checkpoint.manifest).unwrap();
+    let census = crate::storage::Census::open(&root).unwrap();
+    assert!(census.gc_plan(&[]).unwrap().is_empty());
+
+    // Once source custody exists, the pinned warm path stays entirely local.
+    let opened = crate::catalog::connections_opened(&root);
+    let calls = origin.total_hits();
+    let warm = crate::ensure::ensure(&resumed).unwrap();
+    assert_eq!(warm.bytes_fetched, 0);
+    assert_eq!(warm.bytes_held, result.bytes_total);
+    assert_eq!(origin.total_hits(), calls);
+    assert_eq!(crate::catalog::connections_opened(&root), opened);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn corrupt_object_heals_into_wanted_and_refetches() {
     let root = temporary("heal");
     let store = Store::init(&root).unwrap();
