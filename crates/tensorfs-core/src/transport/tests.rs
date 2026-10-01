@@ -5229,10 +5229,7 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
         "no_reference",
         "one_stream",
         "two_streams",
-        "unspecified_budget",
         "store_headroom",
-        "host_bytes",
-        "host_objects",
     ] {
         let root = temporary(&format!("speculation-{mode}"));
         let mut store = Store::init(&root).unwrap();
@@ -5272,21 +5269,12 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
         if mode == "store_headroom" {
             store = store.bind_disk_budget(Some(plan.wanted_bytes())).unwrap();
         }
-        let allowance = match mode {
-            "host_bytes" => Some((plan.wanted_bytes(), 3)),
-            "host_objects" => Some((plan.wanted_bytes() + second.length, 2)),
-            "unspecified_budget" => None,
-            _ => Some((
-                plan.wanted_bytes() + second.length,
-                plan.wanted.len() as u64 + 1,
-            )),
-        };
-        let streams = match mode {
+        let level = match mode {
             "one_stream" => 1,
             "two_streams" => 2,
             _ => 3,
         };
-        let recovery = super::speculate::Recovery::new(&store, &plan, streams, allowance);
+        let recovery = super::speculate::Recovery::default();
         let chunk = Arc::new(AtomicUsize::new(256));
         let source_chunk = Arc::clone(&chunk);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -5358,7 +5346,11 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
                     &Anonymous,
                     Deadline::none(),
                     &ledger,
-                    &|| false,
+                    &|| super::speculate::Lanes {
+                        level,
+                        busy: 1,
+                        tail: false,
+                    },
                     None,
                 )
                 .unwrap_or_else(|e| panic!("{mode}: {e}"));
@@ -5385,6 +5377,8 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
                 "duplicate bytes are not admitted progress: {mode}"
             );
         }
+        // Any idle lane may carry one hedge of a measured slow object; no host budget is
+        // needed (run 2322's pull passed none), and a lost race disables nothing.
         let expected = if matches!(
             mode,
             "fresh_wins"
@@ -5392,6 +5386,7 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
                 | "oversized_contender"
                 | "both_slow"
                 | "slow_small_before_large"
+                | "two_streams"
         ) {
             2
         } else {
@@ -5407,8 +5402,8 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
         if mode == "both_slow" {
             assert_eq!(
                 later_calls.load(Ordering::SeqCst),
-                1,
-                "unhelpful speculation must not repeat"
+                2,
+                "a lost race does not disable hedging for later objects"
             );
         }
         let (warm, _) = FetchPlan::of_objects(&store, "speculation", &objects).unwrap();
@@ -5450,7 +5445,6 @@ fn speculative_and_original_asks_share_one_retry_budget() {
                     None,
                     attempts,
                     retry,
-                    None,
                     super::pull::shared_client(),
                     None,
                 )
@@ -5531,15 +5525,12 @@ fn speculative_winner_cancels_a_loser_refreshing_real_hub_authority() {
     let policy = local_policy();
     let ledger = Ledger::with_resolution(Duration::from_millis(20));
     let deadline = Deadline::after_seconds(Some(2.0));
-    let recovery = super::speculate::Recovery::new(
-        &store,
-        &plan,
-        3,
-        Some((
-            plan.wanted_bytes() + object.length,
-            plan.wanted.len() as u64 + 1,
-        )),
-    );
+    let recovery = super::speculate::Recovery::default();
+    let lanes = || super::speculate::Lanes {
+        level: 3,
+        busy: 1,
+        tail: false,
+    };
     let seed_grant = DeliveryGrant::mint(&plan, &seed_ref).unwrap();
     recovery
         .fetch(
@@ -5550,7 +5541,7 @@ fn speculative_winner_cancels_a_loser_refreshing_real_hub_authority() {
             &Anonymous,
             deadline,
             &ledger,
-            &|| false,
+            &lanes,
             None,
         )
         .unwrap();
@@ -5586,7 +5577,7 @@ fn speculative_winner_cancels_a_loser_refreshing_real_hub_authority() {
             &Anonymous,
             deadline,
             &ledger,
-            &|| false,
+            &lanes,
             None,
         )
         .unwrap();
@@ -5744,7 +5735,7 @@ fn bounded_warm_tail_speculates_without_a_completed_speed_reference() {
                     ttfb: Duration::ZERO,
                 }
             } else {
-                status(200, body)
+                partial(body, request)
             }
         }));
         let urls: BTreeMap<String, String> = plan
@@ -5794,10 +5785,6 @@ fn bounded_warm_tail_speculates_without_a_completed_speed_reference() {
             3,
             3,
             Some(&observer),
-            Some((
-                plan.wanted_bytes() + plan.wanted.iter().map(|o| o.length).max().unwrap(),
-                count as u64 + 1,
-            )),
             None,
         );
         live.store(false, Ordering::Release);
@@ -5814,10 +5801,11 @@ fn bounded_warm_tail_speculates_without_a_completed_speed_reference() {
             "duplicate bytes cannot inflate admitted progress"
         );
         assert!(ledger.still().moved > found.bytes_moved);
+        // A 64 MiB object is hedged as ranged parts; small ones as one whole GET.
         assert!(served.lock().unwrap().values().all(|asks| if uniform {
             (1..=2).contains(asks)
         } else {
-            *asks == 2
+            *asks >= 2
         }));
         assert!(completed.lock().unwrap().values().all(|calls| *calls == 1));
         assert!(store.record_valid(&retained.sha256).is_ok());
@@ -5862,7 +5850,7 @@ fn speculative_tail_does_not_reclassify_a_local_consumer_pause_as_network_delay(
     let (plan, _) =
         FetchPlan::of_objects(&store, "local-consumer", std::slice::from_ref(&object)).unwrap();
     let grant = DeliveryGrant::mint(&plan, &object).unwrap();
-    let recovery = super::speculate::Recovery::new(&store, &plan, 3, Some((object.length * 2, 2)));
+    let recovery = super::speculate::Recovery::default();
     let hits = Arc::clone(&source.hits);
     let control = std::thread::spawn(move || {
         paused.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -5880,7 +5868,11 @@ fn speculative_tail_does_not_reclassify_a_local_consumer_pause_as_network_delay(
         &Anonymous,
         Deadline::after_seconds(Some(3.0)),
         &ledger,
-        &|| true,
+        &|| super::speculate::Lanes {
+            level: 3,
+            busy: 1,
+            tail: true,
+        },
         None,
     );
     assert_eq!(
@@ -6146,3 +6138,5 @@ fn a_pull_killed_mid_walk_is_repaired_after_an_unclean_shutdown() {
     assert!(markers(&root).is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
+
+mod tail;

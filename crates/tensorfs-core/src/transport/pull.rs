@@ -227,7 +227,6 @@ pub fn fetch_authorized(
         observer,
         &AtomicU32::new(0),
         true,
-        None,
         shared_client(),
         None,
     )
@@ -245,7 +244,6 @@ pub(super) fn fetch_with_attempts(
     mut observer: Option<&mut dyn FetchObserver>,
     attempts: &AtomicU32,
     retry: bool,
-    slots: Option<&super::speculate::Slots>,
     client: &Client,
     received: Option<&(dyn Fn() + Sync)>,
 ) -> Result<Fetched> {
@@ -269,7 +267,7 @@ pub(super) fn fetch_with_attempts(
         // A refused re-authorization must still name the origin's answer. It is the whole
         // diagnosis: "403, and re-minting was not honest" and "403, and the hub would not
         // mint" are different problems with different owners.
-        let mut url = match authorize(stale.is_some(), ledger) {
+        let url = match authorize(stale.is_some(), ledger) {
             Ok(url) => url,
             Err(refusal) => match stale {
                 Some(status) => {
@@ -286,16 +284,6 @@ pub(super) fn fetch_with_attempts(
             },
         };
         stale = None;
-        // Grant preparation remains concurrent even when the object stream
-        // budget is occupied; a slow mint must not serialize healthy transfers.
-        let mut slot = slots
-            .map(|slots| slots.acquire(ledger, deadline))
-            .transpose()?;
-        if slot.as_ref().is_some_and(|slot| slot.waited) {
-            // The body permit can outlive a URL. Reconsult its authority after
-            // waiting; Leases reuses a fresh grant and remints an expired one.
-            url = authorize(false, ledger)?;
-        }
         // Every hop of this ask, recorded as it is walked and announced before the body is
         // read: an ask that dies in the middle still says which host answered it and how.
         let mut hops: Vec<(String, u16)> = Vec::new();
@@ -340,7 +328,6 @@ pub(super) fn fetch_with_attempts(
                     // The origin said when to come back; that is not a failed ask.
                     attempts.fetch_sub(1, Ordering::AcqRel);
                 }
-                drop(slot);
                 ledger.pause(wait, deadline)?;
                 continue;
             }
@@ -376,7 +363,6 @@ pub(super) fn fetch_with_attempts(
             // Every byte is here: the socket slot is free for the next object while this
             // one is fsynced and admitted, so a slow disk is not a slow network.
             received: || {
-                slot.take();
                 if let Some(received) = received {
                     received();
                 }
@@ -486,7 +472,7 @@ pub(super) fn open_object<'l>(
         )?;
         let status = response.status;
         hop(&checked, status);
-        if status == 200 {
+        if status == 200 || status == 206 {
             ledger.origin(&format!(
                 "{}://{}:{}",
                 if checked.https { "https" } else { "http" },
@@ -956,7 +942,6 @@ pub fn fetch_wanted(
 ) -> Result<WalkOutcome> {
     fetch_wanted_bounded(
         store, plan, urls, policy, credential, deadline, ledger, STREAMS, streams, on_object, None,
-        None,
     )
 }
 
@@ -972,7 +957,6 @@ pub(super) fn fetch_wanted_bounded(
     start: usize,
     streams: usize,
     on_object: Option<ObjectObserver<'_>>,
-    download_budget: Option<(u64, u64)>,
     cache_writes: Option<&crate::repo_cache::CacheWriteReceipt>,
 ) -> Result<WalkOutcome> {
     let cache = store.repo_cache();
@@ -991,8 +975,8 @@ pub(super) fn fetch_wanted_bounded(
     let streams = crate::descriptors::streams_within(super::memory::transfer_streams(
         streams.clamp(1, PULL_STREAMS),
     ));
-    let recovery = super::speculate::Recovery::new(store, plan, streams, download_budget);
-    // Recovery reserves an object connection, not an authorization worker. A stream's
+    let recovery = super::speculate::Recovery::default();
+    // A stream's
     // permit is released once its body is in, so its thread may still be fsyncing and
     // admitting while another thread uses the permit: twice the threads keeps the permits
     // busy however slow the disk is.
@@ -1100,11 +1084,10 @@ pub(super) fn fetch_wanted_bounded(
                                 credential,
                                 deadline,
                                 ledger,
-                                &|| {
-                                    (plan.wanted.len() as u64).saturating_sub(
-                                        fetched.load(Ordering::Acquire)
-                                            + cached.load(Ordering::Acquire),
-                                    ) < pace.limit() as u64
+                                &|| super::speculate::Lanes {
+                                    level: pace.limit(),
+                                    busy: busy.load(Ordering::Acquire),
+                                    tail: next.load(Ordering::Acquire) >= plan.wanted.len(),
                                 },
                                 Some(&received),
                             )?;
@@ -1489,7 +1472,6 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             request.streams_start,
             request.streams,
             request.on_object,
-            request.download_budget,
             Some(&report.cache_writes),
         )?;
         report.streams = walked.streams;

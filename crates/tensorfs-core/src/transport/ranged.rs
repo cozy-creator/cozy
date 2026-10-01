@@ -109,6 +109,10 @@ pub const PART_BYTES: u64 = 64 << 20;
 /// parameter it was handed.
 pub const RANGED_MIN_BYTES: u64 = 2 * PART_BYTES;
 
+/// The smallest part a hedge cuts. Granularity for spreading one slow object over idle
+/// lanes, and the floor `Ranged::normalized` already holds every part to.
+pub const HEDGE_PART: u64 = 1 << 20;
+
 /// How ONE object is asked for. `streams` of 1 — the default — is one resumable stream of
 /// ascending ranges; above 1 is that many ranges in flight at once, assembled through a
 /// scratch file; 0 is `Ranged::whole`, no ranges at all.
@@ -221,7 +225,51 @@ pub fn fetch_ranged(
         );
     }
     assemble(
-        store, grant, url, &probe, policy, credential, deadline, ledger, ranged, observer,
+        store,
+        grant,
+        &|_| Ok(url.to_string()),
+        pull::shared_client(),
+        probe.total,
+        policy,
+        credential,
+        deadline,
+        ledger,
+        ranged,
+        observer,
+    )
+}
+
+/// A hub object's hedge: the whole object again as `streams` ranged parts on fresh
+/// connections, each ask authorized by the walk's own lease supply so a part that
+/// outlives its URL re-mints instead of presenting it dead.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hedge(
+    store: &Store,
+    grant: &DeliveryGrant,
+    authorize: &(dyn Fn(bool, &Ledger) -> Result<String> + Sync),
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    deadline: Deadline,
+    ledger: &Ledger,
+    streams: usize,
+) -> Result<Fetched> {
+    let total = grant.object.length;
+    let ranged = Ranged {
+        streams,
+        part: total.div_ceil(streams as u64).max(HEDGE_PART),
+    };
+    assemble(
+        store,
+        grant,
+        &|stale| authorize(stale, ledger),
+        &http::Client::new(),
+        total,
+        policy,
+        credential,
+        deadline,
+        ledger,
+        ranged,
+        None,
     )
 }
 
@@ -318,7 +366,6 @@ struct Wire {
     /// construction — a re-asked part resumes at its own offset and re-counts nothing — so
     /// it is a sensible running total even though the parts land out of order.
     moved: AtomicU64,
-    next: AtomicUsize,
     stop: AtomicBool,
     /// Workers that have not yet returned. The reader waits on `filled` for bytes that only
     /// a worker can produce, so "every worker is gone and the object is not whole" has to be
@@ -330,6 +377,11 @@ struct Wire {
 
 struct State {
     done: Vec<bool>,
+    /// Per part, the offset below which its bytes are on disk. Every racer of a part
+    /// starts at this mark, so what is below it stays one contiguous run.
+    reached: Vec<u64>,
+    racers: Vec<usize>,
+    next: usize,
     /// Parts `0..contiguous` are complete on disk, so bytes below `contiguous * part` may
     /// be handed to the door. Nothing above it may, hole or not.
     contiguous: usize,
@@ -346,6 +398,54 @@ impl Wire {
             .lock()
             .unwrap()
             .push((attempt, host.to_string(), status));
+    }
+
+    /// The next part nobody has asked for, else a race on the unfinished part with the
+    /// fewest racers and the most bytes left, from that part's mark. A lane that finished
+    /// its own part thereby heals the slowest one instead of idling.
+    fn claim(&self, part: u64, total: u64) -> Option<(usize, u64)> {
+        let mut state = self.state.lock().unwrap();
+        if state.failure.is_some() || self.stopped() {
+            return None;
+        }
+        let index = if state.next < state.done.len() {
+            state.next += 1;
+            state.next - 1
+        } else {
+            let end = |index: usize| ((index as u64 + 1) * part).min(total);
+            (0..state.done.len())
+                .filter(|&index| !state.done[index])
+                .min_by_key(|&index| {
+                    (
+                        state.racers[index],
+                        std::cmp::Reverse(end(index) - state.reached[index]),
+                    )
+                })?
+        };
+        state.racers[index] += 1;
+        Some((index, state.reached[index]))
+    }
+
+    /// Bytes `..to` of part `index` are on disk. False once another racer finished it.
+    fn advance(&self, index: usize, to: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.reached[index] = state.reached[index].max(to);
+        !state.done[index]
+    }
+
+    fn finished(&self, index: usize) -> bool {
+        self.state.lock().unwrap().done[index]
+    }
+
+    /// A racer left part `index`. Its refusal stands only if nobody else is on the part.
+    fn leave(&self, index: usize, refusal: Option<Refusal>) {
+        let mut state = self.state.lock().unwrap();
+        state.racers[index] -= 1;
+        let orphaned = state.racers[index] == 0 && !state.done[index];
+        drop(state);
+        if let Some(refusal) = refusal.filter(|_| orphaned) {
+            self.failed(refusal);
+        }
     }
 
     fn landed(&self, index: usize) {
@@ -465,8 +565,9 @@ impl Drop for Scratch {
 fn assemble(
     store: &Store,
     grant: &DeliveryGrant,
-    url: &str,
-    probe: &Probe,
+    ask: &(dyn Fn(bool) -> Result<String> + Sync),
+    client: &http::Client,
+    total: u64,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
@@ -474,19 +575,20 @@ fn assemble(
     ranged: Ranged,
     observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
-    let total = probe.total;
     let parts = total.div_ceil(ranged.part) as usize;
     let scratch = Scratch::open(store, total)?;
     let wire = Wire {
         state: Mutex::new(State {
             done: vec![false; parts],
+            reached: (0..parts as u64).map(|index| index * ranged.part).collect(),
+            racers: vec![0; parts],
+            next: 0,
             contiguous: 0,
             failure: None,
         }),
         filled: Condvar::new(),
         hops: Mutex::new(Vec::new()),
         moved: AtomicU64::new(0),
-        next: AtomicUsize::new(0),
         stop: AtomicBool::new(false),
         live: AtomicUsize::new(0),
     };
@@ -497,34 +599,30 @@ fn assemble(
         for _ in 0..streams {
             scope.spawn(|| {
                 let _worker = Worker(&wire);
-                loop {
-                    if wire.stopped() || wire.state.lock().unwrap().failure.is_some() {
-                        return;
-                    }
-                    let index = wire.next.fetch_add(1, Ordering::Relaxed);
-                    if index >= parts {
-                        return;
-                    }
-                    match part(
+                while let Some((index, from)) = wire.claim(ranged.part, total) {
+                    let outcome = part(
                         &wire,
                         &scratch.file,
                         index,
+                        from,
                         total,
                         ranged.part,
-                        url,
+                        ask,
+                        client,
                         policy,
                         credential,
                         deadline,
                         ledger,
-                    ) {
-                        Ok(true) => wire.landed(index),
-                        // Stopped mid-part: the door is finished with this object and
-                        // nothing is waiting for these bytes.
-                        Ok(false) => return,
-                        Err(refusal) => {
-                            wire.failed(refusal);
-                            return;
+                    );
+                    match outcome {
+                        Ok(true) => {
+                            wire.landed(index);
+                            wire.leave(index, None);
                         }
+                        // Another racer finished the part, or the door is done with the
+                        // object and nothing is waiting for these bytes.
+                        Ok(false) => wire.leave(index, None),
+                        Err(refusal) => wire.leave(index, Some(refusal)),
                     }
                 }
             });
@@ -572,9 +670,11 @@ fn part(
     wire: &Wire,
     scratch: &File,
     index: usize,
+    from: u64,
     total: u64,
     size: u64,
-    original: &str,
+    ask: &(dyn Fn(bool) -> Result<String> + Sync),
+    client: &http::Client,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
@@ -582,12 +682,14 @@ fn part(
 ) -> Result<bool> {
     let start = index as u64 * size;
     let end = (start + size).min(total) - 1;
-    let mut at = start;
+    let mut at = from;
     let mut last: Option<Refusal> = None;
     let mut attempt = 0;
+    let mut stale = false;
     while attempt < FETCH_ATTEMPTS {
         attempt += 1;
-        if wire.stopped() {
+        ledger.check_running()?;
+        if wire.stopped() || wire.finished(index) {
             return Ok(false);
         }
         if at > end {
@@ -595,13 +697,15 @@ fn part(
         }
         let asked = format!("bytes={at}-{end}");
         let mut hops: Vec<(String, u16)> = Vec::new();
-        // From the URL the CALLER named, every time. The predicate runs on it and on every
+        // Authorized per ask: a part that outlives its URL is re-minted by whoever owns
+        // the lease rather than presenting it dead. The predicate runs on it and on every
         // hop of it, the credential is re-asked per host, and a relative `Location`
         // resolves against the hop that sent it — because this is the single-stream path's
         // own opener, not a second copy of it that could fall behind.
+        let url = ask(std::mem::take(&mut stale))?;
         let opened = pull::open_object(
-            pull::shared_client(),
-            original,
+            client,
+            &url,
             policy,
             credential,
             deadline,
@@ -664,6 +768,7 @@ fn part(
             // against a chain re-walked from the caller's URL, which is the one thing that
             // could actually change the answer.
             Opened::Expired(status) if !last_attempt => {
+                stale = true;
                 last = Some(Refusal {
                     code: Code::TRANSFER_FAILED,
                     detail: format!("part {index}: the origin answered {status}"),
@@ -696,7 +801,7 @@ fn part(
                 )
             }
         }
-        match body(response, wire, scratch, &mut at, end) {
+        match body(response, wire, scratch, index, &mut at, end) {
             Ok(()) => {}
             Err(refusal) if !last_attempt => {
                 last = Some(refusal);
@@ -707,7 +812,7 @@ fn part(
         if at > end {
             return Ok(true);
         }
-        if wire.stopped() {
+        if wire.stopped() || wire.finished(index) {
             return Ok(false);
         }
     }
@@ -727,16 +832,14 @@ fn body(
     response: crate::transport::http::Response<'_>,
     wire: &Wire,
     scratch: &File,
+    index: usize,
     at: &mut u64,
     end: u64,
 ) -> Result<()> {
     let mut reader = response.into_body();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
-        if *at > end {
-            return Ok(());
-        }
-        if wire.stopped() {
+        if *at > end || wire.stopped() {
             return Ok(());
         }
         let want = (end - *at + 1).min(buf.len() as u64) as usize;
@@ -761,6 +864,11 @@ fn body(
             })?;
         *at += read as u64;
         wire.moved.fetch_add(read as u64, Ordering::Relaxed);
+        // A racer of the same part writes the same bytes at the same offsets; the door's
+        // digest is the authority if an origin ever answers two asks differently.
+        if !wire.advance(index, *at) {
+            return Ok(());
+        }
     }
 }
 

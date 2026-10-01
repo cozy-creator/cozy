@@ -1,62 +1,73 @@
-//! One spare stream may race a measured slow object; only verified completion
-//! cancels its peer. This is recovery from observed degradation, not a deadline.
+//! Hedged recovery of slow object streams. An object's original GET races whatever
+//! hedges the walk's idle lanes can carry; the first verified admission wins and stops
+//! the rest. A hedge is earned by measurement, never by a timer: a stream is slow when,
+//! at its own measured network rate, what it has left would take more than
+//! `STALL_FACTOR` times the pull's best completed transfer of a comparable object.
+//!
+//! A large object is hedged as ranged parts on its share of the idle lanes, so a link
+//! whose individual answers are slow still fills; a small one as one fresh whole GET.
+//! Run 2322: R2 answered eight 64 MiB objects application-limited at 6-50 KB/s while the
+//! rest of the pull moved 400 MB/s, and nothing re-asked them for fifteen minutes.
 use super::{
-    ledger::{Attempt, AttemptData, Deadline, Ledger, STALL_FACTOR, STILL_SAMPLES},
+    ledger::{Attempt, AttemptData, Deadline, Ledger, FETCH_ATTEMPTS, STALL_FACTOR, STILL_SAMPLES},
     pull::{fetch_with_attempts, shared_client, Fetched},
-    CredentialProvider, SourcePolicy,
+    ranged, CredentialProvider, SourcePolicy,
 };
 use crate::{
     err::Result,
-    fetch::{DeliveryGrant, Destination, FetchPlan},
+    fetch::{DeliveryGrant, Destination},
     store::Store,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        mpsc, Arc, Mutex,
     },
     time::{Duration, Instant},
 };
+
+/// What the walk can lend a hedge right now: the level it admits, the objects it has in
+/// flight, and whether every object has been claimed.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Lanes {
+    pub level: usize,
+    pub busy: usize,
+    pub tail: bool,
+}
 
 struct Reference {
     length: u64,
     elapsed: Duration,
 }
 
+#[derive(Default)]
 pub(super) struct Recovery {
-    enabled: bool,
-    occupied: AtomicBool,
-    unhelpful: AtomicBool,
     references: Mutex<BTreeMap<String, Reference>>,
-    slots: Slots,
+    /// Lanes hedges hold across the whole walk.
+    racing: AtomicUsize,
+}
+
+/// Lanes one hedge holds, returned however its thread leaves.
+struct Hold<'a> {
+    racing: &'a AtomicUsize,
+    lanes: usize,
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        self.racing.fetch_sub(self.lanes, Ordering::AcqRel);
+    }
+}
+
+struct Racer {
+    state: Arc<Attempt>,
+    ranged: bool,
+    live: bool,
+    window: Window,
 }
 
 impl Recovery {
-    pub fn new(
-        store: &Store,
-        plan: &FetchPlan,
-        streams: usize,
-        allowance: Option<(u64, u64)>,
-    ) -> Self {
-        let largest = plan.wanted.iter().map(|o| o.length).max().unwrap_or(0);
-        let extra = plan.wanted_bytes().checked_add(largest);
-        let enabled = streams > 2
-            && !plan.wanted.is_empty()
-            && extra.is_some_and(|bytes| {
-                allowance.is_some_and(|(limit, objects)| {
-                    bytes <= limit && (plan.wanted.len() as u64) < objects
-                }) && store.admits(bytes).is_ok()
-            });
-        Self {
-            enabled,
-            occupied: AtomicBool::new(false),
-            unhelpful: AtomicBool::new(false),
-            references: Mutex::new(BTreeMap::new()),
-            slots: Slots::new(streams.saturating_sub(1)),
-        }
-    }
-
     fn learn(&self, data: &AttemptData, length: u64, elapsed: Duration) {
         if data.origin.is_empty() || elapsed.is_zero() {
             return;
@@ -76,36 +87,60 @@ impl Recovery {
         }
     }
 
-    fn worth_asking(
-        &self,
-        data: &AttemptData,
-        window: &Window,
-        length: u64,
-        floor: Duration,
-    ) -> bool {
-        if self.unhelpful.load(Ordering::Acquire) || !data.waiting || data.bytes >= length {
-            return false;
+    /// Whether this stream's measured remaining time dwarfs what a replacement has been
+    /// shown to cost. Without a comparable completed transfer the basis is the time the
+    /// stream has itself already spent waiting.
+    fn judge(&self, data: &AttemptData, window: &Window, length: u64, floor: Duration) -> Verdict {
+        if !data.waiting || data.bytes >= length {
+            return Verdict::Unmeasured;
         }
         let Some(first) = window.0.front() else {
-            return false;
+            return Verdict::Unmeasured;
         };
         let waited = data.waited.saturating_sub(first.waited);
         let bytes = data.bytes.saturating_sub(first.bytes);
-
         if waited < floor || bytes == 0 {
-            return false; // silence already has its own policy; local work is not network delay
+            return Verdict::Unmeasured; // silence has its own policy; local work is not network delay
         }
+        let left = (length - data.bytes) as f64 * waited.as_secs_f64() / bytes as f64;
         let references = self.references.lock().unwrap();
-        let Some(reference) = references.get(&data.origin) else {
-            return false;
-        };
-        if reference.length < length {
-            return false; // fast small metadata cannot qualify a large-body retry
+        // Fast small metadata cannot qualify a large-body retry.
+        match references.get(&data.origin).filter(|r| r.length >= length) {
+            Some(reference) if left > STALL_FACTOR * reference.elapsed.as_secs_f64() => {
+                Verdict::Slow
+            }
+            Some(_) => Verdict::Healthy,
+            None if left > STALL_FACTOR * data.waited.as_secs_f64() => Verdict::Unreferenced,
+            None => Verdict::Healthy,
         }
-        // Excluding consumer time makes the candidate rate optimistic. Even that
-        // measured remaining time must dwarf a whole replacement's proven cost.
-        let rate = bytes as f64 / waited.as_secs_f64();
-        (length - data.bytes) as f64 / rate > STALL_FACTOR * reference.elapsed.as_secs_f64()
+    }
+
+    /// Reserve this object's share of the idle lanes, if the disk has room for the copy.
+    /// The caller hands the count to a `Hold`, which returns it.
+    fn reserve(&self, lanes: Lanes, length: u64, store: &Store, whole: bool) -> Option<usize> {
+        let share = (lanes.level / lanes.busy.max(1)).max(1);
+        let parts = if whole {
+            1
+        } else {
+            (length / ranged::HEDGE_PART).max(1) as usize
+        };
+        loop {
+            let racing = self.racing.load(Ordering::Acquire);
+            let spare = lanes.level.saturating_sub(lanes.busy + racing);
+            let want = share.min(spare).min(parts);
+            // A ranged hedge assembles in scratch before its door writes the object.
+            let copies = if want > 1 { 2 } else { 1 };
+            if want == 0 || store.admits(length.saturating_mul(copies)).is_err() {
+                return None;
+            }
+            if self
+                .racing
+                .compare_exchange(racing, racing + want, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(want);
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -118,26 +153,12 @@ impl Recovery {
         credential: &dyn CredentialProvider,
         deadline: Deadline,
         ledger: &Ledger,
-        tail: &(dyn Fn() -> bool + Sync),
+        lanes: &(dyn Fn() -> Lanes + Sync),
         received: Option<&(dyn Fn() + Sync)>,
     ) -> Result<Fetched> {
-        if !self.enabled {
-            return fetch_with_attempts(
-                store,
-                grant,
-                authorize,
-                policy,
-                credential,
-                deadline,
-                ledger,
-                None,
-                &AtomicU32::new(0),
-                true,
-                None,
-                shared_client(),
-                received,
-            );
-        }
+        // Original asks and hedges share one budget, so a broken object is not re-bought
+        // once per idle lane.
+        let attempts = AtomicU32::new(0);
         if grant.destination != Destination::Blob {
             return fetch_with_attempts(
                 store,
@@ -148,76 +169,82 @@ impl Recovery {
                 deadline,
                 ledger,
                 None,
-                &AtomicU32::new(0),
+                &attempts,
                 true,
-                Some(&self.slots),
                 shared_client(),
                 received,
             );
         }
-        let attempts = AtomicU32::new(0);
-        let states = [Arc::new(Attempt::default()), Arc::new(Attempt::default())];
-        let mut permit = None;
+        let length = grant.object.length;
         std::thread::scope(|scope| {
             let (sender, receiver) = mpsc::channel();
-            let launch = |index, retry, send: mpsc::Sender<_>| {
-                let local = ledger.for_attempt(Arc::clone(&states[index]));
-                let attempts = &attempts;
+            let attempts = &attempts;
+            let launch = |lanes: usize| {
+                let state = Arc::new(Attempt::default());
+                let local = ledger.for_attempt(Arc::clone(&state));
+                let sender = sender.clone();
+                let index_state = Arc::clone(&state);
                 scope.spawn(move || {
+                    let _hold = Hold {
+                        racing: &self.racing,
+                        lanes,
+                    };
                     let started = Instant::now();
-                    // A rare contender starts a fresh TLS session context as well
-                    // as a fresh TCP connection; normal requests retain reuse.
-                    let fresh = (index == 1).then(super::http::Client::new);
-                    let client = fresh.as_ref().unwrap_or_else(|| shared_client());
-                    let result = fetch_with_attempts(
-                        store,
-                        grant,
-                        authorize,
-                        policy,
-                        credential,
-                        deadline,
-                        &local,
-                        None,
-                        attempts,
-                        retry,
-                        if index == 0 { Some(&self.slots) } else { None },
-                        client,
-                        received,
-                    );
-                    let _ = send.send((index, result, started.elapsed()));
+                    let result = if lanes > 1 {
+                        ranged::hedge(
+                            store, grant, authorize, policy, credential, deadline, &local, lanes,
+                        )
+                    } else {
+                        // A whole-object hedge starts a fresh TCP and TLS session; the
+                        // original keeps connection reuse.
+                        let fresh = (lanes == 1).then(super::http::Client::new);
+                        fetch_with_attempts(
+                            store,
+                            grant,
+                            authorize,
+                            policy,
+                            credential,
+                            deadline,
+                            &local,
+                            None,
+                            attempts,
+                            lanes == 0,
+                            fresh.as_ref().unwrap_or_else(|| shared_client()),
+                            received,
+                        )
+                    };
+                    let _ = sender.send((index_state, result, started.elapsed()));
                 });
+                Racer {
+                    state,
+                    ranged: lanes > 1,
+                    live: true,
+                    window: Window::default(),
+                }
             };
-            launch(0, true, sender.clone());
-            let mut window = Window::default();
-            let mut hedged = false;
-            let mut contender_live = false;
-            let mut original_error = None;
+            let mut racers = vec![launch(0)];
+            let mut failure = None;
             let result = loop {
                 match receiver.recv_timeout(ledger.sample()) {
-                    Ok((index, Ok(found), elapsed)) => {
-                        self.learn(
-                            &states[index].data.lock().unwrap(),
-                            grant.object.length,
-                            elapsed,
-                        );
-                        if hedged && index == 0 {
-                            // A uniformly slower route earns continued progress, not
-                            // one speculative download of every remaining object.
-                            self.unhelpful.store(true, Ordering::Release);
+                    Ok((state, Ok(found), elapsed)) => {
+                        self.learn(&state.data.lock().unwrap(), length, elapsed);
+                        if let Some(received) = received {
+                            received();
                         }
                         break Ok(found);
                     }
-                    Ok((index, Err(error), _)) => {
-                        if index == 0 {
-                            original_error = Some(error);
-                        } else {
-                            contender_live = false;
-                            self.unhelpful.store(true, Ordering::Release);
+                    Ok((state, Err(error), _)) => {
+                        let racer = racers
+                            .iter_mut()
+                            .find(|racer| Arc::ptr_eq(&racer.state, &state))
+                            .expect("every racer is recorded");
+                        racer.live = false;
+                        // The original's refusal names the object; a hedge's names a hedge.
+                        if Arc::ptr_eq(&racers[0].state, &state) || failure.is_none() {
+                            failure = Some(error);
                         }
-                        if !contender_live {
-                            if let Some(error) = original_error.take() {
-                                break Err(error);
-                            }
+                        if racers.iter().all(|racer| !racer.live) {
+                            break Err(failure.take().expect("a racer failed"));
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -227,38 +254,46 @@ impl Recovery {
                         {
                             break Err(error);
                         }
-                        let data = states[0].data.lock().unwrap().clone();
-                        window.observe(&data);
-                        // A bounded tail may have no newly completed reference
-                        // (a resumed pull can contain only one missing object).
-                        // Spare capacity permits one extra ask, never a failure
-                        // verdict or cancellation before a verified winner.
-                        let idle_tail = tail()
-                            && data.waiting
-                            && !data.origin.is_empty()
-                            && data.bytes < grant.object.length;
-                        if !hedged
-                            && (idle_tail
-                                || self.worth_asking(
-                                    &data,
-                                    &window,
-                                    grant.object.length,
-                                    ledger.floor(),
-                                ))
-                            && self
-                                .occupied
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                                .is_ok()
-                        {
-                            let reserved = Permit(&self.occupied);
-                            if !idle_tail && self.unhelpful.load(Ordering::Acquire) {
-                                drop(reserved);
-                                continue;
+                        // One hedge per object. A ranged hedge the origin refused (one that
+                        // will not answer ranges, say) may be followed by one whole GET.
+                        let first = racers.len() == 1;
+                        let fallback = racers.len() == 2 && racers[1].ranged && !racers[1].live;
+                        if !first && !fallback {
+                            continue;
+                        }
+                        let now = lanes();
+                        let mut every_slow = true;
+                        for racer in racers.iter_mut().filter(|racer| racer.live) {
+                            let data = racer.state.data.lock().unwrap().clone();
+                            racer.window.observe(&data);
+                            // A ranged hedge heals its own slow parts on its own lanes. With no
+                            // comparable evidence, only an idle tail probes, once per object.
+                            every_slow &= !racer.ranged
+                                && match self.judge(&data, &racer.window, length, ledger.floor()) {
+                                    Verdict::Slow => true,
+                                    Verdict::Unreferenced => first && now.tail,
+                                    Verdict::Healthy | Verdict::Unmeasured => false,
+                                };
+                        }
+                        if every_slow {
+                            if let Some(lanes) = self.reserve(now, length, store, fallback) {
+                                // A whole hedge spends its ask itself; a ranged one spends
+                                // one here, its parts resuming within their own asks.
+                                let budgeted = if lanes > 1 {
+                                    attempts
+                                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                            (n < FETCH_ATTEMPTS).then_some(n + 1)
+                                        })
+                                        .is_ok()
+                                } else {
+                                    attempts.load(Ordering::Acquire) < FETCH_ATTEMPTS
+                                };
+                                if budgeted {
+                                    racers.push(launch(lanes));
+                                } else {
+                                    self.racing.fetch_sub(lanes, Ordering::AcqRel);
+                                }
                             }
-                            permit = Some(reserved);
-                            hedged = true;
-                            contender_live = true;
-                            launch(1, false, sender.clone());
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -268,68 +303,20 @@ impl Recovery {
             };
             // Ok exists only after exact length/hash verification and CAS admission.
             // Errors cancel this object's attempts only; the caller owns pull failure.
-            for state in &states {
-                state.stopped.store(true, Ordering::Release);
+            for racer in &racers {
+                racer.state.stopped.store(true, Ordering::Release);
             }
             result
         })
-        // The permit outlives both scoped threads and their temporary-file cleanup.
     }
 }
 
-/// Normal requests may prepare their grant concurrently, but only N-1 may own
-/// object sockets/temporary writers. The one contender uses the reserved slot.
-pub(super) struct Slots {
-    limit: usize,
-    used: Mutex<usize>,
-    ready: Condvar,
-}
-impl Slots {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            used: Mutex::new(0),
-            ready: Condvar::new(),
-        }
-    }
-
-    pub(super) fn acquire(&self, ledger: &Ledger, deadline: Deadline) -> Result<Slot<'_>> {
-        let mut used = self.used.lock().unwrap();
-        let mut waited = false;
-        while *used >= self.limit {
-            waited = true;
-            ledger.check_running()?;
-            let tick = deadline
-                .remaining()?
-                .map_or(ledger.sample(), |left| left.min(ledger.sample()));
-            used = self.ready.wait_timeout(used, tick).unwrap().0;
-        }
-        ledger.check_running()?;
-        deadline.remaining()?;
-        *used += 1;
-        Ok(Slot {
-            slots: self,
-            waited,
-        })
-    }
-}
-
-pub(super) struct Slot<'a> {
-    slots: &'a Slots,
-    pub waited: bool,
-}
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        *self.slots.used.lock().unwrap() -= 1;
-        self.slots.ready.notify_one();
-    }
-}
-
-struct Permit<'a>(&'a AtomicBool);
-impl Drop for Permit<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Unmeasured,
+    Healthy,
+    Slow,
+    Unreferenced,
 }
 
 #[derive(Default)]
@@ -356,13 +343,7 @@ mod tests {
 
     #[test]
     fn measured_reference_keeps_comparable_size_and_does_not_learn_local_pauses() {
-        let recovery = Recovery {
-            enabled: true,
-            occupied: AtomicBool::new(false),
-            unhelpful: AtomicBool::new(false),
-            references: Mutex::new(BTreeMap::new()),
-            slots: Slots::new(1),
-        };
+        let recovery = Recovery::default();
         let mut data = AttemptData {
             bytes: 4 << 20,
             waited: Duration::from_secs(30),
@@ -372,32 +353,51 @@ mod tests {
         let window = Window(VecDeque::from([AttemptData::default()]));
         let size = 64 << 20;
         let floor = Duration::from_secs(30);
+        let judge = |recovery: &Recovery, data: &AttemptData| recovery.judge(data, &window, size, floor);
+        assert_eq!(judge(&recovery, &data), Verdict::Unreferenced, "15x its own wait left");
         recovery.learn(&data, 1024, Duration::from_millis(1));
-        assert!(
-            !recovery.worth_asking(&data, &window, size, floor),
+        assert_eq!(
+            judge(&recovery, &data),
+            Verdict::Unreferenced,
             "tiny fast metadata is not large-object evidence"
         );
-        recovery.learn(&data, 1024, Duration::from_secs(10));
         recovery.learn(&data, size, Duration::from_secs(3));
-        assert!(
-            recovery.worth_asking(&data, &window, size, floor),
-            "slow small metadata must not poison the later large sample"
-        );
+        assert_eq!(judge(&recovery, &data), Verdict::Slow);
         recovery.learn(&data, size, Duration::from_secs(900));
-        assert!(
-            recovery.worth_asking(&data, &window, size, floor),
+        assert_eq!(
+            judge(&recovery, &data),
+            Verdict::Slow,
             "a completed straggler cannot erase the demonstrated replacement cost"
         );
         data.waited = Duration::from_millis(1);
-        assert!(
-            !recovery.worth_asking(&data, &window, size, floor),
+        assert_eq!(
+            judge(&recovery, &data),
+            Verdict::Unmeasured,
             "consumer time supplies no evidence of network degradation"
         );
         data.waited = floor;
-        recovery.unhelpful.store(true, Ordering::Release);
-        assert!(
-            !recovery.worth_asking(&data, &window, size, floor),
-            "an unhelpful contender must prevent further speculative traffic"
-        );
+        data.bytes = 60 << 20;
+        assert_eq!(judge(&recovery, &data), Verdict::Healthy, "nearly done at its own rate");
+    }
+
+    #[test]
+    fn a_hedge_takes_its_fair_share_of_idle_lanes_and_returns_them() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-hedge-lanes-{}-{}",
+            std::process::id(),
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let recovery = Recovery::default();
+        let tail = Lanes { level: 128, busy: 8, tail: true };
+        let lanes = recovery.reserve(tail, 64 << 20, &store, false).unwrap();
+        assert_eq!(lanes, 16, "eight stragglers share 120 idle lanes");
+        let hold = Hold { racing: &recovery.racing, lanes };
+        assert_eq!(recovery.reserve(tail, 64 << 20, &store, true), Some(1));
+        recovery.racing.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(recovery.reserve(Lanes { level: 4, busy: 4, tail: true }, 1 << 30, &store, false), None);
+        drop(hold);
+        assert_eq!(recovery.racing.load(Ordering::Acquire), 0);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
