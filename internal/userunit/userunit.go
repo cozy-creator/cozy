@@ -44,7 +44,7 @@ type Spec struct {
 // Start runs spec as its unit and answers whether a unit of that name was already running,
 // which is then left as it is. The unit is collected when its process ends.
 func Start(spec Spec) (bool, error) {
-	if running(spec.Unit) {
+	if Running(spec.Unit) {
 		return true, nil
 	}
 	_ = exec.Command("systemctl", "--user", "reset-failed", spec.Unit).Run()
@@ -58,7 +58,7 @@ func Start(spec Spec) (bool, error) {
 	}
 	out, err := exec.Command("systemd-run", append(append(args, "--"), spec.Argv...)...).CombinedOutput()
 	if err != nil {
-		if running(spec.Unit) {
+		if Running(spec.Unit) {
 			return true, nil // another caller started it first
 		}
 		return false, fmt.Errorf("systemd-run %s: %v: %s", spec.Unit, err, strings.TrimSpace(string(out)))
@@ -66,7 +66,8 @@ func Start(spec Spec) (bool, error) {
 	return false, nil
 }
 
-func running(unit string) bool {
+// Running says whether the unit is active, starting or reloading.
+func Running(unit string) bool {
 	state := Property(unit, "ActiveState")
 	return state == "active" || state == "activating" || state == "reloading"
 }
