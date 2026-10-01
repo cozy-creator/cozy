@@ -1534,8 +1534,7 @@ fn a_silent_first_address_gives_way_to_the_next() {
     rustix::net::listen(&hole, 0).unwrap();
     let filled: Vec<_> = (0..4)
         .filter_map(|_| {
-            TcpStream::connect_timeout(&hole.local_addr().unwrap(), Duration::from_millis(100))
-                .ok()
+            TcpStream::connect_timeout(&hole.local_addr().unwrap(), Duration::from_millis(100)).ok()
         })
         .collect();
     let live = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1570,7 +1569,10 @@ fn a_silent_first_address_gives_way_to_the_next() {
     )
     .unwrap();
     assert_eq!(response.read_capped(3).unwrap(), b"abc");
-    assert!(started.elapsed() > ledger.floor(), "the silent address was never tried");
+    assert!(
+        started.elapsed() > ledger.floor(),
+        "the silent address was never tried"
+    );
     drop(filled);
 }
 

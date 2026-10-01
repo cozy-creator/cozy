@@ -255,9 +255,11 @@ pub(super) fn hedge(
     streams: usize,
 ) -> Result<Fetched> {
     let total = grant.object.length;
+    // Four parts a lane: a part stuck on a cold chunk is split or re-asked by the lanes that
+    // finish theirs, and each part is a fresh ranged ask.
     let ranged = Ranged {
         streams,
-        part: total.div_ceil(streams as u64).max(HEDGE_PART),
+        part: total.div_ceil(4 * streams as u64).max(HEDGE_PART),
     };
     assemble(
         store,

@@ -25,11 +25,26 @@ fn drip_gap() -> Duration {
     Duration::from_secs_f64(DRIP as f64 / CRAWL as f64)
 }
 
-/// A hub whose store honours ranges and drip-feeds the first whole GET of each `slow`
-/// object. With `lifetime`, URLs die as `expiring_hub_origin`'s do, and the first ranged
-/// ask for each slow part keeps answering until its URL is dead, then drops — a hedged
-/// range that outlives its presign.
-fn tail_hub(checkpoint: Arc<Checkpoint>, slow: Vec<String>, lifetime: Option<Duration>) -> Tail {
+/// How a slow object's whole GETs behave.
+#[derive(Clone, Copy, PartialEq)]
+enum Stall {
+    /// The first whole GET drips from its first byte; later ones are fast.
+    First,
+    /// Every whole GET streams half the object, then drips: a cold R2 chunk every whole
+    /// read queues behind (sasori, fern). Ranged asks are served apart from it.
+    Chunk,
+}
+
+/// A hub whose store honours ranges and drip-feeds whole GETs of each `slow` object as
+/// `stall` says. With `lifetime`, URLs die as `expiring_hub_origin`'s do, and the first
+/// ranged ask for each slow part keeps answering until its URL is dead, then drops — a
+/// hedged range that outlives its presign.
+fn tail_hub(
+    checkpoint: Arc<Checkpoint>,
+    slow: Vec<String>,
+    lifetime: Option<Duration>,
+    stall: Stall,
+) -> Tail {
     let base_slot: Arc<Mutex<String>> = Arc::default();
     let rejected = Arc::new(AtomicUsize::new(0));
     let hedged = Arc::new(AtomicUsize::new(0));
@@ -79,7 +94,29 @@ fn tail_hub(checkpoint: Arc<Checkpoint>, slow: Vec<String>, lifetime: Option<Dur
             *count += 1;
             if *count > 1 {
                 again.fetch_add(1, Ordering::Relaxed);
-                return status(200, &body);
+                if stall == Stall::First {
+                    return status(200, &body);
+                }
+            }
+            if stall == Stall::Chunk {
+                return Serve::Script(Box::new(move |socket| {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let half = body.len() / 2;
+                    if socket.write_all(head.as_bytes()).is_err()
+                        || socket.write_all(&body[..half]).is_err()
+                    {
+                        return;
+                    }
+                    for piece in body[half..].chunks(DRIP) {
+                        std::thread::sleep(drip_gap());
+                        if socket.write_all(piece).is_err() {
+                            return;
+                        }
+                    }
+                }));
             }
             return Serve::Drip {
                 body,
@@ -139,11 +176,12 @@ fn slow_objects(checkpoint: &Checkpoint, count: usize) -> Vec<String> {
         .collect()
 }
 
+/// The pull's wall time, its report, and the Store's transport decision log.
 fn timed_pull(
     tail: &Tail,
     checkpoint: &Checkpoint,
     name: &str,
-) -> (Duration, crate::transport::PullReport) {
+) -> (Duration, crate::transport::PullReport, String) {
     let root = temporary(name);
     let store = Store::init(&root).unwrap();
     let policy = SourcePolicy::default();
@@ -154,8 +192,9 @@ fn timed_pull(
     assert_eq!(report.held + report.fetched, report.declared, "{name}");
     let (warm, _) = FetchPlan::of_objects(&store, name, &checkpoint.objects).unwrap();
     assert!(warm.wanted.is_empty(), "{name}: every object verified");
+    let log = std::fs::read_to_string(root.join("logs/transport.log")).unwrap_or_default();
     let _ = std::fs::remove_dir_all(root);
-    (elapsed, report)
+    (elapsed, report, log)
 }
 
 /// The regression gate for run 2322. The body throughput is measured on this host first,
@@ -164,15 +203,15 @@ fn timed_pull(
 #[test]
 fn an_application_limited_tail_finishes_at_body_throughput() {
     let checkpoint = Arc::new(checkpoint(24, BLOB));
-    let (body, _) = timed_pull(
-        &tail_hub(Arc::clone(&checkpoint), Vec::new(), None),
+    let (body, _, _) = timed_pull(
+        &tail_hub(Arc::clone(&checkpoint), Vec::new(), None, Stall::First),
         &checkpoint,
         "tail-body",
     );
 
     let slow = slow_objects(&checkpoint, 3);
-    let hub = tail_hub(Arc::clone(&checkpoint), slow, None);
-    let (tail, report) = timed_pull(&hub, &checkpoint, "tail-crawl");
+    let hub = tail_hub(Arc::clone(&checkpoint), slow, None, Stall::First);
+    let (tail, report, _) = timed_pull(&hub, &checkpoint, "tail-crawl");
     let crawl = Duration::from_secs_f64(BLOB as f64 / CRAWL as f64);
     let sample = Duration::from_secs_f64(0.025);
     let bytes: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
@@ -208,8 +247,13 @@ fn a_hedged_range_outliving_its_presign_reauthorizes() {
     // Few objects, so the slow ones are a tail with idle lanes to split them over.
     let checkpoint = Arc::new(checkpoint(3, BLOB));
     let slow = slow_objects(&checkpoint, 2);
-    let hub = tail_hub(Arc::clone(&checkpoint), slow, Some(Duration::from_secs(1)));
-    let (tail, _) = timed_pull(&hub, &checkpoint, "tail-expiry");
+    let hub = tail_hub(
+        Arc::clone(&checkpoint),
+        slow,
+        Some(Duration::from_secs(1)),
+        Stall::First,
+    );
+    let (tail, _, _) = timed_pull(&hub, &checkpoint, "tail-expiry");
     let crawl = Duration::from_secs_f64(BLOB as f64 / CRAWL as f64);
     eprintln!(
         "expiring tail {:.2} s, {} ranged asks, {} dead URLs presented",
@@ -220,6 +264,49 @@ fn a_hedged_range_outliving_its_presign_reauthorizes() {
     assert!(
         hub.ranged.load(Ordering::Relaxed) > 0,
         "no slow object was split"
+    );
+    assert!(tail < crawl / 2, "the tail crawled: {tail:?}");
+}
+
+/// Sasori on 0.3.81: two objects stalled mid-pull, while every lane was busy, on a cold
+/// chunk that every whole GET of them queued behind. The whole-GET hedge and its
+/// replacements stalled in lockstep with the original, and the pull ended on two lone
+/// objects crawling for 7.5 minutes. Ranged parts must carry them home at body speed.
+#[test]
+fn two_objects_stalled_mid_pull_on_a_cold_chunk_finish_at_body_throughput() {
+    let checkpoint = Arc::new(checkpoint(24, BLOB));
+    let (body, _, _) = timed_pull(
+        &tail_hub(Arc::clone(&checkpoint), Vec::new(), None, Stall::Chunk),
+        &checkpoint,
+        "chunk-body",
+    );
+    let slow = slow_objects(&checkpoint, 2);
+    let hub = tail_hub(Arc::clone(&checkpoint), slow, None, Stall::Chunk);
+    let (tail, _, log) = timed_pull(&hub, &checkpoint, "chunk-crawl");
+    let crawl = Duration::from_secs_f64((BLOB / 2) as f64 / CRAWL as f64);
+    let sample = Duration::from_secs_f64(0.025);
+    eprintln!(
+        "body {:.2} s; tail {:.2} s; {} ranged asks; the stalled half alone {:.0} s",
+        body.as_secs_f64(),
+        tail.as_secs_f64(),
+        hub.ranged.load(Ordering::Relaxed),
+        crawl.as_secs_f64()
+    );
+    assert!(
+        hub.ranged.load(Ordering::Relaxed) > 0,
+        "no stalled object was split"
+    );
+    // The decisions stay on disk: each hedge, its winner, and the walk's summary.
+    eprintln!("{log}");
+    assert!(
+        log.contains(" hedge ") && log.contains(" ranged lanes="),
+        "{log}"
+    );
+    assert!(log.contains(" won ") && log.contains(" walk "), "{log}");
+    assert!(log.contains("hedges_won="), "{log}");
+    assert!(
+        tail < body * 3 + sample * 40,
+        "the tail crawled: {tail:?} against a {body:?} body"
     );
     assert!(tail < crawl / 2, "the tail crawled: {tail:?}");
 }

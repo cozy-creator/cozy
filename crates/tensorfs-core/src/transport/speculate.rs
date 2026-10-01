@@ -9,6 +9,7 @@
 //! Run 2322: R2 answered eight 64 MiB objects application-limited at 6-50 KB/s while the
 //! rest of the pull moved 400 MB/s, and nothing re-asked them for fifteen minutes.
 use super::{
+    decisions,
     ledger::{Attempt, AttemptData, Deadline, Ledger, FETCH_ATTEMPTS, STALL_FACTOR, STILL_SAMPLES},
     pull::{fetch_with_attempts, shared_client, Fetched},
     ranged, CredentialProvider, SourcePolicy,
@@ -44,6 +45,9 @@ struct Reference {
 #[derive(Default)]
 pub(super) struct Recovery {
     references: Mutex<BTreeMap<String, Reference>>,
+    /// Hedges launched and won across the walk, for its one summary line.
+    pub hedges: AtomicUsize,
+    pub won: AtomicUsize,
     /// Lanes hedges hold across the whole walk.
     racing: AtomicUsize,
 }
@@ -117,8 +121,8 @@ impl Recovery {
 
     /// Reserve this object's share of the idle lanes, if the disk has room for the copy.
     /// A stream measured slow against a comparable transfer is barely using its own lane,
-    /// so that lane counts as idle for its hedge even when the walk has none to spare: a
-    /// cold-object stall mid-pull is hedged then, not only once the walk drains.
+    /// so that lane counts as idle for its hedge even when the walk has none to spare. A
+    /// ranged hedge always gets two lanes, so one can re-ask a part the other is stuck on.
     /// The caller hands the count to a `Hold`, which returns it.
     fn reserve(
         &self,
@@ -132,20 +136,23 @@ impl Recovery {
         let parts = if whole {
             1
         } else {
-            (length / ranged::HEDGE_PART).max(1) as usize
+            (length / ranged::HEDGE_PART).max(2) as usize
         };
+        // The original's object beside the hedge's copies: a ranged hedge assembles in
+        // scratch before its door writes.
+        let copies = if whole { 2 } else { 3 };
+        if store.admits(length.saturating_mul(copies)).is_err() {
+            return None;
+        }
         loop {
             let racing = self.racing.load(Ordering::Acquire);
             let spare = (lanes.level + usize::from(own)).saturating_sub(lanes.busy + racing);
             let mut want = share.min(spare).min(parts);
-            // Room for the original's object beside the hedge's copies: a ranged hedge
-            // assembles in scratch before its door writes, so a disk without room for
-            // both still takes one whole GET.
-            if want > 1 && store.admits(length.saturating_mul(3)).is_err() {
-                want = 1;
-            }
-            if want == 0 || store.admits(length.saturating_mul(2)).is_err() {
+            if want == 0 {
                 return None;
+            }
+            if !whole {
+                want = want.max(2);
             }
             if self
                 .racing
@@ -242,6 +249,31 @@ impl Recovery {
                 match receiver.recv_timeout(ledger.sample()) {
                     Ok((state, Ok(found), elapsed)) => {
                         self.learn(&state.data.lock().unwrap(), length, elapsed);
+                        if racers.len() > 1 {
+                            self.won.fetch_add(
+                                usize::from(!Arc::ptr_eq(&racers[0].state, &state)),
+                                Ordering::Relaxed,
+                            );
+                            let winner = racers
+                                .iter()
+                                .position(|racer| Arc::ptr_eq(&racer.state, &state))
+                                .unwrap_or(0);
+                            let kind = match winner {
+                                0 => "original",
+                                _ if racers[winner].ranged => "ranged",
+                                _ => "whole",
+                            };
+                            decisions::record(
+                                store,
+                                "won",
+                                &decisions::object(&grant.object),
+                                &format!(
+                                    "{kind} racers={} after_s={:.1}",
+                                    racers.len(),
+                                    elapsed.as_secs_f64()
+                                ),
+                            );
+                        }
                         if let Some(received) = received {
                             received();
                         }
@@ -268,10 +300,7 @@ impl Recovery {
                         {
                             break Err(error);
                         }
-                        // One hedge per object. A ranged hedge the origin refused (one that
-                        // will not answer ranges, say) may be followed by one whole GET.
                         let first = racers.len() == 1;
-                        let fallback = racers.len() == 2 && racers[1].ranged && !racers[1].live;
                         let now = lanes();
                         // A hedge condemns nothing, so two samples of measured network wait
                         // are evidence enough; the stall floor guards verdicts, not hedges.
@@ -279,19 +308,20 @@ impl Recovery {
                         let mut every_slow = true;
                         let mut measured = true;
                         let mut slowest: Option<(usize, f64)> = None;
+                        let mut ranged_live = false;
                         for (index, racer) in racers.iter_mut().enumerate() {
                             if !racer.live {
                                 continue;
                             }
+                            // A ranged hedge heals its own slow parts on its own lanes.
+                            if racer.ranged {
+                                ranged_live = true;
+                                continue;
+                            }
                             let data = racer.state.data.lock().unwrap().clone();
                             racer.window.observe(&data);
-                            // A ranged hedge heals its own slow parts on its own lanes. With no
-                            // comparable evidence, only an idle tail probes, once per object.
-                            let verdict = if racer.ranged {
-                                Verdict::Healthy
-                            } else {
-                                self.judge(&data, &racer.window, length, evidence)
-                            };
+                            // With no comparable evidence, only an idle tail probes, once.
+                            let verdict = self.judge(&data, &racer.window, length, evidence);
                             measured &= verdict == Verdict::Slow;
                             every_slow &= match verdict {
                                 Verdict::Slow => true,
@@ -303,41 +333,68 @@ impl Recovery {
                                 slowest = Some((index, rate));
                             }
                         }
-                        if !every_slow {
+                        if ranged_live || !every_slow || slowest.is_none() {
                             continue;
                         }
-                        if first || fallback {
-                            if let Some(lanes) =
-                                self.reserve(now, length, store, fallback, measured)
-                            {
-                                // A whole hedge spends its ask itself; a ranged one spends
-                                // one here, its parts resuming within their own asks.
-                                let budgeted = if lanes > 1 {
-                                    attempts
-                                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                                            (n < FETCH_ATTEMPTS).then_some(n + 1)
-                                        })
-                                        .is_ok()
-                                } else {
-                                    attempts.load(Ordering::Acquire) < FETCH_ATTEMPTS
-                                };
-                                if budgeted {
-                                    racers.push(launch(lanes));
-                                } else {
-                                    self.racing.fetch_sub(lanes, Ordering::AcqRel);
-                                }
+                        let (index, rate) = slowest.expect("a live racer was judged");
+                        let left =
+                            length.saturating_sub(racers[index].state.data.lock().unwrap().bytes);
+                        if length >= 2 * ranged::HEDGE_PART {
+                            // A cold R2 read stalls at a chunk boundary, and every whole GET
+                            // of that object then streams in lockstep behind the same stall
+                            // (sasori, fern). Fresh ranged asks are served apart from it, so a
+                            // large object is only ever hedged as ranged parts, on at least
+                            // two lanes so one can re-ask whatever the other is stuck on.
+                            let Some(lanes) = self.reserve(now, length, store, false, measured)
+                            else {
+                                continue;
+                            };
+                            let budgeted = attempts
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                    (n < FETCH_ATTEMPTS).then_some(n + 1)
+                                })
+                                .is_ok();
+                            if !budgeted {
+                                self.racing.fetch_sub(lanes, Ordering::AcqRel);
+                                continue;
+                            }
+                            decisions::record(
+                                store,
+                                "hedge",
+                                &decisions::object(&grant.object),
+                                &format!(
+                                    "ranged lanes={lanes} rate_bps={rate:.0} left={left} \
+                                     measured={measured} busy={} level={}",
+                                    now.busy, now.level
+                                ),
+                            );
+                            self.hedges.fetch_add(1, Ordering::Relaxed);
+                            racers.push(launch(lanes));
+                        } else if first {
+                            if self.reserve(now, length, store, true, measured).is_some() {
+                                decisions::record(
+                                    store,
+                                    "hedge",
+                                    &decisions::object(&grant.object),
+                                    &format!("whole rate_bps={rate:.0} left={left}"),
+                                );
+                                self.hedges.fetch_add(1, Ordering::Relaxed);
+                                racers.push(launch(1));
                             }
                         } else if measured
                             && racers.iter().filter(|racer| racer.live).count() > 1
                             && attempts.load(Ordering::Acquire) < FETCH_ATTEMPTS
                         {
-                            // Every racer is measured slow. A cold R2 read stalls at a chunk
-                            // boundary and a fresh ask moves 50-100x faster, so the slowest
-                            // racer gives its lane to a fresh whole GET rather than waiting.
-                            // A sole survivor is never stopped: its hedge already failed.
-                            let (index, _) = slowest.expect("a live racer was judged");
+                            // A small object's racers are all slow: the slowest gives its
+                            // lane to a fresh GET. A sole survivor is never stopped.
                             racers[index].state.stopped.store(true, Ordering::Release);
                             self.racing.fetch_add(1, Ordering::AcqRel);
+                            decisions::record(
+                                store,
+                                "replace",
+                                &decisions::object(&grant.object),
+                                &format!("whole rate_bps={rate:.0} left={left}"),
+                            );
                             racers.push(launch(1));
                         }
                     }
@@ -483,7 +540,7 @@ mod tests {
         assert_eq!(recovery.reserve(full, 64 << 20, &store, false, false), None);
         assert_eq!(
             recovery.reserve(full, 64 << 20, &store, false, true),
-            Some(1),
+            Some(2),
             "a measured stall lends its own lane to its hedge"
         );
         let _ = std::fs::remove_dir_all(root);

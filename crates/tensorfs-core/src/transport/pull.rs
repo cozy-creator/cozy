@@ -976,6 +976,7 @@ pub(super) fn fetch_wanted_bounded(
         streams.clamp(1, PULL_STREAMS),
     ));
     let recovery = super::speculate::Recovery::default();
+    let began = Instant::now();
     // A stream's
     // permit is released once its body is in, so its thread may still be fsyncing and
     // admitting while another thread uses the permit: twice the threads keeps the permits
@@ -1158,13 +1159,30 @@ pub(super) fn fetch_wanted_bounded(
             });
         }
     });
-    if let Some(refusal) = first.lock().unwrap().take() {
+    let refusal = first.lock().unwrap().take();
+    let (streams, levels, backoffs) = pace.outcome();
+    super::decisions::record(
+        store,
+        "walk",
+        &format!("{} {}", plan.wanted.len(), plan.wanted_bytes()),
+        &format!(
+            "fetched={} cached={} moved={} seconds={:.1} level={streams} hedges={} hedges_won={} \
+             outcome={}",
+            fetched.load(Ordering::Relaxed),
+            cached.load(Ordering::Relaxed),
+            bytes_moved.load(Ordering::Relaxed),
+            began.elapsed().as_secs_f64(),
+            recovery.hedges.load(Ordering::Relaxed),
+            recovery.won.load(Ordering::Relaxed),
+            refusal.as_ref().map_or("ok", |r| r.code.as_str()),
+        ),
+    );
+    if let Some(refusal) = refusal {
         return Err(refusal);
     }
     if let Some(backfill) = backfill {
         backfill.finish_offers();
     }
-    let (streams, levels, backoffs) = pace.outcome();
     Ok(WalkOutcome {
         fetched: fetched.load(Ordering::Relaxed),
         bytes_moved: bytes_moved.load(Ordering::Relaxed),
