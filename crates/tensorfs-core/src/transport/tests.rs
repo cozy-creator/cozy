@@ -1745,11 +1745,12 @@ fn a_slow_mint_over_a_moving_transfer_is_left_alone() {
         mints.load(Ordering::Relaxed) >= 2,
         "only one mint was ever asked for"
     );
-    // One ask per object: nothing was condemned and re-asked behind the slow mint.
+    // Nothing was condemned behind the slow mint. An unreferenced tail object may still
+    // be probed once by a hedge, which is not a verdict on the stream it races.
+    assert_eq!(report.backoffs, 0, "a stream was judged stalled");
     for object in checkpoint.objects.iter() {
-        assert_eq!(
-            origin.hits(&format!("/obj/{}", object.sha256)),
-            1,
+        assert!(
+            origin.hits(&format!("/obj/{}", object.sha256)) <= 2,
             "object {} was re-asked",
             object.sha256
         );
@@ -5303,9 +5304,10 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
             }
             if request.path == "/after" {
                 later_requests.fetch_add(1, Ordering::SeqCst);
+                // As slow, relative to this host's measured seed, as the object before it.
                 return Serve::Drip {
                     body: vec![b'd'; body.len()],
-                    chunk: 256,
+                    chunk: source_chunk.load(Ordering::Acquire),
                     gap: Duration::from_millis(10),
                     ttfb: Duration::ZERO,
                 };
@@ -5362,6 +5364,7 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
                         | "oversized_contender"
                         | "both_slow"
                         | "slow_small_before_large"
+                        | "two_streams"
                 )
             {
                 // Make the fixture's slowdown relative to this host's measured

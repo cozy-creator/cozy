@@ -357,8 +357,13 @@ mod tests {
         let window = Window(VecDeque::from([AttemptData::default()]));
         let size = 64 << 20;
         let floor = Duration::from_secs(30);
-        let judge = |recovery: &Recovery, data: &AttemptData| recovery.judge(data, &window, size, floor);
-        assert_eq!(judge(&recovery, &data), Verdict::Unreferenced, "15x its own wait left");
+        let judge =
+            |recovery: &Recovery, data: &AttemptData| recovery.judge(data, &window, size, floor);
+        assert_eq!(
+            judge(&recovery, &data),
+            Verdict::Unreferenced,
+            "15x its own wait left"
+        );
         recovery.learn(&data, 1024, Duration::from_millis(1));
         assert_eq!(
             judge(&recovery, &data),
@@ -381,7 +386,11 @@ mod tests {
         );
         data.waited = floor;
         data.bytes = 60 << 20;
-        assert_eq!(judge(&recovery, &data), Verdict::Healthy, "nearly done at its own rate");
+        assert_eq!(
+            judge(&recovery, &data),
+            Verdict::Healthy,
+            "nearly done at its own rate"
+        );
     }
 
     #[test]
@@ -393,13 +402,32 @@ mod tests {
         ));
         let store = Store::init(&root).unwrap();
         let recovery = Recovery::default();
-        let tail = Lanes { level: 128, busy: 8, tail: true };
+        let tail = Lanes {
+            level: 128,
+            busy: 8,
+            tail: true,
+        };
         let lanes = recovery.reserve(tail, 64 << 20, &store, false).unwrap();
         assert_eq!(lanes, 16, "eight stragglers share 120 idle lanes");
-        let hold = Hold { racing: &recovery.racing, lanes };
+        let hold = Hold {
+            racing: &recovery.racing,
+            lanes,
+        };
         assert_eq!(recovery.reserve(tail, 64 << 20, &store, true), Some(1));
         recovery.racing.fetch_sub(1, Ordering::AcqRel);
-        assert_eq!(recovery.reserve(Lanes { level: 4, busy: 4, tail: true }, 1 << 30, &store, false), None);
+        assert_eq!(
+            recovery.reserve(
+                Lanes {
+                    level: 4,
+                    busy: 4,
+                    tail: true
+                },
+                1 << 30,
+                &store,
+                false
+            ),
+            None
+        );
         drop(hold);
         assert_eq!(recovery.racing.load(Ordering::Acquire), 0);
         let _ = std::fs::remove_dir_all(root);

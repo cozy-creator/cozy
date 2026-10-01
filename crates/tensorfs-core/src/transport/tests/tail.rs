@@ -139,7 +139,11 @@ fn slow_objects(checkpoint: &Checkpoint, count: usize) -> Vec<String> {
         .collect()
 }
 
-fn timed_pull(tail: &Tail, checkpoint: &Checkpoint, name: &str) -> (Duration, crate::transport::PullReport) {
+fn timed_pull(
+    tail: &Tail,
+    checkpoint: &Checkpoint,
+    name: &str,
+) -> (Duration, crate::transport::PullReport) {
     let root = temporary(name);
     let store = Store::init(&root).unwrap();
     let policy = SourcePolicy::default();
@@ -181,7 +185,10 @@ fn an_application_limited_tail_finishes_at_body_throughput() {
         rate(tail),
         crawl.as_secs_f64()
     );
-    assert!(hub.hedged.load(Ordering::Relaxed) > 0, "no slow object was hedged");
+    assert!(
+        hub.hedged.load(Ordering::Relaxed) > 0,
+        "no slow object was hedged"
+    );
     assert!(
         tail < body * 3 + sample * 40,
         "the tail crawled: {tail:?} against a {body:?} body"
@@ -209,6 +216,9 @@ fn a_hedged_range_outliving_its_presign_reauthorizes() {
         hub.ranged.load(Ordering::Relaxed),
         hub.rejected.load(Ordering::Relaxed)
     );
-    assert!(hub.ranged.load(Ordering::Relaxed) > 0, "no slow object was split");
+    assert!(
+        hub.ranged.load(Ordering::Relaxed) > 0,
+        "no slow object was split"
+    );
     assert!(tail < crawl / 4, "the tail crawled: {tail:?}");
 }
