@@ -372,8 +372,10 @@ func (m *machineRuns) exportProducts(ctx context.Context, connection *machineCon
 				problem = verifyFinal(product)
 			}
 			if problem != nil {
-				_ = m.store.FailOutputExport(request.ID, problem.ErrName(), problem.Message)
-				return problem
+				named := *problem
+				named.Message = "output " + product.Output + ": " + problem.Message
+				_ = m.store.FailOutputExport(request.ID, named.ErrName(), named.Message)
+				return &named
 			}
 		}
 		paths = append(paths, product.Path)

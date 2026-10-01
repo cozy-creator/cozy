@@ -470,10 +470,28 @@ func (l *Launch) at(reads string) *Launch {
 	return &out
 }
 
-// Ensure starts the machine independently of any Hub. A named Hub receives a scoped
-// execution credential only after the agent proves its TLS identity; it never owns this
-// machine's identity or lifecycle. Empty hubOrigin is entirely offline.
+type attachKey struct{}
+
+// AttachOnly marks work that uses this computer's machine only while it runs: observing,
+// collecting and controlling runs it already accepted. Such work never starts a stopped
+// machine; it waits for the next local run or `cozy machine start`.
+func AttachOnly(ctx context.Context) context.Context {
+	return context.WithValue(ctx, attachKey{}, true)
+}
+
+func stopped() *exit.Error {
+	return exit.Named(exit.Unavailable, "machine.stopped", "this computer's machine is stopped; work it already accepted waits for it").
+		WithRemedy("`cozy machine start`, or the next local run, starts it")
+}
+
+// Ensure starts the machine independently of any Hub, or attaches to the running one. A named
+// Hub receives a scoped execution credential only after the agent proves its TLS identity; it
+// never owns this machine's identity or lifecycle. Empty hubOrigin is entirely offline.
 func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client, _ bool) (*Launch, *exit.Error) {
+	attach, _ := ctx.Value(attachKey{}).(bool)
+	if _, err := os.Stat(h.path("agent.json")); attach && errors.Is(err, os.ErrNotExist) {
+		return nil, stopped() // one file read: background work asks often while the machine is stopped
+	}
 	if !h.mu.TryLock() {
 		return nil, exit.Named(exit.Unavailable, "machine.busy", "another command is changing the local machine")
 	}
@@ -483,28 +501,40 @@ func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client,
 		return nil, problem
 	}
 	defer unlock()
-	return h.ensureLocked(ctx, hubOrigin, client)
+	return h.ensureLocked(ctx, hubOrigin, client, !attach)
 }
 
-func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.Client) (*Launch, *exit.Error) {
+// Start starts the machine, or attaches to the running one, after any command changing it.
+func (h *Host) Start(ctx context.Context) (*Launch, *exit.Error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	unlock, problem := h.lock(ctx)
+	if problem != nil {
+		return nil, problem
+	}
+	defer unlock()
+	return h.ensureLocked(ctx, "", nil, true)
+}
+
+func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.Client, start bool) (*Launch, *exit.Error) {
 	var launch *Launch
 	if cached := h.cached; cached != nil && h.alive(cached.PID) && (cached.record.StartTicks == 0 || cached.record.StartTicks == processStartTicks(cached.PID)) {
 		launch = cached.Launch
 	}
 	if launch == nil {
-		record, problem := h.record()
-		if problem != nil {
+		record, problem := h.running()
+		switch {
+		case problem != nil:
 			return nil, problem
-		}
-		if record != nil && h.alive(record.PID) {
-			launch, problem = h.await(ctx, record)
-			if problem != nil {
+		case record != nil:
+			if launch, problem = h.await(ctx, record); problem != nil {
 				return nil, problem
 			}
 			h.remember(launch, *record)
-		} else {
-			launch, problem = h.launchLocked(ctx)
-			if problem != nil {
+		case !start:
+			return nil, stopped()
+		default:
+			if launch, problem = h.launchLocked(ctx); problem != nil {
 				return nil, problem
 			}
 		}
@@ -559,10 +589,8 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 	}
 }
 
+// launchLocked starts a new agent once running found none.
 func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
-	if userunit.Available() && userunit.MainPID(userunit.Name("cozy-machine-agent", h.dir, false)) > 0 {
-		return nil, exit.Named(exit.Conflict, "machine.process_untracked", "a machine agent already owns this root but its authenticated launch record is missing; preserve it for repair")
-	}
 	// A directly launched agent or surviving Runtime may have no client record.
 	// Observe its kernel ownership before touching receipt or launch metadata.
 	release, problem := h.bootstrapLease()
@@ -683,16 +711,14 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, record host
 // its own session. Its output appends to host.log.
 func (h *Host) spawn(env []string, log *os.File) (int, error) {
 	if userunit.Available() {
-		unit := userunit.Name("cozy-machine-agent", h.dir, false)
-		if userunit.MainPID(unit) > 0 {
-			return 0, fmt.Errorf("the machine unit is already running without a verified record")
-		}
+		unit := h.Unit()
 		already, err := userunit.Start(userunit.Spec{Unit: unit, Argv: []string{h.binary()}, Env: env, Dir: h.Root(), Stdout: log.Name(), Stderr: log.Name()})
 		if err != nil {
 			return 0, err
 		}
 		if already {
-			return 0, fmt.Errorf("the machine unit was started by another owner; no launch record was replaced")
+			// Only a launcher outside host.lock gets here; the next use adopts its agent.
+			return 0, fmt.Errorf("the machine unit started meanwhile; the next use attaches to it")
 		}
 		if pid := userunit.MainPID(unit); pid > 0 {
 			return pid, nil
@@ -722,13 +748,21 @@ func (h *Host) Stop(ctx context.Context) *exit.Error {
 	return h.stopLocked(ctx)
 }
 
+// stopLocked ends the root's agent, then retires its record. The root's unit is stopped by
+// name, record or not: systemd answers once every process it ran is gone, its executor's too
+// (a PID's executable is not yet the agent's there, and a stop that trusted it left one running).
 func (h *Host) stopLocked(ctx context.Context) *exit.Error {
 	h.cached = nil
 	record, problem := h.record()
-	if problem != nil || record == nil {
+	if problem != nil {
 		return problem
 	}
-	if h.alive(record.PID) {
+	if unit := h.Unit(); userunit.Available() && userunit.Running(unit) {
+		if err := userunit.Stop(unit); userunit.Running(unit) {
+			return exit.Internalf("cannot stop the machine unit %s: %v", unit, err)
+		}
+	}
+	if record != nil && h.alive(record.PID) {
 		if err := terminate(record.PID); err != nil {
 			return exit.Internalf("cannot stop the machine Host: %s", err)
 		}
@@ -752,6 +786,7 @@ type Status struct {
 	MachineID string
 	PID       int
 	Running   bool
+	Recorded  bool // the running agent has its launch record; the next use adopts one without
 }
 
 func (h *Host) Status() (Status, *exit.Error) {
@@ -767,6 +802,13 @@ func (h *Host) Status() (Status, *exit.Error) {
 	if record != nil {
 		out.PID, out.Running, out.MachineID = record.PID, h.alive(record.PID), record.WorkerID
 	}
+	if unit := h.Unit(); userunit.Available() && userunit.Running(unit) {
+		out.PID, out.Running = userunit.MainPID(unit), true
+	}
+	if !out.Running {
+		out.PID = 0
+	}
+	out.Recorded = out.Running && record != nil && record.PID == out.PID
 	if out.MachineID == "" {
 		if raw, err := os.ReadFile(h.path("machine-id")); err == nil {
 			out.MachineID = strings.TrimSpace(string(raw))
@@ -900,6 +942,57 @@ func (h *Host) record() (*hostRecord, *exit.Error) {
 	return &record, nil
 }
 
+// Unit is the root's systemd user unit. Its name derives from the root, so whatever it runs
+// is this root's agent, launch record or not.
+func (h *Host) Unit() string { return userunit.Name("cozy-machine-agent", h.dir, false) }
+
+// running is the root's live agent's launch record, nil when none runs; a record whose agent
+// is gone is retired. An agent the root's unit runs without its record (an older cozy's stop
+// removed it) is adopted: its record is read back from the agent's own environment.
+func (h *Host) running() (*hostRecord, *exit.Error) {
+	record, problem := h.record()
+	if problem != nil {
+		return nil, problem
+	}
+	unit := h.Unit()
+	if !userunit.Available() || !userunit.Running(unit) {
+		if record != nil && h.alive(record.PID) {
+			return record, nil
+		}
+		if err := os.Remove(h.path("agent.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, exit.Internalf("cannot retire the machine Host record: %s", err)
+		}
+		return nil, nil
+	}
+	pid := userunit.MainPID(unit)
+	if record != nil && record.PID == pid {
+		return record, nil
+	}
+	if !h.alive(pid) { // systemd's executor has not exec'd the agent yet
+		return nil, exit.Named(exit.Unavailable, "machine.host_starting", "the machine unit %s is still starting", unit)
+	}
+	environ, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/environ")
+	env := map[string]string{}
+	for _, pair := range strings.Split(string(environ), "\x00") {
+		name, value, _ := strings.Cut(pair, "=")
+		env[name] = value
+	}
+	key, _ := os.ReadFile(h.path("receipt-key"))
+	adopted := hostRecord{PID: pid, WorkerID: env["COZY_WORKER_ID"], ReceiptKey: strings.TrimSpace(string(key)), StartTicks: processStartTicks(pid)}
+	adopted.WorkerPort, _ = strconv.Atoi(env["COZY_WORKER_INTERNAL_PORT"])
+	adopted.MediaPort, _ = strconv.Atoi(env["COZY_MEDIA_INTERNAL_PORT"])
+	if env["COZY_MACHINE_ROOT"] != h.Root() || adopted.WorkerID == "" || adopted.WorkerPort == 0 || adopted.MediaPort == 0 || adopted.ReceiptKey == "" {
+		return nil, exit.Named(exit.Conflict, "machine.process_untracked", "the machine unit %s runs an agent whose launch cannot be read back", unit).
+			WithRemedy("`cozy machine stop` ends it; `cozy machine start` then starts a fresh one")
+	}
+	raw, _ := json.Marshal(adopted)
+	if err := writePrivate(h.path("agent.json"), raw); err != nil {
+		return nil, exit.Internalf("cannot record the adopted machine Host: %s", err)
+	}
+	h.note(fmt.Sprintf("adopted the running agent %d of unit %s, whose launch record was missing", pid, unit))
+	return &adopted, nil
+}
+
 // alive is whether pid is this root's Host, not merely a live process that reused the pid.
 func (h *Host) alive(pid int) bool {
 	if pid <= 0 {
@@ -927,8 +1020,7 @@ func (h *Host) alive(pid int) bool {
 // first as the unit's main process, at the unit's nice and quota, and on a loaded box it can
 // outlast the first readiness probe (run 2311 failed so, 42 ms after the unit started).
 func (h *Host) starting(pid int) bool {
-	unit := userunit.Name("cozy-machine-agent", h.dir, false)
-	return userunit.Available() && userunit.MainPID(unit) == pid && userunit.Running(unit)
+	return userunit.Available() && userunit.MainPID(h.Unit()) == pid && userunit.Running(h.Unit())
 }
 
 // Legacy identity is only a refusal census, never permission to signal a PID.

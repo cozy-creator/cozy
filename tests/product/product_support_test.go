@@ -63,6 +63,11 @@ func TestMain(m *testing.M) {
 		runDaemonReaper(strings.TrimPrefix(os.Args[1], reapMode), os.Stdin) //cozy:stdin-value owned reaper subprocess liveness pipe
 		os.Exit(0)
 	}
+	// So is a root's machine agent (local_machine_lifecycle_test.go).
+	if filepath.Base(os.Args[0]) == "cozy-machine" {
+		serveFakeMachineAgent()
+		os.Exit(0)
+	}
 	// Reap the roots the previous run abandoned before claiming disk of our own,
 	// and refuse to start at all on a box that has no fork headroom left — a
 	// suite that dies partway through leaks a scratch root per killed test.

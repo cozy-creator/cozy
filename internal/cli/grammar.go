@@ -29,7 +29,8 @@ type CLI struct {
 type MachineCmd struct {
 	Install MachineInstallCmd `cmd:"" help:"Install a worker cohort's Host and Runtime as this computer's machine."`
 	Show    MachineShowCmd    `cmd:"" help:"Show this computer's machine."`
-	Stop    MachineStopCmd    `cmd:"" help:"Stop this computer's machine Host; the next local run starts it again."`
+	Start   MachineStartCmd   `cmd:"" help:"Start this computer's machine, or adopt the running one."`
+	Stop    MachineStopCmd    `cmd:"" help:"Stop this computer's machine; it stays stopped until it is started or a local run starts it."`
 }
 
 type MachineInstallCmd struct {
@@ -46,6 +47,12 @@ type MachineShowCmd struct{}
 
 func (c *MachineShowCmd) Run(r *Runtime) error {
 	return r.call(handleMachineShow, nil, nil, nil, false)
+}
+
+type MachineStartCmd struct{}
+
+func (c *MachineStartCmd) Run(r *Runtime) error {
+	return r.call(handleMachineStart, nil, nil, nil, false)
 }
 
 type MachineStopCmd struct{}

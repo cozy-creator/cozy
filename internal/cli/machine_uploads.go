@@ -175,7 +175,7 @@ func (m *machineRuns) uploadOnce(requestID string, upload records.OutputUpload) 
 	source := &pb.DerivedRetentionRequest{WeightsTransactionId: retained.hold.TransactionID,
 		TensorfsReceiptDigest: retained.hold.ReceiptDigest, RetentionId: retained.hold.RetentionID}
 	manifest := &pb.Ref{Digest: digest, Length: uint64(retained.artifact.Manifest.Length)}
-	ctx := m.ctx
+	ctx := machines.AttachOnly(m.ctx)
 	connection, problem := m.connectAtHub(ctx, retained.machine, request.Hub, "uploading its "+upload.Output)
 	if problem != nil {
 		return "", problem

@@ -21,7 +21,7 @@ import (
 func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *exit.Error) {
 	selectedHost := source.Host
 
-	launch, problem := h.ensureLocked(ctx, "", nil)
+	launch, problem := h.ensureLocked(ctx, "", nil, true)
 	if problem != nil {
 		return nil, problem
 	}
