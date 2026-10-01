@@ -168,7 +168,7 @@ func settledRun(t *testing.T, l home.Layout, store *records.Store, requestID str
 		t.Fatal(problem)
 	}
 	fatal(t, store.Closed(requestID, attempt))
-	fatal(t, store.CompleteOutputExport(requestID, []string{published}))
+	fatal(t, store.SettleOutputExport(requestID, []string{published}, nil))
 }
 
 func submitSweepRequest(t *testing.T, store *records.Store, requestID string) {

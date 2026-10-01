@@ -155,6 +155,11 @@ func (s *Store) RefuseMachineCollection(id string, refusal *exit.Error) *exit.Er
 		map[string]any{"machine_execution": true, "error_code": refusal.ErrName(), "error": refusal.Message}); err != nil {
 		return exit.Internalf("cannot record collection refusal: %s", err)
 	}
+	// Its outputs not yet in their folder stay undelivered (an export that ran keeps its own).
+	if _, err := tx.Exec(`UPDATE request_output_exports SET state='failed',error_code=?,safe_error=?,updated_at=?
+ WHERE request_id=? AND state IN ('pending','exporting')`, refusal.ErrName(), refusal.Message, now(), id); err != nil {
+		return exit.Internalf("cannot end the refused collection's export: %s", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit collection refusal: %s", err)
 	}

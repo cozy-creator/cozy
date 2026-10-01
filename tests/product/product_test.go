@@ -337,17 +337,17 @@ func TestProductPath(t *testing.T) {
 	}
 	// The run's record says the same, as text and as JSON.
 	if code, out = runCozy(t, root, "run", "show", idMatch[1]); code != 0 ||
-		!strings.Contains(out, "collection pending: output_destination_unwritable") {
-		t.Fatalf("run show did not name the pending collection [exit %d]\n%s", code, out)
+		!strings.Contains(out, "collection ended: output_destination_unwritable") || !strings.Contains(out, "undelivered") {
+		t.Fatalf("run show did not name the ended collection and its undelivered output [exit %d]\n%s", code, out)
 	}
 	if code, out = runCozy(t, root, "run", "show", idMatch[1], "--json"); code != 0 ||
-		!strings.Contains(out, `"collection_pending":"output_destination_unwritable"`) {
-		t.Fatalf("run show --json did not name the pending collection [exit %d]\n%s", code, out)
+		!strings.Contains(out, `"collection_refused":"output_destination_unwritable"`) {
+		t.Fatalf("run show --json did not name the refused collection [exit %d]\n%s", code, out)
 	}
 	// Watching again once the cause is fixed collects the result the machine kept.
 	must(t, os.Chmod(incidentDir, 0o755))
 	code, out = runCozy(t, root, "run", "watch", idMatch[1], "--json")
-	if code != 0 || !strings.Contains(out, `"status":"completed"`) || strings.Contains(out, "collection pending") {
+	if code != 0 || !strings.Contains(out, `"status":"completed"`) || strings.Contains(out, "collection ended") {
 		t.Fatalf("restored destination did not take the kept result [exit %d]\n%s", code, out)
 	}
 	incidentFiles, err := os.ReadDir(incidentDir)

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -62,7 +64,7 @@ func (m *machineRuns) holdProducts(ctx context.Context, request records.Request,
 		if directory != "" {
 			// The file is where people look while the run goes on. A folder that refuses it never
 			// stops the log: the run's end brings every item's file to its final revision, and a
-			// refusal there waits on the owner as a pending collection, never a silent hang.
+			// refusal there ends the collection on record, never a silent hang.
 			product.Path = filepath.Join(directory, itemFile(strconv.FormatInt(request.Number, 10), item, product.MediaType))
 			_ = writeItem(ctx, connection, directory, product.Path, item, product)
 		}
@@ -338,6 +340,7 @@ func syncDirectory(path string) *exit.Error {
 // exportProducts settles the run's result, whatever its terminal: each item's file at its
 // final revision, checked against that revision's sha256. A file a refused write left behind is
 // written now from the machine's log, which holds every item's current bytes until the ack.
+// Every item is judged; the export records those delivered and why the others were not.
 func (m *machineRuns) exportProducts(ctx context.Context, connection *machineConnection, query *pb.MachineExecutionQuery, request records.Request) *exit.Error {
 	export, problem := m.store.OutputExportOf(request.ID)
 	if problem != nil || export == nil || export.State == "published" {
@@ -348,12 +351,14 @@ func (m *machineRuns) exportProducts(ctx context.Context, connection *machineCon
 		return problem
 	}
 	var live *runoutputs.Fold
-	var paths []string
+	var paths, failed []string
+	var failure *exit.Error
 	for _, product := range records.Fold(products) {
 		if product.Path == "" {
 			continue
 		}
-		if verifyFinal(product) != nil {
+		problem := verifyFinal(product)
+		if problem != nil {
 			if live == nil {
 				if live, problem = m.logFold(ctx, connection, query, request); problem != nil {
 					return problem
@@ -363,24 +368,27 @@ func (m *machineRuns) exportProducts(ctx context.Context, connection *machineCon
 			if product.Op == records.ProductAppend {
 				index = product.Index + 1
 			}
-			item, ok := live.Item(product.Output, index)
-			if !ok {
-				return exit.New(exit.Conflict, "the machine's log no longer names output %s", product.Item)
-			}
-			problem = writeItem(ctx, connection, export.Directory, product.Path, item, product)
-			if problem == nil {
+			if item, ok := live.Item(product.Output, index); !ok {
+				problem = exit.New(exit.Conflict, "the machine's log no longer names it")
+			} else if problem = writeItem(ctx, connection, export.Directory, product.Path, item, product); problem == nil {
 				problem = verifyFinal(product)
 			}
-			if problem != nil {
-				named := *problem
-				named.Message = "output " + product.Output + ": " + problem.Message
-				_ = m.store.FailOutputExport(request.ID, named.ErrName(), named.Message)
-				return &named
-			}
+		}
+		if problem != nil {
+			failed, failure = append(failed, product.Output), cmp.Or(failure, problem)
+			continue
 		}
 		paths = append(paths, product.Path)
 	}
-	return m.store.CompleteOutputExport(request.ID, paths)
+	if failure != nil {
+		named := *failure
+		named.Message = strings.Join(slices.Compact(failed), ", ") + ": " + failure.Message
+		failure = &named
+	}
+	if problem := m.store.SettleOutputExport(request.ID, paths, failure); problem != nil {
+		return problem
+	}
+	return failure
 }
 
 // logFold reads the run's product entries from its machine again, with the byte sources the

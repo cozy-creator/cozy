@@ -120,9 +120,8 @@ type MachineExecutionView struct {
 	// Retained says why the finished result stays with the machine: nothing on this host
 	// can receive it, so no observation waits for it.
 	Retained string `json:"retained,omitempty"`
-	// CollectionRefused names why collecting a finished result cannot proceed until the
-	// owner acts (a destination that refuses the files, say); the machine keeps the result
-	// and a later observation collects it once the cause is fixed.
+	// CollectionRefused names why collecting a finished result ended (a destination that
+	// refuses its files, bytes its machine no longer holds); only `cozy run watch` tries again.
 	CollectionRefused string `json:"collection_refused,omitempty"`
 	// Worker and Number name the run on its machine, as the machine's receipt does; Number
 	// is 0 from a Runtime older than wire 66.

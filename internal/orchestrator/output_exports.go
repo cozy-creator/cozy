@@ -79,7 +79,7 @@ func (c *Orchestrator) RetryOutputExport(requestID string) {
 		c.failOutputExport(requestID, problem)
 		return
 	}
-	if problem := c.opt.Store.CompleteOutputExport(requestID, paths); problem != nil {
+	if problem := c.opt.Store.SettleOutputExport(requestID, paths, nil); problem != nil {
 		c.logf("output export %s settlement failed: %s", requestID, problem.Message)
 		return
 	}
@@ -155,7 +155,7 @@ func outputExportPaths(export records.OutputExport, outputs []records.Output) ([
 }
 
 func (c *Orchestrator) failOutputExport(requestID string, problem *exit.Error) {
-	if persist := c.opt.Store.FailOutputExport(requestID, problem.ErrName(), problem.Message); persist != nil {
+	if persist := c.opt.Store.SettleOutputExport(requestID, nil, problem); persist != nil {
 		c.logf("output export %s failed (%s) and its failure could not be recorded: %s",
 			requestID, problem.ErrName(), persist.Message)
 		return

@@ -2532,20 +2532,14 @@ func undelivered(life api.Lifecycle) *exit.Error {
 	if export == nil {
 		return nil
 	}
-	written := map[string]bool{}
 	if export.State == "published" {
-		for _, path := range export.Paths {
-			written[path] = true
-		}
+		return nil
 	}
 	var missing, names []string
 	for _, item := range life.Output {
-		if !written[item.Path] {
+		if export.State != "failed" || item.Status == "undelivered" {
 			missing, names = append(missing, item.ID), append(names, item.Name)
 		}
-	}
-	if len(missing) == 0 && export.State == "published" {
-		return nil
 	}
 	named := "its outputs are"
 	if names = slices.Compact(names); len(names) > 0 {
