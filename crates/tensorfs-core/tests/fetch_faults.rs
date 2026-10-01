@@ -1400,6 +1400,47 @@ fn a_slow_hub_is_waited_for_not_timed_out() {
     );
 }
 
+/// A hub that has not answered is waited for (no timer on a live hub's answer), but the
+/// wait is visible, one Resolving event a tick, and the caller's cancellation ends it.
+#[test]
+fn a_hub_that_never_answers_is_a_visible_wait_that_cancellation_ends() {
+    let dir = temporary("hub-mute");
+    let checkpoint = checkpoint(1, 4096, 25);
+    let hub = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![on(
+                "closure",
+                1..=usize::MAX,
+                Fault::Delay(Duration::from_secs(3600)),
+            )],
+            ..Config::default()
+        },
+    );
+    let root = store(&dir);
+    let cancellation = PullCancellation::default();
+    let cancelled: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let (cancel, at) = (cancellation.clone(), Arc::clone(&cancelled));
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs_f64(ensure::EVENT_SECONDS * 3.5));
+        *at.lock().unwrap() = Some(Instant::now());
+        cancel.cancel();
+    });
+    let mut run = Run::new(&hub, &root);
+    run.cancellation = Some(cancellation);
+    let outcome = run.ensure();
+    let waited = cancelled.lock().unwrap().expect("cancelled").elapsed();
+    assert!(outcome.result.is_err());
+    let resolving = outcome
+        .events
+        .iter()
+        .filter(|e| e.phase == Phase::Resolving)
+        .count();
+    assert!(resolving >= 3, "{resolving} Resolving events in 3.5 ticks");
+    let floor = sample() * tensorfs_core::transport::STILL_SAMPLES;
+    assert!(waited < floor, "cancellation took {waited:?}");
+}
+
 #[test]
 fn the_hubs_own_verdicts_are_typed_and_terminal() {
     for (status, error, code) in [

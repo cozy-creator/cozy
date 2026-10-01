@@ -164,3 +164,63 @@ fn a_tls_alert_from_the_peer_is_weather_and_asked_again() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A hub that accepts the connection and never speaks TLS is weather, judged by the ledger's
+/// patience in the handshake (a live peer answers it at once), and never a hang.
+#[test]
+fn a_hub_that_never_speaks_tls_is_weather_and_never_a_hang() {
+    let dir = std::env::temp_dir().join(format!("tfs-hub-tls-mute-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.join("store");
+    let init = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["store", "init", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for socket in listener.incoming() {
+            held.extend(socket.ok());
+        }
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ensure", root.to_str().unwrap(), "proof/model"])
+        .args(["--hub", &format!("https://127.0.0.1:{port}")])
+        .args(["--sample-seconds", "0.05"])
+        .env("TFS_CREDENTIAL", "")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A hang guard on output, not a verdict: tfs ensure prints a line every second.
+    let stdout = child.stdout.take().unwrap();
+    let (lines, read) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(|l| l.ok())
+        {
+            let _ = lines.send(line);
+        }
+    });
+    let mut last = String::new();
+    loop {
+        match read.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(line) => last = line,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!("tfs ensure printed nothing for 30 s; last: {last}");
+            }
+        }
+    }
+    assert!(!child.wait().unwrap().success());
+    assert!(
+        last.contains("\"code\":\"HUB_UNREACHABLE\"") && last.contains("\"resumable\":true"),
+        "{last}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

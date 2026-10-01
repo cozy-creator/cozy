@@ -227,9 +227,14 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
             });
         }
     };
-    say(Phase::Resolving, 0, 0, 0.0, 0);
-    let closure = transport::resolve_closure(&request.pull(request.store))?;
     let tick = Duration::from_secs_f64(EVENT_SECONDS);
+    // Resolving says so once per tick: a hub that takes its time is time passing on the
+    // caller's display, never silence, and the caller's cancellation still ends it.
+    let resolving = || say(Phase::Resolving, 0, 0, 0.0, 0);
+    resolving();
+    let closure = ticking(tick, &resolving, || {
+        transport::resolve_closure(&request.pull(request.store))
+    })?;
     let declared = closure.manifest.length + closure.objects.iter().map(|o| o.length).sum::<u64>();
     let flight = Flight::lead(
         request.store,
@@ -346,6 +351,27 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
         attempts: counters.attempt.load(Ordering::Relaxed),
         joined: flight.joined,
         seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
+/// Run `work`, calling `tick` once per `every` until it returns.
+fn ticking<T>(every: Duration, tick: &(dyn Fn() + Sync), work: impl FnOnce() -> T) -> T {
+    let stop = (Mutex::new(false), Condvar::new());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut stopped = stop.0.lock().unwrap();
+            loop {
+                stopped = stop.1.wait_timeout(stopped, every).unwrap().0;
+                if *stopped {
+                    return;
+                }
+                tick();
+            }
+        });
+        let out = work();
+        *stop.0.lock().unwrap() = true;
+        stop.1.notify_all();
+        out
     })
 }
 

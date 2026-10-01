@@ -154,6 +154,33 @@ fn stream_verdict(judge: Judge, ledger: &Ledger, advanced: Instant, phase: &str)
     )
 }
 
+/// Connect, TLS and the request write are phases a live peer answers at once, so on the
+/// CONTROL plane too their silence past the ledger's patience is the peer's verdict: the
+/// exchange's own failure code, which `hub::call` re-asks. Before a byte of the pull has
+/// moved this is the only bound a black-holed hub meets. The head wait is never judged this
+/// way: a live hub may take its time, and a dead one is found by TCP keepalive.
+fn handshake_verdict(
+    judge: Judge,
+    ledger: &Ledger,
+    advanced: Instant,
+    phase: &str,
+    fail: Code,
+) -> Result<()> {
+    stream_verdict(judge, ledger, advanced, phase)?;
+    if judge != Judge::Transfer || advanced.elapsed() <= ledger.patience() {
+        return Ok(());
+    }
+    refuse(
+        fail,
+        format!(
+            "the peer was silent {:.1} s during {phase} against the {:.1} s this pull's \
+             measured pace allows",
+            advanced.elapsed().as_secs_f64(),
+            ledger.patience().as_secs_f64(),
+        ),
+    )
+}
+
 impl Judge {
     fn silent_is_stall(self) -> bool {
         matches!(self, Judge::Stream | Judge::Silence)
@@ -505,7 +532,7 @@ fn connect(
                 transfer_verdict(judge, ledger, since, "a TCP connection")?;
                 // A silent address is that address's verdict, not the URL's: an IPv6 route
                 // that drops SYNs while IPv4 answers must not stall every ask of a pull.
-                if let Err(silent) = stream_verdict(judge, ledger, since, "TCP connect") {
+                if let Err(silent) = handshake_verdict(judge, ledger, since, "TCP connect", fail) {
                     ledger.check_running()?;
                     last = Some(std::io::Error::new(ErrorKind::TimedOut, silent.detail));
                     continue 'addresses;
@@ -544,6 +571,7 @@ fn connect(
             detail: format!("configure connected socket: {error}"),
         })?;
         let _ = socket.set_nodelay(true);
+        keepalive(&socket, ledger);
         return Ok(socket);
     }
     refuse(
@@ -554,6 +582,19 @@ fn connect(
             last.map(|error| error.to_string()).unwrap_or_default()
         ),
     )
+}
+
+/// TCP keepalive at the ledger's own resolution: probes start after the noise floor of
+/// silence and a peer that answers none of `STILL_SAMPLES` probes, a sample apart, is gone.
+/// A live hub that is merely slow ACKs every probe and is waited for; a dead host or a
+/// dropped tunnel fails the read as weather, which the caller asks again.
+fn keepalive(socket: &TcpStream, ledger: &Ledger) {
+    use rustix::net::sockopt;
+    let second = Duration::from_secs(1);
+    let _ = sockopt::set_socket_keepalive(socket, true);
+    let _ = sockopt::set_tcp_keepidle(socket, ledger.floor().max(second));
+    let _ = sockopt::set_tcp_keepintvl(socket, ledger.sample().max(second));
+    let _ = sockopt::set_tcp_keepcnt(socket, crate::transport::ledger::STILL_SAMPLES);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -582,7 +623,7 @@ fn tls_handshake(
                 Ok(n) if n > 0 => advanced = Instant::now(),
                 Ok(_) => {}
                 Err(e) if would_block(&e) => {
-                    stream_verdict(judge, ledger, advanced, "TLS handshake")?;
+                    handshake_verdict(judge, ledger, advanced, "TLS handshake", fail)?;
                 }
                 Err(e) => return refuse(fail, format!("TLS handshake write: {e}")),
             }
@@ -618,7 +659,7 @@ fn tls_handshake(
                 }
             }
             Err(e) if would_block(&e) => {
-                stream_verdict(judge, ledger, advanced, "TLS handshake")?;
+                handshake_verdict(judge, ledger, advanced, "TLS handshake", fail)?;
             }
             Err(e) => return refuse(fail, format!("TLS handshake read: {e}")),
         }
@@ -1295,7 +1336,7 @@ fn write_all(
                 Err(e) => return refuse(fail, format!("the connection failed mid-write: {e}")),
             }
         }
-        stream_verdict(judge, ledger, advanced, "request write")?;
+        handshake_verdict(judge, ledger, advanced, "request write", fail)?;
         if let Some(bound) = silence {
             if advanced.elapsed() > bound {
                 return refuse(
