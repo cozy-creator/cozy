@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -63,6 +64,7 @@ func TestMain(m *testing.M) {
 		runDaemonReaper(strings.TrimPrefix(os.Args[1], reapMode), os.Stdin) //cozy:stdin-value owned reaper subprocess liveness pipe
 		os.Exit(0)
 	}
+	flag.Parse()
 	// Reap the roots the previous run abandoned before claiming disk of our own,
 	// and refuse to start at all on a box that has no fork headroom left — a
 	// suite that dies partway through leaks a scratch root per killed test.
@@ -100,11 +102,22 @@ func TestMain(m *testing.M) {
 		panic("the suite's unanswered Tensorhub " + testDefaultHub + " answers on this box")
 	}
 	cozyBin = filepath.Join(dir, "cozy")
-	build := exec.Command("go", "build", "-o", cozyBin, ".")
-	build.Dir = "../.."
-	if out, err := build.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "building cozy: %v\n%s", err, out)
-		os.Exit(1)
+	if *productCozyBinary != "" {
+		data, err := os.ReadFile(*productCozyBinary)
+		if err == nil {
+			err = os.WriteFile(cozyBin, data, 0755)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "staging prebuilt cozy:", err)
+			os.Exit(1)
+		}
+	} else {
+		build := exec.Command("go", "build", "-o", cozyBin, ".")
+		build.Dir = "../.."
+		if out, err := build.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "building cozy: %v\n%s", err, out)
+			os.Exit(1)
+		}
 	}
 	// Every daemon this run causes to exist dies with it. Layer 3 first, so the roots a
 	// test registers are known to a process that outlives a SIGKILL of this one.
