@@ -116,8 +116,18 @@ impl Recovery {
     }
 
     /// Reserve this object's share of the idle lanes, if the disk has room for the copy.
+    /// A stream measured slow against a comparable transfer is barely using its own lane,
+    /// so that lane counts as idle for its hedge even when the walk has none to spare: a
+    /// cold-object stall mid-pull is hedged then, not only once the walk drains.
     /// The caller hands the count to a `Hold`, which returns it.
-    fn reserve(&self, lanes: Lanes, length: u64, store: &Store, whole: bool) -> Option<usize> {
+    fn reserve(
+        &self,
+        lanes: Lanes,
+        length: u64,
+        store: &Store,
+        whole: bool,
+        own: bool,
+    ) -> Option<usize> {
         let share = (lanes.level / lanes.busy.max(1)).max(1);
         let parts = if whole {
             1
@@ -126,7 +136,7 @@ impl Recovery {
         };
         loop {
             let racing = self.racing.load(Ordering::Acquire);
-            let spare = lanes.level.saturating_sub(lanes.busy + racing);
+            let spare = (lanes.level + usize::from(own)).saturating_sub(lanes.busy + racing);
             let mut want = share.min(spare).min(parts);
             // Room for the original's object beside the hedge's copies: a ranged hedge
             // assembles in scratch before its door writes, so a disk without room for
@@ -270,6 +280,7 @@ impl Recovery {
                         // are evidence enough; the stall floor guards verdicts, not hedges.
                         let evidence = ledger.sample() * 2;
                         let mut every_slow = true;
+                        let mut measured = false;
                         for racer in racers.iter_mut().filter(|racer| racer.live) {
                             let data = racer.state.data.lock().unwrap().clone();
                             racer.window.observe(&data);
@@ -277,13 +288,18 @@ impl Recovery {
                             // comparable evidence, only an idle tail probes, once per object.
                             every_slow &= !racer.ranged
                                 && match self.judge(&data, &racer.window, length, evidence) {
-                                    Verdict::Slow => true,
+                                    Verdict::Slow => {
+                                        measured = true;
+                                        true
+                                    }
                                     Verdict::Unreferenced => first && now.tail,
                                     Verdict::Healthy | Verdict::Unmeasured => false,
                                 };
                         }
                         if every_slow {
-                            if let Some(lanes) = self.reserve(now, length, store, fallback) {
+                            if let Some(lanes) =
+                                self.reserve(now, length, store, fallback, measured)
+                            {
                                 // A whole hedge spends its ask itself; a ranged one spends
                                 // one here, its parts resuming within their own asks.
                                 let budgeted = if lanes > 1 {
@@ -410,27 +426,31 @@ mod tests {
             busy: 8,
             tail: true,
         };
-        let lanes = recovery.reserve(tail, 64 << 20, &store, false).unwrap();
+        let lanes = recovery
+            .reserve(tail, 64 << 20, &store, false, false)
+            .unwrap();
         assert_eq!(lanes, 16, "eight stragglers share 120 idle lanes");
         let hold = Hold {
             racing: &recovery.racing,
             lanes,
         };
-        assert_eq!(recovery.reserve(tail, 64 << 20, &store, true), Some(1));
-        recovery.racing.fetch_sub(1, Ordering::AcqRel);
         assert_eq!(
-            recovery.reserve(
-                Lanes {
-                    level: 4,
-                    busy: 4,
-                    tail: true
-                },
-                1 << 30,
-                &store,
-                false
-            ),
-            None
+            recovery.reserve(tail, 64 << 20, &store, true, false),
+            Some(1)
         );
+        recovery.racing.fetch_sub(1, Ordering::AcqRel);
+        let full = Lanes {
+            level: 4,
+            busy: 4,
+            tail: false,
+        };
+        assert_eq!(recovery.reserve(full, 64 << 20, &store, false, false), None);
+        assert_eq!(
+            recovery.reserve(full, 64 << 20, &store, false, true),
+            Some(1),
+            "a measured stall lends its own lane to its hedge"
+        );
+        recovery.racing.fetch_sub(1, Ordering::AcqRel);
         drop(hold);
         assert_eq!(recovery.racing.load(Ordering::Acquire), 0);
         let _ = std::fs::remove_dir_all(root);
