@@ -5,7 +5,7 @@
 
 use super::hub::{credential_from_spec, Anonymous, HostToken};
 use super::ledger::{Deadline, Ledger};
-use super::policy::{self, blocked, SourcePolicy};
+use super::policy::{self, blocked, CheckedUrl, SourcePolicy};
 use super::pull::{absolute_location, fetch_url, pull, ObjectSource, PullRequest};
 use super::push::{push_object, UploadGrant};
 use super::ranged::{fetch_ranged, Ranged, SOURCE_STREAMS};
@@ -1523,6 +1523,55 @@ fn fragmented_headers_can_progress_across_multiple_stream_windows() {
     .unwrap();
     assert_eq!(response.read_capped(3).unwrap(), b"abc");
     assert!(started.elapsed() > ledger.floor() * 2);
+}
+
+/// A first address that never completes the TCP handshake (an IPv6 route that drops SYNs
+/// while IPv4 works; here a listener whose accept queue is full, so the kernel drops every
+/// SYN) is that address's verdict, not the URL's: the next checked address is asked.
+#[test]
+fn a_silent_first_address_gives_way_to_the_next() {
+    let hole = TcpListener::bind("127.0.0.1:0").unwrap();
+    rustix::net::listen(&hole, 0).unwrap();
+    let filled: Vec<_> = (0..4)
+        .filter_map(|_| {
+            TcpStream::connect_timeout(&hole.local_addr().unwrap(), Duration::from_millis(100))
+                .ok()
+        })
+        .collect();
+    let live = TcpListener::bind("127.0.0.1:0").unwrap();
+    let live_addr = live.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut socket, _) = live.accept().unwrap();
+        read_request(&mut socket).unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+            .unwrap();
+    });
+    let checked = CheckedUrl {
+        https: false,
+        host: "127.0.0.1".into(),
+        port: live_addr.port(),
+        target: "/object".into(),
+        addrs: vec![hole.local_addr().unwrap(), live_addr],
+    };
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let started = std::time::Instant::now();
+    let response = super::http::request(
+        &super::http::Client::new(),
+        &checked,
+        "GET",
+        &[],
+        None,
+        Deadline::none(),
+        &ledger,
+        super::http::Judge::Stream,
+        None,
+        Code::TRANSFER_FAILED,
+    )
+    .unwrap();
+    assert_eq!(response.read_capped(3).unwrap(), b"abc");
+    assert!(started.elapsed() > ledger.floor(), "the silent address was never tried");
+    drop(filled);
 }
 
 #[test]

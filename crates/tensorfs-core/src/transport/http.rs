@@ -503,7 +503,13 @@ fn connect(
                 // sample. Cancellation and existing silence rules remain active
                 // without imposing a new total connection deadline.
                 transfer_verdict(judge, ledger, since, "a TCP connection")?;
-                stream_verdict(judge, ledger, since, "TCP connect")?;
+                // A silent address is that address's verdict, not the URL's: an IPv6 route
+                // that drops SYNs while IPv4 answers must not stall every ask of a pull.
+                if let Err(silent) = stream_verdict(judge, ledger, since, "TCP connect") {
+                    ledger.check_running()?;
+                    last = Some(std::io::Error::new(ErrorKind::TimedOut, silent.detail));
+                    continue 'addresses;
+                }
                 let tick = deadline
                     .remaining()?
                     .map_or(ledger.sample(), |left| left.min(ledger.sample()));
