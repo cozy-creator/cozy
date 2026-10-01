@@ -235,14 +235,15 @@ pub fn fetch_ranged(
         deadline,
         ledger,
         ranged,
-        false,
+        None,
         observer,
     )
 }
 
-/// A hub object's hedge: the whole object again as `streams` ranged parts on fresh
-/// connections, each ask authorized by the walk's own lease supply so a part that
-/// outlives its URL re-mints instead of presenting it dead.
+/// A hub object's hedge: the whole object again as ranged parts on fresh connections, one
+/// stream per lane `lanes` holds — a count the walk raises as its lanes come free — each
+/// ask authorized by the walk's own lease supply so a part that outlives its URL re-mints
+/// instead of presenting it dead.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn hedge(
     store: &Store,
@@ -252,9 +253,10 @@ pub(super) fn hedge(
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
-    streams: usize,
+    lanes: &AtomicUsize,
 ) -> Result<Fetched> {
     let total = grant.object.length;
+    let streams = lanes.load(Ordering::Acquire);
     // Four parts a lane: a part stuck on a cold chunk is split or re-asked by the lanes that
     // finish theirs, and each part is a fresh ranged ask.
     let ranged = Ranged {
@@ -272,7 +274,7 @@ pub(super) fn hedge(
         deadline,
         ledger,
         ranged,
-        true,
+        Some(lanes),
         None,
     )
 }
@@ -566,7 +568,15 @@ struct Door<'a>(&'a Wire);
 
 impl Drop for Door<'_> {
     fn drop(&mut self) {
+        // Under the state lock, so a waiter that just found `stop` clear is already waiting
+        // when the notice comes. Poison-tolerant: this runs in a `Drop`.
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.0.stop.store(true, Ordering::Relaxed);
+        drop(state);
         self.0.filled.notify_all();
     }
 }
@@ -630,9 +640,12 @@ fn assemble(
     deadline: Deadline,
     ledger: &Ledger,
     ranged: Ranged,
-    race: bool,
+    // A hedge's lane count. A hedge races and splits unfinished parts with every stream it
+    // has, and runs a stream for each lane it is lent while the object is still incomplete.
+    lanes: Option<&AtomicUsize>,
     observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
+    let race = lanes.is_some();
     let parts = total.div_ceil(ranged.part) as usize;
     let scratch = Scratch::open(store, total)?;
     let wire = Wire {
@@ -660,35 +673,41 @@ fn assemble(
     };
     let streams = ranged.streams.min(parts);
     wire.live.store(streams, Ordering::Relaxed);
+    let (wire, file) = (&wire, &scratch.file);
+    let stream = move || {
+        let _worker = Worker(wire);
+        while let Some((index, from)) = wire.claim(race) {
+            let outcome = part(
+                wire, file, index, from, total, ask, client, policy, credential, deadline, ledger,
+            );
+            match outcome {
+                Ok(true) => {
+                    wire.landed(index);
+                    wire.leave(index, None);
+                }
+                // Another racer finished the part, or the door is done with the object and
+                // nothing is waiting for these bytes.
+                Ok(false) => wire.leave(index, None),
+                Err(refusal) => wire.leave(index, Some(refusal)),
+            }
+        }
+    };
 
     let admitted = std::thread::scope(|scope| -> Result<Admitted> {
         for _ in 0..streams {
-            scope.spawn(|| {
-                let _worker = Worker(&wire);
-                while let Some((index, from)) = wire.claim(race) {
-                    let outcome = part(
-                        &wire,
-                        &scratch.file,
-                        index,
-                        from,
-                        total,
-                        ask,
-                        client,
-                        policy,
-                        credential,
-                        deadline,
-                        ledger,
-                    );
-                    match outcome {
-                        Ok(true) => {
-                            wire.landed(index);
-                            wire.leave(index, None);
-                        }
-                        // Another racer finished the part, or the door is done with the
-                        // object and nothing is waiting for these bytes.
-                        Ok(false) => wire.leave(index, None),
-                        Err(refusal) => wire.leave(index, Some(refusal)),
+            scope.spawn(stream);
+        }
+        if let Some(lanes) = lanes {
+            scope.spawn(move || {
+                let mut running = streams;
+                let mut state = wire.state.lock().unwrap();
+                while !wire.stopped() && state.failure.is_none() && state.high < total {
+                    while running < lanes.load(Ordering::Acquire) {
+                        wire.live.fetch_add(1, Ordering::AcqRel);
+                        scope.spawn(stream);
+                        running += 1;
                     }
+                    state = wire.filled.wait_timeout(state, ledger.sample()).unwrap().0;
                 }
             });
         }
@@ -696,7 +715,7 @@ fn assemble(
             scratch: &scratch.file,
             at: 0,
             total,
-            wire: &wire,
+            wire,
             observer,
             reported: 0,
             tick: ledger.sample(),
@@ -704,7 +723,7 @@ fn assemble(
         // The door has read every byte it is going to read, whichever way it answered —
         // including by unwinding. Anything still on the wire is unwanted after that.
         let outcome = {
-            let _door = Door(&wire);
+            let _door = Door(wire);
             grant.admit(store, &mut reader)
         };
         reader.report();

@@ -6,6 +6,8 @@
 //!
 //! A large object is hedged as ranged parts on its share of the idle lanes, so a link
 //! whose individual answers are slow still fills; a small one as one fresh whole GET.
+//! Lanes are re-lent every sample: as the walk drains, the lanes it frees go to the
+//! ranged hedges still on the wire, so none sits idle while their bytes remain.
 //! Run 2322: R2 answered eight 64 MiB objects application-limited at 6-50 KB/s while the
 //! rest of the pull moved 400 MB/s, and nothing re-asked them for fifteen minutes.
 use super::{
@@ -50,25 +52,41 @@ pub(super) struct Recovery {
     pub won: AtomicUsize,
     /// Lanes hedges hold across the whole walk.
     racing: AtomicUsize,
+    /// Ranged hedges on the wire, which share the lanes the walk is not using.
+    ranged: AtomicUsize,
 }
+
+/// A hold's lanes once its hedge has returned: nothing more may be lent to it.
+const CLOSED: usize = usize::MAX;
 
 /// Lanes one hedge holds, returned however its thread leaves.
 struct Hold<'a> {
-    racing: &'a AtomicUsize,
-    lanes: usize,
+    recovery: &'a Recovery,
+    lanes: Arc<AtomicUsize>,
+    ranged: bool,
 }
 
 impl Drop for Hold<'_> {
     fn drop(&mut self) {
-        self.racing.fetch_sub(self.lanes, Ordering::AcqRel);
+        let lanes = self.lanes.swap(CLOSED, Ordering::AcqRel);
+        self.recovery.racing.fetch_sub(lanes, Ordering::AcqRel);
+        if self.ranged {
+            self.recovery.ranged.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
 struct Racer {
     state: Arc<Attempt>,
+    lanes: Arc<AtomicUsize>,
     ranged: bool,
     live: bool,
     window: Window,
+}
+
+/// The most lanes a ranged copy of `length` bytes can use: one per part it can be cut into.
+fn parts(length: u64) -> usize {
+    (length / ranged::HEDGE_PART).max(2) as usize
 }
 
 impl Recovery {
@@ -132,36 +150,70 @@ impl Recovery {
         whole: bool,
         own: bool,
     ) -> Option<usize> {
-        let share = (lanes.level / lanes.busy.max(1)).max(1);
-        let parts = if whole {
-            1
-        } else {
-            (length / ranged::HEDGE_PART).max(2) as usize
-        };
         // The original's object beside the hedge's copies: a ranged hedge assembles in
         // scratch before its door writes.
         let copies = if whole { 2 } else { 3 };
         if store.admits(length.saturating_mul(copies)).is_err() {
             return None;
         }
+        let share = (lanes.level / lanes.busy.max(1)).max(1);
+        let want = if whole { 1 } else { share.min(parts(length)) };
+        let taken = self.borrow(lanes, want, own);
+        if taken == 0 {
+            return None;
+        }
+        if !whole && taken < 2 {
+            self.racing.fetch_add(2 - taken, Ordering::AcqRel);
+            return Some(2);
+        }
+        Some(taken)
+    }
+
+    /// Up to `want` of the lanes the walk and every hedge leave idle.
+    fn borrow(&self, lanes: Lanes, want: usize, own: bool) -> usize {
         loop {
             let racing = self.racing.load(Ordering::Acquire);
             let spare = (lanes.level + usize::from(own)).saturating_sub(lanes.busy + racing);
-            let mut want = share.min(spare).min(parts);
-            if want == 0 {
-                return None;
-            }
-            if !whole {
-                want = want.max(2);
+            let take = want.min(spare);
+            if take == 0 {
+                return 0;
             }
             if self
                 .racing
-                .compare_exchange(racing, racing + want, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(racing, racing + take, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(want);
+                return take;
             }
         }
+    }
+
+    /// Raise a running ranged hedge to its share of the lanes the walk is not using, split
+    /// evenly over every ranged hedge on the wire. Asked every sample, so the lanes a
+    /// draining walk frees reach the bytes that remain. Dietfried: hedges fired with two
+    /// lanes while 128 were busy kept two with 125 idle, and the last cold objects took up
+    /// to twelve minutes at about 1 MB/s. Answers the hedge's new lane count.
+    fn grow(&self, lanes: Lanes, length: u64, held: &AtomicUsize) -> Option<usize> {
+        let current = held.load(Ordering::Acquire);
+        let hedges = self.ranged.load(Ordering::Acquire).max(1);
+        let target = (lanes.level.saturating_sub(lanes.busy) / hedges).min(parts(length));
+        if current == CLOSED || target <= current {
+            return None;
+        }
+        let taken = self.borrow(lanes, target - current, false);
+        if taken == 0 {
+            return None;
+        }
+        if held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n != CLOSED).then_some(n + taken)
+            })
+            .is_err()
+        {
+            self.racing.fetch_sub(taken, Ordering::AcqRel);
+            return None;
+        }
+        Some(current + taken)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -205,15 +257,28 @@ impl Recovery {
                 let local = ledger.for_attempt(Arc::clone(&state));
                 let sender = sender.clone();
                 let index_state = Arc::clone(&state);
+                let held = Arc::new(AtomicUsize::new(lanes));
+                if lanes > 1 {
+                    self.ranged.fetch_add(1, Ordering::AcqRel);
+                }
+                let hold = Hold {
+                    recovery: self,
+                    lanes: Arc::clone(&held),
+                    ranged: lanes > 1,
+                };
                 scope.spawn(move || {
-                    let _hold = Hold {
-                        racing: &self.racing,
-                        lanes,
-                    };
+                    let hold = hold;
                     let started = Instant::now();
                     let result = if lanes > 1 {
                         ranged::hedge(
-                            store, grant, authorize, policy, credential, deadline, &local, lanes,
+                            store,
+                            grant,
+                            authorize,
+                            policy,
+                            credential,
+                            deadline,
+                            &local,
+                            &hold.lanes,
                         )
                     } else {
                         // A whole-object hedge starts a fresh TCP and TLS session; the
@@ -238,6 +303,7 @@ impl Recovery {
                 });
                 Racer {
                     state,
+                    lanes: held,
                     ranged: lanes > 1,
                     live: true,
                     window: Window::default(),
@@ -313,9 +379,23 @@ impl Recovery {
                             if !racer.live {
                                 continue;
                             }
-                            // A ranged hedge heals its own slow parts on its own lanes.
+                            // A ranged hedge heals its own slow parts on its own lanes, and
+                            // takes its share of whatever lanes have come free.
                             if racer.ranged {
                                 ranged_live = true;
+                                if let Some(lanes) = self.grow(now, length, &racer.lanes) {
+                                    decisions::record(
+                                        store,
+                                        "grow",
+                                        &decisions::object(&grant.object),
+                                        &format!(
+                                            "lanes={lanes} busy={} level={} hedges={}",
+                                            now.busy,
+                                            now.level,
+                                            self.ranged.load(Ordering::Acquire)
+                                        ),
+                                    );
+                                }
                                 continue;
                             }
                             let data = racer.state.data.lock().unwrap().clone();
@@ -521,16 +601,37 @@ mod tests {
             .reserve(tail, 64 << 20, &store, false, false)
             .unwrap();
         assert_eq!(lanes, 16, "eight stragglers share 120 idle lanes");
+        recovery.ranged.fetch_add(1, Ordering::AcqRel);
         let hold = Hold {
-            racing: &recovery.racing,
-            lanes,
+            recovery: &recovery,
+            lanes: Arc::new(AtomicUsize::new(lanes)),
+            ranged: true,
         };
         assert_eq!(
             recovery.reserve(tail, 64 << 20, &store, true, false),
             Some(1)
         );
         recovery.racing.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(recovery.grow(tail, 64 << 20, &hold.lanes), Some(64));
+        let drained = Lanes {
+            level: 128,
+            busy: 1,
+            tail: true,
+        };
+        assert_eq!(
+            recovery.grow(drained, 64 << 20, &hold.lanes),
+            None,
+            "one lane per part is all a ranged copy can use"
+        );
+        let lanes = Arc::clone(&hold.lanes);
         drop(hold);
+        assert_eq!(recovery.racing.load(Ordering::Acquire), 0);
+        assert_eq!(recovery.ranged.load(Ordering::Acquire), 0);
+        assert_eq!(
+            recovery.grow(drained, 64 << 20, &lanes),
+            None,
+            "a returned hedge is lent nothing"
+        );
         assert_eq!(recovery.racing.load(Ordering::Acquire), 0);
         let full = Lanes {
             level: 4,

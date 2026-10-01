@@ -33,6 +33,10 @@ enum Stall {
     /// Every whole GET streams half the object, then drips: a cold R2 chunk every whole
     /// read queues behind (sasori, fern). Ranged asks are served apart from it.
     Chunk,
+    /// Every ask, whole or ranged, drips one `DRIP` per `gap` on its own connection, and
+    /// parallel asks do not slow each other: a cold R2 object that only lanes can carry
+    /// (dietfried).
+    Cold { gap: Duration },
 }
 
 /// A hub whose store honours ranges and drip-feeds whole GETs of each `slow` object as
@@ -98,6 +102,14 @@ fn tail_hub(
                     return status(200, &body);
                 }
             }
+            if let Stall::Cold { gap } = stall {
+                return Serve::Drip {
+                    body,
+                    chunk: DRIP,
+                    gap,
+                    ttfb: Duration::ZERO,
+                };
+            }
             if stall == Stall::Chunk {
                 return Serve::Script(Box::new(move |socket| {
                     let head = format!(
@@ -127,6 +139,27 @@ fn tail_hub(
         };
         again.fetch_add(1, Ordering::Relaxed);
         ranged.fetch_add(1, Ordering::Relaxed);
+        if let Stall::Cold { gap } = stall {
+            let last = last.min(body.len() - 1);
+            let total = body.len();
+            let range = body[first..=last].to_vec();
+            return Serve::Script(Box::new(move |socket| {
+                let head = format!(
+                    "HTTP/1.1 206 X\r\ncontent-length: {}\r\ncontent-range: bytes \
+                     {first}-{last}/{total}\r\nconnection: close\r\n\r\n",
+                    range.len()
+                );
+                if socket.write_all(head.as_bytes()).is_err() {
+                    return;
+                }
+                for piece in range.chunks(DRIP) {
+                    std::thread::sleep(gap);
+                    if socket.write_all(piece).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
         let first_ask = {
             let mut asks = part_asks.lock().unwrap();
             let count = asks.entry((hex, first)).or_insert(0);
@@ -170,7 +203,7 @@ fn slow_objects(checkpoint: &Checkpoint, count: usize) -> Vec<String> {
     checkpoint
         .objects
         .iter()
-        .filter(|object| object.length == BLOB as u64)
+        .filter(|object| object.length >= BLOB as u64)
         .take(count)
         .map(|object| object.sha256.clone())
         .collect()
@@ -182,12 +215,25 @@ fn timed_pull(
     checkpoint: &Checkpoint,
     name: &str,
 ) -> (Duration, crate::transport::PullReport, String) {
+    timed_pull_from(tail, checkpoint, name, None)
+}
+
+/// `timed_pull` with the walk starting at `start` objects in flight.
+fn timed_pull_from(
+    tail: &Tail,
+    checkpoint: &Checkpoint,
+    name: &str,
+    start: Option<usize>,
+) -> (Duration, crate::transport::PullReport, String) {
     let root = temporary(name);
     let store = Store::init(&root).unwrap();
     let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &tail.origin.base, &policy);
+    if let Some(start) = start {
+        request.streams_start = start;
+    }
     let started = Instant::now();
-    let report = pull(&request_for(&store, &tail.origin.base, &policy))
-        .unwrap_or_else(|refusal| panic!("{name}: {refusal}"));
+    let report = pull(&request).unwrap_or_else(|refusal| panic!("{name}: {refusal}"));
     let elapsed = started.elapsed();
     assert_eq!(report.held + report.fetched, report.declared, "{name}");
     let (warm, _) = FetchPlan::of_objects(&store, name, &checkpoint.objects).unwrap();
@@ -309,6 +355,51 @@ fn two_objects_stalled_mid_pull_on_a_cold_chunk_finish_at_body_throughput() {
         "the tail crawled: {tail:?} against a {body:?} body"
     );
     assert!(tail < crawl / 2, "the tail crawled: {tail:?}");
+}
+
+/// Dietfried on the first 0.3.82 candidate: R2 served the last cold objects slowly to every
+/// ask, whole or ranged, while separate asks ran in parallel. Their hedges fired while the
+/// walk was full, with two lanes each, and kept two as it drained with 125 lanes idle: the
+/// last 1.2 GB took 960 s after a 210 s body. Every lane the walk frees must reach them.
+#[test]
+fn cold_objects_take_every_lane_the_walk_frees_and_finish_near_body_throughput() {
+    // Sixteen parts an object, so a ranged copy has work for sixteen lanes, and a walk
+    // admitting what production's reached (128 on dietfried), so the hedges start on a
+    // full one.
+    let checkpoint = Arc::new(checkpoint(24, 4 * BLOB));
+    let start = Some(64);
+    let (body, _, _) = timed_pull_from(
+        &tail_hub(Arc::clone(&checkpoint), Vec::new(), None, Stall::First),
+        &checkpoint,
+        "cold-body",
+        start,
+    );
+    let bytes: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
+    // One cold ask moves this far below the body's aggregate: dietfried's body moved
+    // 480 MB/s and its cold asks 0.1-1.2 MB/s each.
+    let cold = bytes as f64 / body.as_secs_f64() / 400.0;
+    let gap = Duration::from_secs_f64(DRIP as f64 / cold);
+    let slow = slow_objects(&checkpoint, 2);
+    let hub = tail_hub(Arc::clone(&checkpoint), slow, None, Stall::Cold { gap });
+    let (tail, _, log) = timed_pull_from(&hub, &checkpoint, "cold-tail", start);
+    let sample = Duration::from_secs_f64(0.025);
+    eprintln!(
+        "body {:.2} s; tail {:.2} s; {} ranged asks; a cold object on one ask {:.1} s",
+        body.as_secs_f64(),
+        tail.as_secs_f64(),
+        hub.ranged.load(Ordering::Relaxed),
+        (4 * BLOB) as f64 / cold
+    );
+    eprintln!("{log}");
+    // The first 0.3.82 candidate holds two lanes a hedge: about nine bodies.
+    assert!(
+        tail < body * 3 + sample * 20,
+        "the tail crawled: {tail:?} against a {body:?} body"
+    );
+    assert!(
+        log.contains(" grow "),
+        "no hedge was lent a freed lane: {log}"
+    );
 }
 
 /// An unstalled pull asks the hub for URLs once: nothing slow, nothing hedged, nothing
