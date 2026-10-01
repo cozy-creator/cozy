@@ -47,7 +47,7 @@ jobs:
           for proof in target/debug/deps/tensorfs_core-*; do
             if [ -f "$proof" ] && [ -x "$proof" ]; then
               found=true
-              sudo "$proof" --exact repo_cache::identity::linux::tests::cache_identity_restores_and_does_not_change_other_threads --nocapture
+              sudo "$proof" --exact filesystem_identity::linux::tests::cache_identity_restores_and_does_not_change_other_threads --nocapture
             fi
           done
           [ "$found" = true ]

@@ -221,9 +221,7 @@ impl Meta {
     }
 
     fn connection(&self) -> Result<Connection> {
-        let connection = Connection::open(&self.db).map_err(|error| sql("open catalog", error))?;
-        crate::catalog::configure(&connection, &self.db)?;
-        Ok(connection)
+        crate::catalog::connect(&self.db)
     }
 
     fn lease_path(&self, id: &str) -> PathBuf {

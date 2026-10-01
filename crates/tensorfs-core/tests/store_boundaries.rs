@@ -437,17 +437,40 @@ fn privileged_writer_preserves_the_store_owners_public_directories() {
     let executable = root.join("tfs");
     fs::copy(env!("CARGO_BIN_EXE_tfs"), &executable).unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    // Final inode ownership alone misses SQLite's open -> fchown window. The
+    // subprocess probe rejects a root-owned WAL/SHM inode at that exact boundary.
+    // Root CI compiles the checked-in probe; isolated root-container proofs can
+    // supply the same prebuilt library without requiring a compiler in the image.
+    #[cfg(target_os = "linux")]
+    let owner_probe = if let Some(probe) = std::env::var_os("TFS_TEST_CATALOG_WAL_PROBE") {
+        PathBuf::from(probe)
+    } else {
+        let probe = root.join("catalog-owner-probe.so");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/catalog_owner_probe.c");
+        let compiled = Command::new("cc")
+            .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra"])
+            .arg(&source)
+            .args(["-ldl", "-o"])
+            .arg(&probe)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        probe
+    };
     let store_root = root.join("store");
     fs::create_dir(&store_root).unwrap();
     let uid = 65530;
     chown(&store_root, Some(uid), Some(uid)).unwrap();
     let run = |args: &[&str], as_uid: u32| -> Output {
-        Command::new(&executable)
-            .args(args)
-            .uid(as_uid)
-            .gid(as_uid)
-            .output()
-            .unwrap()
+        let mut command = Command::new(&executable);
+        command.args(args).uid(as_uid).gid(as_uid);
+        #[cfg(target_os = "linux")]
+        command.env("LD_PRELOAD", &owner_probe);
+        command.output().unwrap()
     };
     let ok = |out: Output| {
         assert!(
@@ -537,17 +560,20 @@ fn privileged_writer_preserves_the_store_owners_public_directories() {
     }
     let mut children = Vec::new();
     for (n, file) in inputs.iter().enumerate() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "read gate; exec \"$@\"",
+            "owner-proof",
+            executable.to_str().unwrap(),
+            "put",
+            store_root.to_str().unwrap(),
+            file.to_str().unwrap(),
+        ]);
+        #[cfg(target_os = "linux")]
+        command.env("LD_PRELOAD", &owner_probe);
         children.push(
-            Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    "read gate; exec \"$@\"",
-                    "owner-proof",
-                    executable.to_str().unwrap(),
-                    "put",
-                    store_root.to_str().unwrap(),
-                    file.to_str().unwrap(),
-                ])
+            command
                 .uid(if n % 2 == 0 { 0 } else { uid })
                 .gid(if n % 2 == 0 { 0 } else { uid })
                 .stdin(Stdio::piped())

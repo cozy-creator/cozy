@@ -26,6 +26,7 @@ pub mod durability;
 pub mod ensure;
 pub mod err;
 pub mod fetch;
+mod filesystem_identity;
 pub mod fill;
 pub mod fit;
 pub mod gc;

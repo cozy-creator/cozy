@@ -104,7 +104,14 @@ pub fn connections_opened(root: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn connect(path: &Path) -> Result<Connection> {
+pub(crate) fn connect(path: &Path) -> Result<Connection> {
+    // SQLite creates WAL/SHM files before assigning their database owner. Opening
+    // them under root exposes a transient root-owned inode to concurrent owner
+    // connections, which can permanently fall back to read-only WAL access.
+    let _identity = crate::filesystem_identity::FilesystemIdentity::for_store_root(
+        path.parent().unwrap_or(path),
+    )
+    .map_err(|error| io("enter catalog filesystem identity", error))?;
     *opened()
         .lock()
         .unwrap_or_else(|error| error.into_inner())

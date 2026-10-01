@@ -1,11 +1,10 @@
-//! Scope optional cache writes to the local Store owner on root-squashed NFS.
+//! Scope synchronous filesystem I/O to the trusted local Store owner.
 //!
 //! Only Linux filesystem IDs change, only on the current native thread, and only
-//! while synchronous cache I/O runs. Real/effective IDs, other Runtime threads,
-//! existing cache permissions, and the configured cache path are unchanged.
+//! while Store I/O runs. Real/effective IDs, other Runtime threads, existing
+//! permissions, and configured paths are unchanged.
 
-use super::SoftFailure;
-use crate::store::Store;
+use std::{io, path::Path};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -16,7 +15,7 @@ mod linux {
 
     use nix::unistd::{geteuid, setfsgid, setfsuid, Gid, Uid};
 
-    use super::{SoftFailure, Store};
+    use super::{io, Path};
 
     // Linux has no getfsuid/getfsgid. An invalid ID cannot be installed; each
     // setter returns the previous/current ID even when the attempted set fails.
@@ -27,14 +26,14 @@ mod linux {
         )
     }
 
-    pub(in crate::repo_cache) struct CacheIdentity {
+    pub(crate) struct FilesystemIdentity {
         previous: Option<(Uid, Gid)>,
         // A credential guard must be destroyed by the exact thread that made it.
         _thread: PhantomData<Rc<()>>,
     }
 
-    impl CacheIdentity {
-        pub(in crate::repo_cache) fn for_store(store: &Store) -> Result<Self, SoftFailure> {
+    impl FilesystemIdentity {
+        pub(crate) fn for_store_root(root: &Path) -> io::Result<Self> {
             let mut guard = Self {
                 previous: None,
                 _thread: PhantomData,
@@ -44,9 +43,12 @@ mod linux {
             }
             // Authority is the already-open LOCAL Store's owner, never a UID
             // supplied by an artifact, request, or remote cache directory.
-            let owner = fs::symlink_metadata(store.root()).map_err(|_| SoftFailure::Unavailable)?;
+            let owner = fs::symlink_metadata(root)?;
             if !owner.is_dir() || owner.uid() == u32::MAX || owner.gid() == u32::MAX {
-                return Err(SoftFailure::Unavailable);
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot enter Store filesystem identity",
+                ));
             }
             let desired = (Uid::from_raw(owner.uid()), Gid::from_raw(owner.gid()));
             let previous = filesystem_ids();
@@ -58,14 +60,17 @@ mod linux {
             setfsuid(desired.0);
             if filesystem_ids() != desired {
                 // Drop restores either field that changed before refusing the
-                // optional cache write. The origin/local operation remains valid.
-                return Err(SoftFailure::Unavailable);
+                // synchronous I/O. The caller receives the identity refusal.
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot enter Store filesystem identity",
+                ));
             }
             Ok(guard)
         }
     }
 
-    impl Drop for CacheIdentity {
+    impl Drop for FilesystemIdentity {
         fn drop(&mut self) {
             let Some((uid, gid)) = self.previous else {
                 return;
@@ -74,7 +79,7 @@ mod linux {
             setfsgid(gid);
             if filesystem_ids() != (uid, gid) {
                 // Continuing a reused Runtime thread under the wrong identity is
-                // unsafe. No cache error can reach here: this is a failed kernel
+                // unsafe. No I/O error can reach here: this is a failed kernel
                 // restoration of credentials that this thread previously held.
                 std::process::abort();
             }
@@ -84,6 +89,7 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::store::Store;
         use std::panic::{catch_unwind, AssertUnwindSafe};
         use std::sync::{Arc, Barrier};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -117,7 +123,7 @@ mod linux {
                     other_observed.wait();
                 });
                 {
-                    let _guard = CacheIdentity::for_store(&store).unwrap();
+                    let _guard = FilesystemIdentity::for_store_root(store.root()).unwrap();
                     assert_eq!(filesystem_ids(), desired);
                     assert!(geteuid().is_root());
                     entered.wait();
@@ -129,14 +135,14 @@ mod linux {
                 }
                 assert_eq!(filesystem_ids(), original);
             });
-            let failure: Result<(), SoftFailure> = (|| {
-                let _guard = CacheIdentity::for_store(&store)?;
-                Err(SoftFailure::Unavailable)
+            let failure: io::Result<()> = (|| {
+                let _guard = FilesystemIdentity::for_store_root(store.root())?;
+                Err(io::Error::other("owned fixture failure"))
             })();
             assert!(failure.is_err());
             assert_eq!(filesystem_ids(), original);
             let panic = catch_unwind(AssertUnwindSafe(|| {
-                let _guard = CacheIdentity::for_store(&store).unwrap();
+                let _guard = FilesystemIdentity::for_store_root(store.root()).unwrap();
                 panic!("cache operation unwind");
             }));
             assert!(panic.is_err());
@@ -148,14 +154,14 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) use linux::CacheIdentity;
+pub(crate) use linux::FilesystemIdentity;
 
 #[cfg(not(target_os = "linux"))]
-pub(super) struct CacheIdentity;
+pub(crate) struct FilesystemIdentity;
 
 #[cfg(not(target_os = "linux"))]
-impl CacheIdentity {
-    pub(super) fn for_store(_: &Store) -> Result<Self, SoftFailure> {
+impl FilesystemIdentity {
+    pub(crate) fn for_store_root(_: &Path) -> io::Result<Self> {
         Ok(Self)
     }
 }
