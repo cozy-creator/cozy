@@ -16,9 +16,9 @@
 //! HuggingFace fetch through this code moved at **18.9 MB/s on one stream and 19.1 MB/s on
 //! eight 64 MiB parts** — the link was already saturated by one. On a link like that,
 //! cutting an object into parts moves bytes from one socket to another and changes no
-//! total. `SOURCE_STREAMS` is therefore 1. The one case parallelism wins — the TAIL of a
-//! multi-object pull, where fewer objects remain than lanes and an origin answers some
-//! asks application-limited (run 2322) — is the hub walk's `hedge`.
+//! total. `SOURCE_STREAMS` is therefore 1, and parallelism is a parameter kept for the one
+//! case still argued for — the TAIL of a multi-object pull, where fewer objects remain than
+//! there are lanes — which nobody has measured yet.
 //!
 //! So there are three paths, and the default is the cheap one:
 //!
@@ -92,8 +92,8 @@ use std::sync::{Condvar, Mutex};
 /// object — and buys it at zero extra disk, because one stream needs no scratch file.
 /// Parallelism stays one parameter away for the case still argued for: the TAIL of a
 /// multi-object pull, where fewer objects remain than there are lanes and per-object
-/// concurrency is the only thing that can fill them. Run 2322 measured that case on hub
-/// pulls, and `hedge` answers it there: a slow tail object is split over idle lanes.
+/// concurrency is the only thing that can fill them. That case is real and bounded, and
+/// nobody has measured it yet; when someone does, this constant is where the answer goes.
 pub const SOURCE_STREAMS: usize = 1;
 
 /// One ranged ask's slice and resume unit. The original close-per-request client measured
@@ -108,10 +108,6 @@ pub const PART_BYTES: u64 = 64 << 20;
 /// parts gets a smaller floor with it rather than a constant here silently overriding the
 /// parameter it was handed.
 pub const RANGED_MIN_BYTES: u64 = 2 * PART_BYTES;
-
-/// The smallest part a hedge cuts. Granularity for spreading one slow object over idle
-/// lanes, and the floor `Ranged::normalized` already holds every part to.
-pub const HEDGE_PART: u64 = 1 << 20;
 
 /// How ONE object is asked for. `streams` of 1 — the default — is one resumable stream of
 /// ascending ranges; above 1 is that many ranges in flight at once, assembled through a
@@ -225,57 +221,7 @@ pub fn fetch_ranged(
         );
     }
     assemble(
-        store,
-        grant,
-        &|_| Ok(url.to_string()),
-        pull::shared_client(),
-        probe.total,
-        policy,
-        credential,
-        deadline,
-        ledger,
-        ranged,
-        None,
-        observer,
-    )
-}
-
-/// A hub object's hedge: the whole object again as ranged parts on fresh connections, one
-/// stream per lane `lanes` holds — a count the walk raises as its lanes come free — each
-/// ask authorized by the walk's own lease supply so a part that outlives its URL re-mints
-/// instead of presenting it dead.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn hedge(
-    store: &Store,
-    grant: &DeliveryGrant,
-    authorize: &(dyn Fn(bool, &Ledger) -> Result<String> + Sync),
-    policy: &SourcePolicy,
-    credential: &dyn CredentialProvider,
-    deadline: Deadline,
-    ledger: &Ledger,
-    lanes: &AtomicUsize,
-) -> Result<Fetched> {
-    let total = grant.object.length;
-    let streams = lanes.load(Ordering::Acquire);
-    // Four parts a lane: a part stuck on a cold chunk is split or re-asked by the lanes that
-    // finish theirs, and each part is a fresh ranged ask.
-    let ranged = Ranged {
-        streams,
-        part: total.div_ceil(4 * streams as u64).max(HEDGE_PART),
-    };
-    assemble(
-        store,
-        grant,
-        &|stale| authorize(stale, ledger),
-        &http::Client::new(),
-        total,
-        policy,
-        credential,
-        deadline,
-        ledger,
-        ranged,
-        Some(lanes),
-        None,
+        store, grant, url, &probe, policy, credential, deadline, ledger, ranged, observer,
     )
 }
 
@@ -344,7 +290,7 @@ fn probe(
 
 /// `bytes <first>-<last>/<total>` — the three numbers, or nothing. A `*` total is a
 /// declaration that the origin will not say, which is not something to assemble against.
-fn content_range(header: Option<&str>) -> Option<(u64, u64, u64)> {
+pub(super) fn content_range(header: Option<&str>) -> Option<(u64, u64, u64)> {
     let value = header?.trim();
     let spec = value.strip_prefix("bytes")?.trim_start();
     let (range, total) = spec.split_once('/')?;
@@ -372,6 +318,7 @@ struct Wire {
     /// construction — a re-asked part resumes at its own offset and re-counts nothing — so
     /// it is a sensible running total even though the parts land out of order.
     moved: AtomicU64,
+    next: AtomicUsize,
     stop: AtomicBool,
     /// Workers that have not yet returned. The reader waits on `filled` for bytes that only
     /// a worker can produce, so "every worker is gone and the object is not whole" has to be
@@ -381,46 +328,12 @@ struct Wire {
     live: AtomicUsize,
 }
 
-/// One run of the object some racer is asked to fill. The parts start as `ranged.part`
-/// segments; a hedge splits the largest unfinished one when a lane goes idle.
-struct Segment {
-    /// Inclusive bounds. `end` only shrinks, when the segment is split.
-    start: u64,
-    end: u64,
-    /// Below this mark the segment's bytes are on disk. Every racer starts at it, so what
-    /// is below it stays one contiguous run.
-    reached: u64,
-    racers: usize,
-    done: bool,
-    /// A racer exhausted its asks here; it is not raced again.
-    refused: bool,
-}
-
 struct State {
-    /// The initial parts in offset order, then splits in the order they were cut.
-    segments: Vec<Segment>,
-    /// Initial parts nobody has asked for start here.
-    next: usize,
-    initial: usize,
-    /// Bytes below `high` are complete on disk in one run from the first byte, so they
-    /// may be handed to the door. Nothing above it may, hole or not.
-    high: u64,
+    done: Vec<bool>,
+    /// Parts `0..contiguous` are complete on disk, so bytes below `contiguous * part` may
+    /// be handed to the door. Nothing above it may, hole or not.
+    contiguous: usize,
     failure: Option<Refusal>,
-}
-
-impl State {
-    fn coverage(&self) -> u64 {
-        let mut order: Vec<&Segment> = self.segments.iter().collect();
-        order.sort_by_key(|segment| segment.start);
-        let mut high = 0;
-        for segment in order {
-            if segment.start != high || !segment.done {
-                break;
-            }
-            high = segment.end + 1;
-        }
-        high
-    }
 }
 
 impl Wire {
@@ -435,83 +348,12 @@ impl Wire {
             .push((attempt, host.to_string(), status));
     }
 
-    /// The next part nobody has asked for. A hedge then takes the unfinished segment with
-    /// the most bytes left: it splits off that segment's upper half when there is a part's
-    /// worth left, and races what remains from the segment's mark when there is not. A lane
-    /// that finished its own part thereby speeds the slowest one instead of idling.
-    fn claim(&self, race: bool) -> Option<(usize, u64)> {
-        let mut state = self.state.lock().unwrap();
-        if state.failure.is_some() || self.stopped() {
-            return None;
-        }
-        if state.next < state.initial {
-            let index = state.next;
-            state.next += 1;
-            state.segments[index].racers += 1;
-            return Some((index, state.segments[index].reached));
-        }
-        if !race {
-            return None;
-        }
-        let index = (0..state.segments.len())
-            .filter(|&index| !state.segments[index].done && !state.segments[index].refused)
-            .max_by_key(|&index| {
-                let segment = &state.segments[index];
-                segment.end + 1 - segment.reached
-            })?;
-        let segment = &mut state.segments[index];
-        let left = segment.end + 1 - segment.reached;
-        if segment.racers == 0 || left < HEDGE_PART {
-            segment.racers += 1;
-            return Some((index, segment.reached));
-        }
-        let middle = segment.reached + left / 2;
-        let end = std::mem::replace(&mut segment.end, middle - 1);
-        state.segments.push(Segment {
-            start: middle,
-            end,
-            reached: middle,
-            racers: 1,
-            done: false,
-            refused: false,
-        });
-        Some((state.segments.len() - 1, middle))
-    }
-
-    /// The last byte segment `index` still wants, or nothing once it is complete.
-    fn wants(&self, index: usize) -> Option<u64> {
-        let state = self.state.lock().unwrap();
-        let segment = &state.segments[index];
-        (!segment.done).then_some(segment.end)
-    }
-
-    /// Bytes `..to` of segment `index` are on disk. Answers its last wanted byte, which a
-    /// split may have moved closer, or nothing once another racer finished it.
-    fn advance(&self, index: usize, to: u64) -> Option<u64> {
-        let mut state = self.state.lock().unwrap();
-        let segment = &mut state.segments[index];
-        segment.reached = segment.reached.max(to);
-        (!segment.done).then_some(segment.end)
-    }
-
-    /// A racer left segment `index`. A refusal retires the segment from racing, and fails
-    /// the object once nobody else is on it.
-    fn leave(&self, index: usize, refusal: Option<Refusal>) {
-        let mut state = self.state.lock().unwrap();
-        let segment = &mut state.segments[index];
-        segment.racers -= 1;
-        segment.refused |= refusal.is_some();
-        let orphaned = segment.racers == 0 && !segment.done;
-        drop(state);
-        if let Some(refusal) = refusal.filter(|_| orphaned) {
-            self.failed(refusal);
-        }
-    }
-
     fn landed(&self, index: usize) {
         let mut state = self.state.lock().unwrap();
-        state.segments[index].done = true;
-        state.high = state.coverage();
+        state.done[index] = true;
+        while state.contiguous < state.done.len() && state.done[state.contiguous] {
+            state.contiguous += 1;
+        }
         drop(state);
         self.filled.notify_all();
     }
@@ -537,14 +379,13 @@ impl Wire {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let total = state.segments.iter().map(|segment| segment.end + 1).max();
-        if state.failure.is_none() && Some(state.high) != total && !self.stopped() {
+        if state.failure.is_none() && state.contiguous < state.done.len() && !self.stopped() {
             state.failure = Some(Refusal {
                 code: Code::TRANSFER_FAILED,
                 detail: format!(
-                    "every stream stopped with {} of {} bytes assembled",
-                    state.high,
-                    total.unwrap_or(0)
+                    "every stream stopped with {} of {} parts assembled",
+                    state.contiguous,
+                    state.done.len()
                 ),
             });
         }
@@ -568,15 +409,7 @@ struct Door<'a>(&'a Wire);
 
 impl Drop for Door<'_> {
     fn drop(&mut self) {
-        // Under the state lock, so a waiter that just found `stop` clear is already waiting
-        // when the notice comes. Poison-tolerant: this runs in a `Drop`.
-        let state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.0.stop.store(true, Ordering::Relaxed);
-        drop(state);
         self.0.filled.notify_all();
     }
 }
@@ -632,82 +465,67 @@ impl Drop for Scratch {
 fn assemble(
     store: &Store,
     grant: &DeliveryGrant,
-    ask: &(dyn Fn(bool) -> Result<String> + Sync),
-    client: &http::Client,
-    total: u64,
+    url: &str,
+    probe: &Probe,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
     ranged: Ranged,
-    // A hedge's lane count. A hedge races and splits unfinished parts with every stream it
-    // has, and runs a stream for each lane it is lent while the object is still incomplete.
-    lanes: Option<&AtomicUsize>,
     observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
-    let race = lanes.is_some();
+    let total = probe.total;
     let parts = total.div_ceil(ranged.part) as usize;
     let scratch = Scratch::open(store, total)?;
     let wire = Wire {
         state: Mutex::new(State {
-            segments: (0..parts as u64)
-                .map(|index| Segment {
-                    start: index * ranged.part,
-                    end: ((index + 1) * ranged.part).min(total) - 1,
-                    reached: index * ranged.part,
-                    racers: 0,
-                    done: false,
-                    refused: false,
-                })
-                .collect(),
-            next: 0,
-            initial: parts,
-            high: 0,
+            done: vec![false; parts],
+            contiguous: 0,
             failure: None,
         }),
         filled: Condvar::new(),
         hops: Mutex::new(Vec::new()),
         moved: AtomicU64::new(0),
+        next: AtomicUsize::new(0),
         stop: AtomicBool::new(false),
         live: AtomicUsize::new(0),
     };
     let streams = ranged.streams.min(parts);
     wire.live.store(streams, Ordering::Relaxed);
-    let (wire, file) = (&wire, &scratch.file);
-    let stream = move || {
-        let _worker = Worker(wire);
-        while let Some((index, from)) = wire.claim(race) {
-            let outcome = part(
-                wire, file, index, from, total, ask, client, policy, credential, deadline, ledger,
-            );
-            match outcome {
-                Ok(true) => {
-                    wire.landed(index);
-                    wire.leave(index, None);
-                }
-                // Another racer finished the part, or the door is done with the object and
-                // nothing is waiting for these bytes.
-                Ok(false) => wire.leave(index, None),
-                Err(refusal) => wire.leave(index, Some(refusal)),
-            }
-        }
-    };
 
     let admitted = std::thread::scope(|scope| -> Result<Admitted> {
         for _ in 0..streams {
-            scope.spawn(stream);
-        }
-        if let Some(lanes) = lanes {
-            scope.spawn(move || {
-                let mut running = streams;
-                let mut state = wire.state.lock().unwrap();
-                while !wire.stopped() && state.failure.is_none() && state.high < total {
-                    while running < lanes.load(Ordering::Acquire) {
-                        wire.live.fetch_add(1, Ordering::AcqRel);
-                        scope.spawn(stream);
-                        running += 1;
+            scope.spawn(|| {
+                let _worker = Worker(&wire);
+                loop {
+                    if wire.stopped() || wire.state.lock().unwrap().failure.is_some() {
+                        return;
                     }
-                    state = wire.filled.wait_timeout(state, ledger.sample()).unwrap().0;
+                    let index = wire.next.fetch_add(1, Ordering::Relaxed);
+                    if index >= parts {
+                        return;
+                    }
+                    match part(
+                        &wire,
+                        &scratch.file,
+                        index,
+                        total,
+                        ranged.part,
+                        url,
+                        policy,
+                        credential,
+                        deadline,
+                        ledger,
+                    ) {
+                        Ok(true) => wire.landed(index),
+                        // Stopped mid-part: the door is finished with this object and
+                        // nothing is waiting for these bytes.
+                        Ok(false) => return,
+                        Err(refusal) => {
+                            wire.failed(refusal);
+                            return;
+                        }
+                    }
                 }
             });
         }
@@ -715,7 +533,8 @@ fn assemble(
             scratch: &scratch.file,
             at: 0,
             total,
-            wire,
+            part: ranged.part,
+            wire: &wire,
             observer,
             reported: 0,
             tick: ledger.sample(),
@@ -723,7 +542,7 @@ fn assemble(
         // The door has read every byte it is going to read, whichever way it answered —
         // including by unwinding. Anything still on the wire is unwanted after that.
         let outcome = {
-            let _door = Door(wire);
+            let _door = Door(&wire);
             grant.admit(store, &mut reader)
         };
         reader.report();
@@ -736,10 +555,9 @@ fn assemble(
             Err(door) => Err(wire.state.lock().unwrap().failure.take().unwrap_or(door)),
         }
     })?;
-    // Racing parts write some bytes twice; the ledger counts those, the object once.
     Ok(Fetched {
         admitted,
-        transferred: wire.moved.load(Ordering::Relaxed).min(total),
+        transferred: wire.moved.load(Ordering::Relaxed),
     })
 }
 
@@ -754,42 +572,36 @@ fn part(
     wire: &Wire,
     scratch: &File,
     index: usize,
-    from: u64,
     total: u64,
-    ask: &(dyn Fn(bool) -> Result<String> + Sync),
-    client: &http::Client,
+    size: u64,
+    original: &str,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
 ) -> Result<bool> {
-    let mut at = from;
+    let start = index as u64 * size;
+    let end = (start + size).min(total) - 1;
+    let mut at = start;
     let mut last: Option<Refusal> = None;
     let mut attempt = 0;
-    let mut stale = false;
     while attempt < FETCH_ATTEMPTS {
         attempt += 1;
-        ledger.check_running()?;
         if wire.stopped() {
             return Ok(false);
         }
-        let Some(end) = wire.wants(index) else {
-            return Ok(false);
-        };
         if at > end {
             return Ok(true);
         }
         let asked = format!("bytes={at}-{end}");
         let mut hops: Vec<(String, u16)> = Vec::new();
-        // Authorized per ask: a part that outlives its URL is re-minted by whoever owns
-        // the lease rather than presenting it dead. The predicate runs on it and on every
+        // From the URL the CALLER named, every time. The predicate runs on it and on every
         // hop of it, the credential is re-asked per host, and a relative `Location`
         // resolves against the hop that sent it — because this is the single-stream path's
         // own opener, not a second copy of it that could fall behind.
-        let url = ask(std::mem::take(&mut stale))?;
         let opened = pull::open_object(
-            client,
-            &url,
+            pull::shared_client(),
+            original,
             policy,
             credential,
             deadline,
@@ -852,7 +664,6 @@ fn part(
             // against a chain re-walked from the caller's URL, which is the one thing that
             // could actually change the answer.
             Opened::Expired(status) if !last_attempt => {
-                stale = true;
                 last = Some(Refusal {
                     code: Code::TRANSFER_FAILED,
                     detail: format!("part {index}: the origin answered {status}"),
@@ -885,7 +696,7 @@ fn part(
                 )
             }
         }
-        match body(response, wire, scratch, index, &mut at) {
+        match body(response, wire, scratch, &mut at, end) {
             Ok(()) => {}
             Err(refusal) if !last_attempt => {
                 last = Some(refusal);
@@ -893,10 +704,11 @@ fn part(
             }
             Err(refusal) => return Err(ranged_detail(refusal, index, &asked)),
         }
-        match wire.wants(index) {
-            Some(end) if at > end => return Ok(true),
-            Some(_) if !wire.stopped() => {}
-            _ => return Ok(false),
+        if at > end {
+            return Ok(true);
+        }
+        if wire.stopped() {
+            return Ok(false);
         }
     }
     Err(ranged_detail(
@@ -905,7 +717,7 @@ fn part(
             detail: "the origin did not answer".into(),
         }),
         index,
-        &format!("bytes={at}-"),
+        &format!("bytes={at}-{end}"),
     ))
 }
 
@@ -915,16 +727,16 @@ fn body(
     response: crate::transport::http::Response<'_>,
     wire: &Wire,
     scratch: &File,
-    index: usize,
     at: &mut u64,
+    end: u64,
 ) -> Result<()> {
     let mut reader = response.into_body();
     let mut buf = vec![0u8; 256 * 1024];
-    let Some(mut end) = wire.wants(index) else {
-        return Ok(());
-    };
     loop {
-        if *at > end || wire.stopped() {
+        if *at > end {
+            return Ok(());
+        }
+        if wire.stopped() {
             return Ok(());
         }
         let want = (end - *at + 1).min(buf.len() as u64) as usize;
@@ -949,13 +761,6 @@ fn body(
             })?;
         *at += read as u64;
         wire.moved.fetch_add(read as u64, Ordering::Relaxed);
-        // A racer of the same segment writes the same bytes at the same offsets; the
-        // door's digest is the authority if an origin ever answers two asks differently.
-        // A split moves this segment's end closer; past it the answer is abandoned.
-        match wire.advance(index, *at) {
-            Some(wanted) => end = wanted,
-            None => return Ok(()),
-        }
     }
 }
 
@@ -978,6 +783,7 @@ struct Assembled<'a, 'o> {
     scratch: &'a File,
     at: u64,
     total: u64,
+    part: u64,
     wire: &'a Wire,
     /// The CALLER's observer, and its own lifetime: it outlives this fetch, while the
     /// scratch file and the wire do not.
@@ -1019,7 +825,7 @@ impl Read for Assembled<'_, '_> {
                 if let Some(refusal) = &state.failure {
                     return Err(std::io::Error::other(refusal.to_string()));
                 }
-                let high = state.high;
+                let high = (state.contiguous as u64 * self.part).min(self.total);
                 if high > self.at {
                     Some(high)
                 } else {

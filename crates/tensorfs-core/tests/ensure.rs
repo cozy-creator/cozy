@@ -562,7 +562,8 @@ fn an_attempt_that_landed_objects_is_retried_and_one_that_landed_none_is_stalled
     let dir = temporary("retry");
     let checkpoint = Arc::new(checkpoint(3, 64 << 10, 4));
     let stubborn = checkpoint.blobs[0].sha256.clone();
-    // The first pull attempt exhausts its re-asks on one object; every other object lands.
+    // One object's first four answers die mid-body. Nothing counts asks, so the pull asks
+    // it again while it lands bytes, and the first attempt brings everything home.
     let rule: Rule = Arc::new(move |hex, asked| {
         if hex == stubborn && asked <= 4 {
             Answer::Truncate
@@ -573,7 +574,7 @@ fn an_attempt_that_landed_objects_is_retried_and_one_that_landed_none_is_stalled
     let hub_a = hub(Arc::clone(&checkpoint), None, Duration::ZERO, rule);
     let recovered = run(&store(&dir), &hub_a.base, &[]);
     let result = assert_result(&recovered, &checkpoint);
-    assert_eq!(num(&result, "attempts"), 2, "{}", recovered.stdout);
+    assert_eq!(num(&result, "attempts"), 1, "{}", recovered.stdout);
 
     let never: Rule = Arc::new(|_, _| Answer::Truncate);
     let hub_b = hub(Arc::clone(&checkpoint), None, Duration::ZERO, never);

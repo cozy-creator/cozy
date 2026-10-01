@@ -3724,7 +3724,8 @@ pub fn pull<'p>(
         request.lane = &lane;
         request.session = &session;
         request.streams = streams;
-        request.streams_start = streams_start;
+        // Accepted for callers written before the chunked downloader; it has no ramp.
+        let _ = streams_start;
         request.deadline = transport::Deadline::after_seconds(timeout);
         if let Some(sample) = sample_seconds {
             request.sample_seconds = sample;

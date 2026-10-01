@@ -1,7 +1,7 @@
 //! Run 1297 (2026-09-27): a pull growing toward 128 streams under a 1,024 soft
 //! RLIMIT_NOFILE ran out of descriptors mid-pull. This binary sets the limit itself and
-//! walks an object store that rewards more streams, so the pace wants to grow as far as it
-//! can. Its own binary, because RLIMIT_NOFILE is process-wide.
+//! downloads with as many requests as the table allows. Its own binary, because
+//! RLIMIT_NOFILE is process-wide.
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -201,7 +201,7 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
         "the soft limit was not raised"
     );
     // The raised table no longer bounds the walk: the budget it measures now admits the
-    // whole ceiling. How far the walk then grows is the pace's measurement, not this test's.
+    // whole ceiling.
     assert_eq!(
         tensorfs_core::descriptors::streams_within(PULL_STREAMS),
         PULL_STREAMS,
@@ -224,8 +224,8 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
     // The table shrinks under a running walk. The squeeze is driven by the walk's own
     // progress, never by a clock: once the origin has served 16 more GETs, the soft limit
     // drops just below what is open, and it comes back after the walk has met a full
-    // table three times. EMFILE is then backpressure: the level halves, the object is
-    // asked again, and every byte lands.
+    // table three times. EMFILE is then backpressure: the request is asked again and
+    // every byte lands.
     let requests = Arc::clone(&origin.requests);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished = Arc::clone(&done);
@@ -250,7 +250,7 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
     let open = squeeze.join().unwrap();
     println!("pressed (limit {open}-4 mid-walk): {pressed:?}");
     assert!(
-        tensorfs_core::descriptors::exhaustions() > before && pressed.backoffs > 0,
+        tensorfs_core::descriptors::exhaustions() > before && pressed.requests > pressed.fetched,
         "the squeeze never pressed the walk: {pressed:?}"
     );
 

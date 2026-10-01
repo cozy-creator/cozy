@@ -50,7 +50,6 @@ pub struct Request<'a> {
     pub keep: &'a [String],
     pub cancellation: Option<PullCancellation>,
     pub streams: usize,
-    pub streams_start: usize,
     /// The transport ledger's resolution; configuration, never a verdict.
     pub sample_seconds: f64,
     pub on_event: Option<&'a (dyn Fn(&Event) + Sync)>,
@@ -75,7 +74,6 @@ impl<'a> Request<'a> {
             keep: &[],
             cancellation: None,
             streams: transport::PULL_STREAMS,
-            streams_start: transport::STREAMS,
             sample_seconds: transport::SAMPLE_SECONDS,
             on_event: None,
         }
@@ -87,7 +85,6 @@ impl<'a> Request<'a> {
         pull.lane = self.lane;
         pull.cancellation = self.cancellation.clone();
         pull.streams = self.streams;
-        pull.streams_start = self.streams_start;
         pull.sample_seconds = self.sample_seconds;
         pull
     }

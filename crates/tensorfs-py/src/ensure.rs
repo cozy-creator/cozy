@@ -108,7 +108,8 @@ pub fn ensure<'p>(
         request.keep = &keep;
         request.cancellation = Some(token.clone());
         request.streams = streams;
-        request.streams_start = streams_start;
+        // Accepted for callers written before the chunked downloader; it has no ramp.
+        let _ = streams_start;
         if let Some(sample) = sample_seconds {
             request.sample_seconds = sample;
         }

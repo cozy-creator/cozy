@@ -560,6 +560,13 @@ impl Store {
         }
     }
 
+    /// `bytes` already announced as moved were thrown away.
+    pub(crate) fn discarded(&self, bytes: u64) {
+        if let Some(sink) = &self.progress {
+            sink.discarded(bytes);
+        }
+    }
+
     /// The three authoritative namespaces identify a TensorFS store. Old mixed-object and
     /// state.json layouts are a prelaunch hardcut and never dual-read.
     pub fn open(root: &Path) -> Result<Store> {

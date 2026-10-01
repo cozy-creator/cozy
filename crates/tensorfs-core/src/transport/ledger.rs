@@ -42,6 +42,9 @@ use std::time::{Duration, Instant};
 /// the right number is a property of the LINK, and this module cannot measure the caller's.
 pub const STREAMS: usize = 16;
 
+/// The most requests a pull keeps in flight, before the memory and descriptor bounds.
+pub const PULL_STREAMS: usize = 128;
+
 /// How often a waiting stream SAMPLES — the runtime's one sampling cadence, shared with
 /// cozy-runtime `internal/liveness.py::SAMPLE_SECONDS`. Resolution, not a verdict: nothing
 /// is ended because this many seconds passed.
@@ -151,8 +154,6 @@ impl PullCancellation {
 pub struct Ledger {
     caller_cancellation: Option<PullCancellation>,
     cancelled: Arc<AtomicBool>,
-    /// Streams this pull has judged stalled, a backpressure signal for its pace.
-    stalls: Arc<AtomicU64>,
     sample: Duration,
     worst_gap: Arc<Mutex<Duration>>,
     progress: Arc<Mutex<Progress>>,
@@ -172,7 +173,6 @@ impl Ledger {
         Ledger {
             caller_cancellation: None,
             cancelled: Arc::new(AtomicBool::new(false)),
-            stalls: Arc::new(AtomicU64::new(0)),
             sample: sample.max(Duration::from_millis(1)),
             worst_gap: Arc::new(Mutex::new(Duration::ZERO)),
             progress: Arc::new(Mutex::new(Progress {
@@ -246,16 +246,6 @@ impl Ledger {
         self.sample
     }
 
-    /// A stream of this pull was judged stalled.
-    pub(super) fn stalled_stream(&self) {
-        self.stalls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Streams this pull has judged stalled so far.
-    pub(super) fn stalls(&self) -> u64 {
-        self.stalls.load(Ordering::Relaxed)
-    }
-
     /// The smallest patience ever granted: `STILL_SAMPLES` intervals of the resolution.
     pub fn floor(&self) -> Duration {
         self.sample * STILL_SAMPLES
@@ -284,8 +274,7 @@ impl Ledger {
     pub fn moved(&self, bytes: u64) {
         self.advance(bytes);
         if let Some(attempt) = &self.attempt {
-            let mut data = attempt.data.lock().unwrap();
-            data.bytes = data.bytes.saturating_add(bytes);
+            attempt.bytes.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
@@ -293,39 +282,12 @@ impl Ledger {
         Self {
             caller_cancellation: self.caller_cancellation.clone(),
             cancelled: Arc::clone(&self.cancelled),
-            stalls: Arc::clone(&self.stalls),
             sample: self.sample,
             worst_gap: Arc::clone(&self.worst_gap),
             progress: Arc::clone(&self.progress),
             attempt: Some(attempt),
             #[cfg(test)]
             clock: self.clock.clone(),
-        }
-    }
-
-    pub(super) fn start_attempt(&self) {
-        if let Some(attempt) = &self.attempt {
-            *attempt.data.lock().unwrap() = AttemptData::default();
-        }
-    }
-
-    pub(super) fn origin(&self, host: &str) {
-        if let Some(attempt) = &self.attempt {
-            attempt.data.lock().unwrap().origin = host.to_owned();
-        }
-    }
-
-    pub(super) fn network_read_begins(&self) {
-        if let Some(attempt) = &self.attempt {
-            attempt.data.lock().unwrap().waiting = true;
-        }
-    }
-
-    pub(super) fn network_waited(&self, elapsed: Duration) {
-        if let Some(attempt) = &self.attempt {
-            let mut data = attempt.data.lock().unwrap();
-            data.waited = data.waited.saturating_add(elapsed);
-            data.waiting = false;
         }
     }
 
@@ -418,18 +380,9 @@ impl Default for Ledger {
     }
 }
 
-/// One HTTP attempt's local stop and payload observations. Stopping a redundant
-/// attempt must never cancel the pull that already has a verified winner.
+/// One request's own stop and byte count. Dropping a request never stops the pull.
 #[derive(Default)]
 pub(super) struct Attempt {
     pub stopped: AtomicBool,
-    pub data: Mutex<AttemptData>,
-}
-
-#[derive(Clone, Default)]
-pub(super) struct AttemptData {
-    pub bytes: u64,
-    pub waited: Duration,
-    pub origin: String,
-    pub waiting: bool,
+    pub bytes: AtomicU64,
 }

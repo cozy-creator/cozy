@@ -1,6 +1,6 @@
-//! One line per transport decision (a hedge, a replacement, a win), appended to the
-//! Store's own bounded log so a slow tail is visible after the fact: run 2322 and sasori
-//! left nothing on disk to say whether a hedge fired. Never per chunk, never fatal.
+//! One line per dropped request and one per pull, appended to the Store's own bounded log
+//! so a slow tail is visible after the fact: run 2322 and sasori left nothing on disk to
+//! say what the transport did. Never per chunk, never fatal.
 use crate::ids::ObjectRef;
 use crate::store::Store;
 use std::fs::{self, OpenOptions};

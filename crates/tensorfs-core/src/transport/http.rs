@@ -225,6 +225,10 @@ impl Scope {
             // Preserve duplicate-header ordering as well as values: an origin
             // can assign different meaning to their first or last occurrence.
             let name = name.to_ascii_lowercase();
+            // Which bytes are asked for is not who is asking: chunks share a connection.
+            if name == "range" {
+                continue;
+            }
             hash.update(&(name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
             hash.update(&(value.len() as u64).to_le_bytes());
@@ -853,15 +857,7 @@ impl BodyReader<'_> {
             };
             let wire = self.wire.as_mut().expect("body owns its wire");
             wire.set_read_timeout(tick);
-            let waiting = Instant::now();
-            if self.judge == Judge::Stream {
-                self.ledger.network_read_begins();
-            }
-            let result = wire.read_step(buf, self.ledger);
-            if self.judge == Judge::Stream {
-                self.ledger.network_waited(waiting.elapsed());
-            }
-            match result {
+            match wire.read_step(buf, self.ledger) {
                 Ok(n) => {
                     if n > 0 {
                         let now = Instant::now();
@@ -877,7 +873,6 @@ impl BodyReader<'_> {
                     let silent = self.advanced.elapsed();
                     if self.judge.silent_is_stall() && silent > self.ledger.patience() {
                         self.stalled = true;
-                        self.ledger.stalled_stream();
                         let _ = self
                             .wire
                             .as_ref()

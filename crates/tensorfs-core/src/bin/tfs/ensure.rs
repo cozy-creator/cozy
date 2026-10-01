@@ -124,7 +124,6 @@ pub fn cmd_ensure(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     request.step = step;
     request.keep = &keep;
     request.streams = flag_num(flags, "streams", transport::PULL_STREAMS);
-    request.streams_start = flag_num(flags, "streams-start", transport::STREAMS);
     request.sample_seconds = flag_num(flags, "sample-seconds", transport::SAMPLE_SECONDS);
     request.on_event = Some(&on_event);
     answer(ensure::ensure(&request))

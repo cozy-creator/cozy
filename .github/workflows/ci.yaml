@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
-  # Model weights must keep arriving (run 2322, 2026-10-01): the slow-tail hedge, resets,
+  # Model weights must keep arriving (run 2322, 2026-10-01): slow chunk answers, resets,
   # stalls, 5xx/429/Retry-After, expired URLs, wrong bytes, hub weather and verdicts,
   # cancellation and resume, all over real loopback HTTP through `ensure` and `pull`.
   download-path:

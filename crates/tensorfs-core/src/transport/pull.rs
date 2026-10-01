@@ -1,20 +1,9 @@
-//! The pull: closure → plan → N-way walk → completion proof (tfs-049, `pull.py` ported
-//! with its evidence).
+//! The pull: closure → plan → download → completion proof (tfs-049).
 //!
-//! **The wanted list is walked by N streams, not one.** An artifact is already cut on the
-//! object grid, so the objects are independent and the serial loop was leaving the whole
-//! link on the table — measured, not supposed: at 92.42 GiB on a rented pod the serial
-//! loop moved 49.8 MB/s against a 141 MB/s transport ceiling on the same pods and the same
-//! presigned GETs, and a 16-way walk through this same door landed 117.6 MB/s. Concurrency
-//! changes the ORDER objects are asked for and nothing else: the plan is still
-//! `FetchPlan::of`'s, every byte still enters at `DeliveryGrant::admit` → `put_stream`,
-//! and the proof is still `complete`.
-//!
-//! **Resume is PER OBJECT**, which is what the plan makes free: a dropped connection loses
-//! one object's partial temp file and nothing else, and the next invocation re-plans
-//! against the store and asks only for what is still missing. There is no byte-range
-//! resume inside an object — the artifact is already cut on the object grid, so the
-//! recovery unit is an object.
+//! The plan is `FetchPlan::of`'s, the wanted objects are downloaded by `download` as ranged
+//! chunks, every byte is hashed against its digest before the Store commits it, and the
+//! proof is still `complete`. Resume across pulls is per object: the next invocation
+//! re-plans against the store and asks only for what is still missing.
 //!
 //! **A presigned URL is minted just before the object it authorizes is fetched.** The
 //! hub caps a URL's life, and the question that cap answers depends entirely on WHEN the
@@ -40,32 +29,19 @@
 //! costs a transfer. The only bound with a correctness role is how many digests fit in one
 //! request, and that number belongs to the hub, which now says it on every closure.
 //!
-//! **Which failures deserve a re-ask.** A stall the ledger NAMED, a connection that died,
-//! the object store's own retryable answers, and a LOCAL store that was merely busy do; an
-//! absent key does not. Asking the same question with the same expired URL is a lie about
-//! time — but re-AUTHORIZING is a different act, and it is the one the origin's 403 asked
-//! for. So a 403 is judged by the LEASE it refused: one the hub's own declared life says was
+//! **A 403 is judged by the LEASE it refused.** One the hub's own declared life says was
 //! already spent is re-minted, and one minted moments ago is terminal, because a refusal of
-//! a fresh capability is not about time. That gate is an observed fact and not a count — a
-//! count would call a genuinely slow object's second 403 terminal, and a slow origin is not
-//! a broken one.
-//!
-//! A refusal at the admission door propagates untouched: the bytes are wrong at the only
-//! authority there is. The catalog waits for a live lock holder instead of refusing
-//! (`catalog::lock`), so sixteen concurrent writers queue rather than fail.
+//! a fresh capability is not about time.
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::{DeliveryGrant, Destination, FetchPlan};
+use crate::fetch::{DeliveryGrant, FetchPlan};
 use crate::ids::{Doc, ObjectRef};
-use crate::repo_cache::{CacheKind, CacheRead, CacheTrust};
 use crate::store::Store;
 use crate::transport::http::{self, Client};
 use crate::transport::hub::{self, CredentialProvider};
-use crate::transport::ledger::{Deadline, Ledger, FETCH_ATTEMPTS, STALL_FACTOR, STREAMS};
-use crate::transport::pace::{Level, Pace, PULL_STREAMS};
+use crate::transport::ledger::{Deadline, Ledger, FETCH_ATTEMPTS, PULL_STREAMS, STALL_FACTOR};
 use crate::transport::policy::{self, SourcePolicy};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -123,18 +99,15 @@ pub struct Fetched {
     pub transferred: u64,
 }
 
-struct Observed<'l, F, G> {
+struct Observed<'l, F> {
     inner: http::BodyReader<'l>,
     seen: u64,
     limit: u64,
     failure: Option<Refusal>,
     notify: F,
-    /// Called once the last declared byte is in: the socket is done even though the
-    /// object's fsync and admission are not.
-    received: G,
 }
 
-impl<F: FnMut(u64), G: FnMut()> std::io::Read for Observed<'_, F, G> {
+impl<F: FnMut(u64)> std::io::Read for Observed<'_, F> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let remaining = self.limit.saturating_sub(self.seen);
         let bounded = out
@@ -153,9 +126,6 @@ impl<F: FnMut(u64), G: FnMut()> std::io::Read for Observed<'_, F, G> {
         if n > 0 {
             self.seen += n as u64;
             (self.notify)(self.seen);
-            if self.seen == self.limit {
-                (self.received)();
-            }
         }
         Ok(n)
     }
@@ -217,35 +187,20 @@ pub fn fetch_authorized(
     observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
     fetch_with_attempts(
-        store,
-        grant,
-        &|stale, _| authorize(stale),
-        policy,
-        credential,
-        deadline,
-        ledger,
-        observer,
-        &AtomicU32::new(0),
-        true,
-        shared_client(),
-        None,
+        store, grant, authorize, policy, credential, deadline, ledger, observer,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn fetch_with_attempts(
+fn fetch_with_attempts(
     store: &Store,
     grant: &DeliveryGrant,
-    authorize: &dyn Fn(bool, &Ledger) -> Result<String>,
+    authorize: &dyn Fn(bool) -> Result<String>,
     policy: &SourcePolicy,
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
     mut observer: Option<&mut dyn FetchObserver>,
-    attempts: &AtomicU32,
-    retry: bool,
-    client: &Client,
-    received: Option<&(dyn Fn() + Sync)>,
 ) -> Result<Fetched> {
     let id = grant.object.id();
     let mut last_refusal: Option<Refusal> = None;
@@ -254,20 +209,15 @@ pub(super) fn fetch_with_attempts(
     // the supplier decides whether re-authorizing is honest — it holds the lease and its
     // declared life, which is the only place that question can be answered.
     let mut stale: Option<u16> = None;
-    loop {
+    let mut attempt = 0;
+    while attempt < FETCH_ATTEMPTS {
         ledger.check_running()?;
-        let attempt = match attempts.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < FETCH_ATTEMPTS).then_some(count + 1)
-        }) {
-            Ok(count) => count + 1,
-            Err(_) => break,
-        };
-        ledger.start_attempt();
-        let last = !retry || attempt == FETCH_ATTEMPTS;
+        attempt += 1;
+        let last = attempt == FETCH_ATTEMPTS;
         // A refused re-authorization must still name the origin's answer. It is the whole
         // diagnosis: "403, and re-minting was not honest" and "403, and the hub would not
         // mint" are different problems with different owners.
-        let url = match authorize(stale.is_some(), ledger) {
+        let url = match authorize(stale.is_some()) {
             Ok(url) => url,
             Err(refusal) => match stale {
                 Some(status) => {
@@ -288,7 +238,7 @@ pub(super) fn fetch_with_attempts(
         // read: an ask that dies in the middle still says which host answered it and how.
         let mut hops: Vec<(String, u16)> = Vec::new();
         let opened = open_object(
-            client,
+            shared_client(),
             &url,
             policy,
             credential,
@@ -318,7 +268,7 @@ pub(super) fn fetch_with_attempts(
             Opened::Body(response) => response,
             Opened::Retryable(status, stated) => {
                 let (wait, counted) = ledger.retry_wait(stated);
-                if !retry || (last && counted) {
+                if last && counted {
                     return refuse(
                         Code::TRANSFER_FAILED,
                         format!("{id}: the object store answered {status} on every attempt"),
@@ -326,7 +276,7 @@ pub(super) fn fetch_with_attempts(
                 }
                 if !counted {
                     // The origin said when to come back; that is not a failed ask.
-                    attempts.fetch_sub(1, Ordering::AcqRel);
+                    attempt -= 1;
                 }
                 ledger.pause(wait, deadline)?;
                 continue;
@@ -358,13 +308,6 @@ pub(super) fn fetch_with_attempts(
             notify: |total| {
                 if let Some(watcher) = observer.as_mut() {
                     watcher.moved(total);
-                }
-            },
-            // Every byte is here: the socket slot is free for the next object while this
-            // one is fsynced and admitted, so a slow disk is not a slow network.
-            received: || {
-                if let Some(received) = received {
-                    received();
                 }
             },
         };
@@ -472,14 +415,6 @@ pub(super) fn open_object<'l>(
         )?;
         let status = response.status;
         hop(&checked, status);
-        if status == 200 || status == 206 {
-            ledger.origin(&format!(
-                "{}://{}:{}",
-                if checked.https { "https" } else { "http" },
-                checked.host,
-                checked.port
-            ));
-        }
         if (300..400).contains(&status) {
             let Some(location) = response.header("location").map(str::to_string) else {
                 return refuse(Code::REDIRECT_REFUSED, "origin redirected with no Location");
@@ -900,12 +835,11 @@ pub struct WalkOutcome {
     pub bytes_moved: u64,
     pub cached: u64,
     pub bytes_cached: u64,
-    /// Objects the walk admitted in flight when it ended.
+    /// Requests the download kept in flight.
     pub streams: usize,
-    /// Every level `pace` measured, in order.
-    pub levels: Vec<Level>,
-    /// Times a stall or a full descriptor table halved the level.
-    pub backoffs: u32,
+    /// GETs sent, and how many of them were dropped as silent or slow and asked again.
+    pub requests: u64,
+    pub restarts: u64,
 }
 
 /// Walk `plan.wanted` with `streams` objects in flight. One is the serial walk and it
@@ -930,8 +864,7 @@ pub struct WalkOutcome {
 /// for the cache. Once acquisition finishes, rejected offers are retried while
 /// cache copies make progress. The CLI drains accepted work and reports incomplete
 /// replication on cache failure. A failed pull does not promise a complete cache.
-/// `streams` is the most objects in flight. The walk starts at `STREAMS` (or `streams`, if
-/// smaller) and grows toward it while the measured aggregate goodput grows (`pace`).
+/// `streams` is the most requests in flight (`download`).
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_wanted(
     store: &Store,
@@ -945,7 +878,7 @@ pub fn fetch_wanted(
     on_object: Option<ObjectObserver<'_>>,
 ) -> Result<WalkOutcome> {
     fetch_wanted_bounded(
-        store, plan, urls, policy, credential, deadline, ledger, STREAMS, streams, on_object, None,
+        store, plan, urls, policy, credential, deadline, ledger, streams, on_object, None,
     )
 }
 
@@ -958,284 +891,37 @@ pub(super) fn fetch_wanted_bounded(
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
-    start: usize,
     streams: usize,
     on_object: Option<ObjectObserver<'_>>,
     cache_writes: Option<&crate::repo_cache::CacheWriteReceipt>,
 ) -> Result<WalkOutcome> {
-    let cache = store.repo_cache();
-    let backfill = cache.map(|cache| {
+    let backfill = store.repo_cache().map(|cache| {
         crate::repo_cache::BackfillBatch::new(cache.clone(), store, plan.wanted.len())
             .observe(cache_writes.cloned().unwrap_or_default())
     });
-    // Nothing is checked up front any more, because there is no up-front set to check. The
-    // invariant it proved — the grant set covers the wanted set exactly — is enforced per
-    // mint instead: presign authorizes every digest it was asked or refuses, never a silent
-    // subset, and a supplier with no URL for an object refuses in the same words.
-    // Descriptors are a budget like memory: the soft limit is raised to the hard one (a Go
-    // parent hands its children the original), and the walk never grows past what the
-    // table can hold (run 1297: EMFILE under a 1,024 soft limit at 128 streams).
+    // Descriptors and memory are budgets: the soft descriptor limit is raised to the hard
+    // one, and the download never runs more requests than either can hold (run 1297:
+    // EMFILE under a 1,024 soft limit at 128 streams).
     crate::descriptors::raise();
     let streams = crate::descriptors::streams_within(super::memory::transfer_streams(
         streams.clamp(1, PULL_STREAMS),
     ));
-    let recovery = super::speculate::Recovery::default();
-    let began = Instant::now();
-    // A stream's
-    // permit is released once its body is in, so its thread may still be fsyncing and
-    // admitting while another thread uses the permit: twice the threads keeps the permits
-    // busy however slow the disk is.
-    let workers = (2 * streams).min(plan.wanted.len().max(1));
-    // The level is the link's, not this closure's: a seven-object pull reports the level it
-    // was handed, so the next, larger pull on this pod does not start below it.
-    let pace = Pace::new(start, streams, workers, ledger);
-    let next = AtomicUsize::new(0);
-    // Objects between their first byte asked and their admission done.
-    let busy = AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
-    let fetched = AtomicU64::new(0);
-    let bytes_moved = AtomicU64::new(0);
-    let cached = AtomicU64::new(0);
-    let bytes_cached = AtomicU64::new(0);
-    let first: Mutex<Option<Refusal>> = Mutex::new(None);
-    let halt = |refusal: Refusal| {
-        let mut slot = first.lock().unwrap();
-        if slot.is_none() {
-            // Keep the actual failure before waking peers, so their
-            // cancellation errors cannot replace its diagnosis.
-            *slot = Some(refusal);
-            ledger.cancel();
-        }
-        stop.store(true, Ordering::Relaxed);
-        pace.halt();
-    };
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            pace.steer(ledger, &stop, &|| {
-                plan.wanted
-                    .len()
-                    .saturating_sub(next.load(Ordering::Relaxed))
-            })
-        });
-        for _ in 0..workers {
-            scope.spawn(|| {
-                let _leaving = Leaving(&pace);
-                loop {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let Some(permit) = pace.admit(&stop, ledger) else {
-                        if let Err(refusal) = ledger.check_running() {
-                            halt(refusal);
-                        }
-                        return;
-                    };
-                    let mut first_permit = Some(permit);
-                    let at = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(object) = plan.wanted.get(at) else {
-                        return;
-                    };
-                    let authorize = |stale: bool, ledger: &Ledger| {
-                        urls.url_for_while(at, object, stale, ledger)
-                    };
-                    // A full descriptor table is backpressure, not a verdict about the
-                    // object: the level halves and this object is asked again, until one
-                    // stream still cannot get a descriptor.
-                    let outcome = loop {
-                        let permit = match first_permit.take() {
-                            Some(permit) => permit,
-                            None => match pace.admit(&stop, ledger) {
-                                Some(permit) => permit,
-                                None => {
-                                    break Err(ledger.check_running().err().unwrap_or(Refusal {
-                                        code: Code::TRANSFER_FAILED,
-                                        detail: "the pull stopped".into(),
-                                    }))
-                                }
-                            },
-                        };
-                        let permit = Mutex::new(Some(permit));
-                        let received = || drop(permit.lock().unwrap().take());
-                        let exhausted = crate::descriptors::exhaustions();
-                        let backoffs = pace.backoffs();
-                        busy.fetch_add(1, Ordering::AcqRel);
-                        let attempt = DeliveryGrant::mint(plan, object).and_then(|grant| {
-                            // The grant already knows which namespace this object lives in — it
-                            // derives its own storage key from the same bit — so the cache is asked
-                            // the question the grant answers rather than one restated here. A
-                            // carrier has no namespace and no place in an immutable repo cache; it
-                            // also cannot reach here, because this walk mints from a plan and a
-                            // plan never names one.
-                            let kind = match grant.destination {
-                                Destination::Manifest => Some(CacheKind::Manifest),
-                                Destination::Blob => Some(CacheKind::Blob),
-                                Destination::Staging => None,
-                            };
-                            let mut trust = CacheTrust::Name;
-                            if let (Some(kind), Some(cache)) = (kind, cache) {
-                                match cache.admit(store, kind, object)? {
-                                    CacheRead::Hit => return Ok(Source::Cache),
-                                    // This read proved the cached bytes wrong: the backfill replaces
-                                    // them instead of trusting the name.
-                                    CacheRead::Corrupt => trust = CacheTrust::Rehash,
-                                    CacheRead::Missing | CacheRead::Unavailable => {}
-                                }
-                            }
-                            let one = recovery.fetch(
-                                store,
-                                &grant,
-                                &authorize,
-                                policy,
-                                credential,
-                                deadline,
-                                ledger,
-                                &|| super::speculate::Lanes {
-                                    level: pace.limit(),
-                                    busy: busy.load(Ordering::Acquire),
-                                    tail: next.load(Ordering::Acquire) >= plan.wanted.len(),
-                                },
-                                Some(&received),
-                            )?;
-                            if let (Some(kind), Some(_cache)) = (kind, cache) {
-                                // Local admission is complete. Optional replication must never
-                                // occupy an origin slot or delay this object's completion report.
-                                backfill
-                                    .as_ref()
-                                    .expect("bound cache has a backfill batch")
-                                    .offer(kind, object, trust);
-                            }
-                            Ok(Source::Origin(one))
-                        });
-                        drop(permit);
-                        let others = busy.fetch_sub(1, Ordering::AcqRel) - 1;
-                        match attempt {
-                            Err(refusal)
-                                if refusal.code == Code::FD_HEADROOM
-                                    || crate::descriptors::exhaustions() > exhausted =>
-                            {
-                                // Descriptors come back as the objects still in flight
-                                // finish. With nothing else in flight at one stream, the
-                                // shortage is not this walk's to wait out.
-                                if others == 0 && pace.limit() <= 1 {
-                                    break Err(refusal);
-                                }
-                                pace.back_off(backoffs);
-                                if let Err(refusal) = wait_for_descriptors(&busy, ledger) {
-                                    break Err(refusal);
-                                }
-                            }
-                            attempt => break attempt,
-                        }
-                    };
-                    match outcome {
-                        Ok(source) => {
-                            let moved = match &source {
-                                Source::Cache => {
-                                    cached.fetch_add(1, Ordering::Relaxed);
-                                    bytes_cached.fetch_add(object.length, Ordering::Relaxed);
-                                    // THE CACHE DOOR IS PROGRESS TOO (tfs-106). Origin bytes are
-                                    // counted where they cross the socket; cached ones never
-                                    // reach a socket, so without this a warm datacenter reading
-                                    // its own volume would look, to the control plane, exactly
-                                    // like a pull that had stopped — and the first mint after a
-                                    // run of cache hits would be condemned for the volume's
-                                    // honest read time. Per object is fine grained enough: a CAS
-                                    // object is bounded by the 64 MiB grid.
-                                    ledger.moved(object.length);
-                                    object.length
-                                }
-                                Source::Origin(one) => {
-                                    fetched.fetch_add(1, Ordering::Relaxed);
-                                    bytes_moved.fetch_add(one.transferred, Ordering::Relaxed);
-                                    one.transferred
-                                }
-                            };
-                            if let Some(observer) = on_object {
-                                observer(object, moved, source.door());
-                            }
-                        }
-                        Err(refusal) => {
-                            halt(refusal);
-                            return;
-                        }
-                    }
-                }
-            });
-        }
-    });
-    let refusal = first.lock().unwrap().take();
-    let (streams, levels, backoffs) = pace.outcome();
-    super::decisions::record(
+    let walked = super::download::Download {
         store,
-        "walk",
-        &format!("{} {}", plan.wanted.len(), plan.wanted_bytes()),
-        &format!(
-            "fetched={} cached={} moved={} seconds={:.1} level={streams} hedges={} hedges_won={} \
-             outcome={}",
-            fetched.load(Ordering::Relaxed),
-            cached.load(Ordering::Relaxed),
-            bytes_moved.load(Ordering::Relaxed),
-            began.elapsed().as_secs_f64(),
-            recovery.hedges.load(Ordering::Relaxed),
-            recovery.won.load(Ordering::Relaxed),
-            refusal.as_ref().map_or("ok", |r| r.code.as_str()),
-        ),
-    );
-    if let Some(refusal) = refusal {
-        return Err(refusal);
+        plan,
+        urls,
+        policy,
+        credential,
+        deadline,
+        ledger,
+        on_object,
+        backfill: backfill.as_ref(),
     }
+    .run(streams)?;
     if let Some(backfill) = backfill {
         backfill.finish_offers();
     }
-    Ok(WalkOutcome {
-        fetched: fetched.load(Ordering::Relaxed),
-        bytes_moved: bytes_moved.load(Ordering::Relaxed),
-        cached: cached.load(Ordering::Relaxed),
-        bytes_cached: bytes_cached.load(Ordering::Relaxed),
-        streams,
-        levels,
-        backoffs,
-    })
-}
-
-/// Wait, at the ledger's resolution, until one stream's worth of descriptors is free or no
-/// other object is left in flight to free them. Either way the caller asks again; the next
-/// failure alone at one stream is final.
-fn wait_for_descriptors(busy: &AtomicUsize, ledger: &Ledger) -> Result<()> {
-    loop {
-        ledger.check_running()?;
-        let free = crate::descriptors::available()
-            .is_none_or(|free| free >= crate::descriptors::PER_STREAM);
-        if free || busy.load(Ordering::Acquire) == 0 {
-            return Ok(());
-        }
-        std::thread::sleep(ledger.sample());
-    }
-}
-
-/// A worker's exit, however it leaves, lets the steering thread stop waiting for it.
-struct Leaving<'a>(&'a Pace);
-
-impl Drop for Leaving<'_> {
-    fn drop(&mut self) {
-        self.0.worker_finished();
-    }
-}
-
-/// Which door answered for one object. Both crossed `DeliveryGrant::admit`; only one
-/// crossed the network.
-enum Source {
-    Cache,
-    Origin(Fetched),
-}
-
-impl Source {
-    fn door(&self) -> ObjectSource {
-        match self {
-            Source::Cache => ObjectSource::Cache,
-            Source::Origin(_) => ObjectSource::Origin,
-        }
-    }
+    Ok(walked)
 }
 
 /// One pull, described before it runs. `sample_seconds` is the ledger's RESOLUTION —
@@ -1249,10 +935,8 @@ pub struct PullRequest<'a> {
     pub credential: &'a dyn CredentialProvider,
     pub policy: &'a SourcePolicy,
     pub deadline: Deadline,
-    /// The most objects in flight. The walk starts at `streams_start` and grows toward
-    /// this while the measured goodput grows.
+    /// The most requests in flight.
     pub streams: usize,
-    pub streams_start: usize,
     pub session: &'a str,
     pub sample_seconds: f64,
     /// Remaining admission allowance supplied by the host: new bytes and objects,
@@ -1285,7 +969,6 @@ impl<'a> PullRequest<'a> {
             policy,
             deadline: Deadline::none(),
             streams: PULL_STREAMS,
-            streams_start: STREAMS,
             session: "",
             sample_seconds: crate::transport::ledger::SAMPLE_SECONDS,
             download_budget: None,
@@ -1357,11 +1040,11 @@ pub struct PullReport {
     pub lane: String,
     pub manifest: String,
     pub session: String,
-    /// Objects in flight when the walk ended, and every level it measured on the way.
+    /// Requests the download kept in flight, the GETs it sent, and how many of those it
+    /// dropped as silent or slow and asked again.
     pub streams: usize,
-    pub levels: Vec<Level>,
-    /// Times a stall or a full descriptor table halved the level.
-    pub backoffs: u32,
+    pub requests: u64,
+    pub restarts: u64,
     pub declared: u64,
     pub held: u64,
     pub fetched: u64,
@@ -1491,14 +1174,13 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             request.credential,
             request.deadline,
             &ledger,
-            request.streams_start,
             request.streams,
             request.on_object,
             Some(&report.cache_writes),
         )?;
         report.streams = walked.streams;
-        report.levels = walked.levels;
-        report.backoffs = walked.backoffs;
+        report.requests = walked.requests;
+        report.restarts = walked.restarts;
         report.fetched = walked.fetched;
         report.bytes_moved = walked.bytes_moved;
         report.cached = walked.cached;
@@ -1544,7 +1226,6 @@ fn plan_against_store(
         lane: closure.lane.clone(),
         manifest: closure.manifest.id(),
         session,
-        streams: request.streams_start.clamp(1, request.streams.max(1)),
         declared: (plan.held.len() + plan.wanted.len()) as u64,
         held: plan.held.len() as u64,
         bytes_held: plan.held_bytes(),
@@ -1729,6 +1410,7 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
 #[cfg(test)]
 mod mint_wait_tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn mint_owner_completion_wakes_waiters_and_attempt_stop_is_local() {

@@ -52,8 +52,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p tensorfs-core --test fetch_faults -- --test-threads=2
 
-  # Release gate (run 2322): a real-HTTP hub pull whose tail objects an R2-like store
-  # drip-feeds must finish at body throughput, and a hedged range must outlive its presign.
+  # Release gate (run 2322): a real-HTTP hub pull from an R2-like store, where some MiBs
+  # crawl for their first ask, must finish at body throughput.
   download-tail:
     needs: gate
     runs-on: ubuntu-latest

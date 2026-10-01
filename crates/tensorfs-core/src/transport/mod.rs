@@ -15,16 +15,14 @@
 //! Three behaviours are PORTED from cozy-runtime's `pull.py`/`egress.py` with their
 //! evidence, not reinvented (they were measured, and paid for on a rented pod):
 //!
-//! - **per-object resume** (`pull`): the recovery unit is an object; no byte-range resume
-//!   inside one — the artifact is already cut on the object grid. That is a fact about
-//!   PUBLISHED artifacts, and `ranged` is where it stops being true: a foreign source
-//!   object is whatever the uploader pushed, so the grid is cut at fetch time instead;
+//! - **per-object resume across pulls** (`pull`): the next pull re-plans against the store
+//!   and asks only for the objects still missing;
 //! - **the liveness ledger, never a timeout** (`ledger`): a deadline arrives from the
 //!   caller or there is none; a stream is judged only against the longest gap this pull
 //!   has actually shown;
-//! - **the N-way walk** (`pull::fetch_wanted`): 49.8 MB/s serial vs 117.6 MB/s at 16
-//!   streams on 92.42 GiB, same pods, same presigned GETs, 141 MB/s ceiling. Where one GET
-//!   is the limit rather than the link, `pace` grows the walk past 16 while goodput follows.
+//! - **the chunked download** (`download`): the wanted objects as fixed ranged chunks on
+//!   one queue, 128 requests in flight, and a request that fails, goes silent or runs far
+//!   slower than its peers asked again on a fresh connection.
 //!
 //! And the address predicate travels WITH the transport (`policy`), so there is still
 //! exactly one downloader with the check — cr-012's fence, retargeted here by cr-090.
@@ -34,33 +32,32 @@
 
 mod api;
 mod decisions;
+mod download;
 mod http;
 mod hub;
 mod ledger;
 mod memory;
-mod pace;
 mod policy;
 pub(crate) mod prefix;
 mod pull;
 mod push;
 mod ranged;
-mod speculate;
 
 #[cfg(test)]
 mod tests;
 
 pub use api::{api_get, fetch_prefix, probe_length, Prefix};
+pub use download::CHUNK_BYTES;
 pub use http::{trust_roots, Client};
 pub use hub::{
     closure, closure_all, credential_from_spec, presign, Anonymous, Closure, CredentialProvider,
     HostToken, Presigned, ScopedHeaders,
 };
 pub use ledger::{
-    Deadline, Ledger, PullCancellation, FETCH_ATTEMPTS, SAMPLE_SECONDS, STALL_FACTOR,
+    Deadline, Ledger, PullCancellation, FETCH_ATTEMPTS, PULL_STREAMS, SAMPLE_SECONDS, STALL_FACTOR,
     STILL_SAMPLES, STREAMS,
 };
 pub use memory::{memory_available, streams_within, transfer_streams, STREAM_MEMORY};
-pub use pace::{Level, GAIN, PULL_STREAMS};
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
     fetch_authorized, fetch_url, fetch_wanted, pull, resolve_closure, FetchObserver, Fetched,

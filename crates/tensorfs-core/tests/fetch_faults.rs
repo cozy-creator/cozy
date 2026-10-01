@@ -416,6 +416,8 @@ fn serve(
     };
     let sent = object.then(|| (ledger, route.as_str()));
     let (code, body, range) = ranged(&asked, body);
+    // A fault's offset is within the answer; a ranged answer may be shorter than it.
+    let within = |at: u64| (at as usize).min(body.len());
     let headers = range
         .map(|r| vec![("content-range".to_string(), r)])
         .unwrap_or_default();
@@ -434,16 +436,16 @@ fn serve(
         }
         Some(Fault::Truncate(at)) => {
             head(&mut socket, code, &headers, body.len() as u64);
-            write_counted(&mut socket, &body[..at as usize], sent);
+            write_counted(&mut socket, &body[..within(at)], sent);
         }
         Some(Fault::Reset(at)) => {
             head(&mut socket, code, &headers, body.len() as u64);
-            write_counted(&mut socket, &body[..at as usize], sent);
+            write_counted(&mut socket, &body[..within(at)], sent);
             reset(socket);
         }
         Some(Fault::Stall(at)) => {
             head(&mut socket, code, &headers, body.len() as u64);
-            write_counted(&mut socket, &body[..at as usize], sent);
+            write_counted(&mut socket, &body[..within(at)], sent);
             let mut sink = [0u8; 64];
             while matches!(socket.read(&mut sink), Ok(n) if n > 0) {}
         }
@@ -683,7 +685,6 @@ impl<'a> Run<'a> {
             request.step = "fault proof";
             request.cancellation = Some(stop);
             request.streams = streams;
-            request.streams_start = streams;
             request.sample_seconds = SAMPLE;
             request.on_event = Some(&on_event);
             let _ = tx.send(ensure::ensure(&request));
@@ -971,8 +972,7 @@ fn an_unrepresentable_retry_after_is_no_statement() {
 /// URLs that die before their GET. The hub's declared life either tells the truth (the
 /// client re-mints by age before asking) or disagrees with the object store's clock (the
 /// client learns only from the 403). One stream, each first ask slower than a URL's life,
-/// so later objects are asked for after their URLs died whatever the walk's order, and no
-/// idle lane exists for a hedge to win the race against the expiry.
+/// so later objects are asked for after their URLs died whatever the order.
 #[test]
 fn urls_that_die_before_their_get_are_re_minted_and_every_object_lands() {
     for declared in [None, Some(Duration::from_secs(3600))] {
@@ -1065,8 +1065,8 @@ fn wrong_bytes_once_are_re_asked_and_wrong_bytes_always_are_a_typed_verdict() {
     assert!(always.asks(&victim) <= tensorfs_core::transport::FETCH_ATTEMPTS as usize);
 }
 
-/// A blip that spends every ask of the first attempt in milliseconds measured nothing: the
-/// ensure waits a sample and re-attempts. STALLED needs the ledger's floor of no landing.
+/// A blip is asked through: the pull asks again, a sample apart, until the link answers.
+/// STALLED needs the ledger's floor of no landing.
 #[test]
 fn a_link_blip_before_any_object_lands_is_re_attempted_and_only_stillness_stalls() {
     let checkpoint = checkpoint(3, 64 << 10, 20);
@@ -1078,8 +1078,9 @@ fn a_link_blip_before_any_object_lands_is_re_attempted_and_only_stillness_stalls
         },
     );
     let root = store(&temporary("blip"));
+    // Nothing counts asks: the pull itself asks again and the first attempt lands it all.
     let ensured = assert_landed(&Run::new(&blip, &root).ensure(), &blip, &root);
-    assert!(ensured.attempts >= 2, "{}", blip.log());
+    assert_eq!(ensured.attempts, 1, "{}", blip.log());
 
     let down = hub(
         Arc::clone(&checkpoint),
@@ -1610,31 +1611,25 @@ fn a_cancelled_pull_resumes_with_a_new_token_and_buys_only_what_is_missing() {
 }
 
 #[test]
-fn progress_never_claims_bytes_a_failed_ask_threw_away() {
-    let dir = temporary("honest-progress");
+fn a_failed_asks_bytes_are_kept_and_the_next_ask_is_for_the_rest() {
+    let dir = temporary("resume");
     let checkpoint = checkpoint(2, 1 << 20, 17);
     let victim = blob(&checkpoint, 0);
-    // Three asks die at 90%: 2.7 MiB moved and discarded for a 1 MiB object, and the fourth
-    // is slow enough to be sampled while the object is still missing.
-    let slow = Duration::from_secs(3);
+    // The first answer dies at 90%. Those bytes stay, the second ask is for the last 10%,
+    // and the progress `assert_landed` checks never passes the total on the way.
     let hub = hub(
         Arc::clone(&checkpoint),
         Config {
-            rules: vec![
-                on(&victim, 1..=3, Fault::Truncate(900 << 10)),
-                on(&victim, 4..=4, Fault::Slow(slow)),
-            ],
+            rules: vec![on(&victim, 1..=1, Fault::Truncate(900 << 10))],
             ..Config::default()
         },
     );
     let root = store(&dir);
-    let mut run = Run::new(&hub, &root);
-    run.allowance = slow;
-    assert_landed(&run.ensure(), &hub, &root);
-    assert_eq!(hub.asks(&victim), 4, "{}", hub.log());
+    assert_landed(&Run::new(&hub, &root).ensure(), &hub, &root);
+    assert_eq!(hub.asks(&victim), 2, "{}", hub.log());
     assert_eq!(
         hub.sent(&victim),
-        1 << 20,
-        "the landing ask sent the whole object"
+        (1 << 20) - (900 << 10),
+        "the second ask sent more than the rest"
     );
 }

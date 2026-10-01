@@ -276,7 +276,6 @@ fn pull_with_budget(
     request.lane = flag(flags, "lane").unwrap_or("");
     request.session = flag(flags, "session").unwrap_or("");
     request.streams = crate::flag_num(flags, "streams", transport::PULL_STREAMS);
-    request.streams_start = crate::flag_num(flags, "streams-start", transport::STREAMS);
     request.deadline = deadline_of(flags);
     request.download_budget = budget;
     // THE WALK REPORTS WHILE IT WALKS.
@@ -319,32 +318,19 @@ fn pull_with_budget(
         quoted(&report.model), quoted(&report.manifest), quoted(&report.scope),
         report.cache_writes.bytes(), report.bytes_cached, report.bytes_total,
     );
-    // What each stream level bought, so a slow pull says whether more streams helped
-    // (one GET was the limit) or not (the link, disk or origin was).
-    let levels: Vec<String> = report
-        .levels
-        .iter()
-        .map(|level| {
-            format!(
-                "[{},{}]",
-                level.streams,
-                level.bytes_per_second.round() as u64
-            )
-        })
-        .collect();
-    // And what admitting them cost: a pull whose streams stop growing while its batches
-    // take most of the wall time is held by the disk, not the link. `durability` says
-    // which syncs the disk the Store lives on made it pay, and what an unclean shutdown
-    // before this pull cost to repair.
+    // What the requests cost and what admitting them cost: a pull whose batches take most
+    // of the wall time is held by the disk, not the link. `durability` says which syncs the
+    // disk the Store lives on made it pay, and what an unclean shutdown before this pull
+    // cost to repair.
     let durability = &report.durability;
     eprintln!(
-        "{{\"event\":\"pull.streams\",\"model\":{},\"seconds\":{:.3},\"bytes_moved\":{},\"streams\":{},\"levels\":[{}],\"backoffs\":{},\"admission\":{{\"objects\":{},\"batches\":{},\"seconds\":{:.3}}},\"durability\":{{\"class\":{},\"filesystem\":{},\"syncs\":{},\"sync_seconds\":{:.3},\"recovery\":{{\"rehashed\":{},\"removed\":{},\"seconds\":{:.3}}}}}}}",
+        "{{\"event\":\"pull.streams\",\"model\":{},\"seconds\":{:.3},\"bytes_moved\":{},\"streams\":{},\"requests\":{},\"restarts\":{},\"admission\":{{\"objects\":{},\"batches\":{},\"seconds\":{:.3}}},\"durability\":{{\"class\":{},\"filesystem\":{},\"syncs\":{},\"sync_seconds\":{:.3},\"recovery\":{{\"rehashed\":{},\"removed\":{},\"seconds\":{:.3}}}}}}}",
         quoted(&report.model),
         seconds,
         report.bytes_moved,
         report.streams,
-        levels.join(","),
-        report.backoffs,
+        report.requests,
+        report.restarts,
         after.admitted_objects - before.admitted_objects,
         after.admission_batches - before.admission_batches,
         (after.admission_nanos - before.admission_nanos) as f64 / 1e9,
