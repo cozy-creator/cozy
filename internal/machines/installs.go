@@ -16,12 +16,27 @@ import (
 // observation and attachment, and no installation can allocate or replace a rental.
 type Installs struct {
 	store   *records.Store
-	prepare func(context.Context, records.RentalInstall) *exit.Error
+	prepare func(context.Context, records.RentalInstall, func(InstallProgress)) *exit.Error
 	log     io.Writer
 	wake    chan struct{}
+	// progress is each running installation's latest preparation report, by install id.
+	progress sync.Map
 }
 
-func NewInstalls(store *records.Store, prepare func(context.Context, records.RentalInstall) *exit.Error, log io.Writer) *Installs {
+// InstallProgress is the machine's latest report on one running installation.
+type InstallProgress struct {
+	Stage            string `json:"stage"`
+	TotalBytes       uint64 `json:"total_bytes"`
+	TransferredBytes uint64 `json:"transferred_bytes"`
+}
+
+// InstallStatus is one installation's durable record and, while it runs, its progress.
+type InstallStatus struct {
+	records.RentalInstall
+	Progress *InstallProgress `json:"progress,omitempty"`
+}
+
+func NewInstalls(store *records.Store, prepare func(context.Context, records.RentalInstall, func(InstallProgress)) *exit.Error, log io.Writer) *Installs {
 	if log == nil {
 		log = io.Discard
 	}
@@ -47,6 +62,23 @@ func (q *Installs) Accept(machine string, selection records.RentalInstallSelecti
 		q.Wake()
 	}
 	return row, problem
+}
+
+// Status reads one installation on one machine, with its progress while it runs.
+func (q *Installs) Status(machine, id string) (*InstallStatus, *exit.Error) {
+	row, problem := q.store.RentalInstall(id)
+	if problem != nil {
+		return nil, problem
+	}
+	if row == nil || row.RentalID != machine {
+		return nil, exit.New(exit.NotFound, "no installation %s on %s", id, machine)
+	}
+	status := &InstallStatus{RentalInstall: *row}
+	if progress, ok := q.progress.Load(id); ok && row.Active() {
+		reported := progress.(InstallProgress)
+		status.Progress = &reported
+	}
+	return status, nil
 }
 
 // InstallTarget names the machine an installation goes to: this computer's machine, or a
@@ -175,7 +207,8 @@ func (q *Installs) Run(ctx context.Context) {
 				go func(row records.RentalInstall) {
 					defer workers.Done()
 					defer cancel()
-					problem := q.prepare(work, row)
+					problem := q.prepare(work, row, func(progress InstallProgress) { q.progress.Store(row.ID, progress) })
+					q.progress.Delete(row.ID)
 					state := "succeeded"
 					if problem != nil {
 						state = "failed"

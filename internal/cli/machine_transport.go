@@ -363,7 +363,7 @@ func (c *machineConnection) prepareModels(ctx context.Context, request records.R
 // Prewarm prepares a published package, its selected models, or models alone on a machine
 // without running anything: `cozy package install` and `cozy model download` for any
 // machine. bootID, when set, is the worker lifetime the selection was queued for.
-func (m *machineRuns) Prewarm(ctx context.Context, machine, hub, bootID, pkg, release string, models []*pb.DownloadModelRef) *exit.Error {
+func (m *machineRuns) Prewarm(ctx context.Context, machine, hub, bootID, pkg, release string, models []*pb.DownloadModelRef, report func(machines.InstallProgress)) *exit.Error {
 	connection, problem := m.connectAtHub(ctx, machine, hub, "installing "+either(pkg, "models"))
 	if problem != nil {
 		return problem
@@ -389,7 +389,10 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, hub, bootID, pkg, re
 	if err != nil {
 		return machineTransport(err)
 	}
-	_, problem = readMachinePreparationEvent(stream, nil)
+	_, problem = readMachinePreparationEvent(stream, func(event *pb.PrepareEvent) {
+		report(machines.InstallProgress{Stage: strings.ToLower(strings.TrimPrefix(event.Stage.String(), "PREPARE_STAGE_")),
+			TotalBytes: event.TotalBytes, TransferredBytes: event.TransferredBytes})
+	})
 	return problem
 }
 
@@ -422,6 +425,26 @@ func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release s
 	}
 	keepReleaseInterface(m.layout.Root, pkg, described.Release, described.PackageInterface, nil)
 	return api.DescribedRelease{Package: described.Package, Release: described.Release, PackageInterface: described.PackageInterface}, nil
+}
+
+// Software reads what one machine runs from its DescribeMachine (wire 66). A machine that
+// predates it answers UNIMPLEMENTED, which is said rather than guessed.
+func (m *machineRuns) Software(ctx context.Context, machine string) (api.MachineSoftware, *exit.Error) {
+	connection, problem := m.connect(ctx, machine, "reading its software")
+	if problem != nil {
+		return api.MachineSoftware{}, problem
+	}
+	defer connection.Close()
+	described, err := connection.Host.DescribeMachine(ctx, &pb.DescribeMachineQuery{Claim: connection.Claim})
+	if status.Code(err) == codes.Unimplemented {
+		return api.MachineSoftware{}, exit.Named(exit.Structural, "machine.software_unreported",
+			"this machine's agent predates software reporting")
+	}
+	if err != nil {
+		return api.MachineSoftware{}, machineTransport(err)
+	}
+	return api.MachineSoftware{Agent: described.GetHost().GetVersion(), Runtime: described.GetRuntime().GetVersion(),
+		TensorFS: described.GetRuntime().GetTensorfsVersion(), RuntimeAbsent: described.GetRuntimeAbsent()}, nil
 }
 
 // ForgetPackage tells each machine this daemon knows (this computer's while it runs, every

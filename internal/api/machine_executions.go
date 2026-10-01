@@ -29,6 +29,8 @@ type MachineExecutions interface {
 	// Describe is a published release as one machine reads it at its own Hub: the release
 	// (the newest when none is named) and its interface.
 	Describe(ctx context.Context, machine, hub, pkg, release string) (DescribedRelease, *exit.Error)
+	// Software is the agent, Runtime and TensorFS releases one machine reports it runs.
+	Software(ctx context.Context, machine string) (MachineSoftware, *exit.Error)
 	// Forget drops this daemon's kept connection to a machine, before its credentials go.
 	Forget(machine string)
 	// ForgetPackage tells every machine this daemon knows that a package's releases or owner
@@ -58,6 +60,28 @@ func (s *Server) forgetPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ok(w, r, http.StatusOK, s.machineExecutions.ForgetPackage(r.Context(), body.Package))
+}
+
+// MachineSoftware is what one machine says it runs. An older machine leaves what it cannot
+// report empty; RuntimeAbsent says why the Runtime fields are.
+type MachineSoftware struct {
+	Agent         string `json:"agent,omitempty"`
+	Runtime       string `json:"runtime,omitempty"`
+	TensorFS      string `json:"tensorfs,omitempty"`
+	RuntimeAbsent string `json:"runtime_absent,omitempty"`
+}
+
+func (s *Server) machineSoftware(w http.ResponseWriter, r *http.Request) {
+	if s.machineExecutions == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+		return
+	}
+	software, problem := s.machineExecutions.Software(r.Context(), r.PathValue("machine"))
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	s.ok(w, r, http.StatusOK, software)
 }
 
 // DescribedRelease is one published release's interface, as the machine that runs it read it.

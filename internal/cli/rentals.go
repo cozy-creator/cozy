@@ -1096,10 +1096,41 @@ func handleRentalShow(ctx *Context) *exit.Error {
 			}
 			return out
 		}
-		return emit(ctx, output.Record{Fields: pick(fields), AllFields: pick(all), Next: []string{"cozy rental list"}})
+		record := output.Record{Fields: pick(fields), AllFields: pick(all), Next: []string{"cozy rental list"}}
+		if list.TypedRows[i]["state"] == "ready" {
+			software, notes := rentalSoftware(client, row["rental"], !ctx.Mode().Human || ctx.Mode().JSON)
+			record.Fields, record.AllFields, record.Notes = append(record.Fields, software...), append(record.AllFields, software...), notes
+		}
+		return emit(ctx, record)
 	}
 	return exit.Named(exit.NotFound, "rental.unknown", "no listed rental is named %q", subject).
 		WithNext("cozy rental list --all-hubs")
+}
+
+// rentalSoftware is what a ready rental says it runs. An older machine answers what it can;
+// one that cannot answer leaves a note, never a failed show.
+func rentalSoftware(client *localapi.Client, rentalID string, typed bool) ([]output.Field, []string) {
+	software, problem := client.MachineSoftware(rentalID)
+	if problem != nil {
+		return nil, []string{"software versions unavailable: " + problem.Message}
+	}
+	var notes []string
+	if software.RuntimeAbsent != "" {
+		notes = append(notes, "Runtime not reported: "+software.RuntimeAbsent)
+	}
+	names := [][2]string{{"runtime", "runtime_version"}, {"tensorfs", "tensorfs_version"}, {"agent", "agent_version"}}
+	var fields []output.Field
+	for i, value := range []string{software.Runtime, software.TensorFS, software.Agent} {
+		if value == "" {
+			continue
+		}
+		name := names[i][0]
+		if typed {
+			name = names[i][1]
+		}
+		fields = append(fields, output.Field{K: name, V: value})
+	}
+	return fields, notes
 }
 
 // renderRentalList formats the daemon's public read model; it never opens SQLite.

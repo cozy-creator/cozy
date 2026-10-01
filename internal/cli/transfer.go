@@ -251,13 +251,13 @@ func handleMachineModelDownload(ctx *Context) *exit.Error {
 	if len(ctx.Inv.Args) > 1 && strings.TrimSpace(ctx.Inv.Args[1]) != "" {
 		return exit.Usagef("--rental downloads into the worker store and takes no local destination")
 	}
-	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--await") || ctx.Inv.Value("--idempotency-key") != "" {
-		return exit.Usagef("machine model download does not accept --rental-only, --await, or --idempotency-key")
+	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--idempotency-key") != "" {
+		return exit.Usagef("machine model download does not accept --rental-only or --idempotency-key")
 	}
 	model, problem := resolveRemoteModel(ctx, "", launch.Slot{}, ctx.Inv.Args[0], ctx.Inv.Value("--lane"), nil)
 	if problem != nil {
 		return problem
 	}
 	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}}
-	return enqueueRentalInstall(ctx, machine, selection)
+	return enqueueRentalInstall(ctx, machine, selection, ctx.Inv.Bool("--await"))
 }
