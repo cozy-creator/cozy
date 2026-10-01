@@ -1711,7 +1711,19 @@ fn a_mint_that_goes_silent_on_a_still_pull_faults_with_what_it_measured() {
 #[test]
 fn a_slow_mint_over_a_moving_transfer_is_left_alone() {
     const HOLD: Duration = Duration::from_millis(1200);
-    let root = temporary("slow-mint");
+    // On tmpfs: a write stalled by another process's disk pressure holds the reading
+    // thread off its socket, and the control plane rightly counts that as stillness.
+    // This test is about the hub, so the store must not depend on the box's disk.
+    let shm = std::path::Path::new("/dev/shm");
+    let root = if shm.is_dir() {
+        shm.join(format!(
+            "tensorfs-slow-mint-{}-{}",
+            std::process::id(),
+            crate::meta::now_nanos_unique()
+        ))
+    } else {
+        temporary("slow-mint")
+    };
     let store = Store::init(&root).unwrap();
     let checkpoint = Arc::new(checkpoint(3, 40 * 1024));
     let (origin, mints) = minting_hub(
