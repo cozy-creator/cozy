@@ -272,31 +272,41 @@ impl Recovery {
                         // will not answer ranges, say) may be followed by one whole GET.
                         let first = racers.len() == 1;
                         let fallback = racers.len() == 2 && racers[1].ranged && !racers[1].live;
-                        if !first && !fallback {
-                            continue;
-                        }
                         let now = lanes();
                         // A hedge condemns nothing, so two samples of measured network wait
                         // are evidence enough; the stall floor guards verdicts, not hedges.
                         let evidence = ledger.sample() * 2;
                         let mut every_slow = true;
-                        let mut measured = false;
-                        for racer in racers.iter_mut().filter(|racer| racer.live) {
+                        let mut measured = true;
+                        let mut slowest: Option<(usize, f64)> = None;
+                        for (index, racer) in racers.iter_mut().enumerate() {
+                            if !racer.live {
+                                continue;
+                            }
                             let data = racer.state.data.lock().unwrap().clone();
                             racer.window.observe(&data);
                             // A ranged hedge heals its own slow parts on its own lanes. With no
                             // comparable evidence, only an idle tail probes, once per object.
-                            every_slow &= !racer.ranged
-                                && match self.judge(&data, &racer.window, length, evidence) {
-                                    Verdict::Slow => {
-                                        measured = true;
-                                        true
-                                    }
-                                    Verdict::Unreferenced => first && now.tail,
-                                    Verdict::Healthy | Verdict::Unmeasured => false,
-                                };
+                            let verdict = if racer.ranged {
+                                Verdict::Healthy
+                            } else {
+                                self.judge(&data, &racer.window, length, evidence)
+                            };
+                            measured &= verdict == Verdict::Slow;
+                            every_slow &= match verdict {
+                                Verdict::Slow => true,
+                                Verdict::Unreferenced => first && now.tail,
+                                Verdict::Healthy | Verdict::Unmeasured => false,
+                            };
+                            let rate = racer.window.rate(&data);
+                            if slowest.is_none_or(|(_, worst)| rate < worst) {
+                                slowest = Some((index, rate));
+                            }
                         }
-                        if every_slow {
+                        if !every_slow {
+                            continue;
+                        }
+                        if first || fallback {
                             if let Some(lanes) =
                                 self.reserve(now, length, store, fallback, measured)
                             {
@@ -317,6 +327,14 @@ impl Recovery {
                                     self.racing.fetch_sub(lanes, Ordering::AcqRel);
                                 }
                             }
+                        } else if measured && attempts.load(Ordering::Acquire) < FETCH_ATTEMPTS {
+                            // Every racer is measured slow. A cold R2 read stalls at a chunk
+                            // boundary and a fresh ask moves 50-100x faster, so the slowest
+                            // racer gives its lane to a fresh whole GET rather than waiting.
+                            let (index, _) = slowest.expect("a live racer was judged");
+                            racers[index].state.stopped.store(true, Ordering::Release);
+                            self.racing.fetch_add(1, Ordering::AcqRel);
+                            racers.push(launch(1));
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -345,6 +363,18 @@ enum Verdict {
 #[derive(Default)]
 struct Window(VecDeque<AttemptData>);
 impl Window {
+    /// Bytes per second of network wait across the window.
+    fn rate(&self, data: &AttemptData) -> f64 {
+        let Some(first) = self.0.front() else {
+            return f64::INFINITY;
+        };
+        let waited = data.waited.saturating_sub(first.waited).as_secs_f64();
+        if waited == 0.0 {
+            return f64::INFINITY;
+        }
+        data.bytes.saturating_sub(first.bytes) as f64 / waited
+    }
+
     fn observe(&mut self, data: &AttemptData) {
         if self
             .0
