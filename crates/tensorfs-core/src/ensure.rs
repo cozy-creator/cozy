@@ -14,6 +14,7 @@ mod admission;
 mod flight;
 
 pub use admission::{relieve, Relief};
+pub(crate) use flight::held_objects;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -249,6 +250,9 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
     // runs while a model is leased. Each temp carries its writer's lock, so this takes only
     // the dead ones.
     let _ = request.store.reap();
+    let mut closure_objects = closure.objects.clone();
+    closure_objects.push(closure.manifest.clone());
+    flight.hold(&closure_objects)?;
     let session = format!("ensure-{}", &closure.manifest.sha256[..12]);
     let (plan, _) = FetchPlan::of(request.store, &session, &closure.manifest, &closure.objects)?;
     let total = plan.declared_bytes();

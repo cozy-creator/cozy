@@ -301,6 +301,8 @@ struct Config {
     page: usize,
     /// The presign batch ceiling the closure declares.
     presign_max: u64,
+    /// Closure rows beyond the checkpoint's own: an object the disk cannot hold.
+    extra: Vec<ObjectRef>,
 }
 
 impl Default for Config {
@@ -311,6 +313,7 @@ impl Default for Config {
             declared: None,
             page: 0,
             presign_max: 1024,
+            extra: Vec::new(),
         }
     }
 }
@@ -391,7 +394,7 @@ fn serve(
         return answer(&mut socket, *code, headers, body.as_bytes(), None);
     }
     let body = match route.as_str() {
-        "closure" => closure(checkpoint, &asked.body, config.page, config.presign_max),
+        "closure" => closure(checkpoint, &asked.body, config),
         "presign" => presign(&asked.body, base, config.lifetime, config.declared),
         hex => {
             let dies: u128 = asked
@@ -540,20 +543,22 @@ fn row(object: &ObjectRef) -> Value {
     ])
 }
 
-fn closure(checkpoint: &Checkpoint, asked: &[u8], page: usize, presign_max: u64) -> Vec<u8> {
+fn closure(checkpoint: &Checkpoint, asked: &[u8], config: &Config) -> Vec<u8> {
     let after = match field(asked, "after") {
         Some(Value::Str(after)) => after,
         _ => String::new(),
     };
-    let rest: Vec<&ObjectRef> = checkpoint
+    let mut rest: Vec<&ObjectRef> = checkpoint
         .objects
         .iter()
+        .chain(&config.extra)
         .filter(|o| o.sha256 > after)
         .collect();
-    let take = if page == 0 {
+    rest.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    let take = if config.page == 0 {
         rest.len()
     } else {
-        page.min(rest.len())
+        config.page.min(rest.len())
     };
     canon::write(&Value::obj(vec![
         ("complete", Value::Bool(take == rest.len())),
@@ -564,7 +569,7 @@ fn closure(checkpoint: &Checkpoint, asked: &[u8], page: usize, presign_max: u64)
             "objects",
             Value::arr(rest[..take].iter().map(|o| row(o)).collect()),
         ),
-        ("presign_max_digests", Value::uint(presign_max)),
+        ("presign_max_digests", Value::uint(config.presign_max)),
         ("release", Value::str("r1")),
         ("scope", Value::str("runtime")),
     ]))
@@ -1118,6 +1123,63 @@ fn a_killed_pulls_partial_temp_is_reaped_by_the_next_ensure() {
 
     let healed = hub(Arc::clone(&checkpoint), Config::default());
     assert_landed(&Run::new(&healed, &root).ensure(), &healed, &root);
+}
+
+/// An ensure counts what a cancelled pull already landed as held. When its admission is
+/// short and GC runs, those objects, unreferenced until a pull is recorded, must survive:
+/// collecting them would re-buy them past the space the pull was admitted for.
+#[test]
+fn objects_a_flight_holds_survive_the_gc_its_admission_runs() {
+    let checkpoint = checkpoint(3, 256 << 10, 22);
+    let stuck = blob(&checkpoint, 2);
+    let first = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![on(&stuck, 1..=usize::MAX, Fault::Stall(0))],
+            ..Config::default()
+        },
+    );
+    let root = store(&temporary("held-gc"));
+    let cancellation = PullCancellation::default();
+    let (cancel, landed_root) = (cancellation.clone(), root.clone());
+    let landed: Vec<String> = checkpoint.blobs[..2].to_vec();
+    let watched = landed.clone();
+    std::thread::spawn(move || {
+        let store = Store::open(&landed_root).unwrap();
+        while !watched.iter().all(|hex| store.contains(hex)) {
+            std::thread::sleep(sample());
+        }
+        cancel.cancel();
+    });
+    let mut run = Run::new(&first, &root);
+    run.cancellation = Some(cancellation);
+    assert!(run.ensure().result.is_err());
+
+    // The same checkpoint with one more object than any disk holds: admission collects.
+    let short = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            extra: vec![ObjectRef {
+                sha256: "f".repeat(64),
+                length: 1 << 50,
+            }],
+            ..Config::default()
+        },
+    );
+    let outcome = Run::new(&short, &root).ensure();
+    assert_refused(&outcome, &short, &root, Code::CAPACITY_EXHAUSTED);
+    let store = Store::open(&root).unwrap();
+    for hex in &landed {
+        assert!(store.contains(hex), "GC took {hex}, which the flight held");
+    }
+
+    let healed = hub(Arc::clone(&checkpoint), Config::default());
+    assert_landed(&Run::new(&healed, &root).ensure(), &healed, &root);
+    assert!(
+        landed.iter().all(|hex| healed.asks(hex) == 0),
+        "{}",
+        healed.log()
+    );
 }
 
 #[test]

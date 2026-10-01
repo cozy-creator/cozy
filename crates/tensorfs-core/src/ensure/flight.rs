@@ -13,6 +13,8 @@ use fs2::FileExt;
 
 use crate::canon::{self, Fields, Value};
 use crate::err::{refuse, Code, Refusal, Result};
+use crate::ids::ObjectRef;
+use crate::storage::{self, HeldKey};
 use crate::store::Store;
 use crate::transport::PullCancellation;
 
@@ -123,6 +125,8 @@ impl Record {
 pub(super) struct Flight {
     _lock: File,
     record: PathBuf,
+    /// The closure this flight holds from GC (see [`held_objects`]).
+    objects: PathBuf,
     pub manifest: String,
     /// Another process's flight for this manifest was running when this one asked.
     pub joined: bool,
@@ -155,10 +159,20 @@ impl Flight {
         }
         Ok(Flight {
             _lock: lock,
+            objects: record.with_extension("objects"),
             record,
             manifest: manifest.to_string(),
             joined,
         })
+    }
+
+    /// Hold `objects` (the closure, manifest included) from GC for the life of the flight.
+    pub fn hold(&self, objects: &[ObjectRef]) -> Result<()> {
+        let lines: String = objects
+            .iter()
+            .map(|o| format!("{} {}\n", o.sha256, o.length))
+            .collect();
+        fs::write(&self.objects, lines).map_err(|e| io("write held objects", e))
     }
 
     pub fn record(&self, record: &Record) -> Result<()> {
@@ -178,6 +192,7 @@ impl Drop for Flight {
     fn drop(&mut self) {
         // The record goes first: once the lock is free, nothing may read a stale one.
         let _ = fs::remove_file(&self.record);
+        let _ = fs::remove_file(&self.objects);
     }
 }
 
@@ -213,4 +228,43 @@ pub(super) fn live(store: &Store, except: &str) -> Result<Vec<(String, Option<Re
         }
     }
     Ok(flights)
+}
+
+/// Every resident object a live flight's closure names, as GC holds. An ensure counts the
+/// objects already resident as held when it plans, and lands the rest unreferenced until its
+/// pull is recorded; a collection in between (its own admission's, or another process's)
+/// must not take either, or the pull re-buys them past the space it was admitted for.
+pub(crate) fn held_objects(store: &Store) -> Result<Vec<HeldKey>> {
+    if !store.root().join("tmp/ensure").is_dir() {
+        return Ok(Vec::new());
+    }
+    let dir = dir(store)?;
+    let mut holds = Vec::new();
+    for (manifest, _) in live(store, "")? {
+        let Ok(lines) = fs::read_to_string(dir.join(format!("{manifest}.objects"))) else {
+            continue;
+        };
+        for line in lines.lines() {
+            let Some((hex, length)) = line.split_once(' ') else {
+                continue;
+            };
+            let Ok(length) = length.parse() else {
+                continue;
+            };
+            let (kind, key) = if store.manifest_path(hex).is_file() {
+                ("manifest", storage::manifest_key(hex)?)
+            } else if store.contains(hex) {
+                ("blob", storage::blob_key(hex)?)
+            } else {
+                continue;
+            };
+            holds.push(HeldKey {
+                key,
+                kind: kind.into(),
+                length,
+                sha256: hex.to_string(),
+            });
+        }
+    }
+    Ok(holds)
 }
