@@ -548,7 +548,7 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 		if gone := (*runtimeGone)(nil); errors.As(err, &gone) {
 			return nil, exit.Named(exit.Structural, "machine.runtime_gone", "%s", gone)
 		}
-		if !h.alive(record.PID) {
+		if !h.alive(record.PID) && !h.starting(record.PID) {
 			return nil, exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness")
 		}
 		select {
@@ -921,6 +921,14 @@ func (h *Host) alive(pid int) bool {
 		}
 	}
 	return false
+}
+
+// starting is a Host its user unit runs that is not yet the agent: systemd's executor runs
+// first as the unit's main process, at the unit's nice and quota, and on a loaded box it can
+// outlast the first readiness probe (run 2311 failed so, 42 ms after the unit started).
+func (h *Host) starting(pid int) bool {
+	unit := userunit.Name("cozy-machine-agent", h.dir, false)
+	return userunit.Available() && userunit.MainPID(unit) == pid && userunit.Running(unit)
 }
 
 // Legacy identity is only a refusal census, never permission to signal a PID.
