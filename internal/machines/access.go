@@ -301,6 +301,30 @@ func deviceBoundAccess(token string) bool {
 	return json.Unmarshal(raw, &claims) == nil && claims.Attributes.Device != "" && slices.Equal(claims.Permissions, []string{"cozy.execution-access"})
 }
 
+// machineOrigin is where this computer's machine reads the Hub its owner reached at login.
+// A Hub reached on loopback runs on this computer, so the machine reads it there too, never
+// through the public origin (a tunnel, a proxy) it declares for remote pods.
+func machineOrigin(login, declared string) string {
+	if local := loopbackOrigin(login); local != "" && loopbackOrigin(declared) == "" {
+		return local
+	}
+	return declared
+}
+
+// loopbackOrigin is origin as scheme://host[:port] when it names this computer as every
+// scoped-access agent accepts it, else "".
+func loopbackOrigin(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "http" && u.Scheme != "https" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" {
+		return ""
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return u.Scheme + "://" + u.Host
+	}
+	return ""
+}
+
 func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, account *hub.Client) (string, *exit.Error) {
 	installed, problem := h.Installed()
 	if problem != nil {
@@ -344,7 +368,7 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 			pending = true
 		}
 	}
-	refresh := pending || grant.Certificate != certificate || grant.Credential != credential || grant.ExpiresAt <= time.Now().Add(time.Minute).Unix() || !deviceBoundAccess(grant.Token) || grant.Generation != snapshot[key].Generation
+	refresh := pending || grant.Certificate != certificate || grant.Credential != credential || grant.ExpiresAt <= time.Now().Add(time.Minute).Unix() || !deviceBoundAccess(grant.Token) || grant.Generation != snapshot[key].Generation || grant.Origin != machineOrigin(origin, grant.Origin)
 	if refresh {
 		access, problem := account.AuthorizeExecutionAccess(ctx, launch.Leaf)
 		if problem != nil {
@@ -353,7 +377,9 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 		if !deviceBoundAccess(access.Token) {
 			return "", exit.Named(exit.Credential, "hub.execution_access_device_key_required", "Tensorhub must issue execution access bound to the current login device")
 		}
-		grant = executionAccess{Origin: access.Environment["TENSORHUB_ORIGIN"], Token: access.Token, ExpiresAt: access.ExpiresAt.Unix(), Environment: access.Environment, Certificate: certificate, Credential: credential, Generation: snapshot[key].Generation}
+		reads := machineOrigin(origin, access.Environment["TENSORHUB_ORIGIN"])
+		access.Environment["TENSORHUB_ORIGIN"] = reads
+		grant = executionAccess{Origin: reads, Token: access.Token, ExpiresAt: access.ExpiresAt.Unix(), Environment: access.Environment, Certificate: certificate, Credential: credential, Generation: snapshot[key].Generation}
 		if len(access.TrustRoot) > 0 {
 			grant.CA = base64.RawURLEncoding.EncodeToString(access.TrustRoot)
 		}

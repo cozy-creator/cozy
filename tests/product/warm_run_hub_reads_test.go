@@ -12,6 +12,13 @@ import (
 	"testing"
 )
 
+// probeHeader is proof/probe's canonical CozyTensors header, as TensorFS produced it.
+const probeHeader = "hW1jb3p5dGVuc29ycy8xgYJkdW5ldFgceyJoaWRkZW5fc2l6ZSI6NCwibGF5ZXJzIjoxfYGFc3Rv" +
+	"a2VuaXplci92b2NhYi50eHRYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63Bmp0ZXh0" +
+	"L3BsYWlugYJYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63BoGEjAMLAgEABAUIBwYJC" +
+	"oCBg2V2YWx1ZYEAgQCBglggR2b5Mbu3DtQx40s05Pn8XdqBdOlvQ6is152Hme/NQ9IZAgSBgmR1bm" +
+	"V0gYVmd2VpZ2h0AYEBAIGEZXZhbHVlAYEBRAAAAAA="
+
 // seedCheckpoint lands proof/probe@1.0.0/bf16 in a machine's TensorFS store with the machine's
 // own Python, as a cold pull would: the canonical CozyTensors header TensorFS produced, its
 // asset, and the released lane. It answers the manifest digest and length.
@@ -20,12 +27,7 @@ import base64, hashlib, json, os, sys, tempfile
 import tensorfs
 root = sys.argv[1]
 store = tensorfs.Store.open(root) if os.path.isdir(root) else tensorfs.Store.init(root)
-header = base64.b64decode(
-    "hW1jb3p5dGVuc29ycy8xgYJkdW5ldFgceyJoaWRkZW5fc2l6ZSI6NCwibGF5ZXJzIjoxfYGFc3Rv"
-    "a2VuaXplci92b2NhYi50eHRYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63Bmp0ZXh0"
-    "L3BsYWlugYJYIJ5ekBAsaZRV6QOf+QMoTgaJOU3TRbsRRWcG8IeYTS63BoGEjAMLAgEABAUIBwYJC"
-    "oCBg2V2YWx1ZYEAgQCBglggR2b5Mbu3DtQx40s05Pn8XdqBdOlvQ6is152Hme/NQ9IZAgSBgmR1bm"
-    "V0gYVmd2VpZ2h0AYEBAIGEZXZhbHVlAYEBRAAAAAA=")
+header = base64.b64decode("` + probeHeader + `")
 ref = lambda raw: {"length": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 with tempfile.TemporaryDirectory() as scratch:
     for name, raw in (("header.cbor", header), ("vocab.txt", b"vocab\n")):
