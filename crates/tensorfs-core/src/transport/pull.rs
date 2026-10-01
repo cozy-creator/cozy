@@ -832,7 +832,11 @@ impl Leases<'_> {
     /// that owns it.
     fn mint_from(&self, at: usize, ledger: &Ledger) -> Result<()> {
         let mut digests: Vec<String> = Vec::new();
-        for object in &self.wanted[at..] {
+        // From the asker's place onward, then the unminted objects before it: whichever
+        // worker reaches the hub first, one window covers every object it can hold. Starting
+        // at `at` alone left the objects of workers that started earlier but asked later for
+        // a second presign on a pull the window could have covered in one.
+        for object in self.wanted[at..].iter().chain(&self.wanted[..at]) {
             if digests.len() >= self.window {
                 break;
             }

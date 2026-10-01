@@ -310,3 +310,61 @@ fn two_objects_stalled_mid_pull_on_a_cold_chunk_finish_at_body_throughput() {
     );
     assert!(tail < crawl / 2, "the tail crawled: {tail:?}");
 }
+
+/// An unstalled pull asks the hub for URLs once: nothing slow, nothing hedged, nothing
+/// re-authorized (cozy-runtime's models-only prepare asserts exactly one presign).
+#[test]
+fn an_unstalled_small_pull_presigns_once() {
+    for _ in 0..20 {
+        let checkpoint = Arc::new(checkpoint(2, 16 * 1024));
+        let asked: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let base_slot: Arc<Mutex<String>> = Arc::default();
+        let (slot, log_asks, served) = (
+            Arc::clone(&base_slot),
+            Arc::clone(&asked),
+            Arc::clone(&checkpoint),
+        );
+        let dispatch: Dispatch = Arc::new(move |request: &Request| {
+            let base = slot.lock().unwrap().clone();
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v1/tensorfs/closure") => ok_json(&closure_value(&served, &base)),
+                ("POST", "/v1/tensorfs/presign") => {
+                    let value = presign_value(&request.body, &base);
+                    let Value::Obj(fields) = &value else { panic!() };
+                    let count = fields
+                        .iter()
+                        .find(|(k, _)| k == "urls")
+                        .map(|(_, v)| match v {
+                            Value::Obj(m) => m.len(),
+                            _ => 0,
+                        })
+                        .unwrap_or(0);
+                    log_asks.lock().unwrap().push(count);
+                    ok_json(&value)
+                }
+                ("GET", path) if path.starts_with("/obj/") => {
+                    match served.bodies.get(&path["/obj/".len()..]) {
+                        Some(body) => status(200, body),
+                        None => status(404, b"no such object"),
+                    }
+                }
+                _ => status(404, b"no such route"),
+            }
+        });
+        let origin = origin_with_hits(dispatch, Arc::default());
+        *base_slot.lock().unwrap() = origin.base.clone();
+        let root = temporary("presign-once");
+        let store = Store::init(&root).unwrap();
+        let policy = SourcePolicy::default();
+        let mut request = PullRequest::new(&store, &origin.base, "acme/model", &Anonymous, &policy);
+        request.sample_seconds = super::super::SAMPLE_SECONDS;
+        pull(&request).unwrap();
+        let asks = asked.lock().unwrap().clone();
+        assert_eq!(
+            asks.len(),
+            1,
+            "presign asks and their digest counts: {asks:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
