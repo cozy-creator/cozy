@@ -1037,6 +1037,41 @@ fn wrong_bytes_once_are_re_asked_and_wrong_bytes_always_are_a_typed_verdict() {
     assert!(always.asks(&victim) <= tensorfs_core::transport::FETCH_ATTEMPTS as usize);
 }
 
+/// A blip that spends every ask of the first attempt in milliseconds measured nothing: the
+/// ensure waits a sample and re-attempts. STALLED needs the ledger's floor of no landing.
+#[test]
+fn a_link_blip_before_any_object_lands_is_re_attempted_and_only_stillness_stalls() {
+    let checkpoint = checkpoint(3, 64 << 10, 20);
+    let blip = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![on("*", 1..=4, Fault::Reset(0))],
+            ..Config::default()
+        },
+    );
+    let root = store(&temporary("blip"));
+    let ensured = assert_landed(&Run::new(&blip, &root).ensure(), &blip, &root);
+    assert!(ensured.attempts >= 2, "{}", blip.log());
+
+    let down = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![on("*", 1..=usize::MAX, Fault::Reset(0))],
+            ..Config::default()
+        },
+    );
+    let root = store(&temporary("down"));
+    let started = Instant::now();
+    let outcome = Run::new(&down, &root).ensure();
+    assert_refused(&outcome, &down, &root, Code::STALLED);
+    let floor = sample() * tensorfs_core::transport::STILL_SAMPLES;
+    assert!(
+        started.elapsed() >= floor,
+        "STALLED after {:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn a_missing_object_is_a_typed_refusal_and_the_rest_stay_resident() {
     let dir = temporary("missing");

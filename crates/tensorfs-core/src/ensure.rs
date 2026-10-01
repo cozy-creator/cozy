@@ -2,10 +2,11 @@
 //! the Runtime (`tensorfs.ensure`) use for model download.
 //!
 //! Resolve the closure; lead or join the Store's one flight for its manifest; admit the new
-//! bytes against the disk, running the GC policy when short; pull, re-attempting only an
-//! attempt that landed something. Events sample bytes and rate while it runs; the answer is
-//! an [`Ensured`] or a typed refusal. Nothing here is a timer: a retry is earned by
-//! measured progress, and a stalled stream is judged by the transport's own ledger.
+//! bytes against the disk, running the GC policy when short; pull, re-attempting on the
+//! link's weather until no object has landed for the ledger's floor. Events sample bytes and
+//! rate while it runs; the answer is an [`Ensured`] or a typed refusal. Nothing here is a
+//! timer: giving up is earned by measured stillness, and a stalled stream is judged by the
+//! transport's own ledger.
 //!
 //! The Hub CA is process trust ([`crate::transport::trust_roots`]); callers name it once.
 
@@ -337,8 +338,9 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
     })
 }
 
-/// Pull until done. An attempt that failed on the link is re-attempted only when it landed
-/// at least one object; one that landed nothing is `STALLED`.
+/// Pull until done. A pull that failed on the link is re-attempted; one that landed nothing
+/// waits a sample first. The ensure is `STALLED` only once no object has landed for the
+/// ledger's own floor: a blip that spent one attempt's asks in milliseconds measured nothing.
 fn attempts(
     request: &Request<'_>,
     store: &Store,
@@ -347,6 +349,13 @@ fn attempts(
     on_plan: &(dyn Fn(&FetchPlan) + Sync),
     on_object: &(dyn Fn(&ObjectRef, u64, ObjectSource) + Sync),
 ) -> Result<transport::PullReport> {
+    let sample = Duration::from_secs_f64(request.sample_seconds);
+    let floor = sample * transport::STILL_SAMPLES;
+    let mut waits = transport::Ledger::with_resolution(sample);
+    if let Some(cancellation) = &request.cancellation {
+        waits = waits.with_cancellation(cancellation.clone());
+    }
+    let mut advanced = Instant::now();
     loop {
         let attempt = counters.attempt.fetch_add(1, Ordering::Relaxed) + 1;
         let landed = counters.landed_objects.load(Ordering::Relaxed);
@@ -357,13 +366,21 @@ fn attempts(
         match transport::pull(&pull) {
             Ok(report) => return Ok(report),
             Err(refusal) if request.cancelled() || !weather(refusal.code) => return Err(refusal),
-            Err(refusal) if counters.landed_objects.load(Ordering::Relaxed) == landed => {
+            Err(_) if counters.landed_objects.load(Ordering::Relaxed) != landed => {
+                advanced = Instant::now();
+            }
+            Err(refusal) if advanced.elapsed() > floor => {
                 return Err(Refusal {
                     code: Code::STALLED,
-                    detail: format!("attempt {attempt} landed nothing: {refusal}"),
+                    detail: format!(
+                        "no object landed for {:.1} s over {attempt} attempt(s), past the \
+                         {:.1} s floor: {refusal}",
+                        advanced.elapsed().as_secs_f64(),
+                        floor.as_secs_f64()
+                    ),
                 })
             }
-            Err(_) => {}
+            Err(_) => waits.pause(sample, transport::Deadline::none())?,
         }
     }
 }
