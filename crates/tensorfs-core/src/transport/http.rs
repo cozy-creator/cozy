@@ -543,7 +543,7 @@ fn connect(
                 }
                 let tick = deadline
                     .remaining()?
-                    .map_or(ledger.sample(), |left| left.min(ledger.sample()));
+                    .map_or(ledger.tick(), |left| left.min(ledger.tick()));
                 let timeout = Timespec {
                     tv_sec: tick.as_secs() as _,
                     tv_nsec: tick.subsec_nanos() as _,
@@ -612,7 +612,7 @@ fn tls_handshake(
     since: Instant,
     fail: Code,
 ) -> Result<()> {
-    let sample = ledger.sample();
+    let sample = ledger.tick();
     let mut advanced = Instant::now();
     while conn.is_handshaking() {
         transfer_verdict(judge, ledger, since, "a TLS handshake")?;
@@ -852,8 +852,8 @@ impl BodyReader<'_> {
         loop {
             self.ledger.check_running()?;
             let tick = match self.deadline.remaining()? {
-                Some(left) => left.min(self.ledger.sample()),
-                None => self.ledger.sample(),
+                Some(left) => left.min(self.ledger.tick()),
+                None => self.ledger.tick(),
             };
             let wire = self.wire.as_mut().expect("body owns its wire");
             wire.set_read_timeout(tick);
@@ -1308,8 +1308,8 @@ fn write_all(
     loop {
         transfer_verdict(judge, ledger, since, "a request write")?;
         let tick = match deadline.remaining()? {
-            Some(left) => left.min(ledger.sample()),
-            None => ledger.sample(),
+            Some(left) => left.min(ledger.tick()),
+            None => ledger.tick(),
         };
         wire.set_write_timeout(tick);
         if at >= bytes.len() {
@@ -1414,8 +1414,8 @@ fn read_step_ticking(
     loop {
         transfer_verdict(judge, ledger, since, "a response head")?;
         let tick = match deadline.remaining()? {
-            Some(left) => left.min(ledger.sample()),
-            None => ledger.sample(),
+            Some(left) => left.min(ledger.tick()),
+            None => ledger.tick(),
         };
         wire.set_read_timeout(tick);
         match wire.read_step(buf, ledger) {

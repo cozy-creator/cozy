@@ -1423,7 +1423,7 @@ mod mint_wait_tests {
             });
             let owner = mint.acquire(&root, Deadline::none()).unwrap();
             let attempt = std::sync::Arc::new(super::super::ledger::Attempt::default());
-            let local = root.for_attempt(std::sync::Arc::clone(&attempt));
+            let local = root.for_request(std::sync::Arc::clone(&attempt), root.sample());
             std::thread::scope(|scope| {
                 let (ready, waiting) = std::sync::mpsc::channel();
                 let (done, finished) = std::sync::mpsc::channel();

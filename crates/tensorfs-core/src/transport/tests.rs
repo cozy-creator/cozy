@@ -5139,7 +5139,7 @@ fn attempt_cancellation_interrupts_a_partial_tls_record() {
     });
     let root = Ledger::with_resolution(Duration::from_millis(100));
     let attempt = Arc::new(super::ledger::Attempt::default());
-    let ledger = root.for_attempt(Arc::clone(&attempt));
+    let ledger = root.for_request(Arc::clone(&attempt), root.sample());
     let cancel = std::thread::spawn(move || {
         receiving.recv_timeout(Duration::from_secs(2)).unwrap();
         attempt.stopped.store(true, Ordering::Release);

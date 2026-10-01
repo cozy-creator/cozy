@@ -155,6 +155,9 @@ pub struct Ledger {
     caller_cancellation: Option<PullCancellation>,
     cancelled: Arc<AtomicBool>,
     sample: Duration,
+    /// How often a wait on this ledger wakes to look. The sample, unless a request asked
+    /// to notice its own stop sooner; it never changes a verdict.
+    tick: Duration,
     worst_gap: Arc<Mutex<Duration>>,
     progress: Arc<Mutex<Progress>>,
     attempt: Option<Arc<Attempt>>,
@@ -174,6 +177,7 @@ impl Ledger {
             caller_cancellation: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             sample: sample.max(Duration::from_millis(1)),
+            tick: sample.max(Duration::from_millis(1)),
             worst_gap: Arc::new(Mutex::new(Duration::ZERO)),
             progress: Arc::new(Mutex::new(Progress {
                 moved: 0,
@@ -246,6 +250,10 @@ impl Ledger {
         self.sample
     }
 
+    pub(super) fn tick(&self) -> Duration {
+        self.tick
+    }
+
     /// The smallest patience ever granted: `STILL_SAMPLES` intervals of the resolution.
     pub fn floor(&self) -> Duration {
         self.sample * STILL_SAMPLES
@@ -278,11 +286,14 @@ impl Ledger {
         }
     }
 
-    pub(super) fn for_attempt(&self, attempt: Arc<Attempt>) -> Self {
+    /// This pull's ledger for one request: its own stop and byte count, and the cadence it
+    /// wakes at to notice that stop.
+    pub(super) fn for_request(&self, attempt: Arc<Attempt>, tick: Duration) -> Self {
         Self {
             caller_cancellation: self.caller_cancellation.clone(),
             cancelled: Arc::clone(&self.cancelled),
             sample: self.sample,
+            tick,
             worst_gap: Arc::clone(&self.worst_gap),
             progress: Arc::clone(&self.progress),
             attempt: Some(attempt),

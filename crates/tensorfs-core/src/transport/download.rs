@@ -2,10 +2,10 @@
 //! fixed ranged chunks on one queue, `streams` workers each GET one chunk into its
 //! object's temp file, and a finished file is hashed and committed to the Store.
 //!
-//! One rule per request: one that fails, goes silent, or runs far slower than its peers is
-//! dropped, and the rest of its chunk is asked again on a fresh connection. Nothing counts
-//! asks. The pull ends on an answer asking again cannot change, or when nothing at all has
-//! landed for twice its own measured patience.
+//! One rule per request: one that fails, or moves bytes far slower than the first asks that
+//! came home (or none), is dropped, and the rest of its chunk is asked again on fresh
+//! connections, in 1 MiB pieces. Nothing counts asks. The pull ends on an answer asking
+//! again cannot change, or when nothing new has landed for twice its measured patience.
 //!
 //! Why chunks: a cold R2 object answers each MiB after its own delay, usually under a
 //! second and sometimes a minute. One GET for the object pays every delay in a row (runs
@@ -35,6 +35,10 @@ use std::time::{Duration, Instant};
 /// One request's bytes. Measured on a pod at 128 workers: 4, 8 and 16 MiB chunks all move
 /// what whole 64 MiB GETs move (1.1-1.3 GB/s); 1 MiB chunks move half.
 pub const CHUNK_BYTES: u64 = 8 << 20;
+
+/// What a dropped request's unfinished range is cut into: a slow object answers small
+/// asks side by side, and a chunk asked again whole would pay its slow MiBs in a row.
+const PIECE_BYTES: u64 = 1 << 20;
 
 /// Completed requests whose rates are the peers a running one is compared with.
 const PEERS: usize = 64;
@@ -70,9 +74,21 @@ struct Chunk {
     stated: bool,
     /// The origin refused the URL the last ask held, with this status.
     stale: Option<u16>,
-    /// Asks this chunk has been dropped from. Each doubles the samples the next ask gets
-    /// before it is judged, so a range that is honestly slow still comes home.
-    dropped: u32,
+    /// Asks in a row dropped with no byte moved. Each doubles the time the next ask gets
+    /// before it is judged, so an origin that is honestly slow to answer still does.
+    silent: u32,
+    /// Never dropped or failed: a first ask, whose rate is what peers are compared with.
+    fresh: bool,
+}
+
+impl Chunk {
+    /// This chunk's fields for a piece cut from its front.
+    fn take(&self) -> Chunk {
+        Chunk {
+            object: Arc::clone(&self.object),
+            ..*self
+        }
+    }
 }
 
 /// A request on the wire, as the watch sees it.
@@ -81,17 +97,15 @@ struct Flight {
     subject: String,
     range: (u64, u64),
     began: Instant,
-    /// Samples a verdict is taken over, and when and with how many bytes the last one was.
+    /// Ticks a verdict is taken over, and when and with how many bytes the last one was.
     grace: u32,
     judged: Instant,
     seen: u64,
-    /// What the whole pull had moved at the last verdict.
-    pull: u64,
 }
 
 enum Outcome {
     Home,
-    Again(Chunk),
+    Again(Vec<Chunk>),
     Fatal(Refusal),
 }
 
@@ -246,7 +260,11 @@ impl Run<'_> {
             state.busy -= 1;
             match outcome {
                 Outcome::Home => {}
-                Outcome::Again(chunk) => state.queue.push_front(chunk),
+                Outcome::Again(chunks) => {
+                    for chunk in chunks.into_iter().rev() {
+                        state.queue.push_front(chunk);
+                    }
+                }
                 Outcome::Fatal(refusal) => self.fail(&mut state, refusal),
             }
             self.wake.notify_all();
@@ -400,7 +418,8 @@ impl Run<'_> {
             due: Instant::now(),
             stated: false,
             stale: None,
-            dropped: 0,
+            silent: 0,
+            fresh: true,
         };
         if firsts.is_empty() {
             return Ok(vec![chunk(0, 0)]);
@@ -446,7 +465,7 @@ impl Run<'_> {
             (Err(refusal), None) => return Outcome::Fatal(refusal),
         };
         let attempt = Arc::new(Attempt::default());
-        let ledger = job.ledger.for_attempt(Arc::clone(&attempt));
+        let ledger = job.ledger.for_request(Arc::clone(&attempt), self.tick());
         let began = Instant::now();
         let asked = (chunk.first, chunk.end);
         *self.flights[slot].lock().unwrap() = Some(Flight {
@@ -454,10 +473,10 @@ impl Run<'_> {
             subject: decisions::object(wanted),
             range: asked,
             began,
-            grace: 1 << chunk.dropped.min(6),
+            // Two ticks, so the time to a first byte is not read as a slow body.
+            grace: 2 << chunk.silent.min(6),
             judged: began,
             seen: 0,
-            pull: job.ledger.still().moved,
         });
         self.requests.fetch_add(1, Ordering::Relaxed);
         let ended = self.stream(&mut chunk, &url, &ledger, buffer);
@@ -466,7 +485,7 @@ impl Run<'_> {
         let moved = chunk.first.saturating_sub(asked.0);
         let (refusal, stated) = match ended {
             Ok(()) => {
-                if moved >= CHUNK_BYTES / 8 {
+                if chunk.fresh && moved >= PIECE_BYTES {
                     let rate = moved as f64 / began.elapsed().as_secs_f64().max(1e-6);
                     let mut state = self.state.lock().unwrap();
                     if state.peers.len() == PEERS {
@@ -480,7 +499,7 @@ impl Run<'_> {
                 chunk.first = wanted.length;
                 chunk.end = wanted.length;
                 chunk.due = Instant::now();
-                return Outcome::Again(chunk);
+                return Outcome::Again(vec![chunk]);
             }
             Err(Ended::Retry(refusal, stated)) => (refusal, stated),
             Err(Ended::Fatal(refusal)) => {
@@ -498,9 +517,11 @@ impl Run<'_> {
             return Outcome::Fatal(stopped);
         }
         let dropped = attempt.stopped.load(Ordering::Acquire);
-        if dropped {
-            chunk.dropped += 1;
-        }
+        chunk.fresh = false;
+        chunk.silent = match (dropped, moved) {
+            (true, 0) => chunk.silent + 1,
+            _ => 0,
+        };
         // An ask that moved nothing waits one sample, or as long as the origin stated.
         let wait = match (stated, moved) {
             (Some(stated), _) => stated,
@@ -510,7 +531,25 @@ impl Run<'_> {
         chunk.due = Instant::now() + wait;
         chunk.stated = stated.is_some();
         self.state.lock().unwrap().last = Some(named(refusal, &wanted.id()));
-        Outcome::Again(chunk)
+        // A dropped request's unfinished range goes back as pieces, asked side by side.
+        let mut again = Vec::new();
+        while dropped && chunk.end - chunk.first > PIECE_BYTES {
+            let end = chunk.first + PIECE_BYTES;
+            object.left.fetch_add(1, Ordering::AcqRel);
+            again.push(Chunk {
+                object: Arc::clone(&object),
+                end,
+                ..chunk.take()
+            });
+            chunk.first = end;
+        }
+        again.push(chunk);
+        Outcome::Again(again)
+    }
+
+    /// The watch's cadence, and a request's own: a fifth of the pull's sample.
+    fn tick(&self) -> Duration {
+        (self.job.ledger.sample() / 5).max(Duration::from_millis(1))
     }
 
     /// Ask for `chunk` and write what arrives, advancing `chunk.first` as bytes land.
@@ -670,12 +709,12 @@ impl Run<'_> {
         Outcome::Home
     }
 
-    /// The one rule, once a sample: a request silent while the pull moved, or far slower
-    /// than the requests that came home, is dropped. And the pull's own end: nothing has
-    /// landed for twice its measured patience.
+    /// The one rule, five times a sample: a request moving bytes far slower than the first
+    /// asks that came home, or none at all, is dropped. And the pull's own end: nothing new
+    /// has landed for twice its measured patience.
     fn watch(&self) {
         let job = self.job;
-        let sample = job.ledger.sample();
+        let sample = self.tick();
         // The most bytes ever home, and when that last grew while requests were being asked.
         let (mut most, mut grew) = (0, Instant::now());
         let mut state = self.state.lock().unwrap();
@@ -699,7 +738,6 @@ impl Run<'_> {
             let mut peers: Vec<f64> = state.peers.iter().copied().collect();
             peers.sort_by(f64::total_cmp);
             let typical = peers.get(peers.len() / 2).copied().unwrap_or(0.0);
-            let still = job.ledger.still();
             let mut flying = false;
             for flight in &self.flights {
                 let mut flight = flight.lock().unwrap();
@@ -713,10 +751,8 @@ impl Run<'_> {
                 }
                 let bytes = flight.attempt.bytes.load(Ordering::Relaxed);
                 let rate = (bytes - flight.seen) as f64 / window.as_secs_f64();
-                // Silent while other requests moved bytes.
-                let silent = bytes == flight.seen && still.moved > flight.pull;
-                (flight.judged, flight.seen, flight.pull) = (Instant::now(), bytes, still.moved);
-                if !silent && rate * STALL_FACTOR >= typical {
+                (flight.judged, flight.seen) = (Instant::now(), bytes);
+                if rate * STALL_FACTOR >= typical {
                     continue;
                 }
                 flight.attempt.stopped.store(true, Ordering::Release);
