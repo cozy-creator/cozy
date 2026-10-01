@@ -30,9 +30,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Install private code through the normal CLI, then prepare its unused serving
-// slot through the real authenticated standalone agent. No GPU execution is
-// needed to inspect the ordered, derived adapter view returned by Runtime.
+// Install private code through the normal CLI and inspect Runtime's ordered
+// adapter view through the authenticated standalone agent. The explicit rented
+// H100 flag also executes local roots, generated children and a built public release.
 func TestStandaloneHostPreparesOrderedPrivateLoRAView(t *testing.T) {
 	integration(t)
 	if !*machineLoRAServingGPU {
@@ -395,6 +395,9 @@ print(json.dumps(slots))
 				}
 			}
 		}
+	}
+	if !*machineLoRAServingGPU {
+		t.Log("CPU structural preparation only; serving cases require -lora-serving-gpu on an isolated rented H100")
 	}
 	// The daemon now owns Control; this independent reader reuses the same owner.
 	resolver.Held = func(string) bool { return true }
