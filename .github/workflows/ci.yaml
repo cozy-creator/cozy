@@ -1,12 +1,15 @@
 name: ci
-# Automatic: one ~1 min job on master pushes that touch Rust: `cargo check` of every crate
-# and target (tests included), which targeted local `cargo test -p` runs do not compile.
-# On demand, before a release (full suite, fences, version guards, wheel e2e):
+# Automatic, on master pushes that touch Rust: `cargo check` of every crate and target, and
+# the download path (below). On every pull request: `download-path`, which tests when the
+# PR touches the download path. On demand, before a release (full suite, fences, version guards, wheel e2e):
 #   gh workflow run ci.yaml -R cozy-creator/tensorfs --ref <branch> [-f scope=cache-owner]
 on:
   push:
     branches: [master]
     paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/ci.yaml"]
+  # Every PR reports `download-path` (a required check); it tests only when the PR
+  # touches the download path.
+  pull_request:
   workflow_dispatch:
     inputs:
       scope:
@@ -27,6 +30,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.91.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
+
+  # Model weights must keep arriving (run 2322, 2026-10-01): the slow-tail hedge, resets,
+  # stalls, 5xx/429/Retry-After, expired URLs, wrong bytes, hub weather and verdicts,
+  # cancellation and resume, all over real loopback HTTP through `ensure` and `pull`.
+  download-path:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          path='^(crates/tensorfs-core/src/(transport/|ensure|fetch\.rs|store\.rs|catalog|meta\.rs|gc\.rs|unsynced|bin/tfs/ensure\.rs)|crates/tensorfs-core/tests/(fetch_faults|ensure)\.rs|crates/tensorfs-py/src/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yaml$)'
+          if [ -n "$BASE" ] && ! git diff --name-only "origin/$BASE...HEAD" | grep -qE "$path"; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.scope.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@1.91.1
+      - if: steps.scope.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.scope.outputs.run == 'true'
+        run: cargo test -p tensorfs-core --test fetch_faults --test ensure -- --test-threads=2
+      - if: steps.scope.outputs.run == 'true'
+        run: "cargo test -p tensorfs-core --lib transport:: -- --test-threads=2"
 
   cache-owner:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'cache-owner'
