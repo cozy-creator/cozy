@@ -781,6 +781,9 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	if isOperation(before) {
+		return cancelOperation(ctx, client, before)
+	}
 	if before.Kind == "job" {
 		return handleJobCancel(ctx)
 	}
@@ -908,11 +911,11 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 func runListRows(rows []api.Lifecycle) output.List {
 	list := output.List{
 		Uncapped: true,
-		Name:     "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution", "reason"},
+		Name:     "invocations", Fields: []string{"number", "kind", "target", "machine", "status", "progress", "execution", "reason"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
 			"progress", "phase", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "queued", "execution", "attempt_wall", "attempts", "created", "reason", "hub"},
-		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
+		TypedFields: []string{"number", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
 			"remaining_ms", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining", "retry_available"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
@@ -930,10 +933,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 	for _, life := range rows {
 		life.Status = publicObservedStatus(life.Status)
 		life.Machine = life.DisplayMachine()
-		kind := life.Kind
-		if kind == "" {
-			kind = "invocation"
-		}
+		kind := journalKind(life)
 		// A canceled run is LOUD about its cause (cl-108): the status cell itself names
 		// the recorded actor, so a list is never a quiet no-output ending.
 		status := life.Status
@@ -948,7 +948,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
-			"target": life.Package + "/" + life.Function, "machine": machine,
+			"target": lifeTarget(life), "machine": machine,
 			"rental_id": life.RentalID,
 			"status":    status, "progress": progressValue(life), "phase": life.Phase,
 			"progress_stage":   life.ProgressStage,
@@ -957,14 +957,14 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"position":         integerValue(life.Position),
 			"total":            integerValue(life.Total),
 			"queued":           seconds(life.QueuedMS),
-			"execution":        executionValue(life.ExecutionMS, life.ExecutionKnown, life.MachineExecution != nil),
+			"execution":        executionValue(life.ExecutionMS, life.ExecutionKnown, life.MachineExecution != nil || isOperation(life)),
 			"attempt_wall":     seconds(life.AttemptWallMS),
 			"attempts":         strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 			"reason": reasonCell(life),
 		})
 		typed := map[string]any{
 			"number": life.Number, "id": life.RequestID, "kind": kind,
-			"target": life.Package + "/" + life.Function, "machine": life.Machine,
+			"target": lifeTarget(life), "machine": life.Machine,
 			"status": life.Status, "queued_ms": life.QueuedMS, "execution_ms": life.ExecutionMS,
 			"attempts": life.Attempts, "created_at": life.CreatedAt,
 		}
@@ -1207,6 +1207,9 @@ func PhaseCell(life api.Lifecycle) string {
 func progressValue(life api.Lifecycle) string {
 	if life.Phase == orchestrator.PhaseGPUWait || life.Phase == orchestrator.PhaseOwnerReconciliation {
 		return phaseValue(life)
+	}
+	if isOperation(life) && life.Status == "in_progress" {
+		return either(phaseValue(life), map[bool]string{true: "uploading", false: "starting"}[life.Kind == "upload"])
 	}
 	if life.Status == "queued" {
 		if life.RentalBoot != nil {

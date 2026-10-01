@@ -42,7 +42,7 @@ func rentalIdleRunCounts(reader rentalIdleReader, id, buyer string) (queued, run
 		return 0, 0, exit.Internalf("cannot observe rental work: %s", err)
 	}
 	var queuedInstalls, runningInstalls int
-	err = reader.QueryRow(`SELECT COALESCE(SUM(state='queued'),0),COALESCE(SUM(state='installing'),0) FROM rental_installs WHERE rental_id=? AND state IN ('queued','installing')`, id).Scan(&queuedInstalls, &runningInstalls)
+	err = reader.QueryRow(`SELECT COALESCE(SUM(state='queued'),0),COALESCE(SUM(state<>'queued'),0) FROM operations WHERE machine=? AND state IN ('queued','installing','uploading','preparing','updating','reconciling','waiting_activation')`, id).Scan(&queuedInstalls, &runningInstalls)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot observe queued rental installations: %s", err)
 	}

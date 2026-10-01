@@ -43,9 +43,7 @@ func (s *Store) LocalModelUsers(model string) ([]Request, *exit.Error) {
 }
 
 func (s *Store) numberedRequests(where string, args ...any) ([]Request, *exit.Error) {
-	rows, err := s.db.Query(`WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
-		id AS numbered_id FROM requests)
-		SELECT numbered.number, `+requestCols+` FROM requests r JOIN numbered ON numbered.numbered_id=r.id
+	rows, err := s.db.Query(`SELECT numbered.number, numbered.journal, `+requestCols+` FROM requests r JOIN (SELECT number,kind AS journal,id AS numbered_id FROM journal) numbered ON numbered.numbered_id=r.id
 		WHERE `+where+` ORDER BY r.created_at, r.id`, args...)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the reclamation fence: %s", err)

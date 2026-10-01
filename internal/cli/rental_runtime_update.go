@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,11 +43,11 @@ type runtimeUpdateSelection struct {
 	Native          *nativeUpdate `json:"native,omitempty"`
 }
 
-func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
+func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.Operation, *exit.Error) {
 	return u.start(id, options.RuntimeWheel, options.TensorFSWheel, options.RuntimeVersion, options.TensorFSVersion)
 }
 
-func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath, runtimeVersion, tensorfsVersion string) (*records.RuntimeUpdate, *exit.Error) {
+func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath, runtimeVersion, tensorfsVersion string) (*records.Operation, *exit.Error) {
 	if tensorfsPath != "" && wheelPath == "" {
 		return nil, exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
 	}
@@ -97,17 +98,20 @@ func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath, runtimeVersion
 	}
 	if current != nil && current.Active() && candidate != nil {
 		var saved runtimeUpdateSelection
-		if json.Unmarshal(current.Selection, &saved) != nil || !sameUpdateWheel(saved.LocalRuntime, candidate) || !sameUpdateWheel(saved.LocalTensorFS, tensorfs) {
+		if json.Unmarshal(current.Update, &saved) != nil || !sameUpdateWheel(saved.LocalRuntime, candidate) || !sameUpdateWheel(saved.LocalTensorFS, tensorfs) {
 			return nil, exit.New(exit.Conflict, "this rental already has a different frozen Runtime update; resume it without wheel flags")
 		}
 	}
 	if current == nil || !current.Active() {
+		if problem := m.fleet.owner.MaintenanceBlocker(id); problem != nil {
+			return nil, problem
+		}
 		var selection json.RawMessage
 		if candidate != nil || runtimeVersion != "" || tensorfsVersion != "" {
 			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate, LocalTensorFS: tensorfs,
 				RuntimeVersion: runtimeVersion, TensorFSVersion: tensorfsVersion})
 		}
-		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, "", selection)
+		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, selection)
 		if problem == nil && snapshot != nil {
 			snapshot.Detach()
 			if tensorfsSnapshot != nil {
@@ -146,34 +150,29 @@ func (u *rentalRuntimeUpdates) Resume() {
 	}
 }
 
-func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
-	if _, exists := u.running.LoadOrStore(row.RentalID, true); exists {
+func (u *rentalRuntimeUpdates) run(row records.Operation) {
+	if _, exists := u.running.LoadOrStore(row.Machine, true); exists {
 		return
 	}
 	go func() {
 		defer func() {
-			u.running.Delete(row.RentalID)
-			current, problem := u.machines.store.RuntimeUpdate(row.RentalID)
+			u.running.Delete(row.Machine)
+			current, problem := u.machines.store.RuntimeUpdate(row.Machine)
 			if problem == nil && current != nil && current.Active() && current.ID != row.ID {
 				u.run(*current)
 			}
 		}()
 		m := u.machines
-		problem := m.fleet.owner.MaintainRental(m.ctx, row.RentalID, func(ctx context.Context, identity *orchestrator.WorkerConnection) *exit.Error {
+		problem := m.fleet.owner.MaintainRental(m.ctx, row.Machine, func(ctx context.Context, identity *orchestrator.WorkerConnection) *exit.Error {
 			if identity.WorkerBootID != row.BootID {
 				return exit.New(exit.Conflict, "the rental's worker boot changed before maintenance")
-			}
-			if row.RequestID != "" {
-				if problem := m.store.AppendEvent(row.RequestID, "machine.runtime_update_attempted", 0, map[string]any{"rental": row.RentalID, "update": row.ID}); problem != nil {
-					return problem
-				}
 			}
 			return u.update(ctx, &row, identity)
 		})
 		if problem != nil {
 			row.Error = problem.Message
 			switch {
-			case row.State != "updating" && row.State != "reconciling":
+			case row.State != "updating" && row.State != "reconciling" && row.State != "waiting_activation":
 				row.State = "failed" // nothing was sent to the worker
 			case m.ctx.Err() != nil:
 				row.State = "reconciling" // the next daemon resumes it
@@ -191,9 +190,9 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 	}()
 }
 
-func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeUpdate, identity *orchestrator.WorkerConnection) *exit.Error {
+func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.Operation, identity *orchestrator.WorkerConnection) *exit.Error {
 	var selection runtimeUpdateSelection
-	if len(row.Selection) > 0 && json.Unmarshal(row.Selection, &selection) != nil {
+	if len(row.Update) > 0 && json.Unmarshal(row.Update, &selection) != nil {
 		return exit.New(exit.Structural, "recorded Runtime update selection is unreadable")
 	}
 	machine, problem := u.maintenance(identity)
@@ -253,29 +252,25 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	lastState := ""
-	for result.InProgress() {
-		if !ctx.Mode().JSON && lastState != result.State {
-			messages := map[string]string{"preparing": "Checking Runtime and published updates", "updating": "Updating Runtime", "reconciling": "Checking the worker after an interrupted update"}
-			if message := messages[result.State]; message != "" {
-				fmt.Fprintf(ctx.Err, "%s: %s...\n", row.MachineName, message)
-			}
-			lastState = result.State
+	reference := strconv.FormatInt(result.Number, 10)
+	lastPhase := ""
+	for result.Status == "queued" || result.Status == "in_progress" {
+		if !ctx.Mode().JSON && lastPhase != result.Phase {
+			fmt.Fprintf(ctx.Err, "%s: #%d %s...\n", row.MachineName, result.Number, strings.ReplaceAll(result.Phase, "_", " "))
+			lastPhase = result.Phase
 		}
 		time.Sleep(time.Second)
-		result, problem = c.RentalRuntimeUpdate(row.ID)
-		if problem != nil {
+		if result, problem = c.Request(reference); problem != nil {
 			return problem
 		}
 	}
-	if result.State == "unusable" {
-		return result.Unusable(row.MachineName)
+	if result.Status != "completed" {
+		return exit.Named(exit.Failed, either(result.ErrorCode, "rental.runtime_update_failed"), "%s: #%d %s", row.MachineName, result.Number, result.Error).
+			WithRemedy("cozy run show %d", result.Number)
 	}
-	if result.State == "failed" {
-		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.MachineName, result.Error)
-	}
+	raw, _ := json.Marshal(result.Result)
 	var actual runtimeObservation
-	_ = json.Unmarshal(result.Result, &actual)
+	_ = json.Unmarshal(raw, &actual)
 	var previous runtimeObservation
 	var state struct {
 		Unchanged bool `json:"unchanged"`
@@ -285,7 +280,7 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 			} `json:"from"`
 		} `json:"update"`
 	}
-	_ = json.Unmarshal(result.Result, &state)
+	_ = json.Unmarshal(raw, &state)
 	if previous.Observed.Runtime.Distribution == "" {
 		previous.Observed.Runtime.Distribution = state.Update.From.Runtime // the machine updated itself
 	}
@@ -296,6 +291,6 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	return emit(ctx, compactRecord([]output.Field{
 		{K: "machine", V: row.MachineName}, {K: "runtime", V: actual.Observed.Runtime.Distribution},
 		{K: "tensorfs", V: actual.Observed.TensorFS}, {K: "status", V: status},
-		{K: "previous_runtime", V: previous.Observed.Runtime.Distribution}, {K: "update_id", V: result.ID},
-		{K: "details", V: result.Result}}, "machine", "runtime", "tensorfs", "status"))
+		{K: "previous_runtime", V: previous.Observed.Runtime.Distribution}, {K: "number", V: result.Number}, {K: "update_id", V: result.RequestID},
+		{K: "details", V: result.Result}}, "number", "machine", "runtime", "tensorfs", "status"))
 }

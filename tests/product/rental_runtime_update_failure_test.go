@@ -43,7 +43,9 @@ type nativeMaintenanceFixture struct {
 	runtimeWheel, tensorfsWheel string
 }
 
-func nativeMaintenance(t *testing.T) *nativeMaintenanceFixture {
+// nativeMaintenance attaches an actual agent/Runtime pair as rental tessa; serve adjusts
+// the stand-in Hub before the machine starts.
+func nativeMaintenance(t *testing.T, serve ...func(*machineHub)) *nativeMaintenanceFixture {
 	t.Helper()
 	if *machineHostBinary == "" || *machineRuntimeWheel == "" || *machineTensorFSWheel == "" {
 		if *requireMachineHost {
@@ -59,6 +61,9 @@ func nativeMaintenance(t *testing.T) *nativeMaintenanceFixture {
 		t.Skip("uv is required for the native machine fixture")
 	}
 	h := newMachineHub(t)
+	for _, adjust := range serve {
+		adjust(h)
+	}
 	root, err := os.MkdirTemp("", "cz-native-update-")
 	must(t, err)
 	claimScratch(root)
@@ -173,12 +178,17 @@ func transportLogs(root string) string {
 	return text
 }
 
-// eventually waits for ok; the bound only catches a hang on a loaded shared box.
-func eventually(t *testing.T, root, what string, ok func() bool) {
+// eventually waits for ok; the bound only catches a hang on a loaded shared box. A
+// shown value is the last observation, reported when it never came.
+func eventually(t *testing.T, root, what string, ok func() bool, shown ...*string) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Minute); !ok(); time.Sleep(50 * time.Millisecond) {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s did not happen: %s\n%s", what, tail(filepath.Join(root, "daemon.log")), transportLogs(root))
+			observed := ""
+			for _, value := range shown {
+				observed += *value + "\n"
+			}
+			t.Fatalf("%s did not happen: %s%s\n%s", what, observed, tail(filepath.Join(root, "daemon.log")), transportLogs(root))
 		}
 	}
 }

@@ -29,9 +29,9 @@ daemon.
 |---|---|---|---|
 | `GET /v1/capabilities` | core | yes | operation support; `model_overrides` covers ordered adapters and qualified captured-callable model selectors |
 | `POST /v1/requests` | core | yes | submit; `Idempotency-Key` required; 202 fresh / 200 replay |
-| `GET /v1/requests` | core | yes | listing, newest first; `?status=`, `?package=`, `?limit=` |
-| `GET /v1/requests/{id}` | core | yes | the lifecycle document |
-| `POST /v1/requests/{id}/cancel` | core | yes | requests cancellation; `?grace_ms=` |
+| `GET /v1/requests` | core | yes | the journal, newest number first: runs and operations (download, install, update, upload); `?status=`, `?package=`, `?limit=`, `?before=` |
+| `GET /v1/requests/{id}` | core | yes | the lifecycle document of any number or id; `journal` names its kind |
+| `POST /v1/requests/{id}/cancel` | core | yes | requests cancellation; `?grace_ms=`. An operation detaches its owner; an update cancels only before it starts |
 | `GET /v1/requests/{id}/events` | core | yes | SSE, one request, terminal-stop; `?starting_after=` |
 | `GET /v1/media/{media_id}` | core | yes | bytes by opaque id; `HEAD`; one `Range` |
 
@@ -337,17 +337,15 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/machines/{machine}/logs/{log}` | local | yes | one log a machine keeps (`tensorfs`: TensorFS's transport decisions), oldest line first, `?tail_bytes=` the newest; an older machine answers a note in `unavailable` |
 | `POST /v1/local/machines/forget-package` | local | yes | tell every machine this daemon knows to read a changed package once more on its next run |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
-| `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |
-| `GET /v1/local/rentals/{rental_id}/installs/{id}` | local | yes | one queued installation's state and, while it runs, the machine's latest stage and byte counts |
-| `POST /v1/local/rentals/{rental_id}/runtime-update` | local | yes | start or rejoin a durable per-rental Runtime update; the CLI may disconnect without canceling it |
-| `GET /v1/local/rentals/{rental_id}/runtime-update` | local | yes | read the selected update, phase, actual result, or reconciliation error |
+| `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | journal an exact package or model installation on a machine (`local` or a rental); 202 with its numbered lifecycle before the machine is ready, 200 for a pending or keyed replay |
+| `POST /v1/local/rentals/{rental_id}/runtime-update` | local | yes | journal or rejoin a rental's Runtime update; 202 with its numbered lifecycle, or a refusal naming the numbered work it would interrupt |
 | `POST /v1/local/cache/prune` | local | yes | prune unused operation cache roots in this machine's Runtime workspace; report `removed_entries`, `reclaimed_bytes`, and `store_busy` |
 | `POST /v1/local/daemon/down` | local | yes | non-destructive disconnect guarded by required online work; `{force:true}` overrides that guard without canceling work; mutually exclusive `{all:true}` requests cancellation and paid teardown |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
 | `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
-| `POST /v1/local/jobs/{id}/uploads` | local | yes | upload a run's retained output from the rental holding it as a private checkpoint; never rerun the producer |
+| `POST /v1/local/jobs/{id}/uploads` | local | yes | journal the upload of a run's retained output from the machine holding it as a private checkpoint; never rerun the producer; answers its numbered lifecycle |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | persist cancellation and its actor before contacting the machine; accepted work remains canceling until its outcome is known |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
 | `GET /app.css` | local | no | embedded localhost web UI stylesheet |

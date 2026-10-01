@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,7 +38,7 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 	// Observe the authority directly while the personal daemon is down. This uses
 	// the same authenticated machine client as the parity inventory proof.
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
-		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
+		Rentals: rental.Resolver(layout, store), UseRental: func(string, orchestrator.Holder) (func(), *exit.Error) { return func() {}, nil },
 		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
 	defer found.Forget(machines.Local)
 	defer found.Forget(parityRental)
@@ -95,7 +96,7 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 				fatal(t, problem)
 				var receipt pb.MachineExecutionReceipt
 				must(t, proto.Unmarshal(link.Receipt, &receipt))
-				machine, problem := found.Dial(t.Context(), name, "observe outcome while personal daemon is down")
+				machine, problem := found.Dial(t.Context(), name, orchestrator.Holder{What: "observe outcome while personal daemon is down"})
 				fatal(t, problem)
 				observer = machine
 				defer machine.Close()
@@ -131,7 +132,7 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 			done := start("done")
 			found.Held = func(string) bool { return true }
 			var problem *exit.Error
-			observer, problem = found.Dial(t.Context(), name, "read-only cancellation diagnostics")
+			observer, problem = found.Dial(t.Context(), name, orchestrator.Holder{What: "read-only cancellation diagnostics"})
 			fatal(t, problem)
 			down(done, "")
 			open("done")

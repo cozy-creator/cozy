@@ -106,7 +106,7 @@ type Resolver struct {
 	// bought from; UseRental holds it against release while in use.
 	Rentals       func(string) (*orchestrator.RemoteTarget, *exit.Error)
 	RentalHub     func(string) *hub.Client
-	UseRental     func(id, holder string) (func(), *exit.Error)
+	UseRental     func(id string, holder orchestrator.Holder) (func(), *exit.Error)
 	ObserveRental func(orchestrator.RentalObservation) *exit.Error
 	RentalKey     func(string) (rental.CreatorIdentity, *exit.Error)
 	// Held answers whether this daemon's orchestrator holds the boot's control stream. A
@@ -158,17 +158,17 @@ type target struct {
 
 // Dial connects to a machine and authenticates as its owner; holder names what the caller
 // is doing there, which a rental's maintenance refusal names. The caller closes it.
-func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *exit.Error) {
+func (r *Resolver) Dial(ctx context.Context, name string, holder orchestrator.Holder) (*Machine, *exit.Error) {
 	return r.DialAt(ctx, name, "", holder, true)
 }
 
 // DialAt selects a catalog/account context without changing the machine's lifecycle.
 // Every accepted run and every API call stays on the same local or rented endpoint.
-func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
+func (r *Resolver) DialAt(ctx context.Context, name, origin string, holder orchestrator.Holder, named bool) (*Machine, *exit.Error) {
 	return r.dialAt(ctx, name, origin, holder, named)
 }
 
-func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
+func (r *Resolver) dialAt(ctx context.Context, name, origin string, holder orchestrator.Holder, named bool) (*Machine, *exit.Error) {
 	machine := &Machine{Name: name}
 	var t target
 	if IsLocal(name) {

@@ -208,7 +208,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	resolver := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil)}
-	machine, problem := resolver.DialAt(ctx, machines.Local, frozen.ReleaseRoot.Hub, "schema enforcement proof", true)
+	machine, problem := resolver.DialAt(ctx, machines.Local, frozen.ReleaseRoot.Hub, orchestrator.Holder{What: "schema enforcement proof"}, true)
 	fatal(t, problem)
 	defer machine.Close()
 	injected := proto.Clone(&frozen).(*pb.MachineExecutionSubmit)

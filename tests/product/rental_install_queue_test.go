@@ -45,13 +45,13 @@ func rentalInstallStore(t *testing.T) (home.Layout, *records.Store) {
 func rentalInstallMachine(state string) records.Rental {
 	return records.Rental{ID: "rental-install-proof", MachineName: "kirukiru", State: state, Hub: "https://hub.example", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, ExpectedWorkerBootID: "boot-proof", ReadyAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)}
 }
-func waitRentalInstall(t *testing.T, store *records.Store, id, state string) *records.RentalInstall {
+func waitRentalInstall(t *testing.T, store *records.Store, id, state string) *records.Operation {
 	t.Helper()
 	deadline := time.After(3 * time.Second)
 	tick := time.NewTicker(time.Millisecond)
 	defer tick.Stop()
 	for {
-		row, problem := store.RentalInstall(id)
+		row, problem := store.Operation(id)
 		rentalInstallCheck(t, problem)
 		if row != nil && row.State == state {
 			return row
@@ -84,19 +84,19 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	layout, store := rentalInstallStore(t)
 	machine := rentalInstallMachine("converging")
 	rentalInstallCheck(t, store.RecordRental(machine))
-	selection := records.RentalInstallSelection{Package: "paul/minimax-h3", Release: "1.15.7"}
+	selection := records.InstallSelection{Package: "paul/minimax-h3", Release: "1.15.7"}
 	var calls atomic.Int32
-	started := make(chan records.RentalInstall, 2)
-	prepare := func(ctx context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
+	started := make(chan records.Operation, 2)
+	prepare := func(ctx context.Context, row records.Operation) ([]records.ModelProgress, *exit.Error) {
 		calls.Add(1)
 		started <- row
 		<-ctx.Done()
-		return exit.New(exit.Canceled, "controller disconnected")
+		return nil, exit.New(exit.Canceled, "controller disconnected")
 	}
 	q := machines.NewInstalls(store, prepare, io.Discard)
-	accepted, problem := q.Accept(machine.ID, selection)
+	accepted, _, problem := q.Accept(machine.ID, "", selection)
 	rentalInstallCheck(t, problem)
-	replayed, problem := q.Accept(machine.ID, selection)
+	replayed, _, problem := q.Accept(machine.ID, "", selection)
 	rentalInstallCheck(t, problem)
 	if accepted.State != "queued" || accepted.ID != replayed.ID {
 		t.Fatalf("admission is not durable/idempotent: %+v %+v", accepted, replayed)
@@ -119,7 +119,7 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	rentalInstallCheck(t, problem)
 	found := false
 	for _, o := range obligations {
-		found = found || o.Kind == "rental_install" && o.ID == accepted.ID
+		found = found || o.Kind == "install" && o.ID == accepted.ID
 	}
 	if !found {
 		t.Fatal("daemon could idle-exit over accepted installation")
@@ -129,7 +129,7 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	q.Wake()
 	select {
 	case row := <-started:
-		if !reflect.DeepEqual(row.Selection, selection) {
+		if !reflect.DeepEqual(row.Install, selection) {
 			t.Fatal("selection changed", row)
 		}
 	case <-time.After(3 * time.Second):
@@ -143,12 +143,12 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	resumed, problem := records.Open(layout.DB)
 	rentalInstallCheck(t, problem)
 	defer resumed.Close()
-	q2 := machines.NewInstalls(resumed, func(_ context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
+	q2 := machines.NewInstalls(resumed, func(_ context.Context, row records.Operation) ([]records.ModelProgress, *exit.Error) {
 		calls.Add(1)
-		if !reflect.DeepEqual(row.Selection, selection) || row.WorkerBootID != "boot-proof" {
+		if !reflect.DeepEqual(row.Install, selection) || row.BootID != "boot-proof" {
 			t.Errorf("recovery changed immutable inputs: %+v", row)
 		}
-		return nil
+		return nil, nil
 	}, io.Discard)
 	stop2 := runRentalInstallQueue(t, q2)
 	defer stop2()
@@ -169,14 +169,14 @@ func TestRentalInstallQueueRetainsTypedTerminalFailures(t *testing.T) {
 			_, store := rentalInstallStore(t)
 			machine := rentalInstallMachine("converging")
 			rentalInstallCheck(t, store.RecordRental(machine))
-			selection := records.RentalInstallSelection{Models: []records.ModelRef{{Model: "paul/minimax-h3", Release: "1.0.0", Lane: "fp8", Manifest: "sha256:" + strings.Repeat("a", 64), ManifestLength: 321, CatalogRepository: "paul/minimax-h3"}}}
-			q := machines.NewInstalls(store, func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
+			selection := records.InstallSelection{Models: []records.ModelRef{{Model: "paul/minimax-h3", Release: "1.0.0", Lane: "fp8", Manifest: "sha256:" + strings.Repeat("a", 64), ManifestLength: 321, CatalogRepository: "paul/minimax-h3"}}}
+			q := machines.NewInstalls(store, func(context.Context, records.Operation) ([]records.ModelProgress, *exit.Error) {
 				if state != "worker-refused" {
 					t.Error("terminal rental received work")
 				}
-				return exit.Named(exit.Structural, "worker.prepare_refused", "checkpoint removed")
+				return nil, exit.Named(exit.Structural, "worker.prepare_refused", "checkpoint removed")
 			}, io.Discard)
-			row, problem := q.Accept(machine.ID, selection)
+			row, _, problem := q.Accept(machine.ID, "", selection)
 			rentalInstallCheck(t, problem)
 			want := "rental.boot_failed"
 			switch state {
@@ -198,7 +198,7 @@ func TestRentalInstallQueueRetainsTypedTerminalFailures(t *testing.T) {
 			stop := runRentalInstallQueue(t, q)
 			defer stop()
 			done := waitRentalInstall(t, store, row.ID, "failed")
-			if done.ErrorCode != want || !reflect.DeepEqual(done.Selection, selection) {
+			if done.ErrorCode != want || !reflect.DeepEqual(done.Install, selection) {
 				t.Fatalf("lost terminal failure or model grant: %+v", done)
 			}
 		})
@@ -213,14 +213,14 @@ func TestRentalInstallAdmissionAndStatusAPIWhileBooting(t *testing.T) {
 	rentalInstallCheck(t, problem)
 	defer owner.Close(time.Second)
 	credential := secret.New("installation-test-only")
-	q := machines.NewInstalls(store, func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
+	q := machines.NewInstalls(store, func(context.Context, records.Operation) ([]records.ModelProgress, *exit.Error) {
 		t.Error("admission attempted a worker call")
-		return nil
+		return nil, nil
 	}, io.Discard)
 	server := api.New(api.Options{Orchestrator: owner, Cfg: config.Config{Home: layout.Root, HubURL: machine.Hub}, Creds: api.Credentials{CLI: credential}, Addr: "127.0.0.1:9191", RentalInstall: q.Accept})
 	handler, problem := server.Handler()
 	rentalInstallCheck(t, problem)
-	selections := []records.RentalInstallSelection{{Package: "paul/minimax-h3", Release: "1.15.7"}, {Models: []records.ModelRef{{Model: "paul/minimax-h3", Release: "1.0.0", Lane: "fp8", Manifest: "sha256:" + strings.Repeat("b", 64), ManifestLength: 123, CatalogRepository: "paul/minimax-h3"}}}}
+	selections := []records.InstallSelection{{Package: "paul/minimax-h3", Release: "1.15.7"}, {Models: []records.ModelRef{{Model: "paul/minimax-h3", Release: "1.0.0", Lane: "fp8", Manifest: "sha256:" + strings.Repeat("b", 64), ManifestLength: 123, CatalogRepository: "paul/minimax-h3"}}}}
 	for _, selection := range selections {
 		raw, err := json.Marshal(selection)
 		if err != nil {
@@ -234,16 +234,16 @@ func TestRentalInstallAdmissionAndStatusAPIWhileBooting(t *testing.T) {
 		if response.Code != http.StatusAccepted {
 			t.Fatalf("booting admission=%d %s", response.Code, response.Body)
 		}
-		var accepted records.RentalInstall
+		var accepted api.Lifecycle
 		if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil {
 			t.Fatal(err)
 		}
-		held, problem := store.RentalInstall(accepted.ID)
+		held, problem := store.Operation(accepted.RequestID)
 		rentalInstallCheck(t, problem)
 		// The durable intent names the hub the request came through (#893): here the default.
 		want := selection
 		want.Hub = machine.Hub
-		if held == nil || held.State != "queued" || !reflect.DeepEqual(held.Selection, want) {
+		if held == nil || held.State != "queued" || !reflect.DeepEqual(held.Install, want) {
 			t.Fatalf("202 was not backed by exact durable intent: %+v", held)
 		}
 	}
@@ -256,28 +256,28 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 	entered := make(chan string, 4)
 	release := make(chan struct{})
 	var calls, active atomic.Int32
-	q := machines.NewInstalls(store, func(ctx context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
+	q := machines.NewInstalls(store, func(ctx context.Context, row records.Operation) ([]records.ModelProgress, *exit.Error) {
 		if active.Add(1) != 1 {
 			t.Error("one rental received concurrent installations")
 		}
 		defer active.Add(-1)
 		call := calls.Add(1)
-		entered <- row.Selection.Release
+		entered <- row.Install.Release
 		if call == 1 {
-			return exit.Unavailablef("control stream unavailable")
+			return nil, exit.Unavailablef("control stream unavailable")
 		}
 		if call == 2 {
 			select {
 			case <-release:
 			case <-ctx.Done():
-				return exit.New(exit.Canceled, "disconnected")
+				return nil, exit.New(exit.Canceled, "disconnected")
 			}
 		}
-		return nil
+		return nil, nil
 	}, io.Discard)
-	first, problem := q.Accept(machine.ID, records.RentalInstallSelection{Package: "proof/queued", Release: "1.0.0"})
+	first, _, problem := q.Accept(machine.ID, "", records.InstallSelection{Package: "proof/queued", Release: "1.0.0"})
 	rentalInstallCheck(t, problem)
-	second, problem := q.Accept(machine.ID, records.RentalInstallSelection{Package: "proof/queued", Release: "2.0.0"})
+	second, _, problem := q.Accept(machine.ID, "", records.InstallSelection{Package: "proof/queued", Release: "2.0.0"})
 	rentalInstallCheck(t, problem)
 	machine.State = "ready"
 	rentalInstallCheck(t, store.RecordRental(machine))
@@ -346,9 +346,9 @@ func TestQueuedRentalInstallReclaimsARestartedWorker(t *testing.T) {
 	peer.packageReleases = map[string]any{"proof/restart@1": release}
 	row := records.Rental{ID: podRental, MachineName: "restarted", State: "ready", SKU: "cpu", AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, Hub: peer.server.URL, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: "boot-before-restart"}
 	fatal(t, store.RecordRental(row))
-	queued, problem := store.BeginRentalInstall(podRental, records.RentalInstallSelection{Package: "proof/restart", Release: "1"})
+	queued, _, problem := store.BeginInstall(podRental, "", "", records.InstallSelection{Package: "proof/restart", Release: "1"})
 	fatal(t, problem)
-	_, problem = store.StartRentalInstall(queued.ID, row.ExpectedWorkerBootID)
+	_, problem = store.StartInstall(queued.ID, row.ExpectedWorkerBootID)
 	fatal(t, problem)
 	_, problem = store.ForgetRental(podRental)
 	fatal(t, problem)
@@ -356,16 +356,16 @@ func TestQueuedRentalInstallReclaimsARestartedWorker(t *testing.T) {
 	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token, identity))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+peer.server.URL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	startDaemonProcess(t, root)
-	var done *records.RentalInstall
+	var done *records.Operation
 	waitUntil(t, "the restarted worker's installation settles", func() bool {
-		done, problem = store.RentalInstall(queued.ID)
+		done, problem = store.Operation(queued.ID)
 		fatal(t, problem)
 		return !done.Active()
 	})
 	pod.mu.Lock()
 	prepares := len(pod.prepares)
 	pod.mu.Unlock()
-	if done.State != "succeeded" || done.WorkerBootID != podBootID || prepares != 1 {
+	if done.State != "succeeded" || done.BootID != podBootID || prepares != 1 {
 		t.Fatalf("installation was not claimed again on the new boot: %+v, %d preparations\n%s", done, prepares, tail(filepath.Join(root, "daemon.log")))
 	}
 }

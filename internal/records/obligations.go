@@ -33,7 +33,7 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 		 WHERE state NOT IN (` + finalRentalOperationStates + `)
 		   AND rental_id NOT IN (SELECT id FROM rentals)
 		UNION ALL
-		SELECT 'rental_install',id,state FROM rental_installs WHERE state IN ('queued','installing')
+		SELECT kind,id,state FROM operations WHERE state IN ('queued','installing','uploading','preparing','updating','reconciling','waiting_activation')
 		UNION ALL
 		SELECT 'output_export',request_id,state FROM request_output_exports
 		 WHERE state IN ('pending','exporting')

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -743,23 +745,29 @@ type Lifecycle struct {
 	MachineExecution *MachineExecutionView `json:"machine_execution,omitempty"`
 	Number           int64                 `json:"number"`
 	Kind             string                `json:"kind"`
-	RequestID        string                `json:"request_id"`
-	Status           string                `json:"status"`
-	Package          string                `json:"package"`
-	Function         string                `json:"function"`
-	Attempt          uint64                `json:"attempt"`
-	Attempts         int                   `json:"attempts"`
-	QueuedMS         int64                 `json:"queued_ms"`
-	ExecutionMS      int64                 `json:"execution_ms"`
-	ExecutionKnown   bool                  `json:"execution_known"`
-	AttemptWallMS    int64                 `json:"attempt_wall_ms,omitempty"`
-	ProgressStage    string                `json:"progress_stage,omitempty"`
-	StageFraction    *float64              `json:"stage_fraction,omitempty"`
-	OverallFraction  *float64              `json:"overall_fraction,omitempty"`
-	Position         *int64                `json:"position,omitempty"`
-	Total            *int64                `json:"total,omitempty"`
-	RemainingMS      *int64                `json:"remaining_ms,omitempty"`
-	StepMS           *float64              `json:"step_ms,omitempty"`
+	// Journal is what the number is: run, download, install, update or upload.
+	Journal string `json:"journal"`
+	// Upload is an output upload's own record: what goes where, and its checkpoint.
+	Upload *records.OutputUpload `json:"upload,omitempty"`
+	// Target names what an operation lands; a run's is its package and function.
+	Target          string   `json:"target,omitempty"`
+	RequestID       string   `json:"request_id"`
+	Status          string   `json:"status"`
+	Package         string   `json:"package"`
+	Function        string   `json:"function"`
+	Attempt         uint64   `json:"attempt"`
+	Attempts        int      `json:"attempts"`
+	QueuedMS        int64    `json:"queued_ms"`
+	ExecutionMS     int64    `json:"execution_ms"`
+	ExecutionKnown  bool     `json:"execution_known"`
+	AttemptWallMS   int64    `json:"attempt_wall_ms,omitempty"`
+	ProgressStage   string   `json:"progress_stage,omitempty"`
+	StageFraction   *float64 `json:"stage_fraction,omitempty"`
+	OverallFraction *float64 `json:"overall_fraction,omitempty"`
+	Position        *int64   `json:"position,omitempty"`
+	Total           *int64   `json:"total,omitempty"`
+	RemainingMS     *int64   `json:"remaining_ms,omitempty"`
+	StepMS          *float64 `json:"step_ms,omitempty"`
 	// ProgressUnit names what Position and Total count ("bytes" for a transfer or
 	// conversion stage); ProgressRate is that unit per second, as Runtime measured it.
 	ProgressUnit string   `json:"progress_unit,omitempty"`
@@ -871,13 +879,20 @@ type TriageRef struct {
 func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 	reference := r.PathValue("id")
 	row, e := s.store.RequestByReference(reference)
+	if e == nil && row == nil {
+		var o *records.Operation
+		if o, e = s.store.Operation(reference); e == nil && o != nil {
+			s.ok(w, r, http.StatusOK, s.operationLifecycle(*o))
+			return
+		}
+	}
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
 	if row == nil {
 		s.refuse(w, r, http.StatusNotFound, "not_found",
-			"no request "+reference+" on this host", "")
+			"nothing numbered "+reference+" on this host", "")
 		return
 	}
 	var problem *exit.Error
@@ -899,7 +914,10 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	life := s.lifecycleFacts(row)
-	life.Hub = s.requestHub(row)
+	life.Hub, life.Journal = s.requestHub(row), row.Journal
+	if life.Journal == "" {
+		life.Journal = s.store.JournalKind(row.ID)
+	}
 	if life.Error == "" && life.Status == "failed" {
 		if errType, errCode, errText, problem := s.store.SettledFailure(row.ID); problem == nil {
 			life.ErrorType, life.ErrorCode, life.Error = errType, errCode, errText
@@ -932,10 +950,14 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		if life.Status == "queued" {
 			if phase, ok := s.orchestrator.PhaseOf(row.ID); ok {
 				fillPhase(&life, phase)
+				life.WaitingFor = cmp.Or(life.WaitingFor, s.operationBlocking(link.MachineID, phase))
 			} else if phase, ok := s.orchestrator.RentalPhase(link.MachineID); ok {
 				fillPhase(&life, phase)
 			}
 			s.fillWait(&life)
+			if life.WaitReason == "" && life.WaitingFor != nil && life.WaitingFor.Kind != "" {
+				life.WaitReason = life.WaitingFor.String()
+			}
 		}
 		s.fillLifecycleProgress(&life, row)
 		s.fillGPUWait(&life, row)
@@ -1110,7 +1132,8 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("hubs") == "all" {
 		hub = ""
 	}
-	rows, e := s.store.PublicRequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), hub, s.cfg.HubURL, limit, before)
+	packageName := strings.TrimSpace(r.URL.Query().Get("package"))
+	rows, e := s.store.PublicRequestsBefore(state, packageName, hub, s.cfg.HubURL, limit, before)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -1119,6 +1142,15 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		out = append(out, s.lifecycleOf(row))
 	}
+	operations, e := s.operations(publicOperationStatus(state), packageName, hub, limit, before)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	// One number space: the page is the newest numbers of both, merged.
+	out = append(out, operations...)
+	slices.SortFunc(out, func(a, b Lifecycle) int { return cmp.Compare(b.Number, a.Number) })
+	out = out[:min(len(out), limit)]
 	s.ok(w, r, http.StatusOK, map[string]any{"requests": out, "count": len(out)})
 }
 
@@ -1149,7 +1181,15 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if row == nil {
-		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+reference+" on this host", "")
+		if o, e := s.store.Operation(reference); e != nil || o != nil {
+			if e != nil {
+				s.refuseTyped(w, r, e)
+			} else {
+				s.cancelOperation(w, r, *o)
+			}
+			return
+		}
+		s.refuse(w, r, http.StatusNotFound, "not_found", "nothing numbered "+reference+" on this host", "")
 		return
 	}
 	actor := requestActor(r)

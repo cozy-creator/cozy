@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -61,10 +62,11 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 	}
 	code, out := runCozy(t, root, "model", "download", "proof/model#"+manifest, "--json")
 	var accepted struct {
-		ID     string `json:"id"`
-		Rental string `json:"rental"`
+		Number  int64  `json:"number"`
+		Kind    string `json:"kind"`
+		Machine string `json:"machine"`
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &accepted) != nil || accepted.Rental != machines.Local || accepted.ID == "" {
+	if code != 0 || json.Unmarshal([]byte(out), &accepted) != nil || accepted.Machine != machines.Local || accepted.Number == 0 || accepted.Kind != "download" {
 		t.Fatalf("local model download was not accepted for this computer's machine [exit %d]\n%s", code, out)
 	}
 	layout, problem := home.Open(root)
@@ -72,10 +74,10 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
-	var settled *records.RentalInstall
+	var settled *records.Operation
 	deadline := time.Now().Add(3 * time.Minute)
 	for settled == nil && time.Now().Before(deadline) {
-		row, problem := store.RentalInstall(accepted.ID)
+		row, problem := store.Operation(fmt.Sprint(accepted.Number))
 		fatal(t, problem)
 		if row != nil && (row.State == "succeeded" || row.State == "failed") {
 			settled = row

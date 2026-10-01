@@ -81,7 +81,7 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	if problem != nil {
 		return true, problem
 	}
-	ctx.ingestBytes = plan.source.Bytes
+	ctx.ingestBytes, ctx.journal = plan.source.Bytes, "upload"
 	var script []byte
 	if plan.recipe != nil {
 		script = recipeUploadScript(plan.recipe.Repository, plan.recipe.Revision, destination.String())

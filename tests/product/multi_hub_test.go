@@ -852,7 +852,7 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	for deadline := time.Now().Add(3 * time.Minute); ; time.Sleep(250 * time.Millisecond) {
-		row, problem := store.RentalInstall(accepted.ID)
+		row, problem := store.Operation(accepted.ID)
 		fatal(t, problem)
 		if row != nil && (row.State == "succeeded" || row.State == "failed") {
 			break

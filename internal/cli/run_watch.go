@@ -41,6 +41,9 @@ func handleRunWatch(ctx *Context) *exit.Error {
 		if problem != nil {
 			return problem
 		}
+		if isOperation(life) {
+			return watchOperation(ctx, client, life)
+		}
 		if life.Kind == "job" {
 			state, problem := client.Job(id)
 			if problem != nil {

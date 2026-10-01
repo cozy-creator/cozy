@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"maps"
 	"net"
 	"net/http"
@@ -548,10 +549,10 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 
 	// Both machines report the Runtime's measured inventory through the same Host call.
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
-		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
+		Rentals: rental.Resolver(layout, store), UseRental: func(string, orchestrator.Holder) (func(), *exit.Error) { return func() {}, nil },
 		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
 	for _, name := range []string{machines.Local, parityRental} {
-		machine, problem := found.Dial(context.Background(), name, "parity inventory")
+		machine, problem := found.Dial(context.Background(), name, orchestrator.Holder{What: "parity inventory"})
 		fatal(t, problem)
 		workspace, err := machine.Host.GetMachineExecutionWorkspace(context.Background(), &pb.MachineExecutionWorkspaceQuery{Claim: machine.Claim})
 		machine.Close()

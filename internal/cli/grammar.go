@@ -345,14 +345,12 @@ type ModelDownloadCmd struct {
 	Ref            string `arg:"" optional:"" name:"model" help:"Local destination (local/name); omit it to download into this computer's machine."`
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         string `help:"Download directly into this owned rental (no local destination)."`
-	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
-	Await          bool   `help:"Wait until the download settles, printing the machine's progress."`
-	IdempotencyKey string `help:"Stable request identity for exact replay; otherwise start a new run."`
+	Await          bool   `help:"Watch the numbered download until it settles."`
+	IdempotencyKey string `help:"Stable identity: the same key answers its first number again."`
 }
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
-	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
-		"--rental-only", c.RentalOnly, "--await", c.Await),
+	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools("--await", c.Await),
 		values("--rental", c.Rental, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
 }
 
@@ -445,11 +443,11 @@ func (c *ModelDeleteCmd) Run(r *Runtime) error {
 type RunCmd struct {
 	Upload  RunUploadCmd  `cmd:"" help:"Upload a run's retained output, from the rental holding it, as a private checkpoint in org/model without running it again."`
 	Execute RunExecuteCmd `cmd:"" default:"withargs" hidden:""`
-	Cancel  RunCancelCmd  `cmd:"" help:"Cancel a queued or running run."`
+	Cancel  RunCancelCmd  `cmd:"" help:"Cancel a numbered run, download, install or upload, or an update that has not started."`
 	Pause   RunPauseCmd   `cmd:"" help:"Pause a private transaction and retain its work. Rentals still shut down after 15 idle minutes; cozy rental keepalive <name> resets the deadline once."`
 	Resume  RunResumeCmd  `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
-	List    RunListCmd    `cmd:"" help:"List current and past runs."`
-	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
+	List    RunListCmd    `cmd:"" help:"List runs, downloads, installs, updates and uploads by number."`
+	Watch   RunWatchCmd   `cmd:"" help:"Watch one numbered run or operation until it settles."`
 	Play    RunPlayCmd    `cmd:"" help:"Print a link that plays a run's output in any browser, live as it grows, straight from its rented machine."`
 	Show    RunShowCmd    `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, the GPUs it ran on and each GPU's attention kernels (served, or why not, and compile time), and each child call's function, label, GPUs, stages and steps."`
 }
@@ -515,7 +513,7 @@ func (c *RunUploadCmd) Run(r *Runtime) error {
 }
 
 type RunCancelCmd struct {
-	ID      string `arg:"" name:"run" help:"Run id."`
+	ID      string `arg:"" name:"run" help:"Number or id."`
 	Await   bool   `help:"Wait until the machine confirms the cancellation outcome."`
 	Abandon bool   `help:"Abandon local Runtime-run tracking only; does not confirm remote stop or end a rental."`
 }
@@ -559,7 +557,7 @@ func (c *RunListCmd) Run(r *Runtime) error {
 }
 
 type RunWatchCmd struct {
-	ID string `arg:"" name:"run" help:"Run id."`
+	ID string `arg:"" name:"run" help:"Number or id."`
 }
 
 func (c *RunWatchCmd) Run(r *Runtime) error {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -69,7 +70,7 @@ func TestIndependentAgentBootsOfflineAndRetainsScopedAccess(t *testing.T) {
 		t.Fatal("offline adoption changed machine identity or required a Hub")
 	}
 	resolver := &machines.Resolver{Host: machine}
-	connected, problem := resolver.Dial(ctx, machines.Local, "inspecting an offline machine")
+	connected, problem := resolver.Dial(ctx, machines.Local, orchestrator.Holder{What: "inspecting an offline machine"})
 	fatal(t, problem)
 	if connected.HubID() != "" || !connected.Owned() {
 		t.Fatal("owned machine authentication acquired a rental/registry identity")

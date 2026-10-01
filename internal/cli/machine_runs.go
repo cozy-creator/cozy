@@ -60,7 +60,7 @@ type machineRuns struct {
 	placed    map[string]string // the last placement decision recorded per waiting run
 	machines  *machines.Resolver
 	observers sync.Map // one collection/control lock per observed request
-	uploading sync.Map // retained-output uploads in progress, by operation
+	uploading sync.Map // stops for retained-output uploads in progress, by operation id
 	// awaited names the runs whose last observation ended on the machine's next event.
 	awaited map[string]bool
 	updates *rentalRuntimeUpdates
@@ -340,10 +340,8 @@ func (m *machineRuns) Resume() {
 		fmt.Fprintf(m.context.Out, "output upload recovery: %s\n", problem.Message)
 		return
 	}
-	for request, pending := range uploads {
-		for _, upload := range pending {
-			m.startUpload(request, upload)
-		}
+	for _, upload := range uploads {
+		m.startUpload(upload)
 	}
 }
 
@@ -970,8 +968,11 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 }
 
 // runHolder names a run and what it is doing on its machine.
-func (m *machineRuns) runHolder(request records.Request, doing string) string {
-	return m.runName(request) + " " + doing
+func (m *machineRuns) runHolder(request records.Request, doing string) orchestrator.Holder {
+	if numbered, problem := m.store.RequestByReference(request.ID); problem == nil && numbered != nil && numbered.Number > 0 {
+		return orchestrator.Holder{Number: numbered.Number, What: "run " + doing}
+	}
+	return orchestrator.Holder{What: "run " + request.ID + " " + doing}
 }
 
 func (m *machineRuns) runName(request records.Request) string {

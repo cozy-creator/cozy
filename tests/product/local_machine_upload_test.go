@@ -37,10 +37,10 @@ func TestAnOutputRetainedOnThisComputersMachineUploads(t *testing.T) {
 	}
 	code, out = runCozy(t, root, "run", "upload", row.ID+"#model", "proof/model", "--await", "--json")
 	var uploaded struct {
-		State      string `json:"state"`
+		Status     string `json:"status"`
 		Checkpoint string `json:"checkpoint"`
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &uploaded) != nil || uploaded.State != "uploaded" {
+	if code != 0 || json.Unmarshal([]byte(out), &uploaded) != nil || uploaded.Status != "completed" {
 		t.Fatalf("the retained output was not uploaded from this computer's machine [exit %d]\n%s", code, out)
 	}
 	checkpoints.mu.Lock()

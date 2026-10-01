@@ -37,9 +37,16 @@ func (s *Server) uploadJobOutput(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, exit.Unavailablef("this daemon cannot upload retained outputs"))
 		return
 	}
-	if _, problem := uploader.Upload(row, body.Output, body.Destination); problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
+	upload, problem := uploader.Upload(row, body.Output, body.Destination)
+	if problem == nil {
+		var o *records.Operation
+		if o, problem = s.store.Operation(upload.ID); problem == nil && o == nil {
+			problem = exit.Internalf("the upload was journaled and cannot be read back")
+		}
+		if problem == nil {
+			s.ok(w, r, http.StatusAccepted, s.operationLifecycle(*o))
+			return
+		}
 	}
-	s.ok(w, r, http.StatusAccepted, s.jobStateOf(row))
+	s.refuseTyped(w, r, problem)
 }

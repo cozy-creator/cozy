@@ -109,7 +109,7 @@ func init() {
 	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
 	schema = append(schema, ownerMemoIndex)
-	schema = append(schema, rentalInstallsDDL, rentalInstallsIndex, runtimeUpdatesDDL, rentalIdleDDL,
+	schema = append(schema, journalDDL, operationsDDL, operationsByMachine, operationsByKey, rentalIdleDDL,
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex)
 }
 
@@ -195,6 +195,10 @@ func open(path string) (*Store, *exit.Error) {
 		if err := renameLifecycleEvents(db); err != nil {
 			db.Close()
 			return nil, exit.Internalf("cannot rename lifecycle events in %s: %s", path, err)
+		}
+		if err := numberJournal(db); err != nil {
+			db.Close()
+			return nil, exit.Internalf("cannot number recorded runs in %s: %s", path, err)
 		}
 	}
 	// The database retains request payloads, rental facts and triage bundles; 0600 is

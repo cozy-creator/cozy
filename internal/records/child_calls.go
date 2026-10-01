@@ -109,7 +109,7 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 				return Request{}, false, exit.Named(exit.Conflict, "child.arguments_changed", "serving call index already names different arguments")
 			}
 		}
-		existing.Number, err = requestNumber(tx, existing)
+		existing.Number, existing.Journal, err = journalEntry(tx, existing.ID)
 		if err != nil {
 			return Request{}, false, exit.Internalf("cannot number child replay: %s", err)
 		}
