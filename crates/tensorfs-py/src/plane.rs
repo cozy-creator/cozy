@@ -58,6 +58,11 @@ fn err(py: Python<'_>, e: Error) -> PyErr {
         let _ = v.setattr("available", *available);
         let _ = v.setattr("blockers", blockers.clone());
     }
+    if let Error::BudgetExceeded { pool, requested, available } = &e {
+        let _ = v.setattr("pool", *pool);
+        let _ = v.setattr("requested", *requested);
+        let _ = v.setattr("available", *available);
+    }
     if let Error::BelowFloor { pool, need, budget } = &e {
         let _ = v.setattr("pool", *pool);
         let _ = v.setattr("need", *need);

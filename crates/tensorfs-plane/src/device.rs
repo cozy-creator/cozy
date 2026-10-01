@@ -585,6 +585,10 @@ fn run_copy(
                 bounces[b].last = Some(e);
             }
             if let Some(e) = failed {
+                // Chunks before the failure are still writing the region: drain them, so an
+                // Invalid region never has a copy in flight when it is unmapped.
+                ready.record(stream)?;
+                ready.sync()?;
                 return Err(e);
             }
             if first {

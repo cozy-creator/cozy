@@ -219,8 +219,11 @@ p.events() -> [{"kind", "ws", "region", "device", "bytes", "ns", "detail"}]   # 
 
 `plane.PlaneError` (`.code`), subclasses: `BudgetExceeded`, `Shortfall`, `BelowFloor`, `LeaseViolation`,
 `Poisoned`, `CudaError`, `CudaUnavailable`, `Invalid`, `IoError`, `Closed`. Source refusals
-surface as the usual `tensorfs.errors.*` classes. `BudgetExceeded` with `pool == "device"`
-means the driver itself had no memory left (the budget exceeds what is free): lower it.
+surface as the usual `tensorfs.errors.*` classes. Capacity errors carry their numbers as
+attributes: `BudgetExceeded` (`pool`, `requested`, `available`), `Shortfall` (`pool`, `need`,
+`available`, `blockers`), `BelowFloor` (`pool`, `need`, `budget`). `BudgetExceeded` with
+`pool == "device"` means the driver itself had no memory left (the budget exceeds what is
+free): lower it.
 
 **Poison is latched plane-wide**: an ambiguous driver outcome (a failed unmap or rollback, a
 driver mapping that disagrees with the books) or a lease dropped unreleased makes every later

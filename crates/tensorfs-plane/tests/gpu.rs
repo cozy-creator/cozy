@@ -408,3 +408,42 @@ fn a_dropped_cursor_closes_itself_and_floors_refuse_early() {
     assert!(p.stats().poisoned.is_none());
     p.close().unwrap();
 }
+
+#[test]
+#[ignore = "GPU"]
+fn cutting_just_wanted_regions_waits_for_every_staged_chunk() {
+    // W3 R24: want cold from disk through staging (pinned budget 0; 16 MiB staging puts the
+    // 70 MiB region in 5 chunks), acquire and release each region without the consumer ever
+    // waiting, then cut the budget to zero before anything reads them. A copy still writing an
+    // unmapped range would surface as ILLEGAL_ADDRESS at the next driver call.
+    let fx = Fixture::new("gpu-r24");
+    for _ in 0..4 {
+        let p = plane();
+        let ws = fx.register(&p, None);
+        let s = Stream::new();
+        p.set_vram_budget(DEV, 1 << 30).unwrap();
+        fx.drop_cache();
+        let _ticket = p.want(ws, Tier::Device(DEV), None, 5, false).unwrap();
+        for r in 0..3 {
+            p.acquire(ws, DEV, r, s.raw(), None).unwrap().release(s.raw()).unwrap();
+        }
+        let t = p.set_vram_budget(DEV, 0).unwrap();
+        assert_eq!(t.evicted.len(), 3, "{t:?}");
+        let ev = {
+            let d = cuda::driver().unwrap();
+            let mut e = std::ptr::null_mut();
+            cuda::check("cuEventCreate", unsafe { (d.event_create)(&mut e, cuda::EVENT_DEFAULT) }).unwrap();
+            cuda::check("cuEventRecord", unsafe { (d.event_record)(e, s.0) }).unwrap();
+            e
+        };
+        s.sync();
+        unsafe { (cuda::driver().unwrap().event_destroy)(ev) };
+        p.set_vram_budget(DEV, 1 << 30).unwrap();
+        for r in 0..3 {
+            resident(&p, ws, &s, r).release(s.raw()).unwrap();
+        }
+        assert!(p.stats().poisoned.is_none());
+        s.sync();
+        p.close().unwrap();
+    }
+}

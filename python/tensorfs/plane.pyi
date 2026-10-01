@@ -132,7 +132,10 @@ class Event(TypedDict):
 class PlaneError(Exception):
     code: str
 
-class BudgetExceeded(PlaneError): ...
+class BudgetExceeded(PlaneError):
+    pool: str
+    requested: int
+    available: int
 
 class Shortfall(PlaneError):
     pool: str
