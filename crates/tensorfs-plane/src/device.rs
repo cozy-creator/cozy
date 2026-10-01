@@ -553,7 +553,11 @@ fn run_copy(
                             let into = into;
                             // SAFETY: the bounce range belongs to this chunk until its copy
                             // event, recorded only after this batch completes.
-                            batch.finish(unsafe { source.read_item(&it, into.0, Mode::Buffered, &tally) });
+                            let r = unsafe { source.read_item(&it, into.0, Mode::Buffered, &tally) };
+                            // Drop the source before signalling: whoever waits on the batch may
+                            // then close the last weight set and end the lease at once.
+                            drop(source);
+                            batch.finish(r);
                         });
                     }
                     inflight.push_back((c0, b, w));

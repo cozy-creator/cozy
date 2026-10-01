@@ -636,7 +636,11 @@ impl Inner {
             let dst = Dst(unsafe { host.base().add(it.offset as usize) });
             self.readers.submit(false, move || {
                 let dst = dst;
-                batch.finish(unsafe { source.read_item(&it, dst.0, Mode::Cache, &tally) });
+                let r = unsafe { source.read_item(&it, dst.0, Mode::Cache, &tally) };
+                // Drop the source before signalling: the waiter may then close the last
+                // weight set, and its lease must end then, not when this thread unwinds.
+                drop(source);
+                batch.finish(r);
             });
         }
         Ok(())
