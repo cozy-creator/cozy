@@ -69,19 +69,18 @@ impl Meta {
             lease_dir,
             recovery_lock: writer_dir.join("recovery.lock"),
         };
-        meta.ensure_part_rows()?;
+        store.trust().with_connection(Self::ensure_part_rows)?;
         Ok(meta)
     }
 
     /// Accepted parts are rows of their own, so accepting one costs that one part. Older
     /// builds ignore both additions; a row one of them rewrites has no `open_session`,
     /// which sends this build back to its full-row check.
-    fn ensure_part_rows(&self) -> Result<()> {
-        let connection = self.connection()?;
-        connection
-            .execute_batch("BEGIN IMMEDIATE")
+    fn ensure_part_rows(connection: &mut Connection) -> Result<()> {
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| sql("lock derived part schema", error))?;
-        let has_session: bool = connection
+        let has_session: bool = transaction
             .query_row(
                 "SELECT count(*) FROM pragma_table_info('tensorfs_derived_transactions')
                  WHERE name='open_session'",
@@ -91,13 +90,13 @@ impl Meta {
             .map_err(|error| sql("inspect derived transaction columns", error))?
             > 0;
         if !has_session {
-            connection
+            transaction
                 .execute_batch(
                     "ALTER TABLE tensorfs_derived_transactions ADD COLUMN open_session INTEGER",
                 )
                 .map_err(|error| sql("add derived open session", error))?;
         }
-        connection
+        transaction
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS tensorfs_derived_parts (
                    id TEXT NOT NULL,
@@ -106,10 +105,12 @@ impl Meta {
                    role TEXT NOT NULL,
                    part BLOB NOT NULL,
                    PRIMARY KEY (id,component,key,role)
-                 ) STRICT, WITHOUT ROWID;
-                 COMMIT;",
+                 ) STRICT, WITHOUT ROWID;",
             )
-            .map_err(|error| sql("create derived parts", error))
+            .map_err(|error| sql("create derived parts", error))?;
+        transaction
+            .commit()
+            .map_err(|error| sql("commit derived part schema", error))
     }
 
     /// Refuse unless `writer_session` is the transaction's current writer. One indexed read
@@ -530,5 +531,59 @@ impl Drop for Hold {
                 self.id, self.kind
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn failed_additive_setup_rolls_back_and_reuses_the_validated_connection() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-meta-setup-{}-{}",
+            std::process::id(),
+            now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let opened = crate::catalog::connections_opened(&root);
+        store
+            .trust()
+            .with_connection(|connection| {
+                // Existing readers use the original two-column table. An index
+                // collision makes the later CREATE fail after ALTER has run.
+                connection
+                    .execute_batch(
+                        "CREATE INDEX tensorfs_derived_parts ON tensorfs_derived_transactions(id)",
+                    )
+                    .map_err(|error| sql("create conflicting fixture index", error))
+            })
+            .unwrap();
+        assert!(Meta::open(&store).is_err());
+        store
+            .trust()
+            .with_connection(|connection| {
+                assert!(
+                    connection.is_autocommit(),
+                    "failed setup kept its write lock"
+                );
+                let added: u64 = connection
+                    .query_row(
+                        "SELECT count(*) FROM pragma_table_info('tensorfs_derived_transactions')
+                         WHERE name='open_session'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| sql("inspect rolled-back schema", error))?;
+                assert_eq!(added, 0, "failed setup published a partial schema");
+                connection
+                    .execute_batch("DROP INDEX tensorfs_derived_parts")
+                    .map_err(|error| sql("remove fixture index", error))
+            })
+            .unwrap();
+        Meta::open(&store).unwrap();
+        assert_eq!(crate::catalog::connections_opened(&root) - opened, 1);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 }

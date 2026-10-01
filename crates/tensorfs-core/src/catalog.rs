@@ -260,6 +260,26 @@ impl Trust {
         self.load(&mut kept).map(|_| ())
     }
 
+    /// Finish setup on the already-validated reader connection. The callback is
+    /// synchronous under its mutex; no second setup connection or credential
+    /// lifetime escapes into the returned value.
+    pub(crate) fn with_connection<T>(
+        &self,
+        use_connection: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut kept = self.kept.lock().unwrap_or_else(|error| error.into_inner());
+        self.load(&mut kept)?;
+        let connection = &mut kept.as_mut().expect("validated connection").connection;
+        // A kept connection can be used by another Runtime thread later. Install
+        // the lock context on the thread actually executing this operation.
+        lock::wait_for_live_holders(connection, &self.path)?;
+        let _identity = crate::filesystem_identity::FilesystemIdentity::for_store_root(
+            self.path.parent().unwrap_or(&self.path),
+        )
+        .map_err(|error| io("enter catalog filesystem identity", error))?;
+        use_connection(connection)
+    }
+
     fn miss(&self, sha256: &str) -> Option<crate::store::VRecord> {
         let mut kept = self.kept.lock().unwrap_or_else(|error| error.into_inner());
         if self.load(&mut kept).ok()? {
