@@ -3,10 +3,14 @@ package producttest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -25,11 +30,14 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Install private code through the normal CLI, then prepare its unused serving
-// slot through the real authenticated standalone agent. No GPU execution is
-// needed to inspect the ordered, derived adapter view returned by Runtime.
+// Install private code through the normal CLI and inspect Runtime's ordered
+// adapter view through the authenticated standalone agent. The explicit rented
+// H100 flag also executes local roots, generated children and a built public release.
 func TestStandaloneHostPreparesOrderedPrivateLoRAView(t *testing.T) {
 	integration(t)
+	if !*machineLoRAServingGPU {
+		t.Setenv("CUDA_VISIBLE_DEVICES", "")
+	}
 	if *machineHostBinary == "" || *machineRuntimeWheel == "" || *machineTensorFSWheel == "" {
 		t.Skip("requires an exact standalone agent and paired Runtime/TensorFS wheels")
 	}
@@ -43,6 +51,16 @@ func TestStandaloneHostPreparesOrderedPrivateLoRAView(t *testing.T) {
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	host := machines.NewHost(layout.Machine, filepath.Join(root, "tensorfs"), nil)
+	// Keep the arithmetic proof on CPU; the machine still uses the same public
+	// Runtime, native TensorFS store, authenticated broker and preparation path.
+	if !*machineLoRAServingGPU {
+		virtualInventoryFor(t, host.Root(), true)
+	} else {
+		device, err := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader").Output()
+		if err != nil || !strings.Contains(string(device), "H100") {
+			t.Fatal("-lora-serving-gpu requires the isolated rented H100 host")
+		}
+	}
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "down")
 		_ = host.Stop(context.Background())
@@ -120,7 +138,7 @@ with tempfile.TemporaryDirectory() as scratch:
 	})
 	doors := h.worker.Config.Handler
 	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/models/resolve" || strings.HasPrefix(r.URL.Path, "/v1/models/proof/") {
+		if r.URL.Path == "/v1/models/resolve" || strings.HasPrefix(r.URL.Path, "/v1/models/proof/") || strings.HasPrefix(r.URL.Path, "/v1/packages/proof/lora-host-probe") {
 			h.mux.ServeHTTP(w, r)
 			return
 		}
@@ -132,7 +150,7 @@ with tempfile.TemporaryDirectory() as scratch:
 name="lora-host-probe"
 version="0.1.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime[adapters]>=%s","torch==2.13.0"]
+dependencies=["cozy-runtime[adapters]>=%s","torch==2.13.0","transformers>=5.16.1,<6"]
 [tool.uv.sources]
 cozy-runtime={path=%q}
 tensorfs={path=%q}
@@ -148,7 +166,7 @@ only-include=["lora_host_probe.py"]
 	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject='lora_host_probe:app'\n"), 0600))
 	must(t, os.WriteFile(filepath.Join(project, "lora_host_probe.py"), []byte(`import msgspec
 import torch
-from cozy_runtime.author import AdapterCompatibility, App, Config, Loader, Model
+from cozy_runtime.author import AdapterCompatibility, App, Config, Context, Loader, Model, invocable, uses_components
 class Pipeline:
     def __init__(self):
         transformer=torch.nn.Module()
@@ -159,16 +177,32 @@ def build(config: Config)->Pipeline: return Pipeline()
 class Probe(Model[Pipeline]):
     __adapter_compatibility__=(AdapterCompatibility('lora','',('transformer',)),)
     def load(self,loader:Loader)->None: self.pipe=loader.construct(Pipeline,factory=build)
+    @uses_components('transformer')
+    def score(self)->int:
+        component=self.pipe.components['transformer']
+        if next(component.parameters()).device.type!='cuda' or not torch.cuda.is_initialized():
+            raise AssertionError('the serving qualifier must execute on its rented H100')
+        x=torch.tensor([[1,2,3]],dtype=torch.float32,device=next(component.parameters()).device)
+        return int(4*component.proj(x).sum().item())
 class Request(msgspec.Struct): pass
 class Result(msgspec.Struct): value:int
 app=App()
-@app.job
+@app.job(accelerator=False)
 def scalar(payload:Request)->Result: return Result(42)
-@app.entrypoint
-def generate(payload:Request,model:Probe)->Result: return Result(0)
+@invocable(defaults={'model':[{'gpu':'*','lane':'proof/base@1.0.0/fp32'}]})
+async def generate(ctx:Context,*,payload:Request,model:Probe)->Result: return Result(model.score())
+app.entrypoint(generate)
+@app.job(accelerator=False)
+async def child(ctx:Context,payload:Request)->Result:
+    return await generate(payload=payload)
 `), 0600))
 	lock := exec.Command("uv", "lock", "--project", project, "--python", "3.12")
 	lock.Env = childEnv(t, root)
+	if *machineLoRAServingGPU {
+		lock.Env = append(lock.Env, "UV_TORCH_BACKEND=cu130")
+	} else {
+		lock.Env = append(lock.Env, "UV_TORCH_BACKEND=cpu")
+	}
 	if out, err := lock.CombinedOutput(); err != nil {
 		t.Fatalf("lock private probe: %v\n%s", err, out)
 	}
@@ -185,6 +219,187 @@ def generate(payload:Request,model:Probe)->Result: return Result(0)
 	fatal(t, problem)
 	if row == nil || row.LocalInstallationID == "" {
 		t.Fatal("normal CLI did not retain its private installation identity")
+	}
+	// A normal local root prepares its selected stack before acceptance. First land a
+	// baseline, so an adapter run must not reuse the already-held base placement.
+	if *machineLoRAServingGPU {
+		// Build an actual embedded-interface wheel and serve its complete lock at
+		// this isolated catalog. The same worker and its dependency cache serve
+		// the public release roots; no production publication is involved.
+		pack, problem := packagepublish.PrepareFrom(project)
+		fatal(t, problem)
+		t.Cleanup(pack.Close)
+		fatal(t, pack.Build(t.Context()))
+		objects := map[string]string{}
+		files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := objects[r.URL.Path]
+			if path == "" {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeFile(w, r, path)
+		}))
+		t.Cleanup(files.Close)
+		closure, err := exec.Command("uv", "export", "--project", project, "--frozen", "--no-dev", "--no-emit-project", "--no-header").Output()
+		must(t, err)
+		locked := string(closure)
+		for _, path := range []string{*machineRuntimeWheel, *machineTensorFSWheel} {
+			objects["/"+filepath.Base(path)] = path
+			fileURL := (&url.URL{Scheme: "file", Path: path}).String()
+			locked = strings.ReplaceAll(locked, fileURL, files.URL+"/"+filepath.Base(path))
+		}
+		objects["/"+filepath.Base(pack.Wheel)] = pack.Wheel
+		wheel, err := os.ReadFile(pack.Wheel)
+		must(t, err)
+		digest := sha256.Sum256(wheel)
+		locked += "lora-host-probe @ " + files.URL + "/" + filepath.Base(pack.Wheel) + " --hash=sha256:" + hex.EncodeToString(digest[:]) + "\n"
+		iface, err := os.ReadFile(pack.PackageInterface)
+		must(t, err)
+		prefix := "/v1/packages/proof/lora-host-probe"
+		h.mux.HandleFunc("GET "+prefix, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"releases":[{"release":"0.1.0"}]}`))
+		})
+		h.mux.HandleFunc("GET "+prefix+"/releases/0.1.0", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"release": map[string]string{"release": "0.1.0"}, "package_interface": json.RawMessage(iface), "requires_python": ">=3.12,<3.13"})
+		})
+		h.mux.HandleFunc("GET "+prefix+"/releases/0.1.0/locked-requirements", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(locked))
+		})
+		views := map[string]string{}
+		executors := map[string]string{}
+		for _, arm := range []struct {
+			key, function, slot string
+			scales              []string
+			score               int
+		}{
+			{"baseline", "generate", "model", nil, 184},
+			{"root-stack", "generate", "model", []string{"0.5", "-0.25"}, 320},
+			{"root-repeat", "generate", "model", []string{"0.5", "-0.25"}, 320},
+			{"root-reversed", "generate", "model", []string{"-0.25", "0.5"}, 320},
+			{"root-zero", "generate", "model", []string{"0", "-0.25"}, 124},
+			{"root-baseline-after", "generate", "model", nil, 184},
+			{"child-stack", "child", "generate.models.model", []string{"0.5", "-0.25"}, 320},
+			{"public-baseline", "generate", "model", nil, 184},
+			{"public-stack", "generate", "model", []string{"0.5", "-0.25"}, 320},
+			{"public-repeat", "generate", "model", []string{"0.5", "-0.25"}, 320},
+			{"public-zero", "generate", "model", []string{"0", "-0.25"}, 124},
+			{"public-baseline-after", "generate", "model", nil, 184},
+		} {
+			target := "local/lora-host-probe/" + arm.function
+			if strings.HasPrefix(arm.key, "public-") {
+				target = "proof/lora-host-probe/" + arm.function
+			}
+			args := []string{"run", target, "--await", "--json", "--idempotency-key", arm.key}
+			if arm.function == "generate" {
+				args = append(args, "payload:={}", "model.model=proof/base@1.0.0/fp32")
+			}
+			for i, scale := range arm.scales {
+				name := []string{"first", "second"}[i]
+				if arm.key == "root-reversed" {
+					name = []string{"second", "first"}[i]
+				}
+				args = append(args, "--lora", arm.slot+":transformer=proof/"+name+"@1.0.0/fp32,"+scale)
+			}
+			if code, out := runCozy(t, root, args...); code != 0 || !strings.Contains(out, fmt.Sprintf(`"value":%d`, arm.score)) {
+				t.Fatalf("%s CLI serving [%d], expected score %d: %s", arm.key, code, arm.score, out)
+			}
+			request, problem := store.RequestByIdempotencyKey(arm.key)
+			fatal(t, problem)
+			if request == nil {
+				t.Fatal("normal CLI lost its request")
+			}
+			if arm.function == "generate" {
+				events, problem := store.EvidenceEvents(request.ID, 1000)
+				fatal(t, problem)
+				for _, event := range events {
+					if event.Type == "machine.executor" {
+						executors[arm.key] = fmt.Sprintf("%v", event.Payload["pid"])
+					}
+				}
+				if executors[arm.key] == "" || executors[arm.key] == "<nil>" || executors[arm.key] == "0" {
+					t.Fatalf("%s retained no real executor identity", arm.key)
+				}
+				if (arm.key == "root-repeat" && executors[arm.key] != executors["root-stack"]) || (arm.key == "public-repeat" && executors[arm.key] != executors["public-stack"]) {
+					t.Fatal("identical ordered stack replaced its warm executor")
+				}
+			}
+			// Read the actual Runtime journal. The invocation's capture alone does not
+			// prove which placement was admitted and later handed to its executor.
+			read := exec.Command(python, "-I", "-c", `import json,sqlite3,sys
+from pathlib import Path
+root=Path(sys.argv[1]); db=sqlite3.connect('file:'+str(root/'.cozy-workspace/journal.sqlite3')+'?mode=ro',uri=True)
+row=db.execute('select preparation from executions where request=?',(sys.argv[2],)).fetchone()
+if sys.argv[3]=='child':
+    call=db.execute('select e.preparation from executions e join execution_calls c on e.request=c.child_request where c.parent_request=?',(sys.argv[2],)).fetchone()
+    if call is not None: row=call
+prepared=json.loads(row[0]); slots=[]
+for installation in prepared['installations'].values():
+    placement=installation['placement']; models={model['id']:model for model in placement.get('models',[])}
+    for entry in placement.get('entrypoints',[]):
+        if entry['name']!='generate': continue
+        for slot in entry.get('slots',[]):
+            stack=[dict(adapter,manifest=models[adapter['model_id']]['manifest']['digest']) for adapter in slot.get('adapters',[])]
+            components=[models[component['model_id']]['manifest']['digest'] for component in slot.get('components',[])]
+            slots.append({'stack':stack,'base':models[slot['reference_model_id']]['manifest']['digest'],'components':components})
+print(json.dumps(slots))
+`, filepath.Join(root, "tensorfs"), request.ID, arm.function)
+			raw, err := read.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s retained preparation: %v\n%s", arm.key, err, raw)
+			}
+			var slots []struct {
+				Stack      []struct{ Scale, Manifest string } `json:"stack"`
+				Base       string                             `json:"base"`
+				Components []string                           `json:"components"`
+			}
+			must(t, json.Unmarshal(raw, &slots))
+			if len(slots) != 1 {
+				t.Fatalf("%s selected no exact serving slot: %s", arm.key, raw)
+			}
+			if slots[0].Base != seeded["base"].Record["manifest_id"] {
+				t.Fatalf("%s replaced the original base custody", arm.key)
+			}
+			if len(slots[0].Components) != 1 || (slots[0].Components[0] != slots[0].Base) != (len(arm.scales) > 0) {
+				t.Fatalf("%s served no selected component view: %+v", arm.key, slots[0])
+			}
+			views[arm.key] = slots[0].Components[0]
+			if arm.key == "root-repeat" || arm.key == "child-stack" {
+				if views[arm.key] != views["root-stack"] {
+					t.Fatalf("%s changed the same ordered component view", arm.key)
+				}
+			}
+			if arm.key == "root-reversed" || arm.key == "root-zero" {
+				if views[arm.key] == views["root-stack"] {
+					t.Fatalf("%s reused a different stack's component view", arm.key)
+				}
+			}
+			if arm.key == "public-repeat" && views[arm.key] != views["public-stack"] {
+				t.Fatal("public repeated stack changed its component view")
+			}
+			if arm.key == "public-zero" && views[arm.key] == views["public-stack"] {
+				t.Fatal("public zero strength reused another component view")
+			}
+			stack := slots[0].Stack
+			if len(stack) != len(arm.scales) {
+				t.Fatalf("%s served %d adapters; requested %d", arm.key, len(stack), len(arm.scales))
+			}
+			t.Logf("%s: score=%d adapters=%d component=%s", arm.key, arm.score, len(stack), views[arm.key])
+			for i, adapter := range stack {
+				name := []string{"first", "second"}[i]
+				if arm.key == "root-reversed" {
+					name = []string{"second", "first"}[i]
+				}
+				if adapter.Manifest != seeded[name].Record["manifest_id"] {
+					t.Fatalf("%s changed adapter %d selection", arm.key, i)
+				}
+				if adapter.Scale != arm.scales[i] {
+					t.Fatalf("%s changed adapter %d strength: %s", arm.key, i, adapter.Scale)
+				}
+			}
+		}
+	}
+	if !*machineLoRAServingGPU {
+		t.Log("CPU structural preparation only; serving cases require -lora-serving-gpu on an isolated rented H100")
 	}
 	// The daemon now owns Control; this independent reader reuses the same owner.
 	resolver.Held = func(string) bool { return true }
