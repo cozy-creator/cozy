@@ -1,6 +1,10 @@
 package orchestrator
 
-import "github.com/cozy-creator/cozy/internal/records"
+import (
+	"fmt"
+
+	"github.com/cozy-creator/cozy/internal/records"
+)
 
 // The wait vocabulary (cl-103). A queued/parked event names WHAT the queue is doing in a
 // stable `wait` payload field beside the verbatim diagnostic `reason`, so a client can
@@ -34,6 +38,16 @@ type waitFacts struct {
 type WaitingRun struct {
 	Number    int64  `json:"number"`
 	RequestID string `json:"request_id"`
+	// Kind and Target name journaled work that is not a run: "download", "fidika/x@1".
+	Kind   string `json:"kind,omitempty"`
+	Target string `json:"target,omitempty"`
+}
+
+func (w WaitingRun) String() string {
+	if w.Kind == "" || w.Kind == "run" {
+		return fmt.Sprintf("waiting on run %d", w.Number)
+	}
+	return fmt.Sprintf("waiting on #%d (%s %s)", w.Number, w.Kind, w.Target)
 }
 
 // decorate adds the wait facts and the request's package to an event payload. The

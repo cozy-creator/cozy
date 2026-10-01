@@ -371,7 +371,7 @@ type Orchestrator struct {
 	starting map[string]bool
 	// rentalUses names each transport or preparation using a rental, so maintenance can
 	// say what it waits for.
-	rentalUses        map[string]map[uint64]string
+	rentalUses        map[string]map[uint64]Holder
 	rentalUseSeq      uint64
 	rentalMaintenance map[string]bool
 	events            []string
@@ -407,7 +407,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		outputExporting:   map[string]bool{},
 		starting:          map[string]bool{},
 		parked:            map[string]string{},
-		rentalUses:        map[string]map[uint64]string{},
+		rentalUses:        map[string]map[uint64]Holder{},
 		rentalMaintenance: map[string]bool{},
 		phases:            newPhases(),
 		transferWake:      make(map[string]chan struct{}),

@@ -120,7 +120,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Host: localMachine, HubOrigin: ctx.Cfg.HubURL,
 		Hub:     func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
-		UseRental:     func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
+		UseRental: func(id string, holder orchestrator.Holder) (func(), *exit.Error) {
+			return fleet.owner.UseRental(id, holder)
+		},
 		ObserveRental: rental.ObserveWorker(st),
 		RentalKey:     func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
 	}
@@ -160,13 +162,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// worker, including after a daemon restart.
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
-	installs := machineset.NewInstalls(st, func(ctx context.Context, row records.RentalInstall, report func(machineset.InstallProgress)) *exit.Error {
-		models := orchestrator.DownloadModelRefs(row.Selection.Models)
-		if len(models) != len(row.Selection.Models) {
-			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
-		}
-		return machines.Prewarm(ctx, row.RentalID, row.Selection.Hub, row.WorkerBootID, row.Selection.Package, row.Selection.Release, models, report)
-	}, ctx.Out)
+	installs := machineset.NewInstalls(st, machines.Prewarm, ctx.Out)
 	fleet.installs = installs
 	installsStopped := make(chan struct{})
 	defer cancelInstalls()
@@ -204,12 +200,19 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 
 	server := api.New(api.Options{
-		RuntimeUpdate:       updates.Start,
-		RentalKeepalive:     fleet.keepalive,
-		RentalInstall:       installs.Accept,
-		RentalInstallStatus: installs.Status,
-		MachineExecutions:   machines,
-		Orchestrator:        c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
+		RuntimeUpdate:   updates.Start,
+		RentalKeepalive: fleet.keepalive,
+		RentalInstall:   installs.Accept,
+		CancelOperation: func(o records.Operation, actor string) *exit.Error {
+			if _, problem := st.CancelOperation(o.ID, actor); problem != nil {
+				return problem
+			}
+			installs.Wake()
+			machines.StopUpload(o.ID)
+			return nil
+		},
+		MachineExecutions: machines,
+		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
 		RentalInventory: func(hub string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
 			return readRentalInventory(st, fleet, hub, allHubs, reconcile)

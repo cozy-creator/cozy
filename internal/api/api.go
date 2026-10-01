@@ -81,12 +81,12 @@ type Server struct {
 
 	// rentals resolves only the non-secret, attempt-bound desired placement. The
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
-	rentals             func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
-	rentalInventory     func(string, bool, bool) (RentalInventory, *exit.Error)
-	rentalKeepalive     func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
-	rentalInstall       func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
-	rentalInstallStatus func(string, string) (*RentalInstallStatus, *exit.Error)
-	runtimeUpdate       func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
+	rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
+	rentalInventory func(string, bool, bool) (RentalInventory, *exit.Error)
+	rentalKeepalive func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
+	rentalInstall   func(string, string, records.InstallSelection) (*records.Operation, bool, *exit.Error)
+	runtimeUpdate   func(string, RuntimeUpdateRequest) (*records.Operation, *exit.Error)
+	operationCancel func(records.Operation, string) *exit.Error
 
 	// shutdown asks the process that owns this server to drain and stop — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
@@ -141,10 +141,11 @@ type Options struct {
 	// RentalInventory answers one hub's fleet, or with allHubs every hub's.
 	RentalInventory func(hub string, allHubs, reconcile bool) (RentalInventory, *exit.Error)
 	RentalKeepalive func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
-	RentalInstall   func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
-	// RentalInstallStatus reads one queued installation on one machine, with its progress.
-	RentalInstallStatus func(machine, id string) (*RentalInstallStatus, *exit.Error)
-	RuntimeUpdate       func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
+	// RentalInstall queues a download or installation on a machine under an optional key.
+	RentalInstall func(string, string, records.InstallSelection) (*records.Operation, bool, *exit.Error)
+	RuntimeUpdate func(string, RuntimeUpdateRequest) (*records.Operation, *exit.Error)
+	// CancelOperation cancels one download, installation or not-yet-started update for an actor.
+	CancelOperation func(records.Operation, string) *exit.Error
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
 }
@@ -159,7 +160,7 @@ func New(opt Options) *Server {
 		orchestrator:      opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
-		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, rentalKeepalive: opt.RentalKeepalive, rentalInstall: opt.RentalInstall, rentalInstallStatus: opt.RentalInstallStatus, runtimeUpdate: opt.RuntimeUpdate, shutdown: opt.Shutdown,
+		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, rentalKeepalive: opt.RentalKeepalive, rentalInstall: opt.RentalInstall, runtimeUpdate: opt.RuntimeUpdate, operationCancel: opt.CancelOperation, shutdown: opt.Shutdown,
 	}
 }
 
@@ -254,10 +255,8 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"GET /v1/local/machines/{machine}/software":         s.machineSoftware,
 		"GET /v1/local/machines/{machine}/logs/{log}":       s.machineLog,
 		"POST /v1/local/machines/forget-package":            s.forgetPackage,
-		"POST /v1/local/rentals/{rental_id}/prepare":        s.prepareRentalPackage,
-		"GET /v1/local/rentals/{rental_id}/installs/{id}":   s.rentalInstallState,
+		"POST /v1/local/rentals/{rental_id}/prepare":        s.installOnMachine,
 		"POST /v1/local/rentals/{rental_id}/runtime-update": s.startRuntimeUpdate,
-		"GET /v1/local/rentals/{rental_id}/runtime-update":  s.readRuntimeUpdate,
 		"POST /v1/local/cache/prune":                        s.pruneCache,
 		"POST /v1/local/daemon/down":                        s.downDaemon,
 		"POST /v1/local/jobs":                               s.submitJob,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"io"
 	"net/http"
 	"os"
@@ -56,7 +57,7 @@ func TestStandaloneHostPreparesOrderedPrivateLoRAView(t *testing.T) {
 		Hub: func(origin string) *hub.Client {
 			return hub.New(config.Config{HubURL: origin, HubToken: secret.New("rental-idle-test")}, "LoRA preparation proof")
 		}}
-	connection, problem := resolver.DialAt(t.Context(), machines.Local, h.server.URL, "LoRA preparation proof", true)
+	connection, problem := resolver.DialAt(t.Context(), machines.Local, h.server.URL, orchestrator.Holder{What: "LoRA preparation proof"}, true)
 	fatal(t, problem)
 	defer resolver.Forget(machines.Local)
 	var workspace *pb.MachineExecutionWorkspace
@@ -189,7 +190,7 @@ def generate(payload:Request,model:Probe)->Result: return Result(0)
 	// The daemon now owns Control; this independent reader reuses the same owner.
 	resolver.Held = func(string) bool { return true }
 	resolver.Forget(machines.Local)
-	connection, problem = resolver.DialAt(t.Context(), machines.Local, h.server.URL, "LoRA preparation readback", true)
+	connection, problem = resolver.DialAt(t.Context(), machines.Local, h.server.URL, orchestrator.Holder{What: "LoRA preparation readback"}, true)
 	fatal(t, problem)
 	transfer, problem := store.MachinePackageTransfer(row.ID, connection.Claim.WorkerBootId, row.LocalInstallationID)
 	fatal(t, problem)

@@ -147,7 +147,7 @@ func Tmp(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 		for _, update := range updates {
 			// Public and local updates share this stage, including the pre-plan window.
 			protected["runtime-updates"] = true
-			if len(update.Selection) == 0 {
+			if len(update.Update) == 0 {
 				continue
 			}
 			type localWheel struct {
@@ -157,7 +157,7 @@ func Tmp(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 				LocalRuntime  *localWheel `json:"local_runtime"`
 				LocalTensorFS *localWheel `json:"local_tensorfs"`
 			}
-			if err := json.Unmarshal(update.Selection, &selection); err != nil {
+			if err := json.Unmarshal(update.Update, &selection); err != nil {
 				return Swept{}, exit.Internalf("cannot read active Runtime update staging: %s", err)
 			}
 			for _, wheel := range []*localWheel{selection.LocalRuntime, selection.LocalTensorFS} {

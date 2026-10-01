@@ -64,7 +64,7 @@ func (u *rentalRuntimeUpdates) updatesItself(id string) bool {
 }
 
 // updateNative stages the requested pair on the machine and asks it to update itself.
-func (u *rentalRuntimeUpdates) updateNative(ctx context.Context, row *records.RuntimeUpdate, selection *runtimeUpdateSelection, c *machineMaintenance) *exit.Error {
+func (u *rentalRuntimeUpdates) updateNative(ctx context.Context, row *records.Operation, selection *runtimeUpdateSelection, c *machineMaintenance) *exit.Error {
 	body := map[string]any{"operation": row.ID, "agent": "bundled", "pin": selection.LocalRuntime != nil || selection.LocalTensorFS != nil || selection.RuntimeVersion != "" || selection.TensorFSVersion != ""}
 	choose := func(key string, local *runtimeUpdateWheel, version string) *exit.Error {
 		switch {
@@ -113,7 +113,7 @@ func (u *rentalRuntimeUpdates) updateNative(ctx context.Context, row *records.Ru
 		// The request can take effect even if its response is lost. Preserve that
 		// uncertainty durably before sending, using this operation's stable identity.
 		selection.Native = &nativeUpdate{Operation: row.ID}
-		row.Selection, _ = json.Marshal(selection)
+		row.Update, _ = json.Marshal(selection)
 		row.State = "updating"
 		if problem := u.machines.store.SaveRuntimeUpdate(*row); problem != nil {
 			return problem
@@ -125,7 +125,7 @@ func (u *rentalRuntimeUpdates) updateNative(ctx context.Context, row *records.Ru
 		if problem.ErrName() == "machine.runtime_starting" || code >= 400 && code < 500 {
 			// These responses are the agent's pre-admission refusals.
 			selection.Native = nil
-			row.Selection, _ = json.Marshal(selection)
+			row.Update, _ = json.Marshal(selection)
 			row.State = "preparing"
 			if save := u.machines.store.SaveRuntimeUpdate(*row); save != nil {
 				return save
@@ -143,10 +143,10 @@ func (u *rentalRuntimeUpdates) updateNative(ctx context.Context, row *records.Ru
 }
 
 // followNative waits for the machine's update to end and records how it ended.
-func (u *rentalRuntimeUpdates) followNative(ctx context.Context, row *records.RuntimeUpdate, identity *orchestrator.WorkerConnection, c *machineMaintenance) *exit.Error {
+func (u *rentalRuntimeUpdates) followNative(ctx context.Context, row *records.Operation, identity *orchestrator.WorkerConnection, c *machineMaintenance) *exit.Error {
 	operation := ""
 	var selection runtimeUpdateSelection
-	if json.Unmarshal(row.Selection, &selection) == nil && selection.Native != nil {
+	if json.Unmarshal(row.Update, &selection) == nil && selection.Native != nil {
 		operation = selection.Native.Operation
 	}
 	for ctx.Err() == nil {
@@ -156,7 +156,7 @@ func (u *rentalRuntimeUpdates) followNative(ctx context.Context, row *records.Ru
 		}
 		if problem != nil {
 			// An unreachable machine is asked again only while its rental lasts.
-			if rented, readProblem := u.machines.store.RentalRow(row.RentalID); readProblem != nil {
+			if rented, readProblem := u.machines.store.RentalRow(row.Machine); readProblem != nil {
 				return readProblem
 			} else if rented == nil || rented.State != "ready" {
 				return exit.Named(exit.Conflict, "rental.ended", "the rental ended during its Runtime update")
@@ -180,7 +180,7 @@ func (u *rentalRuntimeUpdates) followNative(ctx context.Context, row *records.Ru
 				}
 			case "succeeded", "rolled_back", "failed":
 				// The worker boot is the same; its Runtime is not. The next call claims it again.
-				u.machines.machines.Forget(row.RentalID)
+				u.machines.machines.Forget(row.Machine)
 				row.Result, _ = json.Marshal(map[string]any{"native": true, "update": update,
 					"observed": map[string]any{"runtime": map[string]string{"distribution": state.Runtime}, "tensorfs": state.TensorFS, "agent": state.Agent, "bootstrap": state.Bootstrap}})
 				switch {

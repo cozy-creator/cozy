@@ -127,7 +127,7 @@ def main(payload: Request) -> Result:
 			t.Fatalf("install %s: %d %s", version, code, out)
 		}
 		eventually(t, root, "accepted installation settles", func() bool {
-			row, problem := store.RentalInstall(accepted.ID)
+			row, problem := store.Operation(accepted.ID)
 			fatal(t, problem)
 			if row != nil && row.State == "failed" {
 				t.Fatalf("installation failed: %s %s", row.ErrorCode, row.Error)

@@ -3,6 +3,7 @@ package producttest
 import (
 	"context"
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,9 +32,9 @@ func TestTheMachineReportsItsAgentRelease(t *testing.T) {
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: testDefaultHub,
-		UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
+		UseRental: func(string, orchestrator.Holder) (func(), *exit.Error) { return func() {}, nil },
 		RentalKey: func(string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentity{}, nil }}
-	machine, problem := found.Dial(context.Background(), machines.Local, "describing it")
+	machine, problem := found.Dial(context.Background(), machines.Local, orchestrator.Holder{What: "describing it"})
 	fatal(t, problem)
 	described, err := machine.Host.DescribeMachine(context.Background(), &pb.DescribeMachineQuery{Claim: machine.Claim})
 	machine.Close()

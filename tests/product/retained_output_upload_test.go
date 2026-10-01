@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -196,10 +197,12 @@ func TestRetainedOutputUploadsFromItsRentalWithoutRunningAgain(t *testing.T) {
 	}
 
 	type uploaded struct {
-		State       string   `json:"state"`
-		Checkpoint  string   `json:"checkpoint"`
-		Destination string   `json:"destination"`
-		Next        []string `json:"next"`
+		Number     int64    `json:"number"`
+		Kind       string   `json:"kind"`
+		Status     string   `json:"status"`
+		Checkpoint string   `json:"checkpoint"`
+		Target     string   `json:"target"`
+		Next       []string `json:"next"`
 	}
 	upload := func() uploaded {
 		code, out, errs := runCozyWithin(t, f.root, "run", "upload", f.request.ID+"#model", "proof/model", "--await", "--json")
@@ -210,7 +213,7 @@ func TestRetainedOutputUploadsFromItsRentalWithoutRunningAgain(t *testing.T) {
 		return got
 	}
 	first := upload()
-	if first.State != "uploaded" || first.Checkpoint != f.manifest || first.Destination != "proof/model" ||
+	if first.Number == 0 || first.Kind != "upload" || first.Status != "completed" || first.Checkpoint != f.manifest || first.Target != "model to proof/model" ||
 		len(first.Next) != 1 || first.Next[0] != "cozy model publish proof/model --release <label> --lane model="+f.manifest {
 		t.Fatalf("upload did not land the output's checkpoint: %+v", first)
 	}
@@ -229,12 +232,12 @@ func TestRetainedOutputUploadsFromItsRentalWithoutRunningAgain(t *testing.T) {
 	if operation == "" {
 		t.Fatal("the checkpoint was never finalized")
 	}
-	awaitLog(t, filepath.Join(f.root, "daemon.log"), "upload of model to proof/model: ", time.Second)
+	awaitLog(t, filepath.Join(f.root, "daemon.log"), fmt.Sprintf("upload #%d of model to proof/model: ", first.Number), time.Second)
 
 	again := upload()
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
-	if again.State != "uploaded" || again.Checkpoint != f.manifest || len(hub.finalized) != 1 || hub.pushes[tensor] != 1 {
+	if again.Number != first.Number || again.Status != "completed" || again.Checkpoint != f.manifest || len(hub.finalized) != 1 || hub.pushes[tensor] != 1 {
 		t.Fatalf("a repeated upload did not return the landed checkpoint: %+v, finalized %v", again, hub.finalized)
 	}
 }

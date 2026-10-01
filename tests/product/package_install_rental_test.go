@@ -61,7 +61,7 @@ func TestPackageInstallRental(t *testing.T) {
 					http.Error(w, "unexpected request", 500)
 					return
 				}
-				var request api.RentalPackagePrepareRequest
+				var request api.InstallRequest
 				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 					t.Error(err)
 				}
@@ -69,7 +69,7 @@ func TestPackageInstallRental(t *testing.T) {
 					t.Errorf("wrong preparation or implicit model selection: %+v", request)
 				}
 				preparations.Add(1)
-				_ = json.NewEncoder(w).Encode(api.RentalPackagePrepareResult{ID: "install-proof", RentalID: "rental-proof", Selection: request, State: "queued"})
+				_ = json.NewEncoder(w).Encode(api.Lifecycle{Number: 1, Kind: "install", Journal: "install", RequestID: "install-proof", RentalID: "rental-proof", Status: "queued", Target: request.Package + "@" + request.Release})
 			}))
 			defer localPeer.Close()
 			layout, problem := home.Open(t.TempDir())
@@ -102,7 +102,7 @@ func TestPackageInstallRental(t *testing.T) {
 				if err == nil || preparations.Load() != 0 {
 					t.Fatalf("bad release reached preparation: %v, %d", err, preparations.Load())
 				}
-			} else if err != nil || preparations.Load() != 1 || !strings.Contains(out.String(), `"release":"`+test.selected+`"`) {
+			} else if err != nil || preparations.Load() != 1 || !strings.Contains(out.String(), `"target":"paul/minimax-h3@`+test.selected+`"`) {
 				t.Fatalf("rental install: %v; preparations=%d; output=%s", err, preparations.Load(), &out)
 			}
 			if resolutions.Load() != 1 {

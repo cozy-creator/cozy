@@ -44,7 +44,7 @@ type machineConnection struct {
 
 // connect opens a machine for work that reads no hub; holder is what the caller is doing
 // there, which a rental's maintenance refusal names.
-func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machineConnection, *exit.Error) {
+func (m *machineRuns) connect(ctx context.Context, name string, holder orchestrator.Holder) (*machineConnection, *exit.Error) {
 	return m.connectAt(ctx, name, "", holder, true)
 }
 
@@ -176,7 +176,7 @@ func capturedSourceAccountIndex(path string) (bool, *exit.Error) {
 }
 
 // connectAtHub opens a machine for a published release read at hub.
-func (m *machineRuns) connectAtHub(ctx context.Context, name, hub, holder string) (*machineConnection, *exit.Error) {
+func (m *machineRuns) connectAtHub(ctx context.Context, name, hub string, holder orchestrator.Holder) (*machineConnection, *exit.Error) {
 	return m.connectAt(ctx, name, hub, holder, true)
 }
 
@@ -203,7 +203,7 @@ func (m *machineRuns) adoptLocalHost(ctx context.Context) {
 	}
 }
 
-func (m *machineRuns) connectAt(ctx context.Context, name, hub, holder string, named bool) (*machineConnection, *exit.Error) {
+func (m *machineRuns) connectAt(ctx context.Context, name, hub string, holder orchestrator.Holder, named bool) (*machineConnection, *exit.Error) {
 	if machines.IsLocal(name) {
 		m.adoptLocalHost(ctx)
 	}
@@ -361,40 +361,89 @@ func (c *machineConnection) prepareModels(ctx context.Context, request records.R
 	return readMachinePreparedSet(stream, c.runs.preparationPhase(request.ID, revision.Package).observe)
 }
 
-// Prewarm prepares a published package, its selected models, or models alone on a machine
-// without running anything: `cozy package install` and `cozy model download` for any
-// machine. bootID, when set, is the worker lifetime the selection was queued for.
-func (m *machineRuns) Prewarm(ctx context.Context, machine, hub, bootID, pkg, release string, models []*pb.DownloadModelRef, report func(machines.InstallProgress)) *exit.Error {
-	connection, problem := m.connectAtHub(ctx, machine, hub, "installing "+either(pkg, "models"))
+// Prewarm lands one journaled download or installation on its machine without running
+// anything, folding the machine's per-model bytes into the operation's live phase. It
+// answers the bytes last observed. A worker boot the operation was not claimed on refuses.
+func (m *machineRuns) Prewarm(ctx context.Context, o records.Operation) ([]records.ModelProgress, *exit.Error) {
+	models := orchestrator.DownloadModelRefs(o.Install.Models)
+	if len(models) != len(o.Install.Models) {
+		return nil, exit.New(exit.Validation, "the installation contains non-downloadable model selections")
+	}
+	connection, problem := m.connectAtHub(ctx, o.Machine, o.Install.Hub, orchestrator.Holder{Number: o.Number, What: o.Kind + " " + o.Target()})
 	if problem != nil {
-		return problem
+		return nil, problem
 	}
 	defer connection.Close()
-	if bootID != "" && connection.Claim.WorkerBootId != bootID {
-		return exit.Unavailablef("the rental's worker restarted before preparation; the installation is claimed again on its new boot")
+	if o.BootID != "" && connection.Claim.WorkerBootId != o.BootID {
+		return nil, exit.Unavailablef("the rental's worker restarted before preparation; the installation is claimed again on its new boot")
 	}
 	if problem := connection.ValidateNewWork(); problem != nil {
-		return problem
+		return nil, problem
 	}
 	var packages []*pb.DownloadPackageRef
-	call := &pb.PreparePackageSetCall{Claim: connection.Claim, Hub: connection.Hub}
-	if pkg != "" {
-		packages = append(packages, &pb.DownloadPackageRef{Package: pkg, Release: release})
+	if o.Install.Package != "" {
+		packages = append(packages, &pb.DownloadPackageRef{Package: o.Install.Package, Release: o.Install.Release})
 	}
 	downloads, problem := rental.DownloadSet(packages, models)
 	if problem != nil {
-		return problem
+		return nil, problem
 	}
-	call.PackageSet = &pb.DesiredPackageSet{DownloadDelegation: downloads}
-	stream, err := connection.Host.PreparePackageSet(ctx, call)
-	if err != nil {
-		return machineTransport(err)
+	observed := &operationProgress{owner: m.fleet.owner, id: o.ID, machine: connection.Name, label: o.Target()}
+	defer m.fleet.owner.ForgetPhase(o.ID)
+	// The operation names its requester: a reconnect attaches to the same work, and only
+	// its owner's cancel detaches it.
+	stream, err := connection.Host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{Claim: connection.Claim, Hub: connection.Hub,
+		PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads}, OperationId: o.ID})
+	if err == nil {
+		_, problem = readMachinePreparationEvent(stream, observed.observe)
+	} else {
+		problem = machineTransport(err)
 	}
-	_, problem = readMachinePreparationEvent(stream, func(event *pb.PrepareEvent) {
-		report(machines.InstallProgress{Stage: strings.ToLower(strings.TrimPrefix(event.Stage.String(), "PREPARE_STAGE_")),
-			TotalBytes: event.TotalBytes, TransferredBytes: event.TransferredBytes})
-	})
-	return problem
+	if errors.Is(context.Cause(ctx), machines.ErrCanceled) {
+		return observed.last, m.cancelPreparation(connection, o, observed)
+	}
+	return observed.last, problem
+}
+
+// cancelPreparation detaches a canceled operation from its machine. The machine stops the
+// transfer once no other requester needs it; one that predates cancellation finishes it.
+func (m *machineRuns) cancelPreparation(connection *machineConnection, o records.Operation, observed *operationProgress) *exit.Error {
+	name := o.Machine
+	if row, problem := m.store.RentalRow(o.Machine); problem == nil && row != nil && row.MachineName != "" {
+		name = row.MachineName
+	}
+	result, err := connection.Host.CancelPreparation(m.ctx, &pb.CancelPreparationCall{Claim: connection.Claim, OperationId: o.ID})
+	switch {
+	case status.Code(err) == codes.Unimplemented || status.Code(err) == codes.FailedPrecondition &&
+		strings.HasPrefix(status.Convert(err).Message(), pb.CapabilityUnavailableCode+":"):
+		return exit.Named(exit.Canceled, "machine.cancel_unavailable",
+			"%s predates cancellation: it finishes the transfer it started; landed bytes stay", name)
+	case err != nil:
+		return exit.Named(exit.Canceled, "machine.cancel_unconfirmed", "%s was not told to stop: %s", name, machineTransport(err).Message)
+	}
+	observed.observe(&pb.PrepareEvent{ModelProgress: result.GetModelProgress()})
+	return exit.Named(exit.Canceled, "operation.canceled",
+		"%s stops the transfer once nothing else needs it; landed bytes stay, so the same download resumes", name)
+}
+
+// operationProgress is one operation's live phase and the model bytes it last saw.
+type operationProgress struct {
+	owner              *orchestrator.Orchestrator
+	id, machine, label string
+	last               []records.ModelProgress
+}
+
+func (p *operationProgress) observe(event *pb.PrepareEvent) {
+	p.owner.ObservePrepareEvent(p.id, p.machine, p.label, event)
+	if len(event.GetModelProgress()) == 0 {
+		return
+	}
+	p.last = p.last[:0]
+	for _, row := range event.GetModelProgress() {
+		model := row.GetModel()
+		p.last = append(p.last, records.ModelProgress{Model: model.GetModel(), Release: model.GetRelease(), Lane: model.GetLane(),
+			Manifest: model.GetManifest(), Moved: row.GetTransferredBytes(), Total: row.GetTotalBytes()})
+	}
 }
 
 // Forget drops the kept connection to a machine, so a rental's credentials can be removed.
@@ -402,7 +451,7 @@ func (m *machineRuns) Forget(machine string) { m.machines.Forget(machine) }
 
 // Describe asks the machine for a published release's interface, as it reads it at its own Hub.
 func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release string) (api.DescribedRelease, *exit.Error) {
-	connection, problem := m.connectAtHub(ctx, machine, hub, "describing "+pkg)
+	connection, problem := m.connectAtHub(ctx, machine, hub, orchestrator.Holder{What: "describing " + pkg})
 	if problem != nil {
 		return api.DescribedRelease{}, problem
 	}
@@ -431,7 +480,7 @@ func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release s
 // Software reads what one machine runs from its DescribeMachine (wire 66). A machine that
 // predates it answers UNIMPLEMENTED, which is said rather than guessed.
 func (m *machineRuns) Software(ctx context.Context, machine string) (api.MachineSoftware, *exit.Error) {
-	connection, problem := m.connect(ctx, machine, "reading its software")
+	connection, problem := m.connect(ctx, machine, orchestrator.Holder{What: "reading its software"})
 	if problem != nil {
 		return api.MachineSoftware{}, problem
 	}
@@ -458,7 +507,7 @@ func (m *machineRuns) MachineLog(ctx context.Context, machine, log string, tailB
 	if !ok {
 		return api.MachineLog{}, exit.Named(exit.NotFound, "machine.log_unknown", "machines keep no log %q", log)
 	}
-	connection, problem := m.connect(ctx, machine, "reading its logs")
+	connection, problem := m.connect(ctx, machine, orchestrator.Holder{What: "reading its logs"})
 	if problem != nil {
 		return api.MachineLog{}, problem
 	}
@@ -503,7 +552,7 @@ func (m *machineRuns) ForgetPackage(ctx context.Context, pkg string) api.Forgott
 		}
 	}
 	for _, name := range names {
-		connection, problem := m.connect(ctx, name, "forgetting "+pkg)
+		connection, problem := m.connect(ctx, name, orchestrator.Holder{What: "forgetting " + pkg})
 		if problem == nil {
 			_, err := connection.Host.ForgetPackage(ctx, &pb.ForgetPackageCall{Claim: connection.Claim, Package: pkg})
 			connection.Close()
@@ -525,7 +574,7 @@ func (m *machineRuns) ForgetPackage(ctx context.Context, pkg string) api.Forgott
 
 // PruneOperationCache frees one machine's unused cached operation results through its Host.
 func (m *machineRuns) PruneOperationCache(ctx context.Context, machine string) (uint32, uint64, bool, *exit.Error) {
-	connection, problem := m.connect(ctx, machine, "pruning its operation cache")
+	connection, problem := m.connect(ctx, machine, orchestrator.Holder{What: "pruning its operation cache"})
 	if problem != nil {
 		return 0, 0, false, problem
 	}

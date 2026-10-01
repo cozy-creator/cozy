@@ -401,31 +401,17 @@ func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Erro
 	return result, problem
 }
 
-// PrepareRentalPackage asks the daemon to materialize one exact package release
-// (and optional model checkpoints) on the named rental.  The worker's desired
-// package set and preparation ledger make repeats idempotent.
-func (c *Client) PrepareRentalPackage(rentalID string, request api.RentalPackagePrepareRequest) (api.RentalPackagePrepareResult, *exit.Error) {
-	var result api.RentalPackagePrepareResult
-	problem := c.call("POST", "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prepare", request, &result)
+// Install journals one exact package release or model selection on a machine ("local" or
+// a rental) and answers its number. A key answers its first acceptance again.
+func (c *Client) Install(machine string, request api.InstallRequest) (api.Lifecycle, *exit.Error) {
+	var result api.Lifecycle
+	problem := c.call("POST", "/v1/local/rentals/"+url.PathEscape(machine)+"/prepare", request, &result)
 	return result, problem
 }
 
-// RentalInstall reads one queued installation and, while it runs, its progress.
-func (c *Client) RentalInstall(rentalID, id string) (api.RentalInstallStatus, *exit.Error) {
-	var result api.RentalInstallStatus
-	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/installs/"+url.PathEscape(id), nil, &result)
-	return result, problem
-}
-
-func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateRequest) (api.RuntimeUpdate, *exit.Error) {
-	var result api.RuntimeUpdate
+func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateRequest) (api.Lifecycle, *exit.Error) {
+	var result api.Lifecycle
 	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", request, &result)
-	return result, problem
-}
-
-func (c *Client) RentalRuntimeUpdate(rentalID string) (api.RuntimeUpdate, *exit.Error) {
-	var result api.RuntimeUpdate
-	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", nil, &result)
 	return result, problem
 }
 
@@ -498,10 +484,11 @@ func (c *Client) ForgetPackage(pkg string) (api.ForgottenPackage, *exit.Error) {
 	return out, e
 }
 
-func (c *Client) UploadJobOutput(id, output, destination string) (api.JobState, *exit.Error) {
-	var state api.JobState
-	problem := c.call("POST", "/v1/local/jobs/"+id+"/uploads", api.OutputUploadRequest{Output: output, Destination: destination}, &state)
-	return state, problem
+// UploadJobOutput journals the upload of a run's retained output and answers its number.
+func (c *Client) UploadJobOutput(id, output, destination string) (api.Lifecycle, *exit.Error) {
+	var upload api.Lifecycle
+	problem := c.call("POST", "/v1/local/jobs/"+id+"/uploads", api.OutputUploadRequest{Output: output, Destination: destination}, &upload)
+	return upload, problem
 }
 
 // CancelJob REQUESTS cancellation. A running job's own journaled terminal settles it; a

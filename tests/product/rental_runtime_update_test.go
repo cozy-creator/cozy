@@ -23,9 +23,9 @@ import (
 func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T) {
 	f := updateFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
-	update, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, "", nil)
+	update, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, nil)
 	fatal(t, problem)
-	update.Selection = []byte(`{"wheels":[]}`)
+	update.Update = []byte(`{"wheels":[]}`)
 	update.State = "updating"
 	fatal(t, f.store.SaveRuntimeUpdate(*update))
 	f.store.Close()
@@ -35,10 +35,10 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 	c, problem := orchestrator.Open(orchestrator.Options{Store: reopened, Layout: f.layout, Rentals: rental.Resolver(f.layout, reopened)})
 	fatal(t, problem)
 	defer c.Close(orchestrator.StopGrace)
-	if _, problem := c.UseRental(f.rentalID, "run 7 reading its execution"); problem == nil || problem.ErrName() != "rental.maintenance" {
+	if _, problem := c.UseRental(f.rentalID, orchestrator.Holder{Number: 7, What: "run reading its execution"}); problem == nil || problem.ErrName() != "rental.maintenance" {
 		t.Fatalf("unfinished update did not retain dispatch hold: %v", problem)
 	}
-	other, problem := c.UseRental("another-rental", "run 8 preparing")
+	other, problem := c.UseRental("another-rental", orchestrator.Holder{Number: 8, What: "run preparing"})
 	fatal(t, problem)
 	other()
 	row, problem := reopened.RuntimeUpdate(f.rentalID)
@@ -48,13 +48,13 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 	}
 	row.State = "waiting_activation"
 	fatal(t, reopened.SaveRuntimeUpdate(*row))
-	if _, problem := c.UseRental(f.rentalID, "run 9 preparing"); problem == nil || problem.ErrName() != "rental.maintenance" {
+	if _, problem := c.UseRental(f.rentalID, orchestrator.Holder{Number: 9, What: "run preparing"}); problem == nil || problem.ErrName() != "rental.maintenance" {
 		t.Fatalf("pending activation reopened dispatch: %v", problem)
 	}
 	row.State = "failed"
 	row.Error = "candidate rolled back"
 	fatal(t, reopened.SaveRuntimeUpdate(*row))
-	release, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
+	release, problem := c.UseRental(f.rentalID, orchestrator.Holder{Number: 7, What: "run reading its execution"})
 	fatal(t, problem)
 	release()
 	release()
@@ -70,25 +70,25 @@ func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testi
 	c, problem := orchestrator.Open(orchestrator.Options{Store: f.store, Layout: f.layout, Rentals: rental.Resolver(f.layout, f.store)})
 	fatal(t, problem)
 	defer c.Close(orchestrator.StopGrace)
-	release, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
+	release, problem := c.UseRental(f.rentalID, orchestrator.Holder{Number: 7, What: "run reading its execution"})
 	fatal(t, problem)
 	called := false
 	updater := func(context.Context, *orchestrator.WorkerConnection) *exit.Error { called = true; return nil }
 	if problem := c.MaintainRental(context.Background(), f.rentalID, updater); problem == nil || problem.ErrName() != "rental.maintenance_busy" ||
-		!strings.Contains(problem.Message, "run 7 reading its execution") || called {
+		!strings.Contains(problem.Message, "blocked by #7 (run reading its execution)") || !strings.Contains(problem.Remedy, "cozy run cancel 7") || called {
 		t.Fatalf("active transport was interrupted, or its refusal did not name it: %v", problem)
 	}
 	release()
 	fatal(t, c.MaintainRental(context.Background(), f.rentalID, func(context.Context, *orchestrator.WorkerConnection) *exit.Error {
-		if _, problem := c.UseRental(f.rentalID, "run 7 reading its execution"); problem == nil {
+		if _, problem := c.UseRental(f.rentalID, orchestrator.Holder{Number: 7, What: "run reading its execution"}); problem == nil {
 			t.Fatal("the target accepted transport during maintenance")
 		}
-		other, problem := c.UseRental("another-rental", "run 8 preparing")
+		other, problem := c.UseRental("another-rental", orchestrator.Holder{Number: 8, What: "run preparing"})
 		fatal(t, problem)
 		other()
 		return nil
 	}))
-	use, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
+	use, problem := c.UseRental(f.rentalID, orchestrator.Holder{Number: 7, What: "run reading its execution"})
 	fatal(t, problem)
 	use()
 }
@@ -133,7 +133,7 @@ func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 	}
 	selection, err := json.Marshal(map[string]any{"local_runtime": map[string]any{"path": candidate, "digest": "sha256:exact", "length": 22}, "local_tensorfs": map[string]any{"path": tensorfs, "digest": "sha256:tensorfs", "length": 22}})
 	must(t, err)
-	initial, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, "", selection)
+	initial, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, selection)
 	fatal(t, problem)
 	f.store.Close()
 	reopened, problem := records.Open(f.layout.DB)
@@ -150,7 +150,7 @@ func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 			t.Fatal("restart sweep lost active update bytes")
 		}
 	}
-	if recovered.ID != initial.ID || recovered.State != "preparing" || !bytes.Equal(recovered.Selection, selection) {
+	if recovered.ID != initial.ID || recovered.State != "preparing" || !bytes.Equal(recovered.Update, selection) {
 		t.Fatalf("initial local candidate lost before remote planning: %+v", recovered)
 	}
 	recovered.State = "failed"
@@ -199,7 +199,7 @@ func TestRentalRuntimeUpdateCLIFreezesLocalCandidate(t *testing.T) {
 			Length                 int64
 		} `json:"local_tensorfs"`
 	}
-	must(t, json.Unmarshal(row.Selection, &selection))
+	must(t, json.Unmarshal(row.Update, &selection))
 	if selection.LocalTensorFS.Path == tensorfsSource || selection.LocalTensorFS.Filename != filepath.Base(tensorfsSource) || selection.LocalTensorFS.Digest != fmt.Sprintf("sha256:%x", sha256.Sum256(content)) {
 		t.Fatalf("TensorFS candidate was not frozen: %+v", selection.LocalTensorFS)
 	}

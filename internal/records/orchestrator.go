@@ -2,6 +2,7 @@ package records
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -459,10 +460,11 @@ type Request struct {
 	Capture         string
 	// AttentionKernel is the optional execution-path pin carried into InvocationSpec.
 	AttentionKernel string
-	// Number is this host's short user-facing request reference. The globally unique ID
-	// remains the durable internal/Hub identity; Number is derived from the retained local
-	// request chronology and is never sent across the worker protocol.
+	// Number is this host's short user-facing request reference, from the journal. The
+	// globally unique ID remains the durable internal/Hub identity; Number is never sent
+	// across the worker protocol. Journal is the kind the user sees: run, download, upload.
 	Number     int64
+	Journal    string
 	ID         string
 	IdemKey    string
 	BodyDigest string
@@ -1021,7 +1023,7 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 func scanNumberedRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets, models string
-	targets := append([]any{&r.Number}, requestScanTargets(&r, &assets, &models)...)
+	targets := append([]any{&r.Number, &r.Journal}, requestScanTargets(&r, &assets, &models)...)
 	err := row.Scan(targets...)
 	return finishRequestScan(r, assets, models, err)
 }
@@ -1102,9 +1104,8 @@ func (s *Store) RequestByReference(reference string) (*Request, *exit.Error) {
 	reference = strings.TrimSpace(reference)
 	if number, err := strconv.ParseInt(reference, 10, 64); err == nil && number > 0 &&
 		strconv.FormatInt(number, 10) == reference {
-		var id string
-		err := s.db.QueryRow(`SELECT id FROM requests ORDER BY created_at,id LIMIT 1 OFFSET ?`,
-			number-1).Scan(&id)
+		var id, kind string
+		err := s.db.QueryRow(`SELECT r.id,j.kind FROM journal j JOIN requests r ON r.id=j.id WHERE j.number=?`, number).Scan(&id, &kind)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -1113,7 +1114,7 @@ func (s *Store) RequestByReference(reference string) (*Request, *exit.Error) {
 		}
 		row, problem := s.RequestRow(id)
 		if row != nil {
-			row.Number = number
+			row.Number, row.Journal = number, kind
 		}
 		return row, problem
 	}
@@ -1121,20 +1122,12 @@ func (s *Store) RequestByReference(reference string) (*Request, *exit.Error) {
 	if problem != nil || row == nil {
 		return row, problem
 	}
-	number, err := requestNumber(s.db, *row)
+	var err error
+	row.Number, row.Journal, err = journalEntry(s.db, row.ID)
 	if err != nil {
 		return nil, exit.Internalf("cannot number request %s: %s", row.ID, err)
 	}
-	row.Number = number
 	return row, nil
-}
-
-func requestNumber(q interface{ QueryRow(string, ...any) *sql.Row }, row Request) (int64, error) {
-	var number int64
-	err := q.QueryRow(`SELECT COUNT(*) FROM requests
-		WHERE created_at < ? OR (created_at = ? AND id <= ?)`,
-		row.CreatedAt, row.CreatedAt, row.ID).Scan(&number)
-	return number, err
 }
 
 // BindRequestPlan records the binding a rental request routes on once the rented worker
@@ -1416,8 +1409,8 @@ func (s *Store) requestsBefore(kind, state, packageName, hub, fallbackHub string
 		selectedHub = requestHubSQL
 		args = append(args, strings.TrimRight(fallbackHub, "/"))
 	}
-	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
-  id,created_at,kind,` + selectedState + ` AS state,package,` + selectedHub + ` AS hub FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
+	query := `WITH numbered AS (SELECT j.number,j.kind AS journal,
+  requests.id,requests.kind,` + selectedState + ` AS state,requests.package,` + selectedHub + ` AS hub FROM requests JOIN journal j ON j.id=requests.id), page AS (SELECT number,journal,id AS page_request_id FROM numbered`
 	where := []string{}
 	if before > 0 {
 		where = append(where, `number<?`)
@@ -1442,7 +1435,7 @@ func (s *Store) requestsBefore(kind, state, packageName, hub, fallbackHub string
 	if len(where) > 0 {
 		query += ` WHERE ` + strings.Join(where, " AND ")
 	}
-	query += ` ORDER BY created_at DESC, id DESC LIMIT ?) SELECT page.number, ` + requestCols +
+	query += ` ORDER BY number DESC LIMIT ?) SELECT page.number, page.journal, ` + requestCols +
 		` FROM requests JOIN page ON requests.id=page.page_request_id ORDER BY page.number DESC`
 	args = append(args, limit)
 	rows, err := s.db.Query(query, args...)
@@ -1697,7 +1690,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 				WithRemedy("one key, one body: %s was recorded, %s was submitted",
 					short(existing.BodyDigest), short(r.BodyDigest))
 		}
-		existing.Number, err = requestNumber(tx, existing)
+		existing.Number, existing.Journal, err = journalEntry(tx, existing.ID)
 		if err != nil {
 			return Request{}, false, exit.Internalf("cannot number request %s: %s", existing.ID, err)
 		}
@@ -1760,7 +1753,8 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	if problem := recordPlannedSourcesTx(tx, r.ID, r.PlannedSourceBytes); problem != nil {
 		return Request{}, false, problem
 	}
-	r.Number, err = requestNumber(tx, r)
+	r.Journal = cmp.Or(r.Journal, "run")
+	r.Number, err = journalTx(tx, r.ID, r.Journal)
 	if err != nil {
 		return Request{}, false, exit.Internalf("cannot number request %s: %s", r.ID, err)
 	}

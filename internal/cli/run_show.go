@@ -296,6 +296,9 @@ func handleRunShow(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	if isOperation(life) {
+		return emit(ctx, operationRecord(life))
+	}
 	evidence, problem := client.Evidence(life.RequestID)
 	if problem != nil {
 		return problem

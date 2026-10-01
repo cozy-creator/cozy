@@ -95,6 +95,8 @@ type Submission struct {
 	// PlannedSourceBytes is what a script ingest will pull; a rental bought for it is
 	// sized to it.
 	PlannedSourceBytes int64
+	// Journal is the kind the run is listed as when it is not a plain run.
+	Journal string
 	// OutputDirectory is the caller's explicit --out; empty means the package's store.
 	// It is part of the submission's identity, where the derived intent below is not.
 	OutputDirectory string
@@ -287,7 +289,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		AttentionKernel: s.AttentionKernel,
 		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, RentNew: s.RentNew, Models: s.Models,
-		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer, PlannedSourceBytes: s.PlannedSourceBytes,
+		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer, PlannedSourceBytes: s.PlannedSourceBytes, Journal: s.Journal,
 		Warnings: s.Warnings,
 	}
 	event := map[string]any{

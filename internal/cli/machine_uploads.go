@@ -9,13 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -42,28 +40,23 @@ func (m *machineRuns) Upload(request records.Request, output, destination string
 	if problem != nil {
 		return records.OutputUpload{}, problem
 	}
-	upload := records.OutputUpload{Output: retained.artifact.OutputSlot, Destination: ref.String(),
-		Operation: uploadOperation(request.ID, retained.artifact.OutputSlot, ref.String()), State: "uploading"}
-	uploads, problem := m.store.OutputUploads(request.ID)
-	if problem != nil {
-		return upload, problem
-	}
-	for _, recorded := range uploads {
-		if recorded.Operation == upload.Operation && recorded.State != "failed" {
-			if recorded.State == "uploading" {
-				m.startUpload(request.ID, recorded)
-			}
-			return recorded, nil
-		}
-	}
+	upload := records.OutputUpload{Request: request.ID, Output: retained.artifact.OutputSlot, Destination: ref.String(),
+		Operation: uploadOperation(request.ID, retained.artifact.OutputSlot, ref.String())}
 	if _, problem := ownedPublication(m.context.forHub(request.Hub), ref); problem != nil {
 		return upload, problem
 	}
-	if problem := m.store.RecordOutputUpload(request.ID, upload); problem != nil {
-		return upload, problem
+	upload, _, problem = m.store.BeginOutputUpload(retained.machine, request.Hub, upload)
+	if problem == nil && upload.State == "uploading" {
+		m.startUpload(upload)
 	}
-	m.startUpload(request.ID, upload)
-	return upload, nil
+	return upload, problem
+}
+
+// StopUpload ends a canceled upload's attempt in flight; its operation is already final.
+func (m *machineRuns) StopUpload(id string) {
+	if stop, ok := m.uploading.Load(id); ok {
+		stop.(context.CancelFunc)()
+	}
 }
 
 // uploadOperation names one upload by what it sends where, so its Hub publication resumes.
@@ -118,41 +111,47 @@ func (m *machineRuns) retainedOutput(request records.Request, output string) (re
 	return found[0], nil
 }
 
-// startUpload runs one upload until it lands or is refused for good. Only the Hub's or the
-// machine's own refusal ends it; a machine or Hub that does not answer is asked again.
-func (m *machineRuns) startUpload(requestID string, upload records.OutputUpload) {
-	if _, running := m.uploading.LoadOrStore(upload.Operation, true); running {
+// startUpload runs one upload until it lands, is refused for good, or is canceled. Only
+// the Hub's or the machine's own refusal ends it; one that does not answer is asked again.
+func (m *machineRuns) startUpload(upload records.OutputUpload) {
+	ctx, stop := context.WithCancel(m.ctx)
+	if _, running := m.uploading.LoadOrStore(upload.ID, stop); running {
+		stop()
 		return
 	}
 	go func() {
-		defer m.uploading.Delete(upload.Operation)
+		defer m.uploading.Delete(upload.ID)
+		defer stop()
 		said := ""
-		for delay := time.Second; m.ctx.Err() == nil; delay = min(2*delay, 30*time.Second) {
-			checkpoint, problem := m.uploadOnce(requestID, upload)
+		for delay := time.Second; ctx.Err() == nil; delay = min(2*delay, 30*time.Second) {
+			checkpoint, problem := m.uploadOnce(ctx, upload)
+			if ctx.Err() != nil {
+				return
+			}
 			if problem == nil {
 				upload.State, upload.Checkpoint = "uploaded", checkpoint
-				_ = m.store.RecordOutputUpload(requestID, upload)
+				_ = m.store.SettleOutputUpload(upload)
 				return
 			}
 			if !transient(problem) {
 				upload.State, upload.ErrorCode, upload.Error = "failed", problem.ErrName(), problem.Message
-				_ = m.store.RecordOutputUpload(requestID, upload)
+				_ = m.store.SettleOutputUpload(upload)
 				return
 			}
 			if problem.Message != said {
 				said = problem.Message
-				fmt.Fprintf(m.context.Out, "upload of %s to %s: %s; retrying\n", upload.Output, upload.Destination, problem.Message)
+				fmt.Fprintf(m.context.Out, "upload #%d of %s to %s: %s; retrying\n", upload.Number, upload.Output, upload.Destination, problem.Message)
 			}
 			select {
-			case <-m.ctx.Done():
+			case <-ctx.Done():
 			case <-time.After(delay):
 			}
 		}
 	}()
 }
 
-func (m *machineRuns) uploadOnce(requestID string, upload records.OutputUpload) (string, *exit.Error) {
-	request, problem := m.store.RequestRow(requestID)
+func (m *machineRuns) uploadOnce(ctx context.Context, upload records.OutputUpload) (string, *exit.Error) {
+	request, problem := m.store.RequestRow(upload.Request)
 	if problem != nil || request == nil {
 		return "", firstProblem(problem, exit.New(exit.NotFound, "the run is gone"))
 	}
@@ -175,8 +174,7 @@ func (m *machineRuns) uploadOnce(requestID string, upload records.OutputUpload) 
 	source := &pb.DerivedRetentionRequest{WeightsTransactionId: retained.hold.TransactionID,
 		TensorfsReceiptDigest: retained.hold.ReceiptDigest, RetentionId: retained.hold.RetentionID}
 	manifest := &pb.Ref{Digest: digest, Length: uint64(retained.artifact.Manifest.Length)}
-	ctx := machines.AttachOnly(m.ctx)
-	connection, problem := m.connectAtHub(ctx, retained.machine, request.Hub, "uploading its "+upload.Output)
+	connection, problem := m.connectAtHub(machines.AttachOnly(ctx), retained.machine, request.Hub, orchestrator.Holder{Number: upload.Number, What: "upload " + upload.Output + " to " + upload.Destination})
 	if problem != nil {
 		return "", problem
 	}
@@ -208,57 +206,24 @@ func firstProblem(problems ...*exit.Error) *exit.Error {
 }
 
 // handleRunUpload is `cozy run upload <run>[#<output>] <org/model>`: a retained output
-// goes from the rental holding it to a private checkpoint; no release is published.
+// goes from the rental holding it to a private checkpoint, under its own number; no
+// release is published.
 func handleRunUpload(ctx *Context) *exit.Error {
 	run, slot, _ := strings.Cut(ctx.Inv.Args[0], "#")
 	ref, problem := hub.ParseRef(ctx.Inv.Args[1])
 	if problem != nil {
 		return problem
 	}
-	destination := ref.String()
 	local, problem := dial(ctx)
 	if problem != nil {
 		return problem
 	}
-	state, problem := local.UploadJobOutput(run, slot, destination)
+	upload, problem := local.UploadJobOutput(run, slot, ref.String())
 	if problem != nil {
 		return problem
 	}
-	upload, machine := stateUpload(state, slot, destination)
-	for ctx.Inv.Bool("--await") && upload.State == "uploading" {
-		time.Sleep(time.Second)
-		if state, problem = local.Job(run); problem != nil {
-			return problem
-		}
-		upload, machine = stateUpload(state, slot, destination)
+	if ctx.Inv.Bool("--await") {
+		return watchOperation(ctx, local, upload)
 	}
-	if upload.State == "failed" {
-		return exit.Named(exit.Failed, upload.ErrorCode, "upload of %s to %s failed: %s", upload.Output, destination, upload.Error)
-	}
-	reference := runReference(state.Number, state.JobID) + "#" + upload.Output
-	rec := compactRecord([]output.Field{{K: "run", V: runReference(state.Number, state.JobID)}, {K: "output", V: upload.Output},
-		{K: "rental", V: machine}, {K: "destination", V: destination}, {K: "state", V: upload.State},
-		{K: "checkpoint", V: upload.Checkpoint}}, "run", "output", "destination", "state", "checkpoint")
-	if upload.State == "uploaded" {
-		rec.Notes = []string{"the checkpoint is private to the repository's owners until a release publishes it"}
-		rec.Next = []string{"cozy model publish " + destination + " --release <label> --lane " + upload.Output + "=" + upload.Checkpoint}
-	} else {
-		rec.Next = []string{"cozy run upload " + reference + " " + destination + " --await"}
-	}
-	return emit(ctx, rec)
-}
-
-// stateUpload is the upload of one retained output to destination, and the rental holding it.
-func stateUpload(state api.JobState, slot, destination string) (records.OutputUpload, string) {
-	for _, retained := range state.RetainedOutputs {
-		if slot != "" && retained.Output != slot {
-			continue
-		}
-		for _, upload := range retained.Uploads {
-			if upload.Destination == destination {
-				return upload, retained.Machine
-			}
-		}
-	}
-	return records.OutputUpload{Output: slot, Destination: destination, State: "uploading"}, ""
+	return emit(ctx, operationRecord(upload))
 }

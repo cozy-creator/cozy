@@ -70,6 +70,8 @@ type JobSubmission struct {
 	// PlannedSourceBytes is what a script ingest will pull, so a rental bought for it
 	// is sized to the ingest.
 	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
+	// Journal is the kind the run is listed as when it is not a plain run ("upload").
+	Journal string `json:"journal,omitempty"`
 	// AttentionKernel is an optional developer execution-path pin; the job's calls inherit it.
 	AttentionKernel string `json:"attention_kernel,omitempty"`
 	// Ignored names the undeclared fields the client dropped from Input.
@@ -436,7 +438,7 @@ func replayJobSubmission(sub JobSubmission,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
-		Models: models, ModelTransfer: transfer, ProducerParams: params, PlannedSourceBytes: sub.PlannedSourceBytes}, nil
+		Models: models, ModelTransfer: transfer, ProducerParams: params, PlannedSourceBytes: sub.PlannedSourceBytes, Journal: sub.Journal}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
@@ -456,7 +458,8 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		}
 		return orchestrator.Submission{Kind: "job", Package: "cozy/platform",
 			Entrypoint: "model-pass-through", Payload: []byte("{}"), Org: "local",
-			PlanID: "sha256:" + strings.Repeat("0", 64), ModelTransfer: sub.ModelTransfer}, nil, nil
+			PlanID: "sha256:" + strings.Repeat("0", 64), ModelTransfer: sub.ModelTransfer,
+			Journal: strings.TrimPrefix(sub.ModelTransfer.Kind, "model-")}, nil, nil
 	}
 	out := orchestrator.Submission{
 		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
@@ -466,7 +469,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 		ModelTransfer: sub.ModelTransfer, PlannedSourceBytes: sub.PlannedSourceBytes,
-		AttentionKernel: sub.AttentionKernel,
+		AttentionKernel: sub.AttentionKernel, Journal: sub.Journal,
 	}
 	if problem := launch.ValidateAttentionOverride(out.AttentionKernel); problem != nil {
 		return out, nil, problem

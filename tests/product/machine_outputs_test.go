@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"io"
 	"net/http"
 	"os"
@@ -118,9 +119,9 @@ func machineServesOutput(t *testing.T, root, output, digest string, revisions in
 	fatal(t, problem)
 	host := machines.NewHost(layout.Machine, "", nil)
 	found := &machines.Resolver{Host: host,
-		UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
+		UseRental: func(string, orchestrator.Holder) (func(), *exit.Error) { return func() {}, nil },
 		RentalKey: func(string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentity{}, nil }}
-	machine, problem := found.Dial(context.Background(), machines.Local, "run outputs")
+	machine, problem := found.Dial(context.Background(), machines.Local, orchestrator.Holder{What: "run outputs"})
 	fatal(t, problem)
 	list, err := machine.Host.ListMachineExecutions(context.Background(), &pb.MachineExecutionListQuery{
 		Claim: machine.Claim, NewestFirst: true, Limit: 1})

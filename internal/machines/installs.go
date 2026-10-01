@@ -2,6 +2,7 @@ package machines
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -11,74 +12,53 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Installs is the daemon's durable queue of package and model installations, one per
-// machine at a time. It observes only local records; the fleet reconciler owns provider
+// ErrCanceled is the cause an installation's context carries when its owner canceled it,
+// as opposed to the daemon stopping: only the first tells the machine to stop.
+var ErrCanceled = errors.New("canceled by its owner")
+
+// Prepare lands one download or installation on its machine and answers the bytes it
+// last observed per model.
+type Prepare func(context.Context, records.Operation) ([]records.ModelProgress, *exit.Error)
+
+// Installs is the daemon's durable queue of downloads and installations, one per machine
+// at a time. It observes only local records; the fleet reconciler owns provider
 // observation and attachment, and no installation can allocate or replace a rental.
 type Installs struct {
 	store   *records.Store
-	prepare func(context.Context, records.RentalInstall, func(InstallProgress)) *exit.Error
+	prepare Prepare
 	log     io.Writer
 	wake    chan struct{}
-	// progress is each running installation's latest preparation report, by install id.
-	progress sync.Map
 }
 
-// InstallProgress is the machine's latest report on one running installation.
-type InstallProgress struct {
-	Stage            string `json:"stage"`
-	TotalBytes       uint64 `json:"total_bytes"`
-	TransferredBytes uint64 `json:"transferred_bytes"`
-}
-
-// InstallStatus is one installation's durable record and, while it runs, its progress.
-type InstallStatus struct {
-	records.RentalInstall
-	Progress *InstallProgress `json:"progress,omitempty"`
-}
-
-func NewInstalls(store *records.Store, prepare func(context.Context, records.RentalInstall, func(InstallProgress)) *exit.Error, log io.Writer) *Installs {
+func NewInstalls(store *records.Store, prepare Prepare, log io.Writer) *Installs {
 	if log == nil {
 		log = io.Discard
 	}
 	return &Installs{store: store, prepare: prepare, log: log, wake: make(chan struct{}, 1)}
 }
 
-// Accept durably queues one installation on a machine this host knows.
-func (q *Installs) Accept(machine string, selection records.RentalInstallSelection) (*records.RentalInstall, *exit.Error) {
+// Accept durably queues one download or installation on a machine this host knows. A
+// non-empty key answers its first acceptance again.
+func (q *Installs) Accept(machine, key string, selection records.InstallSelection) (*records.Operation, bool, *exit.Error) {
+	hub := selection.Hub
 	if machine != Local {
 		row, problem := q.store.RentalRow(machine)
 		if problem != nil {
-			return nil, problem
+			return nil, false, problem
 		}
 		if row == nil {
-			return nil, exit.New(exit.NotFound, "rental %s is not recorded on this host", machine)
+			return nil, false, exit.New(exit.NotFound, "rental %s is not recorded on this host", machine)
 		}
-		if problem := records.RentalInstallStateProblem(row.ID, row.State); problem != nil {
-			return nil, problem
+		if problem := records.MachineEndedProblem(row.ID, row.State); problem != nil {
+			return nil, false, problem
 		}
+		hub = row.Hub
 	}
-	row, problem := q.store.BeginRentalInstall(machine, selection)
+	row, fresh, problem := q.store.BeginInstall(machine, hub, key, selection)
 	if problem == nil {
 		q.Wake()
 	}
-	return row, problem
-}
-
-// Status reads one installation on one machine, with its progress while it runs.
-func (q *Installs) Status(machine, id string) (*InstallStatus, *exit.Error) {
-	row, problem := q.store.RentalInstall(id)
-	if problem != nil {
-		return nil, problem
-	}
-	if row == nil || row.RentalID != machine {
-		return nil, exit.New(exit.NotFound, "no installation %s on %s", id, machine)
-	}
-	status := &InstallStatus{RentalInstall: *row}
-	if progress, ok := q.progress.Load(id); ok && row.Active() {
-		reported := progress.(InstallProgress)
-		status.Progress = &reported
-	}
-	return status, nil
+	return row, fresh, problem
 }
 
 // InstallTarget names the machine an installation goes to: this computer's machine, or a
@@ -128,7 +108,7 @@ func installFence(store *records.Store, machine string) (boot string, ready bool
 	if row == nil {
 		return "", false, exit.Named(exit.Unavailable, "rental.ended", "rental %s ended before installation completed", machine), nil
 	}
-	if ended := records.RentalInstallStateProblem(row.ID, row.State); ended != nil {
+	if ended := records.MachineEndedProblem(row.ID, row.State); ended != nil {
 		return "", false, ended, nil
 	}
 	return row.ExpectedWorkerBootID, row.State == "ready" && row.ExpectedWorkerBootID != "", nil, nil
@@ -141,17 +121,18 @@ func (q *Installs) Wake() {
 	}
 }
 
-// Run recovers unfinished rows before observing new admissions. One preparation
-// per rental runs at a time; interrupted calls replay their exact frozen inputs.
+// Run recovers unfinished rows before observing new admissions. One preparation per
+// machine runs at a time; interrupted calls replay their exact frozen inputs, and a row
+// its owner canceled stops its call.
 func (q *Installs) Run(ctx context.Context) {
 	type active struct {
 		id     string
-		cancel context.CancelFunc
+		cancel context.CancelCauseFunc
 	}
 	running := map[string]active{}
 	type completion struct {
-		rental string
-		retry  bool
+		machine string
+		retry   bool
 	}
 	done := make(chan completion)
 	var workers sync.WaitGroup
@@ -162,53 +143,61 @@ func (q *Installs) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case finished := <-done:
-			delete(running, finished.rental)
+			delete(running, finished.machine)
 			if !finished.retry {
 				q.Wake()
 			}
 		case <-q.wake:
-			rows, problem := q.store.PendingRentalInstalls()
+			rows, problem := q.store.PendingInstalls()
 			if problem != nil {
 				q.report(problem)
 				continue
+			}
+			pending := map[string]bool{}
+			for _, row := range rows {
+				pending[row.ID] = true
+			}
+			for _, held := range running {
+				if !pending[held.id] {
+					held.cancel(ErrCanceled)
+				}
 			}
 			seen := map[string]bool{}
 			for _, row := range rows {
 				if ctx.Err() != nil {
 					break
 				}
-				boot, ready, ended, problem := installFence(q.store, row.RentalID)
+				boot, ready, ended, problem := installFence(q.store, row.Machine)
 				if problem != nil {
 					q.report(problem)
 					continue
 				}
 				if ended != nil {
-					q.report(q.store.SettleRentalInstall(row.ID, "failed", ended))
-					if held, ok := running[row.RentalID]; ok && held.id == row.ID {
-						held.cancel()
+					q.report(q.store.SettleInstall(row.ID, "failed", ended, nil))
+					if held, ok := running[row.Machine]; ok && held.id == row.ID {
+						held.cancel(ended)
 					}
 					continue
 				}
-				if seen[row.RentalID] {
+				if seen[row.Machine] {
 					continue
 				}
-				seen[row.RentalID] = true
-				if _, busy := running[row.RentalID]; busy || !ready {
+				seen[row.Machine] = true
+				if _, busy := running[row.Machine]; busy || !ready {
 					continue
 				}
-				claimed, problem := q.store.StartRentalInstall(row.ID, boot)
+				claimed, problem := q.store.StartInstall(row.ID, boot)
 				if problem != nil {
 					q.report(problem)
 					continue
 				}
-				work, cancel := context.WithCancel(ctx)
-				running[row.RentalID] = active{id: row.ID, cancel: cancel}
+				work, cancel := context.WithCancelCause(ctx)
+				running[row.Machine] = active{id: row.ID, cancel: cancel}
 				workers.Add(1)
-				go func(row records.RentalInstall) {
+				go func(row records.Operation) {
 					defer workers.Done()
-					defer cancel()
-					problem := q.prepare(work, row, func(progress InstallProgress) { q.progress.Store(row.ID, progress) })
-					q.progress.Delete(row.ID)
+					defer cancel(nil)
+					progress, problem := q.prepare(work, row)
 					state := "succeeded"
 					if problem != nil {
 						state = "failed"
@@ -216,9 +205,9 @@ func (q *Installs) Run(ctx context.Context) {
 							state = "queued"
 						}
 					}
-					q.report(q.store.SettleRentalInstall(row.ID, state, problem))
+					q.report(q.store.SettleInstall(row.ID, state, problem, progress))
 					select {
-					case done <- completion{rental: row.RentalID, retry: state == "queued"}:
+					case done <- completion{machine: row.Machine, retry: state == "queued" && !errors.Is(context.Cause(work), ErrCanceled)}:
 					case <-ctx.Done():
 					}
 				}(*claimed)

@@ -57,6 +57,7 @@ type Context struct {
 	AccountAuth    *accountauth.Manager
 	namespace      packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
 	ingestBytes    int64                          // planned source bytes a native ingest declares for its rental
+	journal        string                         // the kind a submitted job is listed as, when not a run
 	warnings       *[]records.Warning             // this command's, shared by its scoped copies
 }
 

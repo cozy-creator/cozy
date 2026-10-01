@@ -84,7 +84,7 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 		json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "paul", Name: "minimax-h3"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "2.0", CutAt: "2026-02-01T00:00:00Z"}, Lanes: []hub.ModelLaneSummary{{Lane: "fp8-pruned", ManifestID: digest, Bytes: 123, ComponentBytes: map[string]int64{"transformer": 123}}}}}})
 	}))
 	defer hubPeer.Close()
-	var accepted records.RentalInstallSelection
+	var accepted records.InstallSelection
 	localPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" && r.URL.Path == "/" {
 			return
@@ -98,7 +98,7 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 			t.Error(err)
 		}
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(records.RentalInstall{ID: "install-proof", RentalID: "rental-proof", State: "queued", Selection: accepted})
+		json.NewEncoder(w).Encode(api.Lifecycle{Number: 1, Kind: "download", Journal: "download", RequestID: "download-proof", RentalID: "rental-proof", Status: "queued"})
 	}))
 	defer localPeer.Close()
 	layout, problem := home.Open(t.TempDir())
@@ -141,7 +141,7 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 	if model.Package != "" || model.Slot != "" || model.Model != "paul/minimax-h3" || model.Release != "2.0" || model.Lane != "fp8-pruned" || model.Manifest != digest || model.CatalogRepository != model.Model || model.Bytes != 123 || model.ComponentBytes["transformer"] != 123 {
 		t.Fatalf("lost model identity or grant facts: %+v", model)
 	}
-	if !strings.Contains(out.String(), "queued") || !strings.Contains(out.String(), "install-proof") {
+	if !strings.Contains(out.String(), `"status":"queued"`) || !strings.Contains(out.String(), `"number":1`) || !strings.Contains(out.String(), "cozy run watch 1") {
 		t.Fatalf("missing queue receipt: %s", out.String())
 	}
 }
@@ -166,9 +166,9 @@ func TestRentalModelLatestUsesVersionOrderWithoutDates(t *testing.T) {
 
 // queueRentalModelDownload runs `cozy model download <ref> --rental=kirukiru` against a
 // stand-in daemon and returns the selection the CLI froze and handed to the queue.
-func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.RentalInstallSelection {
+func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.InstallSelection {
 	t.Helper()
-	var accepted records.RentalInstallSelection
+	var accepted records.InstallSelection
 	localPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" && r.URL.Path == "/" {
 			return
@@ -182,7 +182,7 @@ func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.RentalIn
 			t.Error(err)
 		}
 		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(records.RentalInstall{ID: "install-proof", RentalID: "rental-proof", State: "queued", Selection: accepted})
+		_ = json.NewEncoder(w).Encode(api.Lifecycle{Number: 1, Kind: "download", Journal: "download", RequestID: "download-proof", RentalID: "rental-proof", Status: "queued"})
 	}))
 	defer localPeer.Close()
 	layout, problem := home.Open(t.TempDir())
