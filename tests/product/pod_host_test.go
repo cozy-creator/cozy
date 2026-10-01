@@ -168,6 +168,10 @@ type fakePod struct {
 	// back, nil for one fake-4090 per device.
 	prune     func(*pb.PruneOperationCacheCall) (*pb.PruneOperationCacheResult, error)
 	resources *pb.WorkerResources
+	// describe answers DescribeMachine; nil is a Host that predates it (UNIMPLEMENTED).
+	describe func(*pb.DescribeMachineQuery) (*pb.MachineDescription, error)
+	// prepareModels answers a models-only package set (`cozy model download --rental`).
+	prepareModels func(*pb.PreparePackageSetCall, grpc.ServerStreamingServer[pb.PrepareEvent]) error
 }
 
 func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
@@ -693,6 +697,9 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	}
 	total := uint64(18_874_368)
 	selected := downloadSet.List("packages")
+	if len(selected) == 0 && p.prepareModels != nil {
+		return p.prepareModels(call, stream)
+	}
 	if len(selected) != 1 {
 		for _, event := range []*pb.PrepareEvent{
 			{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
@@ -1013,6 +1020,16 @@ func (p *fakePod) WatchProgress(open *pb.ProgressOpen, stream pb.WorkerControl_W
 	}
 	<-stream.Context().Done()
 	return nil
+}
+
+func (p *fakePod) DescribeMachine(_ context.Context, query *pb.DescribeMachineQuery) (*pb.MachineDescription, error) {
+	if err := p.verifyClaim(query.Claim, false); err != nil {
+		return nil, err
+	}
+	if p.describe == nil {
+		return nil, status.Error(codes.Unimplemented, "DescribeMachine unavailable")
+	}
+	return p.describe(query)
 }
 
 func (p *fakePod) PruneOperationCache(_ context.Context, call *pb.PruneOperationCacheCall) (*pb.PruneOperationCacheResult, error) {

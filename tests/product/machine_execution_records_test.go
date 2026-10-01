@@ -367,3 +367,7 @@ func TestMachineCancellationBeforeTransmissionCreatesNoRemotePromise(t *testing.
 func (*retentionReleaseMachine) Describe(context.Context, string, string, string, string) (api.DescribedRelease, *exit.Error) {
 	return api.DescribedRelease{}, nil
 }
+
+func (*retentionReleaseMachine) Software(context.Context, string) (api.MachineSoftware, *exit.Error) {
+	return api.MachineSoftware{}, nil
+}

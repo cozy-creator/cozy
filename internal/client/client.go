@@ -375,6 +375,13 @@ func (c *Client) DescribeRelease(machine, pkg, release string) (api.DescribedRel
 	return described, problem
 }
 
+// MachineSoftware asks one machine ("local" or a rental id) which releases it runs.
+func (c *Client) MachineSoftware(machine string) (api.MachineSoftware, *exit.Error) {
+	var software api.MachineSoftware
+	problem := c.call(http.MethodGet, "/v1/local/machines/"+url.PathEscape(machine)+"/software", nil, &software)
+	return software, problem
+}
+
 func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Error) {
 	var result api.RentalPruneResult
 	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prune", map[string]any{}, &result)
@@ -387,6 +394,13 @@ func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Erro
 func (c *Client) PrepareRentalPackage(rentalID string, request api.RentalPackagePrepareRequest) (api.RentalPackagePrepareResult, *exit.Error) {
 	var result api.RentalPackagePrepareResult
 	problem := c.call("POST", "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prepare", request, &result)
+	return result, problem
+}
+
+// RentalInstall reads one queued installation and, while it runs, its progress.
+func (c *Client) RentalInstall(rentalID, id string) (api.RentalInstallStatus, *exit.Error) {
+	var result api.RentalInstallStatus
+	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/installs/"+url.PathEscape(id), nil, &result)
 	return result, problem
 }
 

@@ -42,7 +42,9 @@ is ready. The CLI may disconnect, and a restarted daemon resumes the same exact
 selection without re-resolving latest or buying another rental.
 
 The queue is managed in the background. Completion requires a verified Host receipt;
-acceptance is not completion. Failed boot, rental termination, or a changed
+acceptance is not completion. `cozy model download --rental=NAME --await` waits for
+that receipt, printing the machine's stage and bytes as it goes, and reports the elapsed
+time; interrupting it stops only the wait. Failed boot, rental termination, or a changed
 worker identity ends the install with a typed failure. Interrupted transfers
 reuse the worker's retained download progress when Creator reconnects. The queue
 stores exact logical selections, not presigned URLs. The worker refreshes download

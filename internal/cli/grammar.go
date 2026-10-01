@@ -330,7 +330,7 @@ type ModelDownloadCmd struct {
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         string `help:"Download directly into this owned rental (no local destination)."`
 	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
-	Await          bool   `help:"Watch the accepted run until it settles."`
+	Await          bool   `help:"Wait until the download settles, printing the machine's progress."`
 	IdempotencyKey string `help:"Stable request identity for exact replay; otherwise start a new run."`
 }
 
@@ -348,10 +348,12 @@ func (c *ModelRemoveCmd) Run(r *Runtime) error {
 	return r.call(handleModelRemove, c.Refs, nil, nil, false)
 }
 
-type ModelGCCmd struct{}
+type ModelGCCmd struct {
+	Rental string `help:"Reclaim this rental's store instead, freeing its unused cached operation results too."`
+}
 
 func (c *ModelGCCmd) Run(r *Runtime) error {
-	return r.call(handleModelGC, nil, nil, nil, false)
+	return r.call(handleModelGC, nil, nil, values("--rental", c.Rental), false)
 }
 
 type ModelListCmd struct{}

@@ -160,12 +160,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// worker, including after a daemon restart.
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
-	installs := machineset.NewInstalls(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
+	installs := machineset.NewInstalls(st, func(ctx context.Context, row records.RentalInstall, report func(machineset.InstallProgress)) *exit.Error {
 		models := orchestrator.DownloadModelRefs(row.Selection.Models)
 		if len(models) != len(row.Selection.Models) {
 			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
 		}
-		return machines.Prewarm(ctx, row.RentalID, row.Selection.Hub, row.WorkerBootID, row.Selection.Package, row.Selection.Release, models)
+		return machines.Prewarm(ctx, row.RentalID, row.Selection.Hub, row.WorkerBootID, row.Selection.Package, row.Selection.Release, models, report)
 	}, ctx.Out)
 	fleet.installs = installs
 	installsStopped := make(chan struct{})
@@ -204,11 +204,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 
 	server := api.New(api.Options{
-		RuntimeUpdate:     updates.Start,
-		RentalKeepalive:   fleet.keepalive,
-		RentalInstall:     installs.Accept,
-		MachineExecutions: machines,
-		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
+		RuntimeUpdate:       updates.Start,
+		RentalKeepalive:     fleet.keepalive,
+		RentalInstall:       installs.Accept,
+		RentalInstallStatus: installs.Status,
+		MachineExecutions:   machines,
+		Orchestrator:        c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
 		RentalInventory: func(hub string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
 			return readRentalInventory(st, fleet, hub, allHubs, reconcile)

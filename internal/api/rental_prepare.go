@@ -18,6 +18,7 @@ import (
 // daemon observes a verified preparation receipt or a terminal rental failure.
 type RentalPackagePrepareRequest = records.RentalInstallSelection
 type RentalPackagePrepareResult = records.RentalInstall
+type RentalInstallStatus = machines.InstallStatus
 
 func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
@@ -104,6 +105,19 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ok(w, r, http.StatusAccepted, result)
+}
+
+func (s *Server) rentalInstallState(w http.ResponseWriter, r *http.Request) {
+	if s.rentalInstallStatus == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("rental installation queue is unavailable"))
+		return
+	}
+	status, problem := s.rentalInstallStatus(r.PathValue("rental_id"), r.PathValue("id"))
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	s.ok(w, r, http.StatusOK, status)
 }
 
 func canonicalPackageRef(value string) (string, *exit.Error) {
