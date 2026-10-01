@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-plane"
-version = "0.3.78"
+version = "0.3.80"
 dependencies = [
  "libc",
  "libloading",
