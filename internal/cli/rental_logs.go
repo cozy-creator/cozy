@@ -34,6 +34,12 @@ func handleRentalLogs(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	if ctx.Inv.Bool("--tensorfs") {
+		if ctx.Inv.Bool("--follow") || attempt != 0 {
+			return exit.Usagef("--tensorfs reads the machine's own log; --follow and --attempt read the provider's boot log")
+		}
+		return printMachineLog(ctx, id, "rental "+subject)
+	}
 	hubClient := client(ctx.forHub(origin))
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)

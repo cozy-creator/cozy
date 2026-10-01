@@ -334,6 +334,7 @@ installed build. Records at an older schema are refused, never migrated.
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | drop the daemon's kept connection to one rented machine |
 | `GET /v1/local/machines/{machine}/describe` | local | yes | a published release's interface as one machine reads it at its own Hub (the newest release when none is named) |
 | `GET /v1/local/machines/{machine}/software` | local | yes | the agent, Runtime and TensorFS releases one machine reports; an older machine leaves what it cannot report empty |
+| `GET /v1/local/machines/{machine}/logs/{log}` | local | yes | one log a machine keeps (`tensorfs`: TensorFS's transport decisions), oldest line first, `?tail_bytes=` the newest; an older machine answers a note in `unavailable` |
 | `POST /v1/local/machines/forget-package` | local | yes | tell every machine this daemon knows to read a changed package once more on its next run |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
 | `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |

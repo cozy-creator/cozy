@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -380,6 +381,18 @@ func (c *Client) MachineSoftware(machine string) (api.MachineSoftware, *exit.Err
 	var software api.MachineSoftware
 	problem := c.call(http.MethodGet, "/v1/local/machines/"+url.PathEscape(machine)+"/software", nil, &software)
 	return software, problem
+}
+
+// MachineLog reads one log a machine ("local" or a rental id) keeps, its newest tailBytes when
+// nonzero.
+func (c *Client) MachineLog(machine, log string, tailBytes uint64) (api.MachineLog, *exit.Error) {
+	var out api.MachineLog
+	path := "/v1/local/machines/" + url.PathEscape(machine) + "/logs/" + url.PathEscape(log)
+	if tailBytes > 0 {
+		path += "?tail_bytes=" + strconv.FormatUint(tailBytes, 10)
+	}
+	problem := c.call(http.MethodGet, path, nil, &out)
+	return out, problem
 }
 
 func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Error) {
