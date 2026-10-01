@@ -187,12 +187,12 @@ class Probe(Model[Pipeline]):
 class Request(msgspec.Struct): pass
 class Result(msgspec.Struct): value:int
 app=App()
-@app.job
+@app.job(accelerator=False)
 def scalar(payload:Request)->Result: return Result(42)
 @invocable(defaults={'model':[{'gpu':'*','lane':'proof/base@1.0.0/fp32'}]})
 async def generate(ctx:Context,*,payload:Request,model:Probe)->Result: return Result(model.score())
 app.entrypoint(generate)
-@app.job
+@app.job(accelerator=False)
 async def child(ctx:Context,payload:Request)->Result:
     return await generate(payload=payload)
 `), 0600))
