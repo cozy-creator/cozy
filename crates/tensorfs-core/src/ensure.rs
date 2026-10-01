@@ -245,6 +245,10 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
             );
         },
     )?;
+    // A killed pull strands its partial `put-` temps, and GC, the only other reaper, never
+    // runs while a model is leased. Each temp carries its writer's lock, so this takes only
+    // the dead ones.
+    let _ = request.store.reap();
     let session = format!("ensure-{}", &closure.manifest.sha256[..12]);
     let (plan, _) = FetchPlan::of(request.store, &session, &closure.manifest, &closure.objects)?;
     let total = plan.declared_bytes();

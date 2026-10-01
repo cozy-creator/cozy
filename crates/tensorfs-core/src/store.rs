@@ -185,6 +185,20 @@ pub(crate) fn classify_io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     }
 }
 
+/// SQLite's "database or disk is full" is the disk's verdict, exactly as ENOSPC is. As
+/// IO_FAILED it read as a transient catalog fault and bought the object three more times.
+pub(crate) fn classify_sql(what: impl AsRef<str>, e: rusqlite::Error) -> Refusal {
+    let full = matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::DiskFull);
+    Refusal {
+        code: if full {
+            Code::CAPACITY_EXHAUSTED
+        } else {
+            Code::IO_FAILED
+        },
+        detail: format!("{}: {e}", what.as_ref()),
+    }
+}
+
 /// The short local spelling used by every call site in this module.
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     classify_io(what, e)

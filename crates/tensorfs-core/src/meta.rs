@@ -16,10 +16,7 @@ use crate::limits;
 use crate::store::Store;
 
 fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {error}", what.as_ref()),
-    }
+    crate::store::classify_sql(what, error)
 }
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {

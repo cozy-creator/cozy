@@ -1072,6 +1072,54 @@ fn a_link_blip_before_any_object_lands_is_re_attempted_and_only_stillness_stalls
     );
 }
 
+/// A pull killed mid-object strands its partial temp; the next ensure takes it, because GC,
+/// the only other reaper, never runs while a model is leased.
+#[test]
+fn a_killed_pulls_partial_temp_is_reaped_by_the_next_ensure() {
+    let checkpoint = checkpoint(2, 1 << 20, 21);
+    let victim = blob(&checkpoint, 0);
+    let stuck = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![on(&victim, 1..=usize::MAX, Fault::Stall(512 << 10))],
+            ..Config::default()
+        },
+    );
+    let root = store(&temporary("killed"));
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ensure", root.to_str().unwrap(), "acme/model@r1"])
+        .args([
+            "--hub",
+            &stuck.base,
+            "--lane",
+            "public",
+            "--sample-seconds",
+            "60",
+        ])
+        .env("TFS_CREDENTIAL", "")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let partial = |root: &Path| {
+        temps(root).iter().any(|name| {
+            std::fs::metadata(root.join("tmp").join(name)).is_ok_and(|m| m.len() >= 512 << 10)
+        })
+    };
+    while !partial(&root) {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "tfs ensure exited early"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!temps(&root).is_empty());
+
+    let healed = hub(Arc::clone(&checkpoint), Config::default());
+    assert_landed(&Run::new(&healed, &root).ensure(), &healed, &root);
+}
+
 #[test]
 fn a_missing_object_is_a_typed_refusal_and_the_rest_stay_resident() {
     let dir = temporary("missing");
@@ -1426,5 +1474,9 @@ fn progress_never_claims_bytes_a_failed_ask_threw_away() {
     run.allowance = slow;
     assert_landed(&run.ensure(), &hub, &root);
     assert_eq!(hub.asks(&victim), 4, "{}", hub.log());
-    assert_eq!(hub.sent(&victim), 1 << 20, "the landing ask sent the whole object");
+    assert_eq!(
+        hub.sent(&victim),
+        1 << 20,
+        "the landing ask sent the whole object"
+    );
 }

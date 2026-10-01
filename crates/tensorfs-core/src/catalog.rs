@@ -52,10 +52,7 @@ const SCHEMA: &[(&str, &[&str])] = &[
 ];
 
 fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {error}", what.as_ref()),
-    }
+    crate::store::classify_sql(what, error)
 }
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
@@ -1638,6 +1635,23 @@ impl Drop for WriterGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_database_is_a_capacity_verdict_not_an_io_failure() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "PRAGMA page_size = 512; CREATE TABLE t (x BLOB); PRAGMA max_page_count = 3;",
+        )
+        .unwrap();
+        let full = db
+            .execute("INSERT INTO t VALUES (zeroblob(65536))", [])
+            .unwrap_err();
+        assert_eq!(sql("record", full).code, Code::CAPACITY_EXHAUSTED);
+        let other = db
+            .execute("INSERT INTO missing VALUES (1)", [])
+            .unwrap_err();
+        assert_eq!(sql("record", other).code, Code::IO_FAILED);
+    }
 
     fn temporary(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
