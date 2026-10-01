@@ -266,6 +266,9 @@ impl Recovery {
                             continue;
                         }
                         let now = lanes();
+                        // A hedge condemns nothing, so two samples of measured network wait
+                        // are evidence enough; the stall floor guards verdicts, not hedges.
+                        let evidence = ledger.sample() * 2;
                         let mut every_slow = true;
                         for racer in racers.iter_mut().filter(|racer| racer.live) {
                             let data = racer.state.data.lock().unwrap().clone();
@@ -273,7 +276,7 @@ impl Recovery {
                             // A ranged hedge heals its own slow parts on its own lanes. With no
                             // comparable evidence, only an idle tail probes, once per object.
                             every_slow &= !racer.ranged
-                                && match self.judge(&data, &racer.window, length, ledger.floor()) {
+                                && match self.judge(&data, &racer.window, length, evidence) {
                                     Verdict::Slow => true,
                                     Verdict::Unreferenced => first && now.tail,
                                     Verdict::Healthy | Verdict::Unmeasured => false,

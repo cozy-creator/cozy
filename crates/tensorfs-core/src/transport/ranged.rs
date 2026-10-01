@@ -377,19 +377,46 @@ struct Wire {
     live: AtomicUsize,
 }
 
+/// One run of the object some racer is asked to fill. The parts start as `ranged.part`
+/// segments; a hedge splits the largest unfinished one when a lane goes idle.
+struct Segment {
+    /// Inclusive bounds. `end` only shrinks, when the segment is split.
+    start: u64,
+    end: u64,
+    /// Below this mark the segment's bytes are on disk. Every racer starts at it, so what
+    /// is below it stays one contiguous run.
+    reached: u64,
+    racers: usize,
+    done: bool,
+    /// A racer exhausted its asks here; it is not raced again.
+    refused: bool,
+}
+
 struct State {
-    done: Vec<bool>,
-    /// Per part, the offset below which its bytes are on disk. Every racer of a part
-    /// starts at this mark, so what is below it stays one contiguous run.
-    reached: Vec<u64>,
-    racers: Vec<usize>,
-    /// A racer exhausted its asks on this part; it is not raced again.
-    refused: Vec<bool>,
+    /// The initial parts in offset order, then splits in the order they were cut.
+    segments: Vec<Segment>,
+    /// Initial parts nobody has asked for start here.
     next: usize,
-    /// Parts `0..contiguous` are complete on disk, so bytes below `contiguous * part` may
-    /// be handed to the door. Nothing above it may, hole or not.
-    contiguous: usize,
+    initial: usize,
+    /// Bytes below `high` are complete on disk in one run from the first byte, so they
+    /// may be handed to the door. Nothing above it may, hole or not.
+    high: u64,
     failure: Option<Refusal>,
+}
+
+impl State {
+    fn coverage(&self) -> u64 {
+        let mut order: Vec<&Segment> = self.segments.iter().collect();
+        order.sort_by_key(|segment| segment.start);
+        let mut high = 0;
+        for segment in order {
+            if segment.start != high || !segment.done {
+                break;
+            }
+            high = segment.end + 1;
+        }
+        high
+    }
 }
 
 impl Wire {
@@ -404,52 +431,73 @@ impl Wire {
             .push((attempt, host.to_string(), status));
     }
 
-    /// The next part nobody has asked for. A hedge then races the unfinished part with the
-    /// fewest racers and the most bytes left, from that part's mark: a lane that finished
-    /// its own part heals the slowest one instead of idling.
-    fn claim(&self, part: u64, total: u64, race: bool) -> Option<(usize, u64)> {
+    /// The next part nobody has asked for. A hedge then takes the unfinished segment with
+    /// the most bytes left: it splits off that segment's upper half when there is a part's
+    /// worth left, and races what remains from the segment's mark when there is not. A lane
+    /// that finished its own part thereby speeds the slowest one instead of idling.
+    fn claim(&self, race: bool) -> Option<(usize, u64)> {
         let mut state = self.state.lock().unwrap();
         if state.failure.is_some() || self.stopped() {
             return None;
         }
-        let index = if state.next < state.done.len() {
+        if state.next < state.initial {
+            let index = state.next;
             state.next += 1;
-            state.next - 1
-        } else if !race {
+            state.segments[index].racers += 1;
+            return Some((index, state.segments[index].reached));
+        }
+        if !race {
             return None;
-        } else {
-            let end = |index: usize| ((index as u64 + 1) * part).min(total);
-            (0..state.done.len())
-                .filter(|&index| !state.done[index] && !state.refused[index])
-                .min_by_key(|&index| {
-                    (
-                        state.racers[index],
-                        std::cmp::Reverse(end(index) - state.reached[index]),
-                    )
-                })?
-        };
-        state.racers[index] += 1;
-        Some((index, state.reached[index]))
+        }
+        let index = (0..state.segments.len())
+            .filter(|&index| !state.segments[index].done && !state.segments[index].refused)
+            .max_by_key(|&index| {
+                let segment = &state.segments[index];
+                segment.end + 1 - segment.reached
+            })?;
+        let segment = &mut state.segments[index];
+        let left = segment.end + 1 - segment.reached;
+        if segment.racers == 0 || left < HEDGE_PART {
+            segment.racers += 1;
+            return Some((index, segment.reached));
+        }
+        let middle = segment.reached + left / 2;
+        let end = std::mem::replace(&mut segment.end, middle - 1);
+        state.segments.push(Segment {
+            start: middle,
+            end,
+            reached: middle,
+            racers: 1,
+            done: false,
+            refused: false,
+        });
+        Some((state.segments.len() - 1, middle))
     }
 
-    /// Bytes `..to` of part `index` are on disk. False once another racer finished it.
-    fn advance(&self, index: usize, to: u64) -> bool {
+    /// The last byte segment `index` still wants, or nothing once it is complete.
+    fn wants(&self, index: usize) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        let segment = &state.segments[index];
+        (!segment.done).then_some(segment.end)
+    }
+
+    /// Bytes `..to` of segment `index` are on disk. Answers its last wanted byte, which a
+    /// split may have moved closer, or nothing once another racer finished it.
+    fn advance(&self, index: usize, to: u64) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
-        state.reached[index] = state.reached[index].max(to);
-        !state.done[index]
+        let segment = &mut state.segments[index];
+        segment.reached = segment.reached.max(to);
+        (!segment.done).then_some(segment.end)
     }
 
-    fn finished(&self, index: usize) -> bool {
-        self.state.lock().unwrap().done[index]
-    }
-
-    /// A racer left part `index`. A refusal retires the part from racing, and fails the
-    /// object once nobody else is on it.
+    /// A racer left segment `index`. A refusal retires the segment from racing, and fails
+    /// the object once nobody else is on it.
     fn leave(&self, index: usize, refusal: Option<Refusal>) {
         let mut state = self.state.lock().unwrap();
-        state.racers[index] -= 1;
-        state.refused[index] |= refusal.is_some();
-        let orphaned = state.racers[index] == 0 && !state.done[index];
+        let segment = &mut state.segments[index];
+        segment.racers -= 1;
+        segment.refused |= refusal.is_some();
+        let orphaned = segment.racers == 0 && !segment.done;
         drop(state);
         if let Some(refusal) = refusal.filter(|_| orphaned) {
             self.failed(refusal);
@@ -458,10 +506,8 @@ impl Wire {
 
     fn landed(&self, index: usize) {
         let mut state = self.state.lock().unwrap();
-        state.done[index] = true;
-        while state.contiguous < state.done.len() && state.done[state.contiguous] {
-            state.contiguous += 1;
-        }
+        state.segments[index].done = true;
+        state.high = state.coverage();
         drop(state);
         self.filled.notify_all();
     }
@@ -487,13 +533,14 @@ impl Wire {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.failure.is_none() && state.contiguous < state.done.len() && !self.stopped() {
+        let total = state.segments.iter().map(|segment| segment.end + 1).max();
+        if state.failure.is_none() && Some(state.high) != total && !self.stopped() {
             state.failure = Some(Refusal {
                 code: Code::TRANSFER_FAILED,
                 detail: format!(
-                    "every stream stopped with {} of {} parts assembled",
-                    state.contiguous,
-                    state.done.len()
+                    "every stream stopped with {} of {} bytes assembled",
+                    state.high,
+                    total.unwrap_or(0)
                 ),
             });
         }
@@ -588,12 +635,19 @@ fn assemble(
     let scratch = Scratch::open(store, total)?;
     let wire = Wire {
         state: Mutex::new(State {
-            done: vec![false; parts],
-            reached: (0..parts as u64).map(|index| index * ranged.part).collect(),
-            racers: vec![0; parts],
-            refused: vec![false; parts],
+            segments: (0..parts as u64)
+                .map(|index| Segment {
+                    start: index * ranged.part,
+                    end: ((index + 1) * ranged.part).min(total) - 1,
+                    reached: index * ranged.part,
+                    racers: 0,
+                    done: false,
+                    refused: false,
+                })
+                .collect(),
             next: 0,
-            contiguous: 0,
+            initial: parts,
+            high: 0,
             failure: None,
         }),
         filled: Condvar::new(),
@@ -609,14 +663,13 @@ fn assemble(
         for _ in 0..streams {
             scope.spawn(|| {
                 let _worker = Worker(&wire);
-                while let Some((index, from)) = wire.claim(ranged.part, total, race) {
+                while let Some((index, from)) = wire.claim(race) {
                     let outcome = part(
                         &wire,
                         &scratch.file,
                         index,
                         from,
                         total,
-                        ranged.part,
                         ask,
                         client,
                         policy,
@@ -641,7 +694,6 @@ fn assemble(
             scratch: &scratch.file,
             at: 0,
             total,
-            part: ranged.part,
             wire: &wire,
             observer,
             reported: 0,
@@ -683,7 +735,6 @@ fn part(
     index: usize,
     from: u64,
     total: u64,
-    size: u64,
     ask: &(dyn Fn(bool) -> Result<String> + Sync),
     client: &http::Client,
     policy: &SourcePolicy,
@@ -691,8 +742,6 @@ fn part(
     deadline: Deadline,
     ledger: &Ledger,
 ) -> Result<bool> {
-    let start = index as u64 * size;
-    let end = (start + size).min(total) - 1;
     let mut at = from;
     let mut last: Option<Refusal> = None;
     let mut attempt = 0;
@@ -700,9 +749,12 @@ fn part(
     while attempt < FETCH_ATTEMPTS {
         attempt += 1;
         ledger.check_running()?;
-        if wire.stopped() || wire.finished(index) {
+        if wire.stopped() {
             return Ok(false);
         }
+        let Some(end) = wire.wants(index) else {
+            return Ok(false);
+        };
         if at > end {
             return Ok(true);
         }
@@ -812,7 +864,7 @@ fn part(
                 )
             }
         }
-        match body(response, wire, scratch, index, &mut at, end) {
+        match body(response, wire, scratch, index, &mut at) {
             Ok(()) => {}
             Err(refusal) if !last_attempt => {
                 last = Some(refusal);
@@ -820,11 +872,10 @@ fn part(
             }
             Err(refusal) => return Err(ranged_detail(refusal, index, &asked)),
         }
-        if at > end {
-            return Ok(true);
-        }
-        if wire.stopped() || wire.finished(index) {
-            return Ok(false);
+        match wire.wants(index) {
+            Some(end) if at > end => return Ok(true),
+            Some(_) if !wire.stopped() => {}
+            _ => return Ok(false),
         }
     }
     Err(ranged_detail(
@@ -833,7 +884,7 @@ fn part(
             detail: "the origin did not answer".into(),
         }),
         index,
-        &format!("bytes={at}-{end}"),
+        &format!("bytes={at}-"),
     ))
 }
 
@@ -845,10 +896,12 @@ fn body(
     scratch: &File,
     index: usize,
     at: &mut u64,
-    end: u64,
 ) -> Result<()> {
     let mut reader = response.into_body();
     let mut buf = vec![0u8; 256 * 1024];
+    let Some(mut end) = wire.wants(index) else {
+        return Ok(());
+    };
     loop {
         if *at > end || wire.stopped() {
             return Ok(());
@@ -875,10 +928,12 @@ fn body(
             })?;
         *at += read as u64;
         wire.moved.fetch_add(read as u64, Ordering::Relaxed);
-        // A racer of the same part writes the same bytes at the same offsets; the door's
-        // digest is the authority if an origin ever answers two asks differently.
-        if !wire.advance(index, *at) {
-            return Ok(());
+        // A racer of the same segment writes the same bytes at the same offsets; the
+        // door's digest is the authority if an origin ever answers two asks differently.
+        // A split moves this segment's end closer; past it the answer is abandoned.
+        match wire.advance(index, *at) {
+            Some(wanted) => end = wanted,
+            None => return Ok(()),
         }
     }
 }
@@ -902,7 +957,6 @@ struct Assembled<'a, 'o> {
     scratch: &'a File,
     at: u64,
     total: u64,
-    part: u64,
     wire: &'a Wire,
     /// The CALLER's observer, and its own lifetime: it outlives this fetch, while the
     /// scratch file and the wire do not.
@@ -944,7 +998,7 @@ impl Read for Assembled<'_, '_> {
                 if let Some(refusal) = &state.failure {
                     return Err(std::io::Error::other(refusal.to_string()));
                 }
-                let high = (state.contiguous as u64 * self.part).min(self.total);
+                let high = state.high;
                 if high > self.at {
                     Some(high)
                 } else {
