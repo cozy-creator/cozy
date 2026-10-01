@@ -3,10 +3,14 @@ package producttest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -133,7 +138,7 @@ with tempfile.TemporaryDirectory() as scratch:
 	})
 	doors := h.worker.Config.Handler
 	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/models/resolve" || strings.HasPrefix(r.URL.Path, "/v1/models/proof/") {
+		if r.URL.Path == "/v1/models/resolve" || strings.HasPrefix(r.URL.Path, "/v1/models/proof/") || strings.HasPrefix(r.URL.Path, "/v1/packages/proof/lora-host-probe") {
 			h.mux.ServeHTTP(w, r)
 			return
 		}
@@ -216,6 +221,48 @@ async def child(ctx:Context,payload:Request)->Result:
 	// A normal local root prepares its selected stack before acceptance. First land a
 	// baseline, so an adapter run must not reuse the already-held base placement.
 	if *machineLoRAServingGPU {
+		// Build an actual embedded-interface wheel and serve its complete lock at
+		// this isolated catalog. The same worker and its dependency cache serve
+		// the public release roots; no production publication is involved.
+		pack, problem := packagepublish.PrepareFrom(project)
+		fatal(t, problem)
+		t.Cleanup(pack.Close)
+		fatal(t, pack.Build(t.Context()))
+		objects := map[string]string{}
+		files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := objects[r.URL.Path]
+			if path == "" {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeFile(w, r, path)
+		}))
+		t.Cleanup(files.Close)
+		closure, err := exec.Command("uv", "export", "--project", project, "--frozen", "--no-dev", "--no-emit-project", "--no-header").Output()
+		must(t, err)
+		locked := string(closure)
+		for _, path := range []string{*machineRuntimeWheel, *machineTensorFSWheel} {
+			objects["/"+filepath.Base(path)] = path
+			fileURL := (&url.URL{Scheme: "file", Path: path}).String()
+			locked = strings.ReplaceAll(locked, fileURL, files.URL+"/"+filepath.Base(path))
+		}
+		objects["/"+filepath.Base(pack.Wheel)] = pack.Wheel
+		wheel, err := os.ReadFile(pack.Wheel)
+		must(t, err)
+		digest := sha256.Sum256(wheel)
+		locked += "lora-host-probe @ " + files.URL + "/" + filepath.Base(pack.Wheel) + " --hash=sha256:" + hex.EncodeToString(digest[:]) + "\n"
+		iface, err := os.ReadFile(pack.PackageInterface)
+		must(t, err)
+		prefix := "/v1/packages/proof/lora-host-probe"
+		h.mux.HandleFunc("GET "+prefix, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"releases":[{"release":"0.1.0"}]}`))
+		})
+		h.mux.HandleFunc("GET "+prefix+"/releases/0.1.0", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"release": map[string]string{"release": "0.1.0"}, "package_interface": json.RawMessage(iface), "requires_python": ">=3.12,<3.13"})
+		})
+		h.mux.HandleFunc("GET "+prefix+"/releases/0.1.0/locked-requirements", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(locked))
+		})
 		views := map[string]string{}
 		executors := map[string]string{}
 		for _, arm := range []struct {
@@ -230,8 +277,17 @@ async def child(ctx:Context,payload:Request)->Result:
 			{"root-zero", "generate", "model", []string{"0", "-0.25"}, 124},
 			{"root-baseline-after", "generate", "model", nil, 184},
 			{"child-stack", "child", "generate.models.model", []string{"0.5", "-0.25"}, 320},
+			{"public-baseline", "generate", "model", nil, 184},
+			{"public-stack", "generate", "model", []string{"0.5", "-0.25"}, 320},
+			{"public-repeat", "generate", "model", []string{"0.5", "-0.25"}, 320},
+			{"public-zero", "generate", "model", []string{"0", "-0.25"}, 124},
+			{"public-baseline-after", "generate", "model", nil, 184},
 		} {
-			args := []string{"run", "local/lora-host-probe/" + arm.function, "--await", "--json", "--idempotency-key", arm.key}
+			target := "local/lora-host-probe/" + arm.function
+			if strings.HasPrefix(arm.key, "public-") {
+				target = "proof/lora-host-probe/" + arm.function
+			}
+			args := []string{"run", target, "--await", "--json", "--idempotency-key", arm.key}
 			if arm.function == "generate" {
 				args = append(args, "payload:={}", "model.model=proof/base@1.0.0/fp32")
 			}
@@ -261,7 +317,7 @@ async def child(ctx:Context,payload:Request)->Result:
 				if executors[arm.key] == "" || executors[arm.key] == "<nil>" || executors[arm.key] == "0" {
 					t.Fatalf("%s retained no real executor identity", arm.key)
 				}
-				if arm.key == "root-repeat" && executors[arm.key] != executors["root-stack"] {
+				if (arm.key == "root-repeat" && executors[arm.key] != executors["root-stack"]) || (arm.key == "public-repeat" && executors[arm.key] != executors["public-stack"]) {
 					t.Fatal("identical ordered stack replaced its warm executor")
 				}
 			}
@@ -314,6 +370,12 @@ print(json.dumps(slots))
 				if views[arm.key] == views["root-stack"] {
 					t.Fatalf("%s reused a different stack's component view", arm.key)
 				}
+			}
+			if arm.key == "public-repeat" && views[arm.key] != views["public-stack"] {
+				t.Fatal("public repeated stack changed its component view")
+			}
+			if arm.key == "public-zero" && views[arm.key] == views["public-stack"] {
+				t.Fatal("public zero strength reused another component view")
 			}
 			stack := slots[0].Stack
 			if len(stack) != len(arm.scales) {
