@@ -198,7 +198,9 @@ async def child(ctx:Context,payload:Request)->Result:
 `), 0600))
 	lock := exec.Command("uv", "lock", "--project", project, "--python", "3.12")
 	lock.Env = childEnv(t, root)
-	if !*machineLoRAServingGPU {
+	if *machineLoRAServingGPU {
+		lock.Env = append(lock.Env, "UV_TORCH_BACKEND=cu130")
+	} else {
 		lock.Env = append(lock.Env, "UV_TORCH_BACKEND=cpu")
 	}
 	if out, err := lock.CombinedOutput(); err != nil {
