@@ -144,6 +144,21 @@ func recorded(dir string) bool {
 	return err == nil
 }
 
+// A launch waits out its unit's executor: the Host there is starting, not exited (run 2311
+// failed 42 ms after its unit started; TestStopEndsAnAgentStillInSystemdsExecutor sees it
+// starting). A unit that ends there never became the agent: its Host exited.
+func TestALaunchWhoseUnitEndsInItsExecutorReportsTheHostExited(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "home")
+	h, unit := fakeAgentMachine(t, root, time.Second)
+	program := filepath.Join(root, "machine/root/usr/local/bin/cozy-machine")
+	must(t, os.WriteFile(program, []byte("#!/bin/sh\nsleep 1\n"), 0o755)) //cozy:allow an executor that ends before any agent
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, problem := h.Ensure(ctx, "", nil, true); problem == nil || problem.ErrName() != "machine.host_exited" || userunit.Running(unit) {
+		t.Fatalf("a launch whose unit ended in its executor answered %v (unit running %v)", problem, userunit.Running(unit))
+	}
+}
+
 // A launch that gives up while the unit is still in systemd's executor leaves the unit
 // starting; `cozy machine stop` then ends that unit, not just its record.
 func TestStopEndsAnAgentStillInSystemdsExecutor(t *testing.T) {
