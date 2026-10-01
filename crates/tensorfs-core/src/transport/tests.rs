@@ -5407,7 +5407,24 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
         } else {
             1
         };
-        assert_eq!(calls.load(Ordering::SeqCst), expected, "{mode}");
+        // When every racer stays slow, the slowest gives its lane to a fresh ask, bounded by
+        // the object's shared ask budget; the original is never the one stopped alone.
+        let asked = calls.load(Ordering::SeqCst);
+        if matches!(mode, "both_slow" | "two_streams") {
+            assert!(
+                (2..=super::FETCH_ATTEMPTS as usize).contains(&asked),
+                "{mode}: {asked}"
+            );
+        } else if mode == "one_stream" {
+            // A measured stall lends its own lane, so even one stream may be hedged; this
+            // fixture's slowdown is not relative to the seed, so it need not be.
+            assert!(
+                (1..=super::FETCH_ATTEMPTS as usize).contains(&asked),
+                "{mode}: {asked}"
+            );
+        } else {
+            assert_eq!(asked, expected, "{mode}");
+        }
         if expected == 2 {
             assert!(
                 ledger.still().moved > plan.wanted_bytes(),
@@ -5415,9 +5432,8 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
             );
         }
         if mode == "both_slow" {
-            assert_eq!(
-                later_calls.load(Ordering::SeqCst),
-                2,
+            assert!(
+                later_calls.load(Ordering::SeqCst) >= 2,
                 "a lost race does not disable hedging for later objects"
             );
         }

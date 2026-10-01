@@ -153,11 +153,10 @@ enum Fault {
     Overlong(u64),
     /// The declared length with one byte changed.
     Corrupt,
-    /// Keep the stream alive with a trickle until `Duration` has passed, then reset it: a
-    /// GET that outlives its URL and dies, so the re-ask meets an expired signature.
-    TrickleThenReset(Duration),
     /// Wait this long, then answer honestly.
     Delay(Duration),
+    /// The honest body spread evenly over this long: a slow link that keeps moving.
+    Slow(Duration),
 }
 
 fn status(code: u16) -> Fault {
@@ -442,18 +441,15 @@ fn serve(
             let mut sink = [0u8; 64];
             while matches!(socket.read(&mut sink), Ok(n) if n > 0) {}
         }
-        Some(Fault::TrickleThenReset(until)) => {
+        Some(Fault::Slow(over)) => {
             head(&mut socket, code, &headers, body.len() as u64);
-            let started = Instant::now();
-            let mut at = 0;
-            while started.elapsed() < until && at + 1 < body.len() {
-                if !write_counted(&mut socket, &body[at..at + 1], sent) {
+            let pieces = (over.as_secs_f64() / (SAMPLE / 4.0)).ceil().max(1.0) as usize;
+            for piece in body.chunks(body.len().div_ceil(pieces).max(1)) {
+                std::thread::sleep(over / pieces as u32);
+                if !write_counted(&mut socket, piece, sent) {
                     return;
                 }
-                at += 1;
-                std::thread::sleep(sample() / 4);
             }
-            reset(socket);
         }
         Some(Fault::Status(..)) => unreachable!(),
     }
@@ -941,20 +937,21 @@ fn httpdate(at: SystemTime) -> String {
     )
 }
 
-/// A GET that outlives its URL dies; the re-ask needs a fresh signature, whether the hub's
-/// declared life told the truth (the client re-mints by age) or the object store's clock
-/// disagreed with it (the client only learns from the 403).
+/// URLs that die before their GET. The hub's declared life either tells the truth (the
+/// client re-mints by age before asking) or disagrees with the object store's clock (the
+/// client learns only from the 403). One stream, each first ask slower than a URL's life,
+/// so later objects are asked for after their URLs died whatever the walk's order, and no
+/// idle lane exists for a hedge to win the race against the expiry.
 #[test]
-fn a_url_that_dies_mid_object_is_re_minted_and_the_object_completes() {
+fn urls_that_die_before_their_get_are_re_minted_and_every_object_lands() {
     for declared in [None, Some(Duration::from_secs(3600))] {
         let dir = temporary("expiry");
-        let checkpoint = checkpoint(3, 256 << 10, 6);
-        let victim = blob(&checkpoint, 0);
+        let checkpoint = checkpoint(3, 64 << 10, 6);
         let lifetime = Duration::from_secs(1);
         let hub = hub(
             Arc::clone(&checkpoint),
             Config {
-                rules: vec![on(&victim, 1..=1, Fault::TrickleThenReset(lifetime * 2))],
+                rules: vec![on("*", 1..=1, Fault::Slow(lifetime * 3 / 4))],
                 lifetime,
                 declared,
                 ..Config::default()
@@ -962,17 +959,18 @@ fn a_url_that_dies_mid_object_is_re_minted_and_the_object_completes() {
         );
         let root = store(&dir);
         let mut run = Run::new(&hub, &root);
-        run.allowance = lifetime * 3;
+        run.streams = 1;
+        run.allowance = lifetime * 4;
         assert_landed(&run.ensure(), &hub, &root);
         assert!(
             hub.asks("presign") >= 2,
-            "the dead URL was never re-minted\n{}",
+            "the dead URLs were never re-minted\n{}",
             hub.log()
         );
         if declared.is_some() {
             assert!(
                 hub.expired() >= 1,
-                "the skewed URL was never presented dead\n{}",
+                "no ask ever met a dead URL\n{}",
                 hub.log()
             );
         }

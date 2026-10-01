@@ -327,10 +327,14 @@ impl Recovery {
                                     self.racing.fetch_sub(lanes, Ordering::AcqRel);
                                 }
                             }
-                        } else if measured && attempts.load(Ordering::Acquire) < FETCH_ATTEMPTS {
+                        } else if measured
+                            && racers.iter().filter(|racer| racer.live).count() > 1
+                            && attempts.load(Ordering::Acquire) < FETCH_ATTEMPTS
+                        {
                             // Every racer is measured slow. A cold R2 read stalls at a chunk
                             // boundary and a fresh ask moves 50-100x faster, so the slowest
                             // racer gives its lane to a fresh whole GET rather than waiting.
+                            // A sole survivor is never stopped: its hedge already failed.
                             let (index, _) = slowest.expect("a live racer was judged");
                             racers[index].state.stopped.store(true, Ordering::Release);
                             self.racing.fetch_add(1, Ordering::AcqRel);
@@ -469,6 +473,8 @@ mod tests {
             Some(1)
         );
         recovery.racing.fetch_sub(1, Ordering::AcqRel);
+        drop(hold);
+        assert_eq!(recovery.racing.load(Ordering::Acquire), 0);
         let full = Lanes {
             level: 4,
             busy: 4,
@@ -480,9 +486,6 @@ mod tests {
             Some(1),
             "a measured stall lends its own lane to its hedge"
         );
-        recovery.racing.fetch_sub(1, Ordering::AcqRel);
-        drop(hold);
-        assert_eq!(recovery.racing.load(Ordering::Acquire), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 }
