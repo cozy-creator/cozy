@@ -1396,7 +1396,9 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         .or_else(|| pinned_local_closure(request))
     {
         if let Ok((plan, report)) = plan_against_store(request, &closure) {
-            if plan.wanted.is_empty() {
+            // A canceled pull can land every object before recording its source.
+            // Supplied closures still need that custody committed below.
+            if plan.wanted.is_empty() && records_checkpoint(request.store, &closure) {
                 if let Some(observer) = request.on_plan {
                     observer(&plan);
                 }
