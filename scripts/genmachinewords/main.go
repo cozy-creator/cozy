@@ -166,6 +166,7 @@ var reserved = map[string]bool{
 	"com6": true, "com7": true, "com8": true, "com9": true,
 	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true,
 	"lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true,
+	"latina": true, // removed by the owner
 }
 
 // fold maps the accented latin these romanizations use onto ascii. A rune

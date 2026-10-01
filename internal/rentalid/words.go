@@ -318,7 +318,7 @@ var words = []string{
 	"laffey", "laffinty", "lafiel", "lafter", "laharl", "lailah", "lain", "laios",
 	"lakan", "lal039c", "lala", "lalaru", "lalatina", "lambda11", "lambdadelta", "lambo",
 	"lammis", "lamy", "lancelot", "lancer", "landar", "langa", "lanteveldt", "lantis",
-	"lanzhu", "lapis", "lappland", "larcade", "larva", "lashara", "latina", "latvia",
+	"lanzhu", "lapis", "lappland", "larcade", "larva", "lashara", "latvia",
 	"laufen", "laura", "laurent", "lavie", "lawine", "lawrence", "laxus", "layfon",
 	"leah", "leeron", "leficios", "lefiya", "left", "legato", "legom", "legoshi",
 	"lehm", "leif", "leina", "lelei", "lemon", "lenalee", "lenka", "lenneth",
