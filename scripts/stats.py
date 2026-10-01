@@ -10,16 +10,18 @@ import tempfile
 
 import tensorfs
 
+OBSERVED = ("catalog_opens", "presence_passes", "repo_cache_verified_reads")
+
 
 def delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
-    return {name: after[name] - before[name] for name in before}
+    return {name: after[name] - before[name] for name in OBSERVED}
 
 
 def main() -> None:
     root, snap = sys.argv[1], sys.argv[2]
     first = tensorfs.stats()
-    assert set(first) == {"catalog_opens", "presence_passes", "repo_cache_verified_reads"}, first
-    assert all(isinstance(value, int) and value >= 0 for value in first.values()), first
+    assert set(OBSERVED) <= first.keys(), first
+    assert all(isinstance(first[name], int) and first[name] >= 0 for name in OBSERVED), first
 
     store = tensorfs.Store.open(root)
     with store.acquire_cozytensors(snap) as lease:

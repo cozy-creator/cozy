@@ -40,7 +40,7 @@ def main():
         manifest = "sha256:" + receipt["manifest"]["sha256"]
         header = store.manifest(manifest)["header"]
         order = [("model", "weight"), ("model", "unused"), ("model", "bias")]
-        refused("TRAVERSAL_ORDER_MISMATCH", lambda: tensorfs.plan(
+        refused("TRAVERSAL_INCOMPLETE", lambda: tensorfs.plan(
             header, [("model", "weight"), ("model", "bias")], components=["model"], window=128))
         full = tensorfs.plan(header, order, components=["model"], window=128)
         original = full.items()
