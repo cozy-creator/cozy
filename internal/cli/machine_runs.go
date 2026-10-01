@@ -982,13 +982,13 @@ func (m *machineRuns) runName(request records.Request) string {
 }
 
 // Refresh brings a run's record up to date for a reader. A run the observer is following
-// already is: the observer holds its machine's next event, and the reader takes the record,
-// unless its collection is refused.
+// already is: the observer holds its machine's next event, and the reader takes the record.
+// One whose collection ended on a refusal is collected again at once.
 func (m *machineRuns) Refresh(parent context.Context, request records.Request) *exit.Error {
 	m.mu.Lock()
 	following := m.running[request.ID]
 	m.mu.Unlock()
-	if following && !m.collectionRefused(request.ID) {
+	if following {
 		return nil
 	}
 	_, problem := m.follow(parent, request)
@@ -1227,8 +1227,8 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem == nil {
 		models, problem = m.collectMachineModels(ctx, request, connection, outcome, modelPlan, written)
 	}
-	if problem == nil {
-		problem = m.exportProducts(ctx, connection, query, request)
+	if exported := m.exportProducts(ctx, connection, query, request); problem == nil {
+		problem = exported // outputs are delivered whatever became of the run's models
 	}
 	triage.Wait()
 	if body.TriageBundle != nil && triageProblem != nil {

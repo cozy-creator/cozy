@@ -54,12 +54,10 @@ type runReport struct {
 	Triage   json.RawMessage     `json:"triage,omitempty"`
 	// Result is the run's inline result once this host holds it.
 	Result any `json:"result,omitempty"`
-	// Products are the run's output log: what it made, as it made it. A superseded one is
-	// an earlier revision of a single output.
 	// Output is the run's items at their current revision.
 	Output []records.OutputItem `json:"output,omitempty"`
-	// CollectionPending names why a finished result still waits on its machine.
-	CollectionPending string `json:"collection_pending,omitempty"`
+	// CollectionRefused names why collecting a finished result ended; `cozy run watch` tries again.
+	CollectionRefused string `json:"collection_refused,omitempty"`
 	CollectionError   string `json:"collection_error,omitempty"`
 }
 
@@ -335,7 +333,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	report.Result = life.Result
 	report.Output = life.Output
 	if view := life.MachineExecution; view != nil && !view.Collected && view.CollectionRefused != "" {
-		report.CollectionPending, report.CollectionError = view.CollectionRefused, view.ObservationError
+		report.CollectionRefused, report.CollectionError = view.CollectionRefused, view.ObservationError
 	}
 	created, _ := time.Parse(time.RFC3339Nano, life.CreatedAt)
 	calls := map[string]*reportCall{}
@@ -835,8 +833,8 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 			fmt.Fprintf(w, "result %s\n", output.Elide(string(raw), 2000, mode.Full))
 		}
 	}
-	if r.CollectionPending != "" {
-		fmt.Fprintf(w, "collection pending: %s — %s\n", r.CollectionPending, r.CollectionError)
+	if r.CollectionRefused != "" {
+		fmt.Fprintf(w, "collection ended: %s — %s; `cozy run watch %d` tries again\n", r.CollectionRefused, r.CollectionError, r.Number)
 	}
 	table := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	if len(r.Output) > 0 {

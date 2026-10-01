@@ -2,9 +2,11 @@ package producttest
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -88,8 +90,23 @@ func TestARefusedOutputEndsItsCollection(t *testing.T) {
 	if again := machine.reads.Load(); again != asked {
 		t.Fatalf("the daemon asked for the refused bytes %d more times after recording the refusal", again-asked)
 	}
-	if code, shown := runCozy(t, root, "run", "show", request.ID); code != 0 ||
-		!strings.Contains(shown, "collection pending: machine_execution.refused") || !strings.Contains(shown, "no exact received retention") {
-		t.Fatalf("run show does not name the refused collection [exit %d]\n%s", code, shown)
+	// `cozy run show` tells the truth at a glance: the collection ended and why, and the output
+	// it never delivered is undelivered, not completed.
+	showed, shown := runCozy(t, root, "run", "show", request.ID)
+	if showed != 0 || !strings.Contains(shown, "collection ended: machine_execution.refused") ||
+		!strings.Contains(shown, "no exact received retention") || strings.Contains(shown, "collection pending") ||
+		!regexp.MustCompile(`(?m)^image\s.*\sundelivered\s`).MatchString(shown) {
+		t.Fatalf("run show does not say the collection ended without its output [exit %d]\n%s", showed, shown)
+	}
+	var run struct {
+		Status string `json:"status"`
+		Output []struct {
+			Name, Status string
+		} `json:"output"`
+	}
+	showed, shown = runCozy(t, root, "run", "show", request.ID, "--json")
+	if showed != 0 || json.Unmarshal([]byte(shown), &run) != nil || run.Status != "completed" ||
+		len(run.Output) != 1 || run.Output[0].Status != "undelivered" {
+		t.Fatalf("run show --json does not mark the undelivered output [exit %d]\n%s", showed, shown)
 	}
 }

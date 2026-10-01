@@ -3,6 +3,7 @@ package records
 import (
 	"database/sql"
 	"encoding/json"
+	"slices"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -141,9 +142,14 @@ func (p Product) View(status string) OutputItem {
 }
 
 // Output is the run's output: every item at its last revision. A list element is completed
-// once added; a single output is in progress until the run settles in `state`.
+// once added; a single output is in progress until the run settles in `state`. An item its
+// failed export never put in its folder is undelivered.
 func (s *Store) Output(request, state string) ([]OutputItem, *exit.Error) {
 	revisions, problem := s.Products(request)
+	if problem != nil {
+		return nil, problem
+	}
+	export, problem := s.OutputExportOf(request)
 	if problem != nil {
 		return nil, problem
 	}
@@ -156,11 +162,14 @@ func (s *Store) Output(request, state string) ([]OutputItem, *exit.Error) {
 	}
 	var output []OutputItem
 	for _, product := range Fold(revisions) {
+		item := product.View(status)
 		if product.Op == ProductAppend {
-			output = append(output, product.View("completed"))
-		} else {
-			output = append(output, product.View(status))
+			item = product.View("completed")
 		}
+		if export != nil && export.State == "failed" && product.Path != "" && !slices.Contains(export.PublishedPaths, product.Path) {
+			item.Status = "undelivered"
+		}
+		output = append(output, item)
 	}
 	return output, nil
 }

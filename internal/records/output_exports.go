@@ -133,26 +133,18 @@ func scanOutputExport(row interface{ Scan(...any) error }) (OutputExport, error)
 	return out, err
 }
 
-// CompleteOutputExport settles the row with the paths the verified outputs already
-// occupy: the worker wrote each file at its digest name inside the contracted directory
-// and the terminal was accepted against exactly those paths.
-func (s *Store) CompleteOutputExport(requestID string, paths []string) *exit.Error {
-	encoded, err := json.Marshal(paths)
-	if err != nil {
-		return exit.Internalf("cannot encode output export paths: %s", err)
+// SettleOutputExport records the paths of the outputs verified in their folder: published
+// when that is all of them, failed with why when it is not. An output missing from a failed
+// export's paths was never delivered.
+func (s *Store) SettleOutputExport(requestID string, paths []string, failure *exit.Error) *exit.Error {
+	state, code, message := "published", "", ""
+	if failure != nil {
+		state, code, message = "failed", failure.ErrName(), failure.Message
 	}
-	if _, err := s.db.Exec(`UPDATE request_output_exports SET state='published',
-		published_paths=?,error_code='',safe_error='',updated_at=? WHERE request_id=?`,
-		string(encoded), now(), requestID); err != nil {
+	encoded, _ := json.Marshal(append([]string{}, paths...))
+	if _, err := s.db.Exec(`UPDATE request_output_exports SET state=?,published_paths=?,error_code=?,
+		safe_error=?,updated_at=? WHERE request_id=?`, state, string(encoded), code, message, now(), requestID); err != nil {
 		return exit.Internalf("cannot settle output export for %s: %s", requestID, err)
-	}
-	return nil
-}
-
-func (s *Store) FailOutputExport(requestID, code, message string) *exit.Error {
-	if _, err := s.db.Exec(`UPDATE request_output_exports SET state='failed',error_code=?,
-		safe_error=?,updated_at=? WHERE request_id=?`, code, message, now(), requestID); err != nil {
-		return exit.Internalf("cannot record output export failure for %s: %s", requestID, err)
 	}
 	return nil
 }
