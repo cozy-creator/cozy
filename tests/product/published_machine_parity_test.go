@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,39 +44,51 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 		}
 		served.ServeHTTP(w, r)
 	})
+	run := func(venue, key string, args ...string) {
+		t.Helper()
+		mu.Lock()
+		seen = nil
+		mu.Unlock()
+		idem := "published-" + venue + "-" + key
+		code, out := runCozy(t, root, append([]string{"run", parityPublished + "/add", "value=41", "--await", "--json", "--idempotency-key", idem}, args...)...)
+		if code != 0 || !strings.Contains(out, `"value":42`) {
+			t.Fatalf("published add, %s on %s [exit %d]\n%s", key, venue, code, out)
+		}
+		request, problem := store.RequestByIdempotencyKey(idem)
+		fatal(t, problem)
+		link, problem := store.MachineExecution(request.ID)
+		fatal(t, problem)
+		want := map[string]string{"local": machines.Local, "rental": parityRental}[venue]
+		if link == nil || link.MachineID != want || !link.Collected {
+			t.Fatalf("published add on %s was not a collected execution on %s: %+v", venue, want, link)
+		}
+		mu.Lock()
+		calls := append([]string(nil), seen...)
+		mu.Unlock()
+		// Its first published call explicitly delegates content access; identity and
+		// lifecycle remain local, and subsequent calls reuse the bounded grant.
+		if venue == "local" && key == "cold" && len(calls) == 1 && calls[0] == "POST /v1/execution-access" {
+			calls = nil
+		}
+		if len(calls) != 0 {
+			t.Fatalf("the %s run on %s made %d Hub requests; want none: %v", key, venue, len(calls), calls)
+		}
+	}
 	for _, venue := range []struct {
 		name string
 		args []string
 	}{{"local", nil}, {"rental", []string{"--rental=tessa"}}} {
 		for _, key := range []string{"cold", "warm"} {
-			mu.Lock()
-			seen = nil
-			mu.Unlock()
-			idem := "published-" + venue.name + "-" + key
-			code, out := runCozy(t, root, append([]string{"run", parityPublished + "/add", "value=41", "--await", "--json", "--idempotency-key", idem}, venue.args...)...)
-			if code != 0 || !strings.Contains(out, `"value":42`) {
-				t.Fatalf("published add, %s on %s [exit %d]\n%s", key, venue.name, code, out)
-			}
-			request, problem := store.RequestByIdempotencyKey(idem)
-			fatal(t, problem)
-			link, problem := store.MachineExecution(request.ID)
-			fatal(t, problem)
-			want := map[string]string{"local": machines.Local, "rental": parityRental}[venue.name]
-			if link == nil || link.MachineID != want || !link.Collected {
-				t.Fatalf("published add on %s was not a collected execution on %s: %+v", venue.name, want, link)
-			}
-			mu.Lock()
-			calls := append([]string(nil), seen...)
-			mu.Unlock()
-			// Its first published call explicitly delegates content access; identity and
-			// lifecycle remain local, and subsequent calls reuse the bounded grant.
-			if venue.name == "local" && key == "cold" && len(calls) == 1 && calls[0] == "POST /v1/execution-access" {
-				calls = nil
-			}
-			if len(calls) != 0 {
-				t.Fatalf("the %s run on %s made %d Hub requests; want none: %v", key, venue.name, len(calls), calls)
-			}
+			run(venue.name, key, venue.args...)
 		}
+	}
+	// A stopped machine boots for the next run and describes the release itself: its startup
+	// check finds no update pending, so the run reads no Hub either.
+	for i := range 3 {
+		if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
+			t.Fatalf("machine stop [exit %d]\n%s", code, out)
+		}
+		run("local", fmt.Sprintf("restarted-%d", i))
 	}
 }
 
