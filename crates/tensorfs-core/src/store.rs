@@ -286,6 +286,10 @@ impl Fault {
 pub trait Progress: Send + Sync {
     fn moved(&self, bytes: u64);
     fn admitted(&self);
+    /// `bytes` already announced as moved were thrown away: the stream behind a candidate
+    /// failed or proved to be the wrong object. Progress that kept them would claim bytes
+    /// the store does not have, and a pull that re-asks would pass 100% before it ends.
+    fn discarded(&self, _bytes: u64) {}
 }
 
 #[derive(Clone)]
@@ -1453,15 +1457,21 @@ impl Store {
         let mut buf = vec![0u8; BUF];
         let mut len: u64 = 0;
         let mut first = true;
+        let discard = |len: u64, refusal: Refusal| {
+            if let Some(sink) = &self.progress {
+                sink.discarded(len);
+            }
+            cleanup(&tmp, refusal)
+        };
         loop {
             let n = match r.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(e) => return cleanup(&tmp, io("read source", e)),
+                Err(e) => return discard(len, io("read source", e)),
             };
             h.update(&buf[..n]);
             if let Err(e) = f.write_all(&buf[..n]) {
-                return cleanup(&tmp, io("write temp", e));
+                return discard(len, io("write temp", e));
             }
             len += n as u64;
             self.moved(n as u64);
@@ -1473,7 +1483,7 @@ impl Store {
         fault.hit("written");
         if self.flushes() {
             if let Err(e) = f.sync_all() {
-                return cleanup(&tmp, io("fsync temp", e));
+                return discard(len, io("fsync temp", e));
             }
         }
         fault.hit("fsync");
@@ -1481,8 +1491,8 @@ impl Store {
         let hex = sha256::hex(&h.finish());
         if let Some(want) = expect {
             if want.length != len {
-                return cleanup(
-                    &tmp,
+                return discard(
+                    len,
                     Refusal {
                         code: Code::LENGTH_MISMATCH,
                         detail: format!("expected {} bytes, streamed {len}", want.length),
@@ -1490,8 +1500,8 @@ impl Store {
                 );
             }
             if want.sha256 != hex {
-                return cleanup(
-                    &tmp,
+                return discard(
+                    len,
                     Refusal {
                         code: Code::OBJECT_ID_MISMATCH,
                         detail: format!("expected sha256:{}, streamed sha256:{hex}", want.sha256),

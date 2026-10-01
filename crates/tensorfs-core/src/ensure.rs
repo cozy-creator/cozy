@@ -190,6 +190,11 @@ impl store::Progress for Meter {
         self.moved.fetch_add(bytes, Ordering::Relaxed);
     }
     fn admitted(&self) {}
+    fn discarded(&self, bytes: u64) {
+        let _ = (self.moved).fetch_update(Ordering::Relaxed, Ordering::Relaxed, |moved| {
+            Some(moved.saturating_sub(bytes))
+        });
+    }
 }
 
 /// The fetch's live counters, shared by the pull's callbacks and the sampler.

@@ -282,6 +282,9 @@ impl Hub {
     fn expired(&self) -> usize {
         self.ledger.lock().unwrap().expired
     }
+    fn sent(&self, hex: &str) -> u64 {
+        *self.ledger.lock().unwrap().sent.get(hex).unwrap_or(&0)
+    }
     fn log(&self) -> String {
         self.ledger.lock().unwrap().log.join("\n")
     }
@@ -1363,4 +1366,30 @@ fn a_cancelled_pull_resumes_with_a_new_token_and_buys_only_what_is_missing() {
         );
     }
     assert!(ensured.bytes_held > 0);
+}
+
+#[test]
+fn progress_never_claims_bytes_a_failed_ask_threw_away() {
+    let dir = temporary("honest-progress");
+    let checkpoint = checkpoint(2, 1 << 20, 17);
+    let victim = blob(&checkpoint, 0);
+    // Three asks die at 90%: 2.7 MiB moved and discarded for a 1 MiB object, and the fourth
+    // is slow enough to be sampled while the object is still missing.
+    let slow = Duration::from_secs(3);
+    let hub = hub(
+        Arc::clone(&checkpoint),
+        Config {
+            rules: vec![
+                on(&victim, 1..=3, Fault::Truncate(900 << 10)),
+                on(&victim, 4..=4, Fault::Slow(slow)),
+            ],
+            ..Config::default()
+        },
+    );
+    let root = store(&dir);
+    let mut run = Run::new(&hub, &root);
+    run.allowance = slow;
+    assert_landed(&run.ensure(), &hub, &root);
+    assert_eq!(hub.asks(&victim), 4, "{}", hub.log());
+    assert_eq!(hub.sent(&victim), 1 << 20, "the landing ask sent the whole object");
 }
