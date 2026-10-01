@@ -123,7 +123,7 @@ func TestRentalModelDownloadAwaitsWithProgress(t *testing.T) {
 	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &settled) != nil || settled["status"] != "completed" || settled["kind"] != "download" || settled["elapsed"] == nil {
 		t.Fatalf("the awaited download did not report its verified end [exit %d]:\n%s\n%s", code, out, progress)
 	}
-	if !strings.Contains(progress, "downloading models 1.0GiB / 3.0GiB") {
+	if !strings.Contains(progress, "on attached · running · downloading models · 1.0GiB / 3.0GiB") {
 		t.Fatalf("the wait printed no download progress:\n%s", progress)
 	}
 	code, out, progress = runCozyStreams(t, root, "model", "download", "paul/minimax-h3#fp8", "--rental=attached", "--await", "--json")

@@ -133,8 +133,8 @@ func operationRecord(life api.Lifecycle) output.Record {
 	return record
 }
 
-// watchOperation follows an operation to its end, printing what changes. A signal only
-// detaches: the daemon keeps the operation.
+// watchOperation follows an operation to its end, printing what changes on stderr; stdout
+// keeps one record. A signal only detaches: the daemon keeps the operation.
 func watchOperation(ctx *Context, client *localapi.Client, life api.Lifecycle) *exit.Error {
 	interrupt, restore, _, problem := liveSignals(ctx, nil)
 	if problem != nil {
@@ -147,15 +147,13 @@ func watchOperation(ctx *Context, client *localapi.Client, life api.Lifecycle) *
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for life.Status == "queued" || life.Status == "in_progress" {
-		if line := operationLine(life); line != last && !ctx.Mode().JSON {
-			fmt.Fprintln(ctx.Err, line)
+		if line := operationLine(life); line != last {
+			_ = output.Progress(ctx.Err, line)
 			last = line
 		}
 		select {
 		case <-interrupt:
-			if !ctx.Mode().JSON {
-				fmt.Fprintf(ctx.Err, "detached from #%s; it continues\n", reference)
-			}
+			_ = output.Progress(ctx.Err, "detached from #"+reference+"; it continues")
 			return emit(ctx, operationRecord(life))
 		case <-tick.C:
 		}
@@ -179,7 +177,7 @@ func watchOperation(ctx *Context, client *localapi.Client, life api.Lifecycle) *
 }
 
 func operationLine(life api.Lifecycle) string {
-	parts := []string{fmt.Sprintf("#%d %s %s", life.Number, life.Kind, lifeTarget(life)), operationStatus(life).Human()}
+	parts := []string{fmt.Sprintf("#%d %s %s on %s", life.Number, life.Kind, lifeTarget(life), life.Machine), operationStatus(life).Human()}
 	if progress := progressValue(life); progress != "" && progress != "-" {
 		parts = append(parts, progress)
 	}
