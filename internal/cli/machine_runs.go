@@ -150,7 +150,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					// input bytes staged on its machine are owed, and only while there are any.
 					if link.MachineID != "" {
 						var connection *machineConnection
-						connection, problem = m.connect(m.ctx, link.MachineID, m.runHolder(*current, "releasing its inputs"))
+						connection, problem = m.connect(machines.AttachOnly(m.ctx), link.MachineID, m.runHolder(*current, "releasing its inputs"))
 						if problem == nil {
 							problem = m.releaseMachineInputs(m.ctx, *current, connection)
 							connection.Close()
@@ -172,7 +172,14 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				if link.CancelRequested {
 					problem = m.control(m.ctx, *current, "cancel", true)
 				} else {
-					problem = m.follow(m.ctx, *current)
+					var refused bool
+					refused, problem = m.follow(m.ctx, *current)
+					if refused {
+						// Retrying cannot change it: collection ends with its reason on record, and
+						// only the owner (`cozy run watch`) asks again.
+						fmt.Fprintf(m.context.Out, "machine execution %s: collection refused: %s\n", request.ID, problem.Message)
+						return
+					}
 					if problem != nil && problem.ErrName() == "machine_execution.result_custody_required" {
 						return // the result stays with the machine; nothing here can collect it
 					}
@@ -258,7 +265,7 @@ func (m *machineRuns) closePendingSubmission(ctx context.Context, request record
 	if proto.Unmarshal(link.Submission, &frozen) != nil || frozen.Offer == nil || frozen.ExpectedExecutionWorkspaceId == "" {
 		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "pending cancellation has no intact submission identity")
 	}
-	connection, problem := m.connect(ctx, link.MachineID, m.runHolder(request, "closing its pending submission"))
+	connection, problem := m.connect(machines.AttachOnly(ctx), link.MachineID, m.runHolder(request, "closing its pending submission"))
 	if problem != nil {
 		return problem
 	}
@@ -319,6 +326,9 @@ func (m *machineRuns) Resume() {
 	for _, link := range links {
 		if awaiting, problem := m.store.MachinePublicationsAwaitingOwner(link.RequestID); link.Collected && !link.CancelRequested && len(link.PendingControl) == 0 && (problem != nil || len(awaiting) == 0) {
 			continue
+		}
+		if !link.CancelRequested && m.collectionRefused(link.RequestID) {
+			continue // ended with its reason; only its owner asks again
 		}
 		request, problem := m.store.RequestRow(link.RequestID)
 		if problem == nil && request != nil {
@@ -951,7 +961,7 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 	if link == nil || len(link.Receipt) == 0 || proto.Unmarshal(link.Receipt, &receipt) != nil {
 		return nil, nil, nil, exit.Unavailablef("waiting for durable machine acceptance")
 	}
-	connection, problem := m.connect(ctx, link.MachineID, m.runHolder(request, "reading or collecting its execution"))
+	connection, problem := m.connect(machines.AttachOnly(ctx), link.MachineID, m.runHolder(request, "reading or collecting its execution"))
 	if problem != nil {
 		return nil, nil, nil, problem
 	}
@@ -981,7 +991,8 @@ func (m *machineRuns) Refresh(parent context.Context, request records.Request) *
 	if following && !m.collectionRefused(request.ID) {
 		return nil
 	}
-	return m.follow(parent, request)
+	_, problem := m.follow(parent, request)
+	return problem
 }
 
 // collectionRefused is whether a finished result waits on its owner. A reader asking about
@@ -995,21 +1006,24 @@ func (m *machineRuns) collectionRefused(id string) bool {
 	return problem == nil && code != ""
 }
 
-func (m *machineRuns) follow(parent context.Context, request records.Request) *exit.Error {
+// follow observes and collects one execution, answering whether its collection was refused.
+// A finished result its machine (bytes it no longer holds, say) or this host (a destination it
+// cannot write) refuses waits on its owner: the record says why, and a caller waiting for the
+// result wakes. Only a machine that cannot be reached now is asked again.
+func (m *machineRuns) follow(parent context.Context, request records.Request) (bool, *exit.Error) {
 	ctx, done := m.observation(request.ID).observe(parent)
 	defer done()
-	problem := m.refresh(ctx, request)
+	reached, problem := m.refresh(ctx, request)
 	if problem != nil && errors.Is(context.Cause(ctx), errObservationYielded) {
-		return nil // the control that took the turn observes the execution itself
+		return false, nil // the control that took the turn observes the execution itself
 	}
-	if problem != nil && problem.Code != exit.Unavailable && problem.Code != exit.Deadline && problem.Code != exit.Conflict {
-		// A finished result this host refuses (a destination it cannot write, say) waits
-		// on its owner; the record says why, and a caller waiting for the result wakes.
-		if recordProblem := m.store.RefuseMachineCollection(request.ID, problem); recordProblem != nil {
-			return recordProblem
-		}
+	if problem == nil || !reached || problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
+		return false, problem
 	}
-	return problem
+	if recordProblem := m.store.RefuseMachineCollection(request.ID, problem); recordProblem != nil {
+		return false, recordProblem
+	}
+	return m.collectionRefused(request.ID), problem
 }
 
 var errObservationYielded = errors.New("machine observation yielded to a control")
@@ -1066,16 +1080,16 @@ func (o *observation) control() func() {
 // refresh observes and, once finished, collects one execution. Collection moves result
 // bytes whose size no clock can predict, so the work is bounded by progress: it ends only
 // when no step completes and no byte arrives for the stall budget.
-func (m *machineRuns) refresh(parent context.Context, request records.Request) *exit.Error {
+func (m *machineRuns) refresh(parent context.Context, request records.Request) (bool, *exit.Error) {
 	progress := &transfer.Progress{}
 	ctx, cancel := progress.Context(parent)
 	defer cancel()
 	connection, link, query, problem := m.executionConnection(ctx, request)
 	if problem != nil {
-		return problem
+		return false, problem // reaching the machine decides nothing about the result
 	}
 	defer connection.Close()
-	return m.observeOn(ctx, progress, request, connection, link, query, true)
+	return true, m.observeOn(ctx, progress, request, connection, link, query, true)
 }
 
 func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress, request records.Request, connection *machineConnection, link *records.MachineExecution, query *pb.MachineExecutionQuery, wait bool) *exit.Error {

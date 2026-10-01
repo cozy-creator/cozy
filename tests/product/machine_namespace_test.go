@@ -244,7 +244,7 @@ print(json.dumps(r))`
 	}
 }
 
-func TestMissingLaunchRecordPreservesKernelOwnedRuntime(t *testing.T) {
+func TestMissingLaunchRecordAdoptsKernelOwnedRuntime(t *testing.T) {
 	_, h, launch := scopedMachine(t, true)
 	dir := filepath.Dir(h.Root())
 	recordPath := filepath.Join(dir, "agent.json")
@@ -287,9 +287,9 @@ func TestMissingLaunchRecordPreservesKernelOwnedRuntime(t *testing.T) {
 	must(t, os.Remove(recordPath))
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	_, problem = machines.NewHost(dir, "", nil).Ensure(ctx, "", nil, true)
-	if problem == nil || (problem.ErrName() != "machine.process_untracked" && problem.ErrName() != "machine.busy") {
-		t.Errorf("launch ignored an existing kernel owner: %v", problem)
+	adopted, problem := machines.NewHost(dir, "", nil).Ensure(ctx, "", nil, true)
+	if problem != nil || adopted.PID != launch.PID || adopted.BootID != launch.BootID {
+		t.Errorf("launch did not adopt the running kernel owner %d: %+v, %v", launch.PID, adopted, problem)
 	}
 	for path, body := range before {
 		after, err := os.ReadFile(path)
@@ -297,8 +297,8 @@ func TestMissingLaunchRecordPreservesKernelOwnedRuntime(t *testing.T) {
 			t.Errorf("launch changed the running owner's %s", filepath.Base(path))
 		}
 	}
-	if _, err := os.Stat(recordPath); !os.IsNotExist(err) {
-		t.Error("launch replaced missing ownership with another process")
+	if _, err := os.Stat(recordPath); err != nil {
+		t.Errorf("the adopted owner has no launch record: %v", err)
 	}
 	if string(readReceipt()) != string(receiptBefore) {
 		t.Error("launch changed the running owner's public identity receipt")

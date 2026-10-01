@@ -83,7 +83,9 @@ Linux Runtime wheels include this agent. `cozy machine install` bootstraps a new
 or asks an existing current machine to update its Runtime, TensorFS and bundled agent
 through one durable transaction. The same machine API runs on a laptop and a rented pod;
 restarting the personal controller leaves accepted machine work running. `cozy machine stop`
-explicitly stops the local machine. Optional `machine.webrtc_port` in the Cozy config
+explicitly stops the local machine (its systemd user unit, record or not); it stays stopped
+until `cozy machine start` or the next local run, and the daemon never starts it to observe or
+collect accepted work. Optional `machine.webrtc_port` in the Cozy config
 enables its WebRTC media listener; Hub grants cannot change machine listening ports.
 Software replacement waits for confirmed idle state and retains the machine identity,
 execution journal, installed packages, and outputs. A stable bootstrap process owns
@@ -665,7 +667,7 @@ and `cozy down --all` request termination; a plain `cozy down` does not.
 These commands have deliberately different scopes:
 
 ```sh
-cozy machine stop # stop this computer's machine and free its GPU; the next run relaunches it
+cozy machine stop # stop this computer's machine and free its GPU; `cozy machine start` or the next run starts it
 cozy down         # stop the daemon; runs, uploads and rentals continue
 cozy down --all   # cancel all work, end all rentals, then stop the daemon
 ```

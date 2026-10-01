@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/userunit"
 )
 
 func localMachineHost(ctx *Context) (*machines.Host, *exit.Error) {
@@ -84,11 +85,16 @@ func handleMachineShow(ctx *Context) *exit.Error {
 	}
 	fields := []output.Field{{K: "root", V: host.Root()}, {K: "machine", V: status.MachineID},
 		{K: "running", V: status.Running}, {K: "pid", V: status.PID}}
+	if userunit.Available() {
+		fields = append(fields, output.Field{K: "unit", V: host.Unit()})
+	}
 	if status.Installed != nil {
 		fields = append(fields, output.Field{K: "last_install", V: status.Installed})
 	}
 	var notes []string
-	if status.Running {
+	if status.Running && !status.Recorded {
+		notes = append(notes, "its launch record is missing; `cozy machine start` or the next local run adopts it")
+	} else if status.Running {
 		readCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		live, problem := host.ReadSoftware(readCtx)
@@ -100,6 +106,19 @@ func handleMachineShow(ctx *Context) *exit.Error {
 		}
 	}
 	return emit(ctx, output.Record{Fields: fields, Notes: notes})
+}
+
+func handleMachineStart(ctx *Context) *exit.Error {
+	host, problem := localMachineHost(ctx)
+	if problem != nil {
+		return problem
+	}
+	startCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if _, problem := host.Start(startCtx); problem != nil {
+		return problem
+	}
+	return handleMachineShow(ctx)
 }
 
 func handleMachineStop(ctx *Context) *exit.Error {
