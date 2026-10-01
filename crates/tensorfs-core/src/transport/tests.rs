@@ -1841,13 +1841,25 @@ fn a_resume_across_an_expiry_boundary_completes() {
     let store = Store::init(&root).unwrap();
     let policy = SourcePolicy::default();
 
-    // Cut the first walk off with objects still to move.
+    // Cut off only after a verified object has actually landed. A fixed wall
+    // deadline can expire before the first admission on a busy test runner.
+    let cancellation = crate::transport::PullCancellation::default();
+    let admitted = AtomicUsize::new(0);
+    let observer = |object: &ObjectRef, _: u64, _: ObjectSource| {
+        assert!(store.record_valid(&object.sha256).is_ok());
+        admitted.fetch_add(1, Ordering::Relaxed);
+        cancellation.cancel();
+    };
     let mut rushed = request_for(&store, &hub.origin.base, &policy);
     rushed.streams = 2;
     rushed.sample_seconds = 0.2;
-    rushed.deadline = Deadline::after_seconds(Some(0.6));
+    rushed.cancellation = Some(cancellation.clone());
+    rushed.on_object = Some(&observer);
     let refusal = pull(&rushed).unwrap_err();
-    assert_eq!(refusal.code, Code::DEADLINE_EXCEEDED);
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
+    assert!(refusal.detail.contains("cancelled"));
+    assert!(admitted.load(Ordering::Relaxed) > 0);
+    assert!(admitted.load(Ordering::Relaxed) < 20);
 
     // Wait out the life of every URL that walk was holding, then resume.
     std::thread::sleep(hub.lifetime + Duration::from_millis(300));
