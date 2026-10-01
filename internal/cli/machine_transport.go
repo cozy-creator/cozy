@@ -425,8 +425,9 @@ func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release s
 }
 
 // ForgetPackage tells each machine this daemon knows (this computer's while it runs, every
-// ready rental) that a package's releases or owner bindings changed: each keeps what it read
-// of the package at its Hub, and reads it once more on its next run.
+// ready rental) that a package's releases or owner bindings, or a model's releases, changed:
+// each keeps what it read of that name at its Hub, across Runtime restarts, and reads it once
+// more on its next run.
 func (m *machineRuns) ForgetPackage(ctx context.Context, pkg string) api.ForgottenPackage {
 	out := api.ForgottenPackage{Package: pkg, Machines: []string{}}
 	var names []string
@@ -455,7 +456,7 @@ func (m *machineRuns) ForgetPackage(ctx context.Context, pkg string) api.Forgott
 			}
 		}
 		if problem != nil {
-			out.Notes = append(out.Notes, fmt.Sprintf("%s keeps what it read of %s until it restarts: %s", name, pkg, problem.Message))
+			out.Notes = append(out.Notes, fmt.Sprintf("%s keeps what it read of %s until it is told or stopped: %s", name, pkg, problem.Message))
 			continue
 		}
 		out.Machines = append(out.Machines, name)
