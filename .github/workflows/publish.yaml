@@ -38,9 +38,23 @@ jobs:
             echo "tag v$TAG != pyproject version $VER"; exit 1
           fi
 
+  # Release gate (2026-10-01): model weights fetched through `ensure`, the Runtime's path,
+  # against a real loopback hub and object store injecting resets, stalls, truncation,
+  # 5xx/429/Retry-After, expired URLs, wrong bytes, hub weather and verdicts. Each must
+  # land the exact bytes or end in its typed refusal.
+  fetch-faults:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p tensorfs-core --test fetch_faults -- --test-threads=2
+
   # Every platform's wheel, each built and proven on its own runner.
   wheels:
-    needs: gate
+    needs: [gate, fetch-faults]
     uses: ./.github/workflows/wheels.yaml
 
   publish:
