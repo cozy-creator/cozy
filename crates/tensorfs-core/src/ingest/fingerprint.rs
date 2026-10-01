@@ -201,6 +201,9 @@ pub struct FingerprintRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceProfile {
     pub name: String,
+    /// Whether headers alone may choose this format. False requires the caller
+    /// to declare the reviewed format; shapes cannot prove semantic row layout.
+    pub auto_select: bool,
     pub components: Vec<SourceProfileComponent>,
 }
 
@@ -612,7 +615,7 @@ impl FingerprintRegistry {
                     self.source_profiles
                         .iter()
                         .map(|profile| {
-                            Value::obj(vec![
+                            let mut fields = vec![
                                 (
                                     "components",
                                     Value::arr(
@@ -677,7 +680,11 @@ impl FingerprintRegistry {
                                     ),
                                 ),
                                 ("name", Value::str(profile.name.clone())),
-                            ])
+                            ];
+                            if !profile.auto_select {
+                                fields.push(("auto_select", Value::Bool(false)));
+                            }
+                            Value::obj(fields)
                         })
                         .collect(),
                 ),
@@ -692,6 +699,11 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
     for value in as_arr("FingerprintRegistry", "source_profiles", value)? {
         let mut fields = Fields::new("SourceProfile", value)?;
         let name = fields.req_str("name")?.to_string();
+        let auto_select = match fields.opt("auto_select") {
+            None => true,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return refuse(Code::WRONG_TYPE, "SourceProfile.auto_select must be bool"),
+        };
         ascii_name("source profile", &name, limits::MAX_NAME_BYTES)?;
         let mut components = Vec::new();
         for value in as_arr("SourceProfile", "components", fields.req("components")?)? {
@@ -838,7 +850,11 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
                 format!("source profile {name:?} repeats a component"),
             );
         }
-        profiles.push(SourceProfile { name, components });
+        profiles.push(SourceProfile {
+            name,
+            auto_select,
+            components,
+        });
     }
     let mut names: Vec<&str> = profiles
         .iter()
@@ -1044,10 +1060,12 @@ mod tests {
         let mut registry = registry();
         registry.source_profiles = vec![
             SourceProfile {
+                auto_select: true,
                 name: "profile/a".into(),
                 components: vec![source_component(Some("a/model.index.json"), None)],
             },
             SourceProfile {
+                auto_select: true,
                 name: "profile/b".into(),
                 components: vec![
                     source_component(Some("b/model.safetensors"), None),
@@ -1070,6 +1088,7 @@ mod tests {
     fn exact_source_members_refuses_missing_or_non_exact_profiles() {
         let mut registry = registry();
         registry.source_profiles = vec![SourceProfile {
+            auto_select: true,
             name: "profile/prefix".into(),
             components: vec![source_component(None, Some("weights/"))],
         }];

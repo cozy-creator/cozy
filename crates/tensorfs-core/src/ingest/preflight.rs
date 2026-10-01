@@ -340,9 +340,6 @@ pub fn select_members(
             .collect()
     };
     let (own, all) = (carriers(false), carriers(true));
-    if profiles.is_empty() && all.len() == 1 {
-        return Ok(all);
-    }
     let heads = read_heads(&resolution.select(&all)?)?;
     let plan_over = |carriers: &[String]| -> Result<(Vec<String>, bool)> {
         let members = resolution.select(carriers)?.members;

@@ -574,6 +574,7 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
             return ExitCode::FAILURE;
         }
         let profile = SourceProfile {
+            auto_select: true,
             name: name.to_string(),
             components,
         };

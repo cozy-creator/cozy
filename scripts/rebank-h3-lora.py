@@ -68,7 +68,9 @@ def main() -> None:
         updated = json.loads(registry.read_text())
         for profile in updated["source_profiles"]:
             if profile["name"].startswith("h3/native-lora-"):
-                # Explicit opt-in: same reviewed structure under any carrier name.
+                # Selection declares the reviewed trainer/Comfy row layout.
+                # An unknown exporter can share these shapes with another layout.
+                profile["auto_select"] = False
                 profile["components"][0]["source_member_prefix"] = ""
         if args.write:
             registry_path.write_text(json.dumps(updated, sort_keys=True, separators=(",", ":")))

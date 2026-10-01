@@ -429,6 +429,58 @@ fn real_headers_match_by_structure_and_multiple_versions_require_file_selection(
 }
 
 #[test]
+fn ambiguous_fused_exporter_needs_a_declared_layout_before_preflight_or_planning() {
+    use std::cell::Cell;
+    use tensorfs_core::{
+        ingest::{preflight, source},
+        providers::{MemberHead, Provenance, Resolution, ResolvedMember},
+    };
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/h3-lora-headers");
+    let Value::Arr(rows) =
+        canon::parse(&fs::read(fixtures.join("MANIFEST.json")).unwrap(), 1 << 20).unwrap()
+    else {
+        panic!("manifest array")
+    };
+    for row in rows.into_iter().filter(|row| {
+        let Value::Obj(fields) = row else { return false };
+        matches!(fields.iter().find(|(name, _)| name == "member").map(|(_, value)| value), Some(Value::Str(name)) if name.contains("2000step") || name == "wushu_spatial_physics_clean_3000_pruned.safetensors")
+    }) {
+        let Value::Obj(fields) = row else { unreachable!() };
+        let Value::Str(member) = &fields.iter().find(|(name, _)| name == "member").unwrap().1 else { panic!("member") };
+        let Value::Int(full_length) = fields.iter().find(|(name, _)| name == "full_length").unwrap().1 else { panic!("length") };
+        let original = fs::read(fixtures.join(member)).unwrap();
+        let Value::Obj(mut tensors) = canon::parse(&original[8..], 1 << 20).unwrap() else { panic!("header") };
+        tensors.retain(|(key, _)| key != "__metadata__");
+        // Contiguous QKV and per-head interleaved QKV have these exact same keys,
+        // dtypes and shapes. This unknown exporter provides no layout declaration.
+        let header = canon::write(&Value::map(tensors));
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        let length = full_length as u64 - original.len() as u64 + bytes.len() as u64;
+        let head = MemberHead { member: "unknown-exporter.safetensors".into(), length, head: bytes.clone() };
+        let root = root();
+        let refused = preflight::select_profile(source::BUILTIN_REGISTRY, source::BUILTIN_REGISTRY_BYTES, std::slice::from_ref(&head), &root.join("preflight")).unwrap_err();
+        assert_eq!(refused.code, Code::AMBIGUOUS_CLASSIFICATION);
+        assert!(refused.detail.contains("source layout"));
+        assert!(!root.join("preflight").exists());
+        let path = root.join("unknown.safetensors");
+        fs::write(&path, &bytes).unwrap();
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(length).unwrap();
+        let carrier = source::CarrierInput { member: Some(head.member.clone()), path };
+        assert_eq!(source::plan_source(source::BUILTIN_REGISTRY, source::BUILTIN_REGISTRY_BYTES, std::slice::from_ref(&carrier), None, None).unwrap_err().code, Code::AMBIGUOUS_CLASSIFICATION);
+        // Intentional raw preservation remains available; it performs no guessed
+        // normalization. Known independently checked /2 imports are tested above.
+        assert_eq!(source::plan_source(source::BUILTIN_REGISTRY, source::BUILTIN_REGISTRY_BYTES, std::slice::from_ref(&carrier), Some(source::AS_IS), None).unwrap().converter, convert::IDENTITY);
+        let resolution = Resolution { canonical: "hf://unknown/exporter@revision".into(), selection_sha256: "11".repeat(32), members: vec![ResolvedMember { member: head.member.clone(), object: tensorfs_core::ids::ObjectRef { sha256: "22".repeat(32), length }, url: "https://example.invalid/model".into(), provenance: Provenance::Declared, carrier: true, requires: vec![], companion: false }] };
+        let reads = Cell::new(0);
+        let refusal = preflight::select_members(source::BUILTIN_REGISTRY, source::BUILTIN_REGISTRY_BYTES, &resolution, &[], |_| { reads.set(reads.get() + 1); Ok(vec![head.clone()]) }, &root.join("selection")).unwrap_err();
+        assert_eq!(refusal.code, Code::AMBIGUOUS_CLASSIFICATION);
+        assert_eq!(reads.get(), 1, "a single unknown carrier must be checked before payload transfer");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn full_cli_conversion_mints_a_receipt_after_the_live_golden_suite() {
     use std::process::Command;
     let root = root();

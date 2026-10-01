@@ -4664,25 +4664,24 @@ fn a_real_enospc_from_the_kernel_is_a_capacity_verdict_not_an_io_failure() {
 static OPTIONAL_CACHE_PROOFS: Mutex<()> = Mutex::new(());
 
 fn wait_for_cache(store: &Store, checkpoint: &Checkpoint) {
+    // Optional replication is asynchronous. Its existing drain observes copy
+    // progress and reports incomplete work; a fixture wall clock cannot decide
+    // whether the exact bytes will be published on a busy filesystem.
+    assert!(
+        crate::repo_cache::finish_optional_backfills(),
+        "optional cache replication did not complete"
+    );
     let cache = store.repo_cache().unwrap();
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let complete = checkpoint.bodies.iter().all(|(id, bytes)| {
-            let kind = if id == &checkpoint.manifest.sha256 {
-                crate::repo_cache::CacheKind::Manifest
-            } else {
-                crate::repo_cache::CacheKind::Blob
-            };
-            std::fs::read(cache.path(kind, id).unwrap()).is_ok_and(|actual| actual == *bytes)
-        });
-        if complete {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < until,
-            "optional cache bytes did not finish"
+    for (id, bytes) in &checkpoint.bodies {
+        let kind = if id == &checkpoint.manifest.sha256 {
+            crate::repo_cache::CacheKind::Manifest
+        } else {
+            crate::repo_cache::CacheKind::Blob
+        };
+        assert_eq!(
+            std::fs::read(cache.path(kind, id).unwrap()).unwrap(),
+            *bytes
         );
-        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 

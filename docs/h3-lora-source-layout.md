@@ -35,3 +35,25 @@ For example, destination Q head 1 row 0 must use raw B row 128. The existing con
 The correction needs an independent projected-Q/K/V regression that computes the upstream fused projection before dividing its output into thirds. A fixture that repeats the mapper's row formula is insufficient.
 
 Use a new converter and rebanked profile identity for corrected conversions. Preserve existing checkpoint objects and published releases. Corrected public adapters require new immutable patch releases and a fresh GPU quality comparison; the previous videos exercised the wrong normalized factors and cannot establish adapter quality.
+
+## Declare the source layout before normalization
+
+The reviewed `h3/native-lora-a-b/2` and `h3/native-lora-kohya/2` profiles have
+`auto_select: false`. Automatic planning and header preflight refuse a matching
+fused adapter until the caller selects its reviewed format explicitly. Contiguous
+and head-interleaved QKV factors can have identical names, dtypes and shapes, so
+the header fingerprint cannot choose between them. An explicit raw `as-is/1`
+selection still preserves bytes without interpreting their layout.
+
+Selecting `/2` declares the trainer/Comfy contiguous-QKV contract. Before choosing
+it for an unknown producer, review the exporter's declaration and loading code
+and check equivalent projected Q/K/V outputs independently. Explicit selection
+does not prove arbitrary misdeclared bytes satisfy that contract. The pinned
+Wushu and Physics files above have that source and numerical qualification.
+
+CozyTensors' numeric `EncodingSpec` describes each canonical tensor's physical
+representation. The canonical separate `to_q`, `to_k`, and `to_v` keys declare
+the projection identities; normalization must establish the source-to-canonical
+mapping before those tensors exist. This correction adds no numeric encoding or
+deployment-equality requirement. Other source profiles retain automatic
+selection by default.

@@ -750,13 +750,27 @@ fn plan_source_prepared(
         headers.push(read_carrier(carrier, &set)?.0);
     }
     let mut matches = Vec::new();
+    let mut requires_declaration = Vec::new();
     for profile in &registry.source_profiles {
         if requested_profile.is_some_and(|name| name != profile.name) {
             continue;
         }
         for assignments in profile_assignments(profile, &registry, carriers, &headers) {
+            if requested_profile.is_none() && !profile.auto_select {
+                requires_declaration.push(profile.name.as_str());
+                continue;
+            }
             matches.push((profile, assignments));
         }
+    }
+    if !requires_declaration.is_empty() {
+        return refuse(
+            Code::AMBIGUOUS_CLASSIFICATION,
+            format!(
+                "headers cannot establish source layout; explicitly declare a reviewed format \
+                 profile after checking the exporter contract: {requires_declaration:?}"
+            ),
+        );
     }
     if matches.is_empty() {
         if requested_profile.is_some_and(|name| name != AS_IS) {
@@ -966,6 +980,7 @@ fn as_is_profile(
     }
     Ok((
         SourceProfile {
+            auto_select: true,
             name: AS_IS.into(),
             components,
         },
@@ -2392,6 +2407,7 @@ mod tests {
             },
         };
         let source_profile = SourceProfile {
+            auto_select: true,
             name: profile.into(),
             components: vec![SourceProfileComponent {
                 component: component.into(),
@@ -3744,6 +3760,7 @@ mod tests {
             });
         }
         registry.merge_source_profile(SourceProfile {
+            auto_select: true,
             name: "journal/pair/1".into(),
             components,
         });
@@ -3968,6 +3985,7 @@ mod tests {
             });
         }
         registry.merge_source_profile(SourceProfile {
+            auto_select: true,
             name: "sharded/pair/1".into(),
             components,
         });
@@ -4336,6 +4354,7 @@ mod tests {
             });
         }
         registry.merge_source_profile(SourceProfile {
+            auto_select: true,
             name: "shared/pair/1".into(),
             components,
         });
