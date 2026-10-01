@@ -27,6 +27,7 @@ import (
 
 var (
 	failureDiagnosticsDirectory = flag.String("failure-diagnostics", "", "directory for filtered failure-only machine status snapshots")
+	machineLoRAServingGPU       = flag.Bool("lora-serving-gpu", false, "run LoRA serving qualification on an isolated rented H100 host")
 	machineHostBinary           = flag.String("machine-host", "", "the standalone cozy-machine executable each test machine runs")
 	requireMachineHost          = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
 	machineRuntimePython        = flag.String("machine-runtime-python", "", "Development interpreter for the standalone agent public-view media fixture")

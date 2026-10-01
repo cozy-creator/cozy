@@ -30,6 +30,9 @@ import (
 // needed to inspect the ordered, derived adapter view returned by Runtime.
 func TestStandaloneHostPreparesOrderedPrivateLoRAView(t *testing.T) {
 	integration(t)
+	if !*machineLoRAServingGPU {
+		t.Setenv("CUDA_VISIBLE_DEVICES", "")
+	}
 	if *machineHostBinary == "" || *machineRuntimeWheel == "" || *machineTensorFSWheel == "" {
 		t.Skip("requires an exact standalone agent and paired Runtime/TensorFS wheels")
 	}
@@ -43,6 +46,16 @@ func TestStandaloneHostPreparesOrderedPrivateLoRAView(t *testing.T) {
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	host := machines.NewHost(layout.Machine, filepath.Join(root, "tensorfs"), nil)
+	// Keep the arithmetic proof on CPU; the machine still uses the same public
+	// Runtime, native TensorFS store, authenticated broker and preparation path.
+	if !*machineLoRAServingGPU {
+		virtualInventoryFor(t, host.Root(), true)
+	} else {
+		device, err := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader").Output()
+		if err != nil || !strings.Contains(string(device), "H100") {
+			t.Fatal("-lora-serving-gpu requires the isolated rented H100 host")
+		}
+	}
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "down")
 		_ = host.Stop(context.Background())
@@ -177,7 +190,7 @@ async def child(ctx:Context,payload:Request)->Result:
     return await generate(payload=payload)
 `), 0600))
 	lock := exec.Command("uv", "lock", "--project", project, "--python", "3.12")
-	lock.Env = childEnv(t, root)
+	lock.Env = append(childEnv(t, root), "UV_TORCH_BACKEND=cpu")
 	if out, err := lock.CombinedOutput(); err != nil {
 		t.Fatalf("lock private probe: %v\n%s", err, out)
 	}
@@ -197,42 +210,59 @@ async def child(ctx:Context,payload:Request)->Result:
 	}
 	// A normal local root prepares its selected stack before acceptance. First land a
 	// baseline, so an adapter run must not reuse the already-held base placement.
-	views := map[string]string{}
-	for _, arm := range []struct {
-		key, function, slot string
-		scales              []string
-		score               int
-	}{
-		{"baseline", "generate", "model", nil, 184},
-		{"root-stack", "generate", "model", []string{"0.5", "-0.25"}, 320},
-		{"root-repeat", "generate", "model", []string{"0.5", "-0.25"}, 320},
-		{"root-reversed", "generate", "model", []string{"-0.25", "0.5"}, 320},
-		{"root-zero", "generate", "model", []string{"0", "-0.25"}, 124},
-		{"root-baseline-after", "generate", "model", nil, 184},
-		{"child-stack", "child", "generate.models.model", []string{"0.5", "-0.25"}, 320},
-	} {
-		args := []string{"run", "local/lora-host-probe/" + arm.function, "--await", "--json", "--idempotency-key", arm.key}
-		if arm.function == "generate" {
-			args = append(args, "payload:={}", "model.model=proof/base@1.0.0/fp32")
-		}
-		for i, scale := range arm.scales {
-			name := []string{"first", "second"}[i]
-			if arm.key == "root-reversed" {
-				name = []string{"second", "first"}[i]
+	if *machineLoRAServingGPU {
+		views := map[string]string{}
+		executors := map[string]string{}
+		for _, arm := range []struct {
+			key, function, slot string
+			scales              []string
+			score               int
+		}{
+			{"baseline", "generate", "model", nil, 184},
+			{"root-stack", "generate", "model", []string{"0.5", "-0.25"}, 320},
+			{"root-repeat", "generate", "model", []string{"0.5", "-0.25"}, 320},
+			{"root-reversed", "generate", "model", []string{"-0.25", "0.5"}, 320},
+			{"root-zero", "generate", "model", []string{"0", "-0.25"}, 124},
+			{"root-baseline-after", "generate", "model", nil, 184},
+			{"child-stack", "child", "generate.models.model", []string{"0.5", "-0.25"}, 320},
+		} {
+			args := []string{"run", "local/lora-host-probe/" + arm.function, "--await", "--json", "--idempotency-key", arm.key}
+			if arm.function == "generate" {
+				args = append(args, "payload:={}", "model.model=proof/base@1.0.0/fp32")
 			}
-			args = append(args, "--lora", arm.slot+":transformer=proof/"+name+"@1.0.0/fp32,"+scale)
-		}
-		if code, out := runCozy(t, root, args...); code != 0 || !strings.Contains(out, fmt.Sprintf(`"value":%d`, arm.score)) {
-			t.Fatalf("%s CLI serving [%d], expected score %d: %s", arm.key, code, arm.score, out)
-		}
-		request, problem := store.RequestByIdempotencyKey(arm.key)
-		fatal(t, problem)
-		if request == nil {
-			t.Fatal("normal CLI lost its request")
-		}
-		// Read the actual Runtime journal. The invocation's capture alone does not
-		// prove which placement was admitted and later handed to its executor.
-		read := exec.Command(python, "-I", "-c", `import json,sqlite3,sys
+			for i, scale := range arm.scales {
+				name := []string{"first", "second"}[i]
+				if arm.key == "root-reversed" {
+					name = []string{"second", "first"}[i]
+				}
+				args = append(args, "--lora", arm.slot+":transformer=proof/"+name+"@1.0.0/fp32,"+scale)
+			}
+			if code, out := runCozy(t, root, args...); code != 0 || !strings.Contains(out, fmt.Sprintf(`"value":%d`, arm.score)) {
+				t.Fatalf("%s CLI serving [%d], expected score %d: %s", arm.key, code, arm.score, out)
+			}
+			request, problem := store.RequestByIdempotencyKey(arm.key)
+			fatal(t, problem)
+			if request == nil {
+				t.Fatal("normal CLI lost its request")
+			}
+			if arm.function == "generate" {
+				events, problem := store.EvidenceEvents(request.ID, 1000)
+				fatal(t, problem)
+				for _, event := range events {
+					if event.Type == "machine.executor" {
+						executors[arm.key] = fmt.Sprintf("%v", event.Payload["pid"])
+					}
+				}
+				if executors[arm.key] == "" || executors[arm.key] == "<nil>" || executors[arm.key] == "0" {
+					t.Fatalf("%s retained no real executor identity", arm.key)
+				}
+				if arm.key == "root-repeat" && executors[arm.key] != executors["root-stack"] {
+					t.Fatal("identical ordered stack replaced its warm executor")
+				}
+			}
+			// Read the actual Runtime journal. The invocation's capture alone does not
+			// prove which placement was admitted and later handed to its executor.
+			read := exec.Command(python, "-I", "-c", `import json,sqlite3,sys
 from pathlib import Path
 root=Path(sys.argv[1]); db=sqlite3.connect('file:'+str(root/'.cozy-workspace/journal.sqlite3')+'?mode=ro',uri=True)
 row=db.execute('select preparation from executions where request=?',(sys.argv[2],)).fetchone()
@@ -250,51 +280,52 @@ for installation in prepared['installations'].values():
             slots.append({'stack':stack,'base':models[slot['reference_model_id']]['manifest']['digest'],'components':components})
 print(json.dumps(slots))
 `, filepath.Join(root, "tensorfs"), request.ID, arm.function)
-		raw, err := read.CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s retained preparation: %v\n%s", arm.key, err, raw)
-		}
-		var slots []struct {
-			Stack      []struct{ Scale, Manifest string } `json:"stack"`
-			Base       string                             `json:"base"`
-			Components []string                           `json:"components"`
-		}
-		must(t, json.Unmarshal(raw, &slots))
-		if len(slots) != 1 {
-			t.Fatalf("%s selected no exact serving slot: %s", arm.key, raw)
-		}
-		if slots[0].Base != seeded["base"].Record["manifest_id"] {
-			t.Fatalf("%s replaced the original base custody", arm.key)
-		}
-		if len(slots[0].Components) != 1 || (slots[0].Components[0] != slots[0].Base) != (len(arm.scales) > 0) {
-			t.Fatalf("%s served no selected component view: %+v", arm.key, slots[0])
-		}
-		views[arm.key] = slots[0].Components[0]
-		if arm.key == "root-repeat" || arm.key == "child-stack" {
-			if views[arm.key] != views["root-stack"] {
-				t.Fatalf("%s changed the same ordered component view", arm.key)
+			raw, err := read.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s retained preparation: %v\n%s", arm.key, err, raw)
 			}
-		}
-		if arm.key == "root-reversed" || arm.key == "root-zero" {
-			if views[arm.key] == views["root-stack"] {
-				t.Fatalf("%s reused a different stack's component view", arm.key)
+			var slots []struct {
+				Stack      []struct{ Scale, Manifest string } `json:"stack"`
+				Base       string                             `json:"base"`
+				Components []string                           `json:"components"`
 			}
-		}
-		stack := slots[0].Stack
-		if len(stack) != len(arm.scales) {
-			t.Fatalf("%s served %d adapters; requested %d", arm.key, len(stack), len(arm.scales))
-		}
-		t.Logf("%s: score=%d adapters=%d component=%s", arm.key, arm.score, len(stack), views[arm.key])
-		for i, adapter := range stack {
-			name := []string{"first", "second"}[i]
-			if arm.key == "root-reversed" {
-				name = []string{"second", "first"}[i]
+			must(t, json.Unmarshal(raw, &slots))
+			if len(slots) != 1 {
+				t.Fatalf("%s selected no exact serving slot: %s", arm.key, raw)
 			}
-			if adapter.Manifest != seeded[name].Record["manifest_id"] {
-				t.Fatalf("%s changed adapter %d selection", arm.key, i)
+			if slots[0].Base != seeded["base"].Record["manifest_id"] {
+				t.Fatalf("%s replaced the original base custody", arm.key)
 			}
-			if adapter.Scale != arm.scales[i] {
-				t.Fatalf("%s changed adapter %d strength: %s", arm.key, i, adapter.Scale)
+			if len(slots[0].Components) != 1 || (slots[0].Components[0] != slots[0].Base) != (len(arm.scales) > 0) {
+				t.Fatalf("%s served no selected component view: %+v", arm.key, slots[0])
+			}
+			views[arm.key] = slots[0].Components[0]
+			if arm.key == "root-repeat" || arm.key == "child-stack" {
+				if views[arm.key] != views["root-stack"] {
+					t.Fatalf("%s changed the same ordered component view", arm.key)
+				}
+			}
+			if arm.key == "root-reversed" || arm.key == "root-zero" {
+				if views[arm.key] == views["root-stack"] {
+					t.Fatalf("%s reused a different stack's component view", arm.key)
+				}
+			}
+			stack := slots[0].Stack
+			if len(stack) != len(arm.scales) {
+				t.Fatalf("%s served %d adapters; requested %d", arm.key, len(stack), len(arm.scales))
+			}
+			t.Logf("%s: score=%d adapters=%d component=%s", arm.key, arm.score, len(stack), views[arm.key])
+			for i, adapter := range stack {
+				name := []string{"first", "second"}[i]
+				if arm.key == "root-reversed" {
+					name = []string{"second", "first"}[i]
+				}
+				if adapter.Manifest != seeded[name].Record["manifest_id"] {
+					t.Fatalf("%s changed adapter %d selection", arm.key, i)
+				}
+				if adapter.Scale != arm.scales[i] {
+					t.Fatalf("%s changed adapter %d strength: %s", arm.key, i, adapter.Scale)
+				}
 			}
 		}
 	}
