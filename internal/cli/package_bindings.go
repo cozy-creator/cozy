@@ -183,8 +183,9 @@ func handlePackageBind(ctx *Context) *exit.Error {
 }
 
 // changed tells the machines the daemon knows that this command changed ref's releases or
-// bindings: each read the package once and keeps it, so only this names the change. A
-// machine it cannot reach keeps what it read until it restarts, and the note says so.
+// bindings: each read the package or model once and keeps it, so only this names the change.
+// A machine it cannot reach keeps what it read until it is told or stopped, and the note
+// says so.
 func changed(ctx *Context, ref hub.Ref) []string {
 	state, _, problem := ensureDaemon(ctx)
 	if problem == nil {

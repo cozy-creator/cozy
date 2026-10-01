@@ -154,7 +154,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 			return exit.Internalf("Tensorhub returned a different model release lane map")
 		}
 	}
-	return emit(ctx, compactRecord([]output.Field{
+	return emitModelChange(ctx, ref, updated.Changed, compactRecord([]output.Field{
 		{K: "model", V: ref.String()}, {K: "release", V: release},
 		{K: "revision", V: updated.Revision}, {K: "lanes", V: lanes},
 		{K: "status", V: "published"}, {K: "changed", V: updated.Changed},
@@ -199,7 +199,7 @@ func handleModelRetarget(ctx *Context) *exit.Error {
 	if lanes[lane] != checkpoint {
 		return exit.Internalf("Tensorhub returned a different lane pointer")
 	}
-	return emit(ctx, compactRecord([]output.Field{
+	return emitModelChange(ctx, ref, updated.Changed, compactRecord([]output.Field{
 		{K: "model", V: ref.String()}, {K: "release", V: release},
 		{K: "lane", V: lane}, {K: "checkpoint", V: checkpoint},
 		{K: "revision", V: updated.Revision}, {K: "status", V: "retargeted"},
@@ -230,11 +230,20 @@ func handleModelYank(ctx *Context) *exit.Error {
 	if yanked.Release != release || yanked.Revision < 1 || !yanked.Yanked {
 		return exit.Internalf("Tensorhub returned an invalid yanked model release")
 	}
-	return emit(ctx, compactRecord([]output.Field{
+	return emitModelChange(ctx, ref, yanked.Changed, compactRecord([]output.Field{
 		{K: "model", V: ref.String()}, {K: "release", V: release},
 		{K: "revision", V: yanked.Revision}, {K: "status", V: "yanked"},
 		{K: "changed", V: yanked.Changed},
 	}, "model", "release", "revision", "status", "changed"))
+}
+
+// emitModelChange tells the machines this daemon knows that a model's releases or lanes
+// changed: each keeps what it read of the model until told, as it does a package.
+func emitModelChange(ctx *Context, ref hub.Ref, changedAtHub bool, record output.Record) *exit.Error {
+	if changedAtHub {
+		record.Notes = append(record.Notes, changed(ctx, ref)...)
+	}
+	return emit(ctx, record)
 }
 
 // handleModelDelete deletes a Tensorhub model or one unreleased checkpoint. Cozy never
