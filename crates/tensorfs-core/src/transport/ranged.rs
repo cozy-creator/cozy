@@ -16,9 +16,9 @@
 //! HuggingFace fetch through this code moved at **18.9 MB/s on one stream and 19.1 MB/s on
 //! eight 64 MiB parts** — the link was already saturated by one. On a link like that,
 //! cutting an object into parts moves bytes from one socket to another and changes no
-//! total. `SOURCE_STREAMS` is therefore 1, and parallelism is a parameter kept for the one
-//! case still argued for — the TAIL of a multi-object pull, where fewer objects remain than
-//! there are lanes — which nobody has measured yet.
+//! total. `SOURCE_STREAMS` is therefore 1. The one case parallelism wins — the TAIL of a
+//! multi-object pull, where fewer objects remain than lanes and an origin answers some
+//! asks application-limited (run 2322) — is the hub walk's `hedge`.
 //!
 //! So there are three paths, and the default is the cheap one:
 //!
@@ -92,8 +92,8 @@ use std::sync::{Condvar, Mutex};
 /// object — and buys it at zero extra disk, because one stream needs no scratch file.
 /// Parallelism stays one parameter away for the case still argued for: the TAIL of a
 /// multi-object pull, where fewer objects remain than there are lanes and per-object
-/// concurrency is the only thing that can fill them. That case is real and bounded, and
-/// nobody has measured it yet; when someone does, this constant is where the answer goes.
+/// concurrency is the only thing that can fill them. Run 2322 measured that case on hub
+/// pulls, and `hedge` answers it there: a slow tail object is split over idle lanes.
 pub const SOURCE_STREAMS: usize = 1;
 
 /// One ranged ask's slice and resume unit. The original close-per-request client measured
@@ -235,6 +235,7 @@ pub fn fetch_ranged(
         deadline,
         ledger,
         ranged,
+        false,
         observer,
     )
 }
@@ -269,6 +270,7 @@ pub(super) fn hedge(
         deadline,
         ledger,
         ranged,
+        true,
         None,
     )
 }
@@ -381,6 +383,8 @@ struct State {
     /// starts at this mark, so what is below it stays one contiguous run.
     reached: Vec<u64>,
     racers: Vec<usize>,
+    /// A racer exhausted its asks on this part; it is not raced again.
+    refused: Vec<bool>,
     next: usize,
     /// Parts `0..contiguous` are complete on disk, so bytes below `contiguous * part` may
     /// be handed to the door. Nothing above it may, hole or not.
@@ -400,10 +404,10 @@ impl Wire {
             .push((attempt, host.to_string(), status));
     }
 
-    /// The next part nobody has asked for, else a race on the unfinished part with the
-    /// fewest racers and the most bytes left, from that part's mark. A lane that finished
-    /// its own part thereby heals the slowest one instead of idling.
-    fn claim(&self, part: u64, total: u64) -> Option<(usize, u64)> {
+    /// The next part nobody has asked for. A hedge then races the unfinished part with the
+    /// fewest racers and the most bytes left, from that part's mark: a lane that finished
+    /// its own part heals the slowest one instead of idling.
+    fn claim(&self, part: u64, total: u64, race: bool) -> Option<(usize, u64)> {
         let mut state = self.state.lock().unwrap();
         if state.failure.is_some() || self.stopped() {
             return None;
@@ -411,10 +415,12 @@ impl Wire {
         let index = if state.next < state.done.len() {
             state.next += 1;
             state.next - 1
+        } else if !race {
+            return None;
         } else {
             let end = |index: usize| ((index as u64 + 1) * part).min(total);
             (0..state.done.len())
-                .filter(|&index| !state.done[index])
+                .filter(|&index| !state.done[index] && !state.refused[index])
                 .min_by_key(|&index| {
                     (
                         state.racers[index],
@@ -437,10 +443,12 @@ impl Wire {
         self.state.lock().unwrap().done[index]
     }
 
-    /// A racer left part `index`. Its refusal stands only if nobody else is on the part.
+    /// A racer left part `index`. A refusal retires the part from racing, and fails the
+    /// object once nobody else is on it.
     fn leave(&self, index: usize, refusal: Option<Refusal>) {
         let mut state = self.state.lock().unwrap();
         state.racers[index] -= 1;
+        state.refused[index] |= refusal.is_some();
         let orphaned = state.racers[index] == 0 && !state.done[index];
         drop(state);
         if let Some(refusal) = refusal.filter(|_| orphaned) {
@@ -573,6 +581,7 @@ fn assemble(
     deadline: Deadline,
     ledger: &Ledger,
     ranged: Ranged,
+    race: bool,
     observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
     let parts = total.div_ceil(ranged.part) as usize;
@@ -582,6 +591,7 @@ fn assemble(
             done: vec![false; parts],
             reached: (0..parts as u64).map(|index| index * ranged.part).collect(),
             racers: vec![0; parts],
+            refused: vec![false; parts],
             next: 0,
             contiguous: 0,
             failure: None,
@@ -599,7 +609,7 @@ fn assemble(
         for _ in 0..streams {
             scope.spawn(|| {
                 let _worker = Worker(&wire);
-                while let Some((index, from)) = wire.claim(ranged.part, total) {
+                while let Some((index, from)) = wire.claim(ranged.part, total, race) {
                     let outcome = part(
                         &wire,
                         &scratch.file,
@@ -653,9 +663,10 @@ fn assemble(
             Err(door) => Err(wire.state.lock().unwrap().failure.take().unwrap_or(door)),
         }
     })?;
+    // Racing parts write some bytes twice; the ledger counts those, the object once.
     Ok(Fetched {
         admitted,
-        transferred: wire.moved.load(Ordering::Relaxed),
+        transferred: wire.moved.load(Ordering::Relaxed).min(total),
     })
 }
 

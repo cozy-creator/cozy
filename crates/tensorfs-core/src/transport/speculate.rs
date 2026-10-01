@@ -1,6 +1,6 @@
-//! Hedged recovery of slow object streams. An object's original GET races whatever
-//! hedges the walk's idle lanes can carry; the first verified admission wins and stops
-//! the rest. A hedge is earned by measurement, never by a timer: a stream is slow when,
+//! Hedged recovery of slow object streams. An object's original GET may race one hedge
+//! on the walk's idle lanes; the first verified admission wins and stops the other. A
+//! hedge is earned by measurement, never by a timer: a stream is slow when,
 //! at its own measured network rate, what it has left would take more than
 //! `STALL_FACTOR` times the pull's best completed transfer of a comparable object.
 //!
@@ -127,10 +127,14 @@ impl Recovery {
         loop {
             let racing = self.racing.load(Ordering::Acquire);
             let spare = lanes.level.saturating_sub(lanes.busy + racing);
-            let want = share.min(spare).min(parts);
-            // A ranged hedge assembles in scratch before its door writes the object.
-            let copies = if want > 1 { 2 } else { 1 };
-            if want == 0 || store.admits(length.saturating_mul(copies)).is_err() {
+            let mut want = share.min(spare).min(parts);
+            // Room for the original's object beside the hedge's copies: a ranged hedge
+            // assembles in scratch before its door writes, so a disk without room for
+            // both still takes one whole GET.
+            if want > 1 && store.admits(length.saturating_mul(3)).is_err() {
+                want = 1;
+            }
+            if want == 0 || store.admits(length.saturating_mul(2)).is_err() {
                 return None;
             }
             if self
