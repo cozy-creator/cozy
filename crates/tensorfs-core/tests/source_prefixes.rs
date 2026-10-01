@@ -207,7 +207,9 @@ fn kill_at(dir: &std::path::Path, origin: &Origin, stage: &str) {
         .stderr(fs::File::create(dir.join("child-stderr")).unwrap())
         .spawn()
         .unwrap();
-    for _ in 0..2000 {
+    // The fault cut is authorized by its actual marker, not by how long a busy
+    // filesystem took to admit the prefix. A terminal child still fails loudly.
+    loop {
         if dir.join("ready").is_file() {
             break;
         }
