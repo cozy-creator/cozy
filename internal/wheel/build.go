@@ -24,6 +24,8 @@ type Request struct {
 	Tree    string
 	OutDir  string
 	Python  string
+	// Env adds build-process variables, e.g. SOURCE_DATE_EPOCH for a pinned source.
+	Env []string
 }
 
 type Result struct {
@@ -92,7 +94,7 @@ func Build(req Request) (*Result, *exit.Error) {
 	}
 	args = append(args, root)
 	cmd := exec.CommandContext(ctx, "uv", args...)
-	cmd.Env = config.Frozen().Tool()
+	cmd.Env = config.Frozen().Tool(req.Env...)
 	cmd.WaitDelay = 250 * time.Millisecond
 	processtree.Prepare(cmd)
 	cmd.Cancel = func() error {

@@ -36,6 +36,7 @@ type registryPackage struct {
 	Index   string          `toml:"index"`
 	Name    string          `toml:"name"`
 	Sdist   map[string]any  `toml:"sdist"`
+	VCS     map[string]any  `toml:"vcs"`
 	Version string          `toml:"version"`
 	Wheels  []registryWheel `toml:"wheels"`
 }
@@ -156,6 +157,15 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, account string
 			continue
 		}
 		name := normalizedProjectName(pkg.Name)
+		if pkg.VCS != nil {
+			// A pinned git source rides as the wheel built at its commit, never as a row.
+			if _, carried := seen[name]; carried {
+				continue
+			}
+			return nil, exit.Named(exit.Validation, "registry_dependency_git_undeclared",
+				"%s is locked to a git source this package does not declare", name).
+				WithRemedy("add `%s @ git+https://<host>/<repository>@<40-hex commit>` to [project].dependencies", name)
+		}
 		if name == "" || strings.TrimSpace(pkg.Version) == "" {
 			return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
 				"pylock.toml contains a package without an exact name and version")
