@@ -180,7 +180,7 @@ fn the_real_headers_select_the_anima_profile_and_plan_the_constructor_census() {
         &plan.target,
         &inputs,
         &CarrierSet::of(staged.carriers()),
-        Some(&registry),
+        source::Classify::Banked(&registry),
         None,
     )
     .unwrap();
@@ -378,7 +378,7 @@ fn a_synthetic_carrier_with_the_real_layout_ingests_to_the_constructor_census() 
         &plan.target,
         &inputs,
         &CarrierSet::of(&carriers),
-        Some(&registry),
+        source::Classify::Banked(&registry),
         None,
     )
     .unwrap();

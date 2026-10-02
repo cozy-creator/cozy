@@ -575,6 +575,7 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
         }
         let profile = SourceProfile {
             auto_select: true,
+            grammar: None,
             name: name.to_string(),
             components,
         };
@@ -589,7 +590,7 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
             &target,
             &unnamed(&srcs),
             &CarrierSet::default(),
-            Some(&reg),
+            source_core::Classify::Banked(&reg),
             variant,
         ) {
             Ok(prepared) => prepared,
@@ -659,6 +660,7 @@ pub fn cmd_source_plan(f: &Flags) -> ExitCode {
 
 struct ClosedSourcePlan {
     converter: String,
+    profile: String,
     order: Vec<(String, String)>,
     registry: String,
     session: String,
@@ -828,6 +830,7 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
     }
     Ok(ClosedSourcePlan {
         converter,
+        profile,
         order,
         registry,
         session,
@@ -850,10 +853,7 @@ fn prepare_closed_source_plan(
     if closed.registry != BUILTIN_REGISTRY {
         flags.push(("registry".to_string(), closed.registry.clone()));
     }
-    let as_is = closed.converter == convert::IDENTITY;
-    if as_is {
-        flags.push(("source-profile".to_string(), source_core::AS_IS.to_string()));
-    }
+    flags.push(("source-profile".to_string(), closed.profile.clone()));
     for (component, source) in &closed.sources {
         flags.push((
             "source".to_string(),
@@ -865,7 +865,7 @@ fn prepare_closed_source_plan(
         &closed.target,
         &closed.sources,
         &closed.set,
-        (!as_is).then_some(&registry),
+        source_core::classify(&registry, &closed.profile).map_err(bail)?,
         None,
     )
     .map_err(bail)?;
@@ -1000,12 +1000,12 @@ fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
     let sources = sources(f)?;
     let registry = load_registry(f)?;
     let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
-    let as_is = flag(f, "source-profile") == Some(source_core::AS_IS);
     source_core::prepare(
         target,
         &unnamed(&sources),
         &CarrierSet::default(),
-        (!as_is).then_some(&registry),
+        source_core::classify(&registry, flag(f, "source-profile").unwrap_or_default())
+            .map_err(bail)?,
         variant,
     )
     .map_err(bail)

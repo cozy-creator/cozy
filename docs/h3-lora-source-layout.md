@@ -45,6 +45,15 @@ and head-interleaved QKV factors can have identical names, dtypes and shapes, so
 the header fingerprint cannot choose between them. An explicit raw `as-is/1`
 selection still preserves bytes without interpreting their layout.
 
+Both profiles match by grammar, not by an exact key list: every key carries the
+profile's prefix (`diffusion_model.` or `lora_unet_`) and the `h3.lora/2` planner
+accepts it. That admits any non-empty set of complete A/B pairs with an optional
+scalar alpha on the reviewed projections, so attention-only fal trainer exports
+convert. Unknown keys, half pairs and A/B rank disagreement refuse; a carrier the
+grammar rejects is stored as-is when no profile is declared. AdaLN factors
+(`adaln_proj`) refuse `ADAPTER_TARGET_UNSUPPORTED`: the converter has no mapping
+for them and dropping them would change the adapter.
+
 Selecting `/2` declares the trainer/Comfy contiguous-QKV contract. Before choosing
 it for an unknown producer, review the exporter's declaration and loading code
 and check equivalent projected Q/K/V outputs independently. Explicit selection

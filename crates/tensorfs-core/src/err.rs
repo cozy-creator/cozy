@@ -134,6 +134,9 @@ codes![
     PLACEMENT_UNFIT,
     CONVERT_SIZE_CAP,
     SEAM_UNBANKED,
+    // An adapter factor targets a module the reviewed converter cannot map; dropping it
+    // would change the adapter.
+    ADAPTER_TARGET_UNSUPPORTED,
     // ingest border: the temporary candidate transaction
     QUOTA_EXHAUSTED,
     ROOT_EXPIRED,

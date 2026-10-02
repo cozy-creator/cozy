@@ -6,13 +6,20 @@ use std::{
 use tensorfs_core::{
     canon::{self, Value},
     catalog::Catalog,
+    checkpoint,
     err::Code,
     header::{Body, Part},
+    ids::ObjectRef,
     ingest::{
         carrier,
         convert::{self, Bytes, Source, Target},
-        journal, transaction,
+        fingerprint::FingerprintRegistry,
+        journal, preflight,
+        source::{self, ModelSourceProfile, SelectedSourceMember},
+        source::{AS_IS, BUILTIN_REGISTRY, BUILTIN_REGISTRY_BYTES},
+        transaction,
     },
+    providers::MemberHead,
     registry,
     spec::EncodingSpec,
     store::Store,
@@ -25,15 +32,21 @@ fn specs() -> Vec<(String, EncodingSpec)> {
         .map(|s| (s.alias.into(), s.spec))
         .collect()
 }
-fn write_source(root: &Path, kohya: bool, prefix: &str) -> transaction::SourceFile {
+fn write_source(
+    root: &Path,
+    kohya: bool,
+    prefix: &str,
+    attention_only: bool,
+) -> transaction::SourceFile {
     let mut payload = Vec::new();
     let mut tensors = Vec::new();
-    for (native, flat, input, output) in [
+    let projections = [
         ("attn.qkv_proj", "attn_qkv_proj", 5376, 21504),
         ("attn.out_proj", "attn_out_proj", 7168, 5376),
         ("mlp.fc1", "mlp_fc1", 5376, 28672),
         ("mlp.fc2", "mlp_fc2", 14336, 5376),
-    ] {
+    ];
+    for (native, flat, input, output) in &projections[..if attention_only { 2 } else { 4 }] {
         let stem = if kohya {
             format!("lora_unet_blocks_0_{flat}")
         } else {
@@ -46,7 +59,7 @@ fn write_source(root: &Path, kohya: bool, prefix: &str) -> transaction::SourceFi
         };
         for (role, shape) in roles
             .into_iter()
-            .zip([vec![2, input], vec![output, 2], vec![]])
+            .zip([vec![2, *input], vec![*output, 2], vec![]])
         {
             let start = payload.len();
             for i in 0..shape.iter().product::<u64>() {
@@ -130,7 +143,7 @@ fn trainer_fused_projection_and_converted_qkv_have_the_same_heads() {
     // and compare every head element after the actual resumable ingest writer.
     for kohya in [false, true] {
         let root = root();
-        let file = write_source(&root, kohya, "blocks.0");
+        let file = write_source(&root, kohya, "blocks.0", false);
         let carrier_bytes = fs::read(&file.path).unwrap();
         let read = |suffix: &str| {
             let tensor = file
@@ -222,7 +235,7 @@ fn both_dialects_permute_only_b_rows_and_resume_without_new_bytes() {
         ),
     ] {
         let root = root();
-        let file = write_source(&root, kohya, prefix);
+        let file = write_source(&root, kohya, prefix, false);
         let plan = plan(&file).unwrap();
         assert_eq!(plan.ops.len(), 18);
         let mut wrong = plan.clone();
@@ -320,7 +333,7 @@ fn bad_pair_shape_unknown_tensor_and_unreviewed_geometry_refuse_before_payload()
         Code::UNKNOWN_FIELD
     );
     let root = root();
-    let file = write_source(&root, false, "blocks.0");
+    let file = write_source(&root, false, "blocks.0", false);
     for (kind, want) in [
         ("missing", Code::MISSING_COMPANION_ROLE),
         ("rank", Code::SHAPE_MISMATCH),
@@ -360,63 +373,147 @@ fn bad_pair_shape_unknown_tensor_and_unreviewed_geometry_refuse_before_payload()
     fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn real_headers_match_by_structure_and_multiple_versions_require_file_selection() {
-    use tensorfs_core::{
-        ingest::{preflight, source},
-        providers::MemberHead,
+struct Fixture {
+    member: String,
+    full_length: u64,
+    profile: String,
+    constructs: Option<usize>,
+    refusal: Option<String>,
+    session: Option<String>,
+}
+
+fn fixtures() -> (PathBuf, Vec<Fixture>) {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/h3-lora-headers");
+    let Value::Arr(rows) =
+        canon::parse(&fs::read(dir.join("MANIFEST.json")).unwrap(), 1 << 20).unwrap()
+    else {
+        panic!("manifest array")
     };
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/h3-lora-headers");
-    let rows = canon::parse(&fs::read(fixtures.join("MANIFEST.json")).unwrap(), 1 << 20).unwrap();
-    let Value::Arr(rows) = rows else {
-        panic!("array")
-    };
-    let mut heads = Vec::new();
-    for row in rows {
-        let Value::Obj(fields) = row else {
-            panic!("object")
-        };
-        let get = |key: &str| &fields.iter().find(|(k, _)| k == key).unwrap().1;
-        let Value::Str(member) = get("member") else {
-            panic!("member")
-        };
-        let Value::Int(length) = get("full_length") else {
-            panic!("length")
-        };
-        let head = fs::read(fixtures.join(member)).unwrap();
-        let candidate = MemberHead {
-            member: format!("renamed/{member}"),
-            length: *length as u64,
-            head,
-        };
-        let root = root();
-        let result = preflight::plan(
-            source::BUILTIN_REGISTRY,
-            source::BUILTIN_REGISTRY_BYTES,
-            std::slice::from_ref(&candidate),
-            &[if member.contains("spatial") {
-                "h3/native-lora-a-b/2"
-            } else {
-                "h3/native-lora-kohya/2"
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            let Value::Obj(fields) = row else {
+                panic!("object")
+            };
+            let get = |key: &str| fields.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+            let text = |key: &str| match get(key) {
+                Some(Value::Str(value)) => Some(value.clone()),
+                _ => None,
+            };
+            let int = |key: &str| match get(key) {
+                Some(Value::Int(value)) => Some(*value as u64),
+                _ => None,
+            };
+            Fixture {
+                member: text("member").unwrap(),
+                full_length: int("full_length").unwrap(),
+                profile: text("profile").unwrap(),
+                constructs: int("constructs").map(|n| n as usize),
+                refusal: text("refusal"),
+                session: text("session"),
             }
-            .into()],
-            &root.join("sparse"),
-        )
-        .unwrap();
-        assert_eq!(result.plans.len(), 1);
-        assert_eq!(result.plans[0].converter, "h3.lora/2");
-        assert_eq!(
-            result.plans[0].constructs,
-            if member.contains("spatial") { 624 } else { 900 }
-        );
-        assert!(!root.join("sparse").exists());
-        fs::remove_dir_all(root).unwrap();
-        heads.push(candidate);
+        })
+        .collect();
+    (dir, rows)
+}
+
+/// A safetensors head over `tensors` laid out contiguously; the payload stays a hole.
+fn head(member: &str, tensors: &[(String, String, Vec<u64>)]) -> MemberHead {
+    let mut offset = 0u64;
+    let mut fields = Vec::new();
+    for (key, dtype, shape) in tensors {
+        let size = shape.iter().product::<u64>() * if dtype == "F32" { 4 } else { 2 };
+        fields.push((
+            key.clone(),
+            Value::obj(vec![
+                ("dtype", Value::str(dtype.clone())),
+                (
+                    "shape",
+                    Value::arr(shape.iter().copied().map(Value::uint).collect()),
+                ),
+                (
+                    "data_offsets",
+                    Value::arr(vec![Value::uint(offset), Value::uint(offset + size)]),
+                ),
+            ]),
+        ));
+        offset += size;
     }
+    let header = canon::write(&Value::map(fields));
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header);
+    MemberHead {
+        member: member.into(),
+        length: bytes.len() as u64 + offset,
+        head: bytes,
+    }
+}
+
+fn preflight(
+    head: &MemberHead,
+    profile: Option<&str>,
+    scratch: &Path,
+) -> tensorfs_core::err::Result<preflight::ProfilePlan> {
+    let heads = std::slice::from_ref(head);
+    let profile = match profile {
+        Some(profile) => profile.to_string(),
+        None => {
+            preflight::select_profile(BUILTIN_REGISTRY, BUILTIN_REGISTRY_BYTES, heads, scratch)?
+        }
+    };
+    let mut planned = preflight::plan(
+        BUILTIN_REGISTRY,
+        BUILTIN_REGISTRY_BYTES,
+        heads,
+        &[profile],
+        scratch,
+    )?;
+    assert!(!scratch.exists());
+    Ok(planned.plans.remove(0))
+}
+
+#[test]
+fn real_headers_plan_by_grammar_and_multiple_versions_require_file_selection() {
+    let registry = FingerprintRegistry::parse(BUILTIN_REGISTRY_BYTES).unwrap();
+    assert_eq!(registry.to_bytes(), BUILTIN_REGISTRY_BYTES);
+    let (dir, rows) = fixtures();
     let root = root();
+    let mut heads = Vec::new();
+    for row in &rows {
+        let head = MemberHead {
+            member: format!("renamed/{}", row.member),
+            length: row.full_length,
+            head: fs::read(dir.join(&row.member)).unwrap(),
+        };
+        let scratch = root.join("sparse");
+        let declared = preflight(&head, Some(&row.profile), &scratch);
+        let other = if row.profile.ends_with("a-b/2") {
+            "h3/native-lora-kohya/2"
+        } else {
+            "h3/native-lora-a-b/2"
+        };
+        if let Some(code) = &row.refusal {
+            assert_eq!(declared.unwrap_err().code.as_str(), code, "{}", row.member);
+            // A layout the converter cannot map is stored as it is, never refused.
+            assert_eq!(preflight(&head, None, &scratch).unwrap().profile, AS_IS);
+            continue;
+        }
+        let declared = declared.unwrap();
+        assert_eq!(declared.converter, "h3.lora/2");
+        assert_eq!(Some(declared.constructs), row.constructs, "{}", row.member);
+        if let Some(session) = &row.session {
+            assert_eq!(&declared.session, session, "{}", row.member);
+        }
+        let dialect = preflight(&head, Some(other), &scratch).unwrap_err();
+        assert_eq!(dialect.code, Code::KEY_GRAMMAR, "{}", row.member);
+        let undeclared = preflight(&head, None, &scratch).unwrap_err();
+        assert_eq!(undeclared.code, Code::AMBIGUOUS_CLASSIFICATION);
+        assert!(undeclared.detail.contains(&row.profile) && !undeclared.detail.contains(other));
+        heads.push(head);
+    }
     let error = preflight::plan(
-        source::BUILTIN_REGISTRY,
-        source::BUILTIN_REGISTRY_BYTES,
+        BUILTIN_REGISTRY,
+        BUILTIN_REGISTRY_BYTES,
         &heads[..2],
         &["h3/native-lora-a-b/2".into()],
         &root.join("sparse"),
@@ -429,12 +526,225 @@ fn real_headers_match_by_structure_and_multiple_versions_require_file_selection(
 }
 
 #[test]
+fn grammar_takes_complete_subsets_and_refuses_half_pairs_mixed_ranks_unknown_and_adaln_keys() {
+    let (dir, _) = fixtures();
+    let real = fs::read(dir.join("h3-realism-people-t2v-i2v-r2v.safetensors")).unwrap();
+    let Value::Obj(fields) = canon::parse(&real[8..], 1 << 20).unwrap() else {
+        panic!("header")
+    };
+    let tensors: Vec<(String, String, Vec<u64>)> = fields
+        .into_iter()
+        .filter(|(key, _)| key != "__metadata__")
+        .map(|(key, value)| {
+            let Value::Obj(fields) = value else {
+                panic!("tensor")
+            };
+            let get = |name: &str| &fields.iter().find(|(k, _)| k == name).unwrap().1;
+            let (Value::Str(dtype), Value::Arr(shape)) = (get("dtype"), get("shape")) else {
+                panic!("dtype/shape")
+            };
+            let shape = shape
+                .iter()
+                .map(|dim| match dim {
+                    Value::Int(dim) => *dim as u64,
+                    _ => panic!("dim"),
+                })
+                .collect();
+            (key, dtype.clone(), shape)
+        })
+        .collect();
+    let qkv = "diffusion_model.blocks.7.attn.qkv_proj";
+    let adaln = "diffusion_model.blocks.7.adaln_proj.linear";
+    let root = root();
+    for (case, refusal) in [
+        ("one module with alpha", None),
+        ("half pair", Some(Code::MISSING_COMPANION_ROLE)),
+        ("mixed rank", Some(Code::SHAPE_MISMATCH)),
+        ("unknown key", Some(Code::UNKNOWN_FIELD)),
+        ("adaln pair", Some(Code::ADAPTER_TARGET_UNSUPPORTED)),
+    ] {
+        let mut t = tensors.clone();
+        let tensor = |key: String, dtype: &str, shape: &[u64]| (key, dtype.into(), shape.to_vec());
+        match case {
+            "one module with alpha" => {
+                t.retain(|(key, ..)| key.starts_with("diffusion_model.blocks.7.attn.out_proj."));
+                t.push(tensor(
+                    "diffusion_model.blocks.7.attn.out_proj.alpha".into(),
+                    "F32",
+                    &[],
+                ));
+            }
+            "half pair" => t.retain(|(key, ..)| *key != format!("{qkv}.lora_B.weight")),
+            "mixed rank" => {
+                let a = format!("{qkv}.lora_A.weight");
+                t.iter_mut().find(|(key, ..)| *key == a).unwrap().2[0] = 16;
+            }
+            "unknown key" => t.push(tensor(
+                format!("{qkv}.lora_magnitude_vector"),
+                "BF16",
+                &[21504],
+            )),
+            _ => {
+                t.push(tensor(
+                    format!("{adaln}.lora_A.weight"),
+                    "BF16",
+                    &[32, 2688],
+                ));
+                t.push(tensor(
+                    format!("{adaln}.lora_B.weight"),
+                    "BF16",
+                    &[96768, 32],
+                ));
+            }
+        }
+        let head = head("adapter.safetensors", &t);
+        let scratch = root.join("sparse");
+        let declared = preflight(&head, Some("h3/native-lora-a-b/2"), &scratch);
+        let undeclared = preflight(&head, None, &scratch);
+        match refusal {
+            None => {
+                assert_eq!(declared.unwrap().constructs, 3, "{case}");
+                assert_eq!(
+                    undeclared.unwrap_err().code,
+                    Code::AMBIGUOUS_CLASSIFICATION,
+                    "{case}"
+                );
+            }
+            Some(code) => {
+                assert_eq!(declared.unwrap_err().code, code, "{case}");
+                assert_eq!(undeclared.unwrap().profile, AS_IS, "{case}");
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The path an upload takes on a pod: header preflight, landed body, then
+/// `prepare_selected_source` under the declared profile.
+#[test]
+fn attention_only_upload_converts_under_the_declared_profile() {
+    let root = root();
+    let file = write_source(&root, false, "blocks.0", true);
+    let body = fs::read(&file.path).unwrap();
+    let head = MemberHead {
+        member: "trainer-output.safetensors".into(),
+        length: body.len() as u64,
+        head: body[..file.header.data_start as usize].to_vec(),
+    };
+    let profile = "h3/native-lora-a-b/2";
+    let planned = preflight(&head, Some(profile), &root.join("sparse")).unwrap();
+    assert_eq!(planned.constructs, 12);
+    let store = Store::init(&root.join("store")).unwrap();
+    let object = ObjectRef::of(&body);
+    store
+        .put_stream(&mut body.as_slice(), Some(&object), &Default::default())
+        .unwrap();
+    let (prepared, _) = source::prepare_selected_source(
+        &store,
+        &format!("upload-{}", "ab".repeat(28)),
+        &format!("sha256:{}", "11".repeat(32)),
+        vec![ModelSourceProfile {
+            slot: "adapter".into(),
+            profile: profile.into(),
+        }],
+        &[SelectedSourceMember {
+            member: head.member.clone(),
+            object,
+            header: head.head.clone(),
+        }],
+        BUILTIN_REGISTRY,
+        BUILTIN_REGISTRY_BYTES,
+        None,
+    )
+    .unwrap();
+    assert!(prepared.complete);
+    let manifest = store
+        .read_manifest(&ObjectRef {
+            sha256: prepared.sources[0].manifest_digest["sha256:".len()..].into(),
+            length: prepared.sources[0].manifest_length,
+        })
+        .unwrap();
+    let header = checkpoint::load_header(&store, manifest.header().unwrap()).unwrap();
+    let tensors = &header.components[0].1;
+    assert_eq!(tensors.len(), 12);
+    // Contiguous thirds of the fused B: each projection starts 7168 rank-2 rows on.
+    for (part, first) in [("q", 1.), ("k", 14337.), ("v", 28673.)] {
+        let key = format!("transformer_blocks.0.attn.to_{part}.lora_B.weight");
+        let tensor = &tensors.iter().find(|(name, _)| name == &key).unwrap().1;
+        let converted = bytes(&store, &tensor.parts[0].1);
+        assert_eq!(converted.len(), 7168 * 2 * 4);
+        assert_eq!(
+            f32::from_le_bytes(converted[..4].try_into().unwrap()),
+            first
+        );
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn attention_only_subset_converts_through_the_cli_source_plan() {
+    use std::process::Command;
+    let root = root();
+    let file = write_source(&root, false, "token_refiner.blocks.1", true);
+    let source_plan = root.join("source-plan.json");
+    let store = root.join("store");
+    for args in [
+        vec!["store", "init", store.to_str().unwrap()],
+        vec![
+            "ingest",
+            "source-plan",
+            "--source-profile",
+            "h3/native-lora-a-b/2",
+            "--carrier",
+            file.path.to_str().unwrap(),
+            "--out",
+            source_plan.to_str().unwrap(),
+        ],
+        vec![
+            "ingest",
+            "run",
+            store.to_str().unwrap(),
+            "--source-plan",
+            source_plan.to_str().unwrap(),
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let carrier = source::CarrierInput {
+        member: None,
+        path: file.path.clone(),
+    };
+    let plan = source::plan_source(
+        BUILTIN_REGISTRY,
+        BUILTIN_REGISTRY_BYTES,
+        &[carrier],
+        Some("h3/native-lora-a-b/2"),
+        None,
+    )
+    .unwrap();
+    let receipt = root
+        .join("store/tmp/ingest")
+        .join(&plan.session)
+        .join("receipt.json");
+    let receipt = String::from_utf8(fs::read(receipt).unwrap()).unwrap();
+    assert!(receipt.contains("\"tensors\":12") && receipt.contains("\"golden_cases\":2"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn ambiguous_fused_exporter_needs_a_declared_layout_before_preflight_or_planning() {
     use std::cell::Cell;
-    use tensorfs_core::{
-        ingest::{preflight, source},
-        providers::{MemberHead, Provenance, Resolution, ResolvedMember},
-    };
+    use tensorfs_core::providers::{Provenance, Resolution, ResolvedMember};
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/h3-lora-headers");
     let Value::Arr(rows) =
         canon::parse(&fs::read(fixtures.join("MANIFEST.json")).unwrap(), 1 << 20).unwrap()
@@ -484,7 +794,7 @@ fn ambiguous_fused_exporter_needs_a_declared_layout_before_preflight_or_planning
 fn full_cli_conversion_mints_a_receipt_after_the_live_golden_suite() {
     use std::process::Command;
     let root = root();
-    let file = write_source(&root, false, "blocks.0");
+    let file = write_source(&root, false, "blocks.0", false);
     let plan = plan(&file).unwrap();
     let order = root.join("order.json");
     fs::write(

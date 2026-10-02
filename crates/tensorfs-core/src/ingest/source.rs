@@ -23,7 +23,7 @@ use crate::store::Store;
 use super::carrier::{self, SourceHeader};
 use super::convert::{self, Converter, Plan, Rekey, Source, Target};
 use super::fingerprint::{
-    self, Banked, Fingerprint, FingerprintRegistry, SourceProfile, SourceProfileComponent,
+    self, Banked, Fingerprint, FingerprintRegistry, Grammar, SourceProfile, SourceProfileComponent,
 };
 use super::transaction::{self, SourceFile};
 
@@ -238,18 +238,41 @@ fn enumerate_assignments(
     }
 }
 
+/// Every assignment of carriers to the profile's components, and the first grammar refusal,
+/// which explains an explicitly requested profile that matched nothing.
 fn profile_assignments(
     profile: &SourceProfile,
     registry: &FingerprintRegistry,
     carriers: &[CarrierInput],
     headers: &[SourceHeader],
-) -> Vec<Vec<SourceAssignment>> {
+) -> (Vec<Vec<SourceAssignment>>, Option<Refusal>) {
     let mut candidates = Vec::new();
+    let mut rejected = None;
     for component in &profile.components {
+        let member_matches = |index: usize| match (
+            component.source_member.as_deref(),
+            component.source_member_prefix.as_deref(),
+            carriers[index].member.as_deref(),
+        ) {
+            (Some(expected), None, Some(observed)) => expected == observed,
+            (None, Some(prefix), Some(observed)) => observed.starts_with(prefix),
+            // An explicit empty prefix permits this reviewed structure
+            // under any filename, including a local unlabeled carrier.
+            (None, Some(""), None) | (None, None, None) => true,
+            _ => false,
+        };
         // Carriers banked from this exact tensor schema first; otherwise any carrier with
         // the reviewed key set, whose shapes and dtypes the conversion itself validates.
         let mut exact = Vec::new();
         let mut hits = Vec::new();
+        if let Some(grammar) = &profile.grammar {
+            for index in (0..headers.len()).filter(|index| member_matches(*index)) {
+                match grammar_match(component, grammar, &headers[index]) {
+                    Ok(()) => hits.push((index, false, 0)),
+                    Err(refusal) => drop(rejected.get_or_insert(refusal)),
+                }
+            }
+        }
         for (variant_index, variant) in component.variants.iter().enumerate() {
             for entry in registry.entries.iter().filter(|entry| {
                 entry.component == component.component
@@ -260,19 +283,7 @@ fn profile_assignments(
                     .filter(|c| c.dialect == "safetensors.single_file");
                 let projected = projector.is_some();
                 for (index, header) in headers.iter().enumerate() {
-                    let member_matches = match (
-                        component.source_member.as_deref(),
-                        component.source_member_prefix.as_deref(),
-                        carriers[index].member.as_deref(),
-                    ) {
-                        (Some(expected), None, Some(observed)) => expected == observed,
-                        (None, Some(prefix), Some(observed)) => observed.starts_with(prefix),
-                        // An explicit empty prefix permits this reviewed structure
-                        // under any filename, including a local unlabeled carrier.
-                        (None, Some(""), None) | (None, None, None) => true,
-                        _ => false,
-                    };
-                    if !member_matches {
+                    if !member_matches(index) {
                         continue;
                     }
                     let view = match projector {
@@ -305,7 +316,7 @@ fn profile_assignments(
         }
         let hits = if exact.is_empty() { hits } else { exact };
         if hits.is_empty() {
-            return Vec::new();
+            return (Vec::new(), rejected);
         }
         candidates.push(hits);
     }
@@ -318,7 +329,45 @@ fn profile_assignments(
         &profile.components,
         &mut solutions,
     );
-    solutions
+    (solutions, rejected)
+}
+
+/// A grammar matches when its reviewed converter plans the carrier as this component and
+/// every key carries its prefix. The planner refuses unknown, incomplete or misshapen keys,
+/// so the grammar is the converter's, stated once.
+fn grammar_match(
+    component: &SourceProfileComponent,
+    grammar: &Grammar,
+    header: &SourceHeader,
+) -> Result<()> {
+    let name = component.component.clone();
+    let target = Target {
+        components: vec![(name.clone(), component.target_encoding.clone())],
+    };
+    let source = Source::Carrier {
+        component: name,
+        file: 0,
+        header,
+    };
+    let specs = plain_specs(&specs_for(&target, None)?);
+    convert::plan(
+        convert::converter(&grammar.converter)?,
+        &[source],
+        &target,
+        &specs,
+        &Rekey::default(),
+    )?;
+    let prefix = &grammar.key_prefix;
+    match header.tensors.iter().find(|t| !t.key.starts_with(prefix)) {
+        Some(tensor) => refuse(
+            Code::KEY_GRAMMAR,
+            format!(
+                "{}: outside this profile's key prefix {prefix:?}",
+                tensor.key
+            ),
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Where a Store keeps a reviewed registry newer than the built-in one: shipped as a pinned
@@ -377,6 +426,9 @@ pub fn profile_converters(registry: &[u8], profile: &str) -> Result<Vec<&'static
                 }
             }
         }
+    }
+    if let Some(grammar) = &found.grammar {
+        out.push(convert::converter(&grammar.converter)?);
     }
     if out.is_empty() {
         return refuse(
@@ -549,16 +601,39 @@ pub fn plan_tensor_schema(plan: &Plan) -> Value {
     }))
 }
 
+/// How [`prepare`] names each source's converter.
+#[derive(Clone, Copy)]
+pub enum Classify<'a> {
+    /// Every source stored as it is, through [`convert::IDENTITY`].
+    AsIs,
+    /// Each source's banked fingerprint names its converter.
+    Banked(&'a FingerprintRegistry),
+    /// A grammar profile matched: its reviewed converter plans every source.
+    Grammar(&'static Converter),
+}
+
+/// How sources planned under the reviewed `profile` classify: a grammar profile's converter
+/// plans them; any other profile authorizes each by its banked fingerprint.
+pub fn classify<'a>(registry: &'a FingerprintRegistry, profile: &str) -> Result<Classify<'a>> {
+    if profile == AS_IS {
+        return Ok(Classify::AsIs);
+    }
+    let mut profiles = registry.source_profiles.iter();
+    let found = profiles.find(|found| found.name == profile);
+    Ok(match found.and_then(|found| found.grammar.as_ref()) {
+        Some(grammar) => Classify::Grammar(convert::converter(&grammar.converter)?),
+        None => Classify::Banked(registry),
+    })
+}
+
 /// `sources` carries each component's CARRIER, not its path: a path alone cannot say what
 /// the file is, and this is the second place — after the plan's own header pass — that
 /// would otherwise read a CAS-resident index as a safetensors file.
-///
-/// With no registry every source is stored as-is through [`convert::IDENTITY`].
 pub fn prepare(
     target: &str,
     sources: &[(String, CarrierInput)],
     set: &CarrierSet,
-    registry: Option<&FingerprintRegistry>,
+    classify: Classify<'_>,
     spec_variant: Option<usize>,
 ) -> Result<Prepared> {
     let target = Target::parse(target)?;
@@ -569,7 +644,7 @@ pub fn prepare(
     for (component, carrier) in sources {
         let path = &carrier.path;
         let (full, raw) = read_carrier(carrier, set)?;
-        let Some(registry) = registry else {
+        let Classify::Banked(registry) = classify else {
             raws.push(raw);
             files.push(SourceFile {
                 path: path.clone(),
@@ -622,7 +697,10 @@ pub fn prepare(
             format!("reviewed components name different converters {names:?}"),
         );
     }
-    let conv = convert::converter(names.first().copied().unwrap_or(convert::IDENTITY))?;
+    let conv = match classify {
+        Classify::Grammar(conv) => conv,
+        _ => convert::converter(names.first().copied().unwrap_or(convert::IDENTITY))?,
+    };
     let views: Vec<Source<'_>> = files
         .iter()
         .enumerate()
@@ -751,11 +829,14 @@ fn plan_source_prepared(
     }
     let mut matches = Vec::new();
     let mut requires_declaration = Vec::new();
+    let mut rejected = None;
     for profile in &registry.source_profiles {
         if requested_profile.is_some_and(|name| name != profile.name) {
             continue;
         }
-        for assignments in profile_assignments(profile, &registry, carriers, &headers) {
+        let (solutions, refusal) = profile_assignments(profile, &registry, carriers, &headers);
+        rejected = rejected.or(refusal);
+        for assignments in solutions {
             if requested_profile.is_none() && !profile.auto_select {
                 requires_declaration.push(profile.name.as_str());
                 continue;
@@ -774,10 +855,10 @@ fn plan_source_prepared(
     }
     if matches.is_empty() {
         if requested_profile.is_some_and(|name| name != AS_IS) {
-            return refuse(
-                Code::UNREGISTERED_FINGERPRINT,
-                "carrier set does not match the requested reviewed source profile",
-            );
+            return Err(rejected.unwrap_or(Refusal {
+                code: Code::UNREGISTERED_FINGERPRINT,
+                detail: "carrier set does not match the requested reviewed source profile".into(),
+            }));
         }
         let (profile, assignments) = as_is_profile(carriers, &headers)?;
         return plan_match(
@@ -981,6 +1062,7 @@ fn as_is_profile(
     Ok((
         SourceProfile {
             auto_select: true,
+            grammar: None,
             name: AS_IS.into(),
             components,
         },
@@ -1015,7 +1097,7 @@ fn plan_match(
         .map(|component| format!("{}={}", component.component, component.target_encoding))
         .collect::<Vec<_>>()
         .join(",");
-    let order: Vec<(String, String)> = profile
+    let mut order: Vec<(String, String)> = profile
         .components
         .iter()
         .flat_map(|component| {
@@ -1023,13 +1105,26 @@ fn plan_match(
                 .iter()
                 .find(|assignment| assignment.component == component.component)
                 .expect("profile assignment covers every component");
-            component.variants[assignment.variant]
-                .construction_order
-                .iter()
+            let variant = component.variants.get(assignment.variant);
+            variant
+                .into_iter()
+                .flat_map(|variant| &variant.construction_order)
                 .map(|key| (component.component.clone(), key.clone()))
         })
         .collect();
-    let mut prepared = prepare(&target, &sources, set, registry, spec_variant)?;
+    let classify = match registry {
+        Some(registry) => classify(registry, &profile.name)?,
+        None => Classify::AsIs,
+    };
+    let mut prepared = prepare(&target, &sources, set, classify, spec_variant)?;
+    if profile.grammar.is_some() {
+        // A grammar banks no traversal: its keys construct in sorted order.
+        let ops = prepared.plan.ops.iter();
+        order = ops
+            .map(|op| (op.component.clone(), op.out_key.clone()))
+            .collect();
+        order.sort();
+    }
     prepared.plan.apply_order(&order)?;
     prepared.plan.check_converts_something()?;
     let plan = SourcePlan {
@@ -2408,6 +2503,7 @@ mod tests {
         };
         let source_profile = SourceProfile {
             auto_select: true,
+            grammar: None,
             name: profile.into(),
             components: vec![SourceProfileComponent {
                 component: component.into(),
@@ -3761,6 +3857,7 @@ mod tests {
         }
         registry.merge_source_profile(SourceProfile {
             auto_select: true,
+            grammar: None,
             name: "journal/pair/1".into(),
             components,
         });
@@ -3986,6 +4083,7 @@ mod tests {
         }
         registry.merge_source_profile(SourceProfile {
             auto_select: true,
+            grammar: None,
             name: "sharded/pair/1".into(),
             components,
         });
@@ -4355,6 +4453,7 @@ mod tests {
         }
         registry.merge_source_profile(SourceProfile {
             auto_select: true,
+            grammar: None,
             name: "shared/pair/1".into(),
             components,
         });

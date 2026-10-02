@@ -204,7 +204,18 @@ pub struct SourceProfile {
     /// Whether headers alone may choose this format. False requires the caller
     /// to declare the reviewed format; shapes cannot prove semantic row layout.
     pub auto_select: bool,
+    /// Set when a converter's planner, not banked key sets, recognizes the source.
+    pub grammar: Option<Grammar>,
     pub components: Vec<SourceProfileComponent>,
+}
+
+/// A carrier matches when every key starts with `key_prefix` and the reviewed `converter`
+/// plans it: the planner is the key grammar, so any valid subset of its reviewed modules
+/// matches without a banked key list. Its keys construct in sorted order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grammar {
+    pub converter: String,
+    pub key_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,6 +695,13 @@ impl FingerprintRegistry {
                             if !profile.auto_select {
                                 fields.push(("auto_select", Value::Bool(false)));
                             }
+                            if let Some(grammar) = &profile.grammar {
+                                let converter = Value::str(grammar.converter.clone());
+                                let key_prefix = Value::str(grammar.key_prefix.clone());
+                                let grammar =
+                                    vec![("converter", converter), ("key_prefix", key_prefix)];
+                                fields.push(("grammar", Value::obj(grammar)));
+                            }
                             Value::obj(fields)
                         })
                         .collect(),
@@ -705,6 +723,19 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
             Some(_) => return refuse(Code::WRONG_TYPE, "SourceProfile.auto_select must be bool"),
         };
         ascii_name("source profile", &name, limits::MAX_NAME_BYTES)?;
+        let grammar = match fields.opt("grammar") {
+            None => None,
+            Some(value) => {
+                let mut grammar = Fields::new("Grammar", value)?;
+                let converter = grammar.req_str("converter")?.to_string();
+                let key_prefix = grammar.req_str("key_prefix")?.to_string();
+                grammar.done()?;
+                Some(Grammar {
+                    converter,
+                    key_prefix,
+                })
+            }
+        };
         let mut components = Vec::new();
         for value in as_arr("SourceProfile", "components", fields.req("components")?)? {
             let mut component_fields = Fields::new("SourceProfileComponent", value)?;
@@ -795,7 +826,7 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
                     ),
                 );
             }
-            if variants.is_empty() {
+            if variants.is_empty() && grammar.is_none() {
                 return refuse(
                     Code::MISSING_FIELD,
                     format!("source profile {name:?} component {component:?} has no variants"),
@@ -853,6 +884,7 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
         profiles.push(SourceProfile {
             name,
             auto_select,
+            grammar,
             components,
         });
     }
@@ -1061,11 +1093,13 @@ mod tests {
         registry.source_profiles = vec![
             SourceProfile {
                 auto_select: true,
+                grammar: None,
                 name: "profile/a".into(),
                 components: vec![source_component(Some("a/model.index.json"), None)],
             },
             SourceProfile {
                 auto_select: true,
+                grammar: None,
                 name: "profile/b".into(),
                 components: vec![
                     source_component(Some("b/model.safetensors"), None),
@@ -1089,6 +1123,7 @@ mod tests {
         let mut registry = registry();
         registry.source_profiles = vec![SourceProfile {
             auto_select: true,
+            grammar: None,
             name: "profile/prefix".into(),
             components: vec![source_component(None, Some("weights/"))],
         }];
