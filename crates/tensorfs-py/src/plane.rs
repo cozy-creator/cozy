@@ -118,6 +118,7 @@ fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
     let host = dict!(py;
         "budget" => h.budget, "used" => h.used, "ready_bytes" => h.ready_bytes,
         "registered_bytes" => h.registered_bytes, "memfd_bytes" => h.memfd_bytes,
+        "sealed_bytes" => h.sealed_bytes,
         "cached_bytes" => h.cached_bytes, "direct_bytes" => h.direct_bytes,
         "buffered_bytes" => h.buffered_bytes, "inline_bytes" => h.inline_bytes,
         "direct_refused" => h.direct_refused, "map_refused" => h.map_refused,
@@ -244,6 +245,25 @@ impl PyPlane {
         let (id, layout) = py
             .detach(|| {
                 let id = plane.register(&name, src, p, &regions, host_fd)?;
+                Ok((id, plane.layout(id)?))
+            })
+            .or_raise(py)?;
+        Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
+    }
+
+    /// Register one weight set over a sealed layout (`fill_sealed`); `fd` stays the caller's.
+    fn register_sealed(
+        &self,
+        py: Python<'_>,
+        name: String,
+        plan: PyRef<'_, PyPlan>,
+        regions: Vec<Vec<String>>,
+        fd: i32,
+    ) -> PyResult<PyWeightSet> {
+        let (p, plane) = (&plan.plan, &self.plane);
+        let (id, layout) = py
+            .detach(|| {
+                let id = plane.register_sealed(&name, p, &regions, fd)?;
                 Ok((id, plane.layout(id)?))
             })
             .or_raise(py)?;
@@ -760,6 +780,38 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     tensorfs_plane::host::release_hold(hold).or_raise(py)
 }
 
+/// Fill a weight set's layout once through the verified read path and seal it (the machine's
+/// half of a sealed layout; `Plane.register_sealed` adopts it). CONSUMES `lease`. Returns the
+/// sealed memfd (the caller's) and each read mode's bytes.
+#[pyfunction]
+#[pyo3(signature = (store, lease, plan, regions, name, threads = 8))]
+fn fill_sealed<'p>(
+    py: Python<'p>,
+    store: PyRef<'_, PyStore>,
+    lease: PyRef<'_, PyLease>,
+    plan: PyRef<'_, PyPlan>,
+    regions: Vec<Vec<String>>,
+    name: String,
+    threads: usize,
+) -> PyResult<(i32, Bound<'p, PyDict>)> {
+    let lease = lease.take_for_plane(py)?;
+    let (store, meta, p) = (store.store.clone(), store.meta.clone(), &plan.plan);
+    let tally = tensorfs_plane::io::IoTally::default();
+    let fd = py
+        .detach(|| {
+            let layout = Layout::build(p, &regions)?;
+            let source = Source::new(store, meta, lease, true, 0);
+            tensorfs_plane::host::fill_sealed(&name, &layout, &source, threads, &tally)
+        })
+        .or_raise(py)?;
+    let read = |n: &std::sync::atomic::AtomicU64| n.load(Ordering::Relaxed);
+    let facts = dict!(py;
+        "cached_bytes" => read(&tally.cached_bytes), "direct_bytes" => read(&tally.direct_bytes),
+        "buffered_bytes" => read(&tally.buffered_bytes), "inline_bytes" => read(&tally.inline_bytes),
+    );
+    Ok((std::os::fd::IntoRawFd::into_raw_fd(fd), facts))
+}
+
 /// `tensorfs._ext.plane`, importable as such (the facade module `tensorfs.plane` re-exports it).
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
@@ -773,6 +825,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDeviceView>()?;
     m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
+    m.add_function(wrap_pyfunction!(fill_sealed, &m)?)?;
     add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
         CudaUnavailable, Invalid, IoError, Closed);
     parent.add_submodule(&m)?;

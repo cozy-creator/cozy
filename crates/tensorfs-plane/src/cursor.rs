@@ -129,10 +129,14 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
     cur.inflight += 1;
     let w = c.ws_mut(ws)?;
     let region = w.layout.regions[r as usize].clone();
-    let from_host = matches!(w.hregs[r as usize].state, HState::Ready);
+    let held = matches!(w.hregs[r as usize].state, HState::Ready);
+    let from_host = held || w.host.sealed();
     let src = if from_host {
-        w.hregs[r as usize].holds += 1;
-        // SAFETY: inside the live mapping; the hold keeps the region until the copy's event.
+        if held {
+            w.hregs[r as usize].holds += 1;
+        }
+        // SAFETY: inside the live mapping; a hold keeps a Ready region until the copy's event,
+        // and nothing frees a sealed layout's pages while this weight set maps them.
         CopySrc::Host(unsafe { w.host.base().add(region.offset as usize) })
     } else {
         CopySrc::Disk {
@@ -149,7 +153,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
         src,
         done: Box::new(move |res: Result<Copied>| {
             let mut c = inner2.core.lock().unwrap();
-            if from_host {
+            if held {
                 if let Ok(w) = c.ws_mut(ws) {
                     let h = &mut w.hregs[r as usize];
                     h.holds -= 1;
@@ -185,7 +189,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
         }),
     };
     if let Err(e) = inner.devices[d].movers[mover].submit(job) {
-        if from_host {
+        if held {
             c.ws_mut(ws)?.hregs[r as usize].holds -= 1;
         }
         let cur = c.cursors.get_mut(&id).unwrap();

@@ -37,6 +37,7 @@ class HostStats(TypedDict):
     ready_bytes: int
     registered_bytes: int
     memfd_bytes: int
+    sealed_bytes: int  # sealed layouts this plane maps: their owner's RAM
     cached_bytes: int
     direct_bytes: int
     buffered_bytes: int
@@ -251,6 +252,10 @@ class Plane:
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
     ) -> WeightSet: ...
+    def register_sealed(
+        self, name: str, plan: ReadPlan, regions: Sequence[Sequence[str]], fd: int
+    ) -> WeightSet:
+        """A weight set over a sealed layout (`fill_sealed`): no store, no fill, no punch."""
     def set_vram_budget(self, device: int, nbytes: int) -> Trim: ...
     def set_pinned_budget(self, nbytes: int) -> Trim: ...
     def want(
@@ -304,3 +309,20 @@ def hold_tier(fd: int) -> int:
 def release_tier(hold: int) -> int:
     """End a `hold_tier` claim (closes `hold`): punches every Ready region no plane claims and
     returns the bytes punched."""
+
+class SealedFill(TypedDict):
+    cached_bytes: int
+    direct_bytes: int
+    buffered_bytes: int
+    inline_bytes: int
+
+def fill_sealed(
+    store: Store,
+    lease: ReadLease,
+    plan: ReadPlan,
+    regions: Sequence[Sequence[str]],
+    name: str,
+    threads: int = 8,
+) -> tuple[int, SealedFill]:
+    """Fill a weight set's layout through the verified read path and seal it; CONSUMES `lease`.
+    Returns the sealed memfd (the caller's) and each read mode's bytes."""
