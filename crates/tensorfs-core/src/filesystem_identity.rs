@@ -14,6 +14,10 @@ mod linux {
     use std::rc::Rc;
 
     use nix::unistd::{geteuid, setfsgid, setfsuid, Gid, Uid};
+    use rustix::process::{
+        getpid, getppid, kill_process, parent_process_death_signal,
+        set_parent_process_death_signal, Pid, Signal,
+    };
 
     use super::{io, Path};
 
@@ -26,8 +30,41 @@ mod linux {
         )
     }
 
+    struct ParentDeath {
+        signal: Option<Signal>,
+        parent: Option<Pid>,
+    }
+
+    impl ParentDeath {
+        fn capture() -> io::Result<Self> {
+            Ok(Self {
+                signal: parent_process_death_signal()?,
+                parent: getppid(),
+            })
+        }
+
+        fn rearm(&self) -> io::Result<()> {
+            if let Some(signal) = self.signal {
+                set_parent_process_death_signal(Some(signal))?;
+                // Arming only covers future deaths. Deliver the caller's configured
+                // signal if its parent was lost while credential changes cleared it.
+                if getppid() != self.parent {
+                    kill_process(getpid(), signal)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct PreviousIdentity {
+        uid: Uid,
+        gid: Gid,
+        parent_death: ParentDeath,
+        entered: bool,
+    }
+
     pub(crate) struct FilesystemIdentity {
-        previous: Option<(Uid, Gid)>,
+        previous: Option<PreviousIdentity>,
         // A credential guard must be destroyed by the exact thread that made it.
         _thread: PhantomData<Rc<()>>,
     }
@@ -55,9 +92,19 @@ mod linux {
             if previous == desired {
                 return Ok(guard);
             }
-            guard.previous = Some(previous);
+            guard.previous = Some(PreviousIdentity {
+                uid: previous.0,
+                gid: previous.1,
+                parent_death: ParentDeath::capture()?,
+                entered: false,
+            });
             setfsgid(desired.1);
             setfsuid(desired.0);
+            let saved = guard
+                .previous
+                .as_mut()
+                .expect("credential transition recorded");
+            saved.parent_death.rearm()?;
             if filesystem_ids() != desired {
                 // Drop restores either field that changed before refusing the
                 // synchronous I/O. The caller receives the identity refusal.
@@ -66,21 +113,29 @@ mod linux {
                     "cannot enter Store filesystem identity",
                 ));
             }
+            saved.entered = true;
             Ok(guard)
         }
     }
 
     impl Drop for FilesystemIdentity {
         fn drop(&mut self) {
-            let Some((uid, gid)) = self.previous else {
+            let Some(mut previous) = self.previous.take() else {
                 return;
             };
-            setfsuid(uid);
-            setfsgid(gid);
-            if filesystem_ids() != (uid, gid) {
+            // Once entry was guarded, any nonfatal parent-death signal during I/O
+            // has already been delivered. Check the next credential window against
+            // the current parent instead of delivering that event a second time.
+            if previous.entered {
+                previous.parent_death.parent = getppid();
+            }
+            setfsuid(previous.uid);
+            setfsgid(previous.gid);
+            let guard_restored = previous.parent_death.rearm();
+            if filesystem_ids() != (previous.uid, previous.gid) || guard_restored.is_err() {
                 // Continuing a reused Runtime thread under the wrong identity is
                 // unsafe. No I/O error can reach here: this is a failed kernel
-                // restoration of credentials that this thread previously held.
+                // restoration of credentials or the caller's lifecycle guard.
                 std::process::abort();
             }
         }
