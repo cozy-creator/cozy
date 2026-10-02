@@ -715,7 +715,8 @@ impl Run<'_> {
         let job = self.job;
         let object = &chunk.object;
         let wanted = &object.grant.object;
-        // An object that is one chunk is one plain GET.
+        // A Hub object that is one chunk is one plain GET. A source request always names its
+        // range: a 206 is how the origin says it ranges, and its stand-ins answer only ranges.
         let whole = chunk.first == 0 && chunk.end == wanted.length;
         let range = [(
             "range".to_string(),
@@ -729,7 +730,7 @@ impl Run<'_> {
             job.credential,
             job.deadline,
             ledger,
-            if whole { &[] } else { &range },
+            if whole && job.ranged { &[] } else { &range },
             &mut |checked, _| hops.push(checked.url()),
         )?;
         // A redirect target that refuses is forgotten, and the object's URL asked again.

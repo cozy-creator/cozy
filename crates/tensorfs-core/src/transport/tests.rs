@@ -3733,6 +3733,25 @@ fn a_source_object_crosses_in_parallel_byte_ranges() {
     assert_eq!(temps(&source.root), 0);
 }
 
+/// A source object no larger than one request is still asked for by range, as every source
+/// fetch before 0.3.87 was: an origin that answers only ranges serves it.
+#[test]
+fn a_small_source_object_is_asked_for_by_range() {
+    let body = ranged_body(300 << 10);
+    let served = body.clone();
+    let source = Source::new("ranged-small", &body, move |request| {
+        match range_of(request) {
+            Some(_) => partial(&served, request),
+            None => status(400, b"a range is required"),
+        }
+    });
+    let fetched = source.fetch(4, &local_policy()).unwrap();
+
+    assert_eq!(fetched.transferred, source.object.length);
+    assert!(source.held());
+    assert_eq!(source.asked(), vec![format!("bytes=0-{}", body.len() - 1)]);
+}
+
 /// A source that will not range must still work: the first chunk's ask is answered with
 /// the whole object, and that one request is the object.
 #[test]

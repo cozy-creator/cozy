@@ -447,11 +447,9 @@ fn a_connection_cut_mid_body_resumes_at_the_byte_it_reached() {
     let bytes = body(9, 5 * MIB + 1);
     let length = bytes.len() as u64;
     // The first delivery answer dies 2.5 MiB in; the next ask must start there.
-    let origin = Origin::start(vec![(name, bytes)], 0, |request, _| {
-        match request.path.starts_with("/cdn/") && request.range.is_none() {
-            true => Act::Cut(5 * MIB / 2),
-            false => Act::Serve,
-        }
+    let origin = Origin::start(vec![(name, bytes)], 0, |request, _| match request.range {
+        Some((0, _)) if request.path.starts_with("/cdn/") => Act::Cut(5 * MIB / 2),
+        _ => Act::Serve,
     });
     let dir = root("cut");
     let store = Store::init(&dir).unwrap();
