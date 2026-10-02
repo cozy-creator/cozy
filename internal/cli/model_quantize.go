@@ -71,7 +71,7 @@ func handleModelQuantize(ctx *Context) *exit.Error {
 
 // holdCheckpoint has the machine a run names hold the checkpoint first: the request `cozy
 // model download <checkpoint> [--rental]` makes, which moves no byte the machine already has.
-// Runtime before 0.18.102 refuses a run naming a checkpoint whose bytes it holds without its
+// Runtime before 0.18.101 refuses a run naming a checkpoint whose bytes it holds without its
 // repository, as the pod that uploaded it does. A run that buys its machine fetches it itself.
 func holdCheckpoint(ctx *Context, source string) *exit.Error {
 	machine, known, problem := knownMachine(ctx)
