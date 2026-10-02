@@ -4,6 +4,8 @@
 mod common;
 
 use common::*;
+use tensorfs_core::dtype::Dtype;
+use tensorfs_core::fit::{fit, Custody, Fit, TensorRequirements};
 use tensorfs_core::read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -282,6 +284,53 @@ fn a_failed_fill_holds_no_ram_and_no_budget() {
     assert_eq!(plane.stats().host.used, spans[0] + spans[2]);
     plane.close_ws(ws).unwrap();
     assert_eq!(resident(kept.as_raw_fd()), empty);
+    plane.close().unwrap();
+}
+
+/// A stored tensor the code does not build (`fit` skips it with a warning) is in no plan and
+/// no layout. With its objects gone from the store the fill still lands every built byte:
+/// nothing read it, and nothing mapped room for it.
+#[test]
+fn a_tensor_fit_skips_is_never_read_or_mapped() {
+    let fx = Fixture::new("skipped");
+    let built: Vec<(&str, usize)> = TENSORS.iter().copied().filter(|(k, _)| *k != "b.weight").collect();
+    let requirements = TensorRequirements::new(
+        built.iter().map(|(k, n)| ("unet".to_string(), k.to_string(), vec![*n as u64], Some(Dtype::U8))),
+    )
+    .unwrap();
+    let skipped = (70 * MIB + 12) as u64;
+    let verdict = fit(&requirements, &fx.header, Custody::Canonical, false, None, None).unwrap();
+    let Fit::Ok { ignored, ignored_bytes, .. } = &verdict else {
+        panic!("{}", verdict.text());
+    };
+    assert_eq!((ignored.as_slice(), *ignored_bytes), (&["unet/b.weight".to_string()][..], skipped));
+    assert_eq!(
+        verdict.warning().unwrap(),
+        format!("1 stored tensor(s) the code does not build were skipped, not loaded: {skipped} B (unet/b.weight)")
+    );
+
+    // The caller's plan names every stored tensor and keeps the parts it builds.
+    let whats: Vec<String> = built.iter().map(|(k, _)| format!("unet/{k}#value")).collect();
+    let plan = fx.plan().select(&whats).unwrap();
+    let regions: Vec<Vec<String>> = regions().into_iter().filter(|r| r != &["unet/b.weight".to_string()]).collect();
+    let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let plane = host_only();
+    let source = plane.source(fx.store.clone(), fx.meta.clone(), lease);
+    let ws = plane.register("unet", source, &plan, &regions, None).unwrap();
+    // A fill that needs an object that is gone fails (`a_failed_fill_holds_no_ram_and_no_budget`).
+    for object in fx.objects.iter().filter(|o| o.length >= (6 * MIB) as u64) {
+        std::fs::remove_file(fx.store.blob_path(&object.sha256)).unwrap();
+    }
+    plane.set_pinned_budget(1 << 30).unwrap();
+    plane.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    check_bytes(&plane, ws, None);
+
+    let layout = plane.layout(ws).unwrap();
+    assert!(layout.parts.iter().all(|p| !p.what.contains("b.weight")));
+    assert!(layout.nbytes < skipped, "the pinned tier made room for the skipped tensor: {} B", layout.nbytes);
+    let payload: u64 = built.iter().map(|(_, n)| *n as u64).sum();
+    let host = plane.stats().host;
+    assert_eq!(host.direct_bytes + host.cached_bytes + host.buffered_bytes + host.inline_bytes, payload);
     plane.close().unwrap();
 }
 

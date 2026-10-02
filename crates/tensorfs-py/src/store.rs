@@ -958,23 +958,27 @@ impl PyStore {
         .or_refuse(py)?;
         let credentials =
             transport::credential_from_spec(&credential, vec![host.clone()]).or_refuse(py)?;
-        let selected = py
+        let (selected, skipped) = py
             .detach(|| {
                 if !files.is_empty() {
-                    return providers::resolve_files(
+                    let resolved = providers::resolve_files(
                         &uri,
                         &files,
                         &endpoints,
                         &credentials,
                         transport::Deadline::none(),
-                    );
+                    )?;
+                    return Ok((resolved, Vec::new()));
                 }
-                let resolution = providers::resolve(
-                    &uri,
-                    &endpoints,
-                    &credentials,
-                    transport::Deadline::none(),
-                )?;
+                // Carriers named exactly: a file no selection can name is skipped, not refused.
+                let none = transport::Deadline::none();
+                let (resolution, skipped) = match carriers.is_empty() {
+                    true => (
+                        providers::resolve(&uri, &endpoints, &credentials, none)?,
+                        Vec::new(),
+                    ),
+                    false => providers::resolve_named(&uri, &endpoints, &credentials, none)?,
+                };
                 let candidates: Vec<_> = resolution
                     .members
                     .iter()
@@ -1015,7 +1019,7 @@ impl PyStore {
                         )),
                     )?
                 };
-                resolution.select(&selected)
+                Ok((resolution.select(&selected)?, skipped))
             })
             .or_refuse(py)?;
         let manifest = providers::content_manifest(&selected).or_refuse(py)?;
@@ -1041,6 +1045,8 @@ impl PyStore {
         )?;
         result.set_item("allowed_hosts", policy.allowed_hosts)?;
         result.set_item("credential_hosts", vec![host])?;
+        // Tensor files the listing held whose names no selection can spell, for a warning.
+        result.set_item("skipped", skipped)?;
         Ok(result)
     }
 

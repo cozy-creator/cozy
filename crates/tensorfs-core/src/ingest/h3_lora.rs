@@ -161,14 +161,26 @@ pub(super) fn plan(
     plain: &EncodingSpec,
     p: &mut Plan,
 ) -> Result<()> {
-    if let Some(tensor) = header.tensors.iter().find(|t| t.key.contains("adaln_proj")) {
+    let adaln: Vec<&str> = header
+        .tensors
+        .iter()
+        .map(|tensor| tensor.key.as_str())
+        .filter(|key| key.contains("adaln_proj"))
+        .collect();
+    if !adaln.is_empty() {
+        // Named in full: these are the factors a conversion would have to drop.
+        let more = match adaln.len().saturating_sub(4) {
+            0 => String::new(),
+            more => format!(", and {more} more"),
+        };
         return refuse(
             Code::ADAPTER_TARGET_UNSUPPORTED,
             format!(
-                "{}: AdaLN modulation factor. h3.lora/2 maps attention and MLP projections \
-                 only, and dropping AdaLN pairs changes the adapter. Use a repack with the \
-                 AdaLN pairs removed, or store the file as-is.",
-                tensor.key
+                "{} AdaLN modulation factor(s) ({}{more}). h3.lora/2 maps attention and MLP \
+                 projections only, and dropping AdaLN pairs changes the adapter. Use a repack \
+                 with the AdaLN pairs removed, or store the file as-is.",
+                adaln.len(),
+                adaln[..adaln.len().min(4)].join(", "),
             ),
         );
     }

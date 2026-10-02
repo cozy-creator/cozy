@@ -493,7 +493,14 @@ fn real_headers_plan_by_grammar_and_multiple_versions_require_file_selection() {
             "h3/native-lora-a-b/2"
         };
         if let Some(code) = &row.refusal {
-            assert_eq!(declared.unwrap_err().code.as_str(), code, "{}", row.member);
+            let refusal = declared.unwrap_err();
+            assert_eq!(refusal.code.as_str(), code, "{}", row.member);
+            // The refusal counts the AdaLN factors (51 A/B pairs) and names the first four.
+            assert!(
+                refusal.detail.starts_with("102 AdaLN modulation factor(s) (")
+                    && refusal.detail.contains(", and 98 more)"),
+                "{refusal}"
+            );
             // A layout the converter cannot map is stored as it is, never refused.
             assert_eq!(preflight(&head, None, &scratch).unwrap().profile, AS_IS);
             continue;

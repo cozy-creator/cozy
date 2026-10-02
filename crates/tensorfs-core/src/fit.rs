@@ -8,9 +8,12 @@
 use crate::capability::CapabilityRecords;
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
-use crate::header::{Closure, Header};
+use crate::header::{Body, Closure, Header};
 use crate::ids::ascii_name;
 use crate::limits;
+
+/// How many skipped keys the warning names.
+const WARNED_KEYS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorRequirement {
@@ -102,6 +105,7 @@ impl TensorRequirements {
     }
 }
 
+/// Where the checkpoint came from. Accepted and echoed; it no longer changes the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Custody {
     Canonical,
@@ -139,7 +143,11 @@ pub struct Routes {
 pub enum Fit {
     Ok {
         routes: Routes,
+        /// Stored tensors of a constructed component the code does not build, as
+        /// `component/key`: skipped, never loaded.
         ignored: Vec<String>,
+        /// What those tensors store, in bytes.
+        ignored_bytes: u64,
         device: Option<String>,
     },
     ComponentMissing {
@@ -162,6 +170,7 @@ pub enum Fit {
         required: Dtype,
         stored: Dtype,
     },
+    /// No longer answered: a stored key the code does not build is skipped (`Ok.ignored`).
     ExtraTensor {
         component: String,
         key: String,
@@ -207,13 +216,35 @@ impl Fit {
         matches!(self, Self::Ok { .. })
     }
 
+    /// The one line a caller shows when stored tensors were skipped: how many, how many
+    /// bytes, and the first few. A truncated model reads "420 stored tensor(s), 9.8 GB".
+    pub fn warning(&self) -> Option<String> {
+        let Self::Ok {
+            ignored,
+            ignored_bytes,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if ignored.is_empty() {
+            return None;
+        }
+        let more = match ignored.len().saturating_sub(WARNED_KEYS) {
+            0 => String::new(),
+            more => format!(", and {more} more"),
+        };
+        Some(format!(
+            "{} stored tensor(s) the code does not build were skipped, not loaded: {} B ({}{more})",
+            ignored.len(),
+            ignored_bytes,
+            ignored[..ignored.len().min(WARNED_KEYS)].join(", "),
+        ))
+    }
+
     pub fn text(&self) -> String {
         match self {
-            Self::Ok {
-                routes,
-                ignored,
-                device,
-            } => {
+            Self::Ok { routes, device, .. } => {
                 let mut text = format!(
                     "fits (routes: verbatim x{}, decoded_float x{}, encoded_gemm x{}",
                     routes.verbatim, routes.decoded_float, routes.encoded_gemm
@@ -221,13 +252,10 @@ impl Fit {
                 if let Some(device) = device {
                     text.push_str(&format!("; encoded leaves qualified on {device}"));
                 }
-                if !ignored.is_empty() {
-                    text.push_str(&format!(
-                        "; {} stored key(s) ignored on local custody",
-                        ignored.len()
-                    ));
-                }
                 text.push(')');
+                if let Some(warning) = self.warning() {
+                    text.push_str(&format!("; {warning}"));
+                }
                 text
             }
             Self::ComponentMissing { component, present } => format!(
@@ -258,7 +286,7 @@ impl Fit {
                 stored.name()
             ),
             Self::ExtraTensor { component, key } => {
-                format!("{component}.{key}: stored but not constructed on a canonical checkpoint")
+                format!("{component}.{key}: stored but not constructed")
             }
             Self::EncodingUnsupported {
                 component,
@@ -325,8 +353,9 @@ pub fn fit(
 ) -> Result<Fit> {
     header.validate(&Closure::default())?;
     let plain = plain_digest();
+    let _ = custody;
     let mut routes = Routes::default();
-    let mut ignored = Vec::new();
+    let (mut ignored, mut ignored_bytes) = (Vec::new(), 0u64);
     let mut encoded = Vec::new();
 
     for (component, required_tensors) in requirements.components() {
@@ -389,20 +418,22 @@ pub fn fit(
             }
         }
 
-        for (key, _) in stored_tensors {
+        // A stored key the code does not build is skipped, on every custody: the code may
+        // build less than an older checkpoint stores (Qwen's text encoder dropped `lm_head`).
+        for (key, stored) in stored_tensors {
             if required_tensors
                 .iter()
                 .any(|(required_key, _)| required_key == key)
             {
                 continue;
             }
-            if custody == Custody::Canonical {
-                return Ok(Fit::ExtraTensor {
-                    component: component.clone(),
-                    key: key.clone(),
-                });
-            }
             ignored.push(format!("{component}/{key}"));
+            for (_, part) in &stored.parts {
+                ignored_bytes += match &part.body {
+                    Body::Segments(objects) => objects.iter().map(|object| object.length).sum(),
+                    Body::Inline(bytes) => bytes.len() as u64,
+                };
+            }
         }
     }
 
@@ -436,6 +467,7 @@ pub fn fit(
     Ok(Fit::Ok {
         routes,
         ignored,
+        ignored_bytes,
         device: device.map(str::to_string),
     })
 }

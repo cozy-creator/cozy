@@ -43,4 +43,18 @@ answer = tensorfs.fit(
 )
 assert not answer["ok"] and answer["code"] == "shape_mismatch", answer
 
+# A stored tensor the code does not build is skipped on every custody, with one warning.
+for custody in ("canonical", "local"):
+    answer = tensorfs.fit(
+        requirements[1:],
+        header_bytes,
+        custody=custody,
+        encoded_leaves=True,
+    )
+    skipped = f"{first.component}/{first.key}"
+    assert answer["ok"] and answer["ignored"] == [skipped], answer
+    assert answer["ignored_bytes"] > 0, answer
+    assert answer["warning"].startswith("1 stored tensor(s) the code does not build"), answer
+    assert skipped in answer["warning"] and str(answer["ignored_bytes"]) in answer["warning"]
+
 print("request-time in-memory fit green")

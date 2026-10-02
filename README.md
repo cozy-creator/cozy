@@ -329,7 +329,7 @@ no CLI or document form.
 | `component_missing` | (1) every required component exists; extra components are ignored |
 | `tensor_missing`, `shape_mismatch` | (2) every constructed key exists at the same logical shape |
 | `dtype_mismatch` | (3) an optional logical dtype constraint disagrees |
-| `extra_tensor` | (4) a stored key inside a constructed component absent from the requirements — refused on `canonical` custody, listed and ignored on `local` |
+| `ok`, with `ignored` | (4) a stored key inside a constructed component absent from the requirements is skipped, never loaded, on every custody: `ignored` lists it, `ignored_bytes` sums what it stores, and `warning` is the one line to show (count, bytes, first keys). `extra_tensor` is no longer answered |
 | `encoding_unsupported` | (5) the package refuses encoded leaves |
 | `encoding_unqualified` | (6) with `--device`, every encoded leaf has a qualification record for that class (plain storage has nothing to qualify) |
 

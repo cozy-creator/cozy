@@ -52,7 +52,13 @@ scalar alpha on the reviewed projections, so attention-only fal trainer exports
 convert. Unknown keys, half pairs and A/B rank disagreement refuse; a carrier the
 grammar rejects is stored as-is when no profile is declared. AdaLN factors
 (`adaln_proj`) refuse `ADAPTER_TARGET_UNSUPPORTED`: the converter has no mapping
-for them and dropping them would change the adapter.
+for them and dropping them would change the adapter. The refusal counts them and
+names the first four.
+
+Not verified: for fal-trainer exports the fused QKV rows are assumed to be
+contiguous thirds, the layout `/2` declares. That rests on the vh5tape ComfyUI
+build copying the factors bit-exact onto Comfy's contiguous `qkv_proj`. Unlike the
+Wushu and Physics adapters, these have no projected-output or GPU check.
 
 Selecting `/2` declares the trainer/Comfy contiguous-QKV contract. Before choosing
 it for an unknown producer, review the exporter's declaration and loading code

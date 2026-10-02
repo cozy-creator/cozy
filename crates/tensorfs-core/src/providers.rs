@@ -257,9 +257,13 @@ fn list_observed(
     deadline: Deadline,
     ledger: &Ledger,
 ) -> Result<Vec<SourceMember>> {
-    list_selected_observed(uri, endpoints, credentials, deadline, ledger, None)
+    list_selected_observed(uri, endpoints, credentials, deadline, ledger, None, None)
 }
 
+/// `unnameable`, when given, collects tensor carriers whose paths are outside the member
+/// grammar instead of refusing the listing: the caller names its carriers exactly, so a
+/// file no selection can name cannot shrink it.
+#[allow(clippy::too_many_arguments)]
 fn list_selected_observed(
     uri: &SourceUri,
     endpoints: &Endpoints,
@@ -267,6 +271,7 @@ fn list_selected_observed(
     deadline: Deadline,
     ledger: &Ledger,
     files: Option<&[String]>,
+    mut unnameable: Option<&mut Vec<String>>,
 ) -> Result<Vec<SourceMember>> {
     let policy = endpoints.policy(uri);
     let base = endpoints.base(uri);
@@ -320,13 +325,16 @@ fn list_selected_observed(
                         // instead — a smaller model that still downloads is the failure
                         // shape worth refusing loudly.
                         if is_safetensors(path) || is_index(path) {
-                            return refuse(
-                                Code::KEY_GRAMMAR,
-                                format!(
-                                    "tensor carrier {path:?} has a path outside the member \
-                                     grammar, so the selection cannot name it"
-                                ),
-                            );
+                            let Some(skipped) = unnameable.as_mut() else {
+                                return refuse(
+                                    Code::KEY_GRAMMAR,
+                                    format!(
+                                        "tensor carrier {path:?} has a path outside the member \
+                                         grammar, so the selection cannot name it"
+                                    ),
+                                );
+                            };
+                            skipped.push(path.to_string());
                         }
                         continue;
                     }
@@ -1159,9 +1167,42 @@ pub fn resolve(
     credentials: &dyn CredentialProvider,
     deadline: Deadline,
 ) -> Result<Resolution> {
+    resolve_with(uri, endpoints, credentials, deadline, None)
+}
+
+/// [`resolve`] for a caller that then selects carriers BY NAME. A tensor carrier whose path
+/// is outside the member grammar cannot be one of them, so it is skipped and returned for
+/// the caller to report, where `resolve` refuses: a repository of 949 LoRAs with one
+/// `…(QQQQ4413).safetensors` refused every upload from it.
+pub fn resolve_named(
+    uri: &SourceUri,
+    endpoints: &Endpoints,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+) -> Result<(Resolution, Vec<String>)> {
+    let mut skipped = Vec::new();
+    let resolution = resolve_with(uri, endpoints, credentials, deadline, Some(&mut skipped))?;
+    Ok((resolution, skipped))
+}
+
+fn resolve_with(
+    uri: &SourceUri,
+    endpoints: &Endpoints,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+    unnameable: Option<&mut Vec<String>>,
+) -> Result<Resolution> {
     let ledger = Ledger::new();
     let policy = endpoints.policy(uri);
-    let listed = list_observed(uri, endpoints, credentials, deadline, &ledger)?;
+    let listed = list_selected_observed(
+        uri,
+        endpoints,
+        credentials,
+        deadline,
+        &ledger,
+        None,
+        unnameable,
+    )?;
 
     let selected: Vec<SourceMember> = match uri {
         SourceUri::HuggingFace { .. } => listed
@@ -1444,7 +1485,8 @@ pub fn resolve_files(
     let ledger = Ledger::new();
     let policy = endpoints.policy(uri);
     let filter = folders.is_empty().then_some(names.as_slice());
-    let listed = list_selected_observed(uri, endpoints, credentials, deadline, &ledger, filter)?;
+    let listed =
+        list_selected_observed(uri, endpoints, credentials, deadline, &ledger, filter, None)?;
     for folder in &folders {
         let before = names.len();
         names.extend(
@@ -2167,6 +2209,51 @@ mod tests {
         let refusal = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap_err();
         assert_eq!(refusal.code, Code::MISSING_FIELD);
         assert!(refusal.detail.contains("model-00009-of-00009.safetensors"));
+        handle.join().unwrap();
+    }
+
+    /// tfs#298: a repository of LoRAs holds one whose name no selection can spell. A caller
+    /// that names its carrier resolves and hears which file was skipped; a whole-repository
+    /// resolve, which that file would silently shrink, still refuses.
+    #[test]
+    fn a_named_selection_skips_a_sibling_no_selection_can_name() {
+        let revision = "ce".repeat(20);
+        let odd = "living/Clothes-H3(QQQQ4413).safetensors";
+        let lfs = |path: &str, seed: char| {
+            let oid = seed.to_string().repeat(64);
+            format!(
+                r#"{{"type":"file","path":"{path}","size":64,"lfs":{{"oid":"{oid}","size":64}}}}"#
+            )
+        };
+        let tree = format!(
+            "[{},{}]",
+            lfs("retro/GOLDENBOY_H3_V1.safetensors", 'a'),
+            lfs(odd, 'b')
+        );
+        let (base, _, handle) = origin(2, move |_| ok_body(tree.as_bytes(), "application/json"));
+        let uri = SourceUri::parse(&format!("hf://org/repo@{revision}")).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let (resolution, skipped) =
+            resolve_named(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap();
+        assert_eq!(skipped, vec![odd.to_string()]);
+        let names: Vec<&str> = resolution
+            .members
+            .iter()
+            .map(|m| m.member.as_str())
+            .collect();
+        assert_eq!(names, vec!["retro/GOLDENBOY_H3_V1.safetensors"]);
+        let selected = resolution
+            .select(&["retro/GOLDENBOY_H3_V1.safetensors".to_string()])
+            .unwrap();
+        assert_eq!(selected.members.len(), 1);
+
+        let refusal = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap_err();
+        assert_eq!(refusal.code, Code::KEY_GRAMMAR);
+        assert!(refusal.detail.contains("QQQQ4413"), "{refusal}");
         handle.join().unwrap();
     }
 

@@ -12,8 +12,10 @@ pub const FIT_KEYS: &[&str] = &[
     "device",
     "encoding",
     "ignored",
+    "ignored_bytes",
     "key",
     "routes",
+    "warning",
 ];
 
 pub const CAPABILITY_KEYS: &[&str] = &[
@@ -47,11 +49,14 @@ pub fn fit_json(fit: &Fit, custody: crate::fit::Custody) -> Vec<u8> {
             encoding, device, ..
         } => ("", "", encoding.as_str(), device.as_str()),
     };
-    let (routes, ignored) = match fit {
+    let (routes, ignored, ignored_bytes) = match fit {
         Fit::Ok {
-            routes, ignored, ..
-        } => (routes.clone(), ignored.clone()),
-        _ => (crate::fit::Routes::default(), Vec::new()),
+            routes,
+            ignored,
+            ignored_bytes,
+            ..
+        } => (routes.clone(), ignored.clone(), *ignored_bytes),
+        _ => (crate::fit::Routes::default(), Vec::new(), 0),
     };
     write(&Value::obj(vec![
         ("code", Value::str(fit.code())),
@@ -64,6 +69,7 @@ pub fn fit_json(fit: &Fit, custody: crate::fit::Custody) -> Vec<u8> {
             "ignored",
             Value::arr(ignored.into_iter().map(Value::str).collect()),
         ),
+        ("ignored_bytes", Value::uint(ignored_bytes)),
         ("key", Value::str(key)),
         (
             "routes",
@@ -73,6 +79,7 @@ pub fn fit_json(fit: &Fit, custody: crate::fit::Custody) -> Vec<u8> {
                 ("verbatim", Value::uint(routes.verbatim)),
             ]),
         ),
+        ("warning", Value::str(&fit.warning().unwrap_or_default())),
     ]))
 }
 
