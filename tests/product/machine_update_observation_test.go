@@ -5,11 +5,16 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -43,6 +48,10 @@ func updateObservationPeer(t *testing.T, answer func(http.ResponseWriter, *http.
 				t.Error("initial update did not retain operation identity")
 			}
 			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/machine/runtime/wheels/") {
+			answer(w, r, calls.Add(1))
 			return
 		}
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/machine/runtime" {
@@ -125,6 +134,45 @@ func TestMachineAdmissionWaitsForTheRentalAuthorityLease(t *testing.T) {
 	})
 	if _, problem := denied.AwaitUpdateAdmission(t.Context()); problem == nil || problem.Code == exit.Unavailable || calls.Load() != 1 {
 		t.Fatalf("a Hub denial was waited on: calls=%d problem=%v", calls.Load(), problem)
+	}
+}
+
+// A wheel upload cut in transit, before the machine acknowledged it, staged nothing (2026-10-02:
+// this computer's uplink corrupted one upload in a few and the machine's TLS dropped it with
+// "bad record MAC"). The wheel is sent once more when the machine answers; a second cut ends it.
+func TestAWheelUploadCutInTransitIsSentOnceMore(t *testing.T) {
+	wheel := filepath.Join(t.TempDir(), "cozy_runtime-0.0.0-py3-none-any.whl")
+	body := bytes.Repeat([]byte("wheel"), 1<<18)
+	must(t, os.WriteFile(wheel, body, 0o600))
+	want := sha256.Sum256(body)
+	for _, cuts := range []int32{1, 2} {
+		var puts, reads atomic.Int32
+		client, _ := updateObservationPeer(t, func(w http.ResponseWriter, r *http.Request, _ int32) {
+			if r.Method == http.MethodGet {
+				reads.Add(1)
+				updateObservationState(w, "", "")
+				return
+			}
+			if puts.Add(1) <= cuts {
+				_, _ = io.CopyN(io.Discard, r.Body, 1<<16)
+				if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+					conn.Close()
+				}
+				return
+			}
+			sum := sha256.New()
+			_, _ = io.Copy(sum, r.Body)
+			_ = json.NewEncoder(w).Encode(map[string]string{"sha256": hex.EncodeToString(sum.Sum(nil))})
+		})
+		var log bytes.Buffer
+		client.Log = &log
+		staged, problem := client.Stage(t.Context(), wheel, filepath.Base(wheel))
+		if cuts == 1 && (problem != nil || staged != hex.EncodeToString(want[:]) || puts.Load() != 2 || reads.Load() != 1 || !strings.Contains(log.String(), "again")) {
+			t.Fatalf("one cut upload was not sent once more: staged=%q puts=%d reads=%d log=%q problem=%v", staged, puts.Load(), reads.Load(), log.String(), problem)
+		}
+		if cuts == 2 && (problem == nil || problem.Code != exit.Unavailable || puts.Load() != 2) {
+			t.Fatalf("a second cut did not end the upload with its fault: puts=%d problem=%v", puts.Load(), problem)
+		}
 	}
 }
 

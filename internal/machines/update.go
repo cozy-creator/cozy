@@ -80,19 +80,11 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 		if err != nil {
 			return nil, exit.New(exit.NotFound, "cannot read update wheel: %s", err)
 		}
-		file, err := os.Open(item.path)
-		if err != nil {
-			return nil, exit.New(exit.NotFound, "cannot open update wheel: %s", err)
-		}
-		var staged struct {
-			SHA256 string `json:"sha256"`
-		}
-		_, problem := client.Do(ctx, http.MethodPut, "/v1/machine/runtime/wheels/"+filepath.Base(item.path), file, &staged)
-		file.Close()
+		staged, problem := client.Stage(ctx, item.path, filepath.Base(item.path))
 		if problem != nil {
 			return nil, problem
 		}
-		if staged.SHA256 != digest {
+		if staged != digest {
 			return nil, exit.New(exit.Conflict, "the staged update wheel differs from the selected bytes")
 		}
 		item.out.File, item.out.SHA256 = filepath.Base(item.path), digest
