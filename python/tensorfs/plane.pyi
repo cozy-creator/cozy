@@ -43,6 +43,7 @@ class HostStats(TypedDict):
     inline_bytes: int
     direct_refused: int
     map_refused: int
+    disk_read_bytes: int  # read from storage by this process, from /proc/self/io
     fills: int
     fill_bytes: int
     fill_ns: int

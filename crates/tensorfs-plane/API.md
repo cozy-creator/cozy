@@ -297,6 +297,10 @@ an unclosed plane ends.
 
 ## Changelog
 
+- v3.3 2026-10-02: `stats()["host"]["disk_read_bytes"]` exists. The plane has counted it
+  since v3.1 and this file listed it, but the Python facade never carried it: a caller read 0
+  whatever the disk did, so a "nothing read from disk" check on it could not fail.
+
 - v3.3 2026-10-02 (warm loads bound by the plane's own host copy): a device `want` of bytes
   the page cache holds copies straight from mappings of their objects, beside any pinned
   fill. `host_copy_*` counts them with the pinned tier's copies (host + disk copies stay every

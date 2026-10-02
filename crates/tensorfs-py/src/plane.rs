@@ -121,7 +121,7 @@ fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
         "cached_bytes" => h.cached_bytes, "direct_bytes" => h.direct_bytes,
         "buffered_bytes" => h.buffered_bytes, "inline_bytes" => h.inline_bytes,
         "direct_refused" => h.direct_refused, "map_refused" => h.map_refused,
-        "fills" => c.fills, "fill_bytes" => c.fill_bytes,
+        "disk_read_bytes" => h.disk_read_bytes, "fills" => c.fills, "fill_bytes" => c.fill_bytes,
         "fill_ns" => c.fill_ns, "evictions" => c.evictions, "evicted_bytes" => c.evicted_bytes,
         "register_failed" => c.register_failed, "trims" => c.trims,
     );
