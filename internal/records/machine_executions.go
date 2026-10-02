@@ -867,6 +867,31 @@ func (s *Store) RequestMachineCancellation(id, actor string) (bool, *exit.Error)
 	return len(link.Receipt) > 0, nil
 }
 
+// SettleStoppedMachineCancellation ends a requested cancellation whose machine is stopped:
+// nothing runs there, so the run is canceled on record now. The intent stays recorded; the
+// machine's journal learns it when the machine next runs, and can then only end the run.
+func (s *Store) SettleStoppedMachineCancellation(id string) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot settle a stopped machine's cancellation: %s", err)
+	}
+	defer tx.Rollback()
+	link, err := scanMachineExecution(tx.QueryRow(`SELECT `+machineExecutionColumns+` FROM machine_executions WHERE request_id=?`, id))
+	if err != nil {
+		return exit.Internalf("cannot read a stopped machine's cancellation: %s", err)
+	}
+	if link == nil || link.Abandoned || !link.CancelRequested {
+		return nil
+	}
+	if err := projectCancellationTx(tx, id, "canceled", "machine_stopped"); err != nil {
+		return exit.Internalf("cannot settle a stopped machine's cancellation: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit a stopped machine's cancellation: %s", err)
+	}
+	return nil
+}
+
 // projectCancellationTx moves an unfinished run to `state` with its event. A finished run
 // keeps its terminal: what settles after it is a note, never a second status.
 func projectCancellationTx(tx *sql.Tx, id, state, scope string) error {
@@ -877,7 +902,12 @@ func projectCancellationTx(tx *sql.Tx, id, state, scope string) error {
 	if n, _ := projected.RowsAffected(); n != 1 {
 		return nil
 	}
-	return appendEventTx(tx, id, StateEvent(state), 0, map[string]any{"scope": scope})
+	// The terminal carries the run's current attempt: a follower skips an older attempt's.
+	var ordinal int64
+	if err := tx.QueryRow(`SELECT ordinal FROM requests WHERE id=?`, id).Scan(&ordinal); err != nil {
+		return err
+	}
+	return appendEventTx(tx, id, StateEvent(state), ordinal, map[string]any{"scope": scope})
 }
 
 // CompleteMachineSubmissionClosure records the machine's durable promise that a
