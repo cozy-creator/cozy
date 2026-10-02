@@ -872,9 +872,13 @@ def check_typed_resources() -> list[str]:
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
     wheel_build = pathlib.Path("internal/wheel/build.go").read_text()
-    if "cmd.Env = config.Frozen().Tool()" not in wheel_build:
+    # One addition is admitted: a pinned source's own SOURCE_DATE_EPOCH, a validated number.
+    epoch = 'cmd.Env = append(cmd.Env, "SOURCE_DATE_EPOCH="+req.SourceDateEpoch)'
+    if ("cmd.Env = config.Frozen().Tool()" not in wheel_build
+            or wheel_build.count("cmd.Env") != 1 + 2 * wheel_build.count(epoch)):
         bad.append("internal/wheel/build.go: [env] uv build inherits the parent environment; "
-                   "the PEP 517 backend executes project code and must receive only Tool()")
+                   "the PEP 517 backend executes project code and must receive only Tool() "
+                   "and a pinned source's SOURCE_DATE_EPOCH")
     retired_debug = (pathlib.Path("internal/transfer/fetch.go").read_text() +
                      pathlib.Path("internal/transfer/upload.go").read_text() +
                      pathlib.Path("internal/cli/transfer.go").read_text())

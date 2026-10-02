@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,8 +25,9 @@ type Request struct {
 	Tree    string
 	OutDir  string
 	Python  string
-	// Env adds build-process variables, e.g. SOURCE_DATE_EPOCH for a pinned source.
-	Env []string
+	// SourceDateEpoch stamps the wheel with a pinned source's own time, so one commit
+	// builds one wheel. It is the only variable a build receives beyond Tool().
+	SourceDateEpoch string
 }
 
 type Result struct {
@@ -94,7 +96,13 @@ func Build(req Request) (*Result, *exit.Error) {
 	}
 	args = append(args, root)
 	cmd := exec.CommandContext(ctx, "uv", args...)
-	cmd.Env = config.Frozen().Tool(req.Env...)
+	cmd.Env = config.Frozen().Tool()
+	if req.SourceDateEpoch != "" {
+		if _, err := strconv.ParseUint(req.SourceDateEpoch, 10, 63); err != nil {
+			return nil, exit.Internalf("wheel build epoch %q is not a Unix time", req.SourceDateEpoch)
+		}
+		cmd.Env = append(cmd.Env, "SOURCE_DATE_EPOCH="+req.SourceDateEpoch)
+	}
 	cmd.WaitDelay = 250 * time.Millisecond
 	processtree.Prepare(cmd)
 	cmd.Cancel = func() error {
