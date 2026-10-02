@@ -166,7 +166,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
                 c.timings.push_back(Timing {
                     dev: d,
                     ws: ws.0,
-                    kind: TimingKind::Copy { from_host },
+                    kind: TimingKind::Copy { from: cp.from, host_ns: cp.host_ns },
                     a: cp.start.clone(),
                     b: cp.ready.clone(),
                     bytes: cp.bytes,

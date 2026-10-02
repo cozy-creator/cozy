@@ -17,7 +17,7 @@ use tensorfs_core::store::Store;
 
 use crate::cuda::{self, AllocationProp, CUcontext, CUdevice, CUstream, CtxGuard};
 use crate::cursor::Cur;
-use crate::device::{self, Arena, Chunk, CopyJob, CopySrc, Copied, EvRef, EventPool, Mover, MoverCtx};
+use crate::device::{self, Arena, Chunk, CopyFrom, CopyJob, CopySrc, Copied, EvRef, EventPool, Mover, MoverCtx};
 use crate::host::HostMem;
 use crate::io::{Batch, Dst, IoTally, Mode, Readers, Source};
 use crate::layout::{Layout, REGION_ALIGN};
@@ -157,10 +157,15 @@ pub(crate) struct Ws {
 #[derive(Debug, Clone, Default)]
 pub struct DevCounters {
     pub copies: u64,
+    /// Copies from host memory with no staging: the pinned tier, and mappings of objects the
+    /// page cache held. With the disk pair, every byte that landed on the device.
     pub host_copy_bytes: u64,
     pub host_copy_ns: u64,
     pub disk_copy_bytes: u64,
     pub disk_copy_ns: u64,
+    /// Of the host pair, the copies from mappings. Never added on top of it.
+    pub mapped_copy_bytes: u64,
+    pub mapped_copy_ns: u64,
     pub misses: u64,
     pub evictions: u64,
     pub evicted_bytes: u64,
@@ -192,7 +197,7 @@ pub struct TagCounters {
 }
 
 pub(crate) enum TimingKind {
-    Copy { from_host: bool },
+    Copy { from: CopyFrom, host_ns: u64 },
     /// The consumer stream's wait on a late copy.
     Stall { tag: String, region: u32 },
     /// The consumer's use of a region: end of the wait to the release event.
@@ -316,14 +321,18 @@ pub(crate) fn resolve_timings(c: &mut Core, all: bool) {
         }
         let ns = (t.b.since(&t.a).unwrap_or(0.0) as f64 * 1e6) as u64;
         match &t.kind {
-            TimingKind::Copy { from_host } => {
+            TimingKind::Copy { from, host_ns } => {
+                let ns = ns + host_ns;
                 let s = &mut c.dstats[t.dev];
-                if *from_host {
-                    s.host_copy_bytes += t.bytes;
-                    s.host_copy_ns += ns;
-                } else {
-                    s.disk_copy_bytes += t.bytes;
-                    s.disk_copy_ns += ns;
+                let (bytes, time) = match from {
+                    CopyFrom::Disk => (&mut s.disk_copy_bytes, &mut s.disk_copy_ns),
+                    CopyFrom::Pinned | CopyFrom::Mapped => (&mut s.host_copy_bytes, &mut s.host_copy_ns),
+                };
+                *bytes += t.bytes;
+                *time += ns;
+                if *from == CopyFrom::Mapped {
+                    s.mapped_copy_bytes += t.bytes;
+                    s.mapped_copy_ns += ns;
                 }
             }
             TimingKind::Compute { tag, region } => {
@@ -585,6 +594,7 @@ impl Inner {
         let t0 = std::time::Instant::now();
         let host2 = host.clone();
         let done = move |res: Result<()>| {
+            crate::faults::wait("host-fill");
             let mut registered = false;
             if res.is_ok() {
                 if let Some(dev) = inner.devices.first() {
@@ -634,7 +644,7 @@ impl Inner {
             };
             c.event(Event::new(kind, Some(name.clone()), Some(r), None, region.nbytes, ns, detail));
             for d in then {
-                if let Err(e) = inner.submit_dev_fill(&mut c, ws, d, r) {
+                if let Err(e) = inner.submit_dev_fill(&mut c, ws, d, r, false) {
                     c.latch(&e);
                     if let Some(Some(w)) = c.sets.get_mut(ws.0 as usize) {
                         if let Some(dw) = w.devs[d].as_mut() {
@@ -669,8 +679,10 @@ impl Inner {
     }
 
 
-    /// Map + fill `regions` on device slot `d`. The caller binds the device context.
-    pub(crate) fn want_dev(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, regions: &[u32], prio: i64, pin: bool) -> Result<()> {
+    /// Map + fill `regions` on device slot `d`; `cached` are those the page cache holds
+    /// (`cached_regions`). The caller binds the device context.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn want_dev(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, regions: &[u32], prio: i64, pin: bool, cached: &[u32]) -> Result<()> {
         let layout = c.ws(ws)?.layout.clone();
         let mut need = 0u64;
         {
@@ -706,7 +718,7 @@ impl Inner {
             let reg = &mut c.ws_mut(ws)?.devs[d].as_mut().unwrap().regs[r as usize];
             commit(reg)?;
             if matches!(reg.state, DState::Absent | DState::Invalid(_)) {
-                self.submit_dev_fill(c, ws, d, r)?;
+                self.submit_dev_fill(c, ws, d, r, cached.contains(&r))?;
             }
         }
         Ok(())
@@ -734,13 +746,15 @@ impl Inner {
     }
 
     /// Queue the copy that fills region `r` on device slot `d` (mapped) from the pinned tier when
-    /// it holds the region, after it when it is filling, else from disk through staging.
-    pub(crate) fn submit_dev_fill(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, r: u32) -> Result<()> {
+    /// it holds the region; else, when the page cache holds the bytes (`cached`), straight from
+    /// mappings of their objects, beside any pinned fill; else after a pinned fill that is
+    /// running (one disk read serves both); else from disk through staging.
+    pub(crate) fn submit_dev_fill(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, r: u32, cached: bool) -> Result<()> {
         c.check()?;
         let w = c.ws_mut(ws)?;
         let region = w.layout.regions[r as usize].clone();
         let hstate = w.hregs[r as usize].state.clone();
-        if matches!(hstate, HState::Filling) {
+        if matches!(hstate, HState::Filling) && !cached {
             w.hregs[r as usize].then.push(d);
             w.devs[d].as_mut().unwrap().regs[r as usize].state = DState::Queued;
             return Ok(());
@@ -751,10 +765,11 @@ impl Inner {
             // SAFETY: inside the live mapping; the hold keeps the region from eviction.
             CopySrc::Host(unsafe { w.host.base().add(region.offset as usize) })
         } else {
-            CopySrc::Disk {
-                source: w.source.clone(),
-                items: region.items.clone(),
-                base: region.offset,
+            let (source, items, base) = (w.source.clone(), region.items.clone(), region.offset);
+            if cached {
+                CopySrc::Mapped { source, items, base }
+            } else {
+                CopySrc::Disk { source, items, base }
             }
         };
         let dw = w.devs[d].as_mut().unwrap();
@@ -788,7 +803,7 @@ impl Inner {
                         c.timings.push_back(Timing {
                             dev: d,
                             ws: ws.0,
-                            kind: TimingKind::Copy { from_host },
+                            kind: TimingKind::Copy { from: cp.from, host_ns: cp.host_ns },
                             a: cp.start,
                             b: cp.ready,
                             bytes: cp.bytes,
@@ -835,7 +850,7 @@ impl Inner {
                 let pin = reg.pin;
                 c.dstats[d].misses += 1;
                 c.tag(ws.0, d, tag).misses += 1;
-                self.want_dev(&mut c, ws, d, &[r], prio, pin)?;
+                self.want_dev(&mut c, ws, d, &[r], prio, pin, &[])?;
             }
         }
         let t0 = std::time::Instant::now();
@@ -1184,8 +1199,11 @@ impl Plane {
             Tier::Pinned => self.inner.want_host(&mut c, ws, &regions, prio, pin)?,
             Tier::Device(o) => {
                 let d = self.dev(o)?;
+                let cached = self.cached_regions(c, ws, d, &regions)?;
                 let _g = self.inner.devices[d].bind()?;
-                self.inner.want_dev(&mut c, ws, d, &regions, prio, pin)?;
+                let mut c = self.lock();
+                c.check()?;
+                self.inner.want_dev(&mut c, ws, d, &regions, prio, pin, &cached)?;
             }
         }
         Ok(Ticket {
@@ -1194,6 +1212,26 @@ impl Plane {
             tier,
             regions,
         })
+    }
+
+    /// Those of `regions` device slot `d` would fill from somewhere other than a ready pinned
+    /// region, and whose bytes the page cache holds. Gives the core lock back first: the query
+    /// opens (and may verify) the regions' objects.
+    fn cached_regions(&self, c: MutexGuard<'_, Core>, ws: WsId, d: usize, regions: &[u32]) -> Result<Vec<u32>> {
+        let w = c.ws(ws)?;
+        let (source, layout) = (w.source.clone(), w.layout.clone());
+        let absent = |r: u32| match &w.devs[d] {
+            Some(dw) => matches!(dw.regs[r as usize].state, DState::Absent | DState::Invalid(_)),
+            None => true,
+        };
+        let asked: Vec<u32> = regions
+            .iter()
+            .copied()
+            .filter(|&r| absent(r) && !matches!(w.hregs[r as usize].state, HState::Ready))
+            .collect();
+        drop(c);
+        let held = |r: &u32| source.cached(&layout.regions[*r as usize].items, &self.inner.tally);
+        Ok(asked.into_iter().filter(held).collect())
     }
 
     /// One host read, then a device fill per device from it (the pinned tier is filled first
@@ -1446,6 +1484,7 @@ impl Plane {
             buffered_bytes: t.buffered_bytes.load(Ordering::Relaxed),
             inline_bytes: t.inline_bytes.load(Ordering::Relaxed),
             direct_refused: t.direct_refused.load(Ordering::Relaxed),
+            map_refused: t.map_refused.load(Ordering::Relaxed),
             disk_read_bytes: disk_read_bytes(),
             ..Default::default()
         };
@@ -1636,6 +1675,7 @@ pub struct HostStats {
     pub buffered_bytes: u64,
     pub inline_bytes: u64,
     pub direct_refused: u64,
+    pub map_refused: u64,
     /// Bytes this process caused the block layer to read (`/proc/self/io` read_bytes).
     pub disk_read_bytes: u64,
     pub counters: HostCounters,

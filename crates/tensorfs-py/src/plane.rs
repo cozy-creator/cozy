@@ -120,7 +120,8 @@ fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
         "registered_bytes" => h.registered_bytes, "memfd_bytes" => h.memfd_bytes,
         "cached_bytes" => h.cached_bytes, "direct_bytes" => h.direct_bytes,
         "buffered_bytes" => h.buffered_bytes, "inline_bytes" => h.inline_bytes,
-        "direct_refused" => h.direct_refused, "fills" => c.fills, "fill_bytes" => c.fill_bytes,
+        "direct_refused" => h.direct_refused, "map_refused" => h.map_refused,
+        "fills" => c.fills, "fill_bytes" => c.fill_bytes,
         "fill_ns" => c.fill_ns, "evictions" => c.evictions, "evicted_bytes" => c.evicted_bytes,
         "register_failed" => c.register_failed, "trims" => c.trims,
     );
@@ -135,6 +136,7 @@ fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
             "reserved_va" => d.reserved_va, "copies" => c.copies,
             "host_copy_bytes" => c.host_copy_bytes, "host_copy_ns" => c.host_copy_ns,
             "disk_copy_bytes" => c.disk_copy_bytes, "disk_copy_ns" => c.disk_copy_ns,
+            "mapped_copy_bytes" => c.mapped_copy_bytes, "mapped_copy_ns" => c.mapped_copy_ns,
             "misses" => c.misses, "evictions" => c.evictions, "evicted_bytes" => c.evicted_bytes,
             "trims" => c.trims,
         ))?;

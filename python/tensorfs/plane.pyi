@@ -42,6 +42,7 @@ class HostStats(TypedDict):
     buffered_bytes: int
     inline_bytes: int
     direct_refused: int
+    map_refused: int
     fills: int
     fill_bytes: int
     fill_ns: int
@@ -64,10 +65,12 @@ class DeviceStats(TypedDict):
     over_budget_unreleasable: int
     reserved_va: int
     copies: int
-    host_copy_bytes: int
+    host_copy_bytes: int  # from host memory with no staging: pinned tier and mappings
     host_copy_ns: int
     disk_copy_bytes: int
     disk_copy_ns: int
+    mapped_copy_bytes: int  # of host_copy_bytes, from page-cache mappings; never added on top
+    mapped_copy_ns: int
     misses: int
     evictions: int
     evicted_bytes: int

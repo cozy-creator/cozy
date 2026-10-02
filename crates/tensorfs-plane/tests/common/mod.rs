@@ -118,13 +118,40 @@ impl Fixture {
             .unwrap_or(0)
     }
 
-    /// Evict our own blob files from the page cache so a fill has to go to disk.
+    /// Evict our own blob files from the page cache so a fill has to go to disk. Written back
+    /// first: a dirty page stays whatever the advice.
     pub fn drop_cache(&self) {
         for o in &self.objects {
             let f = std::fs::File::open(self.store.blob_path(&o.sha256)).unwrap();
+            f.sync_all().unwrap();
             // SAFETY: advice on our own descriptor.
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         }
+    }
+
+    /// Read every blob file once so the page cache holds it.
+    pub fn read_cache(&self) {
+        for o in &self.objects {
+            std::fs::read(self.store.blob_path(&o.sha256)).unwrap();
+        }
+    }
+
+    /// Mappings of our blob files in this process.
+    pub fn blob_maps(&self) -> usize {
+        let blobs = self.root.join("blobs");
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        maps.lines().filter(|l| l.contains(blobs.to_str().unwrap())).count()
+    }
+
+    /// No mapping of our blob files is left: a copy's mappings go right after its event.
+    pub fn unmapped(&self) -> bool {
+        for _ in 0..5000 {
+            if self.blob_maps() == 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
     }
 
     /// Page-cache pages resident across our blob files (mincore; never faults them in).

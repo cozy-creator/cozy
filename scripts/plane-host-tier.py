@@ -53,7 +53,8 @@ REGIONS = {
 }
 UNET_INLINE = 256 + 4 + 192
 HOST_KEYS = {"budget", "used", "ready_bytes", "registered_bytes", "memfd_bytes", "cached_bytes",
-             "direct_bytes", "buffered_bytes", "inline_bytes", "direct_refused", "fills",
+             "direct_bytes", "buffered_bytes", "inline_bytes", "direct_refused", "map_refused",
+             "fills",
              "fill_bytes", "fill_ns", "evictions", "evicted_bytes", "register_failed", "trims"}
 STATS_KEYS = {"host", "devices", "sets", "stages", "regions", "events_dropped", "poisoned"}
 SET_KEYS = {"id", "name", "nbytes", "regions", "host_ready_bytes", "host_memfd_bytes",

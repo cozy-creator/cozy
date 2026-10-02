@@ -1,5 +1,5 @@
-//! Fault points on the copy path, armed only by tests (cargo feature `faults`). Without the
-//! feature every point is a no-op.
+//! Fault points on the copy and fill paths, armed only by tests (cargo feature `faults`).
+//! Without the feature every point is a no-op.
 
 #[cfg(feature = "faults")]
 mod imp {
@@ -74,12 +74,24 @@ mod imp {
         // SAFETY: our stream; the host function only waits on the flag.
         cuda::check("cuLaunchHostFunc", unsafe { (d.launch_host_func)(stream, hold, p) })
     }
+
+    /// Holds the calling thread at `point` until the gate armed there opens.
+    pub(crate) fn wait(point: &'static str) {
+        let f = {
+            let mut g = GATES.lock().unwrap();
+            let Some(i) = g.iter().position(|(p, _)| *p == point) else { return };
+            g.remove(i).1
+        };
+        while !f.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 }
 
 #[cfg(feature = "faults")]
 pub use imp::{arm, arm_gate, Gate};
 #[cfg(feature = "faults")]
-pub(crate) use imp::{gate, hit};
+pub(crate) use imp::{gate, hit, wait};
 
 #[cfg(not(feature = "faults"))]
 #[inline(always)]
@@ -92,3 +104,7 @@ pub(crate) fn hit(_point: &'static str) -> crate::Result<()> {
 pub(crate) fn gate(_point: &'static str, _stream: crate::cuda::CUstream) -> crate::Result<()> {
     Ok(())
 }
+
+#[cfg(not(feature = "faults"))]
+#[inline(always)]
+pub(crate) fn wait(_point: &'static str) {}
