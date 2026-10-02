@@ -2,6 +2,7 @@ package machines
 
 import (
 	"context"
+	"net"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -52,7 +53,8 @@ func (r *Resolver) dialEndpointAt(ctx context.Context, ep machineendpoint.Endpoi
 			account = r.Hub(origin)
 		}
 		cache := r.Host.endpointCache(ep.Name())
-		target := accessTarget{addr: ep.Address, worker: ep.WorkerID, leaf: pin.DER(),
+		host, _, _ := net.SplitHostPort(ep.Address)
+		target := accessTarget{addr: ep.Address, worker: ep.WorkerID, leaf: pin.DER(), local: loopbackOrigin("http://"+net.JoinHostPort(host, "1")) != "",
 			pin:   func() (*workertls.Pin, *exit.Error) { return pin, nil },
 			owner: func() (rental.CreatorIdentity, *exit.Error) { return key, nil }}
 		resumeAccessCleanup(ctx, cache, target)

@@ -1,6 +1,7 @@
 package machines
 
 import (
+	"cmp"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -49,10 +50,11 @@ func (l *login) Identity() string { return l.identity.Load().(string) }
 // delegated token for the presented leaf.
 type fakeHub struct {
 	*httptest.Server
-	issued  atomic.Int32
-	expires time.Duration
-	subject string
-	unbound bool
+	issued   atomic.Int32
+	expires  time.Duration
+	declared string
+	subject  string
+	unbound  bool
 }
 
 func newHub(t *testing.T) *fakeHub {
@@ -76,7 +78,7 @@ func newHub(t *testing.T) *fakeHub {
 		}
 		claims, _ := json.Marshal(map[string]any{"iss": h.URL, "delegated_sub": h.subject, "permissions": []string{"cozy.execution-access"}, "attributes": attributes, "n": n})
 		token := base64.RawURLEncoding.EncodeToString([]byte(`{"typ":"delegated-access+jwt"}`)) + "." + base64.RawURLEncoding.EncodeToString(claims) + ".sig"
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": time.Now().Add(h.expires).UTC().Format(time.RFC3339), "environment": map[string]string{"TENSORHUB_ORIGIN": h.URL, "TENSORHUB_UNKNOWN": "dropped"}, "future_field": true})
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": time.Now().Add(h.expires).UTC().Format(time.RFC3339), "environment": map[string]string{"TENSORHUB_ORIGIN": cmp.Or(h.declared, h.URL), "TENSORHUB_UNKNOWN": "dropped"}, "future_field": true})
 	}))
 	t.Cleanup(h.Close)
 	return h
@@ -399,5 +401,20 @@ func TestLogoutErasesEndpointGrantAndQueuesRemoval(t *testing.T) {
 	}
 	if s.machine.deletes != 1 || s.hub.issued.Load() != 2 {
 		t.Fatalf("next connection must remove then re-authorize: deletes %d issued %d", s.machine.deletes, s.hub.issued.Load())
+	}
+}
+
+func TestRemoteEndpointReadsDeclaredOriginOfLoopbackHub(t *testing.T) {
+	s := newScope(t)
+	s.hub.declared = "https://public.example.test"
+	reads, problem := s.attach(t)
+	if problem != nil || reads != "https://public.example.test" {
+		t.Fatalf("a remote machine must read the declared origin, got %q %v", reads, problem)
+	}
+	s.target.local = true
+	s.cache = accessCache{dir: t.TempDir()}
+	reads, problem = s.attach(t)
+	if problem != nil || accessOrigin(reads) != accessOrigin(s.hub.URL) {
+		t.Fatalf("a machine on this computer reads a loopback Hub at loopback, got %q %v", reads, problem)
 	}
 }

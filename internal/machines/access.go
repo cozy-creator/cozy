@@ -74,9 +74,11 @@ func accessOrigin(value string) string {
 // grants it attached, per login origin, and the removals it still owes the machine.
 type accessCache struct{ dir string }
 
-// accessTarget is the pinned machine a cache's signed access calls reach.
+// accessTarget is the pinned machine a cache's signed access calls reach. A machine on
+// this computer reads a loopback login Hub at loopback; any other reads its declared origin.
 type accessTarget struct {
 	addr, worker string
+	local        bool
 	leaf         []byte
 	pin          func() (*workertls.Pin, *exit.Error)
 	owner        func() (rental.CreatorIdentity, *exit.Error)
@@ -207,7 +209,7 @@ func (h *Host) endpointCache(name string) accessCache {
 }
 
 func (h *Host) accessTarget(launch *Launch) accessTarget {
-	return accessTarget{addr: launch.Addr, worker: launch.WorkerID, leaf: launch.Leaf, pin: h.Pin, owner: func() (rental.CreatorIdentity, *exit.Error) {
+	return accessTarget{addr: launch.Addr, worker: launch.WorkerID, local: true, leaf: launch.Leaf, pin: h.Pin, owner: func() (rental.CreatorIdentity, *exit.Error) {
 		if _, err := os.Stat(h.path("owner.pem")); err != nil {
 			return rental.CreatorIdentity{}, exit.New(exit.Credential, "the retained machine owner key is unavailable")
 		}
@@ -349,11 +351,11 @@ func deviceBoundAccess(token string) bool {
 	return json.Unmarshal(raw, &claims) == nil && claims.Attributes.Device != "" && slices.Equal(claims.Permissions, []string{"cozy.execution-access"})
 }
 
-// machineOrigin is where this computer's machine reads the Hub its owner reached at login.
-// A Hub reached on loopback runs on this computer, so the machine reads it there too, never
-// through the public origin (a tunnel, a proxy) it declares for remote pods.
-func machineOrigin(login, declared string) string {
-	if local := loopbackOrigin(login); local != "" && loopbackOrigin(declared) == "" {
+// reads is where the target machine reads the Hub its owner reached at login. A Hub reached
+// on loopback runs on this computer, so a machine here reads it there too, never through
+// the public origin (a tunnel, a proxy) it declares for remote machines.
+func (t accessTarget) reads(login, declared string) string {
+	if local := loopbackOrigin(login); t.local && local != "" && loopbackOrigin(declared) == "" {
 		return local
 	}
 	return declared
@@ -421,7 +423,7 @@ func attachAccess(ctx context.Context, cache accessCache, target accessTarget, o
 			pending = true
 		}
 	}
-	refresh := pending || grant.Certificate != certificate || grant.Credential != credential || grant.ExpiresAt <= time.Now().Add(time.Minute).Unix() || !deviceBoundAccess(grant.Token) || grant.Generation != snapshot[key].Generation || accessOrigin(grant.Origin) != accessOrigin(machineOrigin(origin, grant.Origin))
+	refresh := pending || grant.Certificate != certificate || grant.Credential != credential || grant.ExpiresAt <= time.Now().Add(time.Minute).Unix() || !deviceBoundAccess(grant.Token) || grant.Generation != snapshot[key].Generation || accessOrigin(grant.Origin) != accessOrigin(target.reads(origin, grant.Origin))
 	if refresh {
 		access, problem := account.AuthorizeExecutionAccess(ctx, target.leaf)
 		if problem != nil {
@@ -430,7 +432,7 @@ func attachAccess(ctx context.Context, cache accessCache, target accessTarget, o
 		if !deviceBoundAccess(access.Token) {
 			return "", exit.Named(exit.Credential, "hub.execution_access_device_key_required", "Tensorhub must issue execution access bound to the current login device")
 		}
-		reads := machineOrigin(origin, access.Environment["TENSORHUB_ORIGIN"])
+		reads := target.reads(origin, access.Environment["TENSORHUB_ORIGIN"])
 		access.Environment["TENSORHUB_ORIGIN"] = reads
 		grant = executionAccess{Origin: reads, Token: access.Token, ExpiresAt: access.ExpiresAt.Unix(), Environment: access.Environment, Certificate: certificate, Credential: credential, Generation: snapshot[key].Generation}
 		if len(access.TrustRoot) > 0 {
