@@ -11,6 +11,7 @@ Plane is `devices=[]`: libcuda is never loaded.
     PYTHONPATH=python scripts/plane-host-tier.py [workdir]
 """
 
+import gc
 import hashlib
 import io
 import json
@@ -21,6 +22,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import tensorfs
@@ -329,6 +331,33 @@ def main(work: Path):
     check("closing a set punches its pinned RAM while a handle to the memfd survives",
           resident(kept) < REGION_ALIGN, resident(kept))
     os.close(kept)
+
+    # ---- a plane collected unclosed leaves nothing behind
+    def left():
+        fds = [os.readlink(f"/proc/self/fd/{n}") for n in os.listdir("/proc/self/fd")
+               if os.path.exists(f"/proc/self/fd/{n}")]
+        names = [Path(f"/proc/self/task/{t}/comm").read_text() for t in os.listdir("/proc/self/task")]
+        return (sum("memfd:tfs-plane" in f for f in fds), sum(n.startswith("tfs-plane") for n in names))
+
+    def unclosed():
+        q = plane.Plane(devices=[])
+        qsrc = q.source(store, store.acquire_cozytensors(manifest))
+        qws = register(q, qsrc, store, manifest, "unet")
+        q.set_pinned_budget(qws.nbytes)
+        ticket = q.want(qws, "pinned")
+        ticket.wait()
+        del q, qws, qsrc  # the ticket is the plane's last handle
+        return ticket
+
+    before = left()
+    for _ in range(3):
+        unclosed()
+    gc.collect()
+    for _ in range(2000):
+        if left() == before:
+            break
+        time.sleep(0.001)
+    check("planes collected unclosed leave no memfds or threads", left() == before, (before, left()))
 
     # ---- one lease per manifest: it ends with the last weight set and the source handle
     ws.close()

@@ -662,7 +662,7 @@ mod copy_faults {
 
     #[test]
     #[ignore = "GPU"]
-    fn an_undrainable_failure_poisons_and_nothing_is_unmapped_under_it() {
+    fn an_undrainable_failure_poisons_and_its_ranges_outlive_the_queued_copies() {
         let fx = Fixture::new("gpu-undrained");
         let p = staging_plane();
         let ws = fx.register(&p, None);
@@ -675,9 +675,12 @@ mod copy_faults {
         assert!(matches!(r, Err(Error::Poisoned(_))), "{r:?}");
         assert!(matches!(p.close_ws(ws), Err(Error::Poisoned(_))), "a poisoned plane must not unmap");
         assert!(matches!(p.drop_regions(ws, Tier::Device(DEV), None), Err(Error::Poisoned(_))));
+        // Collecting it waits for the device before anything is unmapped: the copies still
+        // queued behind the gate land in mapped memory.
+        let opener = open_later(&gate);
         drop(p);
-        gate.open();
-        std::thread::sleep(Duration::from_millis(200));
+        assert!(gate.is_open(), "the plane was torn down while its copies still waited on the device");
+        opener.join().unwrap();
         healthy();
     }
 

@@ -72,6 +72,10 @@ pub(crate) struct Cur {
 }
 
 impl Cur {
+    /// (device slot, ring base, ring length, ring handles), for a plane torn down unclosed.
+    pub(crate) fn into_ring(self) -> (usize, u64, u64, Vec<Chunk>) {
+        (self.dev, self.ring_base, self.ring_len, self.ring_chunks)
+    }
     fn streamed_total(&self) -> u64 {
         if self.total == u64::MAX {
             return u64::MAX;

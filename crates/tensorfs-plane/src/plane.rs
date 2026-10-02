@@ -1555,33 +1555,72 @@ impl Drop for Plane {
 }
 
 impl Drop for Inner {
-    /// The last reference can go while copies are still on the device: a plane dropped with a
-    /// fill queued ends inside that copy's completion. Pinned ranges are unregistered and
-    /// unmapped only after every copy reading them; a poisoned plane (or one whose events
-    /// cannot be waited) keeps them for the life of the process instead. Device ranges are
-    /// never unmapped here.
+    /// The last reference can go without `close()`: handles collected in any order, a plane
+    /// dropped with a fill queued (it ends inside that copy's completion), a poisoned plane.
+    /// Its threads stop, and once every device has run all queued work its ranges are unmapped,
+    /// its handles released and its pinned tier let go, exactly as `close()` would. A device
+    /// that cannot be synchronized keeps its ranges and the pinned tier for the life of the
+    /// process: a copy may still touch them.
     fn drop(&mut self) {
-        let c = self.core.get_mut().unwrap_or_else(|p| p.into_inner());
-        let mut settled = c.poisoned.is_none();
-        for w in c.sets.iter_mut().flatten() {
-            for h in &mut w.hregs {
-                settled &= sync_all(&mut h.pending).is_ok();
-            }
-            for dw in w.devs.iter_mut().flatten() {
-                for reg in &mut dw.regs {
-                    if let DState::Filling(ev) = &reg.state {
-                        settled &= ev.sync().is_ok();
-                    }
-                    settled &= sync_all(&mut reg.pending).is_ok();
-                }
+        self.readers.stop();
+        for dev in &self.devices {
+            for m in &dev.movers {
+                m.detach();
             }
         }
-        if !settled {
+        let c = self.core.get_mut().unwrap_or_else(|p| p.into_inner());
+        if teardown(&self.devices, c).is_err() {
             for w in c.sets.iter().flatten() {
                 std::mem::forget(w.host.clone());
             }
         }
     }
+}
+
+/// Free everything the books still hold, after the devices ran all queued work.
+fn teardown(devices: &[DeviceRt], c: &mut Core) -> Result<()> {
+    for dev in devices {
+        let _g = dev.bind()?;
+        // SAFETY: the device's context is bound.
+        cuda::check("cuCtxSynchronize", unsafe { (cuda::driver()?.ctx_synchronize)() })?;
+    }
+    let mut rings: Vec<(usize, u64, u64, Vec<Chunk>)> = c.cursors.drain().map(|(_, k)| k.into_ring()).collect();
+    for (d, dev) in devices.iter().enumerate() {
+        let _g = dev.bind()?;
+        let mut chunks = Vec::new();
+        for (_, base, len, held) in rings.iter_mut().filter(|r| r.0 == d && r.2 > 0) {
+            device::unmap_span(*base, *len)?;
+            device::free_va(*base, *len)?;
+            chunks.append(held);
+        }
+        for w in c.sets.iter_mut().flatten() {
+            let Some(dw) = w.devs[d].take() else { continue };
+            for (reg, region) in dw.regs.into_iter().zip(&w.layout.regions) {
+                if !reg.chunks.is_empty() {
+                    device::unmap_span(dw.base + region.offset, region.span)?;
+                    chunks.extend(reg.chunks);
+                }
+            }
+            device::free_va(dw.base, w.layout.nbytes)?;
+        }
+        c.arenas[d].put_idle(chunks);
+        c.arenas[d].release_idle()?;
+    }
+    let first = devices.first().map(|d| d.ctx);
+    for w in c.sets.iter_mut().flatten() {
+        for (r, (h, region)) in w.hregs.iter_mut().zip(&w.layout.regions).enumerate() {
+            if h.registered {
+                let _g = first.map(CtxGuard::enter).transpose()?;
+                w.host.unregister(region.offset)?;
+                h.registered = false;
+            }
+            if matches!(h.state, HState::Ready) {
+                w.host.release(r as u32, region.offset, region.span)?;
+                h.state = HState::Absent;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]

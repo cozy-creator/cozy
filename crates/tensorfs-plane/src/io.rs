@@ -278,10 +278,16 @@ impl Readers {
         self.q.1.notify_one();
     }
 
-    /// Finish queued jobs, then stop the threads.
-    pub fn shutdown(&self) {
+    /// Let the threads exit once the queue is empty; waits for nothing (the caller may be one
+    /// of them).
+    pub fn stop(&self) {
         self.q.0.lock().unwrap().stop = true;
         self.q.1.notify_all();
+    }
+
+    /// Finish queued jobs, then stop the threads.
+    pub fn shutdown(&self) {
+        self.stop();
         for t in self.threads.lock().unwrap().drain(..) {
             let _ = t.join();
         }

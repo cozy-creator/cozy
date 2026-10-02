@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from . import _ext
 from ._ext import (
+    AdapterTargetUnsupported,
     AmbiguousClassification,
     ArchiveRefused,
     ArithOverflow,
@@ -181,6 +182,7 @@ CODES: dict[str, type[Refusal]] = _ext.CODES
 
 __all__ = [
     "CODES",
+    "AdapterTargetUnsupported",
     "AmbiguousClassification",
     "ArchiveRefused",
     "ArithOverflow",

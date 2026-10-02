@@ -431,8 +431,13 @@ impl Mover {
         }
     }
 
-    pub fn stop(&self) {
+    /// Close the queue: the thread drains its stream, frees its buffers and exits by itself.
+    pub fn detach(&self) {
         self.tx.lock().unwrap().take();
+    }
+
+    pub fn stop(&self) {
+        self.detach();
         if let Some(t) = self.thread.lock().unwrap().take() {
             let _ = t.join();
         }

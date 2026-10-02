@@ -1,4 +1,4 @@
-# tensorfs.plane — Python API (v3.1, 2026-10-02)
+# tensorfs.plane — Python API (v3.2, 2026-10-02)
 
 The weight plane moves bytes; cozy-runtime decides. The plane never measures free memory,
 never picks victims among equals, never reorders a schedule. It ships inside the `tensorfs`
@@ -240,10 +240,16 @@ stream cannot drain is `Poisoned`.
 **Poison is latched plane-wide**: an ambiguous driver outcome (a failed unmap or rollback, an
 undrainable copy failure, a driver mapping that disagrees with the books) or a lease dropped
 unreleased makes every later call raise `Poisoned` with the first cause; the runtime replaces
-the executor. A poisoned plane never unmaps, unregisters or frees a range (copies may still
-touch it): `ws.close()`, `cur.close()` and `p.close()` raise `Poisoned` and the process keeps
-the ranges until it exits. Capacity never poisons (`BudgetExceeded`, `Shortfall` leave the
-plane usable).
+the executor. A poisoned plane never unmaps, unregisters or frees a range while it lives
+(copies may still touch it): `ws.close()`, `cur.close()` and `p.close()` raise `Poisoned`.
+Capacity never poisons (`BudgetExceeded`, `Shortfall` leave the plane usable).
+
+**A plane collected without `close()`** (its handles dropped in any order, or poisoned) is
+torn down when its last handle goes: its threads stop, and once every device has run all
+queued work, its device ranges are unmapped, its handles released and its pinned RAM let go as
+`close()` would. Only a device that cannot be synchronized keeps its ranges and the pinned
+tier until the process exits. Closing is still the contract: collection order decides when
+an unclosed plane ends.
 
 ## Host tier across processes
 
@@ -273,6 +279,11 @@ plane usable).
   raises `Invalid`; register a fresh one.
 
 ## Changelog
+
+- v3.2 2026-10-02 (W3: fd and thread growth per weight set): a plane collected unclosed or
+  poisoned is torn down at its last handle (threads, device memory, pinned memfds) once its
+  devices are synchronized; before, its reader threads stayed and a poisoned plane kept its
+  memfds for the life of the process.
 
 - v3.1 2026-10-02 (Xid 31; W3 run 2675): a failed copy is reported only after its stream drained;
   an undrainable one poisons; a poisoned plane never unmaps (close raises `Poisoned`).
