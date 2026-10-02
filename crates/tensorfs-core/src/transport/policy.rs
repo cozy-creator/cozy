@@ -180,10 +180,12 @@ pub struct SourcePolicy {
     pub resolved: Resolved,
 }
 
-/// Checked answers by host and port.
-type Answers = HashMap<(String, u16), Vec<SocketAddr>>;
+/// Answers by host and port, each behind its own lock so one lookup serves every caller.
+type Answers = HashMap<(String, u16), Arc<Mutex<Option<Vec<SocketAddr>>>>>;
 
-/// One resolution per host and port for as long as the policy that made it lives.
+/// One resolution per host and port for as long as the policy that made it lives. Callers
+/// that ask for a host while it resolves wait for that answer: a pull's 512 requests sent
+/// as many lookups to a pod's Docker resolver at once, which answered some after 4-8 s.
 #[derive(Clone, Default)]
 pub struct Resolved(Arc<Mutex<Answers>>);
 
@@ -195,13 +197,20 @@ impl std::fmt::Debug for Resolved {
 
 impl Resolved {
     fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
-        let key = (host.to_string(), port);
-        if let Some(addrs) = self.0.lock().unwrap().get(&key) {
+        let slot = Arc::clone(
+            self.0
+                .lock()
+                .unwrap()
+                .entry((host.to_string(), port))
+                .or_default(),
+        );
+        let mut answer = slot.lock().unwrap();
+        if let Some(addrs) = answer.as_ref() {
             return Ok(addrs.clone());
         }
         let addrs = resolve(host, port)?;
         if !addrs.is_empty() {
-            self.0.lock().unwrap().insert(key, addrs.clone());
+            *answer = Some(addrs.clone());
         }
         Ok(addrs)
     }

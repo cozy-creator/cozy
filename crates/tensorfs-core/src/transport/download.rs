@@ -137,8 +137,11 @@ enum Ended {
 impl From<Refusal> for Ended {
     fn from(refusal: Refusal) -> Ended {
         match refusal.code {
-            // A connection that failed, stalled or was dropped, and a full descriptor table.
-            Code::TRANSFER_FAILED | Code::FD_HEADROOM => Ended::Retry(refusal, None),
+            // A connection that failed, stalled or was dropped, a name the resolver did not
+            // answer, and a full descriptor table.
+            Code::TRANSFER_FAILED | Code::HUB_UNREACHABLE | Code::FD_HEADROOM => {
+                Ended::Retry(refusal, None)
+            }
             _ => Ended::Fatal(refusal),
         }
     }

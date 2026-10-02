@@ -3869,6 +3869,45 @@ fn a_source_request_far_slower_than_its_peers_is_restarted() {
     assert!(log.contains(" restart "), "{log}");
 }
 
+/// A name the resolver does not answer is weather like any failed request: it is asked
+/// again (a pod's Docker resolver answered some of 512 lookups only after 4-8 s, and the
+/// first 0.3.85 walks ended on it), and the fetch ends on its own patience, quoting it.
+#[test]
+fn a_name_that_does_not_resolve_is_asked_again_until_the_pull_stops() {
+    let root = temporary("unresolved");
+    let store = Store::init(&root).unwrap();
+    let object = ObjectRef::of(&ranged_body(1 << 20));
+    let (plan, _) =
+        FetchPlan::of_objects(&store, "unresolved", std::slice::from_ref(&object)).unwrap();
+    let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+    let policy = SourcePolicy {
+        allowed_hosts: vec!["tensorfs-test.invalid".into()],
+        allow_local: true,
+        ..Default::default()
+    };
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let started = std::time::Instant::now();
+    let refusal = fetch_ranged(
+        &store,
+        &grant,
+        "http://tensorfs-test.invalid/member.safetensors",
+        &policy,
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        Ranged::default(),
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED, "{refusal}");
+    assert!(refusal.detail.contains("nothing landed"), "{refusal}");
+    assert!(refusal.detail.contains("name resolution failed"), "{refusal}");
+    assert!(started.elapsed() >= ledger.floor(), "{:?}", started.elapsed());
+    assert_eq!(temps(&root), 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// The door does not soften because the bytes arrived in pieces: one flipped byte and the
 /// object is refused at the digest, with nothing left behind.
 #[test]
