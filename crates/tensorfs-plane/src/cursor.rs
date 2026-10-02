@@ -93,6 +93,9 @@ impl Cur {
 /// Queue copies for streamed positions, in order, while the window and the ring allow.
 fn pump(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
     loop {
+        if c.poisoned.is_some() {
+            return Ok(()); // nothing new goes to a device whose state is ambiguous
+        }
         let cur = c.cursors.get_mut(&id).ok_or(Error::Closed)?;
         let k = cur.next_submit;
         if cur.orphaned || k >= cur.streamed_total() || k - cur.done >= cur.window {
@@ -165,6 +168,9 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
                     bytes: cp.bytes,
                 });
             }
+            if let Err(e) = &res {
+                c.latch(e);
+            }
             if let Some(cur) = c.cursors.get_mut(&id) {
                 cur.inflight -= 1;
                 cur.ready.insert(k, res.map(|cp| cp.ready));
@@ -213,18 +219,16 @@ fn reap(inner: &Arc<Inner>, c: &mut Core, id: u64) {
     }
 }
 
-/// Unmap a cursor's ring and return its holds. No lease, view or copy in flight remains.
+/// Unmap a cursor's ring and return its holds. No lease, view or copy in flight remains (a
+/// failed copy is drained before it is reported). A poisoned plane keeps the ring mapped.
 fn finish(inner: &Arc<Inner>, c: &mut Core, id: u64) -> Result<()> {
+    c.check()?;
     let cur = c.cursors.remove(&id).ok_or(Error::Closed)?;
     let d = cur.dev;
     let _g = inner.devices[d].bind()?;
-    for e in cur.ready.values().flatten() {
-        e.sync()?;
-    }
-    for p in &cur.placed {
-        if let Some(Some(e)) = &p.freed {
-            e.sync()?;
-        }
+    let freed = cur.placed.iter().filter_map(|p| p.freed.as_ref().and_then(Option::as_ref));
+    if let Err(e) = cur.ready.values().flatten().chain(freed).try_for_each(|e| e.sync()) {
+        return Err(c.poison(format!("waiting for a ring's copies and readers failed: {e}")));
     }
     if cur.ring_len > 0 {
         if let Err(e) = device::unmap_span(cur.ring_base, cur.ring_len) {

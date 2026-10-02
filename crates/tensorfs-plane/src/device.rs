@@ -489,7 +489,33 @@ struct Waiter {
     cv: Condvar,
 }
 
+/// One job on the mover's stream. `Err` means nothing this job enqueued is still in flight and
+/// no reader still writes a bounce: a failed copy is drained before it is reported, so no
+/// caller unmaps, unregisters or reuses a range a copy still touches. A drain that itself fails
+/// is ambiguous device state: `Poisoned`.
 fn run_copy(
+    m: &MoverCtx,
+    stream: CUstream,
+    bounces: &mut [Bounce],
+    waits: Vec<EvRef>,
+    dst: u64,
+    len: u64,
+    src: CopySrc,
+) -> Result<Copied> {
+    let r = enqueue_copy(m, stream, bounces, waits, dst, len, src);
+    let Err(e) = r else { return r };
+    let d = cuda::driver()?;
+    // SAFETY: our own stream.
+    let drained = crate::faults::hit("drain").and_then(|_| {
+        cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(stream) })
+    });
+    match drained {
+        Ok(()) => Err(e),
+        Err(drain) => Err(Error::Poisoned(format!("a failed copy ({e}) could not be drained: {drain}"))),
+    }
+}
+
+fn enqueue_copy(
     m: &MoverCtx,
     stream: CUstream,
     bounces: &mut [Bounce],
@@ -511,11 +537,13 @@ fn run_copy(
     match src {
         CopySrc::Host(p) => {
             wait_all(&waits)?;
+            crate::faults::gate("copy", stream)?;
             start.record(stream)?;
             // SAFETY: `p` covers `len` bytes of the pinned tier, kept alive by the books.
             cuda::check("cuMemcpyHtoDAsync", unsafe {
                 (d.memcpy_htod_async)(dst, p as *const libc::c_void, len as usize, stream)
             })?;
+            crate::faults::hit("host-copy-recorded")?;
             ready.record(stream)?;
             Ok(Copied { ready, start, bytes: len, from_host: true })
         }
@@ -528,14 +556,16 @@ fn run_copy(
             let mut inflight: VecDeque<(u64, usize, Arc<Waiter>)> = VecDeque::new();
             let mut next = 0usize;
             // The slot's previous readers first: the stream waits, the host keeps reading.
-            wait_all(&waits)?;
+            let mut failed = wait_all(&waits).and_then(|_| crate::faults::gate("copy", stream)).err();
             let mut first = true;
-            let mut failed = None;
             loop {
                 while failed.is_none() && inflight.len() < bounces.len() && next < nchunks {
                     let b = next % bounces.len();
                     if let Some(last) = bounces[b].last.take() {
-                        last.sync()?;
+                        if let Err(e) = last.sync() {
+                            failed = Some(e);
+                            break;
+                        }
                     }
                     let c0 = next as u64 * cap;
                     let c1 = (c0 + cap).min(len);
@@ -568,31 +598,34 @@ fn run_copy(
                 while g.is_none() {
                     g = w.cv.wait(g).unwrap();
                 }
-                // After a failure keep draining: readers may still write the bounces.
+                // After any failure keep draining: readers may still write the bounces.
                 if let Err(e) = g.take().unwrap() {
                     failed.get_or_insert(e);
                 }
                 if failed.is_some() {
                     continue;
                 }
-                if first {
-                    start.record(stream)?;
-                    first = false;
+                let mut copy = || -> Result<()> {
+                    if first {
+                        start.record(stream)?;
+                        first = false;
+                    }
+                    crate::faults::hit("staged-copy")?;
+                    let n = cap.min(len - c0);
+                    // SAFETY: the bounce holds the chunk; pinned host memory.
+                    cuda::check("cuMemcpyHtoDAsync", unsafe {
+                        (d.memcpy_htod_async)(dst + c0, bounces[b].ptr as *const libc::c_void, n as usize, stream)
+                    })?;
+                    let e = m.events.get(false)?;
+                    e.record(stream)?;
+                    bounces[b].last = Some(e);
+                    Ok(())
+                };
+                if let Err(e) = copy() {
+                    failed = Some(e);
                 }
-                let n = cap.min(len - c0);
-                // SAFETY: the bounce holds the chunk; pinned host memory.
-                cuda::check("cuMemcpyHtoDAsync", unsafe {
-                    (d.memcpy_htod_async)(dst + c0, bounces[b].ptr as *const libc::c_void, n as usize, stream)
-                })?;
-                let e = m.events.get(false)?;
-                e.record(stream)?;
-                bounces[b].last = Some(e);
             }
             if let Some(e) = failed {
-                // Chunks before the failure are still writing the region: drain them, so an
-                // Invalid region never has a copy in flight when it is unmapped.
-                ready.record(stream)?;
-                ready.sync()?;
                 return Err(e);
             }
             if first {

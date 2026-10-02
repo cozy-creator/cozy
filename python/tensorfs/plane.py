@@ -22,6 +22,8 @@ from ._ext.plane import (
     Source,
     Ticket,
     WeightSet,
+    hold_tier,
+    release_tier,
 )
 
 __all__ = [
@@ -43,4 +45,6 @@ __all__ = [
     "Source",
     "Ticket",
     "WeightSet",
+    "hold_tier",
+    "release_tier",
 ]

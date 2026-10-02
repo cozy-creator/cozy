@@ -449,10 +449,11 @@ fn cutting_just_wanted_regions_waits_for_every_staged_chunk() {
 }
 
 /// W3 G4: a repeat run differed only where streamed copies came disk → staging → ring.
-/// Stream cyclically while the source of each copy changes under it: a Worker plane punches the
-/// memfd it shares (foreign eviction under our live registrations), our own pinned budget drops
-/// to zero with a cold page cache (every copy staged from disk), then the tier refills while
-/// streaming, then shrinks to one region. Every streamed read is checked against the source.
+/// Stream cyclically while the source of each copy changes under it: a Worker plane sharing the
+/// memfd lets go of it (its eviction only ends its claim: ours keep the bytes), our own pinned
+/// budget drops to zero with a cold page cache (every copy staged from disk), then the tier
+/// refills while streaming, then shrinks to one region. Every streamed read is checked against
+/// the source.
 fn mixed_source_stream(copy_streams: usize) {
     let fx = Fixture::new("gpu-mixsrc");
     let worker = host_only();
@@ -533,4 +534,189 @@ fn mixed_source_stream(copy_streams: usize) {
 fn streaming_stays_exact_across_pinned_disk_and_foreign_punch() {
     mixed_source_stream(1);
     mixed_source_stream(2);
+}
+
+#[test]
+#[ignore = "GPU"]
+fn verify_bytes_refuses_once_the_lease_is_released() {
+    let fx = Fixture::new("gpu-verify");
+    let p = plane();
+    let ws = fx.register(&p, None);
+    let s = Stream::new();
+    p.set_vram_budget(DEV, 1 << 30).unwrap();
+    let l = resident(&p, ws, &s, 0);
+    assert!(l.verify_bytes().unwrap().is_empty());
+    l.release(s.raw()).unwrap();
+    // Released bytes may be evicted at once: reading them is a read of an unmapped range.
+    assert!(matches!(l.verify_bytes(), Err(Error::Invalid(_))));
+    s.sync();
+    p.close().unwrap();
+}
+
+/// Copy failures with copies of the same job still queued on the device (Xid 31: a copy engine
+/// wrote a range unmapped after its job failed). A gate holds the job's stream on the device;
+/// the fault lands after the job enqueued at least one copy behind it.
+#[cfg(feature = "faults")]
+mod copy_faults {
+    use super::*;
+    use std::time::Duration;
+    use tensorfs_plane::faults;
+
+    fn staging_plane() -> Plane {
+        // Eight bounces: the staged region's five chunks never wait for a bounce to come back.
+        Plane::open(PlaneConfig {
+            devices: vec![DEV],
+            readers: 4,
+            staging_buffers: 8,
+            staging_bytes: 16 << 20,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn open_later(g: &faults::Gate) -> std::thread::JoinHandle<()> {
+        let open = g.opener();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            open();
+        })
+    }
+
+    /// The device context survived: no copy faulted on an unmapped range.
+    fn health() -> Result<(), Error> {
+        let (_, ctx) = cuda::primary_context(DEV)?;
+        let _g = CtxGuard::enter(ctx)?;
+        let d = cuda::driver()?;
+        cuda::check("cuCtxSynchronize", unsafe { (d.ctx_synchronize)() })
+    }
+
+    fn healthy() {
+        health().unwrap();
+    }
+
+    #[test]
+    #[ignore = "GPU"]
+    fn a_failed_fill_is_reported_only_after_its_queued_copies_drained() {
+        let fx = Fixture::new("gpu-drain");
+        // (fault point, pass that fails, source): the second staged chunk; the record after a
+        // pinned-tier copy.
+        for (point, n, pinned) in [("staged-copy", 2, false), ("host-copy-recorded", 1, true)] {
+            let p = staging_plane();
+            let ws = fx.register(&p, None);
+            let s = Stream::new();
+            p.set_vram_budget(DEV, 1 << 30).unwrap();
+            if pinned {
+                p.set_pinned_budget(1 << 30).unwrap();
+                p.want(ws, Tier::Pinned, Some(&[1]), 0, false).unwrap().wait().unwrap();
+            } else {
+                fx.drop_cache();
+            }
+            let gate = faults::arm_gate("copy");
+            faults::arm(point, n);
+            let opener = open_later(&gate);
+            let r = p.want(ws, Tier::Device(DEV), Some(&[1]), 0, false).unwrap().wait();
+            let drained = gate.is_open();
+            // What a runtime does next with a failed region: give its memory back.
+            let dropped = p.drop_regions(ws, Tier::Device(DEV), Some(&[1]));
+            opener.join().unwrap();
+            let device = health();
+            assert!(r.is_err(), "{point}: the injected failure must surface");
+            assert!(drained, "{point}: the failure was reported while its copies still waited on the device; device after the unmap: {device:?}");
+            dropped.unwrap();
+            device.unwrap();
+            // The region refills exactly.
+            resident(&p, ws, &s, 1).release(s.raw()).unwrap();
+            s.sync();
+            assert!(p.stats().poisoned.is_none());
+            p.close().unwrap();
+            healthy();
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU"]
+    fn a_failed_ring_copy_is_reported_only_after_draining_and_the_ring_closes_safely() {
+        let fx = Fixture::new("gpu-ringdrain");
+        let p = staging_plane();
+        let ws = fx.register(&p, None);
+        let s = Stream::new();
+        p.set_vram_budget(DEV, 1 << 30).unwrap();
+        fx.drop_cache();
+        let gate = faults::arm_gate("copy");
+        faults::arm("staged-copy", 2);
+        let opener = open_later(&gate);
+        let cur = p.stream(ws, DEV, &[1], 1, 1, 0, "ring", None).unwrap();
+        let r = cur.acquire(1, s.raw());
+        let drained = gate.is_open();
+        let closed = cur.close(); // unmaps the ring
+        opener.join().unwrap();
+        let device = health();
+        assert!(r.is_err(), "the injected failure must surface at acquire");
+        assert!(drained, "a failed ring copy was reported while its chunks still waited on the device; device after the unmap: {device:?}");
+        closed.unwrap();
+        device.unwrap();
+        assert!(p.stats().poisoned.is_none());
+        p.close().unwrap();
+        healthy();
+    }
+
+    #[test]
+    #[ignore = "GPU"]
+    fn an_undrainable_failure_poisons_and_nothing_is_unmapped_under_it() {
+        let fx = Fixture::new("gpu-undrained");
+        let p = staging_plane();
+        let ws = fx.register(&p, None);
+        p.set_vram_budget(DEV, 1 << 30).unwrap();
+        fx.drop_cache();
+        let gate = faults::arm_gate("copy");
+        faults::arm("staged-copy", 2);
+        faults::arm("drain", 1);
+        let r = p.want(ws, Tier::Device(DEV), Some(&[1]), 0, false).unwrap().wait();
+        assert!(matches!(r, Err(Error::Poisoned(_))), "{r:?}");
+        assert!(matches!(p.close_ws(ws), Err(Error::Poisoned(_))), "a poisoned plane must not unmap");
+        assert!(matches!(p.drop_regions(ws, Tier::Device(DEV), None), Err(Error::Poisoned(_))));
+        drop(p);
+        gate.open();
+        std::thread::sleep(Duration::from_millis(200));
+        healthy();
+    }
+
+    /// Ordering, not a fault reproduction: the driver (580) already makes cuMemHostUnregister
+    /// wait for queued DMA from the range, so this passes without the plane's own wait too.
+    #[test]
+    #[ignore = "GPU"]
+    fn dropping_the_plane_under_a_queued_pinned_copy_keeps_its_range_until_the_copy_ran() {
+        let fx = Fixture::new("gpu-dropq");
+        let p = staging_plane();
+        let ws = fx.register(&p, None);
+        p.set_vram_budget(DEV, 1 << 30).unwrap();
+        p.set_pinned_budget(1 << 30).unwrap();
+        p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+        let kept = unsafe { libc::dup(p.host_fd(ws).unwrap()) };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(kept, &mut st) }, 0);
+        let mapped = || {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .any(|l| l.contains("memfd:tfs-plane") && l.split_whitespace().nth(4) == Some(&st.st_ino.to_string()))
+        };
+        assert!(mapped());
+        let gate = faults::arm_gate("copy");
+        drop(p.want(ws, Tier::Device(DEV), Some(&[1]), 0, false).unwrap());
+        // The queued copy's completion now holds the plane's last reference.
+        drop(p);
+        std::thread::sleep(Duration::from_millis(300));
+        let still = mapped();
+        gate.open();
+        assert!(still, "the pinned range was unmapped while a copy from it waited on the device");
+        let mut rounds = 0;
+        while mapped() {
+            rounds += 1;
+            assert!(rounds < 5000, "the plane never finished dropping");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        healthy();
+        unsafe { libc::close(kept) };
+    }
 }

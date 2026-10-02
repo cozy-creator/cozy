@@ -5,7 +5,9 @@ mod common;
 
 use common::*;
 use tensorfs_core::read;
-use tensorfs_plane::host::HostMem;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+use tensorfs_plane::host::{hold, release_hold, HostMem};
 use tensorfs_plane::layout::{Layout, PART_ALIGN, REGION_ALIGN};
 use tensorfs_plane::{Error, Tier};
 
@@ -163,21 +165,137 @@ fn a_second_description_adopts_ready_bytes_without_reading() {
 }
 
 #[test]
-fn a_punch_is_refused_while_another_description_fills() {
+fn a_release_punches_only_for_the_last_claimant() {
     let fx = Fixture::new("ofd");
     let l = Layout::build(&fx.plan(), &regions()).unwrap();
+    let (off, span) = (l.regions[1].offset, l.regions[1].span);
     let a = HostMem::create("ofd", &l).unwrap();
     let b = HostMem::adopt(a.fd(), &l).unwrap();
-    a.fill_lock(1).unwrap();
-    assert!(!b.punch(1, l.regions[1].offset, l.regions[1].span).unwrap());
-    a.unlock(1);
-    assert!(b.punch(1, l.regions[1].offset, l.regions[1].span).unwrap());
+    // SAFETY: region 1 of our own mapping.
+    unsafe { std::ptr::write_bytes(a.base().add(off as usize), 7, span as usize) };
+    a.set_ready(1, true);
+    let filled = resident(a.fd());
+    a.claim(1).unwrap();
+    b.claim(1).unwrap();
+    assert!(!b.release(1, off, span).unwrap(), "A still claims the region: nothing is punched");
+    assert!(a.ready(1));
+    assert_eq!(resident(a.fd()), filled);
+    // The descriptor handed to other processes holds no claim: keeping it blocks no punch.
+    let kept = dup(a.fd());
+    assert!(a.release(1, off, span).unwrap(), "the last claimant punches");
+    assert!(!b.ready(1));
+    assert!(resident(kept.as_raw_fd()) < filled - span / 2);
+    // A whole-tier hold (the Worker's) keeps every region from the punch; releasing it punches
+    // the Ready regions no description claims, and only those.
+    let fill = |r: usize| {
+        let (o, n) = (l.regions[r].offset, l.regions[r].span);
+        // SAFETY: region r of our own mapping.
+        unsafe { std::ptr::write_bytes(a.base().add(o as usize), 9, n as usize) };
+        a.set_ready(r as u32, true);
+    };
+    fill(1);
+    fill(2);
+    let both = resident(kept.as_raw_fd());
+    a.claim(1).unwrap();
+    a.claim(2).unwrap();
+    let held = hold(kept.as_raw_fd()).unwrap();
+    assert!(!a.release(1, off, span).unwrap(), "the hold still claims region 1");
+    assert!(a.ready(1) && resident(kept.as_raw_fd()) == both);
+    assert_eq!(release_hold(held).unwrap(), span, "only the region A let go is punched");
+    assert!(!a.ready(1) && a.ready(2));
+    assert!(resident(kept.as_raw_fd()) <= both - span);
+    assert!(a.release(2, l.regions[2].offset, l.regions[2].span).unwrap());
     // A layout mismatch is refused, not reinterpreted.
     let mut other = regions();
     let moved = other[2].pop().unwrap();
     other[0].push(moved);
     let l2 = Layout::build(&fx.plan(), &other).unwrap();
     assert!(HostMem::adopt(a.fd(), &l2).is_err());
+}
+
+#[test]
+fn closing_a_weight_set_frees_its_pinned_ram_while_a_handle_survives() {
+    // The Worker keeps every offered memfd (HostTiers): a closed weight set's pages must not
+    // stay resident outside every budget.
+    let fx = Fixture::new("closefree");
+    let plane = host_only();
+    let ws = fx.register(&plane, None);
+    plane.set_pinned_budget(1 << 30).unwrap();
+    let kept = dup(plane.host_fd(ws).unwrap());
+    let empty = resident(kept.as_raw_fd());
+    plane.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    assert!(resident(kept.as_raw_fd()) > 70 << 20);
+    plane.close_ws(ws).unwrap();
+    assert_eq!(resident(kept.as_raw_fd()), empty, "close must punch what no one else claims");
+    plane.close().unwrap();
+}
+
+#[test]
+fn an_adopter_counts_ready_bytes_and_the_last_claimant_frees_them() {
+    let fx = Fixture::new("claims");
+    let a = host_only();
+    let wa = fx.register(&a, None);
+    a.set_pinned_budget(1 << 30).unwrap();
+    a.want(wa, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    let total: u64 = a.layout(wa).unwrap().regions.iter().map(|r| r.span).sum();
+    let kept = dup(a.host_fd(wa).unwrap());
+    let full = resident(kept.as_raw_fd());
+
+    // B adopts the memfd: what it already holds is in B's books at once.
+    let b = host_only();
+    let wb = fx.register(&b, Some(a.host_fd(wa).unwrap()));
+    assert_eq!(b.stats().host.used, total, "adopted RAM must count against the adopter's budget");
+    b.set_pinned_budget(1 << 30).unwrap();
+    b.want(wb, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    assert_eq!(b.stats().host.counters.fill_bytes, 0);
+
+    // A lets go of everything: B still claims it, so no page leaves under B.
+    a.close_ws(wa).unwrap();
+    assert_eq!(resident(kept.as_raw_fd()), full);
+    check_bytes(&b, wb, None);
+    // A budget below what B holds evicts the adopted regions first: B is the last claimant.
+    let t = b.set_pinned_budget(0).unwrap();
+    assert_eq!(t.freed, total);
+    assert!(resident(kept.as_raw_fd()) < full / 8, "the last claimant's eviction frees the RAM");
+    b.close().unwrap();
+    a.close().unwrap();
+}
+
+#[test]
+fn a_failed_fill_holds_no_ram_and_no_budget() {
+    let fx = Fixture::new("failed");
+    let plane = host_only();
+    let ws = fx.register(&plane, None);
+    plane.set_pinned_budget(1 << 30).unwrap();
+    let spans: Vec<u64> = plane.layout(ws).unwrap().regions.iter().map(|r| r.span).collect();
+    // b.weight spans two objects: lose the second, so the first lands and the fill still fails.
+    let tail = fx.objects.iter().find(|o| o.length == (6 * MIB + 12) as u64).unwrap();
+    std::fs::remove_file(fx.store.blob_path(&tail.sha256)).unwrap();
+    let kept = dup(plane.host_fd(ws).unwrap());
+    let empty = resident(kept.as_raw_fd());
+    assert!(plane.want(ws, Tier::Pinned, Some(&[1]), 0, false).unwrap().wait().is_err());
+    assert_eq!(plane.stats().host.used, 0);
+    assert_eq!(resident(kept.as_raw_fd()), empty, "a failed fill's pages must be punched");
+    // The failed region frees nothing more and the books stay whole.
+    assert_eq!(plane.drop_regions(ws, Tier::Pinned, Some(&[1])).unwrap(), 0);
+    plane.want(ws, Tier::Pinned, Some(&[0, 2]), 0, false).unwrap().wait().unwrap();
+    assert_eq!(plane.stats().host.used, spans[0] + spans[2]);
+    plane.close_ws(ws).unwrap();
+    assert_eq!(resident(kept.as_raw_fd()), empty);
+    plane.close().unwrap();
+}
+
+fn dup(fd: i32) -> OwnedFd {
+    // SAFETY: duplicating a live descriptor; the copy is ours.
+    unsafe { OwnedFd::from_raw_fd(libc::dup(fd)) }
+}
+
+/// RAM the memfd behind `fd` holds (kernel truth).
+fn resident(fd: i32) -> u64 {
+    // SAFETY: fstat into a zeroed struct.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+    st.st_blocks as u64 * 512
 }
 
 #[test]

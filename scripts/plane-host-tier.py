@@ -3,7 +3,8 @@
 
 Register and layout alignment, a pinned fill checked byte for byte against the source,
 eviction order and memfd RAM release under a lowered budget, Shortfall, pinning, drop,
-adoption of the memfd by a second PROCESS with zero new fill bytes, and one TensorFS lease
+adoption of the memfd by a second PROCESS with zero new fill bytes, claims (a closed set's
+RAM is punched unless a Worker hold keeps it; releasing the hold punches it), and one TensorFS lease
 per manifest that ends only when its last weight set closes and its Source is dropped. Every
 Plane is `devices=[]`: libcuda is never loaded.
 
@@ -305,6 +306,29 @@ def main(work: Path):
            lambda: register(p, src, store, manifest, "vae", host_fd=ws.host_fd))
     raises("adopting a descriptor that is not open is IoError", plane.IoError,
            lambda: register(p, src, store, manifest, "vae", host_fd=1 << 20))
+
+    # ---- claims: RAM a closed set leaves goes unless someone still claims it
+    def resident(fd):
+        return os.fstat(fd).st_blocks * 512
+
+    tier = register(p, src, store, manifest, "unet")
+    p.set_pinned_budget(tier.nbytes)
+    p.want(tier, "pinned").wait()
+    kept = os.dup(tier.host_fd)  # what the Worker's HostTiers keeps
+    full = resident(kept)
+    hold_fd = plane.hold_tier(kept)
+    tier.close()
+    check("a Worker hold keeps a closed set's pinned RAM", resident(kept) == full, resident(kept))
+    check("releasing the hold punches what no plane claims",
+          plane.release_tier(hold_fd) == sum(spans) and resident(kept) < REGION_ALIGN, resident(kept))
+    os.close(kept)
+    tier = register(p, src, store, manifest, "unet")
+    p.want(tier, "pinned").wait()
+    kept = os.dup(tier.host_fd)
+    tier.close()
+    check("closing a set punches its pinned RAM while a handle to the memfd survives",
+          resident(kept) < REGION_ALIGN, resident(kept))
+    os.close(kept)
 
     # ---- one lease per manifest: it ends with the last weight set and the source handle
     ws.close()

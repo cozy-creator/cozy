@@ -98,7 +98,8 @@ pub(crate) enum HState {
     Absent,
     Filling,
     Ready,
-    /// The fill failed; the typed cause is kept for every later reader.
+    /// The fill failed; the typed cause is kept for every later reader. Like `Absent`, it
+    /// holds no claim, no RAM and no budget.
     Invalid(Error),
 }
 
@@ -270,6 +271,12 @@ pub(crate) struct Inner {
 impl Core {
     pub fn poison(&mut self, cause: String) -> Error {
         Error::Poisoned(self.poisoned.get_or_insert(cause).clone())
+    }
+    /// Latch a `Poisoned` outcome reported by a copy or a driver call.
+    pub fn latch(&mut self, e: &Error) {
+        if let Error::Poisoned(p) = e {
+            self.poison(p.clone());
+        }
     }
     pub fn check(&self) -> Result<()> {
         match &self.poisoned {
@@ -464,7 +471,7 @@ impl Inner {
         for (wi, w) in c.sets.iter_mut().enumerate() {
             let Some(w) = w.as_mut() else { continue };
             for (r, h) in w.hregs.iter_mut().enumerate() {
-                if !matches!(h.state, HState::Ready | HState::Invalid(_)) || h.pin || below.is_some_and(|b| h.prio >= b) {
+                if !matches!(h.state, HState::Ready) || h.pin || below.is_some_and(|b| h.prio >= b) {
                     continue;
                 }
                 prune(&mut h.pending);
@@ -481,44 +488,46 @@ impl Inner {
             if freed >= need {
                 break;
             }
-            match self.punch_region(c, WsId(wi), r)? {
-                Some(n) => {
-                    freed += n;
-                    t.freed += n;
-                    let name = c.ws(WsId(wi))?.name.clone();
-                    t.evicted.push((name, r));
-                }
-                None => t.blockers.push(format!("{}#{r}@pinned (filling elsewhere)", c.ws(WsId(wi))?.name)),
-            }
+            let n = self.release_host(c, WsId(wi), r, true)?;
+            freed += n;
+            t.freed += n;
+            let name = c.ws(WsId(wi))?.name.clone();
+            t.evicted.push((name, r));
         }
         Ok(freed)
     }
 
-    /// Unregister and punch one host region. `None` when another process is filling it.
-    pub(crate) fn punch_region(self: &Arc<Self>, c: &mut Core, ws: WsId, r: u32) -> Result<Option<u64>> {
+    /// Let a Ready host region go: wait for copies reading it, unregister, end this process's
+    /// claim. Its RAM is punched unless another process still claims it (that process counts
+    /// it). Returns the span this plane's budget regains.
+    pub(crate) fn release_host(self: &Arc<Self>, c: &mut Core, ws: WsId, r: u32, evict: bool) -> Result<u64> {
         let first = self.devices.first().map(|d| d.ctx);
         let w = c.ws_mut(ws)?;
         let region = w.layout.regions[r as usize].clone();
         let host = w.host.clone();
         let name = w.name.clone();
         let h = &mut w.hregs[r as usize];
+        debug_assert!(matches!(h.state, HState::Ready) && h.holds == 0);
         sync_all(&mut h.pending)?;
         if h.registered {
             let _g = first.map(CtxGuard::enter).transpose()?;
             host.unregister(region.offset)?;
             h.registered = false;
         }
-        if !host.punch(r, region.offset, region.span)? {
-            return Ok(None);
-        }
+        let punched = host.release(r, region.offset, region.span)?;
         h.state = HState::Absent;
-        w.evictions += 1;
-        w.evicted_bytes += region.span;
+        if evict {
+            w.evictions += 1;
+            w.evicted_bytes += region.span;
+        }
         c.host_used -= region.span;
-        c.hstats.evictions += 1;
-        c.hstats.evicted_bytes += region.span;
-        c.event(Event::new("evicted", Some(name), Some(r), None, region.span, 0, "pinned"));
-        Ok(Some(region.span))
+        if evict {
+            c.hstats.evictions += 1;
+            c.hstats.evicted_bytes += region.span;
+            let detail = if punched { "pinned" } else { "pinned; claimed elsewhere, not punched" };
+            c.event(Event::new("evicted", Some(name), Some(r), None, region.span, 0, detail));
+        }
+        Ok(region.span)
     }
 
     pub(crate) fn want_host(self: &Arc<Self>, c: &mut Core, ws: WsId, regions: &[u32], prio: i64, pin: bool) -> Result<()> {
@@ -550,26 +559,30 @@ impl Inner {
             }
         }
         for &r in regions {
-            self.fill_host(c, ws, r)?;
+            self.fill_host(c, ws, r, false)?;
         }
         Ok(())
     }
 
-    /// Start the host fill of one region (no-op unless Absent/Invalid). Adopts bytes another
-    /// process already made Ready.
-    pub(crate) fn fill_host(self: &Arc<Self>, c: &mut Core, ws: WsId, r: u32) -> Result<()> {
+    /// Claim and start the host fill of one region (no-op unless Absent/Invalid). Adopts bytes
+    /// another process already made Ready; `adopt_only` claims nothing else.
+    pub(crate) fn fill_host(self: &Arc<Self>, c: &mut Core, ws: WsId, r: u32, adopt_only: bool) -> Result<()> {
         let w = c.ws_mut(ws)?;
         if !matches!(w.hregs[r as usize].state, HState::Absent | HState::Invalid(_)) {
             return Ok(());
         }
         let region = w.layout.regions[r as usize].clone();
         let (host, source, name) = (w.host.clone(), w.source.clone(), w.name.clone());
+        host.claim(r)?;
+        let adopted = host.ready(r);
+        if adopt_only && !adopted {
+            host.release(r, region.offset, region.span)?;
+            return Ok(());
+        }
         w.hregs[r as usize].state = HState::Filling;
         c.host_used += region.span;
-        host.fill_lock(r)?;
         let inner = self.clone();
         let t0 = std::time::Instant::now();
-        let adopted = host.ready(r);
         let host2 = host.clone();
         let done = move |res: Result<()>| {
             let mut registered = false;
@@ -587,8 +600,16 @@ impl Inner {
                 }
                 host2.set_ready(r, true);
             }
-            host2.unlock(r);
+            // A failed fill holds nothing: its partial pages go unless another process claims
+            // the region (and fills or holds it).
+            let let_go = match &res {
+                Ok(()) => Ok(false),
+                Err(_) => host2.release(r, region.offset, region.span),
+            };
             let mut c = inner.core.lock().unwrap();
+            if let Err(e) = let_go {
+                c.event(Event::new("release_failed", Some(name.clone()), Some(r), None, region.span, 0, e.to_string()));
+            }
             let ns = t0.elapsed().as_nanos() as u64;
             let Some(Some(w)) = c.sets.get_mut(ws.0 as usize) else { return };
             let h = &mut w.hregs[r as usize];
@@ -614,6 +635,7 @@ impl Inner {
             c.event(Event::new(kind, Some(name.clone()), Some(r), None, region.nbytes, ns, detail));
             for d in then {
                 if let Err(e) = inner.submit_dev_fill(&mut c, ws, d, r) {
+                    c.latch(&e);
                     if let Some(Some(w)) = c.sets.get_mut(ws.0 as usize) {
                         if let Some(dw) = w.devs[d].as_mut() {
                             dw.regs[r as usize].state = DState::Invalid(e);
@@ -714,6 +736,7 @@ impl Inner {
     /// Queue the copy that fills region `r` on device slot `d` (mapped) from the pinned tier when
     /// it holds the region, after it when it is filling, else from disk through staging.
     pub(crate) fn submit_dev_fill(self: &Arc<Self>, c: &mut Core, ws: WsId, d: usize, r: u32) -> Result<()> {
+        c.check()?;
         let w = c.ws_mut(ws)?;
         let region = w.layout.regions[r as usize].clone();
         let hstate = w.hregs[r as usize].state.clone();
@@ -773,6 +796,7 @@ impl Inner {
                     }
                     Err(e) => {
                         reg.state = DState::Invalid(e.clone());
+                        c.latch(&e);
                         c.event(Event::new("fill_failed", Some(name), Some(r), Some(ordinal), region.nbytes, 0, e.to_string()));
                     }
                 }
@@ -1071,7 +1095,18 @@ impl Plane {
         };
         let mut c = self.lock();
         c.sets.push(Some(ws));
-        Ok(WsId(c.sets.len() as u32 - 1))
+        let id = WsId(c.sets.len() as u32 - 1);
+        if host_fd.is_some() {
+            // Bytes another process left Ready in the memfd join this plane's books (claimed,
+            // counted, cheapest to evict): RAM the memfd holds is always inside a live budget.
+            for r in 0..n as u32 {
+                if c.ws(id)?.host.ready(r) {
+                    c.ws_mut(id)?.hregs[r as usize].prio = i64::MIN;
+                    self.inner.fill_host(&mut c, id, r, true)?;
+                }
+            }
+        }
+        Ok(id)
     }
 
     pub fn layout(&self, ws: WsId) -> Result<Arc<Layout>> {
@@ -1167,6 +1202,7 @@ impl Plane {
         let mut out = Vec::new();
         {
             let mut c = self.lock();
+            c.check()?;
             let rs = Self::regions_or_all(&c, ws, regions)?;
             if self.inner.want_host(&mut c, ws, &rs, prio, pin).is_ok() {
                 out.push(Ticket { inner: self.inner.clone(), ws, tier: Tier::Pinned, regions: rs });
@@ -1197,8 +1233,10 @@ impl Plane {
                             what: format!("pinned region {r}"),
                         });
                     }
-                    if !matches!(h.state, HState::Absent) {
-                        freed += self.inner.punch_region(&mut c, ws, r)?.unwrap_or(0);
+                    match h.state {
+                        HState::Ready => freed += self.inner.release_host(&mut c, ws, r, true)?,
+                        HState::Invalid(_) => h.state = HState::Absent,
+                        _ => {}
                     }
                 }
             }
@@ -1309,9 +1347,12 @@ impl Plane {
 
     // ------------------------------------------------------------ lifecycle
 
-    /// Close a weight set: refuses while leases, holds, views or cursors remain.
+    /// Close a weight set: refuses while leases, holds, views or cursors remain. Its device
+    /// memory returns to the arena and its pinned RAM is punched unless another process claims
+    /// it. A poisoned plane refuses: copies may still touch its ranges, so they stay mapped.
     pub fn close_ws(&self, ws: WsId) -> Result<()> {
         let mut c = self.lock();
+        c.check()?;
         if c.cursors.values().any(|k| k.ws == ws) {
             return Err(Error::LeaseViolation { op: "close", live: 1, pending: 0, what: "an open cursor".into() });
         }
@@ -1352,23 +1393,13 @@ impl Plane {
             device::free_va(dw.base, c.ws(ws)?.layout.nbytes)?;
             c.arenas[d].trim()?;
         }
-        let first = self.inner.devices.first().map(|d| d.ctx);
-        let w = c.ws_mut(ws)?;
-        let host = w.host.clone();
-        let layout = w.layout.clone();
-        let mut used = 0;
-        for (r, h) in w.hregs.iter_mut().enumerate() {
-            sync_all(&mut h.pending)?;
-            if h.registered {
-                let _g = first.map(CtxGuard::enter).transpose()?;
-                host.unregister(layout.regions[r].offset)?;
-            }
-            if !matches!(h.state, HState::Absent) {
-                used += layout.regions[r].span;
+        let n = c.ws(ws)?.hregs.len() as u32;
+        for r in 0..n {
+            if matches!(c.ws(ws)?.hregs[r as usize].state, HState::Ready) {
+                self.inner.release_host(&mut c, ws, r, false)?;
             }
         }
         let w = c.sets[ws.0 as usize].take();
-        c.host_used -= used;
         drop(c);
         // Outside the lock: the last weight set on a source ends its TensorFS lease (file I/O).
         drop(w);
@@ -1519,6 +1550,36 @@ impl Drop for Plane {
         // Movers and readers hold `Inner`; stop them when the last user handle goes.
         if Arc::strong_count(&self.inner) == 1 {
             let _ = self.close();
+        }
+    }
+}
+
+impl Drop for Inner {
+    /// The last reference can go while copies are still on the device: a plane dropped with a
+    /// fill queued ends inside that copy's completion. Pinned ranges are unregistered and
+    /// unmapped only after every copy reading them; a poisoned plane (or one whose events
+    /// cannot be waited) keeps them for the life of the process instead. Device ranges are
+    /// never unmapped here.
+    fn drop(&mut self) {
+        let c = self.core.get_mut().unwrap_or_else(|p| p.into_inner());
+        let mut settled = c.poisoned.is_none();
+        for w in c.sets.iter_mut().flatten() {
+            for h in &mut w.hregs {
+                settled &= sync_all(&mut h.pending).is_ok();
+            }
+            for dw in w.devs.iter_mut().flatten() {
+                for reg in &mut dw.regs {
+                    if let DState::Filling(ev) = &reg.state {
+                        settled &= ev.sync().is_ok();
+                    }
+                    settled &= sync_all(&mut reg.pending).is_ok();
+                }
+            }
+        }
+        if !settled {
+            for w in c.sets.iter().flatten() {
+                std::mem::forget(w.host.clone());
+            }
         }
     }
 }
@@ -1724,6 +1785,9 @@ impl Lease {
     /// Diagnostic: compare this lease's device bytes with the source, part by part, and return
     /// the parts that differ. Waits for the copy and reads the store: debugging runs only.
     pub fn verify_bytes(&self) -> Result<Vec<String>> {
+        if self.released.load(Ordering::SeqCst) {
+            return Err(Error::Invalid("verify_bytes after release: the bytes may be unmapped".into()));
+        }
         let rt = &self.inner.devices[self.dev];
         let _g = rt.bind()?;
         if let Some(ev) = &self.fill {

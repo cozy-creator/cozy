@@ -6,6 +6,7 @@
 pub mod cuda;
 pub mod cursor;
 pub mod device;
+pub mod faults;
 pub mod host;
 pub mod io;
 pub mod layout;

@@ -291,3 +291,12 @@ class Plane:
     def stats(self) -> Stats: ...
     def events(self) -> list[Event]: ...
     def close(self) -> None: ...
+
+def hold_tier(fd: int) -> int:
+    """Claim every region of the pinned-tier memfd `fd` for a process without a plane (the
+    Worker): returns a new descriptor. While it is held no plane punches the tier's RAM. End it
+    with `release_tier`."""
+
+def release_tier(hold: int) -> int:
+    """End a `hold_tier` claim (closes `hold`): punches every Ready region no plane claims and
+    returns the bytes punched."""

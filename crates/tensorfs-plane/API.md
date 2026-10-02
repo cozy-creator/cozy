@@ -1,4 +1,4 @@
-# tensorfs.plane — Python API (v3, 2026-09-30)
+# tensorfs.plane — Python API (v3.1, 2026-10-02)
 
 The weight plane moves bytes; cozy-runtime decides. The plane never measures free memory,
 never picks victims among equals, never reorders a schedule. It ships inside the `tensorfs`
@@ -48,13 +48,17 @@ ws = p.register(
     regions,                 # list[list[str]]: region r = tensor ids "component/key" (all roles)
                              #   or exact parts "component/key#role"; every plan part in exactly
                              #   one region; a region's parts keep plan order; no empty region
-    host_fd=None,            # adopt a memfd holding this layout (another process's pinned tier)
+    host_fd=None,            # adopt a memfd holding this layout (another process's pinned tier);
+                             #   every region already Ready in it joins this plane's books at
+                             #   once (claimed, counted in `used`, lowest priority)
 )
 ws.name, ws.nbytes           # nbytes = layout span (multiple of 2 MiB)
 ws.regions                   # [{"index", "offset", "nbytes", "span"}]
 ws.parts                     # [{"what": "comp/key#role", "region", "offset", "nbytes"}]
-ws.host_fd                   # the memfd (plane-owned); pass to another process to share the tier
-ws.close()                   # refuses while leases, holds, cursors or views remain
+ws.host_fd                   # the memfd (plane-owned, an unlocked description); pass it to another
+                             #   process to share the tier
+ws.close()                   # refuses while leases, holds, cursors or views remain; punches the
+                             #   pinned RAM no other process claims (see Host tier across processes)
 ```
 
 Binding a part: `base[part.offset - region.offset : ... + nbytes]` of the region's bytes,
@@ -111,7 +115,8 @@ lease = p.acquire(ws, device, region, stream, priority=None)
 lease.ptr, lease.nbytes, lease.region, lease.ring_offset   # ring_offset is None for resident leases
 lease.view()                 # ONE uint8 DLPack view of the region's bytes (see Views)
 lease.verify_bytes()         # diagnostic: parts whose device bytes differ from the source
-                             #   (waits for the copy, reads the store; debugging runs only)
+                             #   (waits for the copy, reads the store; debugging runs only);
+                             #   Invalid after release
 lease.release()              # records the release event on the acquire stream (or pass stream=)
 with p.acquire(ws, device, region, stream) as lease: ...
 ```
@@ -227,27 +232,54 @@ attributes: `BudgetExceeded` (`pool`, `requested`, `available`), `Shortfall` (`p
 `pool == "device"` means the driver itself had no memory left (the budget exceeds what is
 free): lower it.
 
-**Poison is latched plane-wide**: an ambiguous driver outcome (a failed unmap or rollback, a
-driver mapping that disagrees with the books) or a lease dropped unreleased makes every later
-call raise `Poisoned` with the first cause; the runtime replaces the executor. Capacity never
-poisons (`BudgetExceeded`, `Shortfall` leave the plane usable).
+**A failed copy leaves nothing in flight.** A fill or ring copy that fails after enqueuing part
+of its work is reported (its ticket, `acquire`, `fill_failed`) only after the copy stream has
+drained, so unmapping, dropping or closing what it touched is safe at once. A failure the
+stream cannot drain is `Poisoned`.
+
+**Poison is latched plane-wide**: an ambiguous driver outcome (a failed unmap or rollback, an
+undrainable copy failure, a driver mapping that disagrees with the books) or a lease dropped
+unreleased makes every later call raise `Poisoned` with the first cause; the runtime replaces
+the executor. A poisoned plane never unmaps, unregisters or frees a range (copies may still
+touch it): `ws.close()`, `cur.close()` and `p.close()` raise `Poisoned` and the process keeps
+the ranges until it exits. Capacity never poisons (`BudgetExceeded`, `Shortfall` leave the
+plane usable).
 
 ## Host tier across processes
 
 - One memfd per weight set, laid out exactly like the weight set, with a state page at its
-  end: a layout digest and one Ready word per region. That page IS the shared index.
+  end: a layout digest, one Ready word and the extent of each region. That page IS the shared
+  index.
+- **Claims.** A process holds a shared OFD lock on a region's word for as long as the region is
+  filling or ready in its books. Evicting, dropping or closing ends this process's claim; the
+  last claimant punches the region's RAM. So pinned RAM is always inside some live budget, a
+  closed set does not stay resident because another process kept the fd, and no process loses
+  pages it still has registered. The kernel drops a dead process's claims.
 - `register(..., host_fd=fd)` in another process (or a replacement executor) reopens the fd
-  (its own open file description), refuses a different layout digest, and adopts every
-  region whose Ready word is set on its next `want("pinned")` — registering it, reading
-  nothing (`stats()["host"]["fill_bytes"]` unchanged). The digest covers the plan's parts,
+  (its own open file description), refuses a different layout digest, and claims every region
+  whose Ready word is set — registering it, reading nothing (`stats()["host"]["fill_bytes"]`
+  unchanged) — at the lowest priority, counted in `used`. The digest covers the plan's parts,
   their object ranges and the region grouping: register with the same plan and regions.
+- `ws.host_fd` is a separate, never-locked description: a process that keeps it (or a dup) keeps
+  the memfd alive but no claim.
+- **Keeping a tier without a plane** (the Worker between executors): `h = plane.hold_tier(fd)`
+  claims every region (one shared lock over the whole file, on a new description); while it is
+  held, no plane eviction or close punches the tier. `plane.release_tier(h)` closes it and punches
+  every Ready region no plane claims, returning the bytes punched. Bound held tiers with the
+  holder's own budget (`os.fstat(fd).st_blocks * 512` is the memfd's RAM).
 - A host-only `Plane(devices=[])` (never loads libcuda) can fill a tier before any executor
   holds a GPU; executors adopt and register it.
-- Eviction punches the region's hole under an exclusive OFD lock that fills hold shared:
-  never while another process fills it. Contents are immutable, so a process still DMA-ing
-  from pages it registered before a punch reads the same bytes.
+- A memfd from a plane before v3.1 (state page `TFSPLN01`) is a different layout: adopting it
+  raises `Invalid`; register a fresh one.
 
 ## Changelog
+
+- v3.1 2026-10-02 (Xid 31; W3 run 2675): a failed copy is reported only after its stream drained;
+  an undrainable one poisons; a poisoned plane never unmaps (close raises `Poisoned`).
+  `verify_bytes()` after release raises `Invalid`. Pinned-tier claims: close and eviction punch
+  RAM no other process claims, `register(host_fd=)` claims what the memfd already holds,
+  `plane.hold_tier` / `plane.release_tier` for the Worker. The state page gains region extents
+  (`TFSPLN02`).
 
 - v3 2026-09-30 (proving-cpu.md: fine regions, spread sets): streaming uses a byte ring
   instead of fixed slots. `stream(..., ring_bytes=None)`; `cur.ring_ptr`, `cur.ring_nbytes`,

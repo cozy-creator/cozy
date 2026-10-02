@@ -742,6 +742,22 @@ macro_rules! add_errors {
     ($m:expr; $($e:ident),*) => { $($m.add(stringify!($e), $m.py().get_type::<$e>())?;)* };
 }
 
+/// A whole-tier claim on a pinned-tier memfd for a process without a plane (the Worker): a
+/// new descriptor the caller owns; closing it ends the claim.
+#[pyfunction]
+fn hold_tier(py: Python<'_>, fd: i32) -> PyResult<i32> {
+    tensorfs_plane::host::hold(fd).map(std::os::fd::IntoRawFd::into_raw_fd).or_raise(py)
+}
+
+/// End a `hold_tier` claim: punches every Ready region no plane claims, closes `hold`, and
+/// returns the bytes punched.
+#[pyfunction]
+fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
+    // SAFETY: the caller hands over the descriptor `hold_tier` returned.
+    let hold = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(hold) };
+    tensorfs_plane::host::release_hold(hold).or_raise(py)
+}
+
 /// `tensorfs._ext.plane`, importable as such (the facade module `tensorfs.plane` re-exports it).
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
@@ -753,6 +769,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPlaneLease>()?;
     m.add_class::<PyCursor>()?;
     m.add_class::<PyDeviceView>()?;
+    m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
+    m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
         CudaUnavailable, Invalid, IoError, Closed);
     parent.add_submodule(&m)?;
