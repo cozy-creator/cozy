@@ -21,8 +21,9 @@
 //!   caller or there is none; a stream is judged only against the longest gap this pull
 //!   has actually shown;
 //! - **the chunked download** (`download`): the wanted objects as fixed ranged chunks on
-//!   one queue, 128 requests in flight, and a request that fails, goes silent or runs far
-//!   slower than its peers asked again on a fresh connection.
+//!   one queue, and a request that fails, goes silent or runs far slower than its peers
+//!   asked again on a fresh connection. A Hub pull and one object from a source URL
+//!   (`fetch_ranged`) are the same downloader.
 //!
 //! And the address predicate travels WITH the transport (`policy`), so there is still
 //! exactly one downloader with the check — cr-012's fence, retargeted here by cr-090.
@@ -41,13 +42,12 @@ mod policy;
 pub(crate) mod prefix;
 mod pull;
 mod push;
-mod ranged;
 
 #[cfg(test)]
 mod tests;
 
 pub use api::{api_get, fetch_prefix, probe_length, Prefix};
-pub use download::CHUNK_BYTES;
+pub use download::{fetch_ranged, Ranged, CHUNK_BYTES, PART_BYTES};
 pub use http::{trust_roots, Client};
 pub use hub::{
     closure, closure_all, credential_from_spec, presign, Anonymous, Closure, CredentialProvider,
@@ -60,10 +60,9 @@ pub use ledger::{
 pub use memory::{memory_available, streams_within, transfer_streams, STREAM_MEMORY};
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
-    fetch_authorized, fetch_url, fetch_wanted, pull, resolve_closure, FetchObserver, Fetched,
-    ObjectSource, ObjectUrls, PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
+    fetch_wanted, pull, resolve_closure, FetchObserver, Fetched, ObjectSource, ObjectUrls,
+    PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
 };
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
-pub use ranged::{fetch_ranged, Ranged, PART_BYTES, RANGED_MIN_BYTES, SOURCE_STREAMS};
 
 pub use prefix::{SourceDownload, SourceProgress};

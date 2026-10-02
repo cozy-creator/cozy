@@ -781,8 +781,7 @@ enum Framing {
 /// other source. Every arriving chunk is COUNTED into the ledger where it crosses into
 /// this process — which is what makes "this stream is not moving" a measurement instead
 /// of an opinion — and when `judge` is armed, an empty tick beyond the pull's own measured
-/// patience is a stall: the typed refusal is stashed here (a `Read` can only carry
-/// `io::Error`) and `failure()`/`stalled()` hand it back to the retry loop.
+/// patience is a stall, refused as the request's own failure code.
 pub struct BodyReader<'l> {
     wire: Option<Wire>,
     recycle: Option<Box<(IdlePool, Scope)>>,
@@ -796,8 +795,6 @@ pub struct BodyReader<'l> {
     /// When this body's reader was built — the start of the wait a control-plane verdict
     /// measures, so a body that opens into a pull's local pause is not condemned for it.
     since: Instant,
-    failure: Option<Refusal>,
-    stalled: bool,
     fail: Code,
 }
 
@@ -836,13 +833,6 @@ impl BodyReader<'_> {
 }
 
 impl BodyReader<'_> {
-    pub fn failure(&mut self) -> Option<Refusal> {
-        self.failure.take()
-    }
-    pub fn stalled(&self) -> bool {
-        self.stalled
-    }
-
     /// One raw read off the wire under the sampling rule: the socket timeout is the
     /// RESOLUTION; the deadline and (when judged) the measured patience carry the verdict.
     fn step(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -872,7 +862,6 @@ impl BodyReader<'_> {
                     transfer_verdict(self.judge, self.ledger, self.since, "a response body")?;
                     let silent = self.advanced.elapsed();
                     if self.judge.silent_is_stall() && silent > self.ledger.patience() {
-                        self.stalled = true;
                         let _ = self
                             .wire
                             .as_ref()
@@ -1056,11 +1045,8 @@ impl BodyReader<'_> {
 
 impl Read for BodyReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        self.read_refusing(out).map_err(|refusal| {
-            let text = refusal.to_string();
-            self.failure = Some(refusal);
-            std::io::Error::other(text)
-        })
+        self.read_refusing(out)
+            .map_err(|refusal| std::io::Error::other(refusal.to_string()))
     }
 }
 
@@ -1285,8 +1271,6 @@ pub fn send<'l>(
             judge,
             advanced: Instant::now(),
             since: Instant::now(),
-            failure: None,
-            stalled: false,
             fail,
         },
     })

@@ -3,12 +3,12 @@
 //! no hub. The ledger tests run at millisecond resolution: the cadence is configuration,
 //! the RULE under test is production's.
 
+use super::download::{fetch_ranged, Ranged};
 use super::hub::{credential_from_spec, Anonymous, HostToken};
 use super::ledger::{Deadline, Ledger};
 use super::policy::{self, blocked, CheckedUrl, SourcePolicy};
-use super::pull::{absolute_location, fetch_url, pull, ObjectSource, PullRequest};
+use super::pull::{absolute_location, pull, Fetched, ObjectSource, PullRequest};
 use super::push::{push_object, UploadGrant};
-use super::ranged::{fetch_ranged, Ranged, SOURCE_STREAMS};
 use crate::canon::Value;
 use crate::dtype::Dtype;
 use crate::err::Code;
@@ -2438,7 +2438,7 @@ fn redirects_are_refused_or_revalidated_never_followed_blind() {
     let ledger = Ledger::with_resolution(Duration::from_millis(25));
 
     // Budget 0: a presigned GET has no business redirecting.
-    let refusal = fetch_url(
+    let refusal = fetch_ranged(
         &store,
         &grant,
         &url,
@@ -2446,6 +2446,7 @@ fn redirects_are_refused_or_revalidated_never_followed_blind() {
         &Anonymous,
         Deadline::none(),
         &ledger,
+        Ranged::default(),
         None,
     )
     .unwrap_err();
@@ -2456,7 +2457,8 @@ fn redirects_are_refused_or_revalidated_never_followed_blind() {
     // refused anyway.
     let mut hopping = local_policy();
     hopping.max_redirects = 1;
-    let refusal = fetch_url(
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let refusal = fetch_ranged(
         &store,
         &grant,
         &url,
@@ -2464,6 +2466,7 @@ fn redirects_are_refused_or_revalidated_never_followed_blind() {
         &Anonymous,
         Deadline::none(),
         &ledger,
+        Ranged::default(),
         None,
     )
     .unwrap_err();
@@ -2512,7 +2515,7 @@ fn a_relative_location_is_resolved_against_the_hop_that_sent_it() {
     let mut policy = local_policy();
     policy.max_redirects = 5;
 
-    fetch_url(
+    fetch_ranged(
         &store,
         &grant,
         &url,
@@ -2520,6 +2523,7 @@ fn a_relative_location_is_resolved_against_the_hop_that_sent_it() {
         &Anonymous,
         Deadline::none(),
         &ledger,
+        Ranged::default(),
         None,
     )
     .unwrap();
@@ -3518,11 +3522,11 @@ fn a_hub_that_says_wait_is_waited_for_and_then_answers() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-// ------------------------------------------------- ranged source fetch (tfs-062)
+// ------------------------------------------------- one source object (tfs-062, tfs-127)
 //
+// `fetch_ranged` is the pull's downloader for one object from a URL the caller holds.
 // Every origin here is the same loopback listener the rest of this file uses, one thread
-// per connection, so the parts really do arrive on concurrent sockets and really do land
-// out of order. Nothing is mocked: the client, the fence, the ledger and the admission
+// per connection. Nothing is mocked: the client, the fence, the ledger and the admission
 // door are production's.
 
 /// A body whose every byte depends on its offset, so an object assembled at the wrong
@@ -3539,25 +3543,7 @@ fn ranged_body(bytes: usize) -> Vec<u8> {
     out
 }
 
-/// Whether an assembly scratch file exists RIGHT NOW. Checked from inside the origin's
-/// handler, because "this path never writes the object twice" is a claim about what is on
-/// disk while the bytes move, and nothing after the fetch can see it.
-fn scratch_exists(root: &std::path::Path) -> bool {
-    std::fs::read_dir(root.join("tmp"))
-        .map(|entries| {
-            entries.filter_map(|entry| entry.ok()).any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("put-range-")
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Temp files the store has not cleaned up. `tmp/writers` is a directory the catalog
-/// keeps, so counting entries would count it; the temps are the `put-` names, which the
-/// assembly scratch deliberately shares so the store's own reaper covers it.
+/// Temp files the store has not cleaned up: the `put-` names its reaper covers.
 fn temps(root: &std::path::Path) -> usize {
     std::fs::read_dir(root.join("tmp"))
         .unwrap()
@@ -3593,20 +3579,8 @@ fn partial(body: &[u8], request: &Request) -> Serve {
     }
 }
 
-struct RangedOrigin {
-    origin: Origin,
-    asked: Arc<Mutex<Vec<String>>>,
-}
-
-/// The part boundaries a set of `Range` asks covered, deduplicated by the byte each ask
-/// ENDS at.
-///
-/// Deliberately not "one ask per part". A part may honestly be asked for more than once — a
-/// stalled connection is re-asked, and on a loaded machine the ledger's own patience is what
-/// decides that — and a re-ask covers a SUFFIX of its part, so it ends at the same byte.
-/// Asserting the ends states the property under test (the object was cut into exactly these
-/// parts) without also asserting the absence of weather, which is not a property this module
-/// has or wants.
+/// The byte each `Range` ask ENDS at, deduplicated: a range asked again after a failure
+/// ends where its first ask did, so this names the chunks without counting the weather.
 fn part_ends(asked: &[String]) -> Vec<u64> {
     let mut ends: Vec<u64> = asked
         .iter()
@@ -3624,70 +3598,111 @@ fn part_ends(asked: &[String]) -> Vec<u64> {
     ends
 }
 
-impl RangedOrigin {
-    fn ranges(&self) -> Vec<String> {
+/// A real Store, one object it wants, and a loopback origin that logs every `Range` asked.
+struct Source {
+    root: PathBuf,
+    store: Store,
+    object: ObjectRef,
+    grant: DeliveryGrant,
+    url: String,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl Source {
+    fn new(
+        name: &str,
+        body: &[u8],
+        serve: impl Fn(&Request) -> Serve + Send + Sync + 'static,
+    ) -> Source {
+        let root = temporary(name);
+        let store = Store::init(&root).unwrap();
+        let object = ObjectRef::of(body);
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = Arc::clone(&asked);
+        let listener = origin(Arc::new(move |request: &Request| {
+            log.lock()
+                .unwrap()
+                .push(request.header("range").unwrap_or("").to_string());
+            serve(request)
+        }));
+        let (plan, _) = FetchPlan::of_objects(&store, name, std::slice::from_ref(&object)).unwrap();
+        let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+        Source {
+            root,
+            store,
+            object,
+            grant,
+            url: format!("{}/member.safetensors", listener.base),
+            asked,
+        }
+    }
+
+    /// `streams` requests of 1 MiB. A whole second of resolution unless the proof is about
+    /// the pull's own patience: 25 ms on a loaded box buys asks the origin never earned.
+    fn fetch(&self, streams: usize, policy: &SourcePolicy) -> crate::err::Result<Fetched> {
+        self.fetch_with(
+            streams,
+            policy,
+            &Ledger::with_resolution(Duration::from_secs(1)),
+        )
+    }
+
+    fn fetch_with(
+        &self,
+        streams: usize,
+        policy: &SourcePolicy,
+        ledger: &Ledger,
+    ) -> crate::err::Result<Fetched> {
+        let ranged = Ranged {
+            streams,
+            part: 1 << 20,
+        };
+        fetch_ranged(
+            &self.store,
+            &self.grant,
+            &self.url,
+            policy,
+            &Anonymous,
+            Deadline::none(),
+            ledger,
+            ranged,
+            None,
+        )
+    }
+
+    fn asked(&self) -> Vec<String> {
         self.asked.lock().unwrap().clone()
     }
-}
 
-/// One loopback origin that logs every `Range` it is asked for, so a test can assert on
-/// what the parts actually put on the wire rather than on how fast it went.
-fn ranged_origin(serve: impl Fn(&Request) -> Serve + Send + Sync + 'static) -> RangedOrigin {
-    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
-    let log = Arc::clone(&asked);
-    let dispatch: Dispatch = Arc::new(move |request: &Request| {
-        log.lock()
-            .unwrap()
-            .push(request.header("range").unwrap_or("").to_string());
-        serve(request)
-    });
-    RangedOrigin {
-        origin: origin(dispatch),
-        asked,
+    fn held(&self) -> bool {
+        self.store.record_valid(&self.object.sha256).is_ok()
     }
 }
 
-fn ranged_grant(plan: &FetchPlan, object: &ObjectRef) -> DeliveryGrant {
-    DeliveryGrant::mint(plan, object).unwrap()
+impl Drop for Source {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
-/// Four streams, six parts, one object: the parts arrive on concurrent sockets and in
-/// whatever order the origin answers them, and the object is admitted at the id its bytes
-/// compute — through the same `put_stream` a single stream would have crossed.
+/// Six chunks on four connections: the first goes alone, its 206 queues the rest, and the
+/// object is committed at the id its bytes hash to.
 #[test]
 fn a_source_object_crosses_in_parallel_byte_ranges() {
-    let root = temporary("ranged-parallel");
-    let store = Store::init(&root).unwrap();
     let body = ranged_body(6 << 20);
-    let object = ObjectRef::of(&body);
     let served = body.clone();
-    // Observed from INSIDE the origin, while the bytes are moving: did a scratch file exist
-    // at the moment a range was being served? An after-the-fact check cannot see it.
-    let scratched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watching = Arc::clone(&scratched);
-    let watched = root.clone();
-    let listener = ranged_origin(move |request| {
-        if scratch_exists(&watched) {
-            watching.store(true, Ordering::Relaxed);
-        }
+    let source = Source::new("ranged-parallel", &body, move |request| {
         partial(&served, request)
     });
-    let (plan, _) = FetchPlan::of_objects(&store, "ranged", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    // A whole second of resolution: these proofs are about ranges, not about the stall
-    // rule, and 25 ms of patience on a loaded CI box buys a re-ask the origin never earned.
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
-
     let mut totals: Vec<u64> = Vec::new();
     let fetched = fetch_ranged(
-        &store,
-        &grant,
-        &url,
+        &source.store,
+        &source.grant,
+        &source.url,
         &local_policy(),
         &Anonymous,
         Deadline::none(),
-        &ledger,
+        &Ledger::with_resolution(Duration::from_secs(1)),
         Ranged {
             streams: 4,
             part: 1 << 20,
@@ -3696,103 +3711,88 @@ fn a_source_object_crosses_in_parallel_byte_ranges() {
     )
     .unwrap();
 
-    assert_eq!(fetched.transferred, object.length);
-    // THE point of the whole module: the bytes are in the store at the id the caller
-    // named, verified by the store's own record and not by the transfer's say-so.
-    assert!(store.record_valid(&object.sha256).is_ok());
-
-    let asked = listener.ranges();
-    assert_eq!(asked[0], "bytes=0-0", "the probe asks for one byte first");
+    assert_eq!(fetched.object, source.object);
+    assert_eq!(fetched.transferred, source.object.length);
+    assert!(source.held());
+    let asked = source.asked();
+    assert_eq!(asked[0], "bytes=0-1048575", "the first chunk goes alone");
     assert_eq!(
-        part_ends(&asked[1..]),
+        part_ends(&asked),
         vec![1048575, 2097151, 3145727, 4194303, 5242879, 6291455],
-        "the object was cut into six 1 MiB parts and every part was asked for: {asked:?}"
+        "{asked:?}"
     );
-    // Progress stays a running total even though the parts land out of order: it counts
-    // bytes that are on this machine, never a part index or an estimate.
+    // Progress counts bytes on this machine, whatever order the chunks land in.
     assert!(
         totals.windows(2).all(|pair| pair[0] <= pair[1]),
         "moved went backwards: {totals:?}"
     );
-    assert_eq!(totals.last().copied(), Some(object.length));
-    // The parallel path DOES buffer -- a scratch file existed while the parts were in
-    // flight -- and that second full write of every byte is exactly why it is not the
-    // default. Contrast `one_stream_resumes_and_never_writes_the_object_twice`.
-    assert!(
-        scratched.load(Ordering::Relaxed),
-        "the parallel path should have written a scratch file"
-    );
-    // No litter: the assembly scratch is gone and `put_stream`'s temp with it.
-    assert_eq!(temps(&root), 0);
-    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(totals.last().copied(), Some(source.object.length));
+    assert_eq!(temps(&source.root), 0);
 }
 
-/// A source that will not range must still work. The probe asks for one byte, is answered
-/// with a 200, and the object crosses on the single stream it always did.
+/// A source that will not range must still work: the first chunk's ask is answered with
+/// the whole object, and that one request is the object.
 #[test]
-fn an_origin_that_refuses_ranges_still_delivers_the_object() {
-    let root = temporary("ranged-refused");
-    let store = Store::init(&root).unwrap();
+fn an_origin_that_will_not_range_still_delivers_the_object() {
     let body = ranged_body(6 << 20);
-    let object = ObjectRef::of(&body);
     let served = body.clone();
-    // Range ignored entirely — the shape of an origin with `Accept-Ranges: none`.
-    let listener = ranged_origin(move |_request| Serve::Whole {
+    let source = Source::new("ranged-refused", &body, move |_| Serve::Whole {
         status: 200,
         body: served.clone(),
         headers: Vec::new(),
     });
-    let (plan, _) =
-        FetchPlan::of_objects(&store, "refused", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
+    let fetched = source.fetch(4, &local_policy()).unwrap();
 
-    let fetched = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 4,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(fetched.transferred, object.length);
-    assert!(store.record_valid(&object.sha256).is_ok());
-    // The probe, then a whole-object GET with NO Range at all: the fall-back is the
-    // single-stream path itself, not a one-part version of the ranged one.
-    let asked = listener.ranges();
-    assert_eq!(asked[0], "bytes=0-0", "the probe asks for one byte first");
-    assert!(
-        asked[1..].iter().all(String::is_empty),
-        "the fall-back asked for a range: {asked:?}"
-    );
-    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(fetched.transferred, source.object.length);
+    assert!(source.held());
+    assert_eq!(source.asked(), vec!["bytes=0-1048575".to_string()]);
 }
 
-/// The recovery unit inside a part is a BYTE. A connection that dies half way through a
-/// part re-asks for the half it is missing, and moves nothing it already holds.
+/// The same origin, and its whole answer dies half way. The ask for the rest is answered
+/// with the whole object again, which is taken from its first byte.
 #[test]
-fn a_part_that_dies_mid_range_resumes_at_the_byte_it_reached() {
-    let root = temporary("ranged-resume");
-    let store = Store::init(&root).unwrap();
+fn a_whole_answer_that_dies_starts_the_object_over() {
+    let body = ranged_body(6 << 20);
+    let (served, cuts) = (body.clone(), Arc::new(AtomicUsize::new(0)));
+    let source = Source::new("ranged-refused-cut", &body, move |_| {
+        if cuts.fetch_add(1, Ordering::Relaxed) == 0 {
+            return Serve::Truncate {
+                total: served.len() as u64,
+                prefix: served[..3 << 20].to_vec(),
+            };
+        }
+        Serve::Whole {
+            status: 200,
+            body: served.clone(),
+            headers: Vec::new(),
+        }
+    });
+    let fetched = source.fetch(4, &local_policy()).unwrap();
+
+    assert!(source.held());
+    assert_eq!(
+        source.asked(),
+        vec![
+            "bytes=0-1048575".to_string(),
+            "bytes=3145728-6291455".to_string()
+        ]
+    );
+    // The half that arrived twice was moved twice, and says so.
+    assert_eq!(fetched.transferred, source.object.length + (3 << 20));
+    assert_eq!(temps(&source.root), 0);
+}
+
+/// A connection that dies half way through a chunk is asked again for the half it is
+/// missing, and moves nothing it already holds.
+#[test]
+fn a_request_that_dies_mid_range_resumes_at_the_byte_it_reached() {
     let body = ranged_body(4 << 20);
-    let object = ObjectRef::of(&body);
-    let served = body.clone();
-    let cut = Arc::new(AtomicUsize::new(0));
-    let cuts = Arc::clone(&cut);
-    let listener = ranged_origin(move |request| {
+    let (served, cuts) = (body.clone(), Arc::new(AtomicUsize::new(0)));
+    let source = Source::new("ranged-resume", &body, move |request| {
         let Some((first, last)) = range_of(request) else {
             return partial(&served, request);
         };
-        // The FIRST full ask for the second part dies with half its bytes delivered.
+        // The first ask for the second chunk dies with half its bytes delivered.
         if first == (1 << 20) && cuts.fetch_add(1, Ordering::Relaxed) == 0 {
             let half = (last - first).div_ceil(2);
             return Serve::Short {
@@ -3807,169 +3807,140 @@ fn a_part_that_dies_mid_range_resumes_at_the_byte_it_reached() {
         }
         partial(&served, request)
     });
-    let (plan, _) = FetchPlan::of_objects(&store, "resume", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
+    let fetched = source.fetch(2, &local_policy()).unwrap();
 
-    let fetched = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 2,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap();
-
-    assert!(store.record_valid(&object.sha256).is_ok());
-    let asked = listener.ranges();
-    // The re-ask starts at the byte the dead connection reached — 1.5 MiB — and not at the
-    // part's own start. That difference is the whole feature: at 5.2 GB it is the
-    // difference between re-buying 300 MB and re-buying the shard.
+    assert!(source.held());
+    let asked = source.asked();
     assert!(
         asked.contains(&"bytes=1572864-2097151".to_string()),
         "expected a resumed range, saw {asked:?}"
     );
-    assert_eq!(
-        fetched.transferred, object.length,
-        "a resumed part counts each byte once"
-    );
-    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(fetched.transferred, source.object.length);
 }
 
-/// The door does not soften because the bytes arrived in pieces. One part is served with a
-/// flipped byte and the object is refused at the digest, exactly as a corrupt single
-/// stream would be — and nothing partial is left behind.
+/// Run 2322's shape at a source: one range crawls for its first ask while its peers come
+/// home at once. The crawl is dropped and asked again; the fetch does not wait it out.
+#[test]
+fn a_source_request_far_slower_than_its_peers_is_restarted() {
+    const RATE: usize = 16 << 10;
+    let body = ranged_body(12 << 20);
+    let (served, crawled) = (body.clone(), AtomicUsize::new(0));
+    let source = Source::new("ranged-slow", &body, move |request| {
+        let Some((first, last)) = range_of(request) else {
+            return partial(&served, request);
+        };
+        if first != (8 << 20) || crawled.fetch_add(1, Ordering::Relaxed) != 0 {
+            return partial(&served, request);
+        }
+        let head = format!(
+            "HTTP/1.1 206 X\r\ncontent-length: {}\r\ncontent-range: bytes {first}-{last}/{}\r\n\
+             connection: close\r\n\r\n",
+            last + 1 - first,
+            served.len()
+        );
+        let slow = served[first..=last].to_vec();
+        Serve::Script(Box::new(move |socket| {
+            if socket.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            for piece in slow.chunks(4096) {
+                if socket.write_all(piece).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs_f64(4096.0 / RATE as f64));
+            }
+        }))
+    });
+    let started = std::time::Instant::now();
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let fetched = source.fetch_with(4, &local_policy(), &ledger).unwrap();
+    let took = started.elapsed();
+
+    assert!(source.held());
+    assert!(fetched.transferred >= source.object.length);
+    println!("a 12 MiB object with one crawling MiB: {took:?}");
+    // Alone, the crawling megabyte takes 64 s.
+    let crawl = Duration::from_secs_f64((1 << 20) as f64 / RATE as f64);
+    assert!(took < crawl / 4, "the fetch waited out the crawl: {took:?}");
+    let log = std::fs::read_to_string(source.root.join("logs/transport.log")).unwrap();
+    assert!(log.contains(" restart "), "{log}");
+}
+
+/// The door does not soften because the bytes arrived in pieces: one flipped byte and the
+/// object is refused at the digest, with nothing left behind.
 #[test]
 fn ranged_bytes_that_hash_wrong_are_refused_at_the_same_door() {
-    let root = temporary("ranged-corrupt");
-    let store = Store::init(&root).unwrap();
     let body = ranged_body(6 << 20);
-    let object = ObjectRef::of(&body);
     let mut corrupt = body.clone();
     corrupt[3 << 20] ^= 0xFF;
-    let listener = ranged_origin(move |request| partial(&corrupt, request));
-    let (plan, _) =
-        FetchPlan::of_objects(&store, "corrupt", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
-
-    let refusal = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 4,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap_err();
+    let source = Source::new("ranged-corrupt", &body, move |request| {
+        partial(&corrupt, request)
+    });
+    let refusal = source.fetch(4, &local_policy()).unwrap_err();
 
     assert_eq!(refusal.code, Code::OBJECT_ID_MISMATCH);
-    assert!(store.record_valid(&object.sha256).is_err());
-    assert_eq!(temps(&root), 0, "a temp file was left behind");
-    let _ = std::fs::remove_dir_all(root);
+    assert!(!source.held());
+    assert_eq!(temps(&source.root), 0, "a temp file was left behind");
 }
 
-/// A part that never lands means the object never lands. The bytes that DID arrive are not
-/// admitted at a shorter length, at a different id, or at all.
+/// An origin whose object is another length than the plan declares is refused on its own
+/// `Content-Range`, before its bytes are taken.
 #[test]
-fn a_partly_assembled_object_is_never_admitted() {
-    let root = temporary("ranged-partial");
-    let store = Store::init(&root).unwrap();
+fn an_object_of_another_length_is_refused() {
     let body = ranged_body(6 << 20);
-    let object = ObjectRef::of(&body);
-    let served = body.clone();
-    let listener = ranged_origin(move |request| match range_of(request) {
-        // The fourth part is answered 503 forever; every other part lands normally.
-        Some((first, _)) if first == (3 << 20) => status(503, b"busy"),
-        _ => partial(&served, request),
+    let longer = ranged_body(7 << 20);
+    let source = Source::new("ranged-length", &body, move |request| {
+        partial(&longer, request)
     });
-    let (plan, _) =
-        FetchPlan::of_objects(&store, "partial", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    // Each unstated 503 now waits the ledger's patience before the re-ask.
-    let ledger = Ledger::with_resolution(Duration::from_millis(100));
+    let refusal = source.fetch(4, &local_policy()).unwrap_err();
 
-    let refusal = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 4,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap_err();
+    assert_eq!(refusal.code, Code::LENGTH_MISMATCH, "{refusal}");
+    assert!(!source.held());
+    assert_eq!(temps(&source.root), 0);
+}
+
+/// A chunk that never lands means the object never lands: the fetch ends on its own
+/// patience, quotes the origin, and admits nothing.
+#[test]
+fn a_partly_downloaded_object_is_never_admitted() {
+    let body = ranged_body(6 << 20);
+    let served = body.clone();
+    let source = Source::new("ranged-partial", &body, move |request| {
+        match range_of(request) {
+            // The fourth chunk is answered 503 forever; every other one lands.
+            Some((first, _)) if first == (3 << 20) => status(503, b"busy"),
+            _ => partial(&served, request),
+        }
+    });
+    let ledger = Ledger::with_resolution(Duration::from_millis(100));
+    let refusal = source.fetch_with(4, &local_policy(), &ledger).unwrap_err();
 
     assert_eq!(refusal.code, Code::TRANSFER_FAILED);
     assert!(refusal.detail.contains("503"), "{}", refusal.detail);
-    assert!(store.record_valid(&object.sha256).is_err());
-    assert_eq!(temps(&root), 0, "a temp file was left behind");
-    let _ = std::fs::remove_dir_all(root);
+    assert!(!source.held());
+    assert_eq!(temps(&source.root), 0, "a temp file was left behind");
 }
 
-/// The fence is per REQUEST, not per object. A part that is redirected off the declared
-/// hosts is refused by the same predicate that would have refused a whole-object GET —
-/// asking for a byte range is not a way to reach a host the predicate never saw.
+/// The fence is per REQUEST, not per object: a chunk redirected off the declared hosts is
+/// refused by the predicate a whole-object GET would have met.
 #[test]
-fn a_ranged_part_may_not_reach_a_host_the_predicate_never_saw() {
-    let root = temporary("ranged-fence");
-    let store = Store::init(&root).unwrap();
+fn a_ranged_request_may_not_reach_a_host_the_predicate_never_saw() {
     let body = ranged_body(6 << 20);
-    let object = ObjectRef::of(&body);
     let served = body.clone();
-    let listener = ranged_origin(move |request| match range_of(request) {
-        // The probe is answered honestly; the PARTS are sent somewhere else. An origin
-        // that only diverts the big asks is exactly the shape a per-object check misses.
-        Some((0, 0)) => partial(&served, request),
-        _ => Serve::Whole {
-            status: 302,
-            body: Vec::new(),
-            headers: vec![("location".into(), "https://evil.example.org/steal".into())],
-        },
+    let source = Source::new("ranged-fence", &body, move |request| {
+        match range_of(request) {
+            // The first chunk is answered honestly; the others are sent somewhere else.
+            Some((0, _)) => partial(&served, request),
+            _ => Serve::Whole {
+                status: 302,
+                body: Vec::new(),
+                headers: vec![("location".into(), "https://evil.example.org/steal".into())],
+            },
+        }
     });
-    let (plan, _) = FetchPlan::of_objects(&store, "fence", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
     let mut policy = local_policy();
     policy.max_redirects = 5;
-
-    let refusal = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &policy,
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 4,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap_err();
+    let refusal = source.fetch(4, &policy).unwrap_err();
 
     assert_eq!(refusal.code, Code::SOURCE_NOT_ALLOWED);
     assert!(
@@ -3977,52 +3948,40 @@ fn a_ranged_part_may_not_reach_a_host_the_predicate_never_saw() {
         "{}",
         refusal.detail
     );
-    assert!(store.record_valid(&object.sha256).is_err());
-    let _ = std::fs::remove_dir_all(root);
+    assert!(!source.held());
 }
 
-/// A scoped credential is consulted PER REQUEST against the host that request reaches —
-/// never presented once for the object and reused for its parts. Both arms, because only
-/// the pair proves consultation rather than coincidence: scoped to the host the parts
-/// reach, every part carries it; scoped to any other host, no part does.
+/// A scoped credential is consulted PER REQUEST against the host that request reaches.
+/// Both arms: scoped to the host the chunks reach, every one carries it; scoped to any
+/// other host, none does.
 #[test]
-fn every_part_re_asks_the_credential_for_the_host_it_reaches() {
+fn every_request_re_asks_the_credential_for_the_host_it_reaches() {
     for (scoped_to, expected) in [
         ("127.0.0.1", Some("Bearer hf_secret".to_string())),
         ("cdn.elsewhere.example", None),
     ] {
-        let root = temporary("ranged-credential");
-        let store = Store::init(&root).unwrap();
         let body = ranged_body(4 << 20);
-        let object = ObjectRef::of(&body);
         let served = body.clone();
         let bearers: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
         let seen = Arc::clone(&bearers);
-        let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let source = Source::new("ranged-credential", &body, move |request| {
             seen.lock()
                 .unwrap()
                 .push(request.header("authorization").map(str::to_string));
             partial(&served, request)
         });
-        let listener = origin(dispatch);
-        let (plan, _) =
-            FetchPlan::of_objects(&store, "credential", std::slice::from_ref(&object)).unwrap();
-        let grant = ranged_grant(&plan, &object);
-        let url = format!("{}/member.safetensors", listener.base);
-        let ledger = Ledger::with_resolution(Duration::from_secs(1));
         let credential = HostToken {
             hosts: vec![scoped_to.into()],
             token: "hf_secret".into(),
         };
-
         fetch_ranged(
-            &store,
-            &grant,
-            &url,
+            &source.store,
+            &source.grant,
+            &source.url,
             &local_policy(),
             &credential,
             Deadline::none(),
-            &ledger,
+            &Ledger::with_resolution(Duration::from_secs(1)),
             Ranged {
                 streams: 2,
                 part: 1 << 20,
@@ -4032,361 +3991,12 @@ fn every_part_re_asks_the_credential_for_the_host_it_reaches() {
         .unwrap();
 
         let bearers = bearers.lock().unwrap();
-        // At LEAST the probe and one ask per part. Not exactly: a re-asked part is weather,
-        // and the property under test is what every request CARRIED, not how many there were.
-        assert!(bearers.len() >= 5, "saw only {} requests", bearers.len());
+        assert!(bearers.len() >= 4, "saw only {} requests", bearers.len());
         assert!(
             bearers.iter().all(|value| *value == expected),
-            "scoped to {scoped_to}, the parts carried {bearers:?}"
+            "scoped to {scoped_to}, the requests carried {bearers:?}"
         );
-        drop(bearers);
-        let _ = std::fs::remove_dir_all(root);
     }
-}
-
-/// The DEFAULT path: one stream, ranged, resumable — and it never writes the object twice.
-///
-/// This is what the work is actually for. The throughput case for splitting an object
-/// across sockets did not survive measurement (18.9 MB/s on one stream against 19.1 MB/s on
-/// eight, on a link one stream already saturated), so the default buys the thing that was
-/// never in question: a connection that dies inside a 5 GB member costs the bytes that did
-/// not arrive, and nothing else.
-#[test]
-fn one_stream_resumes_and_never_writes_the_object_twice() {
-    let root = temporary("ranged-sequential");
-    let store = Store::init(&root).unwrap();
-    let body = ranged_body(4 << 20);
-    let object = ObjectRef::of(&body);
-    let served = body.clone();
-    let cut = Arc::new(AtomicUsize::new(0));
-    let cuts = Arc::clone(&cut);
-    // Watched from inside the origin, while the bytes move: the default path must put no
-    // scratch file on disk at all. A second full write of every byte is the cost the
-    // parallel path pays and the reason it is not the default.
-    let scratched = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watching = Arc::clone(&scratched);
-    let watched = root.clone();
-    let listener = ranged_origin(move |request| {
-        if scratch_exists(&watched) {
-            watching.store(true, Ordering::Relaxed);
-        }
-        let Some((first, last)) = range_of(request) else {
-            return partial(&served, request);
-        };
-        // The first ask for the third part dies with half its bytes delivered.
-        if first == (2 << 20) && cuts.fetch_add(1, Ordering::Relaxed) == 0 {
-            let half = (last - first).div_ceil(2);
-            return Serve::Short {
-                status: 206,
-                headers: vec![(
-                    "content-range".into(),
-                    format!("bytes {first}-{last}/{}", served.len()),
-                )],
-                declared: (last - first + 1) as u64,
-                prefix: served[first..first + half].to_vec(),
-            };
-        }
-        partial(&served, request)
-    });
-    let (plan, _) =
-        FetchPlan::of_objects(&store, "sequential", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
-
-    let mut totals: Vec<u64> = Vec::new();
-    let fetched = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            // The DEFAULT stream count, not a hardcoded 1. `SOURCE_STREAMS` is what
-            // production runs and what every claim in this module's doc is about; a proof
-            // that pins its own number cannot notice the default moving under it, which is
-            // exactly how this shipped as 8 once already.
-            streams: SOURCE_STREAMS,
-            part: 1 << 20,
-        },
-        Some(&mut |moved: u64| totals.push(moved)),
-    )
-    .unwrap();
-
-    assert_eq!(
-        SOURCE_STREAMS, 1,
-        "the default is one resumable stream: parallelism did not survive measurement \
-         (18.9 MB/s on one stream against 19.1 MB/s on eight, on a link one stream already \
-         saturated) and it costs a second full write of every byte"
-    );
-    assert!(store.record_valid(&object.sha256).is_ok());
-    assert_eq!(
-        fetched.transferred, object.length,
-        "a resumed range counts each byte once"
-    );
-    // Nothing was ever staged: the door read straight off the wire, across a socket that
-    // was replaced under it half way through the third part.
-    assert!(
-        !scratched.load(Ordering::Relaxed),
-        "the one-stream path wrote a scratch file"
-    );
-    let asked = listener.ranges();
-    assert_eq!(asked[0], "bytes=0-0", "the probe asks for one byte first");
-    // The re-ask begins at the byte the dead connection reached -- 2.5 MiB -- not at the
-    // part's start. At 5.2 GB that is the difference between re-buying 300 MB and re-buying
-    // the shard.
-    assert!(
-        asked.contains(&"bytes=2621440-3145727".to_string()),
-        "expected a resumed range, saw {asked:?}"
-    );
-    // Strictly ascending, which is what separates this path from the parallel one on the
-    // wire: one stream asks for the next range only once the previous is behind it.
-    let starts: Vec<u64> = asked[1..]
-        .iter()
-        .filter_map(|value| {
-            value
-                .strip_prefix("bytes=")?
-                .split_once('-')?
-                .0
-                .parse()
-                .ok()
-        })
-        .collect();
-    assert!(
-        starts.windows(2).all(|pair| pair[0] <= pair[1]),
-        "the default path asked out of order, so it is not the sequential one: {asked:?}"
-    );
-    assert_eq!(
-        part_ends(&asked[1..]),
-        vec![1048575, 2097151, 3145727, 4194303],
-        "four 1 MiB parts: {asked:?}"
-    );
-    assert!(
-        totals.windows(2).all(|pair| pair[0] <= pair[1]),
-        "moved went backwards across the resume: {totals:?}"
-    );
-    assert_eq!(totals.last().copied(), Some(object.length));
-    assert_eq!(temps(&root), 0);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// One stream and an origin that will not range still delivers the object, and does it as
-/// one whole-object GET rather than as a one-part ranged fetch.
-#[test]
-fn one_stream_falls_back_when_the_origin_will_not_range() {
-    let root = temporary("ranged-sequential-refused");
-    let store = Store::init(&root).unwrap();
-    let body = ranged_body(4 << 20);
-    let object = ObjectRef::of(&body);
-    let served = body.clone();
-    let listener = ranged_origin(move |_request| Serve::Whole {
-        status: 200,
-        body: served.clone(),
-        headers: Vec::new(),
-    });
-    let (plan, _) =
-        FetchPlan::of_objects(&store, "seq-refused", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
-
-    fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 1,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap();
-
-    assert!(store.record_valid(&object.sha256).is_ok());
-    let asked = listener.ranges();
-    assert_eq!(asked[0], "bytes=0-0");
-    assert!(
-        asked[1..].iter().all(String::is_empty),
-        "the fall-back asked for a range: {asked:?}"
-    );
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// One stream, and the door still refuses bytes that hash wrong. Resume moves the socket,
-/// never the judgement.
-#[test]
-fn one_stream_bytes_that_hash_wrong_are_refused_at_the_same_door() {
-    let root = temporary("ranged-sequential-corrupt");
-    let store = Store::init(&root).unwrap();
-    let body = ranged_body(4 << 20);
-    let object = ObjectRef::of(&body);
-    let mut corrupt = body.clone();
-    corrupt[3 << 20] ^= 0xFF;
-    let listener = ranged_origin(move |request| partial(&corrupt, request));
-    let (plan, _) =
-        FetchPlan::of_objects(&store, "seq-corrupt", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
-
-    let refusal = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 1,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap_err();
-
-    assert_eq!(refusal.code, Code::OBJECT_ID_MISMATCH);
-    assert!(store.record_valid(&object.sha256).is_err());
-    assert_eq!(temps(&root), 0);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// One stream, and the fence still runs on every ask. The probe is answered honestly and
-/// the ranges are diverted off the allowlist.
-#[test]
-fn one_stream_ranges_may_not_reach_a_host_the_predicate_never_saw() {
-    let root = temporary("ranged-sequential-fence");
-    let store = Store::init(&root).unwrap();
-    let body = ranged_body(4 << 20);
-    let object = ObjectRef::of(&body);
-    let served = body.clone();
-    let listener = ranged_origin(move |request| match range_of(request) {
-        Some((0, 0)) => partial(&served, request),
-        _ => Serve::Whole {
-            status: 302,
-            body: Vec::new(),
-            headers: vec![("location".into(), "https://evil.example.org/steal".into())],
-        },
-    });
-    let (plan, _) =
-        FetchPlan::of_objects(&store, "seq-fence", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
-    let mut policy = local_policy();
-    policy.max_redirects = 5;
-
-    let refusal = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &policy,
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 1,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap_err();
-
-    assert_eq!(refusal.code, Code::SOURCE_NOT_ALLOWED);
-    assert!(
-        refusal.detail.contains("evil.example.org"),
-        "{}",
-        refusal.detail
-    );
-    assert!(store.record_valid(&object.sha256).is_err());
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// A range that never completes means the object never completes. The bytes that DID arrive
-/// are not admitted at a shorter length, at a different id, or at all.
-#[test]
-fn one_stream_never_admits_a_partial_object() {
-    let root = temporary("ranged-sequential-partial");
-    let store = Store::init(&root).unwrap();
-    let body = ranged_body(4 << 20);
-    let object = ObjectRef::of(&body);
-    let served = body.clone();
-    let listener = ranged_origin(move |request| match range_of(request) {
-        Some((first, _)) if first >= (2 << 20) => status(503, b"busy"),
-        _ => partial(&served, request),
-    });
-    let (plan, _) =
-        FetchPlan::of_objects(&store, "seq-partial", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    // Each unstated 503 now waits the ledger's patience before the re-ask.
-    let ledger = Ledger::with_resolution(Duration::from_millis(100));
-
-    let refusal = fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged {
-            streams: 1,
-            part: 1 << 20,
-        },
-        None,
-    )
-    .unwrap_err();
-
-    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
-    assert!(refusal.detail.contains("503"), "{}", refusal.detail);
-    assert!(store.record_valid(&object.sha256).is_err());
-    assert_eq!(temps(&root), 0);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// `Ranged::whole()` means what it says: not one range is asked for. The opt-out must not be
-/// quietly floored up into the default — a `clamp(1, 64)` in the wrong place did exactly
-/// that once, and nothing failed, because every proof passed its own stream count.
-#[test]
-fn whole_asks_for_no_range_at_all() {
-    let root = temporary("ranged-whole");
-    let store = Store::init(&root).unwrap();
-    let body = ranged_body(4 << 20);
-    let object = ObjectRef::of(&body);
-    let served = body.clone();
-    let listener = ranged_origin(move |request| partial(&served, request));
-    let (plan, _) = FetchPlan::of_objects(&store, "whole", std::slice::from_ref(&object)).unwrap();
-    let grant = ranged_grant(&plan, &object);
-    let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
-
-    fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &local_policy(),
-        &Anonymous,
-        Deadline::none(),
-        &ledger,
-        Ranged::whole(),
-        None,
-    )
-    .unwrap();
-
-    assert!(store.record_valid(&object.sha256).is_ok());
-    let asked = listener.ranges();
-    assert!(
-        asked.iter().all(String::is_empty),
-        "whole() asked for a range, including the probe: {asked:?}"
-    );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 // ------------------------------------------------- the disk budget (tfs-064)
@@ -4868,7 +4478,7 @@ fn complete_content_length_body_does_not_wait_for_connection_close() {
         let _ = hold_open.recv();
     });
     let ledger = Ledger::with_resolution(Duration::from_millis(20));
-    let result = fetch_url(
+    let result = fetch_ranged(
         &store,
         &grant,
         &format!("http://{address}/body"),
@@ -4876,12 +4486,13 @@ fn complete_content_length_body_does_not_wait_for_connection_close() {
         &Anonymous,
         Deadline::after_seconds(Some(1.0)),
         &ledger,
+        Ranged::default(),
         None,
     );
     close_peer.send(()).unwrap();
     peer.join().unwrap();
     let result = result.unwrap();
-    assert_eq!(result.admitted.object, object);
+    assert_eq!(result.object, object);
     assert!(store.record_valid(&object.sha256).is_ok());
     let _ = std::fs::remove_dir_all(root);
 }

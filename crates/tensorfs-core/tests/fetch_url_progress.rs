@@ -50,8 +50,8 @@ fn drip_origin(body: Vec<u8>, chunk: usize, gap: Duration) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// Read one integer field out of an event line. The events are flat objects of numbers and
-/// one hostname, so this needs no JSON library to be exact about them.
+/// Read one integer field out of an event line. The events are flat objects of numbers, so
+/// this needs no JSON library to be exact about them.
 fn number(line: &str, key: &str) -> u64 {
     let at = line
         .find(&format!("\"{key}\":"))
@@ -64,15 +64,6 @@ fn number(line: &str, key: &str) -> u64 {
         .collect::<String>()
         .parse()
         .unwrap_or_else(|_| panic!("{key} is not a number in {line}"))
-}
-
-fn text(line: &str, key: &str) -> String {
-    let at = line
-        .find(&format!("\"{key}\":\""))
-        .unwrap_or_else(|| panic!("{key} absent from {line}"))
-        + key.len()
-        + 4;
-    line[at..].chars().take_while(|c| *c != '"').collect()
 }
 
 struct Record {
@@ -88,12 +79,13 @@ fn a_real_transfer_reports_partial_totals_while_it_is_still_moving() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
-    // 16 MiB, dripped 512 KiB at a time. The object is deterministic so the digest the
-    // store admits is the digest this test computed, with nothing to fake.
+    // 16 MiB, dripped 512 KiB at a time over several of the one-second samples the fetch
+    // reports at. The object is deterministic so the digest the store admits is the digest
+    // this test computed, with nothing to fake.
     let body: Vec<u8> = (0..(16usize << 20)).map(|i| (i * 31 + 7) as u8).collect();
     let length = body.len() as u64;
     let sha = tensorfs_core::sha256::hex_digest(&body);
-    let origin = drip_origin(body, 512 << 10, Duration::from_millis(4));
+    let origin = drip_origin(body, 512 << 10, Duration::from_millis(150));
 
     // A REAL store, made the way the pod makes one.
     let init = Command::new(env!("CARGO_BIN_EXE_tfs"))
@@ -152,7 +144,6 @@ fn a_real_transfer_reports_partial_totals_while_it_is_still_moving() {
     // still alive when it arrived. A command that printed everything at exit produces
     // nothing marked in flight — which is exactly the defect this proves closed.
     let mut records: Vec<Record> = Vec::new();
-    let mut attempts: Vec<(u32, String, u16)> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
     while let Ok(line) = rx.recv() {
         let alive = child.try_wait().ok().flatten().is_none();
@@ -162,12 +153,6 @@ fn a_real_transfer_reports_partial_totals_while_it_is_still_moving() {
                 admitted: number(&line, "origin_objects"),
                 in_flight: alive,
             });
-        } else if line.contains("\"event\":\"fetch.delivery\"") {
-            attempts.push((
-                number(&line, "attempt") as u32,
-                text(&line, "host"),
-                number(&line, "http_status") as u16,
-            ));
         }
         // Every event is one JSON object with `event` first — the shape `cmd_pull` set.
         assert!(
@@ -231,14 +216,6 @@ fn a_real_transfer_reports_partial_totals_while_it_is_still_moving() {
         "the closing record is {} B / {} admitted",
         last.moved,
         last.admitted
-    );
-
-    // AND THE DELIVERY IS NAMED. Which host answered and what it answered are the two facts
-    // that separate a throttling origin from a slow link, and neither survives the call.
-    assert_eq!(
-        attempts,
-        vec![(1u32, "127.0.0.1".to_string(), 200u16)],
-        "the transfer named no delivery host and status"
     );
 
     // The URL is a bearer capability. It is not in the channel, at any point.

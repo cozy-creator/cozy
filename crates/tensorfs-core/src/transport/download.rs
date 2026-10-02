@@ -11,19 +11,26 @@
 //! second and sometimes a minute. One GET for the object pays every delay in a row (runs
 //! 2322, sasori, dietfried, chieri: a pull's last objects at 30-180 KB/s for minutes).
 //! Separate requests pay them side by side, and a late one is simply asked again.
+//!
+//! `fetch_ranged` is the same downloader for one object from a URL the caller holds (a
+//! HuggingFace or Civitai member). Such an origin may not answer ranges, so an object's
+//! first chunk goes alone: a 206 queues the rest, a 200 is the whole object.
 
 use super::decisions;
 use super::ledger::{Attempt, Deadline, Ledger, STALL_FACTOR};
 use super::pull::{
-    open_object, shared_client, ObjectObserver, ObjectSource, ObjectUrls, Opened, WalkOutcome,
+    open_object, shared_client, FetchObserver, Fetched, ObjectObserver, ObjectSource, ObjectUrls,
+    Opened, WalkOutcome,
 };
+use super::STREAMS;
 use super::{CredentialProvider, SourcePolicy};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::fetch::{DeliveryGrant, Destination, FetchPlan};
+use crate::fetch::{DeliveryGrant, Destination};
+use crate::ids::ObjectRef;
 use crate::repo_cache::{BackfillBatch, CacheKind, CacheRead, CacheTrust};
 use crate::store::{Fault, Store, Verified, PUT_TEMP};
 use fs2::FileExt;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt};
@@ -35,6 +42,10 @@ use std::time::{Duration, Instant};
 /// One request's bytes. Measured on a pod at 128 workers: 4, 8 and 16 MiB chunks all move
 /// what whole 64 MiB GETs move (1.1-1.3 GB/s); 1 MiB chunks move half.
 pub const CHUNK_BYTES: u64 = 8 << 20;
+
+/// One request's bytes from a source origin. Larger, because every ask walks the origin's
+/// redirect again (0.41 s against HuggingFace, and its resolve endpoint is rate-limited).
+pub const PART_BYTES: u64 = 64 << 20;
 
 /// What a dropped request's unfinished range is cut into: a slow object answers small
 /// asks side by side, and a chunk asked again whole would pay its slow MiBs in a row.
@@ -80,6 +91,8 @@ struct Chunk {
     silent: u32,
     /// Never dropped or failed: a first ask, whose rate is what peers are compared with.
     fresh: bool,
+    /// The object's only chunk so far: its origin has not yet shown that it answers ranges.
+    lead: bool,
 }
 
 impl Chunk {
@@ -151,8 +164,13 @@ struct State {
 
 pub(super) struct Download<'a> {
     pub store: &'a Store,
-    pub plan: &'a FetchPlan,
+    pub wanted: &'a [ObjectRef],
+    /// The door's grant for one wanted object.
+    pub grant: &'a (dyn Fn(&ObjectRef) -> Result<DeliveryGrant> + Sync),
     pub urls: &'a dyn ObjectUrls,
+    /// One request's bytes, and whether the origin is known to answer ranges.
+    pub chunk: u64,
+    pub ranged: bool,
     pub policy: &'a SourcePolicy,
     pub credential: &'a dyn CredentialProvider,
     pub deadline: Deadline,
@@ -186,14 +204,18 @@ struct Run<'a> {
 }
 
 impl Download<'_> {
-    /// Download `plan.wanted` with `streams` requests in flight.
-    pub fn run(&self, streams: usize) -> Result<WalkOutcome> {
+    /// Download `wanted` with `streams` requests in flight. `observer` hears the bytes home
+    /// so far, on this thread.
+    pub fn run(
+        &self,
+        streams: usize,
+        mut observer: Option<&mut dyn FetchObserver>,
+    ) -> Result<WalkOutcome> {
         let began = Instant::now();
         let chunks: usize = self
-            .plan
             .wanted
             .iter()
-            .map(|object| object.length.div_ceil(CHUNK_BYTES).max(1) as usize)
+            .map(|object| object.length.div_ceil(self.chunk).max(1) as usize)
             .sum();
         let streams = streams.min(chunks).max(1);
         let run = Run {
@@ -218,8 +240,11 @@ impl Download<'_> {
                 let run = &run;
                 scope.spawn(move || run.work(slot));
             }
-            run.watch();
+            run.watch(&mut observer);
         });
+        if let Some(observer) = observer.as_mut() {
+            observer.moved(run.landed.load(Ordering::Relaxed));
+        }
         let failure = run.state.lock().unwrap().failure.take();
         let outcome = WalkOutcome {
             fetched: run.fetched.load(Ordering::Relaxed),
@@ -233,7 +258,11 @@ impl Download<'_> {
         decisions::record(
             self.store,
             "walk",
-            &format!("{} {}", self.plan.wanted.len(), self.plan.wanted_bytes()),
+            &format!(
+                "{} {}",
+                self.wanted.len(),
+                self.wanted.iter().map(|object| object.length).sum::<u64>()
+            ),
             &format!(
                 "fetched={} cached={} moved={} seconds={:.1} streams={streams} requests={} \
                  restarts={} outcome={}",
@@ -279,7 +308,7 @@ impl Run<'_> {
     /// The next chunk that is due. With none, the next object is opened and its chunks
     /// queued; with nothing left to open, the worker waits for one to come due or back.
     fn take(&self) -> Option<Chunk> {
-        let wanted = &self.job.plan.wanted;
+        let wanted = self.job.wanted;
         let mut state = self.state.lock().unwrap();
         loop {
             if state.failure.is_some() {
@@ -349,8 +378,8 @@ impl Run<'_> {
     /// and cut into chunks.
     fn open(&self, at: usize) -> Result<Vec<Chunk>> {
         let job = self.job;
-        let wanted = &job.plan.wanted[at];
-        let grant = DeliveryGrant::mint(job.plan, wanted)?;
+        let wanted = &job.wanted[at];
+        let grant = (job.grant)(wanted)?;
         let kind = match grant.destination {
             Destination::Manifest => Some(CacheKind::Manifest),
             Destination::Blob => Some(CacheKind::Blob),
@@ -406,7 +435,7 @@ impl Run<'_> {
             let _ = std::fs::remove_file(&path);
             return Err(io("size", error));
         }
-        let firsts: Vec<u64> = (0..length).step_by(CHUNK_BYTES as usize).collect();
+        let firsts: Vec<u64> = (0..length).step_by(job.chunk as usize).collect();
         let object = Arc::new(Object {
             at,
             grant,
@@ -425,14 +454,38 @@ impl Run<'_> {
             stale: None,
             silent: 0,
             fresh: true,
+            lead: !job.ranged,
         };
         if firsts.is_empty() {
             return Ok(vec![chunk(0, 0)]);
         }
+        // An origin that may not range is asked for the first chunk alone.
+        let asked = if job.ranged { firsts.len() } else { 1 };
         Ok(firsts
             .into_iter()
-            .map(|first| chunk(first, (first + CHUNK_BYTES).min(length)))
+            .take(asked)
+            .map(|first| chunk(first, (first + job.chunk).min(length)))
             .collect())
+    }
+
+    /// The origin answered a range: the object's other chunks join the queue.
+    fn rest(&self, lead: &Chunk) {
+        let length = lead.object.grant.object.length;
+        let mut state = self.state.lock().unwrap();
+        for first in (lead.end..length).step_by(self.job.chunk as usize) {
+            state.queue.push_back(Chunk {
+                object: Arc::clone(&lead.object),
+                first,
+                end: (first + self.job.chunk).min(length),
+                due: Instant::now(),
+                stated: false,
+                stale: None,
+                silent: 0,
+                fresh: true,
+                lead: false,
+            });
+        }
+        self.wake.notify_all();
     }
 
     /// One GET for a chunk, written at its offsets. Whatever ends it early, the bytes that
@@ -540,7 +593,7 @@ impl Run<'_> {
         self.state.lock().unwrap().last = Some(named(refusal, &wanted.id()));
         // A dropped request's unfinished range goes back as pieces, asked side by side.
         let mut again = Vec::new();
-        while dropped && chunk.end - chunk.first > PIECE_BYTES {
+        while dropped && !chunk.lead && chunk.end - chunk.first > PIECE_BYTES {
             let end = chunk.first + PIECE_BYTES;
             object.left.fetch_add(1, Ordering::AcqRel);
             again.push(Chunk {
@@ -609,15 +662,40 @@ impl Run<'_> {
             Opened::Refused(refusal) => return Err(Ended::Fatal(refusal)),
         };
         // A ranged ask must be answered with that range of this object.
-        let ranged = super::ranged::content_range(response.header("content-range"));
+        let ranged = content_range(response.header("content-range"));
+        // An object of another length than the plan declares is a fact no ask changes.
+        let stated = match response.status {
+            206 => ranged.map(|(_, _, total)| total),
+            _ => response
+                .header("content-length")
+                .and_then(|length| length.trim().parse().ok()),
+        };
+        if let Some(total) = stated.filter(|total| *total != wanted.length) {
+            return Err(Ended::Fatal(Refusal {
+                code: Code::LENGTH_MISMATCH,
+                detail: format!(
+                    "the plan declares {} B and the origin says {total} B",
+                    wanted.length
+                ),
+            }));
+        }
         match (response.status, ranged) {
-            (206, Some((first, _, total))) if first == chunk.first && total == wanted.length => {}
+            (206, Some((first, _, _))) if first == chunk.first => {
+                if std::mem::take(&mut chunk.lead) {
+                    self.rest(chunk);
+                }
+            }
             (200, _) if whole => {}
-            // A resumed range answered with the whole object: take it from its first byte.
-            (200, _) if wanted.length <= CHUNK_BYTES => {
+            // A range answered with the whole object: take it from its first byte. An origin
+            // that does not range gives the object to this one request.
+            (200, _) if chunk.lead || wanted.length <= job.chunk => {
                 job.store.discarded(chunk.first);
                 self.landed.fetch_sub(chunk.first, Ordering::Relaxed);
                 chunk.first = 0;
+                if chunk.lead {
+                    chunk.end = wanted.length;
+                    object.left.store(1, Ordering::Release);
+                }
             }
             (status, ranged) => {
                 return Err(Ended::Fatal(Refusal {
@@ -694,6 +772,9 @@ impl Run<'_> {
                 sha256,
                 length: wanted.length,
             };
+            if object.grant.destination == Destination::Staging {
+                return crate::staging::adopt(job.store, verified).map(|_| ());
+            }
             job.store
                 .admit_verified(verified, &Fault::default(), None)
                 .map(|_| ())
@@ -719,7 +800,7 @@ impl Run<'_> {
     /// The one rule, five times a sample: a request that has waited far longer for its first
     /// byte than its peers did, or whose body runs far slower than theirs, is dropped. And
     /// the pull's own end: nothing new has landed for twice its measured patience.
-    fn watch(&self) {
+    fn watch(&self, observer: &mut Option<&mut dyn FetchObserver>) {
         let job = self.job;
         let sample = self.tick();
         // The most bytes ever home, and when that last grew while requests were being asked.
@@ -730,6 +811,12 @@ impl Run<'_> {
                 return;
             }
             state = self.over.wait_timeout(state, sample).unwrap().0;
+            if let Some(observer) = observer.as_mut() {
+                // Told outside the lock: an observer may be slow, and workers must not wait.
+                drop(state);
+                observer.moved(self.landed.load(Ordering::Relaxed));
+                state = self.state.lock().unwrap();
+            }
             if state.done || state.failure.is_some() {
                 return;
             }
@@ -905,4 +992,68 @@ fn named(refusal: Refusal, id: &str) -> Refusal {
         detail: format!("{id}: {}", refusal.detail),
         ..refusal
     }
+}
+
+/// `bytes <first>-<last>/<total>`; a `*` total is no answer.
+pub(super) fn content_range(header: Option<&str>) -> Option<(u64, u64, u64)> {
+    let (range, total) = header?.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let (first, last) = range.split_once('-')?;
+    Some((
+        first.trim().parse().ok()?,
+        last.trim().parse().ok()?,
+        total.trim().parse().ok()?,
+    ))
+}
+
+/// How one source object is asked for: requests in flight, and one request's bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct Ranged {
+    pub streams: usize,
+    pub part: u64,
+}
+
+impl Default for Ranged {
+    fn default() -> Ranged {
+        Ranged {
+            streams: STREAMS,
+            part: PART_BYTES,
+        }
+    }
+}
+
+/// One granted object from a URL the caller holds, through the pull's downloader. Nothing
+/// re-authorizes the URL: an origin that refuses it ends the fetch. A fetch that fails
+/// stops `ledger` with it.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_ranged(
+    store: &Store,
+    grant: &DeliveryGrant,
+    url: &str,
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    deadline: Deadline,
+    ledger: &Ledger,
+    ranged: Ranged,
+    observer: Option<&mut dyn FetchObserver>,
+) -> Result<Fetched> {
+    let urls = BTreeMap::from([(grant.object.sha256.clone(), url.to_string())]);
+    let outcome = Download {
+        store,
+        wanted: std::slice::from_ref(&grant.object),
+        grant: &|_| Ok(grant.clone()),
+        urls: &urls,
+        chunk: ranged.part.clamp(1 << 20, 1 << 30),
+        ranged: false,
+        policy,
+        credential,
+        deadline,
+        ledger,
+        on_object: None,
+        backfill: None,
+    }
+    .run(ranged.streams.clamp(1, 64), observer)?;
+    Ok(Fetched {
+        object: grant.object.clone(),
+        transferred: outcome.bytes_moved,
+    })
 }

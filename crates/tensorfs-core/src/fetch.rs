@@ -413,10 +413,8 @@ pub struct DeliveryGrant {
 /// Where the bytes this grant authorizes come to rest.
 ///
 /// The grant already carried this bit — it was `manifest: bool` — so a third destination is
-/// the existing shape rather than a new concept, and `admit` dispatching on it is what
-/// keeps `transport/` untouched: `ranged::sequential`'s single `grant.admit(store, &mut
-/// reader)` does not move, so byte-range resume works on the staging path for free and
-/// cannot drift from the CAS path.
+/// the existing shape rather than a new concept: the downloader commits a hashed temp file
+/// where the grant says, so the staging path shares the CAS path's transport.
 ///
 /// `Blob` and `Manifest` are store objects. `Staging` is not: it is a foreign source
 /// carrier the store will read once and throw away, and it has no catalog record, no census

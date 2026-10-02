@@ -12,7 +12,7 @@ use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::sha256::{hex, Sha256};
 use tensorfs_core::store::{Fault, Store};
 use tensorfs_core::transport::{
-    fetch_url, push_object, Anonymous, Deadline, Ledger, SourcePolicy, UploadGrant,
+    fetch_ranged, push_object, Anonymous, Deadline, Ledger, Ranged, SourcePolicy, UploadGrant,
 };
 
 const OBJECT: u64 = 128 << 20;
@@ -156,7 +156,7 @@ fn an_object_larger_than_the_memory_budget_uploads_and_downloads() {
         object: object.clone(),
         destination: Destination::Blob,
     };
-    fetch_url(
+    fetch_ranged(
         &destination,
         &grant,
         &format!("{base}/object"),
@@ -164,6 +164,7 @@ fn an_object_larger_than_the_memory_budget_uploads_and_downloads() {
         &Anonymous,
         Deadline::none(),
         &Ledger::new(),
+        Ranged::default(),
         None,
     )
     .unwrap();

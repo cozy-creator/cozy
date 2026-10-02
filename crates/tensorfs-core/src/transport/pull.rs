@@ -39,7 +39,7 @@ use crate::ids::{Doc, ObjectRef};
 use crate::store::Store;
 use crate::transport::http::{self, Client};
 use crate::transport::hub::{self, CredentialProvider};
-use crate::transport::ledger::{Deadline, Ledger, FETCH_ATTEMPTS, PULL_STREAMS, STALL_FACTOR};
+use crate::transport::ledger::{Deadline, Ledger, PULL_STREAMS};
 use crate::transport::policy::{self, SourcePolicy};
 use std::collections::BTreeMap;
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -63,24 +63,13 @@ pub enum ObjectSource {
     Origin,
 }
 
-/// Where ONE object's fetch says what it is doing WHILE it does it, so a supervisor holding
-/// the other end can tell "still working" from "stopped" without a clock of its own — the
-/// same reason `store::Progress` exists, one layer up, where the bytes are still on the wire.
-///
-/// `hop` is announced per redirect hop per ask, BEFORE any byte of that hop moves. Which
-/// delivery host answered and what it answered are the two facts that separate "this link
-/// is slow" from "this origin is throttling us", and neither survives the call: the URL is
-/// a bearer capability that must not be logged, the host is not, and a 429 retry storm and
-/// a slow link are otherwise the same story. `moved` is the running total for THIS ask;
-/// a re-ask restarts it at zero, because a fetch has no mid-object resume and reporting
-/// bytes that are not in the store would be a lie about residency.
+/// Hears how many of ONE object's bytes are home, while its fetch runs. The count goes back
+/// when an origin that does not range starts the object over.
 pub trait FetchObserver {
-    fn hop(&mut self, attempt: u32, host: &str, status: u16);
     fn moved(&mut self, total: u64);
 }
 
 impl<F: FnMut(u64)> FetchObserver for F {
-    fn hop(&mut self, _attempt: u32, _host: &str, _status: u16) {}
     fn moved(&mut self, total: u64) {
         self(total)
     }
@@ -91,278 +80,12 @@ pub(super) fn shared_client() -> &'static Client {
     CLIENT.get_or_init(Client::new)
 }
 
-/// What one fetch moved. `transferred` counts the bytes this CALL pulled off the wire; a
-/// held object never reaches here — `DeliveryGrant::mint` refuses first.
+/// What one fetch moved: the object now in the Store (or the staging area), and the bytes
+/// this call pulled off the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetched {
-    pub admitted: crate::fetch::Admitted,
+    pub object: ObjectRef,
     pub transferred: u64,
-}
-
-struct Observed<'l, F> {
-    inner: http::BodyReader<'l>,
-    seen: u64,
-    limit: u64,
-    failure: Option<Refusal>,
-    notify: F,
-}
-
-impl<F: FnMut(u64)> std::io::Read for Observed<'_, F> {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self.limit.saturating_sub(self.seen);
-        let bounded = out
-            .len()
-            .min(remaining.saturating_add(1).min(usize::MAX as u64) as usize);
-        let n = std::io::Read::read(&mut self.inner, &mut out[..bounded])?;
-        if n as u64 > remaining {
-            let refusal = Refusal {
-                code: Code::LENGTH_MISMATCH,
-                detail: "object response exceeds its declared length".into(),
-            };
-            let error = std::io::Error::other(refusal.to_string());
-            self.failure = Some(refusal);
-            return Err(error); // never write an excess byte into the reserved temporary object
-        }
-        if n > 0 {
-            self.seen += n as u64;
-            (self.notify)(self.seen);
-        }
-        Ok(n)
-    }
-}
-
-/// Move ONE granted object across the door from a URL the caller already holds. The
-/// caller then owns the question of whether that URL is still alive — which is why `pull`
-/// uses `fetch_authorized` instead.
-#[allow(clippy::too_many_arguments)]
-pub fn fetch_url(
-    store: &Store,
-    grant: &DeliveryGrant,
-    url: &str,
-    policy: &SourcePolicy,
-    credential: &dyn CredentialProvider,
-    deadline: Deadline,
-    ledger: &Ledger,
-    observer: Option<&mut dyn FetchObserver>,
-) -> Result<Fetched> {
-    fetch_authorized(
-        store,
-        grant,
-        &|stale: bool| {
-            if stale {
-                return refuse(
-                    Code::TRANSFER_FAILED,
-                    "the object store refused this URL and the caller supplied only one — \
-                     re-run with a freshly minted URL",
-                );
-            }
-            Ok(url.to_string())
-        },
-        policy,
-        credential,
-        deadline,
-        ledger,
-        observer,
-    )
-}
-
-/// Move ONE granted object across the door, re-asking while re-asking is honest, and
-/// re-AUTHORIZING on every ask.
-///
-/// `authorize` is consulted once per attempt rather than once per object, because the two
-/// are not the same thing when a URL has a life: four attempts against one aging URL can
-/// outlast it, and the fourth would then be refused for a reason the first three were not.
-/// Re-asking with the same expired URL is a lie about time — but re-minting is not asking
-/// again, it is being authorized again, which is honest and is exactly what the object
-/// store's refusal asked for.
-#[allow(clippy::too_many_arguments)]
-pub fn fetch_authorized(
-    store: &Store,
-    grant: &DeliveryGrant,
-    authorize: &dyn Fn(bool) -> Result<String>,
-    policy: &SourcePolicy,
-    credential: &dyn CredentialProvider,
-    deadline: Deadline,
-    ledger: &Ledger,
-    observer: Option<&mut dyn FetchObserver>,
-) -> Result<Fetched> {
-    fetch_with_attempts(
-        store, grant, authorize, policy, credential, deadline, ledger, observer,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fetch_with_attempts(
-    store: &Store,
-    grant: &DeliveryGrant,
-    authorize: &dyn Fn(bool) -> Result<String>,
-    policy: &SourcePolicy,
-    credential: &dyn CredentialProvider,
-    deadline: Deadline,
-    ledger: &Ledger,
-    mut observer: Option<&mut dyn FetchObserver>,
-) -> Result<Fetched> {
-    let id = grant.object.id();
-    let mut last_refusal: Option<Refusal> = None;
-    let mut stalled_attempts = 0u32;
-    // Set when the origin refused the URL this loop last held. The next ask says so, and
-    // the supplier decides whether re-authorizing is honest — it holds the lease and its
-    // declared life, which is the only place that question can be answered.
-    let mut stale: Option<u16> = None;
-    let mut attempt = 0;
-    while attempt < FETCH_ATTEMPTS {
-        ledger.check_running()?;
-        attempt += 1;
-        let last = attempt == FETCH_ATTEMPTS;
-        // A refused re-authorization must still name the origin's answer. It is the whole
-        // diagnosis: "403, and re-minting was not honest" and "403, and the hub would not
-        // mint" are different problems with different owners.
-        let url = match authorize(stale.is_some()) {
-            Ok(url) => url,
-            Err(refusal) => match stale {
-                Some(status) => {
-                    return refuse(
-                        Code::TRANSFER_FAILED,
-                        format!(
-                            "{id}: the object store answered {status} and re-authorizing \
-                             was refused — {}",
-                            refusal.detail
-                        ),
-                    )
-                }
-                None => return Err(refusal),
-            },
-        };
-        stale = None;
-        // Every hop of this ask, recorded as it is walked and announced before the body is
-        // read: an ask that dies in the middle still says which host answered it and how.
-        let mut hops: Vec<(String, u16)> = Vec::new();
-        let opened = open_object(
-            shared_client(),
-            &url,
-            policy,
-            credential,
-            deadline,
-            ledger,
-            &[],
-            &mut |checked, status| hops.push((checked.host.clone(), status)),
-        );
-        if let Some(watcher) = observer.as_mut() {
-            for (host, status) in &hops {
-                watcher.hop(attempt, host, *status);
-            }
-        }
-        let opened = match opened {
-            Ok(response) => response,
-            Err(refusal) => match refusal.code {
-                Code::TRANSFER_FAILED if !last => {
-                    last_refusal = Some(refusal);
-                    continue;
-                }
-                _ => {
-                    return Err(named(refusal, &id));
-                }
-            },
-        };
-        let response = match opened {
-            Opened::Body(response) => response,
-            Opened::Retryable(status, stated) => {
-                let (wait, counted) = ledger.retry_wait(stated);
-                if last && counted {
-                    return refuse(
-                        Code::TRANSFER_FAILED,
-                        format!("{id}: the object store answered {status} on every attempt"),
-                    );
-                }
-                if !counted {
-                    // The origin said when to come back; that is not a failed ask.
-                    attempt -= 1;
-                }
-                ledger.pause(wait, deadline)?;
-                continue;
-            }
-            Opened::Expired(status) => {
-                if last {
-                    return refuse(
-                        Code::TRANSFER_FAILED,
-                        format!(
-                            "{id}: the object store answered {status} on every attempt, \
-                             re-authorizing between them"
-                        ),
-                    );
-                }
-                // Ask to be authorized AGAIN — a different act from asking again, and the
-                // only one the origin's refusal can be answered with. The supplier refuses
-                // if the URL it just handed out was too young for time to be the cause.
-                stale = Some(status);
-                continue;
-            }
-            // An origin's own non-retryable answer is a fact, not weather: no re-ask.
-            Opened::Refused(refusal) => return Err(named(refusal, &id)),
-        };
-        let mut body = Observed {
-            inner: response.into_body(),
-            seen: 0,
-            limit: grant.object.length,
-            failure: None,
-            notify: |total| {
-                if let Some(watcher) = observer.as_mut() {
-                    watcher.moved(total);
-                }
-            },
-        };
-        match grant.admit(store, &mut body) {
-            Ok(admitted) => {
-                return Ok(Fetched {
-                    admitted,
-                    transferred: body.seen,
-                })
-            }
-            Err(door) => {
-                let stalled = body.inner.stalled();
-                let refusal = body
-                    .failure
-                    .take()
-                    .or_else(|| body.inner.failure())
-                    .unwrap_or(door);
-                if stalled {
-                    stalled_attempts += 1;
-                }
-                match refusal.code {
-                    // IO_FAILED is the LOCAL store, and at sixteen concurrent writers
-                    // against a rollback-journal SQLite it is routinely "database is
-                    // locked" — a fact about this second, not about the object. It killed
-                    // whole multi-gigabyte walks after the bytes had landed. No wait is
-                    // added: the wait already happened inside SQLite's busy timeout, and
-                    // by the time this object is re-fetched the contention has moved.
-                    Code::TRANSFER_FAILED | Code::IO_FAILED if !last => {
-                        last_refusal = Some(refusal);
-                        continue;
-                    }
-                    Code::TRANSFER_FAILED if stalled_attempts > 0 => {
-                        return refuse(
-                            Code::TRANSFER_FAILED,
-                            format!(
-                                "{id}: the stream stopped moving bytes {stalled_attempts} \
-                                 time(s) of {FETCH_ATTEMPTS} asks, each judged against the \
-                                 {:.1} s this pull's own measured pace allowed \
-                                 ({STALL_FACTOR} times its longest gap) — this link drops \
-                                 streams rather than slowing them; re-run the pull, and if \
-                                 it repeats the route between this machine and the object \
-                                 store is the subject, not the artifact",
-                                ledger.patience().as_secs_f64(),
-                            ),
-                        );
-                    }
-                    _ => return Err(named(refusal, &id)),
-                }
-            }
-        }
-    }
-    Err(last_refusal.unwrap_or(Refusal {
-        code: Code::TRANSFER_FAILED,
-        detail: format!("{id}: the object store did not answer"),
-    }))
 }
 
 pub(super) enum Opened<'l> {
@@ -509,13 +232,6 @@ pub(super) fn absolute_location(base: &policy::CheckedUrl, location: &str) -> Op
         None => "/",
     };
     Some(format!("{origin}{directory}{location}"))
-}
-
-fn named(refusal: Refusal, id: &str) -> Refusal {
-    Refusal {
-        code: refusal.code,
-        detail: format!("{id}: {}", refusal.detail),
-    }
 }
 
 /// Where the walk gets the URL for the object it is ABOUT to fetch — asked at the point of
@@ -908,8 +624,11 @@ pub(super) fn fetch_wanted_bounded(
     ));
     let walked = super::download::Download {
         store,
-        plan,
+        wanted: &plan.wanted,
+        grant: &|object| DeliveryGrant::mint(plan, object),
         urls,
+        chunk: super::download::CHUNK_BYTES,
+        ranged: true,
         policy,
         credential,
         deadline,
@@ -917,7 +636,7 @@ pub(super) fn fetch_wanted_bounded(
         on_object,
         backfill: backfill.as_ref(),
     }
-    .run(streams)?;
+    .run(streams, None)?;
     if let Some(backfill) = backfill {
         backfill.finish_offers();
     }

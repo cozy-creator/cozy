@@ -547,10 +547,8 @@ pub fn pull(
         for (member, object) in &pinned {
             if plan.wants(&object.sha256) {
                 let grant = DeliveryGrant::mint(&plan, object)?;
-                // Ranged: a source member is not cut on the object grid — one HuggingFace
-                // shard is whatever the uploader pushed, and on one stream it is one
-                // stream. `fetch_ranged` falls back to exactly the single-stream call this
-                // replaced whenever the origin will not answer a range.
+                // A source member is whatever the uploader pushed, up to gigabytes: it is
+                // asked for as parallel ranges, or whole if the origin will not range.
                 let fetched = fetch_ranged(
                     store,
                     &grant,

@@ -64,8 +64,7 @@
 //!   tfs fetch url <root> <sha256> <length> <url|-> [--progress] [--streams N]
 //!                                                    one granted object, in parallel ranges
 //!            --progress opens the same STDERR event channel `tfs fetch` reports on, while
-//!            the bytes move: {"event":"fetch.progress","origin_bytes":N,...} per sample
-//!            and {"event":"fetch.delivery","host":..,"http_status":..} per redirect hop,
+//!            the bytes move: {"event":"fetch.progress","origin_bytes":N,...} per sample,
 //!            so a supervisor can tell slow from wedged without a clock. stdout stays the
 //!            result. --progress-bytes <n> is that channel's resolution, never a verdict
 //!

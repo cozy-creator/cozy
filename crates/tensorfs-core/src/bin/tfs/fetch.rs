@@ -430,29 +430,14 @@ fn sample_gap() -> std::time::Duration {
 /// which stream it arrived on. `fetch url`'s result is `held|admitted <id>` and
 /// `transferred <n> B`, and nothing printed here can be mistaken for either.
 ///
-/// Two events, and the counter names are `pull.progress`'s so that one consumer reads both
-/// verbs. `fetch url` is a plan-of-one against the origin — a held object returns before a
-/// socket opens and no repo cache is consulted — so the cache counters would be
-/// structurally zero and are not printed; `origin_objects` goes to one only when the object
-/// is admitted:
+/// One event, and the counter names are `pull.progress`'s so that one consumer reads both
+/// verbs. `origin_bytes` is what is home so far; it goes back if an origin that does not
+/// range starts the object over. `origin_objects` goes to one when the object is admitted:
 ///
-///   {"event":"fetch.progress","origin_bytes":N,"origin_objects":0|1,"attempt":A}
-///   {"event":"fetch.delivery","attempt":A,"host":"h","http_status":S}
-///
-/// `attempt` is on the progress event because a re-ask RESTARTS `origin_bytes` at zero —
-/// `fetch url` has no mid-object resume, so those bytes are not in the store and a
-/// consumer must be able to see the count go back rather than believe a total this fetch
-/// cannot deliver.
-///
-/// `fetch.delivery` is one per redirect hop per ask, and it is the half that makes a
-/// degradation attributable at all. The URL is a bearer capability and never appears; the
-/// HOST is not, and neither is the status. Without them a 429 retry storm and a slow link
-/// produce the same byte curve afterwards, which is exactly why the H3 pod's 70 -> 6 MB/s
-/// could not be attributed to anything.
+///   {"event":"fetch.progress","origin_bytes":N,"origin_objects":0|1}
 struct Reporter {
     moved: u64,
     reported: u64,
-    attempt: u32,
     /// The byte delta between records. `--progress-bytes` states it, because resolution is
     /// configuration and nothing here is a verdict; production states nothing and gets
     /// SAMPLE_BYTES.
@@ -466,7 +451,6 @@ impl Reporter {
         Reporter {
             moved: 0,
             reported: 0,
-            attempt: 0,
             every: every.max(1),
             gap: sample_gap(),
             last: std::time::Instant::now(),
@@ -485,34 +469,16 @@ impl Reporter {
     fn announce(&mut self, admitted: u64) {
         self.reported = self.moved;
         let event = format!(
-            "{{\"event\":\"fetch.progress\",\"origin_bytes\":{},\"origin_objects\":{},\"attempt\":{}}}",
-            self.moved, admitted, self.attempt
+            "{{\"event\":\"fetch.progress\",\"origin_bytes\":{},\"origin_objects\":{}}}",
+            self.moved, admitted
         );
         self.say(&event);
     }
 }
 
 impl transport::FetchObserver for Reporter {
-    fn hop(&mut self, attempt: u32, host: &str, status: u16) {
-        self.attempt = attempt;
-        // The host reaches the channel as JSON, so it reaches it quoted. It comes from the
-        // policy check that already refused anything but a hostname, and this is the belt
-        // that keeps a malformed one from being a malformed EVENT.
-        let host: String = host
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
-            .take(253)
-            .collect();
-        let event = format!(
-            "{{\"event\":\"fetch.delivery\",\"attempt\":{attempt},\"host\":\"{host}\",\"http_status\":{status}}}"
-        );
-        self.say(&event);
-    }
-
     fn moved(&mut self, total: u64) {
-        // A re-ask restarts the count at zero, and saying so is the honest report: those
-        // bytes are not in the store, and a reader that watched them climb must watch them
-        // go back rather than believe a total this fetch cannot deliver.
+        // A count that goes back is reported at once: those bytes are not on this machine.
         let due = total < self.moved
             || total.saturating_sub(self.reported) >= self.every
             || self.last.elapsed() >= self.gap;
@@ -524,14 +490,13 @@ impl transport::FetchObserver for Reporter {
 }
 
 /// `tfs fetch url <root> <sha256> <length> <url|-> [--progress] [--streams N] [--part-mib N]`
-/// — plan-of-one, then the one transport into `put_stream`. A held object answers `held`
-/// and moves nothing. A url of `-` reads the real URL as one line on stdin: a capability
-/// URL can embed a signature, and argv is world-readable in /proc.
+/// — plan-of-one, then the pull's downloader. A held object answers `held` and moves
+/// nothing. A url of `-` reads the real URL as one line on stdin: a capability URL can
+/// embed a signature, and argv is world-readable in /proc.
 ///
-/// `--streams` is how many byte ranges of THIS object are in flight; `--streams 1` is the
-/// single-stream fetch and stays reachable, because a link where concurrency does not help
-/// is a real link. An origin that will not answer a range takes the single-stream path
-/// whatever these say.
+/// `--streams` is how many ranged requests of THIS object are in flight and `--part-mib`
+/// one request's size. An origin that will not answer a range gives the object to one
+/// request whatever these say.
 ///
 /// `--progress` opens the observation channel above. Without it this command says nothing
 /// until it is finished, which for a 5 GiB shard is ten to fifteen minutes of silence a
@@ -570,7 +535,7 @@ fn object_of(what: &str, id: &str, length: &str) -> Result<ObjectRef, ExitCode> 
 
 fn ranged_of(flags: &Flags) -> transport::Ranged {
     transport::Ranged {
-        streams: crate::flag_num(flags, "streams", transport::SOURCE_STREAMS),
+        streams: crate::flag_num(flags, "streams", transport::STREAMS),
         part: crate::flag_num::<u64>(flags, "part-mib", transport::PART_BYTES >> 20) << 20,
     }
 }
@@ -688,7 +653,7 @@ pub fn cmd_url(root: &Path, id: &str, length: &str, url: &str, flags: &Flags) ->
         reporter.moved = fetched.transferred;
         reporter.announce(1);
     }
-    println!("admitted     {}", fetched.admitted.object.id());
+    println!("admitted     {}", fetched.object.id());
     println!("transferred  {} B", fetched.transferred);
     ExitCode::SUCCESS
 }
@@ -765,8 +730,8 @@ pub fn cmd_staging_fetch(
         reporter.moved = fetched.transferred;
         reporter.announce(1);
     }
-    let path = ok!(staging::path(&store, &fetched.admitted.object.sha256));
-    println!("staged       {}", fetched.admitted.object.id());
+    let path = ok!(staging::path(&store, &fetched.object.sha256));
+    println!("staged       {}", fetched.object.id());
     println!("path         {}", path.display());
     println!("transferred  {} B", fetched.transferred);
     ExitCode::SUCCESS

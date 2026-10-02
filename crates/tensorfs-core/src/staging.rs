@@ -181,8 +181,14 @@ pub fn staged(store: &Store, want: &ObjectRef) -> Result<Option<PathBuf>> {
 /// URL that serves the wrong bytes cannot poison this area — it can only fail, leaving
 /// nothing staged and no temp behind.
 pub fn stage<R: Read>(store: &Store, r: &mut R, want: &ObjectRef) -> Result<Carrier> {
-    let dir = ensure(store)?;
+    ensure(store)?;
     let verified = store.stream_verified(r, Some(want), &Fault::default(), STAGE_TEMP)?;
+    adopt(store, verified)
+}
+
+/// Link a temp file already hashed to its id to `staging/<hex>`, and drop the temp.
+pub(crate) fn adopt(store: &Store, verified: crate::store::Verified) -> Result<Carrier> {
+    let dir = ensure(store)?;
     let destination = dir.join(&verified.sha256);
     // 0444 for the same reason an object is: the converter reads it and nothing writes it
     // again. A carrier is removed by unlink, which a read-only mode does not prevent.
