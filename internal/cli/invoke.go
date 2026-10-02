@@ -77,6 +77,11 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	return runTarget(ctx, target, packageInterface)
+}
+
+// runTarget runs one resolved target; ctx.Inv.Args is the target followed by its terms.
+func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInterface) *exit.Error {
 	defer func() { reclaimSnapshot(ctx, target) }()
 	if target.Function == "" {
 		return emitFunctions(ctx, target, packageInterface)

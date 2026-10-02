@@ -271,6 +271,24 @@ cozy run paul/minimax-h3-tools/four-lane \
 cozy run org/quantize/convert org/model@release/bf16 org/quantized --rental=otter
 ```
 
+Upload, quantize, publish: `cozy model quantize <model> --fp8` (or `--mxfp8`) writes that lane
+as a new owner-only checkpoint in the model's repository, on this computer or `--rental=<name>`.
+The machine fetches the checkpoint if it does not hold it; on the rental that ingested it,
+nothing is downloaded again.
+
+```sh
+cozy model upload civitai://2883731 org/model --rental=otter --await
+cozy model quantize org/model#sha256:<checkpoint> --fp8 --rental=otter --await
+cozy model publish org/model --release 1.0.0 --lane fp16=sha256:<checkpoint> --lane fp8=sha256:<fp8 checkpoint>
+```
+
+The package that serves the model owns the recipe (which components and layers). Its quantizer
+is a job that takes the model and declares one weights output named for the lane (`fp8`,
+`mxfp8`); `cozy_runtime.derive` supplies the encodings. The verb runs that job as the
+conversion below, choosing the installed package whose quantizer the checkpoint's components
+satisfy, or `--package org/name`. A model no package quantizes is refused, naming the job a
+package would need.
+
 A conversion job — model inputs and at least one declared weight output — reads
 `cozy run <job> <input> [<org/model>]`: the first positional binds its first model input, the
 second is the `--upload-to` destination (it may be the input's own repository), and any
