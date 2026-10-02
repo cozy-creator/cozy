@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,6 +24,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
 const executionAccessFile = "execution-access.json"
@@ -67,11 +70,25 @@ func accessOrigin(value string) string {
 	return strings.ToLower(u.Scheme) + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
-func (h *Host) accessLock(ctx context.Context, name string, wait bool) (func(), *exit.Error) {
-	if err := os.MkdirAll(h.dir, 0700); err != nil {
+// accessCache is this controller's record of one machine's delegated Hub access: the
+// grants it attached, per login origin, and the removals it still owes the machine.
+type accessCache struct{ dir string }
+
+// accessTarget is the pinned machine a cache's signed access calls reach.
+type accessTarget struct {
+	addr, worker string
+	leaf         []byte
+	pin          func() (*workertls.Pin, *exit.Error)
+	owner        func() (rental.CreatorIdentity, *exit.Error)
+}
+
+func (c accessCache) path(name string) string { return filepath.Join(c.dir, name) }
+
+func (c accessCache) lock(ctx context.Context, name string, wait bool) (func(), *exit.Error) {
+	if err := os.MkdirAll(c.dir, 0700); err != nil {
 		return nil, exit.Internalf("cannot open scoped access storage: %s", err)
 	}
-	file, err := os.OpenFile(h.path(name), os.O_CREATE|os.O_RDWR, 0600)
+	file, err := os.OpenFile(c.path(name), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, exit.Internalf("cannot open scoped access lock: %s", err)
 	}
@@ -88,8 +105,8 @@ func (h *Host) accessLock(ctx context.Context, name string, wait bool) (func(), 
 
 // The cache lock protects only short local I/O. Logout can erase credentials and
 // queue removal while a network request or a machine installation is blocked.
-func (h *Host) accessState(ctx context.Context, change func(*accessState) *exit.Error) *exit.Error {
-	unlock, problem := h.accessLock(ctx, "execution-access.lock", true)
+func (c accessCache) state(ctx context.Context, change func(*accessState) *exit.Error) *exit.Error {
+	unlock, problem := c.lock(ctx, "execution-access.lock", true)
 	if problem != nil {
 		return problem
 	}
@@ -99,7 +116,7 @@ func (h *Host) accessState(ctx context.Context, change func(*accessState) *exit.
 		name  string
 		value any
 	}{{executionAccessFile, &state.cache}, {executionAccessResets, &state.resets}} {
-		raw, err := os.ReadFile(h.path(item.name))
+		raw, err := os.ReadFile(c.path(item.name))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -119,7 +136,7 @@ func (h *Host) accessState(ctx context.Context, change func(*accessState) *exit.
 	return change(&state)
 }
 
-func (h *Host) saveAccessState(state *accessState) *exit.Error {
+func (c accessCache) save(state *accessState) *exit.Error {
 	// Persist the reset generation before cache mutation, so a crash cannot make an
 	// earlier in-flight attachment current again.
 	for _, item := range []struct {
@@ -127,14 +144,14 @@ func (h *Host) saveAccessState(state *accessState) *exit.Error {
 		value any
 	}{{executionAccessResets, state.resets}, {executionAccessFile, state.cache}} {
 		if item.name == executionAccessFile && len(state.cache) == 0 {
-			if err := os.Remove(h.path(executionAccessFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := os.Remove(c.path(executionAccessFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return exit.Internalf("cannot erase scoped access cache: %s", err)
 			}
 			continue
 		}
 		raw, err := json.Marshal(item.value)
 		if err == nil {
-			err = writePrivate(h.path(item.name), raw)
+			err = writePrivate(c.path(item.name), raw)
 		}
 		if err != nil {
 			return exit.Internalf("cannot retain scoped access state: %s", err)
@@ -161,8 +178,8 @@ func eraseCachedAccess(state *accessState, origin string) {
 	}
 }
 
-func (h *Host) queueAccessReset(ctx context.Context, origin, target string) *exit.Error {
-	return h.accessState(ctx, func(state *accessState) *exit.Error {
+func (c accessCache) queueReset(ctx context.Context, origin, target string) *exit.Error {
+	return c.state(ctx, func(state *accessState) *exit.Error {
 		key := accessOrigin(origin)
 		reset := state.resets[key]
 		if target == "" {
@@ -178,18 +195,44 @@ func (h *Host) queueAccessReset(ctx context.Context, origin, target string) *exi
 		reset.AgentOrigin, reset.Pending = target, true
 		state.resets[key] = reset
 		eraseCachedAccess(state, origin)
-		return h.saveAccessState(state)
+		return c.save(state)
 	})
 }
 
-// ForgetExecutionAccess erases only this login origin's client cache and durably
-// requests removal of its mapped agent origin. It never launches a stopped agent.
+func (h *Host) accessCache() accessCache { return accessCache{dir: h.dir} }
+
+// endpointCache is an explicit endpoint's cache, apart from this computer's machine's.
+func (h *Host) endpointCache(name string) accessCache {
+	return accessCache{dir: filepath.Join(h.dir, "endpoints", name)}
+}
+
+func (h *Host) accessTarget(launch *Launch) accessTarget {
+	return accessTarget{addr: launch.Addr, worker: launch.WorkerID, leaf: launch.Leaf, pin: h.Pin, owner: func() (rental.CreatorIdentity, *exit.Error) {
+		if _, err := os.Stat(h.path("owner.pem")); err != nil {
+			return rental.CreatorIdentity{}, exit.New(exit.Credential, "the retained machine owner key is unavailable")
+		}
+		return h.Owner()
+	}}
+}
+
+// ForgetExecutionAccess erases only this login origin's client caches and durably
+// requests removal of its mapped agent origin. It never launches a stopped agent; an
+// explicit endpoint's removal runs when the endpoint is next reached.
 // pending=true means local erasure succeeded but machine-side cleanup is deferred.
 func (h *Host) ForgetExecutionAccess(ctx context.Context, origin string) (pending bool, problem *exit.Error) {
-	if problem := h.queueAccessReset(ctx, origin, ""); problem != nil {
+	if problem := h.accessCache().queueReset(ctx, origin, ""); problem != nil {
 		return false, problem
 	}
-	unlock, problem := h.accessLock(ctx, "execution-access-request.lock", false)
+	endpoints, _ := os.ReadDir(filepath.Join(h.dir, "endpoints"))
+	for _, entry := range endpoints {
+		if entry.IsDir() {
+			if problem := h.endpointCache(entry.Name()).queueReset(ctx, origin, ""); problem != nil {
+				return false, problem
+			}
+		}
+	}
+	cache := h.accessCache()
+	unlock, problem := cache.lock(ctx, "execution-access-request.lock", false)
 	if problem != nil {
 		return true, nil
 	}
@@ -202,24 +245,29 @@ func (h *Host) ForgetExecutionAccess(ctx context.Context, origin string) (pendin
 		return true, nil
 	}
 	launch := &Launch{Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(record.WorkerPort)), WorkerID: record.WorkerID}
-	if problem := h.resetAccessLocked(ctx, launch, accessOrigin(origin)); problem != nil {
+	if problem := resetAccessLocked(ctx, cache, h.accessTarget(launch), accessOrigin(origin)); problem != nil {
 		return true, problem
 	}
-	problem = h.accessState(ctx, func(state *accessState) *exit.Error { pending = state.resets[accessOrigin(origin)].Pending; return nil })
+	problem = cache.state(ctx, func(state *accessState) *exit.Error { pending = state.resets[accessOrigin(origin)].Pending; return nil })
 	return pending, problem
 }
 
-// ResumeExecutionAccessCleanup is best-effort on an already-started agent. A
-// pending unrelated Hub never prevents offline work; selected-origin attachment
-// below requires either completed removal or a fresh same-principal renewal.
+// ResumeExecutionAccessCleanup is best-effort on an already-started agent.
 func (h *Host) ResumeExecutionAccessCleanup(ctx context.Context, launch *Launch) {
-	unlock, problem := h.accessLock(ctx, "execution-access-request.lock", false)
+	resumeAccessCleanup(ctx, h.accessCache(), h.accessTarget(launch))
+}
+
+// resumeAccessCleanup sends queued removals. A pending unrelated Hub never prevents
+// offline work; selected-origin attachment below requires either completed removal or
+// a fresh same-principal renewal.
+func resumeAccessCleanup(ctx context.Context, cache accessCache, target accessTarget) {
+	unlock, problem := cache.lock(ctx, "execution-access-request.lock", false)
 	if problem != nil {
 		return
 	}
 	defer unlock()
 	var origins []string
-	if problem := h.accessState(ctx, func(state *accessState) *exit.Error {
+	if problem := cache.state(ctx, func(state *accessState) *exit.Error {
 		for key, value := range state.resets {
 			if value.Pending {
 				origins = append(origins, key)
@@ -231,21 +279,21 @@ func (h *Host) ResumeExecutionAccessCleanup(ctx context.Context, launch *Launch)
 	}
 	slices.Sort(origins)
 	for _, origin := range origins {
-		if h.resetAccessLocked(ctx, launch, origin) != nil {
+		if resetAccessLocked(ctx, cache, target, origin) != nil {
 			return
 		}
 	}
 }
 
-func (h *Host) resetAccessLocked(ctx context.Context, launch *Launch, origin string) *exit.Error {
+func resetAccessLocked(ctx context.Context, cache accessCache, target accessTarget, origin string) *exit.Error {
 	var selected accessReset
-	if problem := h.accessState(ctx, func(state *accessState) *exit.Error { selected = state.resets[origin]; return nil }); problem != nil {
+	if problem := cache.state(ctx, func(state *accessState) *exit.Error { selected = state.resets[origin]; return nil }); problem != nil {
 		return problem
 	}
 	if !selected.Pending {
 		return nil
 	}
-	code, raw, problem := h.machineAccess(ctx, launch, http.MethodDelete, map[string]string{"origin": selected.AgentOrigin})
+	code, raw, problem := target.call(ctx, http.MethodDelete, map[string]string{"origin": selected.AgentOrigin})
 	if problem != nil {
 		return problem
 	}
@@ -258,16 +306,16 @@ func (h *Host) resetAccessLocked(ctx context.Context, launch *Launch, origin str
 			return exit.Named(exit.Conflict, "machine.execution_access_busy", "machine-side access removal is queued until accepted work and retained results are finished or released")
 		}
 		if code == http.StatusNotFound || code == http.StatusMethodNotAllowed {
-			return exit.Named(exit.Structural, "machine.agent_update_required", "this agent cannot remove scoped access; update it while idle")
+			return exit.Named(exit.Structural, "machine.agent_update_required", "this machine cannot remove scoped access; update it while idle")
 		}
 		return exit.Named(exit.Unavailable, "machine.execution_access_cleanup_pending", "machine-side access removal is queued (HTTP %d)", code)
 	}
-	return h.accessState(ctx, func(state *accessState) *exit.Error {
+	return cache.state(ctx, func(state *accessState) *exit.Error {
 		current := state.resets[origin]
 		if current.Generation == selected.Generation {
 			current.Pending = false
 			state.resets[origin] = current
-			return h.saveAccessState(state)
+			return cache.save(state)
 		}
 		return nil
 	})
@@ -333,6 +381,14 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	if installed == nil || installed.Host.Module != AgentModule || !slices.Contains(launch.Capabilities, HubAccessCapability) {
 		return "", exit.Named(exit.Structural, "machine.agent_update_required", "delegated Hub access requires %s", HubAccessCapability)
 	}
+	return attachAccess(ctx, h.accessCache(), h.accessTarget(launch), origin, account)
+}
+
+// attachAccess gives the target machine the signed-in account's execution access at
+// origin and answers the origin that machine reads. A cached grant is reused while it
+// is the same login's, for the same pinned leaf and generation, and far from expiry:
+// a run never asks Tensorhub for access the machine already holds.
+func attachAccess(ctx context.Context, cache accessCache, target accessTarget, origin string, account *hub.Client) (string, *exit.Error) {
 	credential := ""
 	if account != nil {
 		credential = account.CredentialIdentity()
@@ -340,7 +396,7 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	if credential == "" {
 		return "", exit.Named(exit.Credential, "machine.execution_access_required", "running work from %s requires account-authorized execution access", origin)
 	}
-	unlock, problem := h.accessLock(ctx, "execution-access-request.lock", true)
+	unlock, problem := cache.lock(ctx, "execution-access-request.lock", true)
 	if problem != nil {
 		return "", problem
 	}
@@ -348,19 +404,16 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	key := accessOrigin(origin)
 	var grant executionAccess
 	snapshot := map[string]accessReset{}
-	load := func() *exit.Error {
-		return h.accessState(ctx, func(state *accessState) *exit.Error {
-			grant = cachedAccess(state, origin)
-			for key, value := range state.resets {
-				snapshot[key] = value
-			}
-			return nil
-		})
-	}
-	if problem := load(); problem != nil {
+	if problem := cache.state(ctx, func(state *accessState) *exit.Error {
+		grant = cachedAccess(state, origin)
+		for key, value := range state.resets {
+			snapshot[key] = value
+		}
+		return nil
+	}); problem != nil {
 		return "", problem
 	}
-	digest := sha256.Sum256(launch.Leaf)
+	digest := sha256.Sum256(target.leaf)
 	certificate := hex.EncodeToString(digest[:])
 	pending := snapshot[key].Pending
 	for _, reset := range snapshot {
@@ -368,9 +421,9 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 			pending = true
 		}
 	}
-	refresh := pending || grant.Certificate != certificate || grant.Credential != credential || grant.ExpiresAt <= time.Now().Add(time.Minute).Unix() || !deviceBoundAccess(grant.Token) || grant.Generation != snapshot[key].Generation || grant.Origin != machineOrigin(origin, grant.Origin)
+	refresh := pending || grant.Certificate != certificate || grant.Credential != credential || grant.ExpiresAt <= time.Now().Add(time.Minute).Unix() || !deviceBoundAccess(grant.Token) || grant.Generation != snapshot[key].Generation || accessOrigin(grant.Origin) != accessOrigin(machineOrigin(origin, grant.Origin))
 	if refresh {
-		access, problem := account.AuthorizeExecutionAccess(ctx, launch.Leaf)
+		access, problem := account.AuthorizeExecutionAccess(ctx, target.leaf)
 		if problem != nil {
 			return "", problem
 		}
@@ -389,7 +442,7 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		body := map[string]any{"origin": grant.Origin, "token": grant.Token, "expires_at": grant.ExpiresAt, "environment": grant.Environment, "ca_der_b64url": grant.CA}
-		code, raw, problem := h.machineAccess(ctx, launch, http.MethodPost, body)
+		code, raw, problem := target.call(ctx, http.MethodPost, body)
 		if problem != nil {
 			return "", problem
 		}
@@ -398,7 +451,7 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 		}
 		_ = json.Unmarshal(raw, &refused)
 		if code == http.StatusConflict && refused.Error.Code == "hub_access_principal_conflict" && attempt == 0 {
-			if problem := h.accessState(ctx, func(state *accessState) *exit.Error {
+			if problem := cache.state(ctx, func(state *accessState) *exit.Error {
 				for scope, current := range state.resets {
 					if (scope == key || accessOrigin(current.AgentOrigin) == accessOrigin(grant.Origin)) && current.Generation != snapshot[scope].Generation {
 						return exit.Named(exit.Credential, "machine.execution_access_revoked", "execution access was removed while attachment was in progress; log in again")
@@ -410,14 +463,17 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 				state.resets[key], snapshot[key] = reset, reset
 				grant.Generation = reset.Generation
 				eraseCachedAccess(state, origin)
-				return h.saveAccessState(state)
+				return cache.save(state)
 			}); problem != nil {
 				return "", problem
 			}
-			if problem := h.resetAccessLocked(ctx, launch, key); problem != nil {
+			if problem := resetAccessLocked(ctx, cache, target, key); problem != nil {
 				return "", problem
 			}
 			continue
+		}
+		if code == http.StatusNotFound || code == http.StatusMethodNotAllowed {
+			return "", exit.Named(exit.Structural, "machine.agent_update_required", "this machine cannot accept delegated Hub access; update it")
 		}
 		if code/100 != 2 {
 			return "", exit.Named(exit.Credential, "machine.execution_access_refused", "the machine refused execution access (HTTP %d)", code)
@@ -426,11 +482,11 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 			Origin    string `json:"origin"`
 			ExpiresAt int64  `json:"expires_at"`
 		}
-		if json.Unmarshal(raw, &reply) != nil || reply.Origin != grant.Origin || reply.ExpiresAt != grant.ExpiresAt {
+		if json.Unmarshal(raw, &reply) != nil || accessOrigin(reply.Origin) != accessOrigin(grant.Origin) || reply.ExpiresAt != grant.ExpiresAt {
 			return "", exit.New(exit.Conflict, "the machine did not acknowledge execution access")
 		}
 		revoked := false
-		problem = h.accessState(ctx, func(state *accessState) *exit.Error {
+		problem = cache.state(ctx, func(state *accessState) *exit.Error {
 			for other, current := range state.resets {
 				if (other == key || accessOrigin(current.AgentOrigin) == accessOrigin(grant.Origin)) && current.Generation != snapshot[other].Generation {
 					revoked = true
@@ -458,13 +514,13 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 				eraseCachedAccess(state, origin)
 				state.cache[origin] = raw
 			}
-			return h.saveAccessState(state)
+			return cache.save(state)
 		})
 		if problem != nil {
 			return "", problem
 		}
 		if revoked {
-			_ = h.resetAccessLocked(ctx, launch, key)
+			_ = resetAccessLocked(ctx, cache, target, key)
 			return "", exit.Named(exit.Credential, "machine.execution_access_revoked", "execution access was removed while attachment was in progress; log in again")
 		}
 		return grant.Environment["TENSORHUB_ORIGIN"], nil
@@ -472,11 +528,13 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	return "", exit.Named(exit.Conflict, "machine.execution_access_principal_conflict", "another account changed the machine's Hub access during attachment")
 }
 
-func (h *Host) machineAccess(ctx context.Context, launch *Launch, method string, body any) (int, []byte, *exit.Error) {
-	if _, err := os.Stat(h.path("owner.pem")); err != nil {
-		return 0, nil, exit.New(exit.Credential, "the retained machine owner key is unavailable")
+// call sends one owner-signed scoped-access request over the pinned TLS identity.
+func (t accessTarget) call(ctx context.Context, method string, body any) (int, []byte, *exit.Error) {
+	owner, problem := t.owner()
+	if problem != nil {
+		return 0, nil, problem
 	}
-	owner, problem := h.Owner()
+	pin, problem := t.pin()
 	if problem != nil {
 		return 0, nil, problem
 	}
@@ -484,21 +542,17 @@ func (h *Host) machineAccess(ctx context.Context, launch *Launch, method string,
 	if err != nil || len(public) != ed25519.PublicKeySize {
 		return 0, nil, exit.New(exit.Credential, "the machine owner key is unreadable")
 	}
-	token, err := capability.MintSigned(public, owner.Sign, capability.Grant{Machine: launch.WorkerID, Action: "hub-access", Expires: time.Now().Add(5 * time.Minute).Unix()})
+	token, err := capability.MintSigned(public, owner.Sign, capability.Grant{Machine: t.worker, Action: "hub-access", Expires: time.Now().Add(5 * time.Minute).Unix()})
 	if err != nil {
 		return 0, nil, exit.Internalf("cannot authorize machine execution access")
 	}
 	raw, _ := json.Marshal(body)
-	request, err := http.NewRequestWithContext(ctx, method, "https://"+launch.Addr+"/v1/hubs/access", bytes.NewReader(raw))
+	request, err := http.NewRequestWithContext(ctx, method, "https://"+t.addr+"/v1/hubs/access", bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, exit.Internalf("cannot address machine access API")
 	}
 	request.Header.Set("Authorization", "Cozy-Cap "+token)
 	request.Header.Set("Content-Type", "application/json")
-	pin, problem := h.Pin()
-	if problem != nil {
-		return 0, nil, problem
-	}
 	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
 	defer transport.CloseIdleConnections()
 	response, err := (&http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(request)

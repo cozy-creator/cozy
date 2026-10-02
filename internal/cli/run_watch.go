@@ -25,6 +25,13 @@ type runEventObserver interface {
 // A watcher never cancels work; explicit cancellation belongs to run cancel.
 func handleRunWatch(ctx *Context) *exit.Error {
 	id := strings.TrimSpace(ctx.Inv.Args[0])
+	close, problem := endpointForRecordedRun(ctx, id)
+	if problem != nil {
+		return problem
+	}
+	if close != nil {
+		defer close()
+	}
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem

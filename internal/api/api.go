@@ -66,6 +66,7 @@ const MaxBody = 8 << 20
 
 // Server is the local client API. One per Cozy daemon.
 type Server struct {
+	scopedEndpoint    string
 	machineExecutions MachineExecutions
 	orchestrator      *orchestrator.Orchestrator
 	store             *records.Store
@@ -127,6 +128,7 @@ type Resolver interface {
 
 // Options is the frozen input to one API server.
 type Options struct {
+	ScopedEndpoint    string // foreground controller admits only this explicitly pinned target
 	MachineExecutions MachineExecutions
 	Orchestrator      *orchestrator.Orchestrator
 	Cfg               config.Config
@@ -155,6 +157,7 @@ func New(opt Options) *Server {
 		opt.Log = io.Discard
 	}
 	return &Server{
+		scopedEndpoint:    opt.ScopedEndpoint,
 		machineExecutions: opt.MachineExecutions,
 		orchestrator:      opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,

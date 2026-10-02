@@ -288,6 +288,13 @@ type callEvent struct {
 }
 
 func handleRunShow(ctx *Context) *exit.Error {
+	close, problem := endpointForRecordedRun(ctx, strings.TrimSpace(ctx.Inv.Args[0]))
+	if problem != nil {
+		return problem
+	}
+	if close != nil {
+		defer close()
+	}
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem

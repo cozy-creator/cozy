@@ -56,6 +56,9 @@ import (
 // dial builds the API client. Every verb here has already passed the shared exit-9 gate,
 // so this is the credential read and nothing else.
 func dial(ctx *Context) (*localapi.Client, *exit.Error) {
+	if ctx.foregroundClient != nil {
+		return ctx.foregroundClient, nil
+	}
 	if ctx.Daemon.Addr == "" {
 		state, _, problem := ensureDaemon(ctx)
 		if problem != nil {
@@ -69,6 +72,16 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 // ----------------------------------------------------------------------------- run
 
 func handleRunExecute(ctx *Context) *exit.Error {
+	if path := ctx.Inv.Value("--machine-endpoint-file"); path != "" {
+		if rentalRequested(ctx) {
+			return exit.Usagef("--machine-endpoint-file cannot select or buy a rental")
+		}
+		close, problem := startEndpointController(ctx, path)
+		if problem != nil {
+			return problem
+		}
+		defer close()
+	}
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
@@ -198,6 +211,13 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if ctx.endpoint != nil {
+		normalized, err := canonical.NormalizeJCS(input)
+		if err != nil {
+			return exit.New(exit.Validation, "explicit machine payload cannot be canonicalized: %s", err)
+		}
+		input = normalized
+	}
 	selectedRental, e := requestedRental(ctx)
 	if e != nil {
 		return e
@@ -241,7 +261,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	began := ctx.commandStarted
 	submitting := time.Now()
 	handle, e := c.Submit(api.Submission{
-		Package: target.Package, Function: target.Function, Input: input,
+		MachineEndpoint: ctx.endpoint,
+		Package:         target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, Rental: managedRental,
 		RentalRequired:  ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "",
@@ -773,6 +794,13 @@ func handleRunCancel(ctx *Context) *exit.Error {
 		return handleRunAbandon(ctx)
 	}
 	id := ctx.Inv.Args[0]
+	close, problem := endpointForRecordedRun(ctx, id)
+	if problem != nil {
+		return problem
+	}
+	if close != nil {
+		defer close()
+	}
 	if strings.HasPrefix(id, "job-") {
 		return handleJobCancel(ctx)
 	}
@@ -1483,15 +1511,22 @@ func exportedOutputs(life api.Lifecycle) []savedFile {
 	if life.OutputExport == nil || life.OutputExport.State != "published" {
 		return nil
 	}
-	byPath := make(map[string]api.MediaRef, len(life.Outputs))
+	byPath := make(map[string]savedFile, len(life.Outputs)+len(life.Output))
 	for _, o := range life.Outputs {
-		byPath[o.Path] = o
+		byPath[o.Path] = savedFile{Output: o.OutputID, Path: o.Path, Bytes: o.Length, Mime: o.MimeType, Digest: o.Digest}
+	}
+	// Native products are retained output facts even when nothing was published
+	// to a Hub. Join their committed file paths, without inventing a receipt.
+	for _, o := range life.Output {
+		if o.Status == "completed" && o.Path != "" {
+			byPath[o.Path] = savedFile{Output: o.ID, Path: o.Path, Bytes: o.Length, Mime: o.MediaType, Digest: o.Sha256}
+		}
 	}
 	result := make([]savedFile, 0, len(life.OutputExport.Paths))
 	for _, path := range life.OutputExport.Paths {
 		row := savedFile{Path: path}
 		if o, ok := byPath[path]; ok && path != "" {
-			row.Output, row.Bytes, row.Mime, row.Digest = o.OutputID, o.Length, o.MimeType, o.Digest
+			row = o
 		}
 		result = append(result, row)
 	}

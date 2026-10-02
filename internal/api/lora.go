@@ -1,23 +1,29 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
 // Capabilities describes selection semantics this client endpoint can retain.
 // Execution support is checked separately against the selected machine.
 type Capabilities struct {
-	ModelOverrides bool `json:"model_overrides"`
+	MachineEndpoints bool `json:"machine_endpoints"`
+	ModelOverrides   bool `json:"model_overrides"`
 }
 
 func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
-	s.ok(w, r, http.StatusOK, Capabilities{ModelOverrides: true})
+	_, endpoint := s.machineExecutions.(interface {
+		ValidateEndpoint(context.Context, *machineendpoint.Endpoint) *exit.Error
+	})
+	s.ok(w, r, http.StatusOK, Capabilities{ModelOverrides: true, MachineEndpoints: endpoint})
 }
 
 // validateModelAdapters validates selection syntax; the executing Runtime owns

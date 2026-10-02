@@ -113,6 +113,11 @@ func OwnerIdentityAt(path string) (CreatorIdentity, *exit.Error) {
 	return identity, nil
 }
 
+// ExistingOwnerIdentityAt never creates or changes a controller's signing identity.
+func ExistingOwnerIdentityAt(path string) (CreatorIdentity, *exit.Error) {
+	return loadCreatorIdentity(path)
+}
+
 func mintCreatorIdentity() (CreatorIdentity, *exit.Error) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

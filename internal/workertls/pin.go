@@ -29,17 +29,22 @@ func LoadPin(path string) (*Pin, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading the pinned worker cert: %w", err)
 	}
+	return ParsePin(data)
+}
+
+// ParsePin reads an already retained public endpoint leaf without a temporary file.
+func ParsePin(data []byte) (*Pin, error) {
 	for {
 		var block *pem.Block
 		block, data = pem.Decode(data)
 		if block == nil {
-			return nil, fmt.Errorf("%s holds no usable certificate to pin", path)
+			return nil, fmt.Errorf("endpoint holds no usable certificate to pin")
 		}
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
 		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
-			return nil, fmt.Errorf("%s: pinned certificate is unreadable: %w", path, err)
+			return nil, fmt.Errorf("pinned certificate is unreadable: %w", err)
 		}
 		return &Pin{der: block.Bytes}, nil
 	}

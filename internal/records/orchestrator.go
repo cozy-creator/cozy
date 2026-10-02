@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 )
 
 // The orchestrator's half of the ONE lifecycle authority (cl-001). Worker processes,
@@ -495,8 +496,9 @@ type Request struct {
 	ReleaseImplicitWork bool `json:"-"`
 	// MachineExecutionObserver is admission-only. The marker is committed with
 	// this request, before any scheduler can create a local attempt.
-	MachineExecutionObserver bool   `json:"-"`
-	DeadlineUnixMS           uint64 `json:"-"` // frozen submission event is its durable source
+	MachineExecutionObserver bool                      `json:"-"`
+	MachineEndpoint          *machineendpoint.Endpoint `json:"-"` // admission-only public target in request events
+	DeadlineUnixMS           uint64                    `json:"-"` // frozen submission event is its durable source
 	// Warnings are admission-only: each becomes one request.warning event with the row.
 	Warnings []Warning `json:"-"`
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
@@ -1743,7 +1745,11 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		if r.ParentRequestID != "" {
 			return Request{}, false, exit.New(exit.Validation, "a machine execution observer must be a root request")
 		}
-		if _, err := tx.Exec(`INSERT INTO machine_executions(request_id) VALUES(?)`, r.ID); err != nil {
+		machine := ""
+		if r.MachineEndpoint != nil {
+			machine = r.MachineEndpoint.Name()
+		}
+		if _, err := tx.Exec(`INSERT INTO machine_executions(request_id,machine_id) VALUES(?,?)`, r.ID, machine); err != nil {
 			return Request{}, false, exit.Internalf("cannot mark machine execution observation: %s", err)
 		}
 	} else {
