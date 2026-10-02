@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -18,9 +19,15 @@ import (
 // A frozen submission may already have run despite a lost acceptance reply.
 // Cancellation remains visible and pending until its machine closes the key or
 // returns an accepted receipt; unreachable is not proof of nonexecution.
+//
+// This computer's stopped machine is proof: its unit and agent have ended, so nothing of the
+// run executes. Its cancel settles on record at once, whether the machine never answered or
+// was executing the run, and the intent is kept for the machine's journal (runs 2677-2679 and
+// 2801-2802 stayed canceling after `cozy machine stop` until the machine next started).
 func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 	for _, arm := range []struct{ name, machine string }{{"local machine never boots", machines.Local},
-		{"rental died", "pr-deadpoddeadpoddead0"}, {"left canceling by an older cozy", machines.Local}} {
+		{"rental died", "pr-deadpoddeadpoddead0"}, {"left canceling by an older cozy", machines.Local},
+		{"local machine stopped while executing", machines.Local}} {
 		machine := arm.machine
 		t.Run(arm.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -44,6 +51,15 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			fatal(t, store.RecordMachineSubmission(request.ID, &pb.MachineExecutionSubmit{SubmissionId: "stuck-cancel",
 				ExpectedExecutionWorkspaceId: "workspace", Offer: &pb.AttemptOffer{RequestId: request.ID},
 				PayloadCanonicalBytes: []byte(`{}`), ReleaseRoot: &pb.ReleaseRoot{Package: "proof/stuck", Release: "1.0.0", Entrypoint: "generate"}}))
+			executing := arm.name == "local machine stopped while executing"
+			if executing {
+				fatal(t, store.AcceptMachineExecution(request.ID, &pb.MachineExecutionReceipt{RequestId: request.ID, SubmissionId: "stuck-cancel",
+					AcceptedAtMs: 1000, WorkerId: "worker", WorkerBootId: "boot-1", ExecutionWorkspaceId: "workspace",
+					CaptureDigest: bytes.Repeat([]byte{1}, 32), InvocationSpecDigest: bytes.Repeat([]byte{2}, 32)}))
+				fatal(t, store.ObserveMachineExecution(request.ID, &pb.MachineExecutionState{RequestId: request.ID, WorkerId: "worker", WorkerBootId: "boot-1",
+					ExecutionWorkspaceId: "workspace", Generation: 1, AttemptOrdinal: 1, State: "running", Sequence: 1},
+					&pb.MachineExecutionEventPage{NextAfter: 1, HeadSequence: 1, Events: []*pb.MachineExecutionEvent{{Sequence: 1, AttemptOrdinal: 1, AtMs: 1001, Kind: "running", BodyCanonicalBytes: []byte(`{}`)}}}))
+			}
 			store.Close()
 			left := arm.name == "left canceling by an older cozy"
 			if !rented {
@@ -71,13 +87,32 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			began := time.Now()
 			startDaemonProcess(t, root)
 			if left {
-				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-					if code, out := runCozy(t, root, "run", "show", request.ID, "--json"); code == 0 && strings.Contains(out, `"status":"canceling"`) {
-						break
-					}
-				}
-			} else if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 || !strings.Contains(out, `"canceling"`) {
+				// The restarted daemon's observer settles what the older cozy left waiting.
+			} else if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 ||
+				!strings.Contains(out, map[bool]string{true: `"canceling"`, false: `"canceled"`}[rented]) {
 				t.Fatalf("cancel did not end the run [exit %d]: %s", code, out)
+			}
+			if !rented {
+				// Nothing waits for the stopped machine: the run is canceled on record, a
+				// waiting `--await` ends, and the intent stays for the machine's journal.
+				var row *records.Request
+				store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
+				fatal(t, problem)
+				defer store.Close()
+				eventually(t, root, "the cancel settled on record", func() bool {
+					row, problem = store.RequestRow(request.ID)
+					fatal(t, problem)
+					return row.State == "canceled"
+				})
+				link, problem := store.MachineExecution(request.ID)
+				fatal(t, problem)
+				if !link.CancelRequested || executing != (len(link.Receipt) > 0) || time.Since(began) > 10*time.Second {
+					t.Fatalf("the settled cancel kept intent %v, receipt %d bytes, %s after it", link.CancelRequested, len(link.Receipt), time.Since(began))
+				}
+				if code, out := cozyWithin(t, root, 20*time.Second, "run", "cancel", request.ID, "--await", "--json"); code != 0 || !strings.Contains(out, `"canceled"`) {
+					t.Fatalf("an awaited cancel did not end canceled [exit %d]: %s", code, out)
+				}
+				return
 			}
 			store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)

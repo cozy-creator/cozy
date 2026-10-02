@@ -135,6 +135,9 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				}
 				continue
 			}
+			if current.State == "canceling" {
+				m.settleStoppedCancellation(link)
+			}
 			if len(link.Receipt) == 0 && (records.Settled(current.State) || records.RetainedState(current.State)) &&
 				current.State != "canceled" {
 				// Restart resumes observation, not withdrawn or failed execution
@@ -1334,9 +1337,28 @@ func (m *machineRuns) retainedResult(request records.Request, outcome *pb.Attemp
 func (m *machineRuns) Control(parent context.Context, request records.Request, action string) *exit.Error {
 	if action == "cancel" {
 		m.Withdraw(request.ID)
+		if link, problem := m.store.MachineExecution(request.ID); problem == nil && link != nil {
+			m.settleStoppedCancellation(link)
+		}
 		return m.Start(request)
 	}
 	return m.control(parent, request, action, false)
+}
+
+// settleStoppedCancellation settles a requested cancel whose run is on this computer's machine
+// while that machine is stopped: its unit and agent have ended, so nothing of the run executes.
+// The observer still delivers the cancel when the machine next runs. `cozy machine stop` used
+// to leave such runs canceling until the next start, and `--await` waited with them.
+func (m *machineRuns) settleStoppedCancellation(link *records.MachineExecution) {
+	if link.MachineID != machines.Local || !link.CancelRequested || link.Abandoned || m.machines == nil || m.machines.Host == nil {
+		return
+	}
+	if status, problem := m.machines.Host.Status(); problem != nil || status.Running {
+		return
+	}
+	if problem := m.store.SettleStoppedMachineCancellation(link.RequestID); problem != nil {
+		fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", link.RequestID, problem.Message)
+	}
 }
 
 // control with requested is the observer delivering a recorded cancel request: one the
