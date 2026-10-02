@@ -201,7 +201,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 		return problem
 	}
 	if selection.Native == nil {
-		if _, problem := machine.State(ctx); problem != nil {
+		if _, problem := machine.AwaitUpdateAdmission(ctx); problem != nil {
 			return problem
 		}
 		if problem := u.updateNative(ctx, row, &selection, machine); problem != nil {

@@ -114,7 +114,12 @@ func (c *Maintenance) Do(ctx context.Context, method, path string, body io.Reade
 		if json.Unmarshal(raw, &refusal) == nil && refusal.Code == "runtime_starting" {
 			return response.StatusCode, exit.Named(exit.Unavailable, "machine.runtime_starting", "%s", refusal.Message)
 		}
-		return response.StatusCode, exit.New(exit.Failed, "the machine refused %s %s (HTTP %d): %s", method, path, response.StatusCode, strings.TrimSpace(string(raw)))
+		text := strings.TrimSpace(string(raw))
+		if reason, lease := strings.CutPrefix(text, "rental_authority_unavailable: "); lease && response.StatusCode == http.StatusServiceUnavailable && !strings.Contains(reason, "denied") {
+			// The agent admits controls from its Hub's lease; without one it started nothing.
+			return response.StatusCode, exit.Named(exit.Unavailable, AuthorityPending, "the machine is waiting for its Hub's rental authority and started nothing: %s", reason)
+		}
+		return response.StatusCode, exit.New(exit.Failed, "the machine refused %s %s (HTTP %d): %s", method, path, response.StatusCode, text)
 	}
 	if into != nil && json.Unmarshal(raw, into) != nil {
 		return response.StatusCode, exit.New(exit.Structural, "the machine answered %s %s with unreadable JSON", method, path)
@@ -163,11 +168,15 @@ func NewestPublished(ctx context.Context, name string) (string, *exit.Error) {
 	return project.Info.Version, nil
 }
 
+// AuthorityPending names the agent's refusal of a control it never started: it holds no current
+// rental authority lease from its Hub (after boot, or while its Hub is out of reach).
+const AuthorityPending = "machine.authority_pending"
+
 // Wait on the agent's observed lifecycle, never infer readiness from elapsed time.
 func (c *Maintenance) AwaitUpdateAdmission(ctx context.Context) (*RuntimeState, *exit.Error) {
 	for {
 		state, problem := c.State(ctx)
-		if problem != nil && problem.ErrName() != "machine.runtime_starting" {
+		if problem != nil && problem.ErrName() != "machine.runtime_starting" && problem.ErrName() != AuthorityPending {
 			return nil, problem
 		}
 		if problem == nil {

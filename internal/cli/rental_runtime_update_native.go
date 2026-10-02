@@ -59,8 +59,8 @@ func (u *rentalRuntimeUpdates) updatesItself(id string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	state, _ := machine.State(ctx)
-	return state != nil
+	state, problem := machine.State(ctx)
+	return state != nil || problem != nil && problem.ErrName() == machines.AuthorityPending
 }
 
 // updateNative stages the requested pair on the machine and asks it to update itself.
@@ -122,7 +122,8 @@ func (u *rentalRuntimeUpdates) updateNative(ctx context.Context, row *records.Ru
 		if problem == nil {
 			return nil
 		}
-		if problem.ErrName() == "machine.runtime_starting" || code >= 400 && code < 500 {
+		waits := problem.ErrName() == "machine.runtime_starting" || problem.ErrName() == machines.AuthorityPending
+		if waits || code >= 400 && code < 500 {
 			// These responses are the agent's pre-admission refusals.
 			selection.Native = nil
 			row.Selection, _ = json.Marshal(selection)
@@ -130,7 +131,7 @@ func (u *rentalRuntimeUpdates) updateNative(ctx context.Context, row *records.Ru
 			if save := u.machines.store.SaveRuntimeUpdate(*row); save != nil {
 				return save
 			}
-			if problem.ErrName() == "machine.runtime_starting" {
+			if waits {
 				continue
 			}
 			return problem
