@@ -822,6 +822,10 @@ func (h *Host) Owner() (rental.CreatorIdentity, *exit.Error) {
 	return rental.OwnerIdentityAt(h.path("owner.pem"))
 }
 
+func (h *Host) ExistingOwner() (rental.CreatorIdentity, *exit.Error) {
+	return rental.ExistingOwnerIdentityAt(h.path("owner.pem"))
+}
+
 // Pin is the TLS leaf the running Host proved in its receipt.
 func (h *Host) Pin() (*workertls.Pin, *exit.Error) {
 	pin, err := workertls.LoadPin(h.path("leaf.pem"))

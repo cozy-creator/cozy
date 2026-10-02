@@ -9,9 +9,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// ValidateWorkerProtocol gates a NEW preparation or execution on the peer's range.
-// Observation, collection, cancellation and release never call it. A peer outside the
-// range fails only that operation, and the failure names its update.
+// ValidateWorkerProtocol checks usable protocol metadata for new work. Minor
+// numbers never reject a peer; capabilities and individual RPCs decide support.
 func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental string) *exit.Error {
 	update := "update the local Runtime"
 	if rental != "" {
@@ -21,16 +20,11 @@ func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental string) *exit.Er
 		return exit.Named(exit.Conflict, pb.CapabilityUnavailableCode,
 			format+"; %s to run new work there (its other work continues)", append(args, update)...)
 	}
-	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor {
+	if info == nil || info.MinimumWireMinor > info.WireMinor {
 		return refuse("worker reported no usable protocol range")
 	}
-	if info.WireMinor < pb.MinCompatibleWireMinor || pb.WireMinor < info.MinimumWireMinor {
-		if info.MinimumWireMinor > pb.WireMinor {
-			update = "update the local cozy CLI"
-		}
-		return refuse("Creator executes worker protocol %d–%d; this worker supports %d–%d",
-			pb.MinCompatibleWireMinor, pb.WireMinor, info.MinimumWireMinor, info.WireMinor)
-	}
+	// Minor numbers describe peer evolution, not operation support. Each new
+	// execution checks the actual workspace capabilities and affected RPCs.
 	return nil
 }
 

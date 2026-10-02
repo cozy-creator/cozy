@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -36,10 +37,11 @@ import (
 // carried VERBATIM: the orchestrator digests exactly the bytes the client sent, so a
 // re-submit under one key compares the same request identity.
 type Submission struct {
-	RequestedRental string          `json:"requested_rental,omitempty"`
-	Package         string          `json:"package"`
-	Function        string          `json:"function"`
-	Input           json.RawMessage `json:"input"`
+	MachineEndpoint *machineendpoint.Endpoint `json:"machine_endpoint,omitempty"`
+	RequestedRental string                    `json:"requested_rental,omitempty"`
+	Package         string                    `json:"package"`
+	Function        string                    `json:"function"`
+	Input           json.RawMessage           `json:"input"`
 	// InstallID is the immutable local install selected by the CLI. It is opaque to users;
 	// omitting it asks the daemon to resolve the active package pointer.
 	InstallID string   `json:"install_id,omitempty"`
@@ -119,15 +121,36 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			`{"package":"org/name","function":"denoise","input":{…}}`)
 		return
 	}
+	if s.scopedEndpoint != "" && (sub.MachineEndpoint == nil || sub.MachineEndpoint.Name() != s.scopedEndpoint) {
+		s.refuseTyped(w, r, exit.Named(exit.Credential, "machine.endpoint_scope", "foreground controller requires its explicitly pinned target; no local fallback is allowed"))
+		return
+	}
 	if problem := launch.ValidateAttentionOverride(sub.AttentionKernel); problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	if (len(sub.LocalAssets) > 0 || sub.OutputDirectory != "" || sub.RequestedRental != "") && !s.cliAuthenticated(r) {
+	if (len(sub.LocalAssets) > 0 || sub.OutputDirectory != "" || sub.RequestedRental != "" || sub.MachineEndpoint != nil) && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"local assets and output directories require the OS-protected CLI credential",
 			"use `cozy run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
 		return
+	}
+	if sub.MachineEndpoint != nil {
+		if sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "" {
+			s.refuseTyped(w, r, exit.Usagef("an explicit owned machine endpoint cannot also select or buy a rental"))
+			return
+		}
+		validator, ok := s.machineExecutions.(interface {
+			ValidateEndpoint(context.Context, *machineendpoint.Endpoint) *exit.Error
+		})
+		if !ok {
+			s.refuseTyped(w, r, exit.Named(exit.Unavailable, "machine.endpoint_unavailable", "this controller cannot execute explicit machine endpoints; nothing was submitted"))
+			return
+		}
+		if problem := validator.ValidateEndpoint(r.Context(), sub.MachineEndpoint); problem != nil {
+			s.refuseTyped(w, r, problem)
+			return
+		}
 	}
 	if problem := validateModelAdapters(sub.Models); problem != nil {
 		s.refuseTyped(w, r, problem)
@@ -216,6 +239,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	spec.IdemKey, spec.Hub = key, selectedHub
+	if sub.MachineEndpoint != nil {
+		spec.MachineEndpoint = sub.MachineEndpoint
+		spec.Worker = sub.MachineEndpoint.Name()
+	}
 	// THE BODY DIGEST is over the whole submission the key names, not over the payload
 	// alone: one key that named a different FUNCTION must conflict as loudly as one
 	// that named different input. The canonical preimage is the digest's subject, so
@@ -333,6 +360,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"release":    spec.Release,
 		"input":      base64.StdEncoding.EncodeToString(spec.Payload),
 		"outputs":    strings.Join(spec.Outputs, ","),
+	}
+	if spec.MachineEndpoint != nil {
+		doc["machine_endpoint"] = spec.MachineEndpoint.Name()
 	}
 	assets := assetIdentity(spec.Assets)
 	if len(assets) > 0 {

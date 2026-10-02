@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -97,7 +98,8 @@ func (m *Machine) RentalID() string {
 
 // Resolver finds machines by name.
 type Resolver struct {
-	Host *Host
+	Endpoint func(string) (*machineendpoint.Endpoint, *exit.Error)
+	Host     *Host
 	// HubOrigin is the hub this computer's machine belongs to unless a call names another,
 	// and Hub a client for an origin as the signed-in user.
 	HubOrigin string
@@ -171,6 +173,19 @@ func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string, name
 func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
 	machine := &Machine{Name: name}
 	var t target
+	if machineendpoint.IsName(name) {
+		if r.Endpoint == nil {
+			return nil, exit.Named(exit.Unavailable, "machine.endpoint_unavailable", "this controller cannot resolve the explicit endpoint")
+		}
+		ep, problem := r.Endpoint(name)
+		if problem != nil {
+			return nil, problem
+		}
+		if ep == nil {
+			return nil, exit.New(exit.NotFound, "explicit machine endpoint is not retained")
+		}
+		return r.DialEndpoint(ctx, *ep)
+	}
 	if IsLocal(name) {
 		accountOrigin := cmp.Or(origin, r.HubOrigin)
 		var client *hub.Client
@@ -421,6 +436,9 @@ func RuntimeUpdate(name string) string {
 
 // Placement is where a request runs when it names no rental: this computer.
 func Placement(request records.Request) string {
+	if machineendpoint.IsName(request.Worker) {
+		return request.Worker
+	}
 	if request.Rental {
 		return request.Worker
 	}

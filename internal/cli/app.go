@@ -13,9 +13,11 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/accountauth"
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -46,18 +48,20 @@ func (i *Invocation) Value(name string) string {
 // Context is the retained mechanism boundary. Handlers receive typed values and
 // frozen configuration; they never parse argv or read ambient configuration.
 type Context struct {
-	exitCode       int       // a completed aggregate can report partial failures without a second document
-	teardown       bool      // `down --all`: hand each rental to its hub once; never wait on one
-	commandStarted time.Time // includes capture and resolution before a request exists
-	Inv            *Invocation
-	Out            io.Writer
-	Err            io.Writer
-	Cfg            config.Config
-	Daemon         daemon.State
-	AccountAuth    *accountauth.Manager
-	namespace      packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
-	ingestBytes    int64                          // planned source bytes a native ingest declares for its rental
-	warnings       *[]records.Warning             // this command's, shared by its scoped copies
+	endpoint         *machineendpoint.Endpoint
+	foregroundClient *localapi.Client
+	exitCode         int       // a completed aggregate can report partial failures without a second document
+	teardown         bool      // `down --all`: hand each rental to its hub once; never wait on one
+	commandStarted   time.Time // includes capture and resolution before a request exists
+	Inv              *Invocation
+	Out              io.Writer
+	Err              io.Writer
+	Cfg              config.Config
+	Daemon           daemon.State
+	AccountAuth      *accountauth.Manager
+	namespace        packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
+	ingestBytes      int64                          // planned source bytes a native ingest declares for its rental
+	warnings         *[]records.Warning             // this command's, shared by its scoped copies
 }
 
 // warn says one warning now on stderr for a person and in the command's JSON document for a

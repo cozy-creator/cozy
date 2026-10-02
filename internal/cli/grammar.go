@@ -478,27 +478,28 @@ type RunCmd struct {
 }
 
 type RunExecuteCmd struct {
-	Target          string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
-	Input           []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
-	Out             string   `help:"Output directory." predictor:"dir"`
-	Timeout         string   `help:"Request deadline."`
-	PayloadFile     string   `name:"input" predictor:"file" help:"Read the whole payload from a JSON or YAML file, e.g. --input=~/request.yaml; inline fields override file values."`
-	Assets          []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
-	AssetFidelity   []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
-	LoRAs           []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
-	AttentionKernel string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend. Example: model/fl2va_dit=kitchen-int8. No fallback; Runtime validates hardware, compiled mode and parallelism."`
-	Rental          *string  `predictor:"rental" help:"Run only on this existing rental name or id; never buy a replacement."`
-	RentNew         bool     `help:"Buy a fresh managed rental for this run; do not reuse existing machines."`
-	RentalOnly      bool     `help:"Require a remote rental even when local capacity is ready."`
-	IdempotencyKey  string   `help:"Stable request identity for safe retries."`
-	Retry           string   `help:"Retry with current code while retaining compatible work from this prior run."`
-	Trees           []string `name:"input-tree" predictor:"binding-dir" help:"Bind a job input tree as ref=directory."`
-	Org             string   `help:"Job publication organization (defaults to local)."`
-	UploadTo        string   `help:"Upload the job's declared weight outputs as private checkpoints to org/model; no release is published."`
-	AllowUpload     []string `help:"Allow this rented transaction to upload checkpoints, and publish releases, only to org/model (repeatable)."`
-	SourceProfiles  []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
-	Await           bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
-	Describe        bool     `help:"Print the callable's request contract instead of running it."`
+	MachineEndpointFile string   `name:"machine-endpoint-file" predictor:"file" help:"Run on this explicitly pinned owned machine using the controller's existing signing identity; never register or rent a machine."`
+	Target              string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
+	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
+	Out                 string   `help:"Output directory." predictor:"dir"`
+	Timeout             string   `help:"Request deadline."`
+	PayloadFile         string   `name:"input" predictor:"file" help:"Read the whole payload from a JSON or YAML file, e.g. --input=~/request.yaml; inline fields override file values."`
+	Assets              []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
+	AssetFidelity       []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
+	LoRAs               []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
+	AttentionKernel     string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend. Example: model/fl2va_dit=kitchen-int8. No fallback; Runtime validates hardware, compiled mode and parallelism."`
+	Rental              *string  `predictor:"rental" help:"Run only on this existing rental name or id; never buy a replacement."`
+	RentNew             bool     `help:"Buy a fresh managed rental for this run; do not reuse existing machines."`
+	RentalOnly          bool     `help:"Require a remote rental even when local capacity is ready."`
+	IdempotencyKey      string   `help:"Stable request identity for safe retries."`
+	Retry               string   `help:"Retry with current code while retaining compatible work from this prior run."`
+	Trees               []string `name:"input-tree" predictor:"binding-dir" help:"Bind a job input tree as ref=directory."`
+	Org                 string   `help:"Job publication organization (defaults to local)."`
+	UploadTo            string   `help:"Upload the job's declared weight outputs as private checkpoints to org/model; no release is published."`
+	AllowUpload         []string `help:"Allow this rented transaction to upload checkpoints, and publish releases, only to org/model (repeatable)."`
+	SourceProfiles      []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
+	Await               bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
+	Describe            bool     `help:"Print the callable's request contract instead of running it."`
 }
 
 func (c *RunExecuteCmd) Run(r *Runtime) error {
@@ -511,6 +512,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--await", c.Await,
 		"--rental-only", c.RentalOnly, "--rent-new", c.RentNew, "--describe", c.Describe), values(
 		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
+		"--machine-endpoint-file", c.MachineEndpointFile,
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,

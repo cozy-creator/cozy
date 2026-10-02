@@ -9,6 +9,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -21,6 +22,7 @@ type Submission struct {
 	RequestID                string // server-reserved identity for request-owned input capture
 	AllowPublish             []string
 	MachineExecutionObserver bool
+	MachineEndpoint          *machineendpoint.Endpoint
 	TimeoutMS                int64
 	DeadlineUnixMS           uint64
 	IdemKey                  string // the caller's idempotency key
@@ -274,6 +276,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 	}
 	req := records.Request{
+		MachineEndpoint:          s.MachineEndpoint,
 		MachineExecutionObserver: s.MachineExecutionObserver,
 		DeadlineUnixMS:           s.DeadlineUnixMS,
 		ID:                       id, IdemKey: s.IdemKey, BodyDigest: bodyDigest, Hub: s.Hub,
@@ -295,6 +298,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		"package":     s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"weights_outputs": weightsOutputs,
+	}
+	if s.MachineEndpoint != nil {
+		event["machine_endpoint"] = s.MachineEndpoint
 	}
 	if s.TimeoutMS > 0 {
 		event["timeout_ms"] = s.TimeoutMS

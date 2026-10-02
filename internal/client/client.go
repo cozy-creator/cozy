@@ -38,9 +38,10 @@ import (
 
 // Client is one CLI process's connection to the running Cozy daemon.
 type Client struct {
-	base  string
-	token secret.Value
-	http  *http.Client
+	fixedTransport bool
+	base           string
+	token          secret.Value
+	http           *http.Client
 	// hub is the Tensorhub origin this command addresses; every request names it.
 	hub string
 	// allHubs widens history reads from the command's hub to every hub.
@@ -68,6 +69,9 @@ func (c *Client) Following(reattached func()) *Client {
 // reattach waits for a live daemon's record and credential and adopts them. It returns
 // false only when the caller stops.
 func (c *Client) reattach(ctx context.Context) bool {
+	if c.fixedTransport {
+		return false
+	}
 	for {
 		if st := daemon.Probe(c.cfg); st.Up && st.Addr != "" {
 			if next, e := Open(c.cfg, st); e == nil {
@@ -272,11 +276,26 @@ func Refusal(status int, data []byte) *exit.Error {
 // answer, never inferred from equal ids.
 func (c *Client) Submit(sub api.Submission, key string) (api.Handle, *exit.Error) {
 	var h api.Handle
+	if sub.MachineEndpoint != nil {
+		var caps api.Capabilities
+		if problem := c.call(http.MethodGet, "/v1/capabilities", nil, &caps); problem != nil {
+			return h, problem
+		}
+		if !caps.MachineEndpoints {
+			return h, exit.Named(exit.Unavailable, "daemon.machine_endpoint_unavailable", "this controller cannot retain an explicit machine endpoint; nothing was submitted")
+		}
+	}
 	if problem := c.requireModelOverrides(sub.Package, sub.Function, sub.Models); problem != nil {
 		return h, problem
 	}
 	e := c.call("POST", "/v1/requests", sub, &h, "Idempotency-Key", key)
 	return h, e
+}
+
+// At uses an owned foreground controller's normal authenticated API transport.
+// It neither reads nor rewrites a daemon record and never reattaches to another owner.
+func At(cfg config.Config, address string, token secret.Value) *Client {
+	return &Client{fixedTransport: true, base: "http://" + address, token: token, http: &http.Client{}, hub: cfg.HubURL, cfg: cfg}
 }
 
 // Request reads one request's lifecycle document.

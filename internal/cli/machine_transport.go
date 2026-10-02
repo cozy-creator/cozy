@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
@@ -40,6 +41,22 @@ type machineConnection struct {
 	installed  map[string]*pb.InstalledPackage
 	placements map[string]*pb.DesiredPlacementSet // each captured revision's code-only placement
 	progress   *transfer.Progress
+}
+
+// ValidateEndpoint proves target TLS, controller authority and workspace before admission.
+func (m *machineRuns) ValidateEndpoint(ctx context.Context, ep *machineendpoint.Endpoint) *exit.Error {
+	if ep == nil {
+		return exit.New(exit.Validation, "explicit machine endpoint is absent")
+	}
+	connection, problem := m.machines.DialEndpoint(ctx, *ep)
+	if problem != nil {
+		return problem
+	}
+	defer connection.Close()
+	if !connection.Seen.Workspace.Load().RunOutputLog || !connection.Seen.Workspace.Load().SubmissionClose {
+		return exit.Named(exit.Structural, "machine.endpoint_capability_unavailable", "explicit endpoint lacks durable execution output or submission closure")
+	}
+	return nil
 }
 
 // connect opens a machine for work that reads no hub; holder is what the caller is doing
