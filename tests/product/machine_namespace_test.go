@@ -14,6 +14,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/userunit"
 )
 
 func TestLegacyLiveRecordRefusesNewNamespace(t *testing.T) {
@@ -244,6 +245,9 @@ print(json.dumps(r))`
 	}
 }
 
+// A live agent whose launch record is missing is read back from its systemd user unit and
+// adopted. Without a user manager there is no unit to read it from: the launch is refused and
+// the agent keeps running untouched.
 func TestMissingLaunchRecordAdoptsKernelOwnedRuntime(t *testing.T) {
 	_, h, launch := scopedMachine(t, true)
 	dir := filepath.Dir(h.Root())
@@ -287,9 +291,13 @@ func TestMissingLaunchRecordAdoptsKernelOwnedRuntime(t *testing.T) {
 	must(t, os.Remove(recordPath))
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
+	adopts := userunit.Available()
 	adopted, problem := machines.NewHost(dir, "", nil).Ensure(ctx, "", nil, true)
-	if problem != nil || adopted.PID != launch.PID || adopted.BootID != launch.BootID {
+	if adopts && (problem != nil || adopted.PID != launch.PID || adopted.BootID != launch.BootID) {
 		t.Errorf("launch did not adopt the running kernel owner %d: %+v, %v", launch.PID, adopted, problem)
+	}
+	if !adopts && (problem == nil || (problem.ErrName() != "machine.process_untracked" && problem.ErrName() != "machine.busy")) {
+		t.Errorf("launch ignored an existing kernel owner: %v", problem)
 	}
 	for path, body := range before {
 		after, err := os.ReadFile(path)
@@ -297,8 +305,10 @@ func TestMissingLaunchRecordAdoptsKernelOwnedRuntime(t *testing.T) {
 			t.Errorf("launch changed the running owner's %s", filepath.Base(path))
 		}
 	}
-	if _, err := os.Stat(recordPath); err != nil {
+	if _, err := os.Stat(recordPath); adopts && err != nil {
 		t.Errorf("the adopted owner has no launch record: %v", err)
+	} else if !adopts && !os.IsNotExist(err) {
+		t.Error("launch replaced missing ownership with another process")
 	}
 	if string(readReceipt()) != string(receiptBefore) {
 		t.Error("launch changed the running owner's public identity receipt")

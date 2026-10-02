@@ -11,10 +11,24 @@ import (
 // This computer's machine and a rental answer the TensorFS transport log through the same
 // machine call: `cozy machine logs --tensorfs` and `cozy rental logs <pod> --tensorfs` print
 // what TensorFS wrote beside each store, rotated file first, and a machine whose TensorFS has
-// logged nothing prints a note and succeeds.
+// logged nothing prints a note and succeeds. So does a machine whose agent predates the read
+// (wire 72): both verbs say so and exit 0.
 func TestMachinesPrintTheirTensorFSTransportLog(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
-	if code, out := runCozy(t, root, "machine", "logs", "--tensorfs"); code != 0 || !strings.Contains(out, "has logged no TensorFS transport decisions") {
+	const predates = "agent predates reading its logs"
+	code, out := runCozy(t, root, "machine", "logs", "--tensorfs")
+	if code == 0 && strings.Contains(out, predates) {
+		if code, out := runCozy(t, root, "rental", "logs", "tessa", "--tensorfs"); code != 0 || !strings.Contains(out, predates) {
+			t.Fatalf("the rental's log on an older agent [%d]: %s", code, out)
+		}
+		code, out := runCozy(t, root, "rental", "logs", parityRental, "--tensorfs", "--json")
+		var log struct{ Log, Text, Unavailable string }
+		if code != 0 || json.Unmarshal([]byte(out), &log) != nil || log.Log != "tensorfs" || log.Text != "" || !strings.Contains(log.Unavailable, predates) {
+			t.Fatalf("the rental's log on an older agent as JSON [%d]: %s", code, out)
+		}
+		return
+	}
+	if code != 0 || !strings.Contains(out, "has logged no TensorFS transport decisions") {
 		t.Fatalf("an unwritten log [%d]: %s", code, out)
 	}
 	write := func(store, older, current string) {
@@ -35,7 +49,7 @@ func TestMachinesPrintTheirTensorFSTransportLog(t *testing.T) {
 	if code, out := runCozy(t, root, "rental", "logs", "tessa", "--tensorfs"); code != 0 || out != walk {
 		t.Fatalf("the rental's log [%d]: %q", code, out)
 	}
-	code, out := runCozy(t, root, "rental", "logs", parityRental, "--tensorfs", "--json")
+	code, out = runCozy(t, root, "rental", "logs", parityRental, "--tensorfs", "--json")
 	var log struct {
 		Log, Text, Unavailable string
 	}
