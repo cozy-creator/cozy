@@ -11,6 +11,7 @@ import (
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -39,7 +40,7 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 	background.Out = io.Discard // API progress remains normal typed lifecycle events.
 	resolver := NewResolver(st, ctx.Cfg)
 	fleet := &managedRentals{ctx: &background, layout: l, store: st}
-	found := &machines.Resolver{Host: machines.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, nil), Endpoint: func(name string) (*machineendpoint.Endpoint, *exit.Error) {
+	found := &machines.Resolver{Host: machines.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, nil), Hub: func(origin string) *hub.Client { return client(ctx.forHub(origin)) }, Endpoint: func(name string) (*machineendpoint.Endpoint, *exit.Error) {
 		if name == ep.Name() {
 			return ep, nil
 		}

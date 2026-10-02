@@ -23,6 +23,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
 const executionAccessFile = "execution-access.json"
@@ -480,25 +482,31 @@ func (h *Host) machineAccess(ctx context.Context, launch *Launch, method string,
 	if problem != nil {
 		return 0, nil, problem
 	}
+	pin, problem := h.Pin()
+	if problem != nil {
+		return 0, nil, problem
+	}
+	return signedMachineAccess(ctx, launch.Addr, launch.WorkerID, pin, owner, method, body)
+}
+
+// signedMachineAccess is shared by local machines and explicitly pinned endpoints.
+// The endpoint caller keeps access ephemeral; it never borrows/writes local-machine caches.
+func signedMachineAccess(ctx context.Context, address, worker string, pin *workertls.Pin, owner rental.CreatorIdentity, method string, body any) (int, []byte, *exit.Error) {
 	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
 	if err != nil || len(public) != ed25519.PublicKeySize {
 		return 0, nil, exit.New(exit.Credential, "the machine owner key is unreadable")
 	}
-	token, err := capability.MintSigned(public, owner.Sign, capability.Grant{Machine: launch.WorkerID, Action: "hub-access", Expires: time.Now().Add(5 * time.Minute).Unix()})
+	token, err := capability.MintSigned(public, owner.Sign, capability.Grant{Machine: worker, Action: "hub-access", Expires: time.Now().Add(5 * time.Minute).Unix()})
 	if err != nil {
 		return 0, nil, exit.Internalf("cannot authorize machine execution access")
 	}
 	raw, _ := json.Marshal(body)
-	request, err := http.NewRequestWithContext(ctx, method, "https://"+launch.Addr+"/v1/hubs/access", bytes.NewReader(raw))
+	request, err := http.NewRequestWithContext(ctx, method, "https://"+address+"/v1/hubs/access", bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, exit.Internalf("cannot address machine access API")
 	}
 	request.Header.Set("Authorization", "Cozy-Cap "+token)
 	request.Header.Set("Content-Type", "application/json")
-	pin, problem := h.Pin()
-	if problem != nil {
-		return 0, nil, problem
-	}
 	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
 	defer transport.CloseIdleConnections()
 	response, err := (&http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(request)

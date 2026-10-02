@@ -184,7 +184,7 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 		if ep == nil {
 			return nil, exit.New(exit.NotFound, "explicit machine endpoint is not retained")
 		}
-		return r.DialEndpoint(ctx, *ep)
+		return r.dialEndpointAt(ctx, *ep, origin)
 	}
 	if IsLocal(name) {
 		accountOrigin := cmp.Or(origin, r.HubOrigin)
