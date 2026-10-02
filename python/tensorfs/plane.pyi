@@ -66,6 +66,7 @@ class DeviceStats(TypedDict):
     held_bytes: int
     over_budget_unreleasable: int
     reserved_va: int
+    shared_bytes: int  # mapped shared regions, outside committed and the budget
     copies: int
     host_copy_bytes: int
     host_copy_ns: int
@@ -81,6 +82,11 @@ class DeviceStats(TypedDict):
 class SetDevice(TypedDict):
     ordinal: int
     ready_bytes: int
+    shared_bytes: int
+
+class SharedRegion(TypedDict):
+    region: int
+    chunks: list[tuple[int, int]]  # (bytes, fd) in VA order; the caller owns each fd
 
 class SetStats(TypedDict):
     id: int
@@ -226,6 +232,8 @@ class WeightSet:
     def parts(self) -> list[Part]: ...
     @property
     def host_fd(self) -> int: ...
+    @property
+    def digest(self) -> str: ...
     def view(self, device: int) -> DeviceView: ...
     def verify(self, device: int) -> int: ...
     def close(self) -> None: ...
@@ -267,6 +275,13 @@ class Plane:
         pin: bool = False,
     ) -> Ticket: ...
     def drop(self, ws: WeightSet, tier: Tier, regions: Sequence[int] | None = None) -> int: ...
+    def device_sharing(self, device: int) -> bool: ...
+    def export_device(
+        self, ws: WeightSet, device: int, regions: Sequence[int] | None = None
+    ) -> list[SharedRegion]: ...
+    def attach_device(
+        self, ws: WeightSet, device: int, region: int, chunks: Sequence[tuple[int, int]]
+    ) -> None: ...
     def prioritise(
         self,
         ws: WeightSet,

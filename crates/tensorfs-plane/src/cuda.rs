@@ -38,6 +38,7 @@ pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const MEM_HANDLE_TYPE_NONE: u32 = 0;
 pub const MEM_HANDLE_TYPE_POSIX_FD: u32 = 1;
+pub const MEM_ACCESS_PROT_READ: u32 = 1;
 pub const MEM_ACCESS_PROT_READWRITE: u32 = 3;
 pub const MEM_GRANULARITY_MINIMUM: u32 = 0;
 
@@ -146,6 +147,12 @@ pub struct Driver {
     /// The driver's own answer to "what is mapped here": the one call that reads residency
     /// from the driver instead of the plane's books. Every success needs a `mem_release`.
     pub mem_retain_allocation_handle: unsafe extern "C" fn(*mut Handle, *mut c_void) -> CUresult,
+    /// Device sharing (`Plane::export_device`/`attach_device`). Optional: a driver without
+    /// them still runs every other path.
+    pub mem_export_to_shareable_handle: Option<unsafe extern "C" fn(*mut c_void, Handle, u32, u64) -> CUresult>,
+    pub mem_import_from_shareable_handle: Option<unsafe extern "C" fn(*mut Handle, *mut c_void, u32) -> CUresult>,
+    pub mem_get_allocation_properties: Option<unsafe extern "C" fn(*mut AllocationProp, Handle) -> CUresult>,
+    pub mem_get_access: Option<unsafe extern "C" fn(*mut u64, *const MemLocation, CUdeviceptr) -> CUresult>,
 }
 
 // The table is immutable after load and the driver entry points are thread-safe.
@@ -172,6 +179,13 @@ macro_rules! load {
         *unsafe { $lib.get::<_>($name) }.map_err(|e| {
             Error::CudaUnavailable(format!("{}: {e}", String::from_utf8_lossy($name)))
         })?
+    };
+}
+
+macro_rules! optional {
+    ($lib:expr, $name:literal) => {
+        // SAFETY: as `load!`; an absent symbol is `None`.
+        unsafe { $lib.get::<_>($name) }.ok().map(|f| *f)
     };
 }
 
@@ -221,6 +235,10 @@ impl Driver {
             mem_unmap: load!(lib, b"cuMemUnmap"),
             mem_set_access: load!(lib, b"cuMemSetAccess"),
             mem_retain_allocation_handle: load!(lib, b"cuMemRetainAllocationHandle"),
+            mem_export_to_shareable_handle: optional!(lib, b"cuMemExportToShareableHandle"),
+            mem_import_from_shareable_handle: optional!(lib, b"cuMemImportFromShareableHandle"),
+            mem_get_allocation_properties: optional!(lib, b"cuMemGetAllocationPropertiesFromHandle"),
+            mem_get_access: optional!(lib, b"cuMemGetAccess"),
             _lib: lib,
         };
         // SAFETY: documented as safe to call repeatedly; flags must be 0.

@@ -7,7 +7,7 @@
 //! of the address order). Nothing here measures memory or decides what should be resident.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -72,6 +72,13 @@ pub struct Trim {
     pub blockers: Vec<String>,
 }
 
+/// One region's shared device memory: its physical handles in VA order, (bytes, fd) each.
+#[derive(Debug)]
+pub struct Exported {
+    pub region: u32,
+    pub chunks: Vec<(u64, OwnedFd)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub kind: &'static str,
@@ -126,6 +133,9 @@ pub(crate) enum DState {
 
 pub(crate) struct DReg {
     pub chunks: Vec<Chunk>,
+    /// The chunks are shared device memory (exported by this process or attached from another):
+    /// mapped read-only, outside the arena's budget, released rather than recycled.
+    pub shared: bool,
     pub state: DState,
     pub prio: i64,
     pub pin: bool,
@@ -387,6 +397,7 @@ pub(crate) fn devws(c: &mut Core, ws: WsId, d: usize) -> Result<&mut DevWs> {
             regs: (0..n)
                 .map(|_| DReg {
                     chunks: Vec::new(),
+                    shared: false,
                     state: DState::Absent,
                     prio: 0,
                     pin: false,
@@ -412,7 +423,7 @@ impl Inner {
             let Some(w) = w.as_mut() else { continue };
             let Some(dw) = w.devs[d].as_mut() else { continue };
             for (r, reg) in dw.regs.iter_mut().enumerate() {
-                if reg.chunks.is_empty() || reg.pin || below.is_some_and(|b| reg.prio >= b) {
+                if reg.chunks.is_empty() || reg.shared || reg.pin || below.is_some_and(|b| reg.prio >= b) {
                     continue;
                 }
                 commit(reg)?;
@@ -456,7 +467,18 @@ impl Inner {
         let w = c.ws_mut(ws)?;
         let reg = &mut w.devs[d].as_mut().unwrap().regs[r as usize];
         let chunks = std::mem::take(&mut reg.chunks);
+        let shared = std::mem::take(&mut reg.shared);
         reg.state = DState::Absent;
+        if shared {
+            // Never recycled: other processes may still read these bytes.
+            for ch in chunks {
+                if let Err(e) = device::release(ch.handle) {
+                    return Err(c.poison(format!("release of shared {name}#{r} failed: {e}")));
+                }
+            }
+            c.event(Event::new("detached", Some(name), Some(r), Some(ordinal), region.span, 0, ""));
+            return Ok(region.span);
+        }
         c.arenas[d].mapped -= region.span;
         c.arenas[d].put_idle(chunks);
         if evict {
@@ -731,7 +753,7 @@ impl Inner {
         let sizes = c.arenas[d].chunk_sizes(span);
         let chunks = c.arenas[d].take(&sizes)?;
         let base = devws(c, ws, d)?.base;
-        if let Err(e) = device::map_span(base + off, &chunks, self.devices[d].dev) {
+        if let Err(e) = device::map_span(base + off, &chunks, self.devices[d].dev, cuda::MEM_ACCESS_PROT_READWRITE) {
             if let Error::Poisoned(p) = e {
                 return Err(c.poison(p));
             }
@@ -1299,6 +1321,120 @@ impl Plane {
         Ok(freed)
     }
 
+    // ------------------------------------------------------------ device sharing
+
+    /// This device can export and attach shared regions (POSIX-fd VMM and the driver symbols).
+    pub fn device_sharing(&self, ordinal: i32) -> Result<bool> {
+        let d = self.dev(ordinal)?;
+        Ok(self.inner.devices[d].exportable && device::sharing_symbols())
+    }
+
+    /// Share the Ready, unleased, unshared `regions` (all when None) on a device: export each
+    /// region's physical handles as close-on-exec fds and make the mapping read-only. The
+    /// regions leave this plane's budget (their bytes are now counted once, by whoever keeps
+    /// the fds) and are never refilled or recycled. Regions not Ready, leased or held are
+    /// skipped. All-or-nothing: an export failure changes nothing.
+    pub fn export_device(&self, ws: WsId, ordinal: i32, regions: Option<&[u32]>) -> Result<Vec<Exported>> {
+        let d = self.dev(ordinal)?;
+        if !self.device_sharing(ordinal)? {
+            return Err(Error::CudaUnavailable(format!("device {ordinal} cannot share memory")));
+        }
+        let dev = &self.inner.devices[d];
+        let _g = dev.bind()?;
+        let mut c = self.lock();
+        c.check()?;
+        let regions = Self::regions_or_all(&c, ws, regions)?;
+        let layout = c.ws(ws)?.layout.clone();
+        let Some(dw) = c.ws_mut(ws)?.devs[d].as_mut() else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for r in regions {
+            let reg = &mut dw.regs[r as usize];
+            commit(reg)?;
+            if reg.shared || reg.chunks.is_empty() || !matches!(reg.state, DState::Ready) || reg.live > 0 || reg.holds > 0 {
+                continue;
+            }
+            sync_all(&mut reg.pending)?;
+            let mut chunks = Vec::with_capacity(reg.chunks.len());
+            for ch in &reg.chunks {
+                chunks.push((ch.size, device::export_fd(ch.handle)?));
+            }
+            out.push(Exported { region: r, chunks });
+        }
+        let base = dw.base;
+        for e in &out {
+            let region = &layout.regions[e.region as usize];
+            if let Err(err) = device::set_access(base + region.offset, region.span, dev.dev, cuda::MEM_ACCESS_PROT_READ) {
+                return Err(c.poison(format!("read-only access for shared region {} failed: {err}", e.region)));
+            }
+            c.ws_mut(ws)?.devs[d].as_mut().unwrap().regs[e.region as usize].shared = true;
+            c.arenas[d].mapped -= region.span;
+            c.arenas[d].committed -= region.span;
+            let name = c.ws(ws)?.name.clone();
+            c.event(Event::new("exported", Some(name), Some(e.region), Some(ordinal), region.span, 0, ""));
+        }
+        Ok(out)
+    }
+
+    /// Map another process's shared region read-only at its place in this weight set: `chunks`
+    /// are (bytes, fd) in VA order, as `export_device` gave them for the same layout digest.
+    /// The fds stay the caller's (the imported handles hold their own references). The region
+    /// becomes Ready without a copy, outside the budget; dropping it releases the references.
+    pub fn attach_device(&self, ws: WsId, ordinal: i32, r: u32, chunks: &[(u64, BorrowedFd<'_>)]) -> Result<()> {
+        let d = self.dev(ordinal)?;
+        if !self.device_sharing(ordinal)? {
+            return Err(Error::CudaUnavailable(format!("device {ordinal} cannot share memory")));
+        }
+        let dev = &self.inner.devices[d];
+        let _g = dev.bind()?;
+        let mut c = self.lock();
+        c.check()?;
+        let region = c.ws(ws)?.layout.region(r)?.clone();
+        let total: u64 = chunks.iter().map(|(n, _)| *n).sum();
+        if total != region.span || chunks.iter().any(|(n, _)| *n == 0 || !n.is_multiple_of(dev.granularity)) {
+            return Err(Error::Invalid(format!("shared region {r}: chunks of {total} bytes for a {}-byte span", region.span)));
+        }
+        let dw = devws(&mut c, ws, d)?;
+        let reg = &dw.regs[r as usize];
+        if !reg.chunks.is_empty() || matches!(reg.state, DState::Queued) {
+            return Err(Error::Invalid(format!("region {r} is already on device {ordinal}")));
+        }
+        let base = dw.base;
+        let mut handles: Vec<Chunk> = Vec::with_capacity(chunks.len());
+        for (size, fd) in chunks {
+            match device::import_fd(*fd, dev.dev) {
+                Ok(handle) => handles.push(Chunk { handle, size: *size }),
+                Err(e) => {
+                    for h in handles {
+                        if let Err(re) = device::release(h.handle) {
+                            return Err(c.poison(format!("release after a failed import ({e}) failed: {re}")));
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        if let Err(e) = device::map_span(base + region.offset, &handles, dev.dev, cuda::MEM_ACCESS_PROT_READ) {
+            if let Error::Poisoned(p) = e {
+                return Err(c.poison(p));
+            }
+            for h in handles {
+                if let Err(re) = device::release(h.handle) {
+                    return Err(c.poison(format!("release after a failed map ({e}) failed: {re}")));
+                }
+            }
+            return Err(e);
+        }
+        let name = c.ws(ws)?.name.clone();
+        let reg = &mut devws(&mut c, ws, d)?.regs[r as usize];
+        reg.chunks = handles;
+        reg.shared = true;
+        reg.state = DState::Ready;
+        c.event(Event::new("attached", Some(name), Some(r), Some(ordinal), region.span, 0, ""));
+        drop(c);
+        self.inner.cv.notify_all();
+        Ok(())
+    }
+
     // ------------------------------------------------------------ resident access
 
     /// A stream-scoped lease on a resident region. A region not resident is filled on demand
@@ -1533,11 +1669,15 @@ impl Plane {
             }
             for (d, dw) in w.devs.iter_mut().enumerate() {
                 let Some(dw) = dw.as_mut() else { continue };
-                let mut ready = 0;
+                let (mut ready, mut shared) = (0, 0);
                 for (r, reg) in dw.regs.iter_mut().enumerate() {
                     let _ = commit(reg);
                     if matches!(reg.state, DState::Ready) {
                         ready += w.layout.regions[r].nbytes;
+                    }
+                    if reg.shared {
+                        shared += w.layout.regions[r].nbytes;
+                        devs[d].shared_bytes += w.layout.regions[r].span;
                     }
                     if reg.live > 0 {
                         devs[d].leased_bytes += w.layout.regions[r].span;
@@ -1548,6 +1688,7 @@ impl Plane {
                 }
                 devs[d].reserved_va += w.layout.nbytes;
                 s.devices.push((self.inner.devices[d].ordinal, ready));
+                s.shared.push((self.inner.devices[d].ordinal, shared));
             }
             sets.push(s);
         }
@@ -1635,7 +1776,13 @@ fn teardown(devices: &[DeviceRt], c: &mut Core) -> Result<()> {
             for (reg, region) in dw.regs.into_iter().zip(&w.layout.regions) {
                 if !reg.chunks.is_empty() {
                     device::unmap_span(dw.base + region.offset, region.span)?;
-                    chunks.extend(reg.chunks);
+                    if reg.shared {
+                        for ch in reg.chunks {
+                            device::release(ch.handle)?;
+                        }
+                    } else {
+                        chunks.extend(reg.chunks);
+                    }
                 }
             }
             device::free_va(dw.base, w.layout.nbytes)?;
@@ -1704,6 +1851,8 @@ pub struct DevStats {
     pub held_bytes: u64,
     pub over_budget_unreleasable: u64,
     pub reserved_va: u64,
+    /// Mapped shared regions (exported or attached): outside `committed` and the budget.
+    pub shared_bytes: u64,
     pub counters: DevCounters,
 }
 
@@ -1717,6 +1866,8 @@ pub struct WsStats {
     pub host_memfd_bytes: u64,
     /// (ordinal, resident Ready bytes)
     pub devices: Vec<(i32, u64)>,
+    /// (ordinal, Ready bytes in shared regions)
+    pub shared: Vec<(i32, u64)>,
     pub evictions: u64,
     pub evicted_bytes: u64,
 }
