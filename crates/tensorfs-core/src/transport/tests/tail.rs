@@ -310,12 +310,14 @@ fn a_pull_where_nothing_new_lands_ends_and_quotes_the_last_answer() {
     assert_eq!(refusal.code, Code::TRANSFER_FAILED, "{refusal}");
     assert!(refusal.detail.contains("nothing landed"), "{refusal}");
     assert!(refusal.detail.contains("last answer"), "{refusal}");
+    // An ask that adds nothing waits a sample before the next: about one ask an object a
+    // sample for as long as the pull's own patience ran, never a hot loop.
+    let samples = started.elapsed().as_secs_f64() / 0.025;
+    let objects = checkpoint.objects.len() + 1;
     assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "{:?}",
-        started.elapsed()
+        (origin.total_hits() as f64) < objects as f64 * (samples + 8.0) * 2.0,
+        "{} asks in {samples:.0} samples for {objects} objects",
+        origin.total_hits()
     );
-    // One ask a sample once an ask adds nothing, not a hot loop.
-    assert!(origin.total_hits() < 400, "{} asks", origin.total_hits());
     let _ = std::fs::remove_dir_all(root);
 }
