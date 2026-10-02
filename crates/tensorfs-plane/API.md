@@ -99,18 +99,7 @@ ts = p.replicate(ws, devices, regions=None, priority=0, pin=False)  # [Ticket]
   wait meanwhile; unregister on eviction ~0.03 ms/MiB): want the pinned tier at admission or
   between stages, never while this process computes. A host-only plane registers nothing.
 - device: map the regions (slab-sized handles), then copy from the pinned tier if it holds the
-  region; else, for a `want` of bytes the page cache holds, straight from read-only mappings
-  of their objects (no host copy, no wait for a pinned fill, which then runs beside it;
-  counted in `host_copy_bytes` and, as its part, `mapped_copy_bytes`); else after a pinned
-  fill that is running (one disk read
-  serves both); else disk → staging buffers → device. A demand miss (`acquire`) and a
-  streaming ring never map. An object that cannot be mapped (not ext4, xfs, btrfs, tmpfs or
-  overlayfs; not at its declared length; pages gone from the cache) sends its region through
-  staging (`map_refused`). A mapping's fault is a signal, not an error: a disk read error on a
-  page evicted between the check and the copy kills the process with SIGBUS. The cache query
-  runs on the caller before the fill is queued and opens each object of the wanted regions
-  (a record lookup, a rehash when the record is missing): a device `want` can block on a
-  first open.
+  region, after it if it is filling, else disk → staging buffers → device.
 - `replicate`: one pinned fill (if the pinned budget allows), then one copy per device.
 - A `want` of regions already resident only updates their priority/pin: no bytes move and
   nothing is evicted. To re-prioritise without any chance of a fill, use:
@@ -212,13 +201,8 @@ p.stats() -> {
   "devices": [{"ordinal", "uuid", "granularity", "exportable", "budget", "committed", "mapped",
                "idle", "leased_bytes", "held_bytes", "over_budget_unreleasable", "reserved_va",
                "copies", "host_copy_bytes", "host_copy_ns", "disk_copy_bytes", "disk_copy_ns",
-               "mapped_copy_bytes", "mapped_copy_ns", "misses", "evictions", "evicted_bytes",
-               "trims"}],
-  # host_copy_* counts every copy from host memory with no staging: the pinned tier's and the
-  # mappings' (mapped_copy_* is that part of it; subtract it for the tier alone, whose rate a
-  # reader of the host pair otherwise sees blended). host + disk copies are every byte that
-  # landed on the device. A pinned fill served by the page cache counts in fill_bytes and
-  # cached_bytes, never in disk_read_bytes.
+               "mapped_copy_bytes", "mapped_copy_ns",
+               "misses", "evictions", "evicted_bytes", "trims"}],
   "sets":    [{"id", "name", "nbytes", "regions", "host_ready_bytes", "host_memfd_bytes",
                "evictions", "evicted_bytes", "devices": [{"ordinal", "ready_bytes"}]}],
   "stages":  [{"ws", "device", "tag", "acquires", "skipped", "misses", "late", "late_bytes",
@@ -297,17 +281,19 @@ an unclosed plane ends.
 
 ## Changelog
 
+- v3.4 2026-10-02: the mapped device copy of v3.3 is removed; a device fill is again pinned
+  tier, else after a filling tier, else staging. In real first loads it never acted at full
+  CPU (the tier was ready first) and was slower where it did (L4 held to 4 CPUs, warm cache:
+  SDXL load to denoise 6.44 s -> 7.54 s, Anima 5.54 s -> 8.31 s): the pinned fill copied the
+  same bytes beside it. `mapped_copy_bytes`, `mapped_copy_ns` and `map_refused` stay in
+  `stats()` and read 0. Kept from v3.3: the page-cache query that answers on overlayfs and
+  where seccomp refuses `cachestat` (a pinned fill there copies cached bytes instead of
+  re-reading them), and `stats()["host"]["disk_read_bytes"]`.
+
 - v3.3 2026-10-02: `stats()["host"]["disk_read_bytes"]` exists. The plane has counted it
   since v3.1 and this file listed it, but the Python facade never carried it: a caller read 0
-  whatever the disk did, so a "nothing read from disk" check on it could not fail.
-
-- v3.3 2026-10-02 (warm loads bound by the plane's own host copy): a device `want` of bytes
-  the page cache holds copies straight from mappings of their objects, beside any pinned
-  fill. `host_copy_*` counts them with the pinned tier's copies (host + disk copies stay every
-  byte that landed on the device); `mapped_copy_*` is their part of it. The cache query now also answers where `cachestat` cannot:
-  overlayfs and a seccomp filter that refuses it. Pod-visible: there the pinned fill copies
-  freshly downloaded weights from the page cache where it re-read them by O_DIRECT, so the
-  tier and the cache copy coexist until the kernel reclaims the cache.
+  whatever the disk did, so a "nothing read from disk" check on it could not fail. (v3.3 also
+  added a device copy from page-cache mappings; v3.4 removed it.)
 
 - v3.2 2026-10-02 (W3: fd and thread growth per weight set): a plane collected unclosed or
   poisoned is torn down at its last handle (threads, device memory, pinned memfds) once its

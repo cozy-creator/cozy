@@ -2,8 +2,7 @@
 //! descriptors the plane opens through the store's own verification (`open_verified`). A
 //! pinned-tier fill copies what the page cache already holds and reads the rest by O_DIRECT
 //! into the destination (no second host copy), else through `tensorfs_core::read::read_into`.
-//! A device copy of bytes the page cache holds reads them through a read-only mapping, with no
-//! host copy at all. Each mode's bytes are counted.
+//! Each mode's bytes are counted.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -30,8 +29,6 @@ pub struct IoTally {
     pub inline_bytes: AtomicU64,
     /// Objects whose filesystem refused O_DIRECT: their bytes went buffered.
     pub direct_refused: AtomicU64,
-    /// Device copies whose objects could not be mapped: they went through staging.
-    pub map_refused: AtomicU64,
 }
 
 /// How a fill wants its bytes: `Cache` for the pinned tier (O_DIRECT for what the page cache
@@ -45,94 +42,8 @@ pub enum Mode {
 struct Fds {
     buffered: File,
     direct: Option<File>,
-    fs: Fs,
-}
-
-/// What the plane may do with an object by its filesystem. A fault on a mapping is a signal,
-/// not an error, so only local filesystems are mapped.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Fs {
-    Local,
-    /// Local too, but its files report no page cache of their own (a container's root).
-    Overlay,
-    Other,
-}
-
-impl Fs {
-    fn of(f: &File) -> Fs {
-        // SAFETY: out-param of the right type on our own descriptor.
-        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatfs(f.as_raw_fd(), &mut fs) } != 0 {
-            return Fs::Other;
-        }
-        #[allow(clippy::unnecessary_cast)] // f_type is not an i64 on every target
-        match fs.f_type as i64 {
-            0x794c7630 => Fs::Overlay,
-            // ext4, xfs, btrfs, tmpfs
-            0xEF53 | 0x58465342 | 0x9123683E | 0x01021994 => Fs::Local,
-            _ => Fs::Other,
-        }
-    }
-}
-
-/// One item's bytes for a device copy, with no host copy: a populated read-only mapping of its
-/// object range (unmapped on drop), or the inline bytes themselves.
-pub enum Mapping {
-    Inline(Arc<[u8]>),
-    File { base: *mut u8, span: usize, at: usize },
-}
-// SAFETY: a read-only mapping (or shared immutable bytes) owned by whoever holds the value.
-unsafe impl Send for Mapping {}
-
-impl Mapping {
-    pub fn ptr(&self) -> *const u8 {
-        match self {
-            Mapping::Inline(b) => b.as_ptr(),
-            // SAFETY: `at` lies inside the mapping.
-            Mapping::File { base, at, .. } => unsafe { base.add(*at) },
-        }
-    }
-
-    /// `[off, off+len)` of `f`, which the page cache must hold: a cold range is refused, never
-    /// read from disk through the mapping. Populated and checked again, so the copy that
-    /// follows is not the range's first reader.
-    fn file(f: &File, off: u64, len: u64) -> Result<Mapping> {
-        if !resident(f, off, len) {
-            return Err(Error::Io("the page cache let go of the range".into()));
-        }
-        let at = (off % 4096) as usize;
-        let span = at + len as usize;
-        // SAFETY: a fresh read-only shared mapping of our descriptor.
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                span,
-                libc::PROT_READ,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
-                f.as_raw_fd(),
-                (off - at as u64) as libc::off_t,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            return Err(Error::Io(format!("mmap: {}", std::io::Error::last_os_error())));
-        }
-        let m = Mapping::File { base: p as *mut u8, span, at };
-        let mut pages = vec![0u8; span.div_ceil(4096)];
-        // SAFETY: the vector holds one byte per page of the mapping.
-        if unsafe { libc::mincore(p, span, pages.as_mut_ptr()) } != 0 || pages.iter().any(|b| b & 1 == 0) {
-            return Err(Error::Io("the page cache let go of a mapped range".into()));
-        }
-        Ok(m)
-    }
-}
-
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        if let Mapping::File { base, span, .. } = self {
-            // SAFETY: our own mapping, no longer read by anyone (the holder's contract).
-            unsafe { libc::munmap(*base as *mut libc::c_void, *span) };
-        }
-    }
+    /// On overlayfs (a container's root): the file reports no page cache of its own.
+    overlay: bool,
 }
 
 pub struct Source {
@@ -173,7 +84,16 @@ fn cached(f: &Fds, off: u64, len: u64) -> bool {
     if rc == 0 && st.nr_cache >= (off + len).div_ceil(page) - off / page {
         return true;
     }
-    (rc != 0 || f.fs == Fs::Overlay) && resident(&f.buffered, off, len)
+    (rc != 0 || f.overlay) && resident(&f.buffered, off, len)
+}
+
+fn overlay(f: &File) -> bool {
+    const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+    // SAFETY: out-param of the right type on our own descriptor.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    #[allow(clippy::unnecessary_cast)] // f_type is not an i64 on every target
+    let magic = unsafe { libc::fstatfs(f.as_raw_fd(), &mut fs) == 0 }.then_some(fs.f_type as i64);
+    magic == Some(OVERLAYFS_SUPER_MAGIC)
 }
 
 /// Every page of `[off, off+len)` is in core, by `mincore(2)` over a mapping (never faults).
@@ -250,48 +170,9 @@ impl Source {
         } else {
             None
         };
-        let fs = Fs::of(&buffered);
-        let f = Arc::new(Fds { buffered, direct, fs });
+        let f = Arc::new(Fds { overlay: overlay(&buffered), buffered, direct });
         self.fds.lock().unwrap().insert(obj.sha256.clone(), f.clone());
         Ok(f)
-    }
-
-    /// Whether the page cache holds every object byte of `items`. An object that will not open
-    /// counts as not held: its reader reports the error.
-    pub(crate) fn cached(&self, items: &[Item], tally: &IoTally) -> bool {
-        items.iter().all(|it| match &it.source {
-            ItemSource::Inline(_) => true,
-            ItemSource::Object(o) => {
-                self.fds(&o.obj, tally).is_ok_and(|f| cached(&f, o.off, it.len))
-            }
-        })
-    }
-
-    /// `items` mapped for a device copy. Refuses (the caller stages instead) an object on a
-    /// filesystem where a fault could be a network error, one not at its declared length, and
-    /// pages the cache no longer holds.
-    pub fn map(&self, items: &[Item], tally: &IoTally) -> Result<Vec<Mapping>> {
-        crate::faults::hit("map")?;
-        let guard = self.lease.read().unwrap();
-        let lease = guard.as_ref().ok_or(Error::Closed)?;
-        let one = |it: &Item| -> Result<Mapping> {
-            let o = match &it.source {
-                ItemSource::Inline(b) => return Ok(Mapping::Inline(b.clone())),
-                ItemSource::Object(_) if it.len == 0 => return Ok(Mapping::Inline(Arc::from([]))),
-                ItemSource::Object(o) => o,
-            };
-            lease.covers(o)?;
-            let fds = self.fds(&o.obj, tally)?;
-            if fds.fs == Fs::Other {
-                return Err(Error::Invalid(format!("{}: not on a local filesystem", o.obj.sha256)));
-            }
-            let size = fds.buffered.metadata().map_err(|e| Error::Io(format!("fstat {}: {e}", o.obj.sha256)))?.len();
-            if size != o.obj.length {
-                return Err(Error::Io(format!("{} is {size} bytes, declared {}", o.obj.sha256, o.obj.length)));
-            }
-            Mapping::file(&fds.buffered, o.off, it.len)
-        };
-        items.iter().map(one).collect()
     }
 
     /// Fill `item.len` bytes at `dst`. `Mode::Cache` reads a range the page cache fully

@@ -164,7 +164,7 @@ def main() -> int:
     print(f"step: resident {t_ref * 1e3:.2f} ms, streamed {t_stream * 1e3:.2f} ms "
           f"({t_stream / t_ref:.3f}x), {a.layers - len(resident)} of {a.layers} layers streamed, window {a.window}, "
           f"ring {cur.ring_nbytes >> 20} MiB")
-    print(f"copies {d0['copies']} (pinned {(d0['host_copy_bytes'] - d0['mapped_copy_bytes']) >> 20} MiB, mapped {d0['mapped_copy_bytes'] >> 20} MiB, disk-staged {d0['disk_copy_bytes'] >> 20} MiB), {gbps:.2f} GB/s; late {stage['late']} of {stage['acquires']}, "
+    print(f"copies {d0['copies']} (pinned {d0['host_copy_bytes'] >> 20} MiB, disk-staged {d0['disk_copy_bytes'] >> 20} MiB), {gbps:.2f} GB/s; late {stage['late']} of {stage['acquires']}, "
           f"stall {stage['stall_ns'] / 1e6:.2f} ms, skipped {stage['skipped']}")
     comp = sorted((x["region"], x["compute_ns"] / max(x["uses"], 1) / 1e6) for x in st["regions"] if x["tag"] == "smoke")
     print("per-region GPU compute ms:", " ".join(f"{r}:{ms:.2f}" for r, ms in comp))

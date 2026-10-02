@@ -42,7 +42,7 @@ class HostStats(TypedDict):
     buffered_bytes: int
     inline_bytes: int
     direct_refused: int
-    map_refused: int
+    map_refused: int  # always 0 since 0.3.93
     disk_read_bytes: int  # read from storage by this process, from /proc/self/io
     fills: int
     fill_bytes: int
@@ -66,11 +66,11 @@ class DeviceStats(TypedDict):
     over_budget_unreleasable: int
     reserved_va: int
     copies: int
-    host_copy_bytes: int  # from host memory with no staging: pinned tier and mappings
+    host_copy_bytes: int
     host_copy_ns: int
     disk_copy_bytes: int
     disk_copy_ns: int
-    mapped_copy_bytes: int  # of host_copy_bytes, from page-cache mappings; never added on top
+    mapped_copy_bytes: int  # always 0 since 0.3.93 (0.3.92 copied from page-cache mappings)
     mapped_copy_ns: int
     misses: int
     evictions: int

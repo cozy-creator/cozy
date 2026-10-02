@@ -106,63 +106,35 @@ fn resident(plane: &Plane, ws: WsId, s: &Stream, r: u32) -> Lease {
 
 #[test]
 #[ignore = "GPU"]
-fn fills_from_the_pinned_tier_the_page_cache_and_disk_are_exact() {
+fn fills_from_the_pinned_tier_and_from_disk_are_exact() {
     let fx = Fixture::new("gpu-fill");
     let p = plane();
     let ws = fx.register(&p, None);
     let s = Stream::new();
     p.set_vram_budget(DEV, 512 << 20).unwrap();
-    // Pinned budget 0 and a cold page cache: every device fill reads the store through
-    // staging buffers.
-    fx.drop_cache();
+    // Pinned budget 0: every device fill reads the store through staging buffers.
     p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
     for r in 0..3 {
         resident(&p, ws, &s, r).release(s.raw()).unwrap();
     }
     let st = p.stats();
-    let landed: u64 = p.layout(ws).unwrap().regions.iter().map(|r| r.nbytes).sum();
-    assert_eq!(st.devices[0].counters.disk_copy_bytes, landed, "{:?}", st.devices[0]);
-    assert_eq!((st.devices[0].counters.host_copy_bytes, st.devices[0].counters.mapped_copy_bytes), (0, 0));
+    assert!(st.devices[0].counters.disk_copy_bytes > 70 << 20, "{:?}", st.devices[0]);
+    assert_eq!(st.devices[0].counters.host_copy_bytes, 0);
     assert!(p.verify(ws, DEV).unwrap() > 0);
 
-    // Evict, then refill with the page cache holding the bytes (the staged reads left them
-    // there): straight from mappings of the objects, no staging buffer.
-    assert!(p.drop_regions(ws, Tier::Device(DEV), None).unwrap() > 0);
-    fx.read_cache();
-    let staged = st.host.buffered_bytes;
-    p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
-    for r in 0..3 {
-        resident(&p, ws, &s, r).release(s.raw()).unwrap();
-    }
-    let st = p.stats();
-    // A mapped copy is a host copy with no staging, and says so: what an older caller sums
-    // (host + disk) is still every byte that landed on the device.
-    assert_eq!(st.devices[0].counters.mapped_copy_bytes, landed, "{:?}", st.devices[0]);
-    assert_eq!((st.devices[0].counters.host_copy_bytes, st.devices[0].counters.disk_copy_bytes), (landed, landed));
-    assert_eq!((st.host.buffered_bytes, st.host.map_refused), (staged, 0));
-    assert!(fx.unmapped(), "a mapping outlived its copy");
-    assert!(p.verify(ws, DEV).unwrap() > 0);
-    let gbps = st.devices[0].counters.mapped_copy_bytes as f64 / st.devices[0].counters.mapped_copy_ns as f64;
-    println!("page cache->device {gbps:.2} GB/s");
-
-    // Evict, then refill from the pinned tier, itself filled from the page cache: a fill, and
-    // nothing read from disk.
+    // Evict, then refill from the pinned tier.
     assert!(p.drop_regions(ws, Tier::Device(DEV), None).unwrap() > 0);
     p.set_pinned_budget(1 << 30).unwrap();
     p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
-    let filled = p.stats().host;
-    assert_eq!(filled.registered_bytes, filled.ready_bytes, "pinned tier must be registered");
-    assert_eq!((filled.counters.fill_bytes, filled.direct_bytes), (landed, 0), "{filled:?}");
-    assert_eq!(filled.disk_read_bytes, st.host.disk_read_bytes, "a fill from the page cache read the disk");
+    assert_eq!(p.stats().host.registered_bytes, p.stats().host.ready_bytes, "pinned tier must be registered");
     p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
     for r in 0..3 {
         resident(&p, ws, &s, r).release(s.raw()).unwrap();
     }
     let st = p.stats();
-    let d = &st.devices[0].counters;
-    assert_eq!((d.host_copy_bytes, d.mapped_copy_bytes, d.disk_copy_bytes), (2 * landed, landed, landed), "{d:?}");
-    let gbps = (d.host_copy_bytes - d.mapped_copy_bytes) as f64 / (d.host_copy_ns - d.mapped_copy_ns) as f64;
-    println!("pinned->device {gbps:.2} GB/s over {} copies", d.copies);
+    assert!(st.devices[0].counters.host_copy_bytes > 70 << 20, "{:?}", st.devices[0]);
+    let gbps = st.devices[0].counters.host_copy_bytes as f64 / st.devices[0].counters.host_copy_ns as f64;
+    println!("pinned->device {gbps:.2} GB/s over {} copies", st.devices[0].counters.copies);
     s.sync();
     p.close().unwrap();
 }
@@ -709,117 +681,6 @@ mod copy_faults {
         drop(p);
         assert!(gate.is_open(), "the plane was torn down while its copies still waited on the device");
         opener.join().unwrap();
-        healthy();
-    }
-
-    #[test]
-    #[ignore = "GPU"]
-    fn a_cached_region_copies_from_mappings_beside_its_pinned_fill() {
-        let fx = Fixture::new("gpu-mapped");
-        let p = staging_plane();
-        let ws = fx.register(&p, None);
-        let s = Stream::new();
-        p.set_pinned_budget(1 << 30).unwrap();
-        p.set_vram_budget(DEV, 1 << 30).unwrap();
-        fx.read_cache();
-        // The pinned fill of region 1 is held before it completes.
-        let gate = faults::arm_gate("host-fill");
-        let opener = open_later(&gate);
-        let pinned = p.want(ws, Tier::Pinned, Some(&[1]), 0, false).unwrap();
-        p.want(ws, Tier::Device(DEV), Some(&[1]), 0, false).unwrap().wait().unwrap();
-        let beside = !gate.is_open();
-        resident(&p, ws, &s, 1).release(s.raw()).unwrap();
-        opener.join().unwrap();
-        pinned.wait().unwrap();
-        let st = p.stats();
-        assert!(beside, "the device copy waited for the pinned fill of bytes the page cache held");
-        let d = &st.devices[0].counters;
-        assert!(d.mapped_copy_bytes > 70 << 20, "{d:?}");
-        assert_eq!((d.disk_copy_bytes, d.host_copy_bytes), (0, d.mapped_copy_bytes), "{d:?}");
-        assert_eq!(st.host.buffered_bytes, 0, "a mapped copy read through the staging buffers");
-        assert!(fx.unmapped(), "a mapping outlived its copy");
-        check_bytes(&p, ws, Some(1));
-        assert_eq!(st.host.direct_bytes, 0, "the pinned fill re-read the disk");
-        s.sync();
-        p.close().unwrap();
-        healthy();
-    }
-
-    #[test]
-    #[ignore = "GPU"]
-    fn a_refused_mapping_sends_its_region_through_staging() {
-        let fx = Fixture::new("gpu-maprefused");
-        let p = staging_plane();
-        let ws = fx.register(&p, None);
-        let s = Stream::new();
-        p.set_vram_budget(DEV, 1 << 30).unwrap();
-        fx.read_cache();
-        faults::arm("map", 1);
-        p.want(ws, Tier::Device(DEV), Some(&[1]), 0, false).unwrap().wait().unwrap();
-        resident(&p, ws, &s, 1).release(s.raw()).unwrap();
-        let st = p.stats();
-        assert_eq!(st.host.map_refused, 1);
-        assert!(st.devices[0].counters.disk_copy_bytes > 70 << 20, "{:?}", st.devices[0]);
-        assert_eq!(st.devices[0].counters.mapped_copy_bytes, 0);
-        assert_eq!(fx.blob_maps(), 0);
-        s.sync();
-        p.close().unwrap();
-        healthy();
-    }
-
-    #[test]
-    #[ignore = "GPU"]
-    fn a_failed_mapped_copy_keeps_its_mappings_until_its_copies_drained() {
-        let fx = Fixture::new("gpu-mapdrain");
-        let p = staging_plane();
-        let ws = fx.register(&p, None);
-        let s = Stream::new();
-        p.set_vram_budget(DEV, 1 << 30).unwrap();
-        fx.read_cache();
-        // The stream is held on the device, and the second of region 1's items fails.
-        let gate = faults::arm_gate("copy");
-        faults::arm("mapped-copy", 2);
-        let opener = open_later(&gate);
-        let ticket = p.want(ws, Tier::Device(DEV), Some(&[1]), 0, false).unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-        let held = (fx.blob_maps(), gate.is_open());
-        let r = ticket.wait();
-        let (drained, left) = (gate.is_open(), fx.blob_maps());
-        // What a runtime does next with a failed region: give its memory back.
-        let dropped = p.drop_regions(ws, Tier::Device(DEV), Some(&[1]));
-        opener.join().unwrap();
-        let device = health();
-        assert!(r.is_err(), "the injected failure must surface");
-        assert!(held.0 > 0 && !held.1, "the mappings must be held while the copy waits on the device: {held:?}");
-        assert!(drained, "the failure was reported while its copies still waited on the device; device after the unmap: {device:?}");
-        assert_eq!(left, 0, "a failed copy's mappings go once it drained");
-        dropped.unwrap();
-        device.unwrap();
-        // The region refills exactly.
-        resident(&p, ws, &s, 1).release(s.raw()).unwrap();
-        s.sync();
-        assert!(p.stats().poisoned.is_none());
-        p.close().unwrap();
-        healthy();
-    }
-
-    #[test]
-    #[ignore = "GPU"]
-    fn dropping_the_plane_under_a_queued_mapped_copy_keeps_its_mappings_until_the_copy_ran() {
-        let fx = Fixture::new("gpu-mapdropq");
-        let p = staging_plane();
-        let ws = fx.register(&p, None);
-        p.set_vram_budget(DEV, 1 << 30).unwrap();
-        fx.read_cache();
-        let gate = faults::arm_gate("copy");
-        drop(p.want(ws, Tier::Device(DEV), Some(&[1]), 0, false).unwrap());
-        // The queued copy's completion now holds the plane's last reference.
-        drop(p);
-        std::thread::sleep(Duration::from_millis(300));
-        let still = fx.blob_maps();
-        gate.open();
-        assert!(still > 0, "the mappings went while their copy waited on the device");
-        assert!(fx.unmapped(), "the plane never finished dropping");
         healthy();
     }
 

@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
-use crate::io::{Batch, Dst, IoTally, Mapping, Mode, Readers, Source};
+use crate::io::{Batch, Dst, IoTally, Mode, Readers, Source};
 use crate::layout::{Item, ItemSource, REGION_ALIGN};
 use crate::{Error, Result};
 
@@ -368,31 +368,14 @@ pub enum CopySrc {
         items: Vec<Item>,
         base: u64,
     },
-    /// Bytes the page cache holds, read through mappings of their objects: no host copy. An
-    /// object that cannot be mapped sends the whole copy through staging instead.
-    Mapped {
-        source: Arc<Source>,
-        items: Vec<Item>,
-        base: u64,
-    },
 }
 unsafe impl Send for CopySrc {}
-
-/// Where a copy's bytes came from, for its counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyFrom {
-    Pinned,
-    Disk,
-    Mapped,
-}
 
 pub struct Copied {
     pub ready: EvRef,
     pub start: EvRef,
     pub bytes: u64,
-    pub from: CopyFrom,
-    /// Host time before `start` that belongs to the copy: mapping and faulting its source in.
-    pub host_ns: u64,
+    pub from_host: bool,
 }
 
 pub struct CopyJob {
@@ -491,16 +474,8 @@ fn mover_main(m: MoverCtx, rx: Receiver<CopyJob>, ok: Sender<Result<()>>) {
     };
     while let Ok(job) = rx.recv() {
         let done = job.done;
-        let (r, maps) = run_copy(&m, stream, &mut bounces, job.waits, job.dst, job.len, job.src);
-        // The driver stages a pageable source after the call returns, so a mapped copy's
-        // mappings outlive its event. The region is reported first: its consumer queues behind
-        // the event with no host wait.
-        let mapped = r.as_ref().ok().filter(|_| !maps.is_empty()).map(|cp| cp.ready.clone());
+        let r = run_copy(&m, stream, &mut bounces, job.waits, job.dst, job.len, job.src);
         done(r);
-        match mapped.map(|ready| ready.sync()) {
-            Some(Err(_)) => std::mem::forget(maps), // the copy's end is unknown: it may still read them
-            _ => drop(maps),
-        }
     }
     if let Ok(d) = cuda::driver() {
         // SAFETY: our stream and buffers; the stream is drained first.
@@ -523,9 +498,6 @@ struct Waiter {
 /// no reader still writes a bounce: a failed copy is drained before it is reported, so no
 /// caller unmaps, unregisters or reuses a range a copy still touches. A drain that itself fails
 /// is ambiguous device state: `Poisoned`.
-///
-/// The mappings a queued mapped copy reads come back with it, for the caller to hold past its
-/// event. A failed one's are unmapped here, after the drain, and never if the drain failed.
 fn run_copy(
     m: &MoverCtx,
     stream: CUstream,
@@ -534,36 +506,20 @@ fn run_copy(
     dst: u64,
     len: u64,
     src: CopySrc,
-) -> (Result<Copied>, Vec<Mapping>) {
-    let began = std::time::Instant::now();
-    let (src, maps) = match src {
-        CopySrc::Mapped { source, items, base } => match source.map(&items, &m.tally) {
-            Ok(maps) => (CopySrc::Mapped { source, items, base }, maps),
-            Err(_) => {
-                // Nothing is queued yet: the same bytes go through the staging buffers.
-                m.tally.map_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                (CopySrc::Disk { source, items, base }, Vec::new())
-            }
-        },
-        src => (src, Vec::new()),
-    };
-    let host_ns = if maps.is_empty() { 0 } else { began.elapsed().as_nanos() as u64 };
-    let r = enqueue_copy(m, stream, bounces, waits, dst, len, src, &maps).map(|cp| Copied { host_ns, ..cp });
-    let Err(e) = r else { return (r, maps) };
-    let drained = crate::faults::hit("drain").and_then(|_| cuda::driver()).and_then(|d| {
-        // SAFETY: our own stream.
+) -> Result<Copied> {
+    let r = enqueue_copy(m, stream, bounces, waits, dst, len, src);
+    let Err(e) = r else { return r };
+    let d = cuda::driver()?;
+    // SAFETY: our own stream.
+    let drained = crate::faults::hit("drain").and_then(|_| {
         cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(stream) })
     });
     match drained {
-        Ok(()) => (Err(e), Vec::new()),
-        Err(drain) => {
-            std::mem::forget(maps); // a copy may still read them
-            (Err(Error::Poisoned(format!("a failed copy ({e}) could not be drained: {drain}"))), Vec::new())
-        }
+        Ok(()) => Err(e),
+        Err(drain) => Err(Error::Poisoned(format!("a failed copy ({e}) could not be drained: {drain}"))),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn enqueue_copy(
     m: &MoverCtx,
     stream: CUstream,
@@ -572,7 +528,6 @@ fn enqueue_copy(
     dst: u64,
     len: u64,
     src: CopySrc,
-    maps: &[Mapping],
 ) -> Result<Copied> {
     let d = cuda::driver()?;
     let start = m.events.get(true)?;
@@ -595,22 +550,7 @@ fn enqueue_copy(
             })?;
             crate::faults::hit("host-copy-recorded")?;
             ready.record(stream)?;
-            Ok(Copied { ready, start, bytes: len, from: CopyFrom::Pinned, host_ns: 0 })
-        }
-        CopySrc::Mapped { items, base, .. } => {
-            wait_all(&waits)?;
-            crate::faults::gate("copy", stream)?;
-            start.record(stream)?;
-            for (it, map) in items.iter().zip(maps).filter(|(it, _)| it.len > 0) {
-                crate::faults::hit("mapped-copy")?;
-                // SAFETY: the mapping covers `it.len` bytes and the mover keeps it past this
-                // copy's event.
-                cuda::check("cuMemcpyHtoDAsync", unsafe {
-                    (d.memcpy_htod_async)(dst + (it.offset - base), map.ptr() as *const libc::c_void, it.len as usize, stream)
-                })?;
-            }
-            ready.record(stream)?;
-            Ok(Copied { ready, start, bytes: len, from: CopyFrom::Mapped, host_ns: 0 })
+            Ok(Copied { ready, start, bytes: len, from_host: true })
         }
         CopySrc::Disk { source, items, base } => {
             let cap = m.staging.1;
@@ -697,7 +637,7 @@ fn enqueue_copy(
                 start.record(stream)?;
             }
             ready.record(stream)?;
-            Ok(Copied { ready, start, bytes: len, from: CopyFrom::Disk, host_ns: 0 })
+            Ok(Copied { ready, start, bytes: len, from_host: false })
         }
     }
 }
