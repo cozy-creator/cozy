@@ -6,13 +6,16 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
@@ -56,12 +59,39 @@ type requirement struct {
 	specifier pep440.Specifiers
 	hasSpec   bool
 	direct    bool
+	// reference is the direct reference after `@`, e.g. git+https://host/repo@<commit>.
+	reference string
 }
 
 type localSource struct {
 	path        string
 	workspace   bool
 	unsupported string
+	git         gitPin
+}
+
+// gitPin is a third-party source at one full commit. A branch, tag or short ref can
+// move, so none of those names a source a release can carry.
+type gitPin struct{ url, commit string }
+
+var fullCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func pinnedGit(name, repository, commit string) (gitPin, *exit.Error) {
+	parsed, err := url.Parse(repository)
+	loopback := err == nil && parsed.Scheme == "http" && (parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1")
+	if err != nil || (parsed.Scheme != "https" && !loopback) || parsed.Host == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return gitPin{}, exit.Named(exit.Validation, "project_dependency_git_source_unsupported",
+			"%s names git source %q, which is not a plain https repository", name, repository).
+			WithRemedy("depend on `%s @ git+https://<host>/<repository>@<40-hex commit>`", name)
+	}
+	if !fullCommit.MatchString(commit) {
+		return gitPin{}, exit.Named(exit.Validation, "project_dependency_git_unpinned",
+			"%s pins git source %s at %q, which is not a full commit; a branch, tag or short ref can move",
+			name, repository, commit).
+			WithRemedy("depend on `%s @ git+%s@<40-hex commit>`", name, repository)
+	}
+	return gitPin{url: repository, commit: commit}, nil
 }
 
 type dependencyRecord struct {
@@ -147,9 +177,24 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 			return problem
 		}
 		if req.direct {
-			return exit.Named(exit.Validation, "project_dependency_direct_url_unsupported",
-				"project dependency %q uses a direct URL", raw).
-				WithRemedy("publish the distribution to an index or use a local path/workspace source")
+			repository, found := strings.CutPrefix(req.reference, "git+")
+			if !found {
+				return exit.Named(exit.Validation, "project_dependency_direct_url_unsupported",
+					"project dependency %q uses a direct URL", raw).
+					WithRemedy("publish the distribution to an index, pin a git commit, or use a local path/workspace source")
+			}
+			commit := ""
+			if at := strings.LastIndexByte(repository, '@'); at > strings.LastIndexByte(repository, '/') {
+				repository, commit = repository[:at], repository[at+1:]
+			}
+			pin, problem := pinnedGit(req.name, repository, commit)
+			if problem != nil {
+				return problem
+			}
+			if problem := c.collectGit(req, pin); problem != nil {
+				return problem
+			}
+			continue
 		}
 		if req.name == normalizedProjectName(document.Project.Name) && len(req.extras) > 0 {
 			if problem := req.accepts(document.Project.Version); problem != nil {
@@ -170,6 +215,12 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 			return exit.Named(exit.Validation, "project_dependency_source_unsupported",
 				"%s uses unsupported %s source configuration", req.name, source.unsupported).
 				WithRemedy("publish the distribution to an index or use a local path/workspace source")
+		}
+		if source.git.url != "" {
+			if problem := c.collectGit(req, source.git); problem != nil {
+				return problem
+			}
+			continue
 		}
 		if source.workspace {
 			member, problem := workspaceMember(root, req.name)
@@ -291,7 +342,88 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 			"local project declares %s==%s but its wheel declares %s==%s",
 			name, version, identity.Distribution, identity.Version)
 	}
-	return c.add(identity, built.Path)
+	return c.add(identity, built.Path, true)
+}
+
+// collectGit builds the wheel of a git source at its pinned commit and carries it like a
+// local wheel: machines install those exact bytes from the Hub and never reach the repository.
+func (c *dependencyCollector) collectGit(req requirement, pin gitPin) *exit.Error {
+	if c.scanOnly || c.captureOnly {
+		return nil
+	}
+	source := "git+" + pin.url + "@" + pin.commit
+	if prior, exists := c.byName[req.name]; exists {
+		if prior.source != source {
+			return duplicateDependency(req.name, prior, source, "")
+		}
+		return nil
+	}
+	if c.count >= MaxDependencyWheels {
+		return tooManyDependencies()
+	}
+	c.count++
+	checkout := filepath.Join(c.stage, "git", fmt.Sprintf("%02d-%s", len(c.wheels)+1, req.name))
+	if err := os.MkdirAll(checkout, 0o700); err != nil {
+		return exit.Internalf("cannot stage %s: %s", source, err)
+	}
+	git := func(args ...string) (string, error) {
+		command := exec.CommandContext(c.ctx, "git", append([]string{"-C", checkout}, args...)...)
+		command.Env = config.Frozen().Tool("GIT_TERMINAL_PROMPT=0")
+		output, err := command.CombinedOutput()
+		return strings.TrimSpace(string(output)), err
+	}
+	for _, args := range [][]string{{"init", "--quiet"}, {"fetch", "--quiet", "--depth", "1", pin.url, pin.commit},
+		{"checkout", "--quiet", "--detach", "FETCH_HEAD"}} {
+		if output, err := git(args...); err != nil {
+			return exit.Named(exit.Validation, "project_dependency_git_unavailable",
+				"cannot fetch %s: %s", source, strings.Join(strings.Fields(output), " ")).
+				WithRemedy("check that git is installed and that the repository serves that commit")
+		}
+	}
+	// The commit's own time stamps the wheel, so the same commit builds the same bytes.
+	stamp, err := git("show", "--no-patch", "--format=%H %ct", "HEAD")
+	head, epoch, _ := strings.Cut(stamp, " ")
+	if err != nil || head != pin.commit {
+		return exit.Named(exit.Validation, "project_dependency_git_unavailable",
+			"%s did not fetch as commit %s", pin.url, pin.commit)
+	}
+	if c.python == "" {
+		selected, problem := hostruntime.ProjectPython(c.ctx, c.root)
+		if problem != nil {
+			return problem
+		}
+		c.python = selected.Executable
+	}
+	out := filepath.Join(c.stage, "dependencies", fmt.Sprintf("%02d-%s", len(c.wheels)+1, req.name))
+	built, problem := wheel.Build(wheel.Request{Context: c.ctx, Tree: checkout, OutDir: out, Python: c.python,
+		Env: []string{"SOURCE_DATE_EPOCH=" + epoch}})
+	if problem != nil {
+		return problem
+	}
+	// A published wheel filename is frozen per account. The build tag names these bytes, so
+	// the same commit rebuilt by a newer build backend is another file, never a conflict.
+	path := built.Path
+	if parts := strings.Split(filepath.Base(path), "-"); len(parts) == 5 {
+		digest, problem := dependencyDigest(path)
+		if problem != nil {
+			return problem
+		}
+		parts = append(parts[:2], append([]string{"0" + digest[len("sha256:"):][:12]}, parts[2:]...)...)
+		path = filepath.Join(out, strings.Join(parts, "-"))
+		if err := os.Rename(built.Path, path); err != nil {
+			return exit.Internalf("cannot name the wheel built from %s: %s", source, err)
+		}
+	}
+	identity, problem := wheel.InspectIdentity(path)
+	if problem != nil {
+		return problem
+	}
+	if identity.Distribution != req.name {
+		return exit.Named(exit.Validation, "local_dependency_identity_mismatch",
+			"requirement %s builds %s==%s", req.raw, identity.Distribution, identity.Version)
+	}
+	c.byName[req.name] = dependencyRecord{source: source, version: identity.Version}
+	return c.add(identity, path, false)
 }
 
 func (c *dependencyCollector) collectWheel(req requirement, source string) *exit.Error {
@@ -325,7 +457,7 @@ func (c *dependencyCollector) collectWheel(req requirement, source string) *exit
 	if c.scanOnly {
 		return nil
 	}
-	return c.add(identity, canonical)
+	return c.add(identity, canonical, true)
 }
 
 // LocalDependencyPaths uses the same resolver/closure validation as wheel building,
@@ -381,7 +513,9 @@ func LocalDependencySelections(root string, extras ...string) (map[string]LocalD
 	return out, nil
 }
 
-func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Error {
+// add carries one wheel. nudge names it in the publish note: a local project could be
+// published instead, a pinned third-party commit could not.
+func (c *dependencyCollector) add(identity wheel.Identity, path string, nudge bool) *exit.Error {
 	if len(c.wheels) >= MaxDependencyWheels {
 		return tooManyDependencies()
 	}
@@ -391,7 +525,9 @@ func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Er
 	}
 	c.total += identity.Length
 	c.wheels = append(c.wheels, DependencyWheel{Filename: identity.Filename, Path: path})
-	c.vendored = append(c.vendored, VendoredDependency{Name: identity.Distribution, Version: identity.Version})
+	if nudge {
+		c.vendored = append(c.vendored, VendoredDependency{Name: identity.Distribution, Version: identity.Version})
+	}
 	return nil
 }
 
@@ -530,8 +666,8 @@ func parseRequirement(raw string) (requirement, *exit.Error) {
 	if marker := strings.IndexByte(rest, ';'); marker >= 0 {
 		rest = strings.TrimSpace(rest[:marker])
 	}
-	if strings.HasPrefix(rest, "@") || rest == "" {
-		req.direct = strings.HasPrefix(rest, "@")
+	if reference, direct := strings.CutPrefix(rest, "@"); direct || rest == "" {
+		req.direct, req.reference = direct, strings.TrimSpace(reference)
 		return req, nil
 	}
 	if strings.HasPrefix(rest, "(") && strings.HasSuffix(rest, ")") {
@@ -630,8 +766,10 @@ func decodeLocalSource(name string, value any) (localSource, bool, *exit.Error) 
 	if hasWorkspace && workspace {
 		return localSource{workspace: true}, true, nil
 	}
-	if _, git := table["git"].(string); git {
-		return localSource{unsupported: "Git"}, true, nil
+	if repository, git := table["git"].(string); git {
+		commit, _ := table["rev"].(string)
+		pin, problem := pinnedGit(name, repository, commit)
+		return localSource{git: pin}, true, problem
 	}
 	if _, url := table["url"].(string); url {
 		return localSource{unsupported: "URL"}, true, nil
