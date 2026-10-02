@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -66,6 +68,7 @@ type Maintenance struct {
 	Machine string
 	Public  ed25519.PublicKey
 	Sign    func([]byte) []byte
+	Log     io.Writer // optional: says when an upload is sent again
 }
 
 // ReadSoftware observes a running agent without launching it or changing its receipt.
@@ -166,6 +169,39 @@ func NewestPublished(ctx context.Context, name string) (string, *exit.Error) {
 		return "", exit.New(exit.Unavailable, "the package index has no release of %s", name)
 	}
 	return project.Info.Version, nil
+}
+
+// Stage sends one wheel to the machine and returns the digest the machine kept. A starting
+// Runtime or a missing authority lease is waited out. A transport fault before the machine
+// acknowledged the wheel staged nothing: it is sent once more when the machine answers again.
+func (c *Maintenance) Stage(ctx context.Context, path, name string) (string, *exit.Error) {
+	for resent := false; ; {
+		file, err := os.Open(path)
+		if err != nil {
+			return "", exit.New(exit.NotFound, "cannot open update wheel %s: %s", name, err)
+		}
+		var staged struct {
+			SHA256 string `json:"sha256"`
+		}
+		_, problem := c.Do(ctx, http.MethodPut, "/v1/machine/runtime/wheels/"+name, file, &staged)
+		file.Close()
+		if problem == nil {
+			return staged.SHA256, nil
+		}
+		waits := problem.ErrName() == "machine.runtime_starting" || problem.ErrName() == AuthorityPending
+		if problem.Code != exit.Unavailable || !waits && resent {
+			return "", problem
+		}
+		if _, admission := c.AwaitUpdateAdmission(ctx); admission != nil {
+			return "", problem
+		}
+		if !waits {
+			resent = true
+			if c.Log != nil {
+				fmt.Fprintf(c.Log, "machine %s: sending %s again: %s\n", c.Machine, name, problem.Message)
+			}
+		}
+	}
 }
 
 // AuthorityPending names the agent's refusal of a control it never started: it holds no current

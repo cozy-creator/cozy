@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -44,7 +43,7 @@ func (u *rentalRuntimeUpdates) maintenance(identity *orchestrator.WorkerConnecti
 		return nil, exit.New(exit.Credential, "the rental's owner key is unreadable")
 	}
 	return &machineMaintenance{Base: "https://" + identity.Addr, Machine: identity.WorkerID, Public: public, Sign: key.Sign,
-		Client: &http.Client{Transport: &http.Transport{TLSClientConfig: pin.TLSConfig()}}}, nil
+		Client: &http.Client{Transport: &http.Transport{TLSClientConfig: pin.TLSConfig()}}, Log: u.machines.context.Out}, nil
 }
 
 // updatesItself says whether a rental's machine answers that it updates its own Runtime.
@@ -69,21 +68,14 @@ func (u *rentalRuntimeUpdates) updateNative(ctx context.Context, row *records.Ru
 	choose := func(key string, local *runtimeUpdateWheel, version string) *exit.Error {
 		switch {
 		case local != nil:
-			file, err := os.Open(local.Path)
-			if err != nil {
-				return exit.New(exit.NotFound, "the frozen update wheel is gone: %s", err)
-			}
-			defer file.Close()
-			var staged struct {
-				SHA256 string `json:"sha256"`
-			}
-			if _, problem := c.Do(ctx, http.MethodPut, "/v1/machine/runtime/wheels/"+local.Filename, file, &staged); problem != nil {
+			staged, problem := c.Stage(ctx, local.Path, local.Filename)
+			if problem != nil {
 				return problem
 			}
-			if "sha256:"+staged.SHA256 != local.Digest {
+			if "sha256:"+staged != local.Digest {
 				return exit.New(exit.Conflict, "the machine staged other bytes than %s", local.Filename)
 			}
-			body[key] = map[string]string{"file": local.Filename, "sha256": staged.SHA256}
+			body[key] = map[string]string{"file": local.Filename, "sha256": staged}
 		case version != "":
 			body[key] = map[string]string{"version": version}
 		}
