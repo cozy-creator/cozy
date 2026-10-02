@@ -44,7 +44,7 @@
 //! bare argv; a URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
 //! --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>
 //! --ca-file <pem> (a private hub's CA, trusted beside the webpki set).
-//! `--streams` is the most requests in flight (default 128, memory-bounded).
+//! `--streams` is the most requests in flight (default 512, memory-bounded).
 //! `tfs fetch` reads and backfills the Store's bound repo cache between the local Store
 //! and the origin. It is bound by `tfs store ensure --repo-cache` and never by a flag here.
 //!

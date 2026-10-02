@@ -43,7 +43,11 @@ use std::time::{Duration, Instant};
 pub const STREAMS: usize = 16;
 
 /// The most requests a pull keeps in flight, before the memory and descriptor bounds.
-pub const PULL_STREAMS: usize = 128;
+/// Measured on a pod: 8 MiB requests move the same 1.1-1.2 GB/s at 64, 128 and 256, so
+/// the link is not what more buys. A cold object answers each MiB in its own time, and
+/// 2 GiB of cold objects asked a MiB at a time was 90% home in 12.0 s at 128, 4.7 s at
+/// 512 and 3.2 s at 1,024.
+pub const PULL_STREAMS: usize = 512;
 
 /// How often a waiting stream SAMPLES — the runtime's one sampling cadence, shared with
 /// cozy-runtime `internal/liveness.py::SAMPLE_SECONDS`. Resolution, not a verdict: nothing
@@ -282,6 +286,7 @@ impl Ledger {
     pub fn moved(&self, bytes: u64) {
         self.advance(bytes);
         if let Some(attempt) = &self.attempt {
+            attempt.first.get_or_init(Instant::now);
             attempt.bytes.fetch_add(bytes, Ordering::Relaxed);
         }
     }
@@ -391,9 +396,11 @@ impl Default for Ledger {
     }
 }
 
-/// One request's own stop and byte count. Dropping a request never stops the pull.
+/// One request's own stop, when its first byte came, and its byte count. Dropping a
+/// request never stops the pull.
 #[derive(Default)]
 pub(super) struct Attempt {
     pub stopped: AtomicBool,
+    pub first: std::sync::OnceLock<Instant>,
     pub bytes: AtomicU64,
 }

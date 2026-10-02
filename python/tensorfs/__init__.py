@@ -259,7 +259,7 @@ def ensure(
     allowed_hosts: Sequence[str] = (),
     allow_local: bool = False,
     keep: Sequence[str] = (),
-    streams: int = 128,
+    streams: int = 512,
     streams_start: int = 16,
     sample_seconds: float | None = None,
     cancellation: PullCancellation | None = None,

@@ -1577,7 +1577,7 @@ fn a_silent_first_address_gives_way_to_the_next() {
 }
 
 #[test]
-fn a_slow_origin_is_asked_again_while_its_peers_move_and_then_left_alone() {
+fn a_slow_origin_is_given_longer_each_ask_and_then_left_alone() {
     let root = temporary("slow");
     let store = Store::init(&root).unwrap();
     let checkpoint = Arc::new(checkpoint(1, 6 * 1024));
@@ -1605,9 +1605,10 @@ fn a_slow_origin_is_asked_again_while_its_peers_move_and_then_left_alone() {
     request.sample_seconds = 0.1;
     let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 3);
-    // Silent for a sample while the other objects landed, it is asked once more; with no
-    // peer left to be slower than, the second ask is left to finish at the origin's pace.
-    assert!(origin.hits(&format!("/obj/{slow}")) <= 2);
+    // Its first byte takes 400 ms where its peers' took none. It is asked again with twice
+    // the wait each time until one ask is given long enough; its body, with no peer to be
+    // slower than, is then left to finish at the origin's pace.
+    assert!(origin.hits(&format!("/obj/{slow}")) <= 6);
     let _ = std::fs::remove_dir_all(root);
 }
 

@@ -188,14 +188,15 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
         hard >= 4096,
         "this proof needs a hard limit of at least 4096"
     );
-    let (declared, bodies) = objects(480);
+    // More objects a walk than requests in flight, so a connection has a second request.
+    let (declared, bodies) = objects(3 * 640);
     let origin = origin(bodies);
 
     // A Go parent hands its child the original soft limit. The pull raises it to the hard
     // limit and grows as far as the link rewards, with no descriptor error.
     set_limit(256, original.maximum);
     let before = tensorfs_core::descriptors::exhaustions();
-    let raised = walk(&origin, &declared[..160]);
+    let raised = walk(&origin, &declared[..640]);
     assert!(
         getrlimit(Resource::Nofile).current.unwrap() > 256,
         "the soft limit was not raised"
@@ -245,7 +246,7 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
         set_limit(hard, original.maximum);
         open
     });
-    let pressed = walk(&origin, &declared[160..320]);
+    let pressed = walk(&origin, &declared[640..1280]);
     done.store(true, Ordering::Relaxed);
     let open = squeeze.join().unwrap();
     println!("pressed (limit {open}-4 mid-walk): {pressed:?}");
@@ -259,7 +260,7 @@ fn a_low_descriptor_limit_bounds_the_walk_and_never_exhausts_it() {
     // table, so a transient EMFILE is possible and is absorbed as backpressure; the walk
     // never fails on one and never grows past the budget.
     set_limit(256, Some(256));
-    let bounded = walk(&origin, &declared[320..]);
+    let bounded = walk(&origin, &declared[1280..]);
     let budget = tensorfs_core::descriptors::streams_within(PULL_STREAMS);
     println!("raised: {raised:?}\nbounded to {budget}: {bounded:?}");
     assert!(

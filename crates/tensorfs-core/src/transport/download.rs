@@ -40,7 +40,8 @@ pub const CHUNK_BYTES: u64 = 8 << 20;
 /// asks side by side, and a chunk asked again whole would pay its slow MiBs in a row.
 const PIECE_BYTES: u64 = 1 << 20;
 
-/// Completed requests whose rates are the peers a running one is compared with.
+/// Completed first asks a running request is compared with: how long each waited for its
+/// first byte, and how fast its body then came.
 const PEERS: usize = 64;
 
 /// An object being downloaded: its temp file, and what is still out.
@@ -97,9 +98,10 @@ struct Flight {
     subject: String,
     range: (u64, u64),
     began: Instant,
-    /// Ticks a verdict is taken over, and when and with how many bytes the last one was.
-    grace: u32,
-    judged: Instant,
+    /// How many times its peers' wait this request gets for its first byte.
+    patience: u32,
+    /// When its body was last judged, and with how many bytes.
+    judged: Option<Instant>,
     seen: u64,
 }
 
@@ -136,8 +138,10 @@ struct State {
     again: VecDeque<usize>,
     /// Workers holding a chunk or opening an object.
     busy: usize,
-    /// Rates of the last requests that came home with a chunk's worth of bytes.
-    peers: VecDeque<f64>,
+    /// The last first asks that came home: seconds to their first byte, and the body rate
+    /// of those that carried a piece's worth of bytes.
+    waits: VecDeque<f64>,
+    rates: VecDeque<f64>,
     /// The last refusal a retry answered, quoted if the pull stops moving.
     last: Option<Refusal>,
     failure: Option<Refusal>,
@@ -473,9 +477,8 @@ impl Run<'_> {
             subject: decisions::object(wanted),
             range: asked,
             began,
-            // Two ticks, so the time to a first byte is not read as a slow body.
-            grace: 2 << chunk.silent.min(6),
-            judged: began,
+            patience: 1 << chunk.silent.min(6),
+            judged: None,
             seen: 0,
         });
         self.requests.fetch_add(1, Ordering::Relaxed);
@@ -485,13 +488,14 @@ impl Run<'_> {
         let moved = chunk.first.saturating_sub(asked.0);
         let (refusal, stated) = match ended {
             Ok(()) => {
-                if chunk.fresh && moved >= PIECE_BYTES {
-                    let rate = moved as f64 / began.elapsed().as_secs_f64().max(1e-6);
+                if let (true, Some(first)) = (chunk.fresh, attempt.first.get()) {
+                    let wait = first.duration_since(began).as_secs_f64();
+                    let body = first.elapsed().as_secs_f64().max(1e-6);
                     let mut state = self.state.lock().unwrap();
-                    if state.peers.len() == PEERS {
-                        state.peers.pop_front();
+                    remember(&mut state.waits, wait);
+                    if moved >= PIECE_BYTES {
+                        remember(&mut state.rates, moved as f64 / body);
                     }
-                    state.peers.push_back(rate);
                 }
                 if object.left.fetch_sub(1, Ordering::AcqRel) > 1 {
                     return Outcome::Home;
@@ -709,9 +713,9 @@ impl Run<'_> {
         Outcome::Home
     }
 
-    /// The one rule, five times a sample: a request moving bytes far slower than the first
-    /// asks that came home, or none at all, is dropped. And the pull's own end: nothing new
-    /// has landed for twice its measured patience.
+    /// The one rule, five times a sample: a request that has waited far longer for its first
+    /// byte than its peers did, or whose body runs far slower than theirs, is dropped. And
+    /// the pull's own end: nothing new has landed for twice its measured patience.
     fn watch(&self) {
         let job = self.job;
         let sample = self.tick();
@@ -735,9 +739,7 @@ impl Run<'_> {
                 self.wake.notify_all();
                 return;
             }
-            let mut peers: Vec<f64> = state.peers.iter().copied().collect();
-            peers.sort_by(f64::total_cmp);
-            let typical = peers.get(peers.len() / 2).copied().unwrap_or(0.0);
+            let (wait, typical) = (median(&state.waits), median(&state.rates));
             let mut flying = false;
             for flight in &self.flights {
                 let mut flight = flight.lock().unwrap();
@@ -745,16 +747,31 @@ impl Run<'_> {
                     continue;
                 };
                 flying = true;
-                let window = flight.judged.elapsed();
-                if window < sample * flight.grace {
-                    continue;
-                }
                 let bytes = flight.attempt.bytes.load(Ordering::Relaxed);
-                let rate = (bytes - flight.seen) as f64 / window.as_secs_f64();
-                (flight.judged, flight.seen) = (Instant::now(), bytes);
-                if rate * STALL_FACTOR >= typical {
+                let waited = flight.began.elapsed().as_secs_f64();
+                let slow = match flight.attempt.first.get() {
+                    // No byte yet, after far longer than its peers waited for theirs, and
+                    // never sooner than the two ticks a body is judged over.
+                    None => {
+                        let allowed = (wait * STALL_FACTOR).max(sample.as_secs_f64() * 2.0);
+                        (wait > 0.0 && waited > allowed * flight.patience as f64).then_some(0.0)
+                    }
+                    // A body judged over two ticks, from its first byte.
+                    Some(first) => {
+                        let since = *flight.judged.get_or_insert(*first);
+                        let window = since.elapsed();
+                        (window >= sample * 2)
+                            .then(|| {
+                                let rate = (bytes - flight.seen) as f64 / window.as_secs_f64();
+                                (flight.judged, flight.seen) = (Some(Instant::now()), bytes);
+                                rate
+                            })
+                            .filter(|rate| rate * STALL_FACTOR < typical)
+                    }
+                };
+                let Some(rate) = slow else {
                     continue;
-                }
+                };
                 flight.attempt.stopped.store(true, Ordering::Release);
                 self.restarts.fetch_add(1, Ordering::Relaxed);
                 decisions::record(
@@ -763,10 +780,9 @@ impl Run<'_> {
                     &flight.subject,
                     &format!(
                         "bytes={}-{} got={bytes} rate_bps={rate:.0} peers_bps={typical:.0} \
-                         after_s={:.1}",
+                         peers_wait_s={wait:.2} after_s={waited:.1}",
                         flight.range.0,
                         flight.range.1 - 1,
-                        flight.began.elapsed().as_secs_f64()
                     ),
                 );
             }
@@ -854,6 +870,20 @@ impl Read for Verifying<'_> {
         self.at += read as u64;
         Ok(read)
     }
+}
+
+fn remember(peers: &mut VecDeque<f64>, value: f64) {
+    if peers.len() == PEERS {
+        peers.pop_front();
+    }
+    peers.push_back(value);
+}
+
+/// The middle of what the last peers showed; zero with none to compare with.
+fn median(peers: &VecDeque<f64>) -> f64 {
+    let mut sorted: Vec<f64> = peers.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0.0)
 }
 
 fn named(refusal: Refusal, id: &str) -> Refusal {
