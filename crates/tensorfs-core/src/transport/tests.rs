@@ -1527,7 +1527,8 @@ fn fragmented_headers_can_progress_across_multiple_stream_windows() {
 
 /// A first address that never completes the TCP handshake (an IPv6 route that drops SYNs
 /// while IPv4 works; here a listener whose accept queue is full, so the kernel drops every
-/// SYN) is that address's verdict, not the URL's: the next checked address is asked.
+/// SYN) is that address's verdict, not the URL's: the next checked address is asked a tick
+/// later, not after the silent one's whole patience.
 #[test]
 fn a_silent_first_address_gives_way_to_the_next() {
     let hole = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1553,7 +1554,7 @@ fn a_silent_first_address_gives_way_to_the_next() {
         target: "/object".into(),
         addrs: vec![hole.local_addr().unwrap(), live_addr],
     };
-    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let ledger = Ledger::with_resolution(Duration::from_millis(250));
     let started = std::time::Instant::now();
     let response = super::http::request(
         &super::http::Client::new(),
@@ -1569,9 +1570,11 @@ fn a_silent_first_address_gives_way_to_the_next() {
     )
     .unwrap();
     assert_eq!(response.read_capped(3).unwrap(), b"abc");
+    let took = started.elapsed();
+    assert!(took >= ledger.tick(), "the silent address was never tried");
     assert!(
-        started.elapsed() > ledger.floor(),
-        "the silent address was never tried"
+        took < ledger.floor(),
+        "the silent address held the live one {took:?}"
     );
     drop(filled);
 }

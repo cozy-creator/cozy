@@ -47,8 +47,10 @@ pub const CHUNK_BYTES: u64 = 8 << 20;
 /// redirect again (0.41 s against HuggingFace, and its resolve endpoint is rate-limited).
 pub const PART_BYTES: u64 = 64 << 20;
 
-/// What a dropped request's unfinished range is cut into: a slow object answers small
-/// asks side by side, and a chunk asked again whole would pay its slow MiBs in a row.
+/// A dropped request's unfinished range is cut into pieces, an eighth of a chunk each and
+/// never under this: a slow object answers small asks side by side, and a chunk asked again
+/// whole would pay its slow MiBs in a row. Also the least a request must carry for its body
+/// rate to be compared with its peers'.
 const PIECE_BYTES: u64 = 1 << 20;
 
 /// Completed first asks a running request is compared with: how long each waited for its
@@ -593,8 +595,9 @@ impl Run<'_> {
         self.state.lock().unwrap().last = Some(named(refusal, &wanted.id()));
         // A dropped request's unfinished range goes back as pieces, asked side by side.
         let mut again = Vec::new();
-        while dropped && !chunk.lead && chunk.end - chunk.first > PIECE_BYTES {
-            let end = chunk.first + PIECE_BYTES;
+        let piece = (job.chunk / 8).max(PIECE_BYTES);
+        while dropped && !chunk.lead && chunk.end - chunk.first > piece {
+            let end = chunk.first + piece;
             object.left.fetch_add(1, Ordering::AcqRel);
             again.push(Chunk {
                 object: Arc::clone(&object),

@@ -494,6 +494,10 @@ fn nonblocking_socket(
     Ok(socket)
 }
 
+/// One TCP connection to the first checked address that answers. Another address is
+/// started whenever the newest has been silent for a tick, families alternating, and the
+/// first handshake to complete wins (RFC 8305): an IPv6 route that drops SYNs while IPv4
+/// answers costs a tick, not its patience times every address ahead of the one that works.
 fn connect(
     checked: &CheckedUrl,
     deadline: Deadline,
@@ -503,72 +507,7 @@ fn connect(
 ) -> Result<TcpStream> {
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
     use rustix::net::{self, AddressFamily};
-    let mut last: Option<std::io::Error> = None;
-    'addresses: for addr in &checked.addrs {
-        ledger.check_running()?;
-        let family = if addr.is_ipv4() {
-            AddressFamily::INET
-        } else {
-            AddressFamily::INET6
-        };
-        let socket = match nonblocking_socket(family) {
-            Ok(socket) => socket,
-            Err(error) => {
-                let error: std::io::Error = error.into();
-                if crate::descriptors::exhausted(&error) {
-                    // Another address needs another descriptor it will not get either.
-                    return refuse(
-                        Code::FD_HEADROOM,
-                        format!("{}: no descriptor for a socket ({error})", checked.host),
-                    );
-                }
-                last = Some(error);
-                continue;
-            }
-        };
-        let since = Instant::now();
-        match net::connect(&socket, addr) {
-            Ok(()) => {}
-            Err(rustix::io::Errno::INPROGRESS) => loop {
-                // Poll one pending connection instead of restarting it at each
-                // sample. Cancellation and existing silence rules remain active
-                // without imposing a new total connection deadline.
-                transfer_verdict(judge, ledger, since, "a TCP connection")?;
-                // A silent address is that address's verdict, not the URL's: an IPv6 route
-                // that drops SYNs while IPv4 answers must not stall every ask of a pull.
-                if let Err(silent) = handshake_verdict(judge, ledger, since, "TCP connect", fail) {
-                    ledger.check_running()?;
-                    last = Some(std::io::Error::new(ErrorKind::TimedOut, silent.detail));
-                    continue 'addresses;
-                }
-                let tick = deadline
-                    .remaining()?
-                    .map_or(ledger.tick(), |left| left.min(ledger.tick()));
-                let timeout = Timespec {
-                    tv_sec: tick.as_secs() as _,
-                    tv_nsec: tick.subsec_nanos() as _,
-                };
-                let mut descriptors = [PollFd::new(&socket, PollFlags::OUT)];
-                match poll(&mut descriptors, Some(&timeout)) {
-                    Ok(0) | Err(rustix::io::Errno::INTR) => continue,
-                    Ok(_) => match net::sockopt::socket_error(&socket) {
-                        Ok(Ok(())) => break,
-                        Ok(Err(error)) | Err(error) => {
-                            last = Some(error.into());
-                            continue 'addresses;
-                        }
-                    },
-                    Err(error) => {
-                        last = Some(error.into());
-                        continue 'addresses;
-                    }
-                }
-            },
-            Err(error) => {
-                last = Some(error.into());
-                continue;
-            }
-        }
+    let connected = |socket: std::os::fd::OwnedFd| -> Result<TcpStream> {
         let socket: TcpStream = socket.into();
         socket.set_nonblocking(false).map_err(|error| Refusal {
             code: fail,
@@ -576,16 +515,102 @@ fn connect(
         })?;
         let _ = socket.set_nodelay(true);
         keepalive(&socket, ledger);
-        return Ok(socket);
+        Ok(socket)
+    };
+    let first = checked.addrs.first().is_some_and(|addr| addr.is_ipv4());
+    let (mut family, mut other) = (
+        checked.addrs.iter().filter(|addr| addr.is_ipv4() == first),
+        checked.addrs.iter().filter(|addr| addr.is_ipv4() != first),
+    );
+    let mut addrs = std::iter::from_fn(|| Some([family.next(), other.next()]))
+        .take_while(|pair| pair.iter().any(Option::is_some))
+        .flatten()
+        .flatten();
+    let mut pending: Vec<(std::os::fd::OwnedFd, Instant)> = Vec::new();
+    let mut last: Option<std::io::Error> = None;
+    loop {
+        ledger.check_running()?;
+        let quiet = pending
+            .last()
+            .is_none_or(|(_, since)| since.elapsed() >= ledger.tick());
+        if let Some(addr) = quiet.then(|| addrs.next()).flatten() {
+            let family = match addr.is_ipv4() {
+                true => AddressFamily::INET,
+                false => AddressFamily::INET6,
+            };
+            let socket = match nonblocking_socket(family) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    let error: std::io::Error = error.into();
+                    if crate::descriptors::exhausted(&error) {
+                        // Another address needs another descriptor it will not get either.
+                        return refuse(
+                            Code::FD_HEADROOM,
+                            format!("{}: no descriptor for a socket ({error})", checked.host),
+                        );
+                    }
+                    last = Some(error);
+                    continue;
+                }
+            };
+            match net::connect(&socket, addr) {
+                Ok(()) => return connected(socket),
+                Err(rustix::io::Errno::INPROGRESS) => pending.push((socket, Instant::now())),
+                Err(error) => last = Some(error.into()),
+            }
+            continue;
+        }
+        let Some(oldest) = pending.first().map(|(_, since)| *since) else {
+            return refuse(
+                fail,
+                format!(
+                    "{}: no checked address accepted a connection ({})",
+                    checked.host,
+                    last.map(|error| error.to_string()).unwrap_or_default()
+                ),
+            );
+        };
+        // Cancellation and the silence rules stay active without a total connect deadline.
+        transfer_verdict(judge, ledger, oldest, "a TCP connection")?;
+        // A silent address is that address's verdict, not the URL's.
+        if let Err(silent) = handshake_verdict(judge, ledger, oldest, "TCP connect", fail) {
+            ledger.check_running()?;
+            last = Some(std::io::Error::new(ErrorKind::TimedOut, silent.detail));
+            pending.remove(0);
+            continue;
+        }
+        let tick = deadline
+            .remaining()?
+            .map_or(ledger.tick(), |left| left.min(ledger.tick()));
+        let timeout = Timespec {
+            tv_sec: tick.as_secs() as _,
+            tv_nsec: tick.subsec_nanos() as _,
+        };
+        let mut waiting: Vec<PollFd<'_>> = pending
+            .iter()
+            .map(|(socket, _)| PollFd::new(socket, PollFlags::OUT))
+            .collect();
+        let ready: Vec<bool> = match poll(&mut waiting, Some(&timeout)) {
+            Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+            Ok(_) => waiting.iter().map(|fd| !fd.revents().is_empty()).collect(),
+            Err(error) => {
+                return refuse(fail, format!("{}: poll: {error}", checked.host));
+            }
+        };
+        drop(waiting);
+        let mut at = 0;
+        for ready in ready {
+            if !ready {
+                at += 1;
+                continue;
+            }
+            let (socket, _) = pending.remove(at);
+            match net::sockopt::socket_error(&socket) {
+                Ok(Ok(())) => return connected(socket),
+                Ok(Err(error)) | Err(error) => last = Some(error.into()),
+            }
+        }
     }
-    refuse(
-        fail,
-        format!(
-            "{}: no checked address accepted a connection ({})",
-            checked.host,
-            last.map(|error| error.to_string()).unwrap_or_default()
-        ),
-    )
 }
 
 /// TCP keepalive at the ledger's own resolution: probes start after the noise floor of
