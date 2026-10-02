@@ -7,6 +7,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // quantizedLanes are the lanes `cozy model quantize` can ask a package for, one flag each.
@@ -58,9 +59,38 @@ func handleModelQuantize(ctx *Context) *exit.Error {
 		reclaimSnapshot(ctx, target)
 		return noQuantizer(lane, "%s %s has no %s quantizer", target.Package, target.Release, lane)
 	}
+	source := ref.String() + "#" + checkpoint
+	if problem := holdCheckpoint(ctx, source); problem != nil {
+		reclaimSnapshot(ctx, target)
+		return problem
+	}
 	target.Function = job.Name
-	ctx.Inv.Args = []string{target.Package + "/" + job.Name, ref.String() + "#" + checkpoint, destination}
+	ctx.Inv.Args = []string{target.Package + "/" + job.Name, source, destination}
 	return runTarget(ctx, target, surface)
+}
+
+// holdCheckpoint has the machine a run names hold the checkpoint first: the request `cozy
+// model download <checkpoint> [--rental]` makes, which moves no byte the machine already has.
+// Runtime before 0.18.102 refuses a run naming a checkpoint whose bytes it holds without its
+// repository, as the pod that uploaded it does. A run that buys its machine fetches it itself.
+func holdCheckpoint(ctx *Context, source string) *exit.Error {
+	machine, known, problem := knownMachine(ctx)
+	if problem != nil || !known {
+		return problem
+	}
+	model, problem := resolveRemoteModel(ctx, "", launch.Slot{}, source, "", nil)
+	if problem != nil {
+		return problem
+	}
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	install, problem := client.PrepareRentalPackage(machine, records.RentalInstallSelection{Models: []records.ModelRef{model}})
+	if problem != nil {
+		return problem
+	}
+	return watchRentalInstall(ctx, client, either(ctx.Inv.Value("--rental"), machine), install)
 }
 
 // quantizer is the package's job that writes `lane`: a model input and one weights output

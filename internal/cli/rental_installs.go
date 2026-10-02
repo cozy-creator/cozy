@@ -61,7 +61,16 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 // what the machine reports. Interrupting stops only the watch; the installation goes on.
 func awaitRentalInstall(ctx *Context, client *localapi.Client, machine string, install records.RentalInstall) *exit.Error {
 	began := time.Now()
-	lastStage, shownAt, shownBytes := "", began, uint64(0)
+	if problem := watchRentalInstall(ctx, client, machine, install); problem != nil {
+		return problem
+	}
+	fields := []output.Field{{K: "id", V: install.ID}, {K: "rental", V: install.RentalID}, {K: "status", V: "succeeded"},
+		{K: "target", V: rentalInstallTarget(install.Selection)}, {K: "elapsed", V: time.Since(began).Round(time.Second).String()}}
+	return emit(ctx, compactRecord(fields, "id", "rental", "status", "target", "elapsed"))
+}
+
+func watchRentalInstall(ctx *Context, client *localapi.Client, machine string, install records.RentalInstall) *exit.Error {
+	lastStage, shownAt, shownBytes := "", time.Now(), uint64(0)
 	for {
 		status, problem := client.RentalInstall(install.RentalID, install.ID)
 		if problem != nil {
@@ -69,9 +78,7 @@ func awaitRentalInstall(ctx *Context, client *localapi.Client, machine string, i
 		}
 		switch status.State {
 		case "succeeded":
-			fields := []output.Field{{K: "id", V: status.ID}, {K: "rental", V: status.RentalID}, {K: "status", V: status.State},
-				{K: "target", V: rentalInstallTarget(status.Selection)}, {K: "elapsed", V: time.Since(began).Round(time.Second).String()}}
-			return emit(ctx, compactRecord(fields, "id", "rental", "status", "target", "elapsed"))
+			return nil
 		case "failed":
 			return exit.Named(exit.Failed, either(status.ErrorCode, "rental_install.failed"), "%s: %s", machine, status.Error)
 		}
