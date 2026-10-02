@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -606,6 +607,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if code == exit.OK {
 		if hint := modelPublishHint(state); hint != "" {
 			rec.Next = []string{hint}
+			if quantize := modelQuantizeHint(ctx, state); quantize != "" {
+				rec.Next = append(rec.Next, quantize)
+			}
 		} else if len(state.RetainedOutputs) > 0 {
 			rec.Next = []string{"cozy run upload " + runReference(state.Number, state.JobID) + "#" + state.RetainedOutputs[0].Output + " <org/model> --await"}
 		} else if len(state.NativeOutputs) > 0 {
@@ -704,6 +708,25 @@ func modelPublishHint(state api.JobState) string {
 		command += " --lane " + name + "=" + state.ModelOutputs[name]
 	}
 	return command
+}
+
+// modelQuantizeHint follows one new checkpoint that is not itself a quantized lane with the
+// verb that writes one, on the rental the command named.
+func modelQuantizeHint(ctx *Context, state api.JobState) string {
+	if len(state.ModelOutputs) != 1 {
+		return ""
+	}
+	for name, checkpoint := range state.ModelOutputs {
+		if slices.Contains(quantizedLanes, name) {
+			return ""
+		}
+		command := "cozy model quantize " + state.ModelDestination + "#" + checkpoint + " --" + quantizedLanes[0]
+		if rental := ctx.Inv.Value("--rental"); rental != "" {
+			command += " --rental=" + rental
+		}
+		return command + " --await"
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------- job cancel

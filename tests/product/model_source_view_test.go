@@ -159,4 +159,14 @@ func TestCompletedSourcePublicationSuppressesStalePendingRows(t *testing.T) {
 	if row.State == "succeeded" {
 		t.Fatal("fixture accidentally depended on parent success")
 	}
+	// The settled upload names both next steps for its new checkpoint: publish it, or quantize it.
+	fatal(t, store.SettleRequest(id, "succeeded"))
+	fatal(t, store.AppendEvent(id, "run.completed", ordinal, nil))
+	code, out := runCozy(t, root, "run", "watch", id, "--json")
+	for _, next := range []string{"cozy model publish paul/minimax-h3 --release <label> --lane adapter=" + childDigest("d"),
+		"cozy model quantize paul/minimax-h3#" + childDigest("d") + " --fp8 --await"} {
+		if code != 0 || !strings.Contains(out, next) {
+			t.Fatalf("the settled upload does not name %q [exit %d]\n%s", next, code, out)
+		}
+	}
 }
