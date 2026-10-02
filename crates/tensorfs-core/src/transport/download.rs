@@ -138,10 +138,11 @@ struct State {
     again: VecDeque<usize>,
     /// Workers holding a chunk or opening an object.
     busy: usize,
-    /// The last first asks that came home: seconds to their first byte, and the body rate
-    /// of those that carried a piece's worth of bytes.
+    /// The last first asks that came home. Those that carried a piece's worth of bytes:
+    /// seconds to their first byte, and their body's rate. The smaller ones: seconds in all.
     waits: VecDeque<f64>,
     rates: VecDeque<f64>,
+    small: VecDeque<f64>,
     /// The last refusal a retry answered, quoted if the pull stops moving.
     last: Option<Refusal>,
     failure: Option<Refusal>,
@@ -492,9 +493,11 @@ impl Run<'_> {
                     let wait = first.duration_since(began).as_secs_f64();
                     let body = first.elapsed().as_secs_f64().max(1e-6);
                     let mut state = self.state.lock().unwrap();
-                    remember(&mut state.waits, wait);
                     if moved >= PIECE_BYTES {
+                        remember(&mut state.waits, wait);
                         remember(&mut state.rates, moved as f64 / body);
+                    } else {
+                        remember(&mut state.small, wait + body);
                     }
                 }
                 if object.left.fetch_sub(1, Ordering::AcqRel) > 1 {
@@ -740,6 +743,8 @@ impl Run<'_> {
                 return;
             }
             let (wait, typical) = (median(&state.waits), median(&state.rates));
+            let small = median(&state.small);
+            let floor = sample.as_secs_f64() * 2.0;
             let mut flying = false;
             for flight in &self.flights {
                 let mut flight = flight.lock().unwrap();
@@ -749,12 +754,18 @@ impl Run<'_> {
                 flying = true;
                 let bytes = flight.attempt.bytes.load(Ordering::Relaxed);
                 let waited = flight.began.elapsed().as_secs_f64();
+                let patience = flight.patience as f64;
                 let slow = match flight.attempt.first.get() {
-                    // No byte yet, after far longer than its peers waited for theirs, and
-                    // never sooner than the two ticks a body is judged over.
+                    // Less than a piece to fetch, and far longer at it than its small peers
+                    // took in all. Never sooner than the two ticks a body is judged over.
+                    _ if flight.range.1 - flight.range.0 < PIECE_BYTES && small > 0.0 => {
+                        let allowed = (small * STALL_FACTOR).max(floor) * patience;
+                        (waited > allowed).then_some(bytes as f64 / waited)
+                    }
+                    // No byte yet, after far longer than its peers waited for theirs.
                     None => {
-                        let allowed = (wait * STALL_FACTOR).max(sample.as_secs_f64() * 2.0);
-                        (wait > 0.0 && waited > allowed * flight.patience as f64).then_some(0.0)
+                        let allowed = (wait * STALL_FACTOR).max(floor) * patience;
+                        (wait > 0.0 && waited > allowed).then_some(0.0)
                     }
                     // A body judged over two ticks, from its first byte.
                     Some(first) => {
@@ -780,7 +791,7 @@ impl Run<'_> {
                     &flight.subject,
                     &format!(
                         "bytes={}-{} got={bytes} rate_bps={rate:.0} peers_bps={typical:.0} \
-                         peers_wait_s={wait:.2} after_s={waited:.1}",
+                         peers_wait_s={wait:.2} peers_small_s={small:.2} after_s={waited:.1}",
                         flight.range.0,
                         flight.range.1 - 1,
                     ),
