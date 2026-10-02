@@ -2,12 +2,11 @@ package machines
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
-	"net/http"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
+	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -48,51 +47,19 @@ func (r *Resolver) dialEndpointAt(ctx context.Context, ep machineendpoint.Endpoi
 	}
 	m.Seen.Workspace.Store(workspace)
 	if origin != "" {
-		if r.Hub == nil || r.Hub(origin) == nil {
-			m.Close()
-			return nil, exit.Named(exit.Credential, "machine.execution_access_required", "explicit endpoint has no authenticated client for its selected Hub")
+		var account *hub.Client
+		if r.Hub != nil {
+			account = r.Hub(origin)
 		}
-		account := r.Hub(origin)
-		identity := account.CredentialIdentity()
-		if identity == "" {
-			m.Close()
-			return nil, exit.Named(exit.Credential, "machine.execution_access_required", "explicit endpoint catalog use requires the current Hub login")
-		}
-		access, problem := account.AuthorizeExecutionAccess(ctx, pin.DER())
+		cache := r.Host.endpointCache(ep.Name())
+		target := accessTarget{addr: ep.Address, worker: ep.WorkerID, leaf: pin.DER(),
+			pin:   func() (*workertls.Pin, *exit.Error) { return pin, nil },
+			owner: func() (rental.CreatorIdentity, *exit.Error) { return key, nil }}
+		resumeAccessCleanup(ctx, cache, target)
+		reads, problem := attachAccess(ctx, cache, target, origin, account)
 		if problem != nil {
 			m.Close()
 			return nil, problem
-		}
-		if !deviceBoundAccess(access.Token) {
-			m.Close()
-			return nil, exit.Named(exit.Credential, "hub.execution_access_device_key_required", "Tensorhub execution access must be bound to the current login device")
-		}
-		reads := machineOrigin(origin, access.Environment["TENSORHUB_ORIGIN"])
-		access.Environment["TENSORHUB_ORIGIN"] = reads
-		body := map[string]any{"origin": reads, "token": access.Token, "expires_at": access.ExpiresAt.Unix(), "environment": access.Environment}
-		if len(access.TrustRoot) > 0 {
-			body["ca_der_b64url"] = base64.RawURLEncoding.EncodeToString(access.TrustRoot)
-		}
-		code, raw, problem := signedMachineAccess(ctx, ep.Address, ep.WorkerID, pin, key, http.MethodPost, body)
-		if problem != nil {
-			m.Close()
-			return nil, problem
-		}
-		if code/100 != 2 {
-			m.Close()
-			return nil, exit.Named(exit.Credential, "machine.execution_access_refused", "explicit machine refused scoped access (HTTP %d)", code)
-		}
-		var acknowledged struct {
-			Origin  string `json:"origin"`
-			Expires int64  `json:"expires_at"`
-		}
-		if json.Unmarshal(raw, &acknowledged) != nil || acknowledged.Origin != reads || acknowledged.Expires != access.ExpiresAt.Unix() {
-			m.Close()
-			return nil, exit.New(exit.Conflict, "explicit endpoint did not acknowledge selected catalog scope")
-		}
-		if account.CredentialIdentity() != identity {
-			m.Close()
-			return nil, exit.Named(exit.Credential, "machine.execution_account_changed", "Hub login changed while endpoint access was authorized")
 		}
 		m.Hub, m.hub = reads, account
 	}

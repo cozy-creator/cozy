@@ -37,8 +37,13 @@ bound to an obsolete boot is refused rather than silently replaced. Refreshing a
 recorded selector across boot/address changes is a remaining operation, not an
 automatic target substitution.
 
-The qualified path is a captured, frozen-lock CPU application, including typed
-inputs, native file outputs, idempotent replay, numeric observation and cancellation.
-Published Hub packages, jobs, GPU execution through this API, browser selection and
-boot refresh are separate qualification gates. The explicit selector flag is not a
-claim that the chosen machine implements those operations.
+Published packages and catalog models need the signed-in account's execution access
+at the selected Hub. The CLI asks Tensorhub for access bound to the endpoint's pinned
+leaf and the login device, and hands it to the machine with an owner-signed
+`POST /v1/hubs/access`, exactly as for this computer's machine. The grant is cached
+per endpoint (`machine/endpoints/<name>/`) and reused until the login, leaf or reset
+generation changes or it nears expiry, so a run does not contact Tensorhub. Logout
+erases every endpoint's grant and queues its removal for the next connection.
+
+The explicit selector flag is not a claim that the chosen machine implements every
+operation; jobs, browser selection and boot refresh remain separate gates.
