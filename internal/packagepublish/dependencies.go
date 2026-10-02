@@ -396,7 +396,7 @@ func (c *dependencyCollector) collectGit(req requirement, pin gitPin) *exit.Erro
 	}
 	out := filepath.Join(c.stage, "dependencies", fmt.Sprintf("%02d-%s", len(c.wheels)+1, req.name))
 	built, problem := wheel.Build(wheel.Request{Context: c.ctx, Tree: checkout, OutDir: out, Python: c.python,
-		Env: []string{"SOURCE_DATE_EPOCH=" + epoch}})
+		SourceDateEpoch: epoch})
 	if problem != nil {
 		return problem
 	}
