@@ -101,6 +101,33 @@ func TestAcceptedMachineUpdateObservationSurvivesApplicationHandoff(t *testing.T
 		t.Fatalf("accepted operation lost through handoff: calls=%d state=%+v problem=%v", calls.Load(), state, problem)
 	}
 }
+
+// An agent with no current authority lease from its Hub (just booted, or its Hub out of reach)
+// refuses controls it never started: 503 rental_authority_unavailable. Admission waits for the
+// lease the agent keeps asking for; a Hub denial ends the wait.
+func TestMachineAdmissionWaitsForTheRentalAuthorityLease(t *testing.T) {
+	client, calls := updateObservationPeer(t, func(w http.ResponseWriter, _ *http.Request, n int32) {
+		if n < 3 {
+			http.Error(w, "rental_authority_unavailable: current rental authority could not be verified", http.StatusServiceUnavailable)
+			return
+		}
+		updateObservationState(w, "", "")
+	})
+	if _, problem := client.State(t.Context()); problem == nil || problem.ErrName() != machines.AuthorityPending || problem.Code != exit.Unavailable {
+		t.Fatalf("a missing lease is not named as a control that never started: %v", problem)
+	}
+	state, problem := client.AwaitUpdateAdmission(t.Context())
+	if problem != nil || state == nil || state.Phase != "ready" || calls.Load() != 3 {
+		t.Fatalf("admission did not wait for the lease: calls=%d state=%+v problem=%v", calls.Load(), state, problem)
+	}
+	denied, calls := updateObservationPeer(t, func(w http.ResponseWriter, _ *http.Request, _ int32) {
+		http.Error(w, "rental_authority_unavailable: the Hub denied rental authority", http.StatusServiceUnavailable)
+	})
+	if _, problem := denied.AwaitUpdateAdmission(t.Context()); problem == nil || problem.Code == exit.Unavailable || calls.Load() != 1 {
+		t.Fatalf("a Hub denial was waited on: calls=%d problem=%v", calls.Load(), problem)
+	}
+}
+
 func TestAcceptedMachineUpdateObservationKeepsTerminalFailure(t *testing.T) {
 	for _, terminal := range []string{"rolled_back", "failed"} {
 		t.Run(terminal, func(t *testing.T) {
