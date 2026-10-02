@@ -526,7 +526,7 @@ impl CredentialProvider for CloseRequests {
 }
 
 #[test]
-fn retained_source_redirect_ranges_reduce_connections_without_changing_asks_or_bytes() {
+fn source_chunks_ask_the_redirect_target_on_one_connection() {
     use crate::{
         ids::ObjectRef,
         providers::{self, Provenance, Resolution, ResolvedMember},
@@ -608,15 +608,15 @@ fn retained_source_redirect_ranges_reduce_connections_without_changing_asks_or_b
         let elapsed = start.elapsed();
         assert_eq!(rows[0].transferred, bytes.len() as u64);
         assert!(store.record_valid(&object.sha256).is_ok());
-        // One ask walks the redirect, one GET carries all eight checkpoints of the run,
-        // and the drained redirect's socket serves the delivery hop.
-        assert_eq!(origin.asks.lock().unwrap().len(), 2);
-        assert_eq!(origin.count(), if close { 2 } else { 1 });
+        // One ask walks the redirect and the eight 1 MiB chunks ask its target directly,
+        // all on the drained redirect's socket unless each ask closes its own.
+        assert_eq!(origin.asks.lock().unwrap().len(), 9);
+        assert_eq!(origin.count(), if close { 9 } else { 1 });
         timings.push((close, elapsed.as_secs_f64(), origin.count()));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
-    println!("retained source 8MiB, one redirected ask, eight 1MiB checkpoints, 30ms connection setup: {timings:?}");
+    println!("source 8 MiB, one redirect, eight 1 MiB chunks, 30 ms connection setup: {timings:?}");
 }
 
 #[test]

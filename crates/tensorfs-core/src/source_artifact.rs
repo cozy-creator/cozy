@@ -425,7 +425,7 @@ pub fn release(store: &Store, owner: &str) -> Result<()> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(e)),
         _ => {}
     }
-    crate::transport::prefix::discard_owner(store, owner)
+    crate::transport::sources::discard_owner(store, owner)
 }
 
 /// Mark a retained tree delivered: its bytes may now be evicted under disk pressure, oldest
@@ -546,7 +546,9 @@ pub fn adopt_partial(store: &Store, source: &str, owner: &str) -> Result<TreeRoo
             recipient.landed(&object)?;
         }
     }
-    crate::transport::prefix::adopt_owner(store, source, owner, |object| recipient.landed(object))?;
+    crate::transport::sources::adopt_owner(store, source, owner, |object| {
+        recipient.landed(object)
+    })?;
     Ok(recipient.root.clone())
 }
 
@@ -695,5 +697,5 @@ pub fn release_retention(
     root.released = true;
     root.objects.clear();
     write(store, &root)?;
-    crate::transport::prefix::discard_owner(store, owner)
+    crate::transport::sources::discard_owner(store, owner)
 }

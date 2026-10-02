@@ -635,6 +635,7 @@ pub(super) fn fetch_wanted_bounded(
         ledger,
         on_object,
         backfill: backfill.as_ref(),
+        keep: None,
     }
     .run(streams, None)?;
     if let Some(backfill) = backfill {

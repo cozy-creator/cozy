@@ -847,7 +847,7 @@ pub fn materialize_selected_with_options(
         ledger = ledger.with_cancellation(cancellation.clone());
     }
     // Every member's liveness is published before any of their bytes move.
-    let mut jobs: Vec<crate::transport::prefix::SourceJob> = vec![];
+    let mut jobs: Vec<crate::transport::sources::SourceJob> = vec![];
     let (mut seen, mut held_bytes) = (std::collections::BTreeSet::new(), 0);
     for member in &resolution.members {
         writer.hold_expected(&member.object)?;
@@ -859,12 +859,12 @@ pub fn materialize_selected_with_options(
             held_bytes += object.length;
             continue;
         }
-        jobs.push(crate::transport::prefix::SourceJob {
+        jobs.push(crate::transport::sources::SourceJob {
             grant: DeliveryGrant::mint(&plan, object)?,
             url: member.url.clone(),
         });
     }
-    let transferred = crate::transport::prefix::fetch_sources(
+    let transferred = crate::transport::sources::fetch_sources(
         store,
         owner,
         &jobs,
@@ -893,7 +893,7 @@ pub fn materialize_selected_with_options(
         });
     }
     plan.complete(store)?;
-    crate::transport::prefix::discard_owner(store, owner)?;
+    crate::transport::sources::discard_owner(store, owner)?;
     let result = writer.finish(&tree)?;
     Ok((result, pulled))
 }

@@ -18,7 +18,7 @@ use tensorfs_core::{
     providers::{self, Provenance, Resolution, ResolvedMember},
     source_artifact,
     store::{Fault, Store},
-    transport::{Anonymous, Deadline, SourceDownload, SourcePolicy},
+    transport::{Anonymous, Deadline, PullCancellation, SourceDownload, SourcePolicy},
 };
 const BLOCK: u64 = 1 << 20;
 // These controls deliberately fork/kill owners. A sibling fork can temporarily
@@ -155,6 +155,15 @@ fn run(
     id: &str,
     fault: Fault,
 ) -> Result<(source_artifact::TreeRoot, Vec<providers::Pulled>), tensorfs_core::err::Refusal> {
+    run_with(store, url, id, fault, None)
+}
+fn run_with(
+    store: &Store,
+    url: &str,
+    id: &str,
+    fault: Fault,
+    cancellation: Option<PullCancellation>,
+) -> Result<(source_artifact::TreeRoot, Vec<providers::Pulled>), tensorfs_core::err::Refusal> {
     providers::materialize_selected_with_options(
         store,
         id,
@@ -168,12 +177,12 @@ fn run(
         &Anonymous,
         Deadline::none(),
         &|_, _| {},
-        // One stream: these kill points prove the single prefix's durability order.
+        // One stream: these kill points prove the order a chunk is made durable in.
         &SourceDownload {
             checkpoint_bytes: BLOCK,
             streams: 1,
             fault,
-            ..Default::default()
+            cancellation,
         },
     )
 }
@@ -228,14 +237,14 @@ fn kill_at(dir: &std::path::Path, origin: &Origin, stage: &str) {
 fn sigkill_resumes_only_verified_prefix_and_never_downloads_completed_objects() {
     let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     for (stage, expected) in [
-        ("prefix-written", 0),
-        ("prefix-fsync", 0),
-        ("prefix-checkpoint", BLOCK),
-        ("prefix-next-written", BLOCK),
-        ("prefix-verified", 3 * BLOCK + 19),
+        ("chunk-written", 0),
+        ("chunk-fsync", 0),
+        ("chunk-recorded", BLOCK),
+        ("later-chunk-written", BLOCK),
+        ("verified", 3 * BLOCK + 19),
         ("linked", 3 * BLOCK + 19),
         ("record", 3 * BLOCK + 19),
-        ("prefix-admitted", 3 * BLOCK + 19),
+        ("admitted", 3 * BLOCK + 19),
     ] {
         let dir = root();
         let store = Store::init(&dir).unwrap();
@@ -275,13 +284,13 @@ fn sigkill_resumes_only_verified_prefix_and_never_downloads_completed_objects() 
     }
 }
 #[test]
-fn tampered_prefix_restarts_and_ignored_range_restarts_honestly() {
+fn tampered_chunks_restart_the_object_and_an_ignored_range_takes_it_whole() {
     let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     for (tamper, ignore_range) in [(true, false), (false, true)] {
         let dir = root();
         let store = Store::init(&dir).unwrap();
         let origin = Origin::new(false);
-        kill_at(&dir, &origin, "prefix-checkpoint");
+        kill_at(&dir, &origin, "chunk-recorded");
         if tamper {
             let path = dir
                 .join("roots/source-downloads")
@@ -292,17 +301,8 @@ fn tampered_prefix_restarts_and_ignored_range_restarts_honestly() {
             file.write_all(b"corrupt").unwrap();
         }
         let replacement = Origin::new(ignore_range);
-        if tamper {
-            let refusal = run(
-                &store,
-                &replacement.url,
-                &owner("producer"),
-                Fault::default(),
-            )
-            .unwrap_err();
-            assert_eq!(refusal.code, tensorfs_core::err::Code::OBJECT_CORRUPT);
-            assert!(replacement.asks.lock().unwrap().is_empty());
-        }
+        // A tampered chunk no longer hashes to its record: it is forgotten and fetched
+        // again. An origin that ignores ranges gives the object whole from byte 0.
         let (_, rows) = run(
             &store,
             &replacement.url,
@@ -330,7 +330,7 @@ fn partial_adoption_survives_source_release_and_gc_and_disk_budget_counts_prefix
     let dir = root();
     let store = Store::init(&dir).unwrap();
     let origin = Origin::new(false);
-    kill_at(&dir, &origin, "prefix-checkpoint");
+    kill_at(&dir, &origin, "chunk-recorded");
     assert_eq!(store.occupancy().unwrap(), BLOCK);
     let pending = source_artifact::read(&store, &owner("producer"))
         .unwrap()
@@ -376,9 +376,29 @@ fn expired_authority_and_transformed_responses_preserve_verified_identity_prefix
         let dir = root();
         let store = Store::init(&dir).unwrap();
         let origin = Origin::new(false);
-        kill_at(&dir, &origin, "prefix-checkpoint");
+        kill_at(&dir, &origin, "chunk-recorded");
         let rejected = Origin::mode(false, !encoded, encoded);
-        assert!(run(&store, &rejected.url, &owner("producer"), Fault::default()).is_err());
+        // An expired URL ends the run at once. A transformed answer is asked again until
+        // the pull's patience, so the caller cancels it once it has been asked twice.
+        let cancellation = PullCancellation::default();
+        let asks = rejected.asks.clone();
+        let stop = cancellation.clone();
+        let watcher = thread::spawn(move || {
+            while asks.lock().unwrap().len() < 2 && !stop.is_cancelled() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            stop.cancel();
+        });
+        assert!(run_with(
+            &store,
+            &rejected.url,
+            &owner("producer"),
+            Fault::default(),
+            Some(cancellation.clone()),
+        )
+        .is_err());
+        cancellation.cancel();
+        watcher.join().unwrap();
         let replacement = Origin::new(false);
         let (_, rows) = run(
             &store,
@@ -404,7 +424,7 @@ fn fresh_owner_after_admission(stage: &str, remove_cas: bool) {
         .join("roots/source-downloads")
         .join(&owner("producer")[7..])
         .join(&object.sha256);
-    let before_state = fs::read(prefix.join("state.json")).unwrap();
+    let before_state = fs::read(prefix.join("chunks")).unwrap();
     let before_bytes = fs::metadata(prefix.join("bytes.part")).ok();
     if stage == "linked" {
         assert_eq!(
@@ -434,7 +454,7 @@ fn fresh_owner_after_admission(stage: &str, remove_cas: bool) {
         adopted.objects.contains(&object),
         "verified CAS member needs independent recipient custody"
     );
-    assert_eq!(fs::read(prefix.join("state.json")).unwrap(), before_state);
+    assert_eq!(fs::read(prefix.join("chunks")).unwrap(), before_state);
     if let Some(before) = before_bytes {
         let after = fs::metadata(prefix.join("bytes.part")).unwrap();
         assert_eq!(
@@ -480,7 +500,7 @@ fn fresh_owner_after_record_before_landed() {
 #[test]
 fn fresh_owner_after_admission_before_landed() {
     let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
-    fresh_owner_after_admission("prefix-admitted", false);
+    fresh_owner_after_admission("admitted", false);
 }
 
 #[test]

@@ -39,9 +39,9 @@ mod hub;
 mod ledger;
 mod memory;
 mod policy;
-pub(crate) mod prefix;
 mod pull;
 mod push;
+pub(crate) mod sources;
 
 #[cfg(test)]
 mod tests;
@@ -65,4 +65,4 @@ pub use pull::{
 };
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
 
-pub use prefix::{SourceDownload, SourceProgress};
+pub use sources::{SourceDownload, SourceProgress};

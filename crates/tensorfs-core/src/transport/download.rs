@@ -12,9 +12,10 @@
 //! 2322, sasori, dietfried, chieri: a pull's last objects at 30-180 KB/s for minutes).
 //! Separate requests pay them side by side, and a late one is simply asked again.
 //!
-//! `fetch_ranged` is the same downloader for one object from a URL the caller holds (a
-//! HuggingFace or Civitai member). Such an origin may not answer ranges, so an object's
-//! first chunk goes alone: a 206 queues the rest, a 200 is the whole object.
+//! `fetch_ranged` is the same downloader for one object from a URL the caller holds, and
+//! `sources` for a selected source's members, kept on disk across processes. Such an
+//! origin may not answer ranges, so an object's first chunk goes alone: a 206 queues the
+//! rest, a 200 is the whole object. Where it redirects to is asked for the rest directly.
 
 use super::decisions;
 use super::ledger::{Attempt, Deadline, Ledger, STALL_FACTOR};
@@ -22,6 +23,7 @@ use super::pull::{
     open_object, shared_client, FetchObserver, Fetched, ObjectObserver, ObjectSource, ObjectUrls,
     Opened, WalkOutcome,
 };
+use super::sources::{missing, Keep, Part};
 use super::STREAMS;
 use super::{CredentialProvider, SourcePolicy};
 use crate::err::{refuse, Code, Refusal, Result};
@@ -30,7 +32,7 @@ use crate::ids::ObjectRef;
 use crate::repo_cache::{BackfillBatch, CacheKind, CacheRead, CacheTrust};
 use crate::store::{Fault, Store, Verified, PUT_TEMP};
 use fs2::FileExt;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt};
@@ -57,23 +59,33 @@ const PIECE_BYTES: u64 = 1 << 20;
 /// first byte, and how fast its body then came.
 const PEERS: usize = 64;
 
-/// An object being downloaded: its temp file, and what is still out.
+/// An object being downloaded: its file, and what is still out.
 struct Object {
-    /// Its place in `plan.wanted`, which is how the URL supply names it.
+    /// Its place in `wanted`, which is how the URL supply names it.
     at: usize,
     grant: DeliveryGrant,
     cache: Option<(CacheKind, CacheTrust)>,
     path: PathBuf,
     file: File,
-    /// Chunks not yet home.
+    /// A source download's kept file and record, in place of a temp file.
+    part: Option<Part>,
+    /// Pieces not yet home.
     left: AtomicUsize,
+    /// Chunks not yet asked for: an origin that may not range has not yet answered one.
+    rest: Mutex<Vec<(u64, u64)>>,
+    /// Each chunk not yet home, by its first byte: its end and the pieces still out.
+    units: Mutex<HashMap<u64, (u64, usize)>>,
+    /// Where the origin last redirected this object's URL, asked directly until refused.
+    delivery: Mutex<Option<String>>,
     /// Bytes requests wrote for it, bytes asked twice included.
     moved: AtomicU64,
 }
 
 impl Drop for Object {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.part.is_none() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -95,6 +107,8 @@ struct Chunk {
     fresh: bool,
     /// The object's only chunk so far: its origin has not yet shown that it answers ranges.
     lead: bool,
+    /// The chunk this is (a piece of): the range a source download records when it is home.
+    unit: (u64, u64),
 }
 
 impl Chunk {
@@ -182,6 +196,8 @@ pub(super) struct Download<'a> {
     pub ledger: &'a Ledger,
     pub on_object: Option<ObjectObserver<'a>>,
     pub backfill: Option<&'a BackfillBatch<'a>>,
+    /// A source download: objects kept on disk under their owner, resumable.
+    pub keep: Option<&'a Keep<'a>>,
 }
 
 struct Run<'a> {
@@ -391,7 +407,8 @@ impl Run<'_> {
             Destination::Staging => None,
         };
         let mut cache = None;
-        if let (Some(kind), Some(mounted)) = (kind, job.store.repo_cache()) {
+        let mounted = job.store.repo_cache().filter(|_| job.keep.is_none());
+        if let (Some(kind), Some(mounted)) = (kind, mounted) {
             let mut trust = CacheTrust::Name;
             match mounted.admit(job.store, kind, wanted)? {
                 CacheRead::Hit => {
@@ -413,7 +430,72 @@ impl Run<'_> {
             cache = Some((kind, trust));
         }
         let length = wanted.length;
-        let path = job.store.root().join("tmp").join(format!(
+        let (path, file, part, chunks) = match job.keep {
+            Some(keep) => {
+                let part = Part::open(job.store, keep.owner, wanted, true)?;
+                let done = part.done();
+                keep.landed(part.covered() as i64);
+                let file = part.file.try_clone().map_err(|error| Refusal {
+                    code: Code::IO_FAILED,
+                    detail: format!("source download: {error}"),
+                })?;
+                (part.bytes(), file, Some(part), missing(&done, length))
+            }
+            None => {
+                let (path, file) = self.temp(length)?;
+                (path, file, None, vec![(0, length)])
+            }
+        };
+        let chunks: Vec<(u64, u64)> = chunks
+            .into_iter()
+            .flat_map(|(first, end)| {
+                (first..end)
+                    .step_by(job.chunk as usize)
+                    .map(move |at| (at, (at + job.chunk).min(end)))
+            })
+            .collect();
+        // An origin that may not range is asked for the first chunk alone.
+        let asked = if job.ranged { chunks.len() } else { 1 };
+        let object = Arc::new(Object {
+            at,
+            grant,
+            cache,
+            path,
+            file,
+            part,
+            left: AtomicUsize::new(chunks.len()),
+            rest: Mutex::new(chunks.iter().skip(asked).rev().copied().collect()),
+            units: Mutex::new(
+                chunks
+                    .iter()
+                    .map(|(first, end)| (*first, (*end, 1)))
+                    .collect(),
+            ),
+            delivery: Mutex::new(None),
+            moved: AtomicU64::new(0),
+        });
+        let chunk = |(first, end)| Chunk {
+            object: Arc::clone(&object),
+            first,
+            end,
+            due: Instant::now(),
+            stated: false,
+            stale: None,
+            silent: 0,
+            fresh: true,
+            lead: !job.ranged,
+            unit: (first, end),
+        };
+        if chunks.is_empty() {
+            return Ok(vec![chunk((length, length))]);
+        }
+        Ok(chunks.into_iter().take(asked).map(chunk).collect())
+    }
+
+    /// A locked temp file of `length` bytes, under the Store's own temp name so its reaper
+    /// knows a live writer from an orphan.
+    fn temp(&self, length: u64) -> Result<(PathBuf, File)> {
+        let path = self.job.store.root().join("tmp").join(format!(
             "{PUT_TEMP}chunks-{}-{}",
             std::process::id(),
             crate::meta::now_nanos_unique()
@@ -432,7 +514,6 @@ impl Run<'_> {
             .mode(0o600)
             .open(&path)
             .map_err(|error| io("create", error))?;
-        // The Store's own temp name and lock, so its reaper knows a live writer from an orphan.
         let sized = file
             .try_lock_exclusive()
             .and_then(|()| file.set_len(length));
@@ -440,57 +521,51 @@ impl Run<'_> {
             let _ = std::fs::remove_file(&path);
             return Err(io("size", error));
         }
-        let firsts: Vec<u64> = (0..length).step_by(job.chunk as usize).collect();
-        let object = Arc::new(Object {
-            at,
-            grant,
-            cache,
-            path,
-            file,
-            left: AtomicUsize::new(firsts.len()),
-            moved: AtomicU64::new(0),
-        });
-        let chunk = |first, end| Chunk {
-            object: Arc::clone(&object),
-            first,
-            end,
-            due: Instant::now(),
-            stated: false,
-            stale: None,
-            silent: 0,
-            fresh: true,
-            lead: !job.ranged,
-        };
-        if firsts.is_empty() {
-            return Ok(vec![chunk(0, 0)]);
-        }
-        // An origin that may not range is asked for the first chunk alone.
-        let asked = if job.ranged { firsts.len() } else { 1 };
-        Ok(firsts
-            .into_iter()
-            .take(asked)
-            .map(|first| chunk(first, (first + job.chunk).min(length)))
-            .collect())
+        Ok((path, file))
     }
 
     /// The origin answered a range: the object's other chunks join the queue.
     fn rest(&self, lead: &Chunk) {
-        let length = lead.object.grant.object.length;
+        let rest = std::mem::take(&mut *lead.object.rest.lock().unwrap());
         let mut state = self.state.lock().unwrap();
-        for first in (lead.end..length).step_by(self.job.chunk as usize) {
+        for (first, end) in rest.into_iter().rev() {
             state.queue.push_back(Chunk {
                 object: Arc::clone(&lead.object),
                 first,
-                end: (first + self.job.chunk).min(length),
+                end,
                 due: Instant::now(),
                 stated: false,
                 stale: None,
                 silent: 0,
                 fresh: true,
                 lead: false,
+                unit: (first, end),
             });
         }
         self.wake.notify_all();
+    }
+
+    /// A piece is home. When it was its chunk's last, a source download records the chunk.
+    fn unit_home(&self, chunk: &Chunk) -> Result<()> {
+        let object = &chunk.object;
+        let mut units = object.units.lock().unwrap();
+        let Some((end, out)) = units.get_mut(&chunk.unit.0) else {
+            return Ok(());
+        };
+        *out -= 1;
+        if *out > 0 {
+            return Ok(());
+        }
+        let end = *end;
+        units.remove(&chunk.unit.0);
+        drop(units);
+        let (Some(part), Some(keep)) = (&object.part, self.job.keep) else {
+            return Ok(());
+        };
+        let before = part.covered();
+        part.record(chunk.unit.0, end, keep.fault)?;
+        keep.landed((part.covered() - before) as i64);
+        Ok(())
     }
 
     /// One GET for a chunk, written at its offsets. Whatever ends it early, the bytes that
@@ -503,9 +578,13 @@ impl Run<'_> {
         let stale = chunk.stale.take();
         let asked = self.began.elapsed();
         self.minting[slot].store(asked.as_millis() as u64 + 1, Ordering::Release);
-        let url = job
-            .urls
-            .url_for_while(object.at, wanted, stale.is_some(), job.ledger);
+        let delivery = object.delivery.lock().unwrap().clone();
+        let url = match delivery.clone() {
+            Some(delivery) => Ok(delivery),
+            None => job
+                .urls
+                .url_for_while(object.at, wanted, stale.is_some(), job.ledger),
+        };
         self.minting[slot].store(0, Ordering::Release);
         if self.began.elapsed() - asked >= job.ledger.sample() {
             let now = self.began.elapsed().as_millis() as u64;
@@ -541,7 +620,7 @@ impl Run<'_> {
             seen: 0,
         });
         self.requests.fetch_add(1, Ordering::Relaxed);
-        let ended = self.stream(&mut chunk, &url, &ledger, buffer);
+        let ended = self.stream(&mut chunk, &url, delivery.is_some(), &ledger, buffer);
         *self.flights[slot].lock().unwrap() = None;
         // What this ask added: a whole answer to a resumed range starts the object over.
         let moved = chunk.first.saturating_sub(asked.0);
@@ -557,6 +636,9 @@ impl Run<'_> {
                     } else {
                         remember(&mut state.small, wait + body);
                     }
+                }
+                if let Err(refusal) = self.unit_home(&chunk) {
+                    return Outcome::Fatal(named(refusal, &wanted.id()));
                 }
                 if object.left.fetch_sub(1, Ordering::AcqRel) > 1 {
                     return Outcome::Home;
@@ -602,6 +684,9 @@ impl Run<'_> {
         while dropped && !chunk.lead && chunk.end - chunk.first > piece {
             let end = chunk.first + piece;
             object.left.fetch_add(1, Ordering::AcqRel);
+            if let Some((_, out)) = object.units.lock().unwrap().get_mut(&chunk.unit.0) {
+                *out += 1;
+            }
             again.push(Chunk {
                 object: Arc::clone(&object),
                 end,
@@ -623,6 +708,7 @@ impl Run<'_> {
         &self,
         chunk: &mut Chunk,
         url: &str,
+        delivered: bool,
         ledger: &Ledger,
         buffer: &mut [u8],
     ) -> std::result::Result<(), Ended> {
@@ -635,7 +721,8 @@ impl Run<'_> {
             "range".to_string(),
             format!("bytes={}-{}", chunk.first, chunk.end - 1),
         )];
-        let response = match open_object(
+        let mut hops = Vec::new();
+        let opened = open_object(
             shared_client(),
             url,
             job.policy,
@@ -643,9 +730,24 @@ impl Run<'_> {
             job.deadline,
             ledger,
             if whole { &[] } else { &range },
-            &mut |_, _| {},
-        )? {
-            Opened::Body(response) => response,
+            &mut |checked, _| hops.push(checked.url()),
+        )?;
+        // A redirect target that refuses is forgotten, and the object's URL asked again.
+        if delivered && !matches!(opened, Opened::Body(_) | Opened::Retryable(..)) {
+            *object.delivery.lock().unwrap() = None;
+            let answered = Refusal {
+                code: Code::TRANSFER_FAILED,
+                detail: "the origin's redirect target refused this ask".into(),
+            };
+            return Err(Ended::Retry(answered, Some(Duration::ZERO)));
+        }
+        let response = match opened {
+            Opened::Body(response) => {
+                if hops.len() > 1 {
+                    *object.delivery.lock().unwrap() = hops.pop();
+                }
+                response
+            }
             Opened::Retryable(status, stated) => {
                 let answered = Refusal {
                     code: Code::TRANSFER_FAILED,
@@ -695,12 +797,17 @@ impl Run<'_> {
             // A range answered with the whole object: take it from its first byte. An origin
             // that does not range gives the object to this one request.
             (200, _) if chunk.lead || wanted.length <= job.chunk => {
-                job.store.discarded(chunk.first);
-                self.landed.fetch_sub(chunk.first, Ordering::Relaxed);
+                // What this chunk's earlier asks moved is moved again.
+                let again = chunk.first - chunk.unit.0;
+                job.store.discarded(again);
+                self.landed.fetch_sub(again, Ordering::Relaxed);
                 chunk.first = 0;
                 if chunk.lead {
                     chunk.end = wanted.length;
+                    chunk.unit = (0, wanted.length);
                     object.left.store(1, Ordering::Release);
+                    object.rest.lock().unwrap().clear();
+                    *object.units.lock().unwrap() = HashMap::from([(0, (wanted.length, 1))]);
                 }
             }
             (status, ranged) => {
@@ -751,6 +858,10 @@ impl Run<'_> {
         let job = self.job;
         let wanted = &object.grant.object;
         let moved = object.moved.load(Ordering::Relaxed);
+        let fault = job
+            .keep
+            .map_or(&Fault::default(), |keep| keep.fault)
+            .clone();
         let admitted = (|| {
             if job.store.flushes() {
                 object.file.sync_all().map_err(|error| Refusal {
@@ -781,14 +892,27 @@ impl Run<'_> {
             if object.grant.destination == Destination::Staging {
                 return crate::staging::adopt(job.store, verified).map(|_| ());
             }
-            job.store
-                .admit_verified(verified, &Fault::default(), None)
-                .map(|_| ())
+            fault.hit("verified");
+            job.store.admit_verified(verified, &fault, None).map(|_| ())
         })();
-        // Wrong bytes are the door's verdict on the origin: nothing is asked again.
+        // Wrong bytes are the door's verdict on the origin: nothing is asked again, and a
+        // kept download starts over the next time it is asked for.
         if let Err(refusal) = admitted {
             job.store.discarded(moved);
+            if let (Some(part), Some(keep), Code::OBJECT_ID_MISMATCH) =
+                (&object.part, job.keep, refusal.code)
+            {
+                keep.landed(-(part.covered() as i64));
+                if let Err(reset) = part.reset() {
+                    return Outcome::Fatal(named(reset, &wanted.id()));
+                }
+            }
             return Outcome::Fatal(named(refusal, &wanted.id()));
+        }
+        if let (Some(part), Some(keep)) = (&object.part, job.keep) {
+            fault.hit("admitted");
+            part.finished();
+            keep.landed((wanted.length - part.covered()) as i64);
         }
         job.ledger.answered();
         self.fetched.fetch_add(1, Ordering::Relaxed);
@@ -1056,6 +1180,7 @@ pub fn fetch_ranged(
         ledger,
         on_object: None,
         backfill: None,
+        keep: None,
     }
     .run(ranged.streams.clamp(1, 64), observer)?;
     Ok(Fetched {

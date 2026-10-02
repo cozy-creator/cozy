@@ -3902,8 +3902,15 @@ fn a_name_that_does_not_resolve_is_asked_again_until_the_pull_stops() {
 
     assert_eq!(refusal.code, Code::TRANSFER_FAILED, "{refusal}");
     assert!(refusal.detail.contains("nothing landed"), "{refusal}");
-    assert!(refusal.detail.contains("name resolution failed"), "{refusal}");
-    assert!(started.elapsed() >= ledger.floor(), "{:?}", started.elapsed());
+    assert!(
+        refusal.detail.contains("name resolution failed"),
+        "{refusal}"
+    );
+    assert!(
+        started.elapsed() >= ledger.floor(),
+        "{:?}",
+        started.elapsed()
+    );
     assert_eq!(temps(&root), 0);
     let _ = std::fs::remove_dir_all(root);
 }

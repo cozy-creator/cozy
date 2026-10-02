@@ -55,6 +55,8 @@ enum Act {
     Status(u16, Vec<(String, String)>),
     /// Send the head and this many body bytes, then drop the connection.
     Cut(usize),
+    /// Send the body at this many bytes a second.
+    Crawl(u64),
     /// Read a PUT body, then say nothing, ever.
     Silent,
 }
@@ -227,14 +229,17 @@ impl Origin {
             }
             let name = request.path.strip_prefix("/cdn/").unwrap();
             let bytes = self.objects[name].clone();
-            let (a, b) = request.range.unwrap();
+            let (a, b) = request.range.unwrap_or((0, bytes.len() as u64 - 1));
             self.asked.lock().unwrap().push((name.into(), a, b));
             let slice = &bytes[a as usize..=b as usize];
-            let head = format!(
-                "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {a}-{b}/{}\r\ncontent-length: {}\r\n\r\n",
-                bytes.len(),
-                slice.len()
-            );
+            let head = match request.range {
+                Some(_) => format!(
+                    "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {a}-{b}/{}\r\ncontent-length: {}\r\n\r\n",
+                    bytes.len(),
+                    slice.len()
+                ),
+                None => format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", slice.len()),
+            };
             if socket.write_all(head.as_bytes()).is_err() {
                 return;
             }
@@ -244,7 +249,11 @@ impl Origin {
                 Act::Cut(n) => Some(n.min(slice.len())),
                 _ => None,
             };
-            let complete = self.send(&mut socket, &slice[..cut.unwrap_or(slice.len())]);
+            let pace = match act {
+                Act::Crawl(rate) => rate,
+                _ => self.pace,
+            };
+            let complete = self.send(&mut socket, &slice[..cut.unwrap_or(slice.len())], pace);
             self.live.fetch_sub(1, Ordering::SeqCst);
             if !complete || cut.is_some() {
                 let _ = socket.shutdown(std::net::Shutdown::Both);
@@ -254,12 +263,16 @@ impl Origin {
     }
 
     /// Paced on an absolute schedule so a loaded box does not compound sleep overshoot.
-    fn send(&self, socket: &mut TcpStream, bytes: &[u8]) -> bool {
+    fn send(&self, socket: &mut TcpStream, bytes: &[u8], pace: u64) -> bool {
         let started = Instant::now();
         let mut sent = 0usize;
-        for chunk in bytes.chunks(64 << 10) {
-            if self.pace > 0 {
-                let due = started + Duration::from_secs_f64(sent as f64 / self.pace as f64);
+        for chunk in bytes.chunks(if pace > 0 && pace < 64 << 10 {
+            4 << 10
+        } else {
+            64 << 10
+        }) {
+            if pace > 0 {
+                let due = started + Duration::from_secs_f64(sent as f64 / pace as f64);
                 if let Some(wait) = due.checked_duration_since(Instant::now()) {
                     thread::sleep(wait);
                 }
@@ -380,7 +393,7 @@ fn members_download_concurrently_once_each_and_report_progress() {
         &store,
         &owner("concurrent"),
         &origin.resolution(&names),
-        // Checkpoints larger than any member: no member is split, so each is one ask.
+        // Chunks larger than any member: each member is one ask.
         &options(8 * MIB, 16),
         &|present, whole| reports.lock().unwrap().push((present, whole)),
     )
@@ -401,7 +414,7 @@ fn members_download_concurrently_once_each_and_report_progress() {
 }
 
 #[test]
-fn one_large_member_is_split_across_streams_and_every_byte_lands_once() {
+fn one_large_member_is_asked_in_chunks_across_streams_and_every_byte_lands_once() {
     let name = "model.safetensors";
     let bytes = body(7, 24 * MIB + 3);
     let length = bytes.len() as u64;
@@ -422,7 +435,7 @@ fn one_large_member_is_split_across_streams_and_every_byte_lands_once() {
         origin.most_live.load(Ordering::SeqCst) >= 4,
         "the member was not split"
     );
-    // Every split asks the delivery URL the source resolved to; the source is walked once.
+    // Every chunk asks the delivery URL the source resolved to; the source is walked once.
     let resolves = origin.asks.load(Ordering::Relaxed) - origin.asked.lock().unwrap().len();
     assert_eq!(resolves, 1, "the redirect was re-walked per ask");
     fs::remove_dir_all(dir).unwrap();
@@ -434,9 +447,11 @@ fn a_connection_cut_mid_body_resumes_at_the_byte_it_reached() {
     let bytes = body(9, 5 * MIB + 1);
     let length = bytes.len() as u64;
     // The first delivery answer dies 2.5 MiB in; the next ask must start there.
-    let origin = Origin::start(vec![(name, bytes)], 0, |request, _| match request.range {
-        Some((0, _)) if request.path.starts_with("/cdn/") => Act::Cut(5 * MIB / 2),
-        _ => Act::Serve,
+    let origin = Origin::start(vec![(name, bytes)], 0, |request, _| {
+        match request.path.starts_with("/cdn/") && request.range.is_none() {
+            true => Act::Cut(5 * MIB / 2),
+            false => Act::Serve,
+        }
     });
     let dir = root("cut");
     let store = Store::init(&dir).unwrap();
@@ -444,7 +459,8 @@ fn a_connection_cut_mid_body_resumes_at_the_byte_it_reached() {
         &store,
         &owner("cut"),
         &origin.resolution(&[name]),
-        &options(MIB, 1),
+        // One chunk: the member is one GET, and its resume one more.
+        &options(8 * MIB, 1),
         &|_, _| {},
     )
     .unwrap();
@@ -494,31 +510,27 @@ fn download_child() {
     );
 }
 
-/// Retained run states, read from disk: (object, start, extent).
+/// Recorded chunks, read from disk: (object, first, length). A line a kill cut short is
+/// not a record.
 fn retained(dir: &std::path::Path) -> Vec<(String, u64, u64)> {
     let area = dir
         .join("roots/source-downloads")
         .join(&owner("killed")[7..]);
-    let mut runs = vec![];
-    for object in fs::read_dir(area).unwrap() {
+    let mut chunks = vec![];
+    for object in fs::read_dir(area).into_iter().flatten() {
         let object = object.unwrap().path();
-        for file in fs::read_dir(&object).unwrap() {
-            let path = file.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
+        let name = object.file_name().unwrap().to_string_lossy().to_string();
+        let text = fs::read_to_string(object.join("chunks")).unwrap_or_default();
+        for line in text.split_inclusive('\n').skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if line.ends_with('\n') && fields.len() == 3 {
+                let (first, end): (u64, u64) =
+                    (fields[0].parse().unwrap(), fields[1].parse().unwrap());
+                chunks.push((name.clone(), first, end - first));
             }
-            let text = fs::read_to_string(&path).unwrap();
-            let number = |key: &str| -> u64 {
-                text.split(&format!("\"{key}\":"))
-                    .nth(1)
-                    .map(|rest| rest.split([',', '}']).next().unwrap().parse().unwrap())
-                    .unwrap_or(0)
-            };
-            let name = object.file_name().unwrap().to_string_lossy().to_string();
-            runs.push((name, number("start"), number("extent")));
         }
     }
-    runs
+    chunks
 }
 
 #[test]
@@ -542,21 +554,14 @@ fn a_killed_download_fetches_only_what_it_had_not_retained() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    // SIGKILL once a split run has retained a checkpoint and a good share has crossed.
-    let split_retained = || {
-        fs::read_dir(
-            dir.join("roots/source-downloads")
-                .join(&owner("killed")[7..]),
-        )
-        .into_iter()
-        .flatten()
-        .flat_map(|object| fs::read_dir(object.unwrap().path()).into_iter().flatten())
-        .any(|file| {
-            let name = file.unwrap().file_name().to_string_lossy().to_string();
-            name.starts_with("run-") && name.ends_with(".json")
-        })
+    // SIGKILL once a whole chunk past an object's first is recorded and a good share has
+    // crossed.
+    let later_retained = || {
+        retained(&dir)
+            .iter()
+            .any(|(_, first, length)| *first > 0 && *length == MIB as u64)
     };
-    while origin.served.load(Ordering::Relaxed) < total / 3 || !split_retained() {
+    while origin.served.load(Ordering::Relaxed) < total / 3 || !later_retained() {
         assert!(
             child.try_wait().unwrap().is_none(),
             "the child finished before the kill"
@@ -567,8 +572,8 @@ fn a_killed_download_fetches_only_what_it_had_not_retained() {
     child.wait().unwrap();
     let runs = retained(&dir);
     assert!(
-        runs.iter().any(|(_, start, _)| *start > 0),
-        "no split run was retained: {runs:?}"
+        runs.iter().any(|(_, first, _)| *first > 0),
+        "no later chunk was retained: {runs:?}"
     );
     // What is still owed: every member the child did not finish, less its retained runs.
     let mut owed = 0;
@@ -593,7 +598,7 @@ fn a_killed_download_fetches_only_what_it_had_not_retained() {
         &store,
         &owner("killed"),
         &resumed.resolution(&names),
-        // Large checkpoints: nothing is split again, so asks are exactly the remainder.
+        // Large chunks: each missing range is one ask, so asks are exactly the remainder.
         &options(1 << 30, 16),
         &|_, _| {},
     )
@@ -601,6 +606,49 @@ fn a_killed_download_fetches_only_what_it_had_not_retained() {
     verify(&store, &resumed, &names);
     assert_eq!(resumed.requested(), owed);
     assert_eq!(rows.iter().map(|row| row.transferred).sum::<u64>(), owed);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Run 2322's shape at a source: the first ask that reaches one MiB of a member crawls at
+/// 16 KiB/s while the rest come home at once. That request is restarted; the ingest does
+/// not wait out the crawl (64 s for the MiB alone).
+#[test]
+fn a_crawling_request_is_restarted_and_does_not_hold_the_ingest() {
+    const RATE: u64 = 16 << 10;
+    let name = "model.safetensors";
+    let bytes = body(15, 24 * MIB + 5);
+    let crawled = AtomicBool::new(false);
+    let origin = Origin::start(vec![(name, bytes)], 0, move |request, _| {
+        let reaches = request
+            .range
+            .is_some_and(|(a, b)| a <= 8 * MIB as u64 && 8 * MIB as u64 <= b);
+        match request.path.starts_with("/cdn/") && reaches && !crawled.swap(true, Ordering::SeqCst)
+        {
+            true => Act::Crawl(RATE),
+            false => Act::Serve,
+        }
+    });
+    let dir = root("crawl");
+    let store = Store::init(&dir).unwrap();
+    let started = Instant::now();
+    let rows = materialize(
+        &store,
+        &owner("crawl"),
+        &origin.resolution(&[name]),
+        &options(MIB, 4),
+        &|_, _| {},
+    )
+    .unwrap();
+    let took = started.elapsed();
+    verify(&store, &origin, &[name]);
+    assert!(rows[0].transferred >= 24 * MIB as u64 + 5);
+    let crawl = Duration::from_secs_f64(MIB as f64 / RATE as f64);
+    assert!(
+        took < crawl / 4,
+        "the ingest waited out the crawl: {took:?}"
+    );
+    let log = fs::read_to_string(dir.join("logs/transport.log")).unwrap();
+    assert!(log.contains(" restart "), "{log}");
     fs::remove_dir_all(dir).unwrap();
 }
 

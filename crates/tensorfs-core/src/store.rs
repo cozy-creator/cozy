@@ -785,7 +785,7 @@ impl Store {
     /// admission fits must see them.
     pub fn occupancy(&self) -> Result<u64> {
         let mut total: u64 = crate::staging::bytes(self)?
-            .checked_add(crate::transport::prefix::bytes(self)?)
+            .checked_add(crate::transport::sources::bytes(self)?)
             .ok_or_else(|| Refusal {
                 code: Code::ARITH_OVERFLOW,
                 detail: "prefix occupancy overflow".into(),
