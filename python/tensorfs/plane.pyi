@@ -281,7 +281,12 @@ class Plane:
         self, ws: WeightSet, device: int, regions: Sequence[int] | None = None
     ) -> list[SharedRegion]: ...
     def attach_device(
-        self, ws: WeightSet, device: int, region: int, chunks: Sequence[tuple[int, int]]
+        self,
+        ws: WeightSet,
+        device: int,
+        region: int,
+        chunks: Sequence[tuple[int, int]],
+        digest: str,
     ) -> None: ...
     def prioritise(
         self,

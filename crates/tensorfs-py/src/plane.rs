@@ -332,8 +332,8 @@ impl PyPlane {
     }
 
     /// Map another process's shared `region` read-only, without a copy: `chunks` are
-    /// `(bytes, fd)` in VA order, from `export_device` of the same layout digest. The fds stay
-    /// the caller's to close.
+    /// `(bytes, fd)` in VA order, from `export_device`; `digest` is the holder's layout and must
+    /// equal `ws.digest`. The fds stay the caller's to close.
     fn attach_device(
         &self,
         py: Python<'_>,
@@ -341,6 +341,7 @@ impl PyPlane {
         device: i32,
         region: u32,
         chunks: Vec<(u64, i32)>,
+        digest: String,
     ) -> PyResult<()> {
         let id = self.id(py, &ws)?;
         if chunks.iter().any(|(_, fd)| *fd < 0) {
@@ -350,7 +351,7 @@ impl PyPlane {
         let borrowed: Vec<(u64, BorrowedFd<'_>)> =
             chunks.iter().map(|(n, fd)| (*n, unsafe { BorrowedFd::borrow_raw(*fd) })).collect();
         let plane = &self.plane;
-        py.detach(|| plane.attach_device(id, device, region, &borrowed)).or_raise(py)
+        py.detach(|| plane.attach_device(id, device, region, &borrowed, &digest)).or_raise(py)
     }
 
     /// Bytes freed; refuses on live leases or holds.

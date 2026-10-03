@@ -1401,10 +1401,12 @@ impl Plane {
     }
 
     /// Map another process's shared region read-only at its place in this weight set: `chunks`
-    /// are (bytes, fd) in VA order, as `export_device` gave them for the same layout digest.
+    /// are (bytes, fd) in VA order, as `export_device` gave them, and `digest` is the layout the
+    /// holder says those bytes have. It must be this weight set's own digest (the same object
+    /// ranges at the same offsets in the same regions), checked before any fd is imported.
     /// The fds stay the caller's (the imported handles hold their own references). The region
     /// becomes Ready without a copy, outside the budget; dropping it releases the references.
-    pub fn attach_device(&self, ws: WsId, ordinal: i32, r: u32, chunks: &[(u64, BorrowedFd<'_>)]) -> Result<()> {
+    pub fn attach_device(&self, ws: WsId, ordinal: i32, r: u32, chunks: &[(u64, BorrowedFd<'_>)], digest: &str) -> Result<()> {
         let d = self.dev(ordinal)?;
         if !self.device_sharing(ordinal)? {
             return Err(Error::CudaUnavailable(format!("device {ordinal} cannot share memory")));
@@ -1413,7 +1415,14 @@ impl Plane {
         let _g = dev.bind()?;
         let mut c = self.lock();
         c.check()?;
-        let region = c.ws(ws)?.layout.region(r)?.clone();
+        let layout = c.ws(ws)?.layout.clone();
+        if digest != layout.digest {
+            return Err(Error::Invalid(format!(
+                "shared region {r}: the holder's layout {digest} is not this weight set's {}",
+                layout.digest
+            )));
+        }
+        let region = layout.region(r)?.clone();
         let total: u64 = chunks.iter().map(|(n, _)| *n).sum();
         if total != region.span || chunks.iter().any(|(n, _)| *n == 0 || !n.is_multiple_of(dev.granularity)) {
             return Err(Error::Invalid(format!("shared region {r}: chunks of {total} bytes for a {}-byte span", region.span)));
