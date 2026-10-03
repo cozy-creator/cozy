@@ -183,3 +183,25 @@ fn a_plane_registers_a_streamed_layout_but_never_pins_it() {
     plane.close().unwrap();
     served.end().unwrap();
 }
+
+/// A layout of one region in a window of one slot has exactly the layout's size: the state
+/// page's magic, not the size, tells them apart.
+#[test]
+fn a_one_region_window_the_size_of_its_layout_is_still_a_window() {
+    let fx = Fixture::new("window-single");
+    let one = vec![regions().concat()];
+    let layout = Layout::build(&fx.plan(), &one).unwrap();
+    let (fd, window) = open_window("unet", &layout, 1).unwrap();
+    let (full, _filling) = tensorfs_plane::host::open_sealed("unet", &layout, None).unwrap();
+    let size = |fd: i32| std::fs::File::from(fd_dup(fd)).metadata().unwrap().len();
+    assert_eq!(size(fd.as_raw_fd()), size(full.as_raw_fd()), "the case this test is about");
+    let host = HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
+    assert!(host.window().is_some());
+    assert!(HostMem::adopt_sealed(full.as_raw_fd(), &layout).unwrap().window().is_none());
+    drop(window);
+}
+
+fn fd_dup(fd: i32) -> std::os::fd::OwnedFd {
+    // SAFETY: dup of a live descriptor we hold; the copy is ours.
+    unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(libc::dup(fd)) }
+}

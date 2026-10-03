@@ -117,6 +117,19 @@ fn os(what: &str) -> Error {
     Error::Io(format!("{what}: {}", std::io::Error::last_os_error()))
 }
 
+/// The magic of the state page the file's trailer points at (0 when there is none).
+fn state_magic(fd: RawFd) -> Result<u64> {
+    let size = file_size(fd)?;
+    let read = |at: usize| {
+        let mut b = [0u8; 8];
+        // SAFETY: a read into our own buffer.
+        let got = unsafe { libc::pread(fd, b.as_mut_ptr() as *mut libc::c_void, 8, at as libc::off_t) };
+        (got == 8).then(|| u64::from_le_bytes(b))
+    };
+    let Some(data) = size.checked_sub(8).and_then(read) else { return Ok(0) };
+    Ok(usize::try_from(data).ok().filter(|&d| d + 8 <= size).and_then(read).unwrap_or(0))
+}
+
 fn file_size(fd: RawFd) -> Result<usize> {
     // SAFETY: fstat into a zeroed struct.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -271,10 +284,11 @@ impl HostMem {
             return Err(Error::Invalid("a sealed host layout must carry write, resize and seal seals".into()));
         }
         let own = reopen_as(fd, libc::O_RDONLY)?;
-        let host = if file_size(own.as_raw_fd())? == layout.nbytes as usize + meta_len(layout.regions.len()) {
-            Self::adopt_owned(own, layout, true, false)?
-        } else {
+        // The state page's magic says which (a size can match both: one region, one slot).
+        let host = if state_magic(own.as_raw_fd())? == MAGIC_WINDOW {
             Self::adopt_window(own, layout)?
+        } else {
+            Self::adopt_owned(own, layout, true, false)?
         };
         if (0..host.regions as u32).any(|r| host.failed(r)) {
             return Err(Error::Invalid("a sealed host layout's fill failed".into()));
