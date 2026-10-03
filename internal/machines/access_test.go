@@ -27,6 +27,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
@@ -406,6 +407,9 @@ func TestLogoutErasesEndpointGrantAndQueuesRemoval(t *testing.T) {
 
 func TestRemoteEndpointReadsDeclaredOriginOfLoopbackHub(t *testing.T) {
 	s := newScope(t)
+	pin, _ := s.target.pin()
+	// A loopback endpoint address is a tunnel as often as this computer.
+	s.target = endpointTarget(machineendpoint.Endpoint{Address: s.target.addr, WorkerID: s.target.worker}, pin, s.owner)
 	s.hub.declared = "https://public.example.test"
 	reads, problem := s.attach(t)
 	if problem != nil || reads != "https://public.example.test" {
