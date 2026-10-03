@@ -523,7 +523,7 @@ fn concurrent_ensures_of_one_manifest_share_one_fetch() {
     let mut leader = ensure(
         &root,
         &hub.base,
-        &["--streams", "1", "--streams-start", "1"],
+        &["--streams", "1"],
     )
     .stdout(Stdio::piped())
     .spawn()

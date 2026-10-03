@@ -1,174 +1,5 @@
-//! tfs — TensorFS store and CozyTensors inspection tool.
-//!
-//!   tfs version                  release version + sha256 of this binary, the skew observable
-//!   tfs registry                 print the seeded platform namespace (alias -> digest)
-//!   tfs id <file>                object id (+ derived ids) of a stored document
-//!   tfs cbor encode|decode|check <file>  header conformance seam; JSON is diagnostic only
-//!   tfs config canonicalize <config.json> --out <canonical.json>
-//!
-//! The object store (tfs-002). Flags: --expect <hex> --expect-length <n> --out <path>
-//! --range <off>:<len> --rate <f> --pass <n> --slow-ms <n>
-//! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
-//!
-//! A Store is created only where someone said to: `tfs store init|ensure <root>`, or the same
-//! verbs over `TENSORFS_HOME`. Every other command REFUSES a root that does not exist, and the
-//! `~/.tensorfs` fallback is opened, never conjured (tfs-053).
-//!
-//!   tfs store init|info <root>       [--repo-cache <root> | --no-repo-cache]
-//!   tfs store ensure [<root>]         [--repo-cache <root> | --no-repo-cache]
-//!                                the Store RECORDS the mounted immutable object cache it
-//!                                mirrors through and reads back from, so no later command
-//!                                and no caller ever names one. `info` prints the binding
-//!   tfs store prepare-readers [<root>]
-//!   tfs store complete-cozytensors [<root>]
-//!   tfs home                     print TENSORFS_HOME or ~/.tensorfs
-//!   tfs store rebuild <census> --rows <jsonl> [--sqlite <tensorfs.sqlite>]
-//!   tfs store admit-file <store> blob|manifest <id> <length> <source>
-//!   tfs repo-cache admit <cache> <store> blob|manifest <id> <length>
-//!   tfs repo-cache backfill <cache> <store> blob|manifest <id> <length>
-//!   tfs repo-cache restore <store> <manifest-id> <length> [--session <s>]
-//!   tfs repo-cache resume <store> <chain-id> <length> --plan <sha256:...>
-//!                                   [--session <s>] [--tenant <t>] [--no-journal]
-//!   tfs repo-cache chain <cache> <chain-id> <length>       the links, root to head
-//!   tfs put <root> <file>        stream one object in (any shape)
-//!   tfs get <root> <hex>         verified read, whole or ranged; with --out - the bytes
-//!                                go to stdout under a read lease (--range <off>:<len>|<off>:)
-//!   tfs contains <root> <hex>    the presence HINT, and what it is worth
-//!   tfs verify <root> <hex>      verification record or rehash; remove corrupt bytes
-//!   tfs scrub <root>             one rate knob over the whole store
-//!   tfs reap <root>              reap admission temps whose writer is gone
-//!   tfs fill <root> <plan>       resumable fill: skip only verified objects
-//!
-//! The ONE transport (tfs-048/tfs-049/tfs-050). The credential is `--credential-file` or
-//! TFS_CREDENTIAL (`bearer <token>`, `worker <id> <token>`, or empty for anonymous), never
-//! bare argv; a URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
-//! --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>
-//! --ca-file <pem> (a private hub's CA, trusted beside the webpki set).
-//! `--streams` is the most requests in flight (default 512, memory-bounded).
-//! `tfs fetch` reads and backfills the Store's bound repo cache between the local Store
-//! and the origin. It is bound by `tfs store ensure --repo-cache` and never by a flag here.
-//!
-//!   tfs capabilities             one feature name per line (ensure/1, get-range/1, ...)
-//!   tfs ensure <root> <ref> --hub <base> [--lane L] [--step S] [--keep sha256:<m>]...
-//!                               make one model resident: closure, one flight per manifest per
-//!                               Store, disk admission + GC policy, paced resumable fetch, retry
-//!                               only after measured progress. STDOUT is JSON lines:
-//!                               ensure.progress samples, then ensure.result (exit 0) or
-//!                               ensure.refused {code, resumable, detail} (exit 1)
-//!   tfs pressure <root> [--keep sha256:<m>]...   one pressure pass: at <= 1/10 free, run
-//!                               the GC policy until > 1/5 is free; one JSON line
-//!   tfs fetch <root> <ref>       closure -> plan -> N-way walk (presign at use) -> proof
-//!   tfs fetch bounded <root> <ref> --max-download-bytes N --max-download-objects N
-//!                               same pull, refused before body transfer if new objects exceed bounds
-//!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
-//!   tfs fetch url <root> <sha256> <length> <url|-> [--progress] [--streams N]
-//!                                                    one granted object, in parallel ranges
-//!            --progress opens the same STDERR event channel `tfs fetch` reports on, while
-//!            the bytes move: {"event":"fetch.progress","origin_bytes":N,...} per sample,
-//!            so a supervisor can tell slow from wedged without a clock. stdout stays the
-//!            result. --progress-bytes <n> is that channel's resolution, never a verdict
-//!
-//! The STAGING area (tfs-067). A foreign source carrier is not a CAS object: it lands at
-//! `<root>/staging/<sha256>`, outside every namespace a census walks, with no catalog
-//! record and no `gc` candidacy — a temporary input that the store reads once and throws
-//! away. `tfs fetch url` is unchanged and still admits repo objects to the CAS.
-//!
-//!   tfs staging fetch <root> <sha256> <length> <url|->   same transport, same digest, same
-//!            [--progress] [--streams N] [--part-mib N]   fence; a different destination.
-//!            `present` answers a re-ask over a file that rehashes to the id, moving zero
-//!            bytes; `staged` answers one this call moved. `path` is printed in both cases
-//!   tfs staging drop <root> <sha256>    retire one spent carrier; one unlink, idempotent
-//!   tfs staging clear <root>            sweep the area plus orphan `stage-` temps
-//!   tfs staging list <root>             every carrier: id, length, absolute path
-//!
-//!   tfs push <root> <sha256> --grant-file <path> [--manifest] [--content-type ct]
-//!            the grant is the destination on line one, then one "name: value" per header
-//!            its signature covers; TFS_PUSH_GRANT carries the same text, and
-//!            --url <presigned|-> is a bare destination that signs no conditions
-//!   tfs source list <hf://org/repo@rev | civitai://id> [--api <base>]  provider listing
-//!   tfs source resolve <uri> [--source-profile <name>]... [--registry <r>] [--json]
-//!            the EXACT member list: every tensor
-//!            carrier with its object id, length and URL, sharded repos expanded through
-//!            their weight_map. No store and no tensor bytes — this is what an owner runs
-//!            to size a container disk before renting the machine that will hold it.
-//!            `members` and `objects` are printed as separate counts: two members can be
-//!            the same bytes, and a CAS store holds those once.
-//!            --source-profile NARROWS the repository to one reviewed model and is the
-//!            step that decides 210 GB instead of 498 GB; without it the answer is the
-//!            whole repository, which is a successful download of the wrong size
-//!   tfs source plan <uri> --source-profile <name>... [--registry <r>] [--json]
-//!            the CONVERSION plan, decided from HEADERS, before a byte of payload moves
-//!            and before a pod is rented (tfs-076). Resolve, narrow, fetch each member's
-//!            header by ranged GET, and run the pod's own planner over them. No store, no
-//!            tensor bytes. MiniMax-H3 is 275 KB of header standing in for 210.3 GB of
-//!            payload, and three separate H3 runs moved the 210.3 GB before refusing on
-//!            facts inside those 275 KB.
-//!            exit 0 PLAN OK / 1 REFUSED, this cannot convert / 2 UNDECIDED, a header
-//!            could not be read cheaply — proceed to the ordinary path, never refuse
-//!   tfs source pull <root> <uri> [--api <base>] [--allow-local]        tfs-052 handlers
-//!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
-//!
-//! Qualification (tfs-008): what an (encoding, device) pair is QUALIFIED to execute.
-//! FAIL-CLOSED -- an absent pair refuses, because an unrecognised device is the absence of
-//! evidence and never permission. The compiled-in records speak only for the reference
-//! decoders in `tfs conform`, on the CPU they run on; an accelerator answer exists only
-//! once a component that HELD the card hands one in through `--records`.
-//!
-//!   tfs conform [<what>]                             qualify the reference decoders
-//!   tfs vectors mine <rows> <name>                   mine a producer's vectors
-//!   tfs capability <encoding> <device> [--alias <a>] [--records <observed.json>] [--json]
-//!
-//! The repository/manifest/blob store (tfs-034).
-//!
-//!   tfs manifest build <entries.jsonl> --out <manifest.json>
-//!   tfs manifest admit|get|show|walk|verify <root> ...
-//!   tfs manifest inspect <manifest.json> --refs <jsonl>
-//!   tfs repo inspect <repo.json> --rows <jsonl>
-//!   tfs repo list <store> --rows <jsonl>     every release lane and local alias
-//!   tfs repo usage <store> --rows <jsonl>    blob bytes per repo: total, and unique to it
-//!   tfs repo apply <current.json|-> <mutation.json> --out <replacement> --rows <jsonl>
-//!                  put_checkpoint requires --manifest, --header and --inventory
-//!   tfs repo commit <store> <current.json|-> <mutation.json>
-//!   tfs local resolve <store> <name>
-//!   tfs local replace <store> <name> <source-sha256> <manifest> <length>
-//!                     --observed <repository-sha256|absent>
-//!   tfs local remove <store> <name> --observed <repository-sha256>
-//!   tfs key blob|manifest <sha256> | repo <org> <name>
-//!   tfs gc headers <census> --out <requests.jsonl>
-//!   tfs gc plan <census> --holds <holds.jsonl> --out <plan.jsonl>
-//!
-//! The checkpoint plane (tfs-015). Flags: --blocks <n> --pin <alias|empty> --seed <s>
-//! `write`/`read` also accept `--plain`, the closed all-`plain/1` fixture in PyTorch
-//! `named_parameters()` traversal order.
-//!
-//!   tfs checkpoint write <root> [--plain]    objectize a synthetic tree, emit the header
-//!   tfs checkpoint read <root> <hex>         reconstruct every part, byte-identity checked
-//!   tfs checkpoint info <root> <hex>         component/scope query, zero tensor-byte reads
-//!   tfs checkpoint page <root> <hex> <len>   bounded source recovery link, --offset/--limit
-//!   tfs checkpoint locate <root> <hex> <component> <key> <role> <off> <len>
-//!   tfs checkpoint reproduce <root> <header.json> <entries.json>
-//!                                            verified refs -> canonical header + manifest
-//!   tfs checkpoint caps                      whole-document total caps, armed live
-//!   tfs checkpoint size [n]                  uniform-form header cost at H3 cardinality
-//!   tfs ingest source-members <profile>... [--registry <operator-registry.json>]
-//!   tfs ingest source-plan --carrier <path>... [--registry <operator-registry.json>]
-//!
-//! Reads and projection (tfs-005). Flags: --workers <n> --window <b> --ring <b>
-//! --hold-secs <s> --drop-unreleased --no-symlink
-//!
-//!   tfs read lease <root> <manifest>         acquire/verify/release one ReadLease
-//!   tfs read plan <root> <manifest>          stored construction order + drift refusal
-//!   tfs read fill <root> <manifest>          the pooled fill into a caller-owned ring
-//!   tfs read verify-fill <root> <manifest>   the same bytes through the sequential path
-//!   tfs read span <root> <manifest> <c> <k> <role> <off> <len>
-//!   tfs read arms <root> <manifest>          the read/projection red arms, planted live
-//!   tfs read tear <root> <manifest>          tear a verified blob UNDER a live lease
-//!   tfs read prove <root> <manifest>         delivered bytes vs header digests
-//!   tfs read transform                       run decomposition + the block-granularity rule
-//!   tfs checkout <root> <manifest> <dest>    manifest tree; header included, payload CAS-only
-//!   tfs materialize <root> <manifest> <path> <dest>  independent ordinary-file bytes
-//!   tfs render <root> <hex>                  pretty PROJECTION of a canonical document
-//!
+//! tfs: the Hub's TensorFS verifier, fixture writer and maintainer tool. `USAGE` lists the
+//! verbs; the library is the product path (cozy-machine links it).
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -183,6 +14,58 @@ use tensorfs_core::repo_cache::{CacheKind, RepoObjectCache};
 use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
 
 type TfsResult<T> = tensorfs_core::err::Result<T>;
+
+const USAGE: &str = "usage: tfs <verb> ...
+  version
+  key blob|manifest <sha256> | repo <org> <name>
+  cbor encode|decode|check <file> [--out <file>]
+  manifest build <entries.jsonl> --out <manifest.json>
+  manifest inspect <manifest.json> --refs <jsonl> [--header <h> --inventory <i> --closure <c>]
+  manifest show|get|walk|verify|admit <root> ...
+  repo inspect <repo.json> --rows <jsonl>
+  repo apply <current.json|-> <mutation.json> --out <file> --rows <jsonl> [--manifest <m> --header <h> --inventory <i>]
+  repo list|usage <root> --rows <jsonl>
+  repo get <root> <org> <name> --out <file>
+  repo commit <root> <current.json|-> <mutation.json>
+  local resolve|remove <root> <name>, local replace <root> <name> <source> <manifest> <length> --observed <s>
+  store init|info|ensure <root> [--repo-cache <cache> | --no-repo-cache]
+  store prepare-readers <root>
+  store rebuild <census> --rows <jsonl> [--sqlite <file>]
+  gc <root> [--dry-run] [--json]
+  gc headers <census> --out <jsonl>
+  gc plan <census> --holds <jsonl> --out <jsonl>
+  reclaim usage|plan|run <root>
+  put|get|contains <root> ..., reap <root>, fill <root> <plan>
+  checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]
+  checkpoint reproduce <root> <header.json> <entries.json>
+  fetch [bounded] <root> <ref> --hub <base>, push <root> <sha256> --grant-file <f>
+  staging fetch <root> <sha256> <length> <url|->, staging drop <root> <sha256>
+  ensure <root> <ref> --hub <base>, pressure <root>
+  repo-cache restore|resume|chain ...
+  ingest bank <dialect> <converter> ..., ingest source-members|source-plan|plan|run|install|reap ...";
+
+/// Flags that never take a value.
+const SWITCHES: &[&str] = &[
+    "allow-local", "assume-upstream", "demote", "dry-run", "json", "keys", "no-configs",
+    "no-disk-budget", "no-journal", "no-netns", "no-repo-cache", "plain", "progress",
+];
+/// Flags that take the next token as their value; given last, or before another flag, they
+/// are present without one.
+const VALUED: &[&str] = &[
+    "allow-hosts", "blocks", "ca-file", "candidates", "carrier", "checkpoint-bytes", "closure",
+    "config", "content-type", "credential-file", "disk-budget", "expect", "expect-length", "fault",
+    "grant-file", "header", "holds", "hub", "inventory", "isolation-tier", "keep", "lane",
+    "manifest", "max-download-bytes", "max-download-objects", "max-redirects", "member", "need",
+    "observed", "order", "out", "part-mib", "plan", "progress-bytes", "range", "ready", "refs",
+    "registry", "repo-cache", "rlimit-as-mb", "rlimit-fsize-mb", "rows", "sample-seconds",
+    "scale", "session", "slow-ms", "source", "source-name", "source-plan", "source-profile",
+    "spec-variant", "sqlite", "step", "streams", "target", "tenant", "timeout", "url",
+];
+
+fn usage() -> ExitCode {
+    eprintln!("{USAGE}");
+    ExitCode::from(2)
+}
 
 /// ONE spelling in both directions, on the POSITIONAL surface. Every id this tool prints is
 /// `sha256:<hex>`, and a positional digest used to be bare hex only, so an id copied out of
@@ -303,19 +186,13 @@ fn main() -> ExitCode {
         ["fetch", "bounded", r, refspec] => fetch::cmd_bounded_pull(Path::new(r), refspec, &flags),
         ["staging", "fetch", r, i, l, u] => fetch::cmd_staging_fetch(Path::new(r), i, l, u, &flags),
         ["staging", "drop", r, i] => fetch::cmd_staging_drop(Path::new(r), i),
-        ["fetch", "bounded", _] => {
-            eprintln!("usage: see the header of {}", file!());
-            ExitCode::from(2)
-        }
+        ["fetch", "bounded", _] => usage(),
         ["fetch", r, refspec] => fetch::cmd_pull(Path::new(r), refspec, &flags),
         ["push", r, i] => fetch::cmd_push(Path::new(r), i, &flags),
         ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
         ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
         ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),
-        _ => {
-            eprintln!("usage: see the header of {}", file!());
-            ExitCode::from(2)
-        }
+        _ => usage(),
     }
 }
 
@@ -530,6 +407,8 @@ fn print_restore(report: &tensorfs_core::durability::Restored) -> ExitCode {
 /// `--key value` pairs and bare `--flag` switches, split out of the positionals.
 type Flags = Vec<(String, String)>;
 
+/// A switch never takes the next token. An unknown flag warns, and takes the next token as
+/// its value as every flag once did, so a caller's typo is visible and nothing it passes moves.
 fn split_flags(argv: Vec<String>) -> (Vec<String>, Flags) {
     let (mut pos, mut flags) = (Vec::new(), Flags::new());
     let mut it = argv.into_iter().peekable();
@@ -537,8 +416,12 @@ fn split_flags(argv: Vec<String>) -> (Vec<String>, Flags) {
         match t.strip_prefix("--") {
             None => pos.push(t),
             Some(k) => {
+                let switch = SWITCHES.contains(&k);
+                if !switch && !VALUED.contains(&k) {
+                    eprintln!("tfs: warning: unknown flag --{k}");
+                }
                 let v = match it.peek() {
-                    Some(n) if !n.starts_with("--") => it.next().unwrap(),
+                    Some(n) if !switch && !n.starts_with("--") => it.next().unwrap(),
                     _ => "1".to_string(),
                 };
                 flags.push((k.to_string(), v));
@@ -561,8 +444,15 @@ fn flag_all<'a>(f: &'a Flags, k: &str) -> Vec<&'a str> {
 fn flag_on(f: &Flags, k: &str) -> bool {
     flag(f, k).is_some()
 }
+/// `--k <number>`, or `d` when absent. A value that is not a number is a usage error.
 fn flag_num<T: std::str::FromStr>(f: &Flags, k: &str, d: T) -> T {
-    flag(f, k).and_then(|v| v.parse().ok()).unwrap_or(d)
+    match flag(f, k) {
+        None => d,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("tfs: --{k} {v:?} is not a number");
+            std::process::exit(2)
+        }),
+    }
 }
 
 fn bail(e: Refusal) -> ExitCode {
