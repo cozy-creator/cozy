@@ -2,7 +2,6 @@ package machines
 
 import (
 	"context"
-	"net"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -53,10 +52,7 @@ func (r *Resolver) dialEndpointAt(ctx context.Context, ep machineendpoint.Endpoi
 			account = r.Hub(origin)
 		}
 		cache := r.Host.endpointCache(ep.Name())
-		host, _, _ := net.SplitHostPort(ep.Address)
-		target := accessTarget{addr: ep.Address, worker: ep.WorkerID, leaf: pin.DER(), local: loopbackOrigin("http://"+net.JoinHostPort(host, "1")) != "",
-			pin:   func() (*workertls.Pin, *exit.Error) { return pin, nil },
-			owner: func() (rental.CreatorIdentity, *exit.Error) { return key, nil }}
+		target := endpointTarget(ep, pin, key)
 		resumeAccessCleanup(ctx, cache, target)
 		reads, problem := attachAccess(ctx, cache, target, origin, account)
 		if problem != nil {
@@ -66,4 +62,13 @@ func (r *Resolver) dialEndpointAt(ctx context.Context, ep machineendpoint.Endpoi
 		m.Hub, m.hub = reads, account
 	}
 	return m, nil
+}
+
+// endpointTarget is an explicit endpoint as a scoped-access target. Its address says
+// nothing about where it runs (a loopback address is often a tunnel), so it reads the
+// origin Tensorhub declares, never this computer's loopback Hub.
+func endpointTarget(ep machineendpoint.Endpoint, pin *workertls.Pin, key rental.CreatorIdentity) accessTarget {
+	return accessTarget{addr: ep.Address, worker: ep.WorkerID, leaf: pin.DER(),
+		pin:   func() (*workertls.Pin, *exit.Error) { return pin, nil },
+		owner: func() (rental.CreatorIdentity, *exit.Error) { return key, nil }}
 }
