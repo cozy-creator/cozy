@@ -276,17 +276,6 @@ fn main() -> ExitCode {
         ["fill", r, p] => cmd_fill(Path::new(r), Path::new(p), &flags),
         ["bench-store", r] => cmd_bench_store(Path::new(r), &flags),
         ["checkpoint", "write", r] => ckpt::cmd_write(Path::new(r), &flags),
-        ["checkpoint", "read", r, h] => ckpt::cmd_read(Path::new(r), h, &flags),
-        ["checkpoint", "info", r, h] => ckpt::cmd_info(Path::new(r), h),
-        ["checkpoint", "page", r, h, n] => fetch::cmd_checkpoint_page(Path::new(r), h, n, &flags),
-        ["checkpoint", "locate", r, h, c, k, role, off, len] => ckpt::cmd_locate(
-            Path::new(r),
-            h,
-            [c, k, role],
-            off.parse().unwrap_or(0),
-            len.parse().unwrap_or(0),
-            &flags,
-        ),
         ["conform"] => conform::cmd_conform(None, &flags),
         ["conform", w] => conform::cmd_conform(Some(w), &flags),
         ["capability", e, d] => conform::cmd_capability(e, d, &flags),
@@ -324,11 +313,6 @@ fn main() -> ExitCode {
         ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
         ["gc", "holds", store] => repo::cmd_gc_holds(Path::new(store), &flags),
         ["gc", "plan", census] => repo::cmd_gc_plan(Path::new(census), &flags),
-        ["ingest", "inspect"] => ingest::cmd_inspect(&flags),
-        ["gguf", "plan", f] => ingest::cmd_gguf_plan(Path::new(f), false, &flags),
-        ["gguf", "admit", f] => ingest::cmd_gguf_plan(Path::new(f), true, &flags),
-        ["ingest", "converters"] => ingest::cmd_converters(),
-        ["ingest", "golden"] => ingest::cmd_golden(),
         ["ingest", "bank", dia, conv] => ingest::cmd_bank(dia, conv, &flags),
         ["ingest", "source-members", profiles @ ..] => ingest::cmd_source_members(profiles, &flags),
         ["ingest", "source-plan"] => ingest::cmd_source_plan(&flags),
@@ -349,36 +333,10 @@ fn main() -> ExitCode {
         },
         ["ingest", "run", r, t] => ingest::cmd_run(Path::new(r), t, &flags),
         ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),
-        ["ingest", "reingest", r, h, t] => ingest::cmd_reingest(Path::new(r), h, t, &flags),
         ["ingest", "install", r, s, org, name, version, lane] => {
             ingest::cmd_install(Path::new(r), s, org, name, version, lane, &flags)
         }
-        ["ingest", "restamp", r, s] => ingest::cmd_restamp(Path::new(r), s, &flags),
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
-        ["ingest", "sessions", r] => ingest::cmd_sessions(Path::new(r)),
-        ["checkpoint", "caps"] => ckpt::cmd_caps(),
-        ["checkpoint", "size"] => ckpt::cmd_size(3699),
-        ["checkpoint", "size", n] => ckpt::cmd_size(n.parse().unwrap_or(3699)),
-        ["read", "lease", r, h] => rd::cmd_lease(Path::new(r), h, &flags),
-        ["read", "plan", r, h] => rd::cmd_plan(Path::new(r), h, &flags),
-        ["read", "fill", r, h] => rd::cmd_fill(Path::new(r), h, &flags),
-        ["read", "stream", r, h] => rd::cmd_stream(Path::new(r), h, &flags),
-        ["read", "verify-fill", r, h] => rd::cmd_verify_fill(Path::new(r), h, &flags),
-        ["read", "span", r, h, c, k, role, off, len] => rd::cmd_span(
-            Path::new(r),
-            h,
-            [c, k, role],
-            off.parse().unwrap_or(0),
-            len.parse().unwrap_or(0),
-        ),
-        ["read", "arms", r, h] => rd::cmd_arms(Path::new(r), h),
-        ["read", "tear", r, h] => rd::cmd_tear(Path::new(r), h),
-        ["read", "swap", r, h] => rd::cmd_swap(Path::new(r), h),
-        ["read", "prove", r, h] => rd::cmd_prove(Path::new(r), h, &flags),
-        ["read", "transform"] => rd::cmd_transform(),
-        ["checkout", r, h, d] => rd::cmd_checkout(Path::new(r), h, Path::new(d), &flags),
-        ["materialize", r, h, p, d] => rd::cmd_materialize(Path::new(r), h, p, Path::new(d)),
-        ["render", r, h] => rd::cmd_render(Path::new(r), h),
         ["fetch", "plan", r, d, s] => fetch::cmd_plan(Path::new(r), Path::new(d), s, &flags),
         ["fetch", "plan-objects", r, s] => fetch::cmd_plan_objects(Path::new(r), s, &flags),
         ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
@@ -836,7 +794,6 @@ mod conform;
 mod ensure;
 mod fetch;
 mod ingest;
-mod rd;
 mod repo;
 mod snap;
 mod watch;

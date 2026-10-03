@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tensorfs_core::ids::ObjectRef;
+use tensorfs_core::meta::Meta;
+use tensorfs_core::store::Store;
+use tensorfs_core::{checkpoint, read, sha256};
+
 fn temporary(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "tensorfs-write-through-{name}-{}-{}",
@@ -223,21 +228,29 @@ fn convert(root: &Path, store: &Path, cache: &Path, interval: &str) -> Converted
 /// What one tensor role reassembles to, read back through the ordinary lease path. This is
 /// the end-to-end claim: not "the object is present" but "the tensor reads back".
 fn span(store: &Path, manifest: &str, component: &str, key: &str) -> String {
-    let text = ok(
-        "read span",
-        &tfs(&[
-            "read",
-            "span",
-            store.to_str().unwrap(),
-            manifest,
-            component,
-            key,
-            "value",
-            "0",
-            &TENSOR_BYTES.to_string(),
-        ]),
-    );
-    field(&text, "sha256:", 1)
+    let store = Store::open(store).unwrap();
+    let hex = manifest.trim_start_matches("sha256:");
+    let manifest = checkpoint::load_manifest(
+        &store,
+        &ObjectRef {
+            sha256: hex.to_string(),
+            length: fs::metadata(store.manifest_path(hex)).unwrap().len(),
+        },
+    )
+    .unwrap();
+    let header = checkpoint::load_header(&store, manifest.header().unwrap()).unwrap();
+    let part = header
+        .tensors()
+        .find(|(c, k, _)| *c == component && *k == key)
+        .and_then(|(_, _, tensor)| tensor.parts.iter().find(|(role, _)| role == "value"))
+        .map(|(_, part)| part.clone())
+        .unwrap();
+    let meta = Meta::open(&store).unwrap();
+    let (lease, _) = read::acquire_cozytensors(&store, &meta, &manifest).unwrap();
+    let mut bytes = vec![0u8; TENSOR_BYTES];
+    read::read_part_into(&lease, key, &part, 0, TENSOR_BYTES as u64, &mut bytes).unwrap();
+    lease.release(&meta).unwrap();
+    sha256::hex_digest(&bytes)
 }
 
 #[test]

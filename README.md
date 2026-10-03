@@ -571,8 +571,7 @@ profile is complete. Partial work returns separate `checkpoints` rows:
 `{slot, head, head_length, plan_digest, index, bytes}`. These are **local** progress, not a claim of
 remote durability. The existing immutable Link format carries at most 128 new refs per link and
 an opaque journal snapshot. `Store.checkpoint_page` validates operation/slot/plan and
-returns bounded refs, predecessor and progress references; `tfs checkpoint page ROOT HEAD LENGTH`
-is its diagnostic CLI. Fetch/PUT use `Store.checkpoint_fetch/push` over the existing transport.
+returns bounded refs, predecessor and progress references. Fetch/PUT use `Store.checkpoint_fetch/push` over the existing transport.
 
 Derived writers use the same checkpoint transport. `Store.begin_derived` requires
 `work_fingerprint=` in addition to its existing transaction, epoch and declaration arguments.
@@ -616,24 +615,6 @@ canonical JSON row. Replace atomically swaps the complete `repos/local/<name>.js
 exactly one hidden `(source-selection, local) -> Manifest` release after verifying its closure;
 stale observed repository digests refuse. Remove deletes the complete alias. Ordinary repository
 mutations cannot append a second row under org `local`.
-
-## Read views
-
-```text
-tfs checkout <store> <manifest> <destination>
-tfs materialize <store> <manifest> <path> <destination>
-```
-
-A checkout is a faithful disposable relative-symlink view of every manifest entry, including the
-validated typed CozyTensors header. `--no-symlink` writes small read-only copies instead. Tensor
-payload segments remain CAS-only and are never duplicated into the checkout. Materialization
-writes one independent ordinary file atomically and continues to refuse CozyTensors entries.
-
-Inspect a checked-out header with `tfs cbor check <checkout>/model.cozytensors` (or decode its
-diagnostic projection with `tfs cbor decode <path>`). Python readers use
-`tensorfs.parse_header(path.read_bytes())`. The file is canonical `cozytensors/1` CBOR containing
-CAS ObjectRefs; it is not a self-contained weights file, so tensor payload reads still require the
-original TensorFS store.
 
 ## GC and recovery
 
