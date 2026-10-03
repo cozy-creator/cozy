@@ -19,12 +19,11 @@ const BootstrapCapability = "machine-bootstrap/1"
 
 func (h *Host) bundledAgent() string { return filepath.Join(h.python(), "bin/cozy-machine") }
 
-// Capabilities name the supported operations; release numbers are descriptive.
+// An agent is accepted by its own identity (`version --json`): its name, a usable wire range
+// and the capabilities this client drives. The implementation (the Go agent of a Runtime
+// wheel, the Rust machine, a later one) and release numbers are descriptive.
 func compatibleAgent(ctx context.Context, path string) bool {
-	if HostModule(path) != AgentModule {
-		return false
-	}
-	out, err := exec.CommandContext(ctx, path, "version").Output()
+	out, err := exec.CommandContext(ctx, path, "version", "--json").Output()
 	var version struct {
 		Name             string   `json:"name"`
 		WireMinor        uint32   `json:"wire_minor"`
