@@ -113,28 +113,7 @@ func writeWheel(ctx context.Context, client *machinev1.Client, path string) (*ma
 
 func (h *Host) recordInstalled(installed Installed) error {
 	raw, _ := json.MarshalIndent(installed, "", "  ")
-	if err := writePrivate(h.path("installed.json"), raw); err != nil {
-		return err
-	}
-	// Atomically replace the obsolete entry point; never follow its old symlink
-	// into a shared CLI executable.
-	target := filepath.Join(h.Root(), "usr/local/bin/pod-supervisor")
-	file, err := os.CreateTemp(filepath.Dir(target), ".legacy-refusal-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	_, err = file.WriteString("#!/bin/sh\necho 'legacy machine control retired; use the current cozy CLI' >&2\nexit 6\n")
-	if err == nil {
-		err = file.Chmod(0755)
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	return os.Rename(file.Name(), target)
+	return writePrivate(h.path("installed.json"), raw)
 }
 
 // NewestPublished is a distribution's newest release on the package index.
