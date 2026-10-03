@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -273,7 +272,7 @@ func callsProject(t *testing.T) string {
 	t.Helper()
 	project := filepath.Join(t.TempDir(), "child-calls")
 	must(t, os.MkdirAll(project, 0o700))
-	runtime := "cozy-runtime>=" + machines.RuntimeFloor
+	runtime := "cozy-runtime>=" + runtimeFloor
 	sources := ""
 	if *machineRuntimeWheel != "" {
 		sources = fmt.Sprintf("[tool.uv.sources]\ncozy-runtime={path=%q}\ntensorfs={path=%q}\n", *machineRuntimeWheel, *machineTensorFSWheel)

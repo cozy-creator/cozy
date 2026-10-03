@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -166,18 +165,13 @@ func awaitScopedMachine(t *testing.T, h *machines.Host, launch *machines.Launch)
 	fatal(t, problem)
 	owner, problem := h.Owner()
 	fatal(t, problem)
-	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
-	must(t, err)
-	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
-	defer transport.CloseIdleConnections()
-	client := &machines.Maintenance{Base: "https://" + launch.Addr, Machine: launch.WorkerID, Public: ed25519.PublicKey(public), Sign: owner.Sign, Client: &http.Client{Transport: transport}}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	state, problem := client.AwaitUpdateAdmission(ctx)
-	fatal(t, problem)
-	if state.Phase != "ready" {
-		t.Fatal("fixture Runtime failed", state.Phase)
-	}
+	waitUntil(t, "the fixture Runtime is ready", func() bool {
+		phase, err := runtimePhase(t, launch.Addr, pin, launch.WorkerID, owner)
+		if err == nil && phase == "failed" {
+			t.Fatal("fixture Runtime failed")
+		}
+		return err == nil && phase == "ready"
+	})
 }
 func machineScopedFiles(t *testing.T, h *machines.Host) []byte {
 	t.Helper()

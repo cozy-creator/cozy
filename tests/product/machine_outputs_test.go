@@ -167,11 +167,7 @@ func machineServesOutputAsleep(t *testing.T, root, run, output, digest string, r
 	fatal(t, problem)
 	owner, problem := host.Owner()
 	fatal(t, problem)
-	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
-	must(t, err)
-	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
-	defer transport.CloseIdleConnections()
-	maintenance := &machines.Maintenance{Base: fmt.Sprintf("https://127.0.0.1:%d", record.WorkerPort), Machine: state.MachineID, Public: ed25519.PublicKey(public), Sign: owner.Sign, Client: &http.Client{Transport: transport, Timeout: 5 * time.Second}}
+	addr := fmt.Sprintf("127.0.0.1:%d", record.WorkerPort)
 	// Ordinary SIGKILL is recoverable. Instead, arrange the documented launch
 	// refusal while keeping version/capability probes and read helpers functional.
 	entry := filepath.Join(host.Root(), "opt/cozy/bin/cozy-runtime-worker")
@@ -191,9 +187,9 @@ func machineServesOutputAsleep(t *testing.T, root, run, output, digest string, r
 	}
 	must(t, syscall.Kill(pid, syscall.SIGKILL))
 	landed(t, "structural Runtime refusal with the authenticated machine still available", func() bool {
-		observed, problem := maintenance.State(t.Context())
+		phase, err := runtimePhase(t, addr, pin, state.MachineID, owner)
 		_, witnessErr := os.Stat(witness)
-		return problem == nil && observed.Phase == "failed" && runtimeChild(record.PID) == 0 && witnessErr == nil
+		return err == nil && phase == "failed" && runtimeChild(record.PID) == 0 && witnessErr == nil
 	})
 	idle := filepath.Join(host.Root(), "var/lib/cozy/machine/idle.json")
 	before := readText(idle)

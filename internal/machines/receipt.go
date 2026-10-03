@@ -10,13 +10,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strconv"
-	"time"
+
+	"github.com/cozy-creator/cozy/internal/machinev1"
 )
 
-// The readiness receipt, read as Tensorhub reads a pod's: the envelope over the media plane,
+// The readiness receipt, read as Tensorhub reads a machine's: the envelope from Status,
 // authenticated under the key the launcher minted, naming the TLS leaf that served it.
 const (
 	ReadinessReceiptDomain = "cozy.pod-readiness/1\x00"
@@ -46,47 +45,27 @@ type receiptRefusal struct{ reason string }
 
 func (r *receiptRefusal) Error() string { return r.reason }
 
-// runtimeGone is a Host whose Runtime cannot start: no readiness will come.
-type runtimeGone struct{ reason string }
-
-func (r *runtimeGone) Error() string { return r.reason }
-
-var receiptClient = &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+// readReceipt reads the machine's sealed receipt from its Status, which it answers without a
+// capability, authenticates it under the key this launch minted, and checks it names the TLS
+// leaf that served it.
+func readReceipt(ctx context.Context, workerPort int, key []byte) (receipt, []byte, error) {
 	// The leaf is unknown until the receipt names it; it is compared with the served one below.
-	TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
-}}
-
-func readReceipt(ctx context.Context, mediaPort int, key []byte) (receipt, []byte, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://127.0.0.1:"+strconv.Itoa(mediaPort)+"/v1/bootstrap/receipt", nil)
+	tlsConfig := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}
+	frame, served, err := machinev1.Identity(ctx, "127.0.0.1:"+strconv.Itoa(workerPort), tlsConfig)
 	if err != nil {
 		return receipt{}, nil, err
 	}
-	response, err := receiptClient.Do(request)
-	if err != nil {
-		return receipt{}, nil, err
+	if len(frame.GetReceipt()) == 0 {
+		return receipt{}, nil, fmt.Errorf("the machine has not sealed its receipt yet")
 	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxReceiptBytes+1))
-	if err != nil {
-		return receipt{}, nil, err
-	}
-	if response.StatusCode != http.StatusOK {
-		var answer struct {
-			Error struct{ Code, Message string }
-		}
-		if json.Unmarshal(body, &answer) == nil && answer.Error.Code == "machine.runtime_gone" {
-			return receipt{}, nil, &runtimeGone{answer.Error.Message}
-		}
-		return receipt{}, nil, fmt.Errorf("receipt answered %d", response.StatusCode)
-	}
-	if len(body) > maxReceiptBytes || response.TLS == nil || len(response.TLS.PeerCertificates) == 0 {
+	if len(frame.GetReceipt()) > maxReceiptBytes || len(served) == 0 {
 		return receipt{}, nil, &receiptRefusal{"the receipt is oversized or not served over TLS"}
 	}
 	var envelope struct {
 		Payload    []byte `json:"payload"`
 		HMACSHA256 string `json:"hmac_sha256"`
 	}
-	if err := json.Unmarshal(body, &envelope); err != nil || len(envelope.Payload) == 0 {
+	if err := json.Unmarshal(frame.GetReceipt(), &envelope); err != nil || len(envelope.Payload) == 0 {
 		return receipt{}, nil, &receiptRefusal{"the receipt envelope is malformed"}
 	}
 	want, err := hex.DecodeString(envelope.HMACSHA256)
@@ -101,8 +80,8 @@ func readReceipt(ctx context.Context, mediaPort int, key []byte) (receipt, []byt
 		return receipt{}, nil, &receiptRefusal{"the receipt names no boot"}
 	}
 	leaf, err := base64.StdEncoding.DecodeString(out.TLSCertificateDERBase64)
-	if err != nil || !bytes.Equal(leaf, response.TLS.PeerCertificates[0].Raw) {
-		return receipt{}, nil, &receiptRefusal{"the media plane serves a leaf the receipt does not name"}
+	if err != nil || !bytes.Equal(leaf, served) {
+		return receipt{}, nil, &receiptRefusal{"the machine serves a leaf the receipt does not name"}
 	}
 	return out, leaf, nil
 }

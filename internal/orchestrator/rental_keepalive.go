@@ -2,65 +2,62 @@ package orchestrator
 
 import (
 	"context"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc/codes"
+	"github.com/cozy-creator/cozy/internal/machinev1"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/workertls"
 	"google.golang.org/grpc/status"
 )
 
-// KeepRentalAlive authenticates the recorded Host directly. Runtime protocol
-// admission, availability and control ownership are irrelevant to this manual
-// Host operation; opening a new Control claim would also fence preparation.
-func (c *Orchestrator) KeepRentalAlive(ctx context.Context, id, requestID string) (*pb.KeepRentalAliveResult, *exit.Error) {
-	if requestID == "" || len(requestID) > pb.MaxRentalKeepaliveRequestIDBytes {
-		return nil, exit.New(exit.Validation, "keepalive requires a bounded request ID")
-	}
-	// This unary control acknowledgment uses the existing network-control bound.
-	// It never cancels application work or retries the user action automatically.
+// RentalSignerSource is the owner key that authorizes calls on one rental's machine.
+type RentalSignerSource func(rentalID string) (machinev1.Signer, *exit.Error)
+
+// KeepRentalAlive asks the rental's machine to reset its idle deadline once (Status with
+// keepalive) and answers what it now holds. Runtime admission and running work are
+// irrelevant to this manual owner action, and nothing is retried.
+func (c *Orchestrator) KeepRentalAlive(ctx context.Context, id string) (records.RentalKeepalive, *exit.Error) {
+	var out records.RentalKeepalive
 	ctx, cancel := context.WithTimeout(ctx, hub.Timeout)
 	defer cancel()
 	c.mu.Lock()
 	closing := c.closing
 	c.mu.Unlock()
-	if closing || c.opt.RentalClaimProof == nil {
-		return nil, exit.Unavailablef("rental keepalive owner is unavailable")
+	if closing || c.opt.RentalSigner == nil {
+		return out, exit.Unavailablef("rental keepalive owner is unavailable")
 	}
 	row, problem := c.opt.Store.RentalRow(id)
 	if problem != nil {
-		return nil, problem
+		return out, problem
 	}
 	if row == nil || row.State != "ready" {
-		return nil, exit.New(exit.Conflict, "keepalive requires a current ready rental")
+		return out, exit.New(exit.Conflict, "keepalive requires a current ready rental")
 	}
-	remote := &WorkerConnection{RentalID: row.ID, Addr: row.Address, CACert: row.CertPath,
-		WorkerID: row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID}
-	if remote.RentalID != id || remote.Addr == "" || remote.CACert == "" || remote.WorkerID == "" || remote.WorkerBootID == "" {
-		return nil, exit.New(exit.Credential, "keepalive requires the rental's pinned Host, worker and boot identity")
+	if row.Address == "" || row.CertPath == "" || row.ExpectedWorkerID == "" || row.ExpectedWorkerBootID == "" {
+		return out, exit.New(exit.Credential, "keepalive requires the rental's pinned machine, worker and boot identity")
 	}
-	proof, problem := c.opt.RentalClaimProof(remote, recordOwnerEpoch)
+	pin, err := workertls.LoadPin(row.CertPath)
+	if err != nil {
+		return out, exit.New(exit.Credential, "the rental's machine certificate pin is unreadable: %s", err)
+	}
+	signer, problem := c.opt.RentalSigner(id)
 	if problem != nil {
-		return nil, problem
+		return out, problem
 	}
-	conn, err := dialWorker(remote.Addr, remote)
+	client, err := machinev1.Dial(row.Address, pin.TLSConfig(), row.ExpectedWorkerID, signer)
 	if err != nil {
-		return nil, exit.Unavailablef("rental keepalive could not open its pinned Host connection")
+		return out, exit.Unavailablef("rental keepalive could not open its pinned machine connection")
 	}
-	defer conn.Close()
-	claim := &pb.Claim{RecordOwnerEpoch: recordOwnerEpoch, RecordOwnerId: recordOwnerID,
-		WorkerId: remote.WorkerID, WorkerBootId: remote.WorkerBootID, WireMinor: pb.WireMinor, Proof: proof}
-	// KeepRentalAlive itself is the Host-only capability boundary. ProtocolInfo
-	// advertises the execution intersection and may fail while Runtime is down.
-	result, err := pb.NewPodHostClient(conn).KeepRentalAlive(ctx, &pb.KeepRentalAliveRequest{Claim: claim, RequestId: requestID})
-	if status.Code(err) == codes.Unimplemented {
-		return nil, exit.New(exit.Conflict, "Host does not implement the required rental keepalive contract")
-	}
+	defer client.Close()
+	frame, err := client.Keepalive(ctx)
 	if err != nil {
-		return nil, exit.Unavailablef("rental keepalive was not acknowledged: %s", err)
+		return out, exit.Unavailablef("rental keepalive was not acknowledged: %s", status.Convert(err).Message())
 	}
-	if result.GetRequestId() != requestID || result.GetWorkerId() != claim.WorkerId || result.GetWorkerBootId() != claim.WorkerBootId {
-		return nil, exit.New(exit.Conflict, "rental keepalive acknowledgment does not match the current owner request and worker boot")
+	if frame.GetWorkerId() != row.ExpectedWorkerID || frame.GetBootId() != row.ExpectedWorkerBootID {
+		return out, exit.New(exit.Conflict, "rental keepalive was answered by another worker or boot than the rental's")
 	}
-	return result, nil
+	return records.RentalKeepalive{WorkerID: frame.GetWorkerId(), WorkerBootID: frame.GetBootId(),
+		AcknowledgedAtMS: time.Now().UnixMilli(), IdleDeadlineMS: frame.GetIdleDeadlineUnixMs()}, nil
 }

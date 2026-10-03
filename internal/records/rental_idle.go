@@ -12,7 +12,6 @@ const rentalIdleDDL = `CREATE TABLE IF NOT EXISTS rental_idle (
  rental_id TEXT PRIMARY KEY REFERENCES rentals(id) ON DELETE CASCADE,
  worker_id TEXT NOT NULL DEFAULT '',
  worker_boot_id TEXT NOT NULL DEFAULT '',
- request_id TEXT NOT NULL DEFAULT '',
  acknowledged_at_ms INTEGER NOT NULL DEFAULT 0,
  idle_deadline_ms INTEGER NOT NULL DEFAULT 0,
  receipt_observed_at TEXT NOT NULL DEFAULT '',
@@ -49,21 +48,26 @@ func rentalIdleRunCounts(reader rentalIdleReader, id, buyer string) (queued, run
 	return queued + queuedInstalls, running + runningInstalls, nil
 }
 
-// RecordRentalKeepalive accepts only a full, identity-bound Host acknowledgment.
-// Creator schedules from the first local observation, not the Host clock, so the Host's
-// own idle window is recorded as reported rather than required to equal Creator's.
-// Older receipts never move that clock backward, and a replay cannot renew it.
-func (s *Store) RecordRentalKeepalive(id string, result *pb.KeepRentalAliveResult, observedAt time.Time) *exit.Error {
-	if observedAt.IsZero() || result == nil || result.RequestId == "" || len(result.RequestId) > pb.MaxRentalKeepaliveRequestIDBytes || result.WorkerId == "" || result.WorkerBootId == "" || result.AcknowledgedAtUnixMs <= 0 || result.IdleDeadlineUnixMs <= result.AcknowledgedAtUnixMs {
-		return exit.New(exit.Conflict, "worker returned an invalid rental keepalive receipt")
+// RentalKeepalive is the machine's answer to one explicit idle reset: the boot that reset it
+// and the deadline it now holds, received at AcknowledgedAtMS on this computer's clock.
+type RentalKeepalive struct {
+	WorkerID, WorkerBootID           string
+	AcknowledgedAtMS, IdleDeadlineMS int64
+}
+
+// RecordRentalKeepalive accepts only an acknowledgment from the rental's recorded boot.
+// Creator schedules from its own observation, so the machine's idle window is recorded as
+// reported; an older acknowledgment never moves the clock backward.
+func (s *Store) RecordRentalKeepalive(id string, result RentalKeepalive, observedAt time.Time) *exit.Error {
+	if observedAt.IsZero() || result.WorkerID == "" || result.WorkerBootID == "" || result.AcknowledgedAtMS <= 0 || result.IdleDeadlineMS <= result.AcknowledgedAtMS {
+		return exit.New(exit.Conflict, "the machine returned an invalid rental keepalive acknowledgment")
 	}
-	updated, err := s.db.Exec(`INSERT INTO rental_idle(rental_id,worker_id,worker_boot_id,request_id,acknowledged_at_ms,idle_deadline_ms,receipt_observed_at)
- SELECT id,expected_worker_id,expected_worker_boot_id,?,?,?,? FROM rentals
+	updated, err := s.db.Exec(`INSERT INTO rental_idle(rental_id,worker_id,worker_boot_id,acknowledged_at_ms,idle_deadline_ms,receipt_observed_at)
+ SELECT id,expected_worker_id,expected_worker_boot_id,?,?,? FROM rentals
  WHERE id=? AND state='ready' AND expected_worker_id=? AND expected_worker_boot_id=?
  ON CONFLICT(rental_id) DO UPDATE SET worker_id=excluded.worker_id,worker_boot_id=excluded.worker_boot_id,
- request_id=excluded.request_id,acknowledged_at_ms=excluded.acknowledged_at_ms,idle_deadline_ms=excluded.idle_deadline_ms,receipt_observed_at=excluded.receipt_observed_at
- WHERE excluded.acknowledged_at_ms>rental_idle.acknowledged_at_ms AND
- excluded.request_id!=rental_idle.request_id`, result.RequestId, result.AcknowledgedAtUnixMs, result.IdleDeadlineUnixMs, observedAt.UTC().Format(time.RFC3339Nano), id, result.WorkerId, result.WorkerBootId)
+ acknowledged_at_ms=excluded.acknowledged_at_ms,idle_deadline_ms=excluded.idle_deadline_ms,receipt_observed_at=excluded.receipt_observed_at
+ WHERE excluded.acknowledged_at_ms>rental_idle.acknowledged_at_ms`, result.AcknowledgedAtMS, result.IdleDeadlineMS, observedAt.UTC().Format(time.RFC3339Nano), id, result.WorkerID, result.WorkerBootID)
 	if err != nil {
 		return exit.Internalf("cannot persist rental keepalive acknowledgment: %s", err)
 	}
@@ -71,25 +75,17 @@ func (s *Store) RecordRentalKeepalive(id string, result *pb.KeepRentalAliveResul
 	if err != nil {
 		return exit.Internalf("cannot confirm rental keepalive record: %s", err)
 	}
-	if count != 1 {
-		row, problem := s.RentalRow(id)
-		if problem != nil {
-			return problem
-		}
-		if row == nil || row.State != "ready" || row.ExpectedWorkerID != result.WorkerId || row.ExpectedWorkerBootID != result.WorkerBootId {
-			return exit.New(exit.Conflict, "rental identity or lifetime changed before keepalive acknowledgment")
-		}
-		var request string
-		var ack, deadline int64
-		if err := s.db.QueryRow(`SELECT request_id,acknowledged_at_ms,idle_deadline_ms FROM rental_idle WHERE rental_id=?`, id).Scan(&request, &ack, &deadline); err != nil {
-			return exit.Internalf("cannot confirm prior keepalive: %s", err)
-		}
-		if request == result.RequestId && (ack != result.AcknowledgedAtUnixMs || deadline != result.IdleDeadlineUnixMs) {
-			return exit.New(exit.Conflict, "worker changed an idempotent keepalive acknowledgment")
-		}
-		// A delayed replay of an older receipt is acknowledged without moving
-		// the current deadline backward or extending it again.
+	if count == 1 {
+		return nil
 	}
+	row, problem := s.RentalRow(id)
+	if problem != nil {
+		return problem
+	}
+	if row == nil || row.State != "ready" || row.ExpectedWorkerID != result.WorkerID || row.ExpectedWorkerBootID != result.WorkerBootID {
+		return exit.New(exit.Conflict, "rental identity or lifetime changed before keepalive acknowledgment")
+	}
+	// An older acknowledgment arriving late leaves the current deadline alone.
 	return nil
 }
 

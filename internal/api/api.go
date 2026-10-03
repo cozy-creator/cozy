@@ -84,7 +84,7 @@ type Server struct {
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
 	rentals             func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	rentalInventory     func(string, bool, bool) (RentalInventory, *exit.Error)
-	rentalKeepalive     func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
+	rentalKeepalive     func(context.Context, string) (RentalKeepaliveResult, *exit.Error)
 	rentalInstall       func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	rentalInstallStatus func(string, string) (*RentalInstallStatus, *exit.Error)
 	runtimeUpdate       func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
@@ -142,7 +142,7 @@ type Options struct {
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	// RentalInventory answers one hub's fleet, or with allHubs every hub's.
 	RentalInventory func(hub string, allHubs, reconcile bool) (RentalInventory, *exit.Error)
-	RentalKeepalive func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
+	RentalKeepalive func(context.Context, string) (RentalKeepaliveResult, *exit.Error)
 	RentalInstall   func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	// RentalInstallStatus reads one queued installation on one machine, with its progress.
 	RentalInstallStatus func(machine, id string) (*RentalInstallStatus, *exit.Error)
@@ -254,7 +254,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"DELETE /v1/local/rentals/{rental_id}/claim":        s.detachRental,
 		"POST /v1/local/rentals/{rental_id}/prune":          s.pruneRental,
 		"GET /v1/local/machines/{machine}/describe":         s.describeRelease,
-		"GET /v1/local/machines/{machine}/software":         s.machineSoftware,
+		"GET /v1/local/machines/{machine}/status":           s.machineStatus,
 		"GET /v1/local/machines/{machine}/logs/{log}":       s.machineLog,
 		"POST /v1/local/machines/forget-package":            s.forgetPackage,
 		"POST /v1/local/rentals/{rental_id}/prepare":        s.prepareRentalPackage,

@@ -30,8 +30,8 @@ type MachineExecutions interface {
 	// Describe is a published release as one machine reads it at its own Hub: the release
 	// (the newest when none is named) and its interface.
 	Describe(ctx context.Context, machine, hub, pkg, release string) (DescribedRelease, *exit.Error)
-	// Software is the agent, Runtime and TensorFS releases one machine reports it runs.
-	Software(ctx context.Context, machine string) (MachineSoftware, *exit.Error)
+	// Status is one machine's picture as it reports it (cozy.machine.v1 Status).
+	Status(ctx context.Context, machine string) (MachineStatus, *exit.Error)
 	// MachineLog is one log a machine keeps, at most its newest tailBytes when nonzero.
 	MachineLog(ctx context.Context, machine, log string, tailBytes uint64) (MachineLog, *exit.Error)
 	// Forget drops this daemon's kept connection to a machine, before its credentials go.
@@ -65,26 +65,51 @@ func (s *Server) forgetPackage(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, s.machineExecutions.ForgetPackage(r.Context(), body.Package))
 }
 
-// MachineSoftware is what one machine says it runs. An older machine leaves what it cannot
-// report empty; RuntimeAbsent says why the Runtime fields are.
-type MachineSoftware struct {
-	Agent         string `json:"agent,omitempty"`
-	Runtime       string `json:"runtime,omitempty"`
-	TensorFS      string `json:"tensorfs,omitempty"`
-	RuntimeAbsent string `json:"runtime_absent,omitempty"`
+// MachineStatus is what one machine reports of itself: identity, software, GPUs, the
+// owner's live runs and held environments, disk and its idle deadline (0: none).
+type MachineStatus struct {
+	WorkerID           string               `json:"worker_id"`
+	BootID             string               `json:"boot_id"`
+	Agent              string               `json:"agent"`
+	Phase              string               `json:"phase"`
+	Runtime            string               `json:"runtime,omitempty"`
+	TensorFS           string               `json:"tensorfs,omitempty"`
+	Capabilities       []string             `json:"capabilities"`
+	GPUs               []MachineGPU         `json:"gpus"`
+	Runs               []MachineRun         `json:"runs"`
+	Environments       []MachineEnvironment `json:"environments"`
+	DiskTotalBytes     uint64               `json:"disk_total_bytes,omitempty"`
+	DiskFreeBytes      uint64               `json:"disk_free_bytes,omitempty"`
+	IdleDeadlineUnixMS int64                `json:"idle_deadline_unix_ms,omitempty"`
+}
+type MachineGPU struct {
+	Index       uint32 `json:"index"`
+	Name        string `json:"name"`
+	MemoryBytes uint64 `json:"memory_bytes"`
+	Driver      string `json:"driver"`
+}
+type MachineRun struct {
+	ID     string `json:"id"`
+	Number uint64 `json:"number"`
+	State  string `json:"state"`
+}
+type MachineEnvironment struct {
+	Installation string `json:"installation"`
+	Package      string `json:"package"`
+	Release      string `json:"release"`
 }
 
-func (s *Server) machineSoftware(w http.ResponseWriter, r *http.Request) {
+func (s *Server) machineStatus(w http.ResponseWriter, r *http.Request) {
 	if s.machineExecutions == nil {
 		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
 		return
 	}
-	software, problem := s.machineExecutions.Software(r.Context(), r.PathValue("machine"))
+	status, problem := s.machineExecutions.Status(r.Context(), r.PathValue("machine"))
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	s.ok(w, r, http.StatusOK, software)
+	s.ok(w, r, http.StatusOK, status)
 }
 
 // MachineLog is one log a machine keeps, oldest line first. Unavailable says why the machine
@@ -198,8 +223,11 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		machine = link.MachineID
 	}
 	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected, AbandonedLocally: link.Abandoned}
+	v1run, _ := s.store.RunV1(row.ID)
 	var receipt pb.MachineExecutionReceipt
-	if proto.Unmarshal(link.Receipt, &receipt) == nil {
+	if accepted := records.RunV1State(link); v1run && accepted != nil {
+		view.Worker, view.Number = link.MachineID, accepted.Number
+	} else if !v1run && proto.Unmarshal(link.Receipt, &receipt) == nil {
 		view.Worker, view.Number = receipt.WorkerId, receipt.Number
 	}
 	retaining, retentionProblem := s.store.MachineExecutionOwesWork(row.ID)
@@ -284,7 +312,15 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		}
 	}
 	var terminal *pb.AttemptOutcomeBody
-	if len(link.Outcome) > 0 {
+	if outcome := records.RunV1Outcome(link); v1run && outcome != nil {
+		// A cozy.machine.v1 run's outcome carries its result and typed reason.
+		if state.ErrorType == "" && outcome.Status != "succeeded" && outcome.Reason != nil {
+			state.ErrorType, state.Error = outcome.Reason.Code, outcome.Reason.Message
+		}
+		if view.Collected && len(outcome.Result) > 0 {
+			state.Result = json.RawMessage(outcome.Result)
+		}
+	} else if len(link.Outcome) > 0 && !v1run {
 		var outcome pb.AttemptOutcome
 		var body pb.AttemptOutcomeBody
 		if proto.Unmarshal(link.Outcome, &outcome) == nil && canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body) == nil {
@@ -325,7 +361,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 				intervals = append(intervals, records.MachineExecutionInterval{Attempt: current, FinishedAt: s.store.StoppedEventAt(row)})
 			}
 		}
-		state.AttemptWallMS = machineAttemptWallMS(row, link, intervals, terminal, time.Now().UnixMilli())
+		if !v1run {
+			state.AttemptWallMS = machineAttemptWallMS(row, link, intervals, terminal, time.Now().UnixMilli())
+		}
 	}
 	if measured, known, problem := s.store.MachineRunExecutionMS(row.ID, max(row.Ordinal, 1), state.Status == "in_progress"); problem != nil {
 		view.ObservationError = problem.Message

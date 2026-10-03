@@ -112,6 +112,10 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				_ = m.Start(*current)
 			}
 		}()
+		// A machine that serves cozy.machine.v1 takes the run as one Run call.
+		if m.machines != nil && !m.loopV1(request) {
+			return
+		}
 		lastError, delay := "", time.Second
 		for m.ctx.Err() == nil {
 			current, problem := m.store.RequestRow(request.ID)
@@ -994,6 +998,12 @@ func (m *machineRuns) Refresh(parent context.Context, request records.Request) *
 	if following {
 		return nil
 	}
+	if v1, problem := m.store.RunV1(request.ID); problem != nil || v1 {
+		if problem == nil {
+			problem = m.Start(request) // its log is recorded as it streams
+		}
+		return problem
+	}
 	_, problem := m.follow(parent, request)
 	return problem
 }
@@ -1364,6 +1374,12 @@ func (m *machineRuns) settleStoppedCancellation(link *records.MachineExecution) 
 // control with requested is the observer delivering a recorded cancel request: one the
 // API's own control finished meanwhile needs only observing.
 func (m *machineRuns) control(parent context.Context, request records.Request, action string, requested bool) *exit.Error {
+	if v1, problem := m.store.RunV1(request.ID); problem != nil || v1 {
+		if problem == nil {
+			problem = m.controlV1(parent, request, action)
+		}
+		return problem
+	}
 	defer m.observation(request.ID).control()()
 	progress := &transfer.Progress{}
 	ctx, cancel := progress.Context(parent)

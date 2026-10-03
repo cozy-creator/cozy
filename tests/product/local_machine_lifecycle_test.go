@@ -106,7 +106,7 @@ func fakeAgentMachine(t *testing.T, root string, executor time.Duration) (*machi
 		script := fmt.Sprintf("#!/bin/sh\nsleep %.1f\nexec %s\n", executor.Seconds(), agent)
 		must(t, os.WriteFile(program, []byte(script), 0o755)) //cozy:allow stands in for systemd's executor
 	}
-	metadata := `{"host":{"name":"cozy-machine","module":"` + machines.AgentModule + `"},"host_pinned":true}`
+	metadata := `{"host":{"name":"cozy-machine"},"host_pinned":true}`
 	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), []byte(metadata), 0o600))
 	resolved, err := filepath.EvalSymlinks(dir)
 	must(t, err)

@@ -1,9 +1,6 @@
 package producttest
 
 import (
-	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,10 +10,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 )
 
 func idleRecord(t *testing.T, store *records.Store, id string, at time.Time) records.Rental {
@@ -86,7 +79,7 @@ func TestRentalKeepaliveReceiptSurvivesReconnectAndRejectsInvalidAcknowledgment(
 	fatal(t, problem)
 	at := time.Now().UTC().Truncate(time.Millisecond)
 	row := idleRecord(t, store, "manual", at.Add(-time.Hour))
-	receipt := &pb.KeepRentalAliveResult{RequestId: "manual-1", WorkerId: row.ExpectedWorkerID, WorkerBootId: row.ExpectedWorkerBootID, AcknowledgedAtUnixMs: at.UnixMilli(), IdleDeadlineUnixMs: at.Add(900 * time.Second).UnixMilli()}
+	receipt := records.RentalKeepalive{WorkerID: row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID, AcknowledgedAtMS: at.UnixMilli(), IdleDeadlineMS: at.Add(900 * time.Second).UnixMilli()}
 	fatal(t, store.RecordRentalKeepalive(row.ID, receipt, at))
 	// Status/reconnect writes preserve both readiness and the acknowledged clock.
 	row.ReadyAt = at.Add(time.Hour).Format(time.RFC3339Nano)
@@ -110,26 +103,24 @@ func TestRentalKeepaliveReceiptSurvivesReconnectAndRejectsInvalidAcknowledgment(
 	check(at.Add(900 * time.Second))
 	fatal(t, store.RecordRentalKeepalive(row.ID, receipt, at))
 	check(at.Add(900 * time.Second))
-	for _, mutate := range []func(*pb.KeepRentalAliveResult){func(r *pb.KeepRentalAliveResult) { r.WorkerId = "other" }, func(r *pb.KeepRentalAliveResult) { r.WorkerBootId = "other" }, func(r *pb.KeepRentalAliveResult) { r.IdleDeadlineUnixMs++ }, func(r *pb.KeepRentalAliveResult) { r.AcknowledgedAtUnixMs = 0 }, func(r *pb.KeepRentalAliveResult) { r.RequestId = "" }} {
-		invalid := proto.Clone(receipt).(*pb.KeepRentalAliveResult)
-		mutate(invalid)
+	for _, mutate := range []func(*records.RentalKeepalive){func(r *records.RentalKeepalive) { r.WorkerID = "other" }, func(r *records.RentalKeepalive) { r.WorkerBootID = "other" }, func(r *records.RentalKeepalive) { r.AcknowledgedAtMS = 0 }, func(r *records.RentalKeepalive) { r.IdleDeadlineMS = r.AcknowledgedAtMS }} {
+		invalid := receipt
+		mutate(&invalid)
 		if store.RecordRentalKeepalive(row.ID, invalid, at.Add(time.Minute)) == nil {
 			t.Fatal("invalid worker acknowledgment renewed rental")
 		}
 		check(at.Add(900 * time.Second))
 	}
-	later := proto.Clone(receipt).(*pb.KeepRentalAliveResult)
-	later.RequestId = "manual-2"
-	later.AcknowledgedAtUnixMs += 120000
-	later.IdleDeadlineUnixMs += 120000
+	later := receipt
+	later.AcknowledgedAtMS += 120000
+	later.IdleDeadlineMS += 120000
 	fatal(t, store.RecordRentalKeepalive(row.ID, later, at.Add(120*time.Second)))
 	check(at.Add(1020 * time.Second))
 	// A Host whose own idle window differs is still an acknowledgment: Creator's
 	// schedule comes from its own observation, not the Host's window.
-	longer := proto.Clone(later).(*pb.KeepRentalAliveResult)
-	longer.RequestId = "manual-3"
-	longer.AcknowledgedAtUnixMs += 60000
-	longer.IdleDeadlineUnixMs = longer.AcknowledgedAtUnixMs + 1800000
+	longer := later
+	longer.AcknowledgedAtMS += 60000
+	longer.IdleDeadlineMS = longer.AcknowledgedAtMS + 1800000
 	fatal(t, store.RecordRentalKeepalive(row.ID, longer, at.Add(180*time.Second)))
 	check(at.Add(1080 * time.Second))
 	row.State = "release_requested"
@@ -191,54 +182,6 @@ func TestRentalIdleConfigurationHasNoDurationOrDisableEscape(t *testing.T) {
 	}
 }
 
-func TestRentalKeepaliveUsesCurrentSignedClaimAndRefusesUnconfirmedResult(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public}
-	var mode string
-	calls := 0
-	pod.keepalive = func(request *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
-		calls++
-		if mode == "failure" {
-			return nil, status.Error(codes.Unavailable, "receipt lost")
-		}
-		result := &pb.KeepRentalAliveResult{RequestId: request.RequestId, WorkerId: podWorkerID, WorkerBootId: podBootID, AcknowledgedAtUnixMs: 1700000000000, IdleDeadlineUnixMs: 1700000900000}
-		switch mode {
-		case "request":
-			result.RequestId = "different"
-		case "worker":
-			result.WorkerId = "different"
-		case "boot":
-			result.WorkerBootId = "different"
-		}
-		return result, nil
-	}
-	connection, _ := startFakePod(t, t.TempDir(), pod)
-	owner := hostOwner(t, "keepalive-claim", rentalWiring(connection, private))
-	if _, problem := owner.c.KeepRentalAlive(context.Background(), podRental, "unowned"); problem == nil || calls != 0 {
-		t.Fatal("keepalive accepted an unrecorded rental")
-	}
-	// No media credentials or Runtime/control session are needed for this Host action.
-	fatal(t, owner.store.RecordRental(records.Rental{ID: podRental, MachineName: "keepalive",
-		State: "ready", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1,
-		HourlyRateUSDMicros: 100000, Hub: "https://hub.invalid", Address: connection.Addr,
-		CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
-	result, problem := owner.c.KeepRentalAlive(context.Background(), podRental, "explicit-1")
-	fatal(t, problem)
-	if result.RequestId != "explicit-1" || calls != 1 {
-		t.Fatal("explicit call did not reach Host once")
-	}
-	for _, bad := range []string{"failure", "request", "worker", "boot"} {
-		mode = bad
-		if _, problem := owner.c.KeepRentalAlive(context.Background(), podRental, "explicit-"+bad); problem == nil {
-			t.Fatalf("unconfirmed %s acknowledgment succeeded", bad)
-		}
-	}
-	if _, problem := owner.c.KeepRentalAlive(context.Background(), podRental, strings.Repeat("x", 129)); problem == nil {
-		t.Fatal("oversized request id admitted")
-	}
-}
-
 func TestRentalKeepaliveLocalDeadlineIgnoresHostClockSkew(t *testing.T) {
 	for _, skew := range []time.Duration{-8 * time.Hour, 8 * time.Hour} {
 		t.Run(skew.String(), func(t *testing.T) {
@@ -248,7 +191,7 @@ func TestRentalKeepaliveLocalDeadlineIgnoresHostClockSkew(t *testing.T) {
 			received := time.Date(2026, 9, 24, 12, 0, 0, 123456789, time.UTC)
 			row := idleRecord(t, store, "skew", received.Add(-time.Hour))
 			ack := received.Add(skew).UnixMilli()
-			receipt := &pb.KeepRentalAliveResult{RequestId: "skew-1", WorkerId: row.ExpectedWorkerID, WorkerBootId: row.ExpectedWorkerBootID, AcknowledgedAtUnixMs: ack, IdleDeadlineUnixMs: ack + 900000}
+			receipt := records.RentalKeepalive{WorkerID: row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID, AcknowledgedAtMS: ack, IdleDeadlineMS: ack + 900000}
 			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received))
 			check := func(want time.Time) {
 				t.Helper()
@@ -262,10 +205,9 @@ func TestRentalKeepaliveLocalDeadlineIgnoresHostClockSkew(t *testing.T) {
 			check(received.Add(900 * time.Second))
 			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received.Add(10*time.Minute)))
 			check(received.Add(900 * time.Second))
-			newer := proto.Clone(receipt).(*pb.KeepRentalAliveResult)
-			newer.RequestId = "skew-2"
-			newer.AcknowledgedAtUnixMs += 1000
-			newer.IdleDeadlineUnixMs += 1000
+			newer := receipt
+			newer.AcknowledgedAtMS += 1000
+			newer.IdleDeadlineMS += 1000
 			fatal(t, store.RecordRentalKeepalive(row.ID, newer, received.Add(time.Second)))
 			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received.Add(20*time.Minute)))
 			check(received.Add(901 * time.Second))

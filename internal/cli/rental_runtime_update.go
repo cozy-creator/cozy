@@ -11,7 +11,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -35,11 +34,9 @@ type runtimeUpdateWheel struct {
 type runtimeUpdateSelection struct {
 	LocalRuntime  *runtimeUpdateWheel `json:"local_runtime,omitempty"`
 	LocalTensorFS *runtimeUpdateWheel `json:"local_tensorfs,omitempty"`
-	// Published versions to install instead of local wheels; a machine that updates itself
-	// fetches them (rental_runtime_update_native.go), and records its operation in Native.
-	RuntimeVersion  string        `json:"runtime_version,omitempty"`
-	TensorFSVersion string        `json:"tensorfs_version,omitempty"`
-	Native          *nativeUpdate `json:"native,omitempty"`
+	// Published versions to install instead of local wheels; the machine fetches them.
+	RuntimeVersion  string `json:"runtime_version,omitempty"`
+	TensorFSVersion string `json:"tensorfs_version,omitempty"`
 }
 
 func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
@@ -60,16 +57,6 @@ func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath, runtimeVersion
 	}
 	if row == nil || row.State != "ready" {
 		return nil, exit.New(exit.Conflict, "this rental is not ready; no machine was purchased or changed")
-	}
-	hctx, cancel := hub.Context()
-	remote, hubProblem := client(m.fleet.atRental(id)).Rental(hctx, id)
-	cancel()
-	// Only the Hub's answer can refuse here, and only for a machine that cannot update itself;
-	// an unanswered read leaves the refusal to the update.
-	if hubProblem == nil && !remote.Development && !u.updatesItself(id) {
-		return nil, exit.Named(exit.Conflict, "rental.maintenance_unavailable",
-			"%s was rented without SSH maintenance, so its Runtime cannot be updated in place; nothing was changed", row.MachineName).
-			WithRemedy("rent a replacement with SSH maintenance, the default (omit --development=false), or on a current image")
 	}
 	current, problem := m.store.RuntimeUpdate(id)
 	if problem != nil {
@@ -172,16 +159,11 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		})
 		if problem != nil {
 			row.Error = problem.Message
-			switch {
-			case row.State != "updating" && row.State != "reconciling":
-				row.State = "failed" // nothing was sent to the worker
-			case m.ctx.Err() != nil:
-				row.State = "reconciling" // the next daemon resumes it
-			case problem.ErrName() == "rental.ended":
+			if m.ctx.Err() != nil && row.State != "preparing" {
+				row.State = "reconciling" // the next daemon attaches to the same update
+			} else {
+				// The machine refused it, or rolled it back: it serves its previous software.
 				row.State = "failed"
-			default:
-				// The worker may be part-way through: it takes no work until its owner acts.
-				row.State = "unusable"
 			}
 		}
 		if problem := m.store.SaveRuntimeUpdate(row); problem != nil {
@@ -189,26 +171,6 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		}
 		m.fleet.owner.WakeQueue()
 	}()
-}
-
-func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeUpdate, identity *orchestrator.WorkerConnection) *exit.Error {
-	var selection runtimeUpdateSelection
-	if len(row.Selection) > 0 && json.Unmarshal(row.Selection, &selection) != nil {
-		return exit.New(exit.Structural, "recorded Runtime update selection is unreadable")
-	}
-	machine, problem := u.maintenance(identity)
-	if problem != nil {
-		return problem
-	}
-	if selection.Native == nil {
-		if _, problem := machine.AwaitUpdateAdmission(ctx); problem != nil {
-			return problem
-		}
-		if problem := u.updateNative(ctx, row, &selection, machine); problem != nil {
-			return problem
-		}
-	}
-	return u.followNative(ctx, row, identity, machine)
 }
 
 func handleRentalUpdate(ctx *Context) *exit.Error {

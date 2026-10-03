@@ -70,7 +70,7 @@ requires=["hatchling"]
 build-backend="hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include=[%q]
-`, name, machines.RuntimeFloor, extra, sources, module+":app", module+".py")
+`, name, runtimeFloor, extra, sources, module+":app", module+".py")
 	}
 	// Serving a Model derives its placement under torch.
 	write(child, "pyproject.toml", metadata("owner-child", "owner_child", `, "torch==2.13.0"`, ""))
