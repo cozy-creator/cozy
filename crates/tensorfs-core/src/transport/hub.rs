@@ -474,11 +474,27 @@ fn call(
     deadline: Deadline,
     ledger: &Ledger,
 ) -> Result<Value> {
+    call_method(client, "POST", base, path, body, credential, policy, deadline, ledger)
+}
+
+/// One JSON call of the hub's control plane, re-asked only while the hub says "not now".
+#[allow(clippy::too_many_arguments)]
+pub(super) fn call_method(
+    client: &Client,
+    method: &str,
+    base: &str,
+    path: &str,
+    body: &[u8],
+    credential: &dyn CredentialProvider,
+    policy: &SourcePolicy,
+    deadline: Deadline,
+    ledger: &Ledger,
+) -> Result<Value> {
     let mut last: Option<Refusal> = None;
     for attempt in 1..=crate::transport::ledger::FETCH_ATTEMPTS {
         let final_attempt = attempt == crate::transport::ledger::FETCH_ATTEMPTS;
         match call_once(
-            client, base, path, body, credential, policy, deadline, ledger,
+            client, method, base, path, body, credential, policy, deadline, ledger,
         ) {
             Ok(value) => return Ok(value),
             // NOT WEATHER, AND NOT ABOUT THE HUB (tfs-106). `TRANSFER_FAILED` out of an
@@ -532,6 +548,7 @@ impl From<Refusal> for Retryable {
 #[allow(clippy::too_many_arguments)]
 fn call_once(
     client: &Client,
+    method: &str,
     base: &str,
     path: &str,
     body: &[u8],
@@ -563,9 +580,9 @@ fn call_once(
     let response = crate::transport::http::request(
         client,
         &checked,
-        "POST",
+        method,
         &headers,
-        Some(body),
+        (method != "GET").then_some(body),
         deadline,
         ledger,
         // THE CONTROL PLANE (tfs-106). Every wait in this exchange answers to the pull's own

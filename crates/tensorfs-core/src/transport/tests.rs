@@ -5141,3 +5141,196 @@ fn a_pull_killed_mid_walk_is_repaired_after_an_unclean_shutdown() {
 }
 
 mod tail;
+
+// ---------------------------------------------------------------- publication
+
+#[derive(Default)]
+struct PublicationHub {
+    declared: Vec<String>,
+    uploaded: HashMap<String, Vec<u8>>,
+    verified: Vec<String>,
+    finalized: usize,
+    holds: bool,
+}
+
+fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
+    let state: Arc<Mutex<PublicationHub>> = Arc::default();
+    let base_slot: Arc<Mutex<String>> = Arc::default();
+    let (hub, base) = (Arc::clone(&state), Arc::clone(&base_slot));
+    const REPO: &str = "/v1/models/acme/model";
+    let objects = |body: &[u8], key: &str| -> Vec<String> {
+        let value = crate::canon::parse(body, 1 << 20).unwrap();
+        let Value::Obj(fields) = value else {
+            panic!("body")
+        };
+        let (_, Value::Arr(rows)) = fields.into_iter().find(|(k, _)| k == key).unwrap() else {
+            panic!("rows")
+        };
+        rows.into_iter()
+            .map(|row| match row {
+                Value::Str(id) => id,
+                Value::Obj(f) => match &f.iter().find(|(k, _)| k == "object_id").unwrap().1 {
+                    Value::Str(id) => id.clone(),
+                    _ => panic!("id"),
+                },
+                _ => panic!("row"),
+            })
+            .collect()
+    };
+    let view = move |op: &str, state: &str| {
+        Value::obj(vec![
+            ("operation", Value::str(op)),
+            ("state", Value::str(state)),
+            (
+                "status_url",
+                Value::str(format!("{REPO}/publications/{op}/finalization")),
+            ),
+        ])
+    };
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let mut hub = hub.lock().unwrap();
+        let path = request.path.as_str();
+        let op = path
+            .strip_prefix(&format!("{REPO}/publications/"))
+            .map(|rest| rest.split('/').next().unwrap().to_string())
+            .unwrap_or_default();
+        match request.method.as_str() {
+            "GET" if path.starts_with(&format!("{REPO}/checkpoints/")) => match hub.holds {
+                true => status(200, &manifest),
+                false => status(
+                    404,
+                    br#"{"error":{"code":"model.checkpoint_not_found","message":"absent"}}"#,
+                ),
+            },
+            "PUT" if path.starts_with("/upload/") => {
+                hub.uploaded.insert(
+                    format!("sha256:{}", &path["/upload/".len()..]),
+                    request.body.clone(),
+                );
+                status(200, b"")
+            }
+            "PUT" => {
+                hub.declared = objects(&request.body, "objects");
+                // The Hub already holds the first object: it is never pushed.
+                let rows = hub
+                    .declared
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| {
+                        Value::obj(vec![
+                            ("object_id", Value::str(id.clone())),
+                            (
+                                "state",
+                                Value::str(if i == 0 { "accepted" } else { "claimed" }),
+                            ),
+                        ])
+                    })
+                    .collect();
+                ok_json(&Value::obj(vec![(
+                    "publication",
+                    Value::obj(vec![
+                        ("operation", Value::str(op)),
+                        ("state", Value::str("open")),
+                        ("objects", Value::arr(rows)),
+                    ]),
+                )]))
+            }
+            "POST" if path.ends_with("/grants") => {
+                let url = base.lock().unwrap().clone();
+                let grants = objects(&request.body, "object_ids")
+                    .into_iter()
+                    .map(|id| {
+                        Value::obj(vec![
+                            ("object_id", Value::str(id.clone())),
+                            ("url", Value::str(format!("{url}/upload/{}", &id[7..]))),
+                            (
+                                "required_headers",
+                                Value::obj(vec![("if-none-match", Value::str("*"))]),
+                            ),
+                        ])
+                    })
+                    .collect();
+                ok_json(&Value::obj(vec![("grants", Value::arr(grants))]))
+            }
+            "POST" if path.ends_with("/verify") => {
+                let ids = objects(&request.body, "object_ids");
+                hub.verified.extend(ids);
+                ok_json(&Value::obj(vec![]))
+            }
+            "POST" if path.ends_with("/finalize") => {
+                hub.finalized += 1;
+                Serve::Whole {
+                    status: 202,
+                    body: crate::canon::write(&view(&op, "running")),
+                    headers: vec![("Content-Type".into(), "application/json".into())],
+                }
+            }
+            "GET" if path.ends_with("/finalization") => ok_json(&view(&op, "completed")),
+            _ => status(
+                404,
+                br#"{"error":{"code":"route.absent","message":"no such route"}}"#,
+            ),
+        }
+    });
+    let origin = origin(dispatch);
+    *base_slot.lock().unwrap() = origin.base.clone();
+    (origin, state)
+}
+
+/// A checkpoint goes into a Hub repository's custody: only the objects the Hub lacks are
+/// pushed, each under its grant, then verified and finalized, and the call follows the
+/// finalization job; a repository that already holds it converges with no transfer.
+#[test]
+fn publish_pushes_what_the_hub_lacks_and_follows_its_finalization() {
+    let root = temporary("publish");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(6, 4096));
+    let source = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = local_policy();
+    pull(&request_for(&store, &source.base, &policy)).unwrap();
+    let manifest_bytes = checkpoint.bodies[&checkpoint.manifest.sha256].clone();
+    let (hub, state) = publication_hub(manifest_bytes);
+    let landed = Mutex::new(Vec::new());
+    let progress = |done: u64, total: u64| landed.lock().unwrap().push((done, total));
+    let publication = super::Publication {
+        store: &store,
+        hub: &hub.base,
+        destination: "Acme/Model",
+        manifest: &checkpoint.manifest,
+        operation: "op-1",
+        credential: &Anonymous,
+        policy: &policy,
+        progress: &progress,
+        streams: 4,
+    };
+    let published = super::publish(&publication).unwrap();
+    assert_eq!(published.checkpoint, checkpoint.manifest.id());
+    assert!(!published.converged);
+    let held = state.lock().unwrap();
+    // Manifest, header and six blobs, the first of them already the Hub's.
+    assert_eq!(held.declared.len(), checkpoint.objects.len() + 1);
+    let pushed: Vec<_> = held.declared[1..].to_vec();
+    let mut uploaded: Vec<_> = held.uploaded.keys().cloned().collect();
+    uploaded.sort();
+    assert_eq!(uploaded, pushed);
+    for (id, body) in &held.uploaded {
+        assert_eq!(&ObjectRef::of(body).id(), id);
+    }
+    let mut verified = held.verified.clone();
+    verified.sort();
+    assert_eq!(verified, pushed);
+    assert_eq!(held.finalized, 1);
+    let (done, total) = *landed.lock().unwrap().last().unwrap();
+    assert_eq!(done, total);
+    drop(held);
+
+    state.lock().unwrap().holds = true;
+    let again = super::publish(&super::Publication {
+        operation: "op-2",
+        ..publication
+    })
+    .unwrap();
+    assert!(again.converged);
+    assert_eq!(state.lock().unwrap().finalized, 1);
+    let _ = std::fs::remove_dir_all(root);
+}

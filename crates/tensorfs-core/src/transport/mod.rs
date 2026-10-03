@@ -40,6 +40,7 @@ mod ledger;
 mod memory;
 mod policy;
 mod pull;
+mod publish;
 mod push;
 pub(crate) mod sources;
 
@@ -63,6 +64,7 @@ pub use pull::{
     fetch_wanted, pull, resolve_closure, FetchObserver, Fetched, ObjectSource, ObjectUrls,
     PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
 };
+pub use publish::{publish, Publication, Published};
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
 
 pub use sources::{SourceDownload, SourceProgress};
