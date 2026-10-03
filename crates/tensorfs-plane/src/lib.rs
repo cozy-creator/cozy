@@ -11,6 +11,7 @@ pub mod host;
 pub mod io;
 pub mod layout;
 pub mod plane;
+pub mod window;
 
 pub use cursor::{Cursor, RingView};
 pub use plane::{Exported, Lease, Plane, PlaneConfig, Stats, Ticket, Tier, Trim, View, WsId};
