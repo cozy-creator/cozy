@@ -236,28 +236,11 @@ fn main() -> ExitCode {
         }
         ["ensure", r, refspec] => ensure::cmd_ensure(Path::new(r), refspec, &flags),
         ["pressure", r] => ensure::cmd_pressure(Path::new(r), &flags),
-        ["home"] => cmd_home(None),
-        ["home", r] => cmd_home(Some(Path::new(r))),
-        ["store", "init"] => cmd_store_default("init", &flags),
-        ["store", "info"] => cmd_store_default("info", &flags),
-        ["store", "ensure"] => cmd_store_default("ensure", &flags),
-        ["store", "prepare-readers"] => cmd_store_prepare_readers(None),
-        ["store", "complete-cozytensors"] => cmd_store_complete_cozytensors(None),
         ["store", "init", r] => cmd_store(Path::new(r), "init", &flags),
         ["store", "info", r] => cmd_store(Path::new(r), "info", &flags),
         ["store", "ensure", r] => cmd_store(Path::new(r), "ensure", &flags),
-        ["store", "prepare-readers", r] => cmd_store_prepare_readers(Some(Path::new(r))),
-        ["store", "complete-cozytensors", r] => cmd_store_complete_cozytensors(Some(Path::new(r))),
+        ["store", "prepare-readers", r] => cmd_store_prepare_readers(Path::new(r)),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
-        ["store", "admit-file", store, kind, object, length, source] => {
-            cmd_store_admit_file(Path::new(store), kind, object, length, Path::new(source))
-        }
-        ["repo-cache", "admit", cache, store, kind, object, length] => {
-            cmd_repo_cache_admit(Path::new(cache), Path::new(store), kind, object, length)
-        }
-        ["repo-cache", "backfill", cache, store, kind, object, length] => {
-            cmd_repo_cache_backfill(Path::new(cache), Path::new(store), kind, object, length)
-        }
         ["repo-cache", "restore", store, object, length] => {
             cmd_repo_cache_restore(Path::new(store), object, length, &flags)
         }
@@ -270,23 +253,9 @@ fn main() -> ExitCode {
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
         ["get", r, h] => cmd_get(Path::new(r), h, &flags),
         ["contains", r, h] => cmd_contains(Path::new(r), h),
-        ["verify", r, h] => cmd_verify_object(Path::new(r), h, &flags),
-        ["scrub", r] => cmd_scrub(Path::new(r), &flags),
         ["reap", r] => cmd_reap(Path::new(r)),
         ["fill", r, p] => cmd_fill(Path::new(r), Path::new(p), &flags),
-        ["bench-store", r] => cmd_bench_store(Path::new(r), &flags),
         ["checkpoint", "write", r] => ckpt::cmd_write(Path::new(r), &flags),
-        ["checkpoint", "read", r, h] => ckpt::cmd_read(Path::new(r), h, &flags),
-        ["checkpoint", "info", r, h] => ckpt::cmd_info(Path::new(r), h),
-        ["checkpoint", "page", r, h, n] => fetch::cmd_checkpoint_page(Path::new(r), h, n, &flags),
-        ["checkpoint", "locate", r, h, c, k, role, off, len] => ckpt::cmd_locate(
-            Path::new(r),
-            h,
-            [c, k, role],
-            off.parse().unwrap_or(0),
-            len.parse().unwrap_or(0),
-            &flags,
-        ),
         ["conform"] => conform::cmd_conform(None, &flags),
         ["conform", w] => conform::cmd_conform(Some(w), &flags),
         ["capability", e, d] => conform::cmd_capability(e, d, &flags),
@@ -322,13 +291,7 @@ fn main() -> ExitCode {
         ["reclaim", "run", store] => repo::cmd_reclaim_run(Path::new(store), &flags),
         ["gc", root] => repo::cmd_gc(Path::new(root), &flags),
         ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
-        ["gc", "holds", store] => repo::cmd_gc_holds(Path::new(store), &flags),
         ["gc", "plan", census] => repo::cmd_gc_plan(Path::new(census), &flags),
-        ["ingest", "inspect"] => ingest::cmd_inspect(&flags),
-        ["gguf", "plan", f] => ingest::cmd_gguf_plan(Path::new(f), false, &flags),
-        ["gguf", "admit", f] => ingest::cmd_gguf_plan(Path::new(f), true, &flags),
-        ["ingest", "converters"] => ingest::cmd_converters(),
-        ["ingest", "golden"] => ingest::cmd_golden(),
         ["ingest", "bank", dia, conv] => ingest::cmd_bank(dia, conv, &flags),
         ["ingest", "source-members", profiles @ ..] => ingest::cmd_source_members(profiles, &flags),
         ["ingest", "source-plan"] => ingest::cmd_source_plan(&flags),
@@ -349,61 +312,14 @@ fn main() -> ExitCode {
         },
         ["ingest", "run", r, t] => ingest::cmd_run(Path::new(r), t, &flags),
         ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),
-        ["ingest", "reingest", r, h, t] => ingest::cmd_reingest(Path::new(r), h, t, &flags),
         ["ingest", "install", r, s, org, name, version, lane] => {
             ingest::cmd_install(Path::new(r), s, org, name, version, lane, &flags)
         }
-        ["ingest", "restamp", r, s] => ingest::cmd_restamp(Path::new(r), s, &flags),
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
-        ["ingest", "sessions", r] => ingest::cmd_sessions(Path::new(r)),
-        ["checkpoint", "caps"] => ckpt::cmd_caps(),
-        ["checkpoint", "size"] => ckpt::cmd_size(3699),
-        ["checkpoint", "size", n] => ckpt::cmd_size(n.parse().unwrap_or(3699)),
-        ["read", "lease", r, h] => rd::cmd_lease(Path::new(r), h, &flags),
-        ["read", "plan", r, h] => rd::cmd_plan(Path::new(r), h, &flags),
-        ["read", "fill", r, h] => rd::cmd_fill(Path::new(r), h, &flags),
-        ["read", "stream", r, h] => rd::cmd_stream(Path::new(r), h, &flags),
-        ["read", "verify-fill", r, h] => rd::cmd_verify_fill(Path::new(r), h, &flags),
-        ["read", "span", r, h, c, k, role, off, len] => rd::cmd_span(
-            Path::new(r),
-            h,
-            [c, k, role],
-            off.parse().unwrap_or(0),
-            len.parse().unwrap_or(0),
-        ),
-        ["read", "arms", r, h] => rd::cmd_arms(Path::new(r), h),
-        ["read", "tear", r, h] => rd::cmd_tear(Path::new(r), h),
-        ["read", "swap", r, h] => rd::cmd_swap(Path::new(r), h),
-        ["read", "prove", r, h] => rd::cmd_prove(Path::new(r), h, &flags),
-        ["read", "transform"] => rd::cmd_transform(),
-        ["checkout", r, h, d] => rd::cmd_checkout(Path::new(r), h, Path::new(d), &flags),
-        ["materialize", r, h, p, d] => rd::cmd_materialize(Path::new(r), h, p, Path::new(d)),
-        ["render", r, h] => rd::cmd_render(Path::new(r), h),
-        ["fetch", "plan", r, d, s] => fetch::cmd_plan(Path::new(r), Path::new(d), s, &flags),
-        ["fetch", "plan-objects", r, s] => fetch::cmd_plan_objects(Path::new(r), s, &flags),
-        ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
-        ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
         ["fetch", "bounded", r, refspec] => fetch::cmd_bounded_pull(Path::new(r), refspec, &flags),
-        ["fetch", "url", r, i, l, u] => fetch::cmd_url(Path::new(r), i, l, u, &flags),
         ["staging", "fetch", r, i, l, u] => fetch::cmd_staging_fetch(Path::new(r), i, l, u, &flags),
         ["staging", "drop", r, i] => fetch::cmd_staging_drop(Path::new(r), i),
-        ["staging", "clear", r] => fetch::cmd_staging_clear(Path::new(r)),
-        ["staging", "list", r] => fetch::cmd_staging_list(Path::new(r)),
-        ["source", "list", u] => fetch::cmd_source_list(u, &flags),
-        ["source", "resolve", u] => fetch::cmd_source_resolve(u, &flags),
-        ["source", "plan", u] => fetch::cmd_source_plan(u, &flags),
-        ["source", "pull", r, u] => fetch::cmd_source_pull(Path::new(r), u, &flags),
-        ["fetch", sub, _t]
-            if [
-                "plan",
-                "plan-objects",
-                "admit",
-                "complete",
-                "url",
-                "bounded",
-            ]
-            .contains(sub) =>
-        {
+        ["fetch", "bounded", _] => {
             eprintln!("usage: see the header of {}", file!());
             ExitCode::from(2)
         }
@@ -419,7 +335,6 @@ fn main() -> ExitCode {
         ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),
         ["cbor", "plant", f, kind] => cmd_cbor_plant(Path::new(f), kind, &flags),
         ["config", "canonicalize", f] => cmd_config_canonicalize(Path::new(f), &flags),
-        ["id", f] => cmd_id(Path::new(f)),
         _ => {
             eprintln!("usage: see the header of {}", file!());
             ExitCode::from(2)
@@ -457,52 +372,6 @@ fn cache_args(kind: &str, object: &str, length: &str) -> TfsResult<(CacheKind, O
         detail: format!("repo cache length {length:?} is not an unsigned integer"),
     })?;
     Ok((kind, ObjectRef { sha256, length }))
-}
-
-fn cmd_repo_cache_admit(
-    cache: &Path,
-    store: &Path,
-    kind: &str,
-    object: &str,
-    length: &str,
-) -> ExitCode {
-    let (kind, object) = match cache_args(kind, object, length) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let store = match Store::open(store) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let status = match RepoObjectCache::new(cache).admit(&store, kind, &object) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    println!("{{\"status\":\"{}\"}}", status.as_str());
-    ExitCode::SUCCESS
-}
-
-fn cmd_repo_cache_backfill(
-    cache: &Path,
-    store: &Path,
-    kind: &str,
-    object: &str,
-    length: &str,
-) -> ExitCode {
-    let (kind, object) = match cache_args(kind, object, length) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let store = match Store::open(store) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let status = match RepoObjectCache::new(cache).backfill_store(&store, kind, &object) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    println!("{{\"status\":\"{}\"}}", status.as_str());
-    ExitCode::SUCCESS
 }
 
 /// `tfs repo-cache restore` — bring one whole checkpoint back off the cache.
@@ -679,79 +548,6 @@ fn print_restore(report: &tensorfs_core::durability::Restored) -> ExitCode {
     }
 }
 
-fn cmd_store_admit_file(
-    store: &Path,
-    kind: &str,
-    object: &str,
-    length: &str,
-    source: &Path,
-) -> ExitCode {
-    let (kind, object) = match cache_args(kind, object, length) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let store = match Store::open(store) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let admitted = match kind {
-        CacheKind::Blob => match store.put_file(source, Some(&object), &Fault::default()) {
-            Ok(value) => value.admitted,
-            Err(error) => return bail(error),
-        },
-        CacheKind::Manifest => {
-            let metadata = match fs::metadata(source) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    return bail(Refusal {
-                        code: tensorfs_core::err::Code::IO_FAILED,
-                        detail: format!("stat {}: {error}", source.display()),
-                    })
-                }
-            };
-            if metadata.len() != object.length || object.length > Manifest::MAX_BYTES as u64 {
-                return bail(Refusal {
-                    code: tensorfs_core::err::Code::LENGTH_MISMATCH,
-                    detail: format!(
-                        "{} is {} bytes, expected {}",
-                        source.display(),
-                        metadata.len(),
-                        object.length
-                    ),
-                });
-            }
-            let bytes = match fs::read(source) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return bail(Refusal {
-                        code: tensorfs_core::err::Code::IO_FAILED,
-                        detail: format!("read {}: {error}", source.display()),
-                    })
-                }
-            };
-            let manifest = match Manifest::parse(&bytes) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
-            if ObjectRef::of(&bytes) != object {
-                return bail(Refusal {
-                    code: tensorfs_core::err::Code::OBJECT_ID_MISMATCH,
-                    detail: format!("{} bytes disagree with {}", source.display(), object.id()),
-                });
-            }
-            match store.put_manifest(&manifest) {
-                Ok(value) => value.admitted,
-                Err(error) => return bail(error),
-            }
-        }
-    };
-    println!(
-        "{{\"status\":\"{}\"}}",
-        if admitted { "stored" } else { "present" }
-    );
-    ExitCode::SUCCESS
-}
-
 fn cmd_config_canonicalize(path: &Path, flags: &Flags) -> ExitCode {
     let Some(output) = flag(flags, "out") else {
         eprintln!("--out <canonical.json> is required");
@@ -836,21 +632,9 @@ mod conform;
 mod ensure;
 mod fetch;
 mod ingest;
-mod rd;
 mod repo;
 mod snap;
 mod watch;
-
-fn cmd_home(explicit: Option<&Path>) -> ExitCode {
-    println!("{}", ok!(tensorfs_core::home::resolve(explicit)).display());
-    ExitCode::SUCCESS
-}
-
-/// The no-root spelling of a `store` verb. It uses `TENSORFS_HOME`, or an existing
-/// `$HOME/.tensorfs` — never a Store it would have to invent (tfs-053).
-fn cmd_store_default(verb: &str, flags: &Flags) -> ExitCode {
-    cmd_store(&ok!(tensorfs_core::home::store_root(None)), verb, flags)
-}
 
 /// `tfs store init|ensure|info <root>` — and, on the two SETUP verbs, the one place a
 /// deployment says where its repo cache is.
@@ -930,21 +714,11 @@ fn cmd_store(root: &Path, verb: &str, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_store_prepare_readers(explicit: Option<&Path>) -> ExitCode {
-    let root = ok!(tensorfs_core::home::store_root(explicit));
-    let store = ok!(Store::open(&root));
+fn cmd_store_prepare_readers(root: &Path) -> ExitCode {
+    let store = ok!(Store::open(root));
     ok!(store.prepare_readers());
     println!("root:       {}", store.root().display());
     println!("readers:    prepared");
-    ExitCode::SUCCESS
-}
-
-fn cmd_store_complete_cozytensors(explicit: Option<&Path>) -> ExitCode {
-    let root = ok!(tensorfs_core::home::store_root(explicit));
-    let store = ok!(Store::open(&root));
-    for manifest in ok!(store.complete_cozytensors_manifests()) {
-        println!("{manifest}");
-    }
     ExitCode::SUCCESS
 }
 
@@ -1064,36 +838,6 @@ fn cmd_contains(root: &Path, hex: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_verify_object(root: &Path, hex: &str, f: &Flags) -> ExitCode {
-    let s = ok!(Store::open(root));
-    // Deleted 2026-08-25 (owner ruling). A flag that silently does nothing is worse than
-    // one that is gone, so passing it says where the door moved to.
-    if flag_on(f, "paranoid") {
-        eprintln!(
-            "REFUSED UNKNOWN_FIELD: --paranoid is DELETED (owner ruling 2026-08-25). A read \
-             rehashes exactly when its verification record is missing or stale, which is \
-             correctness and is not optional; the deliberate full-rehash door is \
-             `tfs scrub <root> --rate 1.0`."
-        );
-        return ExitCode::FAILURE;
-    }
-    let v = ok!(s.verify(hex));
-    match &v {
-        Verdict::Verified { rehashed } => {
-            println!("VERIFIED sha256:{hex} (rehashed: {rehashed})");
-            ExitCode::SUCCESS
-        }
-        Verdict::Invalidated { why, .. } => {
-            println!("RECORD INVALIDATED ({why}) — rehashed, bytes are good, record refreshed");
-            ExitCode::SUCCESS
-        }
-        Verdict::CorruptRemoved { why } => {
-            eprintln!("CORRUPT REMOVED sha256:{hex} ({why})");
-            ExitCode::FAILURE
-        }
-    }
-}
-
 fn cmd_get(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let s = ok!(Store::open(root));
     if flag(f, "out") == Some("-") {
@@ -1140,24 +884,6 @@ impl std::io::Write for Counting {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
-}
-
-fn cmd_scrub(root: &Path, f: &Flags) -> ExitCode {
-    let s = ok!(Store::open(root));
-    let (rate, pass) = (flag_num(f, "rate", 0.1f64), flag_num(f, "pass", 0u64));
-    let t = Instant::now();
-    let r = ok!(s.scrub(rate, pass));
-    let secs = t.elapsed().as_secs_f64();
-    println!(
-        "scrub rate={rate} pass={pass}: scanned {} sampled {} rehashed {} corrupt-removed {} ({:.1} MiB hashed, {secs:.3} s, {:.1} MiB/s)",
-        r.scanned,
-        r.sampled,
-        r.rehashed,
-        r.removed,
-        r.bytes_hashed as f64 / 1048576.0,
-        r.bytes_hashed as f64 / secs.max(1e-9) / 1048576.0
-    );
-    ExitCode::from(if r.removed > 0 { 1 } else { 0 })
 }
 
 fn cmd_reap(root: &Path) -> ExitCode {
@@ -1225,86 +951,6 @@ fn cmd_fill(root: &Path, plan: &Path, f: &Flags) -> ExitCode {
     }
     println!("fill: put {put}, skipped {skipped}, refused {refused}");
     ExitCode::from(if refused > 0 { 1 } else { 0 })
-}
-
-fn cmd_bench_store(root: &Path, f: &Flags) -> ExitCode {
-    let s = ok!(Store::open(root));
-    let size: u64 = flag_num(f, "size", 1u64 << 30);
-    let small: usize = flag_num(f, "small", 2000);
-    let src = root.join("bench.src");
-    print!("synthesizing {:.0} MiB … ", size as f64 / 1048576.0);
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    let t = Instant::now();
-    {
-        let mut w = std::io::BufWriter::new(fs::File::create(&src).unwrap());
-        let mut block = vec![0u8; 1 << 20];
-        let mut x: u64 = 0x243f6a8885a308d3;
-        for b in block.iter_mut() {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *b = (x >> 24) as u8;
-        }
-        let mut left = size;
-        while left > 0 {
-            let n = left.min(block.len() as u64) as usize;
-            block[0] = (left >> 20) as u8; // defeat whole-file dedup across runs
-            std::io::Write::write_all(&mut w, &block[..n]).unwrap();
-            left -= n as u64;
-        }
-    }
-    println!("{:.2} s", t.elapsed().as_secs_f64());
-
-    // Which SHA-256 routine these numbers were produced by (tfs-068). Every row below
-    // except the range reads is hash-bound, so the rate means nothing without it.
-    println!(
-        "  sha256 backend: {}",
-        tensorfs_core::sha256::backend_name()
-    );
-
-    let mib = |b: u64, s: f64| b as f64 / s / 1048576.0;
-    let row = |what: &str, bytes: u64, secs: f64| {
-        println!("  {what:<34} {secs:8.3} s   {:9.1} MiB/s", mib(bytes, secs));
-    };
-
-    let t = Instant::now();
-    let p = ok!(s.put_file(&src, None, &Fault::default()));
-    let put_s = t.elapsed().as_secs_f64();
-    row("streaming put (hash+fsync)", size, put_s);
-    let hex = p.obj.sha256.clone();
-
-    let t = Instant::now();
-    let n = ok!(s.read_into(&hex, &mut Counting(0)));
-    row("verified read (record hit)", n, t.elapsed().as_secs_f64());
-
-    let t = Instant::now();
-    let mut got = 0u64;
-    for i in 0..256u64 {
-        let off = (i * 7_919_393) % (size - (1 << 20));
-        got += ok!(s.read_range(&hex, off, 1 << 20)).len() as u64;
-    }
-    row("range reads (256 x 1 MiB)", got, t.elapsed().as_secs_f64());
-
-    let t = Instant::now();
-    ok!(s.hash_object(&hex));
-    row("rehash (scrub rate)", size, t.elapsed().as_secs_f64());
-
-    let t = Instant::now();
-    let mut blob = vec![0u8; 4096];
-    for i in 0..small {
-        blob[0..8].copy_from_slice(&(i as u64).to_le_bytes());
-        ok!(s.put_stream(&mut &blob[..], None, &Fault::default()));
-    }
-    let secs = t.elapsed().as_secs_f64();
-    println!(
-        "  {:<34} {secs:8.3} s   {:9.1} put/s   ({:.2} ms each)",
-        format!("small puts ({small} x 4 KiB)"),
-        small as f64 / secs,
-        secs * 1000.0 / small as f64
-    );
-    println!("  peak RSS {:.1} MiB", rss_kb("VmHWM") as f64 / 1024.0);
-    let _ = fs::remove_file(&src);
-    ExitCode::SUCCESS
 }
 
 fn rss_kb(field: &str) -> u64 {
@@ -2810,36 +2456,6 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 // ------------------------------------------------------------------ id
-
-fn cmd_id(p: &Path) -> ExitCode {
-    let bytes = match fs::read(p) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("{}: {e}", p.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    println!("object_id: {}", tensorfs_core::ids::object_id(&bytes));
-    println!("length:    {}", bytes.len());
-    if let Ok(h) = Header::parse(&bytes) {
-        println!("kind:      cozytensors/1 header");
-        println!("schema:    {}", h.tensor_schema_digest());
-        println!("tensors:   {}", h.tensors().count());
-        match h.diagnostic_value() {
-            Ok(value) => println!("pretty:\n{}", canon::pretty(&value, 0)),
-            Err(error) => return bail(error),
-        }
-    } else if let Ok(m) = Manifest::parse(&bytes) {
-        println!("kind:      manifest");
-        println!("manifest_id: {}", m.manifest_id());
-    } else {
-        println!(
-            "kind:      NOT a tensorfs document — {}",
-            Header::parse(&bytes).err().unwrap()
-        );
-    }
-    ExitCode::SUCCESS
-}
 
 fn write_cli(bytes: &[u8], flags: &Flags) -> ExitCode {
     if let Some(path) = flag(flags, "out") {

@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tensorfs_core::ids::ObjectRef;
+use tensorfs_core::staging;
 use tensorfs_core::storage::Census;
 use tensorfs_core::store::{Fault, Store};
 
@@ -466,26 +467,12 @@ fn drop_is_idempotent_and_clear_sweeps_carriers_and_orphan_temps() {
     origin.serve(second.clone());
     assert!(stage(&store_root, &two, &origin).status.success());
 
-    // ---- list names both, at their lengths, at absolute paths.
-    let out = tfs(&["staging", "list", store]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let listing = String::from_utf8_lossy(&out.stdout).to_string();
+    // ---- list names both, at their lengths.
+    let staged = Store::open(&store_root).unwrap();
+    let listing = staging::list(&staged).unwrap();
     for object in [&one, &two] {
-        let path = store_root.join("staging").join(&object.sha256);
-        assert!(
-            listing.contains(&format!(
-                "{} {} {}",
-                object.id(),
-                object.length,
-                path.display()
-            )),
-            "list did not name {}: {listing}",
-            object.id()
-        );
+        assert!(listing.contains(object), "list did not name {}", object.id());
+        assert!(store_root.join("staging").join(&object.sha256).is_file());
     }
 
     // ---- drop one. The other is untouched: this is a targeted retirement with no plan
@@ -512,29 +499,18 @@ fn drop_is_idempotent_and_clear_sweeps_carriers_and_orphan_temps() {
     let foreign = store_root.join("tmp/put-99999-12345");
     std::fs::write(&foreign, vec![0u8; 16]).unwrap();
 
-    let out = tfs(&["staging", "clear", store]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    let cleared = staging::clear(&staged).unwrap();
+    assert_eq!(
+        (cleared.carriers, cleared.bytes, cleared.temps),
+        (1, two.length, 1)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(field(&stdout, "cleared"), "1 carrier(s)");
-    assert_eq!(field(&stdout, "reclaimed"), format!("{} B", two.length));
-    assert_eq!(field(&stdout, "temps"), "1 orphan(s)");
     assert!(!store_root.join("staging").join(&two.sha256).exists());
     assert!(!orphan.exists());
     assert!(foreign.is_file(), "clear took an admission temp");
     // The area itself survives an empty sweep: a concurrent staging writer is between a
     // create and a link, and removing the directory under it would fail that writer.
     assert!(store_root.join("staging").is_dir());
-
-    let out = tfs(&["staging", "clear", store]);
-    assert!(out.status.success());
-    assert_eq!(
-        field(&String::from_utf8_lossy(&out.stdout), "cleared"),
-        "0 carrier(s)"
-    );
+    assert_eq!(staging::clear(&staged).unwrap().carriers, 0);
 
     let _ = std::fs::remove_dir_all(&root);
 }

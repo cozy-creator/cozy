@@ -894,34 +894,6 @@ pub fn cmd_gc_headers(census: &Path, flags: &Flags) -> ExitCode {
     }
 }
 
-/// The store's holds as the filesystem states them: every candidate an open ingest session
-/// root names (`tmp/ingest/<session>/session.json`). The catalog's hold rows are not read —
-/// the database is not the source of truth (tensorfs_core::gc).
-pub fn cmd_gc_holds(store: &Path, flags: &Flags) -> ExitCode {
-    let Some(output) = flag(flags, "out") else {
-        eprintln!("--out <holds.jsonl> is required");
-        return ExitCode::from(2);
-    };
-    let (holds, _) = match Store::open(store).and_then(|store| gc::session_holds(&store)) {
-        Ok(holds) => holds,
-        Err(error) => return bail(error),
-    };
-    let lines: Vec<Vec<u8>> = holds
-        .iter()
-        .map(|hold| {
-            tensorfs_core::canon::write(&Value::obj(vec![
-                ("key", Value::str(hold.key.clone())),
-                ("kind", Value::str(hold.kind.clone())),
-                ("length", Value::uint(hold.length)),
-            ]))
-        })
-        .collect();
-    match storage::write_json_lines(Path::new(output), &lines) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => bail(error),
-    }
-}
-
 pub fn cmd_gc_plan(census: &Path, flags: &Flags) -> ExitCode {
     let (Some(holds), Some(output)) = (flag(flags, "holds"), flag(flags, "out")) else {
         eprintln!("--holds <holds.jsonl> and --out <plan.jsonl> are required");
