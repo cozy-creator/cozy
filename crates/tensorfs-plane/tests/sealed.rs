@@ -148,3 +148,50 @@ fn a_reservation_made_before_the_plan_takes_any_layout_and_frees_what_it_does_no
         plane.close().unwrap();
     }
 }
+
+fn open(fx: &Fixture) -> (OwnedFd, tensorfs_plane::host::OpenFill, Layout) {
+    let layout = Layout::build(&fx.plan(), &regions()).unwrap();
+    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None).unwrap();
+    (fd, fill, layout)
+}
+
+#[test]
+fn an_adopter_takes_a_layout_before_its_bytes_and_uses_each_region_once_ready() {
+    let fx = Fixture::new("progressive");
+    let (fd, fill, layout) = open(&fx);
+    // Sealed from the start: no write, resize or new writable mapping, by anyone else.
+    // SAFETY: scalar fcntl on a descriptor we hold.
+    unsafe {
+        assert_eq!(libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) & (libc::F_SEAL_SHRINK | libc::F_SEAL_GROW), libc::F_SEAL_SHRINK | libc::F_SEAL_GROW);
+    }
+    let plane = host_only();
+    let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+    plane.set_pinned_budget(1 << 30).unwrap();
+    let ticket = plane.want(ws, Tier::Pinned, None, 0, false).unwrap();
+    assert!(!ticket.done().unwrap(), "nothing is Ready before the fill runs");
+    let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let filler = std::thread::spawn(move || fill.run(&layout, &source, 2, &IoTally::default()));
+    ticket.wait().unwrap();
+    filler.join().unwrap().unwrap();
+    check_bytes(&plane, ws, None);
+    assert_eq!(plane.stats().host.counters.fill_bytes, 0, "waited for, never read here");
+    plane.close().unwrap();
+}
+
+#[test]
+fn a_failed_fill_reaches_every_adopter_as_an_error() {
+    let fx = Fixture::new("progressive-fail");
+    let (fd, fill, _) = open(&fx);
+    let plane = host_only();
+    let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+    plane.set_pinned_budget(1 << 30).unwrap();
+    let ticket = plane.want(ws, Tier::Pinned, None, 0, false).unwrap();
+    fill.fail();
+    assert!(ticket.wait().is_err(), "a region its machine could not fill is an error, never read");
+    // A later adopter refuses the failed layout outright.
+    let other = host_only();
+    assert!(other.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).is_err());
+    other.close().unwrap();
+    let _ = plane.close();
+}

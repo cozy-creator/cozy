@@ -601,10 +601,9 @@ impl Inner {
         let (host, source, name) = (w.host.clone(), w.source.clone(), w.name.clone());
         host.claim(r)?;
         let adopted = host.ready(r);
-        if host.sealed() && !adopted {
-            host.release(r, region.offset, region.span)?;
-            return Err(Error::Invalid(format!("{name}: a sealed layout's region {r} is not Ready")));
-        }
+        // A sealed layout's region still filling (its machine's `OpenFill`) is waited for, never
+        // read or written here.
+        let foreign = host.sealed();
         if adopt_only && !adopted {
             host.release(r, region.offset, region.span)?;
             return Ok(());
@@ -655,13 +654,13 @@ impl Inner {
             }
             if res.is_err() {
                 c.host_used -= region.span;
-            } else if !adopted {
+            } else if !adopted && !foreign {
                 c.hstats.fills += 1;
                 c.hstats.fill_bytes += region.nbytes;
                 c.hstats.fill_ns += ns;
             }
             let (kind, detail) = match &res {
-                Ok(()) => ("fill_done", if adopted { "pinned<-adopted" } else { "pinned<-disk" }.to_string()),
+                Ok(()) => ("fill_done", if adopted || foreign { "pinned<-adopted" } else { "pinned<-disk" }.to_string()),
                 Err(e) => ("fill_failed", e.to_string()),
             };
             c.event(Event::new(kind, Some(name.clone()), Some(r), None, region.nbytes, ns, detail));
@@ -680,6 +679,11 @@ impl Inner {
         };
         if adopted || region.items.is_empty() {
             self.readers.submit(false, move || done(Ok(())));
+            return Ok(());
+        }
+        if foreign {
+            let host = host.clone();
+            self.readers.submit(false, move || done(host.wait_ready(r)));
             return Ok(());
         }
         let batch = Batch::new(region.items.len(), done);
@@ -792,14 +796,14 @@ impl Inner {
         }
         let held = matches!(hstate, HState::Ready);
         let from_host = held || w.host.sealed();
-        let src = if from_host {
-            if held {
-                w.hregs[r as usize].holds += 1;
-            }
-            // SAFETY: inside the live mapping; a hold keeps a Ready region from eviction, and
-            // nothing frees a sealed layout's pages while this weight set maps them (an
-            // unregistered range copies as pageable memory).
+        let src = if held {
+            w.hregs[r as usize].holds += 1;
+            // SAFETY: inside the live mapping; the hold keeps the region from eviction.
             CopySrc::Host(unsafe { w.host.base().add(region.offset as usize) })
+        } else if from_host {
+            // A sealed layout's region outside the pinned books copies as pageable memory, once
+            // its machine marks it Ready (the mover waits for that word).
+            CopySrc::Sealed { host: w.host.clone(), region: r, offset: region.offset }
         } else {
             CopySrc::Disk {
                 source: w.source.clone(),

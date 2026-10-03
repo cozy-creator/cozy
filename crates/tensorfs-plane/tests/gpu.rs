@@ -854,3 +854,34 @@ fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_pageable_past
     s.sync();
     p.close().unwrap();
 }
+
+#[test]
+#[ignore = "GPU"]
+fn a_layout_still_filling_reaches_the_device_region_by_region() {
+    use std::os::fd::AsRawFd;
+    let fx = Fixture::new("gpu-progressive");
+    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None).unwrap();
+    let p = plane();
+    let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+    let s = Stream::new();
+    // Region 0 in the pinned books (waits, then registers); 1 and 2 pageable (the mover waits).
+    let spans: Vec<u64> = p.layout(ws).unwrap().regions.iter().map(|r| r.span).collect();
+    p.set_pinned_budget(spans[0]).unwrap();
+    let pinned = p.want(ws, Tier::Pinned, Some(&[0]), 0, false).unwrap();
+    p.set_vram_budget(DEV, 512 << 20).unwrap();
+    let device = p.want(ws, Tier::Device(DEV), None, 0, false).unwrap();
+    assert!(!device.done().unwrap(), "no device copy before its region is Ready");
+    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let filler = std::thread::spawn(move || fill.run(&layout, &source, 3, &tensorfs_plane::io::IoTally::default()));
+    pinned.wait().unwrap();
+    device.wait().unwrap();
+    filler.join().unwrap().unwrap();
+    for r in 0..3 {
+        resident(&p, ws, &s, r).release(s.raw()).unwrap();
+    }
+    assert_eq!(p.stats().devices[0].counters.disk_copy_bytes, 0);
+    s.sync();
+    p.close().unwrap();
+}
