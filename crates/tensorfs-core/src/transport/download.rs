@@ -45,6 +45,46 @@ use std::time::{Duration, Instant};
 /// what whole 64 MiB GETs move (1.1-1.3 GB/s); 1 MiB chunks move half.
 pub const CHUNK_BYTES: u64 = 8 << 20;
 
+/// The most writes into temp files at once, whatever the requests in flight. A buffered
+/// write is a copy into the page cache: the kernel's writeback writes the disk, and one
+/// file's writes take turns on its inode lock, so more writers add no bytes, only threads
+/// stalled in the kernel. With one writer per request (512) a 6.5 GiB pull on a laptop left
+/// 180 threads in uninterruptible sleep, load at 396 and the disk's IO pressure full for ten
+/// minutes. Requests beyond this wait their turn holding their read buffer, so in-flight
+/// unwritten bytes stay at most one buffer per request.
+pub const WRITERS: usize = 8;
+
+/// Turns at writing, `WRITERS` at once; `peak` is the most that ever wrote together.
+struct Writers {
+    free: Mutex<usize>,
+    freed: Condvar,
+    peak: AtomicUsize,
+}
+
+impl Writers {
+    fn new() -> Self {
+        Writers {
+            free: Mutex::new(WRITERS),
+            freed: Condvar::new(),
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn write(&self, file: &File, data: &[u8], at: u64) -> std::io::Result<()> {
+        let mut free = self.free.lock().unwrap();
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap();
+        }
+        *free -= 1;
+        self.peak.fetch_max(WRITERS - *free, Ordering::Relaxed);
+        drop(free);
+        let written = file.write_all_at(data, at);
+        *self.free.lock().unwrap() += 1;
+        self.freed.notify_one();
+        written
+    }
+}
+
 /// One request's bytes from a source origin. Larger, because every ask walks the origin's
 /// redirect again (0.41 s against HuggingFace, and its resolve endpoint is rate-limited).
 pub const PART_BYTES: u64 = 64 << 20;
@@ -222,6 +262,7 @@ struct Run<'a> {
     /// Bytes home in temp files and from the cache. A whole answer to a resumed range takes
     /// its object's bytes back out, so asking the same bytes forever is not progress.
     landed: AtomicU64,
+    writers: Writers,
 }
 
 impl Download<'_> {
@@ -255,6 +296,7 @@ impl Download<'_> {
             minting: (0..streams).map(|_| AtomicU64::new(0)).collect(),
             minted: AtomicU64::new(0),
             landed: AtomicU64::new(0),
+            writers: Writers::new(),
         };
         std::thread::scope(|scope| {
             for slot in 0..streams {
@@ -273,6 +315,7 @@ impl Download<'_> {
             cached: run.cached.load(Ordering::Relaxed),
             bytes_cached: run.bytes_cached.load(Ordering::Relaxed),
             streams,
+            writers: run.writers.peak.load(Ordering::Relaxed),
             requests: run.requests.load(Ordering::Relaxed),
             restarts: run.restarts.load(Ordering::Relaxed),
         };
@@ -285,12 +328,13 @@ impl Download<'_> {
                 self.wanted.iter().map(|object| object.length).sum::<u64>()
             ),
             &format!(
-                "fetched={} cached={} moved={} seconds={:.1} streams={streams} requests={} \
-                 restarts={} outcome={}",
+                "fetched={} cached={} moved={} seconds={:.1} streams={streams} writers={} \
+                 requests={} restarts={} outcome={}",
                 outcome.fetched,
                 outcome.cached,
                 outcome.bytes_moved,
                 began.elapsed().as_secs_f64(),
+                outcome.writers,
                 outcome.requests,
                 outcome.restarts,
                 failure.as_ref().map_or("ok", |r| r.code.as_str()),
@@ -840,7 +884,10 @@ impl Run<'_> {
                     None,
                 ));
             }
-            if let Err(error) = object.file.write_all_at(&buffer[..read], chunk.first) {
+            if let Err(error) = self
+                .writers
+                .write(&object.file, &buffer[..read], chunk.first)
+            {
                 return Err(Ended::Fatal(Refusal {
                     code: Code::IO_FAILED,
                     detail: format!("write {}: {error}", object.path.display()),
