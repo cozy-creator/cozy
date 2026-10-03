@@ -32,11 +32,13 @@ pub struct IoTally {
 }
 
 /// How a fill wants its bytes: `Cache` for the pinned tier (O_DIRECT for what the page cache
-/// lacks), `Buffered` when no pinned tier exists and the page cache is the host cache.
+/// lacks), `Buffered` when no pinned tier exists and the page cache is the host cache,
+/// `Cached` for an object its caller found resident (`Source::resident`): copied, no check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Cache,
     Buffered,
+    Cached,
 }
 
 struct Fds {
@@ -134,9 +136,15 @@ impl Source {
         Source { lease: RwLock::new(None), meta: None, store: None, fds: Mutex::new(HashMap::new()), direct_io: false, plane }
     }
 
-    /// Close every object descriptor opened so far; the next read reopens through the store.
-    pub fn close_objects(&self) {
-        self.fds.lock().unwrap().clear();
+    /// Close one object's descriptors; the next read of it reopens through the store.
+    pub fn close_object(&self, sha256: &str) {
+        self.fds.lock().unwrap().remove(sha256);
+    }
+
+    /// Whether the page cache holds every byte of `obj` (one check for all its items).
+    pub fn resident(&self, obj: &ObjectRef, tally: &IoTally) -> Result<bool> {
+        let fds = self.fds(obj, tally)?;
+        Ok(cached(&fds, 0, obj.length))
     }
 
     pub(crate) fn made_by(&self, plane: usize) -> bool {

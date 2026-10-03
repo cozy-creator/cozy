@@ -14,21 +14,21 @@
 //! path, every region Ready, then sealed so no process can write, resize or punch it. Executors
 //! adopt it read-only (`adopt_sealed`); its RAM goes when the last descriptor and mapping do.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+use tensorfs_core::ids::ObjectRef;
 
 use crate::cuda;
 use crate::io::{IoTally, Mode, Source};
-use crate::layout::{Layout, PART_ALIGN};
+use crate::layout::{ItemSource, Layout, PART_ALIGN};
 use crate::{Error, Result};
 
 /// What makes a layout immutable: no write, resize, punch or unsealing, by anyone.
 const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-/// Items a sealed fill reads before it closes their objects' descriptors: its descriptor
-/// count stays bounded however many objects a model has.
-const FILL_WINDOW: usize = 256;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
 /// The state page, at `data` (the layout's nbytes): magic, region count, digest (64 hex bytes),
@@ -452,33 +452,60 @@ impl Drop for HostMem {
 
 /// Fill `layout` once through the verified read path (`Source::read_item`: page-cache copies,
 /// O_DIRECT for the rest) on `threads` threads, then seal it (`HostMem::seal`). The owner's
-/// side of a sealed layout; `tally` counts each mode's bytes. Object descriptors close every
-/// `FILL_WINDOW` items, so a model of thousands of objects never holds thousands open.
+/// side of a sealed layout; `tally` counts each mode's bytes. Each object's residency is checked
+/// once, not per item (a check maps the file on overlayfs, which stalls every thread's page
+/// faults), and its descriptors close when its last item lands: a model of thousands of objects
+/// never holds thousands open, and no thread waits at a batch boundary.
 pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<OwnedFd> {
     let host = HostMem::create(name, layout)?;
     let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut objects: Vec<&ObjectRef> = Vec::new();
+    let owner: Vec<Option<usize>> = items
+        .iter()
+        .map(|it| match &it.source {
+            ItemSource::Object(o) => Some(*index.entry(o.obj.sha256.as_str()).or_insert_with(|| {
+                objects.push(&o.obj);
+                objects.len() - 1
+            })),
+            ItemSource::Inline(_) => None,
+        })
+        .collect();
+    let left: Vec<AtomicUsize> = (0..objects.len()).map(|_| AtomicUsize::new(0)).collect();
+    for o in owner.iter().flatten() {
+        left[*o].fetch_add(1, Ordering::Relaxed);
+    }
+    let resident: Vec<OnceLock<bool>> = (0..objects.len()).map(|_| OnceLock::new()).collect();
+    let next = AtomicUsize::new(0);
     let failed: Mutex<Option<Error>> = Mutex::new(None);
-    for window in items.chunks(FILL_WINDOW) {
-        let next = AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            for _ in 0..threads.clamp(1, window.len()) {
-                s.spawn(|| {
-                    while let Some(it) = window.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        // SAFETY: each item's range (and its padding) is this thread's alone;
-                        // the layout keeps items disjoint inside the live mapping.
-                        let dst = unsafe { host.base().add(it.offset as usize) };
-                        if let Err(e) = unsafe { source.read_item(it, dst, Mode::Cache, tally) } {
-                            failed.lock().unwrap().get_or_insert(e);
-                            return;
-                        }
+    std::thread::scope(|s| {
+        for _ in 0..threads.clamp(1, items.len().max(1)) {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                let Some(it) = items.get(k) else { return };
+                let mode = match owner[k] {
+                    Some(o) if *resident[o].get_or_init(|| source.resident(objects[o], tally).unwrap_or(false)) => Mode::Cached,
+                    Some(_) => Mode::Cache,
+                    None => Mode::Cached,
+                };
+                // SAFETY: each item's range (and its padding) is this thread's alone; the layout
+                // keeps items disjoint inside the live mapping.
+                let dst = unsafe { host.base().add(it.offset as usize) };
+                if let Err(e) = unsafe { source.read_item(it, dst, mode, tally) } {
+                    failed.lock().unwrap().get_or_insert(e);
+                    next.store(items.len(), Ordering::Relaxed);
+                    return;
+                }
+                if let Some(o) = owner[k] {
+                    if left[o].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        source.close_object(&objects[o].sha256);
                     }
-                });
-            }
-        });
-        source.close_objects();
-        if let Some(e) = failed.lock().unwrap().take() {
-            return Err(e);
+                }
+            });
         }
+    });
+    if let Some(e) = failed.into_inner().unwrap() {
+        return Err(e);
     }
     for r in 0..layout.regions.len() as u32 {
         host.set_ready(r, true);
