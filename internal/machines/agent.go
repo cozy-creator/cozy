@@ -1,74 +1,62 @@
 package machines
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-
-	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"strings"
 )
 
-const AgentModule = "github.com/cozy-creator/cozy-runtime/machine-agent"
+// HubAccessCapability is the Go agent's delegated Hub access; the v1 API carries the token in
+// the run spec instead.
 const HubAccessCapability = "hub-access/1"
-const RuntimeUpdateCapability = "runtime-update/1"
-const BootstrapCapability = "machine-bootstrap/1"
 
-func (h *Host) bundledAgent() string { return filepath.Join(h.python(), "bin/cozy-machine") }
+// MachineAPI is the client API this controller drives a machine with (G/API.md).
+const MachineAPI = "cozy.machine.v1"
 
-// An agent is accepted by its own identity (`version --json`): its name, a usable wire range
-// and the capabilities this client drives. The implementation (the Go agent of a Runtime
-// wheel, the Rust machine, a later one) and release numbers are descriptive.
-func compatibleAgent(ctx context.Context, path string) bool {
+// servesAPI says whether an executable is a cozy-machine serving MachineAPI, by its own
+// `version --json`. Its implementation and release numbers are descriptive.
+func servesAPI(ctx context.Context, path string) bool {
 	out, err := exec.CommandContext(ctx, path, "version", "--json").Output()
 	var version struct {
-		Name             string   `json:"name"`
-		WireMinor        uint32   `json:"wire_minor"`
-		MinimumWireMinor uint32   `json:"minimum_wire_minor"`
-		Capabilities     []string `json:"capabilities"`
+		Name string   `json:"name"`
+		API  []string `json:"api"`
 	}
-	return err == nil && json.Unmarshal(out, &version) == nil && version.Name == "cozy-machine" &&
-		version.WireMinor >= pb.MinCompatibleWireMinor && version.MinimumWireMinor <= pb.WireMinor &&
-		slices.Contains(version.Capabilities, HubAccessCapability) && slices.Contains(version.Capabilities, RuntimeUpdateCapability) &&
-		slices.Contains(version.Capabilities, BootstrapCapability)
+	return err == nil && json.Unmarshal(out, &version) == nil && version.Name == "cozy-machine" && slices.Contains(version.API, MachineAPI)
 }
 
-func (h *Host) defaultAgent(ctx context.Context) (string, *exit.Error) {
-	path := h.bundledAgent()
-	if !compatibleAgent(ctx, path) {
-		return "", exit.Named(exit.Structural, "machine.agent_update_required", "the Runtime wheel must contain a cozy-machine with %s, %s and %s", HubAccessCapability, RuntimeUpdateCapability, BootstrapCapability).
-			WithRemedy("install the current published Runtime pair, or supply a current development agent with --host")
-	}
-	return path, nil
-}
-
-// Link the wheel-owned executable so later Runtime updates also update the agent.
-func (h *Host) linkAgent() (installedArtifact, error) {
-	source := h.bundledAgent()
-	digest, err := fileDigest(source)
+// bundledAgent writes the cozy-machine a Runtime wheel bundles (its data scripts) into dir.
+func bundledAgent(wheel, dir string) (string, error) {
+	archive, err := zip.OpenReader(wheel)
 	if err != nil {
-		return installedArtifact{}, err
+		return "", err
 	}
-	artifact := installedArtifact{Name: "cozy-machine", SHA256: digest, Module: HostModule(source)}
-	target := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
-	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-		return artifact, err
+	defer archive.Close()
+	for _, member := range archive.File {
+		if !strings.HasSuffix(member.Name, ".data/scripts/cozy-machine") {
+			continue
+		}
+		reader, err := member.Open()
+		if err != nil {
+			return "", err
+		}
+		defer reader.Close()
+		path := filepath.Join(dir, "cozy-machine")
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+		if err != nil {
+			return "", err
+		}
+		_, err = io.Copy(file, reader)
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		return path, err
 	}
-	file, err := os.CreateTemp(filepath.Dir(target), ".agent-link-*")
-	if err != nil {
-		return artifact, err
-	}
-	staged := file.Name()
-	file.Close()
-	defer os.Remove(staged)
-	if err := os.Remove(staged); err != nil {
-		return artifact, err
-	}
-	if err := os.Symlink(source, staged); err != nil {
-		return artifact, err
-	}
-	return artifact, os.Rename(staged, target)
+	return "", fmt.Errorf("%s bundles no cozy-machine", filepath.Base(wheel))
 }

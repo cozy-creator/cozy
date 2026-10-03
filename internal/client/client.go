@@ -395,11 +395,11 @@ func (c *Client) DescribeRelease(machine, pkg, release string) (api.DescribedRel
 	return described, problem
 }
 
-// MachineSoftware asks one machine ("local" or a rental id) which releases it runs.
-func (c *Client) MachineSoftware(machine string) (api.MachineSoftware, *exit.Error) {
-	var software api.MachineSoftware
-	problem := c.call(http.MethodGet, "/v1/local/machines/"+url.PathEscape(machine)+"/software", nil, &software)
-	return software, problem
+// MachineStatus asks one machine ("local" or a rental id) for its picture.
+func (c *Client) MachineStatus(machine string) (api.MachineStatus, *exit.Error) {
+	var status api.MachineStatus
+	problem := c.call(http.MethodGet, "/v1/local/machines/"+url.PathEscape(machine)+"/status", nil, &status)
+	return status, problem
 }
 
 // MachineLog reads one log a machine ("local" or a rental id) keeps, its newest tailBytes when
@@ -529,8 +529,8 @@ func (c *Client) CancelJob(id, actor string) *exit.Error {
 	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", map[string]string{"actor": actor}, nil)
 }
 
-func (c *Client) KeepRentalAlive(id, requestID string) (api.RentalKeepaliveResult, *exit.Error) {
+func (c *Client) KeepRentalAlive(id string) (api.RentalKeepaliveResult, *exit.Error) {
 	var result api.RentalKeepaliveResult
-	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(id)+"/keepalive", api.RentalKeepaliveRequest{RequestID: requestID}, &result)
+	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(id)+"/keepalive", nil, &result)
 	return result, problem
 }

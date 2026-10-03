@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
@@ -55,7 +54,7 @@ func indexProject(t *testing.T, laptopHub string) string {
 name="index-probe"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime>=` + machines.RuntimeFloor + `", "msgspec>=0.19", "org-relative-dep>=1.0,<2"]
+dependencies=["cozy-runtime>=` + runtimeFloor + `", "msgspec>=0.19", "org-relative-dep>=1.0,<2"]
 [project.entry-points."cozy.application"]
 default="index_probe:app"
 ` + sources + `[build-system]

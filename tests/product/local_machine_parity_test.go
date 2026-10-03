@@ -241,10 +241,8 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	trackDaemonRoot(t, providerHome)
 	host := machines.NewHost(dir, "", nil)
 	host.WebRTCPort, _ = strconv.Atoi(h.grants["COZY_WEBRTC_INTERNAL_PORT"])
-	source.Pinned = true // the Host under test, never replaced by the test binary
 	_, problem = host.Install(context.Background(), source, uv)
 	fatal(t, problem)
-	virtualInventory(t, host.Root())
 	key, err := os.ReadFile(layout.PendingRentalCreatorIdentity("parity-rental"))
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(dir, "owner.pem"), key, 0o600))

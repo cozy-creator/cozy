@@ -2,11 +2,9 @@ package machines
 
 import (
 	"bufio"
-	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"debug/buildinfo"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -75,30 +73,23 @@ func (h *Host) path(name string) string { return filepath.Join(h.dir, name) }
 
 // The image layout the Host and Runtime share, rooted.
 func (h *Host) binary() string { return filepath.Join(h.Root(), "usr/local/bin/cozy-machine") }
-func (h *Host) python() string { return filepath.Join(h.Root(), "opt/cozy/python") }
 
-// wheels holds exactly the Runtime and TensorFS wheels the machine installed from (none after
-// a published install): the Runtime's --find-links for a package's SDK. A pod's image links
-// /opt/cozy/wheels to /var/lib/cozy/dev/current, the pair dev/update.py last installed.
-func (h *Host) wheels() string { return filepath.Join(h.Root(), "opt/cozy/wheels") }
+// wheels holds exactly the executor SDK the machine runs package code with: the Runtime and
+// TensorFS wheels, where a worker image keeps them.
+func (h *Host) wheels() string { return filepath.Join(h.Root(), "opt/cozy/machine/wheels") }
 func (h *Host) readinessEnvelope() string {
 	return filepath.Join(h.Root(), "run/cozy/bootstrap/readiness-envelope.json")
 }
 
-// RuntimeFloor is the first Runtime with the single-agent supervisor launch contract.
-const RuntimeFloor = "0.18.85"
-
-// Source optionally pins an agent and paired development Runtime and TensorFS wheels.
-// Pinned retains an explicitly selected agent instead of adopting a published one.
+// Source optionally names the machine executable and the paired Runtime and TensorFS wheels;
+// without them, the newest published pair and the machine its Runtime wheel bundles.
 type Source struct {
 	Host, RuntimeWheel, TensorFSWheel string
-	Pinned                            bool
 }
 
 type installedArtifact struct {
 	Name   string `json:"name"`
 	SHA256 string `json:"sha256"`
-	Module string `json:"module,omitempty"` // a Host's Go main module
 }
 
 // Installed names the artifacts the root holds.
@@ -108,36 +99,6 @@ type Installed struct {
 	TensorFS    installedArtifact `json:"tensorfs"`
 	InstalledAt time.Time         `json:"installed_at"`
 	HostPinned  bool              `json:"host_pinned,omitempty"`
-	// Pending is an operator-facing candidate. It is deliberately not persisted as
-	// installed metadata until the machine reports terminal succeeded activation.
-	Pending *RuntimeUpdateState `json:"-"`
-}
-
-// startupPolicy preserves an explicitly installed Host or wheel pair.
-// The published agent hash alone does not pin the installation.
-func (i Installed) startupPolicy() []byte {
-	mode := "auto"
-	agent := "bundled"
-	if i.HostPinned {
-		agent = "explicit"
-	}
-	if i.HostPinned || i.Runtime.SHA256 != "" || i.TensorFS.SHA256 != "" {
-		mode = "off"
-	}
-	body, _ := json.Marshal(struct {
-		Mode  string `json:"startup_update"`
-		Agent string `json:"agent"`
-	}{mode, agent})
-	return body
-}
-
-// HostModule is the Go main module a Host binary was built from, "" when it is not Go.
-func HostModule(path string) string {
-	info, err := buildinfo.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return info.Main.Path
 }
 
 // placeHost atomically installs the independent agent without changing machine state.
@@ -146,97 +107,12 @@ func (h *Host) placeHost(source string) (installedArtifact, error) {
 	if err != nil {
 		return installedArtifact{}, err
 	}
-	artifact := installedArtifact{Name: filepath.Base(source), SHA256: digest, Module: HostModule(source)}
+	artifact := installedArtifact{Name: filepath.Base(source), SHA256: digest}
 	target := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return artifact, err
 	}
 	return artifact, copyFile(source, target, 0o755)
-}
-
-// Adopt migrates an idle legacy installation to the separately released agent. The
-// identity, Runtime journal, outputs, Python environment and TensorFS store stay in place.
-func (h *Host) Adopt(ctx context.Context, idle bool) (bool, *exit.Error) {
-	if !h.Outdated() {
-		return false, nil
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	unlock, problem := h.lock(ctx)
-	if problem != nil {
-		return false, problem
-	}
-	defer unlock()
-	record, problem := h.record()
-	if problem != nil {
-		return false, problem
-	}
-	if running := record != nil && h.alive(record.PID); running && (!idle || !h.runtimeIdle()) {
-		return false, nil
-	}
-	return h.adoptLocked(ctx)
-}
-
-// runtimeIdle requires a fresh explicit Runtime observation. Missing/stale evidence never
-// authorizes replacing a process that may be serving another controller's accepted work.
-func (h *Host) runtimeIdle() bool {
-	path := filepath.Join(h.Root(), "run/cozy/bootstrap/worker-activity")
-	info, err := os.Stat(path)
-	if err != nil || time.Since(info.ModTime()) > 10*time.Second || info.ModTime().After(time.Now().Add(10*time.Second)) {
-		return false
-	}
-	raw, err := os.ReadFile(path)
-	var state struct {
-		ActiveWork *bool    `json:"active_work"`
-		Holding    []string `json:"holding"`
-	}
-	return err == nil && json.Unmarshal(raw, &state) == nil && state.ActiveWork != nil && !*state.ActiveWork && len(state.Holding) == 0
-}
-
-// Outdated identifies legacy Hosts and unpinned copies shadowing a wheel-owned
-// agent. Adoption still requires an idle machine; CLI updates do not replace it.
-func (h *Host) Outdated() bool {
-	installed, problem := h.Installed()
-	if problem != nil || installed == nil || installed.HostPinned {
-		return false
-	}
-	if bundle, err := os.Stat(h.bundledAgent()); err == nil && HostModule(h.bundledAgent()) == AgentModule {
-		current, err := os.Stat(h.binary())
-		return err != nil || !os.SameFile(bundle, current)
-	}
-	return cmp.Or(installed.Host.Module, HostModule(h.binary())) != AgentModule
-}
-
-func (h *Host) adoptLocked(ctx context.Context) (bool, *exit.Error) {
-	if !h.Outdated() {
-		return false, nil
-	}
-	installed, problem := h.Installed()
-	if problem != nil {
-		return false, problem
-	}
-	source, problem := h.defaultAgent(ctx)
-	if problem != nil {
-		return false, problem
-	}
-
-	var artifact installedArtifact
-	var err error
-	if source == h.bundledAgent() {
-		artifact, err = h.linkAgent()
-	} else {
-		artifact, err = h.placeHost(source)
-	}
-	if err != nil {
-		return false, exit.Internalf("cannot install the machine agent: %s", err)
-	}
-	installed.Host, installed.HostPinned = artifact, false
-	raw, _ := json.MarshalIndent(installed, "", "  ")
-	if err := writePrivate(h.path("installed.json"), raw); err != nil {
-		return false, exit.Internalf("cannot record the machine installation: %s", err)
-	}
-	h.note("adopted independent machine agent; retained machine identity and execution state")
-	return true, nil
 }
 
 func (h *Host) Installed() (*Installed, *exit.Error) {
@@ -254,10 +130,10 @@ func (h *Host) Installed() (*Installed, *exit.Error) {
 	return &out, nil
 }
 
-// Install lays the root out as a pod image does: the Host, a Python 3.12 environment
-// holding the Runtime and TensorFS wheels, and the three executables the image bakes. A
-// running idle agent is stopped first; the next use launches the new one. Existing
-// base packages (including the machine's PyTorch/CUDA closure) remain installed.
+// Install lays the root out as a worker image does: the machine at usr/local/bin/cozy-machine,
+// the executor SDK (Runtime and TensorFS wheels) at opt/cozy/machine/wheels and uv at
+// usr/local/bin/uv. The machine makes its own identity files, installer helper and package
+// environments there, as on a rental. An installed machine is updated in place instead.
 func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installed, *exit.Error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -266,24 +142,13 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		return nil, problem
 	}
 	defer unlock()
-	record, problem := h.record()
-	if problem != nil {
-		return nil, problem
-	}
 	previous, problem := h.Installed()
 	if problem != nil {
 		return nil, problem
 	}
-	if previous == nil && record != nil && h.alive(record.PID) {
-		return nil, exit.Named(exit.Conflict, "machine.installation_unreadable", "the running machine has no installation metadata; repair it through its maintenance API without replacing its process")
-	}
-	installed := Installed{InstalledAt: time.Now().UTC()}
 	if (source.RuntimeWheel == "") != (source.TensorFSWheel == "") ||
 		source.RuntimeWheel != "" && (!strings.HasSuffix(source.RuntimeWheel, ".whl") || !strings.HasSuffix(source.TensorFSWheel, ".whl")) {
-		return nil, exit.New(exit.Validation, "the machine install names both wheels or neither, with an optional Host binary")
-	}
-	if source.Host != "" && !compatibleAgent(ctx, source.Host) {
-		return nil, exit.Named(exit.Structural, "machine.agent_update_required", "the selected agent must advertise %s, %s and %s", HubAccessCapability, RuntimeUpdateCapability, BootstrapCapability)
+		return nil, exit.New(exit.Validation, "the machine install names both wheels or neither, with an optional machine executable")
 	}
 	if previous != nil {
 		return h.updateLocked(ctx, source)
@@ -296,129 +161,52 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 	if _, problem := h.identity(); problem != nil {
 		return nil, problem
 	}
-
-	installed.HostPinned = source.Pinned
-	hostName := filepath.Base(source.Host)
-	for _, artifact := range []struct {
-		path string
-		out  *installedArtifact
-	}{{source.RuntimeWheel, &installed.Runtime}, {source.TensorFSWheel, &installed.TensorFS}} {
-		if artifact.path == "" {
-			continue
-		}
-		digest, err := fileDigest(artifact.path)
-		if err != nil {
-			return nil, exit.New(exit.NotFound, "cannot read %s: %s", artifact.path, err)
-		}
-		*artifact.out = installedArtifact{Name: filepath.Base(artifact.path), SHA256: digest}
-	}
-	if source.Host != "" {
-		if _, err := fileDigest(source.Host); err != nil {
-			return nil, exit.New(exit.NotFound, "cannot read the machine agent: %s", err)
-		}
-	}
-	retain := source.Host
-	if retain != "" {
-		// Preserve an explicitly selected executable before its wheel is replaced.
-		bundle, bundleErr := os.Stat(h.bundledAgent())
-		current, currentErr := os.Stat(retain)
-		if bundleErr == nil && currentErr == nil && os.SameFile(bundle, current) {
-			file, err := os.CreateTemp(h.dir, ".agent-before-*")
-			if err != nil {
-				return nil, exit.Internalf("cannot retain the current agent: %s", err)
-			}
-			file.Close()
-			defer os.Remove(file.Name())
-			if err := copyFile(retain, file.Name(), 0755); err != nil {
-				return nil, exit.Internalf("cannot retain the current agent: %s", err)
-			}
-			source.Host = file.Name()
-		}
-	}
-	root := h.Root()
-	for _, dir := range []string{"usr/local/bin", "opt/cozy/bin"} {
-		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
-			return nil, exit.Internalf("cannot lay out the machine root: %s", err)
-		}
-	}
-	var wheels []string
-	if source.RuntimeWheel != "" {
-		wheels = []string{source.RuntimeWheel, source.TensorFSWheel}
-	}
-	python := filepath.Join(h.python(), "bin/python")
-	if _, err := os.Lstat(h.python()); errors.Is(err, os.ErrNotExist) {
-		if output, err := exec.CommandContext(ctx, uv, "venv", "--no-config", "--no-project", "--python", "3.12", h.python()).CombinedOutput(); err != nil {
-			return nil, exit.New(exit.Structural, "cannot create the machine Python environment: %s", tail(output))
-		}
-	} else if err != nil {
-		return nil, exit.Internalf("cannot read the machine Python environment: %s", err)
-	} else if output, err := exec.CommandContext(ctx, python, "-I", "-c", "import sys; assert sys.version_info[:2] == (3, 12); assert sys.prefix != sys.base_prefix").CombinedOutput(); err != nil {
-		return nil, exit.New(exit.Structural, "the existing machine Python environment is unusable; it was preserved: %s", tail(output))
-	}
-	// Without wheels, the published Runtime and the TensorFS it depends on.
-	// The worker's base is the CPU image's: the Runtime with its media extra. Every
-	// package environment carries its own framework closure. Existing machine base
-	// packages are retained: installing a Runtime is not an environment sync.
-	// An explicit published install selects the newest pair even in an existing venv.
-	requirements := []string{"--upgrade-package", hostruntime.Distribution, "--upgrade-package", "tensorfs", hostruntime.Distribution + "[media]>=" + RuntimeFloor}
-	if len(wheels) > 0 {
-		requirements = []string{hostruntime.Distribution + "[media] @ file://" + wheels[0], wheels[1]}
-	}
-	if err := installMachinePair(ctx, uv, python, requirements); err != nil {
-		return nil, exit.New(exit.Structural, "%s", err)
-	}
-	for distribution, artifact := range map[string]*installedArtifact{hostruntime.Distribution: &installed.Runtime, "tensorfs": &installed.TensorFS} {
-		if artifact.Name != "" {
-			continue
-		}
-		version, err := exec.CommandContext(ctx, python, "-c", "import importlib.metadata as m, sys; print(m.version(sys.argv[1]))", distribution).Output()
-		if err != nil {
-			return nil, exit.New(exit.Structural, "the machine environment has no %s", distribution)
-		}
-		artifact.Name = distribution + " " + strings.TrimSpace(string(version))
-	}
-	for link, target := range map[string]string{
-		"opt/cozy/bin/cozy-runtime-worker": filepath.Join(h.python(), "bin/cozy-runtime-worker"),
-		"usr/local/bin/tfs":                filepath.Join(h.python(), "bin/tfs"),
-		"usr/local/bin/uv":                 uv,
-	} {
-		path := filepath.Join(root, link)
-		if _, err := os.Stat(target); err != nil {
-			return nil, exit.New(exit.Structural, "the installed machine has no %s: %s", filepath.Base(target), err)
-		}
-		_ = os.Remove(path)
-		if err := os.Symlink(target, path); err != nil {
-			return nil, exit.Internalf("cannot link %s: %s", link, err)
-		}
-	}
-	selected := source.Host
-	if selected == "" {
-		selected, problem = h.defaultAgent(ctx)
-		if problem != nil {
-			return nil, problem
-		}
-	}
-	var host installedArtifact
-	var err error
-	if source.Host == "" && selected == h.bundledAgent() {
-		host, err = h.linkAgent()
-	} else {
-		host, err = h.placeHost(selected)
-		if source.Host == "" {
-			host.Name = "cozy-machine"
-		} else {
-			host.Name = hostName
-		}
-	}
+	stage, err := os.MkdirTemp(h.dir, ".install-")
 	if err != nil {
-		return nil, exit.Internalf("cannot install the machine Host: %s", err)
+		return nil, exit.Internalf("cannot stage the machine install: %s", err)
 	}
-	installed.Host = host
-	if _, err := h.keepWheels(wheels); err != nil {
+	defer os.RemoveAll(stage)
+	wheels := []string{source.RuntimeWheel, source.TensorFSWheel}
+	if source.RuntimeWheel == "" {
+		for i, distribution := range []string{hostruntime.Distribution, "tensorfs"} {
+			if wheels[i], err = publishedWheel(ctx, distribution, stage); err != nil {
+				return nil, exit.New(exit.Unavailable, "cannot fetch the published %s: %s", distribution, err)
+			}
+		}
+	}
+	agent := source.Host
+	if agent == "" {
+		if agent, err = bundledAgent(wheels[0], stage); err != nil {
+			return nil, exit.Named(exit.Structural, "machine.agent_unsupported", "%s", err).
+				WithRemedy("name a cozy-machine with --host")
+		}
+	}
+	if !servesAPI(ctx, agent) {
+		return nil, exit.Named(exit.Structural, "machine.agent_unsupported", "%s is not a cozy-machine serving %s", filepath.Base(agent), MachineAPI).
+			WithRemedy("install a current Runtime pair, or name a current cozy-machine with --host")
+	}
+	installed := Installed{InstalledAt: time.Now().UTC(), HostPinned: source.Host != ""}
+	if installed.Host, err = h.placeHost(agent); err != nil {
+		return nil, exit.Internalf("cannot install the machine: %s", err)
+	}
+	if source.Host == "" {
+		installed.Host.Name = "cozy-machine"
+	}
+	kept, err := h.keepWheels(wheels)
+	if err != nil {
 		return nil, exit.Internalf("cannot keep the machine's wheels: %s", err)
 	}
-	if err := writePrivate(filepath.Join(h.Root(), "etc/cozy/software-policy.json"), installed.startupPolicy()); err != nil {
-		return nil, exit.Internalf("cannot record the initial software policy: %s", err)
+	for i, artifact := range []*installedArtifact{&installed.Runtime, &installed.TensorFS} {
+		digest, err := fileDigest(kept[i])
+		if err != nil {
+			return nil, exit.Internalf("cannot read %s: %s", kept[i], err)
+		}
+		*artifact = installedArtifact{Name: filepath.Base(kept[i]), SHA256: digest}
+	}
+	link := filepath.Join(h.Root(), "usr/local/bin/uv")
+	_ = os.Remove(link)
+	if err := os.Symlink(uv, link); err != nil {
+		return nil, exit.Internalf("cannot link uv: %s", err)
 	}
 	if err := h.recordInstalled(installed); err != nil {
 		return nil, exit.Internalf("cannot record the machine installation: %s", err)
@@ -561,7 +349,7 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 		return nil, exit.New(exit.Conflict, "the machine Host record carries no receipt key")
 	}
 	for {
-		receipt, leaf, err := readReceipt(ctx, record.MediaPort, key)
+		receipt, leaf, err := readReceipt(ctx, record.WorkerPort, key)
 		if err == nil {
 			if receipt.WorkerInternalPort != record.WorkerPort {
 				return nil, exit.New(exit.Conflict, "the machine Host's receipt names another worker port")
@@ -574,9 +362,6 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 		}
 		if refused := (*receiptRefusal)(nil); errors.As(err, &refused) {
 			return nil, exit.New(exit.Credential, "the machine Host's readiness receipt did not verify: %s", err)
-		}
-		if gone := (*runtimeGone)(nil); errors.As(err, &gone) {
-			return nil, exit.Named(exit.Structural, "machine.runtime_gone", "%s", gone)
 		}
 		if !h.alive(record.PID) && !h.starting(record.PID) {
 			return nil, exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness")
@@ -601,10 +386,6 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 
 	id, problem := h.identity()
 	if problem != nil {
-		return nil, problem
-	}
-	// Nothing runs: migrate the legacy embedded Host before the next launch.
-	if _, problem := h.adoptLocked(ctx); problem != nil {
 		return nil, problem
 	}
 	installed, problem := h.Installed()
@@ -647,9 +428,6 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE=" + h.path("receipt-key"),
 		"COZY_RECORD_OWNER_AUTH_JSON=" + string(auth),
 	}, h.inherited...)
-	if err := h.writeStartupPolicy(*installed); err != nil {
-		return nil, exit.Internalf("cannot record the machine update policy: %s", err)
-	}
 	if h.store != "" {
 		base = append(base, "COZY_TENSORFS_ROOT="+h.store)
 	}
@@ -1278,16 +1056,4 @@ func (h *Host) note(line string) {
 	}
 	defer log.Close()
 	fmt.Fprintln(log, "cozy:", line)
-}
-
-// Only an explicit installation changes the operator's update policy. A missing
-// policy is seeded from existing installation provenance once.
-func (h *Host) writeStartupPolicy(installed Installed) error {
-	path := filepath.Join(h.Root(), "etc/cozy/software-policy.json")
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return writePrivate(path, installed.startupPolicy())
 }

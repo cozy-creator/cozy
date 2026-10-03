@@ -43,12 +43,11 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		}
 		*target = absolute
 	}
-	// The Runtime wheel supplies the default agent; --host deliberately pins a copy, which
-	// Install accepts by its own identity and capabilities.
-	source.Pinned = source.Host != ""
+	// The Runtime wheel's bundled machine is the default; --host names another, which Install
+	// accepts by the API it serves.
 	uv, err := exec.LookPath("uv")
 	if err != nil {
-		return exit.Named(exit.Structural, "machine.uv_missing", "uv builds the machine's Python environment and is not on PATH")
+		return exit.Named(exit.Structural, "machine.uv_missing", "uv builds the machine's package environments and is not on PATH")
 	}
 	installCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -60,13 +59,7 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		{K: "root", V: host.Root()}, {K: "host", V: installed.Host.Name}, {K: "host_sha256", V: installed.Host.SHA256},
 		{K: "runtime", V: installed.Runtime.Name}, {K: "tensorfs", V: installed.TensorFS.Name},
 	}
-	notes := []string{"the installed machine remains available for local runs"}
-	if installed.Pending != nil {
-		fields = append(fields, output.Field{K: "update", V: installed.Pending})
-		notes = append(notes, "the Runtime candidate is prepared; activation waits for current machine work to drain")
-	} else {
-		notes = append(notes, "the next local run launches this machine")
-	}
+	notes := []string{"the installed machine remains available for local runs", "the next local run launches this machine"}
 	return emit(ctx, output.Record{Fields: fields, Notes: notes})
 }
 
@@ -93,12 +86,11 @@ func handleMachineShow(ctx *Context) *exit.Error {
 	} else if status.Running {
 		readCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		live, problem := host.ReadSoftware(readCtx)
+		live, problem := host.ReadStatus(readCtx)
 		if problem != nil {
-			notes = append(notes, "live software could not be observed: "+problem.Message)
+			notes = append(notes, "live status could not be observed: "+problem.Message)
 		} else if live != nil {
-			fields = append(fields, output.Field{K: "runtime", V: live.Runtime}, output.Field{K: "tensorfs", V: live.TensorFS},
-				output.Field{K: "agent", V: live.Agent}, output.Field{K: "bootstrap", V: live.Bootstrap}, output.Field{K: "phase", V: live.Phase})
+			fields = append(fields, machineStatusFields(statusOf(live), !ctx.Mode().Human || ctx.Mode().JSON)...)
 		}
 	}
 	return emit(ctx, output.Record{Fields: fields, Notes: notes})
