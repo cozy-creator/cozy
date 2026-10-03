@@ -112,7 +112,7 @@ fn projection(native: &str) -> Result<(String, &str, u64, u64)> {
     Ok((format!("{prefix}.{block}"), leaf, input, output))
 }
 
-fn operation(
+pub(super) fn operation(
     component: &str,
     file: usize,
     plain: &EncodingSpec,

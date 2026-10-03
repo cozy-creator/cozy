@@ -1,0 +1,34 @@
+[
+  {
+    "member": "Super_Eye_Detailer_By_Stable_Yogi_SDPD0.safetensors",
+    "source": "civitai://1071060",
+    "full_length": 57417531,
+    "source_sha256": "a1342cb2bd91ddf8921e07702ec2d64288134ba0c4e5ce8985e659c5fe15753d",
+    "header_sha256": "0060a448c6d2b70c3f66d3d643a7c9900c219cb878eeeeb00593431bd8e8f1a6",
+    "header_bytes": 407431,
+    "logical_keys": 2958,
+    "components": {
+      "text_encoder": 216,
+      "text_encoder_2": 576,
+      "unet": 2166
+    },
+    "profile": "sdxl/lora-kohya/1",
+    "constructs": 2958,
+    "session": "50645e9519c191af"
+  },
+  {
+    "member": "DetailedEyes_V3.safetensors",
+    "source": "civitai://145907",
+    "full_length": 93151000,
+    "source_sha256": "2c1c3f889f30f8c61ec73561c1e875eb8ce245f42c0a114b108ee70f61d51b76",
+    "header_sha256": "3d489e6c2dbeca2b96f27730c34ed6a9f9db6a437e52e7b14c24c83039732337",
+    "header_bytes": 252600,
+    "logical_keys": 1680,
+    "components": {
+      "unet": 1680
+    },
+    "profile": "sdxl/lora-kohya/1",
+    "constructs": 1680,
+    "session": "5c83a2c09f7d43f0"
+  }
+]
