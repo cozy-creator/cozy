@@ -28,7 +28,12 @@ use crate::layout::{ItemSource, Layout, PART_ALIGN};
 use crate::{Error, Result};
 
 /// What makes a layout immutable: no write, resize, punch or unsealing, by anyone.
-const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+/// F_SEAL_FUTURE_WRITE (Linux 5.1): no new writable mapping or write; the filler's own mapping,
+/// done writing, may still be going away.
+const F_SEAL_FUTURE_WRITE: libc::c_int = 0x10;
+const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | F_SEAL_FUTURE_WRITE;
+/// What an adopter accepts: resize and sealing sealed, and every write path closed.
+const RESIZE_SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
 /// The state page, at `data` (the layout's nbytes): magic, region count, digest (64 hex bytes),
@@ -217,7 +222,7 @@ impl HostMem {
     pub fn adopt_sealed(fd: RawFd, layout: &Layout) -> Result<HostMem> {
         // SAFETY: a scalar query of a descriptor the caller holds.
         let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
-        if seals < 0 || seals & SEALS != SEALS {
+        if seals < 0 || seals & RESIZE_SEALS != RESIZE_SEALS || seals & (libc::F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0 {
             return Err(Error::Invalid("a sealed host layout must carry write, resize and seal seals".into()));
         }
         let host = Self::adopt_owned(reopen_as(fd, libc::O_RDONLY)?, layout, true, false)?;
@@ -234,11 +239,13 @@ impl HostMem {
             return Err(Error::Invalid("only a complete, unsealed layout seals".into()));
         }
         let fd = reopen(self.fd.as_raw_fd())?;
-        drop(self);
         // SAFETY: a scalar fcntl on our own descriptor.
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } != 0 {
             return Err(os("seal host layout"));
         }
+        // Unmapping gigabytes of filled pages takes a while (0.37 s for 5 GB on a RunPod 3090);
+        // the layout is already sealed and complete, so that happens off the caller's path.
+        std::thread::spawn(move || drop(self));
         Ok(fd)
     }
 
@@ -526,12 +533,9 @@ fn populate(base: *mut u8, len: usize, threads: usize) {
 /// never holds thousands open, and no thread waits at a batch boundary.
 pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize, tally: &IoTally, reserved: Option<OwnedFd>) -> Result<OwnedFd> {
     let host = match reserved {
-        Some(fd) => {
-            let host = HostMem::create_in(fd, layout)?;
-            // Its pages exist: mapping them all now beats a fault per page during the copy.
-            populate(host.base(), host.data, threads);
-            host
-        }
+        // Its pages exist: the copy only maps them (pre-mapping them with MADV_POPULATE_WRITE
+        // measured slower than faulting them in during the copy).
+        Some(fd) => HostMem::create_in(fd, layout)?,
         None => HostMem::create(name, layout)?,
     };
     let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
