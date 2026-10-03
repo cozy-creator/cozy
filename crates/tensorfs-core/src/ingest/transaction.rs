@@ -24,7 +24,7 @@ use crate::manifest::Manifest;
 use crate::repo_cache::{CacheKind, Mirror};
 use crate::repository::{Mutation, ReleaseLane, RepositoryName};
 use crate::spec::EncodingSpec;
-use crate::store::{Store, Verdict};
+use crate::store::Store;
 
 use super::carrier::{self, SourceHeader};
 use super::convert::{check_permute_size, Bytes, Plan, RolePlan};
@@ -676,8 +676,7 @@ fn convert_bounded(
         let roles: Vec<String> = op.roles.iter().map(|r| r.role.clone()).collect();
         if let Some(done) = journal.op(&op.component, &op.out_key, &roles) {
             // A journalled part carries only if its objects still stand. This is
-            // `Bytes::Inherit`'s existing law: `contains` is a presence hint and nothing
-            // more, so admission takes a standing verification record or one rehash. A part
+            // `contains` is a presence hint and nothing more, so admission takes a standing verification record or one rehash. A part
             // the operation's publication custodian already holds stands without local bytes.
             if done.iter().all(|(_, part)| {
                 custody.holds_part(part) || journal::segments_still_stand(store, part)
@@ -691,7 +690,6 @@ fn convert_bounded(
         for role in &op.roles {
             let (file, key) = match &role.bytes {
                 Bytes::Stream { file, key } | Bytes::Permute { file, key, .. } => (*file, key),
-                Bytes::Inherit { .. } => continue,
             };
             let source = &files[file];
             let tensor = indexes[file].get(key.as_str()).ok_or_else(|| Refusal {
@@ -708,11 +706,7 @@ fn convert_bounded(
             .iter()
             .all(|(file, path)| carriers.has(*file, path));
         let bytes = op.roles.iter().try_fold(0u64, |sum, role| {
-            let next = if matches!(role.bytes, Bytes::Inherit { .. }) {
-                0
-            } else {
-                checked_bytes("conversion op", &role.shape, role.dtype)?
-            };
+            let next = checked_bytes("conversion op", &role.shape, role.dtype)?;
             sum.checked_add(next).ok_or_else(|| Refusal {
                 code: Code::COUNT_CAP,
                 detail: "conversion op byte count overflows".into(),
@@ -791,58 +785,6 @@ fn convert_bounded(
                     progress.hashed += w.bytes;
                     progress.deduped += w.deduped;
                     w.part
-                }
-                Bytes::Inherit { part } => {
-                    // VERIFIED INHERIT: the refs carry without re-streaming, but `contains`
-                    // is A PRESENCE HINT AND NOTHING MORE (store.rs). Admission into a
-                    // committed checkpoint takes a valid verification record or exactly one
-                    // rehash — a truncated or swapped object refuses HERE, at execute,
-                    // never at first read.
-                    for s in part.segments() {
-                        let rec = match store.record_valid(&s.sha256) {
-                            Ok(rec) => rec,
-                            Err(_) => {
-                                let v = store.verify(&s.sha256).map_err(|e| Refusal {
-                                    code: e.code,
-                                    detail: format!("{what}: inherit-by-reference: {}", e.detail),
-                                })?;
-                                if let Verdict::CorruptRemoved { why } = v {
-                                    return refuse(
-                                        Code::OBJECT_CORRUPT,
-                                        format!(
-                                            "{what}: inherit-by-reference names {} whose \
-                                             bytes disagree with their id and were removed: {why}",
-                                            s.id()
-                                        ),
-                                    );
-                                }
-                                store.record_valid(&s.sha256).map_err(|why| Refusal {
-                                    code: Code::OBJECT_CORRUPT,
-                                    detail: format!(
-                                        "{what}: {} rehashed clean but its record does not \
-                                         stand: {why}",
-                                        s.id()
-                                    ),
-                                })?
-                            }
-                        };
-                        if rec.length != s.length {
-                            return refuse(
-                                Code::LENGTH_MISMATCH,
-                                format!(
-                                    "{what}: inherit-by-reference declares {} at {} B; the \
-                                     verified store object is {} B",
-                                    s.id(),
-                                    s.length,
-                                    rec.length
-                                ),
-                            );
-                        }
-                    }
-                    let bytes = checked_bytes(&what, &r.shape, r.dtype)?;
-                    progress.inherited += bytes;
-                    store.moved(bytes);
-                    (**part).clone()
                 }
             };
             tparts.push((r.role.clone(), part));

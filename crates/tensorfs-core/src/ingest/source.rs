@@ -21,7 +21,7 @@ use crate::spec::EncodingSpec;
 use crate::store::Store;
 
 use super::carrier::{self, SourceHeader};
-use super::convert::{self, Converter, Plan, Rekey, Source, Target};
+use super::convert::{self, Converter, Plan, Source, Target};
 use super::fingerprint::{
     self, Banked, Fingerprint, FingerprintRegistry, Grammar, SourceProfile, SourceProfileComponent,
 };
@@ -355,7 +355,6 @@ fn grammar_match(
         &[source],
         &target,
         &specs,
-        &Rekey::default(),
     )?;
     let prefix = &grammar.key_prefix;
     match header.tensors.iter().find(|t| !t.key.starts_with(prefix)) {
@@ -710,7 +709,7 @@ pub fn prepare(
             header: &source.header,
         })
         .collect();
-    let plan = convert::plan(conv, &views, &target, &specs, &Rekey::default())?;
+    let plan = convert::plan(conv, &views, &target, &specs)?;
     drop(views);
     Ok(Prepared {
         plan,

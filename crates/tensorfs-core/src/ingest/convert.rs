@@ -15,8 +15,6 @@
 
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Result};
-use crate::header::{Header, Part};
-use crate::ids::ObjectRef;
 use crate::limits;
 use crate::spec::EncodingSpec;
 
@@ -69,7 +67,7 @@ pub const NORMALIZATION: &str = "normalization";
 /// The converter for a source no reviewed profile recognizes: its keys, stored as they are.
 pub const IDENTITY: &str = "identity/1";
 
-pub const CONVERTERS: [Converter; 9] = [
+pub const CONVERTERS: [Converter; 8] = [
     Converter {
         name: "diffusers.identity/1",
         dialect: "safetensors.diffusers",
@@ -88,17 +86,6 @@ pub const CONVERTERS: [Converter; 9] = [
         class: Class::Identity,
         doc: "One file carrying several components, split on the reviewed component prefix \
               map. Same byte path as the diffusers converter — packaging is not identity.",
-        validated_on_real_bytes: true,
-        normalization: None,
-        lane: None,
-        reference: None,
-    },
-    Converter {
-        name: "cozytensors.inherit/1",
-        dialect: "cozytensors",
-        class: Class::Identity,
-        doc: "An already-canonical source. Every untouched tensor carries by OBJECT \
-              REFERENCE; nothing is re-hashed and nothing is re-uploaded.",
         validated_on_real_bytes: true,
         normalization: None,
         lane: None,
@@ -301,8 +288,6 @@ impl Target {
 pub enum Bytes {
     /// Stream the carrier's declared run straight through: no buffer, no transform.
     Stream { file: usize, key: String },
-    /// Carry the already-admitted objects by reference: zero re-hash, zero re-upload.
-    Inherit { part: Box<Part> },
     /// Reorder source runs through the ordinary bounded streaming writer; never arithmetic.
     /// Input role size is bounded by `CONVERT_TENSOR_MAX_BYTES`.
     Permute {
@@ -434,16 +419,6 @@ impl Plan {
     pub fn count(&self, e: Effect) -> usize {
         self.ops.iter().filter(|o| o.effect == e).count()
     }
-    pub fn inherited(&self) -> usize {
-        self.ops
-            .iter()
-            .filter(|o| {
-                o.roles
-                    .iter()
-                    .all(|r| matches!(r.bytes, Bytes::Inherit { .. }))
-            })
-            .count()
-    }
     /// The encodings this plan actually selected, in first-appearance order:
     /// `(alias, spec digest, role names, tensor count)`. With per-tensor selection one
     /// component routinely cites several — the real fp8_scaled DiT cites three.
@@ -536,18 +511,12 @@ pub enum Source<'a> {
         file: usize,
         header: &'a SourceHeader,
     },
-    /// An already-canonical checkpoint component.
-    Canonical {
-        component: String,
-        header: &'a Header,
-    },
 }
 
 impl Source<'_> {
     pub fn component(&self) -> &str {
         match self {
             Source::Carrier { component, .. } => component,
-            Source::Canonical { component, .. } => component,
         }
     }
 }
@@ -628,7 +597,6 @@ pub fn plan(
     sources: &[Source<'_>],
     target: &Target,
     specs: &[(String, EncodingSpec)],
-    rekey: &Rekey,
 ) -> Result<Plan> {
     if conv.class == Class::Value {
         return refuse(
@@ -680,9 +648,6 @@ pub fn plan(
         match s {
             Source::Carrier { file, header, .. } => {
                 plan_carrier(conv, &component, *file, header, &allowed, &cands, &mut p)?
-            }
-            Source::Canonical { header, .. } => {
-                plan_canonical(&component, header, &allowed, &cands, rekey, &mut p)?
             }
         }
     }
@@ -1525,115 +1490,6 @@ fn plan_seam(
     Ok(())
 }
 
-/// A reviewed tier-1 REKEY: a prefix substitution that moves keys and no bytes.
-///
-/// This is the v1 quarry's `anima.net-to-prefixed@1` shape — "a new manifest over the same
-/// chunks, zero new bytes" — and it is the operation that makes inherit-by-reference
-/// observable: every tensor's key changes, every tensor's OBJECTS are the ones already
-/// admitted, and the run hashes nothing.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Rekey {
-    pub rules: Vec<(String, String, String)>,
-}
-
-impl Rekey {
-    /// `component=from:to`, repeated.
-    pub fn parse(s: &str) -> Result<(String, String, String)> {
-        let (component, rest) = match s.split_once('=') {
-            Some(x) => x,
-            None => {
-                return refuse(
-                    Code::MISSING_FIELD,
-                    format!("rekey {s:?}: expected component=from:to"),
-                )
-            }
-        };
-        match rest.split_once(':') {
-            Some((from, to)) => Ok((component.to_string(), from.to_string(), to.to_string())),
-            None => refuse(
-                Code::MISSING_FIELD,
-                format!("rekey {s:?}: expected component=from:to"),
-            ),
-        }
-    }
-    fn apply(&self, component: &str, key: &str) -> String {
-        for (c, from, to) in &self.rules {
-            if c == component {
-                if let Some(rest) = key.strip_prefix(from.as_str()) {
-                    return format!("{to}{rest}");
-                }
-            }
-        }
-        key.to_string()
-    }
-}
-
-/// Re-ingest of an already-canonical component: every part carries by OBJECT REFERENCE.
-fn plan_canonical(
-    component: &str,
-    h: &Header,
-    allowed: &[&str],
-    cands: &Candidates<'_>,
-    rekey: &Rekey,
-    p: &mut Plan,
-) -> Result<()> {
-    let alias = Allowed(allowed);
-    // The candidate set, by DIGEST — an already-canonical component is mixed exactly as its
-    // carrier was, so a re-ingest matches each tensor against every candidate, not one.
-    let mut ids: Vec<(String, &str)> = vec![(cands.plain.object_id(), "plain/1")];
-    for (a, sp) in &cands.encoded {
-        ids.push((sp.object_id(), a));
-    }
-    for (comp, key, t) in h.tensors() {
-        if comp != component {
-            continue;
-        }
-        let chosen = match ids.iter().find(|(id, _)| *id == t.encoding) {
-            Some((_, a)) => *a,
-            None => {
-                return refuse(
-                    Code::DOUBLE_ENCODE,
-                    format!(
-                        "{comp}/{key}: already encoded under {} and the target asks for \
-                         {alias} ({:?}) — re-encoding already-encoded bytes needs the priced \
-                         job, not the border",
-                        t.encoding,
-                        ids.iter().map(|(i, _)| short(i)).collect::<Vec<_>>()
-                    ),
-                );
-            }
-        };
-        let out_key = rekey.apply(component, key);
-        let effect = if out_key == *key {
-            Effect::None
-        } else {
-            Effect::Rekey
-        };
-        p.ops.push(Op {
-            component: component.to_string(),
-            out_key,
-            encoding: chosen.to_string(),
-            encoding_id: t.encoding.clone(),
-            logical_dtype: t.dtype,
-            logical_shape: t.shape.clone(),
-            roles: t
-                .parts
-                .iter()
-                .map(|(role, part)| RolePlan {
-                    role: role.clone(),
-                    dtype: part.dtype,
-                    shape: part.shape.clone(),
-                    bytes: Bytes::Inherit {
-                        part: Box::new(part.clone()),
-                    },
-                })
-                .collect(),
-            effect,
-        });
-    }
-    Ok(())
-}
-
 /// The dialect's key mapping. Identity converters keep the spelling (diffusers spelling IS
 /// the canonical spelling); a renaming dialect declares its map here and nowhere else.
 fn rekey(conv: &Converter, key: &str) -> String {
@@ -1855,21 +1711,6 @@ pub fn check_permute_size(what: &str, nbytes: u64) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Object references a plan inherits, for the CAS assertion that nothing was re-hashed.
-pub fn inherited_objects(p: &Plan) -> Vec<ObjectRef> {
-    let mut v: Vec<ObjectRef> = Vec::new();
-    for o in &p.ops {
-        for r in &o.roles {
-            if let Bytes::Inherit { part } = &r.bytes {
-                v.extend(part.segments().iter().cloned());
-            }
-        }
-    }
-    v.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    v.dedup_by(|a, b| a.sha256 == b.sha256);
-    v
 }
 
 // ---------------------------------------------------------------- banked geometry
