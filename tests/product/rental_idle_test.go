@@ -68,6 +68,9 @@ type fakeRentalHub struct {
 	reads int
 	// software is the target pair GET /v1/software answers; unset, none.
 	software map[string]string
+	// providers is each `?provider=` the catalog was asked for ("" for none). A named one is
+	// answered with the catalog tagged as that provider's, as Tensorhub does.
+	providers []string
 }
 
 func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
@@ -148,8 +151,16 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		provider := r.URL.Query().Get("provider")
+		h.providers = append(h.providers, provider)
+		rows := catalogRows(h.skus)
+		for _, row := range rows {
+			if provider != "" {
+				row["provider"] = provider
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(catalogRows(h.skus))
+		_ = json.NewEncoder(w).Encode(rows)
 	})
 	mux.HandleFunc("POST /v1/rental-quotes", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
