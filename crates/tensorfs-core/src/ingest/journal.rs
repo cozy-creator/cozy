@@ -425,15 +425,6 @@ impl Journal {
         out
     }
 
-    /// Drop this plan's journal. Called only when its result is installed or released — a
-    /// crash never reaches here, which is the point.
-    pub fn remove(self) -> Result<()> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io("remove conversion journal", error)),
-        }
-    }
 }
 
 /// Install a journal a previous pod published, where `Journal::open` will replay it.

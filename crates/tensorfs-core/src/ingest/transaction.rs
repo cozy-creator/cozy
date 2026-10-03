@@ -1129,25 +1129,6 @@ pub fn convert_journal(
     )
 }
 
-/// Drop the conversion journal for one plan. The coordinator's act, after its result is
-/// installed or released — a crash never reaches here, which is the point.
-pub fn forget_journal(
-    store: &Store,
-    plan: &Plan,
-    files: &[SourceFile],
-    operation: &str,
-) -> Result<()> {
-    let headers: Vec<(PathBuf, &SourceHeader)> = files
-        .iter()
-        .map(|file| (file.path.clone(), &file.header))
-        .collect();
-    Journal::open(
-        &candidate_dir(store.root(), operation),
-        &journal::plan_digest(plan, &headers),
-    )?
-    .remove()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
