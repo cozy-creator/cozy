@@ -292,6 +292,12 @@ func (c *Client) Submit(sub api.Submission, key string) (api.Handle, *exit.Error
 	return h, e
 }
 
+// Capabilities is what this controller can run.
+func (c *Client) Capabilities() (api.Capabilities, *exit.Error) {
+	var caps api.Capabilities
+	return caps, c.call(http.MethodGet, "/v1/capabilities", nil, &caps)
+}
+
 // At uses an owned foreground controller's normal authenticated API transport.
 // It neither reads nor rewrites a daemon record and never reattaches to another owner.
 func At(cfg config.Config, address string, token secret.Value) *Client {

@@ -124,6 +124,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		UseRental:     func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
 		ObserveRental: rental.ObserveWorker(st),
 		RentalKey:     func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
+		EndpointKey:   rentalEndpointKey(l, st),
 	}
 	machines := newMachineRuns(ctx, l, st, resolver, fleet, found)
 	defer machines.cancel()

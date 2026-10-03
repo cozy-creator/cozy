@@ -2,9 +2,12 @@ package producttest
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"image"
@@ -15,6 +18,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 var cpuLongform = flag.String("cpu-longform", "", "cozy-machine tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
@@ -105,5 +111,98 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 		"--asset", "reference="+reference, "model.render_segment.models.base=alice/model", "--await", "--json")
 	if code == 0 || !strings.Contains(document, "segment 1 of 3") || !strings.Contains(document, "model choices name no declared model slot") {
 		t.Fatalf("the child did not receive the job's choice for it [exit %d]\n%s", code, document)
+	}
+}
+
+// A job on an explicit endpoint runs in the foreground (no daemon owns it), and an endpoint
+// that is one of this host's rentals is signed with that rental's own key: a rental's machine
+// authorizes it, not this computer's machine owner key. Here this computer's machine stands
+// in for the rental: its key moves to a rental's credential and the owner key is replaced.
+func TestEndpointJobSignsWithItsRentalKey(t *testing.T) {
+	if *machineHostBinary == "" || *cpuLongform == "" {
+		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+	}
+	root, err := os.MkdirTemp(os.TempDir(), "cze")
+	must(t, err)
+	provisionMachine(t, root)
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		if t.Failed() {
+			t.Logf("evidence retained at %s\nmachine log tail:\n%s", root, tail(filepath.Join(root, "machine", "host.log")))
+		} else {
+			_ = removeAllForce(root)
+		}
+	})
+	project := filepath.Join(t.TempDir(), "cpu_longform")
+	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
+	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
+		t.Fatalf("uv lock: %v\n%s", err, out)
+	}
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		t.Fatalf("package install [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "machine", "start"); code != 0 {
+		t.Fatalf("machine start [exit %d]\n%s", code, out)
+	}
+	var agent struct {
+		WorkerID   string `json:"worker_id"`
+		WorkerPort int    `json:"worker_port"`
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "machine", "agent.json"))
+	must(t, err)
+	must(t, json.Unmarshal(raw, &agent))
+	leaf, err := os.ReadFile(filepath.Join(root, "machine", "leaf.pem"))
+	must(t, err)
+	endpoint := filepath.Join(root, "endpoint.json")
+	document, _ := json.Marshal(map[string]string{"format": "cozy.machine.endpoint/1", "address": fmt.Sprintf("127.0.0.1:%d", agent.WorkerPort),
+		"worker_id": agent.WorkerID, "worker_boot_id": "boot", "tls_certificate_pem": string(leaf), "execution_workspace_id": "workspace"})
+	must(t, os.WriteFile(endpoint, document, 0o600))
+	// The machine authorizes the key it started with; that key becomes a rental's, and this
+	// computer's owner key is now another one the machine does not know.
+	owner := filepath.Join(root, "machine", "owner.pem")
+	authorized, err := os.ReadFile(owner)
+	must(t, err)
+	must(t, os.MkdirAll(filepath.Join(root, "rentals"), 0o700))
+	must(t, os.WriteFile(filepath.Join(root, "rentals", "pr-standin.creator.pem"), authorized, 0o600))
+	_, private, _ := ed25519.GenerateKey(nil)
+	der, err := x509.MarshalPKCS8PrivateKey(private)
+	must(t, err)
+	must(t, os.WriteFile(owner, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600))
+
+	picture := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	var encoded bytes.Buffer
+	must(t, png.Encode(&encoded, picture))
+	reference := filepath.Join(root, "ref.png")
+	must(t, os.WriteFile(reference, encoded.Bytes(), 0o600))
+	request, _ := json.Marshal(map[string]any{"segments": []string{"one", "two"}})
+	in := filepath.Join(root, "req.json")
+	must(t, os.WriteFile(in, request, 0o600))
+	run := func(extra ...string) (int, string) {
+		args := append([]string{"run", "local/cozy-machine-cpu-longform/long_form", "--machine-endpoint-file", endpoint,
+			"--input", in, "--asset", "reference=" + reference, "--json"}, extra...)
+		return runCozy(t, root, args...)
+	}
+	// Signed with the owner key, which the machine does not authorize: refused.
+	if code, out := run("--await"); code == 0 {
+		t.Fatalf("the machine accepted a key it does not authorize\n%s", out)
+	}
+	// Once the endpoint is a recorded rental, its rental key signs and the job runs.
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	if problem := store.RecordRental(records.Rental{ID: "pr-standin", MachineName: "standin", State: "ready",
+		Address: fmt.Sprintf("127.0.0.1:%d", agent.WorkerPort), CertPath: filepath.Join(root, "machine", "leaf.pem"),
+		ExpectedWorkerID: agent.WorkerID, ExpectedWorkerBootID: "boot", RentedAt: time.Now().UTC().Format(time.RFC3339)}); problem != nil {
+		t.Fatal(problem)
+	}
+	store.Close()
+	out := filepath.Join(root, "film")
+	if code, document := run("--await", "--out", out); code != 0 {
+		t.Fatalf("the rental-signed job did not succeed [exit %d]\n%s", code, document)
+	}
+	if files, _ := filepath.Glob(filepath.Join(out, "*video*")); len(files) != 1 {
+		t.Fatalf("want the film saved in %s, got %v", out, files)
 	}
 }

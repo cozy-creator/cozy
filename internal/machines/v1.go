@@ -7,6 +7,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machinev1"
+	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
@@ -47,8 +48,16 @@ func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.
 		if problem != nil {
 			return nil, problem
 		}
-		key, problem := r.Host.ExistingOwner()
-		if problem != nil {
+		var rented *rental.CreatorIdentity
+		if r.EndpointKey != nil {
+			if rented, problem = r.EndpointKey(ep); problem != nil {
+				return nil, problem
+			}
+		}
+		var key rental.CreatorIdentity
+		if rented != nil {
+			key = *rented
+		} else if key, problem = r.Host.ExistingOwner(); problem != nil {
 			return nil, problem
 		}
 		pin, err := workertls.ParsePin([]byte(ep.CertificatePEM))
