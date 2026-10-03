@@ -634,6 +634,7 @@ type RentalNewCmd struct {
 	Models         []string `name:"model" help:"Size disk for a Hub model (org/model@release/lane) or a provider source to ingest (hf://org/repo@commit, civitai://version); repeat for several."`
 	SourceProfiles []string `name:"source-profile" help:"Reviewed TensorFS source profile of the one --model provider source (repeatable; several compose one model)."`
 	DiskGB         int      `name:"disk-gb" help:"Container disk to rent, in GB; the Hub picks an offer whose disk allows it."`
+	Provider       string   `name:"provider" help:"Marketplace to rent from: runpod (the default) or vast. Alone, lists that marketplace's machines."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
 	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
 }
@@ -661,7 +662,8 @@ func (c *RentalNewCmd) Run(r *Runtime) error {
 	}
 	return r.call(handleRent, []string{c.SKU}, flags, values(
 		"--gpus", gpus, "--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models,
-		"--source-profile", c.SourceProfiles, "--disk-gb", disk, "--ssh-public-key", c.SSHPublicKey, "--image", c.Image), false)
+		"--source-profile", c.SourceProfiles, "--disk-gb", disk, "--ssh-public-key", c.SSHPublicKey, "--image", c.Image,
+		"--provider", c.Provider), false)
 }
 
 type RentalEndCmd struct {

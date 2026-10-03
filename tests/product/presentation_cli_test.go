@@ -43,7 +43,7 @@ func TestRentalConflictNamesDrainingOperation(t *testing.T) {
 	defer store.Close()
 	_, _, problem = store.BeginRentalOperation(records.RentalOperation{Key: "draining-op", Hub: origin, Reason: "manual", HourlyRateUSDMicros: 100_000}, func(name string) ([]byte, string, *exit.Error) {
 		body, problem := hub.RentalRequestBytes(name, "cpu", 1, strings.Repeat("ab", 32),
-			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil, "")
+			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil, "", "")
 		return body, "draining", problem
 	})
 	fatal(t, problem)
