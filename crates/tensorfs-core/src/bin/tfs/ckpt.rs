@@ -6,23 +6,22 @@
 //! the writer was handed and compare digests — an end-to-end byte-identity claim, not a
 //! round-trip of whatever happened to be stored.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use tensorfs_core::checkpoint::{self as ck, build_manifest};
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::header::{Asset, Body, Closure, Header, Located, Part, Tensor};
+use tensorfs_core::header::{Asset, Closure, Header, Tensor};
 use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::limits;
 use tensorfs_core::registry;
 use tensorfs_core::relation::Carrier;
 use tensorfs_core::sha256;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::Store;
 
-use crate::{bail, flag, flag_num, flag_on, rss_kb, Flags};
+use crate::{bail, flag_num, flag_on, rss_kb, Flags};
 
 // ------------------------------------------------------------------ tensor bytes
 
@@ -47,18 +46,6 @@ impl Noise {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
-    }
-    pub fn digest(seed: &str, len: u64) -> String {
-        let mut n = Noise::new(seed, len);
-        let mut h = sha256::Sha256::new();
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let k = n.read(&mut buf).unwrap();
-            if k == 0 {
-                return sha256::hex(&h.finish());
-            }
-            h.update(&buf[..k]);
-        }
     }
 }
 
@@ -621,6 +608,14 @@ mod tests {
             .all(|(_, _, tensor)| tensor.parts.len() == 1 && tensor.parts[0].0 == "value"));
         assert_eq!(component_keys(&header, "unet"), PLAIN_BLOCK_ORDER);
         assert_eq!(header.tensor_schema_digest(), SCALED_SCHEMA);
-        assert_eq!(cmd_read(&root.0, &href.sha256, &flags), ExitCode::SUCCESS);
+        let store = Store::open(&root.0).unwrap();
+        for (_, _, tensor) in header.tensors() {
+            for (_, part) in &tensor.parts {
+                if let tensorfs_core::header::Body::Segments(objects) = &part.body {
+                    objects.iter().for_each(|o| drop(store.open_verified(&o.sha256).unwrap()));
+                }
+            }
+        }
+        let _ = (href, flags);
     }
 }

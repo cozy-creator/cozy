@@ -71,17 +71,7 @@ never its control loop. A mounted filesystem which stops responding cannot provi
 miss from inside the blocked syscall, so subprocess progress/termination and live hung-mount proof
 remain the supervisor's responsibility.
 
-The supervisor subprocess seam emits exactly one JSON record and exits successfully for cache
-weather:
-
-```bash
-tfs store admit-file <store> blob|manifest <sha256> <length> <source>
-tfs repo-cache admit <cache> <store> blob|manifest <sha256> <length>
-tfs repo-cache backfill <cache> <store> blob|manifest <sha256> <length>
-```
-
-Those three act on a cache directory as such and name one explicitly. The production paths never
-do: `tfs fetch`, `tfs ingest run`, `tfs repo-cache restore <store> ...` and
+The production paths never name a cache directory: `tfs fetch`, `tfs ingest run`, `tfs repo-cache restore <store> ...` and
 `tfs repo-cache resume <store> ...` use whatever the Store is bound to, and an unbound Store is a
 run with no cache rather than a refusal — except a restore, where "bring these bytes back off the
 cache" with no cache is a caller mistake and says so.
@@ -152,18 +142,14 @@ TensorFS owns its Store location independently of Creator. User-facing entrypoin
 default in this order: an explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`. Core Rust
 Store operations remain explicit-root.
 
-A Store is created only where someone NAMED it — a root argument, or `TENSORFS_HOME` — and only by
-`init`/`ensure`. `$HOME/.tensorfs` is a place to look, not a place to conjure: with no root named
-and nothing there, every store verb refuses `STORE_ROOT_ABSENT` and writes nothing. Nor does a
+A Store is created only where someone NAMED it, and only by `init`/`ensure`: every `tfs` store verb
+takes its root as an argument. Nor does a
 writer marker create the root it locks, so no command lays down a skeleton Store in whatever
 directory it happened to be run from.
 
 ```bash
-tfs home
-tfs store ensure                 # over a NAMED root: open valid, or initialize only absent/empty
-TENSORFS_HOME=/var/lib/tensorfs tfs store info
-tfs store prepare-readers        # TensorFS owns cross-uid lease coordination modes
-tfs store complete-cozytensors   # sorted verified-complete runtime manifests
+tfs store ensure <root>          # open valid, or initialize only absent/empty
+tfs store prepare-readers <root> # TensorFS owns cross-uid lease coordination modes
 ```
 
 ## Disk budget
@@ -380,15 +366,13 @@ tfs store rebuild <census> --rows <rows.jsonl> [--sqlite <tensorfs.sqlite>]
 tfs put <root> <file>
 tfs get <root> <sha256>
 tfs contains <root> <sha256>
-tfs verify <root> <sha256>
-tfs scrub <root>
 tfs reap <root>
 ```
 
 Blob admission hashes while streaming, installs with no-clobber semantics, and records its
 rebuildable verification observation in SQLite. Each process loads those rows once per catalog
 into memory; a trust check is an `fstat` compared with the row's `(dev, ino, length, mtime)`,
-and a changed or unrecorded object is rehashed. `tfs scrub` is the only deliberate full rehash.
+and a changed or unrecorded object is rehashed.
 `tensorfs.stats()` returns this process's `catalog_opens`, `presence_passes` (closure walks that
 prove every object resident) and `repo_cache_verified_reads`; diff two snapshots around a call.
 Manifests use the same digest/length identity but
@@ -621,7 +605,6 @@ mutations cannot append a second row under org `local`.
 ```text
 tfs gc <store> [--dry-run] [--json]
 tfs gc headers <census> --out <header-requests.jsonl>
-tfs gc holds <store> --out <holds.jsonl>
 tfs gc plan <census> --holds <holds.jsonl> --out <plan.jsonl>
 ```
 

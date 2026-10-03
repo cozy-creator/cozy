@@ -290,34 +290,17 @@ fn fifo_symlink_and_directory_entries_are_unavailable() {
         .status()
         .unwrap()
         .success());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args([
-            "repo-cache",
-            "admit",
-            cache.root().to_str().unwrap(),
-            destination.root().to_str().unwrap(),
-            "blob",
-            &object.id(),
-            &object.length.to_string(),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while child.try_wait().unwrap().is_none() {
-        if std::time::Instant::now() >= until {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("cache FIFO waited for a writer before rejecting the nonregular entry");
-        }
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        r#"{"status":"unavailable"}"#
-    );
+    // A FIFO must be refused without waiting for a writer.
+    let (sent, answered) = std::sync::mpsc::channel();
+    let (fifo_cache, fifo_destination, fifo_object) =
+        (cache.clone(), destination.clone(), object.clone());
+    thread::spawn(move || {
+        let _ = sent.send(fifo_cache.admit(&fifo_destination, CacheKind::Blob, &fifo_object));
+    });
+    let read = answered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("cache FIFO waited for a writer before rejecting the nonregular entry");
+    assert_eq!(read.unwrap(), CacheRead::Unavailable);
     assert!(!destination.blob_path(&object.sha256).exists());
     fs::remove_file(&path).unwrap();
     fs::copy(&correct, &path).unwrap();
@@ -399,67 +382,25 @@ fn incomplete_hidden_temp_is_never_a_hit_and_disabled_cache_is_soft() {
 }
 
 #[test]
-fn cli_emits_one_json_status_and_admits_verified_bytes() {
-    let root = temporary("cli");
+fn a_backfilled_object_is_admitted_back_verified() {
+    let root = temporary("backfill");
     fs::create_dir_all(&root).unwrap();
-    let cache = root.join("cache");
-    let source = root.join("download");
-    let store_root = root.join("store");
-    let store = Store::init(&store_root).unwrap();
+    let cache = RepoObjectCache::new(root.join("cache"));
+    let store = Store::init(&root.join("store")).unwrap();
     let bytes = b"from-nfs-cache";
-    fs::write(&source, bytes).unwrap();
     let wanted = ObjectRef::of(bytes);
-    let tfs = env!("CARGO_BIN_EXE_tfs");
-
-    let store_admit = Command::new(tfs)
-        .args([
-            "store",
-            "admit-file",
-            store_root.to_str().unwrap(),
-            "blob",
-            &wanted.id(),
-            &wanted.length.to_string(),
-            source.to_str().unwrap(),
-        ])
-        .output()
+    store
+        .put_stream(&mut bytes.as_slice(), Some(&wanted), &Fault::default())
         .unwrap();
-    assert!(store_admit.status.success());
-    assert_eq!(store_admit.stdout, b"{\"status\":\"stored\"}\n");
-    assert!(store_admit.stderr.is_empty());
-
-    let backfill = Command::new(tfs)
-        .args([
-            "repo-cache",
-            "backfill",
-            cache.to_str().unwrap(),
-            store_root.to_str().unwrap(),
-            "blob",
-            &wanted.id(),
-            &wanted.length.to_string(),
-        ])
-        .output()
-        .unwrap();
-    assert!(backfill.status.success());
-    assert_eq!(backfill.stdout, b"{\"status\":\"stored\"}\n");
-    assert!(backfill.stderr.is_empty());
-
+    assert_eq!(
+        cache.backfill_store(&store, CacheKind::Blob, &wanted).unwrap(),
+        CacheWrite::Stored
+    );
     fs::remove_file(store.blob_path(&wanted.sha256)).unwrap();
-
-    let admit = Command::new(tfs)
-        .args([
-            "repo-cache",
-            "admit",
-            cache.to_str().unwrap(),
-            store_root.to_str().unwrap(),
-            "blob",
-            &wanted.id(),
-            &wanted.length.to_string(),
-        ])
-        .output()
-        .unwrap();
-    assert!(admit.status.success());
-    assert_eq!(admit.stdout, b"{\"status\":\"hit\"}\n");
-    assert!(admit.stderr.is_empty());
+    assert_eq!(
+        cache.admit(&store, CacheKind::Blob, &wanted).unwrap(),
+        CacheRead::Hit
+    );
     let mut admitted = store.open_verified(&wanted.sha256).unwrap();
     let mut actual = Vec::new();
     std::io::Read::read_to_end(&mut admitted, &mut actual).unwrap();

@@ -285,23 +285,6 @@ fn complete_cozytensors_census_is_sorted_verified_and_runtime_only() {
     expected.sort();
     assert_eq!(store.complete_cozytensors_manifests().unwrap(), expected);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["store", "complete-cozytensors", root.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-        expected
-    );
     fs::remove_dir_all(root).unwrap();
 }
 

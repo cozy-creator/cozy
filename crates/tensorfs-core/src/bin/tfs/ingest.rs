@@ -15,7 +15,6 @@
 //! A candidate is never a release. Its temporary session is the visible difference.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,13 +23,12 @@ use std::time::Instant;
 
 use tensorfs_core::canon::{self, as_arr, as_str, Fields, Value};
 use tensorfs_core::checkpoint as ck;
-use tensorfs_core::dtype::Dtype;
 use tensorfs_core::durability;
 use tensorfs_core::err::Code;
 use tensorfs_core::header::tensor_schema_digest_of;
 use tensorfs_core::ids::{ObjectRef, Plain};
-use tensorfs_core::ingest::carrier::{self, SourceHeader};
-use tensorfs_core::ingest::convert::{self, Class, Effect, Rekey, Source, Target};
+use tensorfs_core::ingest::carrier::SourceHeader;
+use tensorfs_core::ingest::convert::{self, Class, Effect};
 use tensorfs_core::ingest::fingerprint::{
     self, Banked, FingerprintRegistry, SourceProfile, SourceProfileComponent, SourceProfileVariant,
 };
