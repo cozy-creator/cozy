@@ -1,7 +1,6 @@
 package orchestrator
 
 import (
-
 	"github.com/cozy-creator/cozy/internal/exit"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )

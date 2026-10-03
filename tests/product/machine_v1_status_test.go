@@ -52,8 +52,11 @@ func TestMachineV1StatusKeepaliveAndUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	anyone, err := machinev1.Identity(ctx, launch.Addr, pin.TLSConfig())
+	anyone, served, err := machinev1.Identity(ctx, launch.Addr, pin.TLSConfig())
 	must(t, err)
+	if string(served) != string(launch.Leaf) {
+		t.Fatal("Status was served by another leaf than the machine's")
+	}
 	if anyone.WorkerId != launch.WorkerID || anyone.BootId != launch.BootID || len(anyone.Receipt) == 0 {
 		t.Fatalf("the identity frame does not name this machine's boot and receipt: %v", anyone)
 	}

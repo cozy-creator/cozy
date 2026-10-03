@@ -558,7 +558,7 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 		return nil, exit.New(exit.Conflict, "the machine Host record carries no receipt key")
 	}
 	for {
-		receipt, leaf, err := readReceipt(ctx, record.MediaPort, key)
+		receipt, leaf, err := readReceipt(ctx, record.WorkerPort, key)
 		if err == nil {
 			if receipt.WorkerInternalPort != record.WorkerPort {
 				return nil, exit.New(exit.Conflict, "the machine Host's receipt names another worker port")
@@ -571,9 +571,6 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 		}
 		if refused := (*receiptRefusal)(nil); errors.As(err, &refused) {
 			return nil, exit.New(exit.Credential, "the machine Host's readiness receipt did not verify: %s", err)
-		}
-		if gone := (*runtimeGone)(nil); errors.As(err, &gone) {
-			return nil, exit.Named(exit.Structural, "machine.runtime_gone", "%s", gone)
 		}
 		if !h.alive(record.PID) && !h.starting(record.PID) {
 			return nil, exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness")
