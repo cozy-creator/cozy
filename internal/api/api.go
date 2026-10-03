@@ -84,7 +84,7 @@ type Server struct {
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
 	rentals             func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	rentalInventory     func(string, bool, bool) (RentalInventory, *exit.Error)
-	rentalKeepalive     func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
+	rentalKeepalive     func(context.Context, string) (RentalKeepaliveResult, *exit.Error)
 	rentalInstall       func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	rentalInstallStatus func(string, string) (*RentalInstallStatus, *exit.Error)
 	runtimeUpdate       func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
@@ -142,7 +142,7 @@ type Options struct {
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	// RentalInventory answers one hub's fleet, or with allHubs every hub's.
 	RentalInventory func(hub string, allHubs, reconcile bool) (RentalInventory, *exit.Error)
-	RentalKeepalive func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
+	RentalKeepalive func(context.Context, string) (RentalKeepaliveResult, *exit.Error)
 	RentalInstall   func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	// RentalInstallStatus reads one queued installation on one machine, with its progress.
 	RentalInstallStatus func(machine, id string) (*RentalInstallStatus, *exit.Error)

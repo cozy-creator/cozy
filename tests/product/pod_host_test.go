@@ -61,7 +61,6 @@ const (
 type fakePod struct {
 	// releases are the published releases this pod's machine reads at its own Hub.
 	releases         map[string]*pb.DescribedRelease
-	keepalive        func(*pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error)
 	identity         string
 	noSeats          bool
 	mediaReservation func(int64, int) error
@@ -1039,12 +1038,6 @@ func (p *fakePod) PruneOperationCache(_ context.Context, call *pb.PruneOperation
 	return p.prune(call)
 }
 
-func (p *fakePod) KeepRentalAlive(ctx context.Context, request *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
-	if err := p.verifyClaim(request.Claim, false); err != nil {
-		return nil, err
-	}
-	if p.keepalive == nil {
-		return nil, status.Error(codes.Unimplemented, "keepalive unavailable")
-	}
-	return p.keepalive(request)
+func (p *fakePod) KeepRentalAlive(context.Context, *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
+	return nil, status.Error(codes.Unimplemented, "keepalive is Status on cozy.machine.v1")
 }

@@ -1,9 +1,13 @@
 package rental
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -35,5 +39,20 @@ func ClaimProof(l home.Layout) orchestrator.RentalClaimProofSource {
 			return nil, exit.Internalf("cannot author the rental ClaimProof: %s", err)
 		}
 		return identity.Sign(canonicalBytes), nil
+	}
+}
+
+// Signer is the per-rental Creator key as the signer of that machine's Cozy-Caps.
+func Signer(l home.Layout) orchestrator.RentalSignerSource {
+	return func(rentalID string) (machinev1.Signer, *exit.Error) {
+		identity, problem := CreatorIdentityFor(l, rentalID)
+		if problem != nil {
+			return machinev1.Signer{}, problem
+		}
+		public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
+		if err != nil || len(public) != ed25519.PublicKeySize {
+			return machinev1.Signer{}, exit.New(exit.Credential, "the rental's Creator key is unreadable")
+		}
+		return machinev1.Signer{Public: public, Sign: identity.Sign}, nil
 	}
 }
