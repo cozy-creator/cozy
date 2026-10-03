@@ -1,5 +1,5 @@
-//! Fault points on the copy path, armed only by tests (cargo feature `faults`). Without the
-//! feature every point is a no-op.
+//! Fault points on the copy and staging paths, armed only by tests (cargo feature `faults`).
+//! Without the feature every point is a no-op.
 
 #[cfg(feature = "faults")]
 mod imp {
@@ -10,6 +10,23 @@ mod imp {
 
     static ARMED: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
     static GATES: Mutex<Vec<(&'static str, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+    static STALLS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+    /// Sleep `ms` at every pass through `point` from now on (0 disarms).
+    pub fn arm_stall(point: &'static str, ms: u64) {
+        let mut s = STALLS.lock().unwrap();
+        s.retain(|(p, _)| *p != point);
+        if ms > 0 {
+            s.push((point, ms));
+        }
+    }
+
+    pub(crate) fn stall(point: &'static str) {
+        let ms = STALLS.lock().unwrap().iter().find(|(p, _)| *p == point).map(|(_, ms)| *ms);
+        if let Some(ms) = ms {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
 
     /// Fail the `n`th (1-based) next pass through `point` as a driver out-of-memory. Replaces
     /// any earlier arming of `point`.
@@ -77,9 +94,13 @@ mod imp {
 }
 
 #[cfg(feature = "faults")]
-pub use imp::{arm, arm_gate, Gate};
+pub use imp::{arm, arm_gate, arm_stall, Gate};
 #[cfg(feature = "faults")]
-pub(crate) use imp::{gate, hit};
+pub(crate) use imp::{gate, hit, stall};
+
+#[cfg(not(feature = "faults"))]
+#[inline(always)]
+pub(crate) fn stall(_point: &'static str) {}
 
 #[cfg(not(feature = "faults"))]
 #[inline(always)]

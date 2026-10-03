@@ -558,6 +558,10 @@ impl Inner {
 
     pub(crate) fn want_host(self: &Arc<Self>, c: &mut Core, ws: WsId, regions: &[u32], prio: i64, pin: bool) -> Result<()> {
         let w = c.ws_mut(ws)?;
+        if w.host.window().is_some() {
+            // A streamed layout holds only what its machine staged: nothing here to pin.
+            return Err(Error::BelowFloor { pool: "pinned", need: w.layout.nbytes, budget: c.host_budget });
+        }
         let mut need = 0u64;
         for &r in regions {
             let span = w.layout.regions[r as usize].span;
@@ -1145,7 +1149,9 @@ impl Plane {
     /// Register one weight set over a sealed layout (`host::fill_sealed`, the machine's): the
     /// layout holds every byte, so the set has no store source and never fills or punches.
     /// Its regions join this plane's books only as a pinned budget wants them (`want`), where
-    /// they are registered for DMA; the rest copy to a device as pageable memory.
+    /// they are registered for DMA; the rest copy to a device as pageable memory. A streamed
+    /// layout (`window::open_window`) copies each region from the slot its machine staged it in
+    /// and cannot be pinned (`BelowFloor`).
     pub fn register_sealed(&self, name: &str, plan: &ReadPlan, regions: &[Vec<String>], fd: RawFd) -> Result<WsId> {
         self.check()?;
         let layout = Layout::build(plan, regions)?;

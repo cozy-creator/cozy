@@ -885,3 +885,73 @@ fn a_layout_still_filling_reaches_the_device_region_by_region() {
     s.sync();
     p.close().unwrap();
 }
+
+/// A streamed layout's machine on a thread: its window serves until the returned flag is set.
+fn served_window(fx: &Fixture, slots: usize) -> (std::os::fd::OwnedFd, std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<tensorfs_plane::Result<()>>) {
+    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let (fd, window) = tensorfs_plane::window::open_window("unet", &layout, slots).unwrap();
+    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s = stop.clone();
+    let t = std::thread::spawn(move || window.serve(&layout, &source, 3, &tensorfs_plane::io::IoTally::default(), &s));
+    (fd, stop, t)
+}
+
+#[test]
+#[ignore = "GPU"]
+fn a_streamed_layout_reaches_the_device_through_one_slot() {
+    use std::os::fd::AsRawFd;
+    let fx = Fixture::new("gpu-window");
+    fx.drop_cache();
+    let (fd, stop, machine) = served_window(&fx, 1);
+    let p = plane();
+    let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+    let s = Stream::new();
+    p.set_pinned_budget(1 << 30).unwrap();
+    assert!(matches!(p.want(ws, Tier::Pinned, None, 0, false), Err(Error::BelowFloor { .. })));
+    p.set_vram_budget(DEV, 512 << 20).unwrap();
+    p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
+    for r in 0..3 {
+        resident(&p, ws, &s, r).release(s.raw()).unwrap();
+    }
+    let st = p.stats();
+    assert_eq!(st.devices[0].counters.disk_copy_bytes, 0, "the executor reads no store");
+    assert!(st.devices[0].counters.host_copy_bytes > 70 << 20);
+    s.sync();
+    p.close().unwrap();
+    stop.store(true, Ordering::Release);
+    machine.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore = "GPU"]
+fn a_ring_streams_a_streamed_layout_pass_after_pass() {
+    use std::os::fd::AsRawFd;
+    let fx = Fixture::new("gpu-window-ring");
+    let (fd, stop, machine) = served_window(&fx, 2);
+    let p = plane();
+    let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+    let s = Stream::new();
+    p.set_vram_budget(DEV, (2 * 72) << 20).unwrap();
+    // Neither the host (two slots) nor the device (two ring slots) holds the weight set: every
+    // position comes from disk through the machine's window, three passes over.
+    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 3, 0, "denoise", None).unwrap();
+    let mut reads = Vec::new();
+    for _ in 0..3 {
+        for r in 0..3u32 {
+            let l = cur.acquire(r, s.raw()).unwrap();
+            reads.push((r, s.read_async(l.ptr, l.nbytes)));
+            l.release(s.raw()).unwrap();
+        }
+    }
+    s.sync();
+    for (r, buf) in &reads {
+        check_region(&p, ws, *r, buf.bytes());
+    }
+    assert_eq!(reads.len(), 9);
+    cur.close().unwrap();
+    p.close().unwrap();
+    stop.store(true, Ordering::Release);
+    machine.join().unwrap().unwrap();
+}

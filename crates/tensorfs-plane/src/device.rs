@@ -622,6 +622,15 @@ fn enqueue_copy(
     // Never a byte a sealed layout's machine has not finished: wait for the region's Ready
     // word. `_kept` holds the mapping until the (pageable, so synchronous) enqueue is done.
     let (src, _kept) = match src {
+        // A streamed layout's slot is refilled once this copy lets its region go: copy (pageable,
+        // so staged by the time the call returns) and wait for the copy before letting go.
+        CopySrc::Sealed { host, region, .. } if host.window().is_some() => {
+            return host.clone().with_region(region, |p| {
+                let copied = enqueue_copy(m, stream, bounces, waits, dst, len, CopySrc::Host(p))?;
+                copied.ready.sync()?;
+                Ok(copied)
+            });
+        }
         CopySrc::Sealed { host, region, offset } => {
             host.wait_ready(region)?;
             // SAFETY: inside the live mapping `host` keeps; the region is complete.

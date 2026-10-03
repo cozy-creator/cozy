@@ -13,11 +13,17 @@
 //! A sealed layout (`fill_sealed`) is the machine's: filled once through the verified read
 //! path, every region Ready, then sealed so no process can write, resize or punch it. Executors
 //! adopt it read-only (`adopt_sealed`); its RAM goes when the last descriptor and mapping do.
+//!
+//! A streamed layout (`window::open_window`) is a sealed memfd too, for a weight set larger than
+//! the host may hold: a few slots, each holding whichever region its machine staged there, and
+//! the same state page plus a word per slot. An adopter reads region `r` only while it holds a
+//! shared OFD lock on `r`'s word (`with_region`): that is the want the machine sees, and while it
+//! is held the machine refills no slot holding `r`.
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tensorfs_core::ids::ObjectRef;
@@ -31,11 +37,12 @@ use crate::{Error, Result};
 /// F_SEAL_FUTURE_WRITE (Linux 5.1): no new writable mapping or write; the filler's own mapping,
 /// done writing, may still be going away.
 const F_SEAL_FUTURE_WRITE: libc::c_int = 0x10;
-const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | F_SEAL_FUTURE_WRITE;
+pub(crate) const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | F_SEAL_FUTURE_WRITE;
 /// What an adopter accepts: resize and sealing sealed, and every write path closed.
 const RESIZE_SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
+const MAGIC_WINDOW: u64 = u64::from_le_bytes(*b"TFSWIN01");
 /// The state page, at `data` (the layout's nbytes): magic, region count, digest (64 hex bytes),
 /// one u32 word per region, then each region's (offset, span); the file's last 8 bytes repeat
 /// `data`, so a holder without the layout (`release_hold`) finds the page.
@@ -50,6 +57,28 @@ fn ext_off(regions: usize) -> usize {
 
 fn meta_len(regions: usize) -> usize {
     (ext_off(regions) + 16 * regions + 8).next_multiple_of(PART_ALIGN as usize)
+}
+
+/// A streamed layout's window section, after the extents: slot count, slot span, then one u64
+/// word per slot: `(region + 1) << 32 | READY` once staged, the region without READY while it
+/// is refilled, 0 empty.
+fn win_off(regions: usize) -> usize {
+    ext_off(regions) + 16 * regions
+}
+
+fn meta_len_window(regions: usize, slots: usize) -> usize {
+    (win_off(regions) + 16 + 8 * slots + 8).next_multiple_of(PART_ALIGN as usize)
+}
+
+/// The slot word of region `r` staged and complete.
+pub(crate) fn staged(r: u32) -> u64 {
+    (r as u64 + 1) << 32 | READY as u64
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    pub slots: usize,
+    pub slot_span: u64,
 }
 
 /// An OFD byte-range lock on `fd`; Ok(false) when a non-waiting request conflicts.
@@ -88,9 +117,18 @@ fn os(what: &str) -> Error {
     Error::Io(format!("{what}: {}", std::io::Error::last_os_error()))
 }
 
+fn file_size(fd: RawFd) -> Result<usize> {
+    // SAFETY: fstat into a zeroed struct.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(os("fstat host fd"));
+    }
+    Ok(st.st_size as usize)
+}
+
 /// A new open file description of the file behind `fd` (a dup would share `fd`'s, and with it
 /// its OFD locks).
-fn reopen(fd: RawFd) -> Result<OwnedFd> {
+pub(crate) fn reopen(fd: RawFd) -> Result<OwnedFd> {
     reopen_as(fd, libc::O_RDWR)
 }
 
@@ -185,6 +223,11 @@ pub struct HostMem {
     /// Registered ranges (offset, context as an address): unregistered at drop at the latest,
     /// since unmapping a registered range leaves the driver a stale pinned range at that VA.
     registered: Mutex<Vec<(u64, usize)>>,
+    /// A streamed layout: its slots hold the regions; None, the regions sit at their offsets.
+    window: Option<Window>,
+    /// This process's readers per region of a streamed layout: one claim per description, held
+    /// while any of them reads.
+    readers: Mutex<HashMap<u32, usize>>,
 }
 
 // The mapping is shared memory addressed by offsets; all mutation goes through the plane's
@@ -227,7 +270,12 @@ impl HostMem {
         if seals < 0 || seals & RESIZE_SEALS != RESIZE_SEALS || seals & (libc::F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0 {
             return Err(Error::Invalid("a sealed host layout must carry write, resize and seal seals".into()));
         }
-        let host = Self::adopt_owned(reopen_as(fd, libc::O_RDONLY)?, layout, true, false)?;
+        let own = reopen_as(fd, libc::O_RDONLY)?;
+        let host = if file_size(own.as_raw_fd())? == layout.nbytes as usize + meta_len(layout.regions.len()) {
+            Self::adopt_owned(own, layout, true, false)?
+        } else {
+            Self::adopt_window(own, layout)?
+        };
         if (0..host.regions as u32).any(|r| host.failed(r)) {
             return Err(Error::Invalid("a sealed host layout's fill failed".into()));
         }
@@ -258,6 +306,235 @@ impl HostMem {
 
     pub fn sealed(&self) -> bool {
         self.sealed
+    }
+
+    pub fn window(&self) -> Option<Window> {
+        self.window
+    }
+
+    /// A streamed layout's memfd: `slots` slots of the layout's largest region span, then the
+    /// state page with the window section, every slot empty.
+    pub(crate) fn create_window(name: &str, layout: &Layout, slots: usize) -> Result<HostMem> {
+        let n = layout.regions.len();
+        let slot_span = layout.regions.iter().map(|r| r.span).max().unwrap_or(0).max(PART_ALIGN);
+        let slots = slots.max(1);
+        let data = slots * slot_span as usize;
+        let map_len = data + meta_len_window(n, slots);
+        let cname = CString::new(format!("tfs-window:{name}"))
+            .map_err(|_| Error::Invalid("weight set name contains NUL".into()))?;
+        // SAFETY: plain syscalls on a descriptor we create and own; a sparse file costs no RAM
+        // until written.
+        let fd = unsafe {
+            let fd = libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING);
+            if fd < 0 {
+                return Err(os("memfd_create"));
+            }
+            let fd = OwnedFd::from_raw_fd(fd);
+            if libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) != 0 {
+                return Err(os("ftruncate window"));
+            }
+            fd
+        };
+        let h = Self::map(fd, data, map_len, n, false, Some(Window { slots, slot_span }))?;
+        // SAFETY: every write lies inside the state page of our writable mapping.
+        unsafe {
+            let page = h.ptr.add(data);
+            for (r, reg) in layout.regions.iter().enumerate() {
+                let e = page.add(ext_off(n) + 16 * r) as *mut u64;
+                e.write_unaligned(reg.offset.to_le());
+                e.add(1).write_unaligned(reg.span.to_le());
+            }
+            let w = page.add(win_off(n)) as *mut u64;
+            w.write_unaligned((slots as u64).to_le());
+            w.add(1).write_unaligned(slot_span.to_le());
+            (page.add(meta_len_window(n, slots) - 8) as *mut u64).write_unaligned((data as u64).to_le());
+        }
+        let head = h.head();
+        head.1.copy_from_slice(layout.digest.as_bytes());
+        head.0[1] = n as u64;
+        head.0[0] = MAGIC_WINDOW;
+        Ok(h)
+    }
+
+    /// A streamed layout, read-only: its geometry from the state page (found through the
+    /// trailer), checked against `layout` before anything is mapped at that size.
+    fn adopt_window(fd: OwnedFd, layout: &Layout) -> Result<HostMem> {
+        let n = layout.regions.len();
+        let size = file_size(fd.as_raw_fd())?;
+        let read_u64 = |at: usize| -> Result<u64> {
+            let mut b = [0u8; 8];
+            // SAFETY: a read into our own buffer.
+            let got = unsafe { libc::pread(fd.as_raw_fd(), b.as_mut_ptr() as *mut libc::c_void, 8, at as libc::off_t) };
+            if got != 8 {
+                return Err(Error::Invalid("host fd is neither this layout nor a window of it".into()));
+            }
+            Ok(u64::from_le_bytes(b))
+        };
+        let data = read_u64(size.checked_sub(8).ok_or_else(|| Error::Invalid("empty host fd".into()))?)? as usize;
+        let (magic, count) = (read_u64(data)?, read_u64(data + 8)?);
+        let (slots, slot_span) = (read_u64(data + win_off(n))? as usize, read_u64(data + win_off(n) + 8)?);
+        let largest = layout.regions.iter().map(|r| r.span).max().unwrap_or(0);
+        if magic != MAGIC_WINDOW
+            || count != n as u64
+            || slots == 0
+            || slot_span < largest
+            || slots.checked_mul(slot_span as usize) != Some(data)
+            || data.checked_add(meta_len_window(n, slots)) != Some(size)
+        {
+            return Err(Error::Invalid("host fd is neither this layout nor a window of it".into()));
+        }
+        let h = Self::map(fd, data, size, n, true, Some(Window { slots, slot_span }))?;
+        // SAFETY: the digest lies inside the state page of our mapping.
+        let digest = unsafe { std::slice::from_raw_parts(h.ptr.add(data + 16), 64) };
+        if digest != layout.digest.as_bytes() {
+            return Err(Error::Invalid("host fd holds a different weight-set layout".into()));
+        }
+        Ok(h)
+    }
+
+    fn map(fd: OwnedFd, data: usize, map_len: usize, regions: usize, sealed: bool, window: Option<Window>) -> Result<HostMem> {
+        // SAFETY: shared mapping of a descriptor we hold, sized by the caller's checks.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                if sealed { libc::PROT_READ } else { libc::PROT_READ | libc::PROT_WRITE },
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(os("mmap host fd"));
+        }
+        let share = reopen_as(fd.as_raw_fd(), if sealed { libc::O_RDONLY } else { libc::O_RDWR })?;
+        Ok(HostMem {
+            fd,
+            share,
+            ptr: ptr as *mut u8,
+            data,
+            map_len,
+            regions,
+            sealed,
+            registered: Mutex::new(Vec::new()),
+            window,
+            readers: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+    pub(crate) fn map_len(&self) -> usize {
+        self.map_len
+    }
+    pub(crate) fn regions_len(&self) -> usize {
+        self.regions
+    }
+
+    pub(crate) fn slot_word(&self, s: usize) -> &AtomicU64 {
+        let w = self.window.expect("a streamed layout");
+        assert!(s < w.slots);
+        // SAFETY: in-bounds, 8-byte aligned (the window section is), lives as long as the mapping.
+        unsafe { &*(self.ptr.add(self.data + win_off(self.regions) + 16 + 8 * s) as *const AtomicU64) }
+    }
+
+    pub(crate) fn mark_failed(&self, r: u32) {
+        self.word(r).fetch_or(FAILED, Ordering::Release);
+    }
+
+    /// Region `r`'s offset in the layout (its extent in the state page).
+    fn offset_of(&self, r: u32) -> u64 {
+        assert!((r as usize) < self.regions);
+        // SAFETY: the extent lies inside the state page of our mapping.
+        u64::from_le(unsafe { (self.ptr.add(self.data + ext_off(self.regions) + 16 * r as usize) as *const u64).read_unaligned() })
+    }
+
+    /// Run `f` on region `r`'s bytes once they are in: for a layout, after its Ready word; for a
+    /// streamed layout, in whichever slot holds `r`, which no refill touches until `f` returns
+    /// (this process's claim on `r` is the machine's signal to stage it, and its guard).
+    pub fn with_region<T>(&self, r: u32, f: impl FnOnce(*const u8) -> Result<T>) -> Result<T> {
+        let Some(w) = self.window else {
+            self.wait_ready(r)?;
+            // SAFETY: inside the live mapping; a sealed layout's Ready region never changes.
+            return f(unsafe { self.ptr.add(self.offset_of(r) as usize) });
+        };
+        self.read_begin(r)?;
+        // The claim is visible to the machine before any slot word is read (its refill clears
+        // the word, then looks for claims: one of the two sees the other).
+        fence(Ordering::SeqCst);
+        let tag = staged(r);
+        let mut pause = std::time::Duration::from_micros(20);
+        let res = loop {
+            if let Some(s) = (0..w.slots).find(|&s| self.slot_word(s).load(Ordering::SeqCst) == tag) {
+                // SAFETY: slot `s` lies inside the live mapping and holds `r` while we claim it.
+                break f(unsafe { self.ptr.add(s * w.slot_span as usize) });
+            }
+            if self.failed(r) {
+                break Err(Error::Invalid(format!("streamed layout region {r}: its machine could not stage it")));
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(1));
+        };
+        self.read_end(r);
+        res
+    }
+
+    fn read_begin(&self, r: u32) -> Result<()> {
+        let mut readers = self.readers.lock().unwrap();
+        let n = readers.entry(r).or_insert(0);
+        if *n == 0 {
+            self.lock(r, libc::F_RDLCK as _, true)?;
+        }
+        *n += 1;
+        Ok(())
+    }
+
+    fn read_end(&self, r: u32) {
+        let mut readers = self.readers.lock().unwrap();
+        if let Some(n) = readers.get_mut(&r) {
+            *n -= 1;
+            if *n == 0 {
+                readers.remove(&r);
+                self.unlock(r);
+            }
+        }
+    }
+
+    /// The regions some description claims (a reader's want), ascending, from the lock table.
+    /// A query returns one conflicting lock, not necessarily the lowest, so the words on either
+    /// side of it are asked again: about two queries per claimed run of words.
+    pub(crate) fn claimed(&self) -> Result<Vec<u32>> {
+        let lo = self.data + WORDS_OFF;
+        let mut ranges = vec![(lo, lo + 4 * self.regions)];
+        let mut out = Vec::new();
+        while let Some((a, b)) = ranges.pop() {
+            if a >= b {
+                continue;
+            }
+            let mut fl = libc::flock {
+                l_type: libc::F_WRLCK as _,
+                l_whence: libc::SEEK_SET as libc::c_short,
+                l_start: a as libc::off_t,
+                l_len: (b - a) as libc::off_t,
+                l_pid: 0,
+            };
+            // SAFETY: a lock query on a descriptor we hold.
+            if unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_OFD_GETLK, &mut fl) } != 0 {
+                return Err(os("query region claims"));
+            }
+            if fl.l_type == libc::F_UNLCK as libc::c_short {
+                continue;
+            }
+            let s = (fl.l_start as usize).clamp(a, b);
+            let e = if fl.l_len == 0 { b } else { (fl.l_start + fl.l_len) as usize }.clamp(s, b);
+            out.extend(((s - lo) / 4..(e - lo).div_ceil(4)).map(|r| r as u32));
+            ranges.push((a, s));
+            ranges.push((e.max(s + 1), b));
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 
     /// `init`: this description sizes the memfd to the layout and writes its state page (a
@@ -311,6 +588,8 @@ impl HostMem {
             regions,
             sealed,
             registered: Mutex::new(Vec::new()),
+            window: None,
+            readers: Mutex::new(HashMap::new()),
         };
         if fresh {
             let head = h.head();
