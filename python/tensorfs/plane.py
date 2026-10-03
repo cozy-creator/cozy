@@ -4,6 +4,7 @@ Typed in `plane.pyi`. The plane moves bytes; cozy-runtime decides.
 """
 
 from ._ext.plane import (
+    SEALED_WHILE_FILLING,
     BelowFloor,
     BudgetExceeded,
     Closed,
@@ -29,6 +30,7 @@ from ._ext.plane import (
 )
 
 __all__ = [
+    "SEALED_WHILE_FILLING",
     "BelowFloor",
     "BudgetExceeded",
     "Closed",

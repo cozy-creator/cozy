@@ -132,13 +132,12 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
     let region = w.layout.regions[r as usize].clone();
     let held = matches!(w.hregs[r as usize].state, HState::Ready);
     let from_host = held || w.host.sealed();
-    let src = if from_host {
-        if held {
-            w.hregs[r as usize].holds += 1;
-        }
-        // SAFETY: inside the live mapping; a hold keeps a Ready region until the copy's event,
-        // and nothing frees a sealed layout's pages while this weight set maps them.
+    let src = if held {
+        w.hregs[r as usize].holds += 1;
+        // SAFETY: inside the live mapping; the hold keeps the region until the copy's event.
         CopySrc::Host(unsafe { w.host.base().add(region.offset as usize) })
+    } else if from_host {
+        CopySrc::Sealed { host: w.host.clone(), region: r, offset: region.offset }
     } else {
         CopySrc::Disk {
             source: w.source.clone(),

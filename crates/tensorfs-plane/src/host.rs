@@ -41,6 +41,8 @@ const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
 /// `data`, so a holder without the layout (`release_hold`) finds the page.
 const WORDS_OFF: usize = 8 + 8 + 64;
 const READY: u32 = 1;
+/// A sealed layout's region its filler could not fill: whoever waits for it gets an error.
+const FAILED: u32 = 2;
 
 fn ext_off(regions: usize) -> usize {
     (WORDS_OFF + 4 * regions).next_multiple_of(8)
@@ -217,8 +219,8 @@ impl HostMem {
         Self::adopt_owned(reopen(fd)?, layout, false, false)
     }
 
-    /// Adopt a sealed layout (`fill_sealed`) read-only: its seals are the proof nobody can
-    /// change a byte, and every region must be Ready.
+    /// Adopt a sealed layout (`fill_sealed`, `open_sealed`) read-only: its seals are the proof
+    /// nobody else can change a byte; a region is used only once its filler marks it Ready.
     pub fn adopt_sealed(fd: RawFd, layout: &Layout) -> Result<HostMem> {
         // SAFETY: a scalar query of a descriptor the caller holds.
         let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
@@ -226,27 +228,32 @@ impl HostMem {
             return Err(Error::Invalid("a sealed host layout must carry write, resize and seal seals".into()));
         }
         let host = Self::adopt_owned(reopen_as(fd, libc::O_RDONLY)?, layout, true, false)?;
-        if (0..host.regions as u32).any(|r| !host.ready(r)) {
-            return Err(Error::Invalid("a sealed host layout has a region that is not Ready".into()));
+        if (0..host.regions as u32).any(|r| host.failed(r)) {
+            return Err(Error::Invalid("a sealed host layout's fill failed".into()));
         }
         Ok(host)
     }
 
-    /// Seal a filled layout: no writable mapping remains (this one goes) and nobody can
-    /// write, resize or punch it again. Every region must be Ready. Returns the memfd.
-    pub fn seal(self) -> Result<OwnedFd> {
-        if self.sealed || (0..self.regions as u32).any(|r| !self.ready(r)) {
-            return Err(Error::Invalid("only a complete, unsealed layout seals".into()));
+    pub fn failed(&self, r: u32) -> bool {
+        self.word(r).load(Ordering::Acquire) & FAILED != 0
+    }
+
+    /// Until region `r` of a sealed layout is Ready: its filler sets the word after the last
+    /// byte lands (or marks it failed). Its filler is this executor's machine, so a filler that
+    /// dies takes the waiter with it; there is no deadline to guess.
+    pub fn wait_ready(&self, r: u32) -> Result<()> {
+        let mut pause = std::time::Duration::from_micros(20);
+        loop {
+            let w = self.word(r).load(Ordering::Acquire);
+            if w & READY != 0 {
+                return Ok(());
+            }
+            if w & FAILED != 0 {
+                return Err(Error::Invalid(format!("sealed layout region {r}: its fill failed")));
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(1));
         }
-        let fd = reopen(self.fd.as_raw_fd())?;
-        // SAFETY: a scalar fcntl on our own descriptor.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } != 0 {
-            return Err(os("seal host layout"));
-        }
-        // Unmapping gigabytes of filled pages takes a while (0.37 s for 5 GB on a RunPod 3090);
-        // the layout is already sealed and complete, so that happens off the caller's path.
-        std::thread::spawn(move || drop(self));
-        Ok(fd)
     }
 
     pub fn sealed(&self) -> bool {
@@ -525,70 +532,123 @@ fn populate(base: *mut u8, len: usize, threads: usize) {
     });
 }
 
-/// Fill `layout` once through the verified read path (`Source::read_item`: page-cache copies,
-/// O_DIRECT for the rest) on `threads` threads, then seal it (`HostMem::seal`). The owner's
-/// side of a sealed layout; `tally` counts each mode's bytes. Each object's residency is checked
-/// once, not per item (a check maps the file on overlayfs, which stalls every thread's page
-/// faults), and its descriptors close when its last item lands: a model of thousands of objects
-/// never holds thousands open, and no thread waits at a batch boundary.
-pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize, tally: &IoTally, reserved: Option<OwnedFd>) -> Result<OwnedFd> {
+/// A sealed layout handed out before its bytes: sealed against resize, sealing and every new
+/// write from the start, while this owner's mapping fills it (`run`). Adopters use each region
+/// only once its Ready word is set, after its last byte landed.
+pub struct OpenFill {
+    host: HostMem,
+}
+
+/// Create `layout`'s memfd (in `reserved` when given: its pages exist, so the copy only maps
+/// them) and seal it now; returns the memfd to hand out and the fill to run.
+pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>) -> Result<(OwnedFd, OpenFill)> {
     let host = match reserved {
-        // Its pages exist: the copy only maps them (pre-mapping them with MADV_POPULATE_WRITE
-        // measured slower than faulting them in during the copy).
         Some(fd) => HostMem::create_in(fd, layout)?,
         None => HostMem::create(name, layout)?,
     };
-    let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
-    let mut index: HashMap<&str, usize> = HashMap::new();
-    let mut objects: Vec<&ObjectRef> = Vec::new();
-    let owner: Vec<Option<usize>> = items
-        .iter()
-        .map(|it| match &it.source {
-            ItemSource::Object(o) => Some(*index.entry(o.obj.sha256.as_str()).or_insert_with(|| {
-                objects.push(&o.obj);
-                objects.len() - 1
-            })),
-            ItemSource::Inline(_) => None,
-        })
-        .collect();
-    let left: Vec<AtomicUsize> = (0..objects.len()).map(|_| AtomicUsize::new(0)).collect();
-    for o in owner.iter().flatten() {
-        left[*o].fetch_add(1, Ordering::Relaxed);
+    let fd = reopen(host.fd.as_raw_fd())?;
+    // SAFETY: a scalar fcntl on our own descriptor. Future-write leaves this mapping writable.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } != 0 {
+        return Err(os("seal host layout"));
     }
-    let resident: Vec<OnceLock<bool>> = (0..objects.len()).map(|_| OnceLock::new()).collect();
-    let next = AtomicUsize::new(0);
-    let failed: Mutex<Option<Error>> = Mutex::new(None);
-    std::thread::scope(|s| {
-        for _ in 0..threads.clamp(1, items.len().max(1)) {
-            s.spawn(|| loop {
-                let k = next.fetch_add(1, Ordering::Relaxed);
-                let Some(it) = items.get(k) else { return };
-                let mode = match owner[k] {
-                    Some(o) if *resident[o].get_or_init(|| source.resident(objects[o], tally).unwrap_or(false)) => Mode::Cached,
-                    Some(_) => Mode::Cache,
-                    None => Mode::Cached,
-                };
-                // SAFETY: each item's range (and its padding) is this thread's alone; the layout
-                // keeps items disjoint inside the live mapping.
-                let dst = unsafe { host.base().add(it.offset as usize) };
-                if let Err(e) = unsafe { source.read_item(it, dst, mode, tally) } {
-                    failed.lock().unwrap().get_or_insert(e);
-                    next.store(items.len(), Ordering::Relaxed);
-                    return;
-                }
-                if let Some(o) = owner[k] {
-                    if left[o].fetch_sub(1, Ordering::AcqRel) == 1 {
-                        source.close_object(&objects[o].sha256);
-                    }
-                }
-            });
+    Ok((fd, OpenFill { host }))
+}
+
+/// `open_sealed` and `OpenFill::run` in one: returns once every byte is in.
+pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize, tally: &IoTally, reserved: Option<OwnedFd>) -> Result<OwnedFd> {
+    let (fd, open) = open_sealed(name, layout, reserved)?;
+    open.run(layout, source, threads, tally)?;
+    Ok(fd)
+}
+
+impl OpenFill {
+    /// Fill every region through the verified read path (`Source::read_item`: page-cache
+    /// copies, O_DIRECT for the rest) on `threads` threads, in layout order, setting each
+    /// region's Ready word as its last item lands. Each object's residency is checked once (a
+    /// check maps the file on overlayfs, which stalls every thread's page faults), and its
+    /// descriptors close when its last item lands. The mapping goes when this returns.
+    pub fn run(self, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
+        self.copy(layout, source, threads, tally)
+    }
+
+    fn copy(&self, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
+        let host = &self.host;
+        let mut region_of = Vec::new();
+        for (r, region) in layout.regions.iter().enumerate() {
+            region_of.extend(std::iter::repeat_n(r, region.items.len()));
         }
-    });
-    if let Some(e) = failed.into_inner().unwrap() {
-        return Err(e);
+        let pending: Vec<AtomicUsize> = layout.regions.iter().map(|r| AtomicUsize::new(r.items.len())).collect();
+        for (r, region) in layout.regions.iter().enumerate() {
+            if region.items.is_empty() {
+                host.set_ready(r as u32, true);
+            }
+        }
+        let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
+        let mut index: HashMap<&str, usize> = HashMap::new();
+        let mut objects: Vec<&ObjectRef> = Vec::new();
+        let owner: Vec<Option<usize>> = items
+            .iter()
+            .map(|it| match &it.source {
+                ItemSource::Object(o) => Some(*index.entry(o.obj.sha256.as_str()).or_insert_with(|| {
+                    objects.push(&o.obj);
+                    objects.len() - 1
+                })),
+                ItemSource::Inline(_) => None,
+            })
+            .collect();
+        let left: Vec<AtomicUsize> = (0..objects.len()).map(|_| AtomicUsize::new(0)).collect();
+        for o in owner.iter().flatten() {
+            left[*o].fetch_add(1, Ordering::Relaxed);
+        }
+        let resident: Vec<OnceLock<bool>> = (0..objects.len()).map(|_| OnceLock::new()).collect();
+        let next = AtomicUsize::new(0);
+        let failed: Mutex<Option<Error>> = Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..threads.clamp(1, items.len().max(1)) {
+                s.spawn(|| loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(it) = items.get(k) else { return };
+                    let mode = match owner[k] {
+                        Some(o) if *resident[o].get_or_init(|| source.resident(objects[o], tally).unwrap_or(false)) => Mode::Cached,
+                        Some(_) => Mode::Cache,
+                        None => Mode::Cached,
+                    };
+                    // SAFETY: each item's range (and its padding) is this thread's alone; the layout
+                    // keeps items disjoint inside the live mapping.
+                    let dst = unsafe { host.base().add(it.offset as usize) };
+                    if let Err(e) = unsafe { source.read_item(it, dst, mode, tally) } {
+                        failed.lock().unwrap().get_or_insert(e);
+                        next.store(items.len(), Ordering::Relaxed);
+                        return;
+                    }
+                    if let Some(o) = owner[k] {
+                        if left[o].fetch_sub(1, Ordering::AcqRel) == 1 {
+                            source.close_object(&objects[o].sha256);
+                        }
+                    }
+                    // The region's last item: its bytes are all in, so adopters may use it.
+                    let r = region_of[k];
+                    if pending[r].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        host.set_ready(r as u32, true);
+                    }
+                });
+            }
+        });
+        match failed.into_inner().unwrap() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
-    for r in 0..layout.regions.len() as u32 {
-        host.set_ready(r, true);
+}
+
+impl Drop for OpenFill {
+    /// What the filler leaves unfinished (an error, a panic, a filler that never ran) is marked
+    /// failed: no adopter waits forever for it or reads it.
+    fn drop(&mut self) {
+        for r in 0..self.host.regions as u32 {
+            if !self.host.ready(r) {
+                self.host.word(r).fetch_or(FAILED, Ordering::Release);
+            }
+        }
     }
-    host.seal()
 }

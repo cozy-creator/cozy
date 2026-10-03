@@ -448,6 +448,9 @@ pub fn free_va(base: u64, size: u64) -> Result<()> {
 pub enum CopySrc {
     /// Registered (or at worst pageable) host bytes of the pinned tier.
     Host(*const u8),
+    /// A sealed layout's region outside the pinned books, copied as pageable memory once its
+    /// filler marks it Ready (the layout is kept mapped by this reference).
+    Sealed { host: Arc<crate::host::HostMem>, region: u32, offset: u64 },
     /// Disk through the staging buffers: `items` in layout offsets, `base` the layout offset
     /// that lands at `dst`.
     Disk {
@@ -616,6 +619,17 @@ fn enqueue_copy(
     len: u64,
     src: CopySrc,
 ) -> Result<Copied> {
+    // Never a byte a sealed layout's machine has not finished: wait for the region's Ready
+    // word. `_kept` holds the mapping until the (pageable, so synchronous) enqueue is done.
+    let (src, _kept) = match src {
+        CopySrc::Sealed { host, region, offset } => {
+            host.wait_ready(region)?;
+            // SAFETY: inside the live mapping `host` keeps; the region is complete.
+            let p = unsafe { host.base().add(offset as usize) };
+            (CopySrc::Host(p), Some(host))
+        }
+        src => (src, None),
+    };
     let d = cuda::driver()?;
     let start = m.events.get(true)?;
     let ready = m.events.get(true)?;
@@ -627,6 +641,7 @@ fn enqueue_copy(
         Ok(())
     };
     match src {
+        CopySrc::Sealed { .. } => unreachable!("resolved above"),
         CopySrc::Host(p) => {
             wait_all(&waits)?;
             crate::faults::gate("copy", stream)?;

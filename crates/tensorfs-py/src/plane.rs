@@ -253,7 +253,8 @@ impl PyPlane {
         Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
     }
 
-    /// Register one weight set over a sealed layout (`fill_sealed`); `fd` stays the caller's.
+    /// Register one weight set over a sealed layout (`fill_sealed`, or one still filling: each
+    /// region is used once Ready); `fd` stays the caller's.
     fn register_sealed(
         &self,
         py: Python<'_>,
@@ -897,6 +898,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(fill_sealed, &m)?)?;
     m.add_function(wrap_pyfunction!(reserve, &m)?)?;
+    // `register_sealed` adopts a layout its machine is still filling (waits per region).
+    m.add("SEALED_WHILE_FILLING", true)?;
     add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
         CudaUnavailable, Invalid, IoError, Closed);
     parent.add_submodule(&m)?;
