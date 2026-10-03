@@ -3,15 +3,17 @@
 //! Repository files are the only durable catalog authority. Advisory marker locks protect local
 //! readers; SQLite retains only released-manifest lookup and resumable derived writes.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::ids::ascii_name;
+use crate::ids::{ascii_name, ObjectRef};
 use crate::limits;
 use crate::store::Store;
 
@@ -45,6 +47,47 @@ pub fn now_nanos_unique() -> u128 {
     let mut last = LAST.lock().unwrap();
     *last = nanos.max(*last + 1);
     *last
+}
+
+/// The store's owner process (the machine). Its read leases pin their objects here instead
+/// of holding `recovery.lock` shared, so its own GC keeps them and runs while layouts are
+/// served. Leases taken by any other process still exclude GC.
+#[derive(Default, Debug)]
+pub(crate) struct Owner {
+    /// Held shared while a lease admits its objects, exclusive while GC plans and deletes.
+    pub(crate) gate: RwLock<()>,
+    pins: Mutex<(u64, HashMap<u64, Vec<ObjectRef>>)>,
+}
+
+impl Owner {
+    pub(crate) fn pinned(&self) -> Vec<ObjectRef> {
+        let pins = self.pins.lock().unwrap();
+        pins.1.values().flatten().cloned().collect()
+    }
+}
+
+static OWNERS: Mutex<Vec<(PathBuf, Arc<Owner>)>> = Mutex::new(Vec::new());
+
+fn canonical(root: &Path) -> PathBuf {
+    fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// This process owns `store`: its read leases become in-process pins.
+pub fn own(store: &Store) {
+    let root = canonical(store.root());
+    let mut owners = OWNERS.lock().unwrap();
+    if !owners.iter().any(|(owned, _)| *owned == root) {
+        owners.push((root, Arc::default()));
+    }
+}
+
+pub(crate) fn owner(root: &Path) -> Option<Arc<Owner>> {
+    let root = canonical(root);
+    let owners = OWNERS.lock().unwrap();
+    owners
+        .iter()
+        .find(|(owned, _)| *owned == root)
+        .map(|(_, owner)| owner.clone())
 }
 
 #[derive(Debug, Clone)]
@@ -290,9 +333,31 @@ impl Meta {
             id,
             kind: kind.to_string(),
             file: Some(file),
-            _recovery: recovery,
+            _recovery: Some(recovery),
             path,
             released: false,
+            pin: None,
+        })
+    }
+
+    /// A read hold over `objects`: an in-process pin when this process owns the store, else
+    /// a marker that excludes GC.
+    pub(crate) fn read_hold(&self, owner: Option<&Arc<Owner>>, objects: &[ObjectRef]) -> Result<Hold> {
+        let Some(owner) = owner else {
+            return self.acquire_hold("read");
+        };
+        let mut pins = owner.pins.lock().unwrap();
+        pins.0 += 1;
+        let pin = pins.0;
+        pins.1.insert(pin, objects.to_vec());
+        Ok(Hold {
+            id: format!("read-pin-{}-{pin}", std::process::id()),
+            kind: "read".into(),
+            file: None,
+            _recovery: None,
+            path: PathBuf::new(),
+            released: false,
+            pin: Some((owner.clone(), pin)),
         })
     }
 
@@ -480,9 +545,10 @@ pub struct Hold {
     id: String,
     kind: String,
     file: Option<File>,
-    _recovery: File,
+    _recovery: Option<File>,
     path: PathBuf,
     released: bool,
+    pin: Option<(Arc<Owner>, u64)>,
 }
 
 impl Hold {
@@ -492,6 +558,11 @@ impl Hold {
 
     pub fn release(mut self, meta: &Meta) -> Result<()> {
         let _ = meta;
+        if let Some((owner, pin)) = &self.pin {
+            owner.pins.lock().unwrap().1.remove(pin);
+            self.released = true;
+            return Ok(());
+        }
         fs::remove_file(&self.path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Refusal {
@@ -509,7 +580,11 @@ impl Hold {
 
     pub fn still_registered(&self, meta: &Meta) -> Result<()> {
         let _ = meta;
-        if self.file.is_some() && self.path.is_file() {
+        let registered = match &self.pin {
+            Some((owner, pin)) => owner.pins.lock().unwrap().1.contains_key(pin),
+            None => self.file.is_some() && self.path.is_file(),
+        };
+        if registered {
             Ok(())
         } else {
             refuse(

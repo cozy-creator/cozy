@@ -183,7 +183,10 @@ pub fn acquire(
     objects: Vec<ObjectRef>,
 ) -> Result<(ReadLease, Receipts)> {
     // The hold FIRST: registered before the first fetch (tensorfs.md §2, pin root class 2).
-    let hold = meta.acquire_hold("read")?;
+    // The owner's GC waits for an admission in flight and keeps what it pins.
+    let owner = crate::meta::owner(store.root());
+    let _admitting = owner.as_ref().map(|owner| owner.gate.read().unwrap());
+    let hold = meta.read_hold(owner.as_ref(), &objects)?;
     // Admission proves RLIMIT_NOFILE headroom for the COMPLETE descriptor set (H3 serves
     // 3,627 distinct objects — never an assumable count) or refuses typed.
     let distinct: HashSet<&str> = objects.iter().map(|o| o.sha256.as_str()).collect();
