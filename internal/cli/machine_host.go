@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"cmp"
 	"context"
 	"os"
 	"os/exec"
@@ -44,12 +43,9 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		}
 		*target = absolute
 	}
-	// The Runtime wheel supplies the default agent; --host deliberately pins a copy.
-	if source.Pinned = source.Host != ""; source.Pinned && machines.HostModule(source.Host) != machines.AgentModule {
-		module := machines.HostModule(source.Host)
-		return exit.Usagef("--host %s is not a cozy-machine binary (%s)", source.Host, cmp.Or(module, "not a Go program")).
-			WithRemedy("omit --host to install the published machine agent")
-	}
+	// The Runtime wheel supplies the default agent; --host deliberately pins a copy, which
+	// Install accepts by its own identity and capabilities.
+	source.Pinned = source.Host != ""
 	uv, err := exec.LookPath("uv")
 	if err != nil {
 		return exit.Named(exit.Structural, "machine.uv_missing", "uv builds the machine's Python environment and is not on PATH")

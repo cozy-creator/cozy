@@ -380,7 +380,7 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	if problem != nil {
 		return "", problem
 	}
-	if installed == nil || installed.Host.Module != AgentModule || !slices.Contains(launch.Capabilities, HubAccessCapability) {
+	if installed == nil || !slices.Contains(launch.Capabilities, HubAccessCapability) {
 		return "", exit.Named(exit.Structural, "machine.agent_update_required", "delegated Hub access requires %s", HubAccessCapability)
 	}
 	return attachAccess(ctx, h.accessCache(), h.accessTarget(launch), origin, account)
