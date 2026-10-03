@@ -37,6 +37,21 @@ from os import PathLike
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 from . import errors
+from ._tensors import (
+    TensorAccessError,
+    TensorAllocation,
+    TensorReader,
+    from_parts,
+    physical_tensors,
+    tensors,
+)
+from .derived import (
+    Derivation,
+    OutputCapability,
+    SourceCapability,
+    SourceInspection,
+    derive,
+)
 from ._ext import (
     CAPABILITIES as _CAPABILITIES,
     STORE,
@@ -59,22 +74,9 @@ from ._ext import (
 
 # A plane-only build (what Rust-machine executors install) carries headers, plans, fit and
 # the weight plane; the store, downloader, ingest and GC exist only in the full build.
+# The channel protocols above (derived outputs, tensor reads) import in both: what serves
+# them, a store, exists only in the full build.
 if TYPE_CHECKING or STORE:
-    from ._tensors import (
-        TensorAccessError,
-        TensorAllocation,
-        TensorReader,
-        from_parts,
-        physical_tensors,
-        tensors,
-    )
-    from .derived import (
-        Derivation,
-        OutputCapability,
-        SourceCapability,
-        SourceInspection,
-        derive,
-    )
     from ._ext import (
         ensure as _ensure,
         relieve as _relieve,
@@ -332,6 +334,17 @@ DTYPES: dict[str, int] = dtypes()
 
 __all__ = [
     "STORE",
+    "TensorAccessError",
+    "TensorAllocation",
+    "TensorReader",
+    "from_parts",
+    "physical_tensors",
+    "tensors",
+    "Derivation",
+    "OutputCapability",
+    "SourceCapability",
+    "SourceInspection",
+    "derive",
     "CAPABILITIES",
     "Asset",
     "DTYPES",
@@ -363,17 +376,6 @@ __all__ = [
 ]
 if STORE:
     __all__ += [
-        "TensorAccessError",
-        "TensorAllocation",
-        "TensorReader",
-        "from_parts",
-        "physical_tensors",
-        "tensors",
-        "Derivation",
-        "OutputCapability",
-        "SourceCapability",
-        "SourceInspection",
-        "derive",
         "EnsureEvent",
         "EnsureResult",
         "Relief",

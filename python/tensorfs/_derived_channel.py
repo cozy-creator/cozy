@@ -14,10 +14,12 @@ import socket
 import struct
 import threading
 from collections.abc import Buffer, Callable, Mapping
-from typing import Any, ContextManager, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, ContextManager, Literal, Protocol, cast
 
 from . import errors
-from ._ext import DerivedWriter
+
+if TYPE_CHECKING:  # a type only: the writer exists in the full build, the channel in both
+    from ._ext import DerivedWriter
 
 _HEADER = struct.Struct("!BI")
 _JSON = 0
