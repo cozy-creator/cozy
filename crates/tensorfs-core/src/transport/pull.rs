@@ -553,6 +553,8 @@ pub struct WalkOutcome {
     pub bytes_cached: u64,
     /// Requests the download kept in flight.
     pub streams: usize,
+    /// The most writes into temp files at once (at most `download::WRITERS`).
+    pub writers: usize,
     /// GETs sent, and how many of them were dropped as silent or slow and asked again.
     pub requests: u64,
     pub restarts: u64,
@@ -765,6 +767,8 @@ pub struct PullReport {
     pub streams: usize,
     pub requests: u64,
     pub restarts: u64,
+    /// The most writes into temp files at once (at most `download::WRITERS`).
+    pub writers: usize,
     pub declared: u64,
     pub held: u64,
     pub fetched: u64,
@@ -899,6 +903,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             Some(&report.cache_writes),
         )?;
         report.streams = walked.streams;
+        report.writers = walked.writers;
         report.requests = walked.requests;
         report.restarts = walked.restarts;
         report.fetched = walked.fetched;

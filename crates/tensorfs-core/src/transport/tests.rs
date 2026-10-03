@@ -2108,6 +2108,31 @@ fn retryable_status_buys_a_reask_and_authorization_answers_do_not() {
     let _ = std::fs::remove_dir_all(store2root);
 }
 
+/// Many requests in flight, few writers: network parallelism stays and disk writes are
+/// bounded (`download::WRITERS`).
+#[test]
+fn a_wide_walk_writes_through_a_bounded_number_of_writers() {
+    let root = temporary("writers");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(96, 512 * 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &origin.base, &policy);
+    request.streams = 64;
+    let report = pull(&request).unwrap();
+    assert_eq!(report.fetched, 98);
+    assert!(
+        report.streams > crate::transport::download::WRITERS,
+        "{report:?}"
+    );
+    assert!(
+        (1..=crate::transport::download::WRITERS).contains(&report.writers),
+        "{report:?}"
+    );
+    assert_eq!(pull(&request).unwrap().fetched, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn sixteen_way_walk_lands_everything_through_the_one_door() {
     let root = temporary("nway");
