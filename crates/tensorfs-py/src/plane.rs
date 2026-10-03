@@ -5,6 +5,7 @@
 //! DLPack views that keep the VA (never the pages) alive.
 
 use std::ffi::{c_void, CStr};
+use std::os::fd::{BorrowedFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -134,7 +135,7 @@ fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
             "exportable" => d.exportable, "budget" => d.budget, "committed" => d.committed,
             "mapped" => d.mapped, "idle" => d.idle, "leased_bytes" => d.leased_bytes,
             "held_bytes" => d.held_bytes, "over_budget_unreleasable" => d.over_budget_unreleasable,
-            "reserved_va" => d.reserved_va, "copies" => c.copies,
+            "reserved_va" => d.reserved_va, "shared_bytes" => d.shared_bytes, "copies" => c.copies,
             "host_copy_bytes" => c.host_copy_bytes, "host_copy_ns" => c.host_copy_ns,
             "disk_copy_bytes" => c.disk_copy_bytes, "disk_copy_ns" => c.disk_copy_ns,
             "mapped_copy_bytes" => c.mapped_copy_bytes, "mapped_copy_ns" => c.mapped_copy_ns,
@@ -146,7 +147,8 @@ fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
     for w in &s.sets {
         let devs = PyList::empty(py);
         for (ordinal, ready) in &w.devices {
-            devs.append(dict!(py; "ordinal" => ordinal, "ready_bytes" => ready))?;
+            let shared = w.shared.iter().find(|(o, _)| o == ordinal).map_or(0, |(_, n)| *n);
+            devs.append(dict!(py; "ordinal" => ordinal, "ready_bytes" => ready, "shared_bytes" => shared))?;
         }
         sets.append(dict!(py;
             "id" => w.id, "name" => &w.name, "nbytes" => w.nbytes, "regions" => w.regions,
@@ -296,6 +298,55 @@ impl PyPlane {
         Ok(PyTicket { ticket })
     }
 
+    /// This device can export and attach shared regions.
+    fn device_sharing(&self, py: Python<'_>, device: i32) -> PyResult<bool> {
+        self.plane.device_sharing(device).or_raise(py)
+    }
+
+    /// Share the Ready, unleased regions (all when None) on `device`: they become read-only
+    /// and leave the budget. Returns `[{"region": int, "chunks": [(bytes, fd), ...]}]`; the
+    /// caller owns every fd (close-on-exec).
+    #[pyo3(signature = (ws, device, regions = None))]
+    fn export_device<'p>(
+        &self,
+        py: Python<'p>,
+        ws: PyRef<'_, PyWeightSet>,
+        device: i32,
+        regions: Option<Vec<u32>>,
+    ) -> PyResult<Bound<'p, PyList>> {
+        let id = self.id(py, &ws)?;
+        let plane = &self.plane;
+        let exported = py.detach(|| plane.export_device(id, device, regions.as_deref())).or_raise(py)?;
+        let out = PyList::empty(py);
+        for e in exported {
+            let chunks: Vec<(u64, i32)> = e.chunks.into_iter().map(|(n, fd)| (n, fd.into_raw_fd())).collect();
+            out.append(dict!(py; "region" => e.region, "chunks" => chunks))?;
+        }
+        Ok(out)
+    }
+
+    /// Map another process's shared `region` read-only, without a copy: `chunks` are
+    /// `(bytes, fd)` in VA order, from `export_device` of the same layout digest. The fds stay
+    /// the caller's to close.
+    fn attach_device(
+        &self,
+        py: Python<'_>,
+        ws: PyRef<'_, PyWeightSet>,
+        device: i32,
+        region: u32,
+        chunks: Vec<(u64, i32)>,
+    ) -> PyResult<()> {
+        let id = self.id(py, &ws)?;
+        if chunks.iter().any(|(_, fd)| *fd < 0) {
+            return Err(err(py, Error::Invalid("a negative fd".into())));
+        }
+        // SAFETY: the caller keeps these fds open for the call.
+        let borrowed: Vec<(u64, BorrowedFd<'_>)> =
+            chunks.iter().map(|(n, fd)| (*n, unsafe { BorrowedFd::borrow_raw(*fd) })).collect();
+        let plane = &self.plane;
+        py.detach(|| plane.attach_device(id, device, region, &borrowed)).or_raise(py)
+    }
+
     /// Bytes freed; refuses on live leases or holds.
     #[pyo3(name = "drop", signature = (ws, tier, regions = None))]
     fn drop_regions(
@@ -419,6 +470,12 @@ impl PyWeightSet {
     #[getter]
     fn nbytes(&self) -> u64 {
         self.layout.nbytes
+    }
+
+    /// Identity of the byte layout: equal digests place the same bytes at the same offsets.
+    #[getter]
+    fn digest(&self) -> String {
+        self.layout.digest.clone()
     }
 
     #[getter]

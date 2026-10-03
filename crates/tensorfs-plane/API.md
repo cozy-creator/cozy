@@ -1,4 +1,4 @@
-# tensorfs.plane — Python API (v3.2, 2026-10-02)
+# tensorfs.plane — Python API (v3.5, 2026-10-02)
 
 The weight plane moves bytes; cozy-runtime decides. The plane never measures free memory,
 never picks victims among equals, never reorders a schedule. It ships inside the `tensorfs`
@@ -200,11 +200,11 @@ p.stats() -> {
               "trims"},
   "devices": [{"ordinal", "uuid", "granularity", "exportable", "budget", "committed", "mapped",
                "idle", "leased_bytes", "held_bytes", "over_budget_unreleasable", "reserved_va",
-               "copies", "host_copy_bytes", "host_copy_ns", "disk_copy_bytes", "disk_copy_ns",
+               "shared_bytes", "copies", "host_copy_bytes", "host_copy_ns", "disk_copy_bytes", "disk_copy_ns",
                "mapped_copy_bytes", "mapped_copy_ns",
                "misses", "evictions", "evicted_bytes", "trims"}],
   "sets":    [{"id", "name", "nbytes", "regions", "host_ready_bytes", "host_memfd_bytes",
-               "evictions", "evicted_bytes", "devices": [{"ordinal", "ready_bytes"}]}],
+               "evictions", "evicted_bytes", "devices": [{"ordinal", "ready_bytes", "shared_bytes"}]}],
   "stages":  [{"ws", "device", "tag", "acquires", "skipped", "misses", "late", "late_bytes",
                "stall_ns", "streamed_bytes"}],
   "regions": [{"ws", "device", "tag", "region", "uses", "compute_ns", "stall_ns", "late"}],
@@ -221,7 +221,8 @@ p.events() -> [{"kind", "ws", "region", "device", "bytes", "ns", "detail"}]   # 
   per region and stage tag (the cost model's cᵢ). Timing pairs resolve lazily: `stats()` never
   syncs the device; unfinished pairs count at a later call.
 - `ws` in every row and event is the `name` given to `register`.
-- Event kinds: `fill_done`, `fill_failed`, `evicted`, `budget`, `late`, `register_failed`.
+- Event kinds: `fill_done`, `fill_failed`, `evicted`, `budget`, `late`, `register_failed`,
+  `exported`, `attached`, `detached`.
 
 ## Errors
 
@@ -279,7 +280,39 @@ an unclosed plane ends.
 - A memfd from a plane before v3.1 (state page `TFSPLN01`) is a different layout: adopting it
   raises `Invalid`; register a fresh one.
 
+## Device memory across processes
+
+The device-tier counterpart of the host tier: one process fills a region, every process on
+the GPU maps the same physical bytes read-only, and the bytes outlive the filler.
+
+```python
+p.device_sharing(device) -> bool        # POSIX-fd VMM export on this GPU and driver
+p.export_device(ws, device, regions=None) -> [{"region": int, "chunks": [(bytes, fd), ...]}]
+p.attach_device(ws, device, region, chunks)   # chunks: [(bytes, fd), ...] in VA order
+ws.digest                               # the layout identity both sides must share
+```
+
+- `export_device` takes the Ready regions with no live lease or hold that are not shared yet
+  (others are skipped), exports each physical handle as a close-on-exec fd (the caller owns
+  them), and makes this process's mapping read-only. Shared regions leave the budget
+  (`committed`, `mapped`) and count in `shared_bytes`; they are never evicted by a budget, never
+  recycled, never refilled. All-or-nothing: an export failure changes nothing.
+- `attach_device` imports the fds (they stay the caller's), checks each is pinned memory of
+  this GPU and that the sizes cover the region's span, and maps them read-only at the region's
+  place: the region is Ready with no copy. Attach only from an exporter of the same `ws.digest`.
+- Every fd, imported handle and mapping holds the bytes; they are freed when the last goes, in
+  any process. `drop`, `ws.close()` and `p.close()` of a shared region unmap it and release this
+  process's references (event `detached`); a later acquire is an ordinary miss that fills a
+  private copy.
+- A write through a read-only mapping is an illegal address in the writer's context only.
+- Exporting is not proof of completion to anyone else: export only after the fill (the plane
+  exports only Ready regions); the keeper of the fds decides who may attach.
+
 ## Changelog
+
+- v3.5 2026-10-02: device memory across processes: `device_sharing`, `export_device`,
+  `attach_device`, `ws.digest`, `shared_bytes` in device and set stats, events `exported`,
+  `attached`, `detached`.
 
 - v3.4 2026-10-02: the mapped device copy of v3.3 is removed; a device fill is again pinned
   tier, else after a filling tier, else staging. In real first loads it never acted at full

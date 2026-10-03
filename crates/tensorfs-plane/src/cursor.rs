@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::cuda;
 use crate::device::{self, Chunk, CopyJob, CopySrc, Copied, EvRef};
 use crate::layout::{align_up, PART_ALIGN, REGION_ALIGN};
 use crate::plane::{devws, Core, DState, HState, Inner, Lease, LeaseKind, Plane, Timing, TimingKind, Trim, WsId};
@@ -360,7 +361,7 @@ impl Plane {
         let (ring_base, ring_chunks) = if need > 0 {
             let base = device::reserve_va(need)?;
             let sizes = c.arenas[d].chunk_sizes(need);
-            let mapped = c.arenas[d].take(&sizes).and_then(|ch| match device::map_span(base, &ch, inner.devices[d].dev) {
+            let mapped = c.arenas[d].take(&sizes).and_then(|ch| match device::map_span(base, &ch, inner.devices[d].dev, cuda::MEM_ACCESS_PROT_READWRITE) {
                 Ok(()) => Ok(ch),
                 Err(e) => {
                     c.arenas[d].put_idle(ch);

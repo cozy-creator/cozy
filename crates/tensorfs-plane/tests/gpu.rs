@@ -6,6 +6,7 @@
 mod common;
 
 use std::ffi::c_void;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::*;
@@ -551,6 +552,91 @@ fn verify_bytes_refuses_once_the_lease_is_released() {
     assert!(matches!(l.verify_bytes(), Err(Error::Invalid(_))));
     s.sync();
     p.close().unwrap();
+}
+
+/// The driver's access flags for this process at `va`.
+fn access(va: u64) -> u64 {
+    let d = cuda::driver().unwrap();
+    let get = d.mem_get_access.expect("cuMemGetAccess");
+    let loc = cuda::MemLocation { kind: cuda::MEM_LOCATION_TYPE_DEVICE, id: DEV };
+    let mut flags = 0u64;
+    cuda::check("cuMemGetAccess", unsafe { get(&mut flags, &loc, va) }).unwrap();
+    flags
+}
+
+#[test]
+#[ignore = "GPU"]
+fn shared_regions_attach_read_only_outlive_their_exporter_and_hold_no_budget() {
+    let fx = Fixture::new("gpu-share");
+    let a = plane();
+    if !a.device_sharing(DEV).unwrap() {
+        eprintln!("device {DEV} cannot share memory: nothing to test");
+        return;
+    }
+    let wa = fx.register(&a, None);
+    let s = Stream::new();
+    let spans: Vec<u64> = a.layout(wa).unwrap().regions.iter().map(|r| r.span).collect();
+    let total: u64 = spans.iter().sum();
+    a.set_vram_budget(DEV, 512 << 20).unwrap();
+    a.want(wa, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
+    let before = a.stats().devices[0].committed;
+
+    // A leased region is skipped; the rest leave the budget and become read-only.
+    let held = a.acquire(wa, DEV, 2, s.raw(), None).unwrap();
+    let first = a.export_device(wa, DEV, None).unwrap();
+    assert_eq!(first.iter().map(|e| e.region).collect::<Vec<_>>(), vec![0, 1]);
+    held.release(s.raw()).unwrap();
+    let mut exported = first;
+    exported.extend(a.export_device(wa, DEV, None).unwrap());
+    assert_eq!(exported.len(), 3);
+    assert!(a.export_device(wa, DEV, None).unwrap().is_empty(), "shared regions export once");
+    let st = a.stats();
+    assert_eq!(st.devices[0].committed, before - total);
+    assert_eq!(st.devices[0].shared_bytes, total);
+    let la = resident(&a, wa, &s, 0);
+    assert_eq!(access(la.ptr), u64::from(cuda::MEM_ACCESS_PROT_READ), "the exporter maps it read-only too");
+    la.release(s.raw()).unwrap();
+
+    // Another plane attaches the same layout's regions without a copy.
+    let b = plane();
+    let wb = fx.register(&b, None);
+    assert_eq!(a.layout(wa).unwrap().digest, b.layout(wb).unwrap().digest);
+    b.set_vram_budget(DEV, 512 << 20).unwrap();
+    for e in &exported {
+        let chunks: Vec<(u64, BorrowedFd)> = e.chunks.iter().map(|(n, fd)| (*n, fd.as_fd())).collect();
+        b.attach_device(wb, DEV, e.region, &chunks).unwrap();
+    }
+    let again: Vec<(u64, BorrowedFd)> = exported[0].chunks.iter().map(|(n, fd)| (*n, fd.as_fd())).collect();
+    assert!(matches!(b.attach_device(wb, DEV, 0, &again), Err(Error::Invalid(_))));
+    let short: Vec<(u64, BorrowedFd)> = exported[1].chunks.iter().map(|(n, fd)| (*n / 2, fd.as_fd())).collect();
+    assert!(matches!(b.attach_device(wb, DEV, 2, &short), Err(Error::Invalid(_))));
+
+    // The exporter and every fd go; the attached handles keep the bytes.
+    drop(exported);
+    a.close().unwrap();
+    drop(a);
+    for r in 0..3 {
+        let l = resident(&b, wb, &s, r);
+        assert_eq!(access(l.ptr), u64::from(cuda::MEM_ACCESS_PROT_READ));
+        l.release(s.raw()).unwrap();
+    }
+    let st = b.stats();
+    assert_eq!((st.devices[0].committed, st.devices[0].counters.copies), (0, 0), "attached, never copied");
+    assert_eq!(st.devices[0].shared_bytes, total);
+    assert_eq!(st.sets[0].shared, vec![(DEV, st.sets[0].devices[0].1)]);
+    assert!(b.verify(wb, DEV).unwrap() >= 3);
+
+    // A budget of 0 evicts nothing shared; a drop releases it and the next use fills privately.
+    assert!(b.set_vram_budget(DEV, 0).unwrap().evicted.is_empty());
+    assert_eq!(b.drop_regions(wb, Tier::Device(DEV), Some(&[1])).unwrap(), spans[1]);
+    b.set_vram_budget(DEV, 512 << 20).unwrap();
+    resident(&b, wb, &s, 1).release(s.raw()).unwrap();
+    let st = b.stats();
+    assert_eq!(st.devices[0].counters.misses, 1);
+    assert_eq!(st.devices[0].committed, spans[1]);
+    assert_eq!(st.devices[0].shared_bytes, total - spans[1]);
+    s.sync();
+    b.close().unwrap();
 }
 
 /// Copy failures with copies of the same job still queued on the device (Xid 31: a copy engine
