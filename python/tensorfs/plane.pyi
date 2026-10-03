@@ -338,6 +338,10 @@ def fill_sealed(
     regions: Sequence[Sequence[str]],
     name: str,
     threads: int = 8,
+    reserved: int | None = None,
 ) -> tuple[int, SealedFill]:
     """Fill a weight set's layout through the verified read path and seal it; CONSUMES `lease`.
     Returns the sealed memfd (the caller's) and each read mode's bytes."""
+
+def reserve(name: str, nbytes: int, threads: int = 8) -> int:
+    """A memfd of `nbytes` whose pages are allocated now; `fill_sealed(reserved=)` consumes it."""

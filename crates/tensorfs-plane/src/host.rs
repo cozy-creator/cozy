@@ -28,7 +28,12 @@ use crate::layout::{ItemSource, Layout, PART_ALIGN};
 use crate::{Error, Result};
 
 /// What makes a layout immutable: no write, resize, punch or unsealing, by anyone.
-const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+/// F_SEAL_FUTURE_WRITE (Linux 5.1): no new writable mapping or write; the filler's own mapping,
+/// done writing, may still be going away.
+const F_SEAL_FUTURE_WRITE: libc::c_int = 0x10;
+const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | F_SEAL_FUTURE_WRITE;
+/// What an adopter accepts: resize and sealing sealed, and every write path closed.
+const RESIZE_SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
 /// The state page, at `data` (the layout's nbytes): magic, region count, digest (64 hex bytes),
@@ -196,14 +201,20 @@ impl HostMem {
             return Err(os("memfd_create"));
         }
         // SAFETY: we own the fresh descriptor.
-        Self::adopt_owned(unsafe { OwnedFd::from_raw_fd(fd) }, layout, false)
+        Self::adopt_owned(unsafe { OwnedFd::from_raw_fd(fd) }, layout, false, true)
+    }
+
+    /// A layout's memory in a memfd `reserve` made: sized to the layout now (pages past it are
+    /// freed, pages it lacks come on first write), its state page written fresh.
+    pub fn create_in(reserved: OwnedFd, layout: &Layout) -> Result<HostMem> {
+        Self::adopt_owned(reserved, layout, false, true)
     }
 
     /// Adopt a memfd another process (the Worker) created. Reopening through /proc gives this
     /// process its own open file description, so its OFD locks conflict with other holders'
     /// (a dup or an inherited fd would share theirs).
     pub fn adopt(fd: RawFd, layout: &Layout) -> Result<HostMem> {
-        Self::adopt_owned(reopen(fd)?, layout, false)
+        Self::adopt_owned(reopen(fd)?, layout, false, false)
     }
 
     /// Adopt a sealed layout (`fill_sealed`) read-only: its seals are the proof nobody can
@@ -211,10 +222,10 @@ impl HostMem {
     pub fn adopt_sealed(fd: RawFd, layout: &Layout) -> Result<HostMem> {
         // SAFETY: a scalar query of a descriptor the caller holds.
         let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
-        if seals < 0 || seals & SEALS != SEALS {
+        if seals < 0 || seals & RESIZE_SEALS != RESIZE_SEALS || seals & (libc::F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) == 0 {
             return Err(Error::Invalid("a sealed host layout must carry write, resize and seal seals".into()));
         }
-        let host = Self::adopt_owned(reopen_as(fd, libc::O_RDONLY)?, layout, true)?;
+        let host = Self::adopt_owned(reopen_as(fd, libc::O_RDONLY)?, layout, true, false)?;
         if (0..host.regions as u32).any(|r| !host.ready(r)) {
             return Err(Error::Invalid("a sealed host layout has a region that is not Ready".into()));
         }
@@ -228,11 +239,13 @@ impl HostMem {
             return Err(Error::Invalid("only a complete, unsealed layout seals".into()));
         }
         let fd = reopen(self.fd.as_raw_fd())?;
-        drop(self);
         // SAFETY: a scalar fcntl on our own descriptor.
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } != 0 {
             return Err(os("seal host layout"));
         }
+        // Unmapping gigabytes of filled pages takes a while (0.37 s for 5 GB on a RunPod 3090);
+        // the layout is already sealed and complete, so that happens off the caller's path.
+        std::thread::spawn(move || drop(self));
         Ok(fd)
     }
 
@@ -240,7 +253,10 @@ impl HostMem {
         self.sealed
     }
 
-    fn adopt_owned(fd: OwnedFd, layout: &Layout, sealed: bool) -> Result<HostMem> {
+    /// `init`: this description sizes the memfd to the layout and writes its state page (a
+    /// fresh or reserved memfd); otherwise an empty memfd is initialized and any other must
+    /// already hold this layout.
+    fn adopt_owned(fd: OwnedFd, layout: &Layout, sealed: bool, init: bool) -> Result<HostMem> {
         let regions = layout.regions.len();
         let data = layout.nbytes as usize;
         let map_len = data + meta_len(regions);
@@ -249,7 +265,7 @@ impl HostMem {
         if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(os("fstat host fd"));
         }
-        let fresh = st.st_size == 0 && !sealed;
+        let fresh = (init || st.st_size == 0) && !sealed;
         if fresh {
             // SAFETY: sizing our own descriptor; a sparse file costs no RAM until written.
             if unsafe { libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) } != 0 {
@@ -450,14 +466,78 @@ impl Drop for HostMem {
     }
 }
 
+/// Memory for a layout still to be planned: a memfd of `bytes` whose pages are allocated now,
+/// on `threads` threads. Allocation (the kernel zeroes and charges each 4 KiB page; shmem huge
+/// pages are usually off) is most of a fill from the page cache; `fill_sealed` into the result
+/// then mostly copies. Pages past the layout it receives are freed then.
+pub fn reserve(name: &str, bytes: u64, threads: usize) -> Result<OwnedFd> {
+    let cname = CString::new(format!("tfs-reserve:{name}")).map_err(|_| Error::Invalid("reservation name contains NUL".into()))?;
+    let len = crate::layout::align_up(bytes.max(1), PART_ALIGN) as usize;
+    // SAFETY: plain syscalls on a descriptor we create and own; the mapping is ours and is
+    // unmapped before returning (the pages stay in the memfd).
+    unsafe {
+        let fd = libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING);
+        if fd < 0 {
+            return Err(os("memfd_create"));
+        }
+        let fd = OwnedFd::from_raw_fd(fd);
+        if libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) != 0 {
+            return Err(os("size reservation"));
+        }
+        let ptr = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0);
+        if ptr == libc::MAP_FAILED {
+            return Err(os("map reservation"));
+        }
+        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+        populate(ptr as *mut u8, len, threads);
+        libc::munmap(ptr, len);
+        Ok(fd)
+    }
+}
+
+/// Fault in every page of `[base, base+len)` for writing, in `threads` slices. Pages a memfd
+/// lacks are allocated; pages it has are only mapped. Kernels before 5.14 lack
+/// MADV_POPULATE_WRITE: each page is touched instead (writing the zero it already reads as).
+fn populate(base: *mut u8, len: usize, threads: usize) {
+    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    let page = 4096usize;
+    let threads = threads.max(1);
+    let step = len.div_ceil(threads).next_multiple_of(page);
+    let base = base as usize;
+    std::thread::scope(|s| {
+        for k in 0..threads {
+            let (lo, hi) = ((k * step).min(len), ((k + 1) * step).min(len));
+            if lo == hi {
+                continue;
+            }
+            s.spawn(move || {
+                // SAFETY: a page-aligned slice of the caller's live, writable shared mapping.
+                unsafe {
+                    let at = (base + lo) as *mut libc::c_void;
+                    if libc::madvise(at, hi - lo, MADV_POPULATE_WRITE) != 0 {
+                        for p in (lo..hi).step_by(page) {
+                            std::ptr::write_volatile((base + p) as *mut u8, 0);
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// Fill `layout` once through the verified read path (`Source::read_item`: page-cache copies,
 /// O_DIRECT for the rest) on `threads` threads, then seal it (`HostMem::seal`). The owner's
 /// side of a sealed layout; `tally` counts each mode's bytes. Each object's residency is checked
 /// once, not per item (a check maps the file on overlayfs, which stalls every thread's page
 /// faults), and its descriptors close when its last item lands: a model of thousands of objects
 /// never holds thousands open, and no thread waits at a batch boundary.
-pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<OwnedFd> {
-    let host = HostMem::create(name, layout)?;
+pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize, tally: &IoTally, reserved: Option<OwnedFd>) -> Result<OwnedFd> {
+    let host = match reserved {
+        // Its pages exist: the copy only maps them (pre-mapping them with MADV_POPULATE_WRITE
+        // measured slower than faulting them in during the copy).
+        Some(fd) => HostMem::create_in(fd, layout)?,
+        None => HostMem::create(name, layout)?,
+    };
     let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
     let mut index: HashMap<&str, usize> = HashMap::new();
     let mut objects: Vec<&ObjectRef> = Vec::new();

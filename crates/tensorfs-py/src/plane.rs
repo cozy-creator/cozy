@@ -841,7 +841,8 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
 /// half of a sealed layout; `Plane.register_sealed` adopts it). CONSUMES `lease`. Returns the
 /// sealed memfd (the caller's) and each read mode's bytes.
 #[pyfunction]
-#[pyo3(signature = (store, lease, plan, regions, name, threads = 8))]
+#[pyo3(signature = (store, lease, plan, regions, name, threads = 8, reserved = None))]
+#[allow(clippy::too_many_arguments)]
 fn fill_sealed<'p>(
     py: Python<'p>,
     store: PyRef<'_, PyStore>,
@@ -850,7 +851,10 @@ fn fill_sealed<'p>(
     regions: Vec<Vec<String>>,
     name: String,
     threads: usize,
+    reserved: Option<i32>,
 ) -> PyResult<(i32, Bound<'p, PyDict>)> {
+    // SAFETY: the caller hands over a descriptor `reserve` returned.
+    let reserved = reserved.map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let lease = lease.take_for_plane(py)?;
     let (store, meta, p) = (store.store.clone(), store.meta.clone(), &plan.plan);
     let tally = tensorfs_plane::io::IoTally::default();
@@ -858,7 +862,7 @@ fn fill_sealed<'p>(
         .detach(|| {
             let layout = Layout::build(p, &regions)?;
             let source = Source::new(store, meta, lease, true, 0);
-            tensorfs_plane::host::fill_sealed(&name, &layout, &source, threads, &tally)
+            tensorfs_plane::host::fill_sealed(&name, &layout, &source, threads, &tally, reserved)
         })
         .or_raise(py)?;
     let read = |n: &std::sync::atomic::AtomicU64| n.load(Ordering::Relaxed);
@@ -867,6 +871,15 @@ fn fill_sealed<'p>(
         "buffered_bytes" => read(&tally.buffered_bytes), "inline_bytes" => read(&tally.inline_bytes),
     );
     Ok((std::os::fd::IntoRawFd::into_raw_fd(fd), facts))
+}
+
+/// A memfd of `nbytes` whose pages are allocated now (`fill_sealed(reserved=)` then copies).
+#[pyfunction]
+#[pyo3(signature = (name, nbytes, threads = 8))]
+fn reserve(py: Python<'_>, name: String, nbytes: u64, threads: usize) -> PyResult<i32> {
+    py.detach(|| tensorfs_plane::host::reserve(&name, nbytes, threads))
+        .map(std::os::fd::IntoRawFd::into_raw_fd)
+        .or_raise(py)
 }
 
 /// `tensorfs._ext.plane`, importable as such (the facade module `tensorfs.plane` re-exports it).
@@ -883,6 +896,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(fill_sealed, &m)?)?;
+    m.add_function(wrap_pyfunction!(reserve, &m)?)?;
     add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
         CudaUnavailable, Invalid, IoError, Closed);
     parent.add_submodule(&m)?;

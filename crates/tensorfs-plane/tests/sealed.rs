@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use common::*;
 use tensorfs_core::read;
-use tensorfs_plane::host::fill_sealed;
+use tensorfs_plane::host::{fill_sealed, reserve};
 use tensorfs_plane::io::{IoTally, Source};
 use tensorfs_plane::layout::Layout;
 use tensorfs_plane::{Error, Tier};
@@ -17,7 +17,7 @@ fn sealed(fx: &Fixture, tally: &IoTally) -> OwnedFd {
     let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
-    fill_sealed("unet", &layout, &source, 3, tally).unwrap()
+    fill_sealed("unet", &layout, &source, 3, tally, None).unwrap()
 }
 
 fn resident(fd: i32) -> u64 {
@@ -126,4 +126,25 @@ fn only_a_sealed_complete_layout_is_adopted_read_only() {
     assert!(other.register_sealed("unet", &fx.plan(), &moved, fd.as_raw_fd()).is_err());
     other.close().unwrap();
     plane.close().unwrap();
+}
+
+#[test]
+fn a_reservation_made_before_the_plan_takes_any_layout_and_frees_what_it_does_not_need() {
+    let fx = Fixture::new("reserve");
+    let layout = Layout::build(&fx.plan(), &regions()).unwrap();
+    for bytes in [layout.nbytes * 2, layout.nbytes / 3] {
+        let reserved = reserve("unet", bytes, 3).unwrap();
+        assert!(resident(reserved.as_raw_fd()) >= bytes.next_multiple_of(4096) * 9 / 10, "pages allocated up front");
+        let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+        let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+        let fd = fill_sealed("unet", &layout, &source, 3, &IoTally::default(), Some(reserved)).unwrap();
+        // Sized to the layout: a larger reservation's excess is freed, a smaller one grew.
+        let size = std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap().len();
+        assert!(size >= layout.nbytes && size < layout.nbytes + (1 << 20));
+        assert!(resident(fd.as_raw_fd()) <= size);
+        let plane = host_only();
+        let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+        check_bytes(&plane, ws, None);
+        plane.close().unwrap();
+    }
 }
