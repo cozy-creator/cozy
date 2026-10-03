@@ -108,7 +108,7 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 	}, func(name string) ([]byte, string, *exit.Error) {
 		machine = name
 		body, problem := hub.RentalRequestBytes(name, "cpu", 1, strings.Repeat("ab", 32),
-			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil, "")
+			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil, "", "")
 		return body, "digest-" + name, problem
 	})
 

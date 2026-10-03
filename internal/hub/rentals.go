@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -328,12 +329,14 @@ type RentalDevelopment struct {
 }
 
 type RentalRequest struct {
-	Development      *RentalDevelopment `json:"development,omitempty"`
-	Name             string             `json:"name"`
-	SKU              string             `json:"sku"`
-	AcceleratorCount int                `json:"accelerator_count"`
-	MediaTokenSHA256 string             `json:"media_token_sha256"`
-	CreatorPublicKey string             `json:"creator_public_key"`
+	Development *RentalDevelopment `json:"development,omitempty"`
+	Name        string             `json:"name"`
+	// Provider names the marketplace (`--provider`); omitted buys from the hub's default.
+	Provider         string `json:"provider,omitempty"`
+	SKU              string `json:"sku"`
+	AcceleratorCount int    `json:"accelerator_count"`
+	MediaTokenSHA256 string `json:"media_token_sha256"`
+	CreatorPublicKey string `json:"creator_public_key"`
 	// Image names one worker image registered with the hub (digest, tag, or
 	// kind) in place of the machine's default; empty boots the default.
 	Image string `json:"image,omitempty"`
@@ -396,11 +399,12 @@ const maxServingModels = 32
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
 func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPublicKey string,
-	workload DeclaredWorkload, development *RentalDevelopment, image string,
+	workload DeclaredWorkload, development *RentalDevelopment, image, provider string,
 ) ([]byte, *exit.Error) {
 	req := RentalRequest{
 		Development:        development,
 		Name:               strings.TrimSpace(name),
+		Provider:           provider,
 		SKU:                strings.TrimSpace(sku),
 		AcceleratorCount:   gpus,
 		MediaTokenSHA256:   strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
@@ -412,6 +416,9 @@ func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPub
 	}
 	if len(image) > 512 || strings.TrimSpace(image) != image || strings.ContainsAny(image, " \t\r\n\x00") {
 		return nil, exit.Usagef("--image names one registered worker image by digest, tag, or kind")
+	}
+	if !providerPattern.MatchString(provider) {
+		return nil, exit.Usagef("--provider names one marketplace, such as runpod or vast")
 	}
 	if development != nil && (len(development.SSHPublicKey) == 0 || len(development.SSHPublicKey) > 8192 || strings.TrimSpace(development.SSHPublicKey) != development.SSHPublicKey || strings.ContainsAny(development.SSHPublicKey, "\r\n\x00")) {
 		return nil, exit.Usagef("development requires one bounded SSH public-key line")
@@ -466,6 +473,7 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 // Tensorhub, not its adapter.
 type RentalSKU struct {
 	Name             string `json:"name"`
+	Provider         string `json:"provider,omitempty"`
 	AcceleratorModel string `json:"accelerator_model"`
 	// AcceleratorCount is the machine's GPU count. VRAMGB stays the ONE-CARD figure at
 	// every count, and that is the right fit test: under a sequence-parallel group every
@@ -499,6 +507,7 @@ type RentalSKU struct {
 type RentalProduct struct {
 	PythonProvisionableMinors []string      `json:"python_provisionable_minors"`
 	Name                      string        `json:"name"`
+	Provider                  string        `json:"provider,omitempty"`
 	AcceleratorModel          string        `json:"accelerator_model"`
 	BaseWorkerProfile         string        `json:"base_worker_profile"`
 	ComputeCapability         string        `json:"compute_capability"`
@@ -519,7 +528,7 @@ type RentalWidth struct {
 func (p RentalProduct) Machines() []RentalSKU {
 	out := make([]RentalSKU, 0, len(p.Widths))
 	for _, width := range p.Widths {
-		out = append(out, RentalSKU{Name: p.Name, AcceleratorModel: p.AcceleratorModel,
+		out = append(out, RentalSKU{Name: p.Name, Provider: p.Provider, AcceleratorModel: p.AcceleratorModel,
 			AcceleratorCount: width.AcceleratorCount, PythonProvisionableMinors: p.PythonProvisionableMinors,
 			BaseWorkerProfile: p.BaseWorkerProfile,
 			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB,
@@ -578,10 +587,16 @@ func FindRentalSKU(skus []RentalSKU, name string, gpus int) (RentalSKU, bool) {
 // RentalSKUs reads Tensorhub's public product catalog, flattened to one machine per width.
 // A product or width this build cannot price or size is left out; one bad row never
 // hides the rest of the catalog.
-func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
+// RentalSKUs lists what one provider sells now; "" is the hub's default. A hub that
+// predates providers answers its default listing, which names no provider, so an
+// ask for a named one finds nothing there rather than a different marketplace.
+func (c *Client) RentalSKUs(ctx context.Context, provider string) ([]RentalSKU, *exit.Error) {
 	var products []RentalProduct
-	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rental-skus"}, &products); e != nil {
+	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rental-skus" + providerQuery("?", provider)}, &products); e != nil {
 		return nil, e
+	}
+	if provider != "" {
+		products = slices.DeleteFunc(products, func(p RentalProduct) bool { return p.Provider != provider })
 	}
 	var out []RentalSKU
 	seen := map[string]bool{}
@@ -827,11 +842,20 @@ func (c *Client) QuoteRental(ctx context.Context, body []byte) (RentalQuote, *ex
 	return out, e
 }
 
-func (c *Client) RentalSKUStatus(ctx context.Context, name string, gpus int) (RentalSKUStatus, *exit.Error) {
+func (c *Client) RentalSKUStatus(ctx context.Context, provider, name string, gpus int) (RentalSKUStatus, *exit.Error) {
 	var out RentalSKUStatus
 	if e := c.do(ctx, call{method: http.MethodGet,
-		path: "/v1/rental-skus/" + url.PathEscape(name) + "?accelerator_count=" + strconv.Itoa(gpus)}, &out); e != nil {
+		path: "/v1/rental-skus/" + url.PathEscape(name) + "?accelerator_count=" + strconv.Itoa(gpus) + providerQuery("&", provider)}, &out); e != nil {
 		return RentalSKUStatus{}, e
 	}
 	return out, nil
+}
+
+var providerPattern = regexp.MustCompile(`^([a-z][a-z0-9-]{0,31})?$`)
+
+func providerQuery(sep, provider string) string {
+	if provider == "" {
+		return ""
+	}
+	return sep + "provider=" + url.QueryEscape(provider)
 }
