@@ -155,3 +155,36 @@ fn a_new_handle_validates_and_trusts_on_one_connection() {
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(scratch).unwrap();
 }
+
+/// Many writers in one process mint temp names at once; every object lands (a temp-name
+/// collision fails a `create_new` with "File exists").
+#[test]
+fn concurrent_writers_in_one_process_never_share_a_temp_name() {
+    let root = temporary("temp-names");
+    let store = Store::init(&root).unwrap();
+    let written: Vec<ObjectRef> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..16)
+            .map(|worker| {
+                let store = &store;
+                scope.spawn(move || {
+                    (0..16)
+                        .map(|i| {
+                            let bytes = body(worker * 16 + i);
+                            let expect = ObjectRef::of(&bytes);
+                            store
+                                .put_stream(&mut bytes.as_slice(), Some(&expect), &Fault::default())
+                                .unwrap();
+                            expect
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+    });
+    assert_eq!(written.len(), 16 * 16);
+    for object in &written {
+        assert_eq!(fs::read(store.object_path(&object.sha256)).unwrap().len() as u64, object.length);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
