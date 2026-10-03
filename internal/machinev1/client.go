@@ -25,8 +25,9 @@ type Signer struct {
 	Sign   func([]byte) []byte
 }
 
-// Client is one machine. The underlying connection keeps grpc-go's dynamic HTTP/2 windows
-// (BDP estimation), so a far machine is not capped by the 64 KiB default.
+// Client is one machine. Its HTTP/2 receive windows are fixed at 16 MiB per stream and 32 MiB
+// per connection: BDP probing from 64 KiB lost 16% to a fixed window on a lossy 160 ms link
+// (cozy-machine read-bench); 16 MiB covers 150 Mbit/s at 800 ms.
 type Client struct {
 	conn    *grpc.ClientConn
 	Machine pb.MachineClient
@@ -41,6 +42,7 @@ func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Cl
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 		grpc.WithPerRPCCredentials(caps{c}),
+		grpc.WithInitialWindowSize(16<<20), grpc.WithInitialConnWindowSize(32<<20),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
 	if err != nil {
 		return nil, err
