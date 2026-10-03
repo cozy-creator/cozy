@@ -338,7 +338,6 @@ python3 scripts/fence.py
 python3 scripts/version_contract.py source
 
 cargo build --release --bin tfs
-./target/release/tfs vectors verify
 uv run --python 3.12 --project conformance/cbor/python \
   python scripts/cbor-conformance.py --tfs target/release/tfs conform
 

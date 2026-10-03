@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The shared canonical corpus, run through the PYTHON FACADE (tfs-007 / tfs-013).
 
-Same vectors, same frozen `.verdict` files, same output lines as `tfs vectors verify` —
-so `diff` is the cross-language proof. There is exactly ONE codec underneath (that is the
+Same vectors and frozen `.verdict` files as `cargo test --test vectors`, so agreement is the
+cross-language proof. There is exactly ONE codec underneath (that is the
 design), so a divergence here is a defect in the marshal boundary, never a profile
 difference: a refusal that arrives untyped, an identity that does not survive the FFI, a
 document kind the binding cannot reach.
