@@ -69,7 +69,7 @@ pub const NORMALIZATION: &str = "normalization";
 /// The converter for a source no reviewed profile recognizes: its keys, stored as they are.
 pub const IDENTITY: &str = "identity/1";
 
-pub const CONVERTERS: [Converter; 8] = [
+pub const CONVERTERS: [Converter; 9] = [
     Converter {
         name: "diffusers.identity/1",
         dialect: "safetensors.diffusers",
@@ -110,6 +110,21 @@ pub const CONVERTERS: [Converter; 8] = [
         class: Class::Permutation,
         doc: "Trainer H3 LoRA A/B and Kohya down/up factors: split contiguous Q/K/V B thirds, swap SwiGLU B halves, preserve A and alpha without arithmetic. Original base checkpoint head interleaving belongs to h3.native/2, not this adapter state-dict dialect.",
         validated_on_real_bytes: false,
+        normalization: None,
+        lane: None,
+        reference: None,
+    },
+    Converter {
+        name: super::sdxl_lora::CONVERTER,
+        dialect: "safetensors.sdxl_lora",
+        class: Class::Identity,
+        doc: "Kohya SDXL LoRA down/up/alpha factors (LDM or Diffusers UNet spelling, both CLIP \
+              towers) rekeyed onto the SDXL route table's module paths as PEFT lora_A/lora_B/\
+              alpha, one component per adapted base component. Bytes stream unchanged; conv \
+              (LoCon) factors refuse.",
+        // 2026-10-03: Civitai 1071060 (LDM UNet + both towers) and 145907 (Diffusers UNet)
+        // converted whole; every layer's B@A*alpha/rank equals diffusers' kohya loader's.
+        validated_on_real_bytes: true,
         normalization: None,
         lane: None,
         reference: None,
@@ -1057,12 +1072,15 @@ fn plan_carrier(
     cands: &Candidates<'_>,
     p: &mut Plan,
 ) -> Result<()> {
-    if conv.name == "h3.lora/2" {
+    if conv.name == "h3.lora/2" || conv.name == super::sdxl_lora::CONVERTER {
         if allowed != ["plain/1"] {
             return refuse(
                 Code::UNKNOWN_ENCODING,
-                "H3 LoRA ingestion preserves floating point factors in plain/1",
+                "LoRA ingestion preserves floating point factors in plain/1",
             );
+        }
+        if conv.name == super::sdxl_lora::CONVERTER {
+            return super::sdxl_lora::plan(file, h, cands.plain, p);
         }
         return super::h3_lora::plan(component, file, h, cands.plain, p);
     }

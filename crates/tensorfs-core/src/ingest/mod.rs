@@ -25,6 +25,7 @@ pub mod journal;
 mod narrow;
 pub mod preflight;
 pub mod routes;
+mod sdxl_lora;
 pub mod source;
 pub mod stamp;
 pub mod transaction;
