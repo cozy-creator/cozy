@@ -723,3 +723,48 @@ mod copy_faults {
         unsafe { libc::close(kept) };
     }
 }
+
+#[test]
+#[ignore = "GPU"]
+fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_pageable_past_it() {
+    use std::os::fd::AsRawFd;
+    let fx = Fixture::new("gpu-sealed");
+    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let tally = tensorfs_plane::io::IoTally::default();
+    let fd = tensorfs_plane::host::fill_sealed("unet", &layout, &source, 3, &tally).unwrap();
+    drop(source);
+    let p = plane();
+    let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+    let s = Stream::new();
+    // Region 0 inside the pinned budget (registered read-only for DMA); 1 and 2 past it.
+    let spans: Vec<u64> = p.layout(ws).unwrap().regions.iter().map(|r| r.span).collect();
+    p.set_pinned_budget(spans[0]).unwrap();
+    p.want(ws, Tier::Pinned, Some(&[0]), 0, false).unwrap().wait().unwrap();
+    let st = p.stats();
+    println!("sealed: registered {} of ready {}; register_failed {}", st.host.registered_bytes, st.host.ready_bytes, st.host.counters.register_failed);
+    p.set_vram_budget(DEV, 512 << 20).unwrap();
+    p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
+    for r in 0..3 {
+        resident(&p, ws, &s, r).release(s.raw()).unwrap();
+    }
+    let st = p.stats();
+    assert_eq!(st.devices[0].counters.disk_copy_bytes, 0, "a sealed layout never reads the store");
+    assert!(st.devices[0].counters.host_copy_bytes > 70 << 20, "{:?}", st.devices[0]);
+    assert_eq!(st.host.counters.fill_bytes, 0);
+    // Streaming past the budget copies the unpinned regions straight from the layout.
+    assert!(p.drop_regions(ws, Tier::Device(DEV), None).unwrap() > 0);
+    p.set_vram_budget(DEV, (2 * 72) << 20).unwrap();
+    let cur = p.stream(ws, DEV, &[0, 1, 2], 2, 2, 0, "denoise", None).unwrap();
+    for _ in 0..2 {
+        for r in 0..3u32 {
+            let l = cur.acquire(r, s.raw()).unwrap();
+            check_region(&p, ws, r, &s.read(l.ptr, l.nbytes));
+            l.release(s.raw()).unwrap();
+        }
+    }
+    cur.close().unwrap();
+    s.sync();
+    p.close().unwrap();
+}

@@ -27,6 +27,8 @@ pub const STREAM_NON_BLOCKING: c_uint = 0x1;
 pub const EVENT_DEFAULT: c_uint = 0x0;
 pub const EVENT_DISABLE_TIMING: c_uint = 0x2;
 pub const MEMHOSTREGISTER_PORTABLE: c_uint = 0x1;
+/// The range is mapped read-only (a sealed layout); the device only reads it.
+pub const MEMHOSTREGISTER_READ_ONLY: c_uint = 0x8;
 pub const MEMHOSTALLOC_PORTABLE: c_uint = 0x1;
 
 pub const ATTR_VMM_SUPPORTED: c_int = 102;

@@ -9,15 +9,26 @@
 //! region go; the only destructive act, the punch, needs the lock exclusive, so the last holder
 //! to let go frees the RAM and no process ever loses pages it still registers. The kernel drops
 //! a dead holder's claims.
+//!
+//! A sealed layout (`fill_sealed`) is the machine's: filled once through the verified read
+//! path, every region Ready, then sealed so no process can write, resize or punch it. Executors
+//! adopt it read-only (`adopt_sealed`); its RAM goes when the last descriptor and mapping do.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::cuda;
+use crate::io::{IoTally, Mode, Source};
 use crate::layout::{Layout, PART_ALIGN};
 use crate::{Error, Result};
+
+/// What makes a layout immutable: no write, resize, punch or unsealing, by anyone.
+const SEALS: libc::c_int = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+/// Items a sealed fill reads before it closes their objects' descriptors: its descriptor
+/// count stays bounded however many objects a model has.
+const FILL_WINDOW: usize = 256;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
 /// The state page, at `data` (the layout's nbytes): magic, region count, digest (64 hex bytes),
@@ -73,9 +84,13 @@ fn os(what: &str) -> Error {
 /// A new open file description of the file behind `fd` (a dup would share `fd`'s, and with it
 /// its OFD locks).
 fn reopen(fd: RawFd) -> Result<OwnedFd> {
+    reopen_as(fd, libc::O_RDWR)
+}
+
+fn reopen_as(fd: RawFd, access: libc::c_int) -> Result<OwnedFd> {
     let path = CString::new(format!("/proc/self/fd/{fd}")).expect("no NUL");
     // SAFETY: plain open of a magic link to a descriptor the caller holds.
-    let own = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    let own = unsafe { libc::open(path.as_ptr(), access | libc::O_CLOEXEC) };
     if own < 0 {
         return Err(os("reopen host fd"));
     }
@@ -158,6 +173,8 @@ pub struct HostMem {
     data: usize,
     map_len: usize,
     regions: usize,
+    /// A sealed layout, mapped read-only: never written, never punched by this process.
+    sealed: bool,
     /// Registered ranges (offset, context as an address): unregistered at drop at the latest,
     /// since unmapping a registered range leaves the driver a stale pinned range at that VA.
     registered: Mutex<Vec<(u64, usize)>>,
@@ -174,22 +191,56 @@ impl HostMem {
         let cname = CString::new(format!("tfs-plane:{name}"))
             .map_err(|_| Error::Invalid("weight set name contains NUL".into()))?;
         // SAFETY: plain syscall; the name is NUL-terminated.
-        let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
         if fd < 0 {
             return Err(os("memfd_create"));
         }
         // SAFETY: we own the fresh descriptor.
-        Self::adopt_owned(unsafe { OwnedFd::from_raw_fd(fd) }, layout)
+        Self::adopt_owned(unsafe { OwnedFd::from_raw_fd(fd) }, layout, false)
     }
 
     /// Adopt a memfd another process (the Worker) created. Reopening through /proc gives this
     /// process its own open file description, so its OFD locks conflict with other holders'
     /// (a dup or an inherited fd would share theirs).
     pub fn adopt(fd: RawFd, layout: &Layout) -> Result<HostMem> {
-        Self::adopt_owned(reopen(fd)?, layout)
+        Self::adopt_owned(reopen(fd)?, layout, false)
     }
 
-    fn adopt_owned(fd: OwnedFd, layout: &Layout) -> Result<HostMem> {
+    /// Adopt a sealed layout (`fill_sealed`) read-only: its seals are the proof nobody can
+    /// change a byte, and every region must be Ready.
+    pub fn adopt_sealed(fd: RawFd, layout: &Layout) -> Result<HostMem> {
+        // SAFETY: a scalar query of a descriptor the caller holds.
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        if seals < 0 || seals & SEALS != SEALS {
+            return Err(Error::Invalid("a sealed host layout must carry write, resize and seal seals".into()));
+        }
+        let host = Self::adopt_owned(reopen_as(fd, libc::O_RDONLY)?, layout, true)?;
+        if (0..host.regions as u32).any(|r| !host.ready(r)) {
+            return Err(Error::Invalid("a sealed host layout has a region that is not Ready".into()));
+        }
+        Ok(host)
+    }
+
+    /// Seal a filled layout: no writable mapping remains (this one goes) and nobody can
+    /// write, resize or punch it again. Every region must be Ready. Returns the memfd.
+    pub fn seal(self) -> Result<OwnedFd> {
+        if self.sealed || (0..self.regions as u32).any(|r| !self.ready(r)) {
+            return Err(Error::Invalid("only a complete, unsealed layout seals".into()));
+        }
+        let fd = reopen(self.fd.as_raw_fd())?;
+        drop(self);
+        // SAFETY: a scalar fcntl on our own descriptor.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } != 0 {
+            return Err(os("seal host layout"));
+        }
+        Ok(fd)
+    }
+
+    pub fn sealed(&self) -> bool {
+        self.sealed
+    }
+
+    fn adopt_owned(fd: OwnedFd, layout: &Layout, sealed: bool) -> Result<HostMem> {
         let regions = layout.regions.len();
         let data = layout.nbytes as usize;
         let map_len = data + meta_len(regions);
@@ -198,7 +249,7 @@ impl HostMem {
         if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(os("fstat host fd"));
         }
-        let fresh = st.st_size == 0;
+        let fresh = st.st_size == 0 && !sealed;
         if fresh {
             // SAFETY: sizing our own descriptor; a sparse file costs no RAM until written.
             if unsafe { libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) } != 0 {
@@ -215,7 +266,7 @@ impl HostMem {
             libc::mmap(
                 std::ptr::null_mut(),
                 map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
+                if sealed { libc::PROT_READ } else { libc::PROT_READ | libc::PROT_WRITE },
                 libc::MAP_SHARED,
                 fd.as_raw_fd(),
                 0,
@@ -227,7 +278,7 @@ impl HostMem {
         // Huge pages cut registration and TLB cost where shmem THP is enabled; advisory.
         // SAFETY: advice on our own mapping.
         unsafe { libc::madvise(ptr, data, libc::MADV_HUGEPAGE) };
-        let share = reopen(fd.as_raw_fd())?;
+        let share = reopen_as(fd.as_raw_fd(), if sealed { libc::O_RDONLY } else { libc::O_RDWR })?;
         let h = HostMem {
             fd,
             share,
@@ -235,10 +286,11 @@ impl HostMem {
             data,
             map_len,
             regions,
+            sealed,
             registered: Mutex::new(Vec::new()),
         };
-        let head = h.head();
         if fresh {
+            let head = h.head();
             // SAFETY: the extents and the trailer lie inside the state page of our mapping.
             unsafe {
                 let page = h.ptr.add(data);
@@ -252,13 +304,20 @@ impl HostMem {
             head.1.copy_from_slice(layout.digest.as_bytes());
             head.0[1] = regions as u64;
             head.0[0] = MAGIC;
-        } else if head.0[0] != MAGIC
-            || head.0[1] != regions as u64
-            || head.1 != layout.digest.as_bytes()
-        {
-            return Err(Error::Invalid(
-                "host fd holds a different weight-set layout".into(),
-            ));
+        } else {
+            // Read through raw pointers: a sealed mapping is read-only.
+            // SAFETY: the state page lies inside our mapping, 8-byte aligned (page aligned).
+            let (magic, count, digest) = unsafe {
+                let page = h.ptr.add(data);
+                (
+                    (page as *const u64).read(),
+                    (page.add(8) as *const u64).read(),
+                    std::slice::from_raw_parts(page.add(16), 64),
+                )
+            };
+            if magic != MAGIC || count != regions as u64 || digest != layout.digest.as_bytes() {
+                return Err(Error::Invalid("host fd holds a different weight-set layout".into()));
+            }
         }
         Ok(h)
     }
@@ -292,6 +351,7 @@ impl HostMem {
         self.word(r).load(Ordering::Acquire) & READY != 0
     }
     pub fn set_ready(&self, r: u32, ready: bool) {
+        assert!(!self.sealed, "a sealed layout's Ready words never change");
         if ready {
             self.word(r).fetch_or(READY, Ordering::Release);
         } else {
@@ -323,6 +383,10 @@ impl HostMem {
     /// Let region `r` go. The last claimant clears Ready and punches the region's RAM (true);
     /// while another description still claims it, only this claim ends (false).
     pub fn release(&self, r: u32, off: u64, span: u64) -> Result<bool> {
+        if self.sealed {
+            self.unlock(r);
+            return Ok(false);
+        }
         let last = self.lock(r, libc::F_WRLCK as _, false)?;
         let punched = if last {
             self.set_ready(r, false);
@@ -348,7 +412,7 @@ impl HostMem {
             (d.mem_host_register)(
                 self.ptr.add(off as usize) as *mut libc::c_void,
                 len as usize,
-                cuda::MEMHOSTREGISTER_PORTABLE,
+                cuda::MEMHOSTREGISTER_PORTABLE | if self.sealed { cuda::MEMHOSTREGISTER_READ_ONLY } else { 0 },
             )
         };
         if rc == cuda::ERROR_HOST_MEMORY_ALREADY_REGISTERED {
@@ -384,4 +448,40 @@ impl Drop for HostMem {
         // SAFETY: unmapping our own mapping, now unregistered.
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.map_len) };
     }
+}
+
+/// Fill `layout` once through the verified read path (`Source::read_item`: page-cache copies,
+/// O_DIRECT for the rest) on `threads` threads, then seal it (`HostMem::seal`). The owner's
+/// side of a sealed layout; `tally` counts each mode's bytes. Object descriptors close every
+/// `FILL_WINDOW` items, so a model of thousands of objects never holds thousands open.
+pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<OwnedFd> {
+    let host = HostMem::create(name, layout)?;
+    let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
+    let failed: Mutex<Option<Error>> = Mutex::new(None);
+    for window in items.chunks(FILL_WINDOW) {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads.clamp(1, window.len()) {
+                s.spawn(|| {
+                    while let Some(it) = window.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        // SAFETY: each item's range (and its padding) is this thread's alone;
+                        // the layout keeps items disjoint inside the live mapping.
+                        let dst = unsafe { host.base().add(it.offset as usize) };
+                        if let Err(e) = unsafe { source.read_item(it, dst, Mode::Cache, tally) } {
+                            failed.lock().unwrap().get_or_insert(e);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        source.close_objects();
+        if let Some(e) = failed.lock().unwrap().take() {
+            return Err(e);
+        }
+    }
+    for r in 0..layout.regions.len() as u32 {
+        host.set_ready(r, true);
+    }
+    host.seal()
 }

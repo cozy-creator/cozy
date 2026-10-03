@@ -579,6 +579,10 @@ impl Inner {
         let (host, source, name) = (w.host.clone(), w.source.clone(), w.name.clone());
         host.claim(r)?;
         let adopted = host.ready(r);
+        if host.sealed() && !adopted {
+            host.release(r, region.offset, region.span)?;
+            return Err(Error::Invalid(format!("{name}: a sealed layout's region {r} is not Ready")));
+        }
         if adopt_only && !adopted {
             host.release(r, region.offset, region.span)?;
             return Ok(());
@@ -602,7 +606,9 @@ impl Inner {
                         c.event(Event::new("register_failed", Some(name.clone()), Some(r), None, region.nbytes, 0, e.to_string()));
                     }
                 }
-                host2.set_ready(r, true);
+                if !host2.sealed() {
+                    host2.set_ready(r, true);
+                }
             }
             // A failed fill holds nothing: its partial pages go unless another process claims
             // the region (and fills or holds it).
@@ -749,10 +755,15 @@ impl Inner {
             w.devs[d].as_mut().unwrap().regs[r as usize].state = DState::Queued;
             return Ok(());
         }
-        let from_host = matches!(hstate, HState::Ready);
+        let held = matches!(hstate, HState::Ready);
+        let from_host = held || w.host.sealed();
         let src = if from_host {
-            w.hregs[r as usize].holds += 1;
-            // SAFETY: inside the live mapping; the hold keeps the region from eviction.
+            if held {
+                w.hregs[r as usize].holds += 1;
+            }
+            // SAFETY: inside the live mapping; a hold keeps a Ready region from eviction, and
+            // nothing frees a sealed layout's pages while this weight set maps them (an
+            // unregistered range copies as pageable memory).
             CopySrc::Host(unsafe { w.host.base().add(region.offset as usize) })
         } else {
             CopySrc::Disk {
@@ -775,7 +786,7 @@ impl Inner {
                 let mut c = inner.core.lock().unwrap();
                 let ordinal = inner.devices[d].ordinal;
                 let Some(Some(w)) = c.sets.get_mut(ws.0 as usize) else { return };
-                if from_host {
+                if held {
                     let h = &mut w.hregs[r as usize];
                     h.holds -= 1;
                     if let Ok(cp) = &res {
@@ -811,7 +822,7 @@ impl Inner {
         let m = self.devices[d].mover();
         if let Err(e) = self.devices[d].movers[m].submit(job) {
             let w = c.ws_mut(ws)?;
-            if from_host {
+            if held {
                 w.hregs[r as usize].holds -= 1;
             }
             w.devs[d].as_mut().unwrap().regs[r as usize].state = DState::Invalid(e.clone());
@@ -1077,6 +1088,35 @@ impl Plane {
             None => HostMem::create(name, &layout)?,
         };
         let n = layout.regions.len();
+        let id = self.insert(name, layout, source, host);
+        let mut c = self.lock();
+        if host_fd.is_some() {
+            // Bytes another process left Ready in the memfd join this plane's books (claimed,
+            // counted, cheapest to evict): RAM the memfd holds is always inside a live budget.
+            for r in 0..n as u32 {
+                if c.ws(id)?.host.ready(r) {
+                    c.ws_mut(id)?.hregs[r as usize].prio = i64::MIN;
+                    self.inner.fill_host(&mut c, id, r, true)?;
+                }
+            }
+        }
+        Ok(id)
+    }
+
+    /// Register one weight set over a sealed layout (`host::fill_sealed`, the machine's): the
+    /// layout holds every byte, so the set has no store source and never fills or punches.
+    /// Its regions join this plane's books only as a pinned budget wants them (`want`), where
+    /// they are registered for DMA; the rest copy to a device as pageable memory.
+    pub fn register_sealed(&self, name: &str, plan: &ReadPlan, regions: &[Vec<String>], fd: RawFd) -> Result<WsId> {
+        self.check()?;
+        let layout = Layout::build(plan, regions)?;
+        let host = HostMem::adopt_sealed(fd, &layout)?;
+        let source = Arc::new(Source::sealed(Arc::as_ptr(&self.inner) as usize));
+        Ok(self.insert(name, layout, source, host))
+    }
+
+    fn insert(&self, name: &str, layout: Layout, source: Arc<Source>, host: HostMem) -> WsId {
+        let n = layout.regions.len();
         let ws = Ws {
             name: name.to_string(),
             layout: Arc::new(layout),
@@ -1099,18 +1139,7 @@ impl Plane {
         };
         let mut c = self.lock();
         c.sets.push(Some(ws));
-        let id = WsId(c.sets.len() as u32 - 1);
-        if host_fd.is_some() {
-            // Bytes another process left Ready in the memfd join this plane's books (claimed,
-            // counted, cheapest to evict): RAM the memfd holds is always inside a live budget.
-            for r in 0..n as u32 {
-                if c.ws(id)?.host.ready(r) {
-                    c.ws_mut(id)?.hregs[r as usize].prio = i64::MIN;
-                    self.inner.fill_host(&mut c, id, r, true)?;
-                }
-            }
-        }
-        Ok(id)
+        WsId(c.sets.len() as u32 - 1)
     }
 
     pub fn layout(&self, ws: WsId) -> Result<Arc<Layout>> {
@@ -1497,7 +1526,11 @@ impl Plane {
                     }
                 }
             }
-            host.memfd_bytes += s.host_memfd_bytes;
+            if w.host.sealed() {
+                host.sealed_bytes += s.host_memfd_bytes;
+            } else {
+                host.memfd_bytes += s.host_memfd_bytes;
+            }
             for (d, dw) in w.devs.iter_mut().enumerate() {
                 let Some(dw) = dw.as_mut() else { continue };
                 let mut ready = 0;
@@ -1635,6 +1668,9 @@ pub struct HostStats {
     pub registered_bytes: u64,
     /// Kernel truth: RAM held by this plane's memfds (st_blocks).
     pub memfd_bytes: u64,
+    /// RAM of the sealed layouts this plane maps: their owner's (the machine's), not this
+    /// process's, so never in `memfd_bytes`.
+    pub sealed_bytes: u64,
     pub cached_bytes: u64,
     pub direct_bytes: u64,
     pub buffered_bytes: u64,

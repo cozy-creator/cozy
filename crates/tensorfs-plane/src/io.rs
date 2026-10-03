@@ -48,8 +48,9 @@ struct Fds {
 
 pub struct Source {
     lease: RwLock<Option<ReadLease>>,
-    meta: Arc<Meta>,
-    store: Arc<Store>,
+    /// None for a sealed layout's weight set (`Source::sealed`): it never reads a store.
+    meta: Option<Arc<Meta>>,
+    store: Option<Arc<Store>>,
     fds: Mutex<HashMap<String, Arc<Fds>>>,
     direct_io: bool,
     plane: usize,
@@ -119,12 +120,23 @@ impl Source {
     pub fn new(store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease, direct_io: bool, plane: usize) -> Source {
         Source {
             lease: RwLock::new(Some(lease)),
-            meta,
-            store,
+            meta: Some(meta),
+            store: Some(store),
             fds: Mutex::new(HashMap::new()),
             direct_io,
             plane,
         }
+    }
+
+    /// The source of a weight set over a sealed layout: every byte is in the layout already,
+    /// so it holds no lease, no store and no descriptor, and any read is refused.
+    pub(crate) fn sealed(plane: usize) -> Source {
+        Source { lease: RwLock::new(None), meta: None, store: None, fds: Mutex::new(HashMap::new()), direct_io: false, plane }
+    }
+
+    /// Close every object descriptor opened so far; the next read reopens through the store.
+    pub fn close_objects(&self) {
+        self.fds.lock().unwrap().clear();
     }
 
     pub(crate) fn made_by(&self, plane: usize) -> bool {
@@ -135,7 +147,7 @@ impl Source {
     fn release(&self) -> Result<()> {
         self.fds.lock().unwrap().clear();
         match self.lease.write().unwrap().take() {
-            Some(l) => Ok(l.release(&self.meta)?),
+            Some(l) => Ok(l.release(self.meta.as_ref().ok_or(Error::Closed)?)?),
             None => Ok(()),
         }
     }
@@ -144,7 +156,7 @@ impl Source {
         if let Some(f) = self.fds.lock().unwrap().get(&obj.sha256) {
             return Ok(f.clone());
         }
-        let vf = self.store.open_verified(&obj.sha256)?;
+        let vf = self.store.as_ref().ok_or(Error::Closed)?.open_verified(&obj.sha256)?;
         if vf.len() != obj.length {
             return Err(Error::Invalid(format!(
                 "{}: verified descriptor has {} bytes, the plan says {}",
