@@ -222,7 +222,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if !managedRental {
+	if ctx.endpoint != nil {
+		packagePublishStatus(ctx, "Execution target: machine %s at %s", ctx.endpoint.WorkerID, ctx.endpoint.Address)
+	} else if !managedRental {
 		packagePublishStatus(ctx, "Execution target: local machine")
 	} else if selectedRental != "" {
 		packagePublishStatus(ctx, "Execution target: rental %s", ctx.Inv.Value("--rental"))
