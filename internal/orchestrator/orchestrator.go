@@ -53,6 +53,8 @@ type Options struct {
 	Rentals func(id string) (*RemoteTarget, *exit.Error)
 	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
 	RentalClaimProof RentalClaimProofSource
+	// RentalSigner is the owner key a rental's machine admits on cozy.machine.v1.
+	RentalSigner RentalSignerSource
 	ModelTransfers   ModelTransferOwner
 }
 
