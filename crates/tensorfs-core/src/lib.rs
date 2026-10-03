@@ -51,6 +51,7 @@ pub mod repo_cache;
 pub mod repository;
 pub mod sha256;
 pub mod source_artifact;
+pub mod source_model;
 pub mod spec;
 pub mod staging;
 pub mod stats;
