@@ -187,7 +187,7 @@ fn a_failed_fill_reaches_every_adopter_as_an_error() {
     let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
     plane.set_pinned_budget(1 << 30).unwrap();
     let ticket = plane.want(ws, Tier::Pinned, None, 0, false).unwrap();
-    fill.fail();
+    drop(fill); // a filler that gives up poisons what it did not finish
     assert!(ticket.wait().is_err(), "a region its machine could not fill is an error, never read");
     // A later adopter refuses the failed layout outright.
     let other = host_only();

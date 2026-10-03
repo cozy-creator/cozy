@@ -263,7 +263,8 @@ class Plane:
     def register_sealed(
         self, name: str, plan: ReadPlan, regions: Sequence[Sequence[str]], fd: int
     ) -> WeightSet:
-        """A weight set over a sealed layout (`fill_sealed`): no store, no fill, no punch."""
+        """A weight set over a sealed layout (`fill_sealed`, or one its machine is still filling:
+        each region is used once Ready): no store, no fill, no punch."""
     def set_vram_budget(self, device: int, nbytes: int) -> Trim: ...
     def set_pinned_budget(self, nbytes: int) -> Trim: ...
     def want(
@@ -330,6 +331,9 @@ class SealedFill(TypedDict):
     direct_bytes: int
     buffered_bytes: int
     inline_bytes: int
+
+#: `Plane.register_sealed` adopts a layout still filling (absent in older releases).
+SEALED_WHILE_FILLING: bool
 
 def fill_sealed(
     store: Store,

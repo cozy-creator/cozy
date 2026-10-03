@@ -565,93 +565,91 @@ pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize,
 impl OpenFill {
     /// Fill every region through the verified read path (`Source::read_item`: page-cache
     /// copies, O_DIRECT for the rest) on `threads` threads, in layout order, setting each
-    /// region's Ready word as its last item lands. On an error every region not Ready is marked
-    /// failed, so no adopter waits forever or reads it. Each object's residency is checked once
-    /// (a check maps the file on overlayfs, which stalls every thread's page faults), and its
+    /// region's Ready word as its last item lands. Each object's residency is checked once (a
+    /// check maps the file on overlayfs, which stalls every thread's page faults), and its
     /// descriptors close when its last item lands. The mapping goes when this returns.
     pub fn run(self, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
-        let result = self.copy(layout, source, threads, tally);
-        if result.is_err() {
-            for r in 0..layout.regions.len() as u32 {
-                self.host.word(r).fetch_or(FAILED, Ordering::Release);
-            }
-        }
-        result
-    }
-
-    /// Mark every region failed (the filler gave up before running).
-    pub fn fail(self) {
-        for r in 0..self.host.regions as u32 {
-            self.host.word(r).fetch_or(FAILED, Ordering::Release);
-        }
+        self.copy(layout, source, threads, tally)
     }
 
     fn copy(&self, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
-    let host = &self.host;
-    let mut region_of = Vec::new();
-    for (r, region) in layout.regions.iter().enumerate() {
-        region_of.extend(std::iter::repeat_n(r, region.items.len()));
-    }
-    let pending: Vec<AtomicUsize> = layout.regions.iter().map(|r| AtomicUsize::new(r.items.len())).collect();
-    for (r, region) in layout.regions.iter().enumerate() {
-        if region.items.is_empty() {
-            host.set_ready(r as u32, true);
+        let host = &self.host;
+        let mut region_of = Vec::new();
+        for (r, region) in layout.regions.iter().enumerate() {
+            region_of.extend(std::iter::repeat_n(r, region.items.len()));
         }
-    }
-    let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
-    let mut index: HashMap<&str, usize> = HashMap::new();
-    let mut objects: Vec<&ObjectRef> = Vec::new();
-    let owner: Vec<Option<usize>> = items
-        .iter()
-        .map(|it| match &it.source {
-            ItemSource::Object(o) => Some(*index.entry(o.obj.sha256.as_str()).or_insert_with(|| {
-                objects.push(&o.obj);
-                objects.len() - 1
-            })),
-            ItemSource::Inline(_) => None,
-        })
-        .collect();
-    let left: Vec<AtomicUsize> = (0..objects.len()).map(|_| AtomicUsize::new(0)).collect();
-    for o in owner.iter().flatten() {
-        left[*o].fetch_add(1, Ordering::Relaxed);
-    }
-    let resident: Vec<OnceLock<bool>> = (0..objects.len()).map(|_| OnceLock::new()).collect();
-    let next = AtomicUsize::new(0);
-    let failed: Mutex<Option<Error>> = Mutex::new(None);
-    std::thread::scope(|s| {
-        for _ in 0..threads.clamp(1, items.len().max(1)) {
-            s.spawn(|| loop {
-                let k = next.fetch_add(1, Ordering::Relaxed);
-                let Some(it) = items.get(k) else { return };
-                let mode = match owner[k] {
-                    Some(o) if *resident[o].get_or_init(|| source.resident(objects[o], tally).unwrap_or(false)) => Mode::Cached,
-                    Some(_) => Mode::Cache,
-                    None => Mode::Cached,
-                };
-                // SAFETY: each item's range (and its padding) is this thread's alone; the layout
-                // keeps items disjoint inside the live mapping.
-                let dst = unsafe { host.base().add(it.offset as usize) };
-                if let Err(e) = unsafe { source.read_item(it, dst, mode, tally) } {
-                    failed.lock().unwrap().get_or_insert(e);
-                    next.store(items.len(), Ordering::Relaxed);
-                    return;
-                }
-                if let Some(o) = owner[k] {
-                    if left[o].fetch_sub(1, Ordering::AcqRel) == 1 {
-                        source.close_object(&objects[o].sha256);
+        let pending: Vec<AtomicUsize> = layout.regions.iter().map(|r| AtomicUsize::new(r.items.len())).collect();
+        for (r, region) in layout.regions.iter().enumerate() {
+            if region.items.is_empty() {
+                host.set_ready(r as u32, true);
+            }
+        }
+        let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
+        let mut index: HashMap<&str, usize> = HashMap::new();
+        let mut objects: Vec<&ObjectRef> = Vec::new();
+        let owner: Vec<Option<usize>> = items
+            .iter()
+            .map(|it| match &it.source {
+                ItemSource::Object(o) => Some(*index.entry(o.obj.sha256.as_str()).or_insert_with(|| {
+                    objects.push(&o.obj);
+                    objects.len() - 1
+                })),
+                ItemSource::Inline(_) => None,
+            })
+            .collect();
+        let left: Vec<AtomicUsize> = (0..objects.len()).map(|_| AtomicUsize::new(0)).collect();
+        for o in owner.iter().flatten() {
+            left[*o].fetch_add(1, Ordering::Relaxed);
+        }
+        let resident: Vec<OnceLock<bool>> = (0..objects.len()).map(|_| OnceLock::new()).collect();
+        let next = AtomicUsize::new(0);
+        let failed: Mutex<Option<Error>> = Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..threads.clamp(1, items.len().max(1)) {
+                s.spawn(|| loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(it) = items.get(k) else { return };
+                    let mode = match owner[k] {
+                        Some(o) if *resident[o].get_or_init(|| source.resident(objects[o], tally).unwrap_or(false)) => Mode::Cached,
+                        Some(_) => Mode::Cache,
+                        None => Mode::Cached,
+                    };
+                    // SAFETY: each item's range (and its padding) is this thread's alone; the layout
+                    // keeps items disjoint inside the live mapping.
+                    let dst = unsafe { host.base().add(it.offset as usize) };
+                    if let Err(e) = unsafe { source.read_item(it, dst, mode, tally) } {
+                        failed.lock().unwrap().get_or_insert(e);
+                        next.store(items.len(), Ordering::Relaxed);
+                        return;
                     }
-                }
-                // The region's last item: its bytes are all in, so adopters may use it.
-                let r = region_of[k];
-                if pending[r].fetch_sub(1, Ordering::AcqRel) == 1 {
-                    host.set_ready(r as u32, true);
-                }
-            });
+                    if let Some(o) = owner[k] {
+                        if left[o].fetch_sub(1, Ordering::AcqRel) == 1 {
+                            source.close_object(&objects[o].sha256);
+                        }
+                    }
+                    // The region's last item: its bytes are all in, so adopters may use it.
+                    let r = region_of[k];
+                    if pending[r].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        host.set_ready(r as u32, true);
+                    }
+                });
+            }
+        });
+        match failed.into_inner().unwrap() {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-    });
-    match failed.into_inner().unwrap() {
-        Some(e) => Err(e),
-        None => Ok(()),
     }
+}
+
+impl Drop for OpenFill {
+    /// What the filler leaves unfinished (an error, a panic, a filler that never ran) is marked
+    /// failed: no adopter waits forever for it or reads it.
+    fn drop(&mut self) {
+        for r in 0..self.host.regions as u32 {
+            if !self.host.ready(r) {
+                self.host.word(r).fetch_or(FAILED, Ordering::Release);
+            }
+        }
     }
 }
