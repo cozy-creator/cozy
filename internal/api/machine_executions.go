@@ -223,8 +223,11 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		machine = link.MachineID
 	}
 	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected, AbandonedLocally: link.Abandoned}
+	v1run, _ := s.store.RunV1(row.ID)
 	var receipt pb.MachineExecutionReceipt
-	if proto.Unmarshal(link.Receipt, &receipt) == nil {
+	if accepted := records.RunV1State(link); v1run && accepted != nil {
+		view.Worker, view.Number = link.MachineID, accepted.Number
+	} else if !v1run && proto.Unmarshal(link.Receipt, &receipt) == nil {
 		view.Worker, view.Number = receipt.WorkerId, receipt.Number
 	}
 	retaining, retentionProblem := s.store.MachineExecutionOwesWork(row.ID)
@@ -309,7 +312,15 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		}
 	}
 	var terminal *pb.AttemptOutcomeBody
-	if len(link.Outcome) > 0 {
+	if outcome := records.RunV1Outcome(link); v1run && outcome != nil {
+		// A cozy.machine.v1 run's outcome carries its result and typed reason.
+		if state.ErrorType == "" && outcome.Status != "succeeded" && outcome.Reason != nil {
+			state.ErrorType, state.Error = outcome.Reason.Code, outcome.Reason.Message
+		}
+		if view.Collected && len(outcome.Result) > 0 {
+			state.Result = json.RawMessage(outcome.Result)
+		}
+	} else if len(link.Outcome) > 0 && !v1run {
 		var outcome pb.AttemptOutcome
 		var body pb.AttemptOutcomeBody
 		if proto.Unmarshal(link.Outcome, &outcome) == nil && canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body) == nil {
@@ -350,7 +361,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 				intervals = append(intervals, records.MachineExecutionInterval{Attempt: current, FinishedAt: s.store.StoppedEventAt(row)})
 			}
 		}
-		state.AttemptWallMS = machineAttemptWallMS(row, link, intervals, terminal, time.Now().UnixMilli())
+		if !v1run {
+			state.AttemptWallMS = machineAttemptWallMS(row, link, intervals, terminal, time.Now().UnixMilli())
+		}
 	}
 	if measured, known, problem := s.store.MachineRunExecutionMS(row.ID, max(row.Ordinal, 1), state.Status == "in_progress"); problem != nil {
 		view.ObservationError = problem.Message

@@ -133,7 +133,7 @@ func (f *Fold) Add(sequence uint64, product *pb.RunProduct) (Item, bool, error) 
 	item, known := f.items[k]
 	if !known {
 		item = &Item{OutputIndex: len(f.order), Output: product.Output, Index: k.index, List: list,
-			Type: typeOf(product.MediaType)}
+			Type: TypeOf(product.MediaType)}
 		item.ID = f.run + "/" + product.Output
 		if list {
 			item.ID = fmt.Sprintf("%s/%d", item.ID, k.index)
@@ -202,8 +202,8 @@ func revisionOf(sequence uint64, product *pb.RunProduct) (Revision, error) {
 	return revision, nil
 }
 
-// typeOf is an item's Responses-style type, from its media type.
-func typeOf(mediaType string) string {
+// TypeOf is an item's Responses-style type, from its media type.
+func TypeOf(mediaType string) string {
 	switch {
 	case mediaType == resultfiles.TreeMediaType:
 		return "tree"

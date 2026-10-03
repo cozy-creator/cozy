@@ -16,7 +16,11 @@ import (
 type V1 struct {
 	*machinev1.Client
 	Name, WorkerID, BootID string
-	release                func()
+	// Leaf is the machine's pinned TLS leaf (DER): a Hub binds the execution access it grants
+	// to it. Local is this computer's machine, which reads a loopback Hub there.
+	Leaf    []byte
+	Local   bool
+	release func()
 }
 
 func (v *V1) Close() {
@@ -65,7 +69,7 @@ func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.
 		}
 		return nil, Transport(err)
 	}
-	return &V1{Client: client, Name: name, WorkerID: t.workerID, BootID: t.bootID, release: machine.release}, nil
+	return &V1{Client: client, Name: name, WorkerID: t.workerID, BootID: t.bootID, Leaf: t.pin.DER(), Local: t.lifetime != "", release: machine.release}, nil
 }
 
 // ReadStatus observes this computer's running machine over cozy.machine.v1 without starting
