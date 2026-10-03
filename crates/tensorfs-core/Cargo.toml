@@ -6,19 +6,26 @@ edition.workspace = true
 [[bin]]
 name = "tfs"
 path = "src/bin/tfs/main.rs"
+required-features = ["store"]
+
+[features]
+# The store, downloader, ingest, GC and everything that opens one. Without it: documents,
+# headers, read plans and the fit function only (what a plane-only executor links).
+default = ["store"]
+store = ["dep:fs2", "dep:rusqlite", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:nix"]
 
 [dependencies]
-fs2 = "0.4"
+fs2 = { version = "0.4", optional = true }
 minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-rustix = { version = "1.1.4", default-features = false, features = ["fs", "std", "net", "event", "process"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "std", "net", "event", "process"], optional = true }
 # tfs-049: the ONE transport (src/transport/). rustls is the one TLS stack, used only
 # there; scripts/fence.py refuses it anywhere else so a second mover cannot grow.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["fs", "user"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "user"], optional = true }
 
 [dev-dependencies]
 libc = "0.2"

@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tensorfs_core::canon::Value;
 use tensorfs_core::capability::CapabilityRecords;
+#[cfg(feature = "store")]
 use tensorfs_core::corpus;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::fit::{Custody, TensorRequirements};
@@ -276,6 +277,7 @@ pub fn parse_manifest<'p>(py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyA
     marshal(py, &m.to_value())
 }
 
+#[cfg(feature = "store")]
 #[pyfunction]
 #[pyo3(signature = (doc, data, closure=None, platform=None))]
 pub fn run_doc<'p>(
@@ -296,6 +298,7 @@ pub fn run_doc<'p>(
     Ok(result)
 }
 
+#[cfg(feature = "store")]
 #[pyfunction]
 pub fn receipt_binds(
     py: Python<'_>,
@@ -308,6 +311,7 @@ pub fn receipt_binds(
     corpus::receipt_binds(receipt, subject, manifest, header, stamp).or_refuse(py)
 }
 
+#[cfg(feature = "store")]
 #[pyfunction]
 pub fn doc_kinds() -> Vec<String> {
     corpus::DOC_KINDS
@@ -361,6 +365,7 @@ pub fn manifest_max_bytes() -> usize {
     Manifest::MAX_BYTES
 }
 
+#[cfg(feature = "store")]
 /// Bytes -> the pretty PROJECTION of a canonical document. Projection-only by construction:
 /// what comes back is a string, and no reader in this system accepts it.
 #[pyfunction]

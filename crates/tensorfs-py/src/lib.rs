@@ -9,10 +9,14 @@
 //! `torch.frombuffer` itself. The dtype table crosses exactly once, from `dtypes()`.
 
 mod docs;
+#[cfg(feature = "store")]
 mod ensure;
 mod errors;
+#[cfg(feature = "store")]
 mod ingest;
 mod plane;
+mod readplan;
+#[cfg(feature = "store")]
 mod store;
 
 use pyo3::prelude::*;
@@ -57,6 +61,7 @@ fn py_platform_gate(py: Python<'_>, platform: &str) -> PyResult<()> {
 }
 
 /// Process-wide verify-once counters (proto-061); diff two snapshots around the work.
+#[cfg(feature = "store")]
 #[pyfunction]
 fn stats(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     let now = tensorfs_core::stats::snapshot();
@@ -75,6 +80,7 @@ fn stats(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     Ok(result)
 }
 
+#[cfg(feature = "store")]
 #[pyfunction(name = "home", signature = (root = None))]
 fn py_home(py: Python<'_>, root: Option<std::path::PathBuf>) -> PyResult<String> {
     tensorfs_core::home::resolve(root.as_deref())
@@ -100,33 +106,46 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     platform_gate(&plat).map_err(|e| errors::to_py(py, &e))?;
 
     m.add("__version__", python_distribution_version())?;
+    // A plane-only build (no `store` feature) carries documents, headers, read plans, the fit
+    // function and the weight plane: it cannot open, read or write a store.
+    m.add("STORE", cfg!(feature = "store"))?;
     m.add_function(wrap_pyfunction!(py_platform_gate, m)?)?;
-    m.add_function(wrap_pyfunction!(py_home, m)?)?;
-    m.add_function(wrap_pyfunction!(stats, m)?)?;
 
     m.add_function(wrap_pyfunction!(docs::object_id, m)?)?;
     m.add_function(wrap_pyfunction!(docs::parse_header, m)?)?;
     m.add_function(wrap_pyfunction!(docs::parse_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(docs::py_fit, m)?)?;
     m.add_function(wrap_pyfunction!(docs::capability, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::run_doc, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::receipt_binds, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::doc_kinds, m)?)?;
     m.add_function(wrap_pyfunction!(docs::platform_digests, m)?)?;
     m.add_function(wrap_pyfunction!(docs::seed_digests, m)?)?;
     m.add_function(wrap_pyfunction!(docs::dtypes, m)?)?;
     m.add_function(wrap_pyfunction!(docs::manifest_max_bytes, m)?)?;
-    m.add_function(wrap_pyfunction!(docs::render, m)?)?;
     m.add_function(wrap_pyfunction!(docs::recanonicalize, m)?)?;
     m.add_class::<docs::PyClosure>()?;
+    m.add("CAPABILITIES", tensorfs_core::CAPABILITIES.to_vec())?;
+    m.add_function(wrap_pyfunction!(readplan::plan, m)?)?;
+    m.add_class::<readplan::PyPlan>()?;
+    #[cfg(feature = "store")]
+    store_api(m)?;
+    plane::install(m)?;
+    Ok(())
+}
 
+/// The store, downloader, ingest and GC bindings.
+#[cfg(feature = "store")]
+fn store_api(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(py_home, m)?)?;
+    m.add_function(wrap_pyfunction!(stats, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::run_doc, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::receipt_binds, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::doc_kinds, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::render, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::read_source_heads, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::select_source_profile, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::source_profile_converters, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::prepare_selected_source, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::record_model_source_custody, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::model_source_objects, m)?)?;
-    m.add_function(wrap_pyfunction!(store::plan, m)?)?;
     m.add_function(wrap_pyfunction!(store::gc, m)?)?;
     m.add_function(wrap_pyfunction!(store::transfer_object, m)?)?;
     m.add_function(wrap_pyfunction!(store::transfer_manifest, m)?)?;
@@ -138,7 +157,6 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(store::pull, m)?)?;
     m.add_function(wrap_pyfunction!(ensure::ensure, m)?)?;
     m.add_function(wrap_pyfunction!(ensure::relieve, m)?)?;
-    m.add("CAPABILITIES", tensorfs_core::CAPABILITIES.to_vec())?;
     m.add_function(wrap_pyfunction!(store::transfer_streams, m)?)?;
     m.add("STREAM_MEMORY", tensorfs_core::transport::STREAM_MEMORY)?;
     m.add("AS_IS_PROFILE", tensorfs_core::ingest::source::AS_IS)?;
@@ -147,8 +165,6 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::PyOperation>()?;
     m.add_class::<store::PyDerivedWriter>()?;
     m.add_class::<store::PyLease>()?;
-    m.add_class::<store::PyPlan>()?;
     m.add_class::<store::PyBatch>()?;
-    plane::install(m)?;
     Ok(())
 }

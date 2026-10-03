@@ -809,6 +809,8 @@ def pull(
 
 #: Feature names a caller may detect instead of versions ("ensure/1", ...).
 CAPABILITIES: list[str]
+#: The store, downloader, ingest and GC bindings are present (False: a plane-only build).
+STORE: bool
 
 def ensure(
     store: Store,
