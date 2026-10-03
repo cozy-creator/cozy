@@ -11,9 +11,9 @@ use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use tensorfs_core::meta::Meta;
-use tensorfs_core::read::{ReadLease, ReadPlan};
-use tensorfs_core::store::Store;
+#[cfg(feature = "store")]
+use tensorfs_core::{meta::Meta, read::ReadLease, store::Store};
+use tensorfs_core::read::ReadPlan;
 
 use crate::cuda::{self, AllocationProp, CUcontext, CUdevice, CUstream, CtxGuard};
 use crate::cursor::Cur;
@@ -274,6 +274,7 @@ impl DeviceRt {
 }
 
 pub(crate) struct Inner {
+    #[cfg_attr(not(feature = "store"), allow(dead_code))]
     pub cfg: PlaneConfig,
     pub devices: Vec<DeviceRt>,
     pub readers: Arc<Readers>,
@@ -1107,6 +1108,7 @@ impl Plane {
     /// Wrap a TensorFS read lease as a byte source. The source owns the lease (its GC hold and
     /// verified door) and ends it when the last weight set and handle using it are gone, so
     /// one lease serves every component of a manifest.
+    #[cfg(feature = "store")]
     pub fn source(&self, store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease) -> Arc<Source> {
         Arc::new(Source::new(store, meta, lease, self.inner.cfg.direct_io, Arc::as_ptr(&self.inner) as usize))
     }

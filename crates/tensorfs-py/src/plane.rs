@@ -13,6 +13,7 @@ use pyo3::exceptions::{PyBufferError, PyException};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3::{create_exception, ffi};
+#[cfg(feature = "store")]
 use tensorfs_plane::io::Source;
 use tensorfs_plane::layout::Layout;
 use tensorfs_plane::plane::{Event, LeaseView, Stats};
@@ -21,7 +22,9 @@ use tensorfs_plane::{
 };
 
 use crate::errors::to_py;
-use crate::store::{PyLease, PyPlan, PyStore};
+use crate::readplan::PyPlan;
+#[cfg(feature = "store")]
+use crate::store::{PyLease, PyStore};
 
 create_exception!(tensorfs.plane, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
 create_exception!(tensorfs.plane, BudgetExceeded, PlaneError);
@@ -228,11 +231,13 @@ impl PyPlane {
 
     /// Wrap a TensorFS lease (CONSUMED) as a byte source for a manifest's weight sets. The
     /// lease ends when the last weight set using it closes and the source is dropped.
+    #[cfg(feature = "store")]
     fn source(&self, py: Python<'_>, store: PyRef<'_, PyStore>, lease: PyRef<'_, PyLease>) -> PyResult<PySource> {
         let lease = lease.take_for_plane(py)?;
         Ok(PySource { source: self.plane.source(store.store.clone(), store.meta.clone(), lease) })
     }
 
+    #[cfg(feature = "store")]
     #[pyo3(signature = (name, source, plan, regions, host_fd = None))]
     fn register(
         &self,
@@ -527,6 +532,7 @@ impl PyWeightSet {
 }
 
 /// A manifest's byte source: one TensorFS lease shared by its weight sets.
+#[cfg(feature = "store")]
 #[pyclass(name = "Source", module = "tensorfs.plane", frozen)]
 pub struct PySource {
     source: Arc<Source>,
@@ -841,6 +847,7 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
 /// Fill a weight set's layout once through the verified read path and seal it (the machine's
 /// half of a sealed layout; `Plane.register_sealed` adopts it). CONSUMES `lease`. Returns the
 /// sealed memfd (the caller's) and each read mode's bytes.
+#[cfg(feature = "store")]
 #[pyfunction]
 #[pyo3(signature = (store, lease, plan, regions, name, threads = 8, reserved = None))]
 #[allow(clippy::too_many_arguments)]
@@ -888,6 +895,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "plane")?;
     m.add_class::<PyPlane>()?;
+    #[cfg(feature = "store")]
     m.add_class::<PySource>()?;
     m.add_class::<PyWeightSet>()?;
     m.add_class::<PyTicket>()?;
@@ -896,6 +904,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDeviceView>()?;
     m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
+    #[cfg(feature = "store")]
     m.add_function(wrap_pyfunction!(fill_sealed, &m)?)?;
     m.add_function(wrap_pyfunction!(reserve, &m)?)?;
     // `register_sealed` adopts a layout its machine is still filling (waits per region).

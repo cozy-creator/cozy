@@ -3,6 +3,9 @@
 Typed in `plane.pyi`. The plane moves bytes; cozy-runtime decides.
 """
 
+from typing import TYPE_CHECKING
+
+from ._ext import STORE as _STORE
 from ._ext.plane import (
     SEALED_WHILE_FILLING,
     BelowFloor,
@@ -20,14 +23,16 @@ from ._ext.plane import (
     PlaneError,
     Poisoned,
     Shortfall,
-    Source,
     Ticket,
     WeightSet,
-    fill_sealed,
     hold_tier,
     release_tier,
     reserve,
 )
+
+# Store-backed sources and the machine's fill exist only in the full build.
+if TYPE_CHECKING or _STORE:
+    from ._ext.plane import Source, fill_sealed
 
 __all__ = [
     "SEALED_WHILE_FILLING",
@@ -46,11 +51,11 @@ __all__ = [
     "PlaneError",
     "Poisoned",
     "Shortfall",
-    "Source",
     "Ticket",
     "WeightSet",
-    "fill_sealed",
     "hold_tier",
     "release_tier",
     "reserve",
 ]
+if _STORE:
+    __all__ += ["Source", "fill_sealed"]

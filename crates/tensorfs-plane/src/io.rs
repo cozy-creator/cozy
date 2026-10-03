@@ -4,22 +4,20 @@
 //! into the destination (no second host copy), else through `tensorfs_core::read::read_into`.
 //! Each mode's bytes are counted.
 
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::meta::Meta;
-use tensorfs_core::read::{self, ReadLease};
-use tensorfs_core::store::Store;
 
-use crate::layout::{Item, ItemSource, PART_ALIGN};
+use crate::layout::Item;
 use crate::{Error, Result};
+
+#[cfg(feature = "store")]
+pub use store::Source;
+#[cfg(not(feature = "store"))]
+pub use plane_only::Source;
 
 #[derive(Debug, Default)]
 pub struct IoTally {
@@ -40,6 +38,22 @@ pub enum Mode {
     Buffered,
     Cached,
 }
+
+/// A store-backed source: the lease, the store and its verified descriptors.
+#[cfg(feature = "store")]
+mod store {
+use super::*;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::sync::RwLock;
+
+use tensorfs_core::meta::Meta;
+use tensorfs_core::read::{self, ReadLease};
+use tensorfs_core::store::Store;
+
+use crate::layout::{ItemSource, PART_ALIGN};
 
 struct Fds {
     buffered: File,
@@ -273,6 +287,41 @@ impl Drop for Source {
             eprintln!("tensorfs-plane: read lease release failed: {e}");
         }
     }
+}
+
+}
+
+/// A plane-only build reads no store: its only weight sets are sealed layouts, whose bytes
+/// the machine filled.
+#[cfg(not(feature = "store"))]
+mod plane_only {
+use super::*;
+
+pub struct Source {
+    plane: usize,
+}
+
+impl Source {
+    pub(crate) fn sealed(plane: usize) -> Source {
+        Source { plane }
+    }
+
+    pub fn close_object(&self, _sha256: &str) {}
+
+    pub fn resident(&self, _obj: &ObjectRef, _tally: &IoTally) -> Result<bool> {
+        Err(Error::Closed)
+    }
+
+    pub(crate) fn made_by(&self, plane: usize) -> bool {
+        self.plane == plane
+    }
+
+    /// # Safety
+    /// None needed: it reads nothing (there is no store in this build).
+    pub unsafe fn read_item(&self, _item: &Item, _dst: *mut u8, _mode: Mode, _tally: &IoTally) -> Result<()> {
+        Err(Error::Invalid("a plane-only build reads no store".into()))
+    }
+}
 }
 
 type Job = Box<dyn FnOnce() + Send>;

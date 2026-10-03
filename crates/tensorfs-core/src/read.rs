@@ -17,19 +17,20 @@
 //! benchmark-gated upgrades behind this unchanged API, and none of them appears in any
 //! contract — tfs-018's banked baselines are the bar they would have to miss.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
 
-use crate::checkpoint;
-use crate::err::{refuse, Code, Refusal, Result};
-use crate::header::{Asset, Body, Header, Located, Part, Tensor};
+#[cfg(feature = "store")]
+use crate::err::Refusal;
+use crate::err::{refuse, Code, Result};
+use crate::header::{Body, Header, Tensor};
 use crate::ids::ObjectRef;
-use crate::manifest::Manifest;
-use crate::meta::{Hold, Meta};
-use crate::receipt::{Receipt, Receipts};
-use crate::store::{Store, VerifiedFile};
+
+// The lease, the byte door and the reader pool need a store; planning does not (a plane-only
+// build plans and adopts layouts its machine filled).
+#[cfg(feature = "store")]
+pub use lease::*;
+#[cfg(feature = "store")]
+pub use pool::*;
 
 /// A byte range inside ONE identified object. The identity is part of the range: there is no
 /// such thing here as "an offset in a file".
@@ -41,6 +42,7 @@ pub struct ObjectRange {
 }
 
 impl ObjectRange {
+    #[cfg(feature = "store")]
     fn check(&self) -> Result<()> {
         let end = self.off.checked_add(self.len).ok_or(Refusal {
             code: Code::RANGE_BOUNDS,
@@ -60,6 +62,16 @@ impl ObjectRange {
         Ok(())
     }
 }
+
+#[cfg(feature = "store")]
+mod lease {
+use super::*;
+use crate::checkpoint;
+use crate::header::{Asset, Located, Part};
+use crate::manifest::Manifest;
+use crate::meta::{Hold, Meta};
+use crate::receipt::{Receipt, Receipts};
+use crate::store::{Store, VerifiedFile};
 
 // ---------------------------------------------------------------- the lease
 
@@ -460,6 +472,8 @@ pub fn read_part_into(
     }
 }
 
+}
+
 // ---------------------------------------------------------------- the read plan
 
 /// Where one plan item's bytes come from. An inline part is a first-class item, not a
@@ -746,6 +760,14 @@ pub fn plan_for_traversal(
     }
     build(&ordered, window)
 }
+
+#[cfg(feature = "store")]
+mod pool {
+use super::*;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 // ---------------------------------------------------------------- the reader pool
 
@@ -1163,4 +1185,5 @@ where
         workers,
         elapsed_ms: t0.elapsed().as_millis(),
     })
+}
 }
