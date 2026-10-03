@@ -93,12 +93,11 @@ func handleMachineShow(ctx *Context) *exit.Error {
 	} else if status.Running {
 		readCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		live, problem := host.ReadSoftware(readCtx)
+		live, problem := host.ReadStatus(readCtx)
 		if problem != nil {
-			notes = append(notes, "live software could not be observed: "+problem.Message)
+			notes = append(notes, "live status could not be observed: "+problem.Message)
 		} else if live != nil {
-			fields = append(fields, output.Field{K: "runtime", V: live.Runtime}, output.Field{K: "tensorfs", V: live.TensorFS},
-				output.Field{K: "agent", V: live.Agent}, output.Field{K: "bootstrap", V: live.Bootstrap}, output.Field{K: "phase", V: live.Phase})
+			fields = append(fields, machineStatusFields(statusOf(live), !ctx.Mode().Human || ctx.Mode().JSON)...)
 		}
 	}
 	return emit(ctx, output.Record{Fields: fields, Notes: notes})

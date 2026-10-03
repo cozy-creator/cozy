@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -55,33 +53,6 @@ func attachedRental(t *testing.T, pod *fakePod) (string, *fakeRentalHub) {
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	startDaemonProcess(t, root)
 	return root, stand
-}
-
-// `cozy rental show` names the agent, Runtime and TensorFS the machine says it runs. A Host
-// that predates DescribeMachine still shows its rental, with a note instead of versions.
-func TestRentalShowNamesTheMachinesSoftware(t *testing.T) {
-	var describes atomic.Int32
-	pod := &fakePod{describe: func(*pb.DescribeMachineQuery) (*pb.MachineDescription, error) {
-		if describes.Add(1) > 2 {
-			return nil, status.Error(codes.Unimplemented, "an older Host")
-		}
-		return &pb.MachineDescription{Host: &pb.MachineHost{Version: "0.1.9"},
-			Runtime: &pb.MachineRuntime{Version: "0.18.99", TensorfsVersion: "0.3.81"}}, nil
-	}}
-	root, _ := attachedRental(t, pod)
-	code, out := runCozy(t, root, "rental", "show", "attached", "--json")
-	var shown map[string]any
-	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["runtime_version"] != "0.18.99" ||
-		shown["tensorfs_version"] != "0.3.81" || shown["agent_version"] != "0.1.9" {
-		t.Fatalf("rental show did not name the machine's software [exit %d]:\n%s", code, out)
-	}
-	if code, out = runCozy(t, root, "rental", "show", "attached"); code != 0 || !strings.Contains(out, "0.3.81") || !strings.Contains(out, "0.18.99") {
-		t.Fatalf("the human rental show hides the versions [exit %d]:\n%s", code, out)
-	}
-	if code, out = runCozy(t, root, "rental", "show", "attached", "--json"); code != 0 || strings.Contains(out, "runtime_version") ||
-		!strings.Contains(out, "software versions unavailable") {
-		t.Fatalf("an older Host must leave a note, not fail the show [exit %d]:\n%s", code, out)
-	}
 }
 
 // `cozy model download --rental --await` waits for the machine's verified receipt, saying

@@ -1,9 +1,6 @@
 package rental
 
 import (
-	"crypto/ed25519"
-	"encoding/base64"
-
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -46,13 +43,6 @@ func ClaimProof(l home.Layout) orchestrator.RentalClaimProofSource {
 func Signer(l home.Layout) orchestrator.RentalSignerSource {
 	return func(rentalID string) (machinev1.Signer, *exit.Error) {
 		identity, problem := CreatorIdentityFor(l, rentalID)
-		if problem != nil {
-			return machinev1.Signer{}, problem
-		}
-		public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
-		if err != nil || len(public) != ed25519.PublicKeySize {
-			return machinev1.Signer{}, exit.New(exit.Credential, "the rental's Creator key is unreadable")
-		}
-		return machinev1.Signer{Public: public, Sign: identity.Sign}, nil
+		return identity.Signer(), problem
 	}
 }

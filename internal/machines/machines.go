@@ -172,7 +172,6 @@ func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string, name
 
 func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
 	machine := &Machine{Name: name}
-	var t target
 	if machineendpoint.IsName(name) {
 		if r.Endpoint == nil {
 			return nil, exit.Named(exit.Unavailable, "machine.endpoint_unavailable", "this controller cannot resolve the explicit endpoint")
@@ -186,57 +185,9 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 		}
 		return r.dialEndpointAt(ctx, *ep, origin)
 	}
-	if IsLocal(name) {
-		accountOrigin := cmp.Or(origin, r.HubOrigin)
-		var client *hub.Client
-		if r.Hub != nil {
-			client = r.Hub(accountOrigin)
-		}
-		launch, problem := r.Host.Ensure(ctx, origin, client, named)
-		if problem != nil {
-			return nil, problem
-		}
-		pin, problem := r.Host.Pin()
-		if problem != nil {
-			return nil, problem
-		}
-		key, problem := r.Host.Owner()
-		if problem != nil {
-			return nil, problem
-		}
-		machine.hub, machine.owned, machine.Hub = client, true, launch.Reads
-		t = target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
-			lifetime: fmt.Sprint(launch.PID)}
-	} else {
-		release, problem := r.UseRental(name, holder)
-		if problem != nil {
-			return nil, problem
-		}
-		machine.release = release
-		remote, problem := r.Rentals(name)
-		if problem == nil && (remote == nil || remote.Connection == nil) {
-			problem = exit.New(exit.Conflict, "rental %s has no dial identity", name)
-		}
-		if problem != nil {
-			release()
-			return nil, problem
-		}
-		identity := remote.Connection
-		pin, err := workertls.LoadPin(identity.CACert)
-		if err != nil {
-			release()
-			return nil, exit.New(exit.Credential, "machine TLS identity cannot be read")
-		}
-		key, problem := r.RentalKey(identity.RentalID)
-		if problem != nil {
-			release()
-			return nil, problem
-		}
-		machine.hubID = identity.RentalID
-		if r.RentalHub != nil {
-			machine.hub = r.RentalHub(identity.RentalID)
-		}
-		t = target{name: name, addr: identity.Addr, workerID: identity.WorkerID, bootID: identity.WorkerBootID, pin: pin, key: key}
+	t, problem := r.resolve(ctx, name, origin, holder, named, machine)
+	if problem != nil {
+		return nil, problem
 	}
 	lifetime := name + "\x00" + t.bootID + "\x00" + t.lifetime
 	identity := lifetime + "\x00" + t.addr + "\x00" + t.workerID + "\x00" + string(t.pin.Digest())
@@ -302,6 +253,62 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 		}
 	}
 	return machine, nil
+}
+
+// resolve names a machine's dial identity: this computer's (started if needed), or a
+// rental's (held for holder until machine.release). The endpoint form is resolved apart.
+func (r *Resolver) resolve(ctx context.Context, name, origin, holder string, named bool, machine *Machine) (target, *exit.Error) {
+	if IsLocal(name) {
+		accountOrigin := cmp.Or(origin, r.HubOrigin)
+		var client *hub.Client
+		if r.Hub != nil {
+			client = r.Hub(accountOrigin)
+		}
+		launch, problem := r.Host.Ensure(ctx, origin, client, named)
+		if problem != nil {
+			return target{}, problem
+		}
+		pin, problem := r.Host.Pin()
+		if problem != nil {
+			return target{}, problem
+		}
+		key, problem := r.Host.Owner()
+		if problem != nil {
+			return target{}, problem
+		}
+		machine.hub, machine.owned, machine.Hub = client, true, launch.Reads
+		return target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
+			lifetime: fmt.Sprint(launch.PID)}, nil
+	}
+	release, problem := r.UseRental(name, holder)
+	if problem != nil {
+		return target{}, problem
+	}
+	machine.release = release
+	remote, problem := r.Rentals(name)
+	if problem == nil && (remote == nil || remote.Connection == nil) {
+		problem = exit.New(exit.Conflict, "rental %s has no dial identity", name)
+	}
+	if problem != nil {
+		release()
+		return target{}, problem
+	}
+	identity := remote.Connection
+	pin, err := workertls.LoadPin(identity.CACert)
+	if err != nil {
+		release()
+		return target{}, exit.New(exit.Credential, "machine TLS identity cannot be read")
+	}
+	key, problem := r.RentalKey(identity.RentalID)
+	if problem != nil {
+		release()
+		return target{}, problem
+	}
+	machine.hubID = identity.RentalID
+	if r.RentalHub != nil {
+		machine.hub = r.RentalHub(identity.RentalID)
+	}
+	return target{name: name, addr: identity.Addr, workerID: identity.WorkerID, bootID: identity.WorkerBootID, pin: pin, key: key}, nil
 }
 
 func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.Error {

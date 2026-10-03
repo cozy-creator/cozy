@@ -1098,8 +1098,8 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		}
 		record := output.Record{Fields: pick(fields), AllFields: pick(all), Next: []string{"cozy rental list"}}
 		if list.TypedRows[i]["state"] == "ready" {
-			software, notes := rentalSoftware(client, row["rental"], !ctx.Mode().Human || ctx.Mode().JSON)
-			record.Fields, record.AllFields, record.Notes = append(record.Fields, software...), append(record.AllFields, software...), notes
+			status, notes := rentalStatus(client, row["rental"], !ctx.Mode().Human || ctx.Mode().JSON)
+			record.Fields, record.AllFields, record.Notes = append(record.Fields, status...), append(record.AllFields, status...), notes
 		}
 		return emit(ctx, record)
 	}
@@ -1107,30 +1107,46 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		WithNext("cozy rental list --all-hubs")
 }
 
-// rentalSoftware is what a ready rental says it runs. An older machine answers what it can;
-// one that cannot answer leaves a note, never a failed show.
-func rentalSoftware(client *localapi.Client, rentalID string, typed bool) ([]output.Field, []string) {
-	software, problem := client.MachineSoftware(rentalID)
+// rentalStatus is what a ready rental's machine reports of itself. One that cannot answer
+// leaves a note, never a failed show.
+func rentalStatus(client *localapi.Client, rentalID string, typed bool) ([]output.Field, []string) {
+	status, problem := client.MachineStatus(rentalID)
 	if problem != nil {
-		return nil, []string{"software versions unavailable: " + problem.Message}
+		return nil, []string{"machine status unavailable: " + problem.Message}
 	}
-	var notes []string
-	if software.RuntimeAbsent != "" {
-		notes = append(notes, "Runtime not reported: "+software.RuntimeAbsent)
-	}
-	names := [][2]string{{"runtime", "runtime_version"}, {"tensorfs", "tensorfs_version"}, {"agent", "agent_version"}}
-	var fields []output.Field
-	for i, value := range []string{software.Runtime, software.TensorFS, software.Agent} {
-		if value == "" {
-			continue
-		}
-		name := names[i][0]
+	return machineStatusFields(status, typed), nil
+}
+
+// machineStatusFields names a machine's software, phase, GPUs, live runs and free disk.
+func machineStatusFields(status api.MachineStatus, typed bool) []output.Field {
+	name := func(human, json string) string {
 		if typed {
-			name = names[i][1]
+			return json
 		}
-		fields = append(fields, output.Field{K: name, V: value})
+		return human
 	}
-	return fields, notes
+	fields := []output.Field{{K: name("agent", "agent_version"), V: status.Agent}, {K: "phase", V: status.Phase}}
+	for _, software := range [][3]string{{"runtime", "runtime_version", status.Runtime}, {"tensorfs", "tensorfs_version", status.TensorFS}} {
+		if software[2] != "" {
+			fields = append(fields, output.Field{K: name(software[0], software[1]), V: software[2]})
+		}
+	}
+	if typed {
+		return append(fields, output.Field{K: "gpus", V: status.GPUs}, output.Field{K: "live_runs", V: status.Runs},
+			output.Field{K: "disk_free_bytes", V: status.DiskFreeBytes})
+	}
+	gpus := make([]string, 0, len(status.GPUs))
+	for _, gpu := range status.GPUs {
+		gpus = append(gpus, fmt.Sprintf("%d: %s", gpu.Index, gpu.Name))
+	}
+	if len(gpus) > 0 {
+		fields = append(fields, output.Field{K: "devices", V: strings.Join(gpus, ", ")})
+	}
+	fields = append(fields, output.Field{K: "live runs", V: len(status.Runs)})
+	if status.DiskTotalBytes > 0 {
+		fields = append(fields, output.Field{K: "disk free", V: fmt.Sprintf("%.1f of %.1f GiB", float64(status.DiskFreeBytes)/(1<<30), float64(status.DiskTotalBytes)/(1<<30))})
+	}
+	return fields
 }
 
 // renderRentalList formats the daemon's public read model; it never opens SQLite.

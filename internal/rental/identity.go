@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"os"
 	"runtime"
 
@@ -28,6 +29,11 @@ func (i CreatorIdentity) PublicKey() string {
 
 func (i CreatorIdentity) Sign(message []byte) []byte {
 	return ed25519.Sign(i.private, message)
+}
+
+// Signer is this identity as the signer of a machine's Cozy-Caps.
+func (i CreatorIdentity) Signer() machinev1.Signer {
+	return machinev1.Signer{Public: i.public, Sign: i.Sign}
 }
 
 func CreatorIdentityFor(l home.Layout, rentalID string) (CreatorIdentity, *exit.Error) {

@@ -8,6 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,10 +24,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
-// Ordinary CLI -> actual daemon/records -> the rental's machine over cozy.machine.v1. Only an
-// explicit keepalive moves the machine's deadline and the local clock: listing and a daemon
-// restart never do, and an ending rental is not kept alive.
-func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
+// statusRental gives a fresh root a ready rental named "tessa" whose machine is the real one
+// (-machine-host) behind a stand-in Hub, and a running daemon.
+func statusRental(t *testing.T) (string, *records.Store, *machines.Launch, rental.CreatorIdentity, *daemonProcess) {
+	t.Helper()
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: a machine serving cozy.machine.v1")
 	}
@@ -47,7 +50,7 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	defer store.Close()
+	t.Cleanup(store.Close)
 	source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}
 	launch, identity, token, _ := providerHost(t, h, layout, source, uv)
 	cert := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf}))
@@ -61,6 +64,15 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 		Address: launch.Addr, MediaAddress: launch.MediaAddr, ExpectedWorkerID: launch.WorkerID, ExpectedWorkerBootID: launch.BootID}
 	fatal(t, rental.Attach(layout, store, row, cert, secret.New(token), identity))
 	daemon := startDaemonProcess(t, root)
+	return root, store, launch, identity, daemon
+}
+
+// Ordinary CLI -> actual daemon/records -> the rental's machine over cozy.machine.v1. Only an
+// explicit keepalive moves the machine's deadline and the local clock: listing and a daemon
+// restart never do, and an ending rental is not kept alive.
+func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
+	root, store, launch, identity, daemon := statusRental(t)
+	cert := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf}))
 
 	// The machine's own deadline, read over its API with the rental's owner key.
 	pin, err := workertls.ParsePin([]byte(cert))
@@ -139,5 +151,50 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	}
 	if held() != before {
 		t.Fatal("an ending rental's machine was reset")
+	}
+}
+
+// `cozy rental show` names what the rental's machine reports over Status: its agent, Runtime,
+// TensorFS and phase. The local reader of a running machine reads the same picture, and a
+// machine that cannot answer leaves a note, never a failed show.
+func TestRentalShowReportsTheMachinesStatus(t *testing.T) {
+	root, _, launch, _, _ := statusRental(t)
+	version := func(wheel, distribution string) string {
+		name := strings.TrimPrefix(filepath.Base(wheel), distribution+"-")
+		return name[:strings.Index(name, "-")]
+	}
+	runtime, tensorfs := version(*machineRuntimeWheel, "cozy_runtime"), version(*machineTensorFSWheel, "tensorfs")
+	code, out := runCozy(t, root, "rental", "show", "tessa", "--json")
+	var shown map[string]any
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["runtime_version"] != runtime ||
+		shown["tensorfs_version"] != tensorfs || shown["agent_version"] == "" || shown["phase"] != "ready" {
+		t.Fatalf("rental show did not name the machine's status [exit %d]:\n%s", code, out)
+	}
+	if code, out = runCozy(t, root, "rental", "show", "tessa"); code != 0 || !strings.Contains(out, runtime) || !strings.Contains(out, "live runs") {
+		t.Fatalf("the human rental show hides the status [exit %d]:\n%s", code, out)
+	}
+	environ, err := os.ReadFile("/proc/" + strconv.Itoa(launch.PID) + "/environ")
+	must(t, err)
+	var machineRoot string
+	for _, entry := range strings.Split(string(environ), "\x00") {
+		if value, ok := strings.CutPrefix(entry, "COZY_MACHINE_ROOT="); ok {
+			machineRoot = value
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	local, problem := machines.NewHost(filepath.Dir(machineRoot), "", nil).ReadStatus(ctx)
+	fatal(t, problem)
+	if local == nil || local.WorkerId != launch.WorkerID || local.Runtime != runtime {
+		t.Fatalf("the local reader did not read the running machine: %v", local)
+	}
+	// The test's own provider process: once it is gone the show still answers, with a note.
+	process, err := os.FindProcess(launch.PID)
+	must(t, err)
+	must(t, process.Signal(syscall.SIGTERM))
+	waitUntil(t, "the machine stops", func() bool { return syscall.Kill(launch.PID, 0) != nil })
+	if code, out = runCozy(t, root, "rental", "show", "tessa", "--json"); code != 0 || strings.Contains(out, "runtime_version") ||
+		!strings.Contains(out, "machine status unavailable") {
+		t.Fatalf("an unreachable machine must leave a note, not fail the show [exit %d]:\n%s", code, out)
 	}
 }

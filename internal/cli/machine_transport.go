@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	machinepb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"io"
 	"os"
 	"slices"
@@ -445,24 +446,18 @@ func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release s
 	return api.DescribedRelease{Package: described.Package, Release: described.Release, PackageInterface: described.PackageInterface}, nil
 }
 
-// Software reads what one machine runs from its DescribeMachine (wire 66). A machine that
-// predates it answers UNIMPLEMENTED, which is said rather than guessed.
-func (m *machineRuns) Software(ctx context.Context, machine string) (api.MachineSoftware, *exit.Error) {
-	connection, problem := m.connect(ctx, machine, "reading its software")
+// Status reads one machine's picture over cozy.machine.v1 as its owner.
+func (m *machineRuns) Status(ctx context.Context, machine string) (api.MachineStatus, *exit.Error) {
+	connection, problem := m.machines.DialV1(ctx, machine, "reading its status")
 	if problem != nil {
-		return api.MachineSoftware{}, problem
+		return api.MachineStatus{}, problem
 	}
 	defer connection.Close()
-	described, err := connection.Host.DescribeMachine(ctx, &pb.DescribeMachineQuery{Claim: connection.Claim})
-	if status.Code(err) == codes.Unimplemented {
-		return api.MachineSoftware{}, exit.Named(exit.Structural, "machine.software_unreported",
-			"this machine's agent predates software reporting")
-	}
+	frame, err := connection.Status(ctx)
 	if err != nil {
-		return api.MachineSoftware{}, machineTransport(err)
+		return api.MachineStatus{}, machines.Transport(err)
 	}
-	return api.MachineSoftware{Agent: described.GetHost().GetVersion(), Runtime: described.GetRuntime().GetVersion(),
-		TensorFS: described.GetRuntime().GetTensorfsVersion(), RuntimeAbsent: described.GetRuntimeAbsent()}, nil
+	return statusOf(frame), nil
 }
 
 // machineLogs maps the log names clients use to the logs machines keep.
@@ -607,4 +602,23 @@ func uploadMachinePackage(ctx context.Context, host pb.PodHostClient, claim *pb.
 		}
 	}
 	return nil
+}
+
+// statusOf is a machine's Status frame as the daemon's API answers it.
+func statusOf(frame *machinepb.StatusFrame) api.MachineStatus {
+	out := api.MachineStatus{WorkerID: frame.GetWorkerId(), BootID: frame.GetBootId(), Agent: frame.GetVersion(),
+		Phase: frame.GetPhase(), Runtime: frame.GetRuntime(), TensorFS: frame.GetTensorfs(),
+		Capabilities: frame.GetCapabilities(), IdleDeadlineUnixMS: frame.GetIdleDeadlineUnixMs(),
+		GPUs: []api.MachineGPU{}, Runs: []api.MachineRun{}, Environments: []api.MachineEnvironment{},
+		DiskTotalBytes: frame.GetDisk().GetTotalBytes(), DiskFreeBytes: frame.GetDisk().GetFreeBytes()}
+	for _, gpu := range frame.GetGpus() {
+		out.GPUs = append(out.GPUs, api.MachineGPU{Index: gpu.GetIndex(), Name: gpu.GetName(), MemoryBytes: gpu.GetMemoryBytes(), Driver: gpu.GetDriver()})
+	}
+	for _, run := range frame.GetRuns() {
+		out.Runs = append(out.Runs, api.MachineRun{ID: run.GetId(), Number: run.GetNumber(), State: run.GetState()})
+	}
+	for _, env := range frame.GetEnvironments() {
+		out.Environments = append(out.Environments, api.MachineEnvironment{Installation: env.GetInstallation(), Package: env.GetPackage(), Release: env.GetRelease()})
+	}
+	return out
 }
