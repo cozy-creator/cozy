@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,26 +17,21 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	"github.com/cozy-creator/cozy/internal/machines"
 )
 
-// `cozy machine install` keeps exactly the Runtime and TensorFS wheels it installed in
-// <machine root>/opt/cozy/wheels, replacing an earlier build's, and none after a published
-// install. With -machine-host and a -machine-runtime-wheel that installs packages from that
-// directory, a package on the machine runs the machine's local build, and without the build's
-// wheel the machine refuses rather than put PyPI's Runtime in its place.
+// `cozy machine install` makes this computer's machine the Rust machine a worker image runs:
+// the named executable at usr/local/bin/cozy-machine, exactly the Runtime and TensorFS wheels
+// at opt/cozy/machine/wheels, uv beside it, and no Python worker. It starts as a persistent
+// machine, proves readiness through Status, installs and runs a local package, and installing
+// again updates it in place with Run kind: update.
 func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 	if *machineHostBinary == "" || *machineRuntimeWheel == "" || *machineTensorFSWheel == "" {
-		t.Skip("requires the current bundled agent and Runtime/TensorFS cohort; old published peers are deliberately unsupported")
+		t.Skip("requires -machine-host and a -machine-runtime-wheel/-machine-tensorfs-wheel pair")
 	}
-
 	if _, err := exec.LookPath("uv"); err != nil {
 		t.Skip("uv lays out the machine root")
 	}
 	runtime, tensorfs := *machineRuntimeWheel, *machineTensorFSWheel
-	if runtime == "" {
-		runtime, tensorfs = publishedWheel(t, hostruntime.Distribution, machines.RuntimeFloor), publishedWheel(t, "tensorfs", "0.3.78")
-	}
 	h := newMachineHub(t)
 	root, err := os.MkdirTemp("", "czw")
 	must(t, err)
@@ -46,83 +42,72 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 		_, _ = runCozy(t, root, "down")
 		if t.Failed() {
 			log, _ := os.ReadFile(filepath.Join(root, "machine", "host.log"))
-			t.Logf("evidence retained at %s\nlocal Host log:\n%s", root, log)
+			t.Logf("evidence retained at %s\nlocal machine log:\n%s", root, log)
 		} else {
 			_ = removeAllForce(root)
 		}
 	})
-	dir := filepath.Join(root, "machine", "root", "opt", "cozy", "wheels")
-	install := func(wheels ...string) {
+	machineRoot := filepath.Join(root, "machine", "root")
+	version := func(wheel string) string { return strings.SplitN(filepath.Base(wheel), "-", 3)[1] }
+	show := func() map[string]any {
 		t.Helper()
-		args := []string{"machine", "install"}
-		if *machineHostBinary != "" {
-			args = append(args, "--host", *machineHostBinary)
+		code, out := runCozy(t, root, "machine", "show", "--json")
+		var shown map[string]any
+		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil {
+			t.Fatalf("machine show [exit %d]\n%s", code, out)
 		}
-		if len(wheels) > 0 {
-			args = append(args, "--runtime-wheel", wheels[0], "--tensorfs-wheel", wheels[1])
-		}
-		if code, out := runCozy(t, root, args...); code != 0 {
-			t.Fatalf("machine install [exit %d]\n%s", code, out)
-		}
-		entries, err := os.ReadDir(dir)
-		must(t, err)
-		var held, want []string
-		for _, entry := range entries {
-			held = append(held, entry.Name())
-		}
-		for _, wheel := range wheels {
-			want = append(want, filepath.Base(wheel))
-			if fileSHA(t, wheel) != fileSHA(t, filepath.Join(dir, filepath.Base(wheel))) {
-				t.Fatalf("%s is not the installed %s", dir, filepath.Base(wheel))
-			}
-		}
-		slices.Sort(want)
-		if !slices.Equal(held, want) {
-			t.Fatalf("%s holds %v, want exactly %v", dir, held, want)
-		}
-		host := filepath.Join(root, "machine", "root", "usr", "local", "bin")
-		agent := filepath.Join(host, "cozy-machine")
-		if machines.HostModule(agent) != machines.AgentModule {
-			t.Fatal("the installed machine server is not the independent agent")
-		}
-		if *machineHostBinary != "" && fileSHA(t, agent) != fileSHA(t, *machineHostBinary) {
-			t.Fatal("the installed machine agent differs from the selected artifact")
-		}
-	}
-	install(localBuild(t, runtime, "test1"), tensorfs)
-	build := localBuild(t, runtime, "test2")
-	install(build, tensorfs)
-
-	if *machineHostBinary != "" && *machineRuntimeWheel != "" {
-		virtualInventory(t, filepath.Join(root, "machine", "root"))
-		version := strings.SplitN(filepath.Base(build), "-", 3)[1]
-		if code, out := runCozy(t, root, "package", "install", sdkProbe(t, "wheels-probe"), "--editable"); code != 0 {
-			t.Fatalf("editable install [exit %d]\n%s", code, out)
-		}
-		code, out := runCozy(t, root, "run", "local/wheels-probe/sdk", "value=1", "--await", "--json")
-		if code != 0 || !strings.Contains(out, `"runtime":"`+version+`"`) {
-			t.Fatalf("the package did not run the machine's %s [exit %d]\n%s", version, code, out)
-		}
-		must(t, os.Remove(filepath.Join(dir, filepath.Base(build))))
-		code, out = runCozy(t, root, "package", "install", sdkProbe(t, "wheels-probe-b"), "--editable")
-		if code == 0 {
-			code, out = runCozy(t, root, "run", "local/wheels-probe-b/sdk", "value=1", "--await", "--json")
-		}
-		if code == 0 || !strings.Contains(out, "package_runtime_unavailable") {
-			t.Fatalf("a machine lacking its build's wheel did not refuse [exit %d]\n%s", code, out)
-		}
+		return shown
 	}
 
-	// Restore the exact wheel this negative arm removed. The updater must retain
-	// the installed version for rollback before it can replace the pair.
-	installedWheel, err := os.ReadFile(build)
+	first := localBuild(t, runtime, "test1")
+	if code, out := runCozy(t, root, "machine", "install", "--host", *machineHostBinary, "--runtime-wheel", first, "--tensorfs-wheel", tensorfs); code != 0 {
+		t.Fatalf("machine install [exit %d]\n%s", code, out)
+	}
+	entries, err := os.ReadDir(filepath.Join(machineRoot, "opt/cozy/machine/wheels"))
 	must(t, err)
-	must(t, os.WriteFile(filepath.Join(dir, filepath.Base(build)), installedWheel, 0644))
-	// Stop this fixture after its deliberately failed preparation.
-	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
-		t.Fatalf("machine stop before reinstall [exit %d]\n%s", code, out)
+	var held []string
+	for _, entry := range entries {
+		held = append(held, entry.Name())
 	}
-	install(runtime, tensorfs)
+	want := []string{filepath.Base(first), filepath.Base(tensorfs)}
+	slices.Sort(want)
+	if !slices.Equal(held, want) {
+		t.Fatalf("the machine holds %v, want exactly %v", held, want)
+	}
+	if fileSHA(t, filepath.Join(machineRoot, "usr/local/bin/cozy-machine")) != fileSHA(t, *machineHostBinary) {
+		t.Fatal("the installed machine differs from the named executable")
+	}
+	if _, err := os.Stat(filepath.Join(machineRoot, "usr/local/bin/uv")); err != nil {
+		t.Fatal("the machine root has no uv")
+	}
+	for _, retired := range []string{"opt/cozy/python", "opt/cozy/bin/cozy-runtime-worker"} {
+		if _, err := os.Lstat(filepath.Join(machineRoot, retired)); err == nil {
+			t.Fatalf("the install laid out the retired %s", retired)
+		}
+	}
+	if code, out := runCozy(t, root, "machine", "start"); code != 0 {
+		t.Fatalf("machine start [exit %d]\n%s", code, out)
+	}
+	if shown := show(); shown["phase"] != "ready" || shown["runtime_version"] != version(first) {
+		t.Fatalf("the started machine is not ready on %s: %v", version(first), shown)
+	}
+
+	if code, out := runCozy(t, root, "package", "install", sdkProbe(t, "wheels-probe"), "--editable"); code != 0 {
+		t.Fatalf("editable install [exit %d]\n%s", code, out)
+	}
+	// A local package installs through the helper the machine makes from its embedded client.
+	code, out := runCozy(t, root, "run", "local/wheels-probe/sdk", "value=1", "--await", "--json")
+	if code != 0 || !strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("the local package did not run on the machine [exit %d]\n%s", code, out)
+	}
+
+	second := localBuild(t, runtime, "test2")
+	if code, out := runCozy(t, root, "machine", "install", "--host", *machineHostBinary, "--runtime-wheel", second, "--tensorfs-wheel", tensorfs); code != 0 {
+		t.Fatalf("machine update [exit %d]\n%s", code, out)
+	}
+	if shown := show(); shown["runtime_version"] != version(second) {
+		t.Fatalf("installing again did not update the machine to %s: %v", version(second), shown)
+	}
 }
 
 func fileSHA(t *testing.T, path string) string {
@@ -184,7 +169,7 @@ func localBuild(t *testing.T, wheel, label string) string {
 	return path
 }
 
-// sdkProbe is an editable package whose one job reports the Runtime its environment holds.
+// sdkProbe is an editable package whose one entrypoint reports the Runtime its environment holds.
 func sdkProbe(t *testing.T, name string) string {
 	t.Helper()
 	module := strings.ReplaceAll(name, "-", "_")
@@ -194,7 +179,7 @@ func sdkProbe(t *testing.T, name string) string {
 name="`+name+`"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime>=`+machines.RuntimeFloor+`", "msgspec>=0.19"]
+dependencies=["cozy-runtime>=`+runtimeFloor+`", "msgspec>=0.19"]
 [project.entry-points."cozy.application"]
 default="`+module+`:app"
 [build-system]
@@ -221,7 +206,7 @@ class SDK(msgspec.Struct):
 app = App()
 
 
-@app.job
+@app.entrypoint
 def sdk(payload: Ask) -> SDK:
     return SDK(runtime=importlib.metadata.version("`+hostruntime.Distribution+`"))
 `), 0o600))

@@ -64,7 +64,7 @@ func weightsProject(t *testing.T) string {
 name="weights-proof"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime>=`+machines.RuntimeFloor+`", "tensorfs>=0.3.74,<0.4"]
+dependencies=["cozy-runtime>=`+runtimeFloor+`", "tensorfs>=0.3.74,<0.4"]
 [project.entry-points."cozy.application"]
 default="weights_proof:app"
 `+sources+`[build-system]

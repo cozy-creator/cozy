@@ -43,12 +43,11 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		}
 		*target = absolute
 	}
-	// The Runtime wheel supplies the default agent; --host deliberately pins a copy, which
-	// Install accepts by its own identity and capabilities.
-	source.Pinned = source.Host != ""
+	// The Runtime wheel's bundled machine is the default; --host names another, which Install
+	// accepts by the API it serves.
 	uv, err := exec.LookPath("uv")
 	if err != nil {
-		return exit.Named(exit.Structural, "machine.uv_missing", "uv builds the machine's Python environment and is not on PATH")
+		return exit.Named(exit.Structural, "machine.uv_missing", "uv builds the machine's package environments and is not on PATH")
 	}
 	installCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

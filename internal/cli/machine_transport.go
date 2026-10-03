@@ -198,33 +198,7 @@ func (m *machineRuns) connectAtHub(ctx context.Context, name, hub, holder string
 	return m.connectAt(ctx, name, hub, holder, true)
 }
 
-// adoptLocalHost migrates the embedded Host once no accepted run is active.
-func (m *machineRuns) adoptLocalHost(ctx context.Context) {
-	if !m.machines.Host.Outdated() {
-		return
-	}
-	active, problem := m.store.ActiveRequests()
-	if problem != nil {
-		return
-	}
-	idle := true
-	for _, request := range active {
-		if link, problem := m.store.MachineExecution(request.ID); request.Worker == machines.Local && problem == nil && link != nil && len(link.Submission) > 0 {
-			idle = false
-			break
-		}
-	}
-	if adopted, problem := m.machines.Host.Adopt(ctx, idle); problem != nil {
-		fmt.Fprintf(m.context.Out, "the machine keeps its Host: %s\n", problem.Message)
-	} else if adopted {
-		m.machines.Forget(machines.Local)
-	}
-}
-
 func (m *machineRuns) connectAt(ctx context.Context, name, hub, holder string, named bool) (*machineConnection, *exit.Error) {
-	if machines.IsLocal(name) {
-		m.adoptLocalHost(ctx)
-	}
 	machine, problem := m.machines.DialAt(ctx, name, hub, holder, named)
 	if problem != nil {
 		return nil, problem

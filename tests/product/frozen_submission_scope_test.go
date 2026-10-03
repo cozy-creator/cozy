@@ -113,7 +113,7 @@ func TestFrozenLocalReceiptDoesNotNeedSourceOrCurrentHubGrant(t *testing.T) {
 					"worker_port": workerPort, "media_port": mediaPort, "receipt_key": base64.RawURLEncoding.EncodeToString(key)})
 				must(t, err)
 				writeInstallFile(t, filepath.Join(layout.Machine, "agent.json"), record, 0600)
-				writeInstallFile(t, filepath.Join(layout.Machine, "installed.json"), []byte(`{"host":{"module":"`+machines.AgentModule+`"},"host_pinned":true}`), 0600)
+				writeInstallFile(t, filepath.Join(layout.Machine, "installed.json"), []byte(`{"host":{"name":"cozy-machine"},"host_pinned":true}`), 0600)
 				if grant == "expired" {
 					cached, err := json.Marshal(map[string]any{account.URL: map[string]any{"origin": account.URL,
 						"token": "expired-kept-grant", "expires_at": time.Now().Add(-time.Hour).Unix()}})

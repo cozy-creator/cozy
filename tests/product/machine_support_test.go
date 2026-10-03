@@ -1,16 +1,21 @@
 package producttest
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -57,7 +62,7 @@ func machineTemplateDir(t testing.TB) string {
 			machineTemplate.problem = exit.New(exit.NotFound, "uv lays out the test machines: %s", err)
 			return
 		}
-		source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel, Pinned: true}
+		source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}
 		_, machineTemplate.problem = machines.NewHost(machineTemplate.dir, "", nil).Install(context.Background(), source, uv)
 	})
 	if machineTemplate.problem != nil {
@@ -118,9 +123,9 @@ func provisionMachineIn(t *testing.T, root, parent string) {
 			_ = removeAllForce(short)
 		}
 	})
-	// Everything `cozy machine install` lays out, the wheels it keeps included: a dev Runtime
-	// installs its own SDK into a package's environment from them.
-	for _, link := range []string{"usr/local/bin/cozy-machine", "usr/local/bin/tfs", "usr/local/bin/uv", "opt/cozy/bin/cozy-runtime-worker", "opt/cozy/python", "opt/cozy/wheels"} {
+	// Everything `cozy machine install` lays out: the machine, its uv and the executor SDK
+	// wheels package environments install from.
+	for _, link := range []string{"usr/local/bin/cozy-machine", "usr/local/bin/uv", "opt/cozy/machine/wheels"} {
 		target, err := filepath.EvalSymlinks(filepath.Join(template, "root", link))
 		must(t, err)
 		path := filepath.Join(dir, "root", link)
@@ -205,7 +210,7 @@ func stubMachine(t *testing.T, root, script string) {
 	binary := filepath.Join(dir, "root", "usr", "local", "bin", "cozy-machine")
 	must(t, os.MkdirAll(filepath.Dir(binary), 0o755))
 	must(t, os.WriteFile(binary, []byte(script), 0o700)) //cozy:allow sentinel Host proves whether a launch was attempted
-	metadata := `{"host":{"name":"cozy-machine","module":"` + machines.AgentModule + `"},"host_pinned":true}`
+	metadata := `{"host":{"name":"cozy-machine"},"host_pinned":true}`
 	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), []byte(metadata), 0600))
 
 }
@@ -287,4 +292,112 @@ func cozyWithin(t *testing.T, root string, within time.Duration, args ...string)
 		t.Fatalf("cozy %s hung past %s: %s\n%s", strings.Join(args, " "), within, data, tail(filepath.Join(root, "daemon.log")))
 	}
 	return cmd.ProcessState.ExitCode(), string(data)
+}
+
+// runtimeFloor is the Runtime the test packages' declared dependencies admit.
+const runtimeFloor = "0.18.85"
+
+// publishedWheel is one distribution's released linux x86_64 wheel from PyPI, verified by its
+// digest and kept for the run: the bytes `cozy machine install` puts on a machine.
+func publishedWheel(t *testing.T, distribution, version string) string {
+	t.Helper()
+	response, err := http.Get("https://pypi.org/pypi/" + distribution + "/" + version + "/json")
+	if err != nil {
+		t.Skipf("PyPI unreachable from this runner: %v", err)
+	}
+	defer response.Body.Close()
+	var release struct {
+		URLs []struct {
+			Filename string            `json:"filename"`
+			URL      string            `json:"url"`
+			Digests  map[string]string `json:"digests"`
+		} `json:"urls"`
+	}
+	must(t, json.NewDecoder(response.Body).Decode(&release))
+	for _, file := range release.URLs {
+		if !strings.HasSuffix(file.Filename, "-cp312-abi3-manylinux_2_28_x86_64.whl") &&
+			!strings.HasSuffix(file.Filename, "-manylinux_2_17_x86_64.manylinux2014_x86_64.whl") {
+			continue
+		}
+		path := filepath.Join(scratchBase, "published-wheels", file.Filename)
+		if raw, err := os.ReadFile(path); err == nil && sha256Hex(raw) == file.Digests["sha256"] {
+			return path
+		}
+		download, err := http.Get(file.URL)
+		must(t, err)
+		raw, err := io.ReadAll(download.Body)
+		download.Body.Close()
+		must(t, err)
+		if sha256Hex(raw) != file.Digests["sha256"] {
+			t.Fatalf("%s does not match its published digest", file.Filename)
+		}
+		must(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		must(t, os.WriteFile(path, raw, 0o600))
+		return path
+	}
+	t.Fatalf("%s %s publishes no linux x86_64 wheel", distribution, version)
+	return ""
+}
+
+func writeInstallFile(t *testing.T, path string, body []byte, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, body, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The isolated Hub fixture supplies a syntactic delegated JWT. The real Hub verifies its
+// authority; the agent only needs its stable issuer/account identity to guard replacement.
+func executionGrantToken(issuer, principal string, serial int32) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"typ":"delegated-access+jwt"}`))
+	body, _ := json.Marshal(map[string]any{"iss": issuer, "delegated_sub": principal, "permissions": []string{"cozy.execution-access"}, "jti": serial, "attributes": map[string]any{"execution_device_key_id": "fixture-device"}})
+	return header + "." + base64.RawURLEncoding.EncodeToString(body) + "." + base64.RawURLEncoding.EncodeToString([]byte("fixture-signature"))
+}
+
+func installWheel(t *testing.T, name, version, entrypoint string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name+"-"+version+"-py3-none-any.whl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := zip.NewWriter(f)
+	dist := name + "-" + version + ".dist-info/"
+	files := map[string]string{
+		name + ".py":      "def main(): pass\n",
+		dist + "METADATA": "Metadata-Version: 2.1\nName: " + strings.ReplaceAll(name, "_", "-") + "\nVersion: " + version + "\nProvides-Extra: media\n",
+		dist + "WHEEL":    "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+	}
+	if name == "cozy_runtime" {
+		files[dist+"METADATA"] += "Requires-Dist: tensorfs>=0.3.78\n"
+	}
+	if entrypoint != "" {
+		files[dist+"entry_points.txt"] = "[console_scripts]\n" + entrypoint + " = " + name + ":main\n"
+	}
+	var record strings.Builder
+	for path := range files {
+		fmt.Fprintln(&record, path+",,")
+	}
+	files[dist+"RECORD"] = record.String() + dist + "RECORD,,\n"
+	for path, body := range files {
+		file, err := w.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func sha256Hex(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

@@ -72,7 +72,7 @@ func restartProject(t *testing.T) string {
 name="restart-proof"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime>=`+machines.RuntimeFloor+`", "msgspec>=0.19"]
+dependencies=["cozy-runtime>=`+runtimeFloor+`", "msgspec>=0.19"]
 [project.entry-points."cozy.application"]
 default="restart_proof:app"
 `+sources+`[build-system]

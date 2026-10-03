@@ -48,7 +48,7 @@ func TestLocalMachineRunsOnThisComputersGPU(t *testing.T) {
 name="gpu-proof"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime>=`+machines.RuntimeFloor+`", "msgspec>=0.19", "torch==2.13.0"]
+dependencies=["cozy-runtime>=`+runtimeFloor+`", "msgspec>=0.19", "torch==2.13.0"]
 [project.entry-points."cozy.application"]
 default="gpu_proof:app"
 [build-system]
