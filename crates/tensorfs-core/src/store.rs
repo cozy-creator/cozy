@@ -23,7 +23,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{fchown, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 
@@ -676,7 +675,7 @@ impl Store {
         let temp = self.root.join(format!(
             "tmp/repo-cache.{}.{}",
             std::process::id(),
-            now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -738,7 +737,7 @@ impl Store {
         let temp = self.root.join(format!(
             "tmp/disk-budget.{}.{}",
             std::process::id(),
-            now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -1149,7 +1148,7 @@ impl Store {
             ".{}.{}.{}",
             path.file_name().unwrap().to_string_lossy(),
             std::process::id(),
-            now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let mut file = OpenOptions::new()
             .write(true)
@@ -1372,7 +1371,7 @@ impl Store {
                             ".{}.{}.{}",
                             path_for_write.file_name().unwrap().to_string_lossy(),
                             std::process::id(),
-                            now_nanos_unique()
+                            crate::meta::now_nanos_unique()
                         ));
                         let mut file = OpenOptions::new()
                             .write(true)
@@ -1455,7 +1454,7 @@ impl Store {
             let tmp = self.root.join("tmp").join(format!(
                 "{prefix}{}-{}",
                 std::process::id(),
-                now_nanos_unique()
+                crate::meta::now_nanos_unique()
             ));
             let f = OpenOptions::new()
                 .write(true)
@@ -2396,16 +2395,6 @@ pub(crate) fn fsync_entry_dir(root: &Path, dir: &Path) -> Result<()> {
         set.insert(identity);
     }
     Ok(())
-}
-
-pub(crate) fn now_nanos_unique() -> u128 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        .wrapping_add(N.fetch_add(1, Ordering::Relaxed) as u128)
 }
 
 /// Deterministic [0,1) sample position for (pass, object) — the one scrub knob's input.

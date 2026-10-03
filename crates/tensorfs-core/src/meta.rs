@@ -536,6 +536,18 @@ mod setup_tests {
     use super::*;
 
     #[test]
+    fn unique_nanos_never_repeat_across_threads() {
+        let minted: Vec<u128> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| (0..20_000).map(|_| now_nanos_unique()).collect::<Vec<_>>()))
+                .collect();
+            workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+        });
+        let distinct: std::collections::HashSet<_> = minted.iter().collect();
+        assert_eq!(distinct.len(), minted.len());
+    }
+
+    #[test]
     fn failed_additive_setup_rolls_back_and_reuses_the_validated_connection() {
         let root = std::env::temp_dir().join(format!(
             "tensorfs-meta-setup-{}-{}",

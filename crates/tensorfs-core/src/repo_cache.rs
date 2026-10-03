@@ -843,7 +843,7 @@ fn publish_stream(
         ".{}.{}.{}.tmp",
         name.to_string_lossy(),
         std::process::id(),
-        store::now_nanos_unique()
+        crate::meta::now_nanos_unique()
     );
     let mut output = File::from(
         unix::openat(
@@ -1367,7 +1367,7 @@ mod backfill_tests {
         std::env::temp_dir().join(format!(
             "tensorfs-backfill-{name}-{}-{}",
             std::process::id(),
-            store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ))
     }
 
@@ -1508,7 +1508,7 @@ mod exit_wait_tests {
         let root = std::env::temp_dir().join(format!(
             "tensorfs-exit-moving-{}-{}",
             std::process::id(),
-            store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let data = vec![7; 256 << 10];
         let object = ObjectRef::of(&data);
@@ -1608,7 +1608,7 @@ mod repair_tests {
         let root = std::env::temp_dir().join(format!(
             "tfs-parent-swap-{}-{}",
             std::process::id(),
-            store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let source = Store::init(&root.join("source")).unwrap();
         let data = vec![9; 4096];
@@ -1652,7 +1652,7 @@ mod repair_tests {
         let root = std::env::temp_dir().join(format!(
             "tfs-repair-winner-{}-{}",
             std::process::id(),
-            store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let source = Store::init(&root.join("source")).unwrap();
         let data = vec![17; 4096];
@@ -1701,7 +1701,7 @@ mod repair_tests {
         let root = std::env::temp_dir().join(format!(
             "tfs-repair-interrupted-{}-{}",
             std::process::id(),
-            store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         fs::create_dir_all(&root).unwrap();
         let object = ObjectRef::of(b"right");
@@ -1734,7 +1734,7 @@ mod acquisition_backfill_tests {
     #[test]
     fn cache_write_receipts_are_scoped_and_count_only_new_verified_objects() {
         let root =
-            std::env::temp_dir().join(format!("tfs-cache-receipts-{}", store::now_nanos_unique()));
+            std::env::temp_dir().join(format!("tfs-cache-receipts-{}", crate::meta::now_nanos_unique()));
         let source = Store::init(&root.join("source")).unwrap();
         let cache = RepoObjectCache::new(root.join("cache"));
         let pool = Backfills::start();
@@ -1774,7 +1774,7 @@ mod acquisition_backfill_tests {
     fn an_abandoned_saturated_batch_reports_incomplete_after_accepted_work_drains() {
         let root = std::env::temp_dir().join(format!(
             "tfs-backfill-abandoned-{}",
-            store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let source = Store::init(&root.join("source")).unwrap();
         let bytes = b"local success survives another object's refusal";
@@ -1822,7 +1822,7 @@ mod acquisition_backfill_tests {
         for repair in [false, true] {
             let root = std::env::temp_dir().join(format!(
                 "tfs-backfill-saturation-{repair}-{}",
-                store::now_nanos_unique()
+                crate::meta::now_nanos_unique()
             ));
             let source = Store::init(&root.join("source")).unwrap();
             let cache = RepoObjectCache::new(root.join("cache"));
@@ -1906,7 +1906,7 @@ mod acquisition_backfill_tests {
     fn cache_failure_and_nonadvancing_full_queue_are_explicitly_incomplete() {
         let root = std::env::temp_dir().join(format!(
             "tfs-backfill-incomplete-{}",
-            store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let source = Store::init(&root.join("source")).unwrap();
         let bytes = b"verified local bytes remain usable";

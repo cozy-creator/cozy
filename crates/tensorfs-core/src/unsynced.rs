@@ -93,7 +93,7 @@ impl Marker {
         let path = dir.join(format!(
             "{boot}.{}.{}{SUFFIX}",
             std::process::id(),
-            crate::store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let mut file = OpenOptions::new()
             .write(true)
@@ -495,7 +495,7 @@ pub(crate) mod testing {
             .join(format!(
                 "{name}-{}-{}",
                 std::process::id(),
-                crate::store::now_nanos_unique()
+                crate::meta::now_nanos_unique()
             ))
     }
 
@@ -678,7 +678,7 @@ mod tests {
         let root = Path::new("/dev/shm").join(format!(
             "tensorfs-ephemeral-{}-{}",
             std::process::id(),
-            crate::store::now_nanos_unique()
+            crate::meta::now_nanos_unique()
         ));
         let store = Store::init(&root).unwrap();
         assert_eq!(store.disk().kind, "tmpfs");
