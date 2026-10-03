@@ -683,14 +683,27 @@ impl Inner {
             return Ok(());
         }
         let batch = Batch::new(region.items.len(), done);
+        // One residency check per object, not per item: on overlayfs a check maps the file,
+        // which stalls every reader's page faults.
+        let resident: Arc<HashMap<String, std::sync::OnceLock<bool>>> = Arc::new(
+            region.items.iter().filter_map(|it| match &it.source {
+                crate::layout::ItemSource::Object(o) => Some((o.obj.sha256.clone(), std::sync::OnceLock::new())),
+                crate::layout::ItemSource::Inline(_) => None,
+            }).collect(),
+        );
         for it in region.items.iter().cloned() {
-            let (source, batch, tally) = (source.clone(), batch.clone(), self.tally.clone());
+            let (source, batch, tally, resident) = (source.clone(), batch.clone(), self.tally.clone(), resident.clone());
             // SAFETY: the region's host range is exclusively this fill's until it completes
             // (state Filling; the OFD fill lock keeps other processes from punching it).
             let dst = Dst(unsafe { host.base().add(it.offset as usize) });
             self.readers.submit(false, move || {
                 let dst = dst;
-                let r = unsafe { source.read_item(&it, dst.0, Mode::Cache, &tally) };
+                let mode = match &it.source {
+                    crate::layout::ItemSource::Object(o)
+                        if *resident[&o.obj.sha256].get_or_init(|| source.resident(&o.obj, &tally).unwrap_or(false)) => Mode::Cached,
+                    _ => Mode::Cache,
+                };
+                let r = unsafe { source.read_item(&it, dst.0, mode, &tally) };
                 // Drop the source before signalling: the waiter may then close the last
                 // weight set, and its lease must end then, not when this thread unwinds.
                 drop(source);
