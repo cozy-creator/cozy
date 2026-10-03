@@ -219,8 +219,8 @@ impl HostMem {
         Self::adopt_owned(reopen(fd)?, layout, false, false)
     }
 
-    /// Adopt a sealed layout (`fill_sealed`) read-only: its seals are the proof nobody can
-    /// change a byte, and every region must be Ready.
+    /// Adopt a sealed layout (`fill_sealed`, `open_sealed`) read-only: its seals are the proof
+    /// nobody else can change a byte; a region is used only once its filler marks it Ready.
     pub fn adopt_sealed(fd: RawFd, layout: &Layout) -> Result<HostMem> {
         // SAFETY: a scalar query of a descriptor the caller holds.
         let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
@@ -228,7 +228,6 @@ impl HostMem {
             return Err(Error::Invalid("a sealed host layout must carry write, resize and seal seals".into()));
         }
         let host = Self::adopt_owned(reopen_as(fd, libc::O_RDONLY)?, layout, true, false)?;
-        // Regions may still be filling (`open_sealed`): each is used only once Ready.
         if (0..host.regions as u32).any(|r| host.failed(r)) {
             return Err(Error::Invalid("a sealed host layout's fill failed".into()));
         }
