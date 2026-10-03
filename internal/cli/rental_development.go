@@ -163,6 +163,30 @@ func handleRentalSSHInfo(ctx *Context) *exit.Error {
 
 // rentalImage is the registered worker image `--image` names in place of the
 // machine's default. A recorded acquisition keeps the image it was asked with.
+// rentalProviderFlag is the `--provider` ask, lowercased; empty means the hub's default.
+func rentalProviderFlag(ctx *Context) string {
+	return strings.ToLower(strings.TrimSpace(ctx.Inv.Value("--provider")))
+}
+
+// rentalProvider is the marketplace a paid operation buys from: the flag, or the one its
+// persisted request already names.
+func rentalProvider(ctx *Context, existing *records.RentalOperation) (string, *exit.Error) {
+	provider := rentalProviderFlag(ctx)
+	if existing == nil {
+		return provider, nil
+	}
+	req, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
+	if problem != nil {
+		return "", problem
+	}
+	if provider != "" && provider != req.Provider {
+		return "", exit.Named(exit.Conflict, "rental.idempotency_conflict",
+			"rental operation already buys from provider %q", req.Provider).
+			WithRemedy("resume without --provider or use a new operation key")
+	}
+	return req.Provider, nil
+}
+
 func rentalImage(ctx *Context, existing *records.RentalOperation) (string, *exit.Error) {
 	image := strings.TrimSpace(ctx.Inv.Value("--image"))
 	if existing == nil {

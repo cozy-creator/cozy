@@ -165,13 +165,15 @@ type machineKey struct {
 	gpus int
 }
 
-func (m *managedRentals) admit(skuName string, gpus int) (string, hub.RentalSKU, *exit.Error) {
+func (m *managedRentals) admit(skuName string, gpus int, provider string) (string, hub.RentalSKU, *exit.Error) {
 	origin := m.ctx.Cfg.HubURL
 	line, problem := m.status(records.Request{Hub: origin})
 	if problem != nil {
 		return "", hub.RentalSKU{}, problem
 	}
-	skus, problem := m.catalog(origin)
+	hctx, cancel := hub.Context()
+	skus, problem := client(m.at(origin)).RentalSKUs(hctx, provider)
+	cancel()
 	if problem != nil {
 		return "", hub.RentalSKU{}, problem
 	}
@@ -181,14 +183,14 @@ func (m *managedRentals) admit(skuName string, gpus int) (string, hub.RentalSKU,
 	// An explicit ask is HONOURED OR REFUSED, never widened to a neighbouring card or
 	// count — and the refusal has to say so out loud (cl-132), AND say which absence it
 	// hit (th-150).
-	return "", hub.RentalSKU{}, m.refuseSKU(skuName, gpus, skus)
+	return "", hub.RentalSKU{}, m.refuseSKU(provider, skuName, gpus, skus)
 }
 
 // refuseSKU distinguishes unknown products, provider stock-outs, and
 // temporary boot-failure exclusions. Reading status never acquires a rental.
-func (m *managedRentals) refuseSKU(skuName string, gpus int, skus []hub.RentalSKU) *exit.Error {
+func (m *managedRentals) refuseSKU(provider, skuName string, gpus int, skus []hub.RentalSKU) *exit.Error {
 	hctx, cancel := hub.Context()
-	status, problem := client(m.ctx).RentalSKUStatus(hctx, skuName, gpus)
+	status, problem := client(m.ctx).RentalSKUStatus(hctx, provider, skuName, gpus)
 	cancel()
 	if problem != nil {
 		// The lookup is an EXPLANATION, never the refusal itself: a hub that fails
@@ -691,7 +693,7 @@ func pinText(c orchestrator.PlacementCandidate) string {
 func (m *managedRentals) catalog(origin string) ([]hub.RentalSKU, *exit.Error) {
 	hctx, cancel := hub.Context()
 	defer cancel()
-	return client(m.at(origin)).RentalSKUs(hctx)
+	return client(m.at(origin)).RentalSKUs(hctx, "")
 }
 
 // releaseOrphaned resumes after a daemon restart: every rental is reconciled with the hub
