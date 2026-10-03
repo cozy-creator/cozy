@@ -819,7 +819,7 @@ fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_pageable_past
     let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
     let tally = tensorfs_plane::io::IoTally::default();
-    let fd = tensorfs_plane::host::fill_sealed("unet", &layout, &source, 3, &tally).unwrap();
+    let fd = tensorfs_plane::host::fill_sealed("unet", &layout, &source, 3, &tally, None).unwrap();
     drop(source);
     let p = plane();
     let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();

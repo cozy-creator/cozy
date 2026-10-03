@@ -25,6 +25,7 @@ from ._ext.plane import (
     fill_sealed,
     hold_tier,
     release_tier,
+    reserve,
 )
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     "fill_sealed",
     "hold_tier",
     "release_tier",
+    "reserve",
 ]
