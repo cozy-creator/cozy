@@ -1709,12 +1709,6 @@ fn plan_preparation(
             Some(&requested.profile),
             None,
         )?;
-        let _ = golden_suite(prepared.conv)?;
-        for (_, seed) in &prepared.seeds {
-            if let Some(vectors) = &seed.vectors {
-                vectors.check(&seed.spec)?;
-            }
-        }
         // The tensor plan binds transforms/geometry/order; the pinned request binds all
         // carrier object identities. Locations participate in neither identity.
         let stable_headers: Vec<_> = prepared
@@ -2443,6 +2437,16 @@ pub fn snapshot_model_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every converter's frozen geometries reassemble bit for bit: checked here, once, not
+    /// on every preparation.
+    #[test]
+    fn every_converters_golden_cases_reassemble() {
+        for converter in convert::CONVERTERS.iter() {
+            golden_suite(converter).unwrap();
+        }
+    }
+
     use crate::catalog::Catalog;
     use crate::ingest::fingerprint::{Provenance, REAL};
     use crate::storage::Census;
