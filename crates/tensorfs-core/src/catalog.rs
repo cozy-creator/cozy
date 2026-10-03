@@ -11,7 +11,6 @@ use fs2::FileExt;
 use rusqlite::{params, Connection};
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::storage::Projection;
 
 mod lock;
 
@@ -530,37 +529,6 @@ impl Catalog {
         }
     }
 
-    pub fn replace_all(&self, projection: &Projection) -> Result<()> {
-        let mut connection = self.connection()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| sql("begin projection rebuild", error))?;
-        transaction
-            .execute_batch("DELETE FROM tensorfs_released_manifests;")
-            .map_err(|error| sql("clear projection", error))?;
-        insert_projection(&transaction, projection)?;
-        transaction
-            .commit()
-            .map_err(|error| sql("commit projection rebuild", error))
-    }
-
-    pub fn replace_repo(&self, org: &str, name: &str, projection: &Projection) -> Result<()> {
-        let mut connection = self.connection()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| sql("begin repository projection", error))?;
-        transaction
-            .execute(
-                "DELETE FROM tensorfs_released_manifests WHERE org=?1 AND name=?2",
-                params![org, name],
-            )
-            .map_err(|error| sql("delete old repository projection", error))?;
-        insert_projection(&transaction, projection)?;
-        transaction
-            .commit()
-            .map_err(|error| sql("commit repository projection", error))
-    }
-
     pub fn begin_operation(&self, id: &str, org: &str, name: &str) -> Result<WriterGuard> {
         let root = self.path.parent().ok_or_else(|| Refusal {
             code: Code::IO_FAILED,
@@ -905,31 +873,21 @@ impl Catalog {
         self.complete_operation(operation)
     }
 
-    /// Hold SQLite's short writer transaction across the filesystem repository replacement.
-    /// If projection insertion fails after rename, storage remains ahead of SQL and rebuild
-    /// repairs it; SQL is never allowed to lead the file.
-    pub fn commit_repository<F>(&self, org: &str, name: &str, write: F) -> Result<()>
+    /// Hold SQLite's short writer transaction across the filesystem repository replacement:
+    /// the repository CAS fence.
+    pub fn commit_repository<F>(&self, write: F) -> Result<()>
     where
-        F: FnOnce() -> Result<Projection>,
+        F: FnOnce() -> Result<()>,
     {
         let connection = self.connection()?;
         connection
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| sql("begin repository commit", error))?;
-        let result = (|| {
-            let projection = write()?;
-            connection
-                .execute(
-                    "DELETE FROM tensorfs_released_manifests WHERE org=?1 AND name=?2",
-                    params![org, name],
-                )
-                .map_err(|error| sql("delete old repository projection", error))?;
-            insert_projection(&connection, &projection)?;
+        let result = write().and_then(|()| {
             connection
                 .execute_batch("COMMIT")
-                .map_err(|error| sql("commit repository projection", error))?;
-            Ok(())
-        })();
+                .map_err(|error| sql("commit repository", error))
+        });
         if result.is_err() {
             let _ = connection.execute_batch("ROLLBACK");
         }
@@ -1441,19 +1399,6 @@ fn write_verification_on(connection: &Connection, row: &crate::store::VRecord) -
             ],
         )
         .map_err(|error| sql("write blob verification", error))?;
-    Ok(())
-}
-
-fn insert_projection(transaction: &Connection, projection: &Projection) -> Result<()> {
-    for row in projection.checkpoints.iter().filter(|row| row.published) {
-        transaction
-            .execute(
-                "INSERT INTO tensorfs_released_manifests(org,name,manifest_sha256)
-                 VALUES (?1,?2,?3) ON CONFLICT DO NOTHING",
-                params![row.org, row.name, row.manifest_sha256],
-            )
-            .map_err(|error| sql("insert released manifest", error))?;
-    }
     Ok(())
 }
 
@@ -2061,7 +2006,6 @@ mod tests {
             ["a-incomplete", "z-prepared"]
         );
         assert_eq!(fs::read(Catalog::path(&root)).unwrap(), before);
-        reopened.replace_all(&Projection::default()).unwrap();
         assert_eq!(
             reopened.model_source_operations().unwrap(),
             ["a-incomplete", "z-prepared"]

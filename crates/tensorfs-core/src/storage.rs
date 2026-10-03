@@ -13,7 +13,7 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Header};
 use crate::ids::{hex64, Doc, ObjectRef};
 use crate::manifest::Manifest;
-use crate::repository::{Checkpoint, Release, ReleaseLane, Repository, RepositoryName};
+use crate::repository::{Checkpoint, Release, Repository, RepositoryName};
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
     crate::store::classify_io(what, error)
@@ -471,68 +471,6 @@ impl Census {
         Ok(facts)
     }
 
-    /// Build the complete SQL projection for one release from the exact bytes staged by a
-    /// publisher. This is the pre-CAS admission seam used by local and cloud publication.
-    pub fn project_release_inputs(
-        repository: &Repository,
-        repository_bytes: &[u8],
-        release: &Release,
-        lane: &ReleaseLane,
-        staged: StagedCheckpoint<'_>,
-        inventory: BTreeMap<String, InventoryEntry>,
-    ) -> Result<Projection> {
-        if repository.canonical_bytes() != repository_bytes {
-            return refuse(
-                Code::NONCANONICAL_ENCODING,
-                "repository projection bytes are not the canonical repository",
-            );
-        }
-        if !repository.releases.contains(release) || !release.lanes.contains(lane) {
-            return refuse(
-                Code::RELEASE_ABSENT,
-                "projected release is not present in replacement repository",
-            );
-        }
-        let facts = Self::validate_checkpoint_inputs(&lane.manifest, staged, &inventory)?;
-        let mut projection = Projection::default();
-        projection.repos.push(RepoRow {
-            document_sha256: crate::sha256::hex_digest(repository_bytes),
-            name: repository.repo.name.clone(),
-            org: repository.repo.org.clone(),
-        });
-        projection
-            .checkpoints
-            .extend(
-                repository
-                    .checkpoints
-                    .iter()
-                    .map(|checkpoint| CheckpointRow {
-                        manifest_length: checkpoint.manifest.length,
-                        manifest_sha256: checkpoint.manifest.sha256.clone(),
-                        name: repository.repo.name.clone(),
-                        org: repository.repo.org.clone(),
-                        published: checkpoint.published,
-                    }),
-            );
-        let checkpoint = repository
-            .checkpoints
-            .iter()
-            .find(|checkpoint| checkpoint.manifest == lane.manifest)
-            .expect("validated release checkpoint");
-        Self::append_checkpoint_facts(repository, checkpoint, facts, &mut projection);
-        projection.releases.push(ReleaseRow {
-            lane: lane.lane.clone(),
-            manifest_length: lane.manifest.length,
-            manifest_sha256: lane.manifest.sha256.clone(),
-            name: repository.repo.name.clone(),
-            org: repository.repo.org.clone(),
-            release_revision: release.revision,
-            release_yanked: release.yanked,
-            version: release.version.clone(),
-        });
-        Ok(projection)
-    }
-
     fn append_checkpoint_facts(
         repository: &Repository,
         checkpoint: &Checkpoint,
@@ -685,45 +623,6 @@ impl Census {
             for release in &repository.releases {
                 self.project_release(repository, release, &mut projection)?;
             }
-        }
-        Ok(projection)
-    }
-
-    pub fn projection_for(&self, org: &str, name: &str) -> Result<Projection> {
-        let mut projection = Projection::default();
-        let Some((repository, bytes)) = self
-            .repositories
-            .iter()
-            .find(|(repository, _)| repository.repo.org == org && repository.repo.name == name)
-        else {
-            return Ok(projection);
-        };
-        projection.repos.push(RepoRow {
-            document_sha256: crate::sha256::hex_digest(bytes),
-            name: name.to_string(),
-            org: org.to_string(),
-        });
-        projection
-            .checkpoints
-            .extend(
-                repository
-                    .checkpoints
-                    .iter()
-                    .map(|checkpoint| CheckpointRow {
-                        manifest_length: checkpoint.manifest.length,
-                        manifest_sha256: checkpoint.manifest.sha256.clone(),
-                        name: repository.repo.name.clone(),
-                        org: repository.repo.org.clone(),
-                        published: checkpoint.published,
-                    }),
-            );
-        if self.complete_inventory {
-            for checkpoint in &repository.checkpoints {
-                self.project_checkpoint(repository, checkpoint, &mut projection)?;
-            }
-        }
-        for release in &repository.releases {
-            self.project_release(repository, release, &mut projection)?;
         }
         Ok(projection)
     }
@@ -1503,7 +1402,7 @@ mod tests {
     use crate::dtype::Dtype;
     use crate::header::{Asset, Body, Closure, Header, Part, Tensor};
     use crate::manifest::{Draft, Entry};
-    use crate::repository::{Checkpoint, Mutation, Release, RepositoryName};
+    use crate::repository::{Mutation, ReleaseLane, RepositoryName};
     use crate::store::{Fault, Store};
 
     fn temporary(name: &str) -> PathBuf {
@@ -1718,16 +1617,6 @@ mod tests {
                 .canonical_bytes(),
             bytes
         );
-        let connection = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
-        let releases: u64 = connection
-            .query_row(
-                "SELECT count(*) FROM tensorfs_released_manifests",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(releases, 1);
-
         let census = Census::open(&root).unwrap();
         assert!(census.gc_plan(&[]).unwrap().is_empty());
         let delete = Mutation::DeleteRepository { repo: repo.clone() };
@@ -1852,16 +1741,6 @@ mod tests {
                 actual.checkpoints[0].manifest
             );
             assert!(crate::cache_roots::matches(&store, &repo, &bytes).unwrap());
-            let connection = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
-            let rows: u64 = connection
-                .query_row(
-                    "SELECT count(*) FROM tensorfs_released_manifests",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(rows, 1);
-            drop(connection);
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -2111,87 +1990,51 @@ mod tests {
     }
 
     #[test]
-    fn release_projection_requires_exact_manifest_header_and_complete_inventory() {
+    fn checkpoint_inputs_require_exact_manifest_header_and_complete_inventory() {
         let root = temporary("release-inputs");
         let _ = fs::remove_dir_all(&root);
-        let (store, repo, manifest_ref) = fixture(&root);
+        let (store, _repo, manifest_ref) = fixture(&root);
         let manifest_bytes = fs::read(store.manifest_path(&manifest_ref.sha256)).unwrap();
         let manifest = Manifest::parse(&manifest_bytes).unwrap();
         let header_ref = manifest.header().unwrap();
         let header_bytes = fs::read(store.blob_path(&header_ref.sha256)).unwrap();
-        let lane = ReleaseLane {
-            extra: Default::default(),
-            lane: "cpu".into(),
-            manifest: manifest_ref.clone(),
+        let staged = |header: &'static [u8]| StagedCheckpoint {
+            manifest: &manifest_bytes,
+            header: Some(header),
         };
-        let release = Release {
-            extra: Default::default(),
-            lanes: vec![lane.clone()],
-            revision: 1,
-            version: "1.0.0".into(),
-            yanked: false,
-        };
-        let repository = Repository::empty(repo)
-            .put_checkpoint(Checkpoint {
-                extra: Default::default(),
-                manifest: manifest_ref.clone(),
-                published: false,
-                source_selection: None,
-            })
-            .unwrap()
-            .update_release("1.0.0", 0, vec![lane.clone()], Vec::new())
-            .unwrap();
-        let repository_bytes = repository.canonical_bytes();
         let inventory = inventory_from_tree(&root).unwrap();
-        let projection = Census::project_release_inputs(
-            &repository,
-            &repository_bytes,
-            &release,
-            &lane,
+        let facts = Census::validate_checkpoint_inputs(
+            &manifest_ref,
             StagedCheckpoint {
                 manifest: &manifest_bytes,
                 header: Some(&header_bytes),
             },
-            inventory.clone(),
+            &inventory,
         )
         .unwrap();
-        assert_eq!(projection.releases.len(), 1);
-        assert_eq!(projection.objects.len(), 1);
-        assert!(!projection.encodings.is_empty());
-        assert!(!projection.components.is_empty());
+        assert_eq!(facts.objects.len(), 1);
+        assert!(!facts.encodings.is_empty());
+        assert!(!facts.components.is_empty());
 
         let mut missing_header = inventory;
         missing_header.remove(&header_ref.sha256);
         assert_eq!(
-            Census::project_release_inputs(
-                &repository,
-                &repository_bytes,
-                &release,
-                &lane,
+            Census::validate_checkpoint_inputs(
+                &manifest_ref,
                 StagedCheckpoint {
                     manifest: &manifest_bytes,
                     header: Some(&header_bytes),
                 },
-                missing_header,
+                &missing_header,
             )
             .unwrap_err()
             .code,
             Code::OBJECT_ABSENT
         );
         assert_eq!(
-            Census::project_release_inputs(
-                &repository,
-                &repository_bytes,
-                &release,
-                &lane,
-                StagedCheckpoint {
-                    manifest: &manifest_bytes,
-                    header: Some(b"not the header"),
-                },
-                BTreeMap::new(),
-            )
-            .unwrap_err()
-            .code,
+            Census::validate_checkpoint_inputs(&manifest_ref, staged(b"not the header"), &BTreeMap::new())
+                .unwrap_err()
+                .code,
             Code::OBJECT_ID_MISMATCH
         );
         let _ = fs::remove_dir_all(root);

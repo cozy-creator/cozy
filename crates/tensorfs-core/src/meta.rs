@@ -1,7 +1,7 @@
 //! Transient local coordination in SQLite.
 //!
 //! Repository files are the only durable catalog authority. Advisory marker locks protect local
-//! readers; SQLite retains only released-manifest lookup and resumable derived writes.
+//! readers; SQLite retains resumable derived writes.
 
 use std::collections::HashMap;
 use std::fs::{self, File};

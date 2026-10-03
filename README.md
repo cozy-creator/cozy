@@ -23,7 +23,7 @@ Repository files are authoritative checkpoint roots plus revisioned model releas
 Manifests are immutable virtual file trees. Blobs are immutable content bytes. TensorFS backs model
 and dataset CAS domains; package source and user media are ordinary object storage. SQLite locally
 and PostgreSQL in Tensorhub are
-local indexes and coordination. Repository files rebuild released-manifest lookup; open operation
+local indexes and coordination. Open operation
 holds protect in-flight writes from GC; derived transactions are resumable local work; verified
 blob rows avoid rehashing unchanged files. SQL never makes repository content durable.
 
@@ -360,7 +360,7 @@ green and red vectors.
 ```text
 tfs store init <root>
 tfs store info <root>
-tfs store rebuild <census> --rows <rows.jsonl> [--sqlite <tensorfs.sqlite>]
+tfs store rebuild <census> --rows <rows.jsonl>
 
 tfs put <root> <file>
 tfs get <root> <sha256>

@@ -3541,8 +3541,6 @@ mod tests {
 
         fs::remove_file(Catalog::path(store.root())).unwrap();
         let rebuilt = Catalog::initialize(store.root()).unwrap();
-        let projection = Census::open(store.root()).unwrap().projection().unwrap();
-        rebuilt.replace_all(&projection).unwrap();
         // Catalog destruction loses operation coordination, not retained journal bytes.
         // Enumeration does not guess a source type from generic filesystem sessions.
         assert!(rebuilt.model_source_operations().unwrap().is_empty());
