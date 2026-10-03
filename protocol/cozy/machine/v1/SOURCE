@@ -1,8 +1,8 @@
 repository=https://github.com/cozy-creator/cozy-machine
 path=proto/cozy/machine/v1/machine.proto
-commit=312261694c33660ce35a27c9540b1c06a5dbf43b
-machine.proto=sha256:e58b72cb4d8d473e96105e17bac7ea155c24f080ebf3fe2a51826b7a086fc61e
-machine.pb.go=sha256:1288cd8864fd2be5043a715ea6bec1ae103e165c907b855b686af864ab9f7583
+commit=2b49999da4671bd593f6e52834c7eed582cc76f3
+machine.proto=sha256:42102a2b2a4cb68ca6222c80ce238f031058972d3a9b804383baabdbc1d387ab
+machine.pb.go=sha256:49d8c572b8b3b066e625fc49beebe350c4b9e598cb6dfd3c5e88d2de898f9700
 machine_grpc.pb.go=sha256:105c6ba7356fc594427b08d8373be940ff57f9713e26dd4885ea5d94acd99e7e
 
 Generated with protoc-gen-go and protoc-gen-go-grpc (--go_opt=M, the proto unchanged).

@@ -209,6 +209,7 @@ type RunSpec struct {
 	WeightsDestination string           `protobuf:"bytes,13,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"` // model://… for a job's weights outputs
 	Hub                *HubAccess       `protobuf:"bytes,14,opt,name=hub,proto3" json:"hub,omitempty"`                                                         // held in memory for this run's preparation only
 	Owner              string           `protobuf:"bytes,15,opt,name=owner,proto3" json:"owner,omitempty"`                                                     // the account that org-relative references of local code name
+	Providers          *ProviderAccess  `protobuf:"bytes,16,opt,name=providers,proto3" json:"providers,omitempty"`                                             // provider tokens for source models, memory only like hub
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -354,6 +355,13 @@ func (x *RunSpec) GetOwner() string {
 	return ""
 }
 
+func (x *RunSpec) GetProviders() *ProviderAccess {
+	if x != nil {
+		return x.Providers
+	}
+	return nil
+}
+
 type isRunSpec_Source interface {
 	isRunSpec_Source()
 }
@@ -376,6 +384,59 @@ func (*RunSpec_Installation) isRunSpec_Source() {}
 
 func (*RunSpec_Local) isRunSpec_Source() {}
 
+// The caller's provider tokens, for models a run makes from a provider source.
+type ProviderAccess struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Huggingface   string                 `protobuf:"bytes,1,opt,name=huggingface,proto3" json:"huggingface,omitempty"`
+	Civitai       string                 `protobuf:"bytes,2,opt,name=civitai,proto3" json:"civitai,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProviderAccess) Reset() {
+	*x = ProviderAccess{}
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProviderAccess) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProviderAccess) ProtoMessage() {}
+
+func (x *ProviderAccess) ProtoReflect() protoreflect.Message {
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProviderAccess.ProtoReflect.Descriptor instead.
+func (*ProviderAccess) Descriptor() ([]byte, []int) {
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ProviderAccess) GetHuggingface() string {
+	if x != nil {
+		return x.Huggingface
+	}
+	return ""
+}
+
+func (x *ProviderAccess) GetCivitai() string {
+	if x != nil {
+		return x.Civitai
+	}
+	return ""
+}
+
 type Release struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // org/name
@@ -386,7 +447,7 @@ type Release struct {
 
 func (x *Release) Reset() {
 	*x = Release{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[2]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -398,7 +459,7 @@ func (x *Release) String() string {
 func (*Release) ProtoMessage() {}
 
 func (x *Release) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[2]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -411,7 +472,7 @@ func (x *Release) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Release.ProtoReflect.Descriptor instead.
 func (*Release) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{2}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *Release) GetPackage() string {
@@ -441,7 +502,7 @@ type LocalSource struct {
 
 func (x *LocalSource) Reset() {
 	*x = LocalSource{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[3]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -453,7 +514,7 @@ func (x *LocalSource) String() string {
 func (*LocalSource) ProtoMessage() {}
 
 func (x *LocalSource) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[3]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -466,7 +527,7 @@ func (x *LocalSource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalSource.ProtoReflect.Descriptor instead.
 func (*LocalSource) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{3}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *LocalSource) GetManifest() string {
@@ -489,7 +550,7 @@ type InputFile struct {
 
 func (x *InputFile) Reset() {
 	*x = InputFile{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[4]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -501,7 +562,7 @@ func (x *InputFile) String() string {
 func (*InputFile) ProtoMessage() {}
 
 func (x *InputFile) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[4]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -514,7 +575,7 @@ func (x *InputFile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputFile.ProtoReflect.Descriptor instead.
 func (*InputFile) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{4}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *InputFile) GetField() string {
@@ -561,13 +622,18 @@ type ModelChoice struct {
 	Manifest       string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>, optional exact checkpoint
 	ManifestLength uint64                 `protobuf:"varint,6,opt,name=manifest_length,json=manifestLength,proto3" json:"manifest_length,omitempty"`
 	Adapters       []*Adapter             `protobuf:"bytes,7,rep,name=adapters,proto3" json:"adapters,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// A provider source (hf://<org>/<repo>@<rev>[/member], civitai://<version>[/file]) the
+	// machine makes the slot's model from, under these reviewed profiles (none: the one its
+	// headers select); never with repository or manifest.
+	Source        string   `protobuf:"bytes,8,opt,name=source,proto3" json:"source,omitempty"`
+	Profiles      []string `protobuf:"bytes,9,rep,name=profiles,proto3" json:"profiles,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ModelChoice) Reset() {
 	*x = ModelChoice{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[5]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -579,7 +645,7 @@ func (x *ModelChoice) String() string {
 func (*ModelChoice) ProtoMessage() {}
 
 func (x *ModelChoice) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[5]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -592,7 +658,7 @@ func (x *ModelChoice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelChoice.ProtoReflect.Descriptor instead.
 func (*ModelChoice) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{5}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ModelChoice) GetParameter() string {
@@ -644,6 +710,20 @@ func (x *ModelChoice) GetAdapters() []*Adapter {
 	return nil
 }
 
+func (x *ModelChoice) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *ModelChoice) GetProfiles() []string {
+	if x != nil {
+		return x.Profiles
+	}
+	return nil
+}
+
 type Adapter struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Component     string                 `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
@@ -658,7 +738,7 @@ type Adapter struct {
 
 func (x *Adapter) Reset() {
 	*x = Adapter{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[6]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -670,7 +750,7 @@ func (x *Adapter) String() string {
 func (*Adapter) ProtoMessage() {}
 
 func (x *Adapter) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[6]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -683,7 +763,7 @@ func (x *Adapter) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Adapter.ProtoReflect.Descriptor instead.
 func (*Adapter) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{6}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Adapter) GetComponent() string {
@@ -739,7 +819,7 @@ type MemoResult struct {
 
 func (x *MemoResult) Reset() {
 	*x = MemoResult{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[7]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -751,7 +831,7 @@ func (x *MemoResult) String() string {
 func (*MemoResult) ProtoMessage() {}
 
 func (x *MemoResult) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[7]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -764,7 +844,7 @@ func (x *MemoResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MemoResult.ProtoReflect.Descriptor instead.
 func (*MemoResult) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{7}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *MemoResult) GetOperation() string {
@@ -801,7 +881,7 @@ type HubAccess struct {
 
 func (x *HubAccess) Reset() {
 	*x = HubAccess{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[8]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -813,7 +893,7 @@ func (x *HubAccess) String() string {
 func (*HubAccess) ProtoMessage() {}
 
 func (x *HubAccess) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[8]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -826,7 +906,7 @@ func (x *HubAccess) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HubAccess.ProtoReflect.Descriptor instead.
 func (*HubAccess) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{8}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *HubAccess) GetOrigin() string {
@@ -883,7 +963,7 @@ type RunEvent struct {
 
 func (x *RunEvent) Reset() {
 	*x = RunEvent{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[9]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -895,7 +975,7 @@ func (x *RunEvent) String() string {
 func (*RunEvent) ProtoMessage() {}
 
 func (x *RunEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[9]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -908,7 +988,7 @@ func (x *RunEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunEvent.ProtoReflect.Descriptor instead.
 func (*RunEvent) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{9}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RunEvent) GetSequence() uint64 {
@@ -1040,7 +1120,7 @@ type RunState struct {
 
 func (x *RunState) Reset() {
 	*x = RunState{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[10]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1052,7 +1132,7 @@ func (x *RunState) String() string {
 func (*RunState) ProtoMessage() {}
 
 func (x *RunState) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[10]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1065,7 +1145,7 @@ func (x *RunState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunState.ProtoReflect.Descriptor instead.
 func (*RunState) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{10}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RunState) GetId() string {
@@ -1124,7 +1204,7 @@ type Progress struct {
 
 func (x *Progress) Reset() {
 	*x = Progress{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[11]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1136,7 +1216,7 @@ func (x *Progress) String() string {
 func (*Progress) ProtoMessage() {}
 
 func (x *Progress) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[11]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1149,7 +1229,7 @@ func (x *Progress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Progress.ProtoReflect.Descriptor instead.
 func (*Progress) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{11}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *Progress) GetStage() string {
@@ -1211,7 +1291,7 @@ type Product struct {
 
 func (x *Product) Reset() {
 	*x = Product{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[12]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1223,7 +1303,7 @@ func (x *Product) String() string {
 func (*Product) ProtoMessage() {}
 
 func (x *Product) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[12]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1236,7 +1316,7 @@ func (x *Product) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Product.ProtoReflect.Descriptor instead.
 func (*Product) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{12}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *Product) GetOutput() string {
@@ -1305,7 +1385,7 @@ type LogLine struct {
 
 func (x *LogLine) Reset() {
 	*x = LogLine{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[13]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1317,7 +1397,7 @@ func (x *LogLine) String() string {
 func (*LogLine) ProtoMessage() {}
 
 func (x *LogLine) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[13]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1330,7 +1410,7 @@ func (x *LogLine) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogLine.ProtoReflect.Descriptor instead.
 func (*LogLine) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{13}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *LogLine) GetLevel() string {
@@ -1360,7 +1440,7 @@ type Outcome struct {
 
 func (x *Outcome) Reset() {
 	*x = Outcome{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[14]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1372,7 +1452,7 @@ func (x *Outcome) String() string {
 func (*Outcome) ProtoMessage() {}
 
 func (x *Outcome) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[14]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1385,7 +1465,7 @@ func (x *Outcome) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Outcome.ProtoReflect.Descriptor instead.
 func (*Outcome) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{14}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *Outcome) GetStatus() string {
@@ -1434,7 +1514,7 @@ type Reason struct {
 
 func (x *Reason) Reset() {
 	*x = Reason{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[15]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1446,7 +1526,7 @@ func (x *Reason) String() string {
 func (*Reason) ProtoMessage() {}
 
 func (x *Reason) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[15]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1459,7 +1539,7 @@ func (x *Reason) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Reason.ProtoReflect.Descriptor instead.
 func (*Reason) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{15}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *Reason) GetCode() string {
@@ -1494,7 +1574,7 @@ type MemoRecord struct {
 
 func (x *MemoRecord) Reset() {
 	*x = MemoRecord{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[16]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1506,7 +1586,7 @@ func (x *MemoRecord) String() string {
 func (*MemoRecord) ProtoMessage() {}
 
 func (x *MemoRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[16]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1519,7 +1599,7 @@ func (x *MemoRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MemoRecord.ProtoReflect.Descriptor instead.
 func (*MemoRecord) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{16}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *MemoRecord) GetOperation() string {
@@ -1553,7 +1633,7 @@ type ControlRequest struct {
 
 func (x *ControlRequest) Reset() {
 	*x = ControlRequest{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[17]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1565,7 +1645,7 @@ func (x *ControlRequest) String() string {
 func (*ControlRequest) ProtoMessage() {}
 
 func (x *ControlRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[17]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1578,7 +1658,7 @@ func (x *ControlRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControlRequest.ProtoReflect.Descriptor instead.
 func (*ControlRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{17}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ControlRequest) GetId() string {
@@ -1612,7 +1692,7 @@ type ReadRequest struct {
 
 func (x *ReadRequest) Reset() {
 	*x = ReadRequest{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[18]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1624,7 +1704,7 @@ func (x *ReadRequest) String() string {
 func (*ReadRequest) ProtoMessage() {}
 
 func (x *ReadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[18]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1637,7 +1717,7 @@ func (x *ReadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadRequest.ProtoReflect.Descriptor instead.
 func (*ReadRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{18}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ReadRequest) GetTarget() isReadRequest_Target {
@@ -1728,7 +1808,7 @@ type OutputTarget struct {
 
 func (x *OutputTarget) Reset() {
 	*x = OutputTarget{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[19]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1740,7 +1820,7 @@ func (x *OutputTarget) String() string {
 func (*OutputTarget) ProtoMessage() {}
 
 func (x *OutputTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[19]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1753,7 +1833,7 @@ func (x *OutputTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OutputTarget.ProtoReflect.Descriptor instead.
 func (*OutputTarget) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{19}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *OutputTarget) GetRun() string {
@@ -1791,7 +1871,7 @@ type ReadFrame struct {
 
 func (x *ReadFrame) Reset() {
 	*x = ReadFrame{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[20]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1803,7 +1883,7 @@ func (x *ReadFrame) String() string {
 func (*ReadFrame) ProtoMessage() {}
 
 func (x *ReadFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[20]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1816,7 +1896,7 @@ func (x *ReadFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFrame.ProtoReflect.Descriptor instead.
 func (*ReadFrame) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{20}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ReadFrame) GetRev() uint64 {
@@ -1867,7 +1947,7 @@ type StatusRequest struct {
 
 func (x *StatusRequest) Reset() {
 	*x = StatusRequest{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[21]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1879,7 +1959,7 @@ func (x *StatusRequest) String() string {
 func (*StatusRequest) ProtoMessage() {}
 
 func (x *StatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[21]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1892,7 +1972,7 @@ func (x *StatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
 func (*StatusRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{21}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *StatusRequest) GetKeepalive() bool {
@@ -1926,7 +2006,7 @@ type StatusFrame struct {
 
 func (x *StatusFrame) Reset() {
 	*x = StatusFrame{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[22]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1938,7 +2018,7 @@ func (x *StatusFrame) String() string {
 func (*StatusFrame) ProtoMessage() {}
 
 func (x *StatusFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[22]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1951,7 +2031,7 @@ func (x *StatusFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusFrame.ProtoReflect.Descriptor instead.
 func (*StatusFrame) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{22}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *StatusFrame) GetWorkerId() string {
@@ -2080,7 +2160,7 @@ type Gpu struct {
 
 func (x *Gpu) Reset() {
 	*x = Gpu{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[23]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2092,7 +2172,7 @@ func (x *Gpu) String() string {
 func (*Gpu) ProtoMessage() {}
 
 func (x *Gpu) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[23]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2105,7 +2185,7 @@ func (x *Gpu) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Gpu.ProtoReflect.Descriptor instead.
 func (*Gpu) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{23}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *Gpu) GetIndex() uint32 {
@@ -2160,7 +2240,7 @@ type Hub struct {
 
 func (x *Hub) Reset() {
 	*x = Hub{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[24]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2172,7 +2252,7 @@ func (x *Hub) String() string {
 func (*Hub) ProtoMessage() {}
 
 func (x *Hub) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[24]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2185,7 +2265,7 @@ func (x *Hub) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Hub.ProtoReflect.Descriptor instead.
 func (*Hub) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{24}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *Hub) GetOrigin() string {
@@ -2215,7 +2295,7 @@ type Environment struct {
 
 func (x *Environment) Reset() {
 	*x = Environment{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[25]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2227,7 +2307,7 @@ func (x *Environment) String() string {
 func (*Environment) ProtoMessage() {}
 
 func (x *Environment) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[25]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2240,7 +2320,7 @@ func (x *Environment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Environment.ProtoReflect.Descriptor instead.
 func (*Environment) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{25}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *Environment) GetInstallation() string {
@@ -2288,7 +2368,7 @@ type Disk struct {
 
 func (x *Disk) Reset() {
 	*x = Disk{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[26]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2300,7 +2380,7 @@ func (x *Disk) String() string {
 func (*Disk) ProtoMessage() {}
 
 func (x *Disk) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[26]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2313,7 +2393,7 @@ func (x *Disk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Disk.ProtoReflect.Descriptor instead.
 func (*Disk) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{26}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *Disk) GetTotalBytes() uint64 {
@@ -2344,7 +2424,7 @@ type WriteFrame struct {
 
 func (x *WriteFrame) Reset() {
 	*x = WriteFrame{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[27]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2356,7 +2436,7 @@ func (x *WriteFrame) String() string {
 func (*WriteFrame) ProtoMessage() {}
 
 func (x *WriteFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[27]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2369,7 +2449,7 @@ func (x *WriteFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteFrame.ProtoReflect.Descriptor instead.
 func (*WriteFrame) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{27}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *WriteFrame) GetDigest() string {
@@ -2410,7 +2490,7 @@ type WriteResult struct {
 
 func (x *WriteResult) Reset() {
 	*x = WriteResult{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[28]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2422,7 +2502,7 @@ func (x *WriteResult) String() string {
 func (*WriteResult) ProtoMessage() {}
 
 func (x *WriteResult) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[28]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2435,7 +2515,7 @@ func (x *WriteResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteResult.ProtoReflect.Descriptor instead.
 func (*WriteResult) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{28}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *WriteResult) GetDigest() string {
@@ -2461,7 +2541,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"RunRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
 	"\x05after\x18\x02 \x01(\x04R\x05after\x12,\n" +
-	"\x04spec\x18\x03 \x01(\v2\x18.cozy.machine.v1.RunSpecR\x04spec\"\x84\x05\n" +
+	"\x04spec\x18\x03 \x01(\v2\x18.cozy.machine.v1.RunSpecR\x04spec\"\xc3\x05\n" +
 	"\aRunSpec\x12,\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x18.cozy.machine.v1.RunKindR\x04kind\x124\n" +
 	"\arelease\x18\x02 \x01(\v2\x18.cozy.machine.v1.ReleaseH\x00R\arelease\x12$\n" +
@@ -2479,8 +2559,12 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x10attention_kernel\x18\f \x01(\tR\x0fattentionKernel\x12/\n" +
 	"\x13weights_destination\x18\r \x01(\tR\x12weightsDestination\x12,\n" +
 	"\x03hub\x18\x0e \x01(\v2\x1a.cozy.machine.v1.HubAccessR\x03hub\x12\x14\n" +
-	"\x05owner\x18\x0f \x01(\tR\x05ownerB\b\n" +
-	"\x06source\"=\n" +
+	"\x05owner\x18\x0f \x01(\tR\x05owner\x12=\n" +
+	"\tproviders\x18\x10 \x01(\v2\x1f.cozy.machine.v1.ProviderAccessR\tprovidersB\b\n" +
+	"\x06source\"L\n" +
+	"\x0eProviderAccess\x12 \n" +
+	"\vhuggingface\x18\x01 \x01(\tR\vhuggingface\x12\x18\n" +
+	"\acivitai\x18\x02 \x01(\tR\acivitai\"=\n" +
 	"\aRelease\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\")\n" +
@@ -2492,7 +2576,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x06length\x18\x03 \x01(\x04R\x06length\x12\x1d\n" +
 	"\n" +
 	"media_type\x18\x04 \x01(\tR\tmediaType\x12\x14\n" +
-	"\x05order\x18\x05 \x01(\rR\x05order\"\xf4\x01\n" +
+	"\x05order\x18\x05 \x01(\rR\x05order\"\xa8\x02\n" +
 	"\vModelChoice\x12\x1c\n" +
 	"\tparameter\x18\x01 \x01(\tR\tparameter\x12\x1e\n" +
 	"\n" +
@@ -2502,7 +2586,9 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x04lane\x18\x04 \x01(\tR\x04lane\x12\x1a\n" +
 	"\bmanifest\x18\x05 \x01(\tR\bmanifest\x12'\n" +
 	"\x0fmanifest_length\x18\x06 \x01(\x04R\x0emanifestLength\x124\n" +
-	"\badapters\x18\a \x03(\v2\x18.cozy.machine.v1.AdapterR\badapters\"\x9d\x01\n" +
+	"\badapters\x18\a \x03(\v2\x18.cozy.machine.v1.AdapterR\badapters\x12\x16\n" +
+	"\x06source\x18\b \x01(\tR\x06source\x12\x1a\n" +
+	"\bprofiles\x18\t \x03(\tR\bprofiles\"\x9d\x01\n" +
 	"\aAdapter\x12\x1c\n" +
 	"\tcomponent\x18\x01 \x01(\tR\tcomponent\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x18\n" +
@@ -2681,80 +2767,82 @@ func file_cozy_machine_v1_machine_proto_rawDescGZIP() []byte {
 }
 
 var file_cozy_machine_v1_machine_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_cozy_machine_v1_machine_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_cozy_machine_v1_machine_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
 var file_cozy_machine_v1_machine_proto_goTypes = []any{
 	(RunKind)(0),           // 0: cozy.machine.v1.RunKind
 	(Action)(0),            // 1: cozy.machine.v1.Action
 	(*RunRequest)(nil),     // 2: cozy.machine.v1.RunRequest
 	(*RunSpec)(nil),        // 3: cozy.machine.v1.RunSpec
-	(*Release)(nil),        // 4: cozy.machine.v1.Release
-	(*LocalSource)(nil),    // 5: cozy.machine.v1.LocalSource
-	(*InputFile)(nil),      // 6: cozy.machine.v1.InputFile
-	(*ModelChoice)(nil),    // 7: cozy.machine.v1.ModelChoice
-	(*Adapter)(nil),        // 8: cozy.machine.v1.Adapter
-	(*MemoResult)(nil),     // 9: cozy.machine.v1.MemoResult
-	(*HubAccess)(nil),      // 10: cozy.machine.v1.HubAccess
-	(*RunEvent)(nil),       // 11: cozy.machine.v1.RunEvent
-	(*RunState)(nil),       // 12: cozy.machine.v1.RunState
-	(*Progress)(nil),       // 13: cozy.machine.v1.Progress
-	(*Product)(nil),        // 14: cozy.machine.v1.Product
-	(*LogLine)(nil),        // 15: cozy.machine.v1.LogLine
-	(*Outcome)(nil),        // 16: cozy.machine.v1.Outcome
-	(*Reason)(nil),         // 17: cozy.machine.v1.Reason
-	(*MemoRecord)(nil),     // 18: cozy.machine.v1.MemoRecord
-	(*ControlRequest)(nil), // 19: cozy.machine.v1.ControlRequest
-	(*ReadRequest)(nil),    // 20: cozy.machine.v1.ReadRequest
-	(*OutputTarget)(nil),   // 21: cozy.machine.v1.OutputTarget
-	(*ReadFrame)(nil),      // 22: cozy.machine.v1.ReadFrame
-	(*StatusRequest)(nil),  // 23: cozy.machine.v1.StatusRequest
-	(*StatusFrame)(nil),    // 24: cozy.machine.v1.StatusFrame
-	(*Gpu)(nil),            // 25: cozy.machine.v1.Gpu
-	(*Hub)(nil),            // 26: cozy.machine.v1.Hub
-	(*Environment)(nil),    // 27: cozy.machine.v1.Environment
-	(*Disk)(nil),           // 28: cozy.machine.v1.Disk
-	(*WriteFrame)(nil),     // 29: cozy.machine.v1.WriteFrame
-	(*WriteResult)(nil),    // 30: cozy.machine.v1.WriteResult
+	(*ProviderAccess)(nil), // 4: cozy.machine.v1.ProviderAccess
+	(*Release)(nil),        // 5: cozy.machine.v1.Release
+	(*LocalSource)(nil),    // 6: cozy.machine.v1.LocalSource
+	(*InputFile)(nil),      // 7: cozy.machine.v1.InputFile
+	(*ModelChoice)(nil),    // 8: cozy.machine.v1.ModelChoice
+	(*Adapter)(nil),        // 9: cozy.machine.v1.Adapter
+	(*MemoResult)(nil),     // 10: cozy.machine.v1.MemoResult
+	(*HubAccess)(nil),      // 11: cozy.machine.v1.HubAccess
+	(*RunEvent)(nil),       // 12: cozy.machine.v1.RunEvent
+	(*RunState)(nil),       // 13: cozy.machine.v1.RunState
+	(*Progress)(nil),       // 14: cozy.machine.v1.Progress
+	(*Product)(nil),        // 15: cozy.machine.v1.Product
+	(*LogLine)(nil),        // 16: cozy.machine.v1.LogLine
+	(*Outcome)(nil),        // 17: cozy.machine.v1.Outcome
+	(*Reason)(nil),         // 18: cozy.machine.v1.Reason
+	(*MemoRecord)(nil),     // 19: cozy.machine.v1.MemoRecord
+	(*ControlRequest)(nil), // 20: cozy.machine.v1.ControlRequest
+	(*ReadRequest)(nil),    // 21: cozy.machine.v1.ReadRequest
+	(*OutputTarget)(nil),   // 22: cozy.machine.v1.OutputTarget
+	(*ReadFrame)(nil),      // 23: cozy.machine.v1.ReadFrame
+	(*StatusRequest)(nil),  // 24: cozy.machine.v1.StatusRequest
+	(*StatusFrame)(nil),    // 25: cozy.machine.v1.StatusFrame
+	(*Gpu)(nil),            // 26: cozy.machine.v1.Gpu
+	(*Hub)(nil),            // 27: cozy.machine.v1.Hub
+	(*Environment)(nil),    // 28: cozy.machine.v1.Environment
+	(*Disk)(nil),           // 29: cozy.machine.v1.Disk
+	(*WriteFrame)(nil),     // 30: cozy.machine.v1.WriteFrame
+	(*WriteResult)(nil),    // 31: cozy.machine.v1.WriteResult
 }
 var file_cozy_machine_v1_machine_proto_depIdxs = []int32{
 	3,  // 0: cozy.machine.v1.RunRequest.spec:type_name -> cozy.machine.v1.RunSpec
 	0,  // 1: cozy.machine.v1.RunSpec.kind:type_name -> cozy.machine.v1.RunKind
-	4,  // 2: cozy.machine.v1.RunSpec.release:type_name -> cozy.machine.v1.Release
-	5,  // 3: cozy.machine.v1.RunSpec.local:type_name -> cozy.machine.v1.LocalSource
-	6,  // 4: cozy.machine.v1.RunSpec.inputs:type_name -> cozy.machine.v1.InputFile
-	7,  // 5: cozy.machine.v1.RunSpec.models:type_name -> cozy.machine.v1.ModelChoice
-	9,  // 6: cozy.machine.v1.RunSpec.known_results:type_name -> cozy.machine.v1.MemoResult
-	10, // 7: cozy.machine.v1.RunSpec.hub:type_name -> cozy.machine.v1.HubAccess
-	8,  // 8: cozy.machine.v1.ModelChoice.adapters:type_name -> cozy.machine.v1.Adapter
-	12, // 9: cozy.machine.v1.RunEvent.state:type_name -> cozy.machine.v1.RunState
-	13, // 10: cozy.machine.v1.RunEvent.progress:type_name -> cozy.machine.v1.Progress
-	14, // 11: cozy.machine.v1.RunEvent.product:type_name -> cozy.machine.v1.Product
-	15, // 12: cozy.machine.v1.RunEvent.log:type_name -> cozy.machine.v1.LogLine
-	16, // 13: cozy.machine.v1.RunEvent.outcome:type_name -> cozy.machine.v1.Outcome
-	18, // 14: cozy.machine.v1.RunEvent.memo:type_name -> cozy.machine.v1.MemoRecord
-	17, // 15: cozy.machine.v1.Outcome.reason:type_name -> cozy.machine.v1.Reason
-	14, // 16: cozy.machine.v1.Outcome.outputs:type_name -> cozy.machine.v1.Product
-	1,  // 17: cozy.machine.v1.ControlRequest.action:type_name -> cozy.machine.v1.Action
-	21, // 18: cozy.machine.v1.ReadRequest.output:type_name -> cozy.machine.v1.OutputTarget
-	12, // 19: cozy.machine.v1.StatusFrame.runs:type_name -> cozy.machine.v1.RunState
-	25, // 20: cozy.machine.v1.StatusFrame.gpus:type_name -> cozy.machine.v1.Gpu
-	26, // 21: cozy.machine.v1.StatusFrame.hubs:type_name -> cozy.machine.v1.Hub
-	27, // 22: cozy.machine.v1.StatusFrame.environments:type_name -> cozy.machine.v1.Environment
-	28, // 23: cozy.machine.v1.StatusFrame.disk:type_name -> cozy.machine.v1.Disk
-	23, // 24: cozy.machine.v1.Machine.Status:input_type -> cozy.machine.v1.StatusRequest
-	2,  // 25: cozy.machine.v1.Machine.Run:input_type -> cozy.machine.v1.RunRequest
-	19, // 26: cozy.machine.v1.Machine.Control:input_type -> cozy.machine.v1.ControlRequest
-	20, // 27: cozy.machine.v1.Machine.Read:input_type -> cozy.machine.v1.ReadRequest
-	29, // 28: cozy.machine.v1.Machine.Write:input_type -> cozy.machine.v1.WriteFrame
-	24, // 29: cozy.machine.v1.Machine.Status:output_type -> cozy.machine.v1.StatusFrame
-	11, // 30: cozy.machine.v1.Machine.Run:output_type -> cozy.machine.v1.RunEvent
-	12, // 31: cozy.machine.v1.Machine.Control:output_type -> cozy.machine.v1.RunState
-	22, // 32: cozy.machine.v1.Machine.Read:output_type -> cozy.machine.v1.ReadFrame
-	30, // 33: cozy.machine.v1.Machine.Write:output_type -> cozy.machine.v1.WriteResult
-	29, // [29:34] is the sub-list for method output_type
-	24, // [24:29] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	24, // [24:24] is the sub-list for extension extendee
-	0,  // [0:24] is the sub-list for field type_name
+	5,  // 2: cozy.machine.v1.RunSpec.release:type_name -> cozy.machine.v1.Release
+	6,  // 3: cozy.machine.v1.RunSpec.local:type_name -> cozy.machine.v1.LocalSource
+	7,  // 4: cozy.machine.v1.RunSpec.inputs:type_name -> cozy.machine.v1.InputFile
+	8,  // 5: cozy.machine.v1.RunSpec.models:type_name -> cozy.machine.v1.ModelChoice
+	10, // 6: cozy.machine.v1.RunSpec.known_results:type_name -> cozy.machine.v1.MemoResult
+	11, // 7: cozy.machine.v1.RunSpec.hub:type_name -> cozy.machine.v1.HubAccess
+	4,  // 8: cozy.machine.v1.RunSpec.providers:type_name -> cozy.machine.v1.ProviderAccess
+	9,  // 9: cozy.machine.v1.ModelChoice.adapters:type_name -> cozy.machine.v1.Adapter
+	13, // 10: cozy.machine.v1.RunEvent.state:type_name -> cozy.machine.v1.RunState
+	14, // 11: cozy.machine.v1.RunEvent.progress:type_name -> cozy.machine.v1.Progress
+	15, // 12: cozy.machine.v1.RunEvent.product:type_name -> cozy.machine.v1.Product
+	16, // 13: cozy.machine.v1.RunEvent.log:type_name -> cozy.machine.v1.LogLine
+	17, // 14: cozy.machine.v1.RunEvent.outcome:type_name -> cozy.machine.v1.Outcome
+	19, // 15: cozy.machine.v1.RunEvent.memo:type_name -> cozy.machine.v1.MemoRecord
+	18, // 16: cozy.machine.v1.Outcome.reason:type_name -> cozy.machine.v1.Reason
+	15, // 17: cozy.machine.v1.Outcome.outputs:type_name -> cozy.machine.v1.Product
+	1,  // 18: cozy.machine.v1.ControlRequest.action:type_name -> cozy.machine.v1.Action
+	22, // 19: cozy.machine.v1.ReadRequest.output:type_name -> cozy.machine.v1.OutputTarget
+	13, // 20: cozy.machine.v1.StatusFrame.runs:type_name -> cozy.machine.v1.RunState
+	26, // 21: cozy.machine.v1.StatusFrame.gpus:type_name -> cozy.machine.v1.Gpu
+	27, // 22: cozy.machine.v1.StatusFrame.hubs:type_name -> cozy.machine.v1.Hub
+	28, // 23: cozy.machine.v1.StatusFrame.environments:type_name -> cozy.machine.v1.Environment
+	29, // 24: cozy.machine.v1.StatusFrame.disk:type_name -> cozy.machine.v1.Disk
+	24, // 25: cozy.machine.v1.Machine.Status:input_type -> cozy.machine.v1.StatusRequest
+	2,  // 26: cozy.machine.v1.Machine.Run:input_type -> cozy.machine.v1.RunRequest
+	20, // 27: cozy.machine.v1.Machine.Control:input_type -> cozy.machine.v1.ControlRequest
+	21, // 28: cozy.machine.v1.Machine.Read:input_type -> cozy.machine.v1.ReadRequest
+	30, // 29: cozy.machine.v1.Machine.Write:input_type -> cozy.machine.v1.WriteFrame
+	25, // 30: cozy.machine.v1.Machine.Status:output_type -> cozy.machine.v1.StatusFrame
+	12, // 31: cozy.machine.v1.Machine.Run:output_type -> cozy.machine.v1.RunEvent
+	13, // 32: cozy.machine.v1.Machine.Control:output_type -> cozy.machine.v1.RunState
+	23, // 33: cozy.machine.v1.Machine.Read:output_type -> cozy.machine.v1.ReadFrame
+	31, // 34: cozy.machine.v1.Machine.Write:output_type -> cozy.machine.v1.WriteResult
+	30, // [30:35] is the sub-list for method output_type
+	25, // [25:30] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
 }
 
 func init() { file_cozy_machine_v1_machine_proto_init() }
@@ -2767,7 +2855,7 @@ func file_cozy_machine_v1_machine_proto_init() {
 		(*RunSpec_Installation)(nil),
 		(*RunSpec_Local)(nil),
 	}
-	file_cozy_machine_v1_machine_proto_msgTypes[9].OneofWrappers = []any{
+	file_cozy_machine_v1_machine_proto_msgTypes[10].OneofWrappers = []any{
 		(*RunEvent_State)(nil),
 		(*RunEvent_Progress)(nil),
 		(*RunEvent_Product)(nil),
@@ -2775,7 +2863,7 @@ func file_cozy_machine_v1_machine_proto_init() {
 		(*RunEvent_Outcome)(nil),
 		(*RunEvent_Memo)(nil),
 	}
-	file_cozy_machine_v1_machine_proto_msgTypes[18].OneofWrappers = []any{
+	file_cozy_machine_v1_machine_proto_msgTypes[19].OneofWrappers = []any{
 		(*ReadRequest_Output)(nil),
 		(*ReadRequest_Triage)(nil),
 		(*ReadRequest_Log)(nil),
@@ -2786,7 +2874,7 @@ func file_cozy_machine_v1_machine_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cozy_machine_v1_machine_proto_rawDesc), len(file_cozy_machine_v1_machine_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   29,
+			NumMessages:   30,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
