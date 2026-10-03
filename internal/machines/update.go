@@ -1,11 +1,9 @@
 package machines
 
 import (
-	"bytes"
 	"context"
-	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,122 +11,77 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/google/uuid"
 )
 
-// updateLocked is the client of the same durable installer used by rental machines.
-// It never kills the agent, invokes uv, or treats observer loss as a failed update.
+// updateLocked updates a running machine in place with Run kind: update over its
+// cozy.machine.v1 API: local wheels go up with Write, published versions are fetched by the
+// machine. The machine restarts its service on the candidate and rolls it back if it never
+// proves ready; this waits for the outcome.
 func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *exit.Error) {
-	selectedHost := source.Host
-
 	launch, problem := h.ensureLocked(ctx, "", nil, true)
 	if problem != nil {
 		return nil, problem
 	}
-	client, problem := h.maintenanceFor(launch)
+	pin, problem := h.Pin()
 	if problem != nil {
 		return nil, problem
 	}
-	defer client.Client.CloseIdleConnections()
-	state, problem := client.AwaitUpdateAdmission(ctx)
+	owner, problem := h.ExistingOwner()
 	if problem != nil {
 		return nil, problem
 	}
-	if state.Update != nil && !updateTerminal(state.Update.State) {
-		if state.Update.PendingActivation() {
-			return nil, pendingUpdateConflict(state.Update)
-		}
-		return nil, exit.Named(exit.Conflict, "machine.update_in_progress", "the machine is already completing update %s", state.Update.Operation)
+	client, err := machinev1.Dial(launch.Addr, pin.TLSConfig(), launch.WorkerID, owner.Signer())
+	if err != nil {
+		return nil, Transport(err)
 	}
-	agent := "bundled"
-	if selectedHost != "" {
-		digest, err := fileDigest(selectedHost)
-		if err != nil {
-			return nil, exit.New(exit.NotFound, "cannot read the selected agent: %s", err)
-		}
-		if digest != state.Agent.SHA256 {
-			return nil, exit.Named(exit.Structural, "machine.agent_bundle_required", "an existing machine can retain its running agent or select the agent in a Runtime wheel; bundle a different agent in the selected Runtime wheel and omit --host")
-		}
-		agent = "explicit"
+	defer client.Close()
+	cohort := machinev1.Cohort{Agent: "bundled"}
+	if source.Host != "" {
+		cohort.Agent = "explicit" // keep the running agent; a Runtime wheel's bundled one is not taken
 	}
-	operation := uuid.NewString()
-	type choice struct {
-		File    string `json:"file,omitempty"`
-		SHA256  string `json:"sha256,omitempty"`
-		Version string `json:"version,omitempty"`
-	}
-	body := struct {
-		Operation string `json:"operation"`
-		Pin       bool   `json:"pin"`
-		Agent     string `json:"agent"`
-		Runtime   choice `json:"runtime"`
-		TensorFS  choice `json:"tensorfs"`
-	}{Operation: operation, Agent: agent, Pin: source.Pinned || source.RuntimeWheel != "" || source.TensorFSWheel != ""}
 	for _, item := range []struct {
 		name, path string
-		out        *choice
-	}{{hostruntime.Distribution, source.RuntimeWheel, &body.Runtime}, {"tensorfs", source.TensorFSWheel, &body.TensorFS}} {
+		member     **machinev1.Member
+	}{{hostruntime.Distribution, source.RuntimeWheel, &cohort.Runtime}, {"tensorfs", source.TensorFSWheel, &cohort.TensorFS}} {
 		if item.path == "" {
 			version, problem := NewestPublished(ctx, item.name)
 			if problem != nil {
 				return nil, problem
 			}
-			item.out.Version = version
+			*item.member = &machinev1.Member{Version: version}
 			continue
 		}
-		digest, err := fileDigest(item.path)
-		if err != nil {
-			return nil, exit.New(exit.NotFound, "cannot read update wheel: %s", err)
-		}
-		staged, problem := client.Stage(ctx, item.path, filepath.Base(item.path))
+		member, problem := writeWheel(ctx, client, item.path)
 		if problem != nil {
 			return nil, problem
 		}
-		if staged != digest {
-			return nil, exit.New(exit.Conflict, "the staged update wheel differs from the selected bytes")
-		}
-		item.out.File, item.out.SHA256 = filepath.Base(item.path), digest
+		*item.member = member
 	}
-	raw, _ := json.Marshal(body)
-	for {
-		_, problem := client.Do(ctx, http.MethodPost, "/v1/machine/runtime/update", bytes.NewReader(raw), nil)
-		if problem == nil {
-			break
-		}
-		if problem.ErrName() != "machine.runtime_starting" {
-			return nil, exit.Named(exit.Unavailable, "machine.update_observation_lost", "update %s may continue on the machine; observation ended: %s", operation, problem)
-		}
-		if _, problem = client.AwaitUpdateAdmission(ctx); problem != nil {
-			return nil, problem
-		}
+	operation := uuid.NewString()
+	outcome, err := client.Update(ctx, operation, cohort, nil)
+	if err != nil {
+		return nil, exit.Named(exit.Unavailable, "machine.update_observation_lost", "update %s may continue on the machine; observation ended: %s", operation, Transport(err).Message)
 	}
-	state, problem = client.AwaitUpdateOrPending(ctx, operation)
-	if problem != nil {
-		return nil, problem
+	if outcome.GetStatus() != "succeeded" {
+		return nil, exit.Named(exit.Failed, "machine.update_failed", "update %s: %s", operation, outcome.GetReason().GetMessage())
 	}
-	if state.Update.PendingActivation() {
-		return pendingInstalled(state), nil
+	frame, err := client.Status(ctx)
+	if err != nil {
+		return nil, Transport(err)
 	}
-	if update := state.Update; update.State != "succeeded" {
-		return nil, exit.Named(exit.Failed, "machine.update_failed", "update %s: %s; machine now runs Runtime %s / TensorFS %s", operation, update.Error, state.Runtime, state.TensorFS)
-	}
-	if state.Agent.Selection != agent || state.Agent.SHA256 == "" {
-		return nil, exit.Named(exit.Structural, "machine.agent_selection_unconfirmed", "update %s completed without confirming the selected running agent", operation)
-	}
-	installed := &Installed{InstalledAt: time.Now().UTC(), HostPinned: state.Agent.Selection == "explicit",
-		Host:    installedArtifact{Name: "cozy-machine " + state.Agent.Version, SHA256: state.Agent.SHA256, Module: AgentModule},
-		Runtime: installedArtifact{Name: hostruntime.Distribution + " " + state.Runtime}, TensorFS: installedArtifact{Name: "tensorfs " + state.TensorFS}}
+	installed := &Installed{InstalledAt: time.Now().UTC(), HostPinned: source.Host != "",
+		Host:    installedArtifact{Name: "cozy-machine " + frame.GetVersion(), Module: AgentModule},
+		Runtime: installedArtifact{Name: hostruntime.Distribution + " " + frame.GetRuntime()}, TensorFS: installedArtifact{Name: "tensorfs " + frame.GetTensorfs()}}
 	for _, pair := range []struct {
 		file   string
 		target *installedArtifact
-	}{{source.RuntimeWheel, &installed.Runtime}, {source.TensorFSWheel, &installed.TensorFS}} {
+	}{{source.RuntimeWheel, &installed.Runtime}, {source.TensorFSWheel, &installed.TensorFS}, {source.Host, &installed.Host}} {
 		if pair.file != "" {
 			pair.target.Name = filepath.Base(pair.file)
 			pair.target.SHA256, _ = fileDigest(pair.file)
 		}
-	}
-	if selectedHost != "" {
-		installed.Host.Name = filepath.Base(selectedHost)
 	}
 	if err := h.recordInstalled(*installed); err != nil {
 		return nil, exit.Internalf("updated Runtime but cannot retain installation metadata: %s", err)
@@ -136,47 +89,26 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 	return installed, nil
 }
 
-func pendingUpdateConflict(update *RuntimeUpdateState) *exit.Error {
-	return exit.Named(exit.Conflict, "machine.update_in_progress", "Runtime update %s is awaiting activation; observe the existing candidate before starting another install", update.Operation)
-}
-
-// pendingInstalled reports the active pair and candidate operation without
-// persisting the candidate as installed. Further installs wait until Runtime
-// activates the candidate or rolls it back.
-func pendingInstalled(state *RuntimeState) *Installed {
-	return &Installed{
-		Host:       installedArtifact{Name: "cozy-machine " + state.Agent.Version, SHA256: state.Agent.SHA256, Module: AgentModule},
-		Runtime:    installedArtifact{Name: hostruntime.Distribution + " " + state.Runtime},
-		TensorFS:   installedArtifact{Name: "tensorfs " + state.TensorFS},
-		HostPinned: state.Agent.Selection == "explicit",
-		Pending:    state.Update,
+// writeWheel sends one local wheel to the machine with Write and names it for an update.
+func writeWheel(ctx context.Context, client *machinev1.Client, path string) (*machinev1.Member, *exit.Error) {
+	digest, err := fileDigest(path)
+	if err != nil {
+		return nil, exit.New(exit.NotFound, "cannot read update wheel: %s", err)
 	}
-}
-
-func (h *Host) maintenanceFor(launch *Launch) (*Maintenance, *exit.Error) {
-	// Observing an existing machine must never create new authority.
-	if _, err := os.ReadFile(h.path("owner.pem")); err != nil {
-		return nil, exit.New(exit.Credential, "the retained machine owner key is unavailable")
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, exit.New(exit.NotFound, "cannot read update wheel: %s", err)
 	}
-	owner, problem := h.Owner()
-	if problem != nil {
-		return nil, problem
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, exit.New(exit.NotFound, "cannot read update wheel: %s", err)
 	}
-	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
-	if err != nil || len(public) != ed25519.PublicKeySize {
-		return nil, exit.New(exit.Credential, "the machine owner key is unreadable")
+	member := &machinev1.Member{Wheel: filepath.Base(path), Digest: "sha256:" + digest, Length: uint64(info.Size())}
+	if err := client.Write(ctx, member.Digest, member.Length, file); err != nil {
+		return nil, Transport(err)
 	}
-	pin, problem := h.Pin()
-	if problem != nil {
-		return nil, problem
-	}
-	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
-	return &Maintenance{Base: "https://" + launch.Addr, Machine: launch.WorkerID, Public: public,
-		Sign: owner.Sign, Client: &http.Client{Transport: transport}}, nil
-}
-
-func updateTerminal(state string) bool {
-	return state == "succeeded" || state == "rolled_back" || state == "failed"
+	return member, nil
 }
 
 func (h *Host) recordInstalled(installed Installed) error {
@@ -203,4 +135,26 @@ func (h *Host) recordInstalled(installed Installed) error {
 		return err
 	}
 	return os.Rename(file.Name(), target)
+}
+
+// NewestPublished is a distribution's newest release on the package index.
+func NewestPublished(ctx context.Context, name string) (string, *exit.Error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://pypi.org/pypi/"+name+"/json", nil)
+	if err != nil {
+		return "", exit.Internalf("cannot address the package index: %s", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return "", exit.Unavailablef("the package index did not answer: %s", err)
+	}
+	defer response.Body.Close()
+	var project struct {
+		Info struct {
+			Version string `json:"version"`
+		} `json:"info"`
+	}
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 32<<20)).Decode(&project) != nil || project.Info.Version == "" {
+		return "", exit.New(exit.Unavailable, "the package index has no release of %s", name)
+	}
+	return project.Info.Version, nil
 }

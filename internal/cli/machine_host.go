@@ -60,13 +60,7 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		{K: "root", V: host.Root()}, {K: "host", V: installed.Host.Name}, {K: "host_sha256", V: installed.Host.SHA256},
 		{K: "runtime", V: installed.Runtime.Name}, {K: "tensorfs", V: installed.TensorFS.Name},
 	}
-	notes := []string{"the installed machine remains available for local runs"}
-	if installed.Pending != nil {
-		fields = append(fields, output.Field{K: "update", V: installed.Pending})
-		notes = append(notes, "the Runtime candidate is prepared; activation waits for current machine work to drain")
-	} else {
-		notes = append(notes, "the next local run launches this machine")
-	}
+	notes := []string{"the installed machine remains available for local runs", "the next local run launches this machine"}
 	return emit(ctx, output.Record{Fields: fields, Notes: notes})
 }
 

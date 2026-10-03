@@ -8,7 +8,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
@@ -21,8 +23,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
 var (
@@ -220,4 +225,66 @@ func machineInstallations(root string) string {
 // the machine's own TensorFS Store.
 func machineJournal(root string) string {
 	return filepath.Join(machineStore(root), ".cozy-workspace", "journal.sqlite3")
+}
+
+// runtimePhase is the phase an agent's maintenance route reports (GET /v1/machine/runtime,
+// served until the cutover deletes it), read with a maintenance cap the owner signs.
+func runtimePhase(t *testing.T, addr string, pin *workertls.Pin, worker string, owner rental.CreatorIdentity) (string, error) {
+	t.Helper()
+	signer := owner.Signer()
+	token, err := capability.MintSigned(signer.Public, signer.Sign, capability.Grant{Machine: worker, Action: capability.Maintenance, Expires: time.Now().Add(5 * time.Minute).Unix()})
+	if err != nil {
+		return "", err
+	}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://"+addr+"/v1/machine/runtime", nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Cozy-Cap "+token)
+	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
+	defer transport.CloseIdleConnections()
+	response, err := (&http.Client{Transport: transport, Timeout: 5 * time.Second}).Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	var state struct{ Phase string }
+	if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&state) != nil {
+		return "", fmt.Errorf("the agent answered HTTP %d", response.StatusCode)
+	}
+	return state.Phase, nil
+}
+
+func transportLogs(root string) string {
+	paths, _ := filepath.Glob(filepath.Join(root, "tmp", "runtime-updates", "*", "transport.log"))
+	text := ""
+	for _, path := range paths {
+		data, _ := os.ReadFile(path)
+		text += path + ":\n" + string(data) + "\n"
+	}
+	return text
+}
+
+// eventually waits for ok; the bound only catches a hang on a loaded shared box.
+func eventually(t *testing.T, root, what string, ok func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Minute); !ok(); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not happen: %s\n%s", what, tail(filepath.Join(root, "daemon.log")), transportLogs(root))
+		}
+	}
+}
+
+// cozyWithin runs one CLI command, failing the test if it outlives `within`.
+func cozyWithin(t *testing.T, root string, within time.Duration, args ...string) (int, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
+	cmd.Env = childEnv(t, root)
+	data, _ := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("cozy %s hung past %s: %s\n%s", strings.Join(args, " "), within, data, tail(filepath.Join(root, "daemon.log")))
+	}
+	return cmd.ProcessState.ExitCode(), string(data)
 }
