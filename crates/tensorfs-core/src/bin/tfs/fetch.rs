@@ -24,15 +24,6 @@ use tensorfs_core::transport::ObjectSource;
 
 use crate::{bail, flag, Flags};
 
-macro_rules! ok {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(e) => return bail(e),
-        }
-    };
-}
-
 // ---------------------------------------------------------------- the one transport (tfs-050)
 
 use tensorfs_core::transport::{
@@ -134,10 +125,7 @@ fn pull_with_budget(
         eprintln!("--hub <base-url> is required");
         return ExitCode::from(2);
     };
-    let hub_host = match transport::base_host(base) {
-        Ok(host) => host,
-        Err(refusal) => return bail(refusal),
-    };
+    let hub_host = ok!(transport::base_host(base));
     let credential = match credential_of(flags, vec![hub_host]) {
         Ok(credential) => credential,
         Err(code) => return code,
@@ -440,10 +428,7 @@ pub fn cmd_staging_fetch(
             .as_mut()
             .map(|r| r as &mut dyn transport::FetchObserver),
     );
-    let fetched = match fetched {
-        Ok(fetched) => fetched,
-        Err(refusal) => return bail(refusal),
-    };
+    let fetched = ok!(fetched);
     if let Some(reporter) = reporter.as_mut() {
         reporter.moved = fetched.transferred;
         reporter.announce(1);

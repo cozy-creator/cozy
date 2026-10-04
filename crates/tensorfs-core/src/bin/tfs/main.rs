@@ -15,6 +15,15 @@ use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
 
 type TfsResult<T> = tensorfs_core::err::Result<T>;
 
+macro_rules! ok {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return bail(e),
+        }
+    };
+}
+
 const USAGE: &str = "usage: tfs <verb> ...
   version
   key blob|manifest <sha256> | repo <org> <name>
@@ -236,19 +245,10 @@ fn cache_args(kind: &str, object: &str, length: &str) -> TfsResult<(CacheKind, O
 /// and no second admission path: a cached object whose bytes disagree with its id is removed
 /// and reported, and the completion proof at the end is the Store's own local walk.
 fn cmd_repo_cache_restore(store: &Path, object: &str, length: &str, flags: &Flags) -> ExitCode {
-    let (_, manifest) = match cache_args("manifest", object, length) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let store = match Store::open(store) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let (_, manifest) = ok!(cache_args("manifest", object, length));
+    let store = ok!(Store::open(store));
     let session = flag(flags, "session").unwrap_or("restore");
-    let report = match durability::restore_checkpoint(&store, session, &manifest) {
-        Ok(report) => report,
-        Err(error) => return bail(error),
-    };
+    let report = ok!(durability::restore_checkpoint(&store, session, &manifest));
     print_restore(&report)
 }
 
@@ -275,14 +275,8 @@ fn cmd_repo_cache_resume(store: &Path, object: &str, length: &str, flags: &Flags
         );
         return ExitCode::FAILURE;
     };
-    let (_, head) = match cache_args("blob", object, length) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let store = match Store::open(store) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let (_, head) = ok!(cache_args("blob", object, length));
+    let store = ok!(Store::open(store));
     let session = flag(flags, "session").unwrap_or("resume");
     let cache = match store.repo_cache() {
         Some(cache) => cache.clone(),
@@ -295,10 +289,7 @@ fn cmd_repo_cache_resume(store: &Path, object: &str, length: &str, flags: &Flags
             return ExitCode::FAILURE;
         }
     };
-    let chain = match durability::chain(&cache, &head) {
-        Ok(chain) => chain,
-        Err(error) => return bail(error),
-    };
+    let chain = ok!(durability::chain(&cache, &head));
     let set = match durability::fold(&chain, plan) {
         Ok(set) => set,
         Err(error) if error.code == tensorfs_core::err::Code::IO_FAILED => return bail(error),
@@ -315,10 +306,7 @@ fn cmd_repo_cache_resume(store: &Path, object: &str, length: &str, flags: &Flags
         "chain        {} link(s) over operation {} — {} B declared durable",
         set.links, set.operation, set.bytes
     );
-    let report = match durability::restore_objects(&store, session, &set.blobs, &set.manifests) {
-        Ok(report) => report,
-        Err(error) => return bail(error),
-    };
+    let report = ok!(durability::restore_objects(&store, session, &set.blobs, &set.manifests));
     if !flag_on(flags, "no-journal") {
         match set.progress.last() {
             Some(snapshot) => {
@@ -351,15 +339,9 @@ fn cmd_repo_cache_resume(store: &Path, object: &str, length: &str, flags: &Flags
 /// only honest question to ask about a long conversion: not how many minutes it has taken,
 /// but whether more of it is durable than the last time anyone looked.
 fn cmd_repo_cache_chain(cache: &Path, object: &str, length: &str) -> ExitCode {
-    let (_, head) = match cache_args("blob", object, length) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let (_, head) = ok!(cache_args("blob", object, length));
     let cache = RepoObjectCache::new(cache);
-    let chain = match durability::chain(&cache, &head) {
-        Ok(chain) => chain,
-        Err(error) => return bail(error),
-    };
+    let chain = ok!(durability::chain(&cache, &head));
     for link in &chain {
         let object = link.object_ref();
         println!(
@@ -458,15 +440,6 @@ fn flag_num<T: std::str::FromStr>(f: &Flags, k: &str, d: T) -> T {
 fn bail(e: Refusal) -> ExitCode {
     eprintln!("REFUSED {e}");
     ExitCode::FAILURE
-}
-
-macro_rules! ok {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(e) => return bail(e),
-        }
-    };
 }
 
 mod ckpt;
@@ -839,44 +812,26 @@ fn cmd_cbor(action: &str, path: &Path, flags: &Flags) -> ExitCode {
     match action {
         "encode" => {
             let value =
-                match canon::parse_with_depth(&bytes, tensorfs_core::limits::DOC_MAX_BYTES, 16) {
-                    Ok(value) => value,
-                    Err(error) => return bail(error),
-                };
-            let header = match Header::from_diagnostic_value(&value) {
-                Ok(header) => header,
-                Err(error) => return bail(error),
-            };
+                ok!(canon::parse_with_depth(&bytes, tensorfs_core::limits::DOC_MAX_BYTES, 16));
+            let header = ok!(Header::from_diagnostic_value(&value));
             if let Err(error) = header.validate_structure() {
                 return bail(error);
             }
-            let encoded = match header.canonical_bytes() {
-                Ok(bytes) => bytes,
-                Err(error) => return bail(error),
-            };
+            let encoded = ok!(header.canonical_bytes());
             if let Err(error) = Header::parse(&encoded) {
                 return bail(error);
             }
             write_cli(&encoded, flags)
         }
         "decode" => {
-            let header = match Header::parse(&bytes) {
-                Ok(header) => header,
-                Err(error) => return bail(error),
-            };
-            let value = match header.diagnostic_value() {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
+            let header = ok!(Header::parse(&bytes));
+            let value = ok!(header.diagnostic_value());
             let mut rendered = canon::pretty(&value, 0).into_bytes();
             rendered.push(b'\n');
             write_cli(&rendered, flags)
         }
         "check" => {
-            let header = match Header::parse(&bytes) {
-                Ok(header) => header,
-                Err(error) => return bail(error),
-            };
+            let header = ok!(Header::parse(&bytes));
             println!("header_digest {}", tensorfs_core::ids::object_id(&bytes));
             println!("bytes {}", bytes.len());
             println!("components {}", header.components.len());

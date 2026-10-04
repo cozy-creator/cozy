@@ -42,10 +42,7 @@ pub fn cmd_manifest_build(entries_path: &Path, flags: &Flags) -> ExitCode {
             ),
         });
     }
-    let bytes = match read(entries_path) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let bytes = ok!(read(entries_path));
     let rows = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
     if rows.is_empty() {
         return bail(Refusal {
@@ -61,14 +58,8 @@ pub fn cmd_manifest_build(entries_path: &Path, flags: &Flags) -> ExitCode {
                 detail: "manifest rows contain an empty line".into(),
             });
         }
-        let value = match tensorfs_core::canon::parse_canonical(line, Manifest::MAX_BYTES) {
-            Ok(value) => value,
-            Err(error) => return bail(error),
-        };
-        let mut fields = match tensorfs_core::canon::Fields::new("ManifestFileRow", &value) {
-            Ok(fields) => fields,
-            Err(error) => return bail(error),
-        };
+        let value = ok!(tensorfs_core::canon::parse_canonical(line, Manifest::MAX_BYTES));
+        let mut fields = ok!(tensorfs_core::canon::Fields::new("ManifestFileRow", &value));
         let blob = match fields
             .req("blob")
             .and_then(|value| ObjectRef::from_value("ManifestFileRow.blob", value))
@@ -82,10 +73,7 @@ pub fn cmd_manifest_build(entries_path: &Path, flags: &Flags) -> ExitCode {
         };
         files.push((path, blob));
     }
-    let manifest = match Manifest::from_files(files) {
-        Ok(manifest) => manifest,
-        Err(error) => return bail(error),
-    };
+    let manifest = ok!(Manifest::from_files(files));
     let manifest_bytes = manifest.canonical_bytes();
     if let Err(error) = write(Path::new(output), &manifest_bytes) {
         return bail(error);
@@ -218,14 +206,8 @@ fn checkpoint_fact_rows(
 }
 
 pub fn cmd_repo_inspect(path: &Path, flags: &Flags) -> ExitCode {
-    let bytes = match read(path) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let repository = match Repository::parse(&bytes) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let bytes = ok!(read(path));
+    let repository = ok!(Repository::parse(&bytes));
     let Some(rows) = flag(flags, "rows") else {
         eprintln!("--rows <jsonl> is required");
         return ExitCode::from(2);
@@ -287,14 +269,8 @@ pub fn cmd_repo_get(root: &Path, org: &str, name: &str, flags: &Flags) -> ExitCo
         eprintln!("--out <current.json> is required");
         return ExitCode::from(2);
     };
-    let store = match Store::open(root) {
-        Ok(store) => store,
-        Err(error) => return bail(error),
-    };
-    let repository_name = match repository::RepositoryName::new(org, name) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let store = ok!(Store::open(root));
+    let repository_name = ok!(repository::RepositoryName::new(org, name));
     let path = store.repository_path(&repository_name);
     let bytes = match read(&path) {
         Ok(bytes) => bytes,
@@ -305,10 +281,7 @@ pub fn cmd_repo_get(root: &Path, org: &str, name: &str, flags: &Flags) -> ExitCo
             return bail(error);
         }
     };
-    let repository = match Repository::parse(&bytes) {
-        Ok(repository) => repository,
-        Err(error) => return bail(error),
-    };
+    let repository = ok!(Repository::parse(&bytes));
     if repository.repo != repository_name {
         return bail(Refusal {
             code: Code::PATH_DIGEST_MISMATCH,
@@ -379,14 +352,8 @@ fn observed_local(store: &Store, name: &str, observed: &str) -> Result<Option<Ve
 }
 
 pub fn cmd_local_resolve(root: &Path, name: &str) -> ExitCode {
-    let store = match Store::open(root) {
-        Ok(store) => store,
-        Err(error) => return bail(error),
-    };
-    let repo = match repository::RepositoryName::new("local", name) {
-        Ok(repo) => repo,
-        Err(error) => return bail(error),
-    };
+    let store = ok!(Store::open(root));
+    let repo = ok!(repository::RepositoryName::new("local", name));
     let path = store.repository_path(&repo);
     let bytes = match read(&path) {
         Ok(bytes) => bytes,
@@ -414,14 +381,8 @@ pub fn cmd_local_replace(
         eprintln!("--observed <sha256:...|absent> is required");
         return ExitCode::from(2);
     };
-    let store = match Store::open(root) {
-        Ok(store) => store,
-        Err(error) => return bail(error),
-    };
-    let observed = match observed_local(&store, name, observed) {
-        Ok(observed) => observed,
-        Err(error) => return bail(error),
-    };
+    let store = ok!(Store::open(root));
+    let observed = ok!(observed_local(&store, name, observed));
     let selection = match hex64(
         "source selection",
         source_selection.trim_start_matches("sha256:"),
@@ -446,10 +407,7 @@ pub fn cmd_local_replace(
         return bail(error);
     }
     let mutation = Mutation::ReplaceLocal {
-        repo: match repository::RepositoryName::new("local", name) {
-            Ok(repo) => repo,
-            Err(error) => return bail(error),
-        },
+        repo: ok!(repository::RepositoryName::new("local", name)),
         manifest,
         version: selection,
     };
@@ -472,20 +430,14 @@ pub fn cmd_local_remove(root: &Path, name: &str, flags: &Flags) -> ExitCode {
         eprintln!("--observed absent is invalid for local remove");
         return ExitCode::from(2);
     }
-    let store = match Store::open(root) {
-        Ok(store) => store,
-        Err(error) => return bail(error),
-    };
+    let store = ok!(Store::open(root));
     let observed = match observed_local(&store, name, observed) {
         Ok(Some(observed)) => observed,
         Ok(None) => unreachable!("absent was rejected above"),
         Err(error) => return bail(error),
     };
     let mutation = Mutation::DeleteRepository {
-        repo: match repository::RepositoryName::new("local", name) {
-            Ok(repo) => repo,
-            Err(error) => return bail(error),
-        },
+        repo: ok!(repository::RepositoryName::new("local", name)),
     };
     match store.apply_repository(Some(&observed), &mutation, &Fault::default()) {
         Ok(None) => {
@@ -517,10 +469,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
             Err(error) => return bail(error),
         }
     };
-    let mutation = match read(mutation).and_then(|bytes| Mutation::parse(&bytes)) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let mutation = ok!(read(mutation).and_then(|bytes| Mutation::parse(&bytes)));
 
     let inputs = match &mutation {
         Mutation::PutCheckpoint { manifest, .. } | Mutation::ReplaceLocal { manifest, .. } => {
@@ -530,36 +479,24 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 eprintln!("manifest mutation requires --manifest <json> --inventory <jsonl>");
                 return ExitCode::from(2);
             };
-            let manifest_bytes = match read(Path::new(manifest_path)) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
+            let manifest_bytes = ok!(read(Path::new(manifest_path)));
             if ObjectRef::of(&manifest_bytes) != *manifest {
                 return bail(Refusal {
                     code: Code::OBJECT_ID_MISMATCH,
                     detail: "staged manifest bytes disagree with mutation".into(),
                 });
             }
-            let parsed = match Manifest::parse(&manifest_bytes) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
+            let parsed = ok!(Manifest::parse(&manifest_bytes));
             let header_bytes = match (parsed.header(), flag(flags, "header")) {
                 (Some(header_ref), Some(header_path)) => {
-                    let bytes = match read(Path::new(header_path)) {
-                        Ok(value) => value,
-                        Err(error) => return bail(error),
-                    };
+                    let bytes = ok!(read(Path::new(header_path)));
                     if ObjectRef::of(&bytes) != *header_ref {
                         return bail(Refusal {
                             code: Code::OBJECT_ID_MISMATCH,
                             detail: "staged header bytes disagree with manifest".into(),
                         });
                     }
-                    match Header::parse(&bytes) {
-                        Ok(_) => {}
-                        Err(error) => return bail(error),
-                    }
+                    ok!(Header::parse(&bytes));
                     Some(bytes)
                 }
                 (None, None) => None,
@@ -572,10 +509,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                     return ExitCode::from(2);
                 }
             };
-            let inventory = match storage::read_inventory(Path::new(inventory_path)) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
+            let inventory = ok!(storage::read_inventory(Path::new(inventory_path)));
             Some((manifest_bytes, header_bytes, inventory))
         }
         Mutation::RemoveCheckpoint { .. }
@@ -584,10 +518,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
         | Mutation::DeleteRepository { .. } => None,
     };
 
-    let replacement = match repository::apply(current_bytes.as_deref(), &mutation) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let replacement = ok!(repository::apply(current_bytes.as_deref(), &mutation));
     let (bytes, lines) = match replacement {
         Some(repository) => {
             let bytes = repository.canonical_bytes();
@@ -656,10 +587,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
 }
 
 pub fn cmd_repo_commit(store: &Path, current: &str, mutation: &Path, flags: &Flags) -> ExitCode {
-    let store = match Store::open(store) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let store = ok!(Store::open(store));
     let current = if current == "-" {
         None
     } else {
@@ -668,10 +596,7 @@ pub fn cmd_repo_commit(store: &Path, current: &str, mutation: &Path, flags: &Fla
             Err(error) => return bail(error),
         }
     };
-    let mutation = match read(mutation).and_then(|bytes| Mutation::parse(&bytes)) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let mutation = ok!(read(mutation).and_then(|bytes| Mutation::parse(&bytes)));
     let fault = Fault {
         stage: flag(flags, "fault").map(str::to_string),
         ready: flag(flags, "ready").map(std::path::PathBuf::from),
@@ -710,14 +635,8 @@ pub fn cmd_key(kind: &str, args: &[&str]) -> ExitCode {
 }
 
 pub fn cmd_manifest_inspect(path: &Path, flags: &Flags) -> ExitCode {
-    let bytes = match read(path) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let manifest = match Manifest::parse(&bytes) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let bytes = ok!(read(path));
+    let manifest = ok!(Manifest::parse(&bytes));
     if let Some(expected) = flag(flags, "expect") {
         let (sha256, length) = expected.split_once(':').unwrap_or((expected, ""));
         if sha256.trim_start_matches("sha256:") != tensorfs_core::sha256::hex_digest(&bytes)
@@ -764,28 +683,16 @@ pub fn cmd_manifest_inspect(path: &Path, flags: &Flags) -> ExitCode {
                     })
                 }
             };
-            let header_bytes = match read(Path::new(header)) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
+            let header_bytes = ok!(read(Path::new(header)));
             if ObjectRef::of(&header_bytes) != *header_ref {
                 return bail(Refusal {
                     code: Code::OBJECT_ID_MISMATCH,
                     detail: "--header bytes differ from the manifest's cozytensors ref".into(),
                 });
             }
-            let header = match Header::parse(&header_bytes) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
-            let inventory = match storage::read_inventory(Path::new(inventory)) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
-            let refs = match closure_refs(&manifest, &header, header_ref) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
+            let header = ok!(Header::parse(&header_bytes));
+            let inventory = ok!(storage::read_inventory(Path::new(inventory)));
+            let refs = ok!(closure_refs(&manifest, &header, header_ref));
             for (_, object) in refs.values() {
                 if inventory.get(&object.sha256).map(|entry| entry.length) != Some(object.length) {
                     return bail(Refusal {
@@ -879,14 +786,8 @@ pub fn cmd_gc_headers(census: &Path, flags: &Flags) -> ExitCode {
         eprintln!("--out <requests.jsonl> is required");
         return ExitCode::from(2);
     };
-    let census = match Census::open_metadata(census) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let requests = match census.header_requests() {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let census = ok!(Census::open_metadata(census));
+    let requests = ok!(census.header_requests());
     let lines: Vec<Vec<u8>> = requests.iter().map(InventoryEntry::line).collect();
     match storage::write_json_lines(Path::new(output), &lines) {
         Ok(()) => ExitCode::SUCCESS,
@@ -899,22 +800,10 @@ pub fn cmd_gc_plan(census: &Path, flags: &Flags) -> ExitCode {
         eprintln!("--holds <holds.jsonl> and --out <plan.jsonl> are required");
         return ExitCode::from(2);
     };
-    let _gc = match WriterGuard::lock_rebuild(census) {
-        Ok(guard) => guard,
-        Err(error) => return bail(error),
-    };
-    let census = match Census::open(census) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let holds = match storage::read_holds(Path::new(holds)) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let plan = match census.gc_plan(&holds) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let _gc = ok!(WriterGuard::lock_rebuild(census));
+    let census = ok!(Census::open(census));
+    let holds = ok!(storage::read_holds(Path::new(holds)));
+    let plan = ok!(census.gc_plan(&holds));
     let lines: Vec<Vec<u8>> = plan.iter().map(|row| row.line()).collect();
     match storage::write_json_lines(Path::new(output), &lines) {
         Ok(()) => {
@@ -927,10 +816,7 @@ pub fn cmd_gc_plan(census: &Path, flags: &Flags) -> ExitCode {
 
 /// `tfs gc <root> [--dry-run] [--json]`: one complete reclamation pass (tensorfs_core::gc).
 pub fn cmd_gc(root: &Path, flags: &Flags) -> ExitCode {
-    let report = match gc::collect(root, flag(flags, "dry-run").is_some()) {
-        Ok(report) => report,
-        Err(error) => return bail(error),
-    };
+    let report = ok!(gc::collect(root, flag(flags, "dry-run").is_some()));
     if flag(flags, "json").is_some() {
         println!("{}", String::from_utf8_lossy(&report.json()));
     } else {
@@ -943,18 +829,9 @@ pub fn cmd_gc(root: &Path, flags: &Flags) -> ExitCode {
 }
 
 pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {
-    let _rebuild = match WriterGuard::lock_rebuild(census) {
-        Ok(guard) => guard,
-        Err(error) => return bail(error),
-    };
-    let census_value = match Census::open(census) {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
-    let projection = match census_value.projection() {
-        Ok(value) => value,
-        Err(error) => return bail(error),
-    };
+    let _rebuild = ok!(WriterGuard::lock_rebuild(census));
+    let census_value = ok!(Census::open(census));
+    let projection = ok!(census_value.projection());
     if let Some(rows) = flag(flags, "rows") {
         if let Err(error) = storage::write_json_lines(Path::new(rows), &projection.json_lines()) {
             return bail(error);
@@ -969,10 +846,7 @@ pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {
         let Some(root) = path.parent() else {
             return ExitCode::from(2);
         };
-        let catalog = match Catalog::initialize(root) {
-            Ok(value) => value,
-            Err(error) => return bail(error),
-        };
+        let catalog = ok!(Catalog::initialize(root));
         if let Err(error) = catalog.replace_all(&projection) {
             return bail(error);
         }
@@ -1033,10 +907,7 @@ pub fn cmd_reclaim_usage(root: &Path, flags: &Flags) -> ExitCode {
             }
         }
     }
-    let store = match Store::open(root) {
-        Ok(store) => store,
-        Err(error) => return bail(error),
-    };
+    let store = ok!(Store::open(root));
     let usage = match reclaim_holds(&store)
         .and_then(|holds| reclaim::usage(&store, &keep, &candidates, &holds))
     {
@@ -1092,15 +963,9 @@ pub fn cmd_reclaim_plan(root: &Path, flags: &Flags) -> ExitCode {
             Err(error) => return bail(error),
         }
     }
-    let store = match Store::open(root) {
-        Ok(store) => store,
-        Err(error) => return bail(error),
-    };
+    let store = ok!(Store::open(root));
     let plan =
-        match reclaim_holds(&store).and_then(|holds| reclaim::plan(&store, need, &keep, &holds)) {
-            Ok(plan) => plan,
-            Err(error) => return bail(error),
-        };
+        ok!(reclaim_holds(&store).and_then(|holds| reclaim::plan(&store, need, &keep, &holds)));
     if let Some(output) = flag(flags, "out") {
         if let Err(error) = fs::write(Path::new(output), plan.json()) {
             return bail(Refusal {
@@ -1141,22 +1006,13 @@ pub fn cmd_reclaim_run(root: &Path, flags: &Flags) -> ExitCode {
             })
         }
     };
-    let drop = match reclaim::victims_of(&document) {
-        Ok(names) => names,
-        Err(error) => return bail(error),
-    };
+    let drop = ok!(reclaim::victims_of(&document));
     let options = reclaim::RunOptions {
         demote: crate::flag_on(flags, "demote"),
         assume_upstream: crate::flag_on(flags, "assume-upstream"),
     };
-    let store = match Store::open(root) {
-        Ok(store) => store,
-        Err(error) => return bail(error),
-    };
-    let report = match reclaim::run(&store, &drop, options) {
-        Ok(report) => report,
-        Err(error) => return bail(error),
-    };
+    let store = ok!(Store::open(root));
+    let report = ok!(reclaim::run(&store, &drop, options));
     if crate::flag_on(flags, "json") {
         println!("{}", String::from_utf8_lossy(&report.json()));
     } else {
