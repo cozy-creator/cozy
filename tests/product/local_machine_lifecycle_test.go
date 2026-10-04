@@ -88,6 +88,9 @@ func fakeAgentMachine(t *testing.T, root string, executor time.Duration) (*machi
 		t.Skip("needs a systemd user manager")
 	}
 	must(t, os.MkdirAll(root, 0o700))
+	// The reaper learns the root before its agent can exist: a test interrupted after the
+	// launch, its cleanup never run, still has its agent ended.
+	trackDaemonRoot(t, root)
 	dir := filepath.Join(root, "machine")
 	self, err := os.Executable()
 	must(t, err)
