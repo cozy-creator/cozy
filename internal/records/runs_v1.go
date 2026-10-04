@@ -90,10 +90,11 @@ func projectRunV1(tx *sql.Tx, id string, state *v1.RunState) error {
 		next = "queued"
 	case "running":
 		next = "dispatching"
-	case "paused":
-		next = "paused"
+	case "pausing", "paused":
+		next = state.State
 	}
-	if next == "" || Settled(current) {
+	// A pausing job's root still reads running until it has stopped.
+	if next == "" || Settled(current) || current == "pausing" && next == "dispatching" {
 		return nil
 	}
 	if cancel {

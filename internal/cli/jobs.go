@@ -165,8 +165,9 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	}
 	if handle.MachineExecution {
 		// The daemon already owns this run. Waiting for the worker's receipt is
-		// part of --await, not a second acceptance gate for a detached command.
-		if !ctx.Inv.Bool("--follow") {
+		// part of --await, not a second acceptance gate for a detached command. A
+		// foreground controller ends with this command, so it submits before it does.
+		if !ctx.Inv.Bool("--follow") && ctx.endpoint == nil {
 			state, problem := c.Job(handle.JobID)
 			if problem != nil {
 				return problem

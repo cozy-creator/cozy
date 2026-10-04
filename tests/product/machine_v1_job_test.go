@@ -25,6 +25,8 @@ import (
 
 var cpuLongform = flag.String("cpu-longform", "", "cozy-machine tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
 
+var olderCozy = flag.String("older-cozy", "", "a released cozy whose daemon predates cozy.machine.v1 (0.1.26)")
+
 // `cozy run <pkg>/long_form` on a machine that serves cozy.machine.v1, as a user types it: a
 // job whose file input is a reference image, each segment a child run of the package's own
 // invocable, the film published after every segment and saved to --out at its end.
@@ -114,11 +116,12 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	}
 }
 
-// A job on an explicit endpoint runs in the foreground (no daemon owns it), and an endpoint
-// that is one of this host's rentals is signed with that rental's own key: a rental's machine
-// authorizes it, not this computer's machine owner key. Here this computer's machine stands
-// in for the rental: its key moves to a rental's credential and the owner key is replaced.
-func TestEndpointJobSignsWithItsRentalKey(t *testing.T) {
+// A job on an explicit endpoint runs in the foreground (no daemon owns it), with its pause and
+// resume, and an endpoint that is one of this host's rentals is signed with that rental's own
+// key: a rental's machine authorizes it, not this computer's machine owner key. Here this
+// computer's machine stands in for the rental: its key moves to a rental's credential and the
+// owner key is replaced.
+func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
 		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
 	}
@@ -154,55 +157,131 @@ func TestEndpointJobSignsWithItsRentalKey(t *testing.T) {
 	must(t, json.Unmarshal(raw, &agent))
 	leaf, err := os.ReadFile(filepath.Join(root, "machine", "leaf.pem"))
 	must(t, err)
+	address := fmt.Sprintf("127.0.0.1:%d", agent.WorkerPort)
 	endpoint := filepath.Join(root, "endpoint.json")
-	document, _ := json.Marshal(map[string]string{"format": "cozy.machine.endpoint/1", "address": fmt.Sprintf("127.0.0.1:%d", agent.WorkerPort),
+	document, _ := json.Marshal(map[string]string{"format": "cozy.machine.endpoint/1", "address": address,
 		"worker_id": agent.WorkerID, "worker_boot_id": "boot", "tls_certificate_pem": string(leaf), "execution_workspace_id": "workspace"})
 	must(t, os.WriteFile(endpoint, document, 0o600))
-	// The machine authorizes the key it started with; that key becomes a rental's, and this
-	// computer's owner key is now another one the machine does not know.
+	// The machine authorizes the key it started with; this computer's owner key becomes
+	// another one the machine does not know.
 	owner := filepath.Join(root, "machine", "owner.pem")
 	authorized, err := os.ReadFile(owner)
 	must(t, err)
-	must(t, os.MkdirAll(filepath.Join(root, "rentals"), 0o700))
-	must(t, os.WriteFile(filepath.Join(root, "rentals", "pr-standin.creator.pem"), authorized, 0o600))
 	_, private, _ := ed25519.GenerateKey(nil)
 	der, err := x509.MarshalPKCS8PrivateKey(private)
 	must(t, err)
 	must(t, os.WriteFile(owner, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600))
+	// The daemon is not this run's controller: every command below is its own foreground one.
+	if code, out := runCozy(t, root, "down"); code != 0 {
+		t.Fatalf("down [exit %d]\n%s", code, out)
+	}
 
 	picture := image.NewRGBA(image.Rect(0, 0, 2, 2))
 	var encoded bytes.Buffer
 	must(t, png.Encode(&encoded, picture))
 	reference := filepath.Join(root, "ref.png")
 	must(t, os.WriteFile(reference, encoded.Bytes(), 0o600))
-	request, _ := json.Marshal(map[string]any{"segments": []string{"one", "two"}})
 	in := filepath.Join(root, "req.json")
+	request, _ := json.Marshal(map[string]any{"segments": []string{"one", "two", "three"}, "hold": 2.0})
 	must(t, os.WriteFile(in, request, 0o600))
+	out := filepath.Join(root, "film")
 	run := func(extra ...string) (int, string) {
 		args := append([]string{"run", "local/cozy-machine-cpu-longform/long_form", "--machine-endpoint-file", endpoint,
-			"--input", in, "--asset", "reference=" + reference, "--json"}, extra...)
+			"--input", in, "--asset", "reference=" + reference, "--json", "--out", out}, extra...)
 		return runCozy(t, root, args...)
 	}
-	// Signed with the owner key, which the machine does not authorize: refused.
-	if code, out := run("--await"); code == 0 {
-		t.Fatalf("the machine accepted a key it does not authorize\n%s", out)
+	// Signed with the owner key, which the machine does not authorize: refused, nothing sent.
+	if code, refused := run(); code == 0 || !strings.Contains(refused, "machine.endpoint_unauthorized") {
+		t.Fatalf("the machine accepted a key it does not authorize [exit %d]\n%s", code, refused)
 	}
-	// Once the endpoint is a recorded rental, its rental key signs and the job runs.
+	// Once the endpoint is a recorded rental holding the authorized key, that key signs and the
+	// job is accepted.
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if problem := store.RecordRental(records.Rental{ID: "pr-standin", MachineName: "standin", State: "ready",
-		Address: fmt.Sprintf("127.0.0.1:%d", agent.WorkerPort), CertPath: filepath.Join(root, "machine", "leaf.pem"),
-		ExpectedWorkerID: agent.WorkerID, ExpectedWorkerBootID: "boot", RentedAt: time.Now().UTC().Format(time.RFC3339)}); problem != nil {
+	problem = store.RecordRental(records.Rental{ID: "pr-standin", MachineName: "standin", State: "ready", Address: address,
+		SKU: "virtual-1", AcceleratorModel: "Virtual Accelerator", AcceleratorCount: 1, HourlyRateUSDMicros: 1,
+		CertPath: filepath.Join(root, "machine", "leaf.pem"), ExpectedWorkerID: agent.WorkerID, ExpectedWorkerBootID: "boot",
+		RentedAt: time.Now().UTC().Format(time.RFC3339)})
+	store.Close()
+	if problem != nil {
 		t.Fatal(problem)
 	}
-	store.Close()
-	out := filepath.Join(root, "film")
-	if code, document := run("--await", "--out", out); code != 0 {
-		t.Fatalf("the rental-signed job did not succeed [exit %d]\n%s", code, document)
+	must(t, os.MkdirAll(filepath.Join(root, "rentals"), 0o700))
+	must(t, os.WriteFile(filepath.Join(root, "rentals", "pr-standin.creator.pem"), authorized, 0o600))
+	code, submitted := run()
+	var job struct {
+		ID       string `json:"run"`
+		Accepted bool   `json:"machine_accepted"`
 	}
-	if files, _ := filepath.Glob(filepath.Join(out, "*video*")); len(files) != 1 {
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(submitted)), &job) != nil || job.ID == "" || !job.Accepted {
+		t.Fatalf("the rental-signed job was not accepted [exit %d]\n%s", code, submitted)
+	}
+	status := func() string {
+		_, shown := runCozy(t, root, "run", "show", job.ID, "--json")
+		var state struct {
+			Status string `json:"status"`
+		}
+		_ = json.Unmarshal([]byte(lastJSONLine(shown)), &state)
+		return state.Status
+	}
+	// Pause, then resume, each from its own foreground command on the recorded endpoint.
+	if code, paused := runCozy(t, root, "run", "pause", job.ID, "--json"); code != 0 {
+		t.Fatalf("run pause [exit %d]\n%s", code, paused)
+	}
+	landed(t, "the job to rest paused", func() bool { return status() == "paused" })
+	if code, resumed := runCozy(t, root, "run", "resume", job.ID, "--json"); code != 0 {
+		t.Fatalf("run resume [exit %d]\n%s", code, resumed)
+	}
+	if code, watched := runCozy(t, root, "run", "watch", job.ID, "--json"); code != 0 {
+		t.Fatalf("the resumed job did not complete [exit %d]\n%s", code, watched)
+	}
+	files, _ := filepath.Glob(filepath.Join(out, "*video*"))
+	if len(files) != 1 {
 		t.Fatalf("want the film saved in %s, got %v", out, files)
+	}
+	film, err := os.ReadFile(files[0])
+	must(t, err)
+	if lines := strings.Count(string(film), "\n"); lines != 3 {
+		t.Fatalf("the resumed job's film has %d segments:\n%s", lines, film)
+	}
+	if *olderCozy == "" {
+		return
+	}
+	// Version skew: under a running daemon that predates cozy.machine.v1, a run naming the
+	// rental goes from this command itself to the rental's machine; the daemon is not asked.
+	if code, stopped := runCozy(t, root, "down"); code != 0 {
+		t.Fatalf("down [exit %d]\n%s", code, stopped)
+	}
+	up := exec.Command(*olderCozy, "up")
+	up.Env = childEnv(t, root)
+	if raw, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("the older cozy did not start its daemon: %v\n%s", err, raw)
+	}
+	daemonBinary := func() string {
+		lock, _ := os.ReadFile(filepath.Join(root, "daemon.lock"))
+		for line := range strings.Lines(string(lock)) {
+			if pid, ok := strings.CutPrefix(strings.TrimSpace(line), "pid="); ok {
+				exe, _ := os.Readlink("/proc/" + pid + "/exe")
+				return exe
+			}
+		}
+		return ""
+	}
+	older, err := filepath.EvalSymlinks(*olderCozy)
+	must(t, err)
+	if running := daemonBinary(); running != older {
+		t.Fatalf("the daemon runs %q, not the older cozy %q", running, older)
+	}
+	must(t, os.WriteFile(in, []byte(`{"segments":["solo"]}`), 0o600))
+	skewed := filepath.Join(root, "skewed")
+	code, awaited := runCozy(t, root, "run", "local/cozy-machine-cpu-longform/long_form", "--rental=standin",
+		"--input", in, "--asset", "reference="+reference, "--await", "--json", "--out", skewed)
+	if files, _ := filepath.Glob(filepath.Join(skewed, "*video*")); code != 0 || len(files) != 1 {
+		t.Fatalf("the run under the older daemon did not save its film [exit %d]: %v\n%s", code, files, awaited)
+	}
+	if running := daemonBinary(); running != older {
+		t.Fatalf("the run replaced the older daemon with %q", running)
 	}
 }

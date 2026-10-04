@@ -86,7 +86,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 				return problem
 			}
 			defer close()
-			ctx.Inv.Values["--rental"] = nil
+			delete(ctx.Inv.Values, "--rental")
 			if problem := validateRunPlacement(ctx); problem != nil {
 				return problem
 			}
