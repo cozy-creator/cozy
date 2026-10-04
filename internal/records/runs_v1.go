@@ -56,9 +56,22 @@ func RunV1Outcome(link *MachineExecution) *v1.Outcome {
 	return &outcome
 }
 
-// AcceptRunV1 records the machine's acceptance once: its first RunState, the marker event,
-// and the request projected from that state.
-func (s *Store) AcceptRunV1(id string, state *v1.RunState) *exit.Error {
+// RunV1Worker is the worker id of the machine that accepted the run, as the machine names
+// itself ("" before acceptance): a capability for the run's outputs names it.
+func (s *Store) RunV1Worker(id string) string {
+	var accepted struct {
+		Worker string `json:"worker"`
+	}
+	var payload []byte
+	if s.db.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type=?`, id, RunV1Accepted).Scan(&payload) == nil {
+		_ = json.Unmarshal(payload, &accepted)
+	}
+	return accepted.Worker
+}
+
+// AcceptRunV1 records the acceptance of the machine `worker` once: its first RunState, the
+// marker event, and the request projected from that state.
+func (s *Store) AcceptRunV1(id, worker string, state *v1.RunState) *exit.Error {
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(state)
 	if err != nil {
 		return exit.Internalf("cannot retain the run's acceptance: %s", err)
@@ -75,7 +88,7 @@ func (s *Store) AcceptRunV1(id string, state *v1.RunState) *exit.Error {
 	if n, _ := result.RowsAffected(); n == 0 {
 		return nil // accepted before
 	}
-	if err := appendEventTx(tx, id, RunV1Accepted, int64(state.Attempt), map[string]any{"number": state.Number, "state": state.State}); err != nil {
+	if err := appendEventTx(tx, id, RunV1Accepted, int64(state.Attempt), map[string]any{"number": state.Number, "state": state.State, "worker": worker}); err != nil {
 		return exit.Internalf("cannot record the run's acceptance: %s", err)
 	}
 	if err := projectRunV1(tx, id, state); err != nil {

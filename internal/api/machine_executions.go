@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"math"
@@ -124,9 +125,11 @@ type MachineExecutionView struct {
 	// refuses its files, bytes its machine no longer holds); only `cozy run watch` tries again.
 	CollectionRefused string `json:"collection_refused,omitempty"`
 	// Worker and Number name the run on its machine, as the machine's receipt does; Number
-	// is 0 from a Runtime older than wire 66.
+	// is 0 from a Runtime older than wire 66. Run is its id on a cozy.machine.v1 machine,
+	// which names a run by id in every call and capability.
 	Worker string `json:"worker,omitempty"`
 	Number uint64 `json:"number,omitempty"`
+	Run    string `json:"run,omitempty"`
 }
 
 // RetainedOutput is an output held on the machine that produced it, in this host's custody,
@@ -168,7 +171,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	v1run, _ := s.store.RunV1(row.ID)
 	var receipt pb.MachineExecutionReceipt
 	if accepted := records.RunV1State(link); v1run && accepted != nil {
-		view.Worker, view.Number = link.MachineID, accepted.Number
+		view.Worker, view.Number, view.Run = cmp.Or(s.store.RunV1Worker(row.ID), link.MachineID), accepted.Number, row.ID
 	} else if !v1run && proto.Unmarshal(link.Receipt, &receipt) == nil {
 		view.Worker, view.Number = receipt.WorkerId, receipt.Number
 	}

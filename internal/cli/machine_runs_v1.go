@@ -235,7 +235,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			head, opened = state.Sequence, true // the stream's first frame names the log's head
 		}
 		if state := event.GetState(); state != nil && !accepted {
-			if problem := m.store.AcceptRunV1(request.ID, state); problem != nil {
+			if problem := m.store.AcceptRunV1(request.ID, machine.WorkerID, state); problem != nil {
 				return false, problem
 			}
 			accepted = true

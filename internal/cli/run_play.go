@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -40,7 +41,7 @@ func handleRunPlay(ctx *Context) *exit.Error {
 			WithRemedy("open its output file in a desktop player")
 	case execution == nil || !execution.Accepted:
 		return exit.Named(exit.Conflict, "play.not_started", "run %s has not reached its machine yet", run).WithNext("cozy run watch " + run)
-	case execution.Number == 0:
+	case execution.Number == 0 && execution.Run == "":
 		return exit.Named(exit.Conflict, "play.runtime_predates", "the Runtime on %s predates browser playback: it does not number its runs", life.Machine).
 			WithRemedy("update the rental's Runtime, or play a run of a newer rental")
 	}
@@ -63,7 +64,7 @@ func handleRunPlay(ctx *Context) *exit.Error {
 	case pin == nil:
 		return exit.Named(exit.Conflict, "play.pin_unreadable", "the Hub named rental %s's certificate as %q, not sha-256 AB:CD:…", life.Machine, rental.WebRTC.Fingerprint)
 	}
-	grant := capability.Grant{Machine: life.MachineExecution.Worker, Run: strconv.FormatUint(life.MachineExecution.Number, 10),
+	grant := capability.Grant{Machine: life.MachineExecution.Worker, Run: cmp.Or(life.MachineExecution.Run, strconv.FormatUint(life.MachineExecution.Number, 10)),
 		Outputs: []string{name}, Expires: time.Now().Add(expires).Unix()}
 	token, problem := scoped.AccountAuth.MintCapability(grant)
 	if problem != nil {
