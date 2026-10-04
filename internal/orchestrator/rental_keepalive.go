@@ -52,6 +52,9 @@ func (c *Orchestrator) KeepRentalAlive(ctx context.Context, id string) (records.
 	}
 	defer client.Close()
 	frame, err := client.Keepalive(ctx)
+	if problem := machinev1.Older(err); problem != nil {
+		return out, problem
+	}
 	if err != nil {
 		return out, exit.Unavailablef("rental keepalive was not acknowledged: %s", status.Convert(err).Message())
 	}

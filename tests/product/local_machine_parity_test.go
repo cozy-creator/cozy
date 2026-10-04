@@ -127,7 +127,12 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	must(t, err)
 	claimScratch(providerHome)
 	dir := filepath.Join(providerHome, "machine")
-	t.Cleanup(func() { _ = removeAllForce(providerHome) })
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("rental machine log tail:\n%s", tail(filepath.Join(dir, "host.log")))
+		}
+		_ = removeAllForce(providerHome)
+	})
 	trackDaemonRoot(t, providerHome)
 	host := machines.NewHost(dir, "", nil)
 	host.WebRTCPort, _ = strconv.Atoi(h.grants["COZY_WEBRTC_INTERNAL_PORT"])
@@ -171,6 +176,8 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	for name, value := range environment {
 		command.Env = append(command.Env, name+"="+value)
 	}
+	// As a pod's image does: the machine's own tools (uv) are on its PATH.
+	command.Env = append(command.Env, "PATH="+filepath.Join(host.Root(), "usr/local/bin")+":/usr/bin:/bin")
 	// A machine finds GPUs where its launcher may: a run that hides them hides them here too.
 	if visible, named := os.LookupEnv("CUDA_VISIBLE_DEVICES"); named {
 		command.Env = append(command.Env, "CUDA_VISIBLE_DEVICES="+visible)

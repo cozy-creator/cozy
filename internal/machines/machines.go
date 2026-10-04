@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -438,14 +439,11 @@ func cozyTooOld(name string) *exit.Error {
 
 // Transport names a failed machine RPC the way every machine caller reports it.
 func Transport(err error) *exit.Error {
-	code := status.Code(err)
-	if code == codes.Unimplemented {
-		// The machine is reached and has no such call: it is older than this cozy. Redialing
-		// never installs one, so the run ends here.
-		return exit.Named(exit.Structural, "machine.upgrade_required",
-			"the machine is older than this cozy (%s) and does not serve this call (%s)", build.Version, status.Convert(err).Message()).
-			WithRemedy("update the machine: `cozy machine install` on this computer; a rental on an older image is replaced by a new one (`cozy rental new`)")
+	// Redialing never installs a call the machine lacks, so the run ends here.
+	if problem := machinev1.Older(err); problem != nil {
+		return problem
 	}
+	code := status.Code(err)
 	if code == codes.Unavailable || code == codes.DeadlineExceeded || code == codes.Canceled || code == codes.ResourceExhausted || code == codes.Aborted {
 		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "machine execution observation is unavailable: %s", status.Convert(err).Message())
 	}
