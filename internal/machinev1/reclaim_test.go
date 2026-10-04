@@ -22,6 +22,7 @@ func TestReclaimUsesPinnedTLSMachineAuthorityAndRefusesOnlyUnsupportedOperation(
 		t.Fatal(err)
 	}
 	responseStatus := http.StatusOK
+	responseMalformed := false
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/machine/memory/reclaim" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -32,7 +33,11 @@ func TestReclaimUsesPinnedTLSMachineAuthorityAndRefusesOnlyUnsupportedOperation(
 		}
 		w.WriteHeader(responseStatus)
 		if responseStatus == http.StatusOK {
-			_ = json.NewEncoder(w).Encode(IdleMemoryReclaim{ExecutorsEnded: 2, RootExportBytesReleased: 1234})
+			if responseMalformed {
+				_, _ = w.Write([]byte(`{}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(IdleMemoryReclaim{ExecutorsBefore: 2, ExecutorsEnded: 2, RootExportBytesReleased: 1234})
 		}
 	}))
 	defer server.Close()
@@ -61,5 +66,10 @@ func TestReclaimUsesPinnedTLSMachineAuthorityAndRefusesOnlyUnsupportedOperation(
 	responseStatus = http.StatusConflict
 	if _, err := client.ReclaimIdleMemory(context.Background()); !errors.Is(err, ErrReclaimBusy) {
 		t.Fatalf("busy refusal lost its operation meaning: %v", err)
+	}
+	responseStatus = http.StatusOK
+	responseMalformed = true
+	if _, err := client.ReclaimIdleMemory(context.Background()); err == nil {
+		t.Fatal("missing counters were interpreted as successful zero unknowns")
 	}
 }

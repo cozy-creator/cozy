@@ -57,8 +57,21 @@ func (c *Client) ReclaimIdleMemory(ctx context.Context) (IdleMemoryReclaim, erro
 	case http.StatusConflict:
 		return result, ErrReclaimBusy
 	case http.StatusOK:
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return result, fmt.Errorf("owner memory reclaim answer is unreadable: %w", err)
+		}
+		for _, key := range []string{"executors_before", "executors_ended", "executors_unconfirmed", "root_export_bytes_remaining", "readers_remaining"} {
+			var count *uint64
+			if value, present := fields[key]; !present || json.Unmarshal(value, &count) != nil || count == nil {
+				return result, fmt.Errorf("owner memory reclaim answer lacks %s", key)
+			}
+		}
 		if err := json.Unmarshal(raw, &result); err != nil {
 			return result, fmt.Errorf("owner memory reclaim answer is unreadable: %w", err)
+		}
+		if result.ExecutorsEnded > result.ExecutorsBefore || result.ExecutorsUnconfirmed != result.ExecutorsBefore-result.ExecutorsEnded {
+			return result, errors.New("owner memory reclaim executor counts contradict its receipt")
 		}
 		return result, nil
 	default:
