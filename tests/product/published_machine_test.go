@@ -58,9 +58,6 @@ type publishedRouteObserver struct{}
 func (publishedRouteObserver) Refresh(context.Context, records.Request) *exit.Error { return nil }
 func (publishedRouteObserver) Withdraw(string)                                      {}
 func (publishedRouteObserver) Forget(string)                                        {}
-func (publishedRouteObserver) ForgetPackage(_ context.Context, pkg string) api.ForgottenPackage {
-	return api.ForgottenPackage{Package: pkg}
-}
 func (publishedRouteObserver) Control(context.Context, records.Request, string) *exit.Error {
 	return nil
 }

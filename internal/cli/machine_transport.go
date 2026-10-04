@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	machinepb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"io"
 	"os"
@@ -494,46 +493,6 @@ func (m *machineRuns) MachineLog(ctx context.Context, machine, log string, tailB
 		return out, nil
 	}
 	return api.MachineLog{}, machineTransport(err)
-}
-
-// ForgetPackage tells each machine this daemon knows (this computer's while it runs, every
-// ready rental) that a package's releases or owner bindings, or a model's releases, changed:
-// each keeps what it read of that name at its Hub, across Runtime restarts, and reads it once
-// more on its next run.
-func (m *machineRuns) ForgetPackage(ctx context.Context, pkg string) api.ForgottenPackage {
-	out := api.ForgottenPackage{Package: pkg, Machines: []string{}}
-	var names []string
-	if status, problem := m.machines.Host.Status(); problem == nil && status.Running {
-		names = append(names, machines.Local)
-	}
-	rentals, problem := m.store.Rentals()
-	if problem != nil {
-		out.Notes = append(out.Notes, "rentals were not told: "+problem.Message)
-	}
-	for _, row := range rentals {
-		if row.State == "ready" && row.Address != "" {
-			names = append(names, row.ID)
-		}
-	}
-	for _, name := range names {
-		connection, problem := m.connect(ctx, name, "forgetting "+pkg)
-		if problem == nil {
-			_, err := connection.Host.ForgetPackage(ctx, &pb.ForgetPackageCall{Claim: connection.Claim, Package: pkg})
-			connection.Close()
-			if status.Code(err) == codes.Unimplemented {
-				continue // an older machine keeps no package cache: it reads the package every run
-			}
-			if err != nil {
-				problem = machineTransport(err)
-			}
-		}
-		if problem != nil {
-			out.Notes = append(out.Notes, fmt.Sprintf("%s keeps what it read of %s until it is told or stopped: %s", name, pkg, problem.Message))
-			continue
-		}
-		out.Machines = append(out.Machines, name)
-	}
-	return out
 }
 
 // preparationPhase shows a waiting run what its machine's preparation is doing: resolving,

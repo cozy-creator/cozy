@@ -14,6 +14,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -448,6 +449,23 @@ func TestBindVerifiesTheLadderAgainstTheCardBeforeWriting(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "H100=fp8-adaln-pruned, *=bf16-full") || !strings.Contains(out, "1.0.0-rc.1") {
 		t.Fatalf("bindings does not print the ladder [exit %d]: %s", code, out)
 	}
+	// A bind changes the binding revision every later run carries to its machine.
+	revision := func() string {
+		store, problem := records.Open(home.Paths(root).DB)
+		if problem != nil {
+			t.Fatal(problem)
+		}
+		defer store.Close()
+		held, problem := store.BindingRevision()
+		if problem != nil {
+			t.Fatal(problem)
+		}
+		return held
+	}
+	first := revision()
+	if first == "" {
+		t.Fatal("a bind left no binding revision")
+	}
 
 	// A yanked release named explicitly is the owner's exact choice: honoured, with a warning.
 	code, out = runCozy(t, root, "package", "bind", ladderPackage, ladderSlot, "proof/minimax@0.9.0", "--gpu", "*=bf16-full")
@@ -459,6 +477,9 @@ func TestBindVerifiesTheLadderAgainstTheCardBeforeWriting(t *testing.T) {
 	h.mu.Unlock()
 	if !strings.Contains(string(written), `"release":"0.9.0"`) {
 		t.Fatalf("the yanked release was not bound: %s", written)
+	}
+	if revision() == first {
+		t.Fatal("a second bind kept the binding revision")
 	}
 }
 
