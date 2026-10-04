@@ -114,10 +114,28 @@ func encodePayload(payload map[string]any) (string, *exit.Error) {
 
 // AppendEvent records one lifecycle event outside any transaction. Used for the states
 // that are not themselves a durable commit (submitted, dispatched, accepted, requeued).
+// Telemetry kinds are written without sync, after the run's pending telemetry rows.
 func (s *Store) AppendEvent(requestID, eventType string, attempt int64, payload map[string]any) *exit.Error {
 	body, e := encodePayload(payload)
 	if e != nil {
 		return e
+	}
+	if telemetryTypes[eventType] {
+		s.telemetry.write.Lock()
+		defer s.telemetry.write.Unlock()
+		var sampled int
+		err := s.unsynced(func(tx *sql.Tx) (err error) {
+			if sampled, err = s.telemetryTx(tx, requestID); err != nil {
+				return err
+			}
+			_, err = tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, requestID, eventType, attempt, body, now())
+			return err
+		})
+		if err != nil {
+			return exit.Internalf("cannot append the %s event for %s: %s", eventType, requestID, err)
+		}
+		s.dropTelemetry(requestID, sampled)
+		return nil
 	}
 	if _, err := s.db.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at)
 		VALUES(?,?,?,?,?)`, requestID, eventType, attempt, body, now()); err != nil {
@@ -590,10 +608,19 @@ type MachineGPUWaiting struct {
 // RecordMachineTriage keeps a Runtime execution's triage bundle beside its events, once
 // per attempt; MachineTriage reads the newest back.
 func (s *Store) RecordMachineTriage(requestID string, attempt int64, bundle []byte) *exit.Error {
+	return recordMachineTriage(s.db, requestID, attempt, bundle)
+}
+
+// execer is the database or one of its transactions.
+type execer interface {
+	Exec(string, ...any) (sql.Result, error)
+}
+
+func recordMachineTriage(q execer, requestID string, attempt int64, bundle []byte) *exit.Error {
 	if !json.Valid(bundle) {
 		return exit.New(exit.Conflict, "triage bundle is not a JSON document")
 	}
-	if _, err := s.db.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at)
+	if _, err := q.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at)
 		SELECT ?,'machine.triage',?,?,? WHERE NOT EXISTS(SELECT 1 FROM request_events
 		WHERE request_id=? AND type='machine.triage' AND attempt=?)`,
 		requestID, attempt, string(bundle), now(), requestID, attempt); err != nil {

@@ -137,12 +137,16 @@ func scanOutputExport(row interface{ Scan(...any) error }) (OutputExport, error)
 // when that is all of them, failed with why when it is not. An output missing from a failed
 // export's paths was never delivered.
 func (s *Store) SettleOutputExport(requestID string, paths []string, failure *exit.Error) *exit.Error {
+	return settleOutputExport(s.db, requestID, paths, failure)
+}
+
+func settleOutputExport(q execer, requestID string, paths []string, failure *exit.Error) *exit.Error {
 	state, code, message := "published", "", ""
 	if failure != nil {
 		state, code, message = "failed", failure.ErrName(), failure.Message
 	}
 	encoded, _ := json.Marshal(append([]string{}, paths...))
-	if _, err := s.db.Exec(`UPDATE request_output_exports SET state=?,published_paths=?,error_code=?,
+	if _, err := q.Exec(`UPDATE request_output_exports SET state=?,published_paths=?,error_code=?,
 		safe_error=?,updated_at=? WHERE request_id=?`, state, string(encoded), code, message, now(), requestID); err != nil {
 		return exit.Internalf("cannot settle output export for %s: %s", requestID, err)
 	}
