@@ -55,6 +55,8 @@ pub mod manifest;
 #[cfg(feature = "store")]
 pub mod meta;
 #[cfg(feature = "store")]
+pub mod object_roots;
+#[cfg(feature = "store")]
 pub mod project;
 #[cfg(feature = "store")]
 pub mod providers;

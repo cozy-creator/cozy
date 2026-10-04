@@ -144,6 +144,7 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
     holds.extend(crate::checkpoint_root::held_objects(store)?);
     holds.extend(crate::ensure::held_objects(store)?);
     holds.extend(crate::keyed_roots::held_objects(store)?);
+    holds.extend(crate::object_roots::held_objects(store)?);
     // A full snapshot obligation wins over a runtime-only pin of the same manifest.
     holds.sort_by(|left, right| {
         left.key
