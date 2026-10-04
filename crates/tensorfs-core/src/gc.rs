@@ -206,6 +206,30 @@ pub(crate) fn unretained_manifests(store: &Store, wanted: &[ObjectRef]) -> Resul
     Ok(missing)
 }
 
+/// What the owner process's read leases pin (`meta::own`).
+fn pinned(store: &Store, owner: Option<&crate::meta::Owner>) -> Result<Vec<HeldKey>> {
+    let Some(owner) = owner else {
+        return Ok(vec![]);
+    };
+    owner
+        .pinned()
+        .into_iter()
+        .map(|object| {
+            let manifest = store.manifest_path(&object.sha256).is_file();
+            Ok(HeldKey {
+                key: if manifest {
+                    storage::manifest_key(&object.sha256)?
+                } else {
+                    storage::blob_key(&object.sha256)?
+                },
+                kind: if manifest { "manifest" } else { "blob" }.into(),
+                length: object.length,
+                sha256: object.sha256,
+            })
+        })
+        .collect()
+}
+
 /// One complete pass: exclusivity, orphan temps, census, plan, delete, catalog repair.
 pub fn collect(root: &Path, dry_run: bool) -> Result<Report> {
     let store = Store::open(root)?;
@@ -232,7 +256,10 @@ pub(crate) fn collect_locked(
             report.scratch_reaped += meta.reap_holds()?.len() as u64;
         }
     }
-    let (holds, sessions) = session_holds(store)?;
+    let owner = crate::meta::owner(root);
+    let _planning = owner.as_ref().map(|owner| owner.gate.write().unwrap());
+    let (mut holds, sessions) = session_holds(store)?;
+    holds.extend(pinned(store, owner.as_deref())?);
     report.sessions = sessions;
     let census = Census::open(root)?;
     let plan = census.gc_plan(&holds)?;
@@ -332,7 +359,8 @@ pub fn collect_cached_for(
         return Ok(collected);
     }
     let need = need.max(1) - collected.reclaimed_bytes;
-    let (holds, _) = session_holds(&store)?;
+    let (mut holds, _) = session_holds(&store)?;
+    holds.extend(pinned(&store, crate::meta::owner(root).as_deref())?);
     let mut protected: BTreeSet<&str> = protected_manifests.iter().map(String::as_str).collect();
     protected.extend(
         holds
@@ -376,4 +404,48 @@ pub fn collect_cached_for(
     dropped.reclaimed_manifests += collected.reclaimed_manifests;
     dropped.scratch_reaped += collected.scratch_reaped;
     Ok(dropped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::{self, Meta};
+    use crate::read;
+    use crate::store::Fault;
+
+    #[test]
+    fn the_owners_gc_runs_beside_its_leases_and_keeps_what_they_pin() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-gc-pins-{}-{}",
+            std::process::id(),
+            meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let put = |bytes: &[u8]| {
+            store
+                .put_stream(&mut &bytes[..], None, &Fault::default())
+                .unwrap()
+                .obj
+        };
+        let leased = put(b"bytes a served layout reads");
+        let garbage = put(b"bytes nothing references");
+        let present = |object: &ObjectRef| store.object_path(&object.sha256).is_file();
+
+        // A lease that is not the owner's excludes GC.
+        let (lease, _) = read::acquire(&store, &meta, "m", vec![leased.clone()]).unwrap();
+        assert_eq!(collect(&root, false).unwrap_err().code, Code::STORE_BUSY);
+        lease.release(&meta).unwrap();
+
+        // The owner's lease is a pin: GC runs, keeps it, and takes what nothing holds.
+        meta::own(&store);
+        let (lease, _) = read::acquire(&store, &meta, "m", vec![leased.clone()]).unwrap();
+        collect(&root, false).unwrap();
+        assert!(present(&leased) && !present(&garbage));
+        lease.recheck(&meta).unwrap();
+        lease.release(&meta).unwrap();
+        collect(&root, false).unwrap();
+        assert!(!present(&leased));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
