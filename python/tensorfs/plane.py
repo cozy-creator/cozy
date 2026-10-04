@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from ._ext import STORE as _STORE
 from ._ext.plane import (
+    SEALED_HOLES,
     SEALED_WHILE_FILLING,
     BelowFloor,
     BudgetExceeded,
@@ -35,6 +36,7 @@ if TYPE_CHECKING or _STORE:
     from ._ext.plane import Source, fill_sealed
 
 __all__ = [
+    "SEALED_HOLES",
     "SEALED_WHILE_FILLING",
     "BelowFloor",
     "BudgetExceeded",

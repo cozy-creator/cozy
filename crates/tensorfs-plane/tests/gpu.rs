@@ -866,7 +866,7 @@ fn a_layout_still_filling_reaches_the_device_region_by_region() {
     use std::os::fd::AsRawFd;
     let fx = Fixture::new("gpu-progressive");
     let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
-    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None).unwrap();
+    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, None).unwrap();
     let p = plane();
     let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
     let s = Stream::new();
@@ -959,4 +959,34 @@ fn a_ring_streams_a_streamed_layout_pass_after_pass() {
     p.close().unwrap();
     stop.store(true, Ordering::Release);
     machine.join().unwrap().unwrap();
+}
+
+#[test]
+#[ignore = "GPU"]
+fn holes_reach_the_device_from_the_object_files_and_staged_regions_from_the_layout() {
+    use std::os::fd::AsRawFd;
+    let fx = Fixture::new("gpu-staged");
+    fx.drop_cache();
+    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, Some(&[1])).unwrap();
+    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    fill.fill(&layout, &source, 3, &tensorfs_plane::io::IoTally::default()).unwrap();
+    let files = fx.objects.iter().map(|o| (o.clone(), std::fs::File::open(fx.store.blob_path(&o.sha256)).unwrap())).collect();
+    let p = plane();
+    let ws = p.register_staged("unet", &fx.plan(), &regions(), fd.as_raw_fd(), files).unwrap();
+    let s = Stream::new();
+    p.set_pinned_budget(1 << 30).unwrap();
+    p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap(); // region 1 only
+    p.set_vram_budget(DEV, 512 << 20).unwrap();
+    p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
+    for r in 0..3 {
+        resident(&p, ws, &s, r).release(s.raw()).unwrap();
+    }
+    let st = p.stats();
+    assert!(st.devices[0].counters.disk_copy_bytes > 3 << 20, "holes 0 and 2 came from the files: {:?}", st.devices[0]);
+    assert!(st.devices[0].counters.host_copy_bytes >= 70 << 20, "region 1 from the pinned layout");
+    s.sync();
+    p.close().unwrap();
+    drop(fill);
 }

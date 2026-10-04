@@ -50,6 +50,10 @@ const WORDS_OFF: usize = 8 + 8 + 64;
 const READY: u32 = 1;
 /// A sealed layout's region its filler could not fill: whoever waits for it gets an error.
 const FAILED: u32 = 2;
+/// A sealed layout's region its machine has not staged (`open_sealed`'s `staged` set): no
+/// adopter waits for it; it reads the weight set's object files instead. The machine may stage
+/// it later (`OpenFill::stage`), which clears the bit before the first byte lands.
+const HOLE: u32 = 4;
 
 fn ext_off(regions: usize) -> usize {
     (WORDS_OFF + 4 * regions).next_multiple_of(8)
@@ -300,6 +304,11 @@ impl HostMem {
         self.word(r).load(Ordering::Acquire) & FAILED != 0
     }
 
+    /// Region `r` is not staged in this sealed layout: read it from the object files.
+    pub fn hole(&self, r: u32) -> bool {
+        self.word(r).load(Ordering::Acquire) & (HOLE | READY) == HOLE
+    }
+
     /// Until region `r` of a sealed layout is Ready: its filler sets the word after the last
     /// byte lands (or marks it failed). Its filler is this executor's machine, so a filler that
     /// dies takes the waiter with it; there is no deadline to guess.
@@ -312,6 +321,9 @@ impl HostMem {
             }
             if w & FAILED != 0 {
                 return Err(Error::Invalid(format!("sealed layout region {r}: its fill failed")));
+            }
+            if w & HOLE != 0 {
+                return Err(Error::Invalid(format!("sealed layout region {r} is not staged")));
             }
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(1));
@@ -826,19 +838,28 @@ fn populate(base: *mut u8, len: usize, threads: usize) {
 }
 
 /// A sealed layout handed out before its bytes: sealed against resize, sealing and every new
-/// write from the start, while this owner's mapping fills it (`run`). Adopters use each region
-/// only once its Ready word is set, after its last byte landed.
+/// write from the start, while this owner's mapping fills it (`run`, `fill`) and stages more of
+/// it later (`stage`). Adopters use each region only once its Ready word is set, after its last
+/// byte landed; a region left a hole they read from the object files.
 pub struct OpenFill {
     host: HostMem,
 }
 
 /// Create `layout`'s memfd (in `reserved` when given: its pages exist, so the copy only maps
-/// them) and seal it now; returns the memfd to hand out and the fill to run.
-pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>) -> Result<(OwnedFd, OpenFill)> {
+/// them) and seal it now; returns the memfd to hand out and the fill to run. `staged`: the
+/// only regions this layout will hold (the rest are holes until staged); None: every region.
+pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>, staged: Option<&[u32]>) -> Result<(OwnedFd, OpenFill)> {
     let host = match reserved {
         Some(fd) => HostMem::create_in(fd, layout)?,
         None => HostMem::create(name, layout)?,
     };
+    if let Some(staged) = staged {
+        for r in 0..layout.regions.len() as u32 {
+            if !staged.contains(&r) {
+                host.word(r).fetch_or(HOLE, Ordering::Release);
+            }
+        }
+    }
     let fd = reopen(host.fd.as_raw_fd())?;
     // SAFETY: a scalar fcntl on our own descriptor. Future-write leaves this mapping writable.
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, SEALS) } != 0 {
@@ -849,34 +870,66 @@ pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>) -> Re
 
 /// `open_sealed` and `OpenFill::run` in one: returns once every byte is in.
 pub fn fill_sealed(name: &str, layout: &Layout, source: &Source, threads: usize, tally: &IoTally, reserved: Option<OwnedFd>) -> Result<OwnedFd> {
-    let (fd, open) = open_sealed(name, layout, reserved)?;
+    let (fd, open) = open_sealed(name, layout, reserved, None)?;
     open.run(layout, source, threads, tally)?;
     Ok(fd)
 }
 
 impl OpenFill {
+    /// Region `r` is a hole: not staged (yet).
+    pub fn hole(&self, r: u32) -> bool {
+        self.host.hole(r)
+    }
+
     /// Fill every region through the verified read path (`Source::read_item`: page-cache
     /// copies, O_DIRECT for the rest) on `threads` threads, in layout order, setting each
     /// region's Ready word as its last item lands. Each object's residency is checked once (a
     /// check maps the file on overlayfs, which stalls every thread's page faults), and its
     /// descriptors close when its last item lands. The mapping goes when this returns.
     pub fn run(self, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
-        self.copy(layout, source, threads, tally)
+        self.fill(layout, source, threads, tally)
     }
 
-    fn copy(&self, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
+    /// `run` without giving up the mapping: the owner keeps it to `stage` holes later.
+    pub fn fill(&self, layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
+        let wanted: Vec<u32> = (0..layout.regions.len() as u32).filter(|&r| !self.host.hole(r)).collect();
+        self.copy(layout, &wanted, source, threads, tally)
+    }
+
+    /// Take `regions` that are holes for staging: each stops being one at once, so an adopter
+    /// asking from now on waits for its Ready word instead of reading the files. Returns those
+    /// taken (a region already staged or staging is left alone); `stage` must follow.
+    pub fn take(&self, regions: &[u32]) -> Vec<u32> {
+        let holes = |&r: &u32| r < self.host.regions as u32 && self.host.word(r).fetch_and(!HOLE, Ordering::AcqRel) & HOLE != 0;
+        regions.iter().copied().filter(holes).collect()
+    }
+
+    /// Fill the regions `take` returned; each turns Ready, or failed if this errors. Returns
+    /// the bytes staged.
+    pub fn stage(&self, taken: &[u32], layout: &Layout, source: &Source, threads: usize, tally: &IoTally) -> Result<u64> {
+        self.copy(layout, taken, source, threads, tally).inspect_err(|_| {
+            for &r in taken {
+                if !self.host.ready(r) {
+                    self.host.word(r).fetch_or(FAILED, Ordering::Release);
+                }
+            }
+        })?;
+        Ok(taken.iter().map(|&r| layout.regions[r as usize].span).sum())
+    }
+
+    fn copy(&self, layout: &Layout, wanted: &[u32], source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
         let host = &self.host;
         let mut region_of = Vec::new();
-        for (r, region) in layout.regions.iter().enumerate() {
-            region_of.extend(std::iter::repeat_n(r, region.items.len()));
+        for &r in wanted {
+            region_of.extend(std::iter::repeat_n(r as usize, layout.regions[r as usize].items.len()));
         }
         let pending: Vec<AtomicUsize> = layout.regions.iter().map(|r| AtomicUsize::new(r.items.len())).collect();
-        for (r, region) in layout.regions.iter().enumerate() {
-            if region.items.is_empty() {
-                host.set_ready(r as u32, true);
+        for &r in wanted {
+            if layout.regions[r as usize].items.is_empty() {
+                host.set_ready(r, true);
             }
         }
-        let items: Vec<_> = layout.regions.iter().flat_map(|r| r.items.iter()).collect();
+        let items: Vec<_> = wanted.iter().flat_map(|&r| layout.regions[r as usize].items.iter()).collect();
         let mut index: HashMap<&str, usize> = HashMap::new();
         let mut objects: Vec<&ObjectRef> = Vec::new();
         let owner: Vec<Option<usize>> = items
@@ -936,10 +989,10 @@ impl OpenFill {
 
 impl Drop for OpenFill {
     /// What the filler leaves unfinished (an error, a panic, a filler that never ran) is marked
-    /// failed: no adopter waits forever for it or reads it.
+    /// failed: no adopter waits forever for it or reads it. Holes stay holes.
     fn drop(&mut self) {
         for r in 0..self.host.regions as u32 {
-            if !self.host.ready(r) {
+            if !self.host.ready(r) && !self.host.hole(r) {
                 self.host.word(r).fetch_or(FAILED, Ordering::Release);
             }
         }

@@ -151,7 +151,7 @@ fn a_reservation_made_before_the_plan_takes_any_layout_and_frees_what_it_does_no
 
 fn open(fx: &Fixture) -> (OwnedFd, tensorfs_plane::host::OpenFill, Layout) {
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
-    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None).unwrap();
+    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, None).unwrap();
     (fd, fill, layout)
 }
 
@@ -194,4 +194,71 @@ fn a_failed_fill_reaches_every_adopter_as_an_error() {
     assert!(other.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).is_err());
     other.close().unwrap();
     let _ = plane.close();
+}
+
+/// The object files a machine hands over: each object's verified store file, opened read-only.
+fn object_files(fx: &Fixture) -> Vec<(tensorfs_core::ids::ObjectRef, std::fs::File)> {
+    fx.objects.iter().map(|o| (o.clone(), std::fs::File::open(fx.store.blob_path(&o.sha256)).unwrap())).collect()
+}
+
+#[test]
+fn a_layout_staged_in_part_holds_only_its_staged_regions_and_stages_more_on_request() {
+    let fx = Fixture::new("staged");
+    let layout = Layout::build(&fx.plan(), &regions()).unwrap();
+    // Only region 0 is staged (the blocks that stream); 1 and 2 are holes.
+    let (fd, fill) = tensorfs_plane::host::open_sealed("unet", &layout, None, Some(&[0])).unwrap();
+    let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    fill.fill(&layout, &source, 2, &IoTally::default()).unwrap();
+    let adopter = tensorfs_plane::host::HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
+    assert!(adopter.ready(0) && adopter.hole(1) && adopter.hole(2));
+    let held = resident(fd.as_raw_fd());
+    assert!(held < layout.regions[1].span, "the machine holds no copy of a hole: {held} B");
+
+    // A pinned want covers the staged regions only; the holes are the files' to serve.
+    let plane = host_only();
+    let ws = plane.register_staged("unet", &fx.plan(), &regions(), fd.as_raw_fd(), object_files(&fx)).unwrap();
+    plane.set_pinned_budget(1 << 30).unwrap();
+    plane.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
+    check_bytes(&plane, ws, Some(0));
+    assert_eq!(plane.stats().host.used, layout.regions[0].span);
+
+    // The executor's stream grew: the machine stages region 1 too, and only it.
+    let taken = fill.take(&[1, 0]);
+    assert_eq!(taken, [1], "region 0 was staged already");
+    assert!(!adopter.hole(1) && !adopter.ready(1), "taken: adopters wait for it from now on");
+    let staged = fill.stage(&taken, &layout, &source, 2, &IoTally::default()).unwrap();
+    assert_eq!(staged, layout.regions[1].span);
+    assert!(adopter.ready(1) && adopter.hole(2));
+    plane.want(ws, Tier::Pinned, Some(&[1]), 0, false).unwrap().wait().unwrap();
+    check_bytes(&plane, ws, Some(1));
+    plane.close().unwrap();
+    drop(fill); // holes stay holes when the filler goes; nothing staged is poisoned
+    assert!(adopter.hole(2) && !adopter.failed(2) && !adopter.failed(1));
+}
+
+#[test]
+fn a_files_source_reads_exactly_the_verified_bytes_it_was_handed() {
+    let fx = Fixture::new("files-source");
+    let layout = Layout::build(&fx.plan(), &regions()).unwrap();
+    let source = Source::files(object_files(&fx), true, 0);
+    let tally = IoTally::default();
+    for region in &layout.regions {
+        let mut buf = vec![0u8; region.span as usize];
+        for it in &region.items {
+            // SAFETY: each item's range and padding lie inside `buf`; one thread.
+            unsafe { source.read_item(it, buf.as_mut_ptr().add((it.offset - region.offset) as usize), tensorfs_plane::io::Mode::Cache, &tally) }.unwrap();
+        }
+        for p in layout.parts.iter().filter(|p| layout.regions[p.region as usize].offset == region.offset) {
+            let key = p.what.trim_start_matches("unet/").trim_end_matches("#value");
+            let n = TENSORS.iter().find(|(k, _)| *k == key).unwrap().1;
+            let at = (p.offset - region.offset) as usize;
+            assert!(buf[at..at + n] == bytes_of(key, n)[..], "{} differs", p.what);
+        }
+    }
+    // An object it was not handed is refused, never opened from anywhere else.
+    let other = Source::files(Vec::new(), true, 0);
+    let it = layout.regions[1].items.iter().find(|it| matches!(it.source, tensorfs_plane::layout::ItemSource::Object(_))).unwrap();
+    let mut buf = vec![0u8; layout.regions[1].span as usize];
+    assert!(unsafe { other.read_item(it, buf.as_mut_ptr(), tensorfs_plane::io::Mode::Cache, &tally) }.is_err());
 }

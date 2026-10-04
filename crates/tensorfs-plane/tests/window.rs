@@ -192,7 +192,7 @@ fn a_one_region_window_the_size_of_its_layout_is_still_a_window() {
     let one = vec![regions().concat()];
     let layout = Layout::build(&fx.plan(), &one).unwrap();
     let (fd, window) = open_window("unet", &layout, 1).unwrap();
-    let (full, _filling) = tensorfs_plane::host::open_sealed("unet", &layout, None).unwrap();
+    let (full, _filling) = tensorfs_plane::host::open_sealed("unet", &layout, None, None).unwrap();
     let size = |fd: i32| std::fs::File::from(fd_dup(fd)).metadata().unwrap().len();
     assert_eq!(size(fd.as_raw_fd()), size(full.as_raw_fd()), "the case this test is about");
     let host = HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();

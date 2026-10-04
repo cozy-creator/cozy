@@ -13,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[cfg(feature = "store")]
 use tensorfs_core::{meta::Meta, read::ReadLease, store::Store};
+use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::read::ReadPlan;
 
 use crate::cuda::{self, AllocationProp, CUcontext, CUdevice, CUstream, CtxGuard};
@@ -800,7 +801,8 @@ impl Inner {
             return Ok(());
         }
         let held = matches!(hstate, HState::Ready);
-        let from_host = held || w.host.sealed();
+        // A sealed layout's hole (a region its machine did not stage) reads the object files.
+        let from_host = held || (w.host.sealed() && !w.host.hole(r));
         let src = if held {
             w.hregs[r as usize].holds += 1;
             // SAFETY: inside the live mapping; the hold keeps the region from eviction.
@@ -1155,10 +1157,27 @@ impl Plane {
     /// layout (`window::open_window`) copies each region from the slot its machine staged it in
     /// and cannot be pinned (`BelowFloor`).
     pub fn register_sealed(&self, name: &str, plan: &ReadPlan, regions: &[Vec<String>], fd: RawFd) -> Result<WsId> {
+        self.register_staged(name, plan, regions, fd, Vec::new())
+    }
+
+    /// `register_sealed` over a layout its machine staged only in part: the holes copy from
+    /// `files`, the verified object files the machine handed over (each `(object, file)`),
+    /// through this plane's staging buffers. Nothing here opens a store. Holes read through the
+    /// page cache, never O_DIRECT: a hole that streams every step then stays in memory the
+    /// kernel can reclaim instead of coming from disk on every pass.
+    pub fn register_staged(
+        &self,
+        name: &str,
+        plan: &ReadPlan,
+        regions: &[Vec<String>],
+        fd: RawFd,
+        files: Vec<(ObjectRef, std::fs::File)>,
+    ) -> Result<WsId> {
         self.check()?;
         let layout = Layout::build(plan, regions)?;
         let host = HostMem::adopt_sealed(fd, &layout)?;
-        let source = Arc::new(Source::sealed(Arc::as_ptr(&self.inner) as usize));
+        let plane = Arc::as_ptr(&self.inner) as usize;
+        let source = Arc::new(Source::files(files, false, plane));
         Ok(self.insert(name, layout, source, host))
     }
 
@@ -1215,6 +1234,13 @@ impl Plane {
         }
     }
 
+    /// `regions` less a sealed layout's holes: those have no host bytes to pin (they copy from
+    /// the object files), so a pinned want or ticket never waits for them.
+    fn staged(c: &Core, ws: WsId, regions: Vec<u32>) -> Result<Vec<u32>> {
+        let host = &c.ws(ws)?.host;
+        Ok(regions.into_iter().filter(|&r| !(host.sealed() && host.hole(r))).collect())
+    }
+
     // ------------------------------------------------------------ budgets
 
     pub fn set_pinned_budget(&self, bytes: u64) -> Result<Trim> {
@@ -1261,7 +1287,11 @@ impl Plane {
         c.check()?;
         let regions = Self::regions_or_all(&c, ws, regions)?;
         match tier {
-            Tier::Pinned => self.inner.want_host(&mut c, ws, &regions, prio, pin)?,
+            Tier::Pinned => {
+                let regions = Self::staged(&c, ws, regions)?;
+                self.inner.want_host(&mut c, ws, &regions, prio, pin)?;
+                return Ok(Ticket { inner: self.inner.clone(), ws, tier, regions });
+            }
             Tier::Device(o) => {
                 let d = self.dev(o)?;
                 let _g = self.inner.devices[d].bind()?;
@@ -1283,7 +1313,7 @@ impl Plane {
         {
             let mut c = self.lock();
             c.check()?;
-            let rs = Self::regions_or_all(&c, ws, regions)?;
+            let rs = Self::staged(&c, ws, Self::regions_or_all(&c, ws, regions)?)?;
             if self.inner.want_host(&mut c, ws, &rs, prio, pin).is_ok() {
                 out.push(Ticket { inner: self.inner.clone(), ws, tier: Tier::Pinned, regions: rs });
             }
