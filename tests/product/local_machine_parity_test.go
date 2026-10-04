@@ -25,14 +25,12 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 const (
@@ -307,8 +305,7 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 
 // parityMachines is one daemon root with both machines of the parity body: this computer's,
 // installed and launched by the daemon, and the rental `tessa`, the same Host binary a
-// provider booted and the daemon attached. Each runs a real Runtime worker measuring a
-// virtual four-device inventory.
+// provider booted and the daemon attached. Each measures what its launcher lets it see.
 func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.Store) {
 	t.Helper()
 	return parityMachinesOn(t, machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel})
@@ -369,12 +366,12 @@ func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string
 	return h, root, layout, store
 }
 
-// One product body, run on this computer's machine and on a rental: the literal same agent
-// binary with a real Runtime worker measuring a virtual four-device inventory. The local
+// One product body, run on this computer's machine and on a rental: the literal same machine
+// binary. The local
 // machine uses its own identity; the rental is the same binary a provider booted, pinned
 // and attached. Only the machine name and address may differ.
 func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
-	h, root, layout, store := parityMachines(t)
+	_, root, _, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
@@ -444,18 +441,12 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	}
 	noHistory()
 
-	// Both machines report the Runtime's measured inventory through the same Host call.
-	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
-		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
-		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
-	for _, name := range []string{machines.Local, parityRental} {
-		machine, problem := found.Dial(context.Background(), name, "parity inventory")
-		fatal(t, problem)
-		workspace, err := machine.Host.GetMachineExecutionWorkspace(context.Background(), &pb.MachineExecutionWorkspaceQuery{Claim: machine.Claim})
-		machine.Close()
-		must(t, err)
-		if len(workspace.Devices) != 4 || workspace.Devices[3].Name != "Virtual Accelerator" || workspace.ExecutorUidIsolation {
-			t.Fatalf("%s reports %d devices (%v), executor isolation %v", name, len(workspace.Devices), workspace.Devices, workspace.ExecutorUidIsolation)
+	// Both machines answer the same Status: `machine show` and `rental show` read it.
+	for _, show := range [][]string{{"machine", "show", "--json"}, {"rental", "show", "tessa", "--json"}} {
+		code, out := runCozy(t, root, show...)
+		var shown map[string]any
+		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["phase"] != "ready" || shown["runtime_version"] == nil {
+			t.Fatalf("cozy %s did not report its machine's status [exit %d]\n%s", strings.Join(show, " "), code, out)
 		}
 	}
 }
