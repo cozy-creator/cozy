@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +37,15 @@ func TestMachineV1ProgressStageEndpointSurvivesOrdinaryCLIAndRestart(t *testing.
 	})
 	project := filepath.Join(t.TempDir(), "cpu_progress_burst")
 	must(t, os.CopyFS(project, os.DirFS(*cpuProgressBurst)))
+	if *machineRuntimeWheel != "" {
+		wheel, err := filepath.Abs(*machineRuntimeWheel)
+		must(t, err)
+		manifest := filepath.Join(project, "pyproject.toml")
+		content, err := os.ReadFile(manifest)
+		must(t, err)
+		content = append(content, []byte(fmt.Sprintf("\n[tool.uv.sources]\ncozy-runtime = {path = %q}\n", wheel))...)
+		must(t, os.WriteFile(manifest, content, 0o600))
+	}
 	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v\n%s", err, out)
 	}
