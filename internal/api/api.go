@@ -254,7 +254,6 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"DELETE /v1/local/rentals/{rental_id}/claim":        s.detachRental,
 		"GET /v1/local/machines/{machine}/status":           s.machineStatus,
 		"GET /v1/local/machines/{machine}/logs/{log}":       s.machineLog,
-		"POST /v1/local/machines/forget-package":            s.forgetPackage,
 		"POST /v1/local/rentals/{rental_id}/prepare":        s.prepareRentalPackage,
 		"GET /v1/local/rentals/{rental_id}/installs/{id}":   s.rentalInstallState,
 		"POST /v1/local/rentals/{rental_id}/runtime-update": s.startRuntimeUpdate,

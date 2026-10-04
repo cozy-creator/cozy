@@ -52,10 +52,6 @@ type retentionReleaseMachine struct {
 func (m *retentionReleaseMachine) Refresh(context.Context, records.Request) *exit.Error { return nil }
 func (m *retentionReleaseMachine) Withdraw(string)                                      {}
 func (m *retentionReleaseMachine) Forget(string)                                        {}
-func (m *retentionReleaseMachine) ForgetPackage(_ context.Context, pkg string) api.ForgottenPackage {
-	return api.ForgottenPackage{Package: pkg}
-}
-
 func (m *retentionReleaseMachine) Control(_ context.Context, request records.Request, action string) *exit.Error {
 	if action != "cancel" {
 		return exit.Usagef("expected cancellation")

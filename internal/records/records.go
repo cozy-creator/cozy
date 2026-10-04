@@ -109,7 +109,7 @@ func init() {
 	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
 	schema = append(schema, ownerMemoIndex)
-	schema = append(schema, rentalInstallsDDL, rentalInstallsIndex, runtimeUpdatesDDL, rentalIdleDDL,
+	schema = append(schema, rentalInstallsDDL, rentalInstallsIndex, runtimeUpdatesDDL, rentalIdleDDL, bindingRevisionDDL,
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex)
 }
 

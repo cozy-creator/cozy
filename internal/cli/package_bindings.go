@@ -6,13 +6,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
-	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // Owner overrides are mutable Hub rows, one per (package, slot path). Authored
@@ -182,23 +182,18 @@ func handlePackageBind(ctx *Context) *exit.Error {
 	return emit(ctx, record)
 }
 
-// changed tells the machines the daemon knows that this command changed ref's releases or
-// bindings: each read the package or model once and keeps it, so only this names the change.
-// A machine it cannot reach keeps what it read until it is told or stopped, and the note
-// says so.
+// changed records that this command changed ref's releases or bindings: every later run
+// carries the new binding revision, and a machine holding what it resolved before re-resolves.
 func changed(ctx *Context, ref hub.Ref) []string {
-	state, _, problem := ensureDaemon(ctx)
+	store, problem := records.Open(home.Paths(ctx.Cfg.Home).DB)
 	if problem == nil {
-		ctx.Daemon = state
-		var c *localapi.Client
-		if c, problem = dial(ctx); problem == nil {
-			var told api.ForgottenPackage
-			if told, problem = c.ForgetPackage(ref.String()); problem == nil {
-				return told.Notes
-			}
-		}
+		defer store.Close()
+		_, problem = store.ChangeBindingRevision()
 	}
-	return []string{"no machine was told that " + ref.String() + " changed: " + problem.Message}
+	if problem != nil {
+		return []string{"machines keep what they resolved of " + ref.String() + ": " + problem.Message}
+	}
+	return nil
 }
 
 func handlePackageUnbind(ctx *Context) *exit.Error {

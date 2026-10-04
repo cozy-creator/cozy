@@ -31,33 +31,6 @@ type MachineExecutions interface {
 	MachineLog(ctx context.Context, machine, log string, tailBytes uint64) (MachineLog, *exit.Error)
 	// Forget drops this daemon's kept connection to a machine, before its credentials go.
 	Forget(machine string)
-	// ForgetPackage tells every machine this daemon knows that a package's releases or owner
-	// bindings changed, so its next run reads them once.
-	ForgetPackage(ctx context.Context, pkg string) ForgottenPackage
-}
-
-// ForgottenPackage names the machines that dropped what they read of a package, and why any
-// other known machine could not be told.
-type ForgottenPackage struct {
-	Package  string   `json:"package"`
-	Machines []string `json:"machines"`
-	Notes    []string `json:"notes,omitempty"`
-}
-
-func (s *Server) forgetPackage(w http.ResponseWriter, r *http.Request) {
-	if s.machineExecutions == nil {
-		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
-		return
-	}
-	var body struct {
-		Package string `json:"package"`
-	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
-	if err := decoder.Decode(&body); err != nil || strings.Count(body.Package, "/") != 1 {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "name one package as org/name", "")
-		return
-	}
-	s.ok(w, r, http.StatusOK, s.machineExecutions.ForgetPackage(r.Context(), body.Package))
 }
 
 // MachineStatus is what one machine reports of itself: identity, software, GPUs, the

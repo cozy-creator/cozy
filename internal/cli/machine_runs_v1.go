@@ -305,6 +305,11 @@ func (m *machineRuns) place(ctx context.Context, request records.Request, link *
 func (m *machineRuns) specV1(ctx context.Context, request records.Request, machine *machines.V1) (*v1.RunSpec, *exit.Error) {
 	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_CALL, Entrypoint: request.Entrypoint, Payload: request.Payload,
 		AttentionKernel: request.AttentionKernel, Owner: m.runAccount(request)}
+	revision, problem := m.store.BindingRevision()
+	if problem != nil {
+		return nil, problem
+	}
+	spec.BindingRevision = revision
 	if request.Trees != "" {
 		return nil, exit.Named(exit.Structural, "input_tree_unsupported", "this machine takes file inputs; input trees are not carried to it yet")
 	}
