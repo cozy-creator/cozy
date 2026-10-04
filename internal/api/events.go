@@ -125,6 +125,23 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 		flusher.Flush()
 	}
 	phase()
+	telemetry := map[string]uint64{}
+	samples := func() {
+		active := map[string]uint64{}
+		for _, frame := range s.store.LiveRunEventsV1(requestID) {
+			key := frame.Event.RequestID + "/" + frame.Event.Type
+			active[key] = frame.Sequence
+			if telemetry[key] >= frame.Sequence {
+				continue
+			}
+			env := durableEnvelope(frame.Event)
+			env.SequenceNumber = 0
+			env.Payload["live"] = true
+			writeEvent(w, 0, env)
+			flusher.Flush()
+		}
+		telemetry = active // Completed runs leave no per-stream telemetry memory.
+	}
 
 	ctx := r.Context()
 	beat := time.NewTicker(heartbeat)
@@ -167,6 +184,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 			flusher.Flush()
 		}
 
+		samples()
 		select {
 		case <-ctx.Done():
 			return

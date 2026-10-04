@@ -63,7 +63,12 @@ type Pin struct {
 	ActivatedAt string
 }
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db                *sql.DB
+	telemetryMu       sync.Mutex
+	telemetry         map[string]*runTelemetryV1
+	telemetrySequence uint64
+}
 
 const schemaVersion = 49
 
