@@ -95,10 +95,11 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 	if code, out := runCozy(t, root, "package", "install", sdkProbe(t, "wheels-probe"), "--editable"); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
-	// A local package installs through the helper the machine makes from its embedded client.
+	// A local package installs through the helper the machine makes from its embedded client,
+	// and runs the machine's own Runtime, not the one its lock captured.
 	code, out := runCozy(t, root, "run", "local/wheels-probe/sdk", "value=1", "--await", "--json")
-	if code != 0 || !strings.Contains(out, `"status":"completed"`) {
-		t.Fatalf("the local package did not run on the machine [exit %d]\n%s", code, out)
+	if code != 0 || !strings.Contains(out, `"status":"completed"`) || !strings.Contains(out, `"runtime":"`+version(first)+`"`) {
+		t.Fatalf("the local package did not run on the machine's Runtime %s [exit %d]\n%s", version(first), code, out)
 	}
 
 	second := localBuild(t, runtime, "test2")
