@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"io"
 	"strings"
 
@@ -118,6 +119,20 @@ func normalize(document any) (any, []byte, error) {
 	logical, err := toon.Decode(toonBytes)
 	if err != nil {
 		return nil, nil, err
+	}
+	// A successful TOON decode can still round an application integer or erase
+	// integer/float kind. Such values use the existing JSON fallback in Write.
+	roundTrip, err := json.Marshal(logical)
+	if err != nil {
+		return nil, nil, err
+	}
+	original, err := canonical.NormalizeApplication(encoded)
+	if err != nil {
+		return nil, nil, err
+	}
+	reencoded, err := canonical.NormalizeApplication(roundTrip)
+	if err != nil || !bytes.Equal(original, reencoded) {
+		return nil, nil, errors.New("TOON cannot preserve this document's application values")
 	}
 	return logical, toonBytes, nil
 }

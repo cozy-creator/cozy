@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -131,6 +132,15 @@ async def echo(ctx: Context, payload: Request) -> Value:
 		}
 	}
 	// Use the ordinary authenticated HTTP client independently of CLI argument parsing.
+	code, stdout, stderr := runCozyStreams(t, root, "run", "local/application-json-proof/echo", "seed=18446744073709551615", "number:=1.0", "ordered:=[2,1]", "--await")
+	if code != 0 {
+		t.Fatalf("ordinary default-format typed CLI job [%d]\n%s\n%s", code, stdout, stderr)
+	}
+	for _, exact := range []string{`"seed":18446744073709551615`, `"number":1.0`, `"ordered":[2,1]`, `"kind":"float"`} {
+		if !strings.Contains(stdout, exact) {
+			t.Fatalf("ordinary default output changed typed result: %s\n%s", stdout, stderr)
+		}
+	}
 	cfg := config.Config{Home: root, HubURL: config.DefaultHubURL}
 	client, problem := localapi.Open(cfg, daemon.Probe(cfg))
 	fatal(t, problem)
