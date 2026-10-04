@@ -237,10 +237,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s\n", l.DB, yield)
 	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Daemon)
 	fmt.Fprintln(ctx.Out, "  rentals: released after 15 minutes without active work; manual cozy rental keepalive resets once")
-	if ctx.Cfg.MaintenanceGCCron != "" {
-		fmt.Fprintf(ctx.Out, "  store gc: on the schedule %q (maintenance.gc_cron); cozy model remove and cozy model gc reclaim on demand\n",
-			ctx.Cfg.MaintenanceGCCron)
-	}
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down · exits on its own after %s with nothing to manage\n",
 			ctx.Cfg.DaemonIdleShutdown)
@@ -276,9 +272,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// stops carrying this daemon's claim has taken away every way to reach it or stop it.
 	go claimWatch{held: held, root: l.Root, managed: idle.managed, log: ctx.Out,
 		stop: func() { stop <- syscall.SIGTERM }}.run(quit)
-	if sweep, ok := newGCCron(ctx.Cfg, l, ctx.Out); ok {
-		go sweep.run(quit)
-	}
 
 	<-stop
 	close(quit)

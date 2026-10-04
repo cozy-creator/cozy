@@ -18,7 +18,6 @@ require (
 	github.com/pion/stun/v4 v4.0.1
 	github.com/pion/webrtc/v4 v4.2.22
 	github.com/playwright-community/playwright-go v0.5700.1
-	github.com/robfig/cron/v3 v3.0.1
 	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/sys v0.47.0

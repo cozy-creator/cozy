@@ -30,7 +30,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
 // Tool is one resolved tensorfs CLI plus the store it operates on.
@@ -51,7 +50,7 @@ func Open(cfg config.Config) (*Tool, *exit.Error) {
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "tfs_missing",
 			"the tensorfs CLI %q is not on PATH: %s", cfg.Tfs, err).
-			WithRemedy("install tfs with the host Runtime: %s", hostruntime.InstallCommand)
+			WithRemedy("this command still reads a store on this computer and needs tfs, which cozy no longer installs; run it with --rental, or put a tensorfs release's tfs on PATH")
 	}
 	t := &Tool{Bin: bin, Root: cfg.TensorFSRoot, Source: cfg.TfsSource, env: cfg.Tool()}
 	if err := os.MkdirAll(t.Root, 0o755); err != nil {
@@ -747,60 +746,6 @@ func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length
 		return e
 	}
 	_, e = t.run("repo", "commit", t.Root, checkpointed, releaseMutation)
-	return e
-}
-
-// GCReport is one reclamation pass as TensorFS reports it (`tfs gc --json`).
-type GCReport struct {
-	ReclaimedBytes     int64    `json:"reclaimed_bytes"`
-	ReclaimedBlobs     int64    `json:"reclaimed_blobs"`
-	ReclaimedManifests int64    `json:"reclaimed_manifests"`
-	KeptBytes          int64    `json:"kept_bytes"`
-	KeptObjects        int64    `json:"kept_objects"`
-	Sessions           []string `json:"sessions"`
-	ScratchReaped      int64    `json:"scratch_reaped"`
-}
-
-// GC is the reclamation act over the local store (owner ruling 2026-09-02): TensorFS
-// removes every blob and manifest no repository names, deciding from its own filesystem
-// census — repos, manifests, blobs — never from a database. A live writer or read lease
-// refuses by name; an open ingest session keeps what it names. `abandonSessions` first
-// abandons every session whose writer is gone (`tfs ingest reap`); a caller says so only
-// when none of its own transfers can still stand between `ingest run` and `ingest install`.
-func (t *Tool) GC(abandonSessions bool) (GCReport, *exit.Error) {
-	if abandonSessions {
-		if _, problem := t.run("ingest", "reap", t.Root); problem != nil {
-			return GCReport{}, problem
-		}
-	}
-	out, problem := t.run("gc", t.Root, "--json")
-	if problem != nil {
-		return GCReport{}, problem
-	}
-	var report GCReport
-	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &report); err != nil {
-		return GCReport{}, exit.Internalf("tfs gc returned an unreadable report: %s", err)
-	}
-	return report, nil
-}
-
-// DeleteRepository removes the local durable name. Its bytes are reclaimed by the GC that
-// follows the removal.
-func (t *Tool) DeleteRepository(org, name, scratch string) *exit.Error {
-	current, e := t.observedRepository(org, name, scratch)
-	if e != nil {
-		return e
-	}
-	if current == "-" {
-		return nil
-	}
-	mutation := filepath.Join(scratch, "repo-delete.json")
-	if e := writeJSON(mutation, map[string]any{
-		"action": "delete_repository", "repo": map[string]string{"name": name, "org": org},
-	}); e != nil {
-		return e
-	}
-	_, e = t.run("repo", "commit", t.Root, current, mutation)
 	return e
 }
 

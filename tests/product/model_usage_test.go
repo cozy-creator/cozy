@@ -120,36 +120,6 @@ func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
 	if usage = modelListJSON(t, root); usage.Store.Unreferenced != orphan.length || usage.Store.Size != union {
 		t.Errorf("store json after an orphan = %+v, want unreferenced %d", usage.Store, orphan.length)
 	}
-
-	// `model gc` is the reclamation act for what nothing names: the orphan goes, the footer
-	// with it, and both models keep every byte.
-	code, out = runCozy(t, root, "model", "gc")
-	if code != 0 || !strings.Contains(out, "reclaimed: "+units.Bytes(orphan.length)) {
-		t.Errorf("model gc [exit %d]: want reclaimed %s\n%s", code, units.Bytes(orphan.length), out)
-	}
-	if usage = modelListJSON(t, root); usage.Store.Unreferenced != 0 || usage.Store.Size != union {
-		t.Errorf("store json after gc = %+v, want unreferenced 0 and size %d", usage.Store, union)
-	}
-	if !store.present(shared.sha256) {
-		t.Fatalf("gc removed a referenced blob")
-	}
-
-	// `model remove` reclaims in the same act: alpha's own segment and its manifest go with
-	// its name; what beta shares stays, and nothing is left unreferenced.
-	code, out = runCozy(t, root, "model", "remove", "local/alpha")
-	reclaimed := sum(alpha) - sharedBytes + manifestBytes["alpha"]
-	if code != 0 || !strings.Contains(out, "reclaimed: "+units.Bytes(reclaimed)) {
-		t.Errorf("model remove [exit %d]: want reclaimed %s\n%s", code, units.Bytes(reclaimed), out)
-	}
-	usage = modelListJSON(t, root)
-	if len(usage.Models) != 1 || usage.Models[0].Model != "local/beta" || usage.Store.Size != sum(beta) ||
-		usage.Store.Unreferenced != 0 {
-		t.Errorf("store json after removing alpha = %+v (%d models), want beta alone at %d, unreferenced 0",
-			usage.Store, len(usage.Models), sum(beta))
-	}
-	if !store.present(shared.sha256) {
-		t.Fatalf("removing alpha took a blob beta still reaches")
-	}
 }
 
 type modelUsageDocument struct {

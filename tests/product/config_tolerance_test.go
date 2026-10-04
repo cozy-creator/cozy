@@ -50,7 +50,7 @@ func TestUnusableBehaviourSettingsFallBackToTheirDefaults(t *testing.T) {
 		`local_rate_micro_usd_per_hour "-3" is not a non-negative integer; using "0"`,
 		`rentals.development "maybe" is not true or false; using "true"`,
 		`daemon.idle_shutdown_s "soon" is not a non-negative integer; using "900"`,
-		`maintenance.gc_cron "nightly" is not a five-field cron schedule; using "0 3 * * *"`,
+		`this version does not use maintenance; ignored`, // the store GC schedule, removed
 		`placement.prefer "fastest" is not fast, balanced or cheap; using "balanced"`,
 	} {
 		if strings.Count(stderr, line) != 1 {

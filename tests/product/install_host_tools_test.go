@@ -61,7 +61,6 @@ func TestInstallerWritesShellCompletion(t *testing.T) {
 	for name, body := range map[string]string{
 		filepath.Join(stub, "uv"):            "case \"$1 $2\" in 'tool dir') echo " + tools + " ;; esac\n",
 		filepath.Join(tools, "cozy-runtime"): "echo 'distribution: 0.0.0'\n", //cozy:allow stand-in Runtime the installer reads its version from
-		filepath.Join(tools, "tfs"):          "echo 'tfs 0.0.0'\n",
 	} {
 		must(t, os.WriteFile(name, []byte("#!/bin/sh\n"+body), 0o755))
 	}

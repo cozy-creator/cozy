@@ -1,6 +1,6 @@
 #!/bin/sh
-# Install or upgrade cozy from its public GitHub release, and this host's tools (cozy-runtime
-# and TensorFS's tfs) in one uv tool environment:
+# Install or upgrade cozy from its public GitHub release, and this host's tool (cozy-runtime)
+# in its own uv tool environment:
 #
 #   curl -fsSL https://github.com/cozy-creator/cozy/releases/latest/download/install.sh | sh
 #
@@ -21,7 +21,7 @@ fail() { echo "cozy install: $*" >&2; exit 1; }
 case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) fail "no release for $(uname -s)" ;; esac
 case "$(uname -m)" in x86_64 | amd64) arch=amd64 ;; aarch64 | arm64) arch=arm64 ;; *) fail "no release for $(uname -m)" ;; esac
 asset="cozy-$os-$arch.tar.gz"
-command -v uv >/dev/null || fail "uv is required for cozy-runtime and tfs: https://docs.astral.sh/uv/getting-started/installation/"
+command -v uv >/dev/null || fail "uv is required for cozy-runtime: https://docs.astral.sh/uv/getting-started/installation/"
 
 # Staged inside bin/ so the final move is a rename on one filesystem, never a half-written copy.
 mkdir -p "$bin"
@@ -36,10 +36,7 @@ got="${got%% *}"
 tar -xzf "$stage/$asset" -C "$stage" cozy
 now="$("$stage/cozy" -v)" || fail "the new cozy does not run; nothing was replaced"
 
-# A standalone tensorfs tool would still claim tfs: its later upgrade would relink an unpinned
-# tfs, and its uninstall would delete the one cozy-runtime installs.
-if uv tool list 2>/dev/null | grep -q '^tensorfs '; then uv tool uninstall tensorfs; fi
-host_tools() { uv tool install --force --refresh-package cozy-runtime --refresh-package tensorfs --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.67'; }
+host_tools() { uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=0.18.67'; }
 host_tools || fail "host tool installation failed; cozy was not replaced"
 tools="$(uv tool dir --bin)"
 
@@ -48,7 +45,6 @@ mv -f "$stage/cozy" "$bin/cozy"
 echo "verified: $asset sha256:$got"
 echo "cozy:     $was -> $now ($bin/cozy)"
 echo "runtime:  $("$tools/cozy-runtime" version | sed -n 's/^distribution: *//p')"
-echo "tfs:      $("$tools/tfs" version)"
 
 # Completion goes where each shell autoloads it, written by the binary just installed so an
 # upgrade rewrites it. A completion that cannot be written warns; the install already stands.
