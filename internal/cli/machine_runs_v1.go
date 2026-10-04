@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -216,6 +217,12 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		return false, machines.Transport(err)
 	}
 	head, opened := uint64(0), false
+	// Output files are read apart from the stream: progress and the outcome never wait on bytes.
+	var fetch *fetcherV1
+	if !catchUp {
+		fetch = m.fetcherV1(ctx, request, machine)
+		defer fetch.stop()
+	}
 	for {
 		event, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -243,11 +250,18 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			}
 		}
 		if outcome := event.GetOutcome(); outcome != nil {
-			return true, m.collectV1(ctx, request, machine, outcome)
+			if fetch != nil {
+				fetch.finish() // the newest revisions land, their progress shown
+			}
+			problem := m.collectV1(ctx, request, machine, outcome)
+			// A collection the connection cut is not the run's end here: it is attached again.
+			return problem == nil || problem.ErrName() != "machine_execution.transport_unavailable", problem
 		}
 		var held *records.Product
 		if product := event.GetProduct(); product != nil {
-			held = m.productV1(ctx, request, machine, event.Sequence, product)
+			if held = m.productV1(request, event.Sequence, product); held != nil && fetch != nil {
+				fetch.want(*held, product.AppendedFrom)
+			}
 		}
 		if problem := m.store.ObserveRunV1(request.ID, event, held); problem != nil {
 			return false, problem
@@ -515,9 +529,9 @@ func loopbackHub(origin string) string {
 	return ""
 }
 
-// productV1 brings one output revision's file up to date in the run's outputs folder and
-// answers it as this client records it; nil for a revision this client cannot hold.
-func (m *machineRuns) productV1(ctx context.Context, request records.Request, machine *machines.V1, sequence uint64, product *v1.Product) *records.Product {
+// productV1 is one output revision as this client records it, with the file it lands in;
+// nil for a revision this client cannot hold.
+func (m *machineRuns) productV1(request records.Request, sequence uint64, product *v1.Product) *records.Product {
 	if request.Number == 0 {
 		if numbered, problem := m.store.RequestByReference(request.ID); problem == nil && numbered != nil {
 			request.Number = numbered.Number
@@ -552,18 +566,168 @@ func (m *machineRuns) productV1(ctx context.Context, request records.Request, ma
 	}
 	if export, problem := m.store.OutputExportOf(request.ID); problem == nil && export != nil && export.Directory != "" {
 		held.Path = filepath.Join(export.Directory, itemFile(run, item, media))
-		if problem := writeOutputV1(ctx, machine, request.ID, export.Directory, held); problem != nil {
-			// The folder is where people look while the run goes on; the run's end writes every
-			// file at its final revision and records any refusal then.
-			fmt.Fprintf(m.context.Out, "machine execution %s: %s: %s\n", request.ID, held.Path, problem.Message)
-		}
 	}
 	return &held
 }
 
-// writeOutputV1 makes the file at product.Path this revision's bytes: a file holding a prefix
-// of it gets the missing tail, anything else is written whole beside it and renamed over.
-func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product) *exit.Error {
+// fetcherV1 keeps a run's outputs folder at each item's newest revision while the run goes on.
+// A newer revision of an item stops the read of an older one unless it extends it; the run's
+// end waits for the newest revisions and shows how far each is (collectV1 then settles them).
+type fetcherV1 struct {
+	m       *machineRuns
+	request records.Request
+	machine *machines.V1
+	ctx     context.Context
+	end     context.CancelFunc
+	done    chan struct{}
+	wake    chan struct{}
+
+	mu        sync.Mutex
+	order     []string                   // items in the order they first arrived
+	newest    map[string]records.Product // each item's newest revision
+	from      map[string]int64           // where that revision extends the one before it; 0: it replaces it; -1: unknown
+	landed    map[string]string          // the digest each item's file holds
+	failed    map[string]string          // a revision that could not be read; the end retries it
+	reading   string
+	stopRead  context.CancelFunc
+	finishing bool
+}
+
+func (m *machineRuns) fetcherV1(parent context.Context, request records.Request, machine *machines.V1) *fetcherV1 {
+	ctx, end := context.WithCancel(parent)
+	f := &fetcherV1{m: m, request: request, machine: machine, ctx: ctx, end: end, done: make(chan struct{}),
+		wake: make(chan struct{}, 1), newest: map[string]records.Product{}, from: map[string]int64{},
+		landed: map[string]string{}, failed: map[string]string{}}
+	// What this client recorded before (an earlier attach) is due too: its log is not sent again.
+	if products, problem := m.store.Products(request.ID); problem == nil {
+		for _, product := range records.Fold(products) {
+			f.want(product, nil)
+			f.from[product.Item] = -1
+		}
+	}
+	go f.run()
+	return f
+}
+
+func (f *fetcherV1) signal() {
+	select {
+	case f.wake <- struct{}{}:
+	default:
+	}
+}
+
+// want asks for an item's newest revision; appendedFrom says it extends the previous one.
+func (f *fetcherV1) want(product records.Product, appendedFrom *uint64) {
+	if product.Path == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, known := f.newest[product.Item]; !known {
+		f.order = append(f.order, product.Item)
+	}
+	f.newest[product.Item], f.from[product.Item] = product, 0
+	if appendedFrom != nil {
+		f.from[product.Item] = int64(*appendedFrom)
+	}
+	if f.reading == product.Item && appendedFrom == nil && f.stopRead != nil {
+		f.stopRead() // its bytes are replaced: what is being read is stale
+	}
+	f.signal()
+}
+
+// next is the first item whose file lacks its newest revision.
+func (f *fetcherV1) next() (records.Product, bool) {
+	for _, item := range f.order {
+		product := f.newest[item]
+		if f.landed[item] != product.Digest && f.failed[item] != product.Digest {
+			return product, true
+		}
+	}
+	return records.Product{}, false
+}
+
+func (f *fetcherV1) run() {
+	defer close(f.done)
+	for {
+		f.mu.Lock()
+		product, due := f.next()
+		finishing := f.finishing
+		if !due {
+			f.mu.Unlock()
+			if finishing {
+				return
+			}
+			select {
+			case <-f.ctx.Done():
+				return
+			case <-f.wake:
+			}
+			continue
+		}
+		read, stop := context.WithCancel(f.ctx)
+		f.reading, f.stopRead = product.Item, stop
+		from := f.from[product.Item]
+		f.mu.Unlock()
+		problem := writeOutputV1(read, f.machine, f.request.ID, filepath.Dir(product.Path), product, from, f.progress(product))
+		superseded := read.Err() != nil // a newer revision stopped this read
+		stop()
+		f.mu.Lock()
+		f.reading, f.stopRead = "", nil
+		switch {
+		case problem == nil:
+			f.landed[product.Item] = product.Digest
+		case f.ctx.Err() != nil:
+			f.mu.Unlock()
+			return
+		case superseded || f.newest[product.Item].Digest != product.Digest:
+			// The next turn reads the newer revision.
+		default:
+			// The run's end reads it again (`collectV1`) and records why when it cannot.
+			f.failed[product.Item] = product.Digest
+		}
+		f.mu.Unlock()
+	}
+}
+
+// progress reports a read the run's end waits on, at most once a second.
+func (f *fetcherV1) progress(product records.Product) func(int64) {
+	began, last := time.Now(), time.Time{}
+	return func(held int64) {
+		f.mu.Lock()
+		finishing := f.finishing
+		f.mu.Unlock()
+		if !finishing || time.Since(last) < time.Second && held < product.Length {
+			return
+		}
+		last = time.Now()
+		sample := map[string]any{"stage": "saving " + product.Output, "position": held, "total": product.Length, "unit": "bytes"}
+		if elapsed := time.Since(began).Seconds(); elapsed > 0 {
+			sample["rate"] = float64(held) / elapsed
+		}
+		_ = f.m.store.AppendEvent(f.request.ID, "machine.progress", 0, map[string]any{"type": "progress", "payload": sample})
+	}
+}
+
+// finish waits until every item's file holds its newest revision, or could not.
+func (f *fetcherV1) finish() {
+	f.mu.Lock()
+	f.finishing = true
+	f.signal()
+	f.mu.Unlock()
+	<-f.done
+}
+
+func (f *fetcherV1) stop() {
+	f.end()
+	<-f.done
+}
+
+// writeOutputV1 makes the file at product.Path this revision's bytes, replacing it whole once
+// they match the digest, never editing it in place. `from` > 0 says the revision extends the
+// file's bytes from there, so only the tail is read; -1 says nothing is known, and a shorter
+// file is tried as a prefix first. `held` is told how many bytes are in hand as they arrive.
+func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product, from int64, held func(int64)) *exit.Error {
 	if product.MediaType == resultfiles.TreeMediaType {
 		return exit.Named(exit.Structural, "output_tree_unsupported", "tree outputs are not read over cozy.machine.v1 yet")
 	}
@@ -573,37 +737,68 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 	if digestOf(product.Path) == product.Digest {
 		return nil
 	}
-	if info, err := os.Stat(product.Path); err == nil && info.Mode().IsRegular() && info.Size() < product.Length {
-		file, err := os.OpenFile(product.Path, os.O_WRONLY|os.O_APPEND, 0)
-		if err == nil {
-			_, _, err = machine.ReadOutput(ctx, run, product.Output, outputIndexV1(product), uint64(info.Size()), file)
-			if closeErr := file.Close(); err == nil {
-				err = closeErr
-			}
-			if err == nil && digestOf(product.Path) == product.Digest {
-				return nil
+	if held == nil {
+		held = func(int64) {}
+	}
+	read := func(offset int64) *exit.Error {
+		temporary, err := os.CreateTemp(directory, ".cozy-output-*")
+		if err != nil {
+			return exit.Named(exit.Unavailable, "output_unwritable", "cannot write into %s: %s", directory, err)
+		}
+		defer os.Remove(temporary.Name())
+		if offset > 0 {
+			if prior, err := os.Open(product.Path); err == nil {
+				_, err = io.CopyN(temporary, prior, offset)
+				prior.Close()
+				if err != nil {
+					offset = 0
+					_, _ = temporary.Seek(0, io.SeekStart)
+					_ = temporary.Truncate(0)
+				}
 			}
 		}
+		_, _, err = machine.ReadOutput(ctx, run, product.Output, outputIndexV1(product), uint64(offset), uint64(product.Rev),
+			&counted{w: temporary, n: offset, held: held})
+		if closeErr := temporary.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return machines.Transport(err)
+		}
+		if digestOf(temporary.Name()) != product.Digest {
+			return exit.Named(exit.Conflict, "output_revision_changed", "%s moved past revision %d while it was read", product.Output, product.Rev)
+		}
+		if err := os.Rename(temporary.Name(), product.Path); err != nil {
+			return exit.Named(exit.Unavailable, "output_unwritable", "cannot place %s: %s", product.Path, err)
+		}
+		return nil
 	}
-	temporary, err := os.CreateTemp(directory, ".cozy-output-*")
-	if err != nil {
-		return exit.Named(exit.Unavailable, "output_unwritable", "cannot write into %s: %s", directory, err)
+	info, err := os.Stat(product.Path)
+	prefix := int64(0)
+	if err == nil && info.Mode().IsRegular() && info.Size() < product.Length && (from < 0 || info.Size() == from) {
+		prefix = info.Size()
 	}
-	defer os.Remove(temporary.Name())
-	_, _, err = machine.ReadOutput(ctx, run, product.Output, outputIndexV1(product), 0, temporary)
-	if closeErr := temporary.Close(); err == nil {
-		err = closeErr
+	if prefix > 0 {
+		// Only the tail; bytes that do not match the digest are read whole once.
+		if problem := read(prefix); problem == nil || ctx.Err() != nil {
+			return problem
+		}
 	}
-	if err != nil {
-		return machines.Transport(err)
-	}
-	if digestOf(temporary.Name()) != product.Digest {
-		return exit.Named(exit.Conflict, "output_revision_changed", "%s moved past revision %d while it was read", product.Output, product.Rev)
-	}
-	if err := os.Rename(temporary.Name(), product.Path); err != nil {
-		return exit.Named(exit.Unavailable, "output_unwritable", "cannot place %s: %s", product.Path, err)
-	}
-	return nil
+	return read(0)
+}
+
+// counted reports how many bytes a read holds as they arrive.
+type counted struct {
+	w    io.Writer
+	n    int64
+	held func(int64)
+}
+
+func (c *counted) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	c.held(c.n)
+	return n, err
 }
 
 // outputIndexV1 is the item's index as Read names it: 1-based in a list, 0 for one output.
@@ -646,7 +841,10 @@ func (m *machineRuns) collectV1(ctx context.Context, request records.Request, ma
 			if product.Path == "" {
 				continue
 			}
-			if problem := writeOutputV1(ctx, machine, request.ID, export.Directory, product); problem != nil {
+			if problem := writeOutputV1(ctx, machine, request.ID, export.Directory, product, -1, nil); problem != nil {
+				if problem.ErrName() == "machine_execution.transport_unavailable" {
+					return problem // the connection ended: the run is attached again and collected then
+				}
 				failed = append(failed, product.Output)
 				if failure == nil {
 					failure = problem

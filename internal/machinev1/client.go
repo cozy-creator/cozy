@@ -14,6 +14,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 )
 
 // ScopeMachine is the cap action that authorizes every call as its signer.
@@ -43,6 +44,9 @@ func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Cl
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 		grpc.WithPerRPCCredentials(caps{c}),
 		grpc.WithInitialWindowSize(16<<20), grpc.WithInitialConnWindowSize(32<<20),
+		// A ping every 20 s keeps NAT mappings on the path alive through a quiet run, and an
+		// unanswered one ends a dead connection so the run is attached again at once.
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 20 * time.Second, PermitWithoutStream: true}),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
 	if err != nil {
 		return nil, err
@@ -85,10 +89,10 @@ func (c *Client) Control(ctx context.Context, id string, action pb.Action) (*pb.
 	return c.Machine.Control(ctx, &pb.ControlRequest{Id: id, Action: action})
 }
 
-// ReadOutput copies one output's bytes from offset into w, returning the first frame
-// (revision, total length, final digest) and the bytes written.
-func (c *Client) ReadOutput(ctx context.Context, run, output string, index uint32, offset uint64, w io.Writer) (*pb.ReadFrame, int64, error) {
-	return c.read(ctx, &pb.ReadRequest{Target: &pb.ReadRequest_Output{Output: &pb.OutputTarget{Run: run, Output: output, Index: index}}, Offset: offset}, w)
+// ReadOutput copies an output's bytes from offset into w; with rev set, it is refused
+// (FailedPrecondition) once the output has moved past that revision.
+func (c *Client) ReadOutput(ctx context.Context, run, output string, index uint32, offset, rev uint64, w io.Writer) (*pb.ReadFrame, int64, error) {
+	return c.read(ctx, &pb.ReadRequest{Target: &pb.ReadRequest_Output{Output: &pb.OutputTarget{Run: run, Output: output, Index: index}}, Offset: offset, IfRev: rev}, w)
 }
 
 // ReadTriage copies a failed run's triage bundle into w.
