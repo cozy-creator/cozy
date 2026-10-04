@@ -115,6 +115,9 @@ func encodePayload(payload map[string]any) (string, *exit.Error) {
 // AppendEvent records one lifecycle event outside any transaction. Used for the states
 // that are not themselves a durable commit (submitted, dispatched, accepted, requeued).
 func (s *Store) AppendEvent(requestID, eventType string, attempt int64, payload map[string]any) *exit.Error {
+	if s.sampleLocalTelemetryV1(requestID, eventType, attempt, payload) {
+		return nil
+	}
 	body, e := encodePayload(payload)
 	if e != nil {
 		return e
@@ -464,6 +467,9 @@ func (s *Store) LastEventSeq() (int64, *exit.Error) {
 // LatestMachineProgress reads the current attempt's already-imported Runtime
 // event page. It does not add another telemetry writer or new progress journal.
 func (s *Store) LatestMachineProgress(requestID string, attempt int64) (map[string]any, *exit.Error) {
+	if sample := s.liveProgressV1(requestID, attempt); sample != nil {
+		return sample, nil
+	}
 	var body string
 	err := s.db.QueryRow(`SELECT json_extract(payload,'$.payload') FROM request_events
 		WHERE request_id=? AND attempt=? AND type='machine.progress'
@@ -487,6 +493,9 @@ func (s *Store) LatestMachineProgress(requestID string, attempt int64) (map[stri
 // own progress samples: the Runtime-stamped time between the first and latest whole-job
 // fraction, scaled to the remaining fraction. False without two advancing samples.
 func (s *Store) MachineProgressEstimate(requestID string, attempt int64) (int64, bool) {
+	if estimate, ok := s.liveEstimateV1(requestID, attempt); ok {
+		return estimate, true
+	}
 	sample := func(order string) (float64, time.Time, bool) {
 		var fraction sql.NullFloat64
 		var at string

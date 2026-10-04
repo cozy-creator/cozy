@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -84,6 +83,7 @@ func (s *Store) AcceptRunV1(id string, state *v1.RunState) *exit.Error {
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit the run's acceptance: %s", err)
 	}
+	s.seedTelemetryV1(id, int64(max(state.Attempt, 1)), state.State, 0)
 	return nil
 }
 
@@ -131,6 +131,12 @@ func projectRunV1(tx *sql.Tx, id string, state *v1.RunState) error {
 // `request.preparing`), a product as its output item events (`product` holds the file this
 // client wrote, nil for none), a log line as `request.log`.
 func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *exit.Error {
+	if event.GetProgress() != nil || event.GetLog() != nil {
+		return s.sampleRunV1(id, event)
+	}
+	if state := event.GetState(); event.Sequence == 0 && state != nil && s.sameLiveStateV1(id, state) {
+		return nil // An unchanged reattach snapshot is observation, not a disk transition.
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin the run's observation: %s", err)
@@ -149,6 +155,10 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 	if event.AtMs == 0 {
 		at = now()
 	}
+	sampled, err := s.flushTelemetryV1(tx, id, cursor)
+	if err != nil {
+		return exit.Internalf("cannot coalesce the run's telemetry: %s", err)
+	}
 	insert := func(kind string, payload any) error {
 		raw, err := json.Marshal(payload)
 		if err != nil {
@@ -160,35 +170,6 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 	switch value := event.Event.(type) {
 	case *v1.RunEvent_State:
 		err = projectRunV1(tx, id, value.State)
-	case *v1.RunEvent_Progress:
-		p := value.Progress
-		if current == "queued" {
-			detail := p.Stage
-			if p.BytesTotal > 0 {
-				detail = strings.TrimSpace(detail + " " + humanBytes(p.BytesDone) + " of " + humanBytes(p.BytesTotal))
-			} else if p.BytesDone > 0 {
-				detail = strings.TrimSpace(detail + " · " + humanBytes(p.BytesDone) + " read")
-			}
-			err = insert("request.preparing", map[string]any{"stage": "machine", "detail": detail})
-			break
-		}
-		sample := map[string]any{"stage": p.Stage}
-		if p.Fraction >= 0 {
-			sample["overall_fraction"] = p.Fraction
-		}
-		if p.StageFraction != nil {
-			sample["stage_fraction"] = *p.StageFraction
-		}
-		if p.Total > 0 {
-			sample["position"], sample["total"] = p.Completed, p.Total
-		}
-		if p.BytesTotal > 0 {
-			sample["bytes_done"], sample["bytes_total"] = p.BytesDone, p.BytesTotal
-		}
-		if p.StepMs > 0 {
-			sample["step_ms"] = p.StepMs
-		}
-		err = insert("machine.progress", map[string]any{"type": "progress", "payload": sample})
 	case *v1.RunEvent_Product:
 		if product != nil {
 			for _, item := range outputItemEvents(*product) {
@@ -197,8 +178,7 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 				}
 			}
 		}
-	case *v1.RunEvent_Log:
-		err = insert("request.log", map[string]any{"level": value.Log.Level, "message": value.Log.Text})
+
 	}
 	if err != nil {
 		return exit.Internalf("cannot record the run's log: %s", err)
@@ -211,6 +191,13 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit the run's observation: %s", err)
 	}
+	state := current
+	if value := event.GetState(); value != nil {
+		state = value.State
+		ordinal = int64(max(value.Attempt, 1))
+	}
+	s.seedTelemetryV1(id, max(ordinal, 1), state, max(cursor, int64(event.Sequence)))
+	s.ackTelemetryV1(id, sampled)
 	return nil
 }
 
@@ -241,6 +228,10 @@ func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome, refused *exit
 		return exit.Internalf("cannot read the run's outcome: %s", err)
 	}
 	attempt := uint64(max(ordinal, 1))
+	sampled, err := s.flushTelemetryV1(tx, id, -1)
+	if err != nil {
+		return exit.Internalf("cannot coalesce the run's final telemetry: %s", err)
+	}
 	if len(prior) == 0 {
 		if problem := recordRunEndV1(tx, id, attempt, raw, outcome); problem != nil {
 			return problem
@@ -279,6 +270,8 @@ func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome, refused *exit
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit the run's outcome: %s", err)
 	}
+	s.ackTelemetryV1(id, sampled)
+	s.forgetTelemetryV1(id)
 	return nil
 }
 
