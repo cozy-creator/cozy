@@ -33,9 +33,9 @@ CLI watch events before and after restarting its own isolated controller.
 
 Remote CPU proof is green: six records cases, two real SSE cases, and the actual authored
 SDK/managed-executor/ordinary CLI burst (8.95 s). The latter preserves genuine denoise 30
-and decoding before/after restarting only its isolated controller. Consumer sourcedf82db87
-includes integration30d0e559 and1027; compiled Rustf2636abf includes integration91524d9 and52.
-RuntimeH370 SHA0d50f6b1 /TensorFSf089 were used with CUDA_VISIBLE_DEVICES empty, and
+and decoding before/after restarting only its isolated controller. Consumer source df82db87
+includes integration 30d0e559 and #1027; compiled Rust f2636abf includes integration 91524d9 and #52.
+Runtime H370 SHA 0d50f6b1 /TensorFS f089 were used with CUDA_VISIBLE_DEVICES empty, and
 compute-apps before/after were empty. No model inference or GPU throughput is qualified.
 
 A separate follow-up will replay the actual durable running revision/time when an observer
