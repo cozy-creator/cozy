@@ -101,6 +101,9 @@ func (m *Machine) RentalID() string {
 type Resolver struct {
 	Endpoint func(string) (*machineendpoint.Endpoint, *exit.Error)
 	Host     *Host
+	// Only, when set, is the one machine this resolver reaches: a foreground run's endpoint.
+	// Every other name, this computer's machine included, is refused before anything starts.
+	Only string
 	// HubOrigin is the hub this computer's machine belongs to unless a call names another,
 	// and Hub a client for an origin as the signed-in user.
 	HubOrigin string
@@ -175,6 +178,9 @@ func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string, name
 }
 
 func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
+	if problem := r.scoped(name); problem != nil {
+		return nil, problem
+	}
 	machine := &Machine{Name: name}
 	if machineendpoint.IsName(name) {
 		if r.Endpoint == nil {
@@ -257,6 +263,14 @@ func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, name
 		}
 	}
 	return machine, nil
+}
+
+// scoped refuses a machine outside Only.
+func (r *Resolver) scoped(name string) *exit.Error {
+	if r.Only == "" || name == r.Only {
+		return nil
+	}
+	return exit.Named(exit.Unavailable, "machine.endpoint_scope", "this foreground run reaches only %s, not machine %s", r.Only, name)
 }
 
 // resolve names a machine's dial identity: this computer's (started if needed), or a

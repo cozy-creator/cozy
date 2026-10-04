@@ -51,6 +51,7 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 		return nil, exit.Named(exit.Unavailable, "machine.endpoint_scope", "this foreground operation cannot access another machine")
 	}}
 	found.EndpointKey = rentalEndpointKey(l, st)
+	found.Only = ep.Name() // a foreground run never reaches this computer's machine
 	runs := newMachineRuns(&background, l, st, resolver, fleet, found)
 	owner, problem := orchestrator.Open(orchestrator.Options{StartMachineExecution: runs.Start, Cfg: ctx.Cfg, Layout: l, Store: st, Log: io.Discard})
 	if problem != nil {

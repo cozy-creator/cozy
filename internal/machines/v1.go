@@ -43,6 +43,9 @@ func (v *V1) Close() {
 // and opens its cozy.machine.v1 API, every call carrying a Cozy-Cap the owner key signs.
 // holder names what the caller does there, as a rental's use records it.
 func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.Error) {
+	if problem := r.scoped(name); problem != nil {
+		return nil, problem
+	}
 	if machineendpoint.IsName(name) {
 		if r.Endpoint == nil {
 			return nil, exit.Named(exit.Unavailable, "machine.endpoint_unavailable", "this controller cannot resolve the explicit endpoint")
