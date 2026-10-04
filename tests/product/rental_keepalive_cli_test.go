@@ -137,6 +137,22 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	if code, _ := runCozy(t, root, "rental", "keepalive", "tessa", "--duration", "0"); code == 0 {
 		t.Fatal("CLI duration override admitted")
 	}
+	if *olderCozy != "" {
+		// Version skew: a daemon that predates cozy.machine.v1 cannot keep a Rust rental
+		// alive, so the command does it itself over the rental's pinned machine.
+		if code, out := runCozy(t, root, "down"); code != 0 {
+			t.Fatalf("down [exit %d]\n%s", code, out)
+		}
+		up := exec.Command(*olderCozy, "up")
+		up.Env = childEnv(t, root)
+		if raw, err := up.CombinedOutput(); err != nil {
+			t.Fatalf("the older cozy did not start its daemon: %v\n%s", err, raw)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if third := keepalive(); !third.After(second) || third.UnixMilli() != held() || !baseline().After(renewed) {
+			t.Fatal("keepalive under the older daemon did not reset the machine and the local clock")
+		}
+	}
 
 	current, problem := store.RentalRow(parityRental)
 	fatal(t, problem)
