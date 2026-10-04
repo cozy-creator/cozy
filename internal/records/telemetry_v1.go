@@ -11,6 +11,10 @@ import (
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
+// A sample is lossy diagnostics, not an object-transfer channel. Larger samples are
+// dropped without failing the run; three latest samples and one first sample stay bounded.
+const maxRunTelemetryBytesV1 = 16 << 10
+
 // Telemetry carries no lifecycle authority. One first fraction plus the latest progress,
 // preparation and log sample are retained per observed run. Real transitions flush those
 // bounded samples in their existing FULL transaction; no telemetry event begins a write.
@@ -125,7 +129,11 @@ func (s *Store) sampleRunV1(id string, event *v1.RunEvent) *exit.Error {
 	var payload map[string]any
 	if p := event.GetProgress(); p != nil {
 		sample := samplePayloadV1(p)
-		current.progress, _ = json.Marshal(sample)
+		raw, err := json.Marshal(sample)
+		if err != nil || len(raw) > maxRunTelemetryBytesV1 {
+			return nil
+		}
+		current.progress = raw
 		kind = "machine.progress"
 		payload = map[string]any{"type": "progress", "payload": sample}
 		if current.state == "queued" || current.state == "preparing" {
@@ -145,7 +153,7 @@ func (s *Store) sampleRunV1(id string, event *v1.RunEvent) *exit.Error {
 }
 func (s *Store) retainSampleV1(current *runTelemetryV1, id, kind string, payload map[string]any, at string, remote uint64) {
 	raw, err := json.Marshal(payload)
-	if err != nil {
+	if err != nil || len(raw) > maxRunTelemetryBytesV1 {
 		return
 	}
 	s.telemetrySequence++
@@ -173,7 +181,11 @@ func (s *Store) sampleLocalTelemetryV1(id, kind string, attempt int64, payload m
 		return false
 	} // Other execution paths retain their existing contract.
 	if kind == "machine.progress" {
-		current.progress, _ = json.Marshal(payload["payload"])
+		raw, err := json.Marshal(payload["payload"])
+		if err != nil || len(raw) > maxRunTelemetryBytesV1 {
+			return true
+		}
+		current.progress = raw
 	}
 	s.retainSampleV1(current, id, kind, payload, now(), 0)
 	return true
