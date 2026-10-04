@@ -12,10 +12,12 @@ import (
 	"image/png"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,6 +170,35 @@ func TestCozy1FollowsAJobsFilmOnAV1Machine(t *testing.T) {
 	h.until(c, &f, func() bool { return f.end != nil })
 	if err := command.Wait(); err != nil {
 		t.Fatalf("the job exited %v:\n%s", err, ran.String())
+	}
+	code, played := runCozy(t, root, "run", "play", run, "--output", "video", "--json")
+	if code != 0 {
+		t.Fatalf("ordinary fixture play [exit %d]: %s", code, played)
+	}
+	var link struct {
+		Link string `json:"link"`
+	}
+	must(t, json.Unmarshal([]byte(lastJSONLine(played)), &link))
+	_, fragment, ok := strings.Cut(link.Link, "#")
+	if !ok {
+		t.Fatal("play produced no fragment")
+	}
+	values, err := url.ParseQuery(fragment)
+	must(t, err)
+	if values.Get("r") != run || values.Get("o") != "video" || values.Get("a") == "" || len(values.Get("f")) != 64 {
+		t.Fatalf("play lost its direct descriptor or request id: %s", link.Link)
+	}
+	host := machines.NewHost(filepath.Join(root, "machine"), "", nil)
+	state, problem := host.Status()
+	fatal(t, problem)
+	owner, problem := host.ExistingOwner()
+	fatal(t, problem)
+	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
+	must(t, err)
+	granted, err := capability.Verify(values.Get("c"), state.MachineID, []ed25519.PublicKey{public}, time.Now(), "")
+	must(t, err)
+	if granted.Run != run || !slices.Equal(granted.Outputs, []string{"video"}) {
+		t.Fatalf("play scope was changed: %+v", granted)
 	}
 	saved := savedVideo(t, out, ran)
 	if !bytes.Equal(f.got, saved) || f.end.Status != "completed" || f.end.SHA256 != digestOf(saved) || f.end.Length != uint64(len(saved)) {

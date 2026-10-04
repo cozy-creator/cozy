@@ -116,6 +116,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	localMachine := machineset.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child())
 	localMachine.GPUBudget = ctx.Cfg.MachineGPUBudget
+	localMachine.WebRTCPort = ctx.Cfg.MachineWebRTCPort
 	found := &machineset.Resolver{
 		Endpoint: st.MachineEndpoint,
 		Host:     localMachine, HubOrigin: ctx.Cfg.HubURL,
