@@ -2,17 +2,21 @@ package cli
 
 import (
 	"context"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 func handleRentalKeepalive(ctx *Context) *exit.Error {
-	_, store, problem := rentalStores(ctx)
+	layout, store, problem := rentalStores(ctx)
 	if problem != nil {
 		return problem
 	}
@@ -24,13 +28,38 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 	if subject.Row == nil {
 		return exit.New(exit.NotFound, "no current rental %q on this host", ctx.Inv.Args[0])
 	}
-	client, problem := dial(ctx)
+	var result api.RentalKeepaliveResult
+	endpoint, problem := foregroundRental(ctx, subject.Row.ID)
 	if problem != nil {
 		return problem
 	}
-	result, problem := client.KeepRentalAlive(subject.Row.ID)
-	if problem != nil {
-		return problem
+	if endpoint != nil {
+		// The installed daemon predates v1. This explicit maintenance call uses only
+		// this rental's recorded endpoint/pin/key, never a Hub or local machine launch.
+		key, problem := rental.CreatorIdentityFor(layout, subject.Row.ID)
+		if problem != nil {
+			return problem
+		}
+		observed, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		receipt, problem := machinev1.KeepRentalAlive(observed, subject.Row, key.Signer())
+		if problem != nil {
+			return problem
+		}
+		if problem := store.RecordRentalKeepalive(subject.Row.ID, receipt, time.Now()); problem != nil {
+			return problem
+		}
+		result = api.RentalKeepaliveResult{Rental: subject.Row.ID, WorkerID: receipt.WorkerID, WorkerBootID: receipt.WorkerBootID,
+			AcknowledgedAtUnixMS: receipt.AcknowledgedAtMS, IdleDeadlineUnixMS: receipt.IdleDeadlineMS}
+	} else {
+		client, problem := dial(ctx)
+		if problem != nil {
+			return problem
+		}
+		result, problem = client.KeepRentalAlive(subject.Row.ID)
+		if problem != nil {
+			return problem
+		}
 	}
 	return emit(ctx, compactRecord([]output.Field{
 		{K: "rental", V: result.Rental},
