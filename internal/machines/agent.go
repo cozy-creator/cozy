@@ -39,7 +39,11 @@ func (h *Host) servesAPI(ctx context.Context) bool {
 		return false
 	}
 	if h.asked == nil || !os.SameFile(h.asked, info) || !h.asked.ModTime().Equal(info.ModTime()) {
-		h.asked, h.serves = info, servesAPI(ctx, h.binary())
+		serves := servesAPI(ctx, h.binary())
+		if ctx.Err() != nil {
+			return true // the caller gave up before it answered: nothing is known, nothing is kept
+		}
+		h.asked, h.serves = info, serves
 	}
 	return h.serves
 }

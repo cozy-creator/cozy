@@ -61,8 +61,16 @@ func TestMissingInstallationMetadataNeverBootstrapsOverLiveAgent(t *testing.T) {
 	record, _ := json.Marshal(map[string]any{"pid": process.Process.Pid})
 	dir := filepath.Dir(h.Root())
 	must(t, os.WriteFile(filepath.Join(dir, "agent.json"), record, 0600))
+	// A live machine holds its root's lock for its life.
+	lock := filepath.Join(h.Root(), "var/lib/cozy/machine/agent.lock")
+	must(t, os.MkdirAll(filepath.Dir(lock), 0700))
+	held, err := os.OpenFile(lock, os.O_CREATE|os.O_RDWR, 0600)
+	must(t, err)
+	defer held.Close()
+	must(t, flock.Exclusive(held))
+	defer flock.Release(held)
 	_, problem := h.Install(t.Context(), machines.Source{}, "must-not-run-uv")
-	if problem == nil || problem.ErrName() != "machine.installation_unreadable" {
+	if problem == nil || problem.ErrName() != "machine.busy" {
 		t.Fatalf("bootstrap admitted over live agent: %v", problem)
 	}
 	if err := process.Process.Signal(syscall.Signal(0)); err != nil {
