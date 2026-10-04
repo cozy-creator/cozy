@@ -28,11 +28,11 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 	if problem != nil {
 		return nil, problem
 	}
-	owner, problem := h.ExistingOwner()
+	key, problem := h.Authorize()
 	if problem != nil {
 		return nil, problem
 	}
-	client, err := machinev1.Dial(launch.Addr, pin.TLSConfig(), launch.WorkerID, owner.Signer())
+	client, err := machinev1.Dial(launch.Addr, pin.TLSConfig(), launch.WorkerID, key.Signer())
 	if err != nil {
 		return nil, Transport(err)
 	}

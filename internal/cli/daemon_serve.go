@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	machineset "github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/reclaim"
@@ -122,9 +123,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Hub:     func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
 		UseRental:     func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
-		ObserveRental: rental.ObserveWorker(st),
-		RentalKey:     func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
-		EndpointKey:   rentalEndpointKey(l, st),
+		ObserveRental: rental.ObserveWorker(st), EndpointRented: rentedEndpoint(st),
 	}
 	machines := newMachineRuns(ctx, l, st, resolver, fleet, found)
 	defer machines.cancel()
@@ -134,7 +133,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution: machines.Start,
 		Cfg:                   ctx.Cfg, Layout: l, Store: st, Log: ctx.Out,
-		Rentals: rentals, RentalClaimProof: rental.ClaimProof(l), RentalSigner: rental.Signer(l),
+		Rentals: rentals, Signer: func() (machinev1.Signer, *exit.Error) {
+			key, problem := localMachine.Key()
+			return key.Signer(), problem
+		},
 		ModelTransfers: transfers,
 		ReclaimInstall: func(id string) *exit.Error {
 			// Background cleanup and editable refresh are mutations by this same daemon.

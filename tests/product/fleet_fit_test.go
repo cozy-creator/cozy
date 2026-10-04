@@ -71,10 +71,6 @@ func plantAttached(t *testing.T, root string, h *ladderHub, store *records.Store
 		NotAfter: time.Now().Add(time.Hour)}, &x509.Certificate{SerialNumber: big.NewInt(1)}, public, private)
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(rentals, id+".pem"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
-	key, err := x509.MarshalPKCS8PrivateKey(private)
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(rentals, id+".creator.pem"),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
 	if attached {
 		row.Address, row.CertPath = "127.0.0.1:1", filepath.Join(rentals, id+".pem")
 	}

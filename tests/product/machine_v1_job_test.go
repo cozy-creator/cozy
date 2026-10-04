@@ -2,12 +2,9 @@ package producttest
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"flag"
 	"fmt"
 	"image"
@@ -19,8 +16,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 var cpuLongform = flag.String("cpu-longform", "", "cozy-machine tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
@@ -116,12 +111,11 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	}
 }
 
-// A job on an explicit endpoint runs in the foreground (no daemon owns it), with its pause and
-// resume, and an endpoint that is one of this host's rentals is signed with that rental's own
-// key: a rental's machine authorizes it, not this computer's machine owner key. Here this
-// computer's machine stands in for the rental: its key moves to a rental's credential and the
-// owner key is replaced.
-func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
+// A job on an explicit endpoint runs in the foreground (no daemon owns it): submit, pause and
+// resume are each their own command, signed with this install's key. A machine admits that key
+// as sshd does, by a line in its authorized_keys: without the line the job is refused before
+// anything is sent, and with it again the job is accepted.
+func TestEndpointJobSignsWithTheInstallKeyAndPauses(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
 		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
 	}
@@ -162,15 +156,14 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	document, _ := json.Marshal(map[string]string{"format": "cozy.machine.endpoint/1", "address": address,
 		"worker_id": agent.WorkerID, "worker_boot_id": "boot", "tls_certificate_pem": string(leaf), "execution_workspace_id": "workspace"})
 	must(t, os.WriteFile(endpoint, document, 0o600))
-	// The machine authorizes the key it started with; this computer's owner key becomes
-	// another one the machine does not know.
-	owner := filepath.Join(root, "machine", "owner.pem")
-	authorized, err := os.ReadFile(owner)
+	authorizedKeys := filepath.Join(root, "machine", "root", "authorized_keys")
+	authorized, err := os.ReadFile(authorizedKeys)
 	must(t, err)
-	_, private, _ := ed25519.GenerateKey(nil)
-	der, err := x509.MarshalPKCS8PrivateKey(private)
+	installed, err := os.ReadFile(filepath.Join(root, "id_ed25519.pub"))
 	must(t, err)
-	must(t, os.WriteFile(owner, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600))
+	if !strings.Contains(string(authorized), strings.Join(strings.Fields(string(installed))[:2], " ")) {
+		t.Fatalf("the machine's authorized_keys does not name this install's key\n%s", authorized)
+	}
 	// The daemon is not this run's controller: every command below is its own foreground one.
 	if code, out := runCozy(t, root, "down"); code != 0 {
 		t.Fatalf("down [exit %d]\n%s", code, out)
@@ -190,33 +183,26 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 			"--input", in, "--asset", "reference=" + reference, "--json", "--out", out}, extra...)
 		return runCozy(t, root, args...)
 	}
-	// Signed with the owner key, which the machine does not authorize: refused, nothing sent.
-	if code, refused := run(); code == 0 || !strings.Contains(refused, "machine.endpoint_unauthorized") {
-		t.Fatalf("the machine accepted a key it does not authorize [exit %d]\n%s", code, refused)
-	}
-	// Once the endpoint is a recorded rental holding the authorized key, that key signs and the
-	// job is accepted.
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	if problem != nil {
-		t.Fatal(problem)
-	}
-	problem = store.RecordRental(records.Rental{ID: "pr-standin", MachineName: "standin", State: "ready", Address: address,
-		SKU: "virtual-1", AcceleratorModel: "Virtual Accelerator", AcceleratorCount: 1, HourlyRateUSDMicros: 1,
-		CertPath: filepath.Join(root, "machine", "leaf.pem"), ExpectedWorkerID: agent.WorkerID, ExpectedWorkerBootID: "boot",
-		RentedAt: time.Now().UTC().Format(time.RFC3339)})
-	store.Close()
-	if problem != nil {
-		t.Fatal(problem)
-	}
-	must(t, os.MkdirAll(filepath.Join(root, "rentals"), 0o700))
-	must(t, os.WriteFile(filepath.Join(root, "rentals", "pr-standin.creator.pem"), authorized, 0o600))
-	code, submitted := run()
+	// The line deleted by hand: the machine drops the key at its next look and refuses the job.
+	must(t, os.WriteFile(authorizedKeys, []byte("# no keys\n"), 0o600))
+	landed(t, "the machine to drop the deleted key", func() bool {
+		code, refused := run()
+		return code != 0 && strings.Contains(refused, "machine.endpoint_unauthorized")
+	})
+	// Restored: a refused attempt sent nothing, so the first accepted one is the job.
+	must(t, os.WriteFile(authorizedKeys, authorized, 0o600))
+	var code int
+	var submitted string
+	landed(t, "the machine to admit the key again", func() bool {
+		code, submitted = run()
+		return code == 0 || !strings.Contains(submitted, "machine.endpoint_unauthorized")
+	})
 	var job struct {
 		ID       string `json:"run"`
 		Accepted bool   `json:"machine_accepted"`
 	}
 	if code != 0 || json.Unmarshal([]byte(lastJSONLine(submitted)), &job) != nil || job.ID == "" || !job.Accepted {
-		t.Fatalf("the rental-signed job was not accepted [exit %d]\n%s", code, submitted)
+		t.Fatalf("the job signed with the install key was not accepted [exit %d]\n%s", code, submitted)
 	}
 	status := func() string {
 		_, shown := runCozy(t, root, "run", "show", job.ID, "--json")

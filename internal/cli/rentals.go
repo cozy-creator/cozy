@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -314,7 +315,6 @@ type rentalAcquisition struct {
 	machine  string
 	existing *records.RentalOperation
 	token    secret.Value
-	creator  rental.CreatorIdentity
 	replay   bool
 	sku      string
 	rate     int64
@@ -376,18 +376,18 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 		}
 	}
 	var token secret.Value
-	var creator rental.CreatorIdentity
 	if existing != nil && existing.State == "attached" && existing.RentalID != "" {
 		token, e = rental.MediaToken(l, existing.RentalID)
-		if e == nil {
-			creator, e = rental.CreatorIdentityFor(l, existing.RentalID)
-		}
 	} else {
 		token, e = rental.PendingMediaToken(l, operationKey)
-		if e == nil {
-			creator, e = rental.PendingCreatorIdentity(l, operationKey)
-		}
 	}
+	if e != nil {
+		return nil, e
+	}
+	// The machine admits the account's device keys, this install's among them. A Hub that
+	// predates that still requires creator_public_key: this install's key, which a newer Hub
+	// ignores.
+	key, e := installkey.Load(l.Root)
 	if e != nil {
 		return nil, e
 	}
@@ -428,14 +428,14 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	}
 	if existing != nil {
 		hourlyRateUSDMicros = existing.HourlyRateUSDMicros
-	} else if hourlyRateUSDMicros, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), creator.PublicKey(),
+	} else if hourlyRateUSDMicros, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), key.PublicKey(),
 		workload, development, image, hourlyRateUSDMicros); e != nil {
 		return nil, e
 	}
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
 		body, e := hub.RentalRequestBytes(machineName, skuName, gpus, secret.HashHex(token),
-			creator.PublicKey(), workload, development, image)
+			key.PublicKey(), workload, development, image)
 		if e != nil {
 			return nil, "", e
 		}
@@ -452,14 +452,14 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 		op.HourlyRateUSDMicros != hourlyRateUSDMicros || op.ManagedRequestID != managedRequestID {
 		return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
-			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
+			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and install key")
 	}
 	request, e := hub.ParseRentalRequestBytes(op.RequestBody)
 	if e != nil {
 		return nil, e
 	}
 	return &rentalAcquisition{ctx: ctx, layout: l, store: st, client: c, op: op, machine: request.Name,
-		existing: existing, token: token, creator: creator, replay: replay, sku: skuName,
+		existing: existing, token: token, replay: replay, sku: skuName,
 		rate: hourlyRateUSDMicros, deadline: deadline, managed: managedRequestID}, nil
 }
 
@@ -499,7 +499,7 @@ func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitio
 	ctx, l, st, c, op := a.ctx, a.layout, a.store, a.client, a.op
 	operationKey, machineName, deadline, skuName := op.Key, a.machine, a.deadline, a.sku
 	hourlyRateUSDMicros, managedRequestID := a.rate, a.managed
-	existing, token, creator, replay := a.existing, a.token, a.creator, a.replay
+	existing, token, replay := a.existing, a.token, a.replay
 	observation := lifecycle
 	if !deadline.IsZero() {
 		var cancel context.CancelFunc
@@ -643,7 +643,7 @@ func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitio
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
-	row, e = finishRentalAttachment(l, st, row, attachable, operationKey, token, creator)
+	row, e = finishRentalAttachment(l, st, row, attachable, operationKey, token)
 	return row, attachable, replay, e
 }
 
@@ -651,7 +651,7 @@ func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitio
 // and daemon recovery. It validates the same retained credentials before the row
 // advertises an authenticated worker target.
 func finishRentalAttachment(l home.Layout, st *records.Store, row records.Rental,
-	attachable hub.Rental, operationKey string, token secret.Value, creator rental.CreatorIdentity,
+	attachable hub.Rental, operationKey string, token secret.Value,
 ) (records.Rental, *exit.Error) {
 	if row.ID != attachable.ID || row.MachineName != attachable.Name || !attachable.Attachable() {
 		return records.Rental{}, exit.Named(exit.Conflict, "rental.attach_projection_conflict",
@@ -685,12 +685,7 @@ func finishRentalAttachment(l home.Layout, st *records.Store, row records.Rental
 			WithRemedy("release it and rent again; a pod nobody can authenticate to still costs money").
 			WithNext("cozy rental end " + attachable.ID)
 	}
-	if attachable.CreatorPublicKey != creator.PublicKey() {
-		return records.Rental{}, exit.Named(exit.Conflict, "rental.creator_key_changed",
-			"rental %s did not retain the Creator key sent at create", attachable.ID).
-			WithRemedy("release it; this host will not sign for a rental bound to another key")
-	}
-	if e := rental.AttachAcquisition(l, st, row, attachable.CertPEM, token, creator, operationKey); e != nil {
+	if e := rental.AttachAcquisition(l, st, row, attachable.CertPEM, token, operationKey); e != nil {
 		return records.Rental{}, e
 	}
 	row.CertPath = l.RentalCert(attachable.ID)
@@ -1011,9 +1006,6 @@ func missingOf(r hub.Rental) string {
 	if r.WorkerID == "" || r.WorkerBootID == "" {
 		return "worker and boot identity"
 	}
-	if r.CreatorPublicKey == "" {
-		return "Creator public key"
-	}
 	return "complete ready projection"
 }
 
@@ -1082,10 +1074,10 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		if row["rental"] != subject && row["machine"] != subject {
 			continue
 		}
-		fields, all, value := append([]string{"rental"}, append(list.Fields, "compute", "storage")...), list.AllFields,
+		fields, all, value := append([]string{"rental"}, append(list.Fields, "compute", "storage", "users")...), list.AllFields,
 			func(name string) (any, bool) { return row[name], true }
 		if mode := ctx.Mode(); !mode.Human || mode.JSON {
-			fields, all = list.TypedFields, list.TypedAllFields
+			fields, all = append(slices.Clone(list.TypedFields), "members", "shared"), list.TypedAllFields
 			value = func(name string) (any, bool) { v, ok := list.TypedRows[i][name]; return v, ok }
 		}
 		pick := func(names []string) (out []output.Field) {
@@ -1153,13 +1145,14 @@ func machineStatusFields(status api.MachineStatus, typed bool) []output.Field {
 // renderRentalList formats the daemon's public read model; it never opens SQLite.
 func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs bool) output.List {
 	count, burn := inventory.MachinesRunning, inventory.HourlySpendUSDMicros
-	rows, unrecorded := inventory.Rentals, inventory.Unrecorded
+	// Rentals shared with this account follow its own: it runs there, but they are not its spend.
+	rows, unrecorded := append(slices.Clone(inventory.Rentals), inventory.Shared...), inventory.Unrecorded
 	spend, spendFacts := accruedSpend(inventory)
 	list := output.List{
 		Name:   "rentals",
 		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "uptime", "running", "queued", "idle"},
 		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "compute", "storage", "spent", "failure", "uptime", "running", "queued", "idle",
-			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
+			"rental", "users", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
 			"idle_since", "release_due", "image", "provider", "provider resource",
 			"provider host", "provider state", "container state"},
 		// The machine document carries the underlying facts, never the table's
@@ -1168,7 +1161,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
 			"spend_usd_micros", "spend_basis", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour",
 			"vcpu_count", "memory_gb"},
-		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
+		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "members", "shared", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
 			"hourly_rate_usd_micros", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour", "vcpu_count", "memory_gb",
@@ -1224,7 +1217,11 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if r.Unverified {
 			state += " (unverified)"
 		}
+		if r.Shared {
+			state += " (shared with you)"
+		}
 		list.Rows = append(list.Rows, map[string]string{
+			"users":   orNone(strings.Join(r.Members, ", ")),
 			"machine": r.MachineName, "sku": orNone(r.SKU), "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
 			"state": state, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(activity.Running), "queued": strconv.Itoa(activity.Queued),
@@ -1253,6 +1250,12 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 		if r.Unverified {
 			typed["unverified"] = true
+		}
+		if len(r.Members) > 0 {
+			typed["members"] = r.Members
+		}
+		if r.Shared {
+			typed["shared"] = true
 		}
 		if r.Boot != nil {
 			typed["boot"] = r.Boot
@@ -1985,7 +1988,7 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 		}
 		rental.ForgetPending(l, operationKey)
 	}
-	notes := []string{note + "; its media bearer, Creator key, and pinned certificate are gone from this host"}
+	notes := []string{note + "; its media bearer and pinned certificate are gone from this host"}
 	if !had {
 		switch {
 		case destroyed:

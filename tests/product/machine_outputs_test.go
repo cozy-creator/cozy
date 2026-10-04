@@ -22,7 +22,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machines"
-	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -44,7 +43,7 @@ func machineOutputs(t *testing.T, root, run, output string) (outputReader, strin
 	fatal(t, problem)
 	pin, problem := host.Pin()
 	fatal(t, problem)
-	owner, problem := host.Owner()
+	owner, problem := host.Key()
 	fatal(t, problem)
 	var record struct {
 		WorkerPort int `json:"worker_port"`
@@ -118,8 +117,7 @@ func machineServesOutput(t *testing.T, root, output, digest string, revisions in
 	fatal(t, problem)
 	host := machines.NewHost(layout.Machine, "", nil)
 	found := &machines.Resolver{Host: host,
-		UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
-		RentalKey: func(string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentity{}, nil }}
+		UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil }}
 	machine, problem := found.Dial(context.Background(), machines.Local, "run outputs")
 	fatal(t, problem)
 	list, err := machine.Host.ListMachineExecutions(context.Background(), &pb.MachineExecutionListQuery{
@@ -165,7 +163,7 @@ func machineServesOutputAsleep(t *testing.T, root, run, output, digest string, r
 	fatal(t, problem)
 	pin, problem := host.Pin()
 	fatal(t, problem)
-	owner, problem := host.Owner()
+	owner, problem := host.Key()
 	fatal(t, problem)
 	addr := fmt.Sprintf("127.0.0.1:%d", record.WorkerPort)
 	// Ordinary SIGKILL is recoverable. Instead, arrange the documented launch

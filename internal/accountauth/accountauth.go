@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -26,6 +25,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -144,6 +144,7 @@ func (m *Manager) Forget() *exit.Error {
 // Obtaining one performs no I/O or network work.
 type Manager struct {
 	hub     string
+	home    string
 	path    string
 	http    *http.Client
 	mu      sync.Mutex
@@ -171,7 +172,7 @@ func New(cfg config.Config) *Manager {
 	if managers.byPath == nil {
 		managers.byPath = map[string]*Manager{}
 	}
-	manager := &Manager{hub: origin, path: path, http: &http.Client{Timeout: hub.Timeout}, now: time.Now}
+	manager := &Manager{hub: origin, home: cfg.Home, path: path, http: &http.Client{Timeout: hub.Timeout}, now: time.Now}
 	managers.byPath[path] = manager
 	return manager
 }
@@ -261,23 +262,25 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 	return m.session, problem
 }
 
-// BeginEnrollment sends the email code and retains a fresh key only in memory.
+// BeginEnrollment sends the email code to register this install's key (created on first use)
+// as this account's device key at this Hub.
 func (m *Manager) BeginEnrollment(ctx context.Context, email string) (*Enrollment, time.Time, *exit.Error) {
 	email = strings.TrimSpace(email)
 	if email == "" {
 		return nil, time.Time{}, exit.Usagef("email is required")
 	}
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, time.Time{}, exit.Internalf("cannot generate the machine key: %s", err)
+	key, problem := installkey.Ensure(m.home)
+	if problem != nil {
+		return nil, time.Time{}, problem
 	}
+	private := key.Private()
 	var begun struct {
 		EnrollmentID string `json:"enrollment_id"`
 		Challenge    string `json:"challenge"`
 		ExpiresAt    string `json:"expires_at"`
 	}
 	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/begin", map[string]string{
-		"email": email, "public_key": rawBase64.EncodeToString(public),
+		"email": email, "public_key": key.PublicKey(),
 	}, &begun); problem != nil {
 		return nil, time.Time{}, problem
 	}
@@ -417,7 +420,36 @@ func (m *Manager) load() (credential, ed25519.PrivateKey, *exit.Error) {
 		return credential{}, nil, exit.Named(exit.Credential, "auth.machine_key_invalid",
 			"the stored machine credential is invalid").WithNext(m.loginCommand())
 	}
-	return stored, ed25519.NewKeyFromSeed(seed), nil
+	// A login is this install's key registered here. One made before install keys carries over
+	// (installkey.Ensure adopts it); a login holding another key must be made again.
+	key, problem := installkey.Ensure(m.home)
+	if problem != nil {
+		return credential{}, nil, problem
+	}
+	if !bytes.Equal(key.Seed(), seed) {
+		return credential{}, nil, exit.Named(exit.Credential, "auth.install_key_unregistered",
+			"this install's key is not its device key at %s", m.hub).WithNext(m.loginCommand())
+	}
+	return stored, key.Private(), nil
+}
+
+// RetireInstall ends this install's key (logout): every Hub credential holding it is erased with
+// it, so no copy of the private key is left; the next login creates and registers another.
+func RetireInstall(home string) *exit.Error {
+	key, problem := installkey.Load(home)
+	if problem == nil {
+		paths, _ := filepath.Glob(filepath.Join(home, "auth", "*.json"))
+		for _, path := range paths {
+			var stored credential
+			raw, err := os.ReadFile(path)
+			if err == nil && json.Unmarshal(raw, &stored) == nil && stored.PrivateKey == rawBase64.EncodeToString(key.Seed()) {
+				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return exit.Internalf("cannot erase %s: %s", path, err)
+				}
+			}
+		}
+	}
+	return installkey.Retire(home)
 }
 
 func (m *Manager) save(stored credential) *exit.Error {

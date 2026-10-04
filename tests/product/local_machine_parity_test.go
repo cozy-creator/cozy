@@ -3,9 +3,7 @@ package producttest
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -27,6 +25,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -115,10 +114,10 @@ func randomToken(t *testing.T) string {
 }
 
 // providerHost boots the same Host binary as a rental's provider would: under its own root,
-// with the rental's Creator key as the owner key its grant names.
-func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machines.Source, uv string) (*machines.Launch, rental.CreatorIdentity, string, string) {
+// admitting this install's key as the account's device key its grant and lease name.
+func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machines.Source, uv string) (*machines.Launch, installkey.Key, string, string) {
 	t.Helper()
-	identity, problem := rental.PendingCreatorIdentity(layout, "parity-rental")
+	identity, problem := installkey.Ensure(layout.Root)
 	fatal(t, problem)
 	// Short roots: a Runtime's executor socket lives under the machine root.
 	providerHome, err := os.MkdirTemp("", "czr")
@@ -136,9 +135,6 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	host.WebRTCPort, _ = strconv.Atoi(h.grants["COZY_WEBRTC_INTERNAL_PORT"])
 	_, problem = host.Install(context.Background(), source, uv)
 	fatal(t, problem)
-	key, err := os.ReadFile(layout.PendingRentalCreatorIdentity("parity-rental"))
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(dir, "owner.pem"), key, 0o600))
 	// A provider passes the rental grant directly to the same executable. Local Host.Ensure
 	// intentionally ignores legacy registration/environment files and always boots persistent.
 	free := func() int {
@@ -153,11 +149,6 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 		mediaPort = free()
 	}
 	receiptKey, mediaToken := randomToken(t), randomToken(t)
-	mediaHash := sha256.Sum256([]byte(mediaToken))
-	auth, err := json.Marshal(map[string]any{"control_public_key_ed25519_b64url": identity.PublicKey(),
-		"media_token_sha256": []string{hex.EncodeToString(mediaHash[:])}})
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(dir, "media-token"), []byte(mediaToken), 0600))
 	environment := h.environment()
 	workerToken := randomToken(t)
 	h.mu.Lock()
@@ -167,7 +158,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 		"COZY_MACHINE_ROOT": host.Root(), "COZY_MACHINE_LIFETIME": "rental", "COZY_LISTEN_HOST": "127.0.0.1",
 		"COZY_WORKER_ID": parityWorker, "COZY_WORKER_AUTH_TOKEN": workerToken,
 		"COZY_WORKER_INTERNAL_PORT": strconv.Itoa(workerPort), "COZY_MEDIA_INTERNAL_PORT": strconv.Itoa(mediaPort),
-		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL": receiptKey, "COZY_RECORD_OWNER_AUTH_JSON": string(auth),
+		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL": receiptKey, "COZY_AUTHORIZED_KEYS": identity.PublicKey(),
 	})
 	command := exec.Command(filepath.Join(host.Root(), "usr/local/bin/cozy-machine"))
 	command.Dir = host.Root()

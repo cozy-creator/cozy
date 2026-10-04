@@ -47,7 +47,7 @@ func TestFreshRentalConcurrentCallsShareOneControlClaim(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}
-	launch, identity, token, provider := providerHost(t, h, layout, source, uv)
+	launch, _, token, provider := providerHost(t, h, layout, source, uv)
 	const model, count = "Virtual Accelerator", 4
 	h.mu.Lock()
 	h.rentals[parityRental] = map[string]any{"rental_id": parityRental, "name": "tessa", "state": "ready",
@@ -57,7 +57,7 @@ func TestFreshRentalConcurrentCallsShareOneControlClaim(t *testing.T) {
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: parityRental, MachineName: "tessa", SKU: "virtual-4", State: "ready",
 		AcceleratorModel: model, AcceleratorCount: count, HourlyRateUSDMicros: 1, Hub: h.server.URL,
 		Address: launch.Addr, MediaAddress: launch.MediaAddr, ExpectedWorkerID: launch.WorkerID, ExpectedWorkerBootID: launch.BootID},
-		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})), secret.New(token), identity))
+		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})), secret.New(token)))
 	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}

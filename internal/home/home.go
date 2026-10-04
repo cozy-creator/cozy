@@ -49,7 +49,7 @@ type Layout struct {
 	LocalPackages string
 	// Machine is this computer as a machine (proto-062): `root/` is laid out exactly as a
 	// pod's `/` for the same pod-supervisor Host, beside the controller's own grant for it
-	// (registration, owner key, launch record).
+	// (registration, authorized_keys, launch record).
 	Machine string
 	// Log is the Cozy daemon's own log, bounded by rotation on an observed size
 	// (internal/daemon.OpenLog). Its one rotated predecessor is Log + ".1".
@@ -116,23 +116,12 @@ func (l Layout) RentalMediaToken(id string) string {
 	return filepath.Join(l.Rentals, id+".media-token")
 }
 
-// RentalCreatorIdentity is one rental's Ed25519 private key. The worker receives only
-// the public key and verifies the signed ClaimProof.
-func (l Layout) RentalCreatorIdentity(id string) string {
-	return filepath.Join(l.Rentals, id+".creator.pem")
-}
-
 // PendingRentalMediaToken is the Creator-minted media bearer before the hub has answered with a
 // rental id. The caller's operation key may contain path separators, so only its digest
 // becomes a filename. The operation row keeps the unhashed key needed on the wire.
 func (l Layout) PendingRentalMediaToken(operationKey string) string {
 	sum := sha256.Sum256([]byte(operationKey))
 	return filepath.Join(l.Rentals, "pending-"+hex.EncodeToString(sum[:])+".media-token")
-}
-
-func (l Layout) PendingRentalCreatorIdentity(operationKey string) string {
-	sum := sha256.Sum256([]byte(operationKey))
-	return filepath.Join(l.Rentals, "pending-"+hex.EncodeToString(sum[:])+".creator.pem")
 }
 
 // RentalCert is the worker certificate this client PINS for one rental. A certificate is

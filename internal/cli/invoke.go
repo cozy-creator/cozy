@@ -73,9 +73,13 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 
 func handleRunExecute(ctx *Context) *exit.Error {
 	if name := ctx.Inv.Value("--rental"); name != "" && ctx.Inv.Value("--machine-endpoint-file") == "" {
-		// A running daemon too old for cozy.machine.v1 leaves this run to this process: the
-		// rental's machine as an explicit endpoint, signed with the rental's own key.
-		ep, problem := foregroundRental(ctx, name)
+		// A rental another account shared with this one, or one a running daemon too old for
+		// cozy.machine.v1 cannot drive, runs in this process: its machine as an explicit
+		// endpoint, signed with this install's key.
+		ep, problem := sharedRental(ctx, name)
+		if problem == nil && ep == nil {
+			ep, problem = foregroundRental(ctx, name)
+		}
 		if problem != nil {
 			return problem
 		}

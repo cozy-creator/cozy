@@ -15,11 +15,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -114,10 +114,9 @@ type Resolver struct {
 	RentalHub     func(string) *hub.Client
 	UseRental     func(id, holder string) (func(), *exit.Error)
 	ObserveRental func(orchestrator.RentalObservation) *exit.Error
-	RentalKey     func(string) (rental.CreatorIdentity, *exit.Error)
-	// EndpointKey is the key an explicit endpoint authorizes when it is one of this host's
-	// rentals (its own creator key); nil answers this computer's machine owner key.
-	EndpointKey func(*machineendpoint.Endpoint) (*rental.CreatorIdentity, *exit.Error)
+	// EndpointRented reports whether an explicit endpoint is one of this host's own rentals,
+	// whose machine reads its own Hub as the pod; nil answers no.
+	EndpointRented func(*machineendpoint.Endpoint) (bool, *exit.Error)
 	// Held answers whether this daemon's orchestrator holds the boot's control stream. A
 	// worker takes one control stream at a time, so a second Control Claim would fence the
 	// orchestrator's; its accepted Claim already names this owner.
@@ -161,7 +160,7 @@ func (r *Resolver) Forget(name string) {
 type target struct {
 	name, addr, workerID, bootID string
 	pin                          *workertls.Pin
-	key                          rental.CreatorIdentity
+	key                          installkey.Key
 	lifetime                     string // what else ends the worker process: a local Host's pid
 }
 
@@ -290,7 +289,7 @@ func (r *Resolver) resolve(ctx context.Context, name, origin, holder string, nam
 		if problem != nil {
 			return target{}, problem
 		}
-		key, problem := r.Host.Owner()
+		key, problem := r.Host.Authorize()
 		if problem != nil {
 			return target{}, problem
 		}
@@ -317,7 +316,8 @@ func (r *Resolver) resolve(ctx context.Context, name, origin, holder string, nam
 		release()
 		return target{}, exit.New(exit.Credential, "machine TLS identity cannot be read")
 	}
-	key, problem := r.RentalKey(identity.RentalID)
+	// The rental's machine admits this install's key: the account's device keys, leased.
+	key, problem := r.Host.Key()
 	if problem != nil {
 		release()
 		return target{}, problem
@@ -359,7 +359,7 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 	return nil
 }
 
-// claim authenticates this owner to the worker lifetime the target names: the owner key's
+// claim authenticates this owner to the worker lifetime the target names: the install key's
 // Ed25519 signature over ClaimProof/1, presented on every call. The first connection to a
 // lifetime also opens one Control Claim, which records the owner and its protocol level.
 func claim(ctx context.Context, connection *grpc.ClientConn, t target, wireMinor uint32, control bool) (*pb.Claim, *pb.ClaimAck, *exit.Error) {

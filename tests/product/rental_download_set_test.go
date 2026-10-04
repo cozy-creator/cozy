@@ -14,23 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
 // ---------------------------------------------------------------- the stand-in pod
 
 // ---------------------------------------------------------------- the rented machine
-
-func adoptCreatorIdentity(t *testing.T, l home.Layout, rentalID string) rental.CreatorIdentity {
-	t.Helper()
-	identity, e := rental.PendingCreatorIdentity(l, "op-"+rentalID)
-	fatal(t, e)
-	must(t, os.Rename(l.PendingRentalCreatorIdentity("op-"+rentalID),
-		l.RentalCreatorIdentity(rentalID)))
-	return identity
-}
 
 // standInCertificate mints the self-signed leaf the rental pins, as a pod's own readiness
 // certificate is pinned: the owner admits these exact bytes and nothing else.

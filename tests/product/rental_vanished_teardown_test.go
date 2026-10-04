@@ -1,10 +1,6 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -80,12 +76,6 @@ func TestDownAllIsNotRefusable(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(rentals, "rental-down-all.media-token"), []byte("m"), 0o600))
 	must(t, os.WriteFile(filepath.Join(rentals, "rental-down-all.pem"),
 		[]byte("-----BEGIN CERTIFICATE-----\n"), 0o600))
-	_, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	key, err := x509.MarshalPKCS8PrivateKey(private)
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(rentals, "rental-down-all.creator.pem"),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "rental-down-all", MachineName: "vanished", SKU: "cpu", AcceleratorModel: "CPU",
 		HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,

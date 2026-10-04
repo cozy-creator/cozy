@@ -674,8 +674,11 @@ placement/binding and exact environment identities from the worker's existing
 observed-state stream before dispatch. Tensorhub's exact PackageInterface validates request/result
 shape; Creator never supplies a remote profile, CUDA choice, or precomputed PlacementSet.
 
-Each rental has one local Ed25519 Creator key and one separate media bearer. Both credentials are
-removed when the rental ends, and a lost Creator key requires a new rental.
+This install has one Ed25519 control key, `~/.cozy/id_ed25519`, like `~/.ssh/id_ed25519`. Login
+registers it with your Tensorhub account as a device key. A rental's machine admits your account's
+device keys; this computer's machine admits the keys in `~/.cozy/machine/root/authorized_keys`, where
+`cozy machine install` adds this install's key and you can append another device's
+`id_ed25519.pub` by hand. `cozy auth logout` revokes and deletes the key; the next login makes a new one.
 
 Rentals continue billing until Tensorhub confirms their termination. `cozy rental end`
 and `cozy down --all` request termination; a plain `cozy down` does not.

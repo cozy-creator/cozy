@@ -15,6 +15,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -56,7 +57,7 @@ func startRentedPod(t *testing.T, h *ladderHub, pod *fakePod, machine func(block
 	fatal(t, problem)
 	_, problem = store.FailQueuedRequest(holder.ID, map[string]any{"error_type": "proof", "error": "held elsewhere"})
 	fatal(t, problem)
-	identity, problem := rental.PendingCreatorIdentity(layout, "rented-round-trips")
+	identity, problem := installkey.Ensure(layout.Root)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
@@ -78,7 +79,7 @@ func startRentedPod(t *testing.T, h *ladderHub, pod *fakePod, machine func(block
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: podRental, MachineName: "tessa", SKU: "fake-x", State: "ready",
 		AcceleratorModel: "fake-4090", AcceleratorCount: 4, HourlyRateUSDMicros: 1, Hub: h.server.URL,
 		Address: connection.Addr, MediaAddress: connection.Media.Addr,
-		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
+		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token))
 	store.Close()
 	startDaemonProcess(t, root, daemonEnv...)
 	return root

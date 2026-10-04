@@ -40,7 +40,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/mediawire"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -966,31 +965,6 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 		Media: &media.Spec{Addr: strings.TrimPrefix(mediaPlane.URL, "https://"),
 			Token: secret.New("media-token"), CACert: pemPath},
 	}, pemPath
-}
-
-// rentalWiring is the production entrypoint's rental hooks with a test key: the same
-// ClaimProof/1 signature, and the same unsigned download-set document.
-func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.PrivateKey) func(*orchestrator.Options) {
-	return func(o *orchestrator.Options) {
-		o.Rentals = func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
-			if id != connection.RentalID {
-				return nil, exit.New(exit.NotFound, "no rental %s", id)
-			}
-			return &orchestrator.RemoteTarget{Connection: connection}, nil
-		}
-		o.RentalClaimProof = func(c *orchestrator.WorkerConnection, epoch uint64) ([]byte, *exit.Error) {
-			pin, err := workertls.LoadPin(c.CACert)
-			if err != nil {
-				return nil, exit.Internalf("%v", err)
-			}
-			body, err := canonical.Bytes(&pb.ClaimProof{RecordOwnerEpoch: epoch, WorkerId: c.WorkerID,
-				WorkerBootId: c.WorkerBootID, WorkerTlsCertificateDigest: pin.Digest()})
-			if err != nil {
-				return nil, exit.Internalf("%v", err)
-			}
-			return ed25519.Sign(signer, body), nil
-		}
-	}
 }
 
 func waitUntil(t *testing.T, what string, ok func() bool) {

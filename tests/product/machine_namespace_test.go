@@ -113,7 +113,7 @@ func TestBootstrapRefusesKernelOwnedRootWithoutClientRecords(t *testing.T) {
 			if problem == nil || problem.ErrName() != "machine.busy" {
 				t.Fatalf("bootstrap ignored kernel ownership: %v", problem)
 			}
-			for _, name := range []string{"installed.json", "agent.json", "identity", "owner.pem"} {
+			for _, name := range []string{"installed.json", "agent.json", "identity", "root/authorized_keys"} {
 				if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 					t.Fatalf("refused bootstrap wrote %s", name)
 				}
@@ -137,7 +137,7 @@ func TestBootstrapRefusesKernelOwnedRootWithoutClientRecords(t *testing.T) {
 			if string(afterKey) != "retained private key" {
 				t.Fatal("Ensure rotated the current owner's receipt key")
 			}
-			for _, name := range []string{"agent.json", "identity", "owner.pem"} {
+			for _, name := range []string{"agent.json", "identity", "root/authorized_keys"} {
 				if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 					t.Fatalf("refused Ensure wrote %s", name)
 				}

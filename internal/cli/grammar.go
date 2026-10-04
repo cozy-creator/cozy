@@ -598,6 +598,8 @@ type RentalCmd struct {
 	Logs      RentalLogsCmd      `cmd:"" help:"Print the provider's boot log of a rental's attempt, kept after its pod is gone, or with --tensorfs its machine's TensorFS log."`
 	New       RentalNewCmd       `cmd:"" help:"Start a private rental, or list available machine types."`
 	End       RentalEndCmd       `cmd:"" help:"End a private rental and stop billing."`
+	Share     RentalShareCmd     `cmd:"" help:"Share a rental with another account: its devices' keys join the machine's authorized keys and it runs there as itself; you are billed."`
+	Unshare   RentalUnshareCmd   `cmd:"" help:"Stop sharing a rental with an account: its keys leave the machine at the next lease."`
 }
 
 type RentalUpdateCmd struct {
@@ -650,6 +652,24 @@ type RentalEndCmd struct {
 
 func (c *RentalEndCmd) Run(r *Runtime) error {
 	return r.call(handleRentRelease, []string{c.ID}, nil, nil, true)
+}
+
+type RentalShareCmd struct {
+	Rental  string `arg:"" predictor:"rental" help:"Rental name or id."`
+	Account string `arg:"" help:"Tensorhub account to share it with."`
+}
+
+func (c *RentalShareCmd) Run(r *Runtime) error {
+	return r.call(handleRentalShare, []string{c.Rental, c.Account}, nil, nil, false)
+}
+
+type RentalUnshareCmd struct {
+	Rental  string `arg:"" predictor:"rental" help:"Rental name or id."`
+	Account string `arg:"" help:"Tensorhub account to stop sharing it with."`
+}
+
+func (c *RentalUnshareCmd) Run(r *Runtime) error {
+	return r.call(handleRentalUnshare, []string{c.Rental, c.Account}, nil, nil, false)
 }
 
 type RentalListCmd struct {

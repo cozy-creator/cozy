@@ -29,7 +29,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 	if err != nil {
 		return exit.New(exit.Credential, "the machine's TLS identity cannot be read")
 	}
-	key, problem := u.machines.machines.RentalKey(identity.RentalID)
+	key, problem := u.machines.machines.Host.Key()
 	if problem != nil {
 		return problem
 	}

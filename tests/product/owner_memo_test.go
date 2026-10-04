@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -71,7 +72,7 @@ func TestAMachineMemoLookupIsAnsweredFromTheOwnersRecords(t *testing.T) {
 			store, problem := records.Open(layout.DB)
 			fatal(t, problem)
 			defer store.Close()
-			identity, problem := rental.PendingCreatorIdentity(layout, "owner-memo")
+			identity, problem := installkey.Ensure(layout.Root)
 			fatal(t, problem)
 			public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 			must(t, err)
@@ -131,7 +132,7 @@ func TestAMachineMemoLookupIsAnsweredFromTheOwnersRecords(t *testing.T) {
 			fatal(t, rental.Attach(layout, store, records.Rental{ID: podRental, MachineName: "collector", State: "ready", SKU: "cpu",
 				AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: hubStandIn.server.URL,
 				Address: connection.Addr, MediaAddress: connection.Media.Addr, ExpectedWorkerID: podWorkerID,
-				ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
+				ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token))
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubStandIn.server.URL+
 				"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 			startDaemonProcess(t, root)

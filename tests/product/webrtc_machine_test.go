@@ -152,7 +152,7 @@ func followOnMachine(t *testing.T, dir string, run uint64, output string, port i
 	host := machines.NewHost(dir, "", nil)
 	state, problem := host.Status()
 	fatal(t, problem)
-	owner, problem := host.Owner()
+	owner, problem := host.Key()
 	fatal(t, problem)
 	pin, problem := host.Pin()
 	fatal(t, problem)
@@ -243,7 +243,7 @@ func TestWebRTCServesARentalsFilmAsItLands(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}
-	launch, identity, token, provider := providerHost(t, h, layout, source, uv)
+	launch, _, token, provider := providerHost(t, h, layout, source, uv)
 	dir := filepath.Dir(provider)
 	if receipt, others := machineListens(t, dir); receipt != port || !slices.Equal(others, []int{port}) {
 		t.Fatalf("a machine granted WebRTC port %d names %d in its receipt and also listens on %v", port, receipt, others)
@@ -256,7 +256,7 @@ func TestWebRTCServesARentalsFilmAsItLands(t *testing.T) {
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: parityRental, MachineName: "tessa", SKU: "virtual-4", State: "ready",
 		AcceleratorModel: "Virtual Accelerator", AcceleratorCount: 4, HourlyRateUSDMicros: 1, Hub: h.server.URL,
 		Address: launch.Addr, MediaAddress: launch.MediaAddr, ExpectedWorkerID: launch.WorkerID, ExpectedWorkerBootID: launch.BootID},
-		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})), secret.New(token), identity))
+		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})), secret.New(token)))
 	if code, out := runCozy(t, root, "package", "install", outputLogProof(t, wheel), "--editable"); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}

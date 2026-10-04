@@ -33,6 +33,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -51,14 +52,11 @@ type Options struct {
 	// Rentals resolves an attached rental id to its dial spec; nil = this daemon attaches
 	// no rentals.
 	Rentals func(id string) (*RemoteTarget, *exit.Error)
-	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
-	RentalClaimProof RentalClaimProofSource
-	// RentalSigner is the owner key a rental's machine admits on cozy.machine.v1.
-	RentalSigner   RentalSignerSource
+	// Signer is this install's key, which every machine admits on cozy.machine.v1: a rental's
+	// through the account's device keys.
+	Signer         func() (machinev1.Signer, *exit.Error)
 	ModelTransfers ModelTransferOwner
 }
-
-type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
 
 // RentalPackageSetSource authors the desired download set for one selection. It takes
 // no worker connection: the document names content only and binds no rental, worker or

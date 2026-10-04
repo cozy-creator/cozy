@@ -24,6 +24,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -225,7 +226,7 @@ func newRentedIngestPod(t *testing.T, providerProbe string, extraConfig ...strin
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	t.Cleanup(func() { store.Close() })
-	identity, problem := rental.PendingCreatorIdentity(layout, "ingest-script")
+	identity, problem := installkey.Ensure(layout.Root)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
@@ -322,7 +323,7 @@ func newRentedIngestPod(t *testing.T, providerProbe string, extraConfig ...strin
 	row := records.Rental{ID: podRental, MachineName: "ingester", State: "ready", SKU: "cpu", AcceleratorModel: "fake-4090",
 		AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: hub.server.URL, Address: connection.Addr,
 		MediaAddress: connection.Media.Addr, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
-	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token, identity))
+	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"+strings.Join(extraConfig, "")), 0o600))
 	startDaemonProcess(t, root, "TMPDIR="+tmp)

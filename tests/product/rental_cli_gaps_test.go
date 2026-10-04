@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -37,7 +38,7 @@ func attachedRental(t *testing.T, pod *fakePod) (string, *fakeRentalHub) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	t.Cleanup(store.Close)
-	identity, problem := rental.PendingCreatorIdentity(layout, "attached")
+	identity, problem := installkey.Ensure(layout.Root)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
@@ -51,7 +52,7 @@ func attachedRental(t *testing.T, pod *fakePod) (string, *fakeRentalHub) {
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: podRental, MachineName: "attached", State: "ready", SKU: "cpu",
 		AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, Hub: stand.server.URL,
 		Address: connection.Addr, MediaAddress: connection.Media.Addr, ExpectedWorkerID: podWorkerID,
-		ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
+		ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+stand.server.URL+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	startDaemonProcess(t, root)

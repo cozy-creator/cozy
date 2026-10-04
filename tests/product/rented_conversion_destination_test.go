@@ -22,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -273,7 +274,7 @@ func newConversionFixture(t *testing.T) *conversionFixture {
 		rental.Disk{HaveGB: 30, RetainedBytes: retained, SourceBytes: 2_000_000_000}) || !strings.Contains(candidate.Verdict, "30 GB disk with 7 GB retained") {
 		t.Fatalf("placement does not count the retained ingest's disk: retained=%d verdict=%q", retained, candidate.Verdict)
 	}
-	identity, problem := rental.PendingCreatorIdentity(f.layout, "rented-conversion")
+	identity, problem := installkey.Ensure(f.layout.Root)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
@@ -297,7 +298,7 @@ func newConversionFixture(t *testing.T) *conversionFixture {
 	fatal(t, rental.Attach(f.layout, f.store, records.Rental{ID: podRental, MachineName: "tessa", SKU: "cpu", State: "ready",
 		AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: origin,
 		Address: connection.Addr, MediaAddress: connection.Media.Addr,
-		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
+		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token))
 	return f
 }
 

@@ -1,5 +1,5 @@
 // Package machinev1 is the CLI's client of a machine's `cozy.machine.v1` API: one pinned TLS
-// connection, every call authorized by a short machine-scope Cozy-Cap the owner key signs.
+// connection, every call authorized by a short machine-scope Cozy-Cap this install's key signs.
 package machinev1
 
 import (
@@ -19,7 +19,7 @@ import (
 // ScopeMachine is the cap action that authorizes every call as its signer.
 const ScopeMachine = "machine"
 
-// Signer is the owner key: its public half and a signature over a message.
+// Signer is this install's key: its public half and a signature over a message.
 type Signer struct {
 	Public ed25519.PublicKey
 	Sign   func([]byte) []byte

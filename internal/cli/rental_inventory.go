@@ -70,6 +70,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 		merged.Rentals = append(merged.Rentals, result.Rentals...)
 		merged.Unrecorded = append(merged.Unrecorded, result.Unrecorded...)
 		merged.Pending = append(merged.Pending, result.Pending...)
+		merged.Shared = append(merged.Shared, result.Shared...)
 	}
 	return merged.Current(), nil
 }
@@ -160,6 +161,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			BaseWorkerImageDigest: live[row.ID].BaseWorkerImageDigest,
 			BaseWorkerImageTag:    live[row.ID].BaseWorkerImageTag,
 			HubUnknown:            census.hubUnknown[row.ID],
+			Members:               live[row.ID].Members,
 		}
 		costOf(&summary, live[row.ID])
 		if update, problem := st.RuntimeUpdate(row.ID); problem != nil {
@@ -189,6 +191,14 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			BaseWorkerImageDigest: seen.BaseWorkerImageDigest, BaseWorkerImageTag: seen.BaseWorkerImageTag,
 		})
 		costOf(&result.Unrecorded[len(result.Unrecorded)-1], seen)
+	}
+	for _, seen := range census.shared {
+		result.Shared = append(result.Shared, api.RentalSummary{
+			ID: seen.ID, MachineName: seen.Name, State: seen.State,
+			AcceleratorModel: seen.AcceleratorModel, AcceleratorCount: seen.AcceleratorCount,
+			Address: seen.Address, Hub: origin, RentedAt: seen.CreatedAt,
+			Members: seen.Members, Shared: true,
+		})
 	}
 	open, problem := st.ActiveRentalOperations()
 	if problem != nil {

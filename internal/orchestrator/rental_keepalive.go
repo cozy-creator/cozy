@@ -12,9 +12,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// RentalSignerSource is the owner key that authorizes calls on one rental's machine.
-type RentalSignerSource func(rentalID string) (machinev1.Signer, *exit.Error)
-
 // KeepRentalAlive asks the rental's machine to reset its idle deadline once (Status with
 // keepalive) and answers what it now holds. Runtime admission and running work are
 // irrelevant to this manual owner action, and nothing is retried.
@@ -25,7 +22,7 @@ func (c *Orchestrator) KeepRentalAlive(ctx context.Context, id string) (records.
 	c.mu.Lock()
 	closing := c.closing
 	c.mu.Unlock()
-	if closing || c.opt.RentalSigner == nil {
+	if closing || c.opt.Signer == nil {
 		return out, exit.Unavailablef("rental keepalive owner is unavailable")
 	}
 	row, problem := c.opt.Store.RentalRow(id)
@@ -42,7 +39,7 @@ func (c *Orchestrator) KeepRentalAlive(ctx context.Context, id string) (records.
 	if err != nil {
 		return out, exit.New(exit.Credential, "the rental's machine certificate pin is unreadable: %s", err)
 	}
-	signer, problem := c.opt.RentalSigner(id)
+	signer, problem := c.opt.Signer()
 	if problem != nil {
 		return out, problem
 	}

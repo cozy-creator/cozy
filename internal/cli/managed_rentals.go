@@ -72,6 +72,9 @@ type rentalCensus struct {
 	// falls back to local records is exactly the board that showed an empty fleet
 	// while six H100s billed.
 	unrecorded []hub.Rental
+	// shared are the rentals other accounts shared with this one: never this account's
+	// fleet, spend or orphans.
+	shared []hub.Rental
 	// live is every rental the last listing says this account holds, recorded or
 	// not: the fleet count and burn are the hub's, never a local sum.
 	live           []hub.Rental
@@ -1227,12 +1230,16 @@ func (m *managedRentals) inFlightLocked() (map[string]bool, *exit.Error) {
 // recorded — never an assertion that there is nothing there.
 func (m *managedRentals) applyListingLocked(origin string, remote []hub.Rental, listed bool, problem *exit.Error) {
 	census := m.censusLocked(origin)
-	census.listed, census.listingProblem, census.unrecorded, census.live = listed, problem, nil, nil
+	census.listed, census.listingProblem, census.unrecorded, census.live, census.shared = listed, problem, nil, nil, nil
 	if problem != nil || !listed {
 		return
 	}
 	for _, seen := range remote {
 		if hub.RentalAbsent(seen.State) {
+			continue
+		}
+		if seen.Shared {
+			census.shared = append(census.shared, seen)
 			continue
 		}
 		row, rowProblem := m.store.RentalRow(seen.ID)
@@ -1331,11 +1338,11 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 				current.State == hub.RentalFailed || current.State == hub.RentalReleaseRequested {
 				continue
 			}
-			token, creator, problem := rental.RetainedAcquisitionCredentials(m.layout, *current)
+			token, problem := rental.RetainedMediaToken(m.layout, *current)
 			if problem != nil {
 				return released, failed, rebooted, problem
 			}
-			if _, problem := finishRentalAttachment(m.layout, m.store, row, remote, operation.Key, token, creator); problem != nil {
+			if _, problem := finishRentalAttachment(m.layout, m.store, row, remote, operation.Key, token); problem != nil {
 				return released, failed, rebooted, problem
 			}
 			// The rental just crossed acquiring -> attachable. Re-ask pinned

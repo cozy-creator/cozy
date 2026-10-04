@@ -5,8 +5,8 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -20,7 +20,7 @@ func (r *Resolver) dialEndpointAt(ctx context.Context, ep machineendpoint.Endpoi
 	if err := ep.Validate(); err != nil {
 		return nil, exit.New(exit.Validation, "invalid machine endpoint: %s", err)
 	}
-	key, problem := r.Host.ExistingOwner()
+	key, problem := r.Host.Key()
 	if problem != nil {
 		return nil, problem
 	}
@@ -67,8 +67,8 @@ func (r *Resolver) dialEndpointAt(ctx context.Context, ep machineendpoint.Endpoi
 // endpointTarget is an explicit endpoint as a scoped-access target. Its address says
 // nothing about where it runs (a loopback address is often a tunnel), so it reads the
 // origin Tensorhub declares, never this computer's loopback Hub.
-func endpointTarget(ep machineendpoint.Endpoint, pin *workertls.Pin, key rental.CreatorIdentity) accessTarget {
+func endpointTarget(ep machineendpoint.Endpoint, pin *workertls.Pin, key installkey.Key) accessTarget {
 	return accessTarget{addr: ep.Address, worker: ep.WorkerID, leaf: pin.DER(),
 		pin:   func() (*workertls.Pin, *exit.Error) { return pin, nil },
-		owner: func() (rental.CreatorIdentity, *exit.Error) { return key, nil }}
+		owner: func() (installkey.Key, *exit.Error) { return key, nil }}
 }

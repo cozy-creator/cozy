@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,7 +27,7 @@ import (
 
 // statusRental gives a fresh root a ready rental named "tessa" whose machine is the real one
 // (-machine-host) behind a stand-in Hub, and a running daemon.
-func statusRental(t *testing.T) (string, *records.Store, *machines.Launch, rental.CreatorIdentity, *daemonProcess) {
+func statusRental(t *testing.T) (string, *records.Store, *machines.Launch, installkey.Key, *daemonProcess) {
 	t.Helper()
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: a machine serving cozy.machine.v1")
@@ -62,7 +63,7 @@ func statusRental(t *testing.T) (string, *records.Store, *machines.Launch, renta
 	row := records.Rental{ID: parityRental, MachineName: "tessa", SKU: "cpu", State: "ready",
 		AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: h.server.URL,
 		Address: launch.Addr, MediaAddress: launch.MediaAddr, ExpectedWorkerID: launch.WorkerID, ExpectedWorkerBootID: launch.BootID}
-	fatal(t, rental.Attach(layout, store, row, cert, secret.New(token), identity))
+	fatal(t, rental.Attach(layout, store, row, cert, secret.New(token)))
 	daemon := startDaemonProcess(t, root)
 	return root, store, launch, identity, daemon
 }

@@ -1,10 +1,6 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,12 +38,6 @@ func plantRental(t *testing.T, root string, h *ladderHub, store *records.Store,
 	must(t, os.MkdirAll(rentals, 0o700))
 	must(t, os.WriteFile(filepath.Join(rentals, id+".media-token"), []byte("media-"+id), 0o600))
 	must(t, os.WriteFile(filepath.Join(rentals, id+".pem"), []byte("-----BEGIN CERTIFICATE-----\n"), 0o600))
-	_, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	key, err := x509.MarshalPKCS8PrivateKey(private)
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(rentals, id+".creator.pem"),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
 	row := records.Rental{ID: id, MachineName: machine, SKU: "h100-80", AcceleratorModel: h100SXM,
 		AcceleratorCount: 1, HourlyRateUSDMicros: 2_490_000, State: state, Hub: h.server.URL}
 	if attached {

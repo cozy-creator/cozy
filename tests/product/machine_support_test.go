@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"io"
 	"math/big"
 	"net"
@@ -31,7 +32,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machines"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
@@ -263,7 +263,7 @@ func machineJournal(root string) string {
 
 // runtimePhase is the phase an agent's maintenance route reports (GET /v1/machine/runtime,
 // served until the cutover deletes it), read with a maintenance cap the owner signs.
-func runtimePhase(t *testing.T, addr string, pin *workertls.Pin, worker string, owner rental.CreatorIdentity) (string, error) {
+func runtimePhase(t *testing.T, addr string, pin *workertls.Pin, worker string, owner installkey.Key) (string, error) {
 	t.Helper()
 	signer := owner.Signer()
 	token, err := capability.MintSigned(signer.Public, signer.Sign, capability.Grant{Machine: worker, Action: capability.Maintenance, Expires: time.Now().Add(5 * time.Minute).Unix()})

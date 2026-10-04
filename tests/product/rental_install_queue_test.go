@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -330,7 +331,7 @@ func TestQueuedRentalInstallReclaimsARestartedWorker(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
-	identity, problem := rental.PendingCreatorIdentity(layout, "install-restart")
+	identity, problem := installkey.Ensure(layout.Root)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
@@ -353,7 +354,7 @@ func TestQueuedRentalInstallReclaimsARestartedWorker(t *testing.T) {
 	_, problem = store.ForgetRental(podRental)
 	fatal(t, problem)
 	row.Address, row.MediaAddress, row.ExpectedWorkerBootID = connection.Addr, connection.Media.Addr, podBootID
-	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token, identity))
+	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+peer.server.URL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	startDaemonProcess(t, root)
 	var done *records.RentalInstall

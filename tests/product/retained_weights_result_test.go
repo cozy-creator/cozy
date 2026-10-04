@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -51,7 +52,7 @@ func newRetainedWeights(t *testing.T) *retainedWeights {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	t.Cleanup(store.Close)
-	identity, problem := rental.PendingCreatorIdentity(layout, "retained-weights")
+	identity, problem := installkey.Ensure(layout.Root)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
@@ -133,7 +134,7 @@ func newRetainedWeights(t *testing.T) *retainedWeights {
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: podRental, MachineName: "collector", State: "ready", SKU: "cpu",
 		AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: f.hub.server.URL, Address: connection.Addr,
 		MediaAddress: connection.Media.Addr, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID},
-		string(cert), connection.Media.Token, identity))
+		string(cert), connection.Media.Token))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+f.hub.server.URL+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	return f

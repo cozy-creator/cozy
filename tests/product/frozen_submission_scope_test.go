@@ -58,7 +58,7 @@ func TestFrozenLocalReceiptDoesNotNeedSourceOrCurrentHubGrant(t *testing.T) {
 				must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(settings), 0600))
 				must(t, os.MkdirAll(layout.Machine, 0700))
 				host := machines.NewHost(layout.Machine, "", nil)
-				owner, problem := host.Owner()
+				owner, problem := host.Key()
 				fatal(t, problem)
 				public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
 				must(t, err)

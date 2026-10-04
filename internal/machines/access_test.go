@@ -27,8 +27,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
@@ -192,18 +192,17 @@ type scope struct {
 	login   *login
 	hub     *fakeHub
 	machine *fakeMachine
-	owner   rental.CreatorIdentity
+	owner   installkey.Key
 }
 
 func newScope(t *testing.T) *scope {
 	dir := t.TempDir()
-	owner, problem := rental.OwnerIdentityAt(filepath.Join(dir, "owner.pem"))
+	owner, problem := installkey.Ensure(dir)
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	public, _ := base64.RawURLEncoding.DecodeString(owner.PublicKey())
 	h := newHub(t)
-	m := newMachine(t, ed25519.PublicKey(public))
+	m := newMachine(t, owner.Public())
 	pin, err := workertls.ParsePin(m.pem)
 	if err != nil {
 		t.Fatal(err)
@@ -214,7 +213,7 @@ func newScope(t *testing.T) *scope {
 		account: hub.New(config.Config{HubURL: h.URL}, "test").WithTokenSource(l)}
 	s.target = accessTarget{addr: strings.TrimPrefix(m.URL, "https://"), worker: m.worker, leaf: pin.DER(),
 		pin:   func() (*workertls.Pin, *exit.Error) { return pin, nil },
-		owner: func() (rental.CreatorIdentity, *exit.Error) { return s.owner, nil }}
+		owner: func() (installkey.Key, *exit.Error) { return s.owner, nil }}
 	return s
 }
 
@@ -323,7 +322,7 @@ func TestEndpointAccessRefusesUnboundAccess(t *testing.T) {
 
 func TestEndpointAccessWrongKeyWorkerOrPinRefuses(t *testing.T) {
 	s := newScope(t)
-	other, problem := rental.OwnerIdentityAt(filepath.Join(t.TempDir(), "other.pem"))
+	other, problem := installkey.Ensure(t.TempDir())
 	if problem != nil {
 		t.Fatal(problem)
 	}

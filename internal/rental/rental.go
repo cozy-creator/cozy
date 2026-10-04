@@ -38,20 +38,19 @@ func validID(id string) *exit.Error {
 // files land before the row can advertise a dialable target. The pre-POST operation row
 // already names the paid resource, so a crash at any point resumes rather than orphaning
 // a pod or publishing a row whose credential is absent.
-func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value,
-	creator CreatorIdentity) *exit.Error {
-	return attach(l, st, row, cert, token, creator, "")
+func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value) *exit.Error {
+	return attach(l, st, row, cert, token, "")
 }
 
 // AttachAcquisition publishes the same authenticated target while holding the
 // existing operation transaction against concurrent release or completion.
 func AttachAcquisition(l home.Layout, st *records.Store, row records.Rental, cert string,
-	token secret.Value, creator CreatorIdentity, operationKey string) *exit.Error {
-	return attach(l, st, row, cert, token, creator, operationKey)
+	token secret.Value, operationKey string) *exit.Error {
+	return attach(l, st, row, cert, token, operationKey)
 }
 
 func attach(l home.Layout, st *records.Store, row records.Rental, cert string,
-	token secret.Value, creator CreatorIdentity, operationKey string) *exit.Error {
+	token secret.Value, operationKey string) *exit.Error {
 	if e := validID(row.ID); e != nil {
 		return e
 	}
@@ -72,13 +71,6 @@ func attach(l home.Layout, st *records.Store, row records.Rental, cert string,
 					"rental %s changed its pinned certificate before attachment", row.ID)
 			}
 		}
-		if _, err := os.Stat(l.RentalCreatorIdentity(row.ID)); err == nil {
-			existing, problem := loadCreatorIdentity(l.RentalCreatorIdentity(row.ID))
-			if problem != nil || existing.PublicKey() != creator.PublicKey() {
-				return exit.Named(exit.Conflict, "rental.creator_identity_conflict",
-					"rental %s already belongs to another Creator key", row.ID)
-			}
-		}
 	}
 	row.CertPath = l.RentalCert(row.ID)
 	stage := func() *exit.Error {
@@ -88,16 +80,7 @@ func attach(l home.Layout, st *records.Store, row records.Rental, cert string,
 		if err := os.WriteFile(l.RentalCert(row.ID), []byte(cert), 0o644); err != nil {
 			return exit.Internalf("cannot pin the rental's certificate: %s", err)
 		}
-		if e := write0600(l.RentalMediaToken(row.ID), secret.FileBody(token)); e != nil {
-			return e
-		}
-		if len(creator.pem) == 0 {
-			return exit.Internalf("rental %s has no pending Creator identity", row.ID)
-		}
-		if e := write0600(l.RentalCreatorIdentity(row.ID), creator.pem); e != nil {
-			return e
-		}
-		return nil
+		return write0600(l.RentalMediaToken(row.ID), secret.FileBody(token))
 	}
 	if operationKey != "" {
 		return st.CompleteRentalAttachment(operationKey, row, stage)
@@ -155,33 +138,23 @@ func PendingMediaToken(l home.Layout, operationKey string) (secret.Value, *exit.
 	return token, nil
 }
 
-// RetainedAcquisitionCredentials reads the credentials minted before the paid
-// operation. It never replaces missing keys. Foreground completion may already
-// have moved them to their final names while a daemon observation was in flight.
-func RetainedAcquisitionCredentials(l home.Layout, operation records.RentalOperation) (secret.Value, CreatorIdentity, *exit.Error) {
+// RetainedMediaToken reads the token minted before the paid operation. It never replaces a
+// missing one. Foreground completion may already have moved it to its final name while a
+// daemon observation was in flight.
+func RetainedMediaToken(l home.Layout, operation records.RentalOperation) (secret.Value, *exit.Error) {
 	token, problem := tokenAt(l.PendingRentalMediaToken(operation.Key), "pending rental operation "+operation.Key)
-	if problem == nil {
-		identity, identityProblem := loadCreatorIdentity(l.PendingRentalCreatorIdentity(operation.Key))
-		if identityProblem == nil {
-			return token, identity, nil
-		}
-		problem = identityProblem
-	}
-	if operation.RentalID != "" {
-		token, attachedProblem := MediaToken(l, operation.RentalID)
-		if attachedProblem == nil {
-			identity, identityProblem := CreatorIdentityFor(l, operation.RentalID)
-			return token, identity, identityProblem
+	if problem != nil && operation.RentalID != "" {
+		if token, attached := MediaToken(l, operation.RentalID); attached == nil {
+			return token, nil
 		}
 	}
-	return secret.Value{}, CreatorIdentity{}, problem
+	return token, problem
 }
 
 // ForgetPending removes the pre-id token only after the operation is attached or proved
 // terminal. An interrupted poll deliberately leaves it for the exact-key retry.
 func ForgetPending(l home.Layout, operationKey string) {
 	_ = os.Remove(l.PendingRentalMediaToken(operationKey))
-	_ = os.Remove(l.PendingRentalCreatorIdentity(operationKey))
 }
 
 // Forget removes the local half. The pod is the hub's to destroy; this is what stops
@@ -196,7 +169,6 @@ func Forget(l home.Layout, st *records.Store, id string) (bool, *exit.Error) {
 	}
 	_ = os.Remove(l.RentalMediaToken(id))
 	_ = os.Remove(l.RentalCert(id))
-	_ = os.Remove(l.RentalCreatorIdentity(id))
 	return forgotten, nil
 }
 
@@ -309,9 +281,6 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		if e != nil {
 			return nil, e
 		}
-		if _, e := loadCreatorIdentity(l.RentalCreatorIdentity(id)); e != nil {
-			return nil, e.WithRemedy("end and re-rent; a lost per-rental Creator key cannot be rotated into the live pod")
-		}
 		cert := row.CertPath
 		if cert == "" {
 			cert = l.RentalCert(id)
@@ -358,18 +327,14 @@ func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit
 }
 
 // Reboot re-attaches a rental whose pod came back on a new boot. The Hub authenticated
-// that boot for this rental's attempt; it must still carry this host's media bearer and
-// Creator key. The Hub-verified certificate is pinned and the boot recorded.
+// that boot for this rental's attempt; it must still carry this host's media bearer. The
+// Hub-verified certificate is pinned and the boot recorded.
 func Reboot(l home.Layout, st *records.Store, id string, remote hub.Rental) *exit.Error {
 	token, problem := MediaToken(l, id)
 	if problem != nil {
 		return problem
 	}
-	creator, problem := loadCreatorIdentity(l.RentalCreatorIdentity(id))
-	if problem != nil {
-		return problem
-	}
-	if remote.ID != id || !remote.Attachable() || !remote.HoldsMediaHash(secret.HashHex(token)) || remote.CreatorPublicKey != creator.PublicKey() {
+	if remote.ID != id || !remote.Attachable() || !remote.HoldsMediaHash(secret.HashHex(token)) {
 		return exit.Named(exit.Conflict, "rental.reboot_unauthenticated",
 			"rental %s came back without this host's credentials; its previous attachment is kept", id)
 	}

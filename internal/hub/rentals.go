@@ -33,7 +33,7 @@ import (
 //	                                 widths:[{accelerator_count, price_usd_micros_per_hour,
 //	                                          storage_usd_micros_per_hour}]}]
 //	POST   /v1/rentals               {name, sku, accelerator_count, media_token_sha256:<64 hex>,
-//	                                  creator_public_key}
+//	                                  creator_public_key (this install's key, for older Hubs)}
 //	                                 -> 202 {rental_id, name, state, ...}
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, worker_id, worker_boot_id,
@@ -63,8 +63,8 @@ func RentalAbsent(state string) bool {
 	return state == RentalFailed || state == RentalReleased
 }
 
-// Rental is one rented pod as the hub reports it. No plaintext media bearer or private
-// Creator key is part of this view.
+// Rental is one rented pod as the hub reports it. No plaintext media bearer is part of
+// this view.
 type Rental struct {
 	Development      bool
 	SSHAddress       string
@@ -84,10 +84,9 @@ type Rental struct {
 	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
 	// server's own listener, which is where an owner uploads a payload and downloads an
 	// output. The hub observed it and names it.
-	MediaAddress     string
-	WorkerID         string
-	WorkerBootID     string
-	CreatorPublicKey string
+	MediaAddress string
+	WorkerID     string
+	WorkerBootID string
 	// MediaTokenSHA256 is the pod media plane's LIVE credential set, as hashes. It is here so this host can
 	// see that the hash of the token it minted is one the pod was provisioned with —
 	// a comparison neither end can make by saying the token.
@@ -118,6 +117,11 @@ type Rental struct {
 	// machine's shape where the Hub states one. Zero from a Hub older than the facts.
 	ComputeUSDMicrosPerHour, StorageUSDMicrosPerHour int64
 	VCPUCount, MemoryGB                              int
+	// Members are the accounts the renter shared this rental with; their device keys join its
+	// machine's authorized keys. Shared marks a rental this account is a member of, not its
+	// renter: it runs there as itself and cannot end it.
+	Members []string
+	Shared  bool
 }
 
 type RentalWebRTC struct {
@@ -223,7 +227,7 @@ type ExactDocument struct {
 // prevents a partial ready projection from being mistaken for a usable pod.
 func (r Rental) Ready() bool {
 	return r.State == RentalReady && (!r.Development || r.SSHAddress != "") && r.Address != "" && r.MediaAddress != "" &&
-		r.CertPEM != "" && r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != "" &&
+		r.CertPEM != "" && r.WorkerID != "" && r.WorkerBootID != "" &&
 		len(r.MediaTokenSHA256) > 0
 }
 
@@ -257,7 +261,6 @@ type wireRental struct {
 	MediaAddress          string         `json:"media_address"`
 	WorkerID              string         `json:"worker_id"`
 	WorkerBootID          string         `json:"worker_boot_id"`
-	CreatorPublicKey      string         `json:"creator_public_key"`
 	MediaTokenSHA256      []string       `json:"media_token_sha256"`
 	HourlyRateUSDMicros   int64          `json:"hourly_rate_usd_micros"`
 	Boot                  *wireBoot      `json:"boot,omitempty"`
@@ -270,10 +273,12 @@ type wireRental struct {
 	SpendBasis            string         `json:"spend_basis"`
 	WebRTC                *RentalWebRTC  `json:"webrtc,omitempty"`
 	// The rental's hourly cost, split, and its machine's shape.
-	ComputeUSDMicrosPerHour int64 `json:"compute_usd_micros_per_hour"`
-	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
-	VCPUCount               int   `json:"vcpu_count"`
-	MemoryGB                int   `json:"memory_gb"`
+	ComputeUSDMicrosPerHour int64    `json:"compute_usd_micros_per_hour"`
+	StorageUSDMicrosPerHour int64    `json:"storage_usd_micros_per_hour"`
+	VCPUCount               int      `json:"vcpu_count"`
+	MemoryGB                int      `json:"memory_gb"`
+	Members                 []string `json:"members"`
+	Shared                  bool     `json:"shared,omitempty"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -314,7 +319,6 @@ func (w wireRental) rental() Rental {
 		Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, Failure: w.Failure, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
-		CreatorPublicKey:      w.CreatorPublicKey,
 		MediaTokenSHA256:      w.MediaTokenSHA256,
 		HourlyRateUSDMicros:   w.HourlyRateUSDMicros,
 		Boot:                  w.Boot.local(time.Now()),
@@ -329,6 +333,7 @@ func (w wireRental) rental() Rental {
 		// The hourly cost's split and the machine's shape.
 		ComputeUSDMicrosPerHour: w.ComputeUSDMicrosPerHour, StorageUSDMicrosPerHour: w.StorageUSDMicrosPerHour,
 		VCPUCount: w.VCPUCount, MemoryGB: w.MemoryGB,
+		Members: w.Members, Shared: w.Shared,
 	}
 }
 
@@ -706,7 +711,8 @@ func (c *Client) Rentals(ctx context.Context) ([]Rental, *exit.Error) {
 	var out struct {
 		Rentals []wireRental `json:"rentals"`
 	}
-	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals", auth: true,
+	// shared=1 adds the rentals other accounts shared with this one, marked Shared.
+	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals?shared=1", auth: true,
 		responseBytes: maxRentalListingBytes}, &out)
 	if e != nil {
 		return nil, e
@@ -741,6 +747,29 @@ func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 			WithRemedy("preserve the original rental identity; never attach the response under another id")
 	}
 	return out.rental(), nil
+}
+
+// ShareRental adds an account to the rental's members, or with share false removes it: the
+// account's device keys join or leave the machine's authorized keys at its next lease, with no
+// restart. Answers the members.
+func (c *Client) ShareRental(ctx context.Context, id, account string, share bool) ([]string, *exit.Error) {
+	if e := validateRentalID(id); e != nil {
+		return nil, e
+	}
+	account = strings.TrimSpace(account)
+	if account == "" || strings.ContainsAny(account, "/?#") {
+		return nil, exit.Usagef("name one Tensorhub account")
+	}
+	method := http.MethodPut
+	if !share {
+		method = http.MethodDelete
+	}
+	var out struct {
+		Members []string `json:"members"`
+	}
+	e := c.do(ctx, call{method: method, path: "/v1/rentals/" + url.PathEscape(id) + "/members/" + url.PathEscape(account),
+		auth: true, responseBytes: maxRentalResponseBytes}, &out)
+	return out.Members, e
 }
 
 // RentalView reads a rental for a decision that does not depend on what the pod IS —

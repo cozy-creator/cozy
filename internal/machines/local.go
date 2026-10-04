@@ -27,7 +27,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/userunit"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	"github.com/google/uuid"
@@ -37,6 +37,8 @@ import (
 // execution state outlive the personal controller, using the same server as a rented pod.
 type Host struct {
 	dir string
+	// home holds this install's key (installkey), which the machine's authorized_keys names.
+	home string
 	// store is the box's one TensorFS store, the location this machine's Host uses for
 	// its own, so models are never held twice on one disk. Empty keeps the pod layout.
 	store  string
@@ -57,10 +59,11 @@ type Host struct {
 func NewHost(dir, store string, environ []string) *Host {
 	// A machine moved elsewhere by a symlink (another disk, a shorter path) runs there: the
 	// Runtime's sockets live under the root it is given, and a socket path is bounded.
+	home := filepath.Dir(dir)
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = resolved
 	}
-	h := &Host{dir: dir, store: store}
+	h := &Host{dir: dir, home: home, store: store}
 	for _, value := range environ {
 		name, _, _ := strings.Cut(value, "=")
 		switch name {
@@ -249,6 +252,10 @@ func (h *Host) place(staged *staged, uv string) (*Installed, *exit.Error) {
 	_ = os.Remove(link)
 	if err := os.Symlink(uv, link); err != nil {
 		return nil, exit.Internalf("cannot link uv: %s", err)
+	}
+	// The installing CLI's key is the machine's first authorized key; more are appended by hand.
+	if _, problem := h.Authorize(); problem != nil {
+		return nil, problem
 	}
 	if err := h.recordInstalled(installed); err != nil {
 		return nil, exit.Internalf("cannot record the machine installation: %s", err)
@@ -448,19 +455,9 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "machine.not_installed", "this computer has no machine installed").
 			WithRemedy("cozy machine install")
 	}
-	owner, problem := rental.OwnerIdentityAt(h.path("owner.pem"))
-	if problem != nil {
+	if _, problem := h.Authorize(); problem != nil {
 		return nil, problem
 	}
-	mediaToken, problem := h.secret("media-token")
-	if problem != nil {
-		return nil, problem
-	}
-	mediaHash := sha256.Sum256([]byte(mediaToken))
-	auth, _ := json.Marshal(map[string]any{
-		"control_public_key_ed25519_b64url": owner.PublicKey(),
-		"media_token_sha256":                []string{hex.EncodeToString(mediaHash[:])},
-	})
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, exit.Internalf("cannot mint the machine receipt key: %s", err)
@@ -478,7 +475,6 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 		"COZY_WORKER_ID=" + id,
 		"COZY_MACHINE_LIFETIME=persistent",
 		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE=" + h.path("receipt-key"),
-		"COZY_RECORD_OWNER_AUTH_JSON=" + string(auth),
 	}, h.inherited...)
 	if h.store != "" {
 		base = append(base, "COZY_TENSORFS_ROOT="+h.store)
@@ -647,14 +643,48 @@ func (h *Host) Status() (Status, *exit.Error) {
 	return out, nil
 }
 
-// Owner is the key this controller signs the machine's Claims with.
-func (h *Host) Owner() (rental.CreatorIdentity, *exit.Error) {
-	return rental.OwnerIdentityAt(h.path("owner.pem"))
+// Authorize is this install's key, named in the machine's authorized_keys (<root>/authorized_keys,
+// read as sshd reads its file) if it was not: every call to this computer's machine starts
+// here, so a key made by a later login is admitted without a restart. Every other line is the
+// user's and is kept.
+func (h *Host) Authorize() (installkey.Key, *exit.Error) {
+	key, problem := h.Key()
+	if problem != nil {
+		return key, problem
+	}
+	path := filepath.Join(h.Root(), "authorized_keys")
+	held, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return key, exit.Internalf("cannot read %s: %s", path, err)
+	}
+	if slices.ContainsFunc(strings.Split(string(held), "\n"), key.Names) {
+		return key, nil
+	}
+	if len(held) > 0 && held[len(held)-1] != '\n' {
+		held = append(held, '\n')
+	}
+	if err := writePrivate(path, append(held, key.AuthorizedKey()+"\n"...)); err != nil {
+		return key, exit.Internalf("cannot authorize this install's key: %s", err)
+	}
+	return key, nil
 }
 
-func (h *Host) ExistingOwner() (rental.CreatorIdentity, *exit.Error) {
-	return rental.ExistingOwnerIdentityAt(h.path("owner.pem"))
+// Deauthorize removes this install's key from the machine's authorized_keys (logout retires it).
+func (h *Host) Deauthorize() {
+	key, problem := installkey.Load(h.home)
+	path := filepath.Join(h.Root(), "authorized_keys")
+	held, err := os.ReadFile(path)
+	if problem != nil || err != nil {
+		return
+	}
+	lines := slices.DeleteFunc(strings.SplitAfter(string(held), "\n"), key.Names)
+	_ = writePrivate(path, []byte(strings.Join(lines, "")))
 }
+
+// Key is this install's control key, created on first use. It signs every call to a machine:
+// this computer's admits it through its authorized_keys, a rental's through the account's
+// device keys.
+func (h *Host) Key() (installkey.Key, *exit.Error) { return installkey.Ensure(h.home) }
 
 // Pin is the TLS leaf the running Host proved in its receipt.
 func (h *Host) Pin() (*workertls.Pin, *exit.Error) {

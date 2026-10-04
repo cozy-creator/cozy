@@ -163,7 +163,7 @@ func awaitScopedMachine(t *testing.T, h *machines.Host, launch *machines.Launch)
 	t.Helper()
 	pin, problem := h.Pin()
 	fatal(t, problem)
-	owner, problem := h.Owner()
+	owner, problem := h.Key()
 	fatal(t, problem)
 	waitUntil(t, "the fixture Runtime is ready", func() bool {
 		phase, err := runtimePhase(t, launch.Addr, pin, launch.WorkerID, owner)

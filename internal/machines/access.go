@@ -3,7 +3,6 @@ package machines
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -24,8 +23,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/machinev1"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
@@ -82,7 +81,7 @@ type accessTarget struct {
 	local        bool
 	leaf         []byte
 	pin          func() (*workertls.Pin, *exit.Error)
-	owner        func() (rental.CreatorIdentity, *exit.Error)
+	owner        func() (installkey.Key, *exit.Error)
 }
 
 func (c accessCache) path(name string) string { return filepath.Join(c.dir, name) }
@@ -207,12 +206,7 @@ func (h *Host) endpointCache(name string) accessCache {
 }
 
 func (h *Host) accessTarget(launch *Launch) accessTarget {
-	return accessTarget{addr: launch.Addr, worker: launch.WorkerID, local: true, leaf: launch.Leaf, pin: h.Pin, owner: func() (rental.CreatorIdentity, *exit.Error) {
-		if _, err := os.Stat(h.path("owner.pem")); err != nil {
-			return rental.CreatorIdentity{}, exit.New(exit.Credential, "the retained machine owner key is unavailable")
-		}
-		return h.Owner()
-	}}
+	return accessTarget{addr: launch.Addr, worker: launch.WorkerID, local: true, leaf: launch.Leaf, pin: h.Pin, owner: h.Authorize}
 }
 
 // ForgetExecutionAccess erases only this login origin's client caches and, where this
@@ -544,11 +538,7 @@ func (t accessTarget) call(ctx context.Context, method string, body any) (int, [
 	if problem != nil {
 		return 0, nil, problem
 	}
-	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
-	if err != nil || len(public) != ed25519.PublicKeySize {
-		return 0, nil, exit.New(exit.Credential, "the machine owner key is unreadable")
-	}
-	token, err := capability.MintSigned(public, owner.Sign, capability.Grant{Machine: t.worker, Action: "hub-access", Expires: time.Now().Add(5 * time.Minute).Unix()})
+	token, err := capability.MintSigned(owner.Public(), owner.Sign, capability.Grant{Machine: t.worker, Action: "hub-access", Expires: time.Now().Add(5 * time.Minute).Unix()})
 	if err != nil {
 		return 0, nil, exit.Internalf("cannot authorize machine execution access")
 	}

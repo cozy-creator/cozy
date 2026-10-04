@@ -18,6 +18,9 @@ type RentalInventory struct {
 	Rentals              []RentalSummary `json:"rentals"`
 	Unrecorded           []RentalSummary `json:"unrecorded"`
 	Pending              []RentalSummary `json:"pending"`
+	// Shared are rentals other accounts shared with this one: it runs there as itself, is
+	// not billed and cannot end them. They are no part of the totals.
+	Shared []RentalSummary `json:"shared,omitempty"`
 	// HubUnanswered is set when Tensorhub did not answer this read. Rows are then
 	// this host's last records and the totals are unknown, not zero.
 	HubUnanswered *exit.Error `json:"hub_unanswered,omitempty"`
@@ -95,6 +98,10 @@ type RentalSummary struct {
 	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour,omitempty"`
 	VCPUCount               int   `json:"vcpu_count,omitempty"`
 	MemoryGB                int   `json:"memory_gb,omitempty"`
+	// Members are the accounts the renter shared the rental with; Shared marks one shared
+	// with this account.
+	Members []string `json:"members,omitempty"`
+	Shared  bool     `json:"shared,omitempty"`
 }
 
 // Activity is absent for machines known only to the Hub: this daemon cannot

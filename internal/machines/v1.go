@@ -8,7 +8,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machinev1"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
@@ -40,7 +39,7 @@ func (v *V1) Close() {
 }
 
 // DialV1 resolves a machine as Dial does (this computer's, a rental, or an explicit endpoint)
-// and opens its cozy.machine.v1 API, every call carrying a Cozy-Cap the owner key signs.
+// and opens its cozy.machine.v1 API, every call carrying a Cozy-Cap this install's key signs.
 // holder names what the caller does there, as a rental's use records it.
 func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.Error) {
 	if problem := r.scoped(name); problem != nil {
@@ -80,17 +79,15 @@ func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.
 // this host's rentals is signed with that rental's own key, which its machine authorizes;
 // any other with this computer's machine owner key.
 func (r *Resolver) DialEndpointV1(ep machineendpoint.Endpoint) (*V1, *exit.Error) {
-	var rented *rental.CreatorIdentity
-	var problem *exit.Error
-	if r.EndpointKey != nil {
-		if rented, problem = r.EndpointKey(&ep); problem != nil {
+	rented := false
+	if r.EndpointRented != nil {
+		var problem *exit.Error
+		if rented, problem = r.EndpointRented(&ep); problem != nil {
 			return nil, problem
 		}
 	}
-	var key rental.CreatorIdentity
-	if rented != nil {
-		key = *rented
-	} else if key, problem = r.Host.ExistingOwner(); problem != nil {
+	key, problem := r.Host.Key()
+	if problem != nil {
 		return nil, problem
 	}
 	pin, err := workertls.ParsePin([]byte(ep.CertificatePEM))
@@ -101,7 +98,7 @@ func (r *Resolver) DialEndpointV1(ep machineendpoint.Endpoint) (*V1, *exit.Error
 	if err != nil {
 		return nil, Transport(err)
 	}
-	return &V1{Client: client, Name: ep.Name(), WorkerID: ep.WorkerID, BootID: ep.WorkerBootID, Leaf: pin.DER(), Rented: rented != nil}, nil
+	return &V1{Client: client, Name: ep.Name(), WorkerID: ep.WorkerID, BootID: ep.WorkerBootID, Leaf: pin.DER(), Rented: rented}, nil
 }
 
 // ReadStatus observes this computer's running machine over cozy.machine.v1 without starting
@@ -115,11 +112,11 @@ func (h *Host) ReadStatus(ctx context.Context) (*pb.StatusFrame, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	owner, problem := h.ExistingOwner()
+	key, problem := h.Authorize()
 	if problem != nil {
 		return nil, problem
 	}
-	client, err := machinev1.Dial("127.0.0.1:"+strconv.Itoa(record.WorkerPort), pin.TLSConfig(), record.WorkerID, owner.Signer())
+	client, err := machinev1.Dial("127.0.0.1:"+strconv.Itoa(record.WorkerPort), pin.TLSConfig(), record.WorkerID, key.Signer())
 	if err != nil {
 		return nil, Transport(err)
 	}

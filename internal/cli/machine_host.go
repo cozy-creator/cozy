@@ -67,6 +67,7 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 	fields := []output.Field{
 		{K: "root", V: host.Root()}, {K: "host", V: installed.Host.Name}, {K: "host_sha256", V: installed.Host.SHA256},
 		{K: "runtime", V: installed.Runtime.Name}, {K: "tensorfs", V: installed.TensorFS.Name},
+		{K: "authorized_keys", V: filepath.Join(host.Root(), "authorized_keys")},
 	}
 	notes := []string{"the installed machine remains available for local runs", "the next local run launches this machine"}
 	if replaced := installed.Replaced; replaced != nil {

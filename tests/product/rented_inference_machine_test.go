@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/installkey"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -369,7 +370,7 @@ func rentedLadderHome(t *testing.T, h *ladderHub, pod *fakePod, before func(home
 	if before != nil {
 		before(layout, store)
 	}
-	identity, problem := rental.PendingCreatorIdentity(layout, "rented-inference")
+	identity, problem := installkey.Ensure(layout.Root)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
@@ -401,7 +402,7 @@ func rentedLadderHome(t *testing.T, h *ladderHub, pod *fakePod, before func(home
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: podRental, MachineName: "tessa", SKU: "fake-x", State: "ready",
 		AcceleratorModel: "fake-4090", AcceleratorCount: cards, HourlyRateUSDMicros: 1, Hub: h.server.URL,
 		Address: connection.Addr, MediaAddress: connection.Media.Addr,
-		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
+		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token))
 	store.Close()
 	return root, layout
 }

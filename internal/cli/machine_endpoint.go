@@ -19,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -50,7 +49,7 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 		}
 		return nil, exit.Named(exit.Unavailable, "machine.endpoint_scope", "this foreground operation cannot access another machine")
 	}}
-	found.EndpointKey = rentalEndpointKey(l, st)
+	found.EndpointRented = rentedEndpoint(st)
 	found.Only = ep.Name() // a foreground run never reaches this computer's machine
 	runs := newMachineRuns(&background, l, st, resolver, fleet, found)
 	owner, problem := orchestrator.Open(orchestrator.Options{StartMachineExecution: runs.Start, Cfg: ctx.Cfg, Layout: l, Store: st, Log: io.Discard})
@@ -150,28 +149,6 @@ func endpointForRecordedRun(ctx *Context, id string) (func(), *exit.Error) {
 	return endpointController(ctx, ep)
 }
 
-// rentalEndpointKey answers the creator key of the rental an explicit endpoint reaches (its
-// recorded worker or address): a rental's machine authorizes that key, not this computer's
-// machine owner key. Nil for an endpoint that is no rental of this host.
-func rentalEndpointKey(l home.Layout, st *records.Store) func(*machineendpoint.Endpoint) (*rental.CreatorIdentity, *exit.Error) {
-	return func(ep *machineendpoint.Endpoint) (*rental.CreatorIdentity, *exit.Error) {
-		rows, problem := st.Rentals()
-		if problem != nil {
-			return nil, problem
-		}
-		for _, row := range rows {
-			if row.ExpectedWorkerID != "" && row.ExpectedWorkerID == ep.WorkerID || row.Address != "" && row.Address == ep.Address {
-				key, problem := rental.CreatorIdentityFor(l, row.ID)
-				if problem != nil {
-					return nil, problem
-				}
-				return &key, nil
-			}
-		}
-		return nil, nil
-	}
-}
-
 // runIDOf is the run a path observes or controls: `/v1/requests/<id>/…` or
 // `/v1/local/jobs/<id>/…`.
 func runIDOf(path string) (string, bool) {
@@ -181,6 +158,60 @@ func runIDOf(path string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// rentedEndpoint reports whether an explicit endpoint is one of this host's own rentals (its
+// recorded worker or address): such a machine reads its own Hub as the pod. A rental another
+// account shared with this one is not, so its runs carry this account's own Hub access.
+func rentedEndpoint(st *records.Store) func(*machineendpoint.Endpoint) (bool, *exit.Error) {
+	return func(ep *machineendpoint.Endpoint) (bool, *exit.Error) {
+		rows, problem := st.Rentals()
+		for _, row := range rows {
+			if row.ExpectedWorkerID != "" && row.ExpectedWorkerID == ep.WorkerID || row.Address != "" && row.Address == ep.Address {
+				return true, problem
+			}
+		}
+		return false, problem
+	}
+}
+
+// sharedRental is a rental another account shared with this one, as an explicit endpoint. This
+// host never bought it and holds no record of it; the Hub names its machine, which admits this
+// install's key from the renter's share. Nil when name is one of this host's own rentals or
+// no shared rental.
+func sharedRental(ctx *Context, name string) (*machineendpoint.Endpoint, *exit.Error) {
+	st, problem := records.Open(home.Paths(ctx.Cfg.Home).DB)
+	if problem != nil {
+		return nil, problem
+	}
+	defer st.Close()
+	if row, problem := st.RentalByMachine(name); problem != nil || row != nil {
+		return nil, problem
+	}
+	if row, problem := st.RentalRow(name); problem != nil || row != nil {
+		return nil, problem
+	}
+	hctx, cancel := hub.Context()
+	rentals, problem := client(ctx).Rentals(hctx)
+	cancel()
+	if problem != nil {
+		return nil, problem
+	}
+	for _, shared := range rentals {
+		if !shared.Shared || (shared.ID != name && shared.Name != name) {
+			continue
+		}
+		if !shared.Ready() {
+			return nil, exit.Named(exit.Unavailable, "rental.not_ready", "shared rental %s is %s", name, shared.State)
+		}
+		ep := &machineendpoint.Endpoint{Format: machineendpoint.Format, Address: shared.Address, WorkerID: shared.WorkerID,
+			WorkerBootID: shared.WorkerBootID, CertificatePEM: shared.CertPEM, WorkspaceID: shared.ID}
+		if err := ep.Validate(); err != nil {
+			return nil, exit.New(exit.Validation, "shared rental %s is not reachable as a machine endpoint: %s", name, err)
+		}
+		return ep, nil
+	}
+	return nil, nil
 }
 
 // foregroundRental is a named rental's machine as an explicit endpoint, for a run the running

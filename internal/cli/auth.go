@@ -86,6 +86,12 @@ func handleAuthLogout(ctx *Context) *exit.Error {
 	if forgotten := manager.Forget(); forgotten != nil {
 		return forgotten
 	}
+	// The revoked key cannot be registered again, so this install retires it everywhere: this
+	// computer's machine stops admitting it, and every login that held it is erased with it.
+	machines.NewHost(home.Paths(ctx.Cfg.Home).Machine, "", nil).Deauthorize()
+	if retired := accountauth.RetireInstall(ctx.Cfg.Home); retired != nil {
+		return retired
+	}
 	machine := machines.NewHost(home.Paths(ctx.Cfg.Home).Machine, "", nil)
 	hctx, cancel = hub.Context()
 	pending, cleanupProblem := machine.ForgetExecutionAccess(hctx, ctx.Cfg.HubURL)
@@ -161,7 +167,7 @@ func canEnroll(problem *exit.Error) bool {
 	}
 	switch problem.ErrName() {
 	case "auth.machine_key_missing", "auth.machine_key_invalid", "auth.machine_key_unreadable",
-		"invalid_credentials":
+		"auth.install_key_unregistered", "invalid_credentials":
 		return true
 	}
 	return false

@@ -37,8 +37,7 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 	// Observe the authority directly while the personal daemon is down. This uses
 	// the same authenticated machine client as the parity inventory proof.
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
-		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
-		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
+		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil }}
 	defer found.Forget(machines.Local)
 	defer found.Forget(parityRental)
 	for _, venue := range []struct {
