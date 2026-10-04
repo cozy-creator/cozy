@@ -720,8 +720,8 @@ fn a_pressure_pass_reports_the_disk_and_keeps_what_it_is_told() {
     let relief = tensorfs_core::ensure::relieve(&Store::open(&root).unwrap(), &[keep]).unwrap();
     assert!(relief.capacity_bytes >= relief.available_bytes);
     // Low is at or under the reserve, and a pass over a disk that is not low collects nothing.
-    let reserve = (1u64 << 30).max(relief.capacity_bytes / 50);
-    assert!(relief.pressure || relief.available_bytes > reserve);
+    let disk = tensorfs_core::ensure::Disk::measure(&root).unwrap();
+    assert!(relief.pressure || relief.available_bytes > disk.reserve());
     if !relief.pressure {
         assert_eq!(relief.collected_bytes, 0);
     }

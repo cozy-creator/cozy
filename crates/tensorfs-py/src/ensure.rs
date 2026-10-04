@@ -124,8 +124,8 @@ pub fn ensure<'p>(
     result_dict(py, &ensured.or_refuse(py)?)
 }
 
-/// One pressure pass on `store`: at most 1/10 of its filesystem free (or under the
-/// reserve), run the GC policy until more than 1/5 is free; `keep` is never evicted.
+/// One pressure pass on `store`: with no more than the reserve free, the GC policy frees
+/// what lifts it above; `keep` is never evicted.
 #[pyfunction]
 #[pyo3(signature = (store, *, keep=Vec::new()))]
 pub fn relieve<'p>(
