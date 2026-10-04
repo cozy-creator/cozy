@@ -1,7 +1,5 @@
 //! Capture actual native source/dependency/build inputs, including same-version edits.
-#[allow(dead_code)]
-#[path = "src/sha256.rs"]
-mod sha256;
+use sha2::{Digest, Sha256};
 use std::{env, fs, path::Path};
 fn collect(path: &Path, files: &mut Vec<std::path::PathBuf>) {
     if path.is_dir() {
@@ -26,7 +24,7 @@ fn main() {
         collect(Path::new(path), &mut files);
     }
     files.sort();
-    let mut hash = sha256::Sha256::new();
+    let mut hash = Sha256::new();
     for file in files {
         let name = file.to_string_lossy();
         let bytes = fs::read(&file).unwrap();
@@ -52,8 +50,6 @@ fn main() {
         .output()
         .unwrap();
     hash.update(&rustc.stdout);
-    println!(
-        "cargo:rustc-env=TENSORFS_IMPLEMENTATION_SHA256={}",
-        sha256::hex(&hash.finish())
-    );
+    let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    println!("cargo:rustc-env=TENSORFS_IMPLEMENTATION_SHA256={digest}");
 }

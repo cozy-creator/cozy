@@ -15,9 +15,11 @@ default = ["store"]
 store = ["dep:fs2", "dep:rusqlite", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:nix"]
 
 [dependencies]
+base64 = "0.22"
 fs2 = { version = "0.4", optional = true }
 minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+sha2 = "0.10"
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "std", "net", "event", "process"], optional = true }
 # tfs-049: the ONE transport (src/transport/). rustls is the one TLS stack, used only
 # there; scripts/fence.py refuses it anywhere else so a second mover cannot grow.
@@ -26,6 +28,9 @@ webpki-roots = { version = "0.26", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["fs", "user"], optional = true }
+
+[build-dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 libc = "0.2"

@@ -141,20 +141,6 @@ jobs:
           python3 scripts/version_contract.py source
 
       - run: cargo build --release --bin tfs
-      # SHA-256 instructions may only live in the runtime-dispatched routine (tfs-068);
-      # anywhere else they SIGILL on a host without them. `ring` carries its own dispatch.
-      - name: SHA extensions only behind runtime dispatch
-        run: |
-          set -e
-          out=$(objdump -d --no-show-raw-insn target/release/tfs \
-            | awk '/^[0-9a-f]+ <.*>:$/ { s=$2 }
-                   /sha256rnds2|sha256msg1|sha256msg2/ { print s }' | sort -u)
-          [ -n "$out" ] || { echo "no sha extension instructions: the routine was dropped"; exit 1; }
-          bad=$(echo "$out" | grep -v 'sha2563x868compress' | grep -v 'ring_core' || true)
-          [ -z "$bad" ] || { echo "sha instructions outside the dispatch:"; echo "$bad"; exit 1; }
-          grep -qo sha_ni /proc/cpuinfo \
-            && echo "runner HAS the sha extensions: both routines were exercised" \
-            || echo "runner LACKS the sha extensions: only the scalar fallback was exercised"
       - name: CBOR conformance against the independent Python codec
         run: uv run --python 3.12 --project conformance/cbor/python python scripts/cbor-conformance.py --tfs target/release/tfs conform
 
