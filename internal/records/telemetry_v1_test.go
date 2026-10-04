@@ -161,3 +161,40 @@ func TestUnsyncedTelemetryDoesNotSkipAProductAfterRestart(t *testing.T) {
 		t.Fatal("restart invented live progress")
 	}
 }
+
+func TestOversizedRunTelemetryIsDroppedWithoutAuthorityOrDiskWrites(t *testing.T) {
+	store, _ := telemetryStore(t)
+	before, problem := store.LastEventSeq()
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	if problem := store.ObserveRunV1("run", telemetryProgress(1, .1), nil); problem != nil {
+		t.Fatal(problem)
+	}
+	oversized := strings.Repeat("x", maxRunTelemetryBytesV1+1)
+	if problem := store.ObserveRunV1("run", &v1.RunEvent{Sequence: 2, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: oversized, Fraction: 1}}}, nil); problem != nil {
+		t.Fatal(problem)
+	}
+	if problem := store.ObserveRunV1("run", &v1.RunEvent{Sequence: 3, Event: &v1.RunEvent_Log{Log: &v1.LogLine{Text: oversized}}}, nil); problem != nil {
+		t.Fatal(problem)
+	}
+	if problem := store.AppendEvent("run", "machine.progress", 0, map[string]any{"type": "progress", "payload": map[string]any{"stage": oversized}}); problem != nil {
+		t.Fatal(problem)
+	}
+	samples := store.LiveRunEventsV1("run")
+	if len(samples) != 1 || len(samples[0].Event.Raw) > maxRunTelemetryBytesV1 {
+		t.Fatalf("oversized sample retained: %v", samples)
+	}
+	progress, problem := store.LatestMachineProgress("run", 1)
+	if problem != nil || progress["overall_fraction"] != .1 {
+		t.Fatalf("oversized telemetry displaced the valid sample: %v %v", progress, problem)
+	}
+	row, problem := store.RequestRow("run")
+	if problem != nil || row.State != "dispatching" {
+		t.Fatalf("volatile fraction settled a run: %v %v", row, problem)
+	}
+	after, problem := store.LastEventSeq()
+	if problem != nil || before != after {
+		t.Fatalf("oversized telemetry wrote rows: %d %d %v", before, after, problem)
+	}
+}
