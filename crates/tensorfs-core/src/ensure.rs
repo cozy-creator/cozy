@@ -13,7 +13,7 @@
 mod admission;
 mod flight;
 
-pub use admission::{relieve, Relief};
+pub use admission::{relieve, Disk, Relief};
 pub(crate) use flight::held_objects;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

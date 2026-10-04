@@ -26,11 +26,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::catalog::{Catalog, WriterGuard};
 use crate::err::{Code, Refusal, Result};
 use crate::ids::ObjectRef;
 use crate::ingest::transaction as tx;
+use crate::repository::{Repository, RepositoryName};
 use crate::storage::{self, Census, GcDelete, HeldKey};
 use crate::store::Store;
 
@@ -328,22 +330,19 @@ fn remove(root: &Path, row: &GcDelete) -> Result<()> {
     }
 }
 
-/// One pressure pass on an explicitly managed store: first ordinary garbage, then the
-/// smallest useful cache-root drop chosen by the existing dedup-aware planner. The owner
-/// keeps its placement generation stable through this call. The native lock covers the
-/// entire selection/removal/collection transition, including new readers and downloads.
-/// Old roots without transport provenance are deliberately not migrated or inferred.
-pub fn collect_cached(root: &Path, protected_manifests: &[String]) -> Result<Report> {
-    collect_cached_for(root, protected_manifests, 1)
+/// A managed store's roots, as one pass over its cache sees them.
+struct Roots {
+    repositories: Vec<(Repository, Vec<u8>)>,
+    holds: Vec<HeldKey>,
+    /// Cache roots a protected or held manifest names: in use.
+    used: Vec<RepositoryName>,
+    /// `used`, and every root transport did not write. Old roots without transport
+    /// provenance are deliberately not migrated or inferred.
+    keep: Vec<RepositoryName>,
 }
 
-/// The same pass, dropping the cache roots whose marginal bytes cover `need` together.
-pub fn collect_cached_for(
-    root: &Path,
-    protected_manifests: &[String],
-    need: u64,
-) -> Result<Report> {
-    let protected_manifests = protected_manifests
+fn roots(store: &Store, protected_manifests: &[String]) -> Result<Roots> {
+    let mut protected = protected_manifests
         .iter()
         .map(|digest| {
             crate::ids::hex64(
@@ -351,7 +350,74 @@ pub fn collect_cached_for(
                 digest.strip_prefix("sha256:").unwrap_or(digest),
             )
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<BTreeSet<_>>>()?;
+    let (mut holds, _) = session_holds(store)?;
+    holds.extend(pinned(store, crate::meta::owner(store.root()).as_deref())?);
+    protected.extend(
+        holds
+            .iter()
+            .filter(|hold| hold.kind == "manifest")
+            .map(|hold| hold.sha256.clone()),
+    );
+    let repositories = storage::read_repositories(store.root())?;
+    let (mut used, mut keep) = (Vec::new(), Vec::new());
+    for (repository, body) in &repositories {
+        let named = repository
+            .checkpoints
+            .iter()
+            .any(|checkpoint| protected.contains(&checkpoint.manifest.sha256));
+        let cached = crate::cache_roots::matches(store, &repository.repo, body)?;
+        if cached && named {
+            used.push(repository.repo.clone());
+        }
+        if !cached || named {
+            keep.push(repository.repo.clone());
+        }
+    }
+    Ok(Roots {
+        repositories,
+        holds,
+        used,
+        keep,
+    })
+}
+
+/// Drop the cache roots `victims` names and collect what only they named, on top of
+/// `before`. The native lock covers the removal and the collection, new readers and
+/// downloads included.
+fn drop_cached(
+    store: &Store,
+    roots: &Roots,
+    victims: &[RepositoryName],
+    exclusive: &crate::catalog::RebuildGuard,
+    before: Report,
+) -> Result<Report> {
+    for (repository, body) in &roots.repositories {
+        if victims.contains(&repository.repo) {
+            store.remove_cached_repository(body, &repository.repo, exclusive)?;
+        }
+    }
+    let mut dropped = collect_locked(store, false, exclusive)?;
+    dropped.reclaimed_bytes += before.reclaimed_bytes;
+    dropped.reclaimed_blobs += before.reclaimed_blobs;
+    dropped.reclaimed_manifests += before.reclaimed_manifests;
+    dropped.scratch_reaped += before.scratch_reaped;
+    Ok(dropped)
+}
+
+/// `collect_cached_for` one byte: the garbage, else the least recently used cache root.
+pub fn collect_cached(root: &Path, protected_manifests: &[String]) -> Result<Report> {
+    collect_cached_for(root, protected_manifests, 1)
+}
+
+/// Free `need` bytes of a managed store: ordinary garbage first, then the fewest
+/// least-recently-used cache roots that cover the rest (`reclaim`'s planner). Roots that
+/// cannot cover it all stay: the pass then frees the garbage and nothing else.
+pub fn collect_cached_for(
+    root: &Path,
+    protected_manifests: &[String],
+    need: u64,
+) -> Result<Report> {
     let store = Store::open(root)?;
     let exclusive = WriterGuard::lock_rebuild(root)?;
     let collected = collect_locked(&store, false, &exclusive)?;
@@ -359,28 +425,8 @@ pub fn collect_cached_for(
         return Ok(collected);
     }
     let need = need.max(1) - collected.reclaimed_bytes;
-    let (mut holds, _) = session_holds(&store)?;
-    holds.extend(pinned(&store, crate::meta::owner(root).as_deref())?);
-    let mut protected: BTreeSet<&str> = protected_manifests.iter().map(String::as_str).collect();
-    protected.extend(
-        holds
-            .iter()
-            .filter(|hold| hold.kind == "manifest")
-            .map(|hold| hold.sha256.as_str()),
-    );
-    let repositories = storage::read_repositories(root)?;
-    let mut keep = Vec::new();
-    for (repository, body) in &repositories {
-        if repository
-            .checkpoints
-            .iter()
-            .any(|checkpoint| protected.contains(checkpoint.manifest.sha256.as_str()))
-            || !crate::cache_roots::matches(&store, &repository.repo, body)?
-        {
-            keep.push(repository.repo.clone());
-        }
-    }
-    let plan = match crate::reclaim::plan_managed(&store, need, &keep, &holds) {
+    let roots = roots(&store, protected_manifests)?;
+    let plan = match crate::reclaim::plan_managed(&store, need, &roots.keep, &roots.holds) {
         Ok(plan) => plan,
         Err(error) if error.code == Code::RECLAIM_INSUFFICIENT => return Ok(collected),
         Err(error) => return Err(error),
@@ -389,21 +435,66 @@ pub fn collect_cached_for(
     if plan.victims.len() > 16 {
         return Ok(collected);
     }
-    for victim in plan.victims {
-        let (repository, body) = repositories
-            .iter()
-            .find(|(repository, _)| {
-                repository.repo.org == victim.org && repository.repo.name == victim.name
-            })
-            .expect("planner only names census repositories");
-        store.remove_cached_repository(body, &repository.repo, &exclusive)?;
+    let victims = plan
+        .victims
+        .into_iter()
+        .map(|victim| RepositoryName::new(victim.org, victim.name))
+        .collect::<Result<Vec<_>>>()?;
+    drop_cached(&store, &roots, &victims, &exclusive, collected)
+}
+
+/// What `collect_cached_for` could free at most: the garbage and every cache root outside
+/// `protected_manifests`. Deletes nothing.
+pub fn reclaimable(root: &Path, protected_manifests: &[String]) -> Result<u64> {
+    let store = Store::open(root)?;
+    let roots = roots(&store, protected_manifests)?;
+    crate::reclaim::droppable_bytes(&store, &roots.keep, &roots.holds)
+}
+
+/// The cache roots naming `manifests` were used now.
+pub fn used(root: &Path, manifests: &[String]) -> Result<()> {
+    let store = Store::open(root)?;
+    for (repository, _) in storage::read_repositories(root)? {
+        if repository.checkpoints.iter().any(|checkpoint| {
+            manifests
+                .iter()
+                .any(|m| m.strip_prefix("sha256:").unwrap_or(m) == checkpoint.manifest.sha256)
+        }) {
+            crate::cache_roots::touch(&store, &repository.repo)?;
+        }
     }
-    let mut dropped = collect_locked(&store, false, &exclusive)?;
-    dropped.reclaimed_bytes += collected.reclaimed_bytes;
-    dropped.reclaimed_blobs += collected.reclaimed_blobs;
-    dropped.reclaimed_manifests += collected.reclaimed_manifests;
-    dropped.scratch_reaped += collected.scratch_reaped;
-    Ok(dropped)
+    Ok(())
+}
+
+/// A cache's TTL. The cache roots in use (`protected_manifests`, and what the store's
+/// holds name) are stamped used now; every other cache root unused for `idle` is dropped
+/// and collected, low disk or not. A pass that finds none idle takes no lock and walks no
+/// object.
+pub fn collect_idle(root: &Path, protected_manifests: &[String], idle: Duration) -> Result<Report> {
+    let store = Store::open(root)?;
+    let since = crate::cache_roots::since(&store)?;
+    let expired = |roots: &Roots| -> Vec<RepositoryName> {
+        let unused = |repo: &&RepositoryName| {
+            crate::cache_roots::used(&store, repo)
+                .and_then(|used| used.max(since).elapsed().ok())
+                .is_some_and(|unused| unused > idle)
+        };
+        let all = roots.repositories.iter().map(|(repository, _)| &repository.repo);
+        all.filter(|repo| !roots.keep.contains(*repo))
+            .filter(unused)
+            .cloned()
+            .collect()
+    };
+    let seen = roots(&store, protected_manifests)?;
+    for repo in &seen.used {
+        crate::cache_roots::touch(&store, repo)?;
+    }
+    if expired(&seen).is_empty() {
+        return Ok(Report::default());
+    }
+    let exclusive = WriterGuard::lock_rebuild(root)?;
+    let roots = roots(&store, protected_manifests)?;
+    drop_cached(&store, &roots, &expired(&roots), &exclusive, Report::default())
 }
 
 #[cfg(test)]

@@ -23,41 +23,24 @@
 //! yet applied. A separate, faster estimator is exactly where two expressions that agree on
 //! every fixture anyone thought to write come to disagree on the store that matters.
 //!
-//! ## Why the ranking is not LRU
+//! ## The ranking: the fewest drops, the least recently used among them
 //!
-//! LRU is the familiar name and on its own it is the wrong key here: **LRU ranks access,
-//! the budget is about bytes, and on a content-addressed store those orders differ
-//! arbitrarily.** The least-recently-used model can be the one that frees nothing.
+//! Every candidate is already off the serving set (the caller passes that as `keep`), and
+//! each eviction costs a refetch, so the plan minimises the NUMBER of drops: while no single
+//! root finishes the need, the root that frees the most goes (the older of two that free
+//! the same). **Once a root can finish the need alone, the least recently used such root
+//! goes**, never the largest: a dip of a few bytes takes the coldest model that covers it.
+//! LRU alone would be the wrong key, because the least recently used root can be the one
+//! that frees nothing.
 //!
-//! The ranking is **marginal bytes freed per drop, descending**, over roots whose marginal
-//! is non-zero, with the oldest-recorded root breaking ties. Three reasons, and they are
-//! judgement calls rather than derivations:
+//! A root whose marginal is zero is **never proposed at all**, at any need, and a plan that
+//! cannot cover the need is refused whole rather than returned short.
 //!
-//! 1. **Every candidate is already off the serving set.** The orchestrator passes the
-//!    serving set as `keep`, so recency is a weak signal among what remains — they are all
-//!    cold by construction — while byte yield is the strong one.
-//! 2. **Each eviction has a fixed operational cost** (a model leaves the set, a placement
-//!    is torn down, a later refetch is a round trip), so the thing to minimise is the
-//!    NUMBER of drops needed to reach the need, which is what maximising marginal per drop
-//!    does.
-//! 3. **Per-byte refetch cost is uniform today, so it cannot rank anything.** Bytes
-//!    recoverable from the `/workspace` cache and bytes recoverable from R2 are counted
-//!    apart and reported apart, but they are not weighted apart: the ingest pool measures
-//!    516 MB/s and the volume's read rate against this workload has never been measured.
-//!    Inventing a multiplier would be decisions.md 698's shape exactly — a number that
-//!    looks measured because it is precise.
+//! ## What "recency" is here
 //!
-//! A root whose marginal is zero is **never proposed at all**, at any need. The owner's
-//! worry is made structurally unrepresentable rather than merely unlikely.
-//!
-//! ## What "recency" is here, precisely
-//!
-//! It is the repository document's mtime, and it is named `last_recorded_unix` rather than
-//! "last used" because that is what it measures: when this root was last WRITTEN — pulled,
-//! or had a release lane moved — not when it was last read. TensorFS keeps no read-time
-//! stamp, and inventing one would mean a hot-path write and a new authority for a signal
-//! that only breaks ties. If a true last-read stamp is ever wanted it is a separate issue
-//! with a named consumer.
+//! The later of the repository document's mtime (when the root was last written) and, for
+//! a cache root, its last use (`cache_roots::touch`). It is reported as
+//! `last_recorded_unix`.
 
 use std::collections::BTreeSet;
 
@@ -79,7 +62,7 @@ pub struct RootFacts {
     /// What dropping this root ALONE would free. The gap between this and `bytes_closure`
     /// IS the dedup, which is why both are reported and neither is reported alone.
     pub bytes_solo: u64,
-    /// When the repository document was last written. See the module docs: not last read.
+    /// When the root was last written or, a cache root, last used. See the module docs.
     pub last_recorded_unix: u64,
 }
 
@@ -193,6 +176,7 @@ fn recorded_unix(store: &Store, repo: &RepositoryName) -> u64 {
     std::fs::metadata(store.repository_path(repo))
         .and_then(|metadata| metadata.modified())
         .ok()
+        .max(crate::cache_roots::used(store, repo))
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |since| since.as_secs())
 }
@@ -342,6 +326,19 @@ pub fn plan(store: &Store, need: u64, keep: &[RepositoryName], holds: &[HeldKey]
     plan_managed(store, need, keep, holds)
 }
 
+/// What dropping every root outside `keep` would free, unreferenced bytes included.
+pub(crate) fn droppable_bytes(
+    store: &Store,
+    keep: &[RepositoryName],
+    holds: &[HeldKey],
+) -> Result<u64> {
+    let index = Census::open(store.root())?.holder_index(holds)?;
+    let all = (0..index.roots.len())
+        .filter(|position| !keep.contains(&index.roots[*position]))
+        .collect();
+    Ok(index.reclaimable(&all))
+}
+
 // Managed pressure already has an explicit owner opt-in; it shares the same planner.
 pub(crate) fn plan_managed(
     store: &Store,
@@ -368,48 +365,37 @@ pub(crate) fn plan_managed(
     let mut cumulative = unreferenced;
 
     while cumulative < need {
-        let mut best: Option<(u64, u64, usize)> = None;
-        let mut coldest: Option<(u64, usize)> = None;
-        for &candidate in &candidates {
-            if chosen.contains(&candidate) {
-                continue;
-            }
-            let recorded = recorded_unix(store, &index.roots[candidate]);
-            if coldest.is_none_or(|(top, _)| recorded < top) {
-                coldest = Some((recorded, candidate));
-            }
-            let mut trial = chosen.clone();
-            trial.insert(candidate);
-            let marginal = index.reclaimable(&trial).saturating_sub(cumulative);
-            if marginal == 0 {
-                continue;
-            }
-            // Marginal benefit per drop, descending; oldest-recorded breaks ties, because
-            // between two roots that free the same bytes the colder one is the one less
-            // likely to be wanted back.
-            let better = match best {
-                None => true,
-                Some((top, top_recorded, _)) => {
-                    marginal > top || (marginal == top && recorded < top_recorded)
-                }
-            };
-            if better {
-                best = Some((marginal, recorded, candidate));
-            }
-        }
-        let pick = match best {
-            Some((_, _, candidate)) => candidate,
-            // NOTHING FREES A BYTE ON ITS OWN, WHICH IS NOT THE SAME AS NOTHING CAN BE
-            // FREED. An object reachable from exactly two candidates is unique to neither,
-            // so the PAIR frees it and no member of the pair does. Refusing here — which an
-            // earlier draft did, by skipping every zero-marginal root — would report
-            // "insufficient" over a store where dropping two models frees plenty. So the
-            // search advances on the coldest root and the prune below throws away anything
-            // that turns out not to have earned its place.
-            None => match coldest {
-                Some((_, candidate)) => candidate,
-                None => break,
-            },
+        // (marginal bytes, last use, root) of every root still standing.
+        let rest: Vec<(u64, u64, usize)> = candidates
+            .iter()
+            .filter(|candidate| !chosen.contains(candidate))
+            .map(|&candidate| {
+                let mut trial = chosen.clone();
+                trial.insert(candidate);
+                (
+                    index.reclaimable(&trial).saturating_sub(cumulative),
+                    recorded_unix(store, &index.roots[candidate]),
+                    candidate,
+                )
+            })
+            .collect();
+        let coldest = |rows: &mut dyn Iterator<Item = &(u64, u64, usize)>| {
+            rows.min_by_key(|(_, recorded, _)| *recorded).copied()
+        };
+        let finishing = coldest(&mut rest.iter().filter(|row| cumulative + row.0 >= need));
+        let largest = rest
+            .iter()
+            .rev() // of two that tie on both, the first
+            .filter(|row| row.0 > 0)
+            .max_by_key(|(marginal, recorded, _)| (*marginal, std::cmp::Reverse(*recorded)))
+            .copied();
+        // NOTHING FREES A BYTE ON ITS OWN, WHICH IS NOT THE SAME AS NOTHING CAN BE FREED.
+        // An object reachable from exactly two candidates is unique to neither, so the PAIR
+        // frees it and no member of the pair does. The search then advances on the coldest
+        // root and the prune below throws away anything that did not earn its place.
+        let Some((_, _, pick)) = finishing.or(largest).or_else(|| coldest(&mut rest.iter()))
+        else {
+            break;
         };
         chosen.insert(pick);
         order.push(pick);

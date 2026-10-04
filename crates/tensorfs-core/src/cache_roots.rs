@@ -1,10 +1,12 @@
 //! Local provenance, not reachability: an exact repository body written by Hub transport.
 //! Missing/mismatched receipts preserve roots. GC still owns every object decision.
+//! A receipt's time is its root's last use.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::err::{Refusal, Result};
 use crate::repository::RepositoryName;
@@ -31,6 +33,38 @@ pub(crate) fn matches(store: &Store, repo: &RepositoryName, body: &[u8]) -> Resu
         Err(error) => return Err(io(error)),
     }
     Ok(fs::read(path).map_err(io)? == crate::sha256::hex_digest(body).as_bytes())
+}
+
+/// The root was used now. Nothing to stamp without a receipt.
+pub(crate) fn touch(store: &Store, repo: &RepositoryName) -> Result<()> {
+    match OpenOptions::new().write(true).open(path(store, repo)) {
+        Ok(receipt) => receipt.set_modified(SystemTime::now()).map_err(io),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io(error)),
+    }
+}
+
+/// When the root was last pulled or `touch`ed; `None` without a receipt.
+pub(crate) fn used(store: &Store, repo: &RepositoryName) -> Option<SystemTime> {
+    fs::metadata(path(store, repo)).and_then(|m| m.modified()).ok()
+}
+
+/// When this store began stamping use, begun now if it has not. A root last used before
+/// then counts as used then: an older store's roots are not idle the day they are first
+/// swept.
+pub(crate) fn since(store: &Store) -> Result<SystemTime> {
+    let path = store.root().join("tmp/cache-roots.since");
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(file) => store.assign_new_metadata_owner(&file)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io(error)),
+    }
+    fs::metadata(path).and_then(|m| m.modified()).map_err(io)
 }
 
 // Both writers are called inside the existing repository CAS and native writer fence.
@@ -181,6 +215,72 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(self.store.root());
         }
+    }
+
+    fn age(path: &std::path::Path, days: u64) {
+        let then = SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(then).unwrap();
+    }
+
+    #[test]
+    fn a_covering_drop_takes_the_least_recently_used_root_and_no_cover_takes_none() {
+        let f = Fixture::new();
+        let root = f.store.root();
+        let (cold, _) = f.model("cold", b"cold", true);
+        let (warm, _) = f.model("warm", b"a warm and much larger model", true);
+        for stamp in [path(&f.store, &cold), f.store.repository_path(&cold)] {
+            age(&stamp, 3);
+        }
+        let held = |repo: &RepositoryName| f.store.repository_path(repo).exists();
+        let total = crate::gc::reclaimable(root, &[]).unwrap();
+        assert!(total > 0 && held(&cold) && held(&warm), "reclaimable deletes nothing");
+        // Both together do not cover the need: neither goes.
+        let none = crate::gc::collect_cached_for(root, &[], total + 1).unwrap();
+        assert_eq!(none.reclaimed_bytes, 0);
+        assert!(held(&cold) && held(&warm));
+        // Either covers one byte: the least recently used goes, not the larger.
+        let first = crate::gc::collect_cached_for(root, &[], 1).unwrap();
+        assert!(!held(&cold) && held(&warm));
+        // Using a root moves it behind the others.
+        let (fresh, fresh_manifest) = f.model("fresh", b"pulled last, used first", true);
+        age(&path(&f.store, &warm), 2);
+        age(&path(&f.store, &fresh), 5);
+        age(&f.store.repository_path(&fresh), 5);
+        crate::gc::used(root, &[format!("sha256:{}", fresh_manifest.sha256)]).unwrap();
+        let second = crate::gc::collect_cached_for(root, &[], 1).unwrap();
+        assert!(!held(&warm) && held(&fresh));
+        assert_eq!(first.reclaimed_bytes + second.reclaimed_bytes, total);
+    }
+
+    #[test]
+    fn an_idle_root_expires_while_used_owned_and_untracked_roots_stay() {
+        let f = Fixture::new();
+        let week = std::time::Duration::from_secs(7 * 86_400);
+        let (idle, _) = f.model("idle", b"idle", true);
+        let (served, served_manifest) = f.model("served", b"served", true);
+        let (owned, _) = f.model("owned", b"owned", false);
+        let held = |repo: &RepositoryName| f.store.repository_path(repo).exists();
+        let sweep = |protected: &[String]| {
+            crate::gc::collect_idle(f.store.root(), protected, week)
+                .unwrap()
+                .reclaimed_bytes
+        };
+        let serving = [served_manifest.sha256.clone()];
+        for repo in [&idle, &served] {
+            age(&path(&f.store, repo), 8);
+        }
+        // A store that only now begins stamping use counts its roots as used now.
+        assert_eq!(sweep(&serving), 0);
+        assert!(held(&idle));
+        age(&f.store.root().join("tmp/cache-roots.since"), 9);
+        assert!(sweep(&serving) > 0);
+        assert!(!held(&idle) && held(&served) && held(&owned));
+        // The passes stamped the root in use: no longer served, it is not idle yet.
+        assert_eq!(sweep(&[]), 0);
+        age(&path(&f.store, &served), 8);
+        assert!(sweep(&[]) > 0);
+        assert!(!held(&served) && held(&owned));
     }
 
     #[test]
