@@ -11,6 +11,19 @@ mismatched worker/boot/pin descriptor refuses only playback. URI fragment values
 so a run/output name cannot add another fragment parameter. Missing direct reachability is
 an operation error; no relay is provided.
 
-The paired machine endpoint change is codex/player-endpoint-20261004. Actual Pion, ordinary
-local/rental CLI and browser proof is still required; generated bindings or unit link checks
-alone do not qualify playback or inference.
+The paired machine endpoint change is cozy-machine PR #40. The product fixtures use actual
+Rust machine-v1 jobs, owner keys, TLS pins, Pion ICE-TCP and Google Chrome. They exercise
+completed and growing output delivery, the exact ordinary `cozy run play` link, reload and
+reconnection from a cursor, range reads and seeking, replacement, malformed media, wrong
+pins, expired capabilities and output scope. The network cut test uses a test-only TCP
+forwarder to drop the connection; the product does not supply a relay.
+
+CPU proof uses isolated authored homes and synthetic film bytes, an exact Runtime wheel
+and its executor-plane TensorFS wheel, empty `CUDA_VISIBLE_DEVICES` and Chrome's
+`--disable-gpu`. This establishes media transport and authority. Ordinary default-home
+and rented inference/player qualification, observed provider port mappings, and actual
+machine-v1 media throughput remain separate gates. `BenchmarkWebRTCGet` explicitly skips
+because its numeric-run supervisor fixture no longer describes the current boundary.
+
+The protobuf descriptor is advisory evolution: an older machine lacking it refuses only
+playback. The client does not require a deployment SHA match.

@@ -2,8 +2,10 @@ package producttest
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -124,6 +126,74 @@ func cozy1Sessions(t *testing.T, root string, port int, run string) (*mediaHarne
 		h.send(c, map[string]any{"t": "credit", "bytes": 1 << 30})
 		return c
 	}
+}
+
+// cozy1Machine is root's running Rust machine as a browser holding a link reaches it: the
+// WebRTC port its receipt names, its leaf's fingerprint, and the owner key that signs caps.
+type cozy1Machine struct {
+	t           *testing.T
+	root        string
+	Addr        netip.AddrPort
+	Fingerprint string
+	Machine     string
+	public      ed25519.PublicKey
+	sign        func([]byte) []byte
+}
+
+func newCozy1Machine(t *testing.T, root string, port int) *cozy1Machine {
+	t.Helper()
+	dir := filepath.Join(root, "machine")
+	var envelope struct {
+		Payload []byte `json:"payload"`
+	}
+	var receipt struct {
+		WebRTC *struct {
+			Port int `json:"port"`
+		} `json:"webrtc"`
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "root/run/cozy/bootstrap/readiness-envelope.json"))
+	must(t, err)
+	must(t, json.Unmarshal(raw, &envelope))
+	must(t, json.Unmarshal(envelope.Payload, &receipt))
+	if receipt.WebRTC == nil || receipt.WebRTC.Port != port {
+		t.Fatalf("a machine granted WebRTC port %d names %+v in its receipt", port, receipt.WebRTC)
+	}
+	host := machines.NewHost(dir, "", nil)
+	state, problem := host.Status()
+	fatal(t, problem)
+	owner, problem := host.Owner()
+	fatal(t, problem)
+	public, err := base64.RawURLEncoding.DecodeString(owner.PublicKey())
+	must(t, err)
+	raw, err = os.ReadFile(filepath.Join(dir, "leaf.pem"))
+	must(t, err)
+	leaf, _ := pem.Decode(raw)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(port)), 2*time.Second)
+	must(t, err)
+	must(t, conn.Close())
+	return &cozy1Machine{t: t, root: root, Addr: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)),
+		Fingerprint: webrtctest.Fingerprint(leaf.Bytes), Machine: state.MachineID, public: public, sign: owner.Sign}
+}
+
+// ownerKey is the key this computer's machine authorizes.
+func (m *cozy1Machine) ownerKey() ed25519.PrivateKey {
+	raw, err := os.ReadFile(filepath.Join(m.root, "machine", "owner.pem"))
+	must(m.t, err)
+	block, _ := pem.Decode(raw)
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	must(m.t, err)
+	return parsed.(ed25519.PrivateKey)
+}
+
+// mint signs g with the owner key, for this machine and for ten minutes unless g says otherwise.
+func (m *cozy1Machine) mint(g capability.Grant) string {
+	g.Machine = cmp.Or(g.Machine, m.Machine)
+	if g.Expires == 0 {
+		g.Expires = time.Now().Add(10 * time.Minute).Unix()
+	}
+	token, err := capability.MintSigned(m.public, m.sign, g)
+	must(m.t, err)
+	return token
 }
 
 // savedVideo is the one video `cozy run --out` saved.

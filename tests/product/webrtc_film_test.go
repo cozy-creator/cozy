@@ -177,8 +177,10 @@ func TestWebRTCAFilmStreamsLiveAndItsMiddleSegmentDecodes(t *testing.T) {
 			piece = append(append([]byte(nil), header...), piece...)
 		}
 		published = append(published, piece...)
-		e := h.m.Append(7, "video", -1, piece, 1_000_000)
-		h.until(c, &f, func() bool { return len(f.got) == len(published) && f.seq == e.Seq })
+		h.m.Append(7, piece, 1_000_000)
+		h.until(c, &f, func() bool {
+			return len(f.got) == len(published) && len(f.entries) == k+1 && f.seq == f.entries[k].Seq
+		})
 		if got := countFrames(t, f.got); got != []string{"24", "48", "72"}[k] {
 			t.Fatalf("after mediaSegment %d the follower's copy decodes %s frames", k+1, got)
 		}
@@ -190,10 +192,10 @@ func TestWebRTCAFilmStreamsLiveAndItsMiddleSegmentDecodes(t *testing.T) {
 	}
 
 	seek := h.open(64 << 20)
-	h.send(seek, map[string]any{"t": "get", "id": "init", "run": "7", "output": "video", "length": len(header)})
+	h.send(seek, map[string]any{"t": "get", "id": "init", "run": h.run(7), "output": "video", "length": len(header)})
 	head, _ := h.body(seek)
 	from, to := f.entries[0].Length, f.entries[1].Length // segment 2, by the map
-	h.send(seek, map[string]any{"t": "get", "id": "s2", "run": "7", "output": "video", "offset": from, "length": to - from})
+	h.send(seek, map[string]any{"t": "get", "id": "s2", "run": h.run(7), "output": "video", "offset": from, "length": to - from})
 	middle, _ := h.body(seek)
 	if got := countFrames(t, append(head, middle...)); got != "24" {
 		t.Fatalf("init + mediaSegment 2 decodes %s frames", got)
