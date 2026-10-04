@@ -243,6 +243,10 @@ func treeBytes(path string) int64 {
 func (h *Host) PredatesAPI(ctx context.Context) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.predatesAPI(ctx)
+}
+
+func (h *Host) predatesAPI(ctx context.Context) bool {
 	_, err := os.Stat(h.binary())
 	return err == nil && !h.servesAPI(ctx)
 }

@@ -358,21 +358,21 @@ func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.C
 		launch = cached.Launch
 	}
 	if launch == nil {
-		if _, err := os.Stat(h.binary()); err == nil && !h.servesAPI(ctx) {
-			return nil, exit.Named(exit.Structural, "machine.predates_api", "this computer's machine predates %s, which this cozy drives machines with", MachineAPI).
-				WithRemedy("`cozy machine install` replaces it and keeps its models")
-		}
 		record, problem := h.running()
 		switch {
 		case problem != nil:
 			return nil, problem
+		case record == nil && !start:
+			return nil, stopped()
+		case h.predatesAPI(ctx):
+			// Asked only of a machine about to be awaited or launched; it never readies on the API.
+			return nil, exit.Named(exit.Structural, "machine.predates_api", "this computer's machine predates %s, which this cozy drives machines with", MachineAPI).
+				WithRemedy("`cozy machine install` replaces it and keeps its models")
 		case record != nil:
 			if launch, problem = h.await(ctx, record); problem != nil {
 				return nil, problem
 			}
 			h.remember(launch, *record)
-		case !start:
-			return nil, stopped()
 		default:
 			if launch, problem = h.launchLocked(ctx); problem != nil {
 				return nil, problem
