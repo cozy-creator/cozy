@@ -351,3 +351,60 @@ func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 		}
 	}
 }
+
+// `--timeout` is the run's deadline on cozy.machine.v1 as on worker.v1: when it passes the run
+// is canceled on its machine, attributed to the deadline, whether or not a client waits.
+func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
+	if *machineHostBinary == "" || *cpuLongform == "" {
+		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+	}
+	root, err := os.MkdirTemp(os.TempDir(), "czt")
+	must(t, err)
+	provisionMachine(t, root)
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		if t.Failed() {
+			t.Logf("evidence retained at %s\nmachine log tail:\n%s", root, tail(filepath.Join(root, "machine", "host.log")))
+		} else {
+			_ = removeAllForce(root)
+		}
+	})
+	project := filepath.Join(t.TempDir(), "cpu_longform")
+	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
+	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
+		t.Fatalf("uv lock: %v\n%s", err, out)
+	}
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		t.Fatalf("package install [exit %d]\n%s", code, out)
+	}
+	var encoded bytes.Buffer
+	must(t, png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2))))
+	reference := filepath.Join(root, "ref.png")
+	must(t, os.WriteFile(reference, encoded.Bytes(), 0o600))
+	in := filepath.Join(root, "req.json")
+	must(t, os.WriteFile(in, []byte(`{"segments":["one"],"hold":600}`), 0o600))
+	run := []string{"run", "local/cozy-machine-cpu-longform/long_form", "--input", in, "--asset", "reference=" + reference, "--json", "--timeout", "20s"}
+	status := func(number string) string {
+		_, shown := runCozy(t, root, "run", "show", number, "--json")
+		var state struct {
+			Status string `json:"status"`
+		}
+		_ = json.Unmarshal([]byte(lastJSONLine(shown)), &state)
+		return state.Status
+	}
+
+	// Waiting: the command ends with the deadline code once the machine stopped the run.
+	code, out := runCozy(t, root, append(run, "--await")...)
+	if code == 0 || !strings.Contains(out, `"code":"deadline"`) || !strings.Contains(out, "--timeout") {
+		t.Fatalf("the awaited run did not end at its deadline [exit %d]\n%s", code, out)
+	}
+	if got := status("1"); got != "canceled" {
+		t.Fatalf("the run its deadline ended is %q, not canceled", got)
+	}
+	// Detached: nobody waits, and the daemon still cancels it at the deadline.
+	if code, out := runCozy(t, root, run...); code != 0 {
+		t.Fatalf("detached submit [exit %d]\n%s", code, out)
+	}
+	landed(t, "the detached run to be canceled at its deadline", func() bool { return status("2") == "canceled" })
+}

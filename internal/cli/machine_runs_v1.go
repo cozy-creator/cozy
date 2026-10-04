@@ -39,6 +39,7 @@ var errNotV1 = exit.Named(exit.Unavailable, "machine.v1_absent", "the machine se
 // loopV1 follows one run on a v1 machine until it is settled. It answers true when the run
 // belongs to the worker.v1 path instead (a machine without v1, or a run sent there earlier).
 func (m *machineRuns) loopV1(request records.Request) bool {
+	defer m.enforceDeadlineV1(request)()
 	lastError, delay := "", time.Second
 	for m.ctx.Err() == nil {
 		current, problem := m.store.RequestRow(request.ID)

@@ -1633,7 +1633,7 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 			return
 		}
 		cancelResult := make(chan *exit.Error, 1)
-		go func() { cancelResult <- cancel(requestID, fmt.Sprintf("cozy run --timeout %s", deadline)) }()
+		go func() { cancelResult <- cancel(requestID, fmt.Sprintf("%s %s", deadlineActor, deadline)) }()
 		select {
 		case <-interrupt:
 			if !ctx.Mode().JSON {
@@ -2458,7 +2458,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if status == "" {
 		status = life.Status
 	}
-	if stopped == "deadline" && status == "canceled" {
+	if (stopped == "deadline" || deadlineCancel(life.CanceledBy)) && status == "canceled" {
 		// The DEADLINE is why this ended, and the shared matrix has a code for it.
 		status = "deadline"
 	}

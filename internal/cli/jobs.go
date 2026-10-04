@@ -543,6 +543,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if status == "paused" {
 		return renderSubmittedJob(ctx, state, false)
 	}
+	if status == "canceled" && deadlineCancel(state.CanceledBy) {
+		status = "deadline" // the run's own --timeout ended it
+	}
 	// A REQUEST THAT ENDED BEFORE ANY ATTEMPT has its reason only in the terminal EVENT:
 	// there is no attempt row, so the state document has no terminal to read a cause off.
 	// Without this the client printed `failed` and nothing else — which is exactly the
@@ -624,6 +627,8 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	humanStatus := status
 	if status == "canceled" {
 		humanStatus = humanCancellationStatus(state.CanceledBy)
+	} else if status == "deadline" {
+		humanStatus = "canceled when its --timeout passed"
 	}
 	err := exit.Named(code, status, "job %s ended %s", state.JobID, humanStatus)
 	if status == "failed" && state.RetryAvailable {
