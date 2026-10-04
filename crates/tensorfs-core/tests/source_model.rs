@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use tensorfs_core::{
     checkpoint::load_header,
     source_model::{make, Access, Request},
-    store::Store,
+    store::{Fault, Store},
 };
 
 const SOURCE: &str = "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors";
@@ -76,5 +76,69 @@ fn a_real_hugging_face_carrier_becomes_a_local_model_with_its_pipeline_configs()
     // The same source again: everything is held, the same model is committed.
     let again = make(&store, &request).unwrap();
     assert_eq!(again.manifest, made.manifest);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A file a client wrote into the Store (`object://sha256:<hex>/<file>`) is made like a
+/// provider's single file, with no provider: its configs come from its converters' pinned
+/// reference repository. Real network for the fixture and the reference configs.
+#[test]
+#[ignore = "real network: huggingface.co"]
+fn a_held_file_becomes_a_local_model_with_no_provider() {
+    let root = std::env::temp_dir().join(format!(
+        "source-model-held-{}-{}",
+        std::process::id(),
+        tensorfs_core::meta::now_nanos_unique()
+    ));
+    let store = Store::init(&root).unwrap();
+    let file = root.join("unet.safetensors");
+    let url = "https://huggingface.co/hf-internal-testing/tiny-sdxl-pipe/resolve/20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors";
+    let fetched = std::process::Command::new("curl")
+        .args(["-sSfL", "-o"])
+        .arg(&file)
+        .arg(url)
+        .status()
+        .unwrap();
+    assert!(fetched.success());
+    let held = store.put_file(&file, None, &Fault::default()).unwrap().obj;
+    let source = format!("object://sha256:{}/unet.safetensors", held.sha256);
+    let progress = |_: &str, _: u64, _: u64| {};
+    let access = Access::default();
+    let request = Request {
+        source: &source,
+        profiles: &[],
+        name: "held-unet",
+        access: &access,
+        registry: None,
+        progress: &progress,
+        cancellation: None,
+    };
+    let made = make(&store, &request).unwrap();
+    assert_eq!(made.repository, "local/held-unet");
+    assert_eq!(made.resolved, source);
+    assert_eq!(made.profiles.len(), 1, "{made:?}");
+    let header = load_header(
+        &store,
+        store
+            .read_manifest(&made.manifest)
+            .unwrap()
+            .header()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!header.components.is_empty());
+
+    // A file the Store does not hold is refused, never fetched.
+    let absent = format!("object://sha256:{}/unet.safetensors", "0".repeat(64));
+    let refused = make(
+        &store,
+        &Request {
+            source: &absent,
+            name: "absent",
+            ..request
+        },
+    )
+    .unwrap_err();
+    assert!(!refused.detail.is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
