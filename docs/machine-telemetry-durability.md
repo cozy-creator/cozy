@@ -5,12 +5,14 @@ and synchronizing every v1 sample on the records database's single connection bl
 readers and the terminal consumer behind that disk write. A busy disk has produced 12–75
 second fsync waits in the previous delivery trace.
 
-Creator retains a bounded sample set per observed run: the first measured fraction and the
-latest progress, preparation and log sample. Each sample is limited to 16 KiB; larger
+Creator retains a bounded sample set per observed run: the first measured fraction, up to
+eight genuine previous-stage endpoints, and the latest progress, preparation and log sample.
+Each sample is limited to 16 KiB; larger
 telemetry is dropped without failing or settling work. Samples enter memory without opening a database
 transaction. Status/readers obtain the latest progress there, and SSE emits new samples with
 sequence_number zero and no resumable id. A newly attached live subscriber gets the latest
-sample immediately. These samples never advance either the durable SSE or remote run cursor.
+sample and recent stage endpoints immediately. These samples never advance either the
+durable SSE or remote run cursor. Same-stage floods retain only their genuine latest sample.
 
 State/product transitions coalesce pending samples before their lifecycle events within the
 existing transaction. A terminal coalesces them before its absorbing outcome, in that same

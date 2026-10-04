@@ -77,3 +77,71 @@ func TestMachineTelemetryIsLiveAtSubscribeAndCannotAdvanceTheDurableSSECursor(t 
 		t.Fatalf("live SSE skipped durable output events: %v %v", link, problem)
 	}
 }
+
+func TestStageEndpointBurstReachesSSEWithoutAResumableCursor(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "records.sqlite"))
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	defer store.Close()
+	_, _, problem = store.Submit(records.Request{ID: "run", IdemKey: "run", Package: "local/test", Entrypoint: "main", Kind: "call",
+		Payload: []byte(`{}`), BodyDigest: "sha256:" + strings.Repeat("1", 64), MachineExecutionObserver: true})
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	if problem = store.LinkMachineExecution("run", "machine"); problem != nil {
+		t.Fatal(problem)
+	}
+	if problem = store.AcceptRunV1("run", &v1.RunState{Id: "run", Number: 1, State: "running", Attempt: 1}); problem != nil {
+		t.Fatal(problem)
+	}
+	for _, sample := range []*v1.RunEvent{
+		{Sequence: 29, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Completed: 29, Total: 30}}},
+		{Sequence: 30, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Completed: 30, Total: 30}}},
+		{Sequence: 31, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "decoding"}}},
+	} {
+		if problem = store.ObserveRunV1("run", sample, nil); problem != nil {
+			t.Fatal(problem)
+		}
+	}
+	owner := &Server{store: store}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { owner.stream(w, r, "") }))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	reader := bufio.NewReader(response.Body)
+	var samples []Envelope
+	for len(samples) < 2 {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event Envelope
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data: "))), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type != "machine.progress" {
+			continue
+		}
+		if event.SequenceNumber != 0 || event.Payload["live"] != true {
+			t.Fatalf("advisory sample became durable: %v", event)
+		}
+		samples = append(samples, event)
+	}
+	endpoint := samples[0].Payload["payload"].(map[string]any)
+	if endpoint["stage"] != "denoise" || endpoint["position"] != float64(30) {
+		t.Fatalf("last genuine denoise frame absent: %v", samples)
+	}
+	if samples[1].Payload["payload"].(map[string]any)["stage"] != "decoding" {
+		t.Fatalf("current stage absent: %v", samples)
+	}
+}

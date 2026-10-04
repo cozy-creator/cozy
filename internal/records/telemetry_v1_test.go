@@ -198,3 +198,120 @@ func TestOversizedRunTelemetryIsDroppedWithoutAuthorityOrDiskWrites(t *testing.T
 		t.Fatalf("oversized telemetry wrote rows: %d %d %v", before, after, problem)
 	}
 }
+
+func TestStageEndpointsSurviveBurstAndFlushWithTerminal(t *testing.T) {
+	store, path := telemetryStore(t)
+	before, problem := store.LastEventSeq()
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	// A held FULL transaction cannot prevent genuine burst samples reaching memory.
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []*v1.RunEvent{
+		{Sequence: 29, AtMs: 29000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Completed: 29, Total: 30, Fraction: .9}}},
+		{Sequence: 30, AtMs: 30000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Completed: 30, Total: 30, Fraction: .95}}},
+		{Sequence: 31, AtMs: 31000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "decoding", Fraction: .96}}},
+	} {
+		if problem := store.ObserveRunV1("run", sample, nil); problem != nil {
+			tx.Rollback()
+			t.Fatal(problem)
+		}
+	}
+	tx.Rollback()
+	after, problem := store.LastEventSeq()
+	if problem != nil || before != after {
+		t.Fatalf("burst wrote rows: %d %d %v", before, after, problem)
+	}
+	live := store.LiveRunEventsV1("run")
+	if len(live) != 2 {
+		t.Fatalf("stage endpoint lost: %v", live)
+	}
+	endpoint := live[0].Event.Payload["payload"].(map[string]any)
+	if endpoint["stage"] != "denoise" || endpoint["position"] != float64(30) || live[0].Event.At != "1970-01-01T00:00:30Z" {
+		t.Fatalf("genuine endpoint replaced: %v", live[0])
+	}
+	for _, sample := range live {
+		if sample.Event.Seq != 0 {
+			t.Fatal("live stage endpoint acquired durable authority")
+		}
+	}
+	link, problem := store.MachineExecution("run")
+	if problem != nil || link.RemoteCursor != 0 {
+		t.Fatalf("burst advanced cursor: %v %v", link, problem)
+	}
+	if problem := store.RecordRunOutcomeV1("run", &v1.Outcome{Status: "succeeded", Result: []byte(`{"answer":42}`)}, nil); problem != nil {
+		t.Fatal(problem)
+	}
+	store.Close()
+	reopened, problem := Open(path)
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	defer reopened.Close()
+	events, problem := reopened.EventsAfter("run", 0, 100)
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	seenEndpoint, terminal := false, false
+	for _, event := range events {
+		if TerminalEvent(event.Type) {
+			terminal = true
+		}
+		if event.Type != "machine.progress" {
+			continue
+		}
+		if terminal {
+			t.Fatal("stage sample appended after terminal")
+		}
+		payload := event.Payload["payload"].(map[string]any)
+		if payload["stage"] == "denoise" && payload["position"] == float64(30) {
+			seenEndpoint = true
+		}
+	}
+	if !seenEndpoint || !terminal {
+		t.Fatalf("endpoint=%v terminal=%v", seenEndpoint, terminal)
+	}
+}
+
+func TestProgressStageEndpointsStayBoundedAndResetForANewAttempt(t *testing.T) {
+	store, _ := telemetryStore(t)
+	for i := uint64(1); i <= 2000; i++ {
+		if problem := store.ObserveRunV1("run", telemetryProgress(i, .5), nil); problem != nil {
+			t.Fatal(problem)
+		}
+	}
+	if got := len(store.LiveRunEventsV1("run")); got != 1 {
+		t.Fatalf("same-stage flood retained %d samples", got)
+	}
+	for i := uint64(2001); i <= 2100; i++ {
+		sample := telemetryProgress(i, .5)
+		sample.GetProgress().Stage = fmt.Sprintf("stage-%d", i)
+		if problem := store.ObserveRunV1("run", sample, nil); problem != nil {
+			t.Fatal(problem)
+		}
+	}
+	live := store.LiveRunEventsV1("run")
+	if len(live) != maxRunProgressStageEdgesV1+1 {
+		t.Fatalf("stage flood retained %d samples", len(live))
+	}
+	for _, sample := range live {
+		if len(sample.Event.Raw) > maxRunTelemetryBytesV1 {
+			t.Fatal("oversized stage endpoint")
+		}
+	}
+	sample := telemetryProgress(2101, .5)
+	sample.GetProgress().Stage = strings.Repeat("x", maxRunTelemetryBytesV1+1)
+	if problem := store.ObserveRunV1("run", sample, nil); problem != nil {
+		t.Fatal(problem)
+	}
+	if got := store.LiveRunEventsV1("run"); len(got) != len(live) || got[len(got)-1].Sequence != live[len(live)-1].Sequence {
+		t.Fatal("oversized sample displaced genuine stage endpoint")
+	}
+	store.seedTelemetryV1("run", 2, "running", 0)
+	if len(store.LiveRunEventsV1("run")) != 0 {
+		t.Fatal("new attempt inherited previous-stage samples")
+	}
+}
