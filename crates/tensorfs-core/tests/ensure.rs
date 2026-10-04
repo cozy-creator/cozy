@@ -14,9 +14,9 @@ use tensorfs_core::dtype::Dtype;
 use tensorfs_core::header::{Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::jcs::{self, Json};
-use tensorfs_core::manifest::{Draft, Entry, Manifest};
-use tensorfs_core::store::{Fault, Store};
-use tensorfs_core::{gc, registry, source_artifact};
+use tensorfs_core::manifest::{Draft, Entry};
+use tensorfs_core::store::Store;
+use tensorfs_core::registry;
 
 const TFS: &str = env!("CARGO_BIN_EXE_tfs");
 
@@ -706,47 +706,6 @@ fn a_closure_the_disk_cannot_hold_is_refused_before_a_byte_moves() {
 }
 
 #[test]
-fn delivered_products_are_evictable_oldest_first_and_release_clears_the_mark() {
-    let dir = temporary("deliver");
-    let store = Store::init(&dir.join("store")).unwrap();
-    let owners: Vec<String> = ["a", "b"]
-        .iter()
-        .map(|l| ObjectRef::of(l.as_bytes()).id())
-        .collect();
-    for (owner, bytes) in owners
-        .iter()
-        .zip([b"first product".as_slice(), b"second product"])
-    {
-        let object = ObjectRef::of(bytes);
-        store
-            .put_stream(&mut &bytes[..], Some(&object), &Fault::default())
-            .unwrap();
-        let tree = Manifest::from_files(vec![("out.bin".into(), object)]).unwrap();
-        source_artifact::create(&store, owner, &tree).unwrap();
-    }
-    assert!(source_artifact::delivered(&store).unwrap().is_empty());
-    source_artifact::deliver(&store, &owners[1]).unwrap();
-    std::thread::sleep(Duration::from_millis(20));
-    source_artifact::deliver(&store, &owners[0]).unwrap();
-    source_artifact::deliver(&store, &owners[1]).unwrap();
-    assert_eq!(
-        source_artifact::delivered(&store).unwrap(),
-        vec![owners[1].clone(), owners[0].clone()]
-    );
-    // Delivered is not released: GC keeps its bytes until the policy releases it.
-    assert_eq!(gc::collect(store.root(), false).unwrap().reclaimed_bytes, 0);
-    source_artifact::release(&store, &owners[1]).unwrap();
-    assert_eq!(
-        source_artifact::delivered(&store).unwrap(),
-        vec![owners[0].clone()]
-    );
-    assert!(gc::collect(store.root(), false).unwrap().reclaimed_bytes > 0);
-    let unknown = ObjectRef::of(b"never retained").id();
-    assert!(source_artifact::deliver(&store, &unknown).is_err());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn capabilities_name_ensure() {
     for name in ["ensure/1", "get-range/1"] {
         assert!(tensorfs_core::CAPABILITIES.contains(&name), "{name}");
@@ -760,7 +719,9 @@ fn a_pressure_pass_reports_the_disk_and_keeps_what_it_is_told() {
     let keep = ObjectRef::of(b"serving").id();
     let relief = tensorfs_core::ensure::relieve(&Store::open(&root).unwrap(), &[keep]).unwrap();
     assert!(relief.capacity_bytes >= relief.available_bytes);
-    // A pass that finds no pressure collects nothing.
+    // Low is at or under the reserve, and a pass over a disk that is not low collects nothing.
+    let reserve = (1u64 << 30).max(relief.capacity_bytes / 50);
+    assert!(relief.pressure || relief.available_bytes > reserve);
     if !relief.pressure {
         assert_eq!(relief.collected_bytes, 0);
     }

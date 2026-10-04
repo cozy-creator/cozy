@@ -414,7 +414,7 @@ fn serve(
             }
         }
     };
-    let sent = object.then(|| (ledger, route.as_str()));
+    let sent = object.then_some((ledger, route.as_str()));
     let (code, body, range) = ranged(&asked, body);
     // A fault's offset is within the answer; a ranged answer may be shorter than it.
     let within = |at: u64| (at as usize).min(body.len());
@@ -1263,8 +1263,7 @@ fn a_missing_object_is_a_typed_refusal_and_the_rest_stay_resident() {
     let refusal = outcome
         .result
         .as_ref()
-        .err()
-        .expect("an absent object cannot land");
+        .expect_err("an absent object cannot land");
     assert!(
         refusal.detail.contains("404"),
         "{refusal}\n{}",

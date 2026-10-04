@@ -28,9 +28,9 @@ fn main() {
     for file in files {
         let name = file.to_string_lossy();
         let bytes = fs::read(&file).unwrap();
-        hash.update(&(name.len() as u64).to_le_bytes());
+        hash.update((name.len() as u64).to_le_bytes());
         hash.update(name.as_bytes());
-        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(&bytes);
     }
     for key in [
@@ -43,7 +43,7 @@ fn main() {
         println!("cargo:rerun-if-env-changed={key}");
         hash.update(key.as_bytes());
         hash.update(env::var(key).unwrap_or_default().as_bytes());
-        hash.update(&[0]);
+        hash.update([0]);
     }
     let rustc = std::process::Command::new(env::var("RUSTC").unwrap())
         .arg("--version")

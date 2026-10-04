@@ -79,7 +79,7 @@ pub fn fit_json(fit: &Fit, custody: crate::fit::Custody) -> Vec<u8> {
                 ("verbatim", Value::uint(routes.verbatim)),
             ]),
         ),
-        ("warning", Value::str(&fit.warning().unwrap_or_default())),
+        ("warning", Value::str(fit.warning().unwrap_or_default())),
     ]))
 }
 

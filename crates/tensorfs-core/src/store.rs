@@ -1197,7 +1197,9 @@ impl Store {
     /// Record one verified pull's checkpoint and optional release lane atomically. The
     /// caller holds the native writer fence from FetchPlan completion through this call.
     /// Retained repository roots still require full snapshots, including ordinary siblings.
-    pub(crate) fn apply_cached_repository(
+    /// A cache writer's commit: the root it writes is evictable (`cache_roots`), where
+    /// `apply_repository`'s is the owner's to keep.
+    pub fn apply_cached_repository(
         &self,
         observed: Option<&[u8]>,
         mutations: &[crate::repository::Mutation],
