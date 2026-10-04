@@ -14,16 +14,17 @@ var ErrReclaimUnavailable = errors.New("this machine does not support owner idle
 var ErrReclaimBusy = errors.New("GPU work or an unknown startup reservation prevents idle memory reclaim")
 
 type IdleMemoryReclaim struct {
-	ExecutorsBefore          uint64   `json:"executors_before"`
-	ExecutorsEnded           uint64   `json:"executors_ended"`
-	ExecutorsUnconfirmed     uint64   `json:"executors_unconfirmed"`
-	HoldingsBefore           uint64   `json:"holdings_before"`
-	HoldingsRevoked          uint64   `json:"holdings_revoked"`
-	HoldingsReleased         uint64   `json:"holdings_released"`
-	RootExportBytesReleased  uint64   `json:"root_export_bytes_released"`
-	RootExportBytesRemaining uint64   `json:"root_export_bytes_remaining"`
-	ReadersRemaining         uint64   `json:"readers_remaining"`
-	Warnings                 []string `json:"warnings"`
+	ExecutorsBefore            uint64   `json:"executors_before"`
+	ExecutorsEnded             uint64   `json:"executors_ended"`
+	ExecutorsUnconfirmed       uint64   `json:"executors_unconfirmed"`
+	HoldingsBefore             uint64   `json:"holdings_before"`
+	HoldingsRevoked            uint64   `json:"holdings_revoked"`
+	HoldingsReleased           uint64   `json:"holdings_released"`
+	RootExportBytesReleased    uint64   `json:"root_export_bytes_released"`
+	RootExportBytesRemaining   uint64   `json:"root_export_bytes_remaining"`
+	ReadersRemaining           uint64   `json:"readers_remaining"`
+	UnconfirmedScopesRemaining uint64   `json:"unconfirmed_scopes_remaining"`
+	Warnings                   []string `json:"warnings"`
 }
 
 // ReclaimIdleMemory is explicit owner maintenance over the same pinned machine.
