@@ -30,10 +30,11 @@ const PackageFloor = "0.18.51"
 
 var floor = pep440.MustParse(ToolFloor)
 
-// InstallCommand installs this host's tools in one uv environment: cozy-runtime and the
-// TensorFS `tfs` its dependencies resolve. install.sh and scripts/install.ps1 run it.
+// InstallCommand installs this host's tool, cozy-runtime, in its own uv environment.
+// install.sh and scripts/install.ps1 run it. TensorFS's `tfs` is not installed: only a
+// machine writes its store.
 var InstallCommand = fmt.Sprintf(
-	"uv tool install --force --refresh-package cozy-runtime --refresh-package tensorfs --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=%s'",
+	"uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=%s'",
 	ToolFloor)
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.

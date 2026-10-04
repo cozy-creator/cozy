@@ -30,7 +30,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
 // Tool is one resolved tensorfs CLI plus the store it operates on.
@@ -51,7 +50,7 @@ func Open(cfg config.Config) (*Tool, *exit.Error) {
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "tfs_missing",
 			"the tensorfs CLI %q is not on PATH: %s", cfg.Tfs, err).
-			WithRemedy("install tfs with the host Runtime: %s", hostruntime.InstallCommand)
+			WithRemedy("this command still reads a store on this computer and needs tfs, which cozy no longer installs; run it with --rental, or put a tensorfs release's tfs on PATH")
 	}
 	t := &Tool{Bin: bin, Root: cfg.TensorFSRoot, Source: cfg.TfsSource, env: cfg.Tool()}
 	if err := os.MkdirAll(t.Root, 0o755); err != nil {

@@ -15,7 +15,7 @@ curl -fsSL https://github.com/cozy-creator/cozy/releases/latest/download/install
 ```
 
 The installer checks the release against its `SHA256SUMS`, puts `cozy` in `~/.local/bin` and, in
-one uv tool environment, the host tools Cozy drives: `cozy-runtime` and TensorFS's `tfs`.
+its own uv tool environment, the host tool Cozy drives: `cozy-runtime`.
 `COZY_VERSION=v0.1.0` picks a release. Rerun it to upgrade: the new binary replaces the old by
 rename, so a running daemon keeps its binary and its work; the new one starts after the next
 `cozy down`; work in flight continues and the next command reattaches. From source: `go build -o ~/.local/bin/cozy .`
@@ -25,7 +25,7 @@ automatically for bash and fish, and for zsh when `~/.local/share/zsh/site-funct
 The host-tool step alone is:
 
 ```sh
-uv tool install --force --refresh-package cozy-runtime --refresh-package tensorfs --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.67'
+uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=0.18.67'
 ```
 
 Keep `--python 3.12`: uv
