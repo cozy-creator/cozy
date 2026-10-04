@@ -1,4 +1,5 @@
-//! `tfs conform` — the conformance harness (tfs-008).
+//! The conformance harness (tfs-008): every seeded encoding's reference decoder against its
+//! frozen vectors, bit for bit.
 //!
 //! This qualifies an IMPLEMENTATION against a spec's vectors, bit-for-bit, once, at
 //! qualification time — never in the serve path. The implementations under qualification
@@ -10,14 +11,11 @@
 //! decoder that gets nibble order or scale axis wrong produces plausible output, which is
 //! the whole reason review-only evidence was ruled too weak.
 
-use std::process::ExitCode;
-
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::vectors::{Case, EncodingVectors};
 
-use crate::{bail, flag, Flags};
 
 // ---------------------------------------------------------------- carrier math
 
@@ -150,10 +148,10 @@ fn half_from_f32(v: f32) -> [u8; 2] {
 
 /// A named implementation under qualification. `wrong: true` marks a deliberately-broken
 /// arm that MUST fail — a harness that only ever runs the good one proves nothing.
-pub struct Candidate {
-    pub name: &'static str,
-    pub wrong: bool,
-    pub decode: fn(&Case) -> Option<Vec<u8>>,
+struct Candidate {
+    name: &'static str,
+    wrong: bool,
+    decode: fn(&Case) -> Option<Vec<u8>>,
 }
 
 fn role<'a>(c: &'a Case, name: &str) -> Option<&'a tensorfs_core::vectors::RoleBits> {
@@ -313,7 +311,7 @@ fn nvfp4_inner(c: &Case, swap: bool, skip_global: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn candidates(alias: &str) -> Vec<Candidate> {
+fn candidates(alias: &str) -> Vec<Candidate> {
     let mk = |name, wrong, decode| Candidate {
         name,
         wrong,
@@ -438,7 +436,7 @@ fn hexish(b: &[u8]) -> String {
     }
 }
 
-pub fn cmd_conform(which: Option<&str>, _f: &Flags) -> ExitCode {
+fn conform() -> bool {
     let seeds = registry::seeds();
     let mut any = false;
     let mut bad = false;
@@ -446,11 +444,6 @@ pub fn cmd_conform(which: Option<&str>, _f: &Flags) -> ExitCode {
     let mut vectorless: Vec<String> = Vec::new();
 
     for s in &seeds {
-        if let Some(w) = which {
-            if s.alias != w && !s.spec.object_id().contains(w) {
-                continue;
-            }
-        }
         any = true;
         println!("{} {}", s.alias, s.spec.object_id());
         match (&s.vectors, s.spec.require_executable()) {
@@ -493,218 +486,17 @@ pub fn cmd_conform(which: Option<&str>, _f: &Flags) -> ExitCode {
             }
         }
     }
-    if !any {
-        eprintln!("no seed matches {which:?}");
-        return ExitCode::from(2);
-    }
+    assert!(any, "the registry seeds no encoding");
     println!();
     println!(
         "{qualified} implementations QUALIFIED bit-for-bit, {arms} deliberately-wrong arms \
          correctly refused, {} vectorless specs refused executable qualification",
         vectorless.len()
     );
-    if bad {
-        return ExitCode::FAILURE;
-    }
-    ExitCode::SUCCESS
+    !bad
 }
 
-// ---------------------------------------------------------------- mining
-
-/// Turn PRODUCER-MINED rows into the canonical vector document. The rows carry raw bytes
-/// and nothing else; canonicalisation happens here, once, in the one writer.
-pub fn cmd_mine(rows: &std::path::Path, name: &str, f: &Flags) -> ExitCode {
-    let text = match std::fs::read_to_string(rows) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{}: {e}", rows.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let want = flag(f, "match").unwrap_or("");
-    let shape = |s: &str| -> Vec<u64> {
-        if s.is_empty() {
-            vec![]
-        } else {
-            s.split(',').filter_map(|d| d.parse().ok()).collect()
-        }
-    };
-
-    let mut cases: Vec<Case> = Vec::new();
-    let mut cur: Option<Case> = None;
-    for line in text.lines() {
-        let t: Vec<&str> = line.split_whitespace().collect();
-        match t.first().copied() {
-            Some("case") => {
-                if let Some(c) = cur.take() {
-                    cases.push(c);
-                }
-                cur = Some(Case {
-                    name: t[1].to_string(),
-                    logical_dtype: Dtype::F32,
-                    logical_shape: vec![],
-                    roles: vec![],
-                    expect_logical_bits: vec![],
-                });
-            }
-            Some("logical") => {
-                if let Some(c) = cur.as_mut() {
-                    c.logical_dtype = ok!(Dtype::parse(t[1]));
-                    c.logical_shape = shape(t.get(2).copied().unwrap_or(""));
-                }
-            }
-            Some("expect") => {
-                if let Some(c) = cur.as_mut() {
-                    c.expect_logical_bits = ok!(tensorfs_core::b64::decode(t[1]));
-                }
-            }
-            Some("role") => {
-                if let Some(c) = cur.as_mut() {
-                    let (rname, dt) = (t[1].to_string(), ok!(Dtype::parse(t[2])));
-                    // a rank-0 role prints an empty shape field, so the payload shifts left
-                    let (sh, b64) = if t.len() >= 5 {
-                        (shape(t[3]), t[4])
-                    } else {
-                        (vec![], t[3])
-                    };
-                    c.roles.push((
-                        rname,
-                        tensorfs_core::vectors::RoleBits {
-                            dtype: dt,
-                            shape: sh,
-                            bits: ok!(tensorfs_core::b64::decode(b64)),
-                        },
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some(c) = cur.take() {
-        cases.push(c);
-    }
-    cases.retain(|c| c.name.contains(want));
-    for c in cases.iter_mut() {
-        c.roles.sort_by(|a, b| a.0.cmp(&b.0));
-    }
-    if cases.is_empty() {
-        eprintln!("no mined case matches {want:?}");
-        return ExitCode::from(2);
-    }
-    let v = EncodingVectors { cases };
-    let bytes = v.fixture_bytes();
-    if let Err(e) = EncodingVectors::parse_fixture(&bytes) {
-        return bail(e);
-    }
-    let d: std::path::PathBuf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vectors/mined")
-        .components()
-        .collect();
-    if let Err(e) = std::fs::create_dir_all(&d) {
-        eprintln!("{}: {e}", d.display());
-        return ExitCode::FAILURE;
-    }
-    let path = d.join(format!("{name}.json"));
-    if let Err(e) = std::fs::write(&path, &bytes) {
-        eprintln!("{}: {e}", path.display());
-        return ExitCode::FAILURE;
-    }
-    println!("mined {} ({} B)", path.display(), bytes.len());
-    println!("  cases     {}", v.cases.len());
-    println!(
-        "  fixture_id {}",
-        tensorfs_core::ids::object_id(&v.fixture_bytes())
-    );
-    for c in &v.cases {
-        println!(
-            "    {:<34} logical {} {:?}, roles {:?}",
-            c.name,
-            c.logical_dtype.name(),
-            c.logical_shape,
-            c.roles.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-/// `tfs capability <encoding> <device> [--alias <a>] [--records <path>] [--json]` — the ONE
-/// admission
-/// question, asked from outside the process.
-///
-/// `--json` prints one `capability_json` object on stdout and nothing else, and exits
-/// SUCCESS on both verdicts: the answer is `admitted`. The column-aligned print
-/// keeps its non-zero exit on a refusal and is for people; no program may match on it.
-pub fn cmd_capability(encoding: &str, device: &str, f: &Flags) -> ExitCode {
-    // The compiled-in records speak only for the reference decoders in this harness, on
-    // the CPU they run on. TensorFS holds no accelerator and must never guess about one,
-    // so an accelerator answer can only come from an OBSERVED record set handed in here by
-    // the component that held the card. Absent one, an accelerator pair refuses -- which is
-    // the absence of evidence answering, exactly as intended.
-    let mut recs = registry::capability_records();
-    if let Some(p) = flag(f, "records") {
-        let bytes = match std::fs::read(p) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("{p}: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        let observed = match tensorfs_core::capability::CapabilityRecords::parse_observed(&bytes) {
-            Ok(o) => o,
-            Err(e) => return bail(e),
-        };
-        recs = recs.with_observed(observed);
-    }
-    let json = flag(f, "json").is_some();
-    if !json {
-        println!(
-            "capability records: {} ({} qualified pairs)",
-            recs.records.len(),
-            recs.records.len()
-        );
-    }
-    let enc = match flag(f, "alias") {
-        Some(a) => match registry::seeds().iter().find(|s| s.alias == a) {
-            Some(s) => s.spec.object_id(),
-            None => {
-                eprintln!("no seed aliased {a:?}");
-                return ExitCode::from(2);
-            }
-        },
-        // A spec id is prefixed BY DEFINITION, and the CLI hands every digest argument over
-        // bare (`accept_printed_ids`), so put the one spelling back.
-        None if tensorfs_core::ids::hex64("encoding", encoding).is_ok() => {
-            format!("sha256:{encoding}")
-        }
-        None => encoding.to_string(),
-    };
-    let decision = recs.admit(&enc, device);
-    if json {
-        let qualified: Vec<&str> = recs
-            .records
-            .iter()
-            .filter(|r| r.encoding == enc)
-            .map(|r| r.device.as_str())
-            .collect();
-        let (record, refusal) = match &decision {
-            Ok(r) => (Some(*r), String::new()),
-            Err(e) => (None, e.detail.clone()),
-        };
-        println!(
-            "{}",
-            String::from_utf8_lossy(&tensorfs_core::machine::capability_json(
-                record, &enc, device, &refusal, &qualified
-            ))
-        );
-        return ExitCode::SUCCESS;
-    }
-    match decision {
-        Ok(r) => {
-            println!("ADMITTED ({enc}, {device})");
-            println!("  implementation {}", r.implementation);
-            println!("  qualified against vectors {}", r.vectors.id());
-            ExitCode::SUCCESS
-        }
-        Err(e) => bail(e),
-    }
+#[test]
+fn every_seeded_encoding_qualifies_and_every_wrong_arm_is_refused() {
+    assert!(conform());
 }

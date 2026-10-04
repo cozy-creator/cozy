@@ -66,7 +66,7 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/read-lease-concurrency.py "$fixture" "$SNAP"
 "$work/venv/bin/python" scripts/plane-host-tier.py
 "$work/venv/bin/python" scripts/stats.py "$fixture" "$SNAP"
-# The frozen corpus, through the FACADE. `tfs vectors verify` runs the same 90 vectors
+# The frozen corpus, through the FACADE. `cargo test --test vectors` runs the same vectors
 # through Rust; this proves the marshal boundary agrees — same ids, same typed refusals.
 "$work/venv/bin/python" scripts/facade-conform.py
 

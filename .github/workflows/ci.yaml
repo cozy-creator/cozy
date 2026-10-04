@@ -155,21 +155,8 @@ jobs:
           grep -qo sha_ni /proc/cpuinfo \
             && echo "runner HAS the sha extensions: both routines were exercised" \
             || echo "runner LACKS the sha extensions: only the scalar fallback was exercised"
-      - name: Vectors, capability arms, decoder and CBOR conformance
-        run: |
-          set -eux
-          tfs=target/release/tfs
-          "$tfs" vectors verify
-          m=vectors/cases/machine
-          diff <(cat "$m/capability-admitted.json"; echo) <("$tfs" capability --alias plain/1 x cpu --json)
-          diff <(cat "$m/capability-unqualified.json"; echo) <("$tfs" capability --alias plain/1 x cuda.sm89 --json)
-          "$tfs" capability --alias plain/1 x cpu
-          if "$tfs" capability --alias plain/1 x cuda; then
-            echo "an unqualified device was admitted" >&2
-            exit 1
-          fi
-          "$tfs" conform
-          uv run --python 3.12 --project conformance/cbor/python python scripts/cbor-conformance.py --tfs "$tfs" conform
+      - name: CBOR conformance against the independent Python codec
+        run: uv run --python 3.12 --project conformance/cbor/python python scripts/cbor-conformance.py --tfs target/release/tfs conform
 
       # The CLI rides the wheel (tfs-051), built in the manylinux container so its glibc
       # floor matches the extension beside it.

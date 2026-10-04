@@ -22,8 +22,8 @@ Everything else runs under either. Weights never enter this: the material is a 1
 tensor with the values that break decoders planted in it.
 
 Output is a deliberately dumb line format, NOT JSON: canonical bytes have exactly one
-writer in this repo and it is the Rust one. `tfs vectors mine` turns these rows into the
-canonical EncodingVectors document.
+writer in this repo and it is the Rust one. `cargo run -p tensorfs-core --example mine-vectors
+-- <rows> <name>` turns these rows into the canonical EncodingVectors document.
 
     case <name>
     logical <dtype> <d,d>
