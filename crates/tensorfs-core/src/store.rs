@@ -343,12 +343,10 @@ pub struct Put {
     pub admitted: bool,
 }
 
-/// The store's own scratch names under `tmp/`. [`Store::reap`] collects exactly these two
-/// prefixes and nothing else, so a crashed writer of EITHER destination cannot leak a
-/// partial multi-gigabyte temp forever, and a `tmp/` entry that is somebody else's stays
-/// somebody else's.
+/// The store's own scratch name under `tmp/`. [`Store::reap`] collects exactly this prefix,
+/// so a crashed writer cannot leak a partial temp forever, and a `tmp/` entry that is
+/// somebody else's stays somebody else's.
 pub(crate) const PUT_TEMP: &str = "put-";
-pub(crate) const STAGE_TEMP: &str = "stage-";
 
 /// A durable temp whose bytes are PROVEN and whose destination is not yet decided.
 ///
@@ -527,7 +525,7 @@ impl Store {
                 ),
             );
         }
-        for d in ["repos", "manifests", "blobs", "checkouts", "staging", "tmp"] {
+        for d in ["repos", "manifests", "blobs", "checkouts", "tmp"] {
             fs::create_dir_all(root.join(d)).map_err(|e| io(format!("mkdir {d}"), e))?;
         }
         crate::catalog::Catalog::initialize(root)?;
@@ -783,12 +781,7 @@ impl Store {
     /// they are not in any census — which is exactly why the number that decides whether an
     /// admission fits must see them.
     pub fn occupancy(&self) -> Result<u64> {
-        let mut total: u64 = crate::staging::bytes(self)?
-            .checked_add(crate::transport::sources::bytes(self)?)
-            .ok_or_else(|| Refusal {
-                code: Code::ARITH_OVERFLOW,
-                detail: "prefix occupancy overflow".into(),
-            })?;
+        let mut total: u64 = crate::transport::sources::bytes(self)?;
         for (namespace, suffix) in [("blobs", ""), ("manifests", ".json")] {
             let base = self.root.join(namespace);
             if !base.is_dir() {
@@ -862,7 +855,6 @@ impl Store {
             (self.root.join("manifests"), 0o755),
             (self.root.join("blobs"), 0o755),
             (self.root.join("checkouts"), 0o755),
-            (crate::staging::area(self), 0o755),
             (self.root.join("tmp"), 0o755),
             (self.root.join("tmp/leases"), 0o1733),
             (self.root.join("tmp/writers"), 0o755),
@@ -2047,7 +2039,7 @@ impl Store {
         let (mut gone, mut kept) = (0, 0);
         for p in read_dir(&self.root.join("tmp"))? {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let ours = name.starts_with(PUT_TEMP) || name.starts_with(STAGE_TEMP);
+            let ours = name.starts_with(PUT_TEMP);
             if !ours || !fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
                 continue;
             }

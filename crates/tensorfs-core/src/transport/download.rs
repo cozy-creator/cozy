@@ -445,11 +445,10 @@ impl Run<'_> {
         let job = self.job;
         let wanted = &job.wanted[at];
         let grant = (job.grant)(wanted)?;
-        let kind = match grant.destination {
-            Destination::Manifest => Some(CacheKind::Manifest),
-            Destination::Blob => Some(CacheKind::Blob),
-            Destination::Staging => None,
-        };
+        let kind = Some(match grant.destination {
+            Destination::Manifest => CacheKind::Manifest,
+            Destination::Blob => CacheKind::Blob,
+        });
         let mut cache = None;
         let mounted = job.store.repo_cache().filter(|_| job.keep.is_none());
         if let (Some(kind), Some(mounted)) = (kind, mounted) {
@@ -937,9 +936,6 @@ impl Run<'_> {
                 sha256,
                 length: wanted.length,
             };
-            if object.grant.destination == Destination::Staging {
-                return crate::staging::adopt(job.store, verified).map(|_| ());
-            }
             fault.hit("verified");
             job.store.admit_verified(verified, &fault, None).map(|_| ())
         })();

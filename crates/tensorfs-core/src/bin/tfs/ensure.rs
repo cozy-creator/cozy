@@ -128,32 +128,3 @@ pub fn cmd_ensure(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     request.on_event = Some(&on_event);
     answer(ensure::ensure(&request))
 }
-
-/// `tfs pressure <root> [--keep sha256:<m>]...`: one pressure pass (see `ensure::relieve`),
-/// reported as one JSON line.
-pub fn cmd_pressure(root: &Path, flags: &Flags) -> ExitCode {
-    let keep: Vec<String> = flag_all(flags, "keep")
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    let relief = match Store::open(root).and_then(|store| ensure::relieve(&store, &keep)) {
-        Ok(relief) => relief,
-        Err(refusal) => {
-            println!(
-                "{{\"event\":\"pressure.refused\",\"code\":\"{}\",\"detail\":{}}}",
-                refusal.code.as_str(),
-                quoted(&refusal.detail)
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    println!(
-        "{{\"event\":\"pressure\",\"pressure\":{},\"collected_bytes\":{},\"capacity_bytes\":{},\"available_bytes\":{},\"unable\":{}}}",
-        relief.pressure,
-        relief.collected_bytes,
-        relief.capacity_bytes,
-        relief.available_bytes,
-        relief.unable.as_deref().map_or("null".to_string(), quoted),
-    );
-    ExitCode::SUCCESS
-}

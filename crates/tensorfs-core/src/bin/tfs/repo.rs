@@ -8,14 +8,14 @@ use tensorfs_core::catalog::WriterGuard;
 use tensorfs_core::err::{Code, Refusal};
 use tensorfs_core::gc;
 use tensorfs_core::header::{Body, Header};
-use tensorfs_core::ids::{hex64, prefixed, Doc, ObjectRef};
+use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::Manifest;
 use tensorfs_core::reclaim;
 use tensorfs_core::repository::{self, Mutation, Repository};
 use tensorfs_core::storage::{
     self, Census, CheckpointFacts as CensusCheckpointFacts, InventoryEntry, StagedCheckpoint,
 };
-use tensorfs_core::store::{Fault, Store};
+use tensorfs_core::store::Store;
 
 use crate::{bail, flag, Flags};
 
@@ -226,236 +226,6 @@ pub fn cmd_repo_inspect(path: &Path, flags: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-pub fn cmd_repo_list(root: &Path, flags: &Flags) -> ExitCode {
-    let Some(rows) = flag(flags, "rows") else {
-        eprintln!("--rows <jsonl> is required");
-        return ExitCode::from(2);
-    };
-    if let Err(error) = Store::open(root)
-        .and_then(|_| storage::repository_release_lines(root))
-        .and_then(|lines| storage::write_json_lines(Path::new(rows), &lines))
-    {
-        return bail(error);
-    }
-    ExitCode::SUCCESS
-}
-pub fn cmd_repo_usage(root: &Path, flags: &Flags) -> ExitCode {
-    let Some(rows) = flag(flags, "rows") else {
-        eprintln!("--rows <jsonl> is required");
-        return ExitCode::from(2);
-    };
-    let usage = match Store::open(root)
-        .and_then(|_| Census::open(root))
-        .and_then(|census| census.usage())
-    {
-        Ok(usage) => usage,
-        Err(error) => return bail(error),
-    };
-    if let Err(error) = storage::write_json_lines(Path::new(rows), &usage.json_lines()) {
-        return bail(error);
-    }
-    println!(
-        "{} repos: {} bytes referenced, {} bytes unique, {} bytes unreferenced",
-        usage.repos.len(),
-        usage.bytes_total,
-        usage.bytes_unique_sum,
-        usage.bytes_unreferenced
-    );
-    ExitCode::SUCCESS
-}
-
-pub fn cmd_repo_get(root: &Path, org: &str, name: &str, flags: &Flags) -> ExitCode {
-    let Some(output) = flag(flags, "out") else {
-        eprintln!("--out <current.json> is required");
-        return ExitCode::from(2);
-    };
-    let store = ok!(Store::open(root));
-    let repository_name = ok!(repository::RepositoryName::new(org, name));
-    let path = store.repository_path(&repository_name);
-    let bytes = match read(&path) {
-        Ok(bytes) => bytes,
-        Err(mut error) => {
-            if !path.is_file() {
-                error.code = Code::REPOSITORY_ABSENT;
-            }
-            return bail(error);
-        }
-    };
-    let repository = ok!(Repository::parse(&bytes));
-    if repository.repo != repository_name {
-        return bail(Refusal {
-            code: Code::PATH_DIGEST_MISMATCH,
-            detail: "repository bytes disagree with requested path".into(),
-        });
-    }
-    if let Err(error) = write(Path::new(output), &bytes) {
-        return bail(error);
-    }
-    println!(
-        "repository {org}/{name} sha256:{}",
-        repository.document_sha256()
-    );
-    ExitCode::SUCCESS
-}
-
-fn local_row(repository: &Repository) -> Result<Value, Refusal> {
-    let release = repository.local_checkpoint()?;
-    let row = Value::obj(vec![
-        ("manifest_digest", Value::str(release.manifest.id())),
-        ("manifest_length", Value::uint(release.manifest.length)),
-        ("name", Value::str(repository.repo.name.clone())),
-        (
-            "repository_digest",
-            Value::str(format!("sha256:{}", repository.document_sha256())),
-        ),
-        (
-            "source_selection",
-            Value::str(format!(
-                "sha256:{}",
-                release
-                    .source_selection
-                    .as_ref()
-                    .expect("validated local checkpoint")
-            )),
-        ),
-    ]);
-    Ok(row)
-}
-
-fn print_local(repository: &Repository) -> Result<(), Refusal> {
-    let row = local_row(repository)?;
-    println!(
-        "{}",
-        String::from_utf8(tensorfs_core::canon::write(&row)).unwrap()
-    );
-    Ok(())
-}
-
-fn observed_local(store: &Store, name: &str, observed: &str) -> Result<Option<Vec<u8>>, Refusal> {
-    if observed == "absent" {
-        return Ok(None);
-    }
-    let expected = prefixed("--observed", observed)?;
-    let repo = repository::RepositoryName::new("local", name)?;
-    let path = store.repository_path(&repo);
-    let bytes = read(&path)?;
-    let parsed = Repository::parse(&bytes)?;
-    local_row(&parsed)?;
-    let actual = format!("sha256:{}", parsed.document_sha256());
-    if actual != expected {
-        return Err(Refusal {
-            code: Code::REPOSITORY_CONFLICT,
-            detail: format!("observed local repository {expected}, current is {actual}"),
-        });
-    }
-    Ok(Some(bytes))
-}
-
-pub fn cmd_local_resolve(root: &Path, name: &str) -> ExitCode {
-    let store = ok!(Store::open(root));
-    let repo = ok!(repository::RepositoryName::new("local", name));
-    let path = store.repository_path(&repo);
-    let bytes = match read(&path) {
-        Ok(bytes) => bytes,
-        Err(mut error) if !path.is_file() => {
-            error.code = Code::REPOSITORY_ABSENT;
-            return bail(error);
-        }
-        Err(error) => return bail(error),
-    };
-    match Repository::parse(&bytes).and_then(|repository| print_local(&repository)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => bail(error),
-    }
-}
-
-pub fn cmd_local_replace(
-    root: &Path,
-    name: &str,
-    source_selection: &str,
-    manifest_id: &str,
-    manifest_length: &str,
-    flags: &Flags,
-) -> ExitCode {
-    let Some(observed) = flag(flags, "observed") else {
-        eprintln!("--observed <sha256:...|absent> is required");
-        return ExitCode::from(2);
-    };
-    let store = ok!(Store::open(root));
-    let observed = ok!(observed_local(&store, name, observed));
-    let selection = match hex64(
-        "source selection",
-        source_selection.trim_start_matches("sha256:"),
-    ) {
-        Ok(selection) => selection,
-        Err(error) => return bail(error),
-    };
-    let length = match manifest_length.parse::<u64>() {
-        Ok(length) if length > 0 => length,
-        _ => {
-            return bail(Refusal {
-                code: Code::LENGTH_MISMATCH,
-                detail: "manifest length must be a positive integer".into(),
-            })
-        }
-    };
-    let manifest = ObjectRef {
-        sha256: manifest_id.trim_start_matches("sha256:").to_string(),
-        length,
-    };
-    if let Err(error) = hex64("manifest", &manifest.sha256) {
-        return bail(error);
-    }
-    let mutation = Mutation::ReplaceLocal {
-        repo: ok!(repository::RepositoryName::new("local", name)),
-        manifest,
-        version: selection,
-    };
-    match store.apply_repository(observed.as_deref(), &mutation, &Fault::default()) {
-        Ok(Some(repository)) => match print_local(&repository) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => bail(error),
-        },
-        Ok(None) => unreachable!("replace_local retains the repository"),
-        Err(error) => bail(error),
-    }
-}
-
-pub fn cmd_local_remove(root: &Path, name: &str, flags: &Flags) -> ExitCode {
-    let Some(observed) = flag(flags, "observed") else {
-        eprintln!("--observed <sha256:...> is required");
-        return ExitCode::from(2);
-    };
-    if observed == "absent" {
-        eprintln!("--observed absent is invalid for local remove");
-        return ExitCode::from(2);
-    }
-    let store = ok!(Store::open(root));
-    let observed = match observed_local(&store, name, observed) {
-        Ok(Some(observed)) => observed,
-        Ok(None) => unreachable!("absent was rejected above"),
-        Err(error) => return bail(error),
-    };
-    let mutation = Mutation::DeleteRepository {
-        repo: ok!(repository::RepositoryName::new("local", name)),
-    };
-    match store.apply_repository(Some(&observed), &mutation, &Fault::default()) {
-        Ok(None) => {
-            let row = Value::obj(vec![
-                ("name", Value::str(name.to_string())),
-                ("removed", Value::Bool(true)),
-            ]);
-            println!(
-                "{}",
-                String::from_utf8(tensorfs_core::canon::write(&row)).unwrap()
-            );
-            ExitCode::SUCCESS
-        }
-        Ok(Some(_)) => unreachable!("delete repository returns none"),
-        Err(error) => bail(error),
-    }
-}
-
 pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode {
     let (Some(output), Some(rows)) = (flag(flags, "out"), flag(flags, "rows")) else {
         eprintln!("--out <replacement> and --rows <jsonl> are required");
@@ -584,34 +354,6 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
         }
     );
     ExitCode::SUCCESS
-}
-
-pub fn cmd_repo_commit(store: &Path, current: &str, mutation: &Path, flags: &Flags) -> ExitCode {
-    let store = ok!(Store::open(store));
-    let current = if current == "-" {
-        None
-    } else {
-        match read(Path::new(current)) {
-            Ok(value) => Some(value),
-            Err(error) => return bail(error),
-        }
-    };
-    let mutation = ok!(read(mutation).and_then(|bytes| Mutation::parse(&bytes)));
-    let fault = Fault {
-        stage: flag(flags, "fault").map(str::to_string),
-        ready: flag(flags, "ready").map(std::path::PathBuf::from),
-    };
-    match store.apply_repository(current.as_deref(), &mutation, &fault) {
-        Ok(Some(repository)) => {
-            println!("repository sha256:{}", repository.document_sha256());
-            ExitCode::SUCCESS
-        }
-        Ok(None) => {
-            println!("repository deleted");
-            ExitCode::SUCCESS
-        }
-        Err(error) => bail(error),
-    }
 }
 
 pub fn cmd_key(kind: &str, args: &[&str]) -> ExitCode {
@@ -812,20 +554,6 @@ pub fn cmd_gc_plan(census: &Path, flags: &Flags) -> ExitCode {
         }
         Err(error) => bail(error),
     }
-}
-
-/// `tfs gc <root> [--dry-run] [--json]`: one complete reclamation pass (tensorfs_core::gc).
-pub fn cmd_gc(root: &Path, flags: &Flags) -> ExitCode {
-    let report = ok!(gc::collect(root, flag(flags, "dry-run").is_some()));
-    if flag(flags, "json").is_some() {
-        println!("{}", String::from_utf8_lossy(&report.json()));
-    } else {
-        println!("{}", report.line());
-        for session in &report.sessions {
-            println!("held by ingest session {session} (abandon with `tfs ingest reap`)");
-        }
-    }
-    ExitCode::SUCCESS
 }
 
 pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {

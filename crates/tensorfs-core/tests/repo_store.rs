@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tensorfs_core::canon::Value;
 use tensorfs_core::dtype::Dtype;
@@ -50,11 +50,6 @@ fn one_tmp_tree_is_recreatable_and_corruption_is_not_retained() {
     Store::open(&root).unwrap();
     assert!(root.join("tmp").is_dir());
     let _ = fs::remove_dir_all(root);
-}
-
-fn fixture(root: &Path) -> ObjectRef {
-    let store = Store::init(root).unwrap();
-    model_fixture(&store, [0, 0, 0, 0])
 }
 
 fn model_fixture(store: &Store, value: [u8; 4]) -> ObjectRef {
@@ -273,54 +268,29 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
         tensorfs_core::err::Code::KEY_GRAMMAR
     );
 
-    let replace = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args([
-            "local",
-            "replace",
-            root.to_str().unwrap(),
-            "h3-dev",
-            &format!("sha256:{}", "33".repeat(32)),
-            &manifest_b.id(),
-            &manifest_b.length.to_string(),
-            "--observed",
-            &format!("sha256:{}", alias_b.document_sha256()),
-        ])
-        .output()
+    // Replacing with an observed body swaps the one checkpoint; the alias has no release and
+    // is still the one row a consumer can find a local model by.
+    let alias_c = store
+        .apply_repository(
+            Some(&alias_b.canonical_bytes()),
+            &Mutation::ReplaceLocal {
+                repo: repo.clone(),
+                manifest: manifest_b.clone(),
+                version: "33".repeat(32),
+            },
+            &Fault::default(),
+        )
+        .unwrap()
         .unwrap();
-    assert!(
-        replace.status.success(),
-        "{}",
-        String::from_utf8_lossy(&replace.stderr)
-    );
-    assert!(String::from_utf8_lossy(&replace.stdout).contains(&format!(
-        "\"source_selection\":\"sha256:{}\"",
-        "33".repeat(32)
-    )));
-    let resolve = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["local", "resolve", root.to_str().unwrap(), "h3-dev"])
-        .output()
-        .unwrap();
-    assert!(resolve.status.success());
-    assert_eq!(resolve.stdout, replace.stdout);
-    // The alias has no release, and `repo list` lists it anyway: it is the one row a
-    // consumer can find a local model by.
-    let list = |root: &Path| -> String {
-        let rows = root.join("list.jsonl");
-        assert!(Command::new(env!("CARGO_BIN_EXE_tfs"))
-            .args([
-                "repo",
-                "list",
-                root.to_str().unwrap(),
-                "--rows",
-                rows.to_str().unwrap(),
-            ])
-            .status()
+    let list = || -> String {
+        tensorfs_core::storage::repository_release_lines(&root)
             .unwrap()
-            .success());
-        String::from_utf8(fs::read(rows).unwrap()).unwrap()
+            .into_iter()
+            .map(|line| String::from_utf8(line).unwrap() + "\n")
+            .collect()
     };
     assert_eq!(
-        list(&root),
+        list(),
         format!(
             "{{\"kind\":\"local\",\"manifest_length\":{},\"manifest_sha256\":\"{}\",\"name\":\"h3-dev\",\"org\":\"local\",\"source_selection\":\"sha256:{}\"}}\n",
             manifest_b.length,
@@ -328,49 +298,15 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
             "33".repeat(32)
         )
     );
-    let current = Repository::parse(&fs::read(store.repository_path(&repo)).unwrap()).unwrap();
-    let digest = format!("sha256:{}", current.document_sha256());
-    let remove = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args([
-            "local",
-            "remove",
-            root.to_str().unwrap(),
-            "h3-dev",
-            "--observed",
-            &digest,
-        ])
-        .output()
+    store
+        .apply_repository(
+            Some(&alias_c.canonical_bytes()),
+            &Mutation::DeleteRepository { repo: repo.clone() },
+            &Fault::default(),
+        )
         .unwrap();
-    assert!(
-        remove.status.success(),
-        "{}",
-        String::from_utf8_lossy(&remove.stderr)
-    );
-    assert_eq!(list(&root), "");
+    assert_eq!(list(), "");
     let _ = fs::remove_dir_all(root);
-}
-
-fn mutation(manifest: &ObjectRef) -> Vec<u8> {
-    tensorfs_core::canon::write(&Value::obj(vec![
-        ("action", Value::str("update_release")),
-        ("expected_revision", Value::uint(0)),
-        ("remove", Value::arr(Vec::new())),
-        (
-            "repo",
-            Value::obj(vec![
-                ("name", Value::str("model")),
-                ("org", Value::str("org")),
-            ]),
-        ),
-        (
-            "set",
-            Value::arr(vec![Value::obj(vec![
-                ("lane", Value::str("cpu")),
-                ("manifest", manifest.to_value()),
-            ])]),
-        ),
-        ("version", Value::str("1.0.0")),
-    ]))
 }
 
 fn checkpoint_mutation(manifest: &ObjectRef, org: &str, name: &str) -> Vec<u8> {
@@ -655,89 +591,6 @@ fn ordinary_dataset_repo_apply_needs_no_model_header_or_evidence() {
     assert!(rows.contains("\"release_revision\":1"));
     assert!(!rows.contains("header_sha256"));
     assert!(!rows.contains("tensor_schema_digest"));
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn crash_after_repo_replace_rebuilds_sql_from_files() {
-    let root = temporary("crash-rebuild");
-    let manifest = fixture(&root);
-    let store = Store::open(&root).unwrap();
-    let repo = tensorfs_core::repository::RepositoryName::new("org", "model").unwrap();
-    let checkpointed = store
-        .apply_repository(
-            None,
-            &Mutation::PutCheckpoint {
-                repo,
-                manifest: manifest.clone(),
-            },
-            &Fault::default(),
-        )
-        .unwrap()
-        .unwrap();
-    let checkpointed_path = root.join("checkpointed.json");
-    fs::write(&checkpointed_path, checkpointed.canonical_bytes()).unwrap();
-    let mutation_path = root.join("mutation.json");
-    fs::write(&mutation_path, mutation(&manifest)).unwrap();
-    let ready = root.join("ready");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args([
-            "repo",
-            "commit",
-            root.to_str().unwrap(),
-            checkpointed_path.to_str().unwrap(),
-            mutation_path.to_str().unwrap(),
-            "--fault",
-            "repo-after-replace",
-            "--ready",
-            ready.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let started = Instant::now();
-    while !ready.is_file() && started.elapsed() < Duration::from_secs(10) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(ready.is_file(), "repo writer never reached its crash point");
-    let blocked_rows = root.join("blocked-rows.jsonl");
-    assert!(
-        !Command::new(env!("CARGO_BIN_EXE_tfs"))
-            .args([
-                "store",
-                "rebuild",
-                root.to_str().unwrap(),
-                "--rows",
-                blocked_rows.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap()
-            .success(),
-        "rebuild must refuse while the writer process retains its marker lock"
-    );
-    assert!(Command::new("kill")
-        .args(["-9", &child.id().to_string()])
-        .status()
-        .unwrap()
-        .success());
-    let _ = child.wait();
-    assert!(root.join("repos/org/model.json").is_file());
-    let rows = root.join("rows.jsonl");
-    let status = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args([
-            "store",
-            "rebuild",
-            root.to_str().unwrap(),
-            "--rows",
-            rows.to_str().unwrap(),
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    assert!(fs::read_to_string(rows)
-        .unwrap()
-        .contains("checkpoint_object"));
     let _ = fs::remove_dir_all(root);
 }
 

@@ -424,7 +424,6 @@ pub struct DeliveryGrant {
 pub enum Destination {
     Blob,
     Manifest,
-    Staging,
 }
 
 impl Destination {
@@ -432,7 +431,6 @@ impl Destination {
         match self {
             Destination::Blob => "blob",
             Destination::Manifest => "manifest",
-            Destination::Staging => "staging",
         }
     }
 }
@@ -480,31 +478,7 @@ impl DeliveryGrant {
         }
     }
 
-    /// A grant to STAGE one carrier, with no `FetchPlan` behind it.
-    ///
-    /// There is no closure for this to be a subset of: a carrier is not declared by a
-    /// remote catalog and is not reached by any manifest. The binding it carries is the
-    /// object id itself, which [`DeliveryGrant::admit`] enforces by digest through the same
-    /// hashing core `put_stream` uses — so the authorization is exactly as strong as a
-    /// minted one, and narrower, because a staging grant can never land in `blobs/`.
-    pub fn stage(session: &str, object: &ObjectRef) -> Result<Self> {
-        ascii_name("DeliveryGrant.session", session, limits::MAX_NAME_BYTES)?;
-        hex64("DeliveryGrant.object", &object.sha256)?;
-        if object.length == 0 {
-            return refuse(
-                Code::LENGTH_MISMATCH,
-                "a staged carrier is a file the converter opens; zero bytes is not one",
-            );
-        }
-        Ok(DeliveryGrant {
-            session: session.to_string(),
-            object: object.clone(),
-            destination: Destination::Staging,
-        })
-    }
-
-    /// DERIVED, not stored — the same key publish wrote to. A staging grant's key is not a
-    /// store key at all, and saying so in the same shape is the point.
+    /// DERIVED, not stored — the same key publish wrote to.
     pub fn key(&self) -> String {
         match self.destination {
             Destination::Manifest => crate::storage::manifest_key(&self.object.sha256)
@@ -512,7 +486,6 @@ impl DeliveryGrant {
             Destination::Blob => {
                 final_key(&self.object.sha256).expect("DeliveryGrant carries a validated digest")
             }
-            Destination::Staging => format!("staging/{}", self.object.sha256),
         }
     }
 
@@ -523,16 +496,6 @@ impl DeliveryGrant {
     ///
     /// `r` is whatever the transport adapter opened. This plane neither knows nor asks.
     pub fn admit<R: Read>(&self, store: &Store, r: &mut R) -> Result<Admitted> {
-        if self.destination == Destination::Staging {
-            // Not an admission at all: the bytes cross the same hashing core and land
-            // OUTSIDE every namespace a census walks. Nothing is recorded about them,
-            // because there is nothing to be atomic about — see `crate::staging`.
-            let carrier = crate::staging::stage(store, r, &self.object)?;
-            return Ok(Admitted {
-                object: carrier.object,
-                first_writer: carrier.fetched,
-            });
-        }
         let put = if self.destination == Destination::Manifest {
             validate_manifest_ref(&self.object)?;
             let capacity =

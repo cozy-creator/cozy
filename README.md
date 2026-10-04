@@ -8,16 +8,8 @@ manifests/<aa>/<bb>/<sha256>.json
 blobs/<aa>/<bb>/<sha256>
 tensorfs.sqlite                    # seven small local index/coordination/cache tables
 checkouts/<manifest-sha256>/...    # optional disposable local view
-staging/<sha256>                   # foreign source carriers: NOT store objects
 tmp/                               # all transient local state; delete when stopped
 ```
-
-`staging/` holds downloaded source carriers — a HuggingFace safetensors shard on its way to
-being converted. A carrier crosses the same hashing door a blob does and is refused at the
-same digest, but it is not content-addressed storage: it has no verification record, appears
-in no census, is never a `gc` candidate, and is deleted by `tfs staging drop` as soon as the
-conversion that reads it is done. A temporary input and a durable output do not share a
-lifetime. `tfs staging fetch|drop|clear|list` is the whole surface.
 
 Repository files are authoritative checkpoint roots plus revisioned model release pointers.
 Manifests are immutable virtual file trees. Blobs are immutable content bytes. TensorFS backs model
@@ -34,7 +26,7 @@ mutation authority. Multi-host publication and GC use Tensorhub's R2/PostgreSQL 
 Workers may additionally use a root (for example, `/workspace/cozy/repo-cache`) as an optional
 datacenter cache. The example path is deployment policy, not part of the TensorFS format.
 
-**The cache is a property of the Store, recorded once at setup.** `tfs store ensure <root>
+**The cache is a property of the Store, recorded once at setup.** `tfs store init <root>
 --repo-cache <cache>` writes the mount into `<store-root>/repo-cache`; `--no-repo-cache` clears
 it. Every later handle — `Store::open`, `Store::ensure`, and so every fetch, conversion, restore
 and resume — reads it from there, so no request, protocol field, function argument or child
@@ -147,10 +139,6 @@ takes its root as an argument. Nor does a
 writer marker create the root it locks, so no command lays down a skeleton Store in whatever
 directory it happened to be run from.
 
-```bash
-tfs store ensure <root>          # open valid, or initialize only absent/empty
-tfs store prepare-readers <root> # TensorFS owns cross-uid lease coordination modes
-```
 
 ## Disk budget
 
@@ -188,7 +176,6 @@ tfs capabilities                      # ensure/1, get-range/1, deliver/1, pressu
 tfs ensure <root> org/name@1.0.0 --hub https://hub --lane fp8 --step "load" \
     [--ca-file hub-ca.pem] [--allow-hosts objects.example] [--keep sha256:<manifest>]...
 tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, under a read lease
-tfs pressure <root> [--keep sha256:<manifest>]...
 ```
 
 - **Stdout is JSON lines**: `ensure.progress` samples (`model`, `step`, `phase`,
@@ -204,7 +191,7 @@ tfs pressure <root> [--keep sha256:<manifest>]...
   reserve of max(1 GiB, 1/50 of the filesystem) and 32 inodes, after what other live
   flights still owe. Short, the GC policy runs: unreferenced bytes, then delivered products
   (`Store.deliver_tree_root`, oldest first), then cached lanes; then `CAPACITY_EXHAUSTED`.
-  `tfs pressure` / `tensorfs.relieve` runs the same policy at 1/10 free until 1/5 is free.
+  `ensure::relieve` runs the same policy at 1/10 free until 1/5 is free.
 - **The Hub CA** (`--ca-file`, `ca_file=`) is added to process trust; an untrusted hub is
   `TLS_UNTRUSTED`, never retried.
 
@@ -359,12 +346,10 @@ green and red vectors.
 
 ```text
 tfs store init <root>
-tfs store info <root>
 tfs store rebuild <census> --rows <rows.jsonl>
 
 tfs put <root> <file>
 tfs get <root> <sha256>
-tfs contains <root> <sha256>
 tfs reap <root>
 ```
 
@@ -386,20 +371,10 @@ kernel hands out, never by age, so a slow live writer is never reaped from under
 tfs manifest build <entries.jsonl> --out <manifest.json>
 tfs manifest inspect <manifest.json> --refs <refs.jsonl>
 tfs manifest get <store> <manifest_id> --out <manifest.json>
-tfs manifest admit <store> <manifest.json> --expect <sha256> [--expect-length <bytes>]
 tfs repo inspect <repo.json> --rows <rows.jsonl>
-tfs repo list <store> --rows <rows.jsonl>
-tfs repo usage <store> --rows <rows.jsonl>
-tfs repo get <store> <org> <name> --out <current.json>
 tfs repo apply <current.json|-> <mutation.json> \
   --manifest <manifest.json> --header <header.cbor> --inventory <blobs.jsonl> \
   --out <replacement.json> --rows <rows.jsonl>
-tfs repo commit <store> <current.json|-> <mutation.json>
-
-tfs local resolve <store> <name>
-tfs local replace <store> <name> <source-sha256> <manifest> <length> \
-  --observed <repository-sha256|absent>
-tfs local remove <store> <name> --observed <repository-sha256>
 
 tfs key blob <sha256>
 tfs key manifest <sha256>
@@ -419,17 +394,8 @@ increments one release revision. First publication permanently marks the checkpo
 afterward leaves a durable unreleased checkpoint; `store rebuild` catches SQL projections up. The
 database never leads the repository file.
 
-`repo list` emits one `kind: "release"` row per release lane and one `kind: "local"` row per local
-alias (a checkpoint with a `source_selection` and no release). Repository rows carry only durable
-snapshot identity and release state; historical ingest evidence is not part of the repository.
-
-`repo usage` emits one `kind: "repo"` row per repository — `bytes_total`, the union of blobs its
-retained checkpoints reach through the same closure GC keeps alive (manifest entries plus the
-header's assets and tensor segments), and `bytes_unique`, the part no other repository
-reaches, i.e. what deleting only it would free — then one `kind: "store"` row with the referenced
-union (`bytes_total`), `bytes_unique_sum`, `bytes_unreferenced` (verified blobs nothing retained
-reaches) and `repos`. Manifests are not counted; a blob counts once per repository however many
-paths list it.
+`storage::repository_release_lines` gives one `kind: "release"` row per release lane and one `kind: "local"` row per local
+alias; `Census::usage` gives the bytes each repository reaches and the bytes unique to it.
 
 Rebuild always recovers the repository, Manifest, and complete reached blob set;
 model headers additionally recover the diagnostic projection emitted by `store rebuild --rows`.
@@ -602,12 +568,11 @@ mutations cannot append a second row under org `local`.
 ## GC and recovery
 
 ```text
-tfs gc <store> [--dry-run] [--json]
 tfs gc headers <census> --out <header-requests.jsonl>
 tfs gc plan <census> --holds <holds.jsonl> --out <plan.jsonl>
 ```
 
-`tfs gc <store>` is the local reclamation act: under the store's exclusive lock it marks
+`gc::collect` is the local reclamation act: under the store's exclusive lock it marks
 `repositories -> manifests -> blobs` from the filesystem alone, keeps what an open ingest session
 root (`tmp/ingest/<session>/session.json`) or private derived root (`roots/derived/<transaction>.json`)
 names, deletes every other blob and manifest, and
@@ -667,10 +632,3 @@ these manifest roots directly from the filesystem, without relying on request or
 metadata. Eligibility and authorization belong to the caller; this API provides storage
 retention and never schedules computation or publishes a model repository.
 
-For a host enforcing filesystem headroom, `tfs fetch bounded <root> <ref>`
-requires `--max-download-bytes N --max-download-objects N` alongside the normal
-fetch arguments. It uses the ordinary native plan and pull, refusing before body
-transfers when missing content exceeds either allowance. Already-held objects
-consume neither allowance. These limits do not rewrite the Store's saved quota
-and count objects, not filesystem inodes; the host reserves directory/temporary
-overhead separately. Older CLIs reject the distinct bounded verb.
