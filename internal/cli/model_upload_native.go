@@ -140,6 +140,20 @@ func machineUpload(ctx *Context, rentalID string, parsed modelsource.Source, des
 		}
 		machine, name = machines.Local, machines.Local
 	}
+	if machine != machines.Local {
+		// Under a daemon that predates cozy.machine.v1 the upload is this command's own warm run.
+		ep, problem := foregroundRental(ctx, name)
+		if problem != nil || ep != nil {
+			if problem != nil {
+				return true, problem
+			}
+			selection, problem := uploadSelection(ctx, parsed, destination)
+			if problem != nil {
+				return true, problem
+			}
+			return foregroundInstall(ctx, ep, name, selection)
+		}
+	}
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return true, problem
@@ -152,13 +166,22 @@ func machineUpload(ctx *Context, rentalID string, parsed modelsource.Source, des
 	if status, problem := client.MachineStatus(machine); problem != nil || !slices.Contains(status.Capabilities, "upload/1") {
 		return false, nil
 	}
-	source, problem := pinnedProviderSource(ctx, parsed.Canonical)
+	selection, problem := uploadSelection(ctx, parsed, destination)
 	if problem != nil {
 		return true, problem
 	}
-	model := records.ModelRef{Slot: "model", Source: source, Profiles: ctx.Inv.Values["--source-profile"]}
-	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}, Destination: destination}
 	return true, enqueueRentalInstall(ctx, name, selection, ctx.Inv.Bool("--await"))
+}
+
+// uploadSelection is the installation an upload is: the pinned provider source, made into the
+// destination.
+func uploadSelection(ctx *Context, parsed modelsource.Source, destination string) (records.RentalInstallSelection, *exit.Error) {
+	source, problem := pinnedProviderSource(ctx, parsed.Canonical)
+	if problem != nil {
+		return records.RentalInstallSelection{}, problem
+	}
+	model := records.ModelRef{Slot: "model", Source: source, Profiles: ctx.Inv.Values["--source-profile"]}
+	return records.RentalInstallSelection{Models: []records.ModelRef{model}, Destination: destination}, nil
 }
 
 // nativeIngestPlan is one provider source as a rented ingest converts it: pinned, narrowed

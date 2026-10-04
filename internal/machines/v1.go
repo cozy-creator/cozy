@@ -76,20 +76,27 @@ func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.
 		release: machine.release}, nil
 }
 
+// EndpointRental is one of this host's rentals reached as an explicit endpoint.
+type EndpointRental struct {
+	ID  string
+	Key rental.CreatorIdentity
+}
+
 // DialEndpointV1 opens an explicit endpoint's cozy.machine.v1 API. An endpoint that is one of
-// this host's rentals is signed with that rental's own key, which its machine authorizes;
-// any other with this computer's machine owner key.
+// this host's rentals is signed with that rental's own key, which its machine authorizes, and
+// names its Hub identity, as a dialed rental does; any other with this computer's machine
+// owner key.
 func (r *Resolver) DialEndpointV1(ep machineendpoint.Endpoint) (*V1, *exit.Error) {
-	var rented *rental.CreatorIdentity
+	var rented *EndpointRental
 	var problem *exit.Error
-	if r.EndpointKey != nil {
-		if rented, problem = r.EndpointKey(&ep); problem != nil {
+	if r.EndpointRental != nil {
+		if rented, problem = r.EndpointRental(&ep); problem != nil {
 			return nil, problem
 		}
 	}
-	var key rental.CreatorIdentity
+	key := rental.CreatorIdentity{}
 	if rented != nil {
-		key = *rented
+		key = rented.Key
 	} else if key, problem = r.Host.ExistingOwner(); problem != nil {
 		return nil, problem
 	}
@@ -101,7 +108,14 @@ func (r *Resolver) DialEndpointV1(ep machineendpoint.Endpoint) (*V1, *exit.Error
 	if err != nil {
 		return nil, Transport(err)
 	}
-	return &V1{Client: client, Name: ep.Name(), WorkerID: ep.WorkerID, BootID: ep.WorkerBootID, Leaf: pin.DER(), Rented: rented != nil}, nil
+	v := &V1{Client: client, Name: ep.Name(), WorkerID: ep.WorkerID, BootID: ep.WorkerBootID, Leaf: pin.DER(), Rented: rented != nil}
+	if rented != nil {
+		v.HubID = rented.ID
+		if r.RentalHub != nil {
+			v.Account = r.RentalHub(rented.ID)
+		}
+	}
+	return v, nil
 }
 
 // ReadStatus observes this computer's running machine over cozy.machine.v1 without starting

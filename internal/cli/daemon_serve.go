@@ -121,10 +121,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Host:     localMachine, HubOrigin: ctx.Cfg.HubURL,
 		Hub:     func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
-		UseRental:     func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
-		ObserveRental: rental.ObserveWorker(st),
-		RentalKey:     func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
-		EndpointKey:   rentalEndpointKey(l, st),
+		UseRental:      func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
+		ObserveRental:  rental.ObserveWorker(st),
+		RentalKey:      func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
+		EndpointRental: rentalEndpoint(l, st),
 	}
 	machines := newMachineRuns(ctx, l, st, resolver, fleet, found)
 	defer machines.cancel()
