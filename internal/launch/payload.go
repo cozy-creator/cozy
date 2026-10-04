@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"slices"
@@ -758,7 +759,7 @@ func validateRendered(raw json.RawMessage, value any, path string, r *reading) *
 			}
 		case "int":
 			if number, ok := value.(json.Number); ok {
-				if _, err := strconv.ParseInt(number.String(), 10, 64); err == nil {
+				if _, integer := new(big.Int).SetString(number.String(), 10); integer {
 					return nil
 				}
 			}
@@ -954,10 +955,11 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 	kind, _ := typeOf(rendered)
 	switch kind {
 	case "scalar:int":
-		if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+		integer, ok := new(big.Int).SetString(raw, 10)
+		if !ok {
 			return nil, wrongType(ep, key, raw, "int")
 		}
-		return json.RawMessage(raw), nil
+		return json.RawMessage(integer.String()), nil
 	case "scalar:float":
 		if _, err := strconv.ParseFloat(raw, 64); err != nil {
 			return nil, wrongType(ep, key, raw, "float")

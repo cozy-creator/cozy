@@ -509,7 +509,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
 	}
-	normalized, err := canonical.NormalizeJCS(out.Payload)
+	normalized, err := canonical.NormalizeApplication(out.Payload)
 	if err != nil {
 		return out, nil, exit.New(exit.Validation, "job input cannot be encoded as canonical JSON: %s", err)
 	}
