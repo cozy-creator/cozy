@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -58,7 +59,10 @@ func (m *machineRuns) loopV1(request records.Request) bool {
 		if accepted && link.Collected {
 			return false
 		}
-		if !accepted && records.Settled(current.State) {
+		// Work its machine never accepted is sent only while it is due: never once settled,
+		// paused or blocked (a daemon restart must not start it). A canceled run whose spec was
+		// sent has its cancel delivered.
+		if !accepted && (records.Settled(current.State) || slices.Contains([]string{"pausing", "paused", "blocked"}, current.State)) {
 			m.tellCancelV1(*current, link)
 			return false
 		}
