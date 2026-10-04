@@ -48,7 +48,7 @@ print(json.dumps({"manifest_id": manifest, "manifest_length": len(raw)}))
 // Hub's resolution of it.
 func seedProbe(t *testing.T, h *machineHub, root string) map[string]any {
 	t.Helper()
-	python := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "python")
+	python := machinePython(t)
 	var resolved map[string]any
 	for _, store := range []string{filepath.Join(root, "tensorfs"), filepath.Join(h.provider, "var", "lib", "tensorfs")} {
 		out, err := exec.Command(python, "-I", "-c", seedCheckpoint, store).CombinedOutput()

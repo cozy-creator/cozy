@@ -87,7 +87,7 @@ func unpressuredMachine(t *testing.T, root string) {
 	if *machineHostBinary == "" {
 		return
 	}
-	python := filepath.Join(machineTemplateDir(t), "root", "opt", "cozy", "python", "bin", "python")
+	python := machinePython(t)
 	for _, parent := range []string{os.TempDir(), "/dev/shm"} {
 		out, err := exec.Command(python, "-I", "-c", `import sys
 from pathlib import Path
@@ -99,6 +99,35 @@ print(pressure_target(Path(sys.argv[1])))`, parent).Output()
 		}
 	}
 	t.Fatal("every filesystem for the machine is under storage pressure; its Runtime would evict the memo entries this test reuses")
+}
+
+// machinePython is an interpreter holding the SDK pair the test machines run (the Runtime and
+// TensorFS wheels of the machine template), made once per run. A machine root has no
+// interpreter of its own: fixtures that seed a store or ask the Runtime a fact use this one.
+func machinePython(t testing.TB) string {
+	t.Helper()
+	machineSDK.once.Do(func() {
+		wheels, _ := filepath.Glob(filepath.Join(machineTemplateDir(t), "root/opt/cozy/machine/wheels/*.whl"))
+		venv := filepath.Join(scratchBase, "machine-python")
+		python := filepath.Join(venv, "bin", "python")
+		for _, args := range [][]string{{"venv", "--python", "3.12", venv}, append([]string{"pip", "install", "--python", python}, wheels...)} {
+			if out, err := exec.Command("uv", args...).CombinedOutput(); err != nil {
+				machineSDK.err = fmt.Errorf("uv %s for the machine SDK interpreter: %v\n%s", args[0], err, out)
+				return
+			}
+		}
+		machineSDK.python = python
+	})
+	if machineSDK.err != nil {
+		t.Fatal(machineSDK.err)
+	}
+	return machineSDK.python
+}
+
+var machineSDK struct {
+	once   sync.Once
+	python string
+	err    error
 }
 
 func provisionMachineIn(t *testing.T, root, parent string) {

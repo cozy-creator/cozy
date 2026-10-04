@@ -149,7 +149,7 @@ w.outcome('cozy-local-client',pb.AttemptOutcome(request_id='scoped-paused',attem
 e.reconcile('cozy-local-client','scoped-paused')
 assert e.status('cozy-local-client','scoped-paused').state=='paused'
 `
-		command := exec.Command(filepath.Join(h.Root(), "opt/cozy/python/bin/python"), "-I", "-c", script, filepath.Join(h.Root(), "var/lib/tensorfs"))
+		command := exec.Command(machinePython(t), "-I", "-c", script, filepath.Join(h.Root(), "var/lib/tensorfs"))
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("create actual paused journal: %v %s", err, output)
 		}

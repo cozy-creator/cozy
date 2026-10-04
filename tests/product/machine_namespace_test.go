@@ -202,7 +202,7 @@ c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
 r=c.execute("SELECT state,desired,generation,ordinal,collected,retention_waived FROM executions WHERE owner='cozy-local-client' AND request='scoped-paused'").fetchone()
 assert r and r[0]=='paused',r
 print(json.dumps(r))`
-		out, err := exec.Command(filepath.Join(h.Root(), "opt/cozy/python/bin/python"), "-I", "-c", script, filepath.Join(h.Root(), "var/lib/tensorfs/.cozy-workspace/journal.sqlite3")).CombinedOutput()
+		out, err := exec.Command(machinePython(t), "-I", "-c", script, filepath.Join(h.Root(), "var/lib/tensorfs/.cozy-workspace/journal.sqlite3")).CombinedOutput()
 		if err != nil {
 			t.Fatalf("read retained execution: %v %s", err, out)
 		}

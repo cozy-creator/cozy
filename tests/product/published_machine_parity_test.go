@@ -28,10 +28,6 @@ const (
 // both. Each machine reads the release, its lock and its interface at its own Hub.
 func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 	h, root, _, store := parityMachines(t)
-	python := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "python")
-	if exec.Command(python, "-c", "import cozy_runtime.internal.worker.machine_release_catalog").Run() != nil {
-		t.Skip("the machine's Runtime predates releases the machine installs itself (0.18.67)")
-	}
 	publishParityRelease(t, h, root, parityProject(t))
 	var mu sync.Mutex
 	var seen []string
@@ -118,7 +114,7 @@ func publishParityRelease(t *testing.T, h *machineHub, root, project string) {
 	files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(wheel) }))
 	t.Cleanup(files.Close)
 	sum := sha256.Sum256(wheel)
-	runtime := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "cozy-runtime") //cozy:allow the fixture describes its package as the publisher would
+	runtime := filepath.Join(filepath.Dir(machinePython(t)), "cozy-runtime") //cozy:allow the fixture describes its package as the publisher would
 	iface, err := exec.Command(runtime, "--json", "--dir", project, "describe").Output()
 	must(t, err)
 	closure, err := exec.Command("uv", "export", "--project", project, "--frozen", "--format", "requirements-txt",
