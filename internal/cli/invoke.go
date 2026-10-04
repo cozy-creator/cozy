@@ -71,31 +71,42 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 
 // ----------------------------------------------------------------------------- run
 
+// foregroundTarget takes a named --rental the running daemon cannot carry (it predates
+// cozy.machine.v1) as this process's own run: the rental's machine as an explicit endpoint,
+// signed with the rental's own key. close ends the controller; nil: the daemon carries it.
+func foregroundTarget(ctx *Context) (func(), *exit.Error) {
+	name := ctx.Inv.Value("--rental")
+	if name == "" || ctx.Inv.Value("--machine-endpoint-file") != "" {
+		return nil, nil
+	}
+	ep, problem := foregroundRental(ctx, name)
+	if problem != nil || ep == nil {
+		return nil, problem
+	}
+	adoptRentalHub(ctx, name)
+	close, problem := endpointController(ctx, ep)
+	if problem != nil {
+		return nil, problem
+	}
+	delete(ctx.Inv.Values, "--rental")
+	return close, nil
+}
+
 func handleRunExecute(ctx *Context) *exit.Error {
-	if name := ctx.Inv.Value("--rental"); name != "" && ctx.Inv.Value("--machine-endpoint-file") == "" {
-		// A running daemon too old for cozy.machine.v1 leaves this run to this process: the
-		// rental's machine as an explicit endpoint, signed with the rental's own key.
-		ep, problem := foregroundRental(ctx, name)
+	close, problem := foregroundTarget(ctx)
+	if problem != nil {
+		return problem
+	}
+	if close != nil {
+		defer close()
+		if problem := validateRunPlacement(ctx); problem != nil {
+			return problem
+		}
+		target, packageInterface, problem := invocationTarget(ctx)
 		if problem != nil {
 			return problem
 		}
-		if ep != nil {
-			adoptRentalHub(ctx, name)
-			close, problem := endpointController(ctx, ep)
-			if problem != nil {
-				return problem
-			}
-			defer close()
-			delete(ctx.Inv.Values, "--rental")
-			if problem := validateRunPlacement(ctx); problem != nil {
-				return problem
-			}
-			target, packageInterface, problem := invocationTarget(ctx)
-			if problem != nil {
-				return problem
-			}
-			return runTarget(ctx, target, packageInterface)
-		}
+		return runTarget(ctx, target, packageInterface)
 	}
 	if path := ctx.Inv.Value("--machine-endpoint-file"); path != "" {
 		if rentalRequested(ctx) {

@@ -98,7 +98,8 @@ func foregroundInstall(ctx *Context, ep *machineendpoint.Endpoint, machine strin
 		named.Message = machine + ": " + problem.Message
 		return true, &named
 	}
-	install.Result = result
+	// Shown as the daemon's queue shows it: by the rental's id.
+	install.Result, install.RentalID = result, either(ep.WorkspaceID, ep.Name())
 	return true, emitInstalled(ctx, install, began)
 }
 

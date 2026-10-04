@@ -3,6 +3,8 @@ package producttest
 import (
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -42,8 +45,13 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/model", "manifest_id": manifest,
 				"manifest_length": 128, "bytes": 4096, "components": []string{"transformer"}})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/machine-authorizations":
+			raw, _ := io.ReadAll(r.Body)
 			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = json.Unmarshal(raw, &body)
+			if strings.Contains(string(raw), "quantized") {
+				_ = json.NewEncoder(w).Encode(map[string]any{"token": "machine-grant", "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
+				return
+			}
 			mu.Lock()
 			grants = append(grants, body)
 			mu.Unlock()
@@ -97,6 +105,19 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 		t.Fatalf("the download did not end with the rental machine's own answer [exit %d]\n%s", code, out)
 	}
 
+	// `cozy model quantize --rental` is this command's own job on the rental's machine, which
+	// fetches the checkpoint itself and refuses the stand-in's bytes; nothing is asked of the
+	// older daemon.
+	if code, out := runCozy(t, root, "package", "install", quantizeProject(t), "--editable"); code != 0 {
+		t.Fatalf("editable install [exit %d]\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "model", "quantize", "proof/model#"+manifest, "proof/quantized", "--fp8",
+		"--package", "local/quantize-proof", "--rental=tessa", "--await", "--json")
+	t.Logf("model quantize under the older daemon [exit %d]:\n%s", code, out)
+	if code == 0 || !strings.Contains(out, "OBJECT_ID_MISMATCH") {
+		t.Fatalf("the quantize job did not reach the rental's machine [exit %d]\n%s", code, out)
+	}
+
 	// The upload is granted to the rental itself (its Hub id and pinned leaf); the stand-in hub
 	// refuses the grant, so nothing is made.
 	code, out = runCozy(t, root, "model", "upload", "civitai://1", "proof/model", "--rental=tessa", "--json")
@@ -120,4 +141,55 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 	if raw, err := os.ReadFile(witness); err == nil {
 		t.Fatalf("an installation on a rental started this computer's machine: %s", strings.TrimSpace(string(raw)))
 	}
+}
+
+// quantizeProject is local/quantize-proof: one fp8 quantizer, a job that takes a model and
+// declares the lane's weights output.
+func quantizeProject(t *testing.T) string {
+	t.Helper()
+	project := filepath.Join(t.TempDir(), "quantize-proof")
+	must(t, os.MkdirAll(project, 0o700))
+	sources := ""
+	if *machineRuntimeWheel != "" {
+		sources = fmt.Sprintf("[tool.uv.sources]\ncozy-runtime={path=%q}\ntensorfs={path=%q}\n", *machineRuntimeWheel, *machineTensorFSWheel)
+	}
+	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[project]
+name="quantize-proof"
+version="0.0.1"
+requires-python=">=3.12,<3.13"
+dependencies=["cozy-runtime>=`+runtimeFloor+`"]
+[project.entry-points."cozy.application"]
+default="quantize_proof:app"
+`+sources+`[build-system]
+requires=["hatchling"]
+build-backend="hatchling.build"
+[tool.hatch.build.targets.wheel]
+only-include=["quantize_proof.py"]
+`), 0o600))
+	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject=\"quantize_proof:app\"\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(project, "quantize_proof.py"), []byte(`from cozy_runtime.author import App, Context, Loader, Model, ModelArtifact, WeightsOutput, invocable, uses_components
+
+app = App()
+
+
+class Demo(Model):
+    def load(self, loader: Loader) -> None:
+        pass
+
+    @uses_components("transformer")
+    def generate(self) -> object:
+        return None
+
+
+@invocable
+async def fp8(ctx: Context, *, source: Demo) -> ModelArtifact:
+    raise RuntimeError("the stand-in hub serves no model to quantize")
+
+
+app.job(fp8, name="fp8", weights=(WeightsOutput("fp8", max_new_bytes=65536),), accelerator=False)
+`), 0o600))
+	if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
+		t.Fatalf("locking the quantize package: %v\n%s", err, out)
+	}
+	return project
 }
