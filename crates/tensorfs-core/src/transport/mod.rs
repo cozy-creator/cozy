@@ -51,8 +51,8 @@ pub use api::{api_get, fetch_prefix, probe_length, Prefix};
 pub use download::{fetch_ranged, Ranged, CHUNK_BYTES, PART_BYTES};
 pub use http::{trust_roots, Client};
 pub use hub::{
-    closure, closure_all, credential_from_spec, presign, Anonymous, Closure, CredentialProvider,
-    HostToken, Presigned, ScopedHeaders,
+    closure, closure_all, credential_from_spec, hub_call, presign, Anonymous, Closure,
+    CredentialProvider, HostToken, Presigned, ScopedHeaders,
 };
 pub use ledger::{
     Deadline, Ledger, PullCancellation, FETCH_ATTEMPTS, PULL_STREAMS, SAMPLE_SECONDS, STALL_FACTOR,
