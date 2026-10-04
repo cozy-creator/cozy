@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/publication"
@@ -479,7 +480,7 @@ func (m *machineRuns) MachineLog(ctx context.Context, machine, log string, tailB
 	case errors.Is(err, io.EOF):
 		out.Text = text.String()
 		return out, nil
-	case status.Code(err) == codes.Unimplemented:
+	case status.Code(err) == codes.Unimplemented && !errors.As(err, new(*machinev1.Newer)):
 		out.Unavailable = "this machine's agent predates reading its logs; a machine started on a newer agent has them"
 		return out, nil
 	}
