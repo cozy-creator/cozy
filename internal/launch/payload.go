@@ -502,6 +502,12 @@ func modelOverrideSlot(ep *Entrypoint, asked string) (*Slot, *exit.Error) {
 		WithRemedy("%s declares: %s", ep.Name, strings.Join(params, ", "))
 }
 
+// LoRAMode is the one request field every callable takes beside its interface: "per_step"
+// computes each LoRA's update every forward instead of baking it into the weights, which is
+// the default (owner, 2026-10-04). The Runtime reads it; a callable that declares a field of
+// that name keeps its own meaning.
+const LoRAMode = "lora_mode"
+
 // ValidatePayload checks one already-rendered request object against the exact
 // PackageInterface schema and answers it without the fields that schema does not declare,
 // at any depth, with their paths. An undeclared field is a warning, never a refusal (owner,
@@ -536,6 +542,12 @@ func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) (json.
 		if _, ok := document[field.Name]; !ok && field.Wire == "required" {
 			missing = append(missing, fieldSignature(&field))
 		}
+	}
+	if value, ok := document[LoRAMode]; ok && !known[LoRAMode] {
+		if mode, _ := value.(string); mode != "bake" && mode != "per_step" {
+			problems = append(problems, LoRAMode+` must be "bake" or "per_step"`)
+		}
+		known[LoRAMode] = true
 	}
 	for name := range document {
 		if !known[name] {
