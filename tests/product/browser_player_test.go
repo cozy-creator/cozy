@@ -3,7 +3,6 @@ package producttest
 import (
 	"bytes"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -12,22 +11,20 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/capability"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"github.com/cozy-creator/cozy/tests/product/webrtctest"
 	"github.com/playwright-community/playwright-go"
 )
 
@@ -79,20 +76,20 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			}
 
 			t.Run("live", func(t *testing.T) {
-				m.machine.Append(7, "video", -1, film[0], 500_000)
+				m.machine.Append(7, film[0], 500_000)
 				page := open(t, m.link(nil, "video"))
 				playerWait(t, page, "segment 1 plays", `playing(0.5, 10)`)
 				_, err := page.Reload() // a reload mid-run follows from the start again
 				must(t, err)
 				playerWait(t, page, "segment 1 plays after a reload", `playing(0.5, 10)`)
-				m.machine.Append(7, "video", -1, film[1], 500_000)
+				m.machine.Append(7, film[1], 500_000)
 				playerWait(t, page, "segment 2 plays", `playing(1.0, 22)`)
 				// The connection is lost mid-run. The browser's PeerConnection fails (the machine
 				// refuses the dead session's ufrag), and the page follows again from its cursor.
 				cursor := fmt.Sprint(playerEval(t, page, `[player().seq, player().pos]`))
 				m.relay.cut()
 				playerWait(t, page, "the PeerConnection fails and the page reconnects", `pcStates.includes("failed") && player().stats.connects === 2`)
-				m.machine.Append(7, "video", -1, film[2], 500_000)
+				m.machine.Append(7, film[2], 500_000)
 				m.machine.End(7, "completed")
 				playerWait(t, page, "the finished film ends", `video().ended && decoded(1.5, 36)`)
 				resumed := fmt.Sprint(playerEval(t, page, `(f => [f.after, f.offset])(sent.filter(m => m.t === "follow").at(-1))`))
@@ -109,7 +106,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 					t.Skip("WebKitGTK's MSE never completes a seek into a fetched segment; Safari is proven on a rental")
 				}
 				for _, segment := range film {
-					m.machine.Append(8, "video", -1, segment, 500_000)
+					m.machine.Append(8, segment, 500_000)
 				}
 				m.machine.End(8, "completed")
 				// A small window and lookahead: the film's end is not held when the seek lands.
@@ -137,7 +134,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			for i, movie := range completed {
 				t.Run([]string{"completed end moov", "completed faststart", "completed large header"}[i], func(t *testing.T) {
 					run := uint64(20 + i)
-					m.machine.Replace(run, "video", -1, movie, 1_500_000)
+					m.machine.Replace(run, movie, 1_500_000)
 					m.machine.End(run, "completed")
 					page := open(t, m.link(func(g *capability.Grant) { g.Run = fmt.Sprint(run) }, "video"))
 					if i == 1 {
@@ -173,10 +170,10 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 					video().play().catch(() => {});
 					return true;
 				})()`)
-				m.machine.Append(24, "video", -1, largeLive[0], 500_000)
+				m.machine.Append(24, largeLive[0], 500_000)
 				playerWait(t, page, "large-header live preview plays", `playing(0.5, 10)`)
 				for _, fragment := range largeLive[1:] {
-					m.machine.Append(24, "video", -1, fragment, 500_000)
+					m.machine.Append(24, fragment, 500_000)
 				}
 				m.machine.End(24, "completed")
 				playerWait(t, page, "large-header fragmented film ends", `video().ended && decoded(1.5, 36)`)
@@ -189,14 +186,14 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			})
 
 			t.Run("completed bad header", func(t *testing.T) {
-				m.machine.Replace(25, "video", -1, []byte("unrecognized MP4 header"), 1_500_000)
+				m.machine.Replace(25, []byte("unrecognized MP4 header"), 1_500_000)
 				m.machine.End(25, "completed")
 				page := open(t, m.link(func(g *capability.Grant) { g.Run = "25" }, "video"))
 				playerWait(t, page, "the completed invalid file reports a media error", `player().error?.code === "media" && player().error.message.includes("MP4 header")`)
 			})
 
 			t.Run("live becomes completed file", func(t *testing.T) {
-				m.machine.Append(23, "video", -1, film[0], 500_000)
+				m.machine.Append(23, film[0], 500_000)
 				page := open(t, m.link(func(g *capability.Grant) { g.Run = "23" }, "video"))
 				playerWait(t, page, "the live preview plays", `playing(0.5, 10)`)
 				old := playerEval(t, page, `(async () => {
@@ -204,7 +201,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 					await until(() => !video().seeking);
 					return video().src;
 				})()`)
-				m.machine.Replace(23, "video", -1, completed[0], 1_500_000)
+				m.machine.Replace(23, completed[0], 1_500_000)
 				m.machine.End(23, "completed")
 				playerWait(t, page, "the finalized file replaces the live stream", `player().finished && player().stats.resets === 1 && player().stats.type === "video/mp4" && video().readyState >= 2`)
 				result := playerEval(t, page, `({positionHeld: Math.abs(video().currentTime - 0.25) < 0.05, paused: video().paused, revoked: window.revokedURLs, error: player().error?.message})`)
@@ -236,7 +233,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 				for i, movie := range movies {
 					movies[i] = playerLargeMdat(t, movie, (i+1)*2<<20)
 				}
-				m.machine.Replace(26, "video", -1, movies[0], 500_000)
+				m.machine.Replace(26, movies[0], 500_000)
 				page := open(t, m.link(func(g *capability.Grant) { g.Run = "26" }, "video"))
 				playerEval(t, page, `(async () => {
 					const {play, parseLink} = await import("./cozy-webrtc.js");
@@ -250,7 +247,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 					await until(() => !video().seeking);
 					return video().src;
 				})()`)
-				m.machine.Replace(26, "video", -1, movies[1], 1_000_000)
+				m.machine.Replace(26, movies[1], 1_000_000)
 				playerWait(t, page, "a longer indexed partial replaces the first", `!player().finished && player().stats.resets === 1 && video().readyState >= 2 && video().duration > 0.9`)
 				result := playerEval(t, page, `(async () => {
 					const retained = {paused: video().paused, position: video().currentTime, revoked: revokedURLs};
@@ -267,7 +264,7 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 					fmt.Sprint(r["position"]) != "0.2" {
 					t.Fatalf("indexed partial replacement lost paused position or old URL: %v", r)
 				}
-				m.machine.Replace(26, "video", -1, movies[2], 1_500_000)
+				m.machine.Replace(26, movies[2], 1_500_000)
 				playerWait(t, page, "playing state survives another indexed replacement", `!player().finished && player().stats.resets === 2 && video().readyState >= 2 && video().duration > 1.4 && !video().paused`)
 				m.machine.End(26, "completed")
 				playerWait(t, page, "the indexed revision settles without another reset", `player().finished && player().stats.resets === 2 && !player().error`)
@@ -316,36 +313,30 @@ func playerLargeMdat(t *testing.T, movie []byte, padding int) []byte {
 	return nil
 }
 
-// playerMachine is a machine's real WebRTC listener serving files, reached through a relay
-// the test can cut, and the key that signs its links.
+// playerMachine is the Rust machine's WebRTC listener, reached on this computer's LAN address
+// through a relay the test can cut.
 type playerMachine struct {
 	t       *testing.T
-	machine *webrtctest.Machine
-	server  webrtctest.Server
+	machine *mediaMachine
 	relay   *playerRelay
-	key     ed25519.PrivateKey
 }
 
 func newPlayerMachine(t *testing.T, ip string) *playerMachine {
-	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host=<standalone cozy-machine>")
-	}
-	public, key, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	m := webrtctest.NewMachine(t.TempDir(), public)
-	server := serveMachineMedia(t, ip, m)
-	return &playerMachine{t: t, machine: m, server: server, relay: newPlayerRelay(t, ip, server.Addr.String()), key: key}
+	m := newMediaMachine(t)
+	return &playerMachine{t: t, machine: m, relay: newPlayerRelay(t, ip, m.Addr.String())}
 }
 
-// link is the fragment `cozy run play` prints: run 7's output, unless edit says otherwise.
+// link is the fragment `cozy run play` prints: scripted run 7's output, unless edit says otherwise.
 func (m *playerMachine) link(edit func(*capability.Grant), output string) string {
-	g := capability.Grant{Machine: m.server.Machine, Run: "7", Expires: time.Now().Add(time.Hour).Unix()}
+	g := capability.Grant{Run: "7", Expires: time.Now().Add(time.Hour).Unix()}
 	if edit != nil {
 		edit(&g)
 	}
-	token, err := capability.Mint(m.key, g)
-	must(m.t, err)
-	pin := strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(m.server.Fingerprint, "sha-256 "), ":", ""))
+	if n, err := strconv.ParseUint(g.Run, 10, 64); err == nil {
+		g.Run = m.machine.Begin(n).id
+	}
+	token := m.machine.mint(g)
+	pin := strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(m.machine.Fingerprint, "sha-256 "), ":", ""))
 	return fmt.Sprintf("v=1&a=%s&f=%s&c=%s&r=%s&o=%s", m.relay.addr, pin, token, g.Run, output)
 }
 
@@ -540,100 +531,49 @@ func playerEval(t *testing.T, page playwright.Page, expression string) any {
 	return result
 }
 
-// `cozy run play` prints a link from the run's machine receipt, the Hub's rental view and this
-// home's device key; the link plays in a browser. Each view that cannot serve says why, and
-// no link is printed.
+// `cozy run play` prints a link from the run's acceptance, the Hub's rental view and this home's
+// The ordinary CLI prints a direct link using the actual pinned machine and owner key.
+// It does not depend on Hub availability or a personal daemon upgrade. The browser follows
+// that exact printed link to the completed synthetic CPU film.
 func TestRunPlayPrintsALinkThatPlays(t *testing.T) {
-	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host=<standalone cozy-machine>")
+	if *playerBrowsers == "" {
+		t.Skip("requires -player-browsers=chrome")
 	}
-	ip := "127.0.0.1"
-	if *playerBrowsers != "" {
-		ip = playerLANAddress(t)
-	}
-	public, key, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	machine := webrtctest.NewMachine(t.TempDir(), public)
-	server := serveMachineMedia(t, ip, machine)
-	var mu sync.Mutex
-	view := map[string]any{}
-	hub := httptest.NewServer(machineKeyLogin("dk-play", public, "play-test", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		if r.URL.Path != "/v1/rentals/pr-play" || r.Header.Get("Authorization") != "Bearer play-test" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(view)
-	})))
-	defer hub.Close()
+	m := newMediaMachine(t)
 	pages := httptest.NewServer(http.FileServer(http.Dir(filepath.Join("..", "..", "web", "player"))))
 	defer pages.Close()
-
-	o := hostOwner(t, fmt.Sprintf("run-play-%d", time.Now().UnixNano()))
-	must(t, os.WriteFile(filepath.Join(o.root, config.FileName), []byte("tensorhub_url: "+hub.URL+
-		"\nplayer_url: "+pages.URL+"/index.html\n"), 0o600))
-	plantMachineKey(t, o.root, hub.URL, "dk-play", key)
-
-	// A run the rental "jaguarman" accepted as its run 7.
-	request, _, problem := o.store.Submit(records.Request{ID: "job-play", IdemKey: "play", Package: "local/example", Entrypoint: "main",
-		Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("play"), MachineExecutionObserver: true,
-		Hub: hub.URL, Rental: true, Worker: "pr-play", Machine: "jaguarman"})
-	fatal(t, problem)
-	fatal(t, o.store.LinkMachineExecution(request.ID, "pr-play"))
-	capture, spec := []byte(`{"capture":"play"}`), []byte(`{"invocation":"play"}`)
-	submission := &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "workspace", SubmissionId: request.IdemKey,
-		CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture),
-		Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}
-	fatal(t, o.store.RecordMachineSubmission(request.ID, submission))
-	fatal(t, o.store.AcceptMachineExecution(request.ID, &pb.MachineExecutionReceipt{RequestId: request.ID, SubmissionId: request.IdemKey,
-		CaptureDigest: submission.CaptureDigest, InvocationSpecDigest: submission.Offer.InvocationSpecDigest, AcceptedAtMs: 1000,
-		WorkerId: server.Machine, WorkerBootId: "boot-1", ExecutionWorkspaceId: "workspace", Number: 7}))
-	defer publicationControlAPI(t, o)()
-
-	play := func(state string, webrtc map[string]any, media string) (int, string) {
-		mu.Lock()
-		view = map[string]any{"rental_id": "pr-play", "name": "jaguarman", "state": state, "media_address": media}
-		if webrtc != nil {
-			view["webrtc"] = webrtc
-		}
-		mu.Unlock()
-		return runCozy(t, o.root, "run", "play", request.ID, "--json")
+	cfg := filepath.Join(m.root, config.FileName)
+	raw, err := os.ReadFile(cfg)
+	must(t, err)
+	must(t, os.WriteFile(cfg, append(raw, []byte("tensorhub_url: http://127.0.0.1:1\nplayer_url: "+pages.URL+"/index.html\n")...), 0o600))
+	for _, segment := range playerFilm(t) {
+		m.Append(7, segment, 500_000)
 	}
-	served := map[string]any{"address": server.Addr.String(), "fingerprint": server.Fingerprint}
-	for _, arm := range []struct {
-		name, state, media, says string
-		webrtc                   map[string]any
-	}{
-		{"an ended rental", "released", "", "is released", served},
-		{"an image before machines", "ready", "10.0.0.9:8444", "image that predates browser playback", nil},
-		{"a Hub or daemon before WebRTC", "ready", "", "its Hub (" + hub.URL + ") or its machine's daemon predates it", nil},
-	} {
-		if code, out := play(arm.state, arm.webrtc, arm.media); code == 0 || !strings.Contains(out, arm.says) || strings.Contains(out, "#v=1") {
-			t.Fatalf("%s: [%d] %s", arm.name, code, out)
-		}
-	}
-	code, out := play("ready", served, "")
+	m.End(7, "completed")
+	run := m.Begin(7).id
+	code, out := runCozy(t, m.root, "run", "play", run, "--json")
 	var printed struct{ Link string }
-	if code != 0 || json.Unmarshal([]byte(out), &printed) != nil || !strings.HasPrefix(printed.Link, pages.URL+"/index.html#v=1&a="+server.Addr.String()) {
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &printed) != nil {
 		t.Fatalf("cozy run play: [%d] %s", code, out)
 	}
-	if *playerBrowsers == "" {
-		return
+	parsed, err := url.Parse(printed.Link)
+	must(t, err)
+	link, err := url.ParseQuery(parsed.Fragment)
+	must(t, err)
+	grant, err := capability.Verify(link.Get("c"), m.Machine, []ed25519.PublicKey{m.public}, time.Now(), "")
+	must(t, err)
+	if parsed.Scheme+"://"+parsed.Host+parsed.Path != pages.URL+"/index.html" || link.Get("r") != run || grant.Run != run || grant.Machine != m.Machine || len(grant.Outputs) != 1 || grant.Outputs[0] != "video" {
+		t.Fatalf("the link names run %q; its capability grants %+v", link.Get("r"), grant)
 	}
-	for _, segment := range playerFilm(t) {
-		machine.Append(7, "video", -1, segment, 500_000)
-	}
-	machine.End(7, "completed")
 	pw, err := playwright.Run(&playwright.RunOptions{SkipInstallBrowsers: true})
 	must(t, err)
 	defer pw.Stop()
-	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Channel: playwright.String("chrome")})
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Channel: playwright.String("chrome"), Args: []string{"--disable-gpu"}})
 	must(t, err)
 	defer browser.Close()
 	page, err := browser.NewPage()
 	must(t, err)
+	must(t, page.AddInitScript(playwright.Script{Content: playwright.String(playerRecorder)}))
 	_, err = page.Goto(printed.Link)
 	must(t, err)
 	playerWait(t, page, "the printed link plays the film to its end", `video().ended && decoded(1.5, 36)`)
