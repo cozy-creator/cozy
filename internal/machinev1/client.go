@@ -105,7 +105,11 @@ func (c *Client) ReadLog(ctx context.Context, name string, tail uint64, w io.Wri
 	return c.read(ctx, &pb.ReadRequest{Target: &pb.ReadRequest_Log{Log: name}, Tail: tail}, w)
 }
 
+// read copies the bytes after the first frame into w and fails when fewer arrive than that
+// frame announced or w takes fewer than it was given.
 func (c *Client) read(ctx context.Context, request *pb.ReadRequest, w io.Writer) (*pb.ReadFrame, int64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stream, err := c.Machine.Read(ctx, request)
 	if err != nil {
 		return nil, 0, err
@@ -118,6 +122,9 @@ func (c *Client) read(ctx context.Context, request *pb.ReadRequest, w io.Writer)
 	for {
 		frame, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
+			if request.Offset > meta.Length || uint64(written) != meta.Length-request.Offset {
+				return meta, written, io.ErrUnexpectedEOF
+			}
 			return meta, written, nil
 		}
 		if err != nil {
@@ -125,6 +132,9 @@ func (c *Client) read(ctx context.Context, request *pb.ReadRequest, w io.Writer)
 		}
 		n, err := w.Write(frame.GetData())
 		written += int64(n)
+		if err == nil && n != len(frame.GetData()) {
+			err = io.ErrShortWrite
+		}
 		if err != nil {
 			return meta, written, err
 		}
