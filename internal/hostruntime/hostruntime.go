@@ -10,14 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // ToolFloor is the first released Runtime with everything this Cozy drives: a lower bound.
@@ -42,8 +40,6 @@ var InstallCommand = fmt.Sprintf(
 var hostRuntimeInstall = fmt.Sprintf("install cozy-runtime %s or newer: %s — then retry",
 	ToolFloor, InstallCommand)
 
-func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }
-
 // hostRuntimeVerdicts memoizes a tool's admission by resolved path: a version verb is one
 // interpreter start, and the host is asked once per daemon, not once per launch. Only an
 // admission is kept — a refused tool is re-asked on the next launch, so reinstalling it
@@ -53,10 +49,10 @@ var hostRuntimeVerdicts = struct {
 	admitted map[string]bool
 }{admitted: map[string]bool{}}
 
-// Path is the admitted tool: a cozy-runtime on PATH of this daemon's wire package, at
-// ToolFloor or newer. The tool answers typed CLI verbs (describe, image preparation, builtin
-// metadata) and never speaks the worker wire, so its wire minor is not compared: an older or
-// newer tool serves this daemon. The tool's own `version` verb is the fact, asked here.
+// Path is the admitted tool: a cozy-runtime on PATH at ToolFloor or newer. The tool answers
+// typed CLI verbs (describe, image preparation, builtin metadata) and speaks no machine
+// protocol to this Cozy, so the protocol it names is not read: a Runtime of cozy.worker.v1
+// and one of cozy.machine.v1 both serve. The tool's own `version` verb is the fact, asked here.
 func Path(env []string) (string, *exit.Error) {
 	path, err := exec.LookPath(Distribution)
 	if err != nil {
@@ -79,9 +75,8 @@ func Path(env []string) (string, *exit.Error) {
 	return path, nil
 }
 
-// admitHostRuntime runs `cozy-runtime --json version` once and reads the identity the tool
-// prints for itself: its distribution release and `wire_protocol`, the vendored protobuf
-// package joined to its additive minor as `<package>+minor.<n>`.
+// admitHostRuntime runs `cozy-runtime --json version` once and reads the release the tool
+// prints for itself.
 func admitHostRuntime(path string, env []string) *exit.Error {
 	cmd := exec.Command(path, "--json", "version")
 	cmd.Env = env
@@ -101,23 +96,10 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	var answer struct {
 		Distribution string `json:"distribution"`
-		WireProtocol string `json:"wire_protocol"`
 	}
 	if err := json.Unmarshal([]byte(stdout.String()), &answer); err != nil {
 		return unreadableHostRuntime(path, "`cozy-runtime --json version` answered a document "+
 			"this host cannot read: %s", err)
-	}
-	spoken, minorText, ok := strings.Cut(answer.WireProtocol, "+minor.")
-	_, err = strconv.ParseUint(minorText, 10, 32)
-	if !ok || err != nil {
-		return unreadableHostRuntime(path, "`cozy-runtime --json version` names wire_protocol %q, "+
-			"not <package>+minor.<n>", answer.WireProtocol)
-	}
-	if spoken != wirePackage() {
-		return exit.Named(exit.Structural, "host_runtime_wire_mismatch",
-			"cozy-runtime %s is release %s and speaks %s; this Cozy speaks %s",
-			path, answer.Distribution, answer.WireProtocol, wirePackage()).
-			WithRemedy("%s", hostRuntimeInstall)
 	}
 	release, err := pep440.Parse(answer.Distribution)
 	if err != nil {
