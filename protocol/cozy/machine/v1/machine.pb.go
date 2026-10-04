@@ -725,13 +725,17 @@ func (x *ModelChoice) GetProfiles() []string {
 }
 
 type Adapter struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Component     string                 `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
-	Model         string                 `protobuf:"bytes,2,opt,name=model,proto3" json:"model,omitempty"`
-	Release       string                 `protobuf:"bytes,3,opt,name=release,proto3" json:"release,omitempty"`
-	Lane          string                 `protobuf:"bytes,4,opt,name=lane,proto3" json:"lane,omitempty"`
-	Manifest      string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"`
-	Scale         string                 `protobuf:"bytes,6,opt,name=scale,proto3" json:"scale,omitempty"` // canonical decimal; empty means 1
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Component string                 `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
+	Model     string                 `protobuf:"bytes,2,opt,name=model,proto3" json:"model,omitempty"`
+	Release   string                 `protobuf:"bytes,3,opt,name=release,proto3" json:"release,omitempty"`
+	Lane      string                 `protobuf:"bytes,4,opt,name=lane,proto3" json:"lane,omitempty"`
+	Manifest  string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	Scale     string                 `protobuf:"bytes,6,opt,name=scale,proto3" json:"scale,omitempty"` // canonical decimal; empty means 1
+	// A provider source (civitai://<version>, hf://…) made here and normalized at ingest,
+	// under these reviewed profiles (none: the one its headers select); never with model.
+	Source        string   `protobuf:"bytes,7,opt,name=source,proto3" json:"source,omitempty"`
+	Profiles      []string `protobuf:"bytes,8,rep,name=profiles,proto3" json:"profiles,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -806,6 +810,20 @@ func (x *Adapter) GetScale() string {
 		return x.Scale
 	}
 	return ""
+}
+
+func (x *Adapter) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *Adapter) GetProfiles() []string {
+	if x != nil {
+		return x.Profiles
+	}
+	return nil
 }
 
 type MemoResult struct {
@@ -1198,6 +1216,8 @@ type Progress struct {
 	Total         uint64                 `protobuf:"varint,4,opt,name=total,proto3" json:"total,omitempty"`
 	BytesDone     uint64                 `protobuf:"varint,5,opt,name=bytes_done,json=bytesDone,proto3" json:"bytes_done,omitempty"`
 	BytesTotal    uint64                 `protobuf:"varint,6,opt,name=bytes_total,json=bytesTotal,proto3" json:"bytes_total,omitempty"`
+	StepMs        float64                `protobuf:"fixed64,7,opt,name=step_ms,json=stepMs,proto3" json:"step_ms,omitempty"`                            // the latest step's time, while a stage steps
+	StageFraction *float64               `protobuf:"fixed64,8,opt,name=stage_fraction,json=stageFraction,proto3,oneof" json:"stage_fraction,omitempty"` // how far this stage is, when it says
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1270,6 +1290,20 @@ func (x *Progress) GetBytesDone() uint64 {
 func (x *Progress) GetBytesTotal() uint64 {
 	if x != nil {
 		return x.BytesTotal
+	}
+	return 0
+}
+
+func (x *Progress) GetStepMs() float64 {
+	if x != nil {
+		return x.StepMs
+	}
+	return 0
+}
+
+func (x *Progress) GetStageFraction() float64 {
+	if x != nil && x.StageFraction != nil {
+		return *x.StageFraction
 	}
 	return 0
 }
@@ -1428,12 +1462,17 @@ func (x *LogLine) GetText() string {
 }
 
 type Outcome struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"` // succeeded, failed, canceled
-	Reason        *Reason                `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
-	Result        []byte                 `protobuf:"bytes,3,opt,name=result,proto3" json:"result,omitempty"` // the result's canonical JSON, assets as digests
-	Outputs       []*Product             `protobuf:"bytes,4,rep,name=outputs,proto3" json:"outputs,omitempty"`
-	Triage        bool                   `protobuf:"varint,5,opt,name=triage,proto3" json:"triage,omitempty"` // Read{triage} answers its bundle
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Status  string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"` // succeeded, failed, canceled
+	Reason  *Reason                `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	Result  []byte                 `protobuf:"bytes,3,opt,name=result,proto3" json:"result,omitempty"` // the result's canonical JSON, assets as digests
+	Outputs []*Product             `protobuf:"bytes,4,rep,name=outputs,proto3" json:"outputs,omitempty"`
+	Triage  bool                   `protobuf:"varint,5,opt,name=triage,proto3" json:"triage,omitempty"` // Read{triage} answers its bundle
+	// What its executor measured, as canonical JSON: `attribution` (stage and step tracks),
+	// `execution` (degree, ranks with the GPU and attention each served, executor boot,
+	// construction load and warm) and `observations` (attention rows, Sol's dense and sparse
+	// calls among them). Empty for a run that ran on no device.
+	Measurements  []byte `protobuf:"bytes,6,opt,name=measurements,proto3" json:"measurements,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1501,6 +1540,13 @@ func (x *Outcome) GetTriage() bool {
 		return x.Triage
 	}
 	return false
+}
+
+func (x *Outcome) GetMeasurements() []byte {
+	if x != nil {
+		return x.Measurements
+	}
+	return nil
 }
 
 type Reason struct {
@@ -2588,14 +2634,16 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x0fmanifest_length\x18\x06 \x01(\x04R\x0emanifestLength\x124\n" +
 	"\badapters\x18\a \x03(\v2\x18.cozy.machine.v1.AdapterR\badapters\x12\x16\n" +
 	"\x06source\x18\b \x01(\tR\x06source\x12\x1a\n" +
-	"\bprofiles\x18\t \x03(\tR\bprofiles\"\x9d\x01\n" +
+	"\bprofiles\x18\t \x03(\tR\bprofiles\"\xd1\x01\n" +
 	"\aAdapter\x12\x1c\n" +
 	"\tcomponent\x18\x01 \x01(\tR\tcomponent\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x18\n" +
 	"\arelease\x18\x03 \x01(\tR\arelease\x12\x12\n" +
 	"\x04lane\x18\x04 \x01(\tR\x04lane\x12\x1a\n" +
 	"\bmanifest\x18\x05 \x01(\tR\bmanifest\x12\x14\n" +
-	"\x05scale\x18\x06 \x01(\tR\x05scale\"q\n" +
+	"\x05scale\x18\x06 \x01(\tR\x05scale\x12\x16\n" +
+	"\x06source\x18\a \x01(\tR\x06source\x12\x1a\n" +
+	"\bprofiles\x18\b \x03(\tR\bprofiles\"q\n" +
 	"\n" +
 	"MemoResult\x12\x1c\n" +
 	"\toperation\x18\x01 \x01(\tR\toperation\x12-\n" +
@@ -2624,7 +2672,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x05state\x18\x03 \x01(\tR\x05state\x12\x1a\n" +
 	"\bsequence\x18\x04 \x01(\x04R\bsequence\x12\x18\n" +
 	"\aattempt\x18\x05 \x01(\rR\aattempt\x12\x18\n" +
-	"\awaiting\x18\x06 \x01(\tR\awaiting\"\xb0\x01\n" +
+	"\awaiting\x18\x06 \x01(\tR\awaiting\"\x88\x02\n" +
 	"\bProgress\x12\x14\n" +
 	"\x05stage\x18\x01 \x01(\tR\x05stage\x12\x1a\n" +
 	"\bfraction\x18\x02 \x01(\x01R\bfraction\x12\x1c\n" +
@@ -2633,7 +2681,10 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\n" +
 	"bytes_done\x18\x05 \x01(\x04R\tbytesDone\x12\x1f\n" +
 	"\vbytes_total\x18\x06 \x01(\x04R\n" +
-	"bytesTotal\"\xcf\x01\n" +
+	"bytesTotal\x12\x17\n" +
+	"\astep_ms\x18\a \x01(\x01R\x06stepMs\x12*\n" +
+	"\x0estage_fraction\x18\b \x01(\x01H\x00R\rstageFraction\x88\x01\x01B\x11\n" +
+	"\x0f_stage_fraction\"\xcf\x01\n" +
 	"\aProduct\x12\x16\n" +
 	"\x06output\x18\x01 \x01(\tR\x06output\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\rR\x05index\x12\x10\n" +
@@ -2647,13 +2698,14 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"durationUs\"3\n" +
 	"\aLogLine\x12\x14\n" +
 	"\x05level\x18\x01 \x01(\tR\x05level\x12\x12\n" +
-	"\x04text\x18\x02 \x01(\tR\x04text\"\xb6\x01\n" +
+	"\x04text\x18\x02 \x01(\tR\x04text\"\xda\x01\n" +
 	"\aOutcome\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12/\n" +
 	"\x06reason\x18\x02 \x01(\v2\x17.cozy.machine.v1.ReasonR\x06reason\x12\x16\n" +
 	"\x06result\x18\x03 \x01(\fR\x06result\x122\n" +
 	"\aoutputs\x18\x04 \x03(\v2\x18.cozy.machine.v1.ProductR\aoutputs\x12\x16\n" +
-	"\x06triage\x18\x05 \x01(\bR\x06triage\"N\n" +
+	"\x06triage\x18\x05 \x01(\bR\x06triage\x12\"\n" +
+	"\fmeasurements\x18\x06 \x01(\fR\fmeasurements\"N\n" +
 	"\x06Reason\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x16\n" +
@@ -2863,6 +2915,7 @@ func file_cozy_machine_v1_machine_proto_init() {
 		(*RunEvent_Outcome)(nil),
 		(*RunEvent_Memo)(nil),
 	}
+	file_cozy_machine_v1_machine_proto_msgTypes[12].OneofWrappers = []any{}
 	file_cozy_machine_v1_machine_proto_msgTypes[19].OneofWrappers = []any{
 		(*ReadRequest_Output)(nil),
 		(*ReadRequest_Triage)(nil),

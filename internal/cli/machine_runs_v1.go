@@ -539,6 +539,9 @@ func digestOf(path string) string {
 // judged; the export records those delivered and why the others were not), the triage bundle
 // beside a failure, then the outcome itself.
 func (m *machineRuns) collectV1(ctx context.Context, request records.Request, machine *machines.V1, outcome *v1.Outcome) *exit.Error {
+	// A destination that refuses its files, or bytes the machine no longer serves: the
+	// result stays with the machine, and `cozy run watch` collects it once the cause is gone.
+	var failure *exit.Error
 	if export, problem := m.store.OutputExportOf(request.ID); problem != nil {
 		return problem
 	} else if export != nil && export.State != "published" {
@@ -547,7 +550,6 @@ func (m *machineRuns) collectV1(ctx context.Context, request records.Request, ma
 			return problem
 		}
 		var paths, failed []string
-		var failure *exit.Error
 		for _, product := range records.Fold(products) {
 			if product.Path == "" {
 				continue
@@ -578,7 +580,7 @@ func (m *machineRuns) collectV1(ctx context.Context, request records.Request, ma
 			return problem
 		}
 	}
-	return m.store.RecordRunOutcomeV1(request.ID, outcome)
+	return m.store.RecordRunOutcomeV1(request.ID, outcome, failure)
 }
 
 // controlV1 sends a run's cancel, pause or resume to its machine.
