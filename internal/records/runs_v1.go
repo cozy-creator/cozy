@@ -183,6 +183,9 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 		if p.BytesTotal > 0 {
 			sample["bytes_done"], sample["bytes_total"] = p.BytesDone, p.BytesTotal
 		}
+		if p.StepMs > 0 {
+			sample["step_ms"] = p.StepMs
+		}
 		err = insert("machine.progress", map[string]any{"type": "progress", "payload": sample})
 	case *v1.RunEvent_Product:
 		if product != nil {

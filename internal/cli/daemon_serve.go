@@ -162,13 +162,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// worker, including after a daemon restart.
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
-	installs := machineset.NewInstalls(st, func(ctx context.Context, row records.RentalInstall, report func(machineset.InstallProgress)) *exit.Error {
-		models := orchestrator.DownloadModelRefs(row.Selection.Models)
-		if len(models) != len(row.Selection.Models) {
-			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
-		}
-		return machines.Prewarm(ctx, row.RentalID, row.Selection.Hub, row.WorkerBootID, row.Selection.Package, row.Selection.Release, models, report)
-	}, ctx.Out)
+	installs := machineset.NewInstalls(st, machines.Prewarm, ctx.Out)
 	fleet.installs = installs
 	installsStopped := make(chan struct{})
 	defer cancelInstalls()

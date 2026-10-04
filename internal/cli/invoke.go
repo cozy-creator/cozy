@@ -2903,31 +2903,8 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	if problem.Code != exit.NotFound || strings.HasPrefix(target.Package, "local/") {
 		return Target{}, nil, problem
 	}
-	// A known machine describes the release itself, at its own Hub: the run reads no Hub.
-	if machine, known, problem := knownMachine(ctx); problem != nil {
-		return Target{}, nil, problem
-	} else if known {
-		c, problem := dial(ctx)
-		if problem != nil {
-			return Target{}, nil, problem
-		}
-		described, problem := c.DescribeRelease(machine, target.Package, "")
-		if problem == nil {
-			packageInterface, problem := launch.DecodePackageInterface(described.PackageInterface)
-			if problem != nil {
-				return Target{}, nil, exit.Named(exit.Conflict, "machine.package_interface_invalid",
-					"the machine described an invalid package interface: %s", problem.Message)
-			}
-			target.Release = described.Release
-			return target, packageInterface, nil
-		}
-		if problem.Code != exit.Unavailable {
-			return Target{}, nil, problem
-		}
-		// The machine cannot answer now (a Runtime update): the run is still recorded and
-		// waits on it, and its release is read once at the Hub instead.
-	}
-	// Choosing a machine to rent reads the release at the Hub.
+	// A release this client has not installed is read once at the Hub: its immutable static
+	// description types the request and its results.
 	ref, problem := hub.ParseRef(target.Package)
 	if problem != nil {
 		return Target{}, nil, problem

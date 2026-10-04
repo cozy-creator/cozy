@@ -93,7 +93,7 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 		<-ctx.Done()
 		return exit.New(exit.Canceled, "controller disconnected")
 	}
-	q := machines.NewInstalls(store, prepare, io.Discard)
+	q := machines.NewInstalls(store, prepared(prepare), io.Discard)
 	accepted, problem := q.Accept(machine.ID, selection)
 	rentalInstallCheck(t, problem)
 	replayed, problem := q.Accept(machine.ID, selection)
@@ -143,13 +143,13 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	resumed, problem := records.Open(layout.DB)
 	rentalInstallCheck(t, problem)
 	defer resumed.Close()
-	q2 := machines.NewInstalls(resumed, func(_ context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
+	q2 := machines.NewInstalls(resumed, prepared(func(_ context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
 		calls.Add(1)
 		if !reflect.DeepEqual(row.Selection, selection) || row.WorkerBootID != "boot-proof" {
 			t.Errorf("recovery changed immutable inputs: %+v", row)
 		}
 		return nil
-	}, io.Discard)
+	}), io.Discard)
 	stop2 := runRentalInstallQueue(t, q2)
 	defer stop2()
 	waitRentalInstall(t, resumed, accepted.ID, "succeeded")
@@ -170,12 +170,12 @@ func TestRentalInstallQueueRetainsTypedTerminalFailures(t *testing.T) {
 			machine := rentalInstallMachine("converging")
 			rentalInstallCheck(t, store.RecordRental(machine))
 			selection := records.RentalInstallSelection{Models: []records.ModelRef{{Model: "paul/minimax-h3", Release: "1.0.0", Lane: "fp8", Manifest: "sha256:" + strings.Repeat("a", 64), ManifestLength: 321, CatalogRepository: "paul/minimax-h3"}}}
-			q := machines.NewInstalls(store, func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
+			q := machines.NewInstalls(store, prepared(func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
 				if state != "worker-refused" {
 					t.Error("terminal rental received work")
 				}
 				return exit.Named(exit.Structural, "worker.prepare_refused", "checkpoint removed")
-			}, io.Discard)
+			}), io.Discard)
 			row, problem := q.Accept(machine.ID, selection)
 			rentalInstallCheck(t, problem)
 			want := "rental.boot_failed"
@@ -213,10 +213,10 @@ func TestRentalInstallAdmissionAndStatusAPIWhileBooting(t *testing.T) {
 	rentalInstallCheck(t, problem)
 	defer owner.Close(time.Second)
 	credential := secret.New("installation-test-only")
-	q := machines.NewInstalls(store, func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
+	q := machines.NewInstalls(store, prepared(func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
 		t.Error("admission attempted a worker call")
 		return nil
-	}, io.Discard)
+	}), io.Discard)
 	server := api.New(api.Options{Orchestrator: owner, Cfg: config.Config{Home: layout.Root, HubURL: machine.Hub}, Creds: api.Credentials{CLI: credential}, Addr: "127.0.0.1:9191", RentalInstall: q.Accept})
 	handler, problem := server.Handler()
 	rentalInstallCheck(t, problem)
@@ -256,7 +256,7 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 	entered := make(chan string, 4)
 	release := make(chan struct{})
 	var calls, active atomic.Int32
-	q := machines.NewInstalls(store, func(ctx context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
+	q := machines.NewInstalls(store, prepared(func(ctx context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
 		if active.Add(1) != 1 {
 			t.Error("one rental received concurrent installations")
 		}
@@ -274,7 +274,7 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 			}
 		}
 		return nil
-	}, io.Discard)
+	}), io.Discard)
 	first, problem := q.Accept(machine.ID, records.RentalInstallSelection{Package: "proof/queued", Release: "1.0.0"})
 	rentalInstallCheck(t, problem)
 	second, problem := q.Accept(machine.ID, records.RentalInstallSelection{Package: "proof/queued", Release: "2.0.0"})
@@ -367,5 +367,12 @@ func TestQueuedRentalInstallReclaimsARestartedWorker(t *testing.T) {
 	pod.mu.Unlock()
 	if done.State != "succeeded" || done.WorkerBootID != podBootID || prepares != 1 {
 		t.Fatalf("installation was not claimed again on the new boot: %+v, %d preparations\n%s", done, prepares, tail(filepath.Join(root, "daemon.log")))
+	}
+}
+
+// prepared is an installation that produces no result.
+func prepared(prepare func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error) machines.Prepare {
+	return func(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) (json.RawMessage, *exit.Error) {
+		return nil, prepare(ctx, row, report)
 	}
 }

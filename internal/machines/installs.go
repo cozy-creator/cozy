@@ -2,6 +2,7 @@ package machines
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -16,7 +17,7 @@ import (
 // observation and attachment, and no installation can allocate or replace a rental.
 type Installs struct {
 	store   *records.Store
-	prepare func(context.Context, records.RentalInstall, func(InstallProgress)) *exit.Error
+	prepare Prepare
 	log     io.Writer
 	wake    chan struct{}
 	// progress is each running installation's latest preparation report, by install id.
@@ -36,7 +37,10 @@ type InstallStatus struct {
 	Progress *InstallProgress `json:"progress,omitempty"`
 }
 
-func NewInstalls(store *records.Store, prepare func(context.Context, records.RentalInstall, func(InstallProgress)) *exit.Error, log io.Writer) *Installs {
+// Prepare makes one installation on its machine, answering what it produced, if anything.
+type Prepare func(context.Context, records.RentalInstall, func(InstallProgress)) (json.RawMessage, *exit.Error)
+
+func NewInstalls(store *records.Store, prepare Prepare, log io.Writer) *Installs {
 	if log == nil {
 		log = io.Discard
 	}
@@ -183,7 +187,7 @@ func (q *Installs) Run(ctx context.Context) {
 					continue
 				}
 				if ended != nil {
-					q.report(q.store.SettleRentalInstall(row.ID, "failed", ended))
+					q.report(q.store.SettleRentalInstall(row.ID, "failed", nil, ended))
 					if held, ok := running[row.RentalID]; ok && held.id == row.ID {
 						held.cancel()
 					}
@@ -207,16 +211,16 @@ func (q *Installs) Run(ctx context.Context) {
 				go func(row records.RentalInstall) {
 					defer workers.Done()
 					defer cancel()
-					problem := q.prepare(work, row, func(progress InstallProgress) { q.progress.Store(row.ID, progress) })
+					result, problem := q.prepare(work, row, func(progress InstallProgress) { q.progress.Store(row.ID, progress) })
 					q.progress.Delete(row.ID)
 					state := "succeeded"
 					if problem != nil {
-						state = "failed"
+						state, result = "failed", nil
 						if work.Err() != nil || problem.Code == exit.Unavailable || problem.Code == exit.Canceled {
 							state = "queued"
 						}
 					}
-					q.report(q.store.SettleRentalInstall(row.ID, state, problem))
+					q.report(q.store.SettleRentalInstall(row.ID, state, result, problem))
 					select {
 					case done <- completion{rental: row.RentalID, retry: state == "queued"}:
 					case <-ctx.Done():

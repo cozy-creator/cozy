@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -61,26 +62,39 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 // what the machine reports. Interrupting stops only the watch; the installation goes on.
 func awaitRentalInstall(ctx *Context, client *localapi.Client, machine string, install records.RentalInstall) *exit.Error {
 	began := time.Now()
-	if problem := watchRentalInstall(ctx, client, machine, install); problem != nil {
+	settled, problem := watchRentalInstall(ctx, client, machine, install)
+	if problem != nil {
 		return problem
 	}
 	fields := []output.Field{{K: "id", V: install.ID}, {K: "rental", V: install.RentalID}, {K: "status", V: "succeeded"},
 		{K: "target", V: rentalInstallTarget(install.Selection)}, {K: "elapsed", V: time.Since(began).Round(time.Second).String()}}
-	return emit(ctx, compactRecord(fields, "id", "rental", "status", "target", "elapsed"))
+	shown := []string{"id", "rental", "status", "target", "elapsed"}
+	// An upload names the checkpoint it put in its destination.
+	var result struct {
+		Models []struct {
+			Published *struct{ Destination, Checkpoint string } `json:"published"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(settled.Result, &result) == nil && len(result.Models) == 1 && result.Models[0].Published != nil {
+		published := result.Models[0].Published
+		fields = append(fields, output.Field{K: "destination", V: published.Destination}, output.Field{K: "checkpoint", V: published.Checkpoint})
+		shown = append(shown, "destination", "checkpoint")
+	}
+	return emit(ctx, compactRecord(fields, shown...))
 }
 
-func watchRentalInstall(ctx *Context, client *localapi.Client, machine string, install records.RentalInstall) *exit.Error {
+func watchRentalInstall(ctx *Context, client *localapi.Client, machine string, install records.RentalInstall) (records.RentalInstall, *exit.Error) {
 	lastStage, shownAt, shownBytes := "", time.Now(), uint64(0)
 	for {
 		status, problem := client.RentalInstall(install.RentalID, install.ID)
 		if problem != nil {
-			return problem
+			return install, problem
 		}
 		switch status.State {
 		case "succeeded":
-			return nil
+			return status.RentalInstall, nil
 		case "failed":
-			return exit.Named(exit.Failed, either(status.ErrorCode, "rental_install.failed"), "%s: %s", machine, status.Error)
+			return install, exit.Named(exit.Failed, either(status.ErrorCode, "rental_install.failed"), "%s: %s", machine, status.Error)
 		}
 		stage, done, total := status.State, uint64(0), uint64(0)
 		if p := status.Progress; p != nil {
@@ -107,6 +121,10 @@ func rentalInstallTarget(selection records.RentalInstallSelection) string {
 	}
 	models := make([]string, 0, len(selection.Models))
 	for _, model := range selection.Models {
+		if selection.Destination != "" {
+			models = append(models, either(model.Source, model.Manifest)+" -> "+selection.Destination)
+			continue
+		}
 		name := model.Model
 		if model.Release != "" {
 			name += "@" + model.Release

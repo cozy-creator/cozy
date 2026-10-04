@@ -90,7 +90,8 @@ func holdCheckpoint(ctx *Context, source string) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return watchRentalInstall(ctx, client, either(ctx.Inv.Value("--rental"), machine), install)
+	_, problem = watchRentalInstall(ctx, client, either(ctx.Inv.Value("--rental"), machine), install)
+	return problem
 }
 
 // quantizer is the package's job that writes `lane`: a model input and one weights output

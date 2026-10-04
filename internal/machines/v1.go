@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -23,7 +24,11 @@ type V1 struct {
 	Local bool
 	// Rented is a rental's machine: it reads its own Hub with the pod's capability, so a run
 	// sends it no Hub access.
-	Rented  bool
+	Rented bool
+	// HubID, Owned and Account name the machine at its Hub, as Machine's methods do.
+	HubID   string
+	Owned   bool
+	Account *hub.Client
 	release func()
 }
 
@@ -64,7 +69,8 @@ func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.
 		return nil, Transport(err)
 	}
 	return &V1{Client: client, Name: name, WorkerID: t.workerID, BootID: t.bootID, Leaf: t.pin.DER(),
-		Local: t.lifetime != "", Rented: t.lifetime == "", release: machine.release}, nil
+		Local: t.lifetime != "", Rented: t.lifetime == "", HubID: machine.hubID, Owned: machine.owned, Account: machine.hub,
+		release: machine.release}, nil
 }
 
 // DialEndpointV1 opens an explicit endpoint's cozy.machine.v1 API. An endpoint that is one of

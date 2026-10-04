@@ -3,6 +3,7 @@ package cli
 import (
 	"archive/tar"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	machinepb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
@@ -31,7 +32,6 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -371,10 +371,28 @@ func (c *machineConnection) prepareModels(ctx context.Context, request records.R
 	return readMachinePreparedSet(stream, c.runs.preparationPhase(request.ID, revision.Package).observe)
 }
 
-// Prewarm prepares a published package, its selected models, or models alone on a machine
-// without running anything: `cozy package install` and `cozy model download` for any
-// machine. bootID, when set, is the worker lifetime the selection was queued for.
-func (m *machineRuns) Prewarm(ctx context.Context, machine, hub, bootID, pkg, release string, models []*pb.DownloadModelRef, report func(machines.InstallProgress)) *exit.Error {
+// Prewarm makes one installation on its machine without running anything: `cozy package
+// install`, `cozy model download` and `cozy model upload`. A cozy.machine.v1 machine takes it
+// as a warm run; any other prepares it over worker.v1, which takes no uploads.
+func (m *machineRuns) Prewarm(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) (json.RawMessage, *exit.Error) {
+	result, problem := m.prewarmV1(ctx, row, report)
+	if problem != errNotV1 {
+		return result, problem
+	}
+	selection := row.Selection
+	if selection.Destination != "" {
+		return nil, exit.Named(exit.Structural, "machine.upload_unsupported", "this machine takes no model uploads; %s", machines.RuntimeUpdate(row.RentalID))
+	}
+	models := orchestrator.DownloadModelRefs(selection.Models)
+	if len(models) != len(selection.Models) {
+		return nil, exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
+	}
+	return nil, m.prewarmWorker(ctx, row.RentalID, selection.Hub, row.WorkerBootID, selection.Package, selection.Release, models, report)
+}
+
+// prewarmWorker is Prewarm over worker.v1. bootID, when set, is the worker lifetime the
+// selection was queued for.
+func (m *machineRuns) prewarmWorker(ctx context.Context, machine, hub, bootID, pkg, release string, models []*pb.DownloadModelRef, report func(machines.InstallProgress)) *exit.Error {
 	connection, problem := m.connectAtHub(ctx, machine, hub, "installing "+either(pkg, "models"))
 	if problem != nil {
 		return problem
@@ -409,34 +427,6 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, hub, bootID, pkg, re
 
 // Forget drops the kept connection to a machine, so a rental's credentials can be removed.
 func (m *machineRuns) Forget(machine string) { m.machines.Forget(machine) }
-
-// Describe asks the machine for a published release's interface, as it reads it at its own Hub.
-func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release string) (api.DescribedRelease, *exit.Error) {
-	connection, problem := m.connectAtHub(ctx, machine, hub, "describing "+pkg)
-	if problem != nil {
-		return api.DescribedRelease{}, problem
-	}
-	defer connection.Close()
-	var header, trailer metadata.MD
-	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{
-		Claim: connection.Claim, Describe: &pb.PackageSelection{Package: pkg, Release: release, Hub: connection.Hub}}, grpc.Header(&header), grpc.Trailer(&trailer))
-	if runtimeUnavailable(header, trailer) {
-		return api.DescribedRelease{}, waitForRuntime()
-	}
-	if err != nil {
-		return api.DescribedRelease{}, machineTransport(err)
-	}
-	described := workspace.GetDescribedRelease()
-	if described == nil {
-		return api.DescribedRelease{}, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
-			"this machine's Runtime describes no release; %s", machines.RuntimeUpdate(machine))
-	}
-	if described.Package != pkg || described.Release == "" || release != "" && described.Release != release {
-		return api.DescribedRelease{}, exit.New(exit.Conflict, "the machine described another release than %s", pkg)
-	}
-	keepReleaseInterface(m.layout.Root, pkg, described.Release, described.PackageInterface, nil)
-	return api.DescribedRelease{Package: described.Package, Release: described.Release, PackageInterface: described.PackageInterface}, nil
-}
 
 // Status reads one machine's picture over cozy.machine.v1 as its owner.
 func (m *machineRuns) Status(ctx context.Context, machine string) (api.MachineStatus, *exit.Error) {
