@@ -1,4 +1,4 @@
-# Install or upgrade cozy and this host's tool (cozy-runtime) —
+# Install or upgrade cozy and this host's tools (cozy-runtime and TensorFS's tfs) —
 # install.sh's Windows twin (#449).
 #
 #   scripts\install.ps1 -Asset <cozy-*.zip|.tar.gz> [-Sums <SHA256SUMS> | -Sha256 <hex>]
@@ -28,11 +28,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$hostTools = @('tool', 'install', '--force', '--refresh-package', 'cozy-runtime', '--python', '3.12', 'cozy-runtime[media,model-execution]>=0.18.67')
+$hostTools = @('tool', 'install', '--force', '--refresh-package', 'cozy-runtime', '--refresh-package', 'tensorfs', '--python', '3.12', '--with-executables-from', 'tensorfs', 'cozy-runtime[media,model-execution]>=0.18.67')
 
 if ([bool]$Asset -eq [bool]$Binary) { Write-Error "refusing: give exactly one of -Asset or -Binary"; exit 2 }
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    Write-Error "refusing: uv is required to install cozy-runtime — https://docs.astral.sh/uv/getting-started/installation/"; exit 6
+    Write-Error "refusing: uv is required to install cozy-runtime and tfs — https://docs.astral.sh/uv/getting-started/installation/"; exit 6
 }
 if ($Binary -and -not (Test-Path $Binary)) { Write-Error "refusing: no such binary: $Binary"; exit 4 }
 if ($Asset -and -not (Test-Path $Asset)) { Write-Error "refusing: no such asset: $Asset"; exit 4 }
@@ -80,10 +80,13 @@ try {
     & $new[0].FullName -v | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Error "refusing: the new cozy binary does not run; nothing was replaced"; exit 13 }
 
+    # A standalone tensorfs tool would still claim tfs (see install.sh).
+    if ((& uv tool list 2>$null) -match '^tensorfs ') { & uv tool uninstall tensorfs }
     & uv @hostTools
     if ($LASTEXITCODE -ne 0) { Write-Error "refusing: host tool installation failed; cozy was not replaced"; exit 13 }
     $tools = (& uv tool dir --bin).Trim()
     $runtime = ((& (Join-Path $tools "cozy-runtime.exe") version) -match '^distribution:') -replace '^distribution:\s*', ''
+    $tfs = (& (Join-Path $tools "tfs.exe") version).Trim()
 
     # Sweep strays a PREVIOUS side-by-side replacement left behind; one still held open
     # by a running process simply stays for the next sweep.
@@ -107,4 +110,5 @@ Write-Output "prefix:   $Prefix"
 Write-Output "was:      $was"
 Write-Output "now:      $now"
 Write-Output "runtime:  cozy-runtime $runtime"
+Write-Output "tfs:      $tfs"
 Write-Output "note:     add $bin and $tools to PATH if they are not already there"

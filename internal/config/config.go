@@ -27,6 +27,7 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/secret"
+	"github.com/robfig/cron/v3"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -119,6 +120,13 @@ type Config struct {
 	// configuration it read.
 	Digest string
 
+	// MaintenanceGCCron is when the daemon runs the store's reclamation pass (owner ruling
+	// 2026-09-02: repo-CAS garbage collection runs on a cron job). A cadence, never a
+	// decision: what is reclaimed is TensorFS's call from its filesystem census. Standard
+	// five-field cron; empty disables the scheduled pass (`cozy model remove` and `cozy
+	// model gc` still reclaim on demand).
+	MaintenanceGCCron string
+
 	// PlayerURL is the page `cozy run play` links open: GitHub Pages' build of web/player
 	// unless another build is configured.
 	PlayerURL string
@@ -140,6 +148,7 @@ type values struct {
 	RentalsDevelopment       bool   `name:"rentals_development" default:"true"`
 	RentalsSSHPublicKey      string `name:"rentals_ssh_public_key"`
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
+	MaintenanceGCCron        string `name:"maintenance_gc_cron" default:"0 3 * * *"`
 	PlacementPrefer          string `name:"placement_prefer" default:"balanced"`
 	PlayerURL                string `name:"player_url" default:"https://cozy-creator.github.io/cozy/play/"`
 	Port                     int    `name:"port" default:"8818"`
@@ -168,6 +177,7 @@ var behaviour = map[string]struct {
 	"local_rate_micro_usd_per_hour": {"local_rate_micro_usd_per_hour", nonNegative},
 	"rentals_development":           {"rentals.development", boolean},
 	"daemon_idle_shutdown_s":        {"daemon.idle_shutdown_s", nonNegative},
+	"maintenance_gc_cron":           {"maintenance.gc_cron", cronSchedule},
 	"placement_prefer":              {"placement.prefer", oneOf("fast", "balanced", "cheap")},
 	"port":                          {"port", tcpPort},
 	"yield":                         {"yield", oneOf("smart", "always", "never")},
@@ -187,6 +197,15 @@ func boolean(raw string) error {
 		return nil
 	}
 	return fmt.Errorf("is not true or false")
+}
+
+func cronSchedule(raw string) error {
+	if expr := strings.TrimSpace(raw); expr != "" {
+		if _, err := cron.ParseStandard(expr); err != nil {
+			return fmt.Errorf("is not a five-field cron schedule")
+		}
+	}
+	return nil
 }
 
 func tcpPort(raw string) error {
@@ -248,6 +267,7 @@ var fileKeys = map[string]bool{
 	"yield":                         true,
 	"rentals":                       true,
 	"daemon":                        true,
+	"maintenance":                   true,
 	"placement":                     true,
 	"hubs":                          true,
 	"machine":                       true,
@@ -258,9 +278,10 @@ var fileKeys = map[string]bool{
 var nestedFileKeys = map[string]map[string]string{
 	"rentals": {"development": "rentals_development",
 		"ssh_public_key": "rentals_ssh_public_key"},
-	"daemon":    {"idle_shutdown_s": "daemon_idle_shutdown_s"},
-	"placement": {"prefer": "placement_prefer"},
-	"machine":   {"gpu_budget": "machine_gpu_budget"},
+	"daemon":      {"idle_shutdown_s": "daemon_idle_shutdown_s"},
+	"maintenance": {"gc_cron": "maintenance_gc_cron"},
+	"placement":   {"prefer": "placement_prefer"},
+	"machine":     {"gpu_budget": "machine_gpu_budget"},
 }
 
 var environmentNames = map[string]string{
@@ -457,6 +478,7 @@ func load() (Config, *exit.Error) {
 		RentalsDevelopment:       input.RentalsDevelopment,
 		RentalsSSHPublicKey:      strings.TrimSpace(input.RentalsSSHPublicKey),
 		DaemonIdleShutdown:       time.Duration(input.DaemonIdleShutdownS) * time.Second,
+		MaintenanceGCCron:        strings.TrimSpace(input.MaintenanceGCCron),
 		PlacementPrefer:          input.PlacementPrefer,
 		PlayerURL:                strings.TrimSpace(input.PlayerURL),
 		Digest:                   digest,
