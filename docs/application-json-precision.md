@@ -31,3 +31,8 @@ result spool), a captured child incorrectly classified as serving, and CLI JSON 
 through TOON's float64 reader. Each was corrected and the same authored request rerun. JSON
 now serializes the original typed document directly; TOON's default rendering and protocol
 JCS remain unchanged. Application-only changes do not redefine wire metadata profiles.
+
+The ordinary default CLI rendering was also checked with uint64 maximum and float 1.0.
+TOON values that cannot round-trip application numeric semantics now use the existing
+JSON fallback. Representable TOON output keeps its format, and human scalar results retain
+precise JSON numbers. The extended ordinary CLI/API consumer check passed47.628s.
