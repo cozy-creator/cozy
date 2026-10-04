@@ -368,6 +368,12 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	} else {
 		state.ExecutionMS, state.ExecutionKnown = measured, known
 	}
+	if state.Status == "canceled" {
+		// A canceled run says WHO (cl-108), as a job without a machine does.
+		if actor, _, _, problem := s.store.CancelAttribution(row.ID); problem == nil {
+			state.CanceledBy = actor
+		}
+	}
 	return state
 }
 
