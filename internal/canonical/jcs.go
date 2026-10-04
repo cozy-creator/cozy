@@ -38,6 +38,12 @@ type jcsPair struct {
 // content. Insignificant whitespace, object-key order and equivalent number spellings
 // disappear before identity is computed. Duplicate keys and out-of-profile numbers refuse.
 func NormalizeJCS(data []byte) ([]byte, error) {
+	return normalizeJSON(data, jcsNumber)
+}
+
+// normalizeJSON shares the bounded parser/string renderer. Numeric semantics belong
+// to the selected entry point; protocol JCS always selects jcsNumber above.
+func normalizeJSON(data []byte, number func(string) (string, error)) ([]byte, error) {
 	if len(data) == 0 || len(data) > DocMax {
 		return nil, refuse("size_cap", "%d B is outside the 1..%d B range", len(data), DocMax)
 	}
@@ -49,7 +55,7 @@ func NormalizeJCS(data []byte) ([]byte, error) {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	value, err := readJCS(decoder, 0)
+	value, err := readJCS(decoder, 0, number)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +134,7 @@ func hexQuad(data []byte, at int) (uint16, bool) {
 	return value, true
 }
 
-func readJCS(decoder *json.Decoder, depth int) (jcsNode, error) {
+func readJCS(decoder *json.Decoder, depth int, number func(string) (string, error)) (jcsNode, error) {
 	if depth > jcsDepthMax {
 		return jcsNode{}, refuse("depth_cap", "nesting deeper than %d", jcsDepthMax)
 	}
@@ -144,7 +150,7 @@ func readJCS(decoder *json.Decoder, depth int) (jcsNode, error) {
 	case string:
 		return jcsNode{kind: 's', text: value}, nil
 	case json.Number:
-		canonical, err := jcsNumber(string(value))
+		canonical, err := number(string(value))
 		if err != nil {
 			return jcsNode{}, err
 		}
@@ -154,7 +160,7 @@ func readJCS(decoder *json.Decoder, depth int) (jcsNode, error) {
 		case '[':
 			items := []jcsNode{}
 			for decoder.More() {
-				item, err := readJCS(decoder, depth+1)
+				item, err := readJCS(decoder, depth+1, number)
 				if err != nil {
 					return jcsNode{}, err
 				}
@@ -177,7 +183,7 @@ func readJCS(decoder *json.Decoder, depth int) (jcsNode, error) {
 					return jcsNode{}, refuse("duplicate_key", "key %q appears twice", key)
 				}
 				seen[key] = true
-				item, err := readJCS(decoder, depth+1)
+				item, err := readJCS(decoder, depth+1, number)
 				if err != nil {
 					return jcsNode{}, err
 				}
