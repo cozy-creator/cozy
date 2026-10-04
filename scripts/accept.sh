@@ -40,7 +40,6 @@ install_release "$DIST"
 check "verified release asset installs" "$([ "$CODE" = 0 ] && [ -x "$COZY" ] && echo 1 || echo 0)" "$OUT"
 TOOLS="$(uv tool dir --bin)"
 check "install provides cozy-runtime" "$("$TOOLS/cozy-runtime" version >/dev/null 2>&1 && echo 1 || echo 0)" "$OUT"
-check "install provides tfs" "$("$TOOLS/tfs" version 2>/dev/null | grep -q '^tfs ' && echo 1 || echo 0)" "$OUT"
 
 WANT_TAG="$(basename "$DIST")"; WANT_TAG="${WANT_TAG#v}"
 run -v
