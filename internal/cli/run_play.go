@@ -85,9 +85,10 @@ func handleRunPlay(ctx *Context) *exit.Error {
 	if err != nil {
 		return exit.New(exit.Validation, "player URL is invalid: %s", err)
 	}
-	player.Fragment = fragment.Encode()
+	player.Fragment = ""
+	linkURL := player.String() + "#" + fragment.Encode()
 	return emit(ctx, compactRecord([]output.Field{{K: "run", V: runReference(row.Number, row.ID)}, {K: "output", V: name},
-		{K: "expires", V: time.Now().Add(lifetime).UTC().Format(time.RFC3339)}, {K: "link", V: player.String()}}, "link"))
+		{K: "expires", V: time.Now().Add(lifetime).UTC().Format(time.RFC3339)}, {K: "link", V: linkURL}}, "link"))
 }
 func playMachine(ctx *Context, layout home.Layout, store *records.Store, row records.Request, link *records.MachineExecution) (*machinev1.Client, *pb.StatusFrame, *exit.Error) {
 	var address, worker, boot string
