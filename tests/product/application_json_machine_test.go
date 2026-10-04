@@ -13,6 +13,7 @@ import (
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -138,12 +139,12 @@ async def echo(ctx: Context, payload: Request) -> Value:
 	fatal(t, problem)
 	var state api.JobState
 	landed(t, "typed API job to complete", func() bool {
-		var p error
 		state, problem = client.Job(h.JobID)
-		if problem != nil {
-			p = problem
+		fatal(t, problem)
+		if state.Status == "failed" || state.Status == "canceled" {
+			t.Fatalf("typed API root ended %s: %s %s", state.Status, state.ErrorCode, state.Error)
 		}
-		return p == nil && (state.Status == "completed" || state.Status == "succeeded")
+		return state.Status == "completed" || state.Status == "succeeded"
 	})
 	result, err := json.Marshal(state.Result)
 	must(t, err)
@@ -156,8 +157,8 @@ async def echo(ctx: Context, payload: Request) -> Value:
 	}
 	for _, changed := range []string{`{"seed":18446744073709551614,"number":1.0,"ordered":[2,1]}`, `{"seed":18446744073709551615,"number":1,"ordered":[2,1]}`, `{"seed":18446744073709551615,"number":1.0,"ordered":[1,2]}`} {
 		sub.Input = json.RawMessage(changed)
-		if _, problem := client.SubmitJob(sub, "json-api-semantic-replay"); problem == nil {
-			t.Fatalf("changed API intent reattached: %s", changed)
+		if _, problem := client.SubmitJob(sub, "json-api-semantic-replay"); problem == nil || problem.Code != exit.Conflict {
+			t.Fatalf("changed API intent did not conflict: %s (%v)", changed, problem)
 		}
 	}
 }
