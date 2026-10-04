@@ -452,24 +452,43 @@ func (m *machineRuns) Status(ctx context.Context, machine string) (api.MachineSt
 	return statusOf(frame), nil
 }
 
-// machineLogs maps the log names clients use to the logs machines keep.
-var machineLogs = map[string]pb.MachineLog{"tensorfs": pb.MachineLog_MACHINE_LOG_TENSORFS_TRANSPORT}
+// machineLogs maps the log names clients use to the logs machines keep: the name
+// cozy.machine.v1 Read takes, and worker.v1's.
+var machineLogs = map[string]struct {
+	name string
+	kept pb.MachineLog
+}{"tensorfs": {"tensorfs-transport", pb.MachineLog_MACHINE_LOG_TENSORFS_TRANSPORT}}
 
-// MachineLog reads one log a machine keeps (wire 72). A machine whose agent predates the
-// read answers a note in Unavailable, never a failure.
+// MachineLog reads one log a machine keeps, with cozy.machine.v1 Read. A machine serving no
+// v1 (the Go agent) is read on worker.v1 (wire 72); one predating that answers a note in
+// Unavailable, never a failure.
 func (m *machineRuns) MachineLog(ctx context.Context, machine, log string, tailBytes uint64) (api.MachineLog, *exit.Error) {
 	kept, ok := machineLogs[log]
 	if !ok {
 		return api.MachineLog{}, exit.Named(exit.NotFound, "machine.log_unknown", "machines keep no log %q", log)
+	}
+	out := api.MachineLog{Log: log}
+	var text strings.Builder
+	v1, problem := m.machines.DialV1(ctx, machine, "reading its logs")
+	if problem != nil {
+		return api.MachineLog{}, problem
+	}
+	_, _, err := v1.ReadLog(ctx, kept.name, tailBytes, &text)
+	v1.Close()
+	if err == nil {
+		out.Text = text.String()
+		return out, nil
+	}
+	if status.Code(err) != codes.Unimplemented {
+		return api.MachineLog{}, machines.Transport(err)
 	}
 	connection, problem := m.connect(ctx, machine, "reading its logs")
 	if problem != nil {
 		return api.MachineLog{}, problem
 	}
 	defer connection.Close()
-	out := api.MachineLog{Log: log}
-	stream, err := connection.Host.ReadMachineLog(ctx, &pb.MachineLogQuery{Claim: connection.Claim, Log: kept, TailBytes: tailBytes})
-	var text strings.Builder
+	text.Reset()
+	stream, err := connection.Host.ReadMachineLog(ctx, &pb.MachineLogQuery{Claim: connection.Claim, Log: kept.kept, TailBytes: tailBytes})
 	for err == nil {
 		var chunk *pb.MachineLogChunk
 		if chunk, err = stream.Recv(); err == nil {

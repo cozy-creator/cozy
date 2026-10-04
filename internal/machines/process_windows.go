@@ -3,6 +3,7 @@
 package machines
 
 import (
+	"io/fs"
 	"os"
 	"os/exec"
 )
@@ -17,3 +18,5 @@ func terminate(pid int) error {
 	}
 	return process.Kill()
 }
+
+func diskOf(info fs.FileInfo) (uint64, int64, int64) { return 0, 1, info.Size() }
