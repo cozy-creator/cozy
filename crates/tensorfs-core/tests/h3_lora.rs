@@ -107,7 +107,6 @@ fn plan(file: &transaction::SourceFile) -> tensorfs_core::err::Result<convert::P
             components: vec![("adapter".into(), "plain/1".into())],
         },
         &specs(),
-        &Default::default(),
     )?;
     let order = p
         .ops

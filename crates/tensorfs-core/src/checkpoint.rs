@@ -76,17 +76,6 @@ pub fn objectize<R: Read>(
     shape: Vec<u64>,
     src: &mut R,
 ) -> Result<Written> {
-    objectize_held(store, what, dtype, shape, src, None)
-}
-
-pub fn objectize_held<R: Read>(
-    store: &Store,
-    what: &str,
-    dtype: Dtype,
-    shape: Vec<u64>,
-    src: &mut R,
-    operation: Option<&str>,
-) -> Result<Written> {
     let want = checked_bytes(what, &shape, dtype)?;
     let mut whole = Sha256::new();
     let stored = if want > limits::GRID_BYTES {
@@ -94,9 +83,9 @@ pub fn objectize_held<R: Read>(
             r: src,
             h: &mut whole,
         };
-        store_part_held(store, what, dtype, shape, &mut tee, operation)?
+        store_part_held(store, what, dtype, shape, &mut tee, None)?
     } else {
-        store_part_held(store, what, dtype, shape, src, operation)?
+        store_part_held(store, what, dtype, shape, src, None)?
     };
     let digest = match &stored.part.body {
         Body::Inline(bytes) => sha256::hex_digest(bytes),

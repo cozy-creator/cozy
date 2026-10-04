@@ -419,3 +419,23 @@ pub fn capability_records() -> crate::capability::CapabilityRecords {
 pub fn platform_digests() -> Vec<String> {
     seeds().iter().map(|s| s.spec.object_id()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every seed that carries vectors references exactly them, and they fit its roles:
+    /// checked once here rather than on every derived commit.
+    #[test]
+    fn every_seed_references_its_own_vectors_and_they_fit_its_roles() {
+        for seed in seeds() {
+            let Some(vectors) = &seed.vectors else {
+                continue;
+            };
+            assert_eq!(seed.spec.vectors.as_ref(), Some(&vectors.fixture_ref()), "{}", seed.alias);
+            vectors.check(&seed.spec).unwrap();
+            let parsed = EncodingVectors::parse_fixture(&vectors.fixture_bytes()).unwrap();
+            assert_eq!(parsed.fixture_ref(), vectors.fixture_ref(), "{}", seed.alias);
+        }
+    }
+}

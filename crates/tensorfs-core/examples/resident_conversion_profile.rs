@@ -105,7 +105,7 @@ fn main() {
         .filter(|s| s.alias == "plain/1")
         .map(|s| (s.alias.to_string(), s.spec))
         .collect::<Vec<_>>();
-    let mut plan = convert::plan(conv, &sources, &target, &specs, &Default::default()).unwrap();
+    let mut plan = convert::plan(conv, &sources, &target, &specs).unwrap();
     let order = plan
         .ops
         .iter()

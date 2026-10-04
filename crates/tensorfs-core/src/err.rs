@@ -71,7 +71,6 @@ codes![
     // manifest
     PATH_ILLEGAL,
     PATH_ORDER,
-    PATH_PARENT_MISSING,
     PATH_CASE_COLLISION,
     PATH_RESERVED,
     PATH_DIGEST_MISMATCH,
@@ -111,9 +110,7 @@ codes![
     // ingest border: classification and authorization
     UNREGISTERED_FINGERPRINT,
     AMBIGUOUS_CLASSIFICATION,
-    PROFILE_REQUIRED,
     TENSOR_SCHEMA_MISMATCH,
-    DIALECT_MISMATCH,
     // ingest border: conversion
     CONVERTS_NOTHING,
     MISSING_COMPANION_ROLE,
@@ -128,7 +125,6 @@ codes![
     ADAPTER_TARGET_UNSUPPORTED,
     // ingest border: the temporary candidate transaction
     QUOTA_EXHAUSTED,
-    ROOT_EXPIRED,
     ROOT_ABSENT,
     TRANSACTION_CONFLICT,
     TRANSACTION_CLOSED,
@@ -143,7 +139,6 @@ codes![
     TRAVERSAL_INCOMPLETE,
     TRAVERSAL_ORDER_MISMATCH,
     CONSTRUCTION_ORDER_REQUIRED,
-    PERMUTE_NOT_BLOCK_GRANULAR,
     SLOT_STARVED,
     FD_HEADROOM,
     PLATFORM_UNSUPPORTED,
@@ -151,19 +146,12 @@ codes![
     BLOB_NOT_RETAINED,
     // request-time fit
     MISSING_COMPONENT,
-    EXTRA_COMPONENT,
-    EXTRA_TENSOR,
-    UNCLASSIFIED_EXTRAS,
     // Stamp and the hermetic verifier
     STAMP_MISMATCH,
     EVIDENCE_NOT_RESIDENT,
     VERIFIER_OUTPUT_INCOMPLETE,
     // roots, holds and GC (tfs-006)
-    LOCK_CONTENDED,
-    ROOT_GENERATION,
     CENSUS_INCOMPLETE,
-    SWEEP_SET_INCOMPLETE,
-    SNAPSHOT_PINNED,
     STORE_BUSY,
     DURABILITY_UNPROVEN,
     // reclamation (tfs-065): choosing what to stop naming, so a collection can free it

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use tensorfs_core::canon::Value;
-use tensorfs_core::catalog::{Catalog, WriterGuard};
+use tensorfs_core::catalog::WriterGuard;
 use tensorfs_core::err::{Code, Refusal};
 use tensorfs_core::gc;
 use tensorfs_core::header::{Body, Header};
@@ -834,20 +834,6 @@ pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {
     let projection = ok!(census_value.projection());
     if let Some(rows) = flag(flags, "rows") {
         if let Err(error) = storage::write_json_lines(Path::new(rows), &projection.json_lines()) {
-            return bail(error);
-        }
-    }
-    if let Some(sqlite) = flag(flags, "sqlite") {
-        let path = Path::new(sqlite);
-        if path.file_name().and_then(|value| value.to_str()) != Some("tensorfs.sqlite") {
-            eprintln!("--sqlite path must end in tensorfs.sqlite");
-            return ExitCode::from(2);
-        }
-        let Some(root) = path.parent() else {
-            return ExitCode::from(2);
-        };
-        let catalog = ok!(Catalog::initialize(root));
-        if let Err(error) = catalog.replace_all(&projection) {
             return bail(error);
         }
     }

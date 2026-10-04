@@ -39,7 +39,7 @@ const USAGE: &str = "usage: tfs <verb> ...
   local resolve|remove <root> <name>, local replace <root> <name> <source> <manifest> <length> --observed <s>
   store init|info|ensure <root> [--repo-cache <cache> | --no-repo-cache]
   store prepare-readers <root>
-  store rebuild <census> --rows <jsonl> [--sqlite <file>]
+  store rebuild <census> --rows <jsonl>
   gc <root> [--dry-run] [--json]
   gc headers <census> --out <jsonl>
   gc plan <census> --holds <jsonl> --out <jsonl>
@@ -68,7 +68,7 @@ const VALUED: &[&str] = &[
     "observed", "order", "out", "part-mib", "plan", "progress-bytes", "range", "ready", "refs",
     "registry", "repo-cache", "rlimit-as-mb", "rlimit-fsize-mb", "rows", "sample-seconds",
     "scale", "session", "slow-ms", "source", "source-name", "source-plan", "source-profile",
-    "spec-variant", "sqlite", "step", "streams", "target", "tenant", "timeout", "url",
+    "spec-variant", "step", "streams", "target", "tenant", "timeout", "url",
 ];
 
 fn usage() -> ExitCode {

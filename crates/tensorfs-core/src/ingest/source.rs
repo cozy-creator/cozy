@@ -21,7 +21,7 @@ use crate::spec::EncodingSpec;
 use crate::store::Store;
 
 use super::carrier::{self, SourceHeader};
-use super::convert::{self, Converter, Plan, Rekey, Source, Target};
+use super::convert::{self, Converter, Plan, Source, Target};
 use super::fingerprint::{
     self, Banked, Fingerprint, FingerprintRegistry, Grammar, SourceProfile, SourceProfileComponent,
 };
@@ -355,7 +355,6 @@ fn grammar_match(
         &[source],
         &target,
         &specs,
-        &Rekey::default(),
     )?;
     let prefix = &grammar.key_prefix;
     match header.tensors.iter().find(|t| !t.key.starts_with(prefix)) {
@@ -710,7 +709,7 @@ pub fn prepare(
             header: &source.header,
         })
         .collect();
-    let plan = convert::plan(conv, &views, &target, &specs, &Rekey::default())?;
+    let plan = convert::plan(conv, &views, &target, &specs)?;
     drop(views);
     Ok(Prepared {
         plan,
@@ -1709,12 +1708,6 @@ fn plan_preparation(
             Some(&requested.profile),
             None,
         )?;
-        let _ = golden_suite(prepared.conv)?;
-        for (_, seed) in &prepared.seeds {
-            if let Some(vectors) = &seed.vectors {
-                vectors.check(&seed.spec)?;
-            }
-        }
         // The tensor plan binds transforms/geometry/order; the pinned request binds all
         // carrier object identities. Locations participate in neither identity.
         let stable_headers: Vec<_> = prepared
@@ -2443,6 +2436,16 @@ pub fn snapshot_model_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every converter's frozen geometries reassemble bit for bit: checked here, once, not
+    /// on every preparation.
+    #[test]
+    fn every_converters_golden_cases_reassemble() {
+        for converter in convert::CONVERTERS.iter() {
+            golden_suite(converter).unwrap();
+        }
+    }
+
     use crate::catalog::Catalog;
     use crate::ingest::fingerprint::{Provenance, REAL};
     use crate::storage::Census;
@@ -3537,8 +3540,6 @@ mod tests {
 
         fs::remove_file(Catalog::path(store.root())).unwrap();
         let rebuilt = Catalog::initialize(store.root()).unwrap();
-        let projection = Census::open(store.root()).unwrap().projection().unwrap();
-        rebuilt.replace_all(&projection).unwrap();
         // Catalog destruction loses operation coordination, not retained journal bytes.
         // Enumeration does not guess a source type from generic filesystem sessions.
         assert!(rebuilt.model_source_operations().unwrap().is_empty());

@@ -884,49 +884,6 @@ pub struct Admitted {
     pub first_writer: bool,
 }
 
-impl DeliveryGrant {
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
-        Self::from_value(&canon::parse_canonical(bytes, limits::SPEC_MAX_BYTES)?)
-    }
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        canon::write(&self.to_value())
-    }
-
-    pub fn from_value(v: &Value) -> Result<Self> {
-        let mut f = Fields::new("DeliveryGrant", v)?;
-        let kind = f.req_str("kind")?;
-        let destination = match kind {
-            "blob" => Destination::Blob,
-            "manifest" => Destination::Manifest,
-            "staging" => Destination::Staging,
-            _ => {
-                return refuse(
-                    Code::UNKNOWN_FIELD,
-                    "grant kind must be blob, manifest or staging",
-                )
-            }
-        };
-        let object = ObjectRef::from_value("DeliveryGrant.object", f.req("object")?)?;
-        let session = f.req_str("session")?.to_string();
-        ascii_name("DeliveryGrant.session", &session, limits::MAX_NAME_BYTES)?;
-        Ok(DeliveryGrant {
-            session,
-            object,
-            destination,
-        })
-    }
-
-    pub fn to_value(&self) -> Value {
-        // `key` is deliberately ABSENT for the same reason `PublishGrant` omits it: a
-        // derivable fact stored beside its source is a second authority waiting to disagree.
-        Value::obj(vec![
-            ("kind", Value::str(self.destination.as_str())),
-            ("object", self.object.to_value()),
-            ("session", Value::str(self.session.clone())),
-        ])
-    }
-}
-
 #[cfg(test)]
 mod object_set_tests {
     use super::*;

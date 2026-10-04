@@ -207,13 +207,6 @@ pub fn plan_digest(plan: &Plan, headers: &[(PathBuf, &SourceHeader)]) -> String 
                     field(&mut hash, &(*file as u64).to_le_bytes());
                     field(&mut hash, key.as_bytes());
                 }
-                Bytes::Inherit { part } => {
-                    field(&mut hash, b"inherit");
-                    for segment in part.segments() {
-                        field(&mut hash, segment.sha256.as_bytes());
-                        field(&mut hash, &segment.length.to_le_bytes());
-                    }
-                }
                 Bytes::Permute { file, key, xform } => {
                     field(&mut hash, b"permute");
                     field(&mut hash, &(*file as u64).to_le_bytes());
@@ -432,15 +425,6 @@ impl Journal {
         out
     }
 
-    /// Drop this plan's journal. Called only when its result is installed or released — a
-    /// crash never reaches here, which is the point.
-    pub fn remove(self) -> Result<()> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io("remove conversion journal", error)),
-        }
-    }
 }
 
 /// Install a journal a previous pod published, where `Journal::open` will replay it.
@@ -487,7 +471,7 @@ pub fn install(dir: &Path, plan_digest: &str, bytes: &[u8]) -> Result<()> {
 }
 
 /// A journalled part may be reused only if its objects are still admissible. This is
-/// `Bytes::Inherit`'s existing law, not a new one: `contains` is a presence hint and nothing
+/// `contains` is a presence hint and nothing
 /// more, so admission takes a standing verification record or exactly one rehash.
 pub fn segments_still_stand(store: &Store, part: &Part) -> bool {
     for segment in part.segments() {

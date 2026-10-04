@@ -102,7 +102,6 @@ fn plan(
             components: vec![(component.to_string(), "plain/1".to_string())],
         },
         &specs(),
-        &Default::default(),
     )?;
     let order = plan
         .ops

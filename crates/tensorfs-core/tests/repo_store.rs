@@ -472,23 +472,8 @@ fn manifest_build_is_the_single_ordinary_file_producer() {
     let _ = fs::remove_dir_all(root);
 }
 
-fn projection_snapshot(root: &Path) -> Vec<String> {
-    let db = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
-    let mut statement = db
-        .prepare(
-            "SELECT org||'|'||name||'|'||manifest_sha256
-             FROM tensorfs_released_manifests ORDER BY 1",
-        )
-        .unwrap();
-    statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
-}
-
 #[test]
-fn both_cas_domains_rebuild_after_projection_tables_are_emptied() {
+fn both_cas_domains_rebuild_their_projection_from_the_filesystem() {
     let root = temporary("cas-domain-rebuild");
     for domain in ["repo_cas", "dataset_cas"] {
         let store_root = root.join(domain);
@@ -526,19 +511,6 @@ fn both_cas_domains_rebuild_after_projection_tables_are_emptied() {
             !String::from_utf8_lossy(&repository_bytes).contains("evidence"),
             "ordinary repositories must not fabricate model evidence"
         );
-        let before = projection_snapshot(&store_root);
-        assert_eq!(
-            before.len(),
-            1,
-            "only released manifest lookup is projected"
-        );
-
-        let db = rusqlite::Connection::open(store_root.join("tensorfs.sqlite")).unwrap();
-        db.execute("DELETE FROM tensorfs_released_manifests", [])
-            .unwrap();
-        drop(db);
-        assert!(projection_snapshot(&store_root).is_empty());
-
         let rows = store_root.join("rebuild.jsonl");
         let result = Command::new(env!("CARGO_BIN_EXE_tfs"))
             .args([
@@ -547,8 +519,6 @@ fn both_cas_domains_rebuild_after_projection_tables_are_emptied() {
                 store_root.to_str().unwrap(),
                 "--rows",
                 rows.to_str().unwrap(),
-                "--sqlite",
-                store_root.join("tensorfs.sqlite").to_str().unwrap(),
             ])
             .output()
             .unwrap();
@@ -557,7 +527,6 @@ fn both_cas_domains_rebuild_after_projection_tables_are_emptied() {
             "{domain}: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert_eq!(projection_snapshot(&store_root), before, "{domain}");
         let rows = fs::read_to_string(rows).unwrap();
         assert!(rows.contains("\"kind\":\"repo\""));
         assert!(rows.contains("\"kind\":\"release\""));
@@ -754,17 +723,6 @@ fn crash_after_repo_replace_rebuilds_sql_from_files() {
         .success());
     let _ = child.wait();
     assert!(root.join("repos/org/model.json").is_file());
-    let db = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
-    let before: u64 = db
-        .query_row(
-            "SELECT count(*) FROM tensorfs_released_manifests",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(before, 0, "crash must not let SQL lead or half-commit");
-    drop(db);
-
     let rows = root.join("rows.jsonl");
     let status = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .args([
@@ -773,21 +731,10 @@ fn crash_after_repo_replace_rebuilds_sql_from_files() {
             root.to_str().unwrap(),
             "--rows",
             rows.to_str().unwrap(),
-            "--sqlite",
-            root.join("tensorfs.sqlite").to_str().unwrap(),
         ])
         .status()
         .unwrap();
     assert!(status.success());
-    let db = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
-    let after: u64 = db
-        .query_row(
-            "SELECT count(*) FROM tensorfs_released_manifests",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(after, 1);
     assert!(fs::read_to_string(rows)
         .unwrap()
         .contains("checkpoint_object"));

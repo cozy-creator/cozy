@@ -1322,11 +1322,9 @@ impl Store {
                 self.read_manifest(&checkpoint.manifest)?;
             }
         }
-        let org = repo.org.clone();
-        let name = repo.name.clone();
         let expected = observed;
         let path_for_write = path.clone();
-        catalog.commit_repository(&org, &name, || {
+        catalog.commit_repository(|| {
             let actual = match fs::read(&path_for_write) {
                 Ok(bytes) => Some(bytes),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1342,8 +1340,7 @@ impl Store {
                     if replacement.as_ref().map(Doc::canonical_bytes).as_deref()
                         == actual.as_deref()
                     {
-                        return crate::storage::Census::open_metadata(&self.root)?
-                            .projection_for(&org, &name);
+                        return Ok(());
                     }
                 } else {
                     return refuse(
@@ -1411,7 +1408,7 @@ impl Store {
                     crate::cache_roots::record(self, repo, &repository.canonical_bytes())?;
                 }
             }
-            crate::storage::Census::open_metadata(&self.root)?.projection_for(&org, &name)
+            Ok(())
         })?;
         Ok(replacement)
     }

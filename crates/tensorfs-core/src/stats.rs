@@ -55,18 +55,6 @@ pub fn snapshot() -> Stats {
     }
 }
 
-pub fn catalog_opens() -> u64 {
-    CATALOG_OPENS.load(Ordering::Relaxed)
-}
-
-pub fn presence_passes() -> u64 {
-    PRESENCE_PASSES.load(Ordering::Relaxed)
-}
-
-pub fn repo_cache_verified_reads() -> u64 {
-    REPO_CACHE_VERIFIED_READS.load(Ordering::Relaxed)
-}
-
 pub(crate) fn catalog_opened() {
     CATALOG_OPENS.fetch_add(1, Ordering::Relaxed);
 }

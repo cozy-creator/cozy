@@ -825,10 +825,6 @@ fn print_plan(p: &Prepared) {
         pl.count(Effect::Permute),
         pl.count(Effect::None)
     );
-    println!(
-        "inherit      {} tensors carry by object reference (zero re-hash)",
-        pl.inherited()
-    );
     // The seam's own decomposition. proto-001 #322 measured the real one at 1,376,256 B
     // runs — 5,376x the synthetic fixture's 256 B — so the class printed here is the
     // difference between a copy that rides the staging pass and real budgeted work.
