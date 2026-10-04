@@ -13,6 +13,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -245,6 +247,23 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	must(t, err)
 	if lines := strings.Count(string(film), "\n"); lines != 3 {
 		t.Fatalf("the resumed job's film has %d segments:\n%s", lines, film)
+	}
+	// The film's play link comes from the endpoint's own machine, and its capability is signed
+	// by the rental key that machine authorizes.
+	code, played := runCozy(t, root, "run", "play", job.ID, "--json")
+	var printed struct{ Link string }
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(played)), &printed) != nil {
+		t.Fatalf("run play [exit %d]\n%s", code, played)
+	}
+	_, fragment, _ := strings.Cut(printed.Link, "#")
+	link, err := url.ParseQuery(fragment)
+	must(t, err)
+	block, _ := pem.Decode(authorized)
+	rentalKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	must(t, err)
+	grant, err := capability.Verify(link.Get("c"), agent.WorkerID, []ed25519.PublicKey{rentalKey.(ed25519.PrivateKey).Public().(ed25519.PublicKey)}, time.Now(), "")
+	if err != nil || grant.Run == "" || grant.Run != link.Get("r") || len(grant.Outputs) != 1 || grant.Outputs[0] != "video" {
+		t.Fatalf("the play link's capability is not the rental key's for run %s's video: %+v %v", link.Get("r"), grant, err)
 	}
 	if *olderCozy == "" {
 		return
