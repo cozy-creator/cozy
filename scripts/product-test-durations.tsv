@@ -234,7 +234,7 @@
 0.00	TestHeldDecisionSurvivesExpiredURLInSameWindow
 0.00	TestHeldObjectsReuseOneGrantWindowWithoutAnExpiry
 0.00	TestHostCheckpointSnapshotUsesCanonicalDigestDecoder
-1.48	TestHostRuntimeWireFence
+1.48	TestHostRuntimeAdmission
 5.37	TestHostTensorFSUnawareOfAProfileDefersToTheRental
 0.33	TestHubAccountNameIgnoresCase
 4.00	TestHubAnswersWithAdditiveFieldsAreRead
@@ -298,7 +298,6 @@
 0.12	TestLocalAPIDoor
 21.17	TestLocalAndRentedMachinesRunOneBody
 0.00	TestLocalApplicationEntryPointUsesOrdinaryDependencyCapture
-1.76	TestLocalCachePruneRequiresItsMachineWithoutCreatingAJob
 0.14	TestLocalGPUInventoryKeepsEveryReadableDevice
 5.09	TestLocalMachinePublicationGrantBindsCertificateWithoutRegistration
 0.00	TestLocalMachineRunsOnThisComputersGPU
@@ -575,7 +574,6 @@
 5.95	TestRentalObservationWaitsForWriterWithoutAnotherPaidOperation
 0.02	TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung
 0.02	TestRentalProvenanceSurvivesToTheRecord
-0.09	TestRentalPruneRequiresAuthenticatedKnownWorkspace
 0.02	TestRentalPurposeKeepsManualAndOwedCustody
 0.00	TestRentalPythonAdmissionRefusesUnmeasuredOrWrongABI
 0.00	TestRentalPythonAdmissionUsesAvailableExecutors

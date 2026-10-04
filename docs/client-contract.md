@@ -336,12 +336,10 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/machines/{machine}/status` | local | yes | one machine's picture as it reports it (cozy.machine.v1 Status): software, GPUs, live runs, environments, disk, idle deadline |
 | `GET /v1/local/machines/{machine}/logs/{log}` | local | yes | one log a machine keeps (`tensorfs`: TensorFS's transport decisions), oldest line first, `?tail_bytes=` the newest; an older machine answers a note in `unavailable` |
 | `POST /v1/local/machines/forget-package` | local | yes | tell every machine this daemon knows to read a changed package once more on its next run |
-| `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
 | `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |
 | `GET /v1/local/rentals/{rental_id}/installs/{id}` | local | yes | one queued installation's state and, while it runs, the machine's latest stage and byte counts |
 | `POST /v1/local/rentals/{rental_id}/runtime-update` | local | yes | start or rejoin a durable per-rental Runtime update; the CLI may disconnect without canceling it |
 | `GET /v1/local/rentals/{rental_id}/runtime-update` | local | yes | read the selected update, phase, actual result, or reconciliation error |
-| `POST /v1/local/cache/prune` | local | yes | prune unused operation cache roots in this machine's Runtime workspace; report `removed_entries`, `reclaimed_bytes`, and `store_busy` |
 | `POST /v1/local/daemon/down` | local | yes | non-destructive disconnect guarded by required online work; `{force:true}` overrides that guard without canceling work; mutually exclusive `{all:true}` requests cancellation and paid teardown |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
@@ -443,12 +441,9 @@ authenticated Host. Request history never becomes a second cache authority. Decl
 optional cache admission leaves the successful result unchanged; an unresolved journal
 RPC remains an obligation until it can be reconciled.
 
-`cozy cache prune` or `cozy rental prune <rental>` removes unused cache roots and attempts
-native garbage collection in the selected workspace. Local pruning can start an empty
-control Runtime when no package worker remains. Request-owned results and unresolved lookup recipients are
-preserved. A busy Store reports deferred byte collection; repeating prune can collect
-those bytes even when no further cache entries are removed. Cache roots do not count as
-unfinished rental work, and pruning neither ends the rental nor deletes run history.
+The cache manages itself: entries expire, and a machine low on disk evicts unused entries,
+delivered ones first. There is no prune verb. Request-owned results and unresolved lookup
+recipients are preserved, and cache roots do not count as unfinished rental work.
 
 Model artifacts are closed typed references with `producer_request_id`, `output_slot`,
 `manifest:{digest,length}`, and `tensorfs_receipt_digest`. The last field hashes the native

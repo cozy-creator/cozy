@@ -526,23 +526,6 @@ func (m *machineRuns) ForgetPackage(ctx context.Context, pkg string) api.Forgott
 	return out
 }
 
-// PruneOperationCache frees one machine's unused cached operation results through its Host.
-func (m *machineRuns) PruneOperationCache(ctx context.Context, machine string) (uint32, uint64, bool, *exit.Error) {
-	connection, problem := m.connect(ctx, machine, "pruning its operation cache")
-	if problem != nil {
-		return 0, 0, false, problem
-	}
-	defer connection.Close()
-	result, err := connection.Host.PruneOperationCache(ctx, &pb.PruneOperationCacheCall{Claim: connection.Claim})
-	if err != nil {
-		return 0, 0, false, machineTransport(err)
-	}
-	if result == nil {
-		return 0, 0, false, exit.Named(exit.Structural, "operation.prune_reply_absent", "Host returned no cache pruning observation")
-	}
-	return result.RemovedEntries, result.ReclaimedBytes, result.StoreBusy, nil
-}
-
 // preparationPhase shows a waiting run what its machine's preparation is doing: resolving,
 // downloading its models, installing its package. Each ended stage stays on the run.
 func (m *machineRuns) preparationPhase(request, label string) *machinePreparation {

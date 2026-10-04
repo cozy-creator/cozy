@@ -25,8 +25,6 @@ type MachineExecutions interface {
 	Control(context.Context, records.Request, string) *exit.Error
 	// Withdraw stops a canceled request's submission work that has not reached Runtime.
 	Withdraw(string)
-	// PruneOperationCache frees one machine's unused cached operation results.
-	PruneOperationCache(ctx context.Context, machine string) (uint32, uint64, bool, *exit.Error)
 	// Describe is a published release as one machine reads it at its own Hub: the release
 	// (the newest when none is named) and its interface.
 	Describe(ctx context.Context, machine, hub, pkg, release string) (DescribedRelease, *exit.Error)

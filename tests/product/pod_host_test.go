@@ -163,9 +163,7 @@ type fakePod struct {
 	stagedJobBuild string
 	jobDirectives  []*pb.JobDirective
 
-	// prune answers the Host's cache pruning; resources is what the worker's ClaimAck reads
-	// back, nil for one fake-4090 per device.
-	prune     func(*pb.PruneOperationCacheCall) (*pb.PruneOperationCacheResult, error)
+	// resources is what the worker's ClaimAck reads back, nil for one fake-4090 per device.
 	resources *pb.WorkerResources
 	// describe answers DescribeMachine; nil is a Host that predates it (UNIMPLEMENTED).
 	describe func(*pb.DescribeMachineQuery) (*pb.MachineDescription, error)
@@ -1029,13 +1027,6 @@ func (p *fakePod) DescribeMachine(_ context.Context, query *pb.DescribeMachineQu
 		return nil, status.Error(codes.Unimplemented, "DescribeMachine unavailable")
 	}
 	return p.describe(query)
-}
-
-func (p *fakePod) PruneOperationCache(_ context.Context, call *pb.PruneOperationCacheCall) (*pb.PruneOperationCacheResult, error) {
-	if p.prune == nil {
-		return nil, status.Error(codes.Unimplemented, "cache pruning unavailable")
-	}
-	return p.prune(call)
 }
 
 func (p *fakePod) KeepRentalAlive(context.Context, *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {

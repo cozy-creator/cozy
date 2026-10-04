@@ -16,7 +16,6 @@ func TestFieldFromNewerClientIsIgnoredByAnOlderDaemon(t *testing.T) {
 	for path, body := range map[string]map[string]any{
 		"/v1/requests":   submission,
 		"/v1/local/jobs": submission,
-		"/v1/local/rentals/rental-prune-absent/prune": {},
 	} {
 		key := strings.ReplaceAll(path, "/", "-")
 		older := daemon.call(t, http.MethodPost, path, body, "Idempotency-Key", "older"+key)

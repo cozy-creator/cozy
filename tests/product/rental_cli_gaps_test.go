@@ -103,29 +103,6 @@ func TestRentalModelDownloadAwaitsWithProgress(t *testing.T) {
 	}
 }
 
-// `cozy model gc --rental` reclaims the rental's store through its machine, and says when
-// the machine deferred collection because bytes were still moving in.
-func TestModelGCReclaimsARentalsStore(t *testing.T) {
-	var prunes atomic.Int32
-	pod := &fakePod{prune: func(*pb.PruneOperationCacheCall) (*pb.PruneOperationCacheResult, error) {
-		if prunes.Add(1) > 1 {
-			return &pb.PruneOperationCacheResult{StoreBusy: true}, nil
-		}
-		return &pb.PruneOperationCacheResult{RemovedEntries: 2, ReclaimedBytes: 5 << 30}, nil
-	}}
-	root, _ := attachedRental(t, pod)
-	if code, out := runCozy(t, root, "model", "gc", "--rental=attached"); code != 0 || !strings.Contains(out, "5.0GiB") {
-		t.Fatalf("model gc did not reclaim the rental's store [exit %d]:\n%s", code, out)
-	}
-	if code, out := runCozy(t, root, "model", "gc", "--rental=attached", "--json"); code != 0 ||
-		!strings.Contains(out, `"store_busy":true`) || !strings.Contains(out, "collection deferred") {
-		t.Fatalf("a busy store must be said, not reported as an empty success [exit %d]:\n%s", code, out)
-	}
-	if code, out := runCozy(t, root, "model", "gc", "--rental=nobody"); code == 0 || !strings.Contains(out, "no rental") {
-		t.Fatalf("an unknown rental must be refused [exit %d]:\n%s", code, out)
-	}
-}
-
 func lastJSONLine(out string) string {
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {

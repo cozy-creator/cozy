@@ -56,10 +56,6 @@ func (m *retentionReleaseMachine) ForgetPackage(_ context.Context, pkg string) a
 	return api.ForgottenPackage{Package: pkg}
 }
 
-func (m *retentionReleaseMachine) PruneOperationCache(context.Context, string) (uint32, uint64, bool, *exit.Error) {
-	return 0, 0, false, exit.Unavailablef("no machine")
-}
-
 func (m *retentionReleaseMachine) Control(_ context.Context, request records.Request, action string) *exit.Error {
 	if action != "cancel" {
 		return exit.Usagef("expected cancellation")

@@ -420,12 +420,6 @@ func (c *Client) MachineLog(machine, log string, tailBytes uint64) (api.MachineL
 	return out, problem
 }
 
-func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Error) {
-	var result api.RentalPruneResult
-	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prune", map[string]any{}, &result)
-	return result, problem
-}
-
 // PrepareRentalPackage asks the daemon to materialize one exact package release
 // (and optional model checkpoints) on the named rental.  The worker's desired
 // package set and preparation ledger make repeats idempotent.
@@ -451,12 +445,6 @@ func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateR
 func (c *Client) RentalRuntimeUpdate(rentalID string) (api.RuntimeUpdate, *exit.Error) {
 	var result api.RuntimeUpdate
 	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", nil, &result)
-	return result, problem
-}
-
-func (c *Client) PruneLocalCache() (api.CachePruneResult, *exit.Error) {
-	var result api.CachePruneResult
-	problem := c.call(http.MethodPost, "/v1/local/cache/prune", map[string]any{}, &result)
 	return result, problem
 }
 
