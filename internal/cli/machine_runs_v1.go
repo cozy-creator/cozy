@@ -55,7 +55,11 @@ func (m *machineRuns) loopV1(request records.Request) bool {
 		if !accepted && (len(link.Receipt) > 0 || len(link.Submission) > 0) {
 			return true
 		}
-		if accepted && link.Collected || !accepted && records.Settled(current.State) {
+		if accepted && link.Collected {
+			return false
+		}
+		if !accepted && records.Settled(current.State) {
+			m.tellCancelV1(*current, link)
 			return false
 		}
 		done, problem := m.stepV1(m.ctx, *current, link, accepted, false)
@@ -97,6 +101,38 @@ func (m *machineRuns) loopV1(request records.Request) bool {
 	return false
 }
 
+// tellCancelV1 delivers a cancel that settled here before the machine's acceptance was
+// recorded: the spec was sent, so the machine may be running it. The id is idempotent, and the
+// machine is told until it answers (a machine holding no such run answers that).
+func (m *machineRuns) tellCancelV1(request records.Request, link *records.MachineExecution) {
+	if request.State != "canceled" || link.MachineID == "" {
+		return
+	}
+	sent, _ := m.store.RunV1Marked(request.ID, records.RunV1Sent)
+	told, _ := m.store.RunV1Marked(request.ID, records.RunV1CancelTold)
+	if !sent || told {
+		return
+	}
+	for delay := time.Second; m.ctx.Err() == nil; delay = min(2*delay, 5*time.Second) {
+		machine, problem := m.machines.DialV1(machines.AttachOnly(m.ctx), link.MachineID, m.runHolder(request, "canceling"))
+		if problem == nil {
+			_, err := machine.Control(m.ctx, request.ID, v1.Action_ACTION_CANCEL)
+			machine.Close()
+			if code := status.Code(err); err == nil || code != codes.Unavailable && code != codes.DeadlineExceeded && code != codes.Canceled {
+				_ = m.store.AppendEvent(request.ID, records.RunV1CancelTold, 0, map[string]any{"answer": code.String()})
+				return
+			}
+		} else if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
+			fmt.Fprintf(m.context.Out, "machine execution %s: its cancel was not delivered: %s\n", request.ID, problem.Message)
+			return
+		}
+		select {
+		case <-m.ctx.Done():
+		case <-time.After(delay):
+		}
+	}
+}
+
 // permanentRefusal is a refusal resubmitting the same spec cannot change.
 func permanentRefusal(problem *exit.Error) bool {
 	return problem.Code != exit.Unavailable && problem.Code != exit.Deadline && problem.Code != exit.Canceled
@@ -134,7 +170,12 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		return false, problem
 	}
 	began := time.Now()
-	machine, problem := m.machines.DialV1(ctx, link.MachineID, m.runHolder(request, "running"))
+	// Only a submission may start this computer's machine; observing attaches to a running one.
+	dial := ctx
+	if accepted {
+		dial = machines.AttachOnly(ctx)
+	}
+	machine, problem := m.machines.DialV1(dial, link.MachineID, m.runHolder(request, "running"))
 	if problem != nil {
 		return false, problem
 	}
@@ -157,6 +198,13 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		}
 	}
 	began = time.Now()
+	if spec != nil {
+		if sent, _ := m.store.RunV1Marked(request.ID, records.RunV1Sent); !sent {
+			if problem := m.store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": link.MachineID}); problem != nil {
+				return false, problem
+			}
+		}
+	}
 	stream, err := machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), spec)
 	if err != nil {
 		return false, machines.Transport(err)
@@ -538,7 +586,7 @@ func (m *machineRuns) controlV1(ctx context.Context, request records.Request, ac
 	if problem != nil || link == nil {
 		return problem
 	}
-	machine, problem := m.machines.DialV1(ctx, link.MachineID, m.runHolder(request, action+"ing"))
+	machine, problem := m.machines.DialV1(machines.AttachOnly(ctx), link.MachineID, m.runHolder(request, action+"ing"))
 	if problem != nil {
 		return problem
 	}
