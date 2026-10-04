@@ -602,14 +602,19 @@ fn shared_regions_attach_read_only_outlive_their_exporter_and_hold_no_budget() {
     let wb = fx.register(&b, None);
     assert_eq!(a.layout(wa).unwrap().digest, b.layout(wb).unwrap().digest);
     b.set_vram_budget(DEV, 512 << 20).unwrap();
+    let digest = a.layout(wa).unwrap().digest.clone();
+    // A holder that names another layout is refused before any fd is imported.
+    let first: Vec<(u64, BorrowedFd)> = exported[0].chunks.iter().map(|(n, fd)| (*n, fd.as_fd())).collect();
+    let other = "0".repeat(digest.len());
+    assert!(matches!(b.attach_device(wb, DEV, exported[0].region, &first, &other), Err(Error::Invalid(_))));
+    assert_eq!(b.stats().devices[0].shared_bytes, 0);
     for e in &exported {
         let chunks: Vec<(u64, BorrowedFd)> = e.chunks.iter().map(|(n, fd)| (*n, fd.as_fd())).collect();
-        b.attach_device(wb, DEV, e.region, &chunks).unwrap();
+        b.attach_device(wb, DEV, e.region, &chunks, &digest).unwrap();
     }
-    let again: Vec<(u64, BorrowedFd)> = exported[0].chunks.iter().map(|(n, fd)| (*n, fd.as_fd())).collect();
-    assert!(matches!(b.attach_device(wb, DEV, 0, &again), Err(Error::Invalid(_))));
+    assert!(matches!(b.attach_device(wb, DEV, 0, &first, &digest), Err(Error::Invalid(_))));
     let short: Vec<(u64, BorrowedFd)> = exported[1].chunks.iter().map(|(n, fd)| (*n / 2, fd.as_fd())).collect();
-    assert!(matches!(b.attach_device(wb, DEV, 2, &short), Err(Error::Invalid(_))));
+    assert!(matches!(b.attach_device(wb, DEV, 2, &short, &digest), Err(Error::Invalid(_))));
 
     // The exporter and every fd go; the attached handles keep the bytes.
     drop(exported);

@@ -288,7 +288,7 @@ the GPU maps the same physical bytes read-only, and the bytes outlive the filler
 ```python
 p.device_sharing(device) -> bool        # POSIX-fd VMM export on this GPU and driver
 p.export_device(ws, device, regions=None) -> [{"region": int, "chunks": [(bytes, fd), ...]}]
-p.attach_device(ws, device, region, chunks)   # chunks: [(bytes, fd), ...] in VA order
+p.attach_device(ws, device, region, chunks, digest)   # chunks: [(bytes, fd), ...] in VA order
 ws.digest                               # the layout identity both sides must share
 ```
 
@@ -297,9 +297,15 @@ ws.digest                               # the layout identity both sides must sh
   them), and makes this process's mapping read-only. Shared regions leave the budget
   (`committed`, `mapped`) and count in `shared_bytes`; they are never evicted by a budget, never
   recycled, never refilled. All-or-nothing: an export failure changes nothing.
-- `attach_device` imports the fds (they stay the caller's), checks each is pinned memory of
-  this GPU and that the sizes cover the region's span, and maps them read-only at the region's
-  place: the region is Ready with no copy. Attach only from an exporter of the same `ws.digest`.
+- `attach_device` first refuses a `digest` (the holder's layout) other than `ws.digest`, then
+  imports the fds (they stay the caller's), checks each is pinned memory of this GPU and that the
+  sizes cover the region's span, and maps them read-only at the region's place: the region is
+  Ready with no copy. The digest names every object range, its offset and the region grouping:
+  equal digests are the same stored bytes at the same offsets. Shared regions hold stored bytes
+  only; decoding, casts and adapters happen in the reader's own tensors.
+- Read-only is the attacher's own mapping. CUDA exports carry no access restriction: whoever
+  holds an fd can map it writable (`cuMemExportToShareableHandle` takes no flags; access is set
+  per mapping by the mapping process). Share only within one trust domain.
 - Every fd, imported handle and mapping holds the bytes; they are freed when the last goes, in
   any process. `drop`, `ws.close()` and `p.close()` of a shared region unmap it and release this
   process's references (event `detached`); a later acquire is an ordinary miss that fills a
