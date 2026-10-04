@@ -7,6 +7,7 @@
 //! vocabulary, Torch, schedule, publication, or serving decision here.
 
 mod adoption;
+pub mod channel;
 mod estimate;
 pub use estimate::{estimate_write, WriteEstimate};
 mod progress;

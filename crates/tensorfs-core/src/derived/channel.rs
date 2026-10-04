@@ -1,0 +1,808 @@
+//! The trusted owner's half of an executor's two native weight channels: one authorized derived
+//! writer ([`serve_derived`]) and one exact source ([`serve_source`]). The executor's halves are
+//! `python/tensorfs/_derived_channel.py` and `_source_channel.py`. A frame is a kind byte and a
+//! big-endian u32 length, then JSON or at most 1 MiB of bytes. The peer names no Store,
+//! transaction or path: the owner bound all of them before handing it the connected stream.
+use super::{
+    add_config, add_indexed_part, begin, check_writer, checkpoint_indexed, commit, completed,
+    config_write_bound, fence, finish_writer, inspect_source, part_write_bound, release_guards,
+    transaction_id, writer_store, Additions, CheckpointCursor, ComponentDeclaration,
+    ConfigDeclaration, Declaration, PartDeclaration, PartSource, ReceiptFacts, Source, SourceView,
+    TensorDeclaration, MAX_COMPANION_FILES,
+};
+use crate::canon::Value;
+use crate::dtype::Dtype;
+use crate::err::{refuse, Code, Refusal, Result};
+use crate::header::Part;
+use crate::ids::ObjectRef;
+use crate::jcs::{self, Json};
+use crate::meta::{Hold, Meta};
+use crate::read::{self, ReadLease};
+use crate::store::Store;
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::sync::Mutex;
+
+const JSON: u8 = 0;
+const BYTES: u8 = 1;
+const CHUNK: usize = 1 << 20;
+const METADATA: usize = 64 << 20;
+const READ_MAX: u64 = 64 << 20;
+
+/// The executor's derivation arguments (`Derivation.native_arguments`, as JSON): sources by
+/// alias, targets, configs, construction order, the output's byte bound, companion files.
+pub fn declaration_from_arguments(raw: &[u8]) -> Result<Declaration> {
+    let Json::Arr(arguments) = jcs::parse(raw, METADATA)? else {
+        return refuse(Code::WRONG_TYPE, "derivation arguments are an array");
+    };
+    if !(5..=6).contains(&arguments.len()) {
+        return refuse(Code::WRONG_TYPE, "derivation arguments have five or six members");
+    }
+    let mut sources = vec![];
+    for (alias, value) in object("sources", &arguments[0])? {
+        let pair = array("source", value)?;
+        let [manifest, length] = pair else {
+            return refuse(Code::WRONG_TYPE, "a source is [manifest, length]");
+        };
+        sources.push(Source {
+            alias: alias.clone(),
+            manifest: reference(text("source", manifest)?, uint("source", length)?)?,
+        });
+    }
+    let mut components = vec![];
+    for (target, value) in object("targets", &arguments[1])? {
+        let fields = Fields::new("target", value, &["source", "source_component", "drop", "add"])?;
+        let mut add = vec![];
+        for (key, tensor) in object("addition", fields.req("add")?)? {
+            let tensor = Fields::new("addition", tensor, &["logical_dtype", "shape", "encoding", "parts"])?;
+            let mut parts = vec![];
+            for (role, part) in object("parts", tensor.req("parts")?)? {
+                let part = Fields::new("part", part, &["dtype", "shape", "source"])?;
+                let source = match part.opt("source") {
+                    None => None,
+                    Some(selected) => {
+                        let selected = Fields::new("part source", selected, &["source", "component", "tensor", "role"])?;
+                        Some(PartSource {
+                            source: selected.text("source")?,
+                            component: selected.text("component")?,
+                            tensor: selected.text("tensor")?,
+                            role: selected.text("role")?,
+                        })
+                    }
+                };
+                parts.push(PartDeclaration {
+                    role: role.clone(),
+                    dtype: Dtype::parse(&part.text("dtype")?)?,
+                    shape: shape(part.req("shape")?)?,
+                    source,
+                });
+            }
+            add.push(TensorDeclaration {
+                key: key.clone(),
+                dtype: Dtype::parse(&tensor.text("logical_dtype")?)?,
+                shape: shape(tensor.req("shape")?)?,
+                encoding: tensor.text("encoding")?,
+                parts,
+            });
+        }
+        components.push(ComponentDeclaration {
+            target: target.clone(),
+            source: fields.opt("source").map(|v| text("target", v).map(String::from)).transpose()?,
+            source_component: fields
+                .opt("source_component")
+                .map(|v| text("target", v).map(String::from))
+                .transpose()?,
+            drop: array("drop", fields.req("drop")?)?
+                .iter()
+                .map(|v| text("drop", v).map(String::from))
+                .collect::<Result<_>>()?,
+            add,
+        });
+    }
+    let mut configs = vec![];
+    for (target, value) in object("configs", &arguments[2])? {
+        let fields = Fields::new("config", value, &["kind", "source", "source_config"])?;
+        let target = target.clone();
+        let source = fields.opt("source").map(|v| text("config", v).map(String::from)).transpose()?;
+        let source_config =
+            fields.opt("source_config").map(|v| text("config", v).map(String::from)).transpose()?;
+        configs.push(match (fields.text("kind")?.as_str(), source, source_config) {
+            ("copy", Some(source), Some(source_config)) => ConfigDeclaration::Copy { target, source, source_config },
+            ("derive", Some(source), Some(source_config)) => ConfigDeclaration::Derive { target, source, source_config },
+            ("add", None, None) => ConfigDeclaration::Add { target },
+            _ => {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    format!("config {target:?} has an invalid kind/source combination"),
+                )
+            }
+        });
+    }
+    let order = array("order", &arguments[3])?
+        .iter()
+        .map(|pair| match array("order", pair)? {
+            [component, key] => Ok((text("order", component)?.to_string(), text("order", key)?.to_string())),
+            _ => refuse(Code::WRONG_TYPE, "an order row is [component, key]"),
+        })
+        .collect::<Result<_>>()?;
+    let mut files = vec![];
+    if let Some(companions) = arguments.get(5) {
+        for (path, encoded) in object("files", companions)? {
+            files.push((path.clone(), super::decode_file(text("file", encoded)?)?));
+        }
+        if files.len() > MAX_COMPANION_FILES {
+            return refuse(Code::COUNT_CAP, "at most 16 companion files may be declared");
+        }
+    }
+    let mut declaration = Declaration {
+        work_fingerprint: None,
+        sources,
+        components,
+        configs,
+        files,
+        objects: vec![],
+        order,
+        max_new_bytes: uint("max_new_bytes", &arguments[4])?,
+    };
+    declaration.normalize_and_validate()?;
+    Ok(declaration)
+}
+
+/// One native derived writer with its holds: its work hold and its sources' read leases.
+pub struct Writer {
+    store: Store,
+    meta: std::sync::Arc<Meta>,
+    transaction: String,
+    session: u64,
+    sources: Vec<SourceView>,
+    additions: Additions,
+    cursor: Mutex<Option<CheckpointCursor>>,
+    holds: Mutex<Option<Holds>>,
+}
+
+/// A writer's work hold and its sources' read leases, by alias.
+type Holds = (Hold, Vec<(String, ReadLease)>);
+
+impl Writer {
+    pub fn begin(
+        store: &Store,
+        meta: std::sync::Arc<Meta>,
+        transaction: &str,
+        session: u64,
+        declaration: Declaration,
+        checkpoint: Option<&ObjectRef>,
+    ) -> Result<Writer> {
+        let begun = begin(store, &meta, transaction, session, declaration, checkpoint)?;
+        let writer_store = match writer_store(store) {
+            Ok(store) => store,
+            Err(error) => {
+                release_guards(&meta, Some(begun.writer_hold), begun.source_leases);
+                return Err(error);
+            }
+        };
+        Ok(Writer {
+            store: writer_store,
+            meta,
+            transaction: transaction_id(transaction)?,
+            session,
+            sources: begun.source_views,
+            additions: begun.additions,
+            cursor: Mutex::new(None),
+            holds: Mutex::new(Some((begun.writer_hold, begun.source_leases))),
+        })
+    }
+
+    fn source_read_into(&self, alias: &str, component: &str, key: &str, role: &str, offset: u64, into: &mut [u8]) -> Result<()> {
+        let holds = self.holds.lock().unwrap();
+        let (_, leases) = holds.as_ref().ok_or_else(released)?;
+        let lease = leases
+            .iter()
+            .find(|(held, _)| held == alias)
+            .map(|(_, lease)| lease)
+            .ok_or_else(|| Refusal {
+                code: Code::ROOT_ABSENT,
+                detail: format!("no source alias {alias:?} on this derived writer"),
+            })?;
+        let view = self.sources.iter().find(|view| view.fact.alias == alias).ok_or_else(|| Refusal {
+            code: Code::ROOT_ABSENT,
+            detail: format!("no source alias {alias:?} on this derived writer"),
+        })?;
+        if !view.fact.components.iter().any(|allowed| allowed == component) {
+            return refuse(
+                Code::MISSING_COMPONENT,
+                format!("source alias {alias:?} component {component:?} is outside the locked target declaration"),
+            );
+        }
+        let part = header_part(view, component, key, role)?;
+        check_writer(&self.meta, &self.transaction, self.session)?;
+        let what = format!("{component}/{key}#{role}");
+        read::read_part_into(lease, &what, part, offset, into.len() as u64, into)?;
+        check_writer(&self.meta, &self.transaction, self.session)
+    }
+
+    fn release(&self) {
+        let Some((hold, leases)) = self.holds.lock().unwrap().take() else {
+            return;
+        };
+        release_guards(&self.meta, Some(hold), leases);
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn released() -> Refusal {
+    Refusal {
+        code: Code::LEASE_REVOKED,
+        detail: "derived writer holds were released".into(),
+    }
+}
+
+fn header_part<'v>(view: &'v SourceView, component: &str, key: &str, role: &str) -> Result<&'v Part> {
+    view.header
+        .components
+        .iter()
+        .find(|(name, _)| name == component)
+        .and_then(|(_, tensors)| tensors.iter().find(|(name, _)| name == key))
+        .and_then(|(_, tensor)| tensor.parts.iter().find(|(name, _)| name == role))
+        .map(|(_, part)| part)
+        .ok_or_else(|| Refusal {
+            code: Code::MISSING_TENSOR,
+            detail: format!("source {} has no exact part {component}/{key}#{role}", view.fact.alias),
+        })
+}
+
+/// What the owner keeps of a writer's progress: each checkpoint as it lands and the receipt.
+pub struct Hooks<'a> {
+    /// Refuses once the execution that owns the writer is no longer current.
+    pub check_current: &'a (dyn Fn() -> Result<()> + Sync),
+    pub record_checkpoint: &'a (dyn Fn(&Json) + Sync),
+    pub record_receipt: &'a (dyn Fn(&ReceiptFacts) + Sync),
+}
+
+/// Serve one prebound writer until its commit, fence or peer loss, then fence what is live.
+pub fn serve_derived(
+    writer: &Writer,
+    stream: UnixStream,
+    operation: &str,
+    slot: &str,
+    mut checkpoint: Option<ObjectRef>,
+    hooks: &Hooks,
+) -> Result<()> {
+    let mut channel = Channel(stream);
+    let served = (|| -> Result<()> {
+        loop {
+            let Some(frame) = channel.receive()? else {
+                return Ok(());
+            };
+            let Frame::Json(request) = frame else {
+                return refuse(Code::WRONG_TYPE, "expected a derived operation");
+            };
+            (hooks.check_current)()?;
+            let op = request.op()?;
+            let result = match op.as_str() {
+                "read" => {
+                    read_source(writer, &mut channel, &request, hooks)?;
+                    continue;
+                }
+                "part" => {
+                    let fields = request.only(&["op", "component", "key", "role"])?;
+                    let (component, key, role) = (fields.text("component")?, fields.text("key")?, fields.text("role")?);
+                    part_write_bound(&writer.meta, &writer.transaction, writer.session, &writer.additions, (&component, &key, &role))?;
+                    let mut reader = Pull { channel: &mut channel, writer, hooks, ended: false };
+                    let written = add_indexed_part(
+                        &writer.store,
+                        &writer.meta,
+                        &writer.transaction,
+                        writer.session,
+                        &writer.additions,
+                        writer.cursor.lock().unwrap().as_mut(),
+                        (&component, &key, &role),
+                        &mut reader,
+                    )?;
+                    let objects = written
+                        .part
+                        .segments()
+                        .iter()
+                        .map(|o| obj(vec![("sha256", Json::Str(o.sha256.clone())), ("length", num(o.length))]))
+                        .collect::<Result<_>>()?;
+                    obj(vec![
+                        ("bytes", num(written.bytes)),
+                        ("deduped_bytes", num(written.deduped)),
+                        ("whole_sha256", Json::Str(written.whole)),
+                        ("objects", Json::Arr(objects)),
+                    ])?
+                }
+                "config" => {
+                    let fields = request.only(&["op", "name"])?;
+                    let name = fields.text("name")?;
+                    config_write_bound(&writer.meta, &writer.transaction, writer.session, &name)?;
+                    let mut reader = Pull { channel: &mut channel, writer, hooks, ended: false };
+                    // A config is not a part: the next checkpoint takes the full path.
+                    *writer.cursor.lock().unwrap() = None;
+                    add_config(&writer.meta, &writer.transaction, writer.session, &name, &mut reader)?;
+                    Json::Null
+                }
+                "receipt" | "completed_parts" | "completed_configs" | "checkpoint" | "commit" | "fence" => {
+                    request.only(&["op"])?;
+                    match op.as_str() {
+                        "receipt" => Json::Null,
+                        "completed_parts" => {
+                            let (parts, _) = completed(&writer.meta, &writer.transaction, writer.session)?;
+                            Json::Arr(
+                                parts
+                                    .into_iter()
+                                    .map(|(c, k, r)| Json::Arr(vec![Json::Str(c), Json::Str(k), Json::Str(r)]))
+                                    .collect(),
+                            )
+                        }
+                        "completed_configs" => {
+                            let (_, configs) = completed(&writer.meta, &writer.transaction, writer.session)?;
+                            Json::Arr(configs.into_iter().map(Json::Str).collect())
+                        }
+                        "checkpoint" => {
+                            let (plan, head) = checkpoint_indexed(
+                                &writer.store,
+                                &writer.meta,
+                                &writer.transaction,
+                                writer.session,
+                                operation,
+                                slot,
+                                checkpoint.as_ref(),
+                                &mut writer.cursor.lock().unwrap(),
+                            )?;
+                            let result = obj(vec![
+                                ("plan_digest", Json::Str(plan)),
+                                ("head", head.head.as_ref().map_or(Json::Null, |r| Json::Str(r.id()))),
+                                ("head_length", num(head.head.as_ref().map_or(0, |r| r.length))),
+                                ("index", num(head.links.saturating_sub(1))),
+                                ("bytes", num(head.bytes)),
+                            ])?;
+                            (hooks.check_current)()?;
+                            (hooks.record_checkpoint)(&result);
+                            if head.head.is_some() {
+                                checkpoint = head.head;
+                            }
+                            result
+                        }
+                        "commit" => {
+                            {
+                                let holds = writer.holds.lock().unwrap();
+                                let (hold, _) = holds.as_ref().ok_or_else(released)?;
+                                hold.still_registered(&writer.meta)?;
+                            }
+                            let facts = commit(&writer.store, &writer.meta, &writer.transaction, writer.session)?;
+                            finish_writer(&writer.store)?;
+                            writer.release();
+                            // Recorded even if cancellation raced: the native winner is reconciled.
+                            (hooks.record_receipt)(&facts);
+                            json(&facts.to_value())
+                        }
+                        _ => Json::Bool(fence(&writer.meta, &writer.transaction, writer.session)?),
+                    }
+                }
+                _ => return refuse(Code::SOURCE_NOT_ALLOWED, "operation is outside this derived handle"),
+            };
+            channel.send(&obj(vec![("result", result)])?)?;
+            if op == "commit" || op == "fence" {
+                return Ok(());
+            }
+        }
+    })();
+    if let Err(refusal) = &served {
+        let _ = channel.refuse(refusal);
+    }
+    let _ = fence(&writer.meta, &writer.transaction, writer.session);
+    writer.release();
+    served
+}
+
+/// A completed output's receipt for an executor that reopens it (a resumed attempt).
+pub fn serve_derived_replay(receipt: &ReceiptFacts, stream: UnixStream, hooks: &Hooks) -> Result<()> {
+    let mut channel = Channel(stream);
+    let served = (|| -> Result<()> {
+        let Some(Frame::Json(request)) = channel.receive()? else {
+            return refuse(Code::WRONG_TYPE, "expected a receipt request");
+        };
+        request.only(&["op"])?;
+        if request.op()? != "receipt" {
+            return refuse(Code::SOURCE_NOT_ALLOWED, "a completed output answers its receipt only");
+        }
+        (hooks.check_current)()?;
+        (hooks.record_receipt)(receipt);
+        channel.send(&obj(vec![("result", json(&receipt.to_value()))])?)
+    })();
+    if let Err(refusal) = &served {
+        let _ = channel.refuse(refusal);
+    }
+    served
+}
+
+/// Serve one exact source's inspection, checks and part reads until the peer closes. Part
+/// reads pin the source under a read lease, held until the channel ends.
+pub fn serve_source(
+    store: &Store,
+    meta: &Meta,
+    source: &ObjectRef,
+    stream: UnixStream,
+    check_current: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    let mut channel = Channel(stream);
+    let mut lease: Option<ReadLease> = None;
+    let mut view: Option<SourceView> = None;
+    let served = (|| -> Result<()> {
+        loop {
+            let Some(frame) = channel.receive()? else {
+                return Ok(());
+            };
+            let Frame::Json(request) = frame else {
+                return refuse(Code::WRONG_TYPE, "expected a scoped source operation");
+            };
+            let op = request.op()?;
+            let fields = match op.as_str() {
+                "inspect" => request.only(&["op", "components", "configs"])?,
+                "read" => request.only(&["op", "manifest", "manifest_length", "component", "key", "role", "offset", "length"])?,
+                "check" => request.only(&["op", "manifest", "manifest_length"])?,
+                _ => return refuse(Code::SOURCE_NOT_ALLOWED, "operation is outside this source handle"),
+            };
+            if op != "inspect" && (fields.text("manifest")? != source.id() || fields.uint("manifest_length")? != source.length) {
+                return refuse(Code::TRANSACTION_CONFLICT, "source operation changed its bound identity");
+            }
+            check_current()?;
+            if view.is_none() {
+                // Exact-source validation runs even when the first operation is a read.
+                view = Some(inspect_source(store, meta, source.clone(), vec![], vec![])?.view);
+            }
+            if op != "inspect" && lease.is_none() {
+                lease = Some(read::acquire_cozytensors(store, meta, &store.read_manifest(source)?)?.0);
+            }
+            if let Some(lease) = &lease {
+                lease.recheck(meta)?;
+            }
+            match op.as_str() {
+                "inspect" => {
+                    let names = |key: &str| -> Result<Vec<String>> {
+                        array(key, fields.req(key)?)?.iter().map(|v| text(key, v).map(String::from)).collect()
+                    };
+                    let inspection = inspect_source(store, meta, source.clone(), names("components")?, names("configs")?)?;
+                    let configs = inspection
+                        .configs
+                        .iter()
+                        .map(|c| obj(vec![("name", Json::Str(c.name.clone())), ("length", num(c.bytes.len() as u64))]))
+                        .collect::<Result<_>>()?;
+                    let mut result = inspection_value(&inspection.view)?;
+                    if let Json::Obj(pairs) = &mut result {
+                        pairs.retain(|(k, _)| k != "configs");
+                        pairs.push(("configs".into(), Json::Arr(configs)));
+                        result = Json::object(std::mem::take(pairs))?;
+                    }
+                    channel.send(&obj(vec![("result", result)])?)?;
+                    for config in &inspection.configs {
+                        for chunk in config.bytes.chunks(CHUNK) {
+                            check_current()?;
+                            channel.data(chunk)?;
+                        }
+                    }
+                }
+                "read" => {
+                    let length = fields.uint("length")?;
+                    if length > READ_MAX {
+                        return refuse(Code::SIZE_CAP, "source read exceeds its buffer bound");
+                    }
+                    let (component, key, role) = (fields.text("component")?, fields.text("key")?, fields.text("role")?);
+                    let part = header_part(view.as_ref().unwrap(), &component, &key, &role)?;
+                    let mut data = vec![0; length as usize];
+                    let what = format!("{component}/{key}#{role}");
+                    read::read_part_into(lease.as_ref().unwrap(), &what, part, fields.uint("offset")?, length, &mut data)?;
+                    lease.as_ref().unwrap().recheck(meta)?;
+                    check_current()?;
+                    channel.send(&obj(vec![("result", num(length))])?)?;
+                    for chunk in data.chunks(CHUNK) {
+                        check_current()?;
+                        channel.data(chunk)?;
+                    }
+                }
+                _ => channel.send(&obj(vec![("result", Json::Null)])?)?,
+            }
+        }
+    })();
+    if let Err(refusal) = &served {
+        let _ = channel.refuse(refusal);
+    }
+    if let Some(lease) = lease {
+        let _ = lease.release(meta);
+    }
+    served
+}
+
+/// The executor's `SourceInspection.from_native` facts: the source and its selected
+/// components' tensors (geometry and identity, no payload locations).
+fn inspection_value(view: &SourceView) -> Result<Json> {
+    let fact = &view.fact;
+    let source = obj(vec![
+        ("alias", Json::Str(fact.alias.clone())),
+        ("manifest_id", Json::Str(fact.manifest.id())),
+        ("manifest_length", num(fact.manifest.length)),
+        ("header_id", Json::Str(fact.header.id())),
+        ("header_length", num(fact.header.length)),
+        ("components", Json::Arr(fact.components.iter().cloned().map(Json::Str).collect())),
+    ])?;
+    let mut components = vec![];
+    for (name, tensors) in &view.header.components {
+        if !fact.components.contains(name) {
+            continue;
+        }
+        let mut rows = vec![];
+        for (key, tensor) in tensors {
+            let parts = tensor
+                .parts
+                .iter()
+                .map(|(role, part)| {
+                    obj(vec![
+                        ("role", Json::Str(role.clone())),
+                        ("dtype", Json::Str(part.dtype.name().into())),
+                        ("shape", Json::Arr(part.shape.iter().map(|&d| num(d)).collect())),
+                    ])
+                })
+                .collect::<Result<_>>()?;
+            rows.push(obj(vec![
+                ("key", Json::Str(key.clone())),
+                ("logical_dtype", Json::Str(tensor.dtype.name().into())),
+                ("shape", Json::Arr(tensor.shape.iter().map(|&d| num(d)).collect())),
+                ("encoding", Json::Str(tensor.encoding.clone())),
+                ("identity", Json::Str(tensor.encoded_identity()?)),
+                ("parts", Json::Arr(parts)),
+            ])?);
+        }
+        components.push(obj(vec![("name", Json::Str(name.clone())), ("tensors", Json::Arr(rows))])?);
+    }
+    obj(vec![
+        ("source", source),
+        ("components", Json::Arr(components)),
+        ("configs", Json::Arr(vec![])),
+    ])
+}
+
+/// One bounded source-read window inside a writer, answered with its bytes.
+fn read_source(writer: &Writer, channel: &mut Channel, request: &Json, hooks: &Hooks) -> Result<()> {
+    let fields = request.only(&["op", "source", "component", "key", "role", "offset", "length"])?;
+    let length = fields.uint("length")?;
+    if length == 0 || length > READ_MAX {
+        return refuse(Code::RANGE_BOUNDS, "invalid derived source range");
+    }
+    (hooks.check_current)()?;
+    let mut target = vec![0; length as usize];
+    writer.source_read_into(
+        &fields.text("source")?,
+        &fields.text("component")?,
+        &fields.text("key")?,
+        &fields.text("role")?,
+        fields.uint("offset")?,
+        &mut target,
+    )?;
+    (hooks.check_current)()?;
+    channel.send(&obj(vec![("length", num(length))])?)?;
+    for chunk in target.chunks(CHUNK) {
+        channel.data(chunk)?;
+    }
+    Ok(())
+}
+
+/// A part's or config's bytes, pulled from the producer a bounded chunk at a time; the
+/// producer may read its sources between chunks.
+struct Pull<'c, 'w, 'h> {
+    channel: &'c mut Channel,
+    writer: &'w Writer,
+    hooks: &'w Hooks<'h>,
+    ended: bool,
+}
+
+impl Read for Pull<'_, '_, '_> {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let pulled = (|| -> Result<usize> {
+            (self.hooks.check_current)()?;
+            if self.ended || into.is_empty() {
+                return Ok(0);
+            }
+            let size = into.len().min(CHUNK);
+            self.channel.send(&obj(vec![("pull", num(size as u64))])?)?;
+            loop {
+                match self.channel.receive()? {
+                    None => return refuse(Code::TRANSFER_FAILED, "producer disconnected mid-stream"),
+                    Some(Frame::Bytes(bytes)) => {
+                        if bytes.len() > size {
+                            return refuse(Code::LENGTH_MISMATCH, "producer exceeded native pull");
+                        }
+                        self.ended = bytes.is_empty();
+                        into[..bytes.len()].copy_from_slice(&bytes);
+                        return Ok(bytes.len());
+                    }
+                    // Only bounded source reads may nest inside a part.
+                    Some(Frame::Json(request)) => read_source(self.writer, self.channel, &request, self.hooks)?,
+                }
+            }
+        })();
+        pulled.map_err(|refusal| io::Error::other(format!("{}: {}", refusal.code.as_str(), refusal.detail)))
+    }
+}
+
+enum Frame {
+    Json(Json),
+    Bytes(Vec<u8>),
+}
+
+struct Channel(UnixStream);
+
+impl Channel {
+    fn write(&mut self, kind: u8, body: &[u8]) -> Result<()> {
+        let mut head = [kind, 0, 0, 0, 0];
+        head[1..].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        self.0
+            .write_all(&head)
+            .and_then(|()| self.0.write_all(body))
+            .map_err(|e| Refusal {
+                code: Code::TRANSFER_FAILED,
+                detail: format!("weight channel write: {e}"),
+            })
+    }
+    fn send(&mut self, value: &Json) -> Result<()> {
+        let raw = jcs::write(value);
+        if raw.len() > METADATA {
+            return refuse(Code::SIZE_CAP, "derived metadata exceeds its bound");
+        }
+        self.write(JSON, &raw)
+    }
+    fn data(&mut self, bytes: &[u8]) -> Result<()> {
+        self.write(BYTES, bytes)
+    }
+    fn refuse(&mut self, refusal: &Refusal) -> Result<()> {
+        let detail: String = refusal.detail.chars().take(1024).collect();
+        self.send(&obj(vec![("error", Json::Str(refusal.code.as_str().into())), ("detail", Json::Str(detail))])?)
+    }
+    /// The next frame, or None when the peer closed between frames.
+    fn receive(&mut self) -> Result<Option<Frame>> {
+        let mut head = [0u8; 5];
+        match self.0.read_exact(&mut head) {
+            Ok(()) => (),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return refuse(Code::TRANSFER_FAILED, format!("weight channel read: {e}")),
+        }
+        let length = u32::from_be_bytes(head[1..].try_into().unwrap()) as usize;
+        let bound = match head[0] {
+            JSON => METADATA,
+            BYTES => CHUNK,
+            _ => return refuse(Code::SIZE_CAP, "invalid derived frame"),
+        };
+        if length > bound {
+            return refuse(Code::SIZE_CAP, "invalid derived frame");
+        }
+        let mut body = vec![0; length];
+        self.0.read_exact(&mut body).map_err(|e| Refusal {
+            code: Code::TRANSFER_FAILED,
+            detail: format!("weight channel read: {e}"),
+        })?;
+        Ok(Some(match head[0] {
+            JSON => match jcs::parse(&body, METADATA)? {
+                value @ Json::Obj(_) => Frame::Json(value),
+                _ => return refuse(Code::WRONG_TYPE, "derived frame must be an object"),
+            },
+            _ => Frame::Bytes(body),
+        }))
+    }
+}
+
+/// A request's fields, closed over the names its operation allows.
+struct Fields<'a> {
+    pairs: &'a [(String, Json)],
+}
+
+impl Fields<'_> {
+    fn new<'a>(what: &str, value: &'a Json, allowed: &[&str]) -> Result<Fields<'a>> {
+        let Json::Obj(pairs) = value else {
+            return refuse(Code::WRONG_TYPE, format!("{what} is an object"));
+        };
+        if let Some((key, _)) = pairs.iter().find(|(key, _)| !allowed.contains(&key.as_str())) {
+            return refuse(Code::UNKNOWN_FIELD, format!("{what}: unknown field {key:?}"));
+        }
+        Ok(Fields { pairs })
+    }
+    fn opt(&self, key: &str) -> Option<&Json> {
+        self.pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    fn req(&self, key: &str) -> Result<&Json> {
+        self.opt(key).ok_or_else(|| Refusal {
+            code: Code::MISSING_FIELD,
+            detail: format!("missing {key:?}"),
+        })
+    }
+    fn text(&self, key: &str) -> Result<String> {
+        text(key, self.req(key)?).map(String::from)
+    }
+    fn uint(&self, key: &str) -> Result<u64> {
+        uint(key, self.req(key)?)
+    }
+}
+
+trait Request {
+    fn op(&self) -> Result<String>;
+    fn only(&self, allowed: &[&str]) -> Result<Fields<'_>>;
+}
+
+impl Request for Json {
+    fn op(&self) -> Result<String> {
+        match self {
+            Json::Obj(pairs) => match pairs.iter().find(|(k, _)| k == "op") {
+                Some((_, Json::Str(op))) => Ok(op.clone()),
+                _ => refuse(Code::MISSING_FIELD, "an operation names its op"),
+            },
+            _ => refuse(Code::WRONG_TYPE, "an operation is an object"),
+        }
+    }
+    fn only(&self, allowed: &[&str]) -> Result<Fields<'_>> {
+        let fields = Fields::new("operation", self, allowed)?;
+        if fields.pairs.len() != allowed.len() {
+            return refuse(Code::UNKNOWN_FIELD, "operation is outside this derived handle");
+        }
+        Ok(fields)
+    }
+}
+
+fn object<'a>(what: &str, value: &'a Json) -> Result<&'a [(String, Json)]> {
+    match value {
+        Json::Obj(pairs) => Ok(pairs),
+        _ => refuse(Code::WRONG_TYPE, format!("{what} is an object")),
+    }
+}
+
+fn array<'a>(what: &str, value: &'a Json) -> Result<&'a [Json]> {
+    match value {
+        Json::Arr(items) => Ok(items),
+        _ => refuse(Code::WRONG_TYPE, format!("{what} is an array")),
+    }
+}
+
+fn text<'a>(what: &str, value: &'a Json) -> Result<&'a str> {
+    match value {
+        Json::Str(text) => Ok(text),
+        _ => refuse(Code::WRONG_TYPE, format!("{what} is a string")),
+    }
+}
+
+fn uint(what: &str, value: &Json) -> Result<u64> {
+    match value {
+        Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 => Ok(*n as u64),
+        _ => refuse(Code::NUMBER_RANGE, format!("{what} is a nonnegative integer")),
+    }
+}
+
+fn shape(value: &Json) -> Result<Vec<u64>> {
+    array("shape", value)?.iter().map(|d| uint("shape", d)).collect()
+}
+
+fn reference(id: &str, length: u64) -> Result<ObjectRef> {
+    let sha256 = id.strip_prefix("sha256:").unwrap_or(id).to_string();
+    crate::ids::hex64("ObjectRef", &sha256)?;
+    Ok(ObjectRef { sha256, length })
+}
+
+fn num(value: u64) -> Json {
+    Json::Num(value as f64)
+}
+
+fn obj(pairs: Vec<(&str, Json)>) -> Result<Json> {
+    Json::object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+/// A canonical document as channel JSON.
+fn json(value: &Value) -> Json {
+    match value {
+        Value::Bool(b) => Json::Bool(*b),
+        Value::Int(i) => Json::Num(*i as f64),
+        Value::Str(s) => Json::Str(s.clone()),
+        Value::Arr(items) => Json::Arr(items.iter().map(json).collect()),
+        Value::Obj(pairs) => Json::Obj(pairs.iter().map(|(k, v)| (k.clone(), json(v))).collect()),
+    }
+}
