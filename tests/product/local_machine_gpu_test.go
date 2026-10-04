@@ -119,8 +119,12 @@ def gpu_sum(payload: SumRequest) -> SumResult:
 	t.Logf("%s ran on %s (%d device), grant %s: %s", request.ID, model, count, granted, fmt.Sprint(strings.TrimSpace(out)))
 }
 
-// hostAccelerators is this computer's NVIDIA devices as the driver names them.
+// hostAccelerators are the NVIDIA devices this run's machines may use: none when the run hides
+// them (CUDA_VISIBLE_DEVICES set and empty), as the machines it starts inherit.
 func hostAccelerators() (string, int) {
+	if visible, named := os.LookupEnv("CUDA_VISIBLE_DEVICES"); named && strings.TrimSpace(visible) == "" {
+		return "", 0
+	}
 	out, err := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader").Output()
 	names := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if err != nil || names[0] == "" {
