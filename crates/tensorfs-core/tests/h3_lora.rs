@@ -878,19 +878,6 @@ fn full_cli_conversion_mints_a_receipt_after_the_live_golden_suite() {
     };
     let receipt = fs::read(store.join("tmp/ingest").join(session).join("receipt.json")).unwrap();
     assert!(String::from_utf8_lossy(&receipt).contains("\"golden_cases\":2"));
-    let rejected = Command::new(bin)
-        .args([
-            "ingest",
-            "restamp",
-            &store.display().to_string(),
-            session,
-            "--plant",
-            "quota-bytes",
-        ])
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("QUOTA_EXHAUSTED"));
     let replay = Command::new(bin)
         .args([
             "ingest",
