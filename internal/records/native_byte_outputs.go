@@ -39,7 +39,7 @@ func (s *Store) CompleteNativeByteCall(service string, currentAttempt int64, cur
 	fail := func(message string) (NativeArtifactRetention, *exit.Error) {
 		return NativeArtifactRetention{}, exit.Named(exit.Conflict, "native.byte_authority", "%s", message)
 	}
-	raw, err := canonical.NormalizeJCS(result)
+	raw, err := canonical.NormalizeApplication(result)
 	if err != nil || !bytes.Equal(raw, result) || len(result) > 48<<10 || len(receipt) == 0 || len(receipt) > 1<<20 || b.Attempt <= 0 || b.Attempt > currentAttempt {
 		return fail("native byte completion lacks bounded immutable facts")
 	}

@@ -56,7 +56,7 @@ func OperationKey(request Request) (string, *exit.Error) {
 	if err != nil {
 		return "", exit.Internalf("cannot encode operation identity: %s", err)
 	}
-	raw, err = canonical.NormalizeJCS(raw)
+	raw, err = canonical.NormalizeApplication(raw)
 	if err != nil {
 		return "", exit.New(exit.Validation, "operation inputs are not canonical values")
 	}

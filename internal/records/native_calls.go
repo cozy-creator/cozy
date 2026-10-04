@@ -61,7 +61,7 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 	if _, err := canonical.Raw(call.IntentDigest); err != nil {
 		return NativeCall{}, false, exit.New(exit.Validation, "native call digest is malformed")
 	}
-	raw, err := canonical.NormalizeJCS(call.Request)
+	raw, err := canonical.NormalizeApplication(call.Request)
 	if err != nil || !bytes.Equal(raw, call.Request) || len(raw) == 0 || raw[0] != '{' {
 		return NativeCall{}, false, exit.New(exit.Validation, "native call request is not canonical object")
 	}
@@ -136,7 +136,7 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 	return call, true, nil
 }
 func (s *Store) FreezeNativeCall(id string, frozen []byte) *exit.Error {
-	raw, err := canonical.NormalizeJCS(frozen)
+	raw, err := canonical.NormalizeApplication(frozen)
 	if err != nil || !bytes.Equal(raw, frozen) || len(raw) > 1<<20 {
 		return exit.New(exit.Validation, "native frozen intent is not bounded canonical data")
 	}
@@ -173,7 +173,7 @@ func (s *Store) CompleteNativeCallAt(id string, result, receipt []byte, instance
 	if receipt == nil {
 		receipt = []byte{}
 	}
-	raw, err := canonical.NormalizeJCS(result)
+	raw, err := canonical.NormalizeApplication(result)
 	if err != nil || !bytes.Equal(raw, result) || len(raw) > 48*1024 || len(receipt) > 1<<20 {
 		return exit.New(exit.Validation, "native completion exceeds canonical result bounds")
 	}

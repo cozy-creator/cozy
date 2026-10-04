@@ -129,7 +129,7 @@ func (s *Server) freezeMachineInputs(spec *orchestrator.Submission, entry *launc
 	if problem != nil {
 		return fail(problem)
 	}
-	normalized, err := canonical.NormalizeJCS(raw)
+	normalized, err := canonical.NormalizeApplication(raw)
 	if err != nil {
 		return fail(exit.New(exit.Validation, "captured input payload is not canonical"))
 	}
@@ -209,7 +209,7 @@ func replayMachineInputSnapshots(payload []byte, assets []records.AssetBinding, 
 			return nil, nil, problem
 		}
 	}
-	normalized, err := canonical.NormalizeJCS(payload)
+	normalized, err := canonical.NormalizeApplication(payload)
 	if err != nil {
 		return nil, nil, exit.New(exit.Validation, "replayed input is not canonical")
 	}
