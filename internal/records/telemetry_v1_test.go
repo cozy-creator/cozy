@@ -210,15 +210,29 @@ func TestStageEndpointsSurviveBurstAndFlushWithTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, sample := range []*v1.RunEvent{
-		{Sequence: 29, AtMs: 29000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Completed: 29, Total: 30, Fraction: .9}}},
-		{Sequence: 30, AtMs: 30000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Completed: 30, Total: 30, Fraction: .95}}},
-		{Sequence: 31, AtMs: 31000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "decoding", Fraction: .96}}},
-	} {
-		if problem := store.ObserveRunV1("run", sample, nil); problem != nil {
+	done := make(chan error, 1)
+	go func() {
+		for _, sample := range []*v1.RunEvent{
+			{Sequence: 29, AtMs: 29000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Completed: 29, Total: 30, Fraction: .9}}},
+			{Sequence: 30, AtMs: 30000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "denoise", Completed: 30, Total: 30, Fraction: .95}}},
+			{Sequence: 31, AtMs: 31000, Event: &v1.RunEvent_Progress{Progress: &v1.Progress{Stage: "decoding", Fraction: .96}}},
+		} {
+			if problem := store.ObserveRunV1("run", sample, nil); problem != nil {
+				done <- problem
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case problem := <-done:
+		if problem != nil {
 			tx.Rollback()
 			t.Fatal(problem)
 		}
+	case <-time.After(2 * time.Second):
+		tx.Rollback()
+		t.Fatal("stage endpoint burst waited on the records connection")
 	}
 	tx.Rollback()
 	after, problem := store.LastEventSeq()
