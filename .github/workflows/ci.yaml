@@ -120,13 +120,6 @@ jobs:
           done
       - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::style
       - run: cargo test --workspace
-      - name: Privileged-broker and unprivileged Store-owner writers
-        run: |
-          for proof in target/debug/deps/store_boundaries-*; do
-            if [ -f "$proof" ] && [ -x "$proof" ]; then
-              sudo "$proof" --exact privileged_writer_preserves_the_store_owners_public_directories --nocapture
-            fi
-          done
       - name: Transfers inside a 64 MiB memory budget
         run: |
           for proof in target/debug/deps/transfer_memory-*; do

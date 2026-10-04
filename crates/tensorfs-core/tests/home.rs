@@ -50,12 +50,7 @@ fn refuse_without_a_named_root(name: &str, args: &[&str]) {
 /// A store verb without a root is a usage error that writes nothing (tfs-053).
 #[test]
 fn store_verbs_name_their_root_and_write_nothing_without_one() {
-    for args in [
-        &["store", "init"][..],
-        &["store", "ensure"],
-        &["store", "info"],
-        &["store", "prepare-readers"],
-    ] {
+    for args in [&["store", "init"][..], &["store", "rebuild"], &["fetch", "ref"]] {
         let root = temporary("no-root");
         let home = root.join("home");
         let cwd = root.join("cwd");
@@ -84,18 +79,14 @@ fn rebuild_refuses_an_absent_census_root_instead_of_creating_one() {
 }
 
 #[test]
-fn a_named_root_still_creates_and_store_ensure_stays_idempotent() {
+fn a_named_root_is_created_and_a_second_init_refuses() {
     let root = temporary("named-root");
     let named = root.join("named");
-    let run = |args: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_tfs")).args(args).output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    };
-    run(&["store", "init", named.to_str().unwrap()]);
+    let init = || Command::new(env!("CARGO_BIN_EXE_tfs")).args(["store", "init", named.to_str().unwrap()]).output().unwrap();
+    let first = init();
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
     assert!(named.join("blobs").is_dir());
-    run(&["store", "ensure", named.to_str().unwrap()]);
-    run(&["store", "ensure", named.to_str().unwrap()]);
-    run(&["store", "info", named.to_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&init().stderr).contains("STORE_ERA"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -113,13 +104,10 @@ fn switches_keep_their_positionals_and_unknown_flags_warn() {
             .output()
             .unwrap()
     };
-    let ensured = tfs(&["store", "ensure", "--no-repo-cache", named.to_str().unwrap()]);
-    assert!(ensured.status.success(), "{}", String::from_utf8_lossy(&ensured.stderr));
+    let init = tfs(&["store", "init", "--no-repo-cache", named.to_str().unwrap(), "--streams-start", "4"]);
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
     assert!(named.join("blobs").is_dir() && !environment.exists());
-
-    let info = tfs(&["store", "info", named.to_str().unwrap(), "--streams-start", "4"]);
-    assert!(info.status.success(), "{}", String::from_utf8_lossy(&info.stderr));
-    assert!(String::from_utf8_lossy(&info.stderr).contains("unknown flag --streams-start"));
+    assert!(String::from_utf8_lossy(&init.stderr).contains("unknown flag --streams-start"));
 
     let written = tfs(&["checkpoint", "write", named.to_str().unwrap(), "--blocks", "two"]);
     assert_eq!(written.status.code(), Some(2));

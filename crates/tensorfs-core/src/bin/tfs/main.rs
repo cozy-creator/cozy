@@ -11,7 +11,7 @@ use tensorfs_core::err::Refusal;
 use tensorfs_core::header::Header;
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::repo_cache::{CacheKind, RepoObjectCache};
-use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
+use tensorfs_core::store::{Fault, Store, FAULT_STAGES};
 
 type TfsResult<T> = tensorfs_core::err::Result<T>;
 
@@ -30,26 +30,18 @@ const USAGE: &str = "usage: tfs <verb> ...
   cbor encode|decode|check <file> [--out <file>]
   manifest build <entries.jsonl> --out <manifest.json>
   manifest inspect <manifest.json> --refs <jsonl> [--header <h> --inventory <i> --closure <c>]
-  manifest show|get|walk|verify|admit <root> ...
+  manifest get|walk <root> <sha256> ...
   repo inspect <repo.json> --rows <jsonl>
   repo apply <current.json|-> <mutation.json> --out <file> --rows <jsonl> [--manifest <m> --header <h> --inventory <i>]
-  repo list|usage <root> --rows <jsonl>
-  repo get <root> <org> <name> --out <file>
-  repo commit <root> <current.json|-> <mutation.json>
-  local resolve|remove <root> <name>, local replace <root> <name> <source> <manifest> <length> --observed <s>
-  store init|info|ensure <root> [--repo-cache <cache> | --no-repo-cache]
-  store prepare-readers <root>
+  store init <root> [--repo-cache <cache> | --no-repo-cache]
   store rebuild <census> --rows <jsonl>
-  gc <root> [--dry-run] [--json]
   gc headers <census> --out <jsonl>
   gc plan <census> --holds <jsonl> --out <jsonl>
   reclaim usage|plan|run <root>
-  put|get|contains <root> ..., reap <root>, fill <root> <plan>
+  put|get <root> ..., reap <root>
   checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]
-  checkpoint reproduce <root> <header.json> <entries.json>
-  fetch [bounded] <root> <ref> --hub <base>, push <root> <sha256> --grant-file <f>
-  staging fetch <root> <sha256> <length> <url|->, staging drop <root> <sha256>
-  ensure <root> <ref> --hub <base>, pressure <root>
+  fetch <root> <ref> --hub <base>, push <root> <sha256> --grant-file <f>
+  ensure <root> <ref> --hub <base>
   repo-cache restore|resume|chain ...
   ingest bank <dialect> <converter> ..., ingest source-members|source-plan|plan|run|install|reap ...";
 
@@ -115,11 +107,7 @@ fn main() -> ExitCode {
     match a.as_slice() {
         ["version"] => cmd_version(),
         ["ensure", r, refspec] => ensure::cmd_ensure(Path::new(r), refspec, &flags),
-        ["pressure", r] => ensure::cmd_pressure(Path::new(r), &flags),
-        ["store", "init", r] => cmd_store(Path::new(r), "init", &flags),
-        ["store", "info", r] => cmd_store(Path::new(r), "info", &flags),
-        ["store", "ensure", r] => cmd_store(Path::new(r), "ensure", &flags),
-        ["store", "prepare-readers", r] => cmd_store_prepare_readers(Path::new(r)),
+        ["store", "init", r] => cmd_store_init(Path::new(r), &flags),
         ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
         ["repo-cache", "restore", store, object, length] => {
             cmd_repo_cache_restore(Path::new(store), object, length, &flags)
@@ -132,40 +120,20 @@ fn main() -> ExitCode {
         }
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
         ["get", r, h] => cmd_get(Path::new(r), h, &flags),
-        ["contains", r, h] => cmd_contains(Path::new(r), h),
         ["reap", r] => cmd_reap(Path::new(r)),
-        ["fill", r, p] => cmd_fill(Path::new(r), Path::new(p), &flags),
         ["checkpoint", "write", r] => ckpt::cmd_write(Path::new(r), &flags),
-        ["manifest", "show", r, h] => snap::cmd_show(Path::new(r), h),
         ["manifest", "get", r, h] => snap::cmd_get(Path::new(r), h, &flags),
-        ["manifest", "admit", r, p] => snap::cmd_admit(Path::new(r), Path::new(p), &flags),
         ["manifest", "walk", r, h] => snap::cmd_walk(Path::new(r), h, &flags),
-        ["manifest", "verify", r, h] => snap::cmd_verify(Path::new(r), h),
         ["manifest", "build", entries] => repo::cmd_manifest_build(Path::new(entries), &flags),
-        ["checkpoint", "reproduce", r, h, e] => {
-            snap::cmd_reproduce(Path::new(r), Path::new(h), Path::new(e), &flags)
-        }
         ["manifest", "inspect", p] => repo::cmd_manifest_inspect(Path::new(p), &flags),
         ["repo", "inspect", p] => repo::cmd_repo_inspect(Path::new(p), &flags),
-        ["repo", "list", r] => repo::cmd_repo_list(Path::new(r), &flags),
-        ["repo", "usage", r] => repo::cmd_repo_usage(Path::new(r), &flags),
-        ["repo", "get", r, org, name] => repo::cmd_repo_get(Path::new(r), org, name, &flags),
         ["repo", "apply", current, mutation] => {
             repo::cmd_repo_apply(current, Path::new(mutation), &flags)
         }
-        ["repo", "commit", store, current, mutation] => {
-            repo::cmd_repo_commit(Path::new(store), current, Path::new(mutation), &flags)
-        }
-        ["local", "resolve", store, name] => repo::cmd_local_resolve(Path::new(store), name),
-        ["local", "replace", store, name, source, manifest, length] => {
-            repo::cmd_local_replace(Path::new(store), name, source, manifest, length, &flags)
-        }
-        ["local", "remove", store, name] => repo::cmd_local_remove(Path::new(store), name, &flags),
         ["key", kind, rest @ ..] => repo::cmd_key(kind, rest),
         ["reclaim", "usage", store] => repo::cmd_reclaim_usage(Path::new(store), &flags),
         ["reclaim", "plan", store] => repo::cmd_reclaim_plan(Path::new(store), &flags),
         ["reclaim", "run", store] => repo::cmd_reclaim_run(Path::new(store), &flags),
-        ["gc", root] => repo::cmd_gc(Path::new(root), &flags),
         ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
         ["gc", "plan", census] => repo::cmd_gc_plan(Path::new(census), &flags),
         ["ingest", "bank", dia, conv] => ingest::cmd_bank(dia, conv, &flags),
@@ -192,10 +160,6 @@ fn main() -> ExitCode {
             ingest::cmd_install(Path::new(r), s, org, name, version, lane, &flags)
         }
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
-        ["fetch", "bounded", r, refspec] => fetch::cmd_bounded_pull(Path::new(r), refspec, &flags),
-        ["staging", "fetch", r, i, l, u] => fetch::cmd_staging_fetch(Path::new(r), i, l, u, &flags),
-        ["staging", "drop", r, i] => fetch::cmd_staging_drop(Path::new(r), i),
-        ["fetch", "bounded", _] => usage(),
         ["fetch", r, refspec] => fetch::cmd_pull(Path::new(r), refspec, &flags),
         ["push", r, i] => fetch::cmd_push(Path::new(r), i, &flags),
         ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
@@ -464,7 +428,7 @@ mod watch;
 /// Neither flag touches the cache path. See `Store::bind_repo_cache`: a stat on a hard NFS
 /// mount that has stopped answering never returns, and boot is not allowed to hang on the
 /// thing that may only cost latency.
-fn cmd_store(root: &Path, verb: &str, flags: &Flags) -> ExitCode {
+fn cmd_store_init(root: &Path, flags: &Flags) -> ExitCode {
     let bind = match (flag(flags, "repo-cache"), flag_on(flags, "no-repo-cache")) {
         (Some(_), true) => {
             eprintln!("--repo-cache and --no-repo-cache say opposite things; pass one");
@@ -489,11 +453,7 @@ fn cmd_store(root: &Path, verb: &str, flags: &Flags) -> ExitCode {
         (None, true) => Some(None),
         (None, false) => None,
     };
-    let mut s = match verb {
-        "init" => ok!(Store::init(root)),
-        "ensure" => ok!(Store::ensure(root)),
-        _ => ok!(Store::open(root)),
-    };
+    let mut s = ok!(Store::init(root));
     if let Some(cache) = bind {
         s = ok!(s.bind_repo_cache(cache.as_deref()));
     }
@@ -525,14 +485,6 @@ fn cmd_store(root: &Path, verb: &str, flags: &Flags) -> ExitCode {
         s.disk_class().as_str(),
         s.disk().kind
     );
-    ExitCode::SUCCESS
-}
-
-fn cmd_store_prepare_readers(root: &Path) -> ExitCode {
-    let store = ok!(Store::open(root));
-    ok!(store.prepare_readers());
-    println!("root:       {}", store.root().display());
-    println!("readers:    prepared");
     ExitCode::SUCCESS
 }
 
@@ -638,20 +590,6 @@ fn cmd_put(root: &Path, src: &Path, f: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_contains(root: &Path, hex: &str) -> ExitCode {
-    let s = ok!(Store::open(root));
-    let present = s.contains(hex);
-    println!("contains:  {present}   (presence HINT only)");
-    match s.record_valid(hex) {
-        Ok(r) => println!(
-            "record:    valid (dev:ino {}:{}, {} bytes)",
-            r.dev, r.ino, r.length
-        ),
-        Err(why) => println!("record:    INVALID — {why}"),
-    }
-    ExitCode::SUCCESS
-}
-
 fn cmd_get(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let s = ok!(Store::open(root));
     if flag(f, "out") == Some("-") {
@@ -705,66 +643,6 @@ fn cmd_reap(root: &Path) -> ExitCode {
     let (gone, kept) = ok!(s.reap());
     println!("reap: removed {gone} orphaned temps, kept {kept} with a live writer");
     ExitCode::SUCCESS
-}
-
-/// Plan lines are `<hex> <length> <path>`. Resume skips an object ONLY under a valid
-/// verification record — presence alone is never enough.
-fn cmd_fill(root: &Path, plan: &Path, f: &Flags) -> ExitCode {
-    let s = ok!(Store::open(root));
-    let text = match fs::read_to_string(plan) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{}: {e}", plan.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let slow = flag_num(f, "slow-ms", 0u64);
-    let (mut put, mut skipped, mut refused) = (0, 0, 0);
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let p: Vec<&str> = line.split_whitespace().collect();
-        let (hex, len, src) = (p[0], p[1].parse::<u64>().unwrap_or(0), p[2]);
-        match s.record_valid(hex) {
-            Ok(_) => {
-                skipped += 1;
-                println!("skip   sha256:{hex} (valid verification record)");
-                continue;
-            }
-            // Present but unverified. Presence alone never resumes, and no-clobber
-            // admission means a corrupt squatter would silently survive a re-put — so the
-            // rehash happens HERE: good bytes resume, bad bytes are removed and the
-            // way and the object is admitted afresh.
-            Err(why) if s.contains(hex) => match ok!(s.verify(hex)) {
-                Verdict::CorruptRemoved { .. } => {
-                    println!("requeue sha256:{hex} ({why}; corrupt bytes removed)")
-                }
-                _ => {
-                    skipped += 1;
-                    println!("skip   sha256:{hex} ({why}; rehash agreed, record refreshed)");
-                    continue;
-                }
-            },
-            Err(_) => {}
-        }
-        let want = ObjectRef {
-            sha256: hex.to_string(),
-            length: len,
-        };
-        match s.put_file(Path::new(src), Some(&want), &fault_of(f)) {
-            Ok(_) => {
-                put += 1;
-                println!("put    sha256:{hex}");
-            }
-            Err(e) => {
-                refused += 1;
-                println!("REFUSE sha256:{hex} {e}");
-            }
-        }
-        if slow > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(slow));
-        }
-    }
-    println!("fill: put {put}, skipped {skipped}, refused {refused}");
-    ExitCode::from(if refused > 0 { 1 } else { 0 })
 }
 
 fn rss_kb(field: &str) -> u64 {

@@ -758,21 +758,11 @@ fn a_pressure_pass_reports_the_disk_and_keeps_what_it_is_told() {
     let dir = temporary("pressure");
     let root = store(&dir);
     let keep = ObjectRef::of(b"serving").id();
-    let out = Command::new(TFS)
-        .args(["pressure", root.to_str().unwrap(), "--keep", &keep])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let line = parse(String::from_utf8(out.stdout).unwrap().trim());
-    assert_eq!(text(&line, "event"), "pressure");
-    assert!(num(&line, "capacity_bytes") >= num(&line, "available_bytes"));
-    // This box is not under pressure, and a pass that finds none collects nothing.
-    if !flag(&line, "pressure") {
-        assert_eq!(num(&line, "collected_bytes"), 0);
+    let relief = tensorfs_core::ensure::relieve(&Store::open(&root).unwrap(), &[keep]).unwrap();
+    assert!(relief.capacity_bytes >= relief.available_bytes);
+    // A pass that finds no pressure collects nothing.
+    if !relief.pressure {
+        assert_eq!(relief.collected_bytes, 0);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

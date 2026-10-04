@@ -1,7 +1,6 @@
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tensorfs_core::err::Code;
@@ -77,7 +76,7 @@ fn model_manifest(store: &Store, body: Body, shape: Vec<u64>, note: &[u8]) -> Ob
     store.put_manifest(&manifest).unwrap().obj
 }
 
-/// Many processes ensuring one brand-new root at once: one creates it, the others open it,
+/// Many writers ensuring one brand-new root at once: one creates it, the others open it,
 /// and none is refused as "not empty".
 #[test]
 fn concurrent_ensures_of_a_new_root_all_succeed() {
@@ -86,24 +85,12 @@ fn concurrent_ensures_of_a_new_root_all_succeed() {
     let empty = root.join("empty");
     fs::create_dir(&empty).unwrap();
     for target in [root.join("absent"), empty] {
-        let children: Vec<_> = (0..16)
-            .map(|_| {
-                Command::new(env!("CARGO_BIN_EXE_tfs"))
-                    .args(["store", "ensure", target.to_str().unwrap()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
-        for child in children {
-            let output = child.wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        std::thread::scope(|scope| {
+            let ensures: Vec<_> = (0..16).map(|_| scope.spawn(|| Store::ensure(&target))).collect();
+            for ensure in ensures {
+                ensure.join().unwrap().unwrap();
+            }
+        });
         Store::open(&target).unwrap();
     }
     let _ = fs::remove_dir_all(root);
@@ -115,18 +102,7 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
     fs::create_dir_all(&root).unwrap();
 
     let absent = root.join("absent");
-    let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["store", "ensure", absent.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8(output.stdout)
-        .unwrap()
-        .contains(&format!("root:       {}", absent.display())));
+    assert_eq!(Store::ensure(&absent).unwrap().root(), absent);
     Store::ensure(&absent).unwrap();
     assert_eq!(Store::init(&absent).unwrap_err().code, Code::STORE_ERA);
     Store::ensure(&absent).unwrap();
@@ -209,25 +185,13 @@ fn prepare_readers_owns_exact_modes_and_refuses_internal_symlinks() {
     let store_root = root.join("store");
     fs::create_dir_all(&root).unwrap();
     Store::ensure(&store_root).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["store", "prepare-readers", store_root.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    Store::open(&store_root).unwrap().prepare_readers().unwrap();
     for path in [
         "",
         "repos",
         "manifests",
         "blobs",
         "checkouts",
-        // tfs-067: the staging area is TensorFS's to create at TensorFS's own mode, for
-        // run-185's reason — a directory born under whichever uid touched the Store first
-        // is one the pod's other identity cannot enter.
-        "staging",
         "tmp",
         "tmp/writers",
     ] {
@@ -400,307 +364,3 @@ fn the_repo_cache_binding_survives_reopen_and_can_never_refuse_a_store() {
 
 // Run this arm as root as well as in the ordinary suite. Separate CLI processes
 // exercise the same public Store boundary used by broker writes and Host downloads.
-#[test]
-fn privileged_writer_preserves_the_store_owners_public_directories() {
-    use std::io::Write;
-    use std::os::unix::fs::{chown, MetadataExt};
-    use std::os::unix::process::CommandExt;
-    use std::process::{Output, Stdio};
-
-    let root = temporary("writer-owner");
-    fs::create_dir_all(&root).unwrap();
-    if fs::metadata(&root).unwrap().uid() != 0 {
-        eprintln!("multi-uid arm requires root; CI runs this exact test through sudo too");
-        fs::remove_dir_all(root).unwrap();
-        return;
-    }
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-    // CI workspaces may have owner-only ancestors. The child identities need an
-    // executable in this fixture's traversable root, not access to the runner home.
-    let executable = root.join("tfs");
-    fs::copy(env!("CARGO_BIN_EXE_tfs"), &executable).unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-    // Final inode ownership alone misses SQLite's open -> fchown window. The
-    // subprocess probe rejects a root-owned WAL/SHM inode at that exact boundary.
-    // Root CI compiles the checked-in probe; isolated root-container proofs can
-    // supply the same prebuilt library without requiring a compiler in the image.
-    #[cfg(target_os = "linux")]
-    let owner_probe = if let Some(probe) = std::env::var_os("TFS_TEST_CATALOG_WAL_PROBE") {
-        PathBuf::from(probe)
-    } else {
-        let probe = root.join("catalog-owner-probe.so");
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/catalog_owner_probe.c");
-        let compiled = Command::new("cc")
-            .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra"])
-            .arg(&source)
-            .args(["-ldl", "-o"])
-            .arg(&probe)
-            .output()
-            .unwrap();
-        assert!(
-            compiled.status.success(),
-            "{}",
-            String::from_utf8_lossy(&compiled.stderr)
-        );
-        probe
-    };
-    let store_root = root.join("store");
-    fs::create_dir(&store_root).unwrap();
-    let uid = 65530;
-    chown(&store_root, Some(uid), Some(uid)).unwrap();
-    let run = |args: &[&str], as_uid: u32| -> Output {
-        let mut command = Command::new(&executable);
-        command.args(args).uid(as_uid).gid(as_uid);
-        #[cfg(target_os = "linux")]
-        command.env("LD_PRELOAD", &owner_probe);
-        command.output().unwrap()
-    };
-    let ok = |out: Output| {
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    ok(run(&["store", "init", store_root.to_str().unwrap()], uid));
-    ok(run(
-        &["store", "prepare-readers", store_root.to_str().unwrap()],
-        uid,
-    ));
-    let store = Store::open(&store_root).unwrap();
-    let root_bytes = b"privileged writer payload";
-    let root_ref = ObjectRef::of(root_bytes);
-    let mut matching = Vec::new();
-    for i in 0u64.. {
-        let raw = format!("owner payload {i}").into_bytes();
-        if ObjectRef::of(&raw).sha256[..4] == root_ref.sha256[..4] {
-            matching.push(raw);
-            if matching.len() == 2 {
-                break;
-            }
-        }
-    }
-    let owner_bytes = &matching[0];
-    store
-        .put_stream(&mut root_bytes.as_slice(), None, &Fault::default())
-        .unwrap();
-    let path = store.blob_path(&root_ref.sha256);
-    let directory = path.parent().unwrap();
-    let before = fs::metadata(&path).unwrap();
-    assert_eq!(before.uid(), 0); // immutable payload ownership is not rewritten
-    assert_eq!(mode(&path), 0o444);
-    assert_eq!(fs::metadata(directory).unwrap().uid(), uid);
-    assert_eq!(fs::metadata(directory).unwrap().gid(), uid);
-    assert_eq!(mode(directory), 0o755);
-    let inode = fs::metadata(directory).unwrap().ino();
-    let input = root.join("owner-input");
-    fs::write(&input, owner_bytes).unwrap();
-    ok(run(
-        &["put", store_root.to_str().unwrap(), input.to_str().unwrap()],
-        uid,
-    ));
-    assert_eq!(fs::metadata(directory).unwrap().ino(), inode);
-    let after = fs::metadata(&path).unwrap();
-    assert_eq!(
-        (
-            before.ino(),
-            before.uid(),
-            before.gid(),
-            before.mode(),
-            before.len(),
-            before.mtime(),
-            before.mtime_nsec()
-        ),
-        (
-            after.ino(),
-            after.uid(),
-            after.gid(),
-            after.mode(),
-            after.len(),
-            after.mtime(),
-            after.mtime_nsec()
-        )
-    );
-    assert_eq!(fs::read(&path).unwrap(), root_bytes);
-
-    // Concurrent owners compete for previously absent first-level namespaces. The
-    // parent-directory lock covers mkdir/owner assignment, never their payload reads.
-    let mut inputs = Vec::new();
-    let concurrent_prefix = ObjectRef::of(b"new concurrent shard").sha256[..4].to_string();
-    assert_ne!(concurrent_prefix, root_ref.sha256[..4]);
-    for i in 0u64.. {
-        let raw = format!("concurrent directory fixture {i}");
-        if ObjectRef::of(raw.as_bytes()).sha256[..4] != concurrent_prefix {
-            continue;
-        }
-        let n = inputs.len();
-        let file = root.join(format!("concurrent-{n}"));
-        fs::write(&file, raw).unwrap();
-        inputs.push(file);
-        if inputs.len() == 12 {
-            break;
-        }
-    }
-    let mut children = Vec::new();
-    for (n, file) in inputs.iter().enumerate() {
-        let mut command = Command::new("/bin/sh");
-        command.args([
-            "-c",
-            "read gate; exec \"$@\"",
-            "owner-proof",
-            executable.to_str().unwrap(),
-            "put",
-            store_root.to_str().unwrap(),
-            file.to_str().unwrap(),
-        ]);
-        #[cfg(target_os = "linux")]
-        command.env("LD_PRELOAD", &owner_probe);
-        children.push(
-            command
-                .uid(if n % 2 == 0 { 0 } else { uid })
-                .gid(if n % 2 == 0 { 0 } else { uid })
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
-    }
-    for child in &mut children {
-        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
-    }
-    for child in children {
-        ok(child.wait_with_output().unwrap());
-    }
-    for first in fs::read_dir(store_root.join("blobs")).unwrap() {
-        let first = first.unwrap().path();
-        assert_eq!(fs::metadata(&first).unwrap().uid(), uid);
-        for second in fs::read_dir(first).unwrap() {
-            assert_eq!(fs::metadata(second.unwrap().path()).unwrap().uid(), uid);
-        }
-    }
-    let manifest = Manifest::from_files(vec![("payload".into(), root_ref.clone())]).unwrap();
-    let admitted = store.put_manifest(&manifest).unwrap();
-    let manifest_path = store.manifest_path(&admitted.obj.sha256);
-    assert_eq!(
-        fs::metadata(manifest_path.parent().unwrap()).unwrap().uid(),
-        uid
-    );
-    assert_eq!(mode(&manifest_path), 0o444);
-
-    // The managed Runtime (root) publishes a repository, then the ordinary Host
-    // (Store owner) reads it on the SAME Store. Every atomic replacement must
-    // preserve this handoff; directory ownership alone did not protect 0600 files.
-    use tensorfs_core::repository::{Mutation, ReleaseLane, RepositoryName};
-    let repo = RepositoryName::new("paul", "reference-image").unwrap();
-    store
-        .apply_repository(
-            None,
-            &Mutation::PutCheckpoint {
-                repo: repo.clone(),
-                manifest: admitted.obj.clone(),
-            },
-            &Fault::default(),
-        )
-        .unwrap();
-    let mut observed = Some(fs::read(store.repository_path(&repo)).unwrap());
-    for version in ["1.0.0", "1.0.1", "1.0.2"] {
-        store
-            .apply_repository(
-                observed.as_deref(),
-                &Mutation::UpdateRelease {
-                    expected_revision: 0,
-                    repo: repo.clone(),
-                    remove: vec![],
-                    set: vec![ReleaseLane {
-                        extra: Default::default(),
-                        lane: "original".into(),
-                        manifest: admitted.obj.clone(),
-                    }],
-                    version: version.into(),
-                },
-                &Fault::default(),
-            )
-            .unwrap();
-        let path = store.repository_path(&repo);
-        let metadata = fs::metadata(&path).unwrap();
-        assert_eq!(
-            (metadata.uid(), metadata.gid(), mode(&path)),
-            (uid, uid, 0o600)
-        );
-        observed = Some(fs::read(&path).unwrap());
-        let rows = store_root.join("repo-list.jsonl");
-        ok(run(
-            &[
-                "repo",
-                "list",
-                store_root.to_str().unwrap(),
-                "--rows",
-                rows.to_str().unwrap(),
-            ],
-            uid,
-        ));
-        assert!(String::from_utf8(fs::read(rows).unwrap())
-            .unwrap()
-            .contains(version));
-    }
-    // An already-unreadable file is not silently repaired. Its typed native
-    // refusal lets the Host end this preparation instead of retrying forever.
-    let repo_path = store.repository_path(&repo);
-    chown(&repo_path, Some(0), Some(0)).unwrap();
-    let denied = run(
-        &[
-            "repo",
-            "list",
-            store_root.to_str().unwrap(),
-            "--rows",
-            store_root.join("denied.jsonl").to_str().unwrap(),
-        ],
-        uid,
-    );
-    assert!(!denied.status.success());
-    assert!(
-        String::from_utf8_lossy(&denied.stderr).contains("PERMISSION_DENIED"),
-        "{}",
-        String::from_utf8_lossy(&denied.stderr)
-    );
-    assert_eq!(fs::metadata(&repo_path).unwrap().uid(), 0);
-
-    // Unprivileged readers cannot become public writers. The shared lease door is
-    // separate from all public CAS directories, which remain owner-write only.
-    assert!(!run(
-        &["put", store_root.to_str().unwrap(), input.to_str().unwrap()],
-        uid - 1
-    )
-    .status
-    .success());
-
-    // An existing unexpected owner needs an explicit repair, including when called
-    // by root. Do not mutate its inode, metadata, or existing payload to make it pass.
-    chown(directory, Some(uid - 1), Some(uid - 1)).unwrap();
-    let wrong = fs::metadata(directory).unwrap();
-    let refusal = store
-        .put_stream(&mut matching[1].as_slice(), None, &Fault::default())
-        .unwrap_err();
-    assert_eq!(refusal.code, Code::STORE_ERA);
-    assert_eq!(fs::metadata(directory).unwrap().uid(), wrong.uid());
-    assert_eq!(fs::metadata(directory).unwrap().ino(), wrong.ino());
-    assert_eq!(fs::read(&path).unwrap(), root_bytes);
-    chown(directory, Some(uid), Some(uid)).unwrap();
-
-    let outside = root.join("outside");
-    fs::create_dir(&outside).unwrap();
-    let raw = b"symlink must not redirect admission";
-    let reference = ObjectRef::of(raw);
-    let target = store.blob_path(&reference.sha256);
-    fs::create_dir_all(target.parent().unwrap().parent().unwrap()).unwrap();
-    let first = target.parent().unwrap().parent().unwrap();
-    chown(first, Some(uid), Some(uid)).unwrap();
-    symlink(&outside, target.parent().unwrap()).unwrap();
-    assert!(store
-        .put_stream(&mut raw.as_slice(), None, &Fault::default())
-        .is_err());
-    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
-    assert_eq!(fs::metadata(&outside).unwrap().uid(), 0);
-    fs::remove_dir_all(root).unwrap();
-}

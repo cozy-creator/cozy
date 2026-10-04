@@ -15,9 +15,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tensorfs_core::canon;
-use tensorfs_core::fetch::{self, FetchPlan};
+use tensorfs_core::fetch::FetchPlan;
 use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::staging;
 use tensorfs_core::store::Store;
 use tensorfs_core::transport::ObjectSource;
 
@@ -90,34 +89,6 @@ fn credential_of(
 /// unbound Store is a pull with no cache, and a cache that is missing, cold, corrupt,
 /// read-only or unmounted degrades to exactly that pull.
 pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
-    pull_with_budget(root, refspec, flags, None)
-}
-
-/// A distinct verb makes an older CLI refuse instead of ignoring new quota flags.
-pub fn cmd_bounded_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
-    let bound = |name: &str| {
-        let values = crate::flag_all(flags, name);
-        if values.len() != 1 {
-            return None;
-        }
-        values[0].parse::<u64>().ok()
-    };
-    let (Some(bytes), Some(objects)) = (bound("max-download-bytes"), bound("max-download-objects"))
-    else {
-        eprintln!(
-            "bounded fetch requires one unsigned --max-download-bytes and --max-download-objects"
-        );
-        return ExitCode::from(2);
-    };
-    pull_with_budget(root, refspec, flags, Some((bytes, objects)))
-}
-
-fn pull_with_budget(
-    root: &Path,
-    refspec: &str,
-    flags: &Flags,
-    budget: Option<(u64, u64)>,
-) -> ExitCode {
     // Before the open, which is where an unclean shutdown's recovery runs.
     let before = tensorfs_core::stats::snapshot();
     let store = ok!(Store::open(root));
@@ -136,7 +107,6 @@ fn pull_with_budget(
     request.session = flag(flags, "session").unwrap_or("");
     request.streams = crate::flag_num(flags, "streams", transport::PULL_STREAMS);
     request.deadline = deadline_of(flags);
-    request.download_budget = budget;
     // THE WALK REPORTS WHILE IT WALKS.
     //
     // Until now `tfs fetch` printed one report at the end, the pod's supervisor buffered
@@ -224,238 +194,7 @@ fn pull_with_budget(
 
 // ------------------------------------------------------------ the observation channel
 
-/// The RESOLUTION of `--progress`, never a verdict about it.
-///
-/// A record every `SAMPLE_BYTES` keeps the channel's cost proportional to the BYTES MOVED
-/// rather than to the number of fetches running: the pod runs several `fetch url` children
-/// at once over one link, and the link is what bounds their sum, so the whole transfer
-/// emits `moved / SAMPLE_BYTES` records however many children there are. At the 117.6 MB/s
-/// #566b measured for a saturated link that is about two records a second; at the 6 MB/s
-/// the H3 pod degraded to, one every ten seconds.
-///
-/// `SAMPLE_GAP` floors it so a crawling link still says so several times a minute, and it
-/// is the ledger's own `SAMPLE_SECONDS` rather than a second number invented here — the
-/// same cadence `cmd_pull`'s walk reports at. It is not a deadline and cannot fire on its
-/// own: a record is only ever emitted by a read that ACTUALLY MOVED BYTES, so silence on
-/// this channel means silence on the wire, which is the fact the parent is watching for.
-/// Judging that silence is the parent's job and it does it by observation. Nothing in this
-/// file can end a transfer.
-const SAMPLE_BYTES: u64 = 64 << 20;
-
-fn sample_gap() -> std::time::Duration {
-    std::time::Duration::from_secs_f64(transport::SAMPLE_SECONDS)
-}
-
-/// `--progress`: this command's half of the event channel `cmd_pull` opened.
-///
-/// EVENTS ARE STDERR, one JSON object per line, `event` first; stdout carries the report a
-/// caller parses for its result and nothing else. That is what makes "no event can be
-/// parsed as a completion proof" structural rather than conventional — the guarantee is
-/// which stream it arrived on. `fetch url`'s result is `held|admitted <id>` and
-/// `transferred <n> B`, and nothing printed here can be mistaken for either.
-///
-/// One event, and the counter names are `pull.progress`'s so that one consumer reads both
-/// verbs. `origin_bytes` is what is home so far; it goes back if an origin that does not
-/// range starts the object over. `origin_objects` goes to one when the object is admitted:
-///
-///   {"event":"fetch.progress","origin_bytes":N,"origin_objects":0|1}
-struct Reporter {
-    moved: u64,
-    reported: u64,
-    /// The byte delta between records. `--progress-bytes` states it, because resolution is
-    /// configuration and nothing here is a verdict; production states nothing and gets
-    /// SAMPLE_BYTES.
-    every: u64,
-    gap: std::time::Duration,
-    last: std::time::Instant,
-}
-
-impl Reporter {
-    fn new(every: u64) -> Self {
-        Reporter {
-            moved: 0,
-            reported: 0,
-            every: every.max(1),
-            gap: sample_gap(),
-            last: std::time::Instant::now(),
-        }
-    }
-
-    fn say(&mut self, event: &str) {
-        use std::io::Write;
-        let mut out = io::stderr().lock();
-        // A closed channel is not this transfer's business. The bytes are wanted by
-        // whoever asked for them, not by whoever was watching.
-        let _ = writeln!(out, "{event}").and_then(|()| out.flush());
-        self.last = std::time::Instant::now();
-    }
-
-    fn announce(&mut self, admitted: u64) {
-        self.reported = self.moved;
-        let event = format!(
-            "{{\"event\":\"fetch.progress\",\"origin_bytes\":{},\"origin_objects\":{}}}",
-            self.moved, admitted
-        );
-        self.say(&event);
-    }
-}
-
-impl transport::FetchObserver for Reporter {
-    fn moved(&mut self, total: u64) {
-        // A count that goes back is reported at once: those bytes are not on this machine.
-        let due = total < self.moved
-            || total.saturating_sub(self.reported) >= self.every
-            || self.last.elapsed() >= self.gap;
-        self.moved = total;
-        if due {
-            self.announce(0);
-        }
-    }
-}
-
-/// `tfs fetch url <root> <sha256> <length> <url|-> [--progress] [--streams N] [--part-mib N]`
-/// — plan-of-one, then the pull's downloader. A held object answers `held` and moves
-/// nothing. A url of `-` reads the real URL as one line on stdin: a capability URL can
-/// embed a signature, and argv is world-readable in /proc.
-///
-/// `--streams` is how many ranged requests of THIS object are in flight and `--part-mib`
-/// one request's size. An origin that will not answer a range gives the object to one
-/// request whatever these say.
-///
-/// `--progress` opens the observation channel above. Without it this command says nothing
-/// until it is finished, which for a 5 GiB shard is ten to fifteen minutes of silence a
-/// supervisor cannot read: the H3 ingest moved 210 GB over 2h56m and its only signal was a
-/// cumulative byte total at each file's COMPLETION, so "slow" and "wedged" looked identical
-/// for the whole run and the run was lost.
-/// A url of `-` reads the real URL as one line on stdin: a capability URL can embed a
-/// signature, and argv is world-readable in /proc.
-fn url_of(url: &str) -> Result<String, ExitCode> {
-    use std::io::BufRead;
-    if url != "-" {
-        return Ok(url.to_string());
-    }
-    let mut line = String::new();
-    if io::stdin().lock().read_line(&mut line).is_err() {
-        eprintln!("REFUSED SOURCE_NOT_ALLOWED: could not read the URL from stdin");
-        return Err(ExitCode::FAILURE);
-    }
-    Ok(line.trim().to_string())
-}
-
-fn object_of(what: &str, id: &str, length: &str) -> Result<ObjectRef, ExitCode> {
-    let sha256 = match tensorfs_core::ids::hex64(what, id) {
-        Ok(sha256) => sha256,
-        Err(refusal) => {
-            eprintln!("REFUSED {refusal}");
-            return Err(ExitCode::FAILURE);
-        }
-    };
-    let Ok(length) = length.parse::<u64>() else {
-        eprintln!("length must be a byte count");
-        return Err(ExitCode::from(2));
-    };
-    Ok(ObjectRef { sha256, length })
-}
-
-fn ranged_of(flags: &Flags) -> transport::Ranged {
-    transport::Ranged {
-        streams: crate::flag_num(flags, "streams", transport::STREAMS),
-        part: crate::flag_num::<u64>(flags, "part-mib", transport::PART_BYTES >> 20) << 20,
-    }
-}
-
 // ------------------------------------------------------------ the staging area
-
-/// `tfs staging fetch <root> <sha256> <length> <url|-> [--progress] [--streams N] …` — the
-/// SOURCE-CARRIER fetch, and the one verb the pod's source lane calls.
-///
-/// It is `fetch url`'s transport exactly: the same policy fence on the first URL and every
-/// redirect hop, the same ranged resume, the same event channel, and the same digest
-/// enforced by the same hashing core. What differs is where the bytes come to rest — a
-/// carrier lands at `<root>/staging/<hex>`, outside every namespace a census walks, with no
-/// catalog record and nothing to garbage-collect. `tfs fetch url` is UNCHANGED and still
-/// admits repo objects to the CAS; there is deliberately no flag that could put a 5 GB
-/// carrier in `blobs/` or a repo object in `staging/`.
-///
-/// Two dispositions, and the second is what makes a restart cheap:
-///
-///   present <id> — a staged file at the right length REHASHED to the id asked for. Zero
-///                  bytes moved, which is the behaviour `fetch url` has today for a HELD
-///                  object and which a port could silently have dropped.
-///   staged  <id> — this call moved the bytes.
-///
-/// `path` is on stdout in both cases, because the point of this issue is that the caller
-/// stops deriving TensorFS's internal layout by hand.
-pub fn cmd_staging_fetch(
-    root: &Path,
-    id: &str,
-    length: &str,
-    url: &str,
-    flags: &Flags,
-) -> ExitCode {
-    let store = ok!(Store::open(root));
-    let url = match url_of(url) {
-        Ok(url) => url,
-        Err(code) => return code,
-    };
-    let object = match object_of("staging fetch object", id, length) {
-        Ok(object) => object,
-        Err(code) => return code,
-    };
-    // Residency by REHASH, never by a record: a carrier is a file the store is about to
-    // throw away, and a durable claim about one would outlive it.
-    if let Some(path) = ok!(staging::staged(&store, &object)) {
-        println!("present      {}", object.id());
-        println!("path         {}", path.display());
-        println!("transferred  0 B");
-        return ExitCode::SUCCESS;
-    }
-    let session = flag(flags, "session").unwrap_or("staging");
-    let grant = ok!(fetch::DeliveryGrant::stage(session, &object));
-    let ledger = transport::Ledger::new();
-    let mut reporter = crate::flag_on(flags, "progress")
-        .then(|| Reporter::new(crate::flag_num(flags, "progress-bytes", SAMPLE_BYTES)));
-    let fetched = transport::fetch_ranged(
-        &store,
-        &grant,
-        &url,
-        &policy_of(flags),
-        &Anonymous,
-        deadline_of(flags),
-        &ledger,
-        ranged_of(flags),
-        reporter
-            .as_mut()
-            .map(|r| r as &mut dyn transport::FetchObserver),
-    );
-    let fetched = ok!(fetched);
-    if let Some(reporter) = reporter.as_mut() {
-        reporter.moved = fetched.transferred;
-        reporter.announce(1);
-    }
-    let path = ok!(staging::path(&store, &fetched.object.sha256));
-    println!("staged       {}", fetched.object.id());
-    println!("path         {}", path.display());
-    println!("transferred  {} B", fetched.transferred);
-    ExitCode::SUCCESS
-}
-
-/// `tfs staging drop <root> <sha256>` — retire one spent carrier. One unlink, IDEMPOTENT:
-/// an id that is not there is success, because the caller's intent is already true.
-///
-/// This is the consumer of `Progress.spent` — the carriers no remaining conversion op will
-/// read. It needs no hold check, no chain check and no catalog surgery, because there is
-/// nothing to be atomic about.
-pub fn cmd_staging_drop(root: &Path, id: &str) -> ExitCode {
-    let store = ok!(Store::open(root));
-    let sha256 = ok!(tensorfs_core::ids::hex64("staging drop object", id));
-    let removed = ok!(staging::remove(&store, &sha256));
-    println!(
-        "{}      sha256:{sha256}",
-        if removed { "dropped" } else { "absent " }
-    );
-    ExitCode::SUCCESS
-}
 
 /// The push destination, reaching the child exactly the way the credential does (tfs-050) —
 /// never argv, which is world-readable in `/proc`, and a presigned PUT is a bearer secret.
