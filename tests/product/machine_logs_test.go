@@ -41,8 +41,7 @@ func TestMachinesPrintTheirTensorFSTransportLog(t *testing.T) {
 	const grow = "1790879966.001 grow 2797556697dd7aa8 67108864 lanes=64 busy=3 level=128 hedges=2\n"
 	const walk = "1790881096.936 walk 4477 101123198626 fetched=4477 cached=0 moved=101123198626 seconds=231.4 level=128 hedges=29 hedges_won=29 outcome=ok\n"
 	write(machineStore(root), hedge, grow+walk)
-	// A rental's machine keeps its own store; its launcher names none.
-	write(filepath.Join(h.provider, "var", "lib", "cozy", "rust-machine", "tensorfs"), "", walk)
+	write(filepath.Join(h.provider, "var", "lib", "tensorfs"), "", walk)
 
 	if code, out := runCozy(t, root, "machine", "logs", "--tensorfs"); code != 0 || out != hedge+grow+walk {
 		t.Fatalf("this computer's log [%d]: %q", code, out)

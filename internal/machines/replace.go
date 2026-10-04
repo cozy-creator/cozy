@@ -32,7 +32,7 @@ var wheelCache = [2]string{"var/lib/cozy/dependencies/uv-cache", "var/lib/cozy/r
 func (h *Host) carried() [][2]string {
 	out := [][2]string{wheelCache}
 	if h.store == "" {
-		return append(out, [2]string{"var/lib/tensorfs", "var/lib/cozy/rust-machine/tensorfs"})
+		return append(out, [2]string{"var/lib/tensorfs", "var/lib/tensorfs"}) // both machines' unnamed store
 	}
 	if inside, err := filepath.Rel(h.Root(), h.store); err == nil && inside != "." && filepath.IsLocal(inside) {
 		out = append(out, [2]string{inside, inside})
