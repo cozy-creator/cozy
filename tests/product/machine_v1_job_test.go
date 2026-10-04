@@ -285,3 +285,69 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 		t.Fatalf("the run replaced the older daemon with %q", running)
 	}
 }
+
+// A run its machine already accepted never starts a stopped machine: observing attaches while
+// the machine runs and waits while it is stopped, on cozy.machine.v1 as on the path before it.
+func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
+	if *machineHostBinary == "" || *cpuLongform == "" {
+		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+	}
+	root, err := os.MkdirTemp(os.TempDir(), "czs")
+	must(t, err)
+	provisionMachine(t, root)
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		if t.Failed() {
+			t.Logf("evidence retained at %s\nmachine log tail:\n%s", root, tail(filepath.Join(root, "machine", "host.log")))
+		} else {
+			_ = removeAllForce(root)
+		}
+	})
+	project := filepath.Join(t.TempDir(), "cpu_longform")
+	must(t, os.CopyFS(project, os.DirFS(*cpuLongform)))
+	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
+		t.Fatalf("uv lock: %v\n%s", err, out)
+	}
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		t.Fatalf("package install [exit %d]\n%s", code, out)
+	}
+	picture := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	var encoded bytes.Buffer
+	must(t, png.Encode(&encoded, picture))
+	reference := filepath.Join(root, "ref.png")
+	must(t, os.WriteFile(reference, encoded.Bytes(), 0o600))
+	in := filepath.Join(root, "req.json")
+	must(t, os.WriteFile(in, []byte(`{"segments":["one","two"],"hold":600}`), 0o600))
+	code, submitted := runCozy(t, root, "run", "local/cozy-machine-cpu-longform/long_form", "--input", in,
+		"--asset", "reference="+reference, "--json")
+	if code != 0 {
+		t.Fatalf("submit [exit %d]\n%s", code, submitted)
+	}
+	running := func() bool {
+		_, shown := runCozy(t, root, "machine", "show", "--json")
+		var machine struct {
+			Running bool `json:"running"`
+		}
+		_ = json.Unmarshal([]byte(lastJSONLine(shown)), &machine)
+		return machine.Running
+	}
+	status := func() string {
+		_, shown := runCozy(t, root, "run", "show", "1", "--json")
+		var state struct {
+			Status string `json:"status"`
+		}
+		_ = json.Unmarshal([]byte(lastJSONLine(shown)), &state)
+		return state.Status
+	}
+	landed(t, "the machine to accept the run", func() bool { return status() == "in_progress" })
+	if code, out := runCozy(t, root, "machine", "stop"); code != 0 || running() {
+		t.Fatalf("machine stop [exit %d]\n%s", code, out)
+	}
+	// The daemon's observer retries within seconds; a reader asks at once. Neither starts it.
+	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); time.Sleep(time.Second) {
+		if status(); running() {
+			t.Fatal("observing an accepted run started the stopped machine")
+		}
+	}
+}

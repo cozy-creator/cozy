@@ -17,10 +17,22 @@ import (
 // the same request events a worker.v1 run's import writes, so every reader renders it alike.
 const RunV1Accepted = "machine.api_v1"
 
+// RunV1Sent marks a run whose spec was sent to its machine: the machine may hold it before
+// its acceptance is recorded here. RunV1CancelTold marks that such a run's cancel reached it.
+const (
+	RunV1Sent       = "machine.api_v1_sent"
+	RunV1CancelTold = "machine.api_v1_cancel_told"
+)
+
 // RunV1 is whether the run's machine accepted it over cozy.machine.v1.
 func (s *Store) RunV1(id string) (bool, *exit.Error) {
+	return s.RunV1Marked(id, RunV1Accepted)
+}
+
+// RunV1Marked is whether the run carries one of the marks above.
+func (s *Store) RunV1Marked(id, mark string) (bool, *exit.Error) {
 	var found bool
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, id, RunV1Accepted).Scan(&found); err != nil {
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, id, mark).Scan(&found); err != nil {
 		return false, exit.Internalf("cannot read the run's machine API: %s", err)
 	}
 	return found, nil
