@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -196,3 +197,13 @@ func (c *Client) SendRaw(raw []byte, text bool) error {
 }
 
 func (c *Client) Close() error { return c.pc.Close() }
+
+// Fingerprint spells a certificate's pin as SDP's a=fingerprint does: "sha-256 AB:CD:…".
+func Fingerprint(der []byte) string {
+	sum := sha256.Sum256(der)
+	parts := make([]string, len(sum))
+	for i, b := range sum {
+		parts[i] = fmt.Sprintf("%02X", b)
+	}
+	return "sha-256 " + strings.Join(parts, ":")
+}
