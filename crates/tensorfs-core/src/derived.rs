@@ -30,7 +30,7 @@ use crate::manifest::{Draft, Entry, Manifest};
 use crate::meta::{Hold, Meta};
 use crate::read::{self, ReadLease};
 use crate::store::Store;
-use crate::{registry, spec::EncodingSpec, vectors::EncodingVectors};
+use crate::{registry, spec::EncodingSpec};
 
 fn arithmetic(what: impl Into<String>) -> Refusal {
     Refusal {
@@ -1788,15 +1788,11 @@ fn planned_part(declaration: &PartDeclaration) -> Result<Part> {
     })
 }
 
-#[derive(Debug)]
-struct RegistryAdoption {
-    spec: EncodingSpec,
-    vectors: EncodingVectors,
-}
-
 /// Resolve by artifact identity alone. Registry aliases deliberately never cross this
 /// boundary: they are discovery/display names, while the declaration is locked to a digest.
-fn registry_adoption(encoding: &str) -> Result<RegistryAdoption> {
+/// A compiled seed is consistent with its vectors by construction (`registry` tests); it
+/// enters a derived manifest only if it carries them.
+fn registry_spec(encoding: &str) -> Result<EncodingSpec> {
     let mut matches: Vec<_> = registry::seeds()
         .into_iter()
         .filter(|seed| seed.spec.object_id() == encoding)
@@ -1816,41 +1812,15 @@ fn registry_adoption(encoding: &str) -> Result<RegistryAdoption> {
             "target cites {encoding}, absent from every exact source closure and the compiled platform registry"
         ),
     })?;
-    let spec = EncodingSpec::decode_nested(&seed.spec.canonical_bytes())?;
-    let vectors = seed.vectors.ok_or_else(|| Refusal {
-        code: Code::VECTORS_REQUIRED,
-        detail: format!(
-            "compiled registry spec {encoding} has no conformance-vector document and cannot be introduced into a derived manifest"
-        ),
-    })?;
-    let vectors = EncodingVectors::parse_fixture(&vectors.fixture_bytes())?;
-    let expected = spec.vectors.as_ref().ok_or_else(|| Refusal {
-        code: Code::VECTOR_MISMATCH,
-        detail: format!("compiled registry spec {encoding} does not reference its vectors"),
-    })?;
-    let actual = vectors.fixture_ref();
-    if &actual != expected {
+    if seed.vectors.is_none() {
         return refuse(
-            Code::VECTOR_MISMATCH,
+            Code::VECTORS_REQUIRED,
             format!(
-                "compiled registry spec {encoding} references {}, canonical vectors are {}",
-                expected.id(),
-                actual.id()
+                "compiled registry spec {encoding} has no conformance-vector document and cannot be introduced into a derived manifest"
             ),
         );
     }
-    vectors.check(&spec)?;
-    Ok(RegistryAdoption { spec, vectors })
-}
-
-fn admit_registry(store: &Store, adoptions: &[RegistryAdoption]) -> Result<()> {
-    for adoption in adoptions {
-        // Qualification vectors remain fixture blobs. The encoding value itself is nested
-        // in the CozyTensors header and is never admitted as another stored document.
-        let _ = store;
-        adoption.vectors.check(&adoption.spec)?;
-    }
-    Ok(())
+    Ok(seed.spec)
 }
 
 fn graft_part(
@@ -1908,7 +1878,7 @@ fn build_header(
     added_parts: &[AddedPart],
     added_configs: &[AddedConfig],
     planned: bool,
-) -> Result<(Header, Closure, Vec<RegistryAdoption>)> {
+) -> Result<(Header, Closure)> {
     let mut components = Vec::new();
     for component in &declaration.components {
         let mut tensors = match (&component.source, &component.source_component) {
@@ -2127,7 +2097,6 @@ fn build_header(
         .collect();
     let mut encodings = Vec::new();
     let mut closure = Closure::default();
-    let mut registry_adoptions = Vec::new();
     for encoding in cited {
         let mut found: Option<crate::spec::EncodingSpec> = None;
         for source in sources {
@@ -2154,12 +2123,7 @@ fn build_header(
         }
         let spec = match found {
             Some(found) => found,
-            None => {
-                let adoption = registry_adoption(&encoding)?;
-                let found = adoption.spec.clone();
-                registry_adoptions.push(adoption);
-                found
-            }
+            None => registry_spec(&encoding)?,
         };
         encodings.push(spec.clone());
         closure.insert(spec);
@@ -2187,7 +2151,7 @@ fn build_header(
         components,
     };
     header.validate(&closure)?;
-    Ok((header, closure, registry_adoptions))
+    Ok((header, closure))
 }
 
 pub struct Begin {
@@ -3641,14 +3605,13 @@ pub fn commit(
     };
     let declaration = declaration(&row_before)?;
     let sources = load_sources(store, &declaration)?;
-    let (header, closure, registry_adoptions) = build_header(
+    let (header, closure) = build_header(
         &declaration,
         &sources,
         &row_before.added_parts,
         &row_before.added_configs,
         false,
     )?;
-    admit_registry(store, &registry_adoptions)?;
     let header_ref = checkpoint::put_doc(store, &header)?;
     let mut manifest = Draft::of(&build_manifest(&header, &header_ref, &closure)?);
     for (_, data) in &declaration.files {
