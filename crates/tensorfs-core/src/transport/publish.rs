@@ -17,8 +17,8 @@ use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::SourcePolicy;
 use crate::transport::push::{push_object, UploadGrant};
 
-/// Objects asked for or verified in one request.
-const BATCH: usize = 256;
+/// Objects asked for or verified in one request: the Hub takes 1 through 128.
+const BATCH: usize = 128;
 
 pub struct Publication<'a> {
     pub store: &'a Store,

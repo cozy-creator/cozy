@@ -5198,6 +5198,16 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                     ]),
                 )]))
             }
+            // As Tensorhub: 1 through 128 objects per grant or verify request.
+            "POST"
+                if (path.ends_with("/grants") || path.ends_with("/verify"))
+                    && !(1..=128).contains(&objects(&request.body, "object_ids").len()) =>
+            {
+                status(
+                    422,
+                    br#"{"error":{"code":"publication.object_selection_invalid","message":"select 1 through 128 object ids per request"}}"#,
+                )
+            }
             "POST" if path.ends_with("/grants") => {
                 let url = base.lock().unwrap().clone();
                 let grants = objects(&request.body, "object_ids")
@@ -5295,5 +5305,37 @@ fn publish_pushes_what_the_hub_lacks_and_follows_its_finalization() {
     .unwrap();
     assert!(again.converged);
     assert_eq!(state.lock().unwrap().finalized, 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A closure larger than one request's selection (an SDXL LoRA's) is asked for and verified in
+/// requests the Hub accepts.
+#[test]
+fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
+    let root = temporary("publish-large");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(300, 4096));
+    let source = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = local_policy();
+    pull(&request_for(&store, &source.base, &policy)).unwrap();
+    let manifest_bytes = checkpoint.bodies[&checkpoint.manifest.sha256].clone();
+    let (hub, state) = publication_hub(manifest_bytes);
+    let published = super::publish(&super::Publication {
+        store: &store,
+        hub: &hub.base,
+        destination: "Acme/Model",
+        manifest: &checkpoint.manifest,
+        operation: "op-large",
+        credential: &Anonymous,
+        policy: &policy,
+        progress: &|_, _| {},
+        streams: 4,
+    })
+    .unwrap();
+    assert_eq!(published.checkpoint, checkpoint.manifest.id());
+    let held = state.lock().unwrap();
+    assert_eq!(held.uploaded.len(), held.declared.len() - 1);
+    assert_eq!(held.verified.len(), held.declared.len() - 1);
+    assert_eq!(held.finalized, 1);
     let _ = std::fs::remove_dir_all(root);
 }
