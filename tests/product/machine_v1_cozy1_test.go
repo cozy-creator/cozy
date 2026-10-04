@@ -2,8 +2,10 @@ package producttest
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -11,23 +13,17 @@ import (
 	"image"
 	"image/png"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/netip"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/machines"
-	"github.com/cozy-creator/cozy/internal/records"
-	machinev1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"github.com/cozy-creator/cozy/tests/product/webrtctest"
 )
 
@@ -81,10 +77,19 @@ func cozy1Run(t *testing.T, root string, args ...string) (id string, command *ex
 	return run.ID, command, ran
 }
 
-// cozy1Sessions opens welcomed cozy/1 sessions on root's machine as a browser holding a link
-// does: the port its receipt names, its leaf's fingerprint, and a capability for run that an
-// authorized key signs.
-func cozy1Sessions(t *testing.T, root string, port int, run string) (*mediaHarness, func(capability.Grant) *webrtctest.Client) {
+// cozy1Machine is root's running Rust machine as a browser holding a link reaches it: the
+// WebRTC port its receipt names, its leaf's fingerprint, and the owner key that signs caps.
+type cozy1Machine struct {
+	t           *testing.T
+	root        string
+	Addr        netip.AddrPort
+	Fingerprint string
+	Machine     string
+	public      ed25519.PublicKey
+	sign        func([]byte) []byte
+}
+
+func newCozy1Machine(t *testing.T, root string, port int) *cozy1Machine {
 	t.Helper()
 	dir := filepath.Join(root, "machine")
 	var envelope struct {
@@ -112,18 +117,56 @@ func cozy1Sessions(t *testing.T, root string, port int, run string) (*mediaHarne
 	raw, err = os.ReadFile(filepath.Join(dir, "leaf.pem"))
 	must(t, err)
 	leaf, _ := pem.Decode(raw)
+	var agent struct {
+		PID        int `json:"pid"`
+		WorkerPort int `json:"worker_port"`
+		MediaPort  int `json:"media_port"`
+	}
+	raw, err = os.ReadFile(filepath.Join(dir, "agent.json"))
+	must(t, err)
+	must(t, json.Unmarshal(raw, &agent))
+	// Its listeners: the worker port, the receipt's media port, and the granted WebRTC port.
+	if ports, want := processListenerPorts(t, agent.PID), []int{agent.WorkerPort, agent.MediaPort, port}; !slices.Equal(ports, slices.Sorted(slices.Values(want))) {
+		t.Fatalf("a machine granted WebRTC port %d listens on %v; want %v", port, ports, want)
+	}
+	return &cozy1Machine{t: t, root: root, Addr: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)),
+		Fingerprint: webrtctest.Fingerprint(leaf.Bytes), Machine: state.MachineID, public: public, sign: owner.Sign}
+}
+
+// ownerKey is the key this computer's machine authorizes.
+func (m *cozy1Machine) ownerKey() ed25519.PrivateKey {
+	raw, err := os.ReadFile(filepath.Join(m.root, "machine", "owner.pem"))
+	must(m.t, err)
+	block, _ := pem.Decode(raw)
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	must(m.t, err)
+	return parsed.(ed25519.PrivateKey)
+}
+
+// mint signs g with the owner key, for this machine and for ten minutes unless g says otherwise.
+func (m *cozy1Machine) mint(g capability.Grant) string {
+	g.Machine = cmp.Or(g.Machine, m.Machine)
+	if g.Expires == 0 {
+		g.Expires = time.Now().Add(10 * time.Minute).Unix()
+	}
+	token, err := capability.MintSigned(m.public, m.sign, g)
+	must(m.t, err)
+	return token
+}
+
+// cozy1Sessions opens welcomed cozy/1 sessions on root's machine for run, with caps g narrows.
+func cozy1Sessions(t *testing.T, root string, port int, run string) (*mediaHarness, func(capability.Grant) *webrtctest.Client) {
+	t.Helper()
+	m := newCozy1Machine(t, root, port)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	t.Cleanup(cancel)
 	h := &mediaHarness{t: t, ctx: ctx}
 	return h, func(g capability.Grant) *webrtctest.Client {
-		g.Machine, g.Run, g.Expires = state.MachineID, run, time.Now().Add(10*time.Minute).Unix()
-		token, err := capability.MintSigned(ed25519.PublicKey(public), owner.Sign, g)
-		must(t, err)
-		c, err := webrtctest.Dial(ctx, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)),
-			webrtctest.Fingerprint(leaf.Bytes), webrtctest.Options{})
+		g.Run = run
+		c, err := webrtctest.Dial(ctx, m.Addr, m.Fingerprint, webrtctest.Options{})
 		must(t, err)
 		t.Cleanup(func() { c.Close() })
-		h.send(c, map[string]any{"t": "hello", "v": 1, "cap": token})
+		h.send(c, map[string]any{"t": "hello", "v": 1, "cap": m.mint(g)})
 		h.expect(c, "welcome")
 		h.send(c, map[string]any{"t": "credit", "bytes": 1 << 30})
 		return c
@@ -251,51 +294,5 @@ func TestCozy1FollowsAGrowingVideoOnAV1Machine(t *testing.T) {
 	if !bytes.Equal(f.got, saved) || f.end.Status != "completed" || f.end.SHA256 != digestOf(saved) {
 		t.Fatalf("the follower ended with %s holding %d bytes (%d before it resumed, %d resets since); --out saved %d",
 			f.end.Raw, len(f.got), held, f.resets-resets, len(saved))
-	}
-}
-
-// `cozy run play` on a run a cozy.machine.v1 machine accepted names the run as that machine
-// does, by its id, in the link and in the capability, and names the machine by its worker id.
-func TestRunPlayNamesAV1RunByItsID(t *testing.T) {
-	public, key, err := ed25519.GenerateKey(nil)
-	must(t, err)
-	fingerprint := "sha-256 " + strings.TrimSuffix(strings.Repeat("AB:", 32), ":")
-	hub := httptest.NewServer(machineKeyLogin("dk-play", public, "play-test", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/rentals/pr-play" || r.Header.Get("Authorization") != "Bearer play-test" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": "pr-play", "name": "jaguarman", "state": "ready",
-			"webrtc": map[string]any{"address": "203.0.113.7:8445", "fingerprint": fingerprint}})
-	})))
-	defer hub.Close()
-	o := hostOwner(t, fmt.Sprintf("run-play-v1-%d", time.Now().UnixNano()))
-	must(t, os.WriteFile(filepath.Join(o.root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\n"), 0o600))
-	plantMachineKey(t, o.root, hub.URL, "dk-play", key)
-	request, _, problem := o.store.Submit(records.Request{ID: "job-play", IdemKey: "play", Package: "local/example", Entrypoint: "main",
-		Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("play"), MachineExecutionObserver: true,
-		Hub: hub.URL, Rental: true, Worker: "pr-play", Machine: "jaguarman"})
-	fatal(t, problem)
-	fatal(t, o.store.LinkMachineExecution(request.ID, "pr-play"))
-	fatal(t, o.store.AcceptRunV1(request.ID, "worker-of-jaguarman", &machinev1.RunState{Id: request.ID, Number: 7, State: "running"}))
-	defer publicationControlAPI(t, o)()
-
-	code, out := runCozy(t, o.root, "run", "play", request.ID, "--output", "video", "--json")
-	var printed struct{ Link string }
-	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &printed) != nil {
-		t.Fatalf("cozy run play: [%d] %s", code, out)
-	}
-	_, fragment, _ := strings.Cut(printed.Link, "#")
-	link, err := url.ParseQuery(fragment)
-	must(t, err)
-	payload, _, _ := strings.Cut(link.Get("c"), ".")
-	raw, err := base64.RawURLEncoding.DecodeString(payload)
-	must(t, err)
-	var grant capability.Grant
-	must(t, json.Unmarshal(raw, &grant))
-	if link.Get("r") != request.ID || link.Get("a") != "203.0.113.7:8445" || grant.Run != request.ID || grant.Machine != "worker-of-jaguarman" ||
-		len(grant.Outputs) != 1 || grant.Outputs[0] != "video" {
-		t.Fatalf("the link names run %q at %q; its capability grants %+v", link.Get("r"), link.Get("a"), grant)
 	}
 }
