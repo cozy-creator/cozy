@@ -454,7 +454,16 @@ pub fn serve_source(
             check_current()?;
             if view.is_none() {
                 // Exact-source validation runs even when the first operation is a read.
-                view = Some(inspect_source(store, meta, source.clone(), vec![], vec![])?.view);
+                // An empty selection means everything the source admits.
+                let snapshot = store.read_manifest(source)?;
+                let header_ref = snapshot.header().ok_or_else(|| Refusal {
+                    code: Code::MISSING_FIELD,
+                    detail: "scoped source has no tensor header".into(),
+                })?;
+                let header = crate::checkpoint::load_header(store, header_ref)?;
+                let components = header.components.iter().map(|(name, _)| name.clone()).collect();
+                let configs = header.configs.iter().map(|(name, _)| name.clone()).collect();
+                view = Some(inspect_source(store, meta, source.clone(), components, configs)?.view);
             }
             if op != "inspect" && lease.is_none() {
                 lease = Some(read::acquire_cozytensors(store, meta, &store.read_manifest(source)?)?.0);
@@ -467,7 +476,16 @@ pub fn serve_source(
                     let names = |key: &str| -> Result<Vec<String>> {
                         array(key, fields.req(key)?)?.iter().map(|v| text(key, v).map(String::from)).collect()
                     };
-                    let inspection = inspect_source(store, meta, source.clone(), names("components")?, names("configs")?)?;
+                    let source_view = view.as_ref().unwrap();
+                    let mut components = names("components")?;
+                    if components.is_empty() {
+                        components = source_view.fact.components.clone();
+                    }
+                    let mut selected_configs = names("configs")?;
+                    if selected_configs.is_empty() {
+                        selected_configs = source_view.configs.clone();
+                    }
+                    let inspection = inspect_source(store, meta, source.clone(), components, selected_configs)?;
                     let configs = inspection
                         .configs
                         .iter()
@@ -804,5 +822,76 @@ fn json(value: &Value) -> Json {
         Value::Str(s) => Json::Str(s.clone()),
         Value::Arr(items) => Json::Arr(items.iter().map(json).collect()),
         Value::Obj(pairs) => Json::Obj(pairs.iter().map(|(k, v)| (k.clone(), json(v))).collect()),
+    }
+}
+
+#[cfg(test)]
+mod source_channel_tests {
+    use super::*;
+
+    #[test]
+    fn native_source_inspection_defaults_to_all_admitted_components_and_configs() {
+        let root = std::env::temp_dir().join(format!(
+            "native-source-channel-{}",
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let transaction = format!("sha256:{}", "91".repeat(32));
+        let mut declaration = super::super::tests::created_declaration();
+        declaration.configs.push(ConfigDeclaration::Add {
+            target: "scheduler".into(),
+        });
+        declaration.max_new_bytes = 4096;
+        let begun = super::super::begin(&store, &meta, &transaction, 1, declaration, None).unwrap();
+        let data = vec![0u8; 2048];
+        super::super::add_part(
+            &store,
+            &meta,
+            &transaction,
+            1,
+            ("model", "weight", "value"),
+            &mut data.as_slice(),
+        )
+        .unwrap();
+        super::super::add_config(
+            &meta,
+            &transaction,
+            1,
+            "scheduler",
+            &mut &b"{\"seed\":1}"[..],
+        )
+        .unwrap();
+        let receipt = super::super::commit(&store, &meta, &transaction, 1).unwrap();
+        drop(begun);
+        let (client, server) = UnixStream::pair().unwrap();
+        std::thread::scope(|scope| {
+            let held =
+                scope.spawn(|| serve_source(&store, &meta, &receipt.manifest, server, &|| Ok(())));
+            let mut client = Channel(client);
+            client
+                .send(
+                    &jcs::parse(
+                        br#"{"op":"inspect","components":[],"configs":[]}"#,
+                        METADATA,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let Some(Frame::Json(answer)) = client.receive().unwrap() else {
+                panic!("metadata reply absent")
+            };
+            let answer = String::from_utf8(jcs::write(&answer)).unwrap();
+            assert!(!answer.contains("\"error\""), "{answer}");
+            assert!(answer.contains("\"name\":\"model\""), "{answer}");
+            assert!(answer.contains("\"name\":\"scheduler\""), "{answer}");
+            let Some(Frame::Bytes(config)) = client.receive().unwrap() else {
+                panic!("config reply absent")
+            };
+            assert_eq!(config, b"{\"seed\":1}");
+            drop(client);
+            held.join().unwrap().unwrap();
+        });
+        let _ = std::fs::remove_dir_all(root);
     }
 }
