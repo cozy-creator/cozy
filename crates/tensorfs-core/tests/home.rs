@@ -98,3 +98,31 @@ fn a_named_root_still_creates_and_store_ensure_stays_idempotent() {
     run(&["store", "info", named.to_str().unwrap()]);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// A switch never takes the positional after it, an unknown flag warns without moving any
+/// argument, and a numeric flag that is not a number is a usage error.
+#[test]
+fn switches_keep_their_positionals_and_unknown_flags_warn() {
+    let root = temporary("flags");
+    let named = root.join("named");
+    let environment = root.join("environment");
+    let tfs = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tfs"))
+            .args(args)
+            .env("TENSORFS_HOME", &environment)
+            .output()
+            .unwrap()
+    };
+    let ensured = tfs(&["store", "ensure", "--no-repo-cache", named.to_str().unwrap()]);
+    assert!(ensured.status.success(), "{}", String::from_utf8_lossy(&ensured.stderr));
+    assert!(named.join("blobs").is_dir() && !environment.exists());
+
+    let info = tfs(&["store", "info", named.to_str().unwrap(), "--streams-start", "4"]);
+    assert!(info.status.success(), "{}", String::from_utf8_lossy(&info.stderr));
+    assert!(String::from_utf8_lossy(&info.stderr).contains("unknown flag --streams-start"));
+
+    let written = tfs(&["checkpoint", "write", named.to_str().unwrap(), "--blocks", "two"]);
+    assert_eq!(written.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&written.stderr).contains("--blocks \"two\" is not a number"));
+    fs::remove_dir_all(root).unwrap();
+}

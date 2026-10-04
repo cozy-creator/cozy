@@ -44,15 +44,6 @@ use tensorfs_core::store::{Progress, Store};
 use crate::watch::{self, Verdict, PROGRESS_PREFIX};
 use crate::{bail, flag, flag_num, flag_on, rss_kb, Flags};
 
-macro_rules! ok {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(e) => return bail(e),
-        }
-    };
-}
-
 // ------------------------------------------------------------------ shared plumbing
 
 /// `--source component=path`, repeated. The component name comes from the CALLER, never
@@ -215,10 +206,7 @@ pub fn cmd_source_members(profiles: &[&str], f: &Flags) -> ExitCode {
         .iter()
         .map(|profile| (*profile).to_string())
         .collect();
-    let members = match registry.exact_source_members(&profiles) {
-        Ok(members) => members,
-        Err(error) => return bail(error),
-    };
+    let members = ok!(registry.exact_source_members(&profiles));
     for member in members {
         println!("{member}");
     }
@@ -1304,10 +1292,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
                     if out.iter().any(|(k, _)| k == c) {
                         continue;
                     }
-                    let aliases = match p.target.allowed(c) {
-                        Ok(v) => v,
-                        Err(e) => return bail(e),
-                    };
+                    let aliases = ok!(p.target.allowed(c));
                     out.push((
                         c.clone(),
                         Value::arr(aliases.into_iter().map(Value::str).collect()),

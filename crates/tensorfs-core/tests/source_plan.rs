@@ -261,10 +261,6 @@ fn source_plan_maps_reviewed_multi_file_headers_independent_of_argument_order() 
             "local",
             "--observed",
             "absent",
-            "--source-uri",
-            "hf://reviewed/source@1111111111111111111111111111111111111111",
-            "--declared-license",
-            "test-only",
         ])
         .output()
         .unwrap();

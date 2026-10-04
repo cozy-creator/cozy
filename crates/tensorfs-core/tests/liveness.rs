@@ -269,10 +269,6 @@ fn ingest_run_ends_on_observed_inactivity_and_never_on_cpu_time() {
             "local",
             "--observed",
             "absent",
-            "--source-uri",
-            "hf://reviewed/source@1111111111111111111111111111111111111111",
-            "--declared-license",
-            "test-only",
         ])
         .output()
         .unwrap();
