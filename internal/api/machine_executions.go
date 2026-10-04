@@ -25,9 +25,6 @@ type MachineExecutions interface {
 	Control(context.Context, records.Request, string) *exit.Error
 	// Withdraw stops a canceled request's submission work that has not reached Runtime.
 	Withdraw(string)
-	// Describe is a published release as one machine reads it at its own Hub: the release
-	// (the newest when none is named) and its interface.
-	Describe(ctx context.Context, machine, hub, pkg, release string) (DescribedRelease, *exit.Error)
 	// Status is one machine's picture as it reports it (cozy.machine.v1 Status).
 	Status(ctx context.Context, machine string) (MachineStatus, *exit.Error)
 	// MachineLog is one log a machine keeps, at most its newest tailBytes when nonzero.
@@ -138,32 +135,6 @@ func (s *Server) machineLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ok(w, r, http.StatusOK, log)
-}
-
-// DescribedRelease is one published release's interface, as the machine that runs it read it.
-type DescribedRelease struct {
-	Package          string          `json:"package"`
-	Release          string          `json:"release"`
-	PackageInterface json.RawMessage `json:"package_interface"`
-}
-
-func (s *Server) describeRelease(w http.ResponseWriter, r *http.Request) {
-	if s.machineExecutions == nil {
-		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
-		return
-	}
-	query := r.URL.Query()
-	hub, problem := s.hubOf(r)
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	described, problem := s.machineExecutions.Describe(r.Context(), r.PathValue("machine"), hub, query.Get("package"), query.Get("release"))
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	s.ok(w, r, http.StatusOK, described)
 }
 
 // This is a client observation, not an execution or custody receipt of its own.

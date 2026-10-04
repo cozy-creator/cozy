@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -309,8 +310,14 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	}
 	if request.IsJob() {
 		spec.Kind = v1.RunKind_RUN_KIND_JOB
-		if request.ModelTransfer != nil {
+		if request.ModelTransfer != nil && request.ModelTransfer.Destination != "" {
+			// The machine publishes the job's weights outputs there itself, under this grant.
 			spec.WeightsDestination = request.ModelTransfer.Destination
+			grant, problem := authorizeV1Publication(ctx, machine, []string{spec.WeightsDestination})
+			if problem != nil {
+				return nil, problem
+			}
+			spec.Publication = grant
 		}
 	}
 	began := time.Now()
@@ -361,7 +368,8 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		}
 		for _, adapter := range choice.Adapters {
 			model.Adapters = append(model.Adapters, &v1.Adapter{Component: adapter.Component, Model: adapter.Model,
-				Release: adapter.Release, Lane: adapter.Lane, Manifest: adapter.Manifest, Scale: adapter.Scale})
+				Release: adapter.Release, Lane: adapter.Lane, Manifest: adapter.Manifest, Scale: adapter.Scale,
+				Source: adapter.Source, Profiles: adapter.Profiles})
 		}
 		spec.Models = append(spec.Models, model)
 	}
@@ -378,6 +386,85 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		spec.Providers = providers
 	}
 	return spec, nil
+}
+
+// prewarmV1 makes an installation present as a warm run named by the installation: its code
+// installed (no entrypoint), its Hub models downloaded, a provider source made and, with a
+// destination, uploaded under a publication authorization granted to this machine. errNotV1
+// is a machine that serves no cozy.machine.v1, or none that takes this installation.
+func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) (json.RawMessage, *exit.Error) {
+	selection := row.Selection
+	machine, problem := m.machines.DialV1(ctx, row.RentalID, "installing "+either(selection.Package, "models"))
+	if problem != nil {
+		return nil, problem
+	}
+	defer machine.Close()
+	if row.WorkerBootID != "" && machine.BootID != row.WorkerBootID {
+		return nil, exit.Unavailablef("the rental's worker restarted before preparation; the installation is claimed again on its new boot")
+	}
+	frame, err := machine.Status(ctx)
+	if status.Code(err) == codes.Unimplemented {
+		return nil, errNotV1
+	} else if err != nil {
+		return nil, machines.Transport(err)
+	}
+	if capabilities := frame.GetCapabilities(); !slices.Contains(capabilities, "warm/1") ||
+		selection.Destination != "" && !slices.Contains(capabilities, "upload/1") {
+		return nil, errNotV1
+	}
+	origin := selection.Hub
+	if origin == "" && machine.Account != nil {
+		origin = machine.Account.Base()
+	}
+	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_WARM, WeightsDestination: selection.Destination}
+	if selection.Package != "" {
+		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}}
+	}
+	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
+		spec.Owner = caller.Account
+	}
+	for _, model := range selection.Models {
+		spec.Models = append(spec.Models, &v1.ModelChoice{Parameter: either(model.Slot, model.Model), Repository: model.Model,
+			Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, ManifestLength: uint64(max(model.ManifestLength, 0)),
+			Source: model.Source, Profiles: model.Profiles})
+	}
+	// A rental reads its own Hub with the pod's capability; any other machine with this access.
+	if !machine.Rented {
+		if spec.Hub, problem = m.hubAccessV1(ctx, origin, machine); problem != nil {
+			return nil, problem
+		}
+	}
+	if selection.Destination != "" {
+		if spec.Publication, problem = authorizeV1Publication(ctx, machine, []string{selection.Destination}); problem != nil {
+			return nil, problem
+		}
+	}
+	if providers := (&v1.ProviderAccess{Huggingface: m.resolver.cfg.HuggingFaceToken.Reveal(), Civitai: m.resolver.cfg.CivitaiToken.Reveal()}); providers.Huggingface != "" || providers.Civitai != "" {
+		spec.Providers = providers
+	}
+	stream, err := machine.Run(ctx, row.ID, 0, spec)
+	if err != nil {
+		return nil, machines.Transport(err)
+	}
+	for {
+		event, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil, exit.Unavailablef("the machine ended the installation's stream before its outcome")
+		}
+		if err != nil {
+			return nil, machines.Transport(err)
+		}
+		if progress := event.GetProgress(); progress != nil {
+			report(machines.InstallProgress{Stage: progress.Stage, TotalBytes: progress.BytesTotal, TransferredBytes: progress.BytesDone})
+		}
+		if outcome := event.GetOutcome(); outcome != nil {
+			if outcome.Status != "succeeded" {
+				reason := outcome.GetReason()
+				return nil, exit.Named(exit.Failed, either(reason.GetCode(), "rental_install.failed"), "%s", either(reason.GetMessage(), outcome.Status))
+			}
+			return json.RawMessage(outcome.Result), nil
+		}
+	}
 }
 
 // hubAccessV1 is the signed-in account's execution access at origin, bound to the machine's
@@ -572,11 +659,29 @@ func (m *machineRuns) collectV1(ctx context.Context, request records.Request, ma
 			return problem
 		}
 	}
+	// The triage bundle beside a failure, and what the executor measured (`run show`'s stages,
+	// steps and attention) as its measurements, kept as one evidence document.
+	var bundle []byte
 	if outcome.Triage {
-		var bundle strings.Builder
-		if _, _, err := machine.ReadTriage(ctx, request.ID, &bundle); err != nil {
+		var read strings.Builder
+		if _, _, err := machine.ReadTriage(ctx, request.ID, &read); err != nil {
 			fmt.Fprintf(m.context.Out, "machine execution %s: triage bundle not kept: %s\n", request.ID, err)
-		} else if problem := m.store.RecordMachineTriage(request.ID, 1, []byte(bundle.String())); problem != nil {
+		} else {
+			bundle = []byte(read.String())
+		}
+	}
+	if measured := outcome.GetMeasurements(); json.Valid(measured) {
+		evidence := map[string]json.RawMessage{}
+		if len(bundle) > 0 && json.Unmarshal(bundle, &evidence) != nil {
+			evidence = nil // a bundle that is no JSON object is kept as it is
+		}
+		if _, held := evidence["measurements"]; evidence != nil && !held {
+			evidence["measurements"] = measured
+			bundle, _ = json.Marshal(evidence)
+		}
+	}
+	if len(bundle) > 0 {
+		if problem := m.store.RecordMachineTriage(request.ID, 1, bundle); problem != nil {
 			return problem
 		}
 	}

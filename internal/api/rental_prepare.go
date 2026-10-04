@@ -55,7 +55,22 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation requires a package release or explicitly selected models"))
 		return
 	}
-	for _, model := range body.Models {
+	downloads := body.Models
+	if body.Destination != "" {
+		// An upload: one provider source made on the machine, or one checkpoint it holds (a
+		// run's weights output), put in the destination.
+		if body.Package != "" || len(body.Models) != 1 || body.Models[0].Model != "" ||
+			(body.Models[0].Source == "") == (body.Models[0].Manifest == "") {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "a model upload names one provider source or held checkpoint, and its destination"))
+			return
+		}
+		if _, problem := hub.NormalizePublicationRepositories([]string{body.Destination}); problem != nil {
+			s.refuseTyped(w, r, problem)
+			return
+		}
+		downloads = nil
+	}
+	for _, model := range downloads {
 		if !model.Downloadable() {
 			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model installation requires a downloadable Hub checkpoint"))
 			return

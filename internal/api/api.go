@@ -252,7 +252,6 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/rentals/{rental_id}/keepalive":      s.keepRentalAlive,
 		"GET /v1/local/rentals":                             s.listRentals,
 		"DELETE /v1/local/rentals/{rental_id}/claim":        s.detachRental,
-		"GET /v1/local/machines/{machine}/describe":         s.describeRelease,
 		"GET /v1/local/machines/{machine}/status":           s.machineStatus,
 		"GET /v1/local/machines/{machine}/logs/{log}":       s.machineLog,
 		"POST /v1/local/machines/forget-package":            s.forgetPackage,

@@ -17,6 +17,7 @@ const rentalInstallsDDL = `CREATE TABLE IF NOT EXISTS rental_installs (
  worker_boot_id TEXT NOT NULL DEFAULT '',
  error_code TEXT NOT NULL DEFAULT '',
  error TEXT NOT NULL DEFAULT '',
+ result TEXT NOT NULL DEFAULT '',
  created_at TEXT NOT NULL,
  updated_at TEXT NOT NULL
 )`
@@ -26,6 +27,8 @@ type RentalInstallSelection struct {
 	Package string     `json:"package,omitempty"`
 	Release string     `json:"release,omitempty"`
 	Models  []ModelRef `json:"models,omitempty"`
+	// Destination is the org/name a provider-source model is uploaded to (`cozy model upload`).
+	Destination string `json:"destination,omitempty"`
 	// Hub is the Tensorhub the selection is read at: this computer's machine prepares it there.
 	Hub string `json:"hub,omitempty"`
 }
@@ -38,18 +41,21 @@ type RentalInstall struct {
 	WorkerBootID string                 `json:"worker_boot_id,omitempty"`
 	ErrorCode    string                 `json:"error_code,omitempty"`
 	Error        string                 `json:"error,omitempty"`
-	CreatedAt    string                 `json:"created_at"`
-	UpdatedAt    string                 `json:"updated_at"`
+	// Result is what a succeeded installation produced: an upload's checkpoint.
+	Result    json.RawMessage `json:"result,omitempty"`
+	CreatedAt string          `json:"created_at"`
+	UpdatedAt string          `json:"updated_at"`
 }
 
 func (r RentalInstall) Active() bool { return r.State == "queued" || r.State == "installing" }
 
-const rentalInstallCols = `id,rental_id,state,selection,worker_boot_id,error_code,error,created_at,updated_at`
+const rentalInstallCols = `id,rental_id,state,selection,worker_boot_id,error_code,error,result,created_at,updated_at`
 
 func scanRentalInstall(row interface{ Scan(...any) error }) (*RentalInstall, *exit.Error) {
 	var r RentalInstall
 	var raw []byte
-	err := row.Scan(&r.ID, &r.RentalID, &r.State, &raw, &r.WorkerBootID, &r.ErrorCode, &r.Error, &r.CreatedAt, &r.UpdatedAt)
+	var result string
+	err := row.Scan(&r.ID, &r.RentalID, &r.State, &raw, &r.WorkerBootID, &r.ErrorCode, &r.Error, &result, &r.CreatedAt, &r.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -58,6 +64,9 @@ func scanRentalInstall(row interface{ Scan(...any) error }) (*RentalInstall, *ex
 	}
 	if err := json.Unmarshal(raw, &r.Selection); err != nil {
 		return nil, exit.Internalf("cannot decode rental installation: %s", err)
+	}
+	if result != "" {
+		r.Result = json.RawMessage(result)
 	}
 	return &r, nil
 }
@@ -142,8 +151,8 @@ func (s *Store) StartRentalInstall(id, boot string) (*RentalInstall, *exit.Error
 	return s.RentalInstall(id)
 }
 
-func (s *Store) SettleRentalInstall(id, state string, problem *exit.Error) *exit.Error {
-	if state != "queued" && state != "succeeded" && state != "failed" {
+func (s *Store) SettleRentalInstall(id, state string, result json.RawMessage, problem *exit.Error) *exit.Error {
+	if state != "queued" && state != "succeeded" && state != "failed" || len(result) > 0 && (state != "succeeded" || !json.Valid(result)) {
 		return exit.New(exit.Validation, "invalid rental installation settlement")
 	}
 	code, message := "", ""
@@ -156,11 +165,11 @@ func (s *Store) SettleRentalInstall(id, state string, problem *exit.Error) *exit
 	}
 	defer tx.Rollback()
 	stamp := now()
-	result, err := tx.Exec(`UPDATE rental_installs SET state=?,error_code=?,error=?,updated_at=? WHERE id=? AND state IN ('queued','installing')`, state, code, message, stamp, id)
+	settled, err := tx.Exec(`UPDATE rental_installs SET state=?,error_code=?,error=?,result=?,updated_at=? WHERE id=? AND state IN ('queued','installing')`, state, code, message, string(result), stamp, id)
 	if err != nil {
 		return exit.Internalf("cannot save rental installation result: %s", err)
 	}
-	if n, _ := result.RowsAffected(); n == 1 && state != "queued" {
+	if n, _ := settled.RowsAffected(); n == 1 && state != "queued" {
 		_, err = tx.Exec(`INSERT INTO rental_idle(rental_id,work_finished_at) SELECT r.id,? FROM rentals r JOIN rental_installs i ON i.rental_id=r.id WHERE i.id=? AND r.state='ready' ON CONFLICT(rental_id) DO UPDATE SET work_finished_at=excluded.work_finished_at`, stamp, id)
 		if err != nil {
 			return exit.Internalf("cannot record rental installation completion: %s", err)

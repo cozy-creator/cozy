@@ -216,6 +216,9 @@ func handleRunUpload(ctx *Context) *exit.Error {
 		return problem
 	}
 	destination := ref.String()
+	if taken, problem := uploadV1Output(ctx, run, slot, destination); taken || problem != nil {
+		return problem
+	}
 	local, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -247,6 +250,50 @@ func handleRunUpload(ctx *Context) *exit.Error {
 	}
 	return emit(ctx, rec)
 }
+
+// uploadV1Output puts a cozy.machine.v1 run's weights output in destination: a warm run on the
+// machine that holds it, queued as an installation. false: the run is not a v1 run.
+func uploadV1Output(ctx *Context, run, slot, destination string) (bool, *exit.Error) {
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return true, problem
+	}
+	defer store.Close()
+	request, problem := store.RequestByReference(run)
+	if problem != nil || request == nil {
+		return false, problem
+	}
+	if v1, problem := store.RunV1(request.ID); problem != nil || !v1 {
+		return false, problem
+	}
+	link, problem := store.MachineExecution(request.ID)
+	if problem != nil || link == nil {
+		return true, problem
+	}
+	products, problem := store.Products(request.ID)
+	if problem != nil {
+		return true, problem
+	}
+	var output *records.Product
+	for _, product := range records.Fold(products) {
+		if product.MediaType == modelManifestMedia && (slot == "" || product.Output == slot) {
+			if output != nil {
+				return true, exit.Usagef("run %s has more than one weights output: name it as %s#<output>", run, run)
+			}
+			held := product
+			output = &held
+		}
+	}
+	if output == nil {
+		return true, exit.Named(exit.NotFound, "run_output.absent", "run %s has no weights output %q", run, slot)
+	}
+	model := records.ModelRef{Slot: output.Output, Manifest: output.Digest, ManifestLength: output.Length}
+	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}, Destination: destination}
+	return true, enqueueRentalInstall(ctx, link.MachineID, selection, ctx.Inv.Bool("--await"))
+}
+
+// modelManifestMedia is a weights output's product: its bytes are the output's manifest.
+const modelManifestMedia = "application/vnd.cozy.model-manifest"
 
 // stateUpload is the upload of one retained output to destination, and the rental holding it.
 func stateUpload(state api.JobState, slot, destination string) (records.OutputUpload, string) {

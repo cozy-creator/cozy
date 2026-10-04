@@ -393,14 +393,6 @@ func (c *Client) Abandon(id, actor string) (api.LocalAbandonment, *exit.Error) {
 
 // ------------------------------------------------------------ the LOCAL extension
 
-// DescribeRelease asks one machine ("local" or a rental id) for a published release's interface.
-func (c *Client) DescribeRelease(machine, pkg, release string) (api.DescribedRelease, *exit.Error) {
-	var described api.DescribedRelease
-	query := url.Values{"package": {pkg}, "release": {release}}
-	problem := c.call(http.MethodGet, "/v1/local/machines/"+url.PathEscape(machine)+"/describe?"+query.Encode(), nil, &described)
-	return described, problem
-}
-
 // MachineStatus asks one machine ("local" or a rental id) for its picture.
 func (c *Client) MachineStatus(machine string) (api.MachineStatus, *exit.Error) {
 	var status api.MachineStatus

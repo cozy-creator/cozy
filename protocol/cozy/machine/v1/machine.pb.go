@@ -206,12 +206,16 @@ type RunSpec struct {
 	BindingRevision    string           `protobuf:"bytes,10,opt,name=binding_revision,json=bindingRevision,proto3" json:"binding_revision,omitempty"` // the owner's binding revision the caller knows
 	KnownResults       []*MemoResult    `protobuf:"bytes,11,rep,name=known_results,json=knownResults,proto3" json:"known_results,omitempty"`
 	AttentionKernel    string           `protobuf:"bytes,12,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
-	WeightsDestination string           `protobuf:"bytes,13,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"` // model://… for a job's weights outputs
+	WeightsDestination string           `protobuf:"bytes,13,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"` // org/name: a job's weights outputs, or a warm run's source model
 	Hub                *HubAccess       `protobuf:"bytes,14,opt,name=hub,proto3" json:"hub,omitempty"`                                                         // held in memory for this run's preparation only
 	Owner              string           `protobuf:"bytes,15,opt,name=owner,proto3" json:"owner,omitempty"`                                                     // the account that org-relative references of local code name
 	Providers          *ProviderAccess  `protobuf:"bytes,16,opt,name=providers,proto3" json:"providers,omitempty"`                                             // provider tokens for source models, memory only like hub
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// A machine-publication authorization (POST /v1/machine-authorizations) for this machine's
+	// leaf: the run writes its weights destination under it. The machine renews the bearer with
+	// its sender proof, the run's Hub token or a rental's own worker capability.
+	Publication   string `protobuf:"bytes,17,opt,name=publication,proto3" json:"publication,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RunSpec) Reset() {
@@ -360,6 +364,13 @@ func (x *RunSpec) GetProviders() *ProviderAccess {
 		return x.Providers
 	}
 	return nil
+}
+
+func (x *RunSpec) GetPublication() string {
+	if x != nil {
+		return x.Publication
+	}
+	return ""
 }
 
 type isRunSpec_Source interface {
@@ -2587,7 +2598,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"RunRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
 	"\x05after\x18\x02 \x01(\x04R\x05after\x12,\n" +
-	"\x04spec\x18\x03 \x01(\v2\x18.cozy.machine.v1.RunSpecR\x04spec\"\xc3\x05\n" +
+	"\x04spec\x18\x03 \x01(\v2\x18.cozy.machine.v1.RunSpecR\x04spec\"\xe5\x05\n" +
 	"\aRunSpec\x12,\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x18.cozy.machine.v1.RunKindR\x04kind\x124\n" +
 	"\arelease\x18\x02 \x01(\v2\x18.cozy.machine.v1.ReleaseH\x00R\arelease\x12$\n" +
@@ -2606,7 +2617,8 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x13weights_destination\x18\r \x01(\tR\x12weightsDestination\x12,\n" +
 	"\x03hub\x18\x0e \x01(\v2\x1a.cozy.machine.v1.HubAccessR\x03hub\x12\x14\n" +
 	"\x05owner\x18\x0f \x01(\tR\x05owner\x12=\n" +
-	"\tproviders\x18\x10 \x01(\v2\x1f.cozy.machine.v1.ProviderAccessR\tprovidersB\b\n" +
+	"\tproviders\x18\x10 \x01(\v2\x1f.cozy.machine.v1.ProviderAccessR\tproviders\x12 \n" +
+	"\vpublication\x18\x11 \x01(\tR\vpublicationB\b\n" +
 	"\x06source\"L\n" +
 	"\x0eProviderAccess\x12 \n" +
 	"\vhuggingface\x18\x01 \x01(\tR\vhuggingface\x12\x18\n" +

@@ -114,6 +114,7 @@ type reportCall struct {
 // the number nvidia-smi shows, -1 when unknown. A grant's row names only the card.
 type reportGPU struct {
 	GPU       int    `json:"gpu"`
+	Rank      int    `json:"rank,omitempty"`
 	PID       int    `json:"pid,omitempty"`
 	UUID      string `json:"uuid,omitempty"`
 	Arch      string `json:"arch,omitempty"`
@@ -124,7 +125,16 @@ type reportGPU struct {
 		Observed  string         `json:"observed"`
 		Impl      string         `json:"impl"`
 		Kernels   []reportKernel `json:"kernels,omitempty"` // every kernel of its chains
+		Sol       *solCalls      `json:"sol,omitempty"`
 	} `json:"attention"`
+}
+
+// solCalls are Sol's attention calls on one GPU: sparse ones (approximate) and dense ones.
+type solCalls struct {
+	Sparse      int `json:"sparse"`
+	DenseStep   int `json:"dense_step"`
+	DensePath   int `json:"dense_path"`
+	DensePrefix int `json:"dense_prefix"`
 }
 
 // legacyRank is a Runtime's `ranks` row, all a Runtime before `gpus` sends: its `ordinal`
@@ -193,6 +203,14 @@ type triageEvidence struct {
 			Executor     triageSetup  `json:"executor"`
 			Construction triageSetup  `json:"construction"`
 		} `json:"execution"`
+		// The executor's attention observations: Sol's calls per GPU among them.
+		Observations []struct {
+			Name   string `json:"name"`
+			Fields struct {
+				Rank int `json:"rank"`
+				solCalls
+			} `json:"fields"`
+		} `json:"observations"`
 	} `json:"measurements"`
 }
 
@@ -513,6 +531,14 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	if len(evidence.Triage) > 0 && json.Unmarshal(evidence.Triage, &triage) == nil {
 		execution := triage.Measurements.Execution
 		report.Degree, report.GPUs = execution.Degree, gpuRecords(execution.GPUs, execution.Ranks)
+		for _, row := range triage.Measurements.Observations {
+			for i := range report.GPUs {
+				if row.Name == "attention.sol.calls" && report.GPUs[i].Rank == row.Fields.Rank {
+					calls := row.Fields.solCalls
+					report.GPUs[i].Attention.Sol = &calls
+				}
+			}
+		}
 		if boot := execution.Executor; boot.StartedUnixMS > 0 {
 			report.Stages = append(report.Stages, setupStage("executor boot", boot.StartedUnixMS,
 				boot.MS, created, topLegs(boot.Legs)))
@@ -1130,6 +1156,9 @@ func gpuAttention(gpu reportGPU) string {
 	}
 	if gpu.Attention.Impl != "" {
 		seen += " (" + gpu.Attention.Impl + ")"
+	}
+	if sol := gpu.Attention.Sol; sol != nil {
+		seen += fmt.Sprintf(", Sol calls: %d sparse, %d dense", sol.Sparse, sol.DenseStep+sol.DensePath+sol.DensePrefix)
 	}
 	if gpu.Attention.Requested != "" {
 		return gpu.Attention.Requested + " → " + seen

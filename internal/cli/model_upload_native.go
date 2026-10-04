@@ -11,10 +11,12 @@ import (
 	"slices"
 	"strings"
 
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -77,6 +79,9 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	if _, problem := ownedPublication(ctx, destination); problem != nil {
 		return true, problem
 	}
+	if taken, problem := machineUpload(ctx, rentalID, parsed, destination.String()); taken || problem != nil {
+		return true, problem
+	}
 	plan, problem := planNativeIngest(ctx, cwd, parsed, ctx.Inv.Values["--source-profile"])
 	if problem != nil {
 		return true, problem
@@ -121,6 +126,39 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	delete(ctx.Inv.Values, "--source-profile")
 	delete(ctx.Inv.Values, "--lane")
 	return true, handleRunExecute(ctx)
+}
+
+// machineUpload hands the upload to a cozy.machine.v1 machine that takes uploads, as a warm
+// run of the pinned source with the destination: the machine makes it with TensorFS profiles
+// and puts the checkpoint there itself. false: the machine, or a rental the fleet has yet to
+// choose, takes the generated ingest script instead.
+func machineUpload(ctx *Context, rentalID string, parsed modelsource.Source, destination string) (bool, *exit.Error) {
+	machine, name := rentalID, ctx.Inv.Value("--rental")
+	if machine == "" {
+		if rentalRequested(ctx) {
+			return false, nil
+		}
+		machine, name = machines.Local, machines.Local
+	}
+	state, _, problem := ensureDaemon(ctx)
+	if problem != nil {
+		return true, problem
+	}
+	ctx.Daemon = state
+	client, problem := localapi.Open(ctx.Cfg, state)
+	if problem != nil {
+		return true, problem
+	}
+	if status, problem := client.MachineStatus(machine); problem != nil || !slices.Contains(status.Capabilities, "upload/1") {
+		return false, nil
+	}
+	source, problem := pinnedProviderSource(ctx, parsed.Canonical)
+	if problem != nil {
+		return true, problem
+	}
+	model := records.ModelRef{Slot: "model", Source: source, Profiles: ctx.Inv.Values["--source-profile"]}
+	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}, Destination: destination}
+	return true, enqueueRentalInstall(ctx, name, selection, ctx.Inv.Bool("--await"))
 }
 
 // nativeIngestPlan is one provider source as a rented ingest converts it: pinned, narrowed
