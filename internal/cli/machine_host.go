@@ -158,3 +158,24 @@ func handleMachineStop(ctx *Context) *exit.Error {
 	}
 	return emit(ctx, output.Record{Fields: []output.Field{{K: "stopped", V: true}}})
 }
+
+// runsPhrase names up to five runs with their states.
+func runsPhrase(rows []records.Request) string {
+	const shown = 5
+	refs := make([]string, 0, shown)
+	for i, row := range rows {
+		if i == shown {
+			break
+		}
+		refs = append(refs, fmt.Sprintf("%s (%s)", runReference(row.Number, row.ID),
+			records.PublicRunStatus(row.State, false)))
+	}
+	phrase := "run " + strings.Join(refs, ", ")
+	if len(rows) > 1 {
+		phrase = "runs " + strings.Join(refs, ", ")
+	}
+	if len(rows) > shown {
+		phrase += fmt.Sprintf(" and %d more", len(rows)-shown)
+	}
+	return phrase
+}
