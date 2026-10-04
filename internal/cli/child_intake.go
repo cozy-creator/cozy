@@ -92,7 +92,7 @@ func prepareChildIntakeGraph(ctx *Context, pack *packagepublish.Package, layout 
 	stack[pack.Tree] = true
 	defer delete(stack, pack.Tree)
 	intake := &childIntake{Package: pack, layout: layout, store: store, remoteEnvironment: remote,
-		remoteCapture: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || ctx.Inv.Value("--rental") != "",
+		remoteCapture: remoteRun(ctx),
 		namespace:     commandNamespace(ctx)}
 	fail := func(problem *exit.Error) (*childIntake, *exit.Error) { intake.Close(); return nil, problem }
 	dependencies, problem := packagepublish.LocalDependencySelections(pack.Tree)

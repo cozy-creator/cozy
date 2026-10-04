@@ -190,6 +190,12 @@ func validateRunPlacement(ctx *Context) *exit.Error {
 	return nil
 }
 
+// remoteRun is a run on another computer: a rental, or the endpoint a foreground run took
+// from its --rental. Its preparation never needs this computer's machine.
+func remoteRun(ctx *Context) bool {
+	return ctx.endpoint != nil || rentalRequested(ctx)
+}
+
 func rentalRequested(ctx *Context) bool {
 	return ctx.Inv.Bool("--rent-new") || ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != ""
 }
@@ -2947,6 +2953,9 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 // knownMachine is the machine a run names without renting one: this computer's, or a named
 // rental. It answers false when the run asks the fleet to choose or buy one.
 func knownMachine(ctx *Context) (string, bool, *exit.Error) {
+	if ctx.endpoint != nil {
+		return ctx.endpoint.Name(), true, nil
+	}
 	if ctx.Inv.Value("--rental") != "" {
 		selected, problem := requestedRental(ctx)
 		return selected, problem == nil, problem
