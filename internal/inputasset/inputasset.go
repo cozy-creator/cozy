@@ -65,7 +65,7 @@ type Facts struct {
 
 // Fingerprint streams one bounded regular file and returns the identity facts used by
 // both the request record and InvocationSpec. Encoded media never enters a whole-file
-// buffer. Unknown media type stays empty.
+// buffer. Unrecognized binary content retains the standard octet-stream fallback.
 func Fingerprint(path string, max int64) (Facts, *exit.Error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -196,8 +196,6 @@ func normalizeMediaType(mediaType string) string {
 	switch mediaType {
 	case "audio/wave", "audio/x-wav":
 		mediaType = "audio/wav"
-	case "application/octet-stream":
-		mediaType = ""
 	}
 	return mediaType
 }
