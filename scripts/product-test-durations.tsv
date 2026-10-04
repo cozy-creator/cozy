@@ -782,7 +782,6 @@
 0.00	TestVendoredMatchesUpstream
 0.03	TestVerifiedPublicationRetryPreservesSuccessfulAttempt
 0.82	TestVerifiedPublicationRetryRefusesUnprovenOrCanceledWork
-0.43	TestVirtualInventoryPreservesMeasuredNumericalIdentity
 0.00	TestWaitDetailsStayInDiagnosticOutput
 0.00	TestWaitLinesAreStageHonest
 14.43	TestWaitingRunNamesItsBootingRental
