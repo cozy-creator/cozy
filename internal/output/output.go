@@ -77,19 +77,17 @@ type Document interface {
 	Emit(io.Writer, Mode) error
 }
 
-// Write emits one logical document. TOON is the default; JSON changes only the
-// encoding. Both formats pass through the same TOON data model first.
+// Write preserves the document's authored JSON types. TOON is the default rendering;
+// JSON must not pass through TOON's float64 reader before reaching its consumer.
 func Write(w io.Writer, document any, mode Mode) error {
-	logical, toonBytes, err := normalize(document)
+	if mode.JSON {
+		return writeJSONValue(w, document, mode)
+	}
+	_, toonBytes, err := normalize(document)
 	if err != nil {
 		// A document TOON cannot round-trip (a traceback whose lines read as list items,
 		// say) is still written: as its JSON value, indented for a person.
 		return writeJSONValue(w, document, mode)
-	}
-	if mode.JSON {
-		encoder := json.NewEncoder(w)
-		encoder.SetEscapeHTML(false)
-		return encoder.Encode(logical)
 	}
 	if _, err := w.Write(toonBytes); err != nil {
 		return err
@@ -100,8 +98,8 @@ func Write(w io.Writer, document any, mode Mode) error {
 	return err
 }
 
-// normalize makes the TOON library's JSON-like model authoritative, then uses
-// that same value for JSON. This also honors json tags on domain payloads.
+// normalize prepares the TOON rendering after honoring domain JSON tags.
+// Its reader validates that rendering; explicit JSON preserves the original values.
 func normalize(document any) (any, []byte, error) {
 	encoded, err := json.Marshal(document)
 	if err != nil {
