@@ -8,6 +8,8 @@ import (
 
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -24,6 +26,17 @@ func handleRentalPackageInstall(ctx *Context) *exit.Error {
 }
 
 func enqueueRentalInstall(ctx *Context, rentalName string, selection records.RentalInstallSelection, await bool) *exit.Error {
+	if rentalName != machines.Local {
+		ep, problem := foregroundRental(ctx, rentalName)
+		if problem != nil {
+			return problem
+		}
+		if ep != nil {
+			if taken, problem := foregroundInstall(ctx, ep, rentalName, selection); taken || problem != nil {
+				return problem
+			}
+		}
+	}
 	_, store, problem := rentalStores(ctx)
 	if problem != nil {
 		return problem
@@ -58,6 +71,37 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 	return emit(ctx, record)
 }
 
+// foregroundInstall makes one installation on a machine this command reaches as an explicit
+// endpoint (a rental under a daemon that predates cozy.machine.v1, or the machine a foreground
+// run used): its warm run, watched here to its outcome, with nothing queued. Interrupting stops
+// only the watch. false: the machine takes no such warm run, and the daemon's queue keeps it.
+func foregroundInstall(ctx *Context, ep *machineendpoint.Endpoint, machine string, selection records.RentalInstallSelection) (bool, *exit.Error) {
+	l := home.Paths(ctx.Cfg.Home)
+	st, problem := records.Open(l.DB)
+	if problem != nil {
+		return true, problem
+	}
+	defer st.Close()
+	runs := endpointRuns(ctx, ep, l, st)
+	defer runs.cancel()
+	selection.Hub = either(selection.Hub, ctx.Cfg.HubURL)
+	install := records.RentalInstall{ID: records.NewID("rental-install"), RentalID: ep.Name(), State: "installing", Selection: selection}
+	began, watch := time.Now(), &installWatch{machine: machine, shownAt: time.Now()}
+	result, problem := runs.prewarmV1(runs.ctx, install, func(p machines.InstallProgress) {
+		watch.report(ctx, p.Stage, p.TransferredBytes, p.TotalBytes)
+	})
+	if problem == errNotV1 {
+		return false, nil
+	}
+	if problem != nil {
+		named := *problem
+		named.Message = machine + ": " + problem.Message
+		return true, &named
+	}
+	install.Result = result
+	return true, emitInstalled(ctx, install, began)
+}
+
 // awaitRentalInstall watches one accepted installation until it settles, saying on stderr
 // what the machine reports. Interrupting stops only the watch; the installation goes on.
 func awaitRentalInstall(ctx *Context, client *localapi.Client, machine string, install records.RentalInstall) *exit.Error {
@@ -66,16 +110,22 @@ func awaitRentalInstall(ctx *Context, client *localapi.Client, machine string, i
 	if problem != nil {
 		return problem
 	}
+	install.Result = settled.Result
+	return emitInstalled(ctx, install, began)
+}
+
+// emitInstalled is a succeeded installation; an upload names the checkpoint it put in its
+// destination.
+func emitInstalled(ctx *Context, install records.RentalInstall, began time.Time) *exit.Error {
 	fields := []output.Field{{K: "id", V: install.ID}, {K: "rental", V: install.RentalID}, {K: "status", V: "succeeded"},
 		{K: "target", V: rentalInstallTarget(install.Selection)}, {K: "elapsed", V: time.Since(began).Round(time.Second).String()}}
 	shown := []string{"id", "rental", "status", "target", "elapsed"}
-	// An upload names the checkpoint it put in its destination.
 	var result struct {
 		Models []struct {
 			Published *struct{ Destination, Checkpoint string } `json:"published"`
 		} `json:"models"`
 	}
-	if json.Unmarshal(settled.Result, &result) == nil && len(result.Models) == 1 && result.Models[0].Published != nil {
+	if json.Unmarshal(install.Result, &result) == nil && len(result.Models) == 1 && result.Models[0].Published != nil {
 		published := result.Models[0].Published
 		fields = append(fields, output.Field{K: "destination", V: published.Destination}, output.Field{K: "checkpoint", V: published.Checkpoint})
 		shown = append(shown, "destination", "checkpoint")
@@ -84,7 +134,7 @@ func awaitRentalInstall(ctx *Context, client *localapi.Client, machine string, i
 }
 
 func watchRentalInstall(ctx *Context, client *localapi.Client, machine string, install records.RentalInstall) (records.RentalInstall, *exit.Error) {
-	lastStage, shownAt, shownBytes := "", time.Now(), uint64(0)
+	watch := &installWatch{machine: machine, shownAt: time.Now()}
 	for {
 		status, problem := client.RentalInstall(install.RentalID, install.ID)
 		if problem != nil {
@@ -100,19 +150,32 @@ func watchRentalInstall(ctx *Context, client *localapi.Client, machine string, i
 		if p := status.Progress; p != nil {
 			stage, done, total = p.Stage, p.TransferredBytes, p.TotalBytes
 		}
-		if stage != lastStage || done > shownBytes && time.Since(shownAt) >= 10*time.Second {
-			line := machine + ": " + stage
-			if total > 0 {
-				line += fmt.Sprintf(" %s of %s (%d%%)", output.Bytes(int64(done)), output.Bytes(int64(total)), done*100/total)
-			}
-			if stage == lastStage {
-				line += fmt.Sprintf(", %s/s", output.Bytes(int64(float64(done-shownBytes)/time.Since(shownAt).Seconds())))
-			}
-			_ = output.Progress(ctx.Err, line)
-			lastStage, shownAt, shownBytes = stage, time.Now(), done
-		}
+		watch.report(ctx, stage, done, total)
 		time.Sleep(time.Second)
 	}
+}
+
+// installWatch says on stderr what a machine reports of one installation: each new stage, and
+// its bytes at most every 10 s.
+type installWatch struct {
+	machine, stage string
+	shownAt        time.Time
+	shownBytes     uint64
+}
+
+func (w *installWatch) report(ctx *Context, stage string, done, total uint64) {
+	if stage == w.stage && (done <= w.shownBytes || time.Since(w.shownAt) < 10*time.Second) {
+		return
+	}
+	line := w.machine + ": " + stage
+	if total > 0 {
+		line += fmt.Sprintf(" %s of %s (%d%%)", output.Bytes(int64(done)), output.Bytes(int64(total)), done*100/total)
+	}
+	if stage == w.stage {
+		line += fmt.Sprintf(", %s/s", output.Bytes(int64(float64(done-w.shownBytes)/time.Since(w.shownAt).Seconds())))
+	}
+	_ = output.Progress(ctx.Err, line)
+	w.stage, w.shownAt, w.shownBytes = stage, time.Now(), done
 }
 
 func rentalInstallTarget(selection records.RentalInstallSelection) string {

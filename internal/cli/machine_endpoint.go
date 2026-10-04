@@ -40,19 +40,8 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 	if problem != nil {
 		return nil, problem
 	}
-	background := *ctx
-	background.Out = io.Discard // API progress remains normal typed lifecycle events.
-	resolver := NewResolver(st, ctx.Cfg)
-	fleet := &managedRentals{ctx: &background, layout: l, store: st}
-	found := &machines.Resolver{Host: machines.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, nil), Hub: func(origin string) *hub.Client { return client(ctx.forHub(origin)) }, Endpoint: func(name string) (*machineendpoint.Endpoint, *exit.Error) {
-		if name == ep.Name() {
-			return ep, nil
-		}
-		return nil, exit.Named(exit.Unavailable, "machine.endpoint_scope", "this foreground operation cannot access another machine")
-	}}
-	found.EndpointKey = rentalEndpointKey(l, st)
-	found.Only = ep.Name() // a foreground run never reaches this computer's machine
-	runs := newMachineRuns(&background, l, st, resolver, fleet, found)
+	runs := endpointRuns(ctx, ep, l, st)
+	resolver, fleet := runs.resolver, runs.fleet
 	owner, problem := orchestrator.Open(orchestrator.Options{StartMachineExecution: runs.Start, Cfg: ctx.Cfg, Layout: l, Store: st, Log: io.Discard})
 	if problem != nil {
 		runs.cancel()
@@ -121,6 +110,24 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 	}, nil
 }
 
+// endpointRuns are the machine runs of one explicit target and nothing else: no other machine,
+// this computer's included, is reached through them.
+func endpointRuns(ctx *Context, ep *machineendpoint.Endpoint, l home.Layout, st *records.Store) *machineRuns {
+	background := *ctx
+	background.Out = io.Discard // API progress remains normal typed lifecycle events.
+	fleet := &managedRentals{ctx: &background, layout: l, store: st}
+	found := &machines.Resolver{Host: machines.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, nil), Hub: func(origin string) *hub.Client { return client(ctx.forHub(origin)) }, Endpoint: func(name string) (*machineendpoint.Endpoint, *exit.Error) {
+		if name == ep.Name() {
+			return ep, nil
+		}
+		return nil, exit.Named(exit.Unavailable, "machine.endpoint_scope", "this foreground operation cannot access another machine")
+	}}
+	found.EndpointRental = rentalEndpoint(l, st)
+	found.RentalHub = func(id string) *hub.Client { return client(fleet.atRental(id)) }
+	found.Only = ep.Name()
+	return newMachineRuns(&background, l, st, NewResolver(st, ctx.Cfg), fleet, found)
+}
+
 // endpointForRecordedRun keeps watch/cancel on the recorded target after the
 // selector file or original observer is gone. The existing daemon remains usable.
 func endpointForRecordedRun(ctx *Context, id string) (func(), *exit.Error) {
@@ -150,11 +157,11 @@ func endpointForRecordedRun(ctx *Context, id string) (func(), *exit.Error) {
 	return endpointController(ctx, ep)
 }
 
-// rentalEndpointKey answers the creator key of the rental an explicit endpoint reaches (its
-// recorded worker or address): a rental's machine authorizes that key, not this computer's
-// machine owner key. Nil for an endpoint that is no rental of this host.
-func rentalEndpointKey(l home.Layout, st *records.Store) func(*machineendpoint.Endpoint) (*rental.CreatorIdentity, *exit.Error) {
-	return func(ep *machineendpoint.Endpoint) (*rental.CreatorIdentity, *exit.Error) {
+// rentalEndpoint answers the rental an explicit endpoint reaches (its recorded worker or
+// address), with the creator key its machine authorizes, not this computer's machine owner
+// key. Nil for an endpoint that is no rental of this host.
+func rentalEndpoint(l home.Layout, st *records.Store) func(*machineendpoint.Endpoint) (*machines.EndpointRental, *exit.Error) {
+	return func(ep *machineendpoint.Endpoint) (*machines.EndpointRental, *exit.Error) {
 		rows, problem := st.Rentals()
 		if problem != nil {
 			return nil, problem
@@ -165,7 +172,7 @@ func rentalEndpointKey(l home.Layout, st *records.Store) func(*machineendpoint.E
 				if problem != nil {
 					return nil, problem
 				}
-				return &key, nil
+				return &machines.EndpointRental{ID: row.ID, Key: key}, nil
 			}
 		}
 		return nil, nil

@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -288,8 +289,22 @@ func uploadV1Output(ctx *Context, run, slot, destination string) (bool, *exit.Er
 		return true, exit.Named(exit.NotFound, "run_output.absent", "run %s has no weights output %q", run, slot)
 	}
 	model := records.ModelRef{Slot: output.Output, Manifest: output.Digest, ManifestLength: output.Length}
-	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}, Destination: destination}
-	return true, enqueueRentalInstall(ctx, link.MachineID, selection, ctx.Inv.Bool("--await"))
+	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}, Destination: destination, Hub: request.Hub}
+	if !machineendpoint.IsName(link.MachineID) {
+		return true, enqueueRentalInstall(ctx, link.MachineID, selection, ctx.Inv.Bool("--await"))
+	}
+	// A foreground run's machine is the explicit endpoint it recorded; no daemon queue names it.
+	ep, problem := store.RequestMachineEndpoint(request.ID, link.MachineID)
+	if problem == nil && ep == nil {
+		problem = exit.New(exit.NotFound, "run %s's machine endpoint is no longer recorded", run)
+	}
+	if problem != nil {
+		return true, problem
+	}
+	if taken, problem := foregroundInstall(ctx, ep, link.MachineID, selection); taken || problem != nil {
+		return true, problem
+	}
+	return true, exit.Named(exit.Structural, "machine.upload_unsupported", "the machine run %s ran on takes no model uploads", run)
 }
 
 // modelManifestMedia is a weights output's product: its bytes are the output's manifest.
