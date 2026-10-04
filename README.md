@@ -557,10 +557,11 @@ and return that slot to its authored default.
 `cozy run watch <run-id>` attaches to that same progress stream later; interrupting a watcher
 detaches without canceling the durable run.
 
-`cozy run play <run> [--output video] [--expires 24h]` prints a link that plays a rented run's output
-in any browser, live as it grows, straight from the machine over WebRTC. The link carries the machine's
-address and certificate pin, and a capability for that output signed by this machine's key, in its
-fragment, which never leaves the browser. Anyone holding the link can watch that output until it
+`cozy run play <run> [--output video] [--expires 24h]` prints a link that plays a run's output
+in any browser, live as it grows, straight from its machine (this computer's or a rental's) over WebRTC.
+The address and certificate pin come from the machine's own Status, with no Hub lookup; the link carries
+them and a capability for that output, signed by the key the machine authorizes, in its fragment, which
+never leaves the browser. A machine behind NAT with no mapped address is an error: there is no relay. Anyone holding the link can watch that output until it
 expires. The page is [web/player](web/player), served at `player_url` (default
 `https://cozy-creator.github.io/cozy/play/`).
 

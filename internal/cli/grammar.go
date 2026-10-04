@@ -444,7 +444,7 @@ type RunCmd struct {
 	Resume  RunResumeCmd  `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List    RunListCmd    `cmd:"" help:"List current and past runs."`
 	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
-	Play    RunPlayCmd    `cmd:"" help:"Print a link that plays a run's output in any browser, live as it grows, straight from its rented machine."`
+	Play    RunPlayCmd    `cmd:"" help:"Print a link that plays a run's output in any browser, live as it grows, straight from the machine running it, local or rented."`
 	Show    RunShowCmd    `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, the GPUs it ran on and each GPU's attention kernels (served, or why not, and compile time), and each child call's function, label, GPUs, stages and steps."`
 }
 

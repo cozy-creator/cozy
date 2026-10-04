@@ -114,8 +114,11 @@ func serveDaemon(ctx *Context) *exit.Error {
 	knownRentals := rental.Known(st)
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	localMachine := machineset.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child())
-	localMachine.GPUBudget = ctx.Cfg.MachineGPUBudget
+	// The daemon starts this computer's machine as `cozy machine start` does.
+	localMachine, problem := localMachineHost(ctx)
+	if problem != nil {
+		return problem
+	}
 	found := &machineset.Resolver{
 		Endpoint: st.MachineEndpoint,
 		Host:     localMachine, HubOrigin: ctx.Cfg.HubURL,
