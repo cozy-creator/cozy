@@ -1,7 +1,7 @@
 //! Disk admission for one flight, and the GC policy that makes room. Disk only: nothing here
 //! looks at RAM (owner rule: no RAM floor; the Runtime pages to disk).
 //!
-//! A reserve of max(1 GiB, 1/50 of the filesystem) and 32 inodes is never admitted; a
+//! A reserve of 1/50 of the filesystem, clamped to 1–10 GiB, and 32 inodes is never admitted; a
 //! download needs its wanted bytes and 16 + 3 inodes per wanted object; live flights'
 //! unwritten remainders are already spoken for. A disk is low when no more than the reserve
 //! is free. For a flight that does not fit, or a low disk, GC takes unreferenced bytes and
@@ -17,7 +17,9 @@ use crate::store::Store;
 
 use super::flight::{self, Flight, Record};
 
-const RESERVE_BYTES: u64 = 1 << 30;
+/// 1/50 of the filesystem, at least 1 GiB and at most 10 GiB: 2% of a large disk can be
+/// everything still free on it.
+const RESERVE_BYTES: (u64, u64) = (1 << 30, 10 << 30);
 const RESERVE_DIVISOR: u64 = 50;
 const RESERVE_INODES: u64 = 32;
 pub(super) const METADATA_INODES: u64 = 16;
@@ -87,7 +89,7 @@ impl Disk {
 
     /// Never admitted to a download, and never written into by an optional cache.
     pub fn reserve(&self) -> u64 {
-        RESERVE_BYTES.max(self.capacity / RESERVE_DIVISOR)
+        (self.capacity / RESERVE_DIVISOR).clamp(RESERVE_BYTES.0, RESERVE_BYTES.1)
     }
 
     /// A low disk has no more than its reserve free. Answers the bytes to free before it
@@ -233,17 +235,24 @@ mod tests {
     }
 
     #[test]
-    fn the_reserve_is_a_gib_or_a_fiftieth_and_others_are_spoken_for() {
+    fn the_reserve_is_a_fiftieth_within_a_gib_and_ten_and_others_are_spoken_for() {
         // 10 GiB disk: the reserve is the 1 GiB floor.
+        assert_eq!(disk(10 * GIB, 5 * GIB).reserve(), GIB);
         assert_eq!(
             free(&disk(10 * GIB, 5 * GIB), Space::default()).bytes,
             4 * GIB
         );
-        // 1000 GiB disk: the reserve is 20 GiB.
+        // 250 GiB disk: a fiftieth, 5 GiB.
+        assert_eq!(disk(250 * GIB, 100 * GIB).reserve(), 5 * GIB);
+        // 1000 GiB disk: a fiftieth is 20 GiB, capped at 10 GiB.
         assert_eq!(
             free(&disk(1000 * GIB, 100 * GIB), Space::default()).bytes,
-            80 * GIB
+            90 * GIB
         );
+        // The owner's laptop: 3.6 TiB with 73 GiB free is not low, and admits 63 GiB.
+        let laptop = disk(3686 * GIB, 73 * GIB);
+        assert_eq!((laptop.reserve(), laptop.short()), (10 * GIB, None));
+        assert_eq!(free(&laptop, Space::default()).bytes, 63 * GIB);
         let others = Space::of(GIB, 10);
         let left = free(&disk(10 * GIB, 5 * GIB), others);
         assert_eq!(
@@ -259,11 +268,11 @@ mod tests {
 
     #[test]
     fn a_disk_is_low_at_its_reserve_and_short_by_what_lifts_it_above() {
-        // 1000 GiB: the reserve is 20 GiB. A tenth, even a fortieth, free is not low.
+        // 1000 GiB: the reserve is 10 GiB. A hundredth free is not low.
         assert_eq!(disk(1000 * GIB, 100 * GIB).short(), None);
-        assert_eq!(disk(1000 * GIB, 20 * GIB + 1).short(), None);
-        assert_eq!(disk(1000 * GIB, 20 * GIB).short(), Some(1));
-        assert_eq!(disk(1000 * GIB, 5 * GIB).short(), Some(15 * GIB + 1));
+        assert_eq!(disk(1000 * GIB, 10 * GIB + 1).short(), None);
+        assert_eq!(disk(1000 * GIB, 10 * GIB).short(), Some(1));
+        assert_eq!(disk(1000 * GIB, 5 * GIB).short(), Some(5 * GIB + 1));
         // A small disk keeps the 1 GiB floor.
         assert_eq!(disk(10 * GIB, GIB / 2).short(), Some(GIB / 2 + 1));
         // Out of inodes alone is low.

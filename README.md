@@ -188,10 +188,10 @@ tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, unde
   an object; one that landed none is `STALLED`. Stalled streams are judged by the
   transport's measured ledger; nothing is a timer.
 - **Admission is disk only**: wanted bytes plus 16 + 3 inodes per object must fit under a
-  reserve of max(1 GiB, 1/50 of the filesystem) and 32 inodes, after what other live
+  reserve of 1/50 of the filesystem (clamped to 1–10 GiB) and 32 inodes, after what other live
   flights still owe. Short, the GC policy runs: unreferenced bytes, then delivered products
   (`Store.deliver_tree_root`, oldest first), then cached lanes; then `CAPACITY_EXHAUSTED`.
-  `ensure::relieve` runs the same policy at 1/10 free until 1/5 is free.
+  `ensure::relieve` runs the same policy whenever no more than the reserve is free.
 - **The Hub CA** (`--ca-file`, `ca_file=`) is added to process trust; an untrusted hub is
   `TLS_UNTRUSTED`, never retried.
 
