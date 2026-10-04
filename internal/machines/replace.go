@@ -170,7 +170,7 @@ func (h *Host) recoverReplace(ctx context.Context) *exit.Error {
 func (h *Host) vacated(ctx context.Context) *exit.Error {
 	for {
 		busy := false
-		for _, lock := range []string{guardLock, "run/cozy/worker/worker.lock"} {
+		for _, lock := range []string{guardLock, runtimeLock} {
 			file, held, err := probe(filepath.Join(h.Root(), lock), false)
 			if err != nil {
 				return exit.Internalf("cannot inspect machine ownership: %s", err)

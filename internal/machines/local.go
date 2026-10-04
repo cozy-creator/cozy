@@ -159,6 +159,14 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 	if previous != nil && h.servesAPI(ctx) {
 		return h.updateLocked(ctx, source)
 	}
+	if previous == nil {
+		// A root some machine owns is refused before anything is fetched.
+		release, problem := h.guard()
+		if problem != nil {
+			return nil, problem
+		}
+		release()
+	}
 	// Everything the new machine needs is in hand before an installed one is touched.
 	staged, problem := h.stage(ctx, source)
 	if problem != nil {
@@ -902,21 +910,39 @@ func processStartTicks(pid int) uint64 {
 }
 
 // guardLock is the one lock every machine on a root holds for its life: the Go agent's and
-// the Rust machine's alike (cozy-machine `machine::identity::hold`).
-const guardLock = "var/lib/cozy/machine/agent.lock"
+// the Rust machine's alike (cozy-machine `machine::identity::hold`). runtimeLock is the Go
+// agent's Python Runtime's, which can outlive its agent; it counts while such a Runtime can exist.
+const (
+	guardLock   = "var/lib/cozy/machine/agent.lock"
+	runtimeLock = "run/cozy/worker/worker.lock"
+)
 
 // guard holds the root's lock while this controller changes or starts its machine: the
 // kernel, not a client record, says no machine runs there.
 func (h *Host) guard() (func(), *exit.Error) {
+	busy := exit.Named(exit.Conflict, "machine.busy", "a live machine or Runtime owns this root").
+		WithRemedy("`cozy machine stop` ends it")
 	file, held, err := probe(filepath.Join(h.Root(), guardLock), true)
 	if err != nil {
 		return nil, exit.Internalf("cannot inspect machine ownership: %s", err)
 	}
 	if held {
-		return nil, exit.Named(exit.Conflict, "machine.busy", "a live machine owns this root").
-			WithRemedy("`cozy machine stop` ends it")
+		return nil, busy
 	}
-	return func() { _ = flock.Release(file); _ = file.Close() }, nil
+	release := func() { _ = flock.Release(file); _ = file.Close() }
+	runtime, held, err := probe(filepath.Join(h.Root(), runtimeLock), false)
+	if runtime != nil {
+		_ = flock.Release(runtime)
+		_ = runtime.Close()
+	}
+	if err != nil || held {
+		release()
+		if err != nil {
+			return nil, exit.Internalf("cannot inspect machine ownership: %s", err)
+		}
+		return nil, busy
+	}
+	return release, nil
 }
 
 // probe takes path's exclusive lock, or reports that a live process holds it. An absent file

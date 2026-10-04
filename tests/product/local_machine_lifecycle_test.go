@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,6 +27,9 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/userunit"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // This computer's machine is its root's systemd user unit. Whatever that unit runs is the
@@ -36,10 +38,25 @@ import (
 // unit's executor window removed the record and left the agent running, and every later launch
 // and install refused with machine.process_untracked).
 
-// serveFakeMachineAgent is this test binary run as a root's cozy-machine: it serves the
-// readiness receipt its launcher authenticates, under the launch's key and ports, until stopped.
-// It reads its launch as adoption reads an agent's: from the process environment's file.
+// fakeAgent answers Status as a machine does: one frame, its identity and sealed receipt.
+type fakeAgent struct {
+	pb.UnimplementedMachineServer
+	frame *pb.StatusFrame
+}
+
+func (a fakeAgent) Status(_ *pb.StatusRequest, stream grpc.ServerStreamingServer[pb.StatusFrame]) error {
+	return stream.Send(a.frame)
+}
+
+// serveFakeMachineAgent is this test binary run as a root's cozy-machine: it names the API it
+// serves, and serves the readiness receipt its launcher authenticates on cozy.machine.v1 Status,
+// under the launch's key and port, until stopped. It reads its launch as adoption reads an
+// agent's: from the process environment's file.
 func serveFakeMachineAgent() {
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		fmt.Printf(`{"name":"cozy-machine","api":[%q]}`+"\n", machines.MachineAPI)
+		return
+	}
 	raw, _ := os.ReadFile("/proc/self/environ")
 	env := map[string]string{}
 	for _, pair := range strings.Split(string(raw), "\x00") {
@@ -66,16 +83,17 @@ func serveFakeMachineAgent() {
 	mac.Write([]byte(machines.ReadinessReceiptDomain))
 	mac.Write(payload)
 	envelope, _ := json.Marshal(map[string]any{"payload": payload, "hmac_sha256": hex.EncodeToString(mac.Sum(nil))})
-	listener, err := tls.Listen("tcp", "127.0.0.1:"+env["COZY_MEDIA_INTERNAL_PORT"],
-		&tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leaf}, PrivateKey: leafKey}}})
+	listener, err := net.Listen("tcp", "127.0.0.1:"+env["COZY_WORKER_INTERNAL_PORT"])
 	if err != nil {
 		os.Exit(3)
 	}
+	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(
+		&tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leaf}, PrivateKey: leafKey}}})))
+	pb.RegisterMachineServer(server, fakeAgent{frame: &pb.StatusFrame{WorkerId: env["COZY_WORKER_ID"],
+		BootId: fmt.Sprintf("fake-boot-%d", os.Getpid()), Version: "fake", Phase: "ready", Receipt: envelope}})
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
-	go func() {
-		_ = http.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(envelope) }))
-	}()
+	go func() { _ = server.Serve(listener) }()
 	<-stop
 }
 
@@ -106,7 +124,7 @@ func fakeAgentMachine(t *testing.T, root string, executor time.Duration) (*machi
 	if executor == 0 {
 		must(t, os.Symlink(agent, program))
 	} else {
-		script := fmt.Sprintf("#!/bin/sh\nsleep %.1f\nexec %s\n", executor.Seconds(), agent)
+		script := fmt.Sprintf("#!/bin/sh\n[ \"$1\" = version ] && exec %s \"$@\"\nsleep %.1f\nexec %s\n", agent, executor.Seconds(), agent)
 		must(t, os.WriteFile(program, []byte(script), 0o755)) //cozy:allow stands in for systemd's executor
 	}
 	metadata := `{"host":{"name":"cozy-machine"},"host_pinned":true}`
@@ -154,7 +172,9 @@ func TestALaunchWhoseUnitEndsInItsExecutorReportsTheHostExited(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "home")
 	h, unit := fakeAgentMachine(t, root, time.Second)
 	program := filepath.Join(root, "machine/root/usr/local/bin/cozy-machine")
-	must(t, os.WriteFile(program, []byte("#!/bin/sh\nsleep 1\n"), 0o755)) //cozy:allow an executor that ends before any agent
+	agent := filepath.Join(root, "machine/root/opt/cozy/python/bin/cozy-machine")
+	script := fmt.Sprintf("#!/bin/sh\n[ \"$1\" = version ] && exec %s \"$@\"\nsleep 1\n", agent)
+	must(t, os.WriteFile(program, []byte(script), 0o755)) //cozy:allow an executor that ends before any agent
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, problem := h.Ensure(ctx, "", nil, true); problem == nil || problem.ErrName() != "machine.host_exited" || userunit.Running(unit) {
