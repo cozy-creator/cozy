@@ -134,6 +134,8 @@ impl Layout {
                     n += it.len;
                     if let Source::Object(o) = &it.source {
                         ident.push_str(&format!("{}:{}:{}@{};", o.obj.sha256, o.off, o.len, off + (it.dest_off - base)));
+                    } else if let Source::Inline(bytes) = &it.source {
+                        ident.push_str(&format!("inline:{}:{}@{};", tensorfs_core::sha256::hex_digest(bytes), it.len, off + (it.dest_off - base)));
                     }
                 }
                 out_parts.push(Part {
