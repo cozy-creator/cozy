@@ -3,7 +3,9 @@
 //! downloader, prepare the selected source, compose the model with the configs and tokenizers
 //! it is built from, and commit it as the local repository `local/<name>`.
 //!
-//! A source is `hf://<org>/<repo>@<40-hex>[/<member>]` or `civitai://<version>[/<file>]`.
+//! A source is `hf://<org>/<repo>@<40-hex>[/<member>]`, `civitai://<version>[/<file>]`, or
+//! `object://sha256:<hex>/<file>`: a file this Store already holds (a client wrote it), made
+//! like a Civitai single file with no provider at all.
 //! A Hugging Face repository brings its Diffusers index, each component's config and its
 //! tokenizers; a source with no index (a Civitai single file) takes them from its converters'
 //! pinned reference repository. Members and the conversion journal stay retained until the
@@ -44,7 +46,7 @@ pub struct Access {
 }
 
 pub struct Request<'a> {
-    /// `hf://…@<revision>[/member]` or `civitai://<version>[/file]`.
+    /// `hf://…@<revision>[/member]`, `civitai://<version>[/file]` or `object://sha256:<hex>/<file>`.
     pub source: &'a str,
     /// Reviewed profiles to convert under; none: the one the headers select.
     pub profiles: &'a [String],
@@ -356,6 +358,55 @@ fn local_head(store: &Store, member: &str, object: &ObjectRef) -> Result<Vec<u8>
     Ok(head)
 }
 
+/// `object://sha256:<hex>/<file>`: one SafeTensors file the Store already holds, as a
+/// selection of that one carrier.
+fn held_object(store: &Store, source: &str, file: &str) -> Result<(Resolution, String)> {
+    let (id, member) = file.split_once('/').ok_or(Refusal {
+        code: Code::SOURCE_NOT_ALLOWED,
+        detail: "a held source is object://sha256:<hex>/<file>".into(),
+    })?;
+    let sha256 = id.strip_prefix("sha256:").unwrap_or(id).to_string();
+    crate::ids::hex64("held source", &sha256)?;
+    let member = unquote(member);
+    if !member.ends_with(".safetensors") || member.contains(['/', '\\']) {
+        return refuse(
+            Code::SOURCE_NOT_ALLOWED,
+            format!("held source {member:?} is not one .safetensors file"),
+        );
+    }
+    let length = store.open_verified(&sha256)?.len();
+    let resolution = Resolution {
+        canonical: source.to_string(),
+        members: vec![providers::ResolvedMember {
+            member: member.clone(),
+            object: ObjectRef { sha256, length },
+            url: String::new(),
+            provenance: providers::Provenance::Computed,
+            carrier: true,
+            requires: vec![],
+            companion: false,
+        }],
+        selection_sha256: String::new(),
+    };
+    Ok((resolution.select(std::slice::from_ref(&member))?, member))
+}
+
+/// The carriers' headers, read from the Store.
+fn local_heads(store: &Store, selection: &Resolution) -> Result<Vec<MemberHead>> {
+    selection
+        .members
+        .iter()
+        .filter(|row| carrier(&row.member))
+        .map(|row| {
+            Ok(MemberHead {
+                member: row.member.clone(),
+                length: row.object.length,
+                head: local_head(store, &row.member, &row.object)?,
+            })
+        })
+        .collect()
+}
+
 /// The model `local/<name>` holds, when every byte of it is still held. Sources are
 /// immutable spellings, so a held model is that source's model and needs no provider.
 pub fn held(store: &Store, name: &str) -> Result<Option<(ObjectRef, String)>> {
@@ -379,7 +430,12 @@ pub fn held(store: &Store, name: &str) -> Result<Option<(ObjectRef, String)>> {
 
 /// Make `request.source` the local repository `local/<name>`.
 pub fn make(store: &Store, request: &Request) -> Result<Made> {
-    let (uri, named) = parse(request.source)?;
+    let progress = request.progress;
+    let held_file = request.source.strip_prefix("object://");
+    let parsed = match held_file {
+        Some(_) => None,
+        None => Some(parse(request.source)?),
+    };
     if let Some((manifest, selection)) = held(store, request.name)? {
         return Ok(Made {
             repository: format!("local/{}", request.name),
@@ -389,30 +445,43 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
             selection,
         });
     }
-    let provider = Provider::new(uri, request.access, &request.access.credential)?;
     let (locator, registry) = model_source::effective_registry(store, request.registry)?;
-    let progress = request.progress;
 
     // The exact carriers: the one named, else the one the source has, else the members of
     // the reviewed profiles the headers select.
     progress("resolving the model source", 0, 0);
     let none = Deadline::none();
-    let resolution = match &named {
-        Some(_) => {
-            providers::resolve_named(
-                &provider.uri,
-                &provider.endpoints,
-                &provider.credentials,
-                none,
-            )?
-            .0
+    let (provider, resolution, named) = match (held_file, parsed) {
+        (Some(file), _) => {
+            let (resolution, member) = held_object(store, request.source, file)?;
+            (None, resolution, Some(member))
         }
-        None => providers::resolve(
-            &provider.uri,
-            &provider.endpoints,
-            &provider.credentials,
-            none,
-        )?,
+        (None, Some((uri, named))) => {
+            let provider = Provider::new(uri, request.access, &request.access.credential)?;
+            let resolution = match &named {
+                Some(_) => {
+                    providers::resolve_named(
+                        &provider.uri,
+                        &provider.endpoints,
+                        &provider.credentials,
+                        none,
+                    )?
+                    .0
+                }
+                None => providers::resolve(
+                    &provider.uri,
+                    &provider.endpoints,
+                    &provider.credentials,
+                    none,
+                )?,
+            };
+            (Some(provider), resolution, named)
+        }
+        (None, None) => unreachable!("a provider source is parsed"),
+    };
+    let heads = |selection: &Resolution| match &provider {
+        Some(provider) => provider.heads(selection),
+        None => local_heads(store, selection),
     };
     let candidates: Vec<String> = resolution
         .members
@@ -428,7 +497,7 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
             &registry,
             &resolution,
             request.profiles,
-            |selection| provider.heads(selection),
+            heads,
             &scratch(store, "select"),
         )?,
     };
@@ -450,7 +519,7 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
         vec![preflight::select_profile(
             &locator,
             &registry,
-            &provider.heads(&tensors)?,
+            &heads(&tensors)?,
             &scratch(store, "profile"),
         )?]
     } else {
@@ -461,7 +530,10 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
     // What the model is built from beside its tensors: the repository's own Diffusers index,
     // configs and tokenizers, or those of its converters' pinned reference repository.
     let mut metadata: Vec<(Provider, Resolution)> = vec![];
-    if matches!(provider.uri, SourceUri::HuggingFace { .. }) {
+    if let Some(provider) = provider
+        .as_ref()
+        .filter(|p| matches!(p.uri, SourceUri::HuggingFace { .. }))
+    {
         if let Some(found) = provider.diffusers()? {
             metadata.push((
                 Provider::new(
@@ -486,7 +558,9 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
         }
         for reference in references {
             let (uri, _) = parse(reference)?;
-            let same = std::mem::discriminant(&uri) == std::mem::discriminant(&provider.uri);
+            let same = provider
+                .as_ref()
+                .is_some_and(|p| std::mem::discriminant(&uri) == std::mem::discriminant(&p.uri));
             let credential = if same {
                 request.access.credential.as_str()
             } else {
@@ -506,12 +580,25 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
         "sha256:{}",
         digest(&[FORMAT, request.name, &selected.selection_sha256])
     );
-    let mut landing = vec![(&provider, selected.clone())];
-    landing.extend(metadata.iter().map(|(p, r)| (p, r.clone())));
-    let total: u64 = landing.iter().map(|(_, r)| r.object_bytes()).sum();
+    // A held file is already landed: nothing is fetched for it, so nothing is presented.
+    let anonymous = (SourcePolicy::default(), transport::Anonymous);
+    let (policy, credentials): (&SourcePolicy, &dyn transport::CredentialProvider) = match &provider
+    {
+        Some(provider) => (&provider.policy, &provider.credentials),
+        None => (&anonymous.0, &anonymous.1),
+    };
+    let mut landing = vec![(policy, credentials, selected.clone())];
+    landing.extend(metadata.iter().map(|(p, r)| {
+        (
+            &p.policy,
+            &p.credentials as &dyn transport::CredentialProvider,
+            r.clone(),
+        )
+    }));
+    let total: u64 = landing.iter().map(|(_, _, r)| r.object_bytes()).sum();
     let mut done = 0;
     let mut owners = vec![];
-    for (index, (from, resolution)) in landing.iter().enumerate() {
+    for (index, (policy, credentials, resolution)) in landing.iter().enumerate() {
         let report =
             |present: u64, _: u64| progress("downloading the model source", done + present, total);
         let options = transport::SourceDownload {
@@ -523,8 +610,8 @@ pub fn make(store: &Store, request: &Request) -> Result<Made> {
                 store,
                 owner,
                 resolution,
-                &from.policy,
-                &from.credentials,
+                policy,
+                *credentials,
                 Deadline::none(),
                 &report,
                 &options,
