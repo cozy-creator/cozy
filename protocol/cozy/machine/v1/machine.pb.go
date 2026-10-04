@@ -2236,12 +2236,13 @@ func (x *StatusFrame) GetWebrtc() *WebRTC {
 }
 
 type WebRTC struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Port          uint32                 `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`              // local listener, stable on persistent machines
-	Addresses     []string               `protobuf:"bytes,2,rep,name=addresses,proto3" json:"addresses,omitempty"`     // host:port, LAN/Tailscale or configured provider mapping
-	Fingerprint   string                 `protobuf:"bytes,3,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"` // SHA256 hex of this machine's DTLS certificate
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Port              uint32                 `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`                                                   // local listener, stable on persistent machines
+	Addresses         []string               `protobuf:"bytes,2,rep,name=addresses,proto3" json:"addresses,omitempty"`                                          // host:port, LAN/Tailscale or configured provider mapping
+	Fingerprint       string                 `protobuf:"bytes,3,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`                                      // SHA256 hex of this machine's DTLS certificate
+	UnavailableReason string                 `protobuf:"bytes,4,opt,name=unavailable_reason,json=unavailableReason,proto3" json:"unavailable_reason,omitempty"` // malformed address config affects playback only
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *WebRTC) Reset() {
@@ -2291,6 +2292,13 @@ func (x *WebRTC) GetAddresses() []string {
 func (x *WebRTC) GetFingerprint() string {
 	if x != nil {
 		return x.Fingerprint
+	}
+	return ""
+}
+
+func (x *WebRTC) GetUnavailableReason() string {
+	if x != nil {
+		return x.UnavailableReason
 	}
 	return ""
 }
@@ -3001,11 +3009,12 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x04disk\x18\x10 \x01(\v2\x15.cozy.machine.v1.DiskR\x04disk\x12.\n" +
 	"\x06models\x18\x11 \x03(\v2\x16.cozy.machine.v1.ModelR\x06models\x12!\n" +
 	"\fmodels_bytes\x18\x12 \x01(\x04R\vmodelsBytes\x12/\n" +
-	"\x06webrtc\x18\x13 \x01(\v2\x17.cozy.machine.v1.WebRTCR\x06webrtc\"\\\n" +
+	"\x06webrtc\x18\x13 \x01(\v2\x17.cozy.machine.v1.WebRTCR\x06webrtc\"\x8b\x01\n" +
 	"\x06WebRTC\x12\x12\n" +
 	"\x04port\x18\x01 \x01(\rR\x04port\x12\x1c\n" +
 	"\taddresses\x18\x02 \x03(\tR\taddresses\x12 \n" +
-	"\vfingerprint\x18\x03 \x01(\tR\vfingerprint\"\xaa\x01\n" +
+	"\vfingerprint\x18\x03 \x01(\tR\vfingerprint\x12-\n" +
+	"\x12unavailable_reason\x18\x04 \x01(\tR\x11unavailableReason\"\xaa\x01\n" +
 	"\x05Model\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x01 \x01(\tR\n" +

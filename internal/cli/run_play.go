@@ -61,6 +61,9 @@ func handleRunPlay(ctx *Context) *exit.Error {
 	}
 	defer machine.Close()
 	media := frame.GetWebrtc()
+	if media != nil && media.UnavailableReason != "" {
+		return exit.Named(exit.Unavailable, "play.endpoint_configuration", "%s", media.UnavailableReason)
+	}
 	if media == nil || len(media.Addresses) == 0 {
 		return exit.Named(exit.Unavailable, "play.endpoint_unavailable", "this machine reports no direct playback endpoint")
 	}
