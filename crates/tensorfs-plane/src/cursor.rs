@@ -131,7 +131,7 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
     let w = c.ws_mut(ws)?;
     let region = w.layout.regions[r as usize].clone();
     let held = matches!(w.hregs[r as usize].state, HState::Ready);
-    let from_host = held || w.host.sealed();
+    let from_host = held || (w.host.sealed() && !w.host.hole(r));
     let src = if held {
         w.hregs[r as usize].holds += 1;
         // SAFETY: inside the live mapping; the hold keeps the region until the copy's event.

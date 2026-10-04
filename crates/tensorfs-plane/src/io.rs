@@ -4,20 +4,23 @@
 //! into the destination (no second host copy), else through `tensorfs_core::read::read_into`.
 //! Each mode's bytes are counted.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "store")]
+use std::sync::RwLock;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use tensorfs_core::ids::ObjectRef;
-
-use crate::layout::Item;
-use crate::{Error, Result};
-
 #[cfg(feature = "store")]
-pub use store::Source;
-#[cfg(not(feature = "store"))]
-pub use plane_only::Source;
+use tensorfs_core::{meta::Meta, read::ReadLease, store::Store};
+
+use crate::layout::{Item, ItemSource, PART_ALIGN};
+use crate::{Error, Result};
 
 #[derive(Debug, Default)]
 pub struct IoTally {
@@ -39,22 +42,6 @@ pub enum Mode {
     Cached,
 }
 
-/// A store-backed source: the lease, the store and its verified descriptors.
-#[cfg(feature = "store")]
-mod store {
-use super::*;
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::sync::RwLock;
-
-use tensorfs_core::meta::Meta;
-use tensorfs_core::read::{self, ReadLease};
-use tensorfs_core::store::Store;
-
-use crate::layout::{ItemSource, PART_ALIGN};
-
 struct Fds {
     buffered: File,
     direct: Option<File>,
@@ -62,12 +49,43 @@ struct Fds {
     overlay: bool,
 }
 
+impl Fds {
+    /// A buffered descriptor and, with `direct_io`, a second O_DIRECT description of the SAME
+    /// inode through /proc: no pathname is resolved again.
+    fn of(buffered: File, direct_io: bool, tally: &IoTally) -> Fds {
+        let direct = if direct_io {
+            let p = CString::new(format!("/proc/self/fd/{}", buffered.as_raw_fd())).unwrap();
+            // SAFETY: plain open of a magic link to our own descriptor.
+            let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_DIRECT | libc::O_CLOEXEC) };
+            if fd < 0 {
+                tally.direct_refused.fetch_add(1, Ordering::Relaxed);
+                None
+            } else {
+                // SAFETY: fresh descriptor from the kernel.
+                Some(unsafe { File::from_raw_fd(fd) })
+            }
+        } else {
+            None
+        };
+        Fds { overlay: overlay(&buffered), buffered, direct }
+    }
+}
+
+/// Where a weight set's bytes come from when its plane fills them: a TensorFS read lease (the
+/// GC hold and the verified door) with descriptors opened through the store's verification;
+/// or object files a machine verified and handed over (`files`: a plane-only executor reads
+/// only those); or nothing, for a sealed layout that holds every byte (`sealed`).
 pub struct Source {
+    #[cfg(feature = "store")]
     lease: RwLock<Option<ReadLease>>,
-    /// None for a sealed layout's weight set (`Source::sealed`): it never reads a store.
+    #[cfg(feature = "store")]
     meta: Option<Arc<Meta>>,
+    #[cfg(feature = "store")]
     store: Option<Arc<Store>>,
     fds: Mutex<HashMap<String, Arc<Fds>>>,
+    /// Handed-over object files: the only objects this source reads, kept open until it goes
+    /// (a read opens its working descriptors from them, and closes those after the fill).
+    handed: Option<HashMap<String, File>>,
     direct_io: bool,
     plane: usize,
 }
@@ -132,25 +150,45 @@ fn resident(f: &File, off: u64, len: u64) -> bool {
     ok
 }
 
+fn pread_exact(f: &File, buf: &mut [u8], at: u64, what: &str) -> Result<()> {
+    f.read_exact_at(buf, at).map_err(|e| Error::Io(format!("{what}: read at {at}: {e}")))
+}
+
 impl Source {
+    #[cfg(feature = "store")]
     pub fn new(store: Arc<Store>, meta: Arc<Meta>, lease: ReadLease, direct_io: bool, plane: usize) -> Source {
         Source {
             lease: RwLock::new(Some(lease)),
             meta: Some(meta),
             store: Some(store),
             fds: Mutex::new(HashMap::new()),
+            handed: None,
             direct_io,
             plane,
         }
     }
 
-    /// The source of a weight set over a sealed layout: every byte is in the layout already,
-    /// so it holds no lease, no store and no descriptor, and any read is refused.
-    pub(crate) fn sealed(plane: usize) -> Source {
-        Source { lease: RwLock::new(None), meta: None, store: None, fds: Mutex::new(HashMap::new()), direct_io: false, plane }
+    /// The source of a weight set over a sealed layout: the object files its machine verified
+    /// and handed over for the layout's holes, read through the same descriptors (O_DIRECT
+    /// through a second description of each, where the filesystem allows). No lease, no store;
+    /// with no files (a whole layout holds every byte) any read is refused.
+    pub fn files(files: Vec<(ObjectRef, File)>, direct_io: bool, plane: usize) -> Source {
+        Source {
+            #[cfg(feature = "store")]
+            lease: RwLock::new(None),
+            #[cfg(feature = "store")]
+            meta: None,
+            #[cfg(feature = "store")]
+            store: None,
+            fds: Mutex::new(HashMap::new()),
+            handed: Some(files.into_iter().map(|(obj, file)| (obj.sha256, file)).collect()),
+            direct_io,
+            plane,
+        }
     }
 
-    /// Close one object's descriptors; the next read of it reopens through the store.
+    /// Close one object's working descriptors; the next read of it reopens them (through the
+    /// store, or from the file handed over, which stays).
     pub fn close_object(&self, sha256: &str) {
         self.fds.lock().unwrap().remove(sha256);
     }
@@ -168,43 +206,38 @@ impl Source {
     /// End the TensorFS lease. Runs when the last weight set and handle drop the source.
     fn release(&self) -> Result<()> {
         self.fds.lock().unwrap().clear();
-        match self.lease.write().unwrap().take() {
-            Some(l) => Ok(l.release(self.meta.as_ref().ok_or(Error::Closed)?)?),
-            None => Ok(()),
+        #[cfg(feature = "store")]
+        if let Some(l) = self.lease.write().unwrap().take() {
+            l.release(self.meta.as_ref().ok_or(Error::Closed)?)?;
         }
+        Ok(())
     }
 
     fn fds(&self, obj: &ObjectRef, tally: &IoTally) -> Result<Arc<Fds>> {
         if let Some(f) = self.fds.lock().unwrap().get(&obj.sha256) {
             return Ok(f.clone());
         }
-        let vf = self.store.as_ref().ok_or(Error::Closed)?.open_verified(&obj.sha256)?;
-        if vf.len() != obj.length {
-            return Err(Error::Invalid(format!(
-                "{}: verified descriptor has {} bytes, the plan says {}",
-                obj.sha256,
-                vf.len(),
-                obj.length
-            )));
-        }
-        let buffered = vf.into_file();
-        // A second open file description of the SAME verified inode, through /proc: no
-        // pathname in the store is resolved again.
-        let direct = if self.direct_io {
-            let p = CString::new(format!("/proc/self/fd/{}", buffered.as_raw_fd())).unwrap();
-            // SAFETY: plain open of a magic link to our own descriptor.
-            let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_DIRECT | libc::O_CLOEXEC) };
-            if fd < 0 {
-                tally.direct_refused.fetch_add(1, Ordering::Relaxed);
-                None
-            } else {
-                // SAFETY: fresh descriptor from the kernel.
-                Some(unsafe { File::from_raw_fd(fd) })
+        #[cfg(feature = "store")]
+        if let Some(store) = self.store.as_ref() {
+            let vf = store.open_verified(&obj.sha256)?;
+            if vf.len() != obj.length {
+                return Err(Error::Invalid(format!(
+                    "{}: verified descriptor has {} bytes, the plan says {}",
+                    obj.sha256,
+                    vf.len(),
+                    obj.length
+                )));
             }
-        } else {
-            None
+            let f = Arc::new(Fds::of(vf.into_file(), self.direct_io, tally));
+            self.fds.lock().unwrap().insert(obj.sha256.clone(), f.clone());
+            return Ok(f);
+        }
+        let handed = self.handed.as_ref().and_then(|h| h.get(&obj.sha256));
+        let Some(file) = handed else {
+            return Err(Error::Invalid(format!("{}: no file for this object was handed over", obj.sha256)));
         };
-        let f = Arc::new(Fds { overlay: overlay(&buffered), buffered, direct });
+        let file = file.try_clone().map_err(|e| Error::Io(format!("{}: {e}", obj.sha256)))?;
+        let f = Arc::new(Fds::of(file, self.direct_io, tally));
         self.fds.lock().unwrap().insert(obj.sha256.clone(), f.clone());
         Ok(f)
     }
@@ -227,9 +260,14 @@ impl Source {
             }
             ItemSource::Object(o) => o,
         };
+        #[cfg(feature = "store")]
         let guard = self.lease.read().unwrap();
-        let lease = guard.as_ref().ok_or(Error::Closed)?;
-        lease.covers(o)?;
+        #[cfg(feature = "store")]
+        if let Some(lease) = guard.as_ref() {
+            lease.covers(o)?;
+        } else if self.handed.is_none() {
+            return Err(Error::Closed);
+        }
         let fds = self.fds(&o.obj, tally)?;
         let a = PART_ALIGN;
         let end = o.off + item.len;
@@ -237,7 +275,14 @@ impl Source {
         let direct = match (mode, &fds.direct) {
             (Mode::Cache, Some(f)) if aligned && !cached(&fds, o.off, item.len) => f,
             _ => {
-                read::read_into(lease, o, buf)?;
+                #[cfg(feature = "store")]
+                if let Some(lease) = guard.as_ref() {
+                    tensorfs_core::read::read_into(lease, o, buf)?;
+                } else {
+                    pread_exact(&fds.buffered, buf, o.off, &o.obj.sha256)?;
+                }
+                #[cfg(not(feature = "store"))]
+                pread_exact(&fds.buffered, buf, o.off, &o.obj.sha256)?;
                 let t = if mode == Mode::Buffered { &tally.buffered_bytes } else { &tally.cached_bytes };
                 t.fetch_add(item.len, Ordering::Relaxed);
                 return Ok(());
@@ -287,41 +332,6 @@ impl Drop for Source {
             eprintln!("tensorfs-plane: read lease release failed: {e}");
         }
     }
-}
-
-}
-
-/// A plane-only build reads no store: its only weight sets are sealed layouts, whose bytes
-/// the machine filled.
-#[cfg(not(feature = "store"))]
-mod plane_only {
-use super::*;
-
-pub struct Source {
-    plane: usize,
-}
-
-impl Source {
-    pub(crate) fn sealed(plane: usize) -> Source {
-        Source { plane }
-    }
-
-    pub fn close_object(&self, _sha256: &str) {}
-
-    pub fn resident(&self, _obj: &ObjectRef, _tally: &IoTally) -> Result<bool> {
-        Err(Error::Closed)
-    }
-
-    pub(crate) fn made_by(&self, plane: usize) -> bool {
-        self.plane == plane
-    }
-
-    /// # Safety
-    /// None needed: it reads nothing (there is no store in this build).
-    pub unsafe fn read_item(&self, _item: &Item, _dst: *mut u8, _mode: Mode, _tally: &IoTally) -> Result<()> {
-        Err(Error::Invalid("a plane-only build reads no store".into()))
-    }
-}
 }
 
 type Job = Box<dyn FnOnce() + Send>;

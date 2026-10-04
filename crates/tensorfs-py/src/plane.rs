@@ -259,7 +259,10 @@ impl PyPlane {
     }
 
     /// Register one weight set over a sealed layout (`fill_sealed`, or one still filling: each
-    /// region is used once Ready); `fd` stays the caller's.
+    /// region is used once Ready); `fd` stays the caller's. `files`: `(sha256, length, fd)` per
+    /// object, the verified object files its machine handed over, from which the regions it did
+    /// not stage copy (each fd is duplicated; the caller keeps and closes its own).
+    #[pyo3(signature = (name, plan, regions, fd, files = None))]
     fn register_sealed(
         &self,
         py: Python<'_>,
@@ -267,11 +270,21 @@ impl PyPlane {
         plan: PyRef<'_, PyPlan>,
         regions: Vec<Vec<String>>,
         fd: i32,
+        files: Option<Vec<(String, u64, i32)>>,
     ) -> PyResult<PyWeightSet> {
+        let mut handed = Vec::new();
+        for (sha256, length, file) in files.unwrap_or_default() {
+            // SAFETY: a descriptor the caller holds for the duration of this call.
+            let owned = unsafe { std::os::fd::BorrowedFd::borrow_raw(file) }
+                .try_clone_to_owned()
+                .map_err(|e| err(py, Error::Io(format!("object file {sha256}: {e}"))))?;
+            let sha256 = sha256.strip_prefix("sha256:").unwrap_or(&sha256).to_string();
+            handed.push((tensorfs_core::ids::ObjectRef { sha256, length }, std::fs::File::from(owned)));
+        }
         let (p, plane) = (&plan.plan, &self.plane);
         let (id, layout) = py
             .detach(|| {
-                let id = plane.register_sealed(&name, p, &regions, fd)?;
+                let id = plane.register_staged(&name, p, &regions, fd, handed)?;
                 Ok((id, plane.layout(id)?))
             })
             .or_raise(py)?;
@@ -847,10 +860,11 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
 
 /// Fill a weight set's layout once through the verified read path and seal it (the machine's
 /// half of a sealed layout; `Plane.register_sealed` adopts it). CONSUMES `lease`. Returns the
-/// sealed memfd (the caller's) and each read mode's bytes.
+/// sealed memfd (the caller's) and each read mode's bytes. `staged`: only those regions, the
+/// rest holes an adopter reads from the object files (`Plane.register_sealed(files=)`).
 #[cfg(feature = "store")]
 #[pyfunction]
-#[pyo3(signature = (store, lease, plan, regions, name, threads = 8, reserved = None))]
+#[pyo3(signature = (store, lease, plan, regions, name, threads = 8, reserved = None, staged = None))]
 #[allow(clippy::too_many_arguments)]
 fn fill_sealed<'p>(
     py: Python<'p>,
@@ -861,6 +875,7 @@ fn fill_sealed<'p>(
     name: String,
     threads: usize,
     reserved: Option<i32>,
+    staged: Option<Vec<u32>>,
 ) -> PyResult<(i32, Bound<'p, PyDict>)> {
     // SAFETY: the caller hands over a descriptor `reserve` returned.
     let reserved = reserved.map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
@@ -871,7 +886,9 @@ fn fill_sealed<'p>(
         .detach(|| {
             let layout = Layout::build(p, &regions)?;
             let source = Source::new(store, meta, lease, true, 0);
-            tensorfs_plane::host::fill_sealed(&name, &layout, &source, threads, &tally, reserved)
+            let (fd, open) = tensorfs_plane::host::open_sealed(&name, &layout, reserved, staged.as_deref())?;
+            open.run(&layout, &source, threads, &tally)?;
+            Ok::<_, tensorfs_plane::Error>(fd)
         })
         .or_raise(py)?;
     let read = |n: &std::sync::atomic::AtomicU64| n.load(Ordering::Relaxed);
@@ -910,6 +927,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reserve, &m)?)?;
     // `register_sealed` adopts a layout its machine is still filling (waits per region).
     m.add("SEALED_WHILE_FILLING", true)?;
+    // `register_sealed(files=)`: regions the machine did not stage copy from object files.
+    m.add("SEALED_HOLES", true)?;
     add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
         CudaUnavailable, Invalid, IoError, Closed);
     parent.add_submodule(&m)?;

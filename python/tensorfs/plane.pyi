@@ -261,10 +261,16 @@ class Plane:
         host_fd: int | None = None,
     ) -> WeightSet: ...
     def register_sealed(
-        self, name: str, plan: ReadPlan, regions: Sequence[Sequence[str]], fd: int
+        self,
+        name: str,
+        plan: ReadPlan,
+        regions: Sequence[Sequence[str]],
+        fd: int,
+        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """A weight set over a sealed layout (`fill_sealed`, or one its machine is still filling:
-        each region is used once Ready): no store, no fill, no punch."""
+        each region is used once Ready): no store, no fill, no punch. A region the machine did
+        not stage copies from `files` (`(sha256, length, fd)` per verified object file)."""
     def set_vram_budget(self, device: int, nbytes: int) -> Trim: ...
     def set_pinned_budget(self, nbytes: int) -> Trim: ...
     def want(
@@ -339,6 +345,8 @@ class SealedFill(TypedDict):
 
 #: `Plane.register_sealed` adopts a layout still filling (absent in older releases).
 SEALED_WHILE_FILLING: bool
+#: `Plane.register_sealed` takes a layout its machine staged in part, the rest from `files`.
+SEALED_HOLES: bool
 
 def fill_sealed(
     store: Store,
@@ -348,9 +356,11 @@ def fill_sealed(
     name: str,
     threads: int = 8,
     reserved: int | None = None,
+    staged: Sequence[int] | None = None,
 ) -> tuple[int, SealedFill]:
     """Fill a weight set's layout through the verified read path and seal it; CONSUMES `lease`.
-    Returns the sealed memfd (the caller's) and each read mode's bytes."""
+    Returns the sealed memfd (the caller's) and each read mode's bytes. `staged`: only those
+    regions, the rest holes an adopter reads from object files."""
 
 def reserve(name: str, nbytes: int, threads: int = 8) -> int:
     """A memfd of `nbytes` whose pages are allocated now; `fill_sealed(reserved=)` consumes it."""
