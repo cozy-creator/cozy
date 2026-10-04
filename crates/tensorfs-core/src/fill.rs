@@ -1,10 +1,8 @@
 //! The ONE fill-transform implementation (tensorfs.md §4) — the code that applies a
 //! permutation-rule encoding during the host staging pass.
 //!
-//! It lives here, once, and has exactly two invocation sites: the ingest border's staging
-//! pass (`ingest::convert`) and the serve-side fill path (`read`). Two producers of layout
-//! semantics already disagreed in v1; the fence keeps the variants and `apply` defined in
-//! this file alone.
+//! It lives here, once, and runs where a model is ingested (`ingest::convert`): weights are
+//! normalized at ingest, so nothing applies a layout transform at read time.
 //!
 //! **The decomposition is arithmetic, never a walk.** `runs()` computes the contiguous
 //! source→destination runs from the declared geometry in O(groups), and `apply` is DERIVED
@@ -71,13 +69,6 @@ impl Decomposition {
             },
             runs,
             bytes,
-        }
-    }
-    pub fn mean_run(&self) -> u64 {
-        if self.runs.is_empty() {
-            0
-        } else {
-            self.bytes / self.runs.len() as u64
         }
     }
 }
@@ -360,28 +351,4 @@ impl Xform {
             }
         }
     }
-}
-
-/// The boundary rule for permutation encodings (tensorfs.md §4): a permute over a
-/// BLOCK-QUANTIZED carrier is fill-applicable only when it moves whole blocks. An
-/// element-level permute would need dequant→requant, which is math — an AOT job's work,
-/// never the fill path's.
-///
-/// `block_elements` is the encoding's scale-block size (0 = unquantized carrier, which this
-/// rule does not govern); `unit_elements` is the transform's smallest moved unit.
-pub fn guard_block_granular(what: &str, unit_elements: u64, block_elements: u64) -> Result<()> {
-    if block_elements <= 1 {
-        return Ok(());
-    }
-    if unit_elements == 0 || !unit_elements.is_multiple_of(block_elements) {
-        return refuse(
-            Code::PERMUTE_NOT_BLOCK_GRANULAR,
-            format!(
-                "{what}: a permute unit of {unit_elements} elements is not a whole multiple \
-                 of the carrier's {block_elements}-element quantization block — an \
-                 element-level permute needs dequant→requant, which is an AOT job, never fill"
-            ),
-        );
-    }
-    Ok(())
 }
