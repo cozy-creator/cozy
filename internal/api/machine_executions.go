@@ -318,6 +318,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		if view.Collected && len(outcome.Result) > 0 {
 			state.Result = json.RawMessage(outcome.Result)
 		}
+		if code, message, problem := s.store.MachineCollectionRefusal(row.ID); !view.Collected && problem == nil && code != "" {
+			view.CollectionRefused, view.ObservationError = code, message
+		}
 	} else if len(link.Outcome) > 0 && !v1run {
 		var outcome pb.AttemptOutcome
 		var body pb.AttemptOutcomeBody

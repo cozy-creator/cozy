@@ -174,6 +174,9 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 		if p.Fraction >= 0 {
 			sample["overall_fraction"] = p.Fraction
 		}
+		if p.StageFraction != nil {
+			sample["stage_fraction"] = *p.StageFraction
+		}
 		if p.Total > 0 {
 			sample["position"], sample["total"] = p.Completed, p.Total
 		}
@@ -213,10 +216,11 @@ func humanBytes(n uint64) string {
 	return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
 }
 
-// RecordRunOutcomeV1 ends the run with its machine's outcome: its outputs finished, the
-// terminal event with the result's status and reason, the request settled and its result
-// collected (every output file this client writes is written before this is called).
-func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome) *exit.Error {
+// RecordRunOutcomeV1 ends the run with its machine's outcome, once: its outputs finished, the
+// terminal event with the result's status and reason, and the request settled. Its result is
+// collected when every output file this client writes was written before the call; `refused`
+// is why one was not, and the result then stays with its machine until a later call collects it.
+func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome, refused *exit.Error) *exit.Error {
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(outcome)
 	if err != nil || len(raw) > 8<<20 {
 		return exit.New(exit.Conflict, "the run's outcome is not bounded")
@@ -231,10 +235,50 @@ func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome) *exit.Error {
 	if err := tx.QueryRow(`SELECT r.ordinal, e.outcome FROM requests r JOIN machine_executions e ON e.request_id=r.id WHERE r.id=?`, id).Scan(&ordinal, &prior); err != nil {
 		return exit.Internalf("cannot read the run's outcome: %s", err)
 	}
-	if len(prior) > 0 {
-		return nil // recorded before
-	}
 	attempt := uint64(max(ordinal, 1))
+	if len(prior) == 0 {
+		if problem := recordRunEndV1(tx, id, attempt, raw, outcome); problem != nil {
+			return problem
+		}
+	}
+	// The collection: every output in its folder, or why not. A refused one leaves the result
+	// with its machine, and a reader asking about the run tries again.
+	var collected bool
+	if err := tx.QueryRow(`SELECT collected FROM machine_executions WHERE request_id=?`, id).Scan(&collected); err != nil {
+		return exit.Internalf("cannot read the run's collection: %s", err)
+	}
+	switch {
+	case collected:
+	case refused != nil:
+		code, message, problem := machineCollectionRefusal(tx, id)
+		if problem != nil {
+			return problem
+		}
+		if code != refused.ErrName() || message != refused.Message {
+			if err := appendEventTx(tx, id, MachineCollectionRefused, int64(attempt),
+				map[string]any{"machine_execution": true, "error_code": refused.ErrName(), "error": refused.Message}); err != nil {
+				return exit.Internalf("cannot record collection refusal: %s", err)
+			}
+		}
+	default:
+		// Nothing of the run is owed after its collection: the machine's cache manages what it keeps.
+		if _, err := tx.Exec(`UPDATE machine_executions SET collected=1 WHERE request_id=?`, id); err != nil {
+			return exit.Internalf("cannot record the run's collection: %s", err)
+		}
+		for _, event := range []string{MachineResultCollected, "machine.retention_released"} {
+			if err := appendEventTx(tx, id, event, int64(attempt), map[string]any{"machine_execution": true, "state": outcome.Status}); err != nil {
+				return exit.Internalf("cannot record the run's collection: %s", err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit the run's outcome: %s", err)
+	}
+	return nil
+}
+
+// recordRunEndV1 settles the run from its outcome, once.
+func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, outcome *v1.Outcome) *exit.Error {
 	state, kind, status, itemStatus := "failed", "run.failed", "FAILED", "incomplete"
 	switch outcome.Status {
 	case "succeeded":
@@ -258,20 +302,14 @@ func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome) *exit.Error {
  WHERE NOT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='run.canceled')`, id, kind, attempt, string(payload), now(), id); err != nil {
 		return exit.Internalf("cannot record the run's end: %s", err)
 	}
-	// Nothing of the run is owed after its outcome: the machine's cache manages what it keeps.
-	if _, err := tx.Exec(`UPDATE machine_executions SET outcome=?, collected=1, pending_control=x'', cancel_requested=0 WHERE request_id=?`, raw, id); err != nil {
+	if _, err := tx.Exec(`UPDATE machine_executions SET outcome=?, pending_control=x'', cancel_requested=0 WHERE request_id=?`, raw, id); err != nil {
 		return exit.Internalf("cannot retain the run's outcome: %s", err)
 	}
 	if _, err := tx.Exec(`UPDATE requests SET state=CASE WHEN state='canceled' THEN state ELSE ? END, retain_work=0 WHERE id=?`, state, id); err != nil {
 		return exit.Internalf("cannot settle the run: %s", err)
 	}
-	for _, event := range []string{"client.machine_work_finished", MachineResultCollected, "machine.retention_released"} {
-		if err := appendEventTx(tx, id, event, int64(attempt), map[string]any{"machine_execution": true, "state": outcome.Status}); err != nil {
-			return exit.Internalf("cannot record the run's collection: %s", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit the run's outcome: %s", err)
+	if err := appendEventTx(tx, id, "client.machine_work_finished", int64(attempt), map[string]any{"machine_execution": true, "state": outcome.Status}); err != nil {
+		return exit.Internalf("cannot record the run's end: %s", err)
 	}
 	return nil
 }
