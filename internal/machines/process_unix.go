@@ -4,6 +4,7 @@ package machines
 
 import (
 	"errors"
+	"io/fs"
 	"os/exec"
 	"syscall"
 )
@@ -20,4 +21,13 @@ func terminate(pid int) error {
 		return err
 	}
 	return nil
+}
+
+// diskOf is a file's inode, its link count and the disk its blocks take.
+func diskOf(info fs.FileInfo) (uint64, int64, int64) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 1, info.Size()
+	}
+	return uint64(stat.Ino), int64(stat.Nlink), int64(stat.Blocks) * 512
 }

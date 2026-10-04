@@ -32,6 +32,11 @@ func (s *Store) LocalRetainedStops() ([]Request, *exit.Error) {
 	return s.numberedRequests(`r.worker='' AND r.retain_work=1 AND r.state IN ('paused','blocked')`)
 }
 
+// MachineLiveRuns is every run a machine holds unsettled: replacing the machine loses them.
+func (s *Store) MachineLiveRuns(machine string) ([]Request, *exit.Error) {
+	return s.numberedRequests(`EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=r.id AND e.machine_id=?1 AND `+machineExecutionLive+`)`, machine)
+}
+
 // LocalModelUsers is every live local request that reads or writes the named local model.
 func (s *Store) LocalModelUsers(model string) ([]Request, *exit.Error) {
 	return s.numberedRequests(localLive+` AND (

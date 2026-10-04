@@ -42,6 +42,9 @@ type Host struct {
 	store  string
 	mu     sync.Mutex
 	cached *cachedLaunch
+	// asked is the machine executable servesAPI last asked, and serves its answer.
+	asked  os.FileInfo
+	serves bool
 	// inherited are the locale, trust-store and GPU-visibility values a Host may carry from its
 	// launcher.
 	inherited []string
@@ -99,6 +102,8 @@ type Installed struct {
 	TensorFS    installedArtifact `json:"tensorfs"`
 	InstalledAt time.Time         `json:"installed_at"`
 	HostPinned  bool              `json:"host_pinned,omitempty"`
+	// Replaced is set when this install replaced a machine that predated MachineAPI.
+	Replaced *Replaced `json:"replaced,omitempty"`
 }
 
 // placeHost atomically installs the independent agent without changing machine state.
@@ -130,10 +135,8 @@ func (h *Host) Installed() (*Installed, *exit.Error) {
 	return &out, nil
 }
 
-// Install lays the root out as a worker image does: the machine at usr/local/bin/cozy-machine,
-// the executor SDK (Runtime and TensorFS wheels) at opt/cozy/machine/wheels and uv at
-// usr/local/bin/uv. The machine makes its own identity files, installer helper and package
-// environments there, as on a rental. An installed machine is updated in place instead.
+// Install makes this computer's machine: a new one, an installed one updated in place, or an
+// installed one that predates MachineAPI (the Go agent) replaced.
 func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installed, *exit.Error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -142,6 +145,9 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		return nil, problem
 	}
 	defer unlock()
+	if problem := h.recoverReplace(ctx); problem != nil {
+		return nil, problem
+	}
 	previous, problem := h.Installed()
 	if problem != nil {
 		return nil, problem
@@ -150,10 +156,69 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 		source.RuntimeWheel != "" && (!strings.HasSuffix(source.RuntimeWheel, ".whl") || !strings.HasSuffix(source.TensorFSWheel, ".whl")) {
 		return nil, exit.New(exit.Validation, "the machine install names both wheels or neither, with an optional machine executable")
 	}
-	if previous != nil {
+	if previous != nil && h.servesAPI(ctx) {
 		return h.updateLocked(ctx, source)
 	}
-	release, problem := h.bootstrapLease()
+	// Everything the new machine needs is in hand before an installed one is touched.
+	staged, problem := h.stage(ctx, source)
+	if problem != nil {
+		return nil, problem
+	}
+	defer os.RemoveAll(staged.dir)
+	if previous == nil {
+		return h.place(staged, uv)
+	}
+	return h.replaceLocked(ctx, staged, uv)
+}
+
+// staged is a machine ready to place: its executable and the executor SDK's wheel pair.
+type staged struct {
+	dir, agent string
+	wheels     []string
+	pinned     bool
+}
+
+// stage fetches what source leaves unnamed (the newest published pair, the machine its Runtime
+// wheel bundles) and checks the machine serves MachineAPI.
+func (h *Host) stage(ctx context.Context, source Source) (*staged, *exit.Error) {
+	dir, err := os.MkdirTemp(h.dir, ".install-")
+	if err != nil {
+		return nil, exit.Internalf("cannot stage the machine install: %s", err)
+	}
+	out := &staged{dir: dir, agent: source.Host, wheels: []string{source.RuntimeWheel, source.TensorFSWheel}, pinned: source.Host != ""}
+	problem := func() *exit.Error {
+		if source.RuntimeWheel == "" {
+			for i, distribution := range []string{hostruntime.Distribution, "tensorfs"} {
+				if out.wheels[i], err = publishedWheel(ctx, distribution, dir); err != nil {
+					return exit.New(exit.Unavailable, "cannot fetch the published %s: %s", distribution, err)
+				}
+			}
+		}
+		if out.agent == "" {
+			if out.agent, err = bundledAgent(out.wheels[0], dir); err != nil {
+				return exit.Named(exit.Structural, "machine.agent_unsupported", "%s", err).
+					WithRemedy("name a cozy-machine with --host")
+			}
+		}
+		if !servesAPI(ctx, out.agent) {
+			return exit.Named(exit.Structural, "machine.agent_unsupported", "%s is not a cozy-machine serving %s", filepath.Base(out.agent), MachineAPI).
+				WithRemedy("install a current Runtime pair, or name a current cozy-machine with --host")
+		}
+		return nil
+	}()
+	if problem != nil {
+		os.RemoveAll(dir)
+		return nil, problem
+	}
+	return out, nil
+}
+
+// place lays the root out as a worker image does: the machine at usr/local/bin/cozy-machine,
+// the executor SDK (Runtime and TensorFS wheels) at opt/cozy/machine/wheels and uv at
+// usr/local/bin/uv. The machine makes its own identity files, installer helper and package
+// environments there, as on a rental.
+func (h *Host) place(staged *staged, uv string) (*Installed, *exit.Error) {
+	release, problem := h.guard()
 	if problem != nil {
 		return nil, problem
 	}
@@ -161,38 +226,15 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 	if _, problem := h.identity(); problem != nil {
 		return nil, problem
 	}
-	stage, err := os.MkdirTemp(h.dir, ".install-")
-	if err != nil {
-		return nil, exit.Internalf("cannot stage the machine install: %s", err)
-	}
-	defer os.RemoveAll(stage)
-	wheels := []string{source.RuntimeWheel, source.TensorFSWheel}
-	if source.RuntimeWheel == "" {
-		for i, distribution := range []string{hostruntime.Distribution, "tensorfs"} {
-			if wheels[i], err = publishedWheel(ctx, distribution, stage); err != nil {
-				return nil, exit.New(exit.Unavailable, "cannot fetch the published %s: %s", distribution, err)
-			}
-		}
-	}
-	agent := source.Host
-	if agent == "" {
-		if agent, err = bundledAgent(wheels[0], stage); err != nil {
-			return nil, exit.Named(exit.Structural, "machine.agent_unsupported", "%s", err).
-				WithRemedy("name a cozy-machine with --host")
-		}
-	}
-	if !servesAPI(ctx, agent) {
-		return nil, exit.Named(exit.Structural, "machine.agent_unsupported", "%s is not a cozy-machine serving %s", filepath.Base(agent), MachineAPI).
-			WithRemedy("install a current Runtime pair, or name a current cozy-machine with --host")
-	}
-	installed := Installed{InstalledAt: time.Now().UTC(), HostPinned: source.Host != ""}
-	if installed.Host, err = h.placeHost(agent); err != nil {
+	var err error
+	installed := Installed{InstalledAt: time.Now().UTC(), HostPinned: staged.pinned}
+	if installed.Host, err = h.placeHost(staged.agent); err != nil {
 		return nil, exit.Internalf("cannot install the machine: %s", err)
 	}
-	if source.Host == "" {
+	if !staged.pinned {
 		installed.Host.Name = "cozy-machine"
 	}
-	kept, err := h.keepWheels(wheels)
+	kept, err := h.keepWheels(staged.wheels)
 	if err != nil {
 		return nil, exit.Internalf("cannot keep the machine's wheels: %s", err)
 	}
@@ -289,6 +331,9 @@ func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client,
 		return nil, problem
 	}
 	defer unlock()
+	if problem := h.recoverReplace(ctx); problem != nil {
+		return nil, problem
+	}
 	return h.ensureLocked(ctx, hubOrigin, client, !attach)
 }
 
@@ -301,6 +346,9 @@ func (h *Host) Start(ctx context.Context) (*Launch, *exit.Error) {
 		return nil, problem
 	}
 	defer unlock()
+	if problem := h.recoverReplace(ctx); problem != nil {
+		return nil, problem
+	}
 	return h.ensureLocked(ctx, "", nil, true)
 }
 
@@ -310,6 +358,10 @@ func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.C
 		launch = cached.Launch
 	}
 	if launch == nil {
+		if _, err := os.Stat(h.binary()); err == nil && !h.servesAPI(ctx) {
+			return nil, exit.Named(exit.Structural, "machine.predates_api", "this computer's machine predates %s, which this cozy drives machines with", MachineAPI).
+				WithRemedy("`cozy machine install` replaces it and keeps its models")
+		}
 		record, problem := h.running()
 		switch {
 		case problem != nil:
@@ -376,9 +428,9 @@ func (h *Host) await(ctx context.Context, record *hostRecord) (*Launch, *exit.Er
 
 // launchLocked starts a new agent once running found none.
 func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
-	// A directly launched agent or surviving Runtime may have no client record.
-	// Observe its kernel ownership before touching receipt or launch metadata.
-	release, problem := h.bootstrapLease()
+	// A directly launched machine may have no client record: the root's guard, not the
+	// record, says whether one runs.
+	release, problem := h.guard()
 	if problem != nil {
 		return nil, problem
 	}
@@ -849,34 +901,46 @@ func processStartTicks(pid int) uint64 {
 	return ticks
 }
 
-// A missing client record cannot override kernel-owned machine/Runtime leases.
-func (h *Host) bootstrapLease() (func(), *exit.Error) {
-	var files []*os.File
-	release := func() {
-		for _, file := range files {
-			_ = flock.Release(file)
-			_ = file.Close()
-		}
+// guardLock is the one lock every machine on a root holds for its life: the Go agent's and
+// the Rust machine's alike (cozy-machine `machine::identity::hold`).
+const guardLock = "var/lib/cozy/machine/agent.lock"
+
+// guard holds the root's lock while this controller changes or starts its machine: the
+// kernel, not a client record, says no machine runs there.
+func (h *Host) guard() (func(), *exit.Error) {
+	file, held, err := probe(filepath.Join(h.Root(), guardLock), true)
+	if err != nil {
+		return nil, exit.Internalf("cannot inspect machine ownership: %s", err)
 	}
-	for _, relative := range []string{"var/lib/cozy/machine/agent.lock", "run/cozy/worker/worker.lock"} {
-		path := filepath.Join(h.Root(), relative)
-		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-			release()
-			return nil, exit.Internalf("cannot inspect machine ownership: %s", err)
-		}
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-		if err != nil {
-			release()
-			return nil, exit.Internalf("cannot inspect machine ownership: %s", err)
-		}
-		if err := flock.Exclusive(file); err != nil {
-			file.Close()
-			release()
-			return nil, exit.Named(exit.Conflict, "machine.busy", "a live machine or Runtime owns this root; bootstrap cannot replace its software")
-		}
-		files = append(files, file)
+	if held {
+		return nil, exit.Named(exit.Conflict, "machine.busy", "a live machine owns this root").
+			WithRemedy("`cozy machine stop` ends it")
 	}
-	return release, nil
+	return func() { _ = flock.Release(file); _ = file.Close() }, nil
+}
+
+// probe takes path's exclusive lock, or reports that a live process holds it. An absent file
+// is created only when asked; otherwise nothing holds it.
+func probe(path string, create bool) (*os.File, bool, error) {
+	flags := os.O_RDWR
+	if create {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return nil, false, err
+		}
+		flags |= os.O_CREATE
+	}
+	file, err := os.OpenFile(path, flags, 0o600)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if flock.Exclusive(file) != nil {
+		file.Close()
+		return nil, true, nil
+	}
+	return file, false, nil
 }
 
 func (h *Host) lock(ctx context.Context) (func(), *exit.Error) { return h.acquireLock(ctx, true) }

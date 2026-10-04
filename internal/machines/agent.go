@@ -31,6 +31,19 @@ func servesAPI(ctx context.Context, path string) bool {
 	return err == nil && json.Unmarshal(out, &version) == nil && version.Name == "cozy-machine" && slices.Contains(version.API, MachineAPI)
 }
 
+// servesAPI asks the installed machine's executable once per file: a daemon asks on every
+// launch, and an install replaces the file under it.
+func (h *Host) servesAPI(ctx context.Context) bool {
+	info, err := os.Stat(h.binary())
+	if err != nil {
+		return false
+	}
+	if h.asked == nil || !os.SameFile(h.asked, info) || !h.asked.ModTime().Equal(info.ModTime()) {
+		h.asked, h.serves = info, servesAPI(ctx, h.binary())
+	}
+	return h.serves
+}
+
 // bundledAgent writes the cozy-machine a Runtime wheel bundles (its data scripts) into dir.
 func bundledAgent(wheel, dir string) (string, error) {
 	archive, err := zip.OpenReader(wheel)
