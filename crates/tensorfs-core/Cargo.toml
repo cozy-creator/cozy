@@ -19,6 +19,9 @@ base64 = "0.22"
 fs2 = { version = "0.4", optional = true }
 minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+serde = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json_canonicalizer = "0.3"
 sha2 = "0.10"
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "std", "net", "event", "process"], optional = true }
 # tfs-049: the ONE transport (src/transport/). rustls is the one TLS stack, used only

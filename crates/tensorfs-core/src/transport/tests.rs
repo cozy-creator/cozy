@@ -599,7 +599,7 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
     assert_eq!(report.fetched, 8);
     assert_eq!(
         report.bytes_moved,
-        checkpoint.bodies.values().map(|b| b.len() as u64).sum()
+        checkpoint.bodies.values().map(|b| b.len() as u64).sum::<u64>()
     );
     assert_eq!(report.model, "acme/model");
     assert_eq!(report.release, "r1");
