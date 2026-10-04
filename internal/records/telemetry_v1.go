@@ -12,11 +12,12 @@ import (
 )
 
 // A sample is lossy diagnostics, not an object-transfer channel. Larger samples are
-// dropped without failing the run; three latest samples and one first sample stay bounded.
+// dropped without failing the run; stage endpoints and latest samples stay bounded.
 const maxRunTelemetryBytesV1 = 16 << 10
+const maxRunProgressStageEdgesV1 = 8
 
-// Telemetry carries no lifecycle authority. One first fraction plus the latest progress,
-// preparation and log sample are retained per observed run. Real transitions flush those
+// Telemetry carries no lifecycle authority. One first fraction, up to eight genuine previous
+// stage endpoints, and the latest progress/preparation/log samples are retained per run. Real transitions flush those
 // bounded samples in their existing FULL transaction; no telemetry event begins a write.
 type runTelemetryV1 struct {
 	attempt  int64
@@ -25,6 +26,7 @@ type runTelemetryV1 struct {
 	flushed  uint64
 	first    *telemetrySampleV1
 	latest   map[string]telemetrySampleV1
+	edges    []telemetrySampleV1
 	progress json.RawMessage
 }
 type telemetrySampleV1 struct {
@@ -160,6 +162,14 @@ func (s *Store) retainSampleV1(current *runTelemetryV1, id, kind string, payload
 	sample := telemetrySampleV1{sequence: s.telemetrySequence, remote: remote, event: Event{
 		RequestID: id, Type: kind, Attempt: current.attempt, Raw: raw, At: at,
 	}}
+	if kind == "machine.progress" {
+		if previous, ok := current.latest[kind]; ok && telemetryStageV1(previous) != telemetryStageV1(sample) {
+			current.edges = append(current.edges, previous)
+			if len(current.edges) > maxRunProgressStageEdgesV1 {
+				current.edges = append([]telemetrySampleV1(nil), current.edges[len(current.edges)-maxRunProgressStageEdgesV1:]...)
+			}
+		}
+	}
 	current.latest[kind] = sample
 	if kind == "machine.progress" && current.first == nil {
 		if fields, ok := payload["payload"].(map[string]any); ok {
@@ -169,6 +179,15 @@ func (s *Store) retainSampleV1(current *runTelemetryV1, id, kind string, payload
 			}
 		}
 	}
+}
+func telemetryStageV1(sample telemetrySampleV1) string {
+	var payload struct {
+		Payload struct {
+			Stage string `json:"stage"`
+		} `json:"payload"`
+	}
+	_ = json.Unmarshal(sample.event.Raw, &payload)
+	return payload.Payload.Stage
 }
 func (s *Store) sampleLocalTelemetryV1(id, kind string, attempt int64, payload map[string]any) bool {
 	if kind != "machine.progress" && kind != "request.preparing" && kind != "request.log" {
@@ -197,7 +216,7 @@ func decodedLiveV1(sample telemetrySampleV1) LiveRunEventV1 {
 	return LiveRunEventV1{Sequence: sample.sequence, Event: event}
 }
 
-// LiveRunEventsV1 returns only each run's latest bounded telemetry; an empty id multiplexes.
+// LiveRunEventsV1 returns bounded genuine stage endpoints and latest telemetry; an empty id multiplexes.
 func (s *Store) LiveRunEventsV1(id string) []LiveRunEventV1 {
 	s.telemetryMu.Lock()
 	defer s.telemetryMu.Unlock()
@@ -207,6 +226,9 @@ func (s *Store) LiveRunEventsV1(id string) []LiveRunEventV1 {
 			continue
 		}
 		for _, sample := range current.latest {
+			samples = append(samples, decodedLiveV1(sample))
+		}
+		for _, sample := range current.edges {
 			samples = append(samples, decodedLiveV1(sample))
 		}
 	}
@@ -265,6 +287,11 @@ func (s *Store) flushTelemetryV1(tx *sql.Tx, id string, cursor int64) (uint64, e
 			samples = append(samples, *current.first)
 		}
 		for _, sample := range current.latest {
+			if sample.sequence > current.flushed {
+				samples = append(samples, sample)
+			}
+		}
+		for _, sample := range current.edges {
 			if sample.sequence > current.flushed {
 				samples = append(samples, sample)
 			}
