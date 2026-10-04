@@ -83,7 +83,7 @@ func TestStandaloneHostPreparesOrderedPrivateLoRAView(t *testing.T) {
 	must(t, json.Unmarshal(data, &seeded))
 	seedFile := filepath.Join(root, "seed-data.json")
 	must(t, os.WriteFile(seedFile, data, 0600))
-	python := filepath.Join(host.Root(), "opt/cozy/python/bin/python")
+	python := machinePython(t)
 	seed := exec.Command(python, "-I", "-c", `import base64, json, os, sys, tempfile
 import tensorfs
 rows=json.load(open(sys.argv[2])); store=tensorfs.Store.open(sys.argv[1])

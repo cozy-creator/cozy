@@ -14,13 +14,14 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// TestHostRuntimeWireFence: the host tool answers typed CLI verbs and speaks no worker wire, so
-// any wire minor, older or newer, serves; a release below ToolFloor or another wire package
-// does not. A host tool that cannot serve never stops the daemon (rentals and the Hub need
-// none): `cozy up` names the upgrade, and only what needs the host tool refuses by name, with
-// the reinstall. Every arm is the real binary against a real root; the tool is a stand-in
-// that answers only `version`.
-func TestHostRuntimeWireFence(t *testing.T) {
+// TestHostRuntimeAdmission: the host tool answers typed CLI verbs and speaks no machine protocol
+// to this Cozy, so a Runtime of any protocol serves: the worker.v1 Runtime, the cohort Runtime
+// of cozy.machine.v1, and one that names none. Only a release below ToolFloor does not. A host
+// tool that cannot serve never stops the daemon (rentals and the Hub need none): `cozy up`
+// names the upgrade, and only what needs the host tool refuses by name, with the reinstall.
+// Every arm is the real binary against a real root; the tool is a stand-in that answers only
+// `version`.
+func TestHostRuntimeAdmission(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtimes are POSIX shell scripts")
 	}
@@ -41,35 +42,24 @@ func TestHostRuntimeWireFence(t *testing.T) {
 		}
 	}
 
-	// (a) Another wire package cannot serve: the daemon starts, and `cozy up` names the upgrade.
-	root, path := hostRuntimeRoot(t, "foreign", strings.ReplaceAll(stubRuntime(t, hostruntime.ToolFloor, pb.WireMinor), "cozy.worker.v1", "cozy.worker.v0"))
-	upNames(t, root, path, "host_runtime_wire_mismatch",
-		"speaks cozy.worker.v0+minor.", "this Cozy speaks cozy.worker.v1")
-
-	// (a′) The wire is right but the release predates static describe (cl-175).
-	root, path = hostRuntimeRoot(t, "below-floor", stubRuntime(t, "0.4.0", pb.WireMinor))
+	// (a) The release predates static describe (cl-175).
+	root, path := hostRuntimeRoot(t, "below-floor", stubRuntime(t, "0.4.0", runtimeWireProtocol))
 	upNames(t, root, path, "host_runtime_below_floor", "release 0.4.0; this Cozy needs "+hostruntime.ToolFloor+" or newer")
 
 	// (b) A tool that cannot say what it is.
 	root, path = hostRuntimeRoot(t, "mute", "#!/bin/sh\necho 'usage: cozy-runtime <verb>' >&2\nexit 2\n")
 	upNames(t, root, path, "host_runtime_unreadable", "exited 2: usage: cozy-runtime <verb>")
 
-	// (c) The wire is additive: a newer minor serves an older daemon.
-	root, path = hostRuntimeRoot(t, "newer", stubRuntime(t, "9.9.9", pb.WireMinor+1))
-	if code, out := runCozyPath(t, root, path, "up"); code != 0 {
-		t.Fatalf("a newer host tool was refused [exit %d]\n%s", code, out)
-	}
-	if code, out := runCozyPath(t, root, path, "down"); code != 0 {
-		t.Fatalf("down [exit %d]\n%s", code, out)
-	}
-
-	// (c′) Version skew: an older wire minor at ToolFloor serves too.
-	root, path = hostRuntimeRoot(t, "older-minor", stubRuntime(t, hostruntime.ToolFloor, pb.MinCompatibleWireMinor-1))
-	if code, out := runCozyPath(t, root, path, "up"); code != 0 || strings.Contains(out, "local runs refuse") {
-		t.Fatalf("an older wire minor was refused [exit %d]\n%s", code, out)
-	}
-	if code, out := runCozyPath(t, root, path, "down"); code != 0 {
-		t.Fatalf("down [exit %d]\n%s", code, out)
+	// (c) The protocol a Runtime names for its machine is not this tool's contract.
+	for name, protocol := range map[string]string{"worker": runtimeWireProtocol, "machine": "cozy.machine.v1",
+		"older-minor": fmt.Sprintf("cozy.worker.v1+minor.%d", pb.MinCompatibleWireMinor-1), "unnamed": ""} {
+		root, path = hostRuntimeRoot(t, name, stubRuntime(t, hostruntime.ToolFloor, protocol))
+		if code, out := runCozyPath(t, root, path, "up"); code != 0 || strings.Contains(out, "local runs refuse") {
+			t.Fatalf("a host tool naming protocol %q was refused [exit %d]\n%s", protocol, code, out)
+		}
+		if code, out := runCozyPath(t, root, path, "down"); code != 0 {
+			t.Fatalf("down [exit %d]\n%s", code, out)
+		}
 	}
 
 	// (d) No tool at all starts the daemon: rentals and the hub need none, and a local
@@ -97,11 +87,13 @@ func TestHostRuntimeWireFence(t *testing.T) {
 }
 
 // stubRuntime answers `cozy-runtime --json version` the way the real tool does.
-func stubRuntime(t *testing.T, release string, minor uint32) string {
+func stubRuntime(t *testing.T, release, protocol string) string {
 	t.Helper()
-	answer, err := json.Marshal(map[string]string{
-		"distribution": release, "wire_protocol": fmt.Sprintf("cozy.worker.v1+minor.%d", minor),
-	})
+	identity := map[string]string{"distribution": release}
+	if protocol != "" {
+		identity["wire_protocol"] = protocol
+	}
+	answer, err := json.Marshal(identity)
 	must(t, err)
 	return "#!/bin/sh\nprintf '%s\\n' '" + string(answer) + "'\n"
 }

@@ -25,8 +25,6 @@ type MachineExecutions interface {
 	Control(context.Context, records.Request, string) *exit.Error
 	// Withdraw stops a canceled request's submission work that has not reached Runtime.
 	Withdraw(string)
-	// PruneOperationCache frees one machine's unused cached operation results.
-	PruneOperationCache(ctx context.Context, machine string) (uint32, uint64, bool, *exit.Error)
 	// Describe is a published release as one machine reads it at its own Hub: the release
 	// (the newest when none is named) and its interface.
 	Describe(ctx context.Context, machine, hub, pkg, release string) (DescribedRelease, *exit.Error)
@@ -369,6 +367,12 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		view.ObservationError = problem.Message
 	} else {
 		state.ExecutionMS, state.ExecutionKnown = measured, known
+	}
+	if state.Status == "canceled" {
+		// A canceled run says WHO (cl-108), as a job without a machine does.
+		if actor, _, _, problem := s.store.CancelAttribution(row.ID); problem == nil {
+			state.CanceledBy = actor
+		}
 	}
 	return state
 }

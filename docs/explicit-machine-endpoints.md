@@ -44,6 +44,8 @@ leaf and the login device, and hands it to the machine with an owner-signed
 per endpoint (`machine/endpoints/<name>/`) and reused until the login, leaf or reset
 generation changes or it nears expiry, so a run does not contact Tensorhub. Logout
 erases every endpoint's grant and queues its removal for the next connection.
+A machine that serves `cozy.machine.v1` is given that access inside each run instead and
+keeps none, so nothing is cached for it and logout asks it for nothing.
 
 The explicit selector flag is not a claim that the chosen machine implements every
 operation; jobs, browser selection and boot refresh remain separate gates.

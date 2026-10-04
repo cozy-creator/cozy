@@ -250,7 +250,7 @@ func downFailureDiagnostics(t *testing.T, root, venue, provider string, store *r
 	if venue == "rental" {
 		journal = filepath.Join(provider, "var/lib/tensorfs/.cozy-workspace/journal.sqlite3")
 	}
-	python := filepath.Join(root, "machine/root/opt/cozy/python/bin/python")
+	python := machinePython(t)
 	command := exec.CommandContext(ctx, python, append([]string{"-I", "-c", `import json,sqlite3,sys
 from pathlib import Path
 path=Path(sys.argv[1]); ids=sys.argv[2:]

@@ -25,14 +25,12 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 const (
@@ -116,116 +114,6 @@ func randomToken(t *testing.T) string {
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
-// virtualInventory replaces the image's worker entry with the same `main` measuring a
-// virtual four-device inventory: the in-process launcher seam, never an environment switch.
-// When this test process hides the GPUs (CUDA_VISIBLE_DEVICES set and empty) the worker asks
-// no driver anything, as on a driverless host, and its virtual devices are ordinals no card has.
-func virtualInventory(t *testing.T, root string) {
-	t.Helper()
-	cfg, problem := config.Load()
-	fatal(t, problem)
-	virtualInventoryFor(t, root, cfg.GPUsNamed && len(cfg.VisibleGPUs) == 0)
-}
-
-func virtualInventoryFor(t *testing.T, root string, hidden bool) {
-	t.Helper()
-	python := filepath.Join(root, "opt/cozy/python/bin/python")
-	worker := filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker")
-	driverless := filepath.Join(root, "opt/cozy/driverless")
-	must(t, os.MkdirAll(driverless, 0o755))
-	must(t, os.WriteFile(filepath.Join(driverless, "nvidia-smi"), []byte("#!/bin/sh\necho 'GPUs are hidden' >&2\nexit 9\n"), 0o755))
-	must(t, os.Remove(worker))
-	must(t, os.WriteFile(worker, []byte("#!"+python+`
-import os, sys
-from dataclasses import replace
-from cozy_runtime.internal import accel, hostfacts
-from cozy_runtime.cli import runtime_worker
-HIDDEN = `+map[bool]string{false: "False", true: "True"}[hidden]+`
-first = 64 if HIDDEN else 0
-inventory = [{"device_index": first + i, "device_name": "Virtual Accelerator", "device_uuid": f"GPU-virtual-{i}",
-    "driver_version": "0.0", "memory_bytes": 8 << 30, "pci_bus_id": f"00000000:0{i}:00.0"} for i in range(4)]
-if HIDDEN:
-    accel._nvml_absent = True
-    os.environ["PATH"] = `+strconv.Quote(driverless)+` + os.pathsep + os.environ.get("PATH", "")
-measure = hostfacts.measure
-def fixture_measure(expected_backend=""):
-    if expected_backend != "cuda":
-        return measure(expected_backend)
-    # Model-default selection and readiness must see the same synthetic devices.
-    # Numerical backend/architecture and other host facts remain actually measured; with the
-    # GPUs hidden they are absent, as on a driverless host.
-    if HIDDEN:
-        facts = measure("none")
-        facts = replace(facts, backend="", gpu_sm=0, unreadable=tuple(sorted({*facts.unreadable, "gpu_sm"})))
-    else:
-        facts = measure(expected_backend)
-    inventory_fields = {"gpu_name", "vram_total_bytes", "driver_version"}
-    return replace(facts, gpu_name=inventory[0]["device_name"], gpu_count=len(inventory),
-        vram_total_bytes=inventory[0]["memory_bytes"], driver_version=inventory[0]["driver_version"],
-        unreadable=tuple(name for name in facts.unreadable if name not in inventory_fields))
-hostfacts.measure = fixture_measure
-sys.exit(runtime_worker.main(sys.argv[1:], gpus=inventory))
-`), 0o755))
-}
-
-// The routing fixture may replace inventory facts, but numerical identity must stay absent or
-// present exactly as the real measurement reports it. With the GPUs hidden nothing is measured
-// from a driver: identity is absent and the virtual devices cannot name a real card.
-func TestVirtualInventoryPreservesMeasuredNumericalIdentity(t *testing.T) {
-	if *machineHostBinary == "" {
-		t.Skip("requires the selected Runtime SDK to inspect its fixture entrypoint")
-	}
-	python := filepath.Join(machineTemplateDir(t), "root/opt/cozy/python/bin/python")
-	for _, hidden := range []bool{false, true} {
-		root := t.TempDir()
-		worker := filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker")
-		must(t, os.MkdirAll(filepath.Dir(worker), 0755))
-		must(t, os.WriteFile(worker, nil, 0755))
-		virtualInventoryFor(t, root, hidden)
-		script := `import runpy, shutil, subprocess, sys
-from cozy_runtime.cli import runtime_worker
-from cozy_runtime.internal import accel, hostfacts
-hidden = sys.argv[2] == "hidden"
-for backend, architecture in [("", 0), ("cuda", 89)]:
-    calls = []
-    def measure(expected_backend=""):
-        calls.append(expected_backend)
-        return hostfacts.HostFacts(backend=backend if expected_backend == "cuda" else "none", gpu_sm=architecture,
-            host_ram_total_bytes=12345, vcpu_count=7, unreadable=("gpu_name", "driver_version", "backend_version"))
-    hostfacts.measure = measure
-    def main(argv, *, gpus):
-        facts = hostfacts.measure("cuda")
-        assert len(gpus) == facts.gpu_count == 4
-        assert facts.gpu_name == gpus[0]["device_name"] == "Virtual Accelerator"
-        assert facts.vram_total_bytes == gpus[0]["memory_bytes"] == 8 << 30
-        assert facts.driver_version == gpus[0]["driver_version"] == "0.0"
-        assert (facts.host_ram_total_bytes, facts.vcpu_count) == (12345, 7)
-        assert hostfacts.measure("none").unreadable == ("gpu_name", "driver_version", "backend_version")
-        if hidden:
-            assert (facts.backend, facts.gpu_sm, facts.unreadable) == ("", 0, ("backend_version", "gpu_sm"))
-            assert calls == ["none", "none"], calls
-            assert min(gpu["device_index"] for gpu in gpus) >= 64
-            assert accel._nvml_absent and accel._nvml_library() is None
-            assert subprocess.run([shutil.which("nvidia-smi"), "-L"], capture_output=True).returncode == 9
-        else:
-            assert (facts.backend, facts.gpu_sm) == (backend, architecture)
-            assert facts.unreadable == ("backend_version",)
-            assert calls == ["cuda", "none"]
-            assert [gpu["device_index"] for gpu in gpus] == [0, 1, 2, 3]
-        return 0
-    runtime_worker.main = main
-    try:
-        runpy.run_path(sys.argv[1], run_name="__main__")
-    except SystemExit as exit:
-        assert exit.code == 0
-`
-		mode := map[bool]string{false: "visible", true: "hidden"}[hidden]
-		if output, err := exec.Command(python, "-I", "-c", script, worker, mode).CombinedOutput(); err != nil {
-			t.Fatalf("%s virtual inventory changed measured numerical identity: %v\n%s", mode, err, output)
-		}
-	}
-}
-
 // providerHost boots the same Host binary as a rental's provider would: under its own root,
 // with the rental's Creator key as the owner key its grant names.
 func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machines.Source, uv string) (*machines.Launch, rental.CreatorIdentity, string, string) {
@@ -237,7 +125,12 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	must(t, err)
 	claimScratch(providerHome)
 	dir := filepath.Join(providerHome, "machine")
-	t.Cleanup(func() { _ = removeAllForce(providerHome) })
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("rental machine log tail:\n%s", tail(filepath.Join(dir, "host.log")))
+		}
+		_ = removeAllForce(providerHome)
+	})
 	trackDaemonRoot(t, providerHome)
 	host := machines.NewHost(dir, "", nil)
 	host.WebRTCPort, _ = strconv.Atoi(h.grants["COZY_WEBRTC_INTERNAL_PORT"])
@@ -280,6 +173,12 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	command.Dir = host.Root()
 	for name, value := range environment {
 		command.Env = append(command.Env, name+"="+value)
+	}
+	// As a pod's image does: the machine's own tools (uv) are on its PATH.
+	command.Env = append(command.Env, "PATH="+filepath.Join(host.Root(), "usr/local/bin")+":/usr/bin:/bin")
+	// A machine finds GPUs where its launcher may: a run that hides them hides them here too.
+	if visible, named := os.LookupEnv("CUDA_VISIBLE_DEVICES"); named {
+		command.Env = append(command.Env, "CUDA_VISIBLE_DEVICES="+visible)
 	}
 	log, err := os.OpenFile(filepath.Join(dir, "host.log"), os.O_CREATE|os.O_WRONLY, 0600)
 	must(t, err)
@@ -406,8 +305,7 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 
 // parityMachines is one daemon root with both machines of the parity body: this computer's,
 // installed and launched by the daemon, and the rental `tessa`, the same Host binary a
-// provider booted and the daemon attached. Each runs a real Runtime worker measuring a
-// virtual four-device inventory.
+// provider booted and the daemon attached. Each measures what its launcher lets it see.
 func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.Store) {
 	t.Helper()
 	return parityMachinesOn(t, machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel})
@@ -445,7 +343,6 @@ func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string
 	if code, out := runCozy(t, root, install...); code != 0 {
 		t.Fatalf("machine install [exit %d]\n%s", code, out)
 	}
-	virtualInventory(t, filepath.Join(root, "machine", "root"))
 
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -469,12 +366,12 @@ func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string
 	return h, root, layout, store
 }
 
-// One product body, run on this computer's machine and on a rental: the literal same agent
-// binary with a real Runtime worker measuring a virtual four-device inventory. The local
+// One product body, run on this computer's machine and on a rental: the literal same machine
+// binary. The local
 // machine uses its own identity; the rental is the same binary a provider booted, pinned
 // and attached. Only the machine name and address may differ.
 func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
-	h, root, layout, store := parityMachines(t)
+	_, root, _, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
@@ -544,18 +441,12 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	}
 	noHistory()
 
-	// Both machines report the Runtime's measured inventory through the same Host call.
-	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
-		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
-		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
-	for _, name := range []string{machines.Local, parityRental} {
-		machine, problem := found.Dial(context.Background(), name, "parity inventory")
-		fatal(t, problem)
-		workspace, err := machine.Host.GetMachineExecutionWorkspace(context.Background(), &pb.MachineExecutionWorkspaceQuery{Claim: machine.Claim})
-		machine.Close()
-		must(t, err)
-		if len(workspace.Devices) != 4 || workspace.Devices[3].Name != "Virtual Accelerator" || workspace.ExecutorUidIsolation {
-			t.Fatalf("%s reports %d devices (%v), executor isolation %v", name, len(workspace.Devices), workspace.Devices, workspace.ExecutorUidIsolation)
+	// Both machines answer the same Status: `machine show` and `rental show` read it.
+	for _, show := range [][]string{{"machine", "show", "--json"}, {"rental", "show", "tessa", "--json"}} {
+		code, out := runCozy(t, root, show...)
+		var shown map[string]any
+		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["phase"] != "ready" || shown["runtime_version"] == nil {
+			t.Fatalf("cozy %s did not report its machine's status [exit %d]\n%s", strings.Join(show, " "), code, out)
 		}
 	}
 }

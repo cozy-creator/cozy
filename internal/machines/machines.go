@@ -16,6 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -315,8 +316,9 @@ func (r *Resolver) resolve(ctx context.Context, name, origin, holder string, nam
 }
 
 func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.Error {
-	connection, err := grpc.NewClient(t.addr, grpc.WithTransportCredentials(credentials.NewTLS(t.pin.TLSConfig())),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
+	options := append([]grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(t.pin.TLSConfig())),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20))}, machinev1.SkewInterceptors()...)
+	connection, err := grpc.NewClient(t.addr, options...)
 	if err != nil {
 		return Transport(err)
 	}
@@ -327,6 +329,10 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 	cancel()
 	if err != nil {
 		connection.Close()
+		if status.Code(err) == codes.FailedPrecondition {
+			// A machine past cozy.worker.v1 keeps only this call, to say so.
+			return machinev1.NewerThanCozy("machine %s: %s", m.Name, status.Convert(err).Message())
+		}
 		return Transport(err)
 	}
 	m.Protocol, m.WireMinor = info, info.WireMinor
@@ -423,13 +429,11 @@ func (m *Machine) ValidateNewWork() *exit.Error {
 
 // Transport names a failed machine RPC the way every machine caller reports it.
 func Transport(err error) *exit.Error {
-	code := status.Code(err)
-	if code == codes.Unimplemented {
-		// The worker has no such call; redialing never installs one, so the run ends here.
-		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
-			"the worker does not implement machine execution (%s); update its Runtime", status.Convert(err).Message()).
-			WithRemedy("update the machine's Runtime, then run it again")
+	// Redialing never installs a call the peer lacks, so the run ends here.
+	if problem := machinev1.Skew(err); problem != nil {
+		return problem
 	}
+	code := status.Code(err)
 	if code == codes.Unavailable || code == codes.DeadlineExceeded || code == codes.Canceled || code == codes.ResourceExhausted || code == codes.Aborted {
 		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "machine execution observation is unavailable: %s", status.Convert(err).Message())
 	}

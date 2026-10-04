@@ -24,6 +24,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
@@ -180,21 +181,18 @@ func eraseCachedAccess(state *accessState, origin string) {
 	}
 }
 
-func (c accessCache) queueReset(ctx context.Context, origin, target string) *exit.Error {
+// queueReset forgets origin's cached grant and advances its generation, so an attachment in
+// flight discards what it was authorizing. A removal is owed only for a grant this controller
+// attached, which it does over cozy.worker.v1 alone: a machine serving cozy.machine.v1 takes
+// Hub access inside each run, keeps none, and is never asked to remove any.
+func (c accessCache) queueReset(ctx context.Context, origin string) *exit.Error {
 	return c.state(ctx, func(state *accessState) *exit.Error {
 		key := accessOrigin(origin)
 		reset := state.resets[key]
-		if target == "" {
-			target = cachedAccess(state, origin).Origin
-		}
-		if target == "" {
-			target = reset.AgentOrigin
-		}
-		if target == "" {
-			target = origin
-		}
 		reset.Generation++
-		reset.AgentOrigin, reset.Pending = target, true
+		if attached := cachedAccess(state, origin).Origin; attached != "" {
+			reset.AgentOrigin, reset.Pending = attached, true
+		}
 		state.resets[key] = reset
 		eraseCachedAccess(state, origin)
 		return c.save(state)
@@ -217,18 +215,18 @@ func (h *Host) accessTarget(launch *Launch) accessTarget {
 	}}
 }
 
-// ForgetExecutionAccess erases only this login origin's client caches and durably
-// requests removal of its mapped agent origin. It never launches a stopped agent; an
-// explicit endpoint's removal runs when the endpoint is next reached.
-// pending=true means local erasure succeeded but machine-side cleanup is deferred.
+// ForgetExecutionAccess erases only this login origin's client caches and, where this
+// controller attached a grant, durably requests its removal from that machine. It never
+// launches a stopped agent; an explicit endpoint's removal runs when the endpoint is next
+// reached. pending=true means local erasure succeeded but machine-side cleanup is deferred.
 func (h *Host) ForgetExecutionAccess(ctx context.Context, origin string) (pending bool, problem *exit.Error) {
-	if problem := h.accessCache().queueReset(ctx, origin, ""); problem != nil {
+	if problem := h.accessCache().queueReset(ctx, origin); problem != nil {
 		return false, problem
 	}
 	endpoints, _ := os.ReadDir(filepath.Join(h.dir, "endpoints"))
 	for _, entry := range endpoints {
 		if entry.IsDir() {
-			if problem := h.endpointCache(entry.Name()).queueReset(ctx, origin, ""); problem != nil {
+			if problem := h.endpointCache(entry.Name()).queueReset(ctx, origin); problem != nil {
 				return false, problem
 			}
 		}
@@ -239,6 +237,9 @@ func (h *Host) ForgetExecutionAccess(ctx context.Context, origin string) (pendin
 		return true, nil
 	}
 	defer unlock()
+	if problem := cache.state(ctx, func(state *accessState) *exit.Error { pending = state.resets[accessOrigin(origin)].Pending; return nil }); problem != nil || !pending {
+		return false, problem // nothing was attached: no machine is asked anything
+	}
 	record, problem := h.record()
 	if problem != nil {
 		return true, problem
@@ -381,6 +382,9 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 		return "", problem
 	}
 	if installed == nil || !slices.Contains(launch.Capabilities, HubAccessCapability) {
+		if servesAPI(ctx, h.binary()) {
+			return "", machinev1.NewerThanCozy("it takes Hub access only inside a cozy.machine.v1 run") // never a standing grant
+		}
 		return "", exit.Named(exit.Structural, "machine.agent_update_required", "delegated Hub access requires %s", HubAccessCapability)
 	}
 	return attachAccess(ctx, h.accessCache(), h.accessTarget(launch), origin, account)

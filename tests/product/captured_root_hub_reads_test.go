@@ -36,11 +36,7 @@ func TestACapturedRootReadsItsModelOnceAcrossRuntimeRestarts(t *testing.T) {
 		}
 	})
 	provisionMachine(t, root)
-	python := filepath.Join(root, "machine", "root", "opt", "cozy", "python", "bin", "python")
-	if exec.Command(python, "-I", "-c", "from cozy_runtime.internal.worker.machine_model_resolve import KEPT").Run() != nil {
-		t.Skip("the machine's Runtime predates kept catalog reads (0.18.100)")
-	}
-	seeded, err := exec.Command(python, "-I", "-c", seedCheckpoint, filepath.Join(root, "tensorfs")).CombinedOutput()
+	seeded, err := exec.Command(machinePython(t), "-I", "-c", seedCheckpoint, filepath.Join(root, "tensorfs")).CombinedOutput()
 	if err != nil {
 		t.Fatalf("seeding the machine's store: %v\n%s", err, seeded)
 	}

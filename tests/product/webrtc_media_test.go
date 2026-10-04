@@ -9,7 +9,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -26,7 +25,7 @@ func serveMachineMedia(t testing.TB, host string, machine *webrtctest.Machine) w
 	}
 	python := *machineRuntimePython
 	if python == "" {
-		python = filepath.Join(machineTemplateDir(t), "root/opt/cozy/python/bin/python")
+		python = machinePython(t)
 	}
 	return webrtctest.Serve(t, host, machine, *machineHostBinary, python)
 }

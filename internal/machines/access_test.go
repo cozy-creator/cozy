@@ -405,6 +405,21 @@ func TestLogoutErasesEndpointGrantAndQueuesRemoval(t *testing.T) {
 	}
 }
 
+// A machine serving cozy.machine.v1 is never given a standing grant, so a logout that finds
+// none cached owes it no removal and asks it nothing.
+func TestLogoutWithNoAttachedGrantOwesNoRemoval(t *testing.T) {
+	s := newScope(t)
+	host := NewHost(filepath.Dir(filepath.Dir(s.cache.dir)), "", nil)
+	pending, problem := host.ForgetExecutionAccess(context.Background(), s.hub.URL)
+	if problem != nil || pending {
+		t.Fatalf("a logout with nothing attached deferred a removal: %v %v", pending, problem)
+	}
+	resumeAccessCleanup(context.Background(), s.cache, s.target)
+	if s.machine.deletes != 0 {
+		t.Fatalf("the machine was asked to remove access it never held: %d", s.machine.deletes)
+	}
+}
+
 func TestRemoteEndpointReadsDeclaredOriginOfLoopbackHub(t *testing.T) {
 	s := newScope(t)
 	pin, _ := s.target.pin()

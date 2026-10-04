@@ -512,8 +512,7 @@ The worker may retain reusable results under an independent cache hold. Cancelin
 run releases its own holds; cache or other consumer holds may keep those bytes available.
 Cache holds alone do not keep paid capacity alive, and evicted or missing results compute again.
 The cache records original result provenance without inventing another compute attempt.
-Use `cozy cache prune` for unused local operation results, or `cozy rental prune <rental>`
-on a rented machine. Both preserve results still owned by retained runs or other consumers.
+The cache manages itself (expiry, and eviction when disk runs low); there is no prune verb.
 
 For editable libraries, declare paths explicitly in the same script metadata:
 

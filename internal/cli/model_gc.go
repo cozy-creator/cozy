@@ -16,9 +16,6 @@ import (
 // runs on maintenance.gc_cron. The decision is TensorFS's, from its filesystem census;
 // only a local request still moving bytes in defers it (reclamationFence).
 func handleModelGC(ctx *Context) *exit.Error {
-	if name := strings.TrimSpace(ctx.Inv.Value("--rental")); name != "" {
-		return rentalModelGC(ctx, name)
-	}
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
 		return problem
@@ -39,40 +36,6 @@ func handleModelGC(ctx *Context) *exit.Error {
 		return problem
 	}
 	return emit(ctx, output.Record{Fields: reclaimFields(report), Notes: notes})
-}
-
-// rentalModelGC reclaims a rental's store through its machine: the Runtime drops cached
-// operation results nothing uses, then collects what no model or live work references,
-// deferring while bytes are still moving in (store_busy).
-func rentalModelGC(ctx *Context, name string) *exit.Error {
-	_, store, problem := rentalStores(ctx)
-	if problem != nil {
-		return problem
-	}
-	row, problem := store.RentalByMachine(name)
-	store.Close()
-	if problem != nil {
-		return problem
-	}
-	if row == nil {
-		return exit.New(exit.NotFound, "no rental %q on this host", name)
-	}
-	client, problem := dial(ctx)
-	if problem != nil {
-		return problem
-	}
-	result, problem := client.PruneRental(row.ID)
-	if problem != nil {
-		return problem
-	}
-	record := compactRecord([]output.Field{{K: "rental", V: row.MachineName},
-		{K: "reclaimed", V: reclaimed(tfs.GCReport{ReclaimedBytes: int64(result.ReclaimedBytes)})},
-		{K: "cached_results_removed", V: result.RemovedEntries}, {K: "store_busy", V: result.StoreBusy}},
-		"rental", "reclaimed", "cached_results_removed", "store_busy")
-	if result.StoreBusy {
-		record.Notes = []string{"collection deferred: the machine is still moving bytes into its store; run it again once that settles"}
-	}
-	return emit(ctx, record)
 }
 
 // reclaimed is the `reclaimed` field: a program gets the pass, a person gets the bytes.

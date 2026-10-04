@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -103,26 +106,32 @@ func TestRentalModelDownloadAwaitsWithProgress(t *testing.T) {
 	}
 }
 
-// `cozy model gc --rental` reclaims the rental's store through its machine, and says when
-// the machine deferred collection because bytes were still moving in.
-func TestModelGCReclaimsARentalsStore(t *testing.T) {
-	var prunes atomic.Int32
-	pod := &fakePod{prune: func(*pb.PruneOperationCacheCall) (*pb.PruneOperationCacheResult, error) {
-		if prunes.Add(1) > 1 {
-			return &pb.PruneOperationCacheResult{StoreBusy: true}, nil
+// A cozy and a machine a release apart share no protocol for some verb. Each way round the
+// user reads one message naming the side to upgrade, never the transport's own error.
+func TestProtocolSkewNamesTheSideToUpgrade(t *testing.T) {
+	// An older machine serves cozy.worker.v1 only. `rental show` reads cozy.machine.v1 Status
+	// and still shows what the Hub knows; `rental keepalive` has nothing else to do.
+	root, _ := attachedRental(t, &fakePod{})
+	code, out := runCozy(t, root, "rental", "show", "attached")
+	if code != 0 || !strings.Contains(out, "the machine is older than this cozy") || strings.Contains(out, "upgrade cozy") {
+		t.Fatalf("an older machine was not named as the side to upgrade [exit %d]:\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "rental", "keepalive", "attached")
+	if code != 1 || !strings.Contains(out, "the machine is older than this cozy") || !strings.Contains(out, "update the machine") || strings.Contains(out, "upgrade cozy") {
+		t.Fatalf("an older machine was not named as the side to upgrade [exit %d]:\n%s", code, out)
+	}
+	// A newer machine serves cozy.machine.v1 and not every worker.v1 call this cozy still makes
+	// (`rental logs --tensorfs` reads ReadMachineLog); one past worker.v1 keeps only
+	// ProtocolInfo, to say so. Either way this cozy is the side to upgrade.
+	for name, pod := range map[string]*fakePod{"unported call": {servesV1: true},
+		"past worker.v1": {protocolInfo: func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+			return nil, status.Error(codes.FailedPrecondition, "this machine serves cozy.machine.v1 only; upgrade cozy")
+		}}} {
+		root, _ = attachedRental(t, pod)
+		code, out = runCozy(t, root, "rental", "logs", "attached", "--tensorfs")
+		if code != 1 || !strings.Contains(out, "is newer than this cozy") || !strings.Contains(out, "upgrade cozy") || strings.Contains(out, "update the machine") {
+			t.Fatalf("%s: this cozy was not named as the side to upgrade [exit %d]:\n%s", name, code, out)
 		}
-		return &pb.PruneOperationCacheResult{RemovedEntries: 2, ReclaimedBytes: 5 << 30}, nil
-	}}
-	root, _ := attachedRental(t, pod)
-	if code, out := runCozy(t, root, "model", "gc", "--rental=attached"); code != 0 || !strings.Contains(out, "5.0GiB") {
-		t.Fatalf("model gc did not reclaim the rental's store [exit %d]:\n%s", code, out)
-	}
-	if code, out := runCozy(t, root, "model", "gc", "--rental=attached", "--json"); code != 0 ||
-		!strings.Contains(out, `"store_busy":true`) || !strings.Contains(out, "collection deferred") {
-		t.Fatalf("a busy store must be said, not reported as an empty success [exit %d]:\n%s", code, out)
-	}
-	if code, out := runCozy(t, root, "model", "gc", "--rental=nobody"); code == 0 || !strings.Contains(out, "no rental") {
-		t.Fatalf("an unknown rental must be refused [exit %d]:\n%s", code, out)
 	}
 }
 

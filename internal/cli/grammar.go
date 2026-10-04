@@ -18,7 +18,6 @@ type CLI struct {
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
 	Machine MachineCmd `cmd:"" group:"Rentals" help:"This computer as a machine: the same Host a rental runs."`
 	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
-	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui; running work continues."`
 	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
@@ -72,16 +71,6 @@ func (c *MachineLogsCmd) Run(r *Runtime) error {
 
 type DaemonCmd struct {
 	Log DaemonLogCmd `cmd:"" help:"Print the cozy-daemon log ($COZY_HOME/daemon.log)."`
-}
-
-type CacheCmd struct {
-	Prune CachePruneCmd `cmd:"" help:"Free unused cached operation results on this machine."`
-}
-
-type CachePruneCmd struct{}
-
-func (c *CachePruneCmd) Run(r *Runtime) error {
-	return r.call(handleCachePrune, nil, nil, nil, true)
 }
 
 type DaemonLogCmd struct {
@@ -365,12 +354,10 @@ func (c *ModelRemoveCmd) Run(r *Runtime) error {
 	return r.call(handleModelRemove, c.Refs, nil, nil, false)
 }
 
-type ModelGCCmd struct {
-	Rental string `help:"Reclaim this rental's store instead, freeing its unused cached operation results too."`
-}
+type ModelGCCmd struct{}
 
 func (c *ModelGCCmd) Run(r *Runtime) error {
-	return r.call(handleModelGC, nil, nil, values("--rental", c.Rental), false)
+	return r.call(handleModelGC, nil, nil, nil, false)
 }
 
 type ModelListCmd struct{}
@@ -611,7 +598,6 @@ type RentalCmd struct {
 	Logs      RentalLogsCmd      `cmd:"" help:"Print the provider's boot log of a rental's attempt, kept after its pod is gone, or with --tensorfs its machine's TensorFS log."`
 	New       RentalNewCmd       `cmd:"" help:"Start a private rental, or list available machine types."`
 	End       RentalEndCmd       `cmd:"" help:"End a private rental and stop billing."`
-	Prune     RentalPruneCmd     `cmd:"" help:"Free unused cached operation results on a private rental."`
 }
 
 type RentalUpdateCmd struct {
@@ -638,14 +624,6 @@ type RentalNewCmd struct {
 	DiskGB         int      `name:"disk-gb" help:"Container disk to rent, in GB; the Hub picks an offer whose disk allows it."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
 	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
-}
-
-type RentalPruneCmd struct {
-	ID string `arg:"" name:"rental" predictor:"rental" help:"Rental machine name or id."`
-}
-
-func (c *RentalPruneCmd) Run(r *Runtime) error {
-	return r.call(handleRentalPrune, []string{c.ID}, nil, nil, true)
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {

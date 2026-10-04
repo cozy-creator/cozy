@@ -1132,7 +1132,8 @@ func machineStatusFields(status api.MachineStatus, typed bool) []output.Field {
 		}
 	}
 	if typed {
-		return append(fields, output.Field{K: "gpus", V: status.GPUs}, output.Field{K: "live_runs", V: status.Runs},
+		// "devices", as a person reads it: a rental's own "gpus" is the count it was bought with.
+		return append(fields, output.Field{K: "devices", V: status.GPUs}, output.Field{K: "live_runs", V: status.Runs},
 			output.Field{K: "disk_free_bytes", V: status.DiskFreeBytes})
 	}
 	gpus := make([]string, 0, len(status.GPUs))
