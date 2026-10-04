@@ -31,5 +31,13 @@ Count/byte/flood/attempt tests and a real SSE subscription cover bounds and pres
 `-cpu-progress-burst=<machine repo>/tests/fixtures/cpu_progress_burst`, then reads ordinary
 CLI watch events before and after restarting its own isolated controller.
 
-Source checkpoint only: new proof is pending the host resource gate or coordinated rented
-CPU execution. Rented model delivery, congested-disk timing and GPU throughput remain open.
+Remote CPU proof is green: six records cases, two real SSE cases, and the actual authored
+SDK/managed-executor/ordinary CLI burst (8.95 s). The latter preserves genuine denoise 30
+and decoding before/after restarting only its isolated controller. Consumer sourcedf82db87
+includes integration30d0e559 and1027; compiled Rustf2636abf includes integration91524d9 and52.
+RuntimeH370 SHA0d50f6b1 /TensorFSf089 were used with CUDA_VISIBLE_DEVICES empty, and
+compute-apps before/after were empty. No model inference or GPU throughput is qualified.
+
+A separate follow-up will replay the actual durable running revision/time when an observer
+misses that state between queued and terminal; otherwise Creator may still classify those
+later progress frames as preparation. Rented model delivery and congested-disk timing remain open.
