@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/build"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -327,6 +328,9 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 	cancel()
 	if err != nil {
 		connection.Close()
+		if status.Code(err) == codes.Unimplemented {
+			return cozyTooOld(m.Name)
+		}
 		return Transport(err)
 	}
 	m.Protocol, m.WireMinor = info, info.WireMinor
@@ -421,14 +425,26 @@ func (m *Machine) ValidateNewWork() *exit.Error {
 	return nil
 }
 
+// A machine and this cozy can be a release apart and share no protocol for a call. Each way
+// round is one message naming the side to upgrade.
+
+// cozyTooOld is a machine that serves no cozy.worker.v1 at all: it speaks only
+// cozy.machine.v1, and the command that dialed it still uses the protocol before it.
+func cozyTooOld(name string) *exit.Error {
+	return exit.Named(exit.Structural, "cozy.upgrade_required",
+		"machine %s is newer than this cozy (%s): it serves only cozy.machine.v1, which this command does not use yet", name, build.Version).
+		WithRemedy("upgrade cozy: curl -fsSL https://github.com/cozy-creator/cozy/releases/latest/download/install.sh | sh")
+}
+
 // Transport names a failed machine RPC the way every machine caller reports it.
 func Transport(err error) *exit.Error {
 	code := status.Code(err)
 	if code == codes.Unimplemented {
-		// The worker has no such call; redialing never installs one, so the run ends here.
-		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
-			"the worker does not implement machine execution (%s); update its Runtime", status.Convert(err).Message()).
-			WithRemedy("update the machine's Runtime, then run it again")
+		// The machine is reached and has no such call: it is older than this cozy. Redialing
+		// never installs one, so the run ends here.
+		return exit.Named(exit.Structural, "machine.upgrade_required",
+			"the machine is older than this cozy (%s) and does not serve this call (%s)", build.Version, status.Convert(err).Message()).
+			WithRemedy("update the machine: `cozy machine install` on this computer; a rental on an older image is replaced by a new one (`cozy rental new`)")
 	}
 	if code == codes.Unavailable || code == codes.DeadlineExceeded || code == codes.Canceled || code == codes.ResourceExhausted || code == codes.Aborted {
 		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "machine execution observation is unavailable: %s", status.Convert(err).Message())

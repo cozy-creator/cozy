@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -100,6 +103,26 @@ func TestRentalModelDownloadAwaitsWithProgress(t *testing.T) {
 	code, out, progress = runCozyStreams(t, root, "model", "download", "paul/minimax-h3#fp8", "--rental=attached", "--await", "--json")
 	if code == 0 || !strings.Contains(out+progress, "store_full") {
 		t.Fatalf("a refused download must end the wait with the machine's reason [exit %d]:\n%s\n%s", code, out, progress)
+	}
+}
+
+// A cozy and a machine a release apart share no protocol for some verb. Each way round the
+// user reads one message naming the side to upgrade, never the transport's own error.
+func TestProtocolSkewNamesTheSideToUpgrade(t *testing.T) {
+	// An older machine serves cozy.worker.v1 only; `rental show` reads cozy.machine.v1 Status.
+	root, _ := attachedRental(t, &fakePod{})
+	code, out := runCozy(t, root, "rental", "show", "attached")
+	if code != 6 || !strings.Contains(out, "the machine is older than this cozy") || !strings.Contains(out, "update the machine") || strings.Contains(out, "upgrade cozy") {
+		t.Fatalf("an older machine was not named as the side to upgrade [exit %d]:\n%s", code, out)
+	}
+	// A machine that serves only cozy.machine.v1 answers no worker.v1 call, the first included;
+	// `rental logs --tensorfs` is a verb this cozy still does over worker.v1.
+	root, _ = attachedRental(t, &fakePod{protocolInfo: func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+		return nil, status.Error(codes.Unimplemented, "")
+	}})
+	code, out = runCozy(t, root, "rental", "logs", "attached", "--tensorfs")
+	if code != 6 || !strings.Contains(out, "is newer than this cozy") || !strings.Contains(out, "upgrade cozy") || strings.Contains(out, "update the machine") {
+		t.Fatalf("this cozy was not named as the side to upgrade [exit %d]:\n%s", code, out)
 	}
 }
 
