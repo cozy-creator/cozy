@@ -18,3 +18,16 @@ machine with isolated CPU homes and exact executor-plane SDK wheels, plus target
 result/input-snapshot identity tests. Preserve different large seeds and integer versus
 float as true intent, while formatting/key order reattaches. Do not substitute smaller
 seeds. Root/rental inference qualification remains independent.
+
+Confirmed consumer proof: the unchanged typed parent/internal-job child runs through ordinary
+CLI and authenticated API on Rust candidate72c5c88, Runtime source0012896a and executor-plane
+TensorFS source3fc31b3. Four CLI requests retain zero, uint64 maximum and beyond-53-bit seeds,
+integer/float observations and ordered values; direct API result keeps uint64 maximum,
+formatting/key order/1e0 replay the same request, and seed/type/order changes conflict. The
+product check passed32.104s. This is CPU application/transport proof, not GPU qualification.
+
+The full path exposed two additional SDK boundaries (managed arguments/results and typed
+result spool), a captured child incorrectly classified as serving, and CLI JSON rendering
+through TOON's float64 reader. Each was corrected and the same authored request rerun. JSON
+now serializes the original typed document directly; TOON's default rendering and protocol
+JCS remain unchanged. Application-only changes do not redefine wire metadata profiles.
