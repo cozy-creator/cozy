@@ -35,6 +35,13 @@ func handleModelQuantize(ctx *Context) *exit.Error {
 		return problem
 	}
 	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
+	close, problem := foregroundTarget(ctx)
+	if problem != nil {
+		return problem
+	}
+	if close != nil {
+		defer close()
+	}
 	ref, checkpoint, problem := quantizeSource(ctx, ctx.Inv.Args[0])
 	if problem != nil {
 		return problem
@@ -60,9 +67,12 @@ func handleModelQuantize(ctx *Context) *exit.Error {
 		return noQuantizer(lane, "%s %s has no %s quantizer", target.Package, target.Release, lane)
 	}
 	source := ref.String() + "#" + checkpoint
-	if problem := holdCheckpoint(ctx, source); problem != nil {
-		reclaimSnapshot(ctx, target)
-		return problem
+	// A foreground run's machine serves cozy.machine.v1 and fetches the checkpoint itself.
+	if ctx.endpoint == nil {
+		if problem := holdCheckpoint(ctx, source); problem != nil {
+			reclaimSnapshot(ctx, target)
+			return problem
+		}
 	}
 	target.Function = job.Name
 	ctx.Inv.Args = []string{target.Package + "/" + job.Name, source, destination}
