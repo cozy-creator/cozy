@@ -366,8 +366,8 @@ func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.C
 			return nil, stopped()
 		case h.predatesAPI(ctx):
 			// Asked only of a machine about to be awaited or launched; it never readies on the API.
-			return nil, exit.Named(exit.Structural, "machine.predates_api", "this computer's machine predates %s, which this cozy drives machines with", MachineAPI).
-				WithRemedy("`cozy machine install` replaces it and keeps its models")
+			return nil, exit.Named(exit.Structural, "machine.predates_api", "this computer's machine is an older kind this cozy cannot run").
+				WithRemedy("run `cozy machine install` to replace it; your downloaded models are kept")
 		case record != nil:
 			if launch, problem = h.await(ctx, record); problem != nil {
 				return nil, problem

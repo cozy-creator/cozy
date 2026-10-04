@@ -72,9 +72,9 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 	if replaced := installed.Replaced; replaced != nil {
 		fields = append(fields, output.Field{K: "replaced", V: replaced})
 		notes = []string{
-			"replaced the installed machine, which predated " + machines.MachineAPI + "; this one answered Status as ready",
-			"kept in place: " + strings.Join(replaced.Kept, ", ") + " (no model is downloaded again)",
-			fmt.Sprintf("removed the old machine's software, package environments and run journal (%.1f GiB); environments are rebuilt on first use", float64(replaced.FreedBytes)/(1<<30)),
+			"replaced the older machine; the new one started and answered as ready",
+			"kept: your downloaded models and the package cache (" + strings.Join(replaced.Kept, ", ") + ")",
+			fmt.Sprintf("removed the old machine's software, package environments and run history (%.1f GiB freed); each package is set up again on its first run", float64(replaced.FreedBytes)/(1<<30)),
 		}
 	}
 	return emit(ctx, output.Record{Fields: fields, Notes: notes})
@@ -119,7 +119,7 @@ func handleMachineShow(ctx *Context) *exit.Error {
 	}
 	var notes []string
 	if host.PredatesAPI(context.Background()) {
-		notes = append(notes, "this machine predates "+machines.MachineAPI+"; `cozy machine install` replaces it and keeps its models")
+		notes = append(notes, "this machine is an older kind this cozy cannot run; `cozy machine install` replaces it and keeps your downloaded models")
 	} else if status.Running && !status.Recorded {
 		notes = append(notes, "its launch record is missing; `cozy machine start` or the next local run adopts it")
 	} else if status.Running {
