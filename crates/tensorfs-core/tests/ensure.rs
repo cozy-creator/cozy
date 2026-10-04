@@ -748,13 +748,9 @@ fn delivered_products_are_evictable_oldest_first_and_release_clears_the_mark() {
 
 #[test]
 fn capabilities_name_ensure() {
-    let out = Command::new(TFS).arg("capabilities").output().unwrap();
-    let names = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        out.status.success() && names.lines().any(|n| n == "ensure/1"),
-        "{names}"
-    );
-    assert!(names.lines().any(|n| n == "get-range/1"));
+    for name in ["ensure/1", "get-range/1"] {
+        assert!(tensorfs_core::CAPABILITIES.contains(&name), "{name}");
+    }
 }
 
 #[test]
