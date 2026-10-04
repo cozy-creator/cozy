@@ -63,7 +63,10 @@ type Pin struct {
 	ActivatedAt string
 }
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db        *sql.DB
+	telemetry telemetryV1
+}
 
 const schemaVersion = 49
 
@@ -309,7 +312,10 @@ func verifySchema(db *sql.DB, path string) *exit.Error {
 	return nil
 }
 
-func (s *Store) Close() { _ = s.db.Close() }
+func (s *Store) Close() {
+	s.stopTelemetry()
+	_ = s.db.Close()
+}
 
 var installFields = []string{
 	"id", "package", "major", "version", "source_kind", "source_ref",

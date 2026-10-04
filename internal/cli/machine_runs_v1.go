@@ -252,10 +252,11 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			}
 		}
 		if outcome := event.GetOutcome(); outcome != nil {
+			observed := time.Now().UnixMilli()
 			if fetch != nil {
 				fetch.finish() // the newest revisions land, their progress shown
 			}
-			problem := m.collectV1(ctx, request, machine, outcome)
+			problem := m.collectV1(ctx, request, machine, outcome, event.AtMs, observed)
 			// A collection the connection cut is not the run's end here: it is attached again.
 			return problem == nil || problem.ErrName() != "machine_execution.transport_unavailable", problem
 		}
@@ -882,10 +883,11 @@ func digestOf(path string) string {
 // collectV1 settles the run with its outcome: every output file at its final revision (each
 // judged; the export records those delivered and why the others were not), the triage bundle
 // beside a failure, then the outcome itself.
-func (m *machineRuns) collectV1(ctx context.Context, request records.Request, machine *machines.V1, outcome *v1.Outcome) *exit.Error {
+func (m *machineRuns) collectV1(ctx context.Context, request records.Request, machine *machines.V1, outcome *v1.Outcome, finished, observed int64) *exit.Error {
 	// A destination that refuses its files, or bytes the machine no longer serves: the
 	// result stays with the machine, and `cozy run watch` collects it once the cause is gone.
 	var failure *exit.Error
+	end := records.RunEndV1{Outcome: outcome, FinishedMS: finished, ObservedMS: observed}
 	if export, problem := m.store.OutputExportOf(request.ID); problem != nil {
 		return problem
 	} else if export != nil && export.State != "published" {
@@ -915,9 +917,7 @@ func (m *machineRuns) collectV1(ctx context.Context, request records.Request, ma
 			named.Message = strings.Join(failed, ", ") + ": " + failure.Message
 			failure = &named
 		}
-		if problem := m.store.SettleOutputExport(request.ID, paths, failure); problem != nil {
-			return problem
-		}
+		end.Export, end.Paths = true, paths
 	}
 	// The triage bundle beside a failure, and what the executor measured (`run show`'s stages,
 	// steps and attention) as its measurements, kept as one evidence document.
@@ -940,12 +940,8 @@ func (m *machineRuns) collectV1(ctx context.Context, request records.Request, ma
 			bundle, _ = json.Marshal(evidence)
 		}
 	}
-	if len(bundle) > 0 {
-		if problem := m.store.RecordMachineTriage(request.ID, 1, bundle); problem != nil {
-			return problem
-		}
-	}
-	return m.store.RecordRunOutcomeV1(request.ID, outcome, failure)
+	end.Refused, end.Evidence = failure, bundle
+	return m.store.RecordRunOutcomeV1(request.ID, end)
 }
 
 // controlV1 sends a run's cancel, pause or resume to its machine.

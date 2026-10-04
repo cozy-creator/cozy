@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -127,90 +126,60 @@ func projectRunV1(tx *sql.Tx, id string, state *v1.RunState) error {
 }
 
 // ObserveRunV1 records one entry of the run's log, past the recorded cursor, in the shapes a
-// worker.v1 import writes: progress as `machine.progress` samples (preparation's as
-// `request.preparing`), a product as its output item events (`product` holds the file this
-// client wrote, nil for none), a log line as `request.log`.
+// worker.v1 import writes. Nothing here waits on fsync (see telemetryV1): progress and log
+// lines join the run's batch; a state or a product (`product` holds the file this client
+// wrote, nil for none) is written at once, with the run's pending rows ahead of it.
 func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *exit.Error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin the run's observation: %s", err)
+	if telemetryEventV1(event) {
+		s.queueTelemetryV1(id, event)
+		return nil
 	}
-	defer tx.Rollback()
-	var cursor int64
-	var ordinal int64
-	var current string
-	if err := tx.QueryRow(`SELECT e.remote_cursor, r.ordinal, r.state FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE e.request_id=?`, id).Scan(&cursor, &ordinal, &current); err != nil {
-		return exit.Internalf("cannot read the run's observation: %s", err)
-	}
-	if event.Sequence != 0 && int64(event.Sequence) <= cursor {
-		return nil // recorded before
-	}
-	at := time.UnixMilli(event.AtMs).UTC().Format(time.RFC3339Nano)
-	if event.AtMs == 0 {
-		at = now()
-	}
-	insert := func(kind string, payload any) error {
-		raw, err := json.Marshal(payload)
-		if err != nil {
+	s.telemetry.write.Lock()
+	defer s.telemetry.write.Unlock()
+	var sampled int
+	err := s.unsynced(func(tx *sql.Tx) (err error) {
+		if sampled, err = s.telemetryTx(tx, id); err != nil {
 			return err
 		}
-		_, err = tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, id, kind, max(ordinal, 1), string(raw), at)
-		return err
-	}
-	switch value := event.Event.(type) {
-	case *v1.RunEvent_State:
-		err = projectRunV1(tx, id, value.State)
-	case *v1.RunEvent_Progress:
-		p := value.Progress
-		if current == "queued" {
-			detail := p.Stage
-			if p.BytesTotal > 0 {
-				detail = strings.TrimSpace(detail + " " + humanBytes(p.BytesDone) + " of " + humanBytes(p.BytesTotal))
-			} else if p.BytesDone > 0 {
-				detail = strings.TrimSpace(detail + " · " + humanBytes(p.BytesDone) + " read")
+		var cursor, ordinal int64
+		if err := tx.QueryRow(`SELECT e.remote_cursor, r.ordinal FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE e.request_id=?`, id).Scan(&cursor, &ordinal); err != nil {
+			return err
+		}
+		if event.Sequence != 0 && int64(event.Sequence) <= cursor {
+			return nil // recorded before
+		}
+		at := time.UnixMilli(event.AtMs).UTC().Format(time.RFC3339Nano)
+		if event.AtMs == 0 {
+			at = now()
+		}
+		switch value := event.Event.(type) {
+		case *v1.RunEvent_State:
+			if err := projectRunV1(tx, id, value.State); err != nil {
+				return err
 			}
-			err = insert("request.preparing", map[string]any{"stage": "machine", "detail": detail})
-			break
-		}
-		sample := map[string]any{"stage": p.Stage}
-		if p.Fraction >= 0 {
-			sample["overall_fraction"] = p.Fraction
-		}
-		if p.StageFraction != nil {
-			sample["stage_fraction"] = *p.StageFraction
-		}
-		if p.Total > 0 {
-			sample["position"], sample["total"] = p.Completed, p.Total
-		}
-		if p.BytesTotal > 0 {
-			sample["bytes_done"], sample["bytes_total"] = p.BytesDone, p.BytesTotal
-		}
-		if p.StepMs > 0 {
-			sample["step_ms"] = p.StepMs
-		}
-		err = insert("machine.progress", map[string]any{"type": "progress", "payload": sample})
-	case *v1.RunEvent_Product:
-		if product != nil {
+		case *v1.RunEvent_Product:
+			if product == nil {
+				break
+			}
 			for _, item := range outputItemEvents(*product) {
-				if err = insert(item.kind, item.payload); err != nil {
-					break
+				raw, err := json.Marshal(item.payload)
+				if err != nil {
+					return err
+				}
+				if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, id, item.kind, max(ordinal, 1), string(raw), at); err != nil {
+					return err
 				}
 			}
 		}
-	case *v1.RunEvent_Log:
-		err = insert("request.log", map[string]any{"level": value.Log.Level, "message": value.Log.Text})
-	}
-	if err != nil {
-		return exit.Internalf("cannot record the run's log: %s", err)
-	}
-	if event.Sequence != 0 {
-		if _, err := tx.Exec(`UPDATE machine_executions SET remote_cursor=? WHERE request_id=?`, event.Sequence, id); err != nil {
-			return exit.Internalf("cannot advance the run's cursor: %s", err)
+		if event.Sequence != 0 {
+			_, err = tx.Exec(`UPDATE machine_executions SET remote_cursor=? WHERE request_id=?`, event.Sequence, id)
 		}
+		return err
+	})
+	if err != nil {
+		return exit.Internalf("cannot record the run's observation: %s", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit the run's observation: %s", err)
-	}
+	s.dropTelemetry(id, sampled)
 	return nil
 }
 
@@ -221,15 +190,31 @@ func humanBytes(n uint64) string {
 	return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
 }
 
+// RunEndV1 is what a run's collection settles in one transaction: the outcome, the export of
+// its output files and the evidence kept beside it.
+type RunEndV1 struct {
+	Outcome  *v1.Outcome
+	Refused  *exit.Error // why an output file was not written here; nil when every one was
+	Export   bool        // the run has an output export, settled with Paths and Refused
+	Paths    []string
+	Evidence []byte // the triage bundle with the run's measurements; empty for none
+	// FinishedMS is the machine's time of the outcome and ObservedMS when it reached this
+	// client: their difference is the machine's delivery, the rest of a run's tail is ours.
+	FinishedMS, ObservedMS int64
+}
+
 // RecordRunOutcomeV1 ends the run with its machine's outcome, once: its outputs finished, the
 // terminal event with the result's status and reason, and the request settled. Its result is
-// collected when every output file this client writes was written before the call; `refused`
+// collected when every output file this client writes was written before the call; `Refused`
 // is why one was not, and the result then stays with its machine until a later call collects it.
-func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome, refused *exit.Error) *exit.Error {
+func (s *Store) RecordRunOutcomeV1(id string, end RunEndV1) *exit.Error {
+	outcome, refused := end.Outcome, end.Refused
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(outcome)
 	if err != nil || len(raw) > 8<<20 {
 		return exit.New(exit.Conflict, "the run's outcome is not bounded")
 	}
+	s.telemetry.write.Lock()
+	defer s.telemetry.write.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin the run's outcome: %s", err)
@@ -241,8 +226,22 @@ func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome, refused *exit
 		return exit.Internalf("cannot read the run's outcome: %s", err)
 	}
 	attempt := uint64(max(ordinal, 1))
+	sampled, err := s.telemetryTx(tx, id)
+	if err != nil {
+		return exit.Internalf("cannot record the run's telemetry: %s", err)
+	}
+	if end.Export {
+		if problem := settleOutputExport(tx, id, end.Paths, refused); problem != nil {
+			return problem
+		}
+	}
+	if len(end.Evidence) > 0 {
+		if problem := recordMachineTriage(tx, id, 1, end.Evidence); problem != nil {
+			return problem
+		}
+	}
 	if len(prior) == 0 {
-		if problem := recordRunEndV1(tx, id, attempt, raw, outcome); problem != nil {
+		if problem := recordRunEndV1(tx, id, attempt, raw, end); problem != nil {
 			return problem
 		}
 	}
@@ -279,11 +278,13 @@ func (s *Store) RecordRunOutcomeV1(id string, outcome *v1.Outcome, refused *exit
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit the run's outcome: %s", err)
 	}
+	s.dropTelemetry(id, sampled)
 	return nil
 }
 
 // recordRunEndV1 settles the run from its outcome, once.
-func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, outcome *v1.Outcome) *exit.Error {
+func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, end RunEndV1) *exit.Error {
+	outcome := end.Outcome
 	state, kind, status, itemStatus := "failed", "run.failed", "FAILED", "incomplete"
 	switch outcome.Status {
 	case "succeeded":
@@ -313,7 +314,11 @@ func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, outcome *
 	if _, err := tx.Exec(`UPDATE requests SET state=CASE WHEN state='canceled' THEN state ELSE ? END, retain_work=0 WHERE id=?`, state, id); err != nil {
 		return exit.Internalf("cannot settle the run: %s", err)
 	}
-	if err := appendEventTx(tx, id, "client.machine_work_finished", int64(attempt), map[string]any{"machine_execution": true, "state": outcome.Status}); err != nil {
+	finished := map[string]any{"machine_execution": true, "state": outcome.Status}
+	if end.ObservedMS > 0 {
+		finished["finished_unix_ms"], finished["observed_unix_ms"] = end.FinishedMS, end.ObservedMS
+	}
+	if err := appendEventTx(tx, id, "client.machine_work_finished", int64(attempt), finished); err != nil {
 		return exit.Internalf("cannot record the run's end: %s", err)
 	}
 	return nil
