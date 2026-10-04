@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/build"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -317,8 +316,9 @@ func (r *Resolver) resolve(ctx context.Context, name, origin, holder string, nam
 }
 
 func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.Error {
-	connection, err := grpc.NewClient(t.addr, grpc.WithTransportCredentials(credentials.NewTLS(t.pin.TLSConfig())),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
+	options := append([]grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(t.pin.TLSConfig())),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20))}, machinev1.SkewInterceptors()...)
+	connection, err := grpc.NewClient(t.addr, options...)
 	if err != nil {
 		return Transport(err)
 	}
@@ -329,8 +329,9 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 	cancel()
 	if err != nil {
 		connection.Close()
-		if status.Code(err) == codes.Unimplemented {
-			return cozyTooOld(m.Name)
+		if status.Code(err) == codes.FailedPrecondition {
+			// A machine past cozy.worker.v1 keeps only this call, to say so.
+			return machinev1.NewerThanCozy("machine %s: %s", m.Name, status.Convert(err).Message())
 		}
 		return Transport(err)
 	}
@@ -426,21 +427,10 @@ func (m *Machine) ValidateNewWork() *exit.Error {
 	return nil
 }
 
-// A machine and this cozy can be a release apart and share no protocol for a call. Each way
-// round is one message naming the side to upgrade.
-
-// cozyTooOld is a machine that serves no cozy.worker.v1 at all: it speaks only
-// cozy.machine.v1, and the command that dialed it still uses the protocol before it.
-func cozyTooOld(name string) *exit.Error {
-	return exit.Named(exit.Structural, "cozy.upgrade_required",
-		"machine %s is newer than this cozy (%s): it serves only cozy.machine.v1, which this command does not use yet", name, build.Version).
-		WithRemedy("upgrade cozy: curl -fsSL https://github.com/cozy-creator/cozy/releases/latest/download/install.sh | sh")
-}
-
 // Transport names a failed machine RPC the way every machine caller reports it.
 func Transport(err error) *exit.Error {
-	// Redialing never installs a call the machine lacks, so the run ends here.
-	if problem := machinev1.Older(err); problem != nil {
+	// Redialing never installs a call the peer lacks, so the run ends here.
+	if problem := machinev1.Skew(err); problem != nil {
 		return problem
 	}
 	code := status.Code(err)

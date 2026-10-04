@@ -46,6 +46,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
+	machinepb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -63,6 +64,7 @@ type fakePod struct {
 	releases         map[string]*pb.DescribedRelease
 	identity         string
 	noSeats          bool
+	servesV1         bool // also answers cozy.machine.v1 Status (identity), as a Rust machine does
 	mediaReservation func(int64, int) error
 	mediaRequest     func(http.ResponseWriter, *http.Request) bool
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
@@ -852,6 +854,15 @@ func sealPodBindings(placement *pb.Placement) {
 	placement.BindingsDigest = canonical.Digest(raw)
 }
 
+// v1Identity answers cozy.machine.v1 Status with the identity frame anyone may read.
+type v1Identity struct {
+	machinepb.UnimplementedMachineServer
+}
+
+func (v1Identity) Status(_ *machinepb.StatusRequest, stream grpc.ServerStreamingServer[machinepb.StatusFrame]) error {
+	return stream.Send(&machinepb.StatusFrame{WorkerId: podWorkerID, BootId: podBootID})
+}
+
 // startFakePod mints the pod leaf, binds the pinned listener, and serves the media health
 // route the owner dials before it will attach.
 func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.WorkerConnection, string) {
@@ -875,6 +886,9 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}})))
 	pb.RegisterWorkerControlServer(server, pod)
 	pb.RegisterPodHostServer(server, pod)
+	if pod.servesV1 {
+		machinepb.RegisterMachineServer(server, v1Identity{})
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the test's POD binds; the product dials
 	must(t, err)
 	go server.Serve(listener)

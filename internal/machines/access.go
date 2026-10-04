@@ -24,6 +24,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
@@ -382,7 +383,7 @@ func (h *Host) attachAccess(ctx context.Context, launch *Launch, origin string, 
 	}
 	if installed == nil || !slices.Contains(launch.Capabilities, HubAccessCapability) {
 		if servesAPI(ctx, h.binary()) {
-			return "", cozyTooOld(Local) // it takes Hub access inside a cozy.machine.v1 run only
+			return "", machinev1.NewerThanCozy("it takes Hub access only inside a cozy.machine.v1 run") // never a standing grant
 		}
 		return "", exit.Named(exit.Structural, "machine.agent_update_required", "delegated Hub access requires %s", HubAccessCapability)
 	}

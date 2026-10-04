@@ -120,14 +120,18 @@ func TestProtocolSkewNamesTheSideToUpgrade(t *testing.T) {
 	if code != 1 || !strings.Contains(out, "the machine is older than this cozy") || !strings.Contains(out, "update the machine") || strings.Contains(out, "upgrade cozy") {
 		t.Fatalf("an older machine was not named as the side to upgrade [exit %d]:\n%s", code, out)
 	}
-	// A machine that serves only cozy.machine.v1 answers no worker.v1 call, the first included;
-	// `rental logs --tensorfs` is a verb this cozy still does over worker.v1.
-	root, _ = attachedRental(t, &fakePod{protocolInfo: func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
-		return nil, status.Error(codes.Unimplemented, "")
-	}})
-	code, out = runCozy(t, root, "rental", "logs", "attached", "--tensorfs")
-	if code != 1 || !strings.Contains(out, "is newer than this cozy") || !strings.Contains(out, "upgrade cozy") || strings.Contains(out, "update the machine") {
-		t.Fatalf("this cozy was not named as the side to upgrade [exit %d]:\n%s", code, out)
+	// A newer machine serves cozy.machine.v1 and not every worker.v1 call this cozy still makes
+	// (`rental logs --tensorfs` reads ReadMachineLog); one past worker.v1 keeps only
+	// ProtocolInfo, to say so. Either way this cozy is the side to upgrade.
+	for name, pod := range map[string]*fakePod{"unported call": {servesV1: true},
+		"past worker.v1": {protocolInfo: func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+			return nil, status.Error(codes.FailedPrecondition, "this machine serves cozy.machine.v1 only; upgrade cozy")
+		}}} {
+		root, _ = attachedRental(t, pod)
+		code, out = runCozy(t, root, "rental", "logs", "attached", "--tensorfs")
+		if code != 1 || !strings.Contains(out, "is newer than this cozy") || !strings.Contains(out, "upgrade cozy") || strings.Contains(out, "update the machine") {
+			t.Fatalf("%s: this cozy was not named as the side to upgrade [exit %d]:\n%s", name, code, out)
+		}
 	}
 }
 
