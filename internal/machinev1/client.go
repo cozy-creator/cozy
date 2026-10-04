@@ -8,13 +8,16 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 )
 
 // ScopeMachine is the cap action that authorizes every call as its signer.
@@ -78,6 +81,12 @@ func (k caps) GetRequestMetadata(context.Context, ...string) (map[string]string,
 }
 func (caps) RequireTransportSecurity() bool { return true }
 
+// expiredCap is the machine's typed end of an otherwise valid short cap. A lost signing
+// key is a different refusal and must never be treated as permission to keep reading.
+func expiredCap(err error) bool {
+	return status.Code(err) == codes.Unauthenticated && strings.HasPrefix(status.Convert(err).Message(), "capability_expired:")
+}
+
 // Run submits spec under id when id is new (nil spec attaches) and streams the run's log
 // after the cursor. Closing the stream never cancels the run.
 func (c *Client) Run(ctx context.Context, id string, after uint64, spec *pb.RunSpec) (grpc.ServerStreamingClient[pb.RunEvent], error) {
@@ -92,7 +101,23 @@ func (c *Client) Control(ctx context.Context, id string, action pb.Action) (*pb.
 // ReadOutput copies an output's bytes from offset into w; with rev set, it is refused
 // (FailedPrecondition) once the output has moved past that revision.
 func (c *Client) ReadOutput(ctx context.Context, run, output string, index uint32, offset, rev uint64, w io.Writer) (*pb.ReadFrame, int64, error) {
-	return c.read(ctx, &pb.ReadRequest{Target: &pb.ReadRequest_Output{Output: &pb.OutputTarget{Run: run, Output: output, Index: index}}, Offset: offset, IfRev: rev}, w)
+	request := &pb.ReadRequest{Target: &pb.ReadRequest_Output{Output: &pb.OutputTarget{Run: run, Output: output, Index: index}}, Offset: offset, IfRev: rev}
+	var first *pb.ReadFrame
+	var written int64
+	for {
+		meta, n, err := c.read(ctx, request, w)
+		written += n
+		if first == nil {
+			first = meta
+		}
+		if !expiredCap(err) || ctx.Err() != nil {
+			return first, written, err
+		}
+		if meta != nil && request.IfRev == 0 {
+			request.IfRev = meta.Rev
+		}
+		request.Offset += uint64(n)
+	}
 }
 
 // ReadTriage copies a failed run's triage bundle into w.
@@ -106,6 +131,8 @@ func (c *Client) ReadLog(ctx context.Context, name string, tail uint64, w io.Wri
 }
 
 func (c *Client) read(ctx context.Context, request *pb.ReadRequest, w io.Writer) (*pb.ReadFrame, int64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stream, err := c.Machine.Read(ctx, request)
 	if err != nil {
 		return nil, 0, err
@@ -118,6 +145,9 @@ func (c *Client) read(ctx context.Context, request *pb.ReadRequest, w io.Writer)
 	for {
 		frame, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
+			if request.Offset > meta.Length || uint64(written) != meta.Length-request.Offset {
+				return meta, written, io.ErrUnexpectedEOF
+			}
 			return meta, written, nil
 		}
 		if err != nil {
@@ -125,6 +155,9 @@ func (c *Client) read(ctx context.Context, request *pb.ReadRequest, w io.Writer)
 		}
 		n, err := w.Write(frame.GetData())
 		written += int64(n)
+		if err == nil && n != len(frame.GetData()) {
+			err = io.ErrShortWrite
+		}
 		if err != nil {
 			return meta, written, err
 		}
