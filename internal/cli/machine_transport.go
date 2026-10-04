@@ -49,6 +49,23 @@ func (m *machineRuns) ValidateEndpoint(ctx context.Context, ep *machineendpoint.
 	if ep == nil {
 		return exit.New(exit.Validation, "explicit machine endpoint is absent")
 	}
+	// A cozy.machine.v1 machine answers Status to a key it authorizes: that is the check.
+	v1, problem := m.machines.DialEndpointV1(*ep)
+	if problem != nil {
+		return problem
+	}
+	frame, err := v1.Status(ctx)
+	v1.Close()
+	switch {
+	case err == nil && frame.WorkerId != ep.WorkerID:
+		return exit.New(exit.Conflict, "the explicit endpoint is machine %s, not %s", frame.WorkerId, ep.WorkerID)
+	case err == nil:
+		return nil
+	case status.Code(err) == codes.Unauthenticated || status.Code(err) == codes.PermissionDenied:
+		return exit.Named(exit.Credential, "machine.endpoint_unauthorized", "the machine does not authorize this host's key: %s", status.Convert(err).Message())
+	case status.Code(err) != codes.Unimplemented:
+		return machines.Transport(err)
+	}
 	connection, problem := m.machines.DialEndpoint(ctx, *ep)
 	if problem != nil {
 		return problem

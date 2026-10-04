@@ -1,14 +1,17 @@
 package cli
 
 import (
+	"cmp"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -16,6 +19,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -46,6 +50,7 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 		}
 		return nil, exit.Named(exit.Unavailable, "machine.endpoint_scope", "this foreground operation cannot access another machine")
 	}}
+	found.EndpointKey = rentalEndpointKey(l, st)
 	runs := newMachineRuns(&background, l, st, resolver, fleet, found)
 	owner, problem := orchestrator.Open(orchestrator.Options{StartMachineExecution: runs.Start, Cfg: ctx.Cfg, Layout: l, Store: st, Log: io.Discard})
 	if problem != nil {
@@ -79,8 +84,8 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 			http.Error(w, "foreground controller authentication required", http.StatusUnauthorized)
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/v1/requests/") {
-			id := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/requests/"), "/")[0]
+		// A run of this target is observed and controlled by id, a request's or a job's.
+		if id, ok := runIDOf(r.URL.Path); ok {
 			row, problem := st.RequestByReference(id)
 			if problem != nil || row == nil {
 				http.Error(w, "foreground operation cannot observe or control another target", http.StatusForbidden)
@@ -92,7 +97,9 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 				return
 			}
 		}
-		if r.Method == http.MethodPost && r.URL.Path != "/v1/requests" && !strings.HasPrefix(r.URL.Path, "/v1/requests/") || r.Method == http.MethodDelete && r.URL.Path == "/v1/local/daemon" {
+		_, run := runIDOf(r.URL.Path)
+		submit := r.URL.Path == "/v1/requests" || r.URL.Path == "/v1/local/jobs"
+		if r.Method == http.MethodPost && !submit && !run || r.Method == http.MethodDelete && r.URL.Path == "/v1/local/daemon" {
 			http.Error(w, "foreground operation is scoped to this request lifecycle", http.StatusForbidden)
 			return
 		}
@@ -140,4 +147,76 @@ func endpointForRecordedRun(ctx *Context, id string) (func(), *exit.Error) {
 		return nil, exit.New(exit.NotFound, "recorded endpoint is absent")
 	}
 	return endpointController(ctx, ep)
+}
+
+// rentalEndpointKey answers the creator key of the rental an explicit endpoint reaches (its
+// recorded worker or address): a rental's machine authorizes that key, not this computer's
+// machine owner key. Nil for an endpoint that is no rental of this host.
+func rentalEndpointKey(l home.Layout, st *records.Store) func(*machineendpoint.Endpoint) (*rental.CreatorIdentity, *exit.Error) {
+	return func(ep *machineendpoint.Endpoint) (*rental.CreatorIdentity, *exit.Error) {
+		rows, problem := st.Rentals()
+		if problem != nil {
+			return nil, problem
+		}
+		for _, row := range rows {
+			if row.ExpectedWorkerID != "" && row.ExpectedWorkerID == ep.WorkerID || row.Address != "" && row.Address == ep.Address {
+				key, problem := rental.CreatorIdentityFor(l, row.ID)
+				if problem != nil {
+					return nil, problem
+				}
+				return &key, nil
+			}
+		}
+		return nil, nil
+	}
+}
+
+// runIDOf is the run a path observes or controls: `/v1/requests/<id>/…` or
+// `/v1/local/jobs/<id>/…`.
+func runIDOf(path string) (string, bool) {
+	for _, prefix := range []string{"/v1/requests/", "/v1/local/jobs/"} {
+		if rest, ok := strings.CutPrefix(path, prefix); ok && rest != "" {
+			return strings.Split(rest, "/")[0], true
+		}
+	}
+	return "", false
+}
+
+// foregroundRental is a named rental's machine as an explicit endpoint, for a run the running
+// daemon cannot carry (it predates cozy.machine.v1): nil when no daemon runs (this CLI starts
+// its own) or the daemon runs v1 work itself.
+func foregroundRental(ctx *Context, name string) (*machineendpoint.Endpoint, *exit.Error) {
+	state := daemon.Probe(ctx.Cfg)
+	if !state.Up || state.OperatorOwned {
+		return nil, nil
+	}
+	c, problem := localapi.Open(ctx.Cfg, state)
+	if problem != nil {
+		return nil, problem
+	}
+	if caps, problem := c.Capabilities(); problem != nil || caps.MachineV1 {
+		return nil, problem
+	}
+	st, problem := records.Open(home.Paths(ctx.Cfg.Home).DB)
+	if problem != nil {
+		return nil, problem
+	}
+	defer st.Close()
+	row, problem := st.RentalByMachine(name)
+	if problem != nil {
+		return nil, problem
+	}
+	if row == nil || row.Address == "" || row.CertPath == "" || row.ExpectedWorkerID == "" {
+		return nil, exit.Named(exit.Unavailable, "rental.not_attached", "rental %s has no machine this host can reach", name)
+	}
+	leaf, err := os.ReadFile(row.CertPath)
+	if err != nil {
+		return nil, exit.New(exit.Credential, "rental %s's pinned certificate is unreadable: %s", name, err)
+	}
+	ep := &machineendpoint.Endpoint{Format: machineendpoint.Format, Address: row.Address, WorkerID: row.ExpectedWorkerID,
+		WorkerBootID: cmp.Or(row.ExpectedWorkerBootID, row.ID), CertificatePEM: string(leaf), WorkspaceID: row.ID}
+	if err := ep.Validate(); err != nil {
+		return nil, exit.New(exit.Validation, "rental %s is not reachable as a machine endpoint: %s", name, err)
+	}
+	return ep, nil
 }

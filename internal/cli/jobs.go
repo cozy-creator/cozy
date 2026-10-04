@@ -110,7 +110,8 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory,
-		PlannedSourceBytes: ctx.ingestBytes, AttentionKernel: overrides.AttentionKernel, Ignored: ignored}
+		PlannedSourceBytes: ctx.ingestBytes, AttentionKernel: overrides.AttentionKernel, Ignored: ignored,
+		MachineEndpoint: ctx.endpoint}
 	if deadline%time.Millisecond != 0 {
 		sub.TimeoutMS++
 	}
@@ -164,8 +165,9 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	}
 	if handle.MachineExecution {
 		// The daemon already owns this run. Waiting for the worker's receipt is
-		// part of --await, not a second acceptance gate for a detached command.
-		if !ctx.Inv.Bool("--follow") {
+		// part of --await, not a second acceptance gate for a detached command. A
+		// foreground controller ends with this command, so it submits before it does.
+		if !ctx.Inv.Bool("--follow") && ctx.endpoint == nil {
 			state, problem := c.Job(handle.JobID)
 			if problem != nil {
 				return problem

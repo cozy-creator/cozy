@@ -111,6 +111,9 @@ type Resolver struct {
 	UseRental     func(id, holder string) (func(), *exit.Error)
 	ObserveRental func(orchestrator.RentalObservation) *exit.Error
 	RentalKey     func(string) (rental.CreatorIdentity, *exit.Error)
+	// EndpointKey is the key an explicit endpoint authorizes when it is one of this host's
+	// rentals (its own creator key); nil answers this computer's machine owner key.
+	EndpointKey func(*machineendpoint.Endpoint) (*rental.CreatorIdentity, *exit.Error)
 	// Held answers whether this daemon's orchestrator holds the boot's control stream. A
 	// worker takes one control stream at a time, so a second Control Claim would fence the
 	// orchestrator's; its accepted Claim already names this owner.

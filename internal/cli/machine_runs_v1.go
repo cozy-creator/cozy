@@ -58,7 +58,7 @@ func (m *machineRuns) loopV1(request records.Request) bool {
 		if accepted && link.Collected || !accepted && records.Settled(current.State) {
 			return false
 		}
-		done, problem := m.stepV1(*current, link, accepted)
+		done, problem := m.stepV1(m.ctx, *current, link, accepted, false)
 		if problem == errNotV1 {
 			return true
 		}
@@ -102,19 +102,33 @@ func permanentRefusal(problem *exit.Error) bool {
 	return problem.Code != exit.Unavailable && problem.Code != exit.Deadline && problem.Code != exit.Canceled
 }
 
+// catchUpV1 records what an accepted run's machine holds now, for a reader: its state and its
+// log up to the head the machine names, without waiting for more.
+func (m *machineRuns) catchUpV1(ctx context.Context, request records.Request) *exit.Error {
+	link, problem := m.store.MachineExecution(request.ID)
+	if problem != nil || link == nil || link.Collected || link.Abandoned {
+		return problem
+	}
+	_, problem = m.stepV1(ctx, request, link, true, true)
+	return problem
+}
+
 // stepV1 places the run if it has no machine, connects, submits or attaches, and records the
 // log until the stream ends; done once the outcome is recorded.
-func (m *machineRuns) stepV1(request records.Request, link *records.MachineExecution, accepted bool) (bool, *exit.Error) {
-	ctx, stop := context.WithCancel(m.ctx)
-	m.mu.Lock()
-	m.submitting[request.ID] = stop
-	m.mu.Unlock()
-	defer func() {
+// `catchUp` ends it at the log's head as the machine named it when the stream opened.
+func (m *machineRuns) stepV1(parent context.Context, request records.Request, link *records.MachineExecution, accepted, catchUp bool) (bool, *exit.Error) {
+	ctx, stop := context.WithCancel(parent)
+	defer stop()
+	if !catchUp {
 		m.mu.Lock()
-		delete(m.submitting, request.ID)
+		m.submitting[request.ID] = stop
 		m.mu.Unlock()
-		stop()
-	}()
+		defer func() {
+			m.mu.Lock()
+			delete(m.submitting, request.ID)
+			m.mu.Unlock()
+		}()
+	}
 	request, problem := m.place(ctx, request, link)
 	if problem != nil {
 		return false, problem
@@ -147,6 +161,7 @@ func (m *machineRuns) stepV1(request records.Request, link *records.MachineExecu
 	if err != nil {
 		return false, machines.Transport(err)
 	}
+	head, opened := uint64(0), false
 	for {
 		event, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -154,6 +169,9 @@ func (m *machineRuns) stepV1(request records.Request, link *records.MachineExecu
 		}
 		if err != nil {
 			return false, machines.Transport(err)
+		}
+		if state := event.GetState(); state != nil && !opened {
+			head, opened = state.Sequence, true // the stream's first frame names the log's head
 		}
 		if state := event.GetState(); state != nil && !accepted {
 			if problem := m.store.AcceptRunV1(request.ID, state); problem != nil {
@@ -179,6 +197,9 @@ func (m *machineRuns) stepV1(request records.Request, link *records.MachineExecu
 		}
 		if problem := m.store.ObserveRunV1(request.ID, event, held); problem != nil {
 			return false, problem
+		}
+		if catchUp && (head <= uint64(max(link.RemoteCursor, 0)) || event.Sequence >= head) {
+			return false, nil
 		}
 	}
 }
@@ -291,7 +312,8 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		}
 		spec.Models = append(spec.Models, model)
 	}
-	if request.Hub != "" {
+	// A rental's machine reads its own Hub as the pod; any other gets the account's access.
+	if request.Hub != "" && !machine.Rented {
 		if access, problem := m.hubAccessV1(ctx, request.Hub, machine); problem != nil {
 			return nil, problem
 		} else {
@@ -521,8 +543,16 @@ func (m *machineRuns) controlV1(ctx context.Context, request records.Request, ac
 		return problem
 	}
 	defer machine.Close()
-	if _, err := machine.Control(ctx, request.ID, value); err != nil {
+	state, err := machine.Control(ctx, request.ID, value)
+	if err != nil {
 		return machines.Transport(err)
+	}
+	// A running job stops before it rests paused: until then it is pausing.
+	if action == "pause" && state.State != "paused" {
+		state.State = "pausing"
+	}
+	if problem := m.store.ObserveRunV1(request.ID, &v1.RunEvent{Event: &v1.RunEvent_State{State: state}}, nil); problem != nil {
+		return problem
 	}
 	return m.Start(request)
 }

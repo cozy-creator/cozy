@@ -999,8 +999,12 @@ func (m *machineRuns) Refresh(parent context.Context, request records.Request) *
 		return nil
 	}
 	if v1, problem := m.store.RunV1(request.ID); problem != nil || v1 {
+		// What its machine holds now, then its log as it streams.
 		if problem == nil {
-			problem = m.Start(request) // its log is recorded as it streams
+			problem = m.catchUpV1(parent, request)
+		}
+		if problem == nil {
+			problem = m.Start(request)
 		}
 		return problem
 	}

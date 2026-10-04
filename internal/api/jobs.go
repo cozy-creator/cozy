@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -67,6 +68,9 @@ type JobSubmission struct {
 	// Trees are the typed input trees as `ref=<directory>`. The grant is the read
 	// capability: a `Tree` field naming a ref that is not here never hydrates.
 	Trees []string `json:"trees,omitempty"`
+	// MachineEndpoint is an explicit machine the job runs on (a foreground controller's
+	// pinned target), never combined with a rental.
+	MachineEndpoint *machineendpoint.Endpoint `json:"machine_endpoint,omitempty"`
 	// PlannedSourceBytes is what a script ingest will pull, so a rental bought for it
 	// is sized to the ingest.
 	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
@@ -144,6 +148,31 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			"trees name host filesystem directories and require the OS-protected CLI credential",
 			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
+	}
+	if s.scopedEndpoint != "" && (sub.MachineEndpoint == nil || sub.MachineEndpoint.Name() != s.scopedEndpoint) {
+		s.refuseTyped(w, r, exit.Named(exit.Credential, "machine.endpoint_scope", "foreground controller requires its explicitly pinned target; no local fallback is allowed"))
+		return
+	}
+	if sub.MachineEndpoint != nil {
+		if !s.cliAuthenticated(r) {
+			s.refuse(w, r, http.StatusForbidden, "cli_credential_required", "an explicit machine endpoint requires the OS-protected CLI credential", "")
+			return
+		}
+		if sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "" || sub.Worker != "" {
+			s.refuseTyped(w, r, exit.Usagef("an explicit owned machine endpoint cannot also select or buy a rental"))
+			return
+		}
+		validator, ok := s.machineExecutions.(interface {
+			ValidateEndpoint(context.Context, *machineendpoint.Endpoint) *exit.Error
+		})
+		if !ok {
+			s.refuseTyped(w, r, exit.Named(exit.Unavailable, "machine.endpoint_unavailable", "this controller cannot execute explicit machine endpoints; nothing was submitted"))
+			return
+		}
+		if problem := validator.ValidateEndpoint(r.Context(), sub.MachineEndpoint); problem != nil {
+			s.refuseTyped(w, r, problem)
+			return
+		}
 	}
 	named := sub.RequestedRental
 	if named == "" {
@@ -260,6 +289,9 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.IdemKey, spec.Hub = key, selectedHub
+	if sub.MachineEndpoint != nil {
+		spec.MachineEndpoint, spec.Worker = sub.MachineEndpoint, sub.MachineEndpoint.Name()
+	}
 	grants := sub.AllowPublish
 	if destination := machineDestination(spec); destination != "" {
 		// The machine publishes the job's outputs itself; the destination is its grant.
@@ -296,7 +328,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.BodyDigest = digest
-	if s.machineExecutions != nil && (spec.LocalInstallationID != "" || publishedMachineJob(spec)) {
+	if s.machineExecutions != nil && (spec.LocalInstallationID != "" || publishedMachineJob(spec) || spec.MachineEndpoint != nil) {
 		if existing == nil {
 			spec.MachineExecutionObserver = true
 		} else if link, problem := s.store.MachineExecution(existing.ID); problem == nil {

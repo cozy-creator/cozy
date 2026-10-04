@@ -17,13 +17,15 @@ import (
 type Capabilities struct {
 	MachineEndpoints bool `json:"machine_endpoints"`
 	ModelOverrides   bool `json:"model_overrides"`
+	// MachineV1 is a controller that runs work on cozy.machine.v1 machines (calls and jobs).
+	MachineV1 bool `json:"machine_v1"`
 }
 
 func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
 	_, endpoint := s.machineExecutions.(interface {
 		ValidateEndpoint(context.Context, *machineendpoint.Endpoint) *exit.Error
 	})
-	s.ok(w, r, http.StatusOK, Capabilities{ModelOverrides: true, MachineEndpoints: endpoint})
+	s.ok(w, r, http.StatusOK, Capabilities{ModelOverrides: true, MachineEndpoints: endpoint, MachineV1: s.machineExecutions != nil})
 }
 
 // validateModelAdapters validates selection syntax; the executing Runtime owns
