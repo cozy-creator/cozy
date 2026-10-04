@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -182,7 +183,9 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 	if accepted {
 		dial = machines.AttachOnly(ctx)
 	}
+	taildbg(request.ID, "dial begin")
 	machine, problem := m.machines.DialV1(dial, link.MachineID, m.runHolder(request, "running"))
+	taildbg(request.ID, "dial end")
 	if problem != nil {
 		return false, problem
 	}
@@ -225,6 +228,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 	}
 	for {
 		event, err := stream.Recv()
+		taildbg(request.ID, "recv %T seq=%d", event.GetEvent(), event.GetSequence())
 		if errors.Is(err, io.EOF) {
 			return false, nil
 		}
@@ -251,9 +255,12 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		}
 		if outcome := event.GetOutcome(); outcome != nil {
 			if fetch != nil {
+				taildbg(request.ID, "finish begin")
 				fetch.finish() // the newest revisions land, their progress shown
+				taildbg(request.ID, "finish end")
 			}
 			problem := m.collectV1(ctx, request, machine, outcome)
+			taildbg(request.ID, "collected")
 			// A collection the connection cut is not the run's end here: it is attached again.
 			return problem == nil || problem.ErrName() != "machine_execution.transport_unavailable", problem
 		}
@@ -263,7 +270,15 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 				fetch.want(*held, product.AppendedFrom)
 			}
 		}
-		if problem := m.store.ObserveRunV1(request.ID, event, held); problem != nil {
+		taildbg(request.ID, "observe begin")
+		slow := time.AfterFunc(5*time.Second, func() {
+			buf := make([]byte, 4<<20)
+			n := runtime.Stack(buf, true)
+			taildbg(request.ID, "observe slow; goroutines:\n%s", buf[:n])
+		})
+		problem := m.store.ObserveRunV1(request.ID, event, held)
+		slow.Stop()
+		if problem != nil {
 			return false, problem
 		}
 		if catchUp && (head <= uint64(max(link.RemoteCursor, 0)) || event.Sequence >= head) {
@@ -669,7 +684,9 @@ func (f *fetcherV1) run() {
 		f.reading, f.stopRead = product.Item, stop
 		from := f.from[product.Item]
 		f.mu.Unlock()
+		taildbg(f.request.ID, "read begin rev=%d", product.Rev)
 		problem := writeOutputV1(read, f.machine, f.request.ID, filepath.Dir(product.Path), product, from, f.progress(product))
+		taildbg(f.request.ID, "read end %v", problem)
 		superseded := read.Err() != nil // a newer revision stopped this read
 		stop()
 		f.mu.Lock()
@@ -918,4 +935,8 @@ func (m *machineRuns) controlV1(ctx context.Context, request records.Request, ac
 		return problem
 	}
 	return m.Start(request)
+}
+
+func taildbg(id, format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "TAILDBG %s %s %s\n", time.Now().Format("15:04:05.000"), id, fmt.Sprintf(format, args...))
 }
