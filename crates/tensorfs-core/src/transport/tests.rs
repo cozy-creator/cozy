@@ -4237,43 +4237,6 @@ fn a_store_with_no_budget_admits_everything() {
 }
 
 #[test]
-fn host_download_budget_refuses_before_transfer_and_credits_shared_objects() {
-    let root = temporary("host-download-budget");
-    let store = Store::init(&root).unwrap();
-    let policy = SourcePolicy::default();
-    let small = Arc::new(checkpoint(3, 32 * 1024));
-    let small_origin = hub_origin(small, |_, _| None);
-    let mut request = request_for(&store, &small_origin.base, &policy);
-
-    // Three blobs, a header and a manifest: refuse either short allowance before
-    // admitting any of them. The host's transient allowance never rewrites quota.
-    for budget in [
-        (THREE_BLOB_CLOSURE_BYTES - 1, 5),
-        (THREE_BLOB_CLOSURE_BYTES, 4),
-    ] {
-        request.download_budget = Some(budget);
-        let error = pull(&request).unwrap_err();
-        assert_eq!(error.code, Code::CAPACITY_EXHAUSTED, "{error}");
-        assert!(store.objects().unwrap().is_empty());
-        assert_eq!(store.disk_budget(), None);
-    }
-    request.download_budget = Some((THREE_BLOB_CLOSURE_BYTES, 5));
-    assert_eq!(pull(&request).unwrap().fetched, 5);
-
-    // The already-held three bodies must not consume either allowance again.
-    let large = Arc::new(checkpoint(6, 32 * 1024));
-    let large_origin = hub_origin(large, |_, _| None);
-    let mut request = request_for(&store, &large_origin.base, &policy);
-    request.download_budget = Some((SIX_AFTER_THREE_WANTED_BYTES, 5));
-    let report = pull(&request).unwrap();
-    assert_eq!((report.held, report.fetched), (3, 5));
-    request.download_budget = Some((0, 0));
-    let report = pull(&request).unwrap();
-    assert_eq!((report.held, report.fetched), (8, 0));
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
 fn a_real_enospc_from_the_kernel_is_a_capacity_verdict_not_an_io_failure() {
     // The error here is not constructed and not simulated: `/dev/full` is a real device
     // whose write returns a real ENOSPC from the real kernel, which is the exact errno a

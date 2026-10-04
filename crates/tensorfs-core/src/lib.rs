@@ -76,8 +76,6 @@ pub mod source_artifact;
 pub mod source_model;
 pub mod spec;
 #[cfg(feature = "store")]
-pub mod staging;
-#[cfg(feature = "store")]
 pub mod stats;
 #[cfg(feature = "store")]
 pub mod storage;
