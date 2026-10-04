@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
@@ -34,12 +35,14 @@ type Client struct {
 	Machine pb.MachineClient
 	worker  string
 	signer  Signer
+	address string
+	http    *http.Client
 }
 
 // Dial connects to the machine at addr whose pinned leaf tlsConfig trusts; worker is the
 // machine's worker id, which every cap names.
 func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Client, error) {
-	c := &Client{worker: worker, signer: signer}
+	c := &Client{worker: worker, signer: signer, address: addr, http: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig.Clone(), ForceAttemptHTTP2: true}}}
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 		grpc.WithPerRPCCredentials(caps{c}),
@@ -56,7 +59,7 @@ func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Cl
 }
 
 // Close ends the connection.
-func (c *Client) Close() error { return c.conn.Close() }
+func (c *Client) Close() error { c.http.CloseIdleConnections(); return c.conn.Close() }
 
 // Cap mints a cap for this machine: machine scope (run empty) or one run's outputs.
 func (c *Client) Cap(run string, outputs []string, lifetime time.Duration) (string, error) {
