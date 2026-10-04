@@ -19,26 +19,31 @@ const writeChunk = 1 << 20
 // Write puts one content-addressed object on the machine, resuming from the bytes it already
 // holds: a header-only Write asks, and the rest streams from there.
 func Write(ctx context.Context, client pb.MachineClient, digest string, length int64, open func() (io.ReadSeekCloser, error)) error {
-	held, err := write(ctx, client, &pb.WriteFrame{Digest: digest, Length: uint64(length)}, nil)
-	if err != nil || held == uint64(length) {
-		return err
+	for {
+		held, err := write(ctx, client, &pb.WriteFrame{Digest: digest, Length: uint64(length)}, nil)
+		if err == nil && held == uint64(length) {
+			return nil
+		}
+		if err == nil {
+			body, openErr := open()
+			if openErr != nil {
+				return openErr
+			}
+			if _, err = body.Seek(int64(held), io.SeekStart); err == nil {
+				header := &pb.WriteFrame{Digest: digest, Length: uint64(length), Offset: held}
+				held, err = write(ctx, client, header, body)
+			}
+			body.Close()
+			if err == nil && held != uint64(length) {
+				return fmt.Errorf("the machine holds %d of %s's %d bytes", held, digest, length)
+			}
+		}
+		if !expiredCap(err) || ctx.Err() != nil {
+			return err
+		}
+		// The fresh RPC mints a new cap and probes the actual staged length. A lost key
+		// never reaches this retry path, and an upload has no inference to replay.
 	}
-	body, err := open()
-	if err != nil {
-		return err
-	}
-	defer body.Close()
-	if _, err := body.Seek(int64(held), io.SeekStart); err != nil {
-		return err
-	}
-	header := &pb.WriteFrame{Digest: digest, Length: uint64(length), Offset: held}
-	if held, err = write(ctx, client, header, body); err != nil {
-		return err
-	}
-	if held != uint64(length) {
-		return fmt.Errorf("the machine holds %d of %s's %d bytes", held, digest, length)
-	}
-	return nil
 }
 
 func write(ctx context.Context, client pb.MachineClient, header *pb.WriteFrame, body io.Reader) (uint64, error) {

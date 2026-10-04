@@ -84,7 +84,7 @@ func (c *Client) Update(ctx context.Context, id string, cohort Cohort, each func
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if !errors.Is(err, io.EOF) && status.Code(err) != codes.Unavailable {
+		if !errors.Is(err, io.EOF) && status.Code(err) != codes.Unavailable && !expiredCap(err) {
 			return nil, err
 		}
 		// The service is restarting onto the update: wait for it to answer again.

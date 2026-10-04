@@ -13,17 +13,21 @@ import (
 // and returns once the machine holds all of it, for this signer. An earlier partial attempt
 // resumes where the machine's copy ends; an object it already holds sends no bytes.
 func (c *Client) Write(ctx context.Context, digest string, length uint64, r io.ReaderAt) error {
-	held, err := c.write(ctx, &pb.WriteFrame{Digest: digest, Length: length}, nil)
-	for err == nil && held < length {
-		var next uint64
-		next, err = c.write(ctx, &pb.WriteFrame{Digest: digest, Length: length, Offset: held},
-			io.NewSectionReader(r, int64(held), int64(length-held)))
-		if err == nil && next <= held {
-			err = fmt.Errorf("the machine holds %d of %d bytes after a write", next, length)
+	for {
+		held, err := c.write(ctx, &pb.WriteFrame{Digest: digest, Length: length}, nil)
+		for err == nil && held < length {
+			var next uint64
+			next, err = c.write(ctx, &pb.WriteFrame{Digest: digest, Length: length, Offset: held},
+				io.NewSectionReader(r, int64(held), int64(length-held)))
+			if err == nil && next <= held {
+				err = fmt.Errorf("the machine holds %d of %d bytes after a write", next, length)
+			}
+			held = next
 		}
-		held = next
+		if !expiredCap(err) || ctx.Err() != nil {
+			return err
+		}
 	}
-	return err
 }
 
 func (c *Client) write(ctx context.Context, first *pb.WriteFrame, body io.Reader) (uint64, error) {
