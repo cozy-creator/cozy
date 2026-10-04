@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"context"
 	"fmt"
-	"path/filepath"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -12,7 +15,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
@@ -49,76 +51,64 @@ func localTensorFS(ctx *Context) (*tfs.Tool, home.Layout, *exit.Error) {
 	return tool, layout, problem
 }
 
+// handleModelList lists what this computer's machine holds, from its Status: one row per
+// repository release lane, with the repository's bytes (TensorFS measures per repository).
 func handleModelList(ctx *Context) *exit.Error {
-	tool, layout, problem := localTensorFS(ctx)
+	host, problem := localMachineHost(ctx)
 	if problem != nil {
 		return problem
 	}
-	work, problem := scratch.Temp(layout.Tmp, "repo-list-")
+	readCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	frame, problem := host.ReadStatus(readCtx)
 	if problem != nil {
 		return problem
 	}
-	defer work.Release()
-	releases, problem := tool.Releases(filepath.Join(work.Path, "rows.jsonl"))
-	if problem != nil {
-		return problem
-	}
-	// The list stands without its byte columns: a store the byte plane refuses to
-	// measure is still a store with names in it, and the refusal is said, not hidden.
-	usage, usageProblem := tool.Usage(filepath.Join(work.Path, "usage.jsonl"))
-	bytesOf := make(map[string]tfs.RepositoryUsage, len(usage.Repos))
-	for _, repo := range usage.Repos {
-		bytesOf[repo.Org+"/"+repo.Name] = repo
+	if frame == nil {
+		return exit.Named(exit.Unavailable, "machine.stopped", "this computer's machine is not running; it lists the models it holds").
+			WithNext("cozy machine start")
 	}
 	list := output.List{
 		Name: "models", Fields: []string{"model", "release", "lane", "size", "shared"},
-		AllFields: []string{"model", "kind", "release", "lane", "manifest_id", "size", "shared"},
+		AllFields: []string{"model", "kind", "release", "lane", "manifest_id", "yanked", "size", "shared"},
 		Bytes:     []string{"size", "shared", "unique"},
-		// unique is the fact tfs computes; a program gets it, a table does not widen for it.
-		Machine: []string{"unique"},
+		Machine:   []string{"unique"},
 	}
-	for _, release := range releases {
-		row := map[string]string{"model": release.Org + "/" + release.Name,
-			"kind": "catalog", "release": release.Version, "lane": release.Lane,
-			"manifest_id": "sha256:" + release.ManifestSHA256}
-		if release.Kind == "local" {
-			row["kind"] = "local"
+	for _, model := range frame.GetModels() {
+		kind := "catalog"
+		if strings.HasPrefix(model.GetRepository(), "local/") {
+			kind = "local"
 		}
-		if repo, ok := bytesOf[row["model"]]; ok {
-			row["size"] = output.Int(repo.Total)
-			row["shared"] = output.Int(repo.Total - repo.Unique)
-			row["unique"] = output.Int(repo.Unique)
+		total, unique := int64(model.GetTotalBytes()), int64(model.GetUniqueBytes())
+		row := func(release, lane, manifest string, yanked bool) map[string]string {
+			return map[string]string{"model": model.GetRepository(), "kind": kind, "release": release, "lane": lane,
+				"manifest_id": manifest, "yanked": fmt.Sprint(yanked), "size": output.Int(total),
+				"shared": output.Int(total - unique), "unique": output.Int(unique)}
 		}
-		list.Rows = append(list.Rows, row)
+		if len(model.GetCheckpoints()) == 0 {
+			list.Rows = append(list.Rows, row("", "", "", false))
+		}
+		for _, checkpoint := range model.GetCheckpoints() {
+			list.Rows = append(list.Rows, row(checkpoint.GetRelease(), checkpoint.GetLane(), checkpoint.GetManifest(), checkpoint.GetYanked()))
+		}
 	}
-	if usageProblem != nil {
-		list.Notes = []string{"disk usage is unavailable: " + usageProblem.Message}
-		return emit(ctx, list)
-	}
-	list.Aggregates = []output.Field{{K: "store", V: storeUsage{Size: usage.Total,
-		Unique: usage.UniqueSum, Unreferenced: usage.Unreferenced, Models: len(usage.Repos)}}}
+	list.Aggregates = []output.Field{{K: "store", V: storeUsage{Size: int64(frame.GetModelsBytes()), Models: len(frame.GetModels())}}}
 	return emit(ctx, list)
 }
 
-// storeUsage is the model list's footer: the store's byte plane for a program, one
-// sentence for a person — and only a sentence once there is something to reclaim.
+// storeUsage is the model list's footer: the bytes the machine's models hold together, shared
+// content counted once.
 type storeUsage struct {
-	Size         int64 `json:"size"`   // the union every model reaches
-	Unique       int64 `json:"unique"` // the sum of every model's unique part
-	Unreferenced int64 `json:"unreferenced"`
-	Models       int   `json:"models"`
+	Size   int64 `json:"size"`
+	Models int   `json:"models"`
 }
 
 func (s storeUsage) Human() string {
-	if s.Unreferenced == 0 {
-		return ""
-	}
 	noun := "models"
 	if s.Models == 1 {
 		noun = "model"
 	}
-	return fmt.Sprintf("%s in %d %s · %s unreferenced",
-		output.Bytes(s.Size), s.Models, noun, output.Bytes(s.Unreferenced))
+	return fmt.Sprintf("%s in %d %s", output.Bytes(s.Size), s.Models, noun)
 }
 
 // handleMachineModelDownload freezes a catalog selection before durable acceptance and

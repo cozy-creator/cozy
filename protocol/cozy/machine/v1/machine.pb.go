@@ -2063,8 +2063,10 @@ type StatusFrame struct {
 	Hubs               []*Hub                 `protobuf:"bytes,12,rep,name=hubs,proto3" json:"hubs,omitempty"`
 	Runtime            string                 `protobuf:"bytes,13,opt,name=runtime,proto3" json:"runtime,omitempty"` // the executors' cozy-runtime
 	Tensorfs           string                 `protobuf:"bytes,14,opt,name=tensorfs,proto3" json:"tensorfs,omitempty"`
-	Environments       []*Environment         `protobuf:"bytes,15,rep,name=environments,proto3" json:"environments,omitempty"` // the caller's held package installations
-	Disk               *Disk                  `protobuf:"bytes,16,opt,name=disk,proto3" json:"disk,omitempty"`                 // the filesystem holding the machine's store
+	Environments       []*Environment         `protobuf:"bytes,15,rep,name=environments,proto3" json:"environments,omitempty"`                   // the caller's held package installations
+	Disk               *Disk                  `protobuf:"bytes,16,opt,name=disk,proto3" json:"disk,omitempty"`                                   // the filesystem holding the machine's store
+	Models             []*Model               `protobuf:"bytes,17,rep,name=models,proto3" json:"models,omitempty"`                               // the models the machine's store holds
+	ModelsBytes        uint64                 `protobuf:"varint,18,opt,name=models_bytes,json=modelsBytes,proto3" json:"models_bytes,omitempty"` // their bytes together, shared content counted once
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -2211,6 +2213,156 @@ func (x *StatusFrame) GetDisk() *Disk {
 	return nil
 }
 
+func (x *StatusFrame) GetModels() []*Model {
+	if x != nil {
+		return x.Models
+	}
+	return nil
+}
+
+func (x *StatusFrame) GetModelsBytes() uint64 {
+	if x != nil {
+		return x.ModelsBytes
+	}
+	return 0
+}
+
+type Model struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Repository    string                 `protobuf:"bytes,1,opt,name=repository,proto3" json:"repository,omitempty"`                       // org/name; org "local" is a local alias
+	TotalBytes    uint64                 `protobuf:"varint,2,opt,name=total_bytes,json=totalBytes,proto3" json:"total_bytes,omitempty"`    // everything this repository reaches
+	UniqueBytes   uint64                 `protobuf:"varint,3,opt,name=unique_bytes,json=uniqueBytes,proto3" json:"unique_bytes,omitempty"` // reached by no other held repository
+	Checkpoints   []*Checkpoint          `protobuf:"bytes,4,rep,name=checkpoints,proto3" json:"checkpoints,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Model) Reset() {
+	*x = Model{}
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Model) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Model) ProtoMessage() {}
+
+func (x *Model) ProtoReflect() protoreflect.Message {
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Model.ProtoReflect.Descriptor instead.
+func (*Model) Descriptor() ([]byte, []int) {
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *Model) GetRepository() string {
+	if x != nil {
+		return x.Repository
+	}
+	return ""
+}
+
+func (x *Model) GetTotalBytes() uint64 {
+	if x != nil {
+		return x.TotalBytes
+	}
+	return 0
+}
+
+func (x *Model) GetUniqueBytes() uint64 {
+	if x != nil {
+		return x.UniqueBytes
+	}
+	return 0
+}
+
+func (x *Model) GetCheckpoints() []*Checkpoint {
+	if x != nil {
+		return x.Checkpoints
+	}
+	return nil
+}
+
+type Checkpoint struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Release       string                 `protobuf:"bytes,1,opt,name=release,proto3" json:"release,omitempty"` // empty for a local alias
+	Lane          string                 `protobuf:"bytes,2,opt,name=lane,proto3" json:"lane,omitempty"`
+	Manifest      string                 `protobuf:"bytes,3,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>
+	Yanked        bool                   `protobuf:"varint,4,opt,name=yanked,proto3" json:"yanked,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Checkpoint) Reset() {
+	*x = Checkpoint{}
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Checkpoint) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Checkpoint) ProtoMessage() {}
+
+func (x *Checkpoint) ProtoReflect() protoreflect.Message {
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Checkpoint.ProtoReflect.Descriptor instead.
+func (*Checkpoint) Descriptor() ([]byte, []int) {
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *Checkpoint) GetRelease() string {
+	if x != nil {
+		return x.Release
+	}
+	return ""
+}
+
+func (x *Checkpoint) GetLane() string {
+	if x != nil {
+		return x.Lane
+	}
+	return ""
+}
+
+func (x *Checkpoint) GetManifest() string {
+	if x != nil {
+		return x.Manifest
+	}
+	return ""
+}
+
+func (x *Checkpoint) GetYanked() bool {
+	if x != nil {
+		return x.Yanked
+	}
+	return false
+}
+
 type Gpu struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Index         uint32                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
@@ -2225,7 +2377,7 @@ type Gpu struct {
 
 func (x *Gpu) Reset() {
 	*x = Gpu{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[24]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2237,7 +2389,7 @@ func (x *Gpu) String() string {
 func (*Gpu) ProtoMessage() {}
 
 func (x *Gpu) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[24]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2250,7 +2402,7 @@ func (x *Gpu) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Gpu.ProtoReflect.Descriptor instead.
 func (*Gpu) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{24}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *Gpu) GetIndex() uint32 {
@@ -2305,7 +2457,7 @@ type Hub struct {
 
 func (x *Hub) Reset() {
 	*x = Hub{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[25]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2317,7 +2469,7 @@ func (x *Hub) String() string {
 func (*Hub) ProtoMessage() {}
 
 func (x *Hub) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[25]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2330,7 +2482,7 @@ func (x *Hub) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Hub.ProtoReflect.Descriptor instead.
 func (*Hub) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{25}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *Hub) GetOrigin() string {
@@ -2360,7 +2512,7 @@ type Environment struct {
 
 func (x *Environment) Reset() {
 	*x = Environment{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[26]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2372,7 +2524,7 @@ func (x *Environment) String() string {
 func (*Environment) ProtoMessage() {}
 
 func (x *Environment) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[26]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2385,7 +2537,7 @@ func (x *Environment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Environment.ProtoReflect.Descriptor instead.
 func (*Environment) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{26}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *Environment) GetInstallation() string {
@@ -2433,7 +2585,7 @@ type Disk struct {
 
 func (x *Disk) Reset() {
 	*x = Disk{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[27]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2445,7 +2597,7 @@ func (x *Disk) String() string {
 func (*Disk) ProtoMessage() {}
 
 func (x *Disk) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[27]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2458,7 +2610,7 @@ func (x *Disk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Disk.ProtoReflect.Descriptor instead.
 func (*Disk) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{27}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *Disk) GetTotalBytes() uint64 {
@@ -2489,7 +2641,7 @@ type WriteFrame struct {
 
 func (x *WriteFrame) Reset() {
 	*x = WriteFrame{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[28]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2501,7 +2653,7 @@ func (x *WriteFrame) String() string {
 func (*WriteFrame) ProtoMessage() {}
 
 func (x *WriteFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[28]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2514,7 +2666,7 @@ func (x *WriteFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteFrame.ProtoReflect.Descriptor instead.
 func (*WriteFrame) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{28}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *WriteFrame) GetDigest() string {
@@ -2555,7 +2707,7 @@ type WriteResult struct {
 
 func (x *WriteResult) Reset() {
 	*x = WriteResult{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[29]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2567,7 +2719,7 @@ func (x *WriteResult) String() string {
 func (*WriteResult) ProtoMessage() {}
 
 func (x *WriteResult) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[29]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2580,7 +2732,7 @@ func (x *WriteResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteResult.ProtoReflect.Descriptor instead.
 func (*WriteResult) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{29}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *WriteResult) GetDigest() string {
@@ -2760,7 +2912,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"media_type\x18\x04 \x01(\tR\tmediaType\x12\x12\n" +
 	"\x04data\x18\x05 \x01(\fR\x04data\"-\n" +
 	"\rStatusRequest\x12\x1c\n" +
-	"\tkeepalive\x18\x01 \x01(\bR\tkeepalive\"\xd3\x04\n" +
+	"\tkeepalive\x18\x01 \x01(\bR\tkeepalive\"\xa6\x05\n" +
 	"\vStatusFrame\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x17\n" +
 	"\aboot_id\x18\x02 \x01(\tR\x06bootId\x12\x18\n" +
@@ -2778,7 +2930,23 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\aruntime\x18\r \x01(\tR\aruntime\x12\x1a\n" +
 	"\btensorfs\x18\x0e \x01(\tR\btensorfs\x12@\n" +
 	"\fenvironments\x18\x0f \x03(\v2\x1c.cozy.machine.v1.EnvironmentR\fenvironments\x12)\n" +
-	"\x04disk\x18\x10 \x01(\v2\x15.cozy.machine.v1.DiskR\x04disk\"\x9c\x01\n" +
+	"\x04disk\x18\x10 \x01(\v2\x15.cozy.machine.v1.DiskR\x04disk\x12.\n" +
+	"\x06models\x18\x11 \x03(\v2\x16.cozy.machine.v1.ModelR\x06models\x12!\n" +
+	"\fmodels_bytes\x18\x12 \x01(\x04R\vmodelsBytes\"\xaa\x01\n" +
+	"\x05Model\x12\x1e\n" +
+	"\n" +
+	"repository\x18\x01 \x01(\tR\n" +
+	"repository\x12\x1f\n" +
+	"\vtotal_bytes\x18\x02 \x01(\x04R\n" +
+	"totalBytes\x12!\n" +
+	"\funique_bytes\x18\x03 \x01(\x04R\vuniqueBytes\x12=\n" +
+	"\vcheckpoints\x18\x04 \x03(\v2\x1b.cozy.machine.v1.CheckpointR\vcheckpoints\"n\n" +
+	"\n" +
+	"Checkpoint\x12\x18\n" +
+	"\arelease\x18\x01 \x01(\tR\arelease\x12\x12\n" +
+	"\x04lane\x18\x02 \x01(\tR\x04lane\x12\x1a\n" +
+	"\bmanifest\x18\x03 \x01(\tR\bmanifest\x12\x16\n" +
+	"\x06yanked\x18\x04 \x01(\bR\x06yanked\"\x9c\x01\n" +
 	"\x03Gpu\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\rR\x05index\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -2841,7 +3009,7 @@ func file_cozy_machine_v1_machine_proto_rawDescGZIP() []byte {
 }
 
 var file_cozy_machine_v1_machine_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_cozy_machine_v1_machine_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_cozy_machine_v1_machine_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_cozy_machine_v1_machine_proto_goTypes = []any{
 	(RunKind)(0),           // 0: cozy.machine.v1.RunKind
 	(Action)(0),            // 1: cozy.machine.v1.Action
@@ -2869,12 +3037,14 @@ var file_cozy_machine_v1_machine_proto_goTypes = []any{
 	(*ReadFrame)(nil),      // 23: cozy.machine.v1.ReadFrame
 	(*StatusRequest)(nil),  // 24: cozy.machine.v1.StatusRequest
 	(*StatusFrame)(nil),    // 25: cozy.machine.v1.StatusFrame
-	(*Gpu)(nil),            // 26: cozy.machine.v1.Gpu
-	(*Hub)(nil),            // 27: cozy.machine.v1.Hub
-	(*Environment)(nil),    // 28: cozy.machine.v1.Environment
-	(*Disk)(nil),           // 29: cozy.machine.v1.Disk
-	(*WriteFrame)(nil),     // 30: cozy.machine.v1.WriteFrame
-	(*WriteResult)(nil),    // 31: cozy.machine.v1.WriteResult
+	(*Model)(nil),          // 26: cozy.machine.v1.Model
+	(*Checkpoint)(nil),     // 27: cozy.machine.v1.Checkpoint
+	(*Gpu)(nil),            // 28: cozy.machine.v1.Gpu
+	(*Hub)(nil),            // 29: cozy.machine.v1.Hub
+	(*Environment)(nil),    // 30: cozy.machine.v1.Environment
+	(*Disk)(nil),           // 31: cozy.machine.v1.Disk
+	(*WriteFrame)(nil),     // 32: cozy.machine.v1.WriteFrame
+	(*WriteResult)(nil),    // 33: cozy.machine.v1.WriteResult
 }
 var file_cozy_machine_v1_machine_proto_depIdxs = []int32{
 	3,  // 0: cozy.machine.v1.RunRequest.spec:type_name -> cozy.machine.v1.RunSpec
@@ -2898,25 +3068,27 @@ var file_cozy_machine_v1_machine_proto_depIdxs = []int32{
 	1,  // 18: cozy.machine.v1.ControlRequest.action:type_name -> cozy.machine.v1.Action
 	22, // 19: cozy.machine.v1.ReadRequest.output:type_name -> cozy.machine.v1.OutputTarget
 	13, // 20: cozy.machine.v1.StatusFrame.runs:type_name -> cozy.machine.v1.RunState
-	26, // 21: cozy.machine.v1.StatusFrame.gpus:type_name -> cozy.machine.v1.Gpu
-	27, // 22: cozy.machine.v1.StatusFrame.hubs:type_name -> cozy.machine.v1.Hub
-	28, // 23: cozy.machine.v1.StatusFrame.environments:type_name -> cozy.machine.v1.Environment
-	29, // 24: cozy.machine.v1.StatusFrame.disk:type_name -> cozy.machine.v1.Disk
-	24, // 25: cozy.machine.v1.Machine.Status:input_type -> cozy.machine.v1.StatusRequest
-	2,  // 26: cozy.machine.v1.Machine.Run:input_type -> cozy.machine.v1.RunRequest
-	20, // 27: cozy.machine.v1.Machine.Control:input_type -> cozy.machine.v1.ControlRequest
-	21, // 28: cozy.machine.v1.Machine.Read:input_type -> cozy.machine.v1.ReadRequest
-	30, // 29: cozy.machine.v1.Machine.Write:input_type -> cozy.machine.v1.WriteFrame
-	25, // 30: cozy.machine.v1.Machine.Status:output_type -> cozy.machine.v1.StatusFrame
-	12, // 31: cozy.machine.v1.Machine.Run:output_type -> cozy.machine.v1.RunEvent
-	13, // 32: cozy.machine.v1.Machine.Control:output_type -> cozy.machine.v1.RunState
-	23, // 33: cozy.machine.v1.Machine.Read:output_type -> cozy.machine.v1.ReadFrame
-	31, // 34: cozy.machine.v1.Machine.Write:output_type -> cozy.machine.v1.WriteResult
-	30, // [30:35] is the sub-list for method output_type
-	25, // [25:30] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	28, // 21: cozy.machine.v1.StatusFrame.gpus:type_name -> cozy.machine.v1.Gpu
+	29, // 22: cozy.machine.v1.StatusFrame.hubs:type_name -> cozy.machine.v1.Hub
+	30, // 23: cozy.machine.v1.StatusFrame.environments:type_name -> cozy.machine.v1.Environment
+	31, // 24: cozy.machine.v1.StatusFrame.disk:type_name -> cozy.machine.v1.Disk
+	26, // 25: cozy.machine.v1.StatusFrame.models:type_name -> cozy.machine.v1.Model
+	27, // 26: cozy.machine.v1.Model.checkpoints:type_name -> cozy.machine.v1.Checkpoint
+	24, // 27: cozy.machine.v1.Machine.Status:input_type -> cozy.machine.v1.StatusRequest
+	2,  // 28: cozy.machine.v1.Machine.Run:input_type -> cozy.machine.v1.RunRequest
+	20, // 29: cozy.machine.v1.Machine.Control:input_type -> cozy.machine.v1.ControlRequest
+	21, // 30: cozy.machine.v1.Machine.Read:input_type -> cozy.machine.v1.ReadRequest
+	32, // 31: cozy.machine.v1.Machine.Write:input_type -> cozy.machine.v1.WriteFrame
+	25, // 32: cozy.machine.v1.Machine.Status:output_type -> cozy.machine.v1.StatusFrame
+	12, // 33: cozy.machine.v1.Machine.Run:output_type -> cozy.machine.v1.RunEvent
+	13, // 34: cozy.machine.v1.Machine.Control:output_type -> cozy.machine.v1.RunState
+	23, // 35: cozy.machine.v1.Machine.Read:output_type -> cozy.machine.v1.ReadFrame
+	33, // 36: cozy.machine.v1.Machine.Write:output_type -> cozy.machine.v1.WriteResult
+	32, // [32:37] is the sub-list for method output_type
+	27, // [27:32] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_cozy_machine_v1_machine_proto_init() }
@@ -2950,7 +3122,7 @@ func file_cozy_machine_v1_machine_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cozy_machine_v1_machine_proto_rawDesc), len(file_cozy_machine_v1_machine_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   30,
+			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
