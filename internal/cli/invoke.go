@@ -243,7 +243,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return e
 	}
 	if ctx.endpoint != nil {
-		normalized, err := canonical.NormalizeJCS(input)
+		normalized, err := canonical.NormalizeApplication(input)
 		if err != nil {
 			return exit.New(exit.Validation, "explicit machine payload cannot be canonicalized: %s", err)
 		}

@@ -121,7 +121,7 @@ func exactMemoryRequest(req Request) string {
 	if req.Release == "" || req.LocalInstallationID != "" || strings.HasPrefix(req.Package, "local/") {
 		return ""
 	}
-	payload, err := canonical.NormalizeJCS(req.Payload)
+	payload, err := canonical.NormalizeApplication(req.Payload)
 	if err != nil {
 		return ""
 	}

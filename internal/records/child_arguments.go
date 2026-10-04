@@ -15,7 +15,7 @@ const childArgumentsDDL = `CREATE TABLE IF NOT EXISTS request_child_arguments (
 
 // ServingCallArguments separates immutable call options from the unchanged inference payload.
 func ServingCallArguments(body []byte) ([]byte, map[string]json.RawMessage, *exit.Error) {
-	normalized, err := canonical.NormalizeJCS(body)
+	normalized, err := canonical.NormalizeApplication(body)
 	if err != nil || !bytes.Equal(body, normalized) || len(body) > 48*1024 {
 		return nil, nil, exit.New(exit.Validation, "serving call must be bounded canonical JSON")
 	}
