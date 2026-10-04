@@ -5107,6 +5107,9 @@ mod tail;
 
 // ---------------------------------------------------------------- publication
 
+/// The most objects this stand-in Hub takes in one grant or verify request.
+const SELECTION: usize = 50;
+
 #[derive(Default)]
 struct PublicationHub {
     declared: Vec<String>,
@@ -5114,6 +5117,8 @@ struct PublicationHub {
     verified: Vec<String>,
     finalized: usize,
     holds: bool,
+    /// Grant or verify requests refused for their selection's size.
+    refused: usize,
 }
 
 fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
@@ -5198,14 +5203,15 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                     ]),
                 )]))
             }
-            // As Tensorhub: 1 through 128 objects per grant or verify request.
+            // As Tensorhub: a bounded selection per grant or verify request (128 there).
             "POST"
                 if (path.ends_with("/grants") || path.ends_with("/verify"))
-                    && !(1..=128).contains(&objects(&request.body, "object_ids").len()) =>
+                    && !(1..=SELECTION).contains(&objects(&request.body, "object_ids").len()) =>
             {
+                hub.refused += 1;
                 status(
                     422,
-                    br#"{"error":{"code":"publication.object_selection_invalid","message":"select 1 through 128 object ids per request"}}"#,
+                    br#"{"error":{"code":"publication.object_selection_invalid","message":"the object selection is empty or too large"}}"#,
                 )
             }
             "POST" if path.ends_with("/grants") => {
@@ -5309,7 +5315,8 @@ fn publish_pushes_what_the_hub_lacks_and_follows_its_finalization() {
 }
 
 /// A closure larger than one request's selection (an SDXL LoRA's) is asked for and verified in
-/// requests the Hub accepts.
+/// requests the Hub accepts: this Hub takes fewer than the first request asks for, so the
+/// selection is halved until it fits, and stays there.
 #[test]
 fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
     let root = temporary("publish-large");
@@ -5337,5 +5344,7 @@ fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
     assert_eq!(held.uploaded.len(), held.declared.len() - 1);
     assert_eq!(held.verified.len(), held.declared.len() - 1);
     assert_eq!(held.finalized, 1);
+    // 128, then 64, were refused once each; every later request fit.
+    assert_eq!(held.refused, 2);
     let _ = std::fs::remove_dir_all(root);
 }

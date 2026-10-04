@@ -17,7 +17,8 @@ use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::SourcePolicy;
 use crate::transport::push::{push_object, UploadGrant};
 
-/// Objects asked for or verified in one request: the Hub takes 1 through 128.
+/// Objects first asked for in one request. The Hub decides how many it takes: a selection it
+/// refuses as too large is halved and asked again.
 const BATCH: usize = 128;
 
 pub struct Publication<'a> {
@@ -201,8 +202,23 @@ pub fn publish(p: &Publication) -> Result<Published> {
     (p.progress)(*landed.lock().unwrap(), total);
 
     // Push what the Hub lacks under its grants, then have it verify them.
-    for batch in pending.chunks(BATCH) {
-        let answer = call("POST", &format!("{path}/grants"), &ids(batch))?;
+    let (mut rest, mut size) = (pending.as_slice(), BATCH);
+    while !rest.is_empty() {
+        let batch = &rest[..size.min(rest.len())];
+        let answer = match call("POST", &format!("{path}/grants"), &ids(batch)) {
+            Err(refusal)
+                if batch.len() > 1
+                    && refusal.code == Code::HUB_REFUSED
+                    && refusal
+                        .detail
+                        .starts_with("publication.object_selection_invalid") =>
+            {
+                size = batch.len() / 2;
+                continue;
+            }
+            answer => answer?,
+        };
+        rest = &rest[batch.len()..];
         let mut uploads = vec![];
         for grant in rows(&answer, "grants") {
             let id = text(grant, "object_id").to_string();
