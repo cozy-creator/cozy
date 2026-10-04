@@ -166,6 +166,8 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 			detail := p.Stage
 			if p.BytesTotal > 0 {
 				detail = strings.TrimSpace(detail + " " + humanBytes(p.BytesDone) + " of " + humanBytes(p.BytesTotal))
+			} else if p.BytesDone > 0 {
+				detail = strings.TrimSpace(detail + " · " + humanBytes(p.BytesDone) + " read")
 			}
 			err = insert("request.preparing", map[string]any{"stage": "machine", "detail": detail})
 			break

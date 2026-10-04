@@ -1329,7 +1329,8 @@ type Product struct {
 	Digest        string                 `protobuf:"bytes,5,opt,name=digest,proto3" json:"digest,omitempty"` // sha256:<hex> of these bytes
 	MediaType     string                 `protobuf:"bytes,6,opt,name=media_type,json=mediaType,proto3" json:"media_type,omitempty"`
 	Label         string                 `protobuf:"bytes,7,opt,name=label,proto3" json:"label,omitempty"`
-	DurationUs    uint64                 `protobuf:"varint,8,opt,name=duration_us,json=durationUs,proto3" json:"duration_us,omitempty"` // media time, for a growing video
+	DurationUs    uint64                 `protobuf:"varint,8,opt,name=duration_us,json=durationUs,proto3" json:"duration_us,omitempty"`             // media time, for a growing video
+	AppendedFrom  *uint64                `protobuf:"varint,9,opt,name=appended_from,json=appendedFrom,proto3,oneof" json:"appended_from,omitempty"` // these bytes extend the previous revision's, from here
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1416,6 +1417,13 @@ func (x *Product) GetLabel() string {
 func (x *Product) GetDurationUs() uint64 {
 	if x != nil {
 		return x.DurationUs
+	}
+	return 0
+}
+
+func (x *Product) GetAppendedFrom() uint64 {
+	if x != nil && x.AppendedFrom != nil {
+		return *x.AppendedFrom
 	}
 	return 0
 }
@@ -2696,7 +2704,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"bytesTotal\x12\x17\n" +
 	"\astep_ms\x18\a \x01(\x01R\x06stepMs\x12*\n" +
 	"\x0estage_fraction\x18\b \x01(\x01H\x00R\rstageFraction\x88\x01\x01B\x11\n" +
-	"\x0f_stage_fraction\"\xcf\x01\n" +
+	"\x0f_stage_fraction\"\x8b\x02\n" +
 	"\aProduct\x12\x16\n" +
 	"\x06output\x18\x01 \x01(\tR\x06output\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\rR\x05index\x12\x10\n" +
@@ -2707,7 +2715,9 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"media_type\x18\x06 \x01(\tR\tmediaType\x12\x14\n" +
 	"\x05label\x18\a \x01(\tR\x05label\x12\x1f\n" +
 	"\vduration_us\x18\b \x01(\x04R\n" +
-	"durationUs\"3\n" +
+	"durationUs\x12(\n" +
+	"\rappended_from\x18\t \x01(\x04H\x00R\fappendedFrom\x88\x01\x01B\x10\n" +
+	"\x0e_appended_from\"3\n" +
 	"\aLogLine\x12\x14\n" +
 	"\x05level\x18\x01 \x01(\tR\x05level\x12\x12\n" +
 	"\x04text\x18\x02 \x01(\tR\x04text\"\xda\x01\n" +
@@ -2928,6 +2938,7 @@ func file_cozy_machine_v1_machine_proto_init() {
 		(*RunEvent_Memo)(nil),
 	}
 	file_cozy_machine_v1_machine_proto_msgTypes[12].OneofWrappers = []any{}
+	file_cozy_machine_v1_machine_proto_msgTypes[13].OneofWrappers = []any{}
 	file_cozy_machine_v1_machine_proto_msgTypes[19].OneofWrappers = []any{
 		(*ReadRequest_Output)(nil),
 		(*ReadRequest_Triage)(nil),
