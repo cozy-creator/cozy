@@ -502,6 +502,7 @@
 0.00	TestReattachedProgressUsesRecordedStageBoundaries
 10.20	TestRebootedRentalIsReattachedAndServesNewWork
 0.14	TestReclaimSweeps
+0.83	TestReclamationWaitsOnlyForWhatHoldsBytes
 0.06	TestRecordedLegacyFailureReasonIsTheSameInListAndWatch
 0.04	TestRecordsOpenAcceptsADriftedShapeAndKeepsRentals
 0.45	TestRecordsRefuseAnOlderSchemaUnchanged

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
@@ -119,6 +121,121 @@ func (s storeUsage) Human() string {
 	}
 	return fmt.Sprintf("%s in %d %s · %s unreferenced",
 		output.Bytes(s.Size), s.Models, noun, output.Bytes(s.Unreferenced))
+}
+
+func handleModelRemove(ctx *Context) *exit.Error {
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return problem
+	}
+	if problem := modelRemovalRefusal(layout, ctx.Inv.Args); problem != nil {
+		return problem
+	}
+	fence, problem := readReclamationFence(layout)
+	if problem != nil {
+		return problem
+	}
+	tool, _, problem := localTensorFS(ctx)
+	if problem != nil {
+		return problem
+	}
+	return removeModels(ctx, tool, layout, fence)
+}
+
+// modelRemovalRefusal refuses only for a live local request that reads or writes a named
+// model.
+func modelRemovalRefusal(layout home.Layout, names []string) *exit.Error {
+	store, problem := records.Open(layout.DB)
+	if problem != nil {
+		return problem
+	}
+	defer store.Close()
+	for _, name := range names {
+		ref, problem := hub.ParseRef(name)
+		if problem != nil {
+			return problem
+		}
+		users, problem := store.LocalModelUsers(ref.String())
+		if problem != nil {
+			return problem
+		}
+		if len(users) > 0 {
+			first := users[0]
+			return exit.New(exit.Conflict, "%s still uses %s", runsPhrase(users), ref.String()).
+				WithRemedy("let it settle, or cancel it, then remove the model repository").
+				WithNext("cozy run cancel " + runReference(first.Number, first.ID))
+		}
+	}
+	return nil
+}
+
+func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, fence reclamationFence) *exit.Error {
+	work, problem := scratch.Temp(layout.Tmp, "repo-remove-")
+	if problem != nil {
+		return problem
+	}
+	defer work.Release()
+	releases, problem := tool.Releases(filepath.Join(work.Path, "rows.jsonl"))
+	if problem != nil {
+		return problem
+	}
+	held := make(map[string]bool, len(releases))
+	for _, release := range releases {
+		held[release.Org+"/"+release.Name] = true
+	}
+	removed := output.List{
+		Name: "models", Fields: []string{"model"}, AllFields: []string{"model"},
+	}
+	for _, name := range ctx.Inv.Args {
+		ref, parseProblem := hub.ParseRef(name)
+		if parseProblem != nil {
+			return parseProblem
+		}
+		if !held[ref.String()] {
+			continue
+		}
+		if ref.Org == "local" {
+			if _, problem := modelsource.LocalName(ref.Name); problem != nil {
+				return problem
+			}
+			alias, problem := tool.ResolveLocal(ref.Name)
+			if problem != nil {
+				return problem
+			}
+			if problem := tool.RemoveLocal(ref.Name, alias.RepositoryDigest); problem != nil {
+				return problem
+			}
+		} else {
+			repoScratch := filepath.Join(work.Path, strings.ReplaceAll(ref.String(), "/", "-"))
+			if err := os.MkdirAll(repoScratch, 0o700); err != nil {
+				return exit.Internalf("cannot create repository-remove scratch: %s", err)
+			}
+			if problem := tool.DeleteRepository(ref.Org, ref.Name, repoScratch); problem != nil {
+				return problem
+			}
+		}
+		removed.Rows = append(removed.Rows, map[string]string{"model": ref.String()})
+		delete(held, ref.String())
+	}
+	removed.Aggregates = []output.Field{{K: "changed", V: len(removed.Rows) > 0}}
+	// Reclamation is part of the act: the name is gone, so its bytes go now, unless a local
+	// request may still be moving bytes into the store (a download's admitted objects are
+	// unnamed until its commit) or the byte plane names a live holder. Either keeps the name
+	// removed and says what deferred it; `cozy model gc` finishes the job.
+	if problem := fence.busy(); problem != nil {
+		removed.Notes = []string{"reclamation deferred: " + problem.Message}
+		removed.Next = []string{"cozy model gc"}
+		return emit(ctx, removed)
+	}
+	report, notes, problem := fence.collect(tool)
+	if problem != nil {
+		removed.Notes = []string{"reclamation deferred: " + problem.Message}
+		removed.Next = []string{"cozy model gc"}
+		return emit(ctx, removed)
+	}
+	removed.Notes = notes
+	removed.Aggregates = append(removed.Aggregates, reclaimFields(report)...)
+	return emit(ctx, removed)
 }
 
 // handleMachineModelDownload freezes a catalog selection before durable acceptance and

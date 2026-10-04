@@ -289,6 +289,8 @@ type ModelCmd struct {
 	Search   ModelSearchCmd   `cmd:"" help:"Search models, showing each model's latest available release."`
 	Family   ModelFamilyCmd   `cmd:"" help:"Set a model repository's discovery family."`
 	Download ModelDownloadCmd `cmd:"" help:"Download a model into a local destination or an owned rental store."`
+	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories and reclaim their bytes."`
+	GC       ModelGCCmd       `cmd:"" name:"gc" help:"Reclaim the bytes no local model references."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
 	Upload   ModelUploadCmd   `cmd:"" help:"Ingest a model with its required metadata and upload an owner-only checkpoint."`
 	Quantize ModelQuantizeCmd `cmd:"" help:"Write a model's fp8 or mxfp8 lane with the package that serves it, as an owner-only checkpoint."`
@@ -342,6 +344,20 @@ func (c *ModelDownloadCmd) Run(r *Runtime) error {
 	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
 		"--rental-only", c.RentalOnly, "--await", c.Await),
 		values("--rental", c.Rental, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
+}
+
+type ModelRemoveCmd struct {
+	Refs []string `arg:"" name:"model" help:"Local model repository name."`
+}
+
+func (c *ModelRemoveCmd) Run(r *Runtime) error {
+	return r.call(handleModelRemove, c.Refs, nil, nil, false)
+}
+
+type ModelGCCmd struct{}
+
+func (c *ModelGCCmd) Run(r *Runtime) error {
+	return r.call(handleModelGC, nil, nil, nil, false)
 }
 
 type ModelListCmd struct{}

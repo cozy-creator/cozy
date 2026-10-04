@@ -15,7 +15,7 @@ curl -fsSL https://github.com/cozy-creator/cozy/releases/latest/download/install
 ```
 
 The installer checks the release against its `SHA256SUMS`, puts `cozy` in `~/.local/bin` and, in
-its own uv tool environment, the host tool Cozy drives: `cozy-runtime`.
+one uv tool environment, the host tools Cozy drives: `cozy-runtime` and TensorFS's `tfs`.
 `COZY_VERSION=v0.1.0` picks a release. Rerun it to upgrade: the new binary replaces the old by
 rename, so a running daemon keeps its binary and its work; the new one starts after the next
 `cozy down`; work in flight continues and the next command reattaches. From source: `go build -o ~/.local/bin/cozy .`
@@ -25,7 +25,7 @@ automatically for bash and fish, and for zsh when `~/.local/share/zsh/site-funct
 The host-tool step alone is:
 
 ```sh
-uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=0.18.67'
+uv tool install --force --refresh-package cozy-runtime --refresh-package tensorfs --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.67'
 ```
 
 Keep `--python 3.12`: uv
@@ -235,10 +235,20 @@ cozy model info org/model
 cozy model info org/model@release
 cozy model download org/model@release local/flux --lane task=text-to-image
 cozy model list
+cozy model remove local/flux
+cozy model gc
 ```
 
-A machine's models are a cache it manages itself: unused ones expire, and a machine low on disk
-evicts them. There is no remove or gc verb, and nothing but the machine deletes from its store.
+`model remove` deletes the repository name and reclaims its bytes in the same act, printing
+`reclaimed: 5.2GiB`; `model list` shows `unreferenced 0` after it. `model gc` reclaims what no
+local model names for any other reason (a crashed download, an abandoned ingest), and the daemon
+runs the same pass on `maintenance.gc_cron` (default `0 3 * * *`, while it is up). What is
+reclaimed is TensorFS's decision from its filesystem census — repos, manifests, blobs — never a
+database's. A pass never runs beside a local run still moving bytes in (a download's bytes are
+unnamed until its commit): `remove` defers reclamation to `model gc`, `model gc` refuses naming
+the run, the cron logs `gc: deferred`. A paused or failed run that retains its work keeps only
+the ingest sessions its retry may resume. `remove` refuses only for a queued or running local run
+that uses the model.
 
 Upload an already canonical local alias, or ingest a provider source with `model download`.
 Run quantization and other weight-producing jobs through the ordinary package command.
@@ -739,6 +749,8 @@ player_url: https://cozy-creator.github.io/cozy/play/   # the page `cozy run pla
 local_rate_micro_usd_per_hour: 250000
 daemon:
   idle_shutdown_s: 900
+maintenance:
+  gc_cron: "0 3 * * *"
 ```
 
 Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an available

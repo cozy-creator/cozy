@@ -18,12 +18,14 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	"github.com/cozy-creator/cozy/internal/runoutputs"
+	"github.com/cozy-creator/cozy/internal/scratch"
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -324,8 +326,8 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		return nil, problem
 	}
 	spec.BindingRevision = revision
-	if request.Trees != "" {
-		return nil, exit.Named(exit.Structural, "input_tree_unsupported", "this machine takes file inputs; input trees are not carried to it yet")
+	if problem := m.writeTreesV1(ctx, request, machine, spec); problem != nil {
+		return nil, problem
 	}
 	if request.IsJob() {
 		spec.Kind = v1.RunKind_RUN_KIND_JOB
@@ -356,17 +358,24 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	}
 	began = time.Now()
 	for _, asset := range request.Assets {
-		// The bytes the run captured at submission: its snapshot's member, else the file itself.
-		path := asset.LocalPath
-		if asset.Snapshot != nil && asset.Snapshot.Path != "" {
-			path = filepath.Join(asset.Snapshot.Path+".files", strings.TrimPrefix(asset.Digest, "sha256:"))
-		}
-		object, err := machinev1.WriteFile(ctx, machine.Machine, path)
-		if err != nil {
-			return nil, machines.Transport(err)
-		}
-		if object.Digest != asset.Digest || int64(object.Length) != asset.Length {
-			return nil, exit.Named(exit.Conflict, "input_changed", "%s changed since the run was submitted", path)
+		if asset.MediaType == resultfiles.TreeMediaType && asset.Snapshot != nil {
+			// A Tree input: each member the run captured, then its manifest, which the input names.
+			if problem := writeTreeV1(ctx, machine, asset.Snapshot); problem != nil {
+				return nil, problem
+			}
+		} else {
+			// The bytes the run captured at submission: its snapshot's member, else the file itself.
+			path := asset.LocalPath
+			if asset.Snapshot != nil && asset.Snapshot.Path != "" {
+				path = filepath.Join(asset.Snapshot.Path+".files", strings.TrimPrefix(asset.Digest, "sha256:"))
+			}
+			object, err := machinev1.WriteFile(ctx, machine.Machine, path)
+			if err != nil {
+				return nil, machines.Transport(err)
+			}
+			if object.Digest != asset.Digest || int64(object.Length) != asset.Length {
+				return nil, exit.Named(exit.Conflict, "input_changed", "%s changed since the run was submitted", path)
+			}
 		}
 		spec.Inputs = append(spec.Inputs, &v1.InputFile{Field: asset.FieldPath, Digest: asset.Digest,
 			Length: uint64(asset.Length), MediaType: asset.MediaType, Order: asset.Order})
@@ -484,6 +493,54 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			return json.RawMessage(outcome.Result), nil
 		}
 	}
+}
+
+// writeTreesV1 writes each `--input-tree ref=dir` to the machine as writeTreeV1 does; the
+// spec names its manifest as an input of the tree media type under the payload's ref.
+func (m *machineRuns) writeTreesV1(ctx context.Context, request records.Request, machine *machines.V1, spec *v1.RunSpec) *exit.Error {
+	if request.Trees == "" {
+		return nil
+	}
+	work, problem := scratch.Temp(m.layout.Tmp, "input-trees-")
+	if problem != nil {
+		return problem
+	}
+	defer work.Release()
+	began := time.Now()
+	for index, pair := range strings.Split(request.Trees, ",") {
+		ref, directory, _ := strings.Cut(pair, "=")
+		tree, problem := inputasset.CaptureTree(filepath.Join(work.Path, strconv.Itoa(index)), ref, directory, inputasset.MaxRootInputBytes)
+		if problem != nil {
+			return problem
+		}
+		if problem := writeTreeV1(ctx, machine, tree.Snapshot); problem != nil {
+			return problem
+		}
+		spec.Inputs = append(spec.Inputs, &v1.InputFile{Field: ref, Digest: tree.Digest, Length: uint64(tree.Length), MediaType: resultfiles.TreeMediaType})
+	}
+	m.submissionStage(request.ID, "trees", request.Trees, began)
+	return nil
+}
+
+// writeTreeV1 writes a captured tree to the machine: each member file, then the manifest.
+func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.ByteInputSnapshot) *exit.Error {
+	members, problem := resultfiles.ParseTreeManifest(snapshot.Body, snapshot.ContentBytes)
+	if problem != nil {
+		return problem
+	}
+	for _, member := range members {
+		object, err := machinev1.WriteFile(ctx, machine.Machine, filepath.Join(snapshot.Path+".files", strings.TrimPrefix(member.Digest, "sha256:")))
+		if err != nil {
+			return machines.Transport(err)
+		}
+		if object.Digest != member.Digest {
+			return exit.Named(exit.Conflict, "input_changed", "tree member %s changed since the run was submitted", member.Path)
+		}
+	}
+	if _, err := machinev1.WriteBytes(ctx, machine.Machine, snapshot.Body); err != nil {
+		return machines.Transport(err)
+	}
+	return nil
 }
 
 // hubAccessV1 is the signed-in account's execution access at origin, bound to the machine's

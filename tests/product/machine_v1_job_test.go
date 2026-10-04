@@ -408,3 +408,55 @@ func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 	}
 	landed(t, "the detached run to be canceled at its deadline", func() bool { return status("2") == "canceled" })
 }
+
+var cpuTree = flag.String("cpu-tree", "", "cozy-machine tests/fixtures/cpu_tree: a callable that reads one input Tree")
+
+// `cozy run <pkg>/count --asset data=<dir>` on a machine that serves cozy.machine.v1: the
+// directory's files and its tree manifest are written to the machine, which materializes the
+// tree for the callable.
+func TestMachineV1InputTreeReachesTheCallable(t *testing.T) {
+	if *machineHostBinary == "" || *cpuTree == "" {
+		t.Skip("requires -machine-host=<cozy-machine> and -cpu-tree=<cozy-machine>/tests/fixtures/cpu_tree")
+	}
+	root, err := os.MkdirTemp(os.TempDir(), "czt")
+	must(t, err)
+	provisionMachine(t, root)
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		if t.Failed() {
+			t.Logf("evidence retained at %s\nmachine log tail:\n%s", root, tail(filepath.Join(root, "machine", "host.log")))
+		} else {
+			_ = removeAllForce(root)
+		}
+	})
+	project := filepath.Join(t.TempDir(), "cpu_tree")
+	must(t, os.CopyFS(project, os.DirFS(*cpuTree)))
+	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
+		t.Fatalf("uv lock: %v\n%s", err, out)
+	}
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		t.Fatalf("package install [exit %d]\n%s", code, out)
+	}
+	data := filepath.Join(root, "data")
+	must(t, os.MkdirAll(filepath.Join(data, "nested"), 0o755))
+	must(t, os.WriteFile(filepath.Join(data, "a.txt"), []byte("alpha"), 0o600))
+	must(t, os.WriteFile(filepath.Join(data, "nested", "b.bin"), []byte("\x00\x01beta"), 0o600))
+
+	code, document := runCozy(t, root, "run", "local/cozy-machine-cpu-tree/count", "--asset", "data="+data, "--await", "--json")
+	skipWithoutMachine(t, code, document)
+	if code != 0 {
+		t.Fatalf("the run did not succeed [exit %d]\n%s", code, document)
+	}
+	var run struct {
+		Result struct {
+			Files  []string `json:"files"`
+			SHA256 string   `json:"sha256"`
+		} `json:"result"`
+	}
+	sum := sha256.Sum256([]byte("alpha\x00\x01beta"))
+	if json.Unmarshal([]byte(lastJSONLine(document)), &run) != nil || strings.Join(run.Result.Files, ",") != "a.txt,nested/b.bin" ||
+		run.Result.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("the callable did not read the tree as written\n%s", document)
+	}
+}
