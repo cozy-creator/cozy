@@ -19,7 +19,9 @@ import (
 
 // The public install command reaches a real standalone agent and Runtime over the
 // rental transport. Only the Hub and provider are loopback fixtures. Preparation
-// installs packages with uv; it runs no inference and downloads no model weights.
+// installs packages with uv; it runs no inference and downloads no model weights. It never
+// imports the package: the interface comes from the Hub's release detail, for releases
+// with and without embedded metadata.
 func TestPublishedInstallUsesEmbeddedInterfaceWithoutImport(t *testing.T) {
 	h, root, _, store := parityMachines(t)
 	imports := filepath.Join(t.TempDir(), "imports")
@@ -135,14 +137,8 @@ def main(payload: Request) -> Result:
 			return row != nil && row.State == "succeeded"
 		})
 		t.Logf("ordinary published install %s: %s", version, time.Since(started))
-		body, err := os.ReadFile(imports)
-		must(t, err)
-		want := "1.0.0\n"
-		if version != "1.0.0" {
-			want += "1.0.1\n"
-		}
-		if string(body) != want {
-			t.Fatalf("installed metadata did not bypass package import: got %q want %q", body, want)
+		if body, err := os.ReadFile(imports); !os.IsNotExist(err) {
+			t.Fatalf("installing %s imported the package: %q %v", version, body, err)
 		}
 	}
 }
