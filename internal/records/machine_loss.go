@@ -29,37 +29,42 @@ func (s *Store) MachineExecutionLost(id string) (bool, *exit.Error) {
 	return lost, nil
 }
 
-// ReconcileEndedMachineExecutions settles every machine this owner has proof is
+// executionRental is the machine an execution ran on: its recorded machine, or for an explicit
+// endpoint (a foreground --rental run of a daemon older than cozy.machine.v1) the rental its
+// retained selector names as its workspace.
+const executionRental = `CASE WHEN e.machine_id LIKE 'endpoint-%' THEN (SELECT json_extract(v.payload,'$.machine_endpoint.execution_workspace_id')
+ FROM request_events v WHERE v.request_id=e.request_id AND v.type IN ('run.created','request.submitted') ORDER BY v.seq DESC LIMIT 1)
+ ELSE e.machine_id END`
+
+// ReconcileEndedMachineExecutions settles every run on a rental this owner has proof is
 // gone: its confirmed-release ledger, or a Hub state committed only after provider
 // absence. An absent row, timeout or empty account listing is not that proof.
-func (s *Store) ReconcileEndedMachineExecutions() *exit.Error {
+func (s *Store) ReconcileEndedMachineExecutions() *exit.Error { return s.reconcileEnded("") }
+
+// ReconcileEndedMachineExecution settles one run whose rental is proven gone, so a reader
+// answers from the records instead of waiting on a machine that no longer exists.
+func (s *Store) ReconcileEndedMachineExecution(id string) *exit.Error { return s.reconcileEnded(id) }
+
+func (s *Store) reconcileEnded(request string) *exit.Error {
+	// Read first: the writer lock is taken only when there is something to settle.
+	ended, err := endedRentals(s.db, request)
+	if err != nil {
+		return exit.Internalf("cannot read ended rentals: %s", err)
+	}
+	if len(ended) == 0 {
+		return nil
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin ended-machine reconciliation: %s", err)
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT DISTINCT e.machine_id FROM machine_executions e WHERE e.machine_id<>'' AND (
- EXISTS(SELECT 1 FROM rental_operations o WHERE o.rental_id=e.machine_id AND o.state='released') OR
- EXISTS(SELECT 1 FROM rentals WHERE id=e.machine_id AND state IN (` + absentRentalStates + `)))`)
+	ended, err = endedRentals(tx, request)
 	if err != nil {
-		return exit.Internalf("cannot read confirmed ended machines: %s", err)
+		return exit.Internalf("cannot read ended rentals: %s", err)
 	}
-	var machines []string
-	for rows.Next() {
-		var machine string
-		if err := rows.Scan(&machine); err != nil {
-			rows.Close()
-			return exit.Internalf("cannot read ended machine identity: %s", err)
-		}
-		machines = append(machines, machine)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return exit.Internalf("cannot finish ended machine identities: %s", err)
-	}
-	for _, machine := range machines {
-		if problem := settleLostMachine(tx, machine); problem != nil {
+	for _, rental := range ended {
+		if problem := settleLostMachine(tx, rental); problem != nil {
 			return problem
 		}
 	}
@@ -67,6 +72,35 @@ func (s *Store) ReconcileEndedMachineExecutions() *exit.Error {
 		return exit.Internalf("cannot commit ended-machine reconciliation: %s", err)
 	}
 	return nil
+}
+
+// endedRentals are the rentals proven gone that runs still owe work on: those runs or, given
+// request, that one run.
+func endedRentals(q interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, request string) ([]string, error) {
+	filter, args := "", []any{}
+	if request != "" {
+		filter, args = " AND e.request_id=?", []any{request}
+	}
+	rows, err := q.Query(`WITH ended(rental) AS (SELECT rental_id FROM rental_operations WHERE state='released' AND rental_id<>''
+ UNION SELECT id FROM rentals WHERE state IN (`+absentRentalStates+`)),
+ reached(request_id, rental) AS (SELECT e.request_id, `+executionRental+` FROM machine_executions e WHERE e.machine_id<>''`+filter+`)
+ SELECT DISTINCT reached.rental FROM reached JOIN ended ON ended.rental=reached.rental
+ JOIN machine_executions e ON e.request_id=reached.request_id JOIN requests r ON r.id=e.request_id WHERE `+machineExecutionOwed, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ended []string
+	for rows.Next() {
+		var rental string
+		if err := rows.Scan(&rental); err != nil {
+			return nil, err
+		}
+		ended = append(ended, rental)
+	}
+	return ended, rows.Err()
 }
 
 // LoseMachineExecution settles one accepted execution its machine proved it no longer
@@ -104,9 +138,10 @@ func (s *Store) LoseMachine(machine, message string) *exit.Error {
 	return nil
 }
 
-// settleLostMachine ends every obligation on a machine proven gone. A run whose offer
-// never left this host is released to be placed again, charging nothing. A sent offer
-// may have executed, and that execution and its bytes died with the machine.
+// settleLostMachine ends every obligation on a rental proven gone, its runs and those that
+// reached it as an explicit endpoint. A run whose offer never left this host is released to
+// be placed again, charging nothing. A sent offer may have executed, and that execution and
+// its bytes died with the machine.
 func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
 	return settleLost(tx, machine, "", "")
 }
@@ -116,21 +151,21 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 	if err := tx.QueryRow(`SELECT failure_code FROM rentals WHERE id=?`, machine).Scan(&cause); err != nil && err != sql.ErrNoRows {
 		return exit.Internalf("cannot read lost machine cause: %s", err)
 	}
-	rows, err := tx.Query(`SELECT r.id,r.state,r.retain_work,r.rental=1 AND r.requested_rental='',
- e.cancel_requested,length(e.submission)>0,length(e.receipt)>0,length(e.outcome)>0
+	rows, err := tx.Query(`SELECT e.machine_id,r.id,r.state,r.retain_work,r.rental=1 AND r.requested_rental='',
+ e.cancel_requested,length(e.submission)>0 OR length(e.receipt)>0,length(e.receipt)>0,length(e.outcome)>0
  FROM machine_executions e JOIN requests r ON r.id=e.request_id
- WHERE e.machine_id=? AND (?='' OR e.request_id=?) AND `+machineExecutionOwed, machine, request, request)
+ WHERE e.machine_id<>'' AND (e.machine_id=?1 OR `+executionRental+`=?1) AND (?2='' OR e.request_id=?2) AND `+machineExecutionOwed, machine, request)
 	if err != nil {
 		return exit.Internalf("cannot read destroyed machine observers: %s", err)
 	}
 	type observation struct {
-		id, state                                                   string
+		machine, id, state                                          string
 		retained, placeable, cancel, submitted, accepted, hasResult bool
 	}
 	var observations []observation
 	for rows.Next() {
 		var value observation
-		if err := rows.Scan(&value.id, &value.state, &value.retained, &value.placeable,
+		if err := rows.Scan(&value.machine, &value.id, &value.state, &value.retained, &value.placeable,
 			&value.cancel, &value.submitted, &value.accepted, &value.hasResult); err != nil {
 			rows.Close()
 			return exit.Internalf("cannot read destroyed machine observer: %s", err)
@@ -144,13 +179,13 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 	}
 	for _, value := range observations {
 		if !value.submitted && value.placeable && !value.retained && (value.state == "submitted" || value.state == "queued") {
-			if problem := releaseUnsentTx(tx, value.id, machine, cause); problem != nil {
+			if problem := releaseUnsentTx(tx, value.id, value.machine, cause); problem != nil {
 				return problem
 			}
 			continue
 		}
 		if value.retained {
-			failed, problem := failLostRetainedWorkTx(tx, value.id, machine, cause)
+			failed, problem := failLostRetainedWorkTx(tx, value.id, value.machine, cause)
 			if problem != nil {
 				return problem
 			}
@@ -158,15 +193,17 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 				continue
 			}
 		}
-		message := "rented machine was confirmed destroyed; its execution and retained bytes can no longer be observed"
-		if !value.submitted {
-			message = "rented machine was confirmed destroyed before this run was submitted to it"
+		message := "its rental ended before it finished"
+		if settledRequestState(value.state) {
+			message = "its rental ended; anything not yet collected from it is gone"
+		} else if !value.submitted {
+			message = "its rental ended before the run was sent to it"
 		}
 		if lost != "" {
 			message = lost
 		}
 		detail := map[string]any{
-			"machine_id": machine, "error_type": "machine_execution.state_lost", "error": message,
+			"machine_id": value.machine, "error_type": "machine_execution.state_lost", "error": message,
 			"had_acceptance_receipt": value.accepted, "had_recorded_outcome": value.hasResult,
 		}
 		if cause != "" {
