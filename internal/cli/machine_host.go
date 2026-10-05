@@ -76,28 +76,55 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 			"kept: your downloaded models and the package cache (" + strings.Join(replaced.Kept, ", ") + ")",
 			fmt.Sprintf("removed the old machine's software, package environments and run history (%.1f GiB freed); each package is set up again on its first run", float64(replaced.FreedBytes)/(1<<30)),
 		}
+		// The install stands either way; what the records could not say is said here.
+		switch uncollected, problem := replacedMachineRuns(ctx); {
+		case problem != nil:
+			notes = append(notes, "the older machine's ended runs could not be marked as gone with it: "+problem.Message)
+		case len(uncollected) > 0:
+			notes = append(notes, "never collected, and gone with the older machine: the outputs of "+runsPhrase(uncollected))
+		}
 	}
 	return emit(ctx, output.Record{Fields: fields, Notes: notes})
 }
 
-// localRunsSettled refuses while this computer's machine holds unsettled runs.
-func localRunsSettled(ctx *Context) *exit.Error {
+// localRuns asks this computer's machine's runs of the records; an absent database has none.
+func localRuns(ctx *Context, ask func(*records.Store) ([]records.Request, *exit.Error)) ([]records.Request, *exit.Error) {
 	layout := home.Paths(ctx.Cfg.Home)
 	if _, err := os.Stat(layout.DB); err != nil {
-		return nil
+		return nil, nil
 	}
 	store, problem := records.Open(layout.DB)
 	if problem != nil {
-		return problem
+		return nil, problem
 	}
 	defer store.Close()
-	live, problem := store.MachineLiveRuns(machines.Local)
+	return ask(store)
+}
+
+// localRunsSettled refuses while this computer's machine holds runs that have not ended. Ended
+// runs do not hold it: only the machine's own record of them goes.
+func localRunsSettled(ctx *Context) *exit.Error {
+	live, problem := localRuns(ctx, func(store *records.Store) ([]records.Request, *exit.Error) {
+		return store.MachineLiveRuns(machines.Local)
+	})
 	if problem != nil || len(live) == 0 {
 		return problem
 	}
 	return exit.Named(exit.Conflict, "machine.holds_runs", "this computer's machine still holds %s; replacing it would lose that work", runsPhrase(live)).
 		WithRemedy("let them finish, or settle each with `cozy run cancel --abandon`, then install again").
 		WithNext("cozy run cancel --abandon " + runReference(live[0].Number, live[0].ID))
+}
+
+// replacedMachineRuns records that the replaced machine's own record of its ended runs went
+// with it, so nothing waits on them, and answers the completed runs never collected from it.
+func replacedMachineRuns(ctx *Context) ([]records.Request, *exit.Error) {
+	return localRuns(ctx, func(store *records.Store) ([]records.Request, *exit.Error) {
+		uncollected, problem := store.MachineUncollectedRuns(machines.Local)
+		if problem != nil {
+			return nil, problem
+		}
+		return uncollected, store.LoseMachine(machines.Local, "this computer's machine was replaced; the older machine's own record of this run went with it")
+	})
 }
 
 func handleMachineShow(ctx *Context) *exit.Error {
