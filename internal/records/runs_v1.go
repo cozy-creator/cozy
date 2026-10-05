@@ -178,6 +178,10 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 					return err
 				}
 			}
+		case *v1.RunEvent_Call:
+			if err := insertCallV1(tx, id, max(ordinal, 1), value.Call); err != nil {
+				return err
+			}
 		}
 		if event.Sequence != 0 {
 			_, err = tx.Exec(`UPDATE machine_executions SET remote_cursor=? WHERE request_id=?`, event.Sequence, id)
@@ -189,6 +193,28 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 	}
 	s.dropTelemetry(id, sampled)
 	return nil
+}
+
+// insertCallV1 records one settled call of the run as `machine.call`, the record `run show`
+// lists: the callee, the author's label, how it ended, when, and its stage and step tracks.
+func insertCallV1(tx *sql.Tx, id string, attempt int64, call *v1.Call) error {
+	var measured struct {
+		Attribution struct {
+			Stages json.RawMessage `json:"stages"`
+			Steps  json.RawMessage `json:"steps"`
+		} `json:"attribution"`
+	}
+	_ = json.Unmarshal(call.Measurements, &measured)
+	record := map[string]any{"request": call.Run, "parent": id, "index": call.Index, "attempt": attempt,
+		"export": call.Function, "label": call.Label, "status": call.Status, "error": call.GetReason().GetMessage(),
+		"called_unix_ms": call.CalledAtMs, "stages": measured.Attribution.Stages, "steps": measured.Attribution.Steps}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	at := time.UnixMilli(max(call.FinishedAtMs, call.CalledAtMs)).UTC().Format(time.RFC3339Nano)
+	_, err = tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,'machine.call',?,?,?)`, id, attempt, string(raw), at)
+	return err
 }
 
 func humanBytes(n uint64) string {
