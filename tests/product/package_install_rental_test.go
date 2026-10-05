@@ -56,6 +56,10 @@ func TestPackageInstallRental(t *testing.T) {
 				if r.Method == "GET" && r.URL.Path == "/" {
 					return
 				}
+				if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // a current daemon: it carries v1 installs
+					_, _ = w.Write([]byte(`{"machine_v1":true}`))
+					return
+				}
 				if r.Method != "POST" || r.URL.Path != "/v1/local/rentals/rental-proof/prepare" || r.Header.Get("Authorization") == "" {
 					t.Errorf("unexpected daemon request: %s %s", r.Method, r.URL)
 					http.Error(w, "unexpected request", 500)

@@ -84,6 +84,18 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		return exit.Usagef("--source-profile selects the profiles a provider ingest converts").
 			WithRemedy("omit --source-profile to use the one profile the headers match")
 	}
+	// A named rental exists before anything is asked of a Hub or a machine.
+	if machine != "" {
+		_, store, problem := rentalStores(ctx)
+		if problem != nil {
+			return problem
+		}
+		_, problem = machines.InstallTarget(store, machine)
+		store.Close()
+		if problem != nil {
+			return problem
+		}
+	}
 	var selection records.RentalInstallSelection
 	if kind == "model-upload" {
 		ref, problem := hub.ParseRef(destinationArg)
@@ -136,8 +148,8 @@ func transferSource(ctx *Context, raw string, upload bool) (records.ModelRef, st
 	}
 	parsed, problem := modelsource.Parse(raw, cwd)
 	if problem == nil && parsed.Kind == modelsource.LocalFile {
-		if !upload || lane != "" {
-			return records.ModelRef{}, "", exit.Usagef("a local file is uploaded as it is, to a Tensorhub repository")
+		if lane != "" {
+			return records.ModelRef{}, "", exit.Usagef("--lane selects only a Tensorhub model release")
 		}
 		digest, problem := fileDigest(parsed.Path, parsed.Bytes)
 		if problem != nil {

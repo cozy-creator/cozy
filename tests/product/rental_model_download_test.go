@@ -89,6 +89,10 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 		if r.Method == "GET" && r.URL.Path == "/" {
 			return
 		}
+		if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // a current daemon: it carries v1 installs
+			_, _ = w.Write([]byte(`{"machine_v1":true}`))
+			return
+		}
 		if r.Method != "POST" || r.URL.Path != "/v1/local/rentals/rental-proof/prepare" || r.Header.Get("Authorization") == "" {
 			t.Errorf("unexpected local request: %s %s", r.Method, r.URL)
 			http.Error(w, "unexpected", 500)
@@ -171,6 +175,10 @@ func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.RentalIn
 	var accepted records.RentalInstallSelection
 	localPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" && r.URL.Path == "/" {
+			return
+		}
+		if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // a current daemon: it carries v1 installs
+			_, _ = w.Write([]byte(`{"machine_v1":true}`))
 			return
 		}
 		if r.Method != "POST" || r.URL.Path != "/v1/local/rentals/rental-proof/prepare" || r.Header.Get("Authorization") == "" {
