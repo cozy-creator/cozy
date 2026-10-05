@@ -181,7 +181,13 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		if len(requirements) > 0 {
 			dependencyRequirements = []byte(strings.Join(requirements, "\n") + "\n")
 		}
-		_, problem = localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths, dependencyRequirements)
+		callees := map[string]string{}
+		for dependency, captured := range closure {
+			if captured.Package != "" {
+				callees[dependency] = captured.Package
+			}
+		}
+		_, problem = localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths, dependencyRequirements, callees)
 		if problem != nil {
 			return problem
 		}

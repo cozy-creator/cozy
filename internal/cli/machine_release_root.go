@@ -47,11 +47,7 @@ func (m *machineRuns) capturedRevision(request records.Request) (localpackage.In
 	if problem != nil {
 		return localpackage.Installation{}, problem
 	}
-	if len(capture.Installations) != 1 || capture.Installations[0].ID != request.LocalInstallationID {
-		return localpackage.Installation{}, exit.Named(exit.Structural, "machine_execution.captured_callees_unsupported",
-			"a provider-source Model on a package that calls other unpublished packages is not supported yet")
-	}
-	return capture.Installations[0], nil
+	return localpackage.CapturedRoot(capture, request.LocalInstallationID)
 }
 
 // prepareRoot puts a root's unpublished installation on the machine: a reopen of what its disk

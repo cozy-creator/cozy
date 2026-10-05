@@ -38,13 +38,13 @@ func TestCapturedHubWheelRetainsBytesWithoutRemoteLoopbackRequirement(t *testing
 	captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}})
 	fatal(t, problem)
 	got := captured["hub-fixture"]
-	if got.Path == "" || got.Digest != "sha256:"+digest || got.RegistryRequirement != "" || !got.Application {
+	if got.Path == "" || got.Digest != "sha256:"+digest || got.RegistryRequirement != "" || !got.Application || got.Package != "paul/hub-fixture" {
 		t.Fatalf("Hub wheel was not retained privately: %+v", got)
 	}
 	packRoot := t.TempDir()
 	pack := packagepublish.Package{Name: "capture-root", Release: "1.0.0", Root: packRoot, Wheel: prebuiltProjectWheel(t, packRoot, "capture-root", "py3-none-any", "weightless:app"), Files: map[string]string{"uv.lock": filepath.Join(root, "uv.lock")}}
 	fatal(t, pack.CaptureUnpublishedClosure(t.Context(), closure, nil, "3.12.12"))
-	if len(pack.DependencyWheels) != 1 || len(pack.DependencyRequirements) != 0 {
+	if len(pack.DependencyWheels) != 1 || len(pack.DependencyRequirements) != 0 || pack.DependencyPackages["hub-fixture"] != "paul/hub-fixture" {
 		t.Fatalf("Hub source leaked into remote requirements: wheels=%v requirements=%s", pack.DependencyWheels, pack.DependencyRequirements)
 	}
 	for _, candidate := range []string{

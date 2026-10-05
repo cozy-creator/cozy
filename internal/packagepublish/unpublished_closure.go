@@ -110,6 +110,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 			return nil, nil, problem
 		}
 		captureLocally := false
+		packageRef := ""
 		if entry.Source.Registry == "https://pypi.org/simple" {
 			// Registry artifacts are fetched by Runtime's bounded storage; the
 			// private client upload byte bound applies only to local wheels.
@@ -117,6 +118,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 				return nil, nil, problem
 			}
 		} else if organization := orgIndexNamespace(entry.Source.Registry); organization != "" {
+			packageRef = organization + "/" + name
 			index, _ := url.Parse(entry.Source.Registry)
 			object, err := url.Parse(candidate.URL)
 			if err != nil || index.Host == "" || object.Scheme != index.Scheme || object.Host != index.Host {
@@ -132,7 +134,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 				return nil, nil, problem
 			}
 		}
-		rows = append(rows, RegistryRow{captureLocally: captureLocally, Name: name, Version: entry.Version, URL: candidate.URL, SHA256: candidate.Hashes["sha256"], Size: candidate.Size})
+		rows = append(rows, RegistryRow{captureLocally: captureLocally, packageRef: packageRef, Name: name, Version: entry.Version, URL: candidate.URL, SHA256: candidate.Hashes["sha256"], Size: candidate.Size})
 		delete(expected, name)
 	}
 	for name := range pins {
@@ -170,7 +172,11 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 		return problem
 	}
 	public := rows[:0]
+	p.DependencyPackages = map[string]string{}
 	for _, row := range rows {
+		if row.packageRef != "" {
+			p.DependencyPackages[row.Name] = row.packageRef
+		}
 		if !row.captureLocally {
 			public = append(public, row)
 			continue

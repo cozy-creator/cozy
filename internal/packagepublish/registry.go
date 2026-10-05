@@ -52,6 +52,7 @@ type registryWheel struct {
 type RegistryRow struct {
 	// Captured Hub bytes travel with private revisions, never as worker-local URLs.
 	captureLocally bool
+	packageRef     string // original Hub index identity for private captured wheels
 	Name           string `json:"name"`
 	SHA256         string `json:"sha256"`
 	Size           int64  `json:"size"`

@@ -35,6 +35,32 @@ type Installation struct {
 	Files                         []File
 	DependencyRequirements        []byte
 	PythonRequires, PythonVersion string
+	Callees                       map[string]string
+}
+
+// StagePrepared retains the executable closure while its intake-owned source is still alive.
+// Replays read this record; they never rebuild a dependency from the author's tree.
+func StagePrepared(ctx context.Context, layout home.Layout, install records.PackageInstall, pack *packagepublish.Package) (Installation, *exit.Error) {
+	if _, err := os.Stat(filepath.Join(layout.LocalPackages, install.ID, installationFile)); err == nil {
+		return Open(layout, install, install.ID)
+	}
+	if pack.Wheel == "" {
+		if problem := pack.Build(ctx); problem != nil {
+			return Installation{}, problem
+		}
+	}
+	if problem := pack.CaptureUnpublishedClosure(ctx, install.Closure, strings.Fields(install.Extra), install.Python); problem != nil {
+		return Installation{}, problem
+	}
+	paths := []string{pack.Wheel}
+	for _, dependency := range pack.DependencyWheels {
+		paths = append(paths, dependency.Path)
+	}
+	surface, err := os.ReadFile(filepath.Join(install.Dir, "documents", "package-interface.json"))
+	if err != nil {
+		return Installation{}, exit.Internalf("cannot read captured package interface: %s", err)
+	}
+	return StageWheels(layout, install, surface, paths, pack.DependencyRequirements, pack.DependencyPackages)
 }
 
 func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Installation, *exit.Error) {
@@ -83,7 +109,7 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 }
 
 // StageWheels retains ordinary published/builtin wheels. Editable projects use Stage.
-func StageWheels(layout home.Layout, install records.PackageInstall, surface []byte, paths []string, requirements []byte) (Installation, *exit.Error) {
+func StageWheels(layout home.Layout, install records.PackageInstall, surface []byte, paths []string, requirements []byte, callees ...map[string]string) (Installation, *exit.Error) {
 	if !validInstallationID(install.ID) || len(paths) == 0 || len(paths) > 256 {
 		return Installation{}, exit.New(exit.Validation, "wheel installation inputs are incomplete")
 	}
@@ -93,6 +119,9 @@ func StageWheels(layout home.Layout, install records.PackageInstall, surface []b
 	}
 	defer os.RemoveAll(stage)
 	result := Installation{ID: install.ID, Package: install.Package, Release: install.Version, PackageInterface: append([]byte(nil), surface...), DependencyRequirements: append([]byte(nil), requirements...), PythonVersion: hostruntime.PythonMinor(install.Python)}
+	if len(callees) > 0 {
+		result.Callees = callees[0]
+	}
 	for index, source := range paths {
 		fact, problem := wheel.InspectIdentity(source)
 		if problem != nil {

@@ -119,13 +119,14 @@ func (nopCloser) Close() error { return nil }
 
 // localManifest is the LocalSource manifest the machine installs from (machine.proto).
 type localManifest struct {
-	Package        string   `json:"package"`
-	Release        string   `json:"release"`
-	PythonRequires string   `json:"python_requires,omitempty"`
-	PythonVersion  string   `json:"python_version,omitempty"`
-	Source         Object   `json:"source"`
-	Wheels         []Object `json:"wheels,omitempty"`
-	Requirements   *Object  `json:"requirements,omitempty"`
+	Package        string            `json:"package"`
+	Release        string            `json:"release"`
+	PythonRequires string            `json:"python_requires,omitempty"`
+	PythonVersion  string            `json:"python_version,omitempty"`
+	Source         *Object           `json:"source,omitempty"`
+	Wheels         []Object          `json:"wheels,omitempty"`
+	Requirements   *Object           `json:"requirements,omitempty"`
+	Callees        map[string]string `json:"callees,omitempty"`
 }
 
 // LocalSource writes an unpublished package (its source archive, vendored wheels and locked
@@ -133,7 +134,7 @@ type localManifest struct {
 // writes nothing new and reopens the machine's installation.
 func LocalSource(ctx context.Context, client pb.MachineClient, installation localpackage.Installation) (string, error) {
 	manifest := localManifest{Package: installation.Package, Release: installation.Release,
-		PythonRequires: installation.PythonRequires, PythonVersion: installation.PythonVersion}
+		PythonRequires: installation.PythonRequires, PythonVersion: installation.PythonVersion, Callees: installation.Callees}
 	sourced := false
 	for _, file := range installation.Files {
 		object, err := WriteFile(ctx, client, file.Path)
@@ -141,14 +142,14 @@ func LocalSource(ctx context.Context, client pb.MachineClient, installation loca
 			return "", fmt.Errorf("writing %s: %w", file.Filename, err)
 		}
 		if file.Kind == "source" {
-			manifest.Source, sourced = object, true
+			manifest.Source, sourced = &object, true
 			continue
 		}
 		object.Name = file.Filename
 		manifest.Wheels = append(manifest.Wheels, object)
 	}
-	if !sourced {
-		return "", fmt.Errorf("%s has no source archive to write", installation.Package)
+	if !sourced && len(manifest.Wheels) == 0 {
+		return "", fmt.Errorf("%s has no source archive or retained wheels to write", installation.Package)
 	}
 	if len(installation.DependencyRequirements) > 0 {
 		requirements, err := WriteBytes(ctx, client, installation.DependencyRequirements)

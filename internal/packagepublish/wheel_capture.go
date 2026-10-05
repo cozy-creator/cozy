@@ -18,6 +18,7 @@ type CapturedDependency struct {
 	Name, Version, Path, Digest string
 	Requirement                 string
 	RegistryRequirement         string
+	Package                     string // original Hub package, empty for an unpublished wheel
 	Application                 bool
 }
 
@@ -99,6 +100,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 				captured.RegistryRequirement = requirement
 			}
 		}
+		captured.Package = row.packageRef
 		out[row.Name] = captured
 	}
 	return out, nil

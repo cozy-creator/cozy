@@ -40,6 +40,11 @@ func (i *childIntake) Finish(parentInstall string) *exit.Error {
 	if problem := i.store.RecordChildBindings(bindings); problem != nil {
 		return problem
 	}
+	if len(bindings) > 0 && i.prepared != nil && i.prepared.Install.ID == parentInstall {
+		if _, problem := localpackage.StagePrepared(context.Background(), i.layout, i.prepared.Install, i.Package); problem != nil {
+			return problem
+		}
+	}
 	if i.prepared != nil && i.prepared.Install.ID == parentInstall {
 		i.prepared = nil
 	}
@@ -151,7 +156,7 @@ func prepareChildIntakeGraph(ctx *Context, pack *packagepublish.Package, layout 
 			dependency.Close()
 			continue
 		}
-		_, problem = localpackage.Stage(context.Background(), layout, result.Install)
+		_, problem = localpackage.StagePrepared(context.Background(), layout, result.Install, dependency)
 		if problem != nil {
 			nested.Close()
 			dependency.Close()

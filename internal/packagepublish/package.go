@@ -42,6 +42,7 @@ type Package struct {
 	SourceArchive          string
 	DependencyWheels       []DependencyWheel
 	DependencyRequirements []byte
+	DependencyPackages     map[string]string    // original locked Hub identities of copied dependency wheels
 	Vendored               []VendoredDependency // auto-vendored local deps, for the publish nudge (th-113)
 	Registry               []RegistryRow        // locked registry rows; Tensorhub fetches (cl-078)
 	Tree                   string
