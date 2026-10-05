@@ -19,26 +19,32 @@ const writeChunk = 1 << 20
 // Write puts one content-addressed object on the machine, resuming from the bytes it already
 // holds: a header-only Write asks, and the rest streams from there.
 func Write(ctx context.Context, client pb.MachineClient, digest string, length int64, open func() (io.ReadSeekCloser, error)) error {
+	_, err := writeObject(ctx, client, digest, length, open)
+	return err
+}
+
+// writeObject is Write, answering whether any byte was sent (false: the machine held it all).
+func writeObject(ctx context.Context, client pb.MachineClient, digest string, length int64, open func() (io.ReadSeekCloser, error)) (bool, error) {
 	held, err := write(ctx, client, &pb.WriteFrame{Digest: digest, Length: uint64(length)}, nil)
 	if err != nil || held == uint64(length) {
-		return err
+		return false, err
 	}
 	body, err := open()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer body.Close()
 	if _, err := body.Seek(int64(held), io.SeekStart); err != nil {
-		return err
+		return false, err
 	}
 	header := &pb.WriteFrame{Digest: digest, Length: uint64(length), Offset: held}
 	if held, err = write(ctx, client, header, body); err != nil {
-		return err
+		return true, err
 	}
 	if held != uint64(length) {
-		return fmt.Errorf("the machine holds %d of %s's %d bytes", held, digest, length)
+		return true, fmt.Errorf("the machine holds %d of %s's %d bytes", held, digest, length)
 	}
-	return nil
+	return true, nil
 }
 
 func write(ctx context.Context, client pb.MachineClient, header *pb.WriteFrame, body io.Reader) (uint64, error) {
@@ -90,27 +96,39 @@ type Object struct {
 
 // WriteFile writes the file at path, named by its sha256.
 func WriteFile(ctx context.Context, client pb.MachineClient, path string) (Object, error) {
+	object, _, err := writeFile(ctx, client, path)
+	return object, err
+}
+
+func writeFile(ctx context.Context, client pb.MachineClient, path string) (Object, bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return Object{}, err
+		return Object{}, false, err
 	}
 	hash := sha256.New()
 	length, err := io.Copy(hash, file)
 	file.Close()
 	if err != nil {
-		return Object{}, err
+		return Object{}, false, err
 	}
 	object := Object{Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil)), Length: length}
 	open := func() (io.ReadSeekCloser, error) { return os.Open(path) }
-	return object, Write(ctx, client, object.Digest, length, open)
+	sent, err := writeObject(ctx, client, object.Digest, length, open)
+	return object, sent, err
 }
 
 // WriteBytes writes a small document, named by its sha256.
 func WriteBytes(ctx context.Context, client pb.MachineClient, data []byte) (Object, error) {
+	object, _, err := writeBytes(ctx, client, data)
+	return object, err
+}
+
+func writeBytes(ctx context.Context, client pb.MachineClient, data []byte) (Object, bool, error) {
 	sum := sha256.Sum256(data)
 	object := Object{Digest: "sha256:" + hex.EncodeToString(sum[:]), Length: int64(len(data))}
 	open := func() (io.ReadSeekCloser, error) { return nopCloser{bytes.NewReader(data)}, nil }
-	return object, Write(ctx, client, object.Digest, object.Length, open)
+	sent, err := writeObject(ctx, client, object.Digest, object.Length, open)
+	return object, sent, err
 }
 
 type nopCloser struct{ io.ReadSeeker }
@@ -131,16 +149,17 @@ type localManifest struct {
 
 // LocalSource writes an unpublished package (its source archive, vendored wheels and locked
 // requirements) and then its manifest. A run names the manifest's digest; unchanged code
-// writes nothing new and reopens the machine's installation.
-func LocalSource(ctx context.Context, client pb.MachineClient, installation localpackage.Installation) (string, error) {
+// writes nothing new and reopens the machine's installation, and `sent` is then false.
+func LocalSource(ctx context.Context, client pb.MachineClient, installation localpackage.Installation) (manifestDigest string, sent bool, err error) {
 	manifest := localManifest{Package: installation.Package, Release: installation.Release,
 		PythonRequires: installation.PythonRequires, PythonVersion: installation.PythonVersion, Callees: installation.Callees}
 	sourced := false
 	for _, file := range installation.Files {
-		object, err := WriteFile(ctx, client, file.Path)
+		object, wrote, err := writeFile(ctx, client, file.Path)
 		if err != nil {
-			return "", fmt.Errorf("writing %s: %w", file.Filename, err)
+			return "", false, fmt.Errorf("writing %s: %w", file.Filename, err)
 		}
+		sent = sent || wrote
 		if file.Kind == "source" {
 			manifest.Source, sourced = &object, true
 			continue
@@ -149,19 +168,20 @@ func LocalSource(ctx context.Context, client pb.MachineClient, installation loca
 		manifest.Wheels = append(manifest.Wheels, object)
 	}
 	if !sourced && len(manifest.Wheels) == 0 {
-		return "", fmt.Errorf("%s has no source archive or retained wheels to write", installation.Package)
+		return "", false, fmt.Errorf("%s has no source archive or retained wheels to write", installation.Package)
 	}
 	if len(installation.DependencyRequirements) > 0 {
-		requirements, err := WriteBytes(ctx, client, installation.DependencyRequirements)
+		requirements, wrote, err := writeBytes(ctx, client, installation.DependencyRequirements)
 		if err != nil {
-			return "", fmt.Errorf("writing the locked requirements: %w", err)
+			return "", false, fmt.Errorf("writing the locked requirements: %w", err)
 		}
+		sent = sent || wrote
 		manifest.Requirements = &requirements
 	}
 	document, err := json.Marshal(manifest)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	written, err := WriteBytes(ctx, client, document)
-	return written.Digest, err
+	written, wrote, err := writeBytes(ctx, client, document)
+	return written.Digest, sent || wrote, err
 }

@@ -133,17 +133,20 @@ func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 	}
 	installation := localpackage.Installation{Package: "local/cozy-machine-cpu-lifecycle", Release: "0.1.0", PythonVersion: "3.12",
 		Files: []localpackage.File{{Kind: "source", Filename: "source.tar", Path: archive}}}
-	manifest, err := LocalSource(ctx, client, installation)
+	manifest, sent, err := LocalSource(ctx, client, installation)
 	must(t, err)
+	if !sent {
+		t.Fatal("new code was not written")
+	}
 	var stages []string
 	spec := &pb.RunSpec{Source: &pb.RunSpec_Local{Local: &pb.LocalSource{Manifest: manifest}}, Entrypoint: "steps", Owner: "alice"}
 	must(t, Prepare(ctx, client, "warm-1", spec, func(p Progress) { stages = append(stages, p.Stage) }))
 	if len(stages) == 0 {
 		t.Fatal("the warm run reported no progress")
 	}
-	again, err := LocalSource(ctx, client, installation)
+	again, sent, err := LocalSource(ctx, client, installation)
 	must(t, err)
-	if again != manifest {
-		t.Fatalf("the same code named another manifest: %s, then %s", manifest, again)
+	if again != manifest || sent {
+		t.Fatalf("the same code named another manifest (%s, then %s) or was written again (%t)", manifest, again, sent)
 	}
 }
