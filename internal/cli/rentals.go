@@ -1139,7 +1139,7 @@ func machineStatusFields(status api.MachineStatus, typed bool) []output.Field {
 	if typed {
 		// "devices", as a person reads it: a rental's own "gpus" is the count it was bought with.
 		return append(fields, output.Field{K: "devices", V: status.GPUs}, output.Field{K: "live_runs", V: status.Runs},
-			output.Field{K: "disk_free_bytes", V: status.DiskFreeBytes})
+			output.Field{K: "disk_free_bytes", V: status.DiskFreeBytes}, output.Field{K: "warm", V: status.Warm})
 	}
 	gpus := make([]string, 0, len(status.GPUs))
 	for _, gpu := range status.GPUs {
@@ -1149,6 +1149,14 @@ func machineStatusFields(status api.MachineStatus, typed bool) []output.Field {
 		fields = append(fields, output.Field{K: "devices", V: strings.Join(gpus, ", ")})
 	}
 	fields = append(fields, output.Field{K: "live runs", V: len(status.Runs)})
+	// The warm set: each member at its level, or what it holds instead and why.
+	for _, member := range status.Warm {
+		held := member.Level
+		if member.Holds != member.Level {
+			held = fmt.Sprintf("%s, holds %s: %s", member.Level, member.Holds, member.HeldBack)
+		}
+		fields = append(fields, output.Field{K: "warm " + member.Package + "/" + member.Entrypoint, V: held})
+	}
 	if status.DiskTotalBytes > 0 {
 		fields = append(fields, output.Field{K: "disk free", V: fmt.Sprintf("%.1f of %.1f GiB", float64(status.DiskFreeBytes)/(1<<30), float64(status.DiskTotalBytes)/(1<<30))})
 	}

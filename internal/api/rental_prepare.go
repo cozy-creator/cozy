@@ -77,6 +77,14 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		}
 		downloads = nil
 	}
+	if body.Warm != "" {
+		// A warm set member: the machine resolves its function's model choices itself.
+		if body.Package == "" || body.Entrypoint == "" || body.Destination != "" {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "a warm set member names one package function"))
+			return
+		}
+		downloads = nil
+	}
 	for _, model := range downloads {
 		if !model.Downloadable() {
 			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model installation requires a downloadable Hub checkpoint"))

@@ -471,6 +471,7 @@ type RunExecuteCmd struct {
 	SourceProfiles      []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
 	Await               bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
 	Describe            bool     `help:"Print the callable's request contract instead of running it."`
+	Warm                string   `help:"Keep the function ready on the machine instead of running it: installed, downloaded, imported, host or gpu (each includes the ones before); off takes it out of the machine's warm set."`
 }
 
 func (c *RunExecuteCmd) Run(r *Runtime) error {
@@ -487,7 +488,8 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
-		"--upload-to", c.UploadTo, "--allow-upload", c.AllowUpload, "--source-profile", c.SourceProfiles), !c.Describe)
+		"--upload-to", c.UploadTo, "--allow-upload", c.AllowUpload, "--source-profile", c.SourceProfiles,
+		"--warm", c.Warm), !c.Describe)
 }
 
 type RunPlayCmd struct {

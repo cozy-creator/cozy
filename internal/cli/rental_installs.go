@@ -125,8 +125,22 @@ func emitInstalled(ctx *Context, install records.RentalInstall, began time.Time)
 		Models []struct {
 			Published *struct{ Destination, Checkpoint string } `json:"published"`
 		} `json:"models"`
+		// A warm set: each member with the level it holds and why that is short of its ask.
+		Set []struct {
+			Package, Entrypoint, Level string
+			HeldBack                   string `json:"held_back"`
+		} `json:"set"`
 	}
-	if json.Unmarshal(install.Result, &result) == nil && len(result.Models) == 1 && result.Models[0].Published != nil {
+	_ = json.Unmarshal(install.Result, &result)
+	for _, member := range result.Set {
+		if selection := install.Selection; member.Package == selection.Package && member.Entrypoint == selection.Entrypoint {
+			fields, shown = append(fields, output.Field{K: "level", V: member.Level}), append(shown, "level")
+			if member.HeldBack != "" {
+				fields, shown = append(fields, output.Field{K: "held_back", V: member.HeldBack}), append(shown, "held_back")
+			}
+		}
+	}
+	if len(result.Models) == 1 && result.Models[0].Published != nil {
 		published := result.Models[0].Published
 		fields = append(fields, output.Field{K: "destination", V: published.Destination}, output.Field{K: "checkpoint", V: published.Checkpoint})
 		shown = append(shown, "destination", "checkpoint")
@@ -180,6 +194,9 @@ func (w *installWatch) report(ctx *Context, stage string, done, total uint64) {
 }
 
 func rentalInstallTarget(selection records.RentalInstallSelection) string {
+	if selection.Warm != "" {
+		return selection.Package + "/" + selection.Entrypoint + " warm=" + selection.Warm
+	}
 	if selection.Package != "" {
 		return selection.Package + "@" + selection.Release
 	}
