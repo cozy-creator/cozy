@@ -87,6 +87,23 @@ func (s *Store) LoseMachineExecution(id, machine, message string) *exit.Error {
 	return nil
 }
 
+// LoseMachine settles everything a machine replaced for good still owed. Each run keeps the
+// state it ended in and records, in message, that the machine's own record of it is gone.
+func (s *Store) LoseMachine(machine, message string) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin the replaced machine's settlement: %s", err)
+	}
+	defer tx.Rollback()
+	if problem := settleLost(tx, machine, "", message); problem != nil {
+		return problem
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit the replaced machine's settlement: %s", err)
+	}
+	return nil
+}
+
 // settleLostMachine ends every obligation on a machine proven gone. A run whose offer
 // never left this host is released to be placed again, charging nothing. A sent offer
 // may have executed, and that execution and its bytes died with the machine.
