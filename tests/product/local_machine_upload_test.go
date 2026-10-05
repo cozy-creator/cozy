@@ -76,8 +76,8 @@ app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),))
 
 // A conversion shows every call it made: its own execution as call 0, and its checkpoint
 // upload as a call, with how it ended and why. Here the Hub refuses the publication, so the
-// run fails and its upload call says so. A real Runtime records the call (0.18.79+); a
-// successful upload's transfer bytes are recorded the same way (Runtime's checkpoint test).
+// run fails and its upload call says so, with the Hub's reason. The machine records the call
+// for the publication it makes during the run.
 func TestAConversionShowsItsCheckpointUploadAsACall(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	// The machine's grant to publish into the destination the owner consented to, and the
@@ -126,7 +126,7 @@ func TestAConversionShowsItsCheckpointUploadAsACall(t *testing.T) {
 		t.Fatalf("call 0 is not the run's own execution: %+v", run)
 	}
 	if upload.Number != 1 || upload.Function != "upload_checkpoint" || upload.Label != "Upload checkpoint to proof/model" ||
-		upload.Status != "failed" || upload.Error != "publication was refused before its commit" {
+		upload.Status != "failed" || !strings.HasPrefix(upload.Error, "publication was refused before its commit: publication.destination_refused") {
 		t.Fatalf("the checkpoint upload is not a call that says why it failed: %+v", upload)
 	}
 	code, human := runCozy(t, root, "run", "show", "1")
