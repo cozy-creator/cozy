@@ -22,6 +22,23 @@ func CapturedRoot(capture ExecutionCapture, rootID string) (Installation, *exit.
 	if len(capture.Installations) == 1 {
 		return root, nil
 	}
+	rootHasWheel := false
+	var source *File
+	for i := range root.Files {
+		file := &root.Files[i]
+		rootHasWheel = rootHasWheel || file.Kind == "project"
+		if file.Kind == "source" {
+			source = file
+		}
+	}
+	if !rootHasWheel && source != nil {
+		// Earlier source captures already contain the relocated local dependency
+		// trees and frozen lock. Replay that immutable archive through uv sync;
+		// mixing a new wheel closure into that lock would change its installation.
+		root.Files = []File{*source}
+		root.DependencyRequirements = nil
+		return root, nil
+	}
 	root.Callees = map[string]string{}
 	wheels := map[string]File{}
 	versions := map[string]string{}
@@ -43,7 +60,7 @@ func CapturedRoot(capture ExecutionCapture, rootID string) (Installation, *exit.
 			if problem != nil {
 				return Installation{}, problem
 			}
-			if !wheel.SameVersion(fact.Version, installation.Release) || fact.Distribution != strings.TrimPrefix(installation.Package, "local/") {
+			if !wheel.SameVersion(fact.Version, installation.Release) || fact.Distribution != packageDistribution(installation.Package) {
 				return Installation{}, exit.New(exit.Conflict, "captured project wheel differs from its installation")
 			}
 			if previous := wheels[fact.Distribution]; previous.Path != "" && previous.Digest != file.Digest {
@@ -55,7 +72,7 @@ func CapturedRoot(capture ExecutionCapture, rootID string) (Installation, *exit.
 			}
 		}
 	}
-	if !projects[strings.TrimPrefix(root.Package, "local/")] {
+	if !projects[packageDistribution(root.Package)] {
 		return Installation{}, exit.New(exit.Conflict, "multi-package capture has no retained root wheel; capture its source at intake")
 	}
 	for _, file := range root.Files {
@@ -90,4 +107,11 @@ func CapturedRoot(capture ExecutionCapture, rootID string) (Installation, *exit.
 	}
 	sort.Slice(root.Files, func(i, j int) bool { return root.Files[i].Filename < root.Files[j].Filename })
 	return root, nil
+}
+
+func packageDistribution(pkg string) string {
+	if _, name, ok := strings.Cut(pkg, "/"); ok {
+		return name
+	}
+	return pkg
 }

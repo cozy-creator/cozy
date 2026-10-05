@@ -76,10 +76,39 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 	if code, out := runCozy(t, root, "run", "local/callee-caller-proof/main", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":214`) {
 		t.Fatalf("ordinary nested package job did not return 214 [%d]: %s", code, out)
 	}
+	// Recreate the older source-only retention format from this run's immutable
+	// installed snapshot, keeping its existing captured graph and install ID.
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	request, problem := store.RequestByReference("1")
+	fatal(t, problem)
+	installed, problem := store.Install(request.InstallID)
+	fatal(t, problem)
+	legacyLayout, problem := home.Open(t.TempDir())
+	fatal(t, problem)
+	legacyInstall := *installed
+	legacyInstall.ProjectDir = legacyInstall.SourceRef
+	legacy, problem := localpackage.Stage(t.Context(), legacyLayout, legacyInstall)
+	fatal(t, problem)
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	retained := filepath.Join(layout.LocalPackages, installed.ID)
+	archive, err := os.ReadFile(legacy.Files[0].Path)
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(retained, "source.tar"), archive, 0o600))
+	document, err := json.Marshal(legacy)
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(retained, "installation.json"), document, 0o600))
+	if code, out := runCozy(t, root, "run", "local/callee-caller-proof/main", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":214`) {
+		t.Fatalf("old source-only multi-package capture did not replay [%d]: %s", code, out)
+	}
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine/root/var/lib/cozy/rust-machine/execution/executions.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer db.Close()
-	rows, err := db.Query("SELECT invocation FROM executions ORDER BY id")
+	// Inspect the first run's three executed jobs. The legacy replay may reuse its
+	// previously completed child through a memo, which has no live generation/executor.
+	rows, err := db.Query("SELECT invocation FROM executions WHERE id <= 3 ORDER BY id")
 	must(t, err)
 	defer rows.Close()
 	var packages []string
@@ -92,7 +121,10 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 			Job                         bool
 		}
 		must(t, json.Unmarshal(raw, &invocation))
-		if !invocation.Job || len(packages) > 0 && (invocation.Generation != generation || invocation.Parent == "") {
+		if invocation.Parent == "" {
+			generation = invocation.Generation
+		}
+		if !invocation.Job || invocation.Generation != generation {
 			t.Fatalf("callee job escaped the captured environment or kind: %+v", invocation)
 		}
 		generation = invocation.Generation
