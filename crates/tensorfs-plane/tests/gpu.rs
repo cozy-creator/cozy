@@ -98,6 +98,26 @@ fn check_region(plane: &Plane, ws: WsId, r: u32, got: &[u8]) {
     }
 }
 
+/// Every host copy was one DMA from locked memory or went through the staging buffers; locked
+/// whenever the driver locked the layout. Prints both rates.
+fn assert_never_pageable(p: &Plane, what: &str) {
+    let st = p.stats();
+    let d = &st.devices[0].counters;
+    let gbps = |b: u64, ns: u64| b as f64 / ns.max(1) as f64;
+    println!(
+        "{what}: locked {} B at {:.1} GB/s, bounced {} B at {:.1} GB/s, files {} B; register_failed {}",
+        d.host_copy_bytes,
+        gbps(d.host_copy_bytes, d.host_copy_ns),
+        d.bounce_copy_bytes,
+        gbps(d.bounce_copy_bytes, d.bounce_copy_ns),
+        d.disk_copy_bytes,
+        st.host.counters.register_failed
+    );
+    if st.host.counters.register_failed == 0 {
+        assert_eq!(d.bounce_copy_bytes, 0, "{d:?}");
+    }
+}
+
 fn resident(plane: &Plane, ws: WsId, s: &Stream, r: u32) -> Lease {
     let l = plane.acquire(ws, DEV, r, s.raw(), None).unwrap();
     let got = s.read(l.ptr, l.nbytes);
@@ -685,6 +705,45 @@ mod copy_faults {
         health().unwrap();
     }
 
+    /// A region the driver refuses to page-lock is copied through the staging buffers, exact,
+    /// never as pageable memory, and asked once.
+    #[test]
+    #[ignore = "GPU"]
+    fn a_region_refused_a_lock_is_bounced_and_never_asked_again() {
+        use std::os::fd::AsRawFd;
+        let fx = Fixture::new("gpu-sealed-refused");
+        let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+        let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+        let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+        let fd = tensorfs_plane::host::fill_sealed("unet", &layout, &source, 3, &tensorfs_plane::io::IoTally::default(), None).unwrap();
+        drop(source);
+        let p = staging_plane();
+        let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+        let s = Stream::new();
+        p.set_pinned_budget(0).unwrap();
+        p.set_vram_budget(DEV, 512 << 20).unwrap();
+        faults::arm("pin", 1); // the first region's lock is refused
+        let mut asked = 0;
+        for pass in 0..2 {
+            p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
+            for r in 0..3 {
+                resident(&p, ws, &s, r).release(s.raw()).unwrap();
+            }
+            if pass == 0 {
+                asked = p.stats().host.counters.register_failed;
+                assert!(p.drop_regions(ws, Tier::Device(DEV), None).unwrap() > 0);
+            }
+        }
+        let st = p.stats();
+        let d = &st.devices[0].counters;
+        assert!(asked >= 1 && st.host.counters.register_failed == asked, "asked once: {:?}", st.host.counters);
+        assert!(d.bounce_copy_bytes > 0, "{d:?}");
+        assert_eq!(d.disk_copy_bytes, 0);
+        healthy();
+        s.sync();
+        p.close().unwrap();
+    }
+
     #[test]
     #[ignore = "GPU"]
     fn a_failed_fill_is_reported_only_after_its_queued_copies_drained() {
@@ -817,7 +876,7 @@ mod copy_faults {
 
 #[test]
 #[ignore = "GPU"]
-fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_pageable_past_it() {
+fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_locked_past_it() {
     use std::os::fd::AsRawFd;
     let fx = Fixture::new("gpu-sealed");
     let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
@@ -841,9 +900,12 @@ fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_pageable_past
         resident(&p, ws, &s, r).release(s.raw()).unwrap();
     }
     let st = p.stats();
-    assert_eq!(st.devices[0].counters.disk_copy_bytes, 0, "a sealed layout never reads the store");
-    assert!(st.devices[0].counters.host_copy_bytes > 70 << 20, "{:?}", st.devices[0]);
+    let d = &st.devices[0].counters;
+    assert_eq!(d.disk_copy_bytes, 0, "a sealed layout never reads the store");
+    assert!(d.host_copy_bytes + d.bounce_copy_bytes > 70 << 20, "{d:?}");
     assert_eq!(st.host.counters.fill_bytes, 0);
+    // Past the budget: locked on its first copy, or bounced where the driver refuses.
+    assert_never_pageable(&p, "sealed, pinned budget for region 0");
     // Streaming past the budget copies the unpinned regions straight from the layout.
     assert!(p.drop_regions(ws, Tier::Device(DEV), None).unwrap() > 0);
     p.set_vram_budget(DEV, (2 * 72) << 20).unwrap();
@@ -870,7 +932,8 @@ fn a_layout_still_filling_reaches_the_device_region_by_region() {
     let p = plane();
     let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
     let s = Stream::new();
-    // Region 0 in the pinned books (waits, then registers); 1 and 2 pageable (the mover waits).
+    // Region 0 in the pinned books (waits, then registers); 1 and 2 locked on their first copy
+    // once Ready (the mover waits for that).
     let spans: Vec<u64> = p.layout(ws).unwrap().regions.iter().map(|r| r.span).collect();
     p.set_pinned_budget(spans[0]).unwrap();
     let pinned = p.want(ws, Tier::Pinned, Some(&[0]), 0, false).unwrap();
@@ -887,6 +950,45 @@ fn a_layout_still_filling_reaches_the_device_region_by_region() {
         resident(&p, ws, &s, r).release(s.raw()).unwrap();
     }
     assert_eq!(p.stats().devices[0].counters.disk_copy_bytes, 0);
+    s.sync();
+    p.close().unwrap();
+}
+
+/// F's R1 cells (RTX 3070, 3 GiB pool): a sealed region outside the executor's pinned books was
+/// copied as pageable memory, about 2 GB/s against 11 through the staging buffers, and every
+/// request after the machine staged a model's streamed regions was 1.7x slower than the first.
+/// Each such region is page-locked on its first copy, with no pinned budget charged.
+#[test]
+#[ignore = "GPU"]
+fn a_sealed_region_outside_the_pinned_books_is_locked_on_its_first_copy() {
+    use std::os::fd::AsRawFd;
+    let fx = Fixture::new("gpu-sealed-locked");
+    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let source = tensorfs_plane::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let layout = tensorfs_plane::layout::Layout::build(&fx.plan(), &regions()).unwrap();
+    let fd = tensorfs_plane::host::fill_sealed("unet", &layout, &source, 3, &tensorfs_plane::io::IoTally::default(), None).unwrap();
+    drop(source);
+    let p = plane();
+    let ws = p.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
+    let s = Stream::new();
+    p.set_pinned_budget(0).unwrap();
+    p.set_vram_budget(DEV, 512 << 20).unwrap();
+    for pass in 0..2 {
+        p.want(ws, Tier::Device(DEV), None, 0, false).unwrap().wait().unwrap();
+        for r in 0..3 {
+            resident(&p, ws, &s, r).release(s.raw()).unwrap();
+        }
+        if pass == 0 {
+            assert!(p.drop_regions(ws, Tier::Device(DEV), None).unwrap() > 0);
+        }
+    }
+    let st = p.stats();
+    let d = &st.devices[0].counters;
+    assert_eq!(st.host.used, 0, "no pinned budget was charged");
+    assert_eq!(d.disk_copy_bytes, 0);
+    assert!(d.host_copy_bytes + d.bounce_copy_bytes >= (2 * 70) << 20, "{d:?}");
+    assert!(st.host.counters.register_failed <= 1, "a refusal holds for the layout: {:?}", st.host.counters);
+    assert_never_pageable(&p, "sealed, outside the pinned books");
     s.sync();
     p.close().unwrap();
 }
@@ -922,7 +1024,9 @@ fn a_streamed_layout_reaches_the_device_through_one_slot() {
     }
     let st = p.stats();
     assert_eq!(st.devices[0].counters.disk_copy_bytes, 0, "the executor reads no store");
-    assert!(st.devices[0].counters.host_copy_bytes > 70 << 20);
+    // A slot is refilled with another region once its copy lets go: never locked, bounced.
+    assert!(st.devices[0].counters.bounce_copy_bytes > 70 << 20, "{:?}", st.devices[0]);
+    assert_eq!(st.devices[0].counters.host_copy_bytes, 0);
     s.sync();
     p.close().unwrap();
     stop.store(true, Ordering::Release);
@@ -985,7 +1089,8 @@ fn holes_reach_the_device_from_the_object_files_and_staged_regions_from_the_layo
     }
     let st = p.stats();
     assert!(st.devices[0].counters.disk_copy_bytes > 3 << 20, "holes 0 and 2 came from the files: {:?}", st.devices[0]);
-    assert!(st.devices[0].counters.host_copy_bytes >= 70 << 20, "region 1 from the pinned layout");
+    let d = &st.devices[0].counters;
+    assert!(d.host_copy_bytes + d.bounce_copy_bytes >= 70 << 20, "region 1 from the layout: {d:?}");
     s.sync();
     p.close().unwrap();
     drop(fill);

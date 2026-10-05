@@ -140,6 +140,7 @@ fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
             "held_bytes" => d.held_bytes, "over_budget_unreleasable" => d.over_budget_unreleasable,
             "reserved_va" => d.reserved_va, "shared_bytes" => d.shared_bytes, "copies" => c.copies,
             "host_copy_bytes" => c.host_copy_bytes, "host_copy_ns" => c.host_copy_ns,
+            "bounce_copy_bytes" => c.bounce_copy_bytes, "bounce_copy_ns" => c.bounce_copy_ns,
             "disk_copy_bytes" => c.disk_copy_bytes, "disk_copy_ns" => c.disk_copy_ns,
             "mapped_copy_bytes" => c.mapped_copy_bytes, "mapped_copy_ns" => c.mapped_copy_ns,
             "misses" => c.misses, "evictions" => c.evictions, "evicted_bytes" => c.evicted_bytes,

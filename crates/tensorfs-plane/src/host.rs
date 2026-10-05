@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tensorfs_core::ids::ObjectRef;
@@ -54,6 +54,11 @@ const FAILED: u32 = 2;
 /// adopter waits for it; it reads the weight set's object files instead. The machine may stage
 /// it later (`OpenFill::stage`), which clears the bit before the first byte lands.
 const HOLE: u32 = 4;
+
+/// A region's page lock in this process (`HostMem::pin_region`): not tried, registered, refused.
+const PIN_NONE: u8 = 0;
+const PIN_YES: u8 = 1;
+const PIN_REFUSED: u8 = 2;
 
 fn ext_off(regions: usize) -> usize {
     (WORDS_OFF + 4 * regions).next_multiple_of(8)
@@ -240,6 +245,9 @@ pub struct HostMem {
     /// Registered ranges (offset, context as an address): unregistered at drop at the latest,
     /// since unmapping a registered range leaves the driver a stale pinned range at that VA.
     registered: Mutex<Vec<(u64, usize)>>,
+    /// Each region's page lock (`pin_region`); taken under `pinning`.
+    pinned: Vec<AtomicU8>,
+    pinning: Mutex<()>,
     /// A streamed layout: its slots hold the regions; None, the regions sit at their offsets.
     window: Option<Window>,
     /// This process's readers per region of a streamed layout: one claim per description, held
@@ -443,6 +451,8 @@ impl HostMem {
             regions,
             sealed,
             registered: Mutex::new(Vec::new()),
+            pinned: (0..regions).map(|_| AtomicU8::new(PIN_NONE)).collect(),
+            pinning: Mutex::new(()),
             window,
             readers: Mutex::new(HashMap::new()),
         })
@@ -614,6 +624,8 @@ impl HostMem {
             regions,
             sealed,
             registered: Mutex::new(Vec::new()),
+            pinned: (0..regions).map(|_| AtomicU8::new(PIN_NONE)).collect(),
+            pinning: Mutex::new(()),
             window: None,
             readers: Mutex::new(HashMap::new()),
         };
@@ -751,6 +763,61 @@ impl HostMem {
         // SAFETY: out-param.
         unsafe { (d.ctx_get_current)(&mut ctx) };
         self.registered.lock().unwrap().push((off, ctx as usize));
+        Ok(())
+    }
+
+    /// Page-lock region `r` (`[off, off + len)`) once, so its copies to a device are one DMA,
+    /// and keep it until `unpin_region` or the layout closes. Returns (locked, refused now): a
+    /// refused region is never asked again and its copies go through the staging buffers,
+    /// never as pageable memory. A sealed layout is mapped read-only, so only a driver that
+    /// locks read-only memory can lock it (an RTX 4070 answers NOT_SUPPORTED): that answer
+    /// holds for the whole layout. Only a region whose bytes exist (Ready): a hole's pages
+    /// would be allocated by the lock. The caller binds a context first.
+    pub fn pin_region(&self, r: u32, off: u64, len: u64) -> (bool, bool) {
+        let state = &self.pinned[r as usize];
+        let _g = self.pinning.lock().unwrap();
+        match state.load(Ordering::Acquire) {
+            PIN_YES => (true, false),
+            PIN_REFUSED => (false, false),
+            _ => match crate::faults::hit("pin").and_then(|_| self.register(off, len)) {
+                Ok(()) => {
+                    state.store(PIN_YES, Ordering::Release);
+                    (true, false)
+                }
+                Err(Error::Cuda { code: cuda::ERROR_NOT_SUPPORTED, .. }) if self.sealed => {
+                    for state in &self.pinned {
+                        let _ = state.compare_exchange(PIN_NONE, PIN_REFUSED, Ordering::AcqRel, Ordering::Acquire);
+                    }
+                    (false, true)
+                }
+                Err(_) => {
+                    state.store(PIN_REFUSED, Ordering::Release);
+                    (false, true)
+                }
+            },
+        }
+    }
+
+    /// Unlock region `r` before its RAM is punched; a refill locks it again. The caller binds a
+    /// context first.
+    pub fn unpin_region(&self, r: u32, off: u64) -> Result<()> {
+        let _g = self.pinning.lock().unwrap();
+        if self.pinned[r as usize].swap(PIN_NONE, Ordering::AcqRel) == PIN_YES {
+            self.unregister(off)?;
+        }
+        Ok(())
+    }
+
+    /// Unlock every region this process locked (a plane closing, while its context lives).
+    pub fn unpin_all(&self) -> Result<()> {
+        let _g = self.pinning.lock().unwrap();
+        let offsets: Vec<u64> = self.registered.lock().unwrap().iter().map(|r| r.0).collect();
+        for off in offsets {
+            self.unregister(off)?;
+        }
+        for state in &self.pinned {
+            state.store(PIN_NONE, Ordering::Release);
+        }
         Ok(())
     }
 

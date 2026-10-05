@@ -131,12 +131,14 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
     let w = c.ws_mut(ws)?;
     let region = w.layout.regions[r as usize].clone();
     let held = matches!(w.hregs[r as usize].state, HState::Ready);
-    let from_host = held || (w.host.sealed() && !w.host.hole(r));
+    let sealed = w.host.sealed() && !w.host.hole(r);
     let src = if held {
+        let locked = w.hregs[r as usize].registered;
         w.hregs[r as usize].holds += 1;
         // SAFETY: inside the live mapping; the hold keeps the region until the copy's event.
-        CopySrc::Host(unsafe { w.host.base().add(region.offset as usize) })
-    } else if from_host {
+        let p = unsafe { w.host.base().add(region.offset as usize) } as *const u8;
+        if locked { CopySrc::Host(p) } else { CopySrc::Bounce(p) }
+    } else if sealed {
         CopySrc::Sealed { host: w.host.clone(), region: r, offset: region.offset }
     } else {
         CopySrc::Disk {
@@ -167,10 +169,13 @@ fn submit(inner: &Arc<Inner>, c: &mut Core, id: u64, k: u64, off: u64, waits: Ve
             if let Ok(cp) = &res {
                 c.dstats[d].copies += 1;
                 c.tag(ws.0, d, &tag).streamed_bytes += cp.bytes;
+                if cp.refused {
+                    c.hstats.register_failed += 1;
+                }
                 c.timings.push_back(Timing {
                     dev: d,
                     ws: ws.0,
-                    kind: TimingKind::Copy { from_host },
+                    kind: TimingKind::Copy { path: cp.path },
                     a: cp.start.clone(),
                     b: cp.ready.clone(),
                     bytes: cp.bytes,

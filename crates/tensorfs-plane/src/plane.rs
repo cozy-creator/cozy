@@ -18,7 +18,7 @@ use tensorfs_core::read::ReadPlan;
 
 use crate::cuda::{self, AllocationProp, CUcontext, CUdevice, CUstream, CtxGuard};
 use crate::cursor::Cur;
-use crate::device::{self, Arena, Chunk, CopyJob, CopySrc, Copied, EvRef, EventPool, Mover, MoverCtx};
+use crate::device::{self, Arena, Chunk, CopyJob, CopyPath, CopySrc, Copied, EvRef, EventPool, Mover, MoverCtx};
 use crate::host::HostMem;
 use crate::io::{Batch, Dst, IoTally, Mode, Readers, Source};
 use crate::layout::{Layout, REGION_ALIGN};
@@ -168,8 +168,14 @@ pub(crate) struct Ws {
 #[derive(Debug, Clone, Default)]
 pub struct DevCounters {
     pub copies: u64,
+    /// One DMA from page-locked host memory (the pinned tier, a sealed region locked on its
+    /// first copy).
     pub host_copy_bytes: u64,
     pub host_copy_ns: u64,
+    /// Host memory this process could not page-lock, through the staging buffers.
+    pub bounce_copy_bytes: u64,
+    pub bounce_copy_ns: u64,
+    /// The object files, through the staging buffers.
     pub disk_copy_bytes: u64,
     pub disk_copy_ns: u64,
     /// 0.3.92's copies from page-cache mappings, removed in 0.3.93: always 0, kept for callers
@@ -207,7 +213,7 @@ pub struct TagCounters {
 }
 
 pub(crate) enum TimingKind {
-    Copy { from_host: bool },
+    Copy { path: CopyPath },
     /// The consumer stream's wait on a late copy.
     Stall { tag: String, region: u32 },
     /// The consumer's use of a region: end of the wait to the release event.
@@ -332,15 +338,15 @@ pub(crate) fn resolve_timings(c: &mut Core, all: bool) {
         }
         let ns = (t.b.since(&t.a).unwrap_or(0.0) as f64 * 1e6) as u64;
         match &t.kind {
-            TimingKind::Copy { from_host } => {
+            TimingKind::Copy { path } => {
                 let s = &mut c.dstats[t.dev];
-                if *from_host {
-                    s.host_copy_bytes += t.bytes;
-                    s.host_copy_ns += ns;
-                } else {
-                    s.disk_copy_bytes += t.bytes;
-                    s.disk_copy_ns += ns;
-                }
+                let (bytes, total) = match path {
+                    CopyPath::Pinned => (&mut s.host_copy_bytes, &mut s.host_copy_ns),
+                    CopyPath::Bounced => (&mut s.bounce_copy_bytes, &mut s.bounce_copy_ns),
+                    CopyPath::Files => (&mut s.disk_copy_bytes, &mut s.disk_copy_ns),
+                };
+                *bytes += t.bytes;
+                *total += ns;
             }
             TimingKind::Compute { tag, region } => {
                 let k = (t.ws, t.dev, tag.clone(), *region);
@@ -537,11 +543,13 @@ impl Inner {
         let h = &mut w.hregs[r as usize];
         debug_assert!(matches!(h.state, HState::Ready) && h.holds == 0);
         sync_all(&mut h.pending)?;
-        if h.registered {
+        if h.registered && !host.sealed() {
+            // Its RAM is punched below; a sealed layout's is the machine's and stays locked
+            // here until the layout closes, so a later copy of it is still one DMA.
             let _g = first.map(CtxGuard::enter).transpose()?;
-            host.unregister(region.offset)?;
-            h.registered = false;
+            host.unpin_region(r, region.offset)?;
         }
+        h.registered = false;
         let punched = host.release(r, region.offset, region.span)?;
         h.state = HState::Absent;
         if evict {
@@ -623,14 +631,13 @@ impl Inner {
             let mut registered = false;
             if res.is_ok() {
                 if let Some(dev) = inner.devices.first() {
-                    let reg = CtxGuard::enter(dev.ctx).and_then(|_g| {
-                        host2.register(region.offset, crate::layout::align_up(region.nbytes, crate::layout::PART_ALIGN))
-                    });
-                    registered = reg.is_ok();
-                    if let Err(e) = reg {
+                    let span = crate::layout::align_up(region.nbytes, crate::layout::PART_ALIGN);
+                    let pinned = CtxGuard::enter(dev.ctx).map(|_g| host2.pin_region(r, region.offset, span));
+                    registered = matches!(pinned, Ok((true, _)));
+                    if matches!(pinned, Ok((false, true)) | Err(_)) {
                         let mut c = inner.core.lock().unwrap();
                         c.hstats.register_failed += 1;
-                        c.event(Event::new("register_failed", Some(name.clone()), Some(r), None, region.nbytes, 0, e.to_string()));
+                        c.event(Event::new("register_failed", Some(name.clone()), Some(r), None, region.nbytes, 0, String::new()));
                     }
                 }
                 if !host2.sealed() {
@@ -802,12 +809,14 @@ impl Inner {
         }
         let held = matches!(hstate, HState::Ready);
         // A sealed layout's hole (a region its machine did not stage) reads the object files.
-        let from_host = held || (w.host.sealed() && !w.host.hole(r));
+        let sealed = w.host.sealed() && !w.host.hole(r);
         let src = if held {
+            let locked = w.hregs[r as usize].registered;
             w.hregs[r as usize].holds += 1;
             // SAFETY: inside the live mapping; the hold keeps the region from eviction.
-            CopySrc::Host(unsafe { w.host.base().add(region.offset as usize) })
-        } else if from_host {
+            let p = unsafe { w.host.base().add(region.offset as usize) } as *const u8;
+            if locked { CopySrc::Host(p) } else { CopySrc::Bounce(p) }
+        } else if sealed {
             // A sealed layout's region outside the pinned books copies as pageable memory, once
             // its machine marks it Ready (the mover waits for that word).
             CopySrc::Sealed { host: w.host.clone(), region: r, offset: region.offset }
@@ -846,10 +855,13 @@ impl Inner {
                     Ok(cp) => {
                         reg.state = DState::Filling(cp.ready.clone());
                         c.dstats[d].copies += 1;
+                        if cp.refused {
+                            c.hstats.register_failed += 1;
+                        }
                         c.timings.push_back(Timing {
                             dev: d,
                             ws: ws.0,
-                            kind: TimingKind::Copy { from_host },
+                            kind: TimingKind::Copy { path: cp.path },
                             a: cp.start,
                             b: cp.ready,
                             bytes: cp.bytes,
@@ -1856,12 +1868,14 @@ fn teardown(devices: &[DeviceRt], c: &mut Core) -> Result<()> {
     }
     let first = devices.first().map(|d| d.ctx);
     for w in c.sets.iter_mut().flatten() {
+        // Every region this process locked (in the books, or a sealed one locked on a copy)
+        // is unlocked before its RAM is punched, while the context lives.
+        {
+            let _g = first.map(CtxGuard::enter).transpose()?;
+            w.host.unpin_all()?;
+        }
         for (r, (h, region)) in w.hregs.iter_mut().zip(&w.layout.regions).enumerate() {
-            if h.registered {
-                let _g = first.map(CtxGuard::enter).transpose()?;
-                w.host.unregister(region.offset)?;
-                h.registered = false;
-            }
+            h.registered = false;
             if matches!(h.state, HState::Ready) {
                 w.host.release(r as u32, region.offset, region.span)?;
                 h.state = HState::Absent;

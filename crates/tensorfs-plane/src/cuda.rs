@@ -22,6 +22,7 @@ pub const ERROR_INVALID_VALUE: CUresult = 1;
 pub const ERROR_OUT_OF_MEMORY: CUresult = 2;
 pub const ERROR_HOST_MEMORY_ALREADY_REGISTERED: CUresult = 712;
 pub const ERROR_NOT_READY: CUresult = 600;
+pub const ERROR_NOT_SUPPORTED: CUresult = 801;
 
 pub const STREAM_NON_BLOCKING: c_uint = 0x1;
 pub const EVENT_DEFAULT: c_uint = 0x0;
