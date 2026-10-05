@@ -65,6 +65,7 @@ type fakePod struct {
 	identity         string
 	noSeats          bool
 	servesV1         bool // also answers cozy.machine.v1 Status (identity), as a Rust machine does
+	keepalive        func(*pb.KeepRentalAliveRequest) *pb.KeepRentalAliveResult
 	mediaReservation func(int64, int) error
 	mediaRequest     func(http.ResponseWriter, *http.Request) bool
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
@@ -1043,6 +1044,14 @@ func (p *fakePod) DescribeMachine(_ context.Context, query *pb.DescribeMachineQu
 	return p.describe(query)
 }
 
-func (p *fakePod) KeepRentalAlive(context.Context, *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
-	return nil, status.Error(codes.Unimplemented, "keepalive is Status on cozy.machine.v1")
+// KeepRentalAlive is a machine that predates cozy.machine.v1 resetting its idle deadline when
+// keepalive is set; nil answers UNIMPLEMENTED, as the Rust machine's worker.v1 surface does.
+func (p *fakePod) KeepRentalAlive(_ context.Context, request *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
+	if p.keepalive == nil {
+		return nil, status.Error(codes.Unimplemented, "keepalive is Status on cozy.machine.v1")
+	}
+	if err := p.verifyClaim(request.GetClaim(), false); err != nil {
+		return nil, err
+	}
+	return p.keepalive(request), nil
 }

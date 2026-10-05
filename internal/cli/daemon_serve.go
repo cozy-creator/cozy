@@ -137,7 +137,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution: machines.Start,
 		Cfg:                   ctx.Cfg, Layout: l, Store: st, Log: ctx.Out,
-		Rentals: rentals, RentalClaimProof: rental.ClaimProof(l), RentalSigner: rental.Signer(l),
+		Rentals: rentals, RentalClaimProof: rental.ClaimProof(l),
 		ModelTransfers: transfers,
 		ReclaimInstall: func(id string) *exit.Error {
 			// Background cleanup and editable refresh are mutations by this same daemon.
