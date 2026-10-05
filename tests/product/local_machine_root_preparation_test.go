@@ -1,20 +1,17 @@
 package producttest
 
 import (
-	"encoding/json"
 	"os"
-	"path/filepath"
-	"syscall"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// An unchanged unpublished package is prepared once per Runtime: a warm run goes straight
-// to the machine that holds it. A Runtime that restarted under the same connection answers
-// the root as absent and gets the code again; a new machine lifetime prepares it anew.
-func TestAnUnpublishedRootIsPreparedOncePerRuntime(t *testing.T) {
+// An unchanged unpublished package is prepared once per machine store: a warm run, and a run
+// after the machine restarts, go straight to the code the machine holds, and the run shows no
+// package preparation for them.
+func TestAnUnpublishedRootIsPreparedOncePerMachine(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine runs the call")
 	}
@@ -60,29 +57,11 @@ func TestAnUnpublishedRootIsPreparedOncePerRuntime(t *testing.T) {
 		t.Fatal("a warm run prepared the package its machine already holds")
 	}
 
-	var agent struct {
-		PID int `json:"pid"`
-	}
-	raw, err := os.ReadFile(filepath.Join(layout.Machine, "agent.json"))
-	must(t, err)
-	must(t, json.Unmarshal(raw, &agent))
-	runtime := runtimeChild(agent.PID)
-	if runtime == 0 {
-		t.Fatal("the machine runs no Runtime")
-	}
-	must(t, syscall.Kill(runtime, syscall.SIGKILL))
-	landed(t, "the machine to restart its Runtime", func() bool {
-		next := runtimeChild(agent.PID)
-		return next != 0 && next != runtime
-	})
-	if !prepared("restarted") {
-		t.Fatal("a restarted Runtime's run did not get its package again")
-	}
-
 	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 		t.Fatalf("machine stop [exit %d]\n%s", code, out)
 	}
-	if !prepared("rebooted") {
-		t.Fatal("a new machine lifetime's first run did not prepare its package")
+	// The machine's store outlives it: a new lifetime reopens the code it holds.
+	if prepared("rebooted") {
+		t.Fatal("a restarted machine's run prepared the package its store already holds")
 	}
 }

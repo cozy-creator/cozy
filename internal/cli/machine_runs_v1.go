@@ -354,12 +354,15 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		if problem != nil {
 			return nil, problem
 		}
-		manifest, err := machinev1.LocalSource(ctx, machine.Machine, revision)
+		manifest, sent, err := machinev1.LocalSource(ctx, machine.Machine, revision)
 		if err != nil {
 			return nil, machines.Transport(err)
 		}
 		spec.Source = &v1.RunSpec_Local{Local: &v1.LocalSource{Manifest: manifest}}
-		m.submissionStage(request.ID, "package", revision.Package, began)
+		if sent {
+			// Code the machine did not hold yet; held code reopens its installation as it is.
+			m.submissionStage(request.ID, "package", revision.Package, began)
+		}
 	} else {
 		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: request.Package, Release: request.Release}}
 	}
