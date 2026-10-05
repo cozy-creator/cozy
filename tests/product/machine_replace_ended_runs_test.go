@@ -99,7 +99,7 @@ func TestMachineInstallReplacesAnOlderMachineWhoseRunsHaveEnded(t *testing.T) {
 	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &installed) != nil || installed.Replaced == nil {
 		t.Fatalf("install over a machine whose runs have ended [exit %d]\n%s", code, out)
 	}
-	if !strings.Contains(out, "never collected, and gone with the older machine: the outputs of run 2 ") {
+	if !strings.Contains(out, "any output not already saved went with the older machine: run 2 ") {
 		t.Fatalf("the install does not say which completed run's outputs went with the older machine:\n%s", out)
 	}
 	if code, human := runCozy(t, root, "machine", "show"); code != 0 || strings.Contains(human, "older kind") {
