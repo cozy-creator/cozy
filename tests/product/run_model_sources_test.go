@@ -122,18 +122,18 @@ func declaredInstallPlan(distribution, release string, iface *launch.PackageInte
 func TestPinnedCheckpointTransferKeepsReleaseAndLaneConstraints(t *testing.T) {
 	root, _, _, digest, _ := runModelCatalog(t)
 	source := "proof/source@1.0.0/bf16#" + digest
-	request, _, out := submitRun(t, root, "pinned-download", "model", "download", source, "local/pinned", "--json", "--full")
-	if request == nil || request.ModelTransfer == nil || request.ModelTransfer.SourceSelection != digest ||
-		request.ModelTransfer.InputLane != "bf16" || !strings.Contains(request.ModelTransfer.Source, "1.0.0") {
-		t.Fatalf("the accepted transfer discarded the explicit release/lane/digest constraints: %+v %s", request, out)
+	accepted := queuedTransfer(t, root, "model", "download", source, "local/pinned", "--json", "--full")
+	if len(accepted.Models) != 1 || accepted.Models[0].Manifest != digest || accepted.Models[0].Lane != "bf16" ||
+		accepted.Models[0].Release != "1.0.0" || accepted.Destination != "local/pinned" {
+		t.Fatalf("the accepted transfer discarded the explicit release/lane/digest constraints: %+v", accepted)
 	}
 	code, out := runCozy(t, root, "model", "download", source, "local/pinned", "--lane", "fp8", "--json")
-	if code == 0 || !strings.Contains(out, "disagree") {
-		t.Fatal("conflicting explicit lane was accepted")
+	if code == 0 || !strings.Contains(out, "was already selected") {
+		t.Fatalf("conflicting explicit lane was accepted [exit %d]: %s", code, out)
 	}
 	code, out = runCozy(t, root, "model", "download", "proof/source@1.0.0/bf16#sha256:"+strings.Repeat("f", 64), "local/pinned", "--json")
-	if code == 0 || !strings.Contains(out, "manifest.not_found") {
-		t.Fatal("checkpoint outside the pinned release/lane was accepted")
+	if code == 0 || !strings.Contains(out, "does not contain manifest") {
+		t.Fatalf("checkpoint outside the pinned release/lane was accepted [exit %d]: %s", code, out)
 	}
 }
 
@@ -175,8 +175,8 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
 	root, mu, posts, digest, manifest := runModelCatalog(t)
 	startDaemonProcess(t, root)
-	if request, _, out := submitRun(t, root, "checkpoint-download", "model", "download", "proof/source#"+digest, "local/checkpoint-proof", "--json"); request == nil {
-		t.Fatalf("checkpoint download was refused: %s", out)
+	if accepted := queuedTransfer(t, root, "model", "download", "proof/source#"+digest, "local/checkpoint-proof", "--json", "--full"); len(accepted.Models) != 1 || accepted.Models[0].Manifest != digest {
+		t.Fatalf("checkpoint download lost its checkpoint: %+v", accepted)
 	}
 	args := []string{"run", "proof/quantize/quantize", "steps=7",
 		"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
@@ -314,4 +314,27 @@ func TestCatalogCheckpointReferenceRoundTripsThroughRun(t *testing.T) {
 	if request == nil || len(request.Models) != 2 || !request.Models[0].HubCheckpoint || request.Models[0].Manifest != digest {
 		t.Fatalf("copied catalog ref did not resolve checkpoint: %+v %s", request, out)
 	}
+}
+
+// queuedTransfer runs a model transfer and answers the installation it queued on this
+// computer's machine, as the daemon recorded it: the models, file and destination the
+// command froze.
+func queuedTransfer(t *testing.T, root string, args ...string) records.RentalInstallSelection {
+	t.Helper()
+	code, out := runCozy(t, root, args...)
+	var accepted struct {
+		ID string `json:"id"`
+	}
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &accepted) != nil || accepted.ID == "" {
+		t.Fatalf("%v was not queued [exit %d]: %s", args, code, out)
+	}
+	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer st.Close()
+	install, problem := st.RentalInstall(accepted.ID)
+	fatal(t, problem)
+	if install == nil {
+		t.Fatalf("installation %s is not recorded", accepted.ID)
+	}
+	return install.Selection
 }

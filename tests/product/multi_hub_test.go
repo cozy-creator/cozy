@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -187,17 +186,19 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 	// The upload to hub b is accepted by the same daemon that holds a's rental.
 	source := filepath.Join(root, "source.safetensors")
 	must(t, os.WriteFile(source, []byte("multi-hub upload source"), 0o600))
-	code, out := runCozy(t, root, "model", "upload", source, "proof/multi-hub", "--tensorhub=b",
-		"--idempotency-key", "multi-hub-upload", "--json")
-	if code != 0 {
+	code, out := runCozy(t, root, "model", "upload", source, "proof/multi-hub", "--tensorhub=b", "--json")
+	var accepted struct {
+		ID string `json:"id"`
+	}
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &accepted) != nil || accepted.ID == "" {
 		t.Fatalf("upload to hub b was refused: %d %s", code, out)
 	}
 	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	upload, problem := store.RequestByIdempotencyKey("multi-hub-upload")
+	upload, problem := store.RentalInstall(accepted.ID)
 	fatal(t, problem)
 	store.Close()
-	if upload == nil || upload.Hub != hubB {
+	if upload == nil || upload.Selection.Hub != hubB || upload.Selection.Destination != "proof/multi-hub" {
 		t.Fatalf("the upload did not record hub b: %+v", upload)
 	}
 
@@ -235,10 +236,6 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 	}
 	if all := list("--all-hubs"); len(all.Rentals) != 1 || all.Rentals[0]["hub"] != hubA {
 		t.Fatalf("--all-hubs lost a's rental: %+v", all)
-	}
-	code, out = runCozy(t, root, "run", "list", "--all-hubs", "--json")
-	if code != 0 || !strings.Contains(out, fmt.Sprintf("%q", hubB)) {
-		t.Fatalf("run list --all-hubs lost the upload's hub: %d %s", code, out)
 	}
 
 	// Ending a's rental while b is current goes to a, with a's credential.

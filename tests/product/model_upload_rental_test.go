@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// A local source never goes to a rental, and a named rental must never degrade to a
-// boolean; both refuse without provider I/O, a daemon or an allocation.
+// A named rental this host does not hold is refused, and a named rental must never degrade
+// to a boolean; both refuse without Hub or provider I/O, a daemon or an allocation.
 func TestModelUploadNamedRentalGrammar(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source.safetensors")
@@ -18,7 +18,7 @@ func TestModelUploadNamedRentalGrammar(t *testing.T) {
 		code  int
 		want  string
 	}{
-		{[]string{"--rental=otter"}, 1, "model_transfer.rented_source_unavailable"},
+		{[]string{"--rental=otter"}, 1, `no rental \"otter\" on this host`},
 		{[]string{"--rental="}, 2, "requires an existing rental name"},
 	} {
 		args := append([]string{"model", "upload", source, "proof/output", "--json"}, row.flags...)

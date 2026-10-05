@@ -1,43 +1,29 @@
 package producttest
 
 import (
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/modelsource"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
+// A local file kept under a local alias is an installation on this computer's machine that
+// names the file by its content (object://sha256:<hex>/<name>) and the exact path written to
+// the machine; noncanonical file spellings are refused.
 func TestLocalModelSourceStaysLocalAfterCanonicalization(t *testing.T) {
 	root, _, _, _, _ := runModelCatalog(t)
 	source := filepath.Join(root, "fixture.safetensors")
-	must(t, os.WriteFile(source, []byte("small local source"), 0o600))
+	body := []byte("small local source")
+	must(t, os.WriteFile(source, body, 0o600))
 	startDaemonProcess(t, root)
-	code, out := runCozy(t, root, "model", "download", source, "local/classification-proof", "--json", "--full")
-	if code != 0 {
-		t.Fatalf("local source was refused before submission: %d %s", code, out)
-	}
-	var result struct {
-		ID string `json:"id"`
-	}
-	must(t, json.Unmarshal([]byte(out), &result))
-	if result.ID == "" {
-		t.Fatalf("no submitted run: %s", out)
-	}
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	transfer, problem := store.ModelTransferOf(result.ID)
-	fatal(t, problem)
-	if transfer == nil || !transfer.LocalOnly || transfer.Source != "file:"+source {
-		t.Fatalf("local path lost its placement at submission: %+v", transfer)
-	}
-	parsed, problem := modelsource.Parse(transfer.Source, root)
-	fatal(t, problem)
-	if parsed.Kind != modelsource.LocalFile || parsed.Path != source {
-		t.Fatalf("executing machine cannot reopen the exact persisted source: %+v", parsed)
+	accepted := queuedTransfer(t, root, "model", "download", source, "local/classification-proof", "--json", "--full")
+	sum := sha256.Sum256(body)
+	if len(accepted.Models) != 1 || accepted.Models[0].Source != "object://sha256:"+hex.EncodeToString(sum[:])+"/fixture.safetensors" ||
+		accepted.Write != source || accepted.Destination != "local/classification-proof" {
+		t.Fatalf("the local file lost its exact identity at submission: %+v", accepted)
 	}
 	for _, spelling := range []string{"file:./fixture.safetensors", "file://" + source} {
 		if _, problem := modelsource.Parse(spelling, root); problem == nil {
