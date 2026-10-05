@@ -332,6 +332,12 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	}
 	if request.IsJob() {
 		spec.Kind = v1.RunKind_RUN_KIND_JOB
+		// Its memoized calls' results this computer already holds, from any machine.
+		known, problem := m.store.KnownResults(request.Package)
+		if problem != nil {
+			return nil, problem
+		}
+		spec.KnownResults = known
 		if request.ModelTransfer != nil && request.ModelTransfer.Destination != "" {
 			// The machine publishes the job's weights outputs there itself, under this grant.
 			spec.WeightsDestination = request.ModelTransfer.Destination

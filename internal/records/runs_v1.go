@@ -170,6 +170,14 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 					return err
 				}
 			}
+		case *v1.RunEvent_Memo:
+			// A memoized call's result: the package's later jobs carry it as known (KnownResults).
+			if m := value.Memo; json.Valid(m.Result) && len(m.Result) <= maxKnownResult {
+				if err := appendEventTx(tx, id, MemoRecorded, max(ordinal, 1), map[string]any{"operation": m.Operation,
+					"computation_digest": m.ComputationDigest, "result": json.RawMessage(m.Result)}); err != nil {
+					return err
+				}
+			}
 		}
 		if event.Sequence != 0 {
 			_, err = tx.Exec(`UPDATE machine_executions SET remote_cursor=? WHERE request_id=?`, event.Sequence, id)
