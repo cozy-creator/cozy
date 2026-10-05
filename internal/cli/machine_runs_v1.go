@@ -390,23 +390,8 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	if len(request.Assets) > 0 {
 		m.submissionStage(request.ID, "inputs", fmt.Sprintf("%d input(s)", len(request.Assets)), began)
 	}
-	choices, problem := orchestrator.ModelChoices(request, request.Models)
-	if problem != nil {
+	if spec.Models, problem = modelChoicesV1(request, request.Models); problem != nil {
 		return nil, problem
-	}
-	for _, choice := range choices {
-		model := &v1.ModelChoice{Parameter: choice.Parameter, Repository: choice.Repository, Release: choice.Release,
-			Lane: choice.Lane, Source: choice.Source, Profiles: choice.Profiles}
-		if choice.Manifest != nil {
-			model.Manifest, _ = canonical.Spell(choice.Manifest.Digest)
-			model.ManifestLength = choice.Manifest.Length
-		}
-		for _, adapter := range choice.Adapters {
-			model.Adapters = append(model.Adapters, &v1.Adapter{Component: adapter.Component, Model: adapter.Model,
-				Release: adapter.Release, Lane: adapter.Lane, Manifest: adapter.Manifest, Scale: adapter.Scale,
-				Source: adapter.Source, Profiles: adapter.Profiles})
-		}
-		spec.Models = append(spec.Models, model)
 	}
 	// A rental's machine reads its own Hub as the pod; any other gets the account's access.
 	if request.Hub != "" && !machine.Rented {
@@ -421,6 +406,57 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		spec.Providers = providers
 	}
 	return spec, nil
+}
+
+// modelChoicesV1 are a run's model choices as a v1 spec names them.
+func modelChoicesV1(request records.Request, models []records.ModelRef) ([]*v1.ModelChoice, *exit.Error) {
+	choices, problem := orchestrator.ModelChoices(request, models)
+	if problem != nil {
+		return nil, problem
+	}
+	out := make([]*v1.ModelChoice, 0, len(choices))
+	for _, choice := range choices {
+		model := &v1.ModelChoice{Parameter: choice.Parameter, Repository: choice.Repository, Release: choice.Release,
+			Lane: choice.Lane, Source: choice.Source, Profiles: choice.Profiles}
+		if choice.Manifest != nil {
+			model.Manifest, _ = canonical.Spell(choice.Manifest.Digest)
+			model.ManifestLength = choice.Manifest.Length
+		}
+		for _, adapter := range choice.Adapters {
+			model.Adapters = append(model.Adapters, &v1.Adapter{Component: adapter.Component, Model: adapter.Model,
+				Release: adapter.Release, Lane: adapter.Lane, Manifest: adapter.Manifest, Scale: adapter.Scale,
+				Source: adapter.Source, Profiles: adapter.Profiles})
+		}
+		out = append(out, model)
+	}
+	return out, nil
+}
+
+// warmSetV1 is the machine's warm set with the selection's member added, changed or (`off`)
+// removed; the other members are sent back as the machine reported them.
+func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection) (*v1.WarmSet, *exit.Error) {
+	set := &v1.WarmSet{}
+	for _, item := range current {
+		if item.GetRelease().GetPackage() == selection.Package && item.GetEntrypoint() == selection.Entrypoint {
+			continue
+		}
+		item.Holds, item.HeldBack = "", ""
+		set.Items = append(set.Items, item)
+	}
+	if selection.Warm == "off" {
+		return set, nil
+	}
+	level := slices.Index(records.WarmLevels, selection.Warm)
+	if level < 0 {
+		return nil, exit.Usagef("--warm=%s is not one of %s or off", selection.Warm, strings.Join(records.WarmLevels, ", "))
+	}
+	models, problem := modelChoicesV1(records.Request{Package: selection.Package, Entrypoint: selection.Entrypoint}, selection.Models)
+	if problem != nil {
+		return nil, problem
+	}
+	set.Items = append(set.Items, &v1.WarmItem{Source: &v1.WarmItem_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}},
+		Entrypoint: selection.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1)})
+	return set, nil
 }
 
 // prewarmV1 makes an installation present as a warm run named by the installation: its code
@@ -456,11 +492,21 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		origin = machine.Account.Base()
 	}
 	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_WARM, WeightsDestination: selection.Destination}
-	if selection.Package != "" {
-		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}}
-	}
 	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
 		spec.Owner = caller.Account
+	}
+	if selection.Warm != "" {
+		// A warm set member: the machine's whole set goes back with this one changed.
+		if !slices.Contains(capabilities, "warm/2") {
+			return nil, exit.Named(exit.Structural, "machine.warm_set_unsupported",
+				"this machine keeps no warm set; %s", machines.RuntimeUpdate(row.RentalID))
+		}
+		if spec.Set, problem = warmSetV1(frame.GetWarm(), selection); problem != nil {
+			return nil, problem
+		}
+		selection.Models = nil
+	} else if selection.Package != "" {
+		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}}
 	}
 	for _, model := range selection.Models {
 		spec.Models = append(spec.Models, &v1.ModelChoice{Parameter: either(model.Slot, model.Model), Repository: model.Model,

@@ -36,7 +36,15 @@ type RentalInstallSelection struct {
 	Write string `json:"write,omitempty"`
 	// Hub is the Tensorhub the selection is read at: this computer's machine prepares it there.
 	Hub string `json:"hub,omitempty"`
+	// Warm makes the package's Entrypoint a member of the machine's warm set, kept ready up to
+	// this level (WarmLevels); "off" takes it out. Models are then its `model.<param>=` choices.
+	Entrypoint string `json:"entrypoint,omitempty"`
+	Warm       string `json:"warm,omitempty"`
 }
+
+// WarmLevels are how far a machine keeps a warm set member ready, each including the ones
+// before it.
+var WarmLevels = []string{"installed", "downloaded", "imported", "host", "gpu"}
 
 type RentalInstall struct {
 	ID           string                 `json:"id"`

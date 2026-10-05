@@ -47,6 +47,7 @@ type MachineStatus struct {
 	GPUs               []MachineGPU         `json:"gpus"`
 	Runs               []MachineRun         `json:"runs"`
 	Environments       []MachineEnvironment `json:"environments"`
+	Warm               []MachineWarmMember  `json:"warm,omitempty"`
 	DiskTotalBytes     uint64               `json:"disk_total_bytes,omitempty"`
 	DiskFreeBytes      uint64               `json:"disk_free_bytes,omitempty"`
 	IdleDeadlineUnixMS int64                `json:"idle_deadline_unix_ms,omitempty"`
@@ -66,6 +67,18 @@ type MachineEnvironment struct {
 	Installation string `json:"installation"`
 	Package      string `json:"package"`
 	Release      string `json:"release"`
+	Level        string `json:"level,omitempty"` // what it holds now: installed … gpu
+}
+
+// MachineWarmMember is one function of the caller's warm set: the level asked, the level it
+// holds now, and why that is lower.
+type MachineWarmMember struct {
+	Package    string `json:"package"`
+	Release    string `json:"release,omitempty"`
+	Entrypoint string `json:"entrypoint"`
+	Level      string `json:"level"`
+	Holds      string `json:"holds"`
+	HeldBack   string `json:"held_back,omitempty"`
 }
 
 func (s *Server) machineStatus(w http.ResponseWriter, r *http.Request) {

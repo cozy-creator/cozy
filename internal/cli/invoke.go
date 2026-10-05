@@ -145,6 +145,9 @@ func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInte
 	if ctx.Inv.Bool("--describe") {
 		return emitDescribe(ctx, target, packageInterface, callable)
 	}
+	if level := ctx.Inv.Value("--warm"); level != "" {
+		return handleWarm(ctx, target, callable, level)
+	}
 	if callable.Kind == "job" && strings.HasPrefix(target.Package, "local/") && !target.Snapshot {
 		resolved := target.lease
 		target, packageInterface, problem = snapshotLocalJob(ctx, target)

@@ -542,7 +542,13 @@ func statusOf(frame *machinepb.StatusFrame) api.MachineStatus {
 		out.Runs = append(out.Runs, api.MachineRun{ID: run.GetId(), Number: run.GetNumber(), State: run.GetState()})
 	}
 	for _, env := range frame.GetEnvironments() {
-		out.Environments = append(out.Environments, api.MachineEnvironment{Installation: env.GetInstallation(), Package: env.GetPackage(), Release: env.GetRelease()})
+		out.Environments = append(out.Environments, api.MachineEnvironment{Installation: env.GetInstallation(), Package: env.GetPackage(),
+			Release: env.GetRelease(), Level: env.GetLevel()})
+	}
+	for _, item := range frame.GetWarm() {
+		level := strings.ToLower(strings.TrimPrefix(item.GetLevel().String(), "WARM_LEVEL_"))
+		out.Warm = append(out.Warm, api.MachineWarmMember{Package: either(item.GetRelease().GetPackage(), item.GetInstallation()),
+			Release: item.GetRelease().GetRelease(), Entrypoint: item.GetEntrypoint(), Level: level, Holds: item.GetHolds(), HeldBack: item.GetHeldBack()})
 	}
 	return out
 }

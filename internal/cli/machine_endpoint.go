@@ -205,6 +205,12 @@ func foregroundRental(ctx *Context, name string) (*machineendpoint.Endpoint, *ex
 	if caps, problem := c.Capabilities(); problem != nil || caps.MachineV1 {
 		return nil, problem
 	}
+	return rentalMachineEndpoint(ctx, name)
+}
+
+// rentalMachineEndpoint is a rental's machine as this command reaches it itself, by the
+// address and pinned certificate its record holds.
+func rentalMachineEndpoint(ctx *Context, name string) (*machineendpoint.Endpoint, *exit.Error) {
 	st, problem := records.Open(home.Paths(ctx.Cfg.Home).DB)
 	if problem != nil {
 		return nil, problem
