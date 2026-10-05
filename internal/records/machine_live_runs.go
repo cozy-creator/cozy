@@ -9,8 +9,8 @@ func (s *Store) MachineLiveRuns(machine string) ([]Request, *exit.Error) {
 	return s.machineRuns(machine, `r.state NOT IN (`+settledRequestStates+`) AND `+machineExecutionLive)
 }
 
-// MachineUncollectedRuns is every completed run on a machine whose outputs this client never
-// collected: they exist only on that machine.
+// MachineUncollectedRuns is every completed run on a machine that this client never finished
+// collecting: an output it has not saved exists only on that machine.
 func (s *Store) MachineUncollectedRuns(machine string) ([]Request, *exit.Error) {
 	return s.machineRuns(machine, `r.state='succeeded' AND length(e.receipt)>0 AND e.collected=0 AND NOT `+
 		machineExecutionLost+` AND NOT `+machineRetentionReleased)

@@ -81,7 +81,7 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		case problem != nil:
 			notes = append(notes, "the older machine's ended runs could not be marked as gone with it: "+problem.Message)
 		case len(uncollected) > 0:
-			notes = append(notes, "never collected, and gone with the older machine: the outputs of "+runsPhrase(uncollected))
+			notes = append(notes, "completed but not fully collected; any output not already saved went with the older machine: "+runsPhrase(uncollected))
 		}
 	}
 	return emit(ctx, output.Record{Fields: fields, Notes: notes})
