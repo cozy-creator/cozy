@@ -22,7 +22,14 @@ type shownRun struct {
 		Type    string          `json:"type"`
 		Payload json.RawMessage `json:"payload"`
 	} `json:"events"`
-	Calls []shownCall `json:"calls"`
+	Calls       []shownCall `json:"calls"`
+	ExecutionMS *int64      `json:"execution_ms"`
+	Stages      []struct {
+		Name        string  `json:"name"`
+		StartUnixMS int64   `json:"start_unix_ms"`
+		MS          float64 `json:"ms"`
+		Detail      string  `json:"detail"`
+	} `json:"stages"`
 }
 
 type shownCall struct {
@@ -246,6 +253,24 @@ func TestRunShowListsEachChildCallOfALocalRun(t *testing.T) {
 	var shown shownRun
 	if code != 0 || json.Unmarshal([]byte(out), &shown) != nil || len(shown.Calls) != 4 || shown.Calls[0].Number != 0 {
 		t.Fatalf("run show --json [%d]:\n%.2000s", code, out)
+	}
+	// The machine measures the run's own running time; each step of its preparation is one row
+	// that says when it began and how long it took.
+	if shown.ExecutionMS == nil || *shown.ExecutionMS <= 0 {
+		t.Fatalf("run show --json has no execution time:\n%.2000s", out)
+	}
+	steps := map[string]bool{}
+	for _, stage := range shown.Stages {
+		if stage.Name != "machine preparation" {
+			continue
+		}
+		if steps[stage.Detail] || stage.StartUnixMS <= 0 || stage.MS <= 0 {
+			t.Fatalf("machine preparation step %q is repeated or unmeasured:\n%.3000s", stage.Detail, out)
+		}
+		steps[stage.Detail] = true
+	}
+	if len(steps) == 0 {
+		t.Fatalf("run show --json lists no machine preparation:\n%.3000s", out)
 	}
 	for _, call := range shown.Calls[1:] {
 		kinds := map[string]string{}

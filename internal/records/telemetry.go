@@ -221,7 +221,11 @@ func telemetryRowV1(event *v1.RunEvent, current string) (string, map[string]any)
 		} else if p.BytesDone > 0 {
 			detail = strings.TrimSpace(detail + " · " + humanBytes(p.BytesDone) + " read")
 		}
-		return "request.preparing", map[string]any{"stage": "machine", "detail": detail}
+		preparing := map[string]any{"stage": "machine", "step": p.Stage, "detail": detail}
+		if p.BytesTotal > 0 || p.BytesDone > 0 {
+			preparing["bytes_done"], preparing["bytes_total"] = p.BytesDone, p.BytesTotal
+		}
+		return "request.preparing", preparing
 	}
 	sample := map[string]any{"stage": p.Stage}
 	if p.Fraction >= 0 {

@@ -337,6 +337,10 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	} else {
 		state.ExecutionMS, state.ExecutionKnown = measured, known
 	}
+	if outcome := records.RunV1Outcome(link); v1run && outcome != nil && outcome.ExecutionMs > 0 && outcome.ExecutionMs <= math.MaxInt64 {
+		// A cozy.machine.v1 machine measures the run's own running time, every attempt summed.
+		state.ExecutionMS, state.ExecutionKnown = int64(outcome.ExecutionMs), true
+	}
 	if state.Status == "canceled" {
 		// A canceled run says WHO (cl-108), as a job without a machine does.
 		if actor, _, _, problem := s.store.CancelAttribution(row.ID); problem == nil {

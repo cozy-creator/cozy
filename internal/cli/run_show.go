@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -241,6 +242,7 @@ func (e gpuEvent) cards() []reportGPU {
 
 type preparingEvent struct {
 	Stage            string `json:"stage"`
+	Step             string `json:"step"` // a machine's preparation step, its bytes aside
 	Detail           string `json:"detail"`
 	MS               int64  `json:"ms"`
 	StartedUnixMS    int64  `json:"started_unix_ms"`
@@ -376,12 +378,23 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	phases := map[string][]reportStage{} // phase records naming a child request, by it
 	fetched := false                     // the Runtime recorded each model's pull itself
 	var started time.Time                // when the machine began the run's own execution
+	var machineSteps []machineStep       // the machine's preparation steps, in order
+	var machineStarted int64             // when the machine started running the run (its clock)
+	var endedAt int64                    // when the run ended here
 	for _, event := range evidence.Events {
 		at, _ := time.Parse(time.RFC3339Nano, event.At)
 		switch event.Type {
 		case "run.in_progress":
 			if started.IsZero() {
 				started = at
+				var running struct {
+					StartedUnixMS int64 `json:"started_unix_ms"`
+				}
+				if json.Unmarshal(event.Payload, &running) == nil && running.StartedUnixMS > 0 {
+					machineStarted = running.StartedUnixMS // on the machine's clock, as its steps
+				} else {
+					machineStarted = at.UnixMilli()
+				}
 			}
 		case "machine.gpu.grant":
 			// Runtime's device lease for one call attempt, held until the matching release.
@@ -478,9 +491,22 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			}
 		case "request.preparing":
 			var preparing preparingEvent
-			if json.Unmarshal(event.Payload, &preparing) == nil {
-				report.Stages = append(report.Stages, preparingStage(preparing))
+			if json.Unmarshal(event.Payload, &preparing) != nil {
+				continue
 			}
+			if preparing.Stage != "machine" {
+				report.Stages = append(report.Stages, preparingStage(preparing))
+				continue
+			}
+			// The machine's own preparation: each progress line of one step is that step.
+			step := cmp.Or(preparing.Step, preparing.Detail)
+			if n := len(machineSteps); n > 0 && machineSteps[n-1].step == step {
+				machineSteps[n-1].Detail = preparing.Detail
+				continue
+			}
+			row := preparingStage(preparing)
+			row.StartUnixMS = at.UnixMilli()
+			machineSteps = append(machineSteps, machineStep{reportStage: row, step: step})
 		case "request.log":
 			var record logEvent
 			if json.Unmarshal(event.Payload, &record) != nil {
@@ -512,7 +538,19 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			if !at.IsZero() && !created.IsZero() {
 				report.WallMS = at.Sub(created).Milliseconds()
 			}
+			endedAt = at.UnixMilli()
 		}
+	}
+	// Each machine preparation step lasts until the next begins; the last, until the run runs.
+	for i := range machineSteps {
+		end := cmp.Or(machineStarted, endedAt) // a run that never ran prepared until it ended
+		if i+1 < len(machineSteps) {
+			end = machineSteps[i+1].StartUnixMS
+		}
+		if end > machineSteps[i].StartUnixMS {
+			machineSteps[i].MS = float64(end - machineSteps[i].StartUnixMS)
+		}
+		report.Stages = append(report.Stages, machineSteps[i].reportStage)
 	}
 	// A call's phases are its own; a shared preparation's (a model download several calls
 	// wait on) and the run's are the run's. A Runtime that records each model's pull has
@@ -676,6 +714,12 @@ func (r runReport) call(selector string) (reportCall, *exit.Error) {
 	}
 	return reportCall{}, exit.New(exit.NotFound, "run %s has no call %q; `cozy run show %s` lists its calls",
 		runReference(r.Number, r.RequestID), selector, runReference(r.Number, r.RequestID))
+}
+
+// machineStep is one step of a machine's own preparation and the progress line that names it.
+type machineStep struct {
+	reportStage
+	step string
 }
 
 func preparingStage(event preparingEvent) reportStage {

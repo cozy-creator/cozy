@@ -77,7 +77,7 @@ func (s *Store) AcceptRunV1(id string, state *v1.RunState) *exit.Error {
 	if err := appendEventTx(tx, id, RunV1Accepted, int64(state.Attempt), map[string]any{"number": state.Number, "state": state.State}); err != nil {
 		return exit.Internalf("cannot record the run's acceptance: %s", err)
 	}
-	if err := projectRunV1(tx, id, state); err != nil {
+	if err := projectRunV1(tx, id, state, 0); err != nil {
 		return exit.Internalf("cannot project the run's acceptance: %s", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -89,7 +89,8 @@ func (s *Store) AcceptRunV1(id string, state *v1.RunState) *exit.Error {
 // projectRunV1 moves the request to the machine's state. A terminal word waits for the
 // outcome, which carries the result; a canceled request stays canceled; a requested cancel
 // shows canceling until the machine ends the run.
-func projectRunV1(tx *sql.Tx, id string, state *v1.RunState) error {
+// startedMS is when the machine started the run running (its clock), 0 when not known.
+func projectRunV1(tx *sql.Tx, id string, state *v1.RunState, startedMS int64) error {
 	var current string
 	var cancel bool
 	if err := tx.QueryRow(`SELECT r.state, COALESCE(e.cancel_requested,0) FROM requests r LEFT JOIN machine_executions e ON e.request_id=r.id WHERE r.id=?`, id).Scan(&current, &cancel); err != nil {
@@ -112,7 +113,11 @@ func projectRunV1(tx *sql.Tx, id string, state *v1.RunState) error {
 		next = "canceling"
 	}
 	if next == "dispatching" && current != "dispatching" {
-		if err := appendEventTx(tx, id, "run.in_progress", int64(state.Attempt), map[string]any{"machine_execution": true}); err != nil {
+		running := map[string]any{"machine_execution": true}
+		if startedMS > 0 {
+			running["started_unix_ms"] = startedMS
+		}
+		if err := appendEventTx(tx, id, "run.in_progress", int64(state.Attempt), running); err != nil {
 			return err
 		}
 	}
@@ -154,7 +159,7 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 		}
 		switch value := event.Event.(type) {
 		case *v1.RunEvent_State:
-			if err := projectRunV1(tx, id, value.State); err != nil {
+			if err := projectRunV1(tx, id, value.State, event.AtMs); err != nil {
 				return err
 			}
 		case *v1.RunEvent_Product:
