@@ -764,16 +764,26 @@ fn staged_copy(
                     }
                 }
                 Staged::Host(p) => {
-                    let batch = Batch::new(1, signal);
-                    let (from, into) = (Dst(unsafe { p.add(c0 as usize) } as *mut u8), Dst(bounces[b].ptr));
+                    // One piece per reader thread: a chunk copied by one thread is the whole
+                    // pipeline's rate (an RTX 3070 pod under CPU pressure: 2 GB/s on a 12 GB/s
+                    // link), and the file path already reads a chunk's items in parallel.
                     let n = (c1 - c0) as usize;
-                    m.readers.submit(true, move || {
-                        let (from, into) = (from, into);
-                        // SAFETY: the host range stays mapped until this copy returns (it
-                        // waits for every batch); the bounce is this chunk's.
-                        unsafe { std::ptr::copy_nonoverlapping(from.0 as *const u8, into.0, n) };
-                        batch.finish(Ok(()));
-                    });
+                    let pieces = m.readers.threads().min(n.div_ceil(crate::layout::PART_ALIGN as usize)).max(1);
+                    let piece = n.div_ceil(pieces);
+                    let batch = Batch::new(pieces, signal);
+                    for k in 0..pieces {
+                        let (at, len) = (k * piece, piece.min(n - (k * piece).min(n)));
+                        let from = Dst(unsafe { p.add(c0 as usize + at) } as *mut u8);
+                        let into = Dst(unsafe { bounces[b].ptr.add(at) });
+                        let batch = batch.clone();
+                        m.readers.submit(true, move || {
+                            let (from, into) = (from, into);
+                            // SAFETY: the host range stays mapped until this copy returns (it
+                            // waits for every batch); the bounce range is this piece's.
+                            unsafe { std::ptr::copy_nonoverlapping(from.0 as *const u8, into.0, len) };
+                            batch.finish(Ok(()));
+                        });
+                    }
                 }
             }
             inflight.push_back((c0, b, w));
