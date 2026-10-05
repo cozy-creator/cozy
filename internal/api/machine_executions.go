@@ -159,6 +159,10 @@ func (s *Server) refreshMachineExecution(ctx context.Context, request records.Re
 	if problem != nil || link == nil || link.Abandoned || len(link.Receipt) == 0 || link.Collected && len(link.PendingControl) == 0 {
 		return problem
 	}
+	// A run whose rental is known to have ended settles here: nothing waits on its machine.
+	if problem := s.store.ReconcileEndedMachineExecution(request.ID); problem != nil {
+		return problem
+	}
 	if lost, problem := s.store.MachineExecutionLost(request.ID); problem != nil || lost {
 		return problem
 	}

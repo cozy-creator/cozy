@@ -147,6 +147,10 @@ func endpointForRecordedRun(ctx *Context, id string) (func(), *exit.Error) {
 	if !machineendpoint.IsName(link.MachineID) {
 		return nil, nil
 	}
+	// Settled before anything starts: a run whose rental is known to have ended has nothing to reach.
+	if problem := st.ReconcileEndedMachineExecution(row.ID); problem != nil {
+		return nil, problem
+	}
 	ep, problem := st.RequestMachineEndpoint(row.ID, link.MachineID)
 	if problem != nil {
 		return nil, problem
