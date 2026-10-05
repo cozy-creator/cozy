@@ -166,10 +166,10 @@ func handleRent(ctx *Context) *exit.Error {
 	row, attachable, replay, e := acquireRentalContext(watchCtx, ctx, l, st, skuName, gpus,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, deadline, "", rentalDiskWatch(progress, requestedDisk))
 	if e != nil {
-		if e.Code == exit.Canceled && watchCtx.Err() != nil && !ctx.Mode().JSON {
+		if e.ErrName() == "rental.wait_stopped" && !ctx.Mode().JSON {
 			detached = true
 			progress.Done()
-			fmt.Fprintln(ctx.Err, "detached from acquisition; `cozy rental list` shows its status")
+			fmt.Fprintf(ctx.Err, "%s\n  end it: %s\n", e.Message, e.Next[0])
 			return nil
 		}
 		return e
@@ -569,8 +569,7 @@ func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitio
 		}
 	}
 	if lifecycle.Err() != nil {
-		return records.Rental{}, remote, false, exit.New(exit.Canceled,
-			"rental %s was acquired after model transfer cancellation", remote.ID)
+		return records.Rental{}, remote, false, stoppedWaiting(remote.ID)
 	}
 	// A fresh acceptance may not lock more than the catalog quote the renter agreed
 	// to; a rate at or below it is adopted, as is a replayed ask's reconciled
@@ -858,8 +857,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 	said := ""
 	for {
 		if lifecycle.Err() != nil {
-			return hub.Rental{}, exit.New(exit.Canceled,
-				"rental %s acquisition was cancelled", id)
+			return hub.Rental{}, stoppedWaiting(id)
 		}
 		hctx, cancel := rentalCallContext(deadline)
 		stopCancel := context.AfterFunc(lifecycle, cancel)
@@ -867,7 +865,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		stopCancel()
 		cancel()
 		if lifecycle.Err() != nil {
-			return hub.Rental{}, exit.New(exit.Canceled, "rental %s acquisition watch stopped", id)
+			return hub.Rental{}, stoppedWaiting(id)
 		}
 		if e != nil && !transient(e) {
 			return hub.Rental{}, e
@@ -882,8 +880,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 			}
 			select {
 			case <-lifecycle.Done():
-				return hub.Rental{}, exit.New(exit.Canceled,
-					"rental %s acquisition was cancelled", id)
+				return hub.Rental{}, stoppedWaiting(id)
 			case <-time.After(pollCadence):
 			}
 			continue
@@ -927,11 +924,19 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		}
 		select {
 		case <-lifecycle.Done():
-			return hub.Rental{}, exit.New(exit.Canceled,
-				"rental %s acquisition was cancelled", id)
+			return hub.Rental{}, stoppedWaiting(id)
 		case <-time.After(pollCadence):
 		}
 	}
+}
+
+// stoppedWaiting is an acquisition this command stopped watching (an interrupt, a SIGTERM):
+// the order is Tensorhub's and goes on, so the words say that and how to end it.
+func stoppedWaiting(id string) *exit.Error {
+	return exit.Named(exit.Canceled, "rental.wait_stopped",
+		"stopped waiting for rental %s; the order was not cancelled and Tensorhub keeps acquiring it", id).
+		WithRemedy("it bills once a pod boots, until it is ended").
+		WithNext("cozy rental end "+id, "cozy rental list")
 }
 
 func pastDeadline(id, state string, deadline time.Time) *exit.Error {
