@@ -1748,6 +1748,7 @@ type Outcome struct {
 	// construction load and warm) and `observations` (attention rows, Sol's dense and sparse
 	// calls among them). Empty for a run that ran on no device.
 	Measurements  []byte `protobuf:"bytes,6,opt,name=measurements,proto3" json:"measurements,omitempty"`
+	ExecutionMs   uint64 `protobuf:"varint,7,opt,name=execution_ms,json=executionMs,proto3" json:"execution_ms,omitempty"` // its own time running its callable, every attempt summed; 0: unknown
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1822,6 +1823,13 @@ func (x *Outcome) GetMeasurements() []byte {
 		return x.Measurements
 	}
 	return nil
+}
+
+func (x *Outcome) GetExecutionMs() uint64 {
+	if x != nil {
+		return x.ExecutionMs
+	}
+	return 0
 }
 
 type Reason struct {
@@ -3344,14 +3352,15 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x0e_appended_from\"3\n" +
 	"\aLogLine\x12\x14\n" +
 	"\x05level\x18\x01 \x01(\tR\x05level\x12\x12\n" +
-	"\x04text\x18\x02 \x01(\tR\x04text\"\xda\x01\n" +
+	"\x04text\x18\x02 \x01(\tR\x04text\"\xfd\x01\n" +
 	"\aOutcome\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12/\n" +
 	"\x06reason\x18\x02 \x01(\v2\x17.cozy.machine.v1.ReasonR\x06reason\x12\x16\n" +
 	"\x06result\x18\x03 \x01(\fR\x06result\x122\n" +
 	"\aoutputs\x18\x04 \x03(\v2\x18.cozy.machine.v1.ProductR\aoutputs\x12\x16\n" +
 	"\x06triage\x18\x05 \x01(\bR\x06triage\x12\"\n" +
-	"\fmeasurements\x18\x06 \x01(\fR\fmeasurements\"N\n" +
+	"\fmeasurements\x18\x06 \x01(\fR\fmeasurements\x12!\n" +
+	"\fexecution_ms\x18\a \x01(\x04R\vexecutionMs\"N\n" +
 	"\x06Reason\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x16\n" +
