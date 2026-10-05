@@ -186,7 +186,7 @@ func rentalInstallTarget(selection records.RentalInstallSelection) string {
 	models := make([]string, 0, len(selection.Models))
 	for _, model := range selection.Models {
 		if selection.Destination != "" {
-			models = append(models, either(model.Source, model.Manifest)+" -> "+selection.Destination)
+			models = append(models, either(model.Source, either(model.Model, model.Manifest))+" -> "+selection.Destination)
 			continue
 		}
 		name := model.Model

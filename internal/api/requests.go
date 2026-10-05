@@ -943,10 +943,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 	if link, problem := s.store.MachineExecution(row.ID); problem == nil && link != nil {
 		state := s.machineJobState(row, link)
-		machine := row.Machine
-		if machine == "" {
-			machine = link.MachineID
-		}
+		machine := s.machineWord(row, link)
 		kind := "invocation"
 		if row.IsJob() {
 			kind = "job"

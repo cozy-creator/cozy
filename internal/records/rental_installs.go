@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -27,8 +28,12 @@ type RentalInstallSelection struct {
 	Package string     `json:"package,omitempty"`
 	Release string     `json:"release,omitempty"`
 	Models  []ModelRef `json:"models,omitempty"`
-	// Destination is the org/name a provider-source model is uploaded to (`cozy model upload`).
+	// Destination is where the one model is put: the org/name it is uploaded to (`cozy model
+	// upload`), or the local/name the machine holds it under (`cozy model download … local/`).
 	Destination string `json:"destination,omitempty"`
+	// Write is a local file this computer writes to the machine before the warm run: the file
+	// an upload makes (its model's object:// source).
+	Write string `json:"write,omitempty"`
 	// Hub is the Tensorhub the selection is read at: this computer's machine prepares it there.
 	Hub string `json:"hub,omitempty"`
 }
@@ -45,6 +50,16 @@ type RentalInstall struct {
 	Result    json.RawMessage `json:"result,omitempty"`
 	CreatedAt string          `json:"created_at"`
 	UpdatedAt string          `json:"updated_at"`
+}
+
+// HoldsLocally is a selection only a machine that keeps local models takes: a file it is
+// written, a local/ alias it reads, or a local/ alias it is put under.
+func (s RentalInstallSelection) HoldsLocally() bool {
+	local := s.Write != "" || strings.HasPrefix(s.Destination, "local/")
+	for _, model := range s.Models {
+		local = local || strings.HasPrefix(model.Model, "local/")
+	}
+	return local
 }
 
 func (r RentalInstall) Active() bool { return r.State == "queued" || r.State == "installing" }

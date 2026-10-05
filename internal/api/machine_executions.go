@@ -13,6 +13,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
@@ -129,13 +130,11 @@ type MachineExecutionView struct {
 	Number uint64 `json:"number,omitempty"`
 }
 
-// RetainedOutput is an output held on the machine that produced it, in this host's custody,
-// with each upload of it to a private checkpoint.
+// RetainedOutput is an output held on the machine that produced it, in this host's custody.
 type RetainedOutput struct {
-	Output   string                 `json:"output"`
-	Machine  string                 `json:"machine"`
-	Manifest string                 `json:"manifest,omitempty"`
-	Uploads  []records.OutputUpload `json:"uploads,omitempty"`
+	Output   string `json:"output"`
+	Machine  string `json:"machine"`
+	Manifest string `json:"manifest,omitempty"`
 }
 
 // providerRefusal is TensorFS reporting that a provider refused a machine's source call for
@@ -159,11 +158,24 @@ func (s *Server) refreshMachineExecution(ctx context.Context, request records.Re
 	return s.machineExecutions.Refresh(ctx, request)
 }
 
-func (s *Server) machineJobState(row records.Request, link *records.MachineExecution) JobState {
-	machine := row.Machine
-	if machine == "" {
-		machine = link.MachineID
+// machineWord is the machine a run names: its recorded word, else its machine, a rental
+// reached as an explicit endpoint (a foreground --rental run) by that rental's name.
+func (s *Server) machineWord(row records.Request, link *records.MachineExecution) string {
+	if row.Machine != "" {
+		return row.Machine
 	}
+	if machineendpoint.IsName(link.MachineID) {
+		if ep, _ := s.store.RequestMachineEndpoint(row.ID, link.MachineID); ep != nil && ep.WorkspaceID != "" {
+			if rented, _ := s.store.RentalRow(ep.WorkspaceID); rented != nil && rented.MachineName != "" {
+				return rented.MachineName
+			}
+		}
+	}
+	return link.MachineID
+}
+
+func (s *Server) machineJobState(row records.Request, link *records.MachineExecution) JobState {
+	machine := s.machineWord(row, link)
 	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected, AbandonedLocally: link.Abandoned}
 	v1run, _ := s.store.RunV1(row.ID)
 	var receipt pb.MachineExecutionReceipt
@@ -186,16 +198,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		if rented, _ := s.store.RentalRow(link.MachineID); row.Machine == "" && rented != nil && rented.MachineName != "" {
 			holder = rented.MachineName
 		}
-		uploads, _ := s.store.OutputUploads(row.ID)
 		for _, hold := range holds {
 			if artifact, _ := records.DecodeModelArtifact(hold.Artifact); hold.State == "held" && artifact != nil {
-				output := RetainedOutput{Output: artifact.OutputSlot, Machine: holder, Manifest: artifact.Manifest.Digest}
-				for _, upload := range uploads {
-					if upload.Output == artifact.OutputSlot {
-						output.Uploads = append(output.Uploads, upload)
-					}
-				}
-				retained = append(retained, output)
+				retained = append(retained, RetainedOutput{Output: artifact.OutputSlot, Machine: holder, Manifest: artifact.Manifest.Digest})
 			}
 		}
 	}
