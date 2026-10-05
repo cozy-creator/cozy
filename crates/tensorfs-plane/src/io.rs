@@ -351,6 +351,11 @@ pub struct Readers {
 }
 
 impl Readers {
+    /// The pool's threads: how many pieces of one job can run at once.
+    pub fn threads(&self) -> usize {
+        self.threads.lock().unwrap().len().max(1)
+    }
+
     pub fn new(n: usize) -> Readers {
         let q = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
         let threads = (0..n.max(1))

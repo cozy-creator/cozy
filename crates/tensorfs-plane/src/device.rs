@@ -446,10 +446,14 @@ pub fn free_va(base: u64, size: u64) -> Result<()> {
 
 /// Where a device copy reads from.
 pub enum CopySrc {
-    /// Registered (or at worst pageable) host bytes of the pinned tier.
+    /// Page-locked host bytes (a registered region): one DMA.
     Host(*const u8),
-    /// A sealed layout's region outside the pinned books, copied as pageable memory once its
-    /// filler marks it Ready (the layout is kept mapped by this reference).
+    /// Host bytes this process could not page-lock: copied through the staging buffers, never
+    /// as pageable memory (a pageable copy runs at a fraction of the link and stalls the mover).
+    Bounce(*const u8),
+    /// A sealed layout's region outside the pinned books, once its filler marks it Ready: the
+    /// mover page-locks it on its first copy (`HostMem::pin_region`; the layout is the machine's
+    /// RAM, so no budget is charged), else bounces it. This reference keeps the layout mapped.
     Sealed { host: Arc<crate::host::HostMem>, region: u32, offset: u64 },
     /// Disk through the staging buffers: `items` in layout offsets, `base` the layout offset
     /// that lands at `dst`.
@@ -461,11 +465,22 @@ pub enum CopySrc {
 }
 unsafe impl Send for CopySrc {}
 
+/// Where a copy's bytes came from, for the facts: one DMA from page-locked host memory, host
+/// memory through the staging buffers, or the object files through them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyPath {
+    Pinned,
+    Bounced,
+    Files,
+}
+
 pub struct Copied {
     pub ready: EvRef,
     pub start: EvRef,
     pub bytes: u64,
-    pub from_host: bool,
+    pub path: CopyPath,
+    /// This copy's region was refused a page lock (counted once per region).
+    pub refused: bool,
 }
 
 pub struct CopyJob {
@@ -620,22 +635,24 @@ fn enqueue_copy(
     src: CopySrc,
 ) -> Result<Copied> {
     // Never a byte a sealed layout's machine has not finished: wait for the region's Ready
-    // word. `_kept` holds the mapping until the (pageable, so synchronous) enqueue is done.
+    // word. `_kept` holds the mapping until the enqueue is done (a bounce has read the bytes).
+    let mut refused = false;
     let (src, _kept) = match src {
-        // A streamed layout's slot is refilled once this copy lets its region go: copy (pageable,
-        // so staged by the time the call returns) and wait for the copy before letting go.
+        // A streamed layout's slot is refilled once this copy lets its region go, so it is never
+        // locked: its bytes are in the staging buffers by the time the call returns.
         CopySrc::Sealed { host, region, .. } if host.window().is_some() => {
-            return host.clone().with_region(region, |p| {
-                let copied = enqueue_copy(m, stream, bounces, waits, dst, len, CopySrc::Host(p))?;
-                copied.ready.sync()?;
-                Ok(copied)
-            });
+            return host
+                .clone()
+                .with_region(region, |p| enqueue_copy(m, stream, bounces, waits, dst, len, CopySrc::Bounce(p)));
         }
         CopySrc::Sealed { host, region, offset } => {
             host.wait_ready(region)?;
+            let span = crate::layout::align_up(len, crate::layout::PART_ALIGN);
+            let (pinned, now) = host.pin_region(region, offset, span);
+            refused = now;
             // SAFETY: inside the live mapping `host` keeps; the region is complete.
-            let p = unsafe { host.base().add(offset as usize) };
-            (CopySrc::Host(p), Some(host))
+            let p = unsafe { host.base().add(offset as usize) } as *const u8;
+            (if pinned { CopySrc::Host(p) } else { CopySrc::Bounce(p) }, Some(host))
         }
         src => (src, None),
     };
@@ -661,37 +678,76 @@ fn enqueue_copy(
             })?;
             crate::faults::hit("host-copy-recorded")?;
             ready.record(stream)?;
-            Ok(Copied { ready, start, bytes: len, from_host: true })
+            Ok(Copied { ready, start, bytes: len, path: CopyPath::Pinned, refused })
         }
+        CopySrc::Bounce(p) => staged_copy(m, stream, bounces, waits, dst, len, Staged::Host(p), start, ready)
+            .map(|c| Copied { refused, ..c }),
         CopySrc::Disk { source, items, base } => {
-            let cap = m.staging.1;
-            if bounces.is_empty() || cap == 0 {
-                return Err(Error::Invalid("disk-sourced device fill with no staging buffers".into()));
+            staged_copy(m, stream, bounces, waits, dst, len, Staged::Files { source, items, base }, start, ready)
+        }
+    }
+}
+
+/// What a staged copy reads into the staging buffers: object-file items, or host memory.
+enum Staged {
+    Files { source: Arc<Source>, items: Vec<Item>, base: u64 },
+    Host(*const u8),
+}
+
+/// A copy through the staging buffers, chunk by chunk: the readers fill a buffer (from the
+/// object files, or by memcpy from host memory) while earlier chunks' DMA runs.
+#[allow(clippy::too_many_arguments)]
+fn staged_copy(
+    m: &MoverCtx,
+    stream: CUstream,
+    bounces: &mut [Bounce],
+    waits: Vec<EvRef>,
+    dst: u64,
+    len: u64,
+    staged: Staged,
+    start: EvRef,
+    ready: EvRef,
+) -> Result<Copied> {
+    let d = cuda::driver()?;
+    let wait_all = |waits: &[EvRef]| -> Result<()> {
+        for w in waits {
+            // SAFETY: events of this context; the stream is ours.
+            cuda::check("cuStreamWaitEvent", unsafe { (d.stream_wait_event)(stream, w.raw(), 0) })?;
+        }
+        Ok(())
+    };
+    let cap = m.staging.1;
+    if bounces.is_empty() || cap == 0 {
+        return Err(Error::Invalid("a staged device fill with no staging buffers".into()));
+    }
+    let nchunks = len.div_ceil(cap) as usize;
+    let mut inflight: VecDeque<(u64, usize, Arc<Waiter>)> = VecDeque::new();
+    let mut next = 0usize;
+    // The slot's previous readers first: the stream waits, the host keeps reading.
+    let mut failed = wait_all(&waits).and_then(|_| crate::faults::gate("copy", stream)).err();
+    let mut first = true;
+    loop {
+        while failed.is_none() && inflight.len() < bounces.len() && next < nchunks {
+            let b = next % bounces.len();
+            if let Some(last) = bounces[b].last.take() {
+                if let Err(e) = last.sync() {
+                    failed = Some(e);
+                    break;
+                }
             }
-            let nchunks = len.div_ceil(cap) as usize;
-            let mut inflight: VecDeque<(u64, usize, Arc<Waiter>)> = VecDeque::new();
-            let mut next = 0usize;
-            // The slot's previous readers first: the stream waits, the host keeps reading.
-            let mut failed = wait_all(&waits).and_then(|_| crate::faults::gate("copy", stream)).err();
-            let mut first = true;
-            loop {
-                while failed.is_none() && inflight.len() < bounces.len() && next < nchunks {
-                    let b = next % bounces.len();
-                    if let Some(last) = bounces[b].last.take() {
-                        if let Err(e) = last.sync() {
-                            failed = Some(e);
-                            break;
-                        }
-                    }
-                    let c0 = next as u64 * cap;
-                    let c1 = (c0 + cap).min(len);
-                    let pieces = slice_items(&items, base + c0, base + c1);
-                    let w = Arc::new(Waiter { m: Mutex::new(None), cv: Condvar::new() });
-                    let w2 = w.clone();
-                    let batch = Batch::new(pieces.len(), move |r| {
-                        *w2.m.lock().unwrap() = Some(r);
-                        w2.cv.notify_all();
-                    });
+            let c0 = next as u64 * cap;
+            let c1 = (c0 + cap).min(len);
+            let w = Arc::new(Waiter { m: Mutex::new(None), cv: Condvar::new() });
+            let w2 = w.clone();
+            let signal = move |r| {
+                *w2.m.lock().unwrap() = Some(r);
+                w2.cv.notify_all();
+            };
+            match &staged {
+                Staged::Files { source, items, base } => {
+                    let base = *base;
+                    let pieces = slice_items(items, base + c0, base + c1);
+                    let batch = Batch::new(pieces.len(), signal);
                     for it in pieces {
                         let into = Dst(unsafe { bounces[b].ptr.add((it.offset - base - c0) as usize) });
                         let (source, batch, tally) = (source.clone(), batch.clone(), m.tally.clone());
@@ -700,57 +756,83 @@ fn enqueue_copy(
                             // SAFETY: the bounce range belongs to this chunk until its copy
                             // event, recorded only after this batch completes.
                             let r = unsafe { source.read_item(&it, into.0, Mode::Buffered, &tally) };
-                            // Drop the source before signalling: whoever waits on the batch may
-                            // then close the last weight set and end the lease at once.
+                            // Drop the source before signalling: whoever waits on the batch
+                            // may then close the last weight set and end the lease at once.
                             drop(source);
                             batch.finish(r);
                         });
                     }
-                    inflight.push_back((c0, b, w));
-                    next += 1;
                 }
-                let Some((c0, b, w)) = inflight.pop_front() else { break };
-                let mut g = w.m.lock().unwrap();
-                while g.is_none() {
-                    g = w.cv.wait(g).unwrap();
-                }
-                // After any failure keep draining: readers may still write the bounces.
-                if let Err(e) = g.take().unwrap() {
-                    failed.get_or_insert(e);
-                }
-                if failed.is_some() {
-                    continue;
-                }
-                let mut copy = || -> Result<()> {
-                    if first {
-                        start.record(stream)?;
-                        first = false;
+                Staged::Host(p) => {
+                    // One piece per reader thread: a chunk copied by one thread is the whole
+                    // pipeline's rate (an RTX 3070 pod under CPU pressure: 2 GB/s on a 12 GB/s
+                    // link), and the file path already reads a chunk's items in parallel.
+                    let n = (c1 - c0) as usize;
+                    let pieces = m.readers.threads().min(n.div_ceil(crate::layout::PART_ALIGN as usize)).max(1);
+                    let piece = n.div_ceil(pieces);
+                    let batch = Batch::new(pieces, signal);
+                    for k in 0..pieces {
+                        let (at, len) = (k * piece, piece.min(n - (k * piece).min(n)));
+                        let from = Dst(unsafe { p.add(c0 as usize + at) } as *mut u8);
+                        let into = Dst(unsafe { bounces[b].ptr.add(at) });
+                        let batch = batch.clone();
+                        m.readers.submit(true, move || {
+                            let (from, into) = (from, into);
+                            // SAFETY: the host range stays mapped until this copy returns (it
+                            // waits for every batch); the bounce range is this piece's.
+                            unsafe { std::ptr::copy_nonoverlapping(from.0 as *const u8, into.0, len) };
+                            batch.finish(Ok(()));
+                        });
                     }
-                    crate::faults::hit("staged-copy")?;
-                    let n = cap.min(len - c0);
-                    // SAFETY: the bounce holds the chunk; pinned host memory.
-                    cuda::check("cuMemcpyHtoDAsync", unsafe {
-                        (d.memcpy_htod_async)(dst + c0, bounces[b].ptr as *const libc::c_void, n as usize, stream)
-                    })?;
-                    let e = m.events.get(false)?;
-                    e.record(stream)?;
-                    bounces[b].last = Some(e);
-                    Ok(())
-                };
-                if let Err(e) = copy() {
-                    failed = Some(e);
                 }
             }
-            if let Some(e) = failed {
-                return Err(e);
-            }
+            inflight.push_back((c0, b, w));
+            next += 1;
+        }
+        let Some((c0, b, w)) = inflight.pop_front() else { break };
+        let mut g = w.m.lock().unwrap();
+        while g.is_none() {
+            g = w.cv.wait(g).unwrap();
+        }
+        // After any failure keep draining: readers may still write the bounces.
+        if let Err(e) = g.take().unwrap() {
+            failed.get_or_insert(e);
+        }
+        if failed.is_some() {
+            continue;
+        }
+        let mut copy = || -> Result<()> {
             if first {
                 start.record(stream)?;
+                first = false;
             }
-            ready.record(stream)?;
-            Ok(Copied { ready, start, bytes: len, from_host: false })
+            crate::faults::hit("staged-copy")?;
+            let n = cap.min(len - c0);
+            // SAFETY: the bounce holds the chunk; pinned host memory.
+            cuda::check("cuMemcpyHtoDAsync", unsafe {
+                (d.memcpy_htod_async)(dst + c0, bounces[b].ptr as *const libc::c_void, n as usize, stream)
+            })?;
+            let e = m.events.get(false)?;
+            e.record(stream)?;
+            bounces[b].last = Some(e);
+            Ok(())
+        };
+        if let Err(e) = copy() {
+            failed = Some(e);
         }
     }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    if first {
+        start.record(stream)?;
+    }
+    ready.record(stream)?;
+    let path = match staged {
+        Staged::Files { .. } => CopyPath::Files,
+        Staged::Host(_) => CopyPath::Bounced,
+    };
+    Ok(Copied { ready, start, bytes: len, path, refused: false })
 }
 
 /// The parts of `items` inside layout range `[lo, hi)`, split at the edges. Object ranges are

@@ -68,9 +68,11 @@ class DeviceStats(TypedDict):
     reserved_va: int
     shared_bytes: int  # mapped shared regions, outside committed and the budget
     copies: int
-    host_copy_bytes: int
+    host_copy_bytes: int  # one DMA from page-locked host memory
     host_copy_ns: int
-    disk_copy_bytes: int
+    bounce_copy_bytes: int  # host memory that could not be page-locked, via the staging buffers
+    bounce_copy_ns: int
+    disk_copy_bytes: int  # the object files, via the staging buffers
     disk_copy_ns: int
     mapped_copy_bytes: int  # always 0 since 0.3.93 (0.3.92 copied from page-cache mappings)
     mapped_copy_ns: int
