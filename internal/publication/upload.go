@@ -17,20 +17,6 @@ type UploadIntent struct {
 }
 type ObjectUploader func(context.Context, hub.Grant, int64) *exit.Error
 
-// ArtifactTransferRefusal keeps permanent policy, identity and exhausted mover
-// refusals terminal. Only a busy slot or expired grant can be repaired by simply
-// reissuing this same effect; the mover already bounds its own network retries.
-func ArtifactTransferRefusal(code, detail string) *exit.Error {
-	if code == "" {
-		return nil
-	}
-	kind := exit.Conflict
-	if code == "native_artifact_busy" || code == "weights_grant_expired" {
-		kind = exit.Unavailable
-	}
-	return exit.Named(kind, code, "%s", detail)
-}
-
 // UploadCheckpoint uses Tensorhub's existing publication/object journal. The
 // retained private Runtime streams each granted object directly to its destination.
 func UploadCheckpoint(ctx context.Context, client *hub.Client, operation string, intent UploadIntent, beforeWrite func() *exit.Error, upload ObjectUploader) (CheckpointRef, *exit.Error) {

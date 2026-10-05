@@ -11,44 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/cozy-creator/cozy/internal/machines"
 )
-
-// `cozy run upload` from this computer's machine: a job there retains its weights output,
-// and the upload sends it from that machine to the Hub over the machine connection, as it
-// does from a rental; this computer's machine is never taken for an ended rental.
-func TestAnOutputRetainedOnThisComputersMachineUploads(t *testing.T) {
-	h, root, _, store := parityMachines(t)
-	checkpoints := serveCheckpoints(t, h.fakeRentalHub)
-	if code, out := runCozy(t, root, "package", "install", weightsProject(t), "--editable"); code != 0 {
-		t.Fatalf("installing the weights package [exit %d]\n%s", code, out)
-	}
-	code, out := runCozy(t, root, "run", "local/weights-proof/convert", "n=2", "--await", "--json", "--idempotency-key", "retained")
-	if code != 0 {
-		t.Fatalf("the weights job failed [exit %d]\n%s", code, out)
-	}
-	row, problem := store.RequestByIdempotencyKey("retained")
-	fatal(t, problem)
-	link, problem := store.MachineExecution(row.ID)
-	fatal(t, problem)
-	if link == nil || link.MachineID != machines.Local {
-		t.Fatalf("the weights job did not run on this computer's machine: %+v", link)
-	}
-	code, out = runCozy(t, root, "run", "upload", row.ID+"#model", "proof/model", "--await", "--json")
-	var uploaded struct {
-		State      string `json:"state"`
-		Checkpoint string `json:"checkpoint"`
-	}
-	if code != 0 || json.Unmarshal([]byte(out), &uploaded) != nil || uploaded.State != "uploaded" {
-		t.Fatalf("the retained output was not uploaded from this computer's machine [exit %d]\n%s", code, out)
-	}
-	checkpoints.mu.Lock()
-	defer checkpoints.mu.Unlock()
-	if checkpoints.finalized[uploaded.Checkpoint] == "" || len(checkpoints.stored) == 0 {
-		t.Fatalf("the Hub holds no finalized checkpoint %s: %v", uploaded.Checkpoint, checkpoints.finalized)
-	}
-}
 
 // weightsProject is local/weights-proof: one job that derives a small checkpoint into its
 // declared weights output.

@@ -60,7 +60,6 @@ type machineRuns struct {
 	placed    map[string]string // the last placement decision recorded per waiting run
 	machines  *machines.Resolver
 	observers sync.Map // one collection/control lock per observed request
-	uploading sync.Map // retained-output uploads in progress, by operation
 	// awaited names the runs whose last observation ended on the machine's next event.
 	awaited map[string]bool
 	updates *rentalRuntimeUpdates
@@ -340,16 +339,6 @@ func (m *machineRuns) Resume() {
 		request, problem := m.store.RequestRow(link.RequestID)
 		if problem == nil && request != nil {
 			_ = m.Start(*request)
-		}
-	}
-	uploads, problem := m.store.UnfinishedOutputUploads()
-	if problem != nil {
-		fmt.Fprintf(m.context.Out, "output upload recovery: %s\n", problem.Message)
-		return
-	}
-	for request, pending := range uploads {
-		for _, upload := range pending {
-			m.startUpload(request, upload)
 		}
 	}
 }

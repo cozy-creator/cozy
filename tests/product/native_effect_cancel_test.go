@@ -230,21 +230,3 @@ func TestCanceledGrantReplyCannotStartNativePUTOrFinalize(t *testing.T) {
 		t.Fatalf("canceled grant permitted writes: problem%v grants%d puts%d finalizes%d", problem, grants, puts, finalizes)
 	}
 }
-
-func TestNativeArtifactTransferRefusalClassification(t *testing.T) {
-	for _, code := range []string{"egress_scheme", "egress_blocked_address", "egress_host_not_allowed", "egress_url", "egress_http_error", "egress_unreachable", "stream_under_declared_size", "native_artifact_refused", "unknown_peer_refusal"} {
-		problem := publication.ArtifactTransferRefusal(code, "native transfer refused")
-		if problem == nil || problem.Code != exit.Conflict || problem.ErrName() != code {
-			t.Fatalf("%s can be retried without changing its invalid grant: %v", code, problem)
-		}
-	}
-	for _, code := range []string{"native_artifact_busy", "weights_grant_expired"} {
-		problem := publication.ArtifactTransferRefusal(code, "retry with a fresh slot or grant")
-		if problem == nil || problem.Code != exit.Unavailable {
-			t.Fatalf("%s lost its bounded recovery path: %v", code, problem)
-		}
-	}
-	if publication.ArtifactTransferRefusal("", "") != nil {
-		t.Fatal("successful native transfer became a refusal")
-	}
-}

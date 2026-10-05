@@ -121,9 +121,6 @@ func handleMachineModelDownload(ctx *Context) *exit.Error {
 	} else {
 		machine = machines.Local
 	}
-	if len(ctx.Inv.Args) > 1 && strings.TrimSpace(ctx.Inv.Args[1]) != "" {
-		return exit.Usagef("--rental downloads into the worker store and takes no local destination")
-	}
 	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--idempotency-key") != "" {
 		return exit.Usagef("machine model download does not accept --rental-only or --idempotency-key")
 	}

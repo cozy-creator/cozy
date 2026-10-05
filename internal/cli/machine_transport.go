@@ -5,14 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	machinepb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"io"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
+
+	machinepb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -24,7 +24,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
-	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/transfer"
@@ -221,24 +220,6 @@ func (m *machineRuns) connectAt(ctx context.Context, name, hub, holder string, n
 		return nil, problem
 	}
 	return &machineConnection{Machine: machine, runs: m, installed: map[string]*pb.InstalledPackage{}, placements: map[string]*pb.DesiredPlacementSet{}}, nil
-}
-
-// artifactCommands numbers this host's retained-artifact commands; the machine keys a
-// command's replay by it.
-var artifactCommands atomic.Uint64
-
-// artifactTransfer sends one retained-artifact command over the machine connection: a
-// closure page or one granted object upload, authorized by this connection's claim.
-func (c *machineConnection) artifactTransfer(ctx context.Context, command *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error) {
-	command.CommandId = artifactCommands.Add(1)
-	status, err := c.Host.NativeArtifactTransfer(ctx, &pb.NativeArtifactTransferCall{Claim: c.Claim, Request: command})
-	if err != nil {
-		return nil, machineTransport(err)
-	}
-	if problem := publication.ArtifactTransferRefusal(status.SafeCode, status.SafeDetail); problem != nil {
-		return nil, problem
-	}
-	return status, nil
 }
 
 func (c *machineConnection) retainModel(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {

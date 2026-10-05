@@ -443,9 +443,13 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	} else if err != nil {
 		return nil, machines.Transport(err)
 	}
-	if capabilities := frame.GetCapabilities(); !slices.Contains(capabilities, "warm/1") ||
-		selection.Destination != "" && !slices.Contains(capabilities, "upload/1") {
+	capabilities := frame.GetCapabilities()
+	if !slices.Contains(capabilities, "warm/1") || selection.Destination != "" && !slices.Contains(capabilities, "upload/1") {
 		return nil, errNotV1
+	}
+	if selection.HoldsLocally() && !slices.Contains(capabilities, "local-models/1") {
+		return nil, exit.Named(exit.Structural, "machine.local_models_unsupported",
+			"this machine holds no local files or local/ models; %s", machines.RuntimeUpdate(row.RentalID))
 	}
 	origin := selection.Hub
 	if origin == "" && machine.Account != nil {
@@ -469,9 +473,19 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			return nil, problem
 		}
 	}
-	if selection.Destination != "" {
+	if selection.Destination != "" && !strings.HasPrefix(selection.Destination, "local/") {
 		if spec.Publication, problem = authorizeV1Publication(ctx, machine, []string{selection.Destination}); problem != nil {
 			return nil, problem
+		}
+	}
+	if selection.Write != "" {
+		report(machines.InstallProgress{Stage: "writing " + filepath.Base(selection.Write)})
+		object, err := machinev1.WriteFile(ctx, machine.Machine, selection.Write)
+		if err != nil {
+			return nil, machines.Transport(err)
+		}
+		if !strings.HasPrefix(strings.TrimPrefix(selection.Models[0].Source, "object://"), object.Digest+"/") {
+			return nil, exit.Named(exit.Conflict, "model_source.local_changed", "%s changed since it was measured", selection.Write)
 		}
 	}
 	if providers := (&v1.ProviderAccess{Huggingface: m.resolver.cfg.HuggingFaceToken.Reveal(), Civitai: m.resolver.cfg.CivitaiToken.Reveal()}); providers.Huggingface != "" || providers.Civitai != "" {

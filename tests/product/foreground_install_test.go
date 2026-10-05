@@ -141,6 +141,15 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 	if raw, err := os.ReadFile(witness); err == nil {
 		t.Fatalf("an installation on a rental started this computer's machine: %s", strings.TrimSpace(string(raw)))
 	}
+
+	// This client's own daemon names the foreground quantize run's machine by the rental.
+	if code, out := runCozy(t, root, "down"); code != 0 {
+		t.Fatalf("down [exit %d]\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "run", "list", "--json")
+	if code != 0 || !strings.Contains(out, `"machine":"tessa"`) || strings.Contains(out, `"machine":"endpoint-`) {
+		t.Fatalf("run list does not name the rental the foreground run used [exit %d]\n%s", code, out)
+	}
 }
 
 // quantizeProject is local/quantize-proof: one fp8 quantizer, a job that takes a model and

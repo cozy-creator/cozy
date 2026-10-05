@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -57,14 +58,20 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	}
 	downloads := body.Models
 	if body.Destination != "" {
-		// An upload: one provider source made on the machine, or one checkpoint it holds (a
-		// run's weights output), put in the destination.
-		if body.Package != "" || len(body.Models) != 1 || body.Models[0].Model != "" ||
-			(body.Models[0].Source == "") == (body.Models[0].Manifest == "") {
-			s.refuseTyped(w, r, exit.New(exit.Validation, "a model upload names one provider source or held checkpoint, and its destination"))
+		// One model put in the destination: a provider source or a written file made on the
+		// machine, a checkpoint it holds or downloads, or a local/ alias it holds; the
+		// destination is a Tensorhub repository or a local/ alias.
+		if body.Package != "" || len(body.Models) != 1 || body.Models[0].Source == "" && body.Models[0].Manifest == "" && body.Models[0].Model == "" ||
+			body.Write != "" && !strings.HasPrefix(body.Models[0].Source, "object://") {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "a model transfer names one model and its destination"))
 			return
 		}
-		if _, problem := hub.NormalizePublicationRepositories([]string{body.Destination}); problem != nil {
+		if _, local, problem := modelsource.LocalAlias(body.Destination); local {
+			if problem != nil {
+				s.refuseTyped(w, r, problem)
+				return
+			}
+		} else if _, problem := hub.NormalizePublicationRepositories([]string{body.Destination}); problem != nil {
 			s.refuseTyped(w, r, problem)
 			return
 		}

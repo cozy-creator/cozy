@@ -5,16 +5,17 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -63,17 +64,27 @@ func handleModelUpload(ctx *Context) *exit.Error {
 }
 
 func handleModelDownload(ctx *Context) *exit.Error {
-	if ctx.Inv.Value("--rental") != "" || len(ctx.Inv.Args) < 2 || strings.TrimSpace(ctx.Inv.Args[1]) == "" {
+	if len(ctx.Inv.Args) < 2 || strings.TrimSpace(ctx.Inv.Args[1]) == "" {
 		return handleMachineModelDownload(ctx)
 	}
+	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	return handleModelTransfer(ctx, "model-download")
 }
 
-// handleModelTransfer moves a local file, a local/ alias or a Tensorhub checkpoint into
-// a Tensorhub destination (upload) or a local/ alias (download) on this computer.
+// handleModelTransfer puts a local file, a local/ alias or a Tensorhub checkpoint in a
+// Tensorhub destination (upload), or a Tensorhub model under a local/ alias (download): one
+// warm run on the machine that makes and holds it, this computer's or --rental's.
 func handleModelTransfer(ctx *Context, kind string) *exit.Error {
-	sourceArg, destinationArg := ctx.Inv.Args[0], strings.TrimSpace(ctx.Inv.Args[1])
-	var destination string
+	sourceArg, destinationArg := strings.TrimSpace(ctx.Inv.Args[0]), strings.TrimSpace(ctx.Inv.Args[1])
+	machine := ctx.Inv.Value("--rental")
+	if machine == "" && rentalRequested(ctx) {
+		return exit.Usagef("a model transfer runs on this computer's machine or on --rental=NAME")
+	}
+	if len(ctx.Inv.Values["--source-profile"]) > 0 {
+		return exit.Usagef("--source-profile selects the profiles a provider ingest converts").
+			WithRemedy("omit --source-profile to use the one profile the headers match")
+	}
+	var selection records.RentalInstallSelection
 	if kind == "model-upload" {
 		ref, problem := hub.ParseRef(destinationArg)
 		if problem != nil {
@@ -83,7 +94,10 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
 				WithRemedy("upload under your Tensorhub account, for example alice/%s", ref.Name)
 		}
-		destination = ref.String()
+		if _, problem := ownedPublication(ctx, ref); problem != nil {
+			return problem
+		}
+		selection.Destination = ref.String()
 	} else {
 		name, local, problem := modelsource.LocalAlias(destinationArg)
 		if !local {
@@ -92,89 +106,72 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		destination = "local/" + name
+		selection.Destination = "local/" + name
 	}
-	if rentalRequested(ctx) {
-		if kind == "model-download" {
-			return exit.Named(exit.Unavailable, "model_download.rented_return_unavailable",
-				"a rented machine cannot return a model into a local/ alias").
-				WithRemedy("omit local/NAME to download into the rental's own store with --rental=NAME")
-		}
-		return exit.Named(exit.Unavailable, "model_transfer.rented_source_unavailable",
-			"a rented machine ingests only Hugging Face and Civitai sources").
-			WithRemedy("upload this source without --rental")
-	}
-	if len(ctx.Inv.Values["--source-profile"]) > 0 {
-		return exit.Usagef("--source-profile selects the profiles a provider ingest converts").
-			WithRemedy("omit --source-profile to use the one profile the headers match")
-	}
-	source, problem := resolvePublishSource(ctx, sourceArg, nil)
+	model, file, problem := transferSource(ctx, sourceArg, kind == "model-upload")
 	if problem != nil {
 		return problem
 	}
-	if kind == "model-upload" {
-		ref, _ := hub.ParseRef(destination)
-		if _, problem := ownedPublication(ctx, ref); problem != nil {
-			return problem
-		}
-	}
-	intent := modelTransferIntent(modeltransfer.Plan{
-		Kind: kind, Destination: destination,
-		Source: source.Canonical, SourceSelection: source.Selection,
-		SourceLicense: source.License, InputLane: source.Lane,
-		SourceFiles: source.Exact, Outputs: []modeltransfer.OutputPin{{Name: "model"}},
-	})
-	intent.LocalOnly = localOnlyModelSource(sourceArg)
-	daemonState, _, problem := ensureDaemon(ctx)
-	if problem != nil {
-		return problem
-	}
-	ctx.Daemon = daemonState
-	local, problem := dial(ctx)
-	if problem != nil {
-		return problem
-	}
-	submission := api.JobSubmission{Input: []byte("{}"), ModelTransfer: &intent}
-	handle, problem := local.SubmitJob(submission, requestKey(ctx.Inv.Value("--idempotency-key")))
-	if problem != nil {
-		return problem
-	}
-	state, problem := local.Job(handle.JobID)
-	if problem != nil {
-		return problem
-	}
-	if ctx.Inv.Bool("--await") {
-		return watchJob(ctx, local, state)
-	}
-	return renderSubmittedJob(ctx, state, !handle.Replay)
+	selection.Models, selection.Write = []records.ModelRef{model}, file
+	return enqueueRentalInstall(ctx, either(machine, machines.Local), selection, ctx.Inv.Bool("--await"))
 }
 
-func localOnlyModelSource(source string) bool {
-	if strings.HasPrefix(source, "local/") {
-		return true
+// transferSource is the model a transfer moves: a local file (written to the machine, then
+// made like a provider's single file), a local/ alias the machine holds, or a Tensorhub
+// checkpoint. file is the local file to write.
+func transferSource(ctx *Context, raw string, upload bool) (records.ModelRef, string, *exit.Error) {
+	lane := strings.TrimSpace(ctx.Inv.Value("--lane"))
+	if name, local, problem := modelsource.LocalAlias(raw); local {
+		if problem != nil {
+			return records.ModelRef{}, "", problem
+		}
+		if !upload || lane != "" {
+			return records.ModelRef{}, "", exit.Usagef("a local/%s alias is uploaded as it is, to a Tensorhub repository", name)
+		}
+		return records.ModelRef{Slot: "model", Model: "local/" + name}, "", nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return false
+		return records.ModelRef{}, "", exit.Internalf("cannot resolve the current directory: %s", err)
 	}
-	parsed, problem := modelsource.Parse(source, cwd)
-	return problem == nil && parsed.Kind == modelsource.LocalFile
+	parsed, problem := modelsource.Parse(raw, cwd)
+	if problem == nil && parsed.Kind == modelsource.LocalFile {
+		if !upload || lane != "" {
+			return records.ModelRef{}, "", exit.Usagef("a local file is uploaded as it is, to a Tensorhub repository")
+		}
+		digest, problem := fileDigest(parsed.Path, parsed.Bytes)
+		if problem != nil {
+			return records.ModelRef{}, "", problem
+		}
+		source := "object://sha256:" + digest + "/" + url.PathEscape(filepath.Base(parsed.Path))
+		return records.ModelRef{Slot: "model", Source: source}, parsed.Path, nil
+	}
+	if problem == nil {
+		// A provider source kept under a local alias: made on the machine, as an upload makes it.
+		if lane != "" {
+			return records.ModelRef{}, "", exit.Usagef("--lane selects only a Tensorhub model release")
+		}
+		source, problem := pinnedProviderSource(ctx, parsed.Canonical)
+		return records.ModelRef{Slot: "model", Source: source}, "", problem
+	}
+	model, problem := resolveRemoteModel(ctx, "", launch.Slot{}, raw, lane, nil)
+	model.Slot = "model"
+	return model, "", problem
 }
 
-func modelTransferIntent(plan modeltransfer.Plan) records.ModelTransferIntent {
-	files := make([]records.ModelTransferSourceFile, 0, len(plan.SourceFiles))
-	for _, file := range plan.SourceFiles {
-		files = append(files, records.ModelTransferSourceFile{Member: file.Member,
-			SHA256: file.SHA256, Length: file.Length})
+// fileDigest is a local file's sha256, refused if its length changed since it was measured.
+func fileDigest(path string, length int64) (string, *exit.Error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", exit.New(exit.NotFound, "cannot open local model source: %s", err)
 	}
-	outputs := make([]records.ModelTransferOutput, 0, len(plan.Outputs))
-	for _, output := range plan.Outputs {
-		outputs = append(outputs, records.ModelTransferOutput{Name: output.Name})
+	defer file.Close()
+	hash := sha256.New()
+	if read, err := io.Copy(hash, file); err != nil || read != length {
+		return "", exit.Named(exit.Conflict, "model_source.local_changed",
+			"local model source changed while measuring its exact identity")
 	}
-	return records.ModelTransferIntent{Kind: plan.Kind, Destination: plan.Destination,
-		Source: plan.Source, SourceSelection: plan.SourceSelection, SourceLicense: plan.SourceLicense,
-		SourceFiles: files, InputLane: plan.InputLane, SourceProfiles: plan.SourceProfiles,
-		Outputs: outputs}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (publishSource, *exit.Error) {
