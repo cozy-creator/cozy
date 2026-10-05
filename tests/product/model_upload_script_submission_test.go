@@ -86,10 +86,6 @@ func TestRentedIngestPinsAMovingHuggingFaceRef(t *testing.T) {
 // other captures instead of refusing them as a competing writer.
 func TestConcurrentRentedIngestsAreAllSubmitted(t *testing.T) {
 	pod := newRentedIngestPod(t, "https://civitai.com/api/v1/model-versions/128078")
-	// The owner's local TensorFS store already exists, as it does after any first command.
-	if code, out := runCozy(t, pod.root, "model", "list", "--json"); code != 0 {
-		t.Fatalf("model list [exit %d]: %s", code, out)
-	}
 	outputs := make([]string, 2)
 	codes := make([]int, 2)
 	var group sync.WaitGroup
