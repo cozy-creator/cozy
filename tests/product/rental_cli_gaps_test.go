@@ -110,15 +110,16 @@ func TestRentalModelDownloadAwaitsWithProgress(t *testing.T) {
 // user reads one message naming the side to upgrade, never the transport's own error.
 func TestProtocolSkewNamesTheSideToUpgrade(t *testing.T) {
 	// An older machine serves cozy.worker.v1 only. `rental show` reads cozy.machine.v1 Status
-	// and still shows what the Hub knows; `rental keepalive` has nothing else to do.
+	// and still shows what the Hub knows. `rental keepalive` falls back to worker.v1
+	// (TestRentalKeepaliveWorksOnAMachineThatPredatesV1); this one serves neither.
 	root, _ := attachedRental(t, &fakePod{})
 	code, out := runCozy(t, root, "rental", "show", "attached")
 	if code != 0 || !strings.Contains(out, "the machine is older than this cozy") || strings.Contains(out, "upgrade cozy") {
 		t.Fatalf("an older machine was not named as the side to upgrade [exit %d]:\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "rental", "keepalive", "attached")
-	if code != 1 || !strings.Contains(out, "the machine is older than this cozy") || !strings.Contains(out, "update the machine") || strings.Contains(out, "upgrade cozy") {
-		t.Fatalf("an older machine was not named as the side to upgrade [exit %d]:\n%s", code, out)
+	if code != 1 || !strings.Contains(out, "answers neither cozy.machine.v1 Status nor worker.v1 KeepRentalAlive") || strings.Contains(out, "upgrade cozy") {
+		t.Fatalf("a machine serving no keepalive was not named as such [exit %d]:\n%s", code, out)
 	}
 	// A newer machine serves cozy.machine.v1 and not every worker.v1 call this cozy still makes
 	// (`rental logs --tensorfs` reads ReadMachineLog); one past worker.v1 keeps only

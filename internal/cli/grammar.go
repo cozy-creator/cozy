@@ -697,5 +697,5 @@ type RentalKeepaliveCmd struct {
 }
 
 func (c *RentalKeepaliveCmd) Run(r *Runtime) error {
-	return r.call(handleRentalKeepalive, []string{c.Rental}, nil, nil, true)
+	return r.call(handleRentalKeepalive, []string{c.Rental}, nil, nil, false)
 }
