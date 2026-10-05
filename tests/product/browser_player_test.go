@@ -579,6 +579,79 @@ func TestRunPlayPrintsALinkThatPlays(t *testing.T) {
 	playerWait(t, page, "the printed link plays the film to its end", `video().ended && decoded(1.5, 36)`)
 }
 
+// This computer's machine plays its own run's growing film (the owner's local-playback ruling):
+// with no port configured it takes one and keeps it, `cozy run play` prints the link while the
+// run is running, and Chrome plays each segment the Runtime encodes as it lands, then the whole
+// film, every byte `cozy run --out` saved.
+func TestRunPlayPlaysALocalMachinesGrowingFilm(t *testing.T) {
+	if *playerBrowsers == "" || *machineHostBinary == "" || *privateScriptRuntimeWheel == "" {
+		t.Skip("requires -player-browsers=chrome, -machine-host and -script-runtime-wheel")
+	}
+	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
+	must(t, err)
+	root, err := os.MkdirTemp(os.TempDir(), "czp")
+	must(t, err)
+	provisionMachine(t, root)
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		if t.Failed() {
+			t.Logf("evidence retained at %s\nmachine log tail:\n%s", root, tail(filepath.Join(root, "machine", "host.log")))
+		} else {
+			_ = removeAllForce(root)
+		}
+	})
+	pages := httptest.NewServer(http.FileServer(http.Dir(filepath.Join("..", "..", "web", "player"))))
+	defer pages.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: http://127.0.0.1:1\nplayer_url: "+pages.URL+"/index.html\n"), 0o600))
+	if code, out := runCozy(t, root, "package", "install", outputLogProof(t, wheel), "--editable"); code != 0 {
+		t.Fatalf("package install [exit %d]\n%s", code, out)
+	}
+	gate, out := t.TempDir(), filepath.Join(root, "film")
+	run, command, ran := cozy1Run(t, root, "local/output-log-proof/film", "gate="+gate, "--await", "--json", "--out", out)
+	must(t, os.WriteFile(filepath.Join(gate, "go-1"), nil, 0o600))
+	code, printed := runCozy(t, root, "run", "play", run, "--json")
+	var play struct{ Link string }
+	if code != 0 || json.Unmarshal([]byte(lastJSONLine(printed)), &play) != nil {
+		t.Fatalf("cozy run play: [%d] %s", code, printed)
+	}
+	parsed, err := url.Parse(play.Link)
+	must(t, err)
+	link, err := url.ParseQuery(parsed.Fragment)
+	must(t, err)
+	port, _ := os.ReadFile(filepath.Join(root, "machine", "root", "var", "lib", "cozy", "machine", "webrtc-port"))
+	if _, at, _ := net.SplitHostPort(link.Get("a")); len(port) == 0 || at != strings.TrimSpace(string(port)) || link.Get("r") != run {
+		t.Fatalf("the link plays run %q at %q; the machine keeps port %q", link.Get("r"), link.Get("a"), port)
+	}
+	pw, err := playwright.Run(&playwright.RunOptions{SkipInstallBrowsers: true})
+	must(t, err)
+	defer pw.Stop()
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Channel: playwright.String("chrome"), Args: []string{"--disable-gpu"}})
+	must(t, err)
+	defer browser.Close()
+	page, err := browser.NewPage()
+	must(t, err)
+	must(t, page.AddInitScript(playwright.Script{Content: playwright.String(playerRecorder)}))
+	_, err = page.Goto(play.Link)
+	must(t, err)
+	// Each segment is shown as it lands, whether its revision extends the video or replaces it.
+	shown := func(seconds float64) string {
+		return fmt.Sprintf(`!player().error && video().currentTime >= %v && ranges().some(([, e]) => e >= %v)`, seconds-0.1, seconds-0.05)
+	}
+	playerWait(t, page, "segment 1 plays while the run runs", shown(0.5))
+	must(t, os.WriteFile(filepath.Join(gate, "go-2"), nil, 0o600))
+	playerWait(t, page, "segment 2 plays as it lands", shown(1.0))
+	must(t, os.WriteFile(filepath.Join(gate, "go-3"), nil, 0o600))
+	playerWait(t, page, "the finished film plays to its end", "player().finished && "+shown(1.5))
+	if err := command.Wait(); err != nil {
+		t.Fatalf("the job exited %v:\n%s", err, ran.String())
+	}
+	saved := savedVideo(t, out, ran)
+	if held := fmt.Sprint(playerEval(t, page, `[player().pos, player().final.sha256]`)); held != fmt.Sprint([]any{len(saved), digestOf(saved)}) {
+		t.Fatalf("the page holds %s; --out saved %d bytes, %s", held, len(saved), digestOf(saved))
+	}
+}
+
 // A rented run's growing video says, once, how to watch it in a browser; a local run's does not.
 func TestAwaitNamesThePlayCommandForARentedVideo(t *testing.T) {
 	added := func(output string) localapi.Event {
