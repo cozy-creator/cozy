@@ -1,14 +1,21 @@
 name: Publish to PyPI
 
-# Publication IS the tag push (cozy-eval's pattern). No local publish —
-# this workflow is the single release procedure. Manual run for an existing tag
-# (the tag's tree must carry this dispatch trigger):
-#   gh workflow run publish.yaml -R cozy-creator/tensorfs --ref vX.Y.Z
+# A tag push publishes nothing. Two manual runs, each through the same trusted publisher:
+#   build and publish an existing tag's tree (the tag's tree must carry this trigger):
+#     gh workflow run publish.yaml -R cozy-creator/tensorfs --ref vX.Y.Z
+#   publish exactly the gated files attached to an existing GitHub release, building nothing:
+#     gh workflow run publish.yaml -R cozy-creator/tensorfs -f release_tag=vX.Y.Z -f gated_sha256sums='<sum> <file> ...'
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release whose attached files are published as they are (with gated_sha256sums)
+        type: string
+        default: ''
+      gated_sha256sums:
+        description: '"<sha256> <filename>" pairs, space separated; the release must hold exactly these files'
+        type: string
+        default: ''
 
 # Never cancel a publication midway.
 concurrency:
@@ -18,6 +25,7 @@ concurrency:
 jobs:
   # The tag must name the version the tree declares before anything is built.
   gate:
+    if: ${{ !inputs.gated_sha256sums }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -97,3 +105,54 @@ jobs:
       - run: ls -l dist
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The gated files a release candidate was proven with, published byte for byte: no build,
+  # no project code, only the release's assets checked against the sums the release owner
+  # recorded, then the same trusted publisher.
+  publish-gated:
+    if: ${{ inputs.gated_sha256sums != '' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 20
+    permissions:
+      contents: read   # the release's assets
+      id-token: write  # PyPI trusted publishing (OIDC)
+    steps:
+      - name: The release holds exactly the gated files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          SUMS: ${{ inputs.gated_sha256sums }}
+        run: |
+          set -eu
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist
+          printf '%s\n' $SUMS | paste -d' ' - - | sed 's/ /  /' > sums
+          (cd dist && sha256sum --check --strict ../sums)
+          [ "$(ls dist | sort)" = "$(awk '{print $2}' sums | sort)" ]
+      - name: Publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: PyPI serves exactly the gated files
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os, time, urllib.request
+          version = os.environ["TAG"].removeprefix("v")
+          want = {name: digest for digest, name in (line.split() for line in open("sums"))}
+          url = f"https://pypi.org/pypi/tensorfs/{version}/json"
+          while True:
+              request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+              try:
+                  files = {f["filename"]: f["digests"]["sha256"] for f in json.load(urllib.request.urlopen(request))["urls"]}
+              except OSError:
+                  files = {}
+              extra = set(files) - set(want)
+              if extra or any(files.get(n, d) != d for n, d in want.items()):
+                  raise SystemExit(f"PyPI holds files this run did not publish or different bytes: {sorted(extra)}")
+              if files == want:
+                  print("\n".join(f"{d}  {n}" for n, d in sorted(want.items())))
+                  break
+              time.sleep(10)
+          PY
+
