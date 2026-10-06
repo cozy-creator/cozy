@@ -119,7 +119,7 @@ async def main(ctx):
 	// The machine installs each captured script as an ordinary uv installation; the public
 	// NumPy wheel's bytes come from uv's cache, so every installation links one inode.
 	installations := machineInstallations(root)
-	libraries, err := filepath.Glob(filepath.Join(installations, "*", "venv", "lib", "python3.12", "site-packages", "numpy", "_core", "_multiarray_umath*.so"))
+	libraries, err := filepath.Glob(filepath.Join(installations, "*", "env", "lib", "python3.12", "site-packages", "numpy", "_core", "_multiarray_umath*.so"))
 	must(t, err)
 	if len(libraries) < 2 {
 		t.Fatalf("expected an installation per captured script, found %v", libraries)
@@ -139,7 +139,7 @@ async def main(ctx):
 	must(t, err)
 	capturedModules, err := filepath.Glob(filepath.Join(installations, "*", "source", "numerical_tools.py"))
 	must(t, err)
-	installed, err := filepath.Glob(filepath.Join(installations, "*", "venv", "lib", "python3.12", "site-packages", "numerical_tools.py"))
+	installed, err := filepath.Glob(filepath.Join(installations, "*", "env", "lib", "python3.12", "site-packages", "numerical_tools.py"))
 	must(t, err)
 	capturedModules = append(capturedModules, installed...)
 	if len(capturedModules) == 0 {

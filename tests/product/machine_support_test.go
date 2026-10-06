@@ -250,9 +250,10 @@ func machineStore(root string) string {
 	return filepath.Join(root, "tensorfs")
 }
 
-// machineInstallations holds the package environments this computer's machine prepared.
+// machineInstallations holds the package environments this computer's machine prepared: one
+// generation each, its packages in `env` and an unpublished root's code in `source`.
 func machineInstallations(root string) string {
-	return filepath.Join(root, "machine", "root", "var", "lib", "cozy", "installs", "installations")
+	return filepath.Join(root, "machine", "root", "var", "lib", "cozy", "rust-machine", "generations")
 }
 
 // machineJournal is this computer's machine's execution journal: the Runtime's workspace in

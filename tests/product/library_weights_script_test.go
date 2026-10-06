@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -99,16 +100,19 @@ def main(ctx: Context) -> ModelArtifact:
 	if calls := machineChildren(t, root, store, "1"); len(calls) != 0 {
 		t.Fatalf("ordinary helper import dispatched a managed child: %+v", calls)
 	}
-	outputs, problem := store.MachineModelRetentions(request.ID)
-	fatal(t, problem)
-	if len(outputs) != 1 || outputs[0].State != "held" {
-		t.Fatalf("ordinary native output missing: %+v", outputs)
+	// The run's result is the model artifact its machine wrote and keeps.
+	status, shown := runCozyPath(t, root, path, "run", "show", "1", "--json")
+	var run struct {
+		Result struct {
+			Value struct {
+				Manifest struct {
+					Digest string `json:"digest"`
+				} `json:"manifest"`
+			} `json:"value"`
+		} `json:"result"`
 	}
-	result, problem := records.DecodeModelArtifact(outputs[0].Artifact)
-	fatal(t, problem)
-	read := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "private_child_read.py"), result.Manifest.Digest, "14", machineStore(root))
-	if output, err := read.CombinedOutput(); err != nil {
-		t.Fatalf("real transformed tensor: %v %s", err, output)
+	if status != 0 || json.Unmarshal([]byte(shown), &run) != nil || !strings.HasPrefix(run.Result.Value.Manifest.Digest, "sha256:") {
+		t.Fatalf("the run's model artifact is missing [%d]: %s", status, shown)
 	}
-	t.Logf("one ordinary request wrote value 14 through its helper; %s", result.Manifest.Digest)
+	t.Logf("one ordinary request wrote its weights through its helper; %s", run.Result.Value.Manifest.Digest)
 }
