@@ -298,7 +298,7 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 
 func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 	status := state.Status
-	if state.Status == "canceled" {
+	if state.Status == "canceled" && !mode.JSON {
 		status = humanCancellationStatus(state.CanceledBy)
 	}
 	if export := state.OutputExport; export != nil && export.State == "failed" && status == "completed" {
@@ -739,6 +739,10 @@ func modelQuantizeHint(ctx *Context, state api.JobState) string {
 // ---------------------------------------------------------------------- job cancel
 
 func handleJobCancel(ctx *Context) *exit.Error {
+	return cancelJob(ctx, "cozy job cancel")
+}
+
+func cancelJob(ctx *Context, actor string) *exit.Error {
 	c, e := dial(ctx)
 	if e != nil {
 		return e
@@ -752,9 +756,9 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	// the terminal is late, not wrong.
 	if settled(state.Status) && !state.Retaining {
 		fields := append(jobFields(ctx.Mode(), state, true), output.Field{K: "changed", V: false})
-		return emit(ctx, compactRecord(fields, "job", "status", "changed"))
+		return emit(ctx, compactRecord(fields, "job", "status", "changed", "canceled_by"))
 	}
-	if e := c.CancelJob(jobID, "cozy job cancel"); e != nil {
+	if e := c.CancelJob(jobID, actor); e != nil {
 		return e
 	}
 	// Cancellation is durable intent. Waiting for its effective outcome is explicit;
@@ -769,7 +773,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 		return e
 	}
 	fields := append(jobFields(ctx.Mode(), final, true), output.Field{K: "changed", V: true})
-	return emit(ctx, compactRecord(fields, "job", "status", "changed"))
+	return emit(ctx, compactRecord(fields, "job", "status", "changed", "canceled_by"))
 }
 
 func settled(status string) bool {

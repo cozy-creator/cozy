@@ -849,7 +849,7 @@ func handleRunCancel(ctx *Context) *exit.Error {
 		defer close()
 	}
 	if strings.HasPrefix(id, "job-") {
-		return handleJobCancel(ctx)
+		return cancelJob(ctx, "cozy run cancel")
 	}
 	client, problem := dial(ctx)
 	if problem != nil {
@@ -862,7 +862,7 @@ func handleRunCancel(ctx *Context) *exit.Error {
 		return problem
 	}
 	if before.Kind == "job" {
-		return handleJobCancel(ctx)
+		return cancelJob(ctx, "cozy run cancel")
 	}
 	// A settled run holding nothing is final. A completed machine run holds nothing a cancel
 	// would release unless its machine keeps the result: this host's own collection, in
