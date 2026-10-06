@@ -110,9 +110,15 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		// As Tensorhub: money in flight, or with ?state=all the ended ones too; ?name= keeps the
+		// rentals that bore one name.
+		history, name := r.URL.Query().Get("state") == "all", r.URL.Query().Get("name")
 		rows := []map[string]any{}
 		for _, row := range h.rentals {
-			if state, _ := row["state"].(string); state == "released" || state == "failed" {
+			if state, _ := row["state"].(string); !history && (state == "released" || state == "failed") {
+				continue
+			}
+			if name != "" && row["name"] != name {
 				continue
 			}
 			rows = append(rows, row)
@@ -130,7 +136,10 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		h.reads++
 		row, ok := h.rentals[r.PathValue("id")]
 		if !ok || r.Header.Get("Authorization") != "Bearer rental-idle-test" {
+			// As Tensorhub answers an id it does not hold for this caller.
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"rental.not_found","message":"no rental","remedy":"POST /v1/rentals creates one"}}`))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

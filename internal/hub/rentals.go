@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -112,6 +113,13 @@ type Rental struct {
 	// WebRTC is a ready machine-image rental's browser-media listener: the address a
 	// browser dials over ICE-TCP and the pinned leaf's "sha-256 AB:…". Nil otherwise.
 	WebRTC *RentalWebRTC
+	// ReleaseCause is who ended a released rental (owner_stop, released_by_pod,
+	// idle_unreached, ...), and EndedAt when it ended, RFC 3339 on the Hub's clock. Blank
+	// while it lives, and from a Hub older than the facts.
+	ReleaseCause, EndedAt string
+	// UnreachableSince is when the Hub last reached a ready rental's pod, once a probe has
+	// not answered since; blank otherwise.
+	UnreachableSince string
 	// ComputeUSDMicrosPerHour and StorageUSDMicrosPerHour are what the rental costs an
 	// hour, its machine and its disk, from its create on; VCPUCount and MemoryGB are the
 	// machine's shape where the Hub states one. Zero from a Hub older than the facts.
@@ -225,6 +233,20 @@ func (r Rental) Ready() bool {
 
 func (r Rental) Attachable() bool { return r.Ready() }
 
+// EndCause is why an ended rental ended: who released it, else its failure. A Hub older than
+// release_cause names a released rental's cause as its detail.
+func (r Rental) EndCause() string {
+	switch {
+	case !RentalAbsent(r.State):
+		return ""
+	case r.ReleaseCause != "":
+		return r.ReleaseCause
+	case r.Failure != nil && r.Failure.Code != "":
+		return r.Failure.Code
+	}
+	return r.Detail
+}
+
 // HoldsMediaHash answers whether the pod media plane's live set carries this hash.
 // Both bare and sha256-prefixed spellings describe the same value.
 
@@ -256,6 +278,9 @@ type wireRental struct {
 	SpendUSDMicros        int64          `json:"spend_usd_micros"`
 	SpendBasis            string         `json:"spend_basis"`
 	WebRTC                *RentalWebRTC  `json:"webrtc,omitempty"`
+	ReleaseCause          string         `json:"release_cause,omitempty"`
+	EndedAt               string         `json:"ended_at,omitempty"`
+	UnreachableSince      string         `json:"unreachable_since,omitempty"`
 	// The rental's hourly cost, split, and its machine's shape.
 	ComputeUSDMicrosPerHour int64 `json:"compute_usd_micros_per_hour"`
 	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
@@ -313,6 +338,9 @@ func (w wireRental) rental() Rental {
 		SpendUSDMicros:        w.SpendUSDMicros,
 		SpendBasis:            w.SpendBasis,
 		WebRTC:                w.WebRTC,
+		ReleaseCause:          w.ReleaseCause,
+		EndedAt:               w.EndedAt,
+		UnreachableSince:      w.UnreachableSince,
 		// The hourly cost's split and the machine's shape.
 		ComputeUSDMicrosPerHour: w.ComputeUSDMicrosPerHour, StorageUSDMicrosPerHour: w.StorageUSDMicrosPerHour,
 		VCPUCount: w.VCPUCount, MemoryGB: w.MemoryGB,
@@ -712,6 +740,29 @@ func (c *Client) RentalListing(ctx context.Context) ([]Rental, int64, *exit.Erro
 		rentals = append(rentals, wire.rental())
 	}
 	return rentals, out.BindingsRevision, nil
+}
+
+// RentalHistory is every rental of this account that bore `name`, ended ones included, newest
+// first. A Hub that does not filter by name answers its whole history; the filter here holds.
+func (c *Client) RentalHistory(ctx context.Context, name string) ([]Rental, *exit.Error) {
+	var out struct {
+		Rentals []wireRental `json:"rentals"`
+	}
+	query := url.Values{"state": {"all"}, "name": {strings.ToLower(name)}}
+	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals?" + query.Encode(), auth: true,
+		responseBytes: maxRentalListingBytes}, &out)
+	if e != nil {
+		return nil, e
+	}
+	var named []Rental
+	for _, wire := range out.Rentals {
+		if rental := wire.rental(); rentalid.Valid(wire.ID) && strings.EqualFold(rental.Name, name) {
+			named = append(named, rental)
+		}
+	}
+	created := func(r Rental) time.Time { at, _ := time.Parse(time.RFC3339Nano, r.CreatedAt); return at }
+	slices.SortStableFunc(named, func(a, b Rental) int { return created(b).Compare(created(a)) })
+	return named, nil
 }
 
 // Rental reads one rental's current state using the renter's account authority.

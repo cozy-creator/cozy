@@ -86,6 +86,9 @@ type RentalSummary struct {
 
 	// Unverified marks a row whose hub could not be asked: this host's last record only.
 	Unverified bool `json:"unverified,omitempty"`
+	// UnreachableSince is when its Hub last reached a ready rental's pod, once a probe has
+	// not answered since (RFC 3339, the Hub's clock); blank otherwise.
+	UnreachableSince string `json:"unreachable_since,omitempty"`
 	// SpendUSDMicros and SpendBasis are the Hub's accrued spend; a blank basis is unknown.
 	SpendUSDMicros int64  `json:"spend_usd_micros,omitempty"`
 	SpendBasis     string `json:"spend_basis,omitempty"`
