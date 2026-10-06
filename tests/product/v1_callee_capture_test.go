@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -204,5 +205,81 @@ func TestV1CaptureKeepsTheCallersSelectedWheelAndRemovesItsRegistryDuplicate(t *
 				}
 			}
 		}
+	}
+}
+
+// Cut condition 21: a machine runs its own Runtime/TensorFS pair. A package whose local
+// dependency is captured with its closure installs there although its lock chose another
+// Runtime: the sealed wheel pins every other dependency exactly and the pair to its author's
+// bounds. Pinned exactly, the machine's own pair failed `uv pip check` (run 4811).
+func TestACapturedPackageInstallsOnAMachineWhoseRuntimeDiffers(t *testing.T) {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host")
+	}
+	root, err := os.MkdirTemp(os.TempDir(), "czsdk-")
+	must(t, err)
+	provisionMachine(t, root)
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		if t.Failed() {
+			t.Log("SDK skew proof retained", root)
+		} else {
+			must(t, removeAllForce(root))
+		}
+	})
+	machineWheels, _ := filepath.Glob(filepath.Join(machineTemplateDir(t), "root/opt/cozy/machine/wheels/cozy_runtime-*.whl"))
+	if len(machineWheels) != 1 {
+		t.Fatalf("the test machine holds no single Runtime wheel: %v", machineWheels)
+	}
+	machine := runtimeFixtureVersion(t, machineWheels[0])
+	project := t.TempDir()
+	for _, node := range []string{"callee", "caller"} {
+		dir := filepath.Join(project, node)
+		must(t, os.MkdirAll(dir, 0o700))
+		module := "skew_" + node
+		dependencies, extra := `"cozy-runtime>=0.18.89", "msgspec>=0.19,<1"`, ""
+		body := "import msgspec\nfrom cozy_runtime.author import App, Context, invocable\napp = App()\nclass Squared(msgspec.Struct):\n    square: int\n" +
+			"@invocable()\nasync def square(ctx: Context, *, value: int) -> Squared:\n    return Squared(value * value)\napp.job(square)\n"
+		if node == "caller" {
+			// The lock picks a published Runtime other than the machine's.
+			dependencies += `, "skew-callee>=1.0.0"`
+			extra = fmt.Sprintf("[tool.uv]\nconstraint-dependencies = [\"cozy-runtime!=%s\"]\n[tool.uv.sources]\nskew-callee = {path = \"../callee\"}\n", machine)
+			body = "import msgspec\nfrom cozy_runtime.author import App, Context\nfrom skew_callee import square\napp = App()\n" +
+				"class Survey(msgspec.Struct):\n    values: list[int]\nclass Surveyed(msgspec.Struct):\n    squares: list[int]\n" +
+				"async def survey(ctx: Context, payload: Survey) -> Surveyed:\n    return Surveyed([(await square(value=v)).square for v in payload.values])\napp.job(survey)\n"
+		}
+		metadata := fmt.Sprintf("[project]\nname=%q\nversion=\"1.0.0\"\nrequires-python=\">=3.12,<3.13\"\ndependencies=[%s]\n%s[project.entry-points.\"cozy.application\"]\ndefault=%q\n[build-system]\nrequires=[\"hatchling\"]\nbuild-backend=\"hatchling.build\"\n[tool.hatch.build.targets.wheel]\nonly-include=[%q]\n",
+			"skew-"+node, dependencies, extra, module+":app", module+".py")
+		must(t, os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(metadata), 0o600))
+		must(t, os.WriteFile(filepath.Join(dir, "package.toml"), []byte(fmt.Sprintf("[application]\nobject=%q\n", module+":app")), 0o600))
+		must(t, os.WriteFile(filepath.Join(dir, module+".py"), []byte(body), 0o600))
+	}
+	caller := filepath.Join(project, "caller")
+	if out, err := exec.Command("uv", "lock", "--directory", caller, "--python", "3.12").CombinedOutput(); err != nil {
+		t.Fatalf("uv lock: %v: %s", err, out)
+	}
+	lock, err := os.ReadFile(filepath.Join(caller, "uv.lock"))
+	must(t, err)
+	locked := regexp.MustCompile(`name = "cozy-runtime"\nversion = "([^"]+)"`).FindSubmatch(lock)
+	if locked == nil || string(locked[1]) == machine {
+		t.Fatalf("the lock must choose a Runtime other than the machine's %s: %q", machine, locked)
+	}
+	if code, out := runCozy(t, root, "package", "install", caller, "--editable"); code != 0 {
+		t.Fatalf("package install [%d]: %s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "local/skew-caller/survey", "values:=[3,4]", "--await", "--json"); code != 0 || !strings.Contains(out, `"squares":[9,16]`) {
+		t.Fatalf("the captured pair locked to Runtime %s did not run on a machine with %s [%d]: %s", locked[1], machine, code, out)
+	}
+	sealed, _ := filepath.Glob(filepath.Join(root, "local-packages", "*", "skew_caller-1.0.0-py3-none-any.whl"))
+	if len(sealed) != 1 {
+		t.Fatalf("no single sealed caller wheel: %v", sealed)
+	}
+	metadata, problem := capturedwheel.Metadata(sealed[0])
+	fatal(t, problem)
+	text := string(metadata)
+	if strings.Contains(text, "cozy-runtime==") || strings.Contains(text, "tensorfs==") ||
+		!strings.Contains(text, "Requires-Dist: cozy-runtime>=0.18.89") || !strings.Contains(text, "Requires-Dist: msgspec==") {
+		t.Fatalf("the sealed wheel must leave the SDK pair at its bounds and pin the rest:\n%s", text)
 	}
 }
