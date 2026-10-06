@@ -77,10 +77,10 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 	for {
 		var state string
 		must(t, journal.QueryRow("SELECT state FROM executions WHERE request_id=?", request.ID).Scan(&state))
-		if state == "succeeded" {
+		if state == "completed" {
 			break
 		}
-		if state == "failed" || state == "canceled" || time.Now().After(deadline) {
+		if state == "failed" || state == "cancelled" || state == "canceled" || time.Now().After(deadline) {
 			t.Fatalf("Runtime did not finish with client absent: %s\n%s", state, productWorkerLogs(root))
 		}
 		time.Sleep(100 * time.Millisecond)
