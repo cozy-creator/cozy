@@ -456,7 +456,7 @@ func TestBindVerifiesTheLadderAgainstTheCardBeforeWriting(t *testing.T) {
 			t.Fatal(problem)
 		}
 		defer store.Close()
-		held, problem := store.BindingRevision()
+		held, problem := store.BindingRevision("")
 		if problem != nil {
 			t.Fatal(problem)
 		}

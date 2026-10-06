@@ -1068,9 +1068,13 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 	var listingProblem *exit.Error
 	if asked == nil && only == nil {
 		hctx, cancel := hub.Context()
-		listing, listingProblem = owner.Rentals(hctx)
+		var bindings int64
+		listing, bindings, listingProblem = owner.RentalListing(hctx)
 		listed = listingProblem == nil
 		cancel()
+		if listed {
+			_ = m.store.StateHubBindingsRevision(origin, bindings)
+		}
 	}
 	m.mu.Lock()
 	released, failed, rebooted, problem := m.applyRowsLocked(origin, views)
