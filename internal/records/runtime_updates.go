@@ -11,7 +11,6 @@ import (
 const runtimeUpdatesDDL = `CREATE TABLE IF NOT EXISTS rental_runtime_updates (
   rental_id TEXT PRIMARY KEY,
   operation_id TEXT NOT NULL,
-  request_id TEXT NOT NULL DEFAULT '',
   worker_boot_id TEXT NOT NULL,
   state TEXT NOT NULL,
   selection BLOB NOT NULL DEFAULT x'',
@@ -24,7 +23,6 @@ const runtimeUpdatesDDL = `CREATE TABLE IF NOT EXISTS rental_runtime_updates (
 type RuntimeUpdate struct {
 	RentalID  string          `json:"rental"`
 	ID        string          `json:"id"`
-	RequestID string          `json:"request_id,omitempty"`
 	BootID    string          `json:"worker_boot_id"`
 	State     string          `json:"state"`
 	Selection json.RawMessage `json:"selection,omitempty"`
@@ -34,42 +32,28 @@ type RuntimeUpdate struct {
 	UpdatedAt string          `json:"updated_at"`
 }
 
-// Active is an update that holds its rental: in progress, or unusable until the owner acts.
-func (r RuntimeUpdate) Active() bool { return r.State != "succeeded" && r.State != "failed" }
-
-// InProgress is an update the daemon is still carrying out.
-func (r RuntimeUpdate) InProgress() bool {
+// Active is an update still being carried out: it holds its rental.
+func (r RuntimeUpdate) Active() bool {
 	return r.State == "preparing" || r.State == "updating" || r.State == "reconciling" || r.State == "waiting_activation"
 }
 
-// RuntimeUpdateHold is why a rental takes no work because of its Runtime update, or nil.
-// Work waits for an update in progress; an update that ended without a serving worker
-// refuses work until the owner resumes it or ends the rental.
+// RuntimeUpdateHold is why a rental takes no work because of its software update, or nil:
+// work waits for an update of the rental's current boot to end.
 func (s *Store) RuntimeUpdateHold(rental string) *exit.Error {
 	r, problem := s.RuntimeUpdate(rental)
 	if problem != nil || r == nil || !r.Active() {
 		return problem
 	}
-	if r.InProgress() {
-		return exit.Named(exit.Unavailable, "rental.maintenance", "this rental is updating its Runtime; work waits for it")
+	if row, problem := s.RentalRow(rental); problem != nil || row == nil || row.ExpectedWorkerBootID != r.BootID {
+		return problem // the boot it updated is gone
 	}
-	name := rental
-	if row, _ := s.RentalRow(rental); row != nil && row.MachineName != "" {
-		name = row.MachineName
-	}
-	return r.Unusable(name)
-}
-
-// Unusable is the refusal of work on the machine name while this update is unusable.
-func (r RuntimeUpdate) Unusable(name string) *exit.Error {
-	return exit.Named(exit.Conflict, "rental.unusable", "%s is unusable: its Runtime update could not finish: %s", name, r.Error).
-		WithRemedy("cozy rental update %s retries it; cozy rental end %s ends the rental", name, name)
+	return exit.Named(exit.Unavailable, "rental.maintenance", "this rental is updating its software; work waits for it")
 }
 
 func (s *Store) RuntimeUpdate(rental string) (*RuntimeUpdate, *exit.Error) {
 	var r RuntimeUpdate
-	err := s.db.QueryRow(`SELECT rental_id,operation_id,request_id,worker_boot_id,state,selection,result,error,created_at,updated_at
-	 FROM rental_runtime_updates WHERE rental_id=?`, rental).Scan(&r.RentalID, &r.ID, &r.RequestID, &r.BootID, &r.State, &r.Selection, &r.Result, &r.Error, &r.CreatedAt, &r.UpdatedAt)
+	err := s.db.QueryRow(`SELECT rental_id,operation_id,worker_boot_id,state,selection,result,error,created_at,updated_at
+	 FROM rental_runtime_updates WHERE rental_id=?`, rental).Scan(&r.RentalID, &r.ID, &r.BootID, &r.State, &r.Selection, &r.Result, &r.Error, &r.CreatedAt, &r.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -79,7 +63,7 @@ func (s *Store) RuntimeUpdate(rental string) (*RuntimeUpdate, *exit.Error) {
 	return &r, nil
 }
 
-func (s *Store) BeginRuntimeUpdate(rental, boot, request string, selection json.RawMessage) (*RuntimeUpdate, *exit.Error) {
+func (s *Store) BeginRuntimeUpdate(rental, boot string, selection json.RawMessage) (*RuntimeUpdate, *exit.Error) {
 	if len(selection) > 1<<20 || (len(selection) > 0 && !json.Valid(selection)) {
 		return nil, exit.New(exit.Validation, "invalid initial Runtime update selection")
 	}
@@ -93,15 +77,15 @@ func (s *Store) BeginRuntimeUpdate(rental, boot, request string, selection json.
 		return nil, exit.New(exit.Conflict, "the rental is no longer ready on its pinned worker boot")
 	}
 	var active bool
-	if err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM rental_runtime_updates WHERE rental_id=? AND state NOT IN ('succeeded','failed'))`, rental).Scan(&active); err != nil {
+	if err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM rental_runtime_updates WHERE rental_id=? AND worker_boot_id=? AND state NOT IN ('succeeded','failed'))`, rental, boot).Scan(&active); err != nil {
 		return nil, exit.Internalf("cannot inspect existing Runtime update: %s", err)
 	}
 	if active {
 		return nil, exit.Named(exit.Unavailable, "rental.maintenance", "this rental already has an unfinished Runtime update")
 	}
-	r := RuntimeUpdate{RentalID: rental, ID: NewID("runtime-update"), RequestID: request, BootID: boot, State: "preparing", Selection: append([]byte{}, selection...), CreatedAt: now(), UpdatedAt: now()}
-	_, err = tx.Exec(`INSERT INTO rental_runtime_updates(rental_id,operation_id,request_id,worker_boot_id,state,selection,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)
-	 ON CONFLICT(rental_id) DO UPDATE SET operation_id=excluded.operation_id,request_id=excluded.request_id,worker_boot_id=excluded.worker_boot_id,state=excluded.state,selection=excluded.selection,result=x'',error='',created_at=excluded.created_at,updated_at=excluded.updated_at`, r.RentalID, r.ID, r.RequestID, r.BootID, r.State, r.Selection, r.CreatedAt, r.UpdatedAt)
+	r := RuntimeUpdate{RentalID: rental, ID: NewID("runtime-update"), BootID: boot, State: "preparing", Selection: append([]byte{}, selection...), CreatedAt: now(), UpdatedAt: now()}
+	_, err = tx.Exec(`INSERT INTO rental_runtime_updates(rental_id,operation_id,worker_boot_id,state,selection,created_at,updated_at) VALUES(?,?,?,?,?,?,?)
+	 ON CONFLICT(rental_id) DO UPDATE SET operation_id=excluded.operation_id,worker_boot_id=excluded.worker_boot_id,state=excluded.state,selection=excluded.selection,result=x'',error='',created_at=excluded.created_at,updated_at=excluded.updated_at`, r.RentalID, r.ID, r.BootID, r.State, r.Selection, r.CreatedAt, r.UpdatedAt)
 	if err != nil {
 		return nil, exit.Internalf("cannot record Runtime update: %s", err)
 	}
@@ -113,7 +97,7 @@ func (s *Store) BeginRuntimeUpdate(rental, boot, request string, selection json.
 
 func (s *Store) SaveRuntimeUpdate(r RuntimeUpdate) *exit.Error {
 	switch r.State {
-	case "preparing", "updating", "reconciling", "waiting_activation", "unusable", "succeeded", "failed":
+	case "preparing", "updating", "reconciling", "waiting_activation", "succeeded", "failed":
 	default:
 		return exit.New(exit.Validation, "invalid Runtime update state")
 	}
@@ -161,17 +145,4 @@ func (s *Store) ActiveRuntimeUpdates() ([]RuntimeUpdate, *exit.Error) {
 		}
 	}
 	return result, nil
-}
-
-func (s *Store) RuntimeUpdateAttempted(request string) (bool, *exit.Error) {
-	return s.RequestHasEvent(request, "machine.runtime_update_attempted")
-}
-
-func (s *Store) RequestHasEvent(request, kind string) (bool, *exit.Error) {
-	var found bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, request, kind).Scan(&found)
-	if err != nil {
-		return false, exit.Internalf("cannot read automatic Runtime update history: %s", err)
-	}
-	return found, nil
 }

@@ -29,6 +29,13 @@ import (
 // (-machine-host) behind a stand-in Hub, and a running daemon.
 func statusRental(t *testing.T) (string, *records.Store, *machines.Launch, rental.CreatorIdentity, *daemonProcess) {
 	t.Helper()
+	root, store, launch, identity, daemon, _ := statusRentalHub(t)
+	return root, store, launch, identity, daemon
+}
+
+// statusRentalHub is statusRental with the stand-in Hub the rental was bought from.
+func statusRentalHub(t *testing.T) (string, *records.Store, *machines.Launch, rental.CreatorIdentity, *daemonProcess, *machineHub) {
+	t.Helper()
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: a machine serving cozy.machine.v1")
 	}
@@ -65,7 +72,7 @@ func statusRental(t *testing.T) (string, *records.Store, *machines.Launch, renta
 		Address: launch.Addr, MediaAddress: launch.MediaAddr, ExpectedWorkerID: launch.WorkerID, ExpectedWorkerBootID: launch.BootID}
 	fatal(t, rental.Attach(layout, store, row, cert, secret.New(token), identity))
 	daemon := startDaemonProcess(t, root)
-	return root, store, launch, identity, daemon
+	return root, store, launch, identity, daemon, h
 }
 
 // Ordinary CLI -> actual daemon/records -> the rental's machine over cozy.machine.v1. Only an

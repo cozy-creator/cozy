@@ -14,10 +14,14 @@ import (
 	"strings"
 )
 
-// publishedWheel fetches a distribution's newest release wheel for this computer from the
-// package index into dir, checking the index's sha256, and answers its path.
-func publishedWheel(ctx context.Context, distribution, dir string) (string, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://pypi.org/pypi/"+distribution+"/json", nil)
+// publishedWheel fetches a distribution's release wheel for this computer (version, or the
+// newest) from the package index into dir, checking the index's sha256, and answers its path.
+func publishedWheel(ctx context.Context, distribution, version, dir string) (string, error) {
+	release := distribution
+	if version != "" {
+		release += "/" + version
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://pypi.org/pypi/"+release+"/json", nil)
 	if err != nil {
 		return "", err
 	}
@@ -34,7 +38,7 @@ func publishedWheel(ctx context.Context, distribution, dir string) (string, erro
 		} `json:"urls"`
 	}
 	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 32<<20)).Decode(&project) != nil {
-		return "", fmt.Errorf("the package index has no release of %s", distribution)
+		return "", fmt.Errorf("the package index has no release %s", release)
 	}
 	arch := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}[runtime.GOARCH]
 	for _, file := range project.URLs {
@@ -47,7 +51,7 @@ func publishedWheel(ctx context.Context, distribution, dir string) (string, erro
 		}
 		return path, nil
 	}
-	return "", fmt.Errorf("the newest %s has no wheel for linux/%s", distribution, runtime.GOARCH)
+	return "", fmt.Errorf("%s has no wheel for linux/%s", release, runtime.GOARCH)
 }
 
 func download(ctx context.Context, url, path, digest string) error {

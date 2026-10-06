@@ -63,6 +63,8 @@ type fakeRentalHub struct {
 	publishes bool
 	// reads counts rental reads, so a test can plant a transition after the daemon's first look.
 	reads int
+	// software is the target pair GET /v1/software answers; unset, none.
+	software map[string]string
 }
 
 func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
@@ -89,6 +91,11 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(rentalDownloadPlan(pkg, release))
+	})
+	mux.HandleFunc("GET /v1/software", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]string{"runtime": h.software["runtime"], "tensorfs": h.software["tensorfs"]})
 	})
 	// Ordinary fixtures provide the real account census. Tests of an unavailable
 	// route must opt into that refusal explicitly.

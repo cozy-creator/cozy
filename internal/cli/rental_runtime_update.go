@@ -4,19 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
+	"github.com/cozy-creator/cozy/internal/workertls"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
+// rentalRuntimeUpdates changes rentals' software with Run kind: update. Each rental's latest
+// update is recorded against its boot; until it ends it holds the rental, so work waits and
+// lands on the new software. The machine waits for idleness and rolls back a candidate that
+// never proves ready, so an update ends succeeded or failed and the rental serves either way.
 type rentalRuntimeUpdates struct {
 	machines *machineRuns
 	running  sync.Map
@@ -31,23 +41,43 @@ type runtimeUpdateWheel struct {
 	Length   int64  `json:"length"`
 }
 
+// runtimeUpdateSelection is what an update installs: local wheels or published versions.
+// Nothing named is the Hub's target software.
 type runtimeUpdateSelection struct {
-	LocalRuntime  *runtimeUpdateWheel `json:"local_runtime,omitempty"`
-	LocalTensorFS *runtimeUpdateWheel `json:"local_tensorfs,omitempty"`
-	// Published versions to install instead of local wheels; the machine fetches them.
-	RuntimeVersion  string `json:"runtime_version,omitempty"`
-	TensorFSVersion string `json:"tensorfs_version,omitempty"`
+	LocalRuntime    *runtimeUpdateWheel `json:"local_runtime,omitempty"`
+	LocalTensorFS   *runtimeUpdateWheel `json:"local_tensorfs,omitempty"`
+	RuntimeVersion  string              `json:"runtime_version,omitempty"`
+	TensorFSVersion string              `json:"tensorfs_version,omitempty"`
+}
+
+type softwarePair struct {
+	Runtime  string `json:"runtime"`
+	TensorFS string `json:"tensorfs"`
+}
+
+// runtimeUpdateResult is a finished update's record. Unchanged: nothing was installed, and
+// Note says why.
+type runtimeUpdateResult struct {
+	From      softwarePair `json:"from"`
+	To        softwarePair `json:"to"`
+	Unchanged bool         `json:"unchanged,omitempty"`
+	Note      string       `json:"note,omitempty"`
+}
+
+// Boot brings a rental's newly attached worker boot to the Hub's target software before it
+// takes work. Only a new boot is followed, so an explicit update stands until the pod boots
+// again.
+func (u *rentalRuntimeUpdates) Boot(id string) {
+	if _, problem := u.Start(id, api.RuntimeUpdateRequest{}); problem != nil {
+		fmt.Fprintf(u.machines.context.Out, "rental %s keeps its software: %s\n", id, problem.Message)
+	}
 }
 
 func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
-	return u.start(id, options.RuntimeWheel, options.TensorFSWheel, options.RuntimeVersion, options.TensorFSVersion)
-}
-
-func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath, runtimeVersion, tensorfsVersion string) (*records.RuntimeUpdate, *exit.Error) {
-	if tensorfsPath != "" && wheelPath == "" {
+	if options.TensorFSWheel != "" && options.RuntimeWheel == "" {
 		return nil, exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
 	}
-	if wheelPath != "" && runtimeVersion != "" || tensorfsPath != "" && tensorfsVersion != "" {
+	if options.RuntimeWheel != "" && options.RuntimeVersion != "" || options.TensorFSWheel != "" && options.TensorFSVersion != "" {
 		return nil, exit.New(exit.Validation, "name a wheel or a version, not both")
 	}
 	m := u.machines
@@ -62,62 +92,44 @@ func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath, runtimeVersion
 	if problem != nil {
 		return nil, problem
 	}
-	var candidate *runtimeUpdateWheel
-	var snapshot *scratch.Dir
-	if wheelPath != "" {
-		candidate, snapshot, problem = freezeRuntimeWheel(m.layout.Tmp, wheelPath)
+	if current != nil && current.Active() && current.BootID == row.ExpectedWorkerBootID {
+		if options != (api.RuntimeUpdateRequest{}) {
+			return nil, exit.Named(exit.Unavailable, "rental.maintenance", "this rental is already updating its software; wait for it to end")
+		}
+		u.run(*current) // the update in progress is the one asked for
+		return current, nil
+	}
+	selection := runtimeUpdateSelection{RuntimeVersion: options.RuntimeVersion, TensorFSVersion: options.TensorFSVersion}
+	var snapshots []*scratch.Dir
+	defer func() {
+		for _, snapshot := range snapshots {
+			snapshot.Release()
+		}
+	}()
+	for _, local := range []struct {
+		path string
+		into **runtimeUpdateWheel
+	}{{options.RuntimeWheel, &selection.LocalRuntime}, {options.TensorFSWheel, &selection.LocalTensorFS}} {
+		if local.path == "" {
+			continue
+		}
+		wheel, snapshot, problem := freezeRuntimeWheel(m.layout.Tmp, local.path)
 		if problem != nil {
 			return nil, problem
 		}
+		*local.into, snapshots = wheel, append(snapshots, snapshot)
 	}
-	if snapshot != nil {
-		defer snapshot.Release()
+	raw, _ := json.Marshal(selection)
+	current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, raw)
+	if problem != nil {
+		return nil, problem
 	}
-	var tensorfs *runtimeUpdateWheel
-	var tensorfsSnapshot *scratch.Dir
-	if tensorfsPath != "" {
-		tensorfs, tensorfsSnapshot, problem = freezeRuntimeWheel(m.layout.Tmp, tensorfsPath)
-		if problem != nil {
-			return nil, problem
-		}
-		defer tensorfsSnapshot.Release()
+	for _, snapshot := range snapshots {
+		snapshot.Detach() // the record owns the frozen wheels now
 	}
-	if current != nil && current.Active() && candidate != nil {
-		var saved runtimeUpdateSelection
-		if json.Unmarshal(current.Selection, &saved) != nil || !sameUpdateWheel(saved.LocalRuntime, candidate) || !sameUpdateWheel(saved.LocalTensorFS, tensorfs) {
-			return nil, exit.New(exit.Conflict, "this rental already has a different frozen Runtime update; resume it without wheel flags")
-		}
-	}
-	if current == nil || !current.Active() {
-		var selection json.RawMessage
-		if candidate != nil || runtimeVersion != "" || tensorfsVersion != "" {
-			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate, LocalTensorFS: tensorfs,
-				RuntimeVersion: runtimeVersion, TensorFSVersion: tensorfsVersion})
-		}
-		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, "", selection)
-		if problem == nil && snapshot != nil {
-			snapshot.Detach()
-			if tensorfsSnapshot != nil {
-				tensorfsSnapshot.Detach()
-			}
-		}
-	}
-	if problem == nil && current.State == "unusable" {
-		// The owner resumes the same recorded operation; its error says what to re-check.
-		current.State = "reconciling"
-		problem = m.store.SaveRuntimeUpdate(*current)
-	}
-	if problem == nil {
-		u.run(*current)
-	}
-	return current, problem
-}
-
-func sameUpdateWheel(a, b *runtimeUpdateWheel) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return a.Digest == b.Digest && a.Filename == b.Filename && a.Length == b.Length
+	snapshots = nil
+	u.run(*current)
+	return current, nil
 }
 
 func (u *rentalRuntimeUpdates) Resume() {
@@ -127,10 +139,13 @@ func (u *rentalRuntimeUpdates) Resume() {
 		return
 	}
 	for _, row := range rows {
-		if row.InProgress() {
-			u.run(row)
-		}
+		u.run(row)
 	}
+}
+
+// preflight holds work off a rental while its software update runs.
+func (u *rentalRuntimeUpdates) preflight(_ context.Context, _ records.Request, machine string) *exit.Error {
+	return u.machines.store.RuntimeUpdateHold(machine)
 }
 
 func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
@@ -138,22 +153,17 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		return
 	}
 	go func() {
+		m := u.machines
 		defer func() {
 			u.running.Delete(row.RentalID)
-			current, problem := u.machines.store.RuntimeUpdate(row.RentalID)
+			current, problem := m.store.RuntimeUpdate(row.RentalID)
 			if problem == nil && current != nil && current.Active() && current.ID != row.ID {
 				u.run(*current)
 			}
 		}()
-		m := u.machines
 		problem := m.fleet.owner.MaintainRental(m.ctx, row.RentalID, func(ctx context.Context, identity *orchestrator.WorkerConnection) *exit.Error {
 			if identity.WorkerBootID != row.BootID {
-				return exit.New(exit.Conflict, "the rental's worker boot changed before maintenance")
-			}
-			if row.RequestID != "" {
-				if problem := m.store.AppendEvent(row.RequestID, "machine.runtime_update_attempted", 0, map[string]any{"rental": row.RentalID, "update": row.ID}); problem != nil {
-					return problem
-				}
+				return exit.New(exit.Conflict, "the rental's worker boot changed before its update")
 			}
 			return u.update(ctx, &row, identity)
 		})
@@ -162,15 +172,126 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 			if m.ctx.Err() != nil && row.State != "preparing" {
 				row.State = "reconciling" // the next daemon attaches to the same update
 			} else {
-				// The machine refused it, or rolled it back: it serves its previous software.
-				row.State = "failed"
+				row.State = "failed" // refused or rolled back: it serves its previous software
 			}
 		}
 		if problem := m.store.SaveRuntimeUpdate(row); problem != nil {
 			fmt.Fprintln(m.context.Out, problem.Message)
 		}
 		m.fleet.owner.WakeQueue()
+		if m.fleet.installs != nil {
+			m.fleet.installs.Wake()
+		}
 	}()
+}
+
+// update sends the recorded selection to the rental's machine as Run kind: update and follows
+// it to its outcome. The run's id is this update's id, so a daemon that resumes the update
+// attaches to the same run; local wheels go up first with Write. Published versions the
+// machine already runs are not installed again.
+func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeUpdate, identity *orchestrator.WorkerConnection) *exit.Error {
+	var selection runtimeUpdateSelection
+	if len(row.Selection) > 0 && json.Unmarshal(row.Selection, &selection) != nil {
+		return exit.New(exit.Structural, "recorded software update selection is unreadable")
+	}
+	pin, err := workertls.LoadPin(identity.CACert)
+	if err != nil {
+		return exit.New(exit.Credential, "the machine's TLS identity cannot be read")
+	}
+	key, problem := u.machines.machines.RentalKey(identity.RentalID)
+	if problem != nil {
+		return problem
+	}
+	machine, err := machinev1.Dial(identity.Addr, pin.TLSConfig(), identity.WorkerID, key.Signer())
+	if err != nil {
+		return machines.Transport(err)
+	}
+	defer machine.Close()
+	frame, err := machine.Status(ctx)
+	if err != nil {
+		return machines.Transport(err)
+	}
+	result := runtimeUpdateResult{From: softwarePair{frame.GetRuntime(), frame.GetTensorfs()}}
+	finish := func(note string) *exit.Error {
+		result.To, result.Unchanged, result.Note = result.From, true, note
+		row.State, row.Error = "succeeded", ""
+		row.Result, _ = json.Marshal(result)
+		return nil
+	}
+	member := func(local *runtimeUpdateWheel, version string) (*machinev1.Member, *exit.Error) {
+		if local == nil {
+			if version == "" {
+				return nil, nil
+			}
+			return &machinev1.Member{Version: version}, nil
+		}
+		file, err := os.Open(local.Path)
+		if err != nil {
+			return nil, exit.New(exit.Conflict, "the frozen update wheel %s is gone: %s", local.Filename, err)
+		}
+		defer file.Close()
+		if err := machine.Write(ctx, local.Digest, uint64(local.Length), file); err != nil {
+			return nil, machines.Transport(err)
+		}
+		return &machinev1.Member{Wheel: local.Filename, Digest: local.Digest, Length: uint64(local.Length)}, nil
+	}
+	cohort := machinev1.Cohort{Agent: "bundled"}
+	if cohort.Runtime, problem = member(selection.LocalRuntime, selection.RuntimeVersion); problem != nil {
+		return problem
+	}
+	if cohort.TensorFS, problem = member(selection.LocalTensorFS, selection.TensorFSVersion); problem != nil {
+		return problem
+	}
+	if cohort.Runtime == nil && cohort.TensorFS == nil {
+		target, problem := client(u.machines.fleet.atRental(row.RentalID)).Software(ctx)
+		if problem != nil {
+			return problem
+		}
+		if target.Runtime == "" {
+			return finish("the Hub names no target software")
+		}
+		cohort.Runtime, cohort.TensorFS = &machinev1.Member{Version: target.Runtime}, &machinev1.Member{Version: target.TensorFS}
+	}
+	if published(cohort.Runtime, result.From.Runtime) && published(cohort.TensorFS, result.From.TensorFS) {
+		return finish("it already runs this software")
+	}
+	row.State = "updating"
+	if problem := u.machines.store.SaveRuntimeUpdate(*row); problem != nil {
+		return problem
+	}
+	var saveProblem *exit.Error
+	outcome, err := machine.Update(ctx, row.ID, cohort, func(event *pb.RunEvent) {
+		if event.GetProgress().GetStage() == "waiting_activation" && row.State != "waiting_activation" {
+			row.State = "waiting_activation"
+			saveProblem = u.machines.store.SaveRuntimeUpdate(*row)
+		}
+	})
+	if err != nil {
+		return machines.Transport(err)
+	}
+	if saveProblem != nil {
+		return saveProblem
+	}
+	// Same boot, other software: the next call on the kept connection asks it again.
+	u.machines.machines.Forget(row.RentalID)
+	var outcomeResult struct{ From, To softwarePair }
+	_ = json.Unmarshal(outcome.GetResult(), &outcomeResult)
+	result.To = outcomeResult.To
+	row.State, row.Error = "succeeded", ""
+	if outcome.GetStatus() != "succeeded" {
+		result.To = result.From
+		row.State, row.Error = "failed", outcome.GetReason().GetMessage()
+		if row.Error == "" {
+			row.Error = outcome.GetReason().GetCode()
+		}
+	}
+	row.Result, _ = json.Marshal(result)
+	return nil
+}
+
+// published answers whether a cohort member leaves the running version as it is.
+func published(member *machinev1.Member, running string) bool {
+	return member == nil || member.Wheel == "" && member.Version == running
 }
 
 func handleRentalUpdate(ctx *Context) *exit.Error {
@@ -187,77 +308,81 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	if row == nil {
 		return exit.New(exit.NotFound, "no rental %q on this host", ctx.Inv.Args[0])
 	}
+	request := api.RuntimeUpdateRequest{RuntimeVersion: ctx.Inv.Value("--runtime-version"), TensorFSVersion: ctx.Inv.Value("--tensorfs-version")}
+	for flag, into := range map[string]*string{"--runtime-wheel": &request.RuntimeWheel, "--tensorfs-wheel": &request.TensorFSWheel} {
+		if path := ctx.Inv.Value(flag); path != "" {
+			absolute, err := filepath.Abs(path)
+			if err != nil {
+				return exit.New(exit.Validation, "cannot resolve %s: %s", path, err)
+			}
+			*into = absolute
+		}
+	}
 	c, problem := dial(ctx)
 	if problem != nil {
 		return problem
 	}
-	wheelPath := ctx.Inv.Value("--runtime-wheel")
-	if wheelPath != "" {
-		var err error
-		wheelPath, err = filepath.Abs(wheelPath)
-		if err != nil {
-			return exit.New(exit.Validation, "cannot resolve local Runtime wheel: %s", err)
-		}
+	update, problem := c.UpdateRentalRuntime(row.ID, request)
+	if problem == nil {
+		update, problem = awaitRentalUpdate(ctx, c, row.MachineName, update)
 	}
-	tensorfsPath := ctx.Inv.Value("--tensorfs-wheel")
-	if tensorfsPath != "" {
-		if wheelPath == "" {
-			return exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
-		}
-		var err error
-		tensorfsPath, err = filepath.Abs(tensorfsPath)
-		if err != nil {
-			return exit.New(exit.Validation, "cannot resolve local TensorFS wheel: %s", err)
-		}
-	}
-	result, problem := c.UpdateRentalRuntime(row.ID, api.RuntimeUpdateRequest{RuntimeWheel: wheelPath, TensorFSWheel: tensorfsPath,
-		RuntimeVersion: ctx.Inv.Value("--runtime-version"), TensorFSVersion: ctx.Inv.Value("--tensorfs-version")})
 	if problem != nil {
 		return problem
 	}
-	lastState := ""
-	for result.InProgress() {
-		if !ctx.Mode().JSON && lastState != result.State {
-			messages := map[string]string{"preparing": "Checking Runtime and published updates", "updating": "Updating Runtime", "reconciling": "Checking the worker after an interrupted update"}
-			if message := messages[result.State]; message != "" {
-				fmt.Fprintf(ctx.Err, "%s: %s...\n", row.MachineName, message)
-			}
-			lastState = result.State
-		}
-		time.Sleep(time.Second)
-		result, problem = c.RentalRuntimeUpdate(row.ID)
-		if problem != nil {
-			return problem
-		}
+	if update.State == "failed" {
+		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.MachineName, update.Error)
 	}
-	if result.State == "unusable" {
-		return result.Unusable(row.MachineName)
-	}
-	if result.State == "failed" {
-		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.MachineName, result.Error)
-	}
-	var actual runtimeObservation
-	_ = json.Unmarshal(result.Result, &actual)
-	var previous runtimeObservation
-	var state struct {
-		Unchanged bool `json:"unchanged"`
-		Update    struct {
-			From struct {
-				Runtime string `json:"runtime"`
-			} `json:"from"`
-		} `json:"update"`
-	}
-	_ = json.Unmarshal(result.Result, &state)
-	if previous.Observed.Runtime.Distribution == "" {
-		previous.Observed.Runtime.Distribution = state.Update.From.Runtime // the machine updated itself
-	}
+	var result runtimeUpdateResult
+	_ = json.Unmarshal(update.Result, &result)
 	status := "ready"
-	if state.Unchanged {
-		status = "already current"
+	if result.Unchanged {
+		status = "unchanged: " + result.Note
 	}
 	return emit(ctx, compactRecord([]output.Field{
-		{K: "machine", V: row.MachineName}, {K: "runtime", V: actual.Observed.Runtime.Distribution},
-		{K: "tensorfs", V: actual.Observed.TensorFS}, {K: "status", V: status},
-		{K: "previous_runtime", V: previous.Observed.Runtime.Distribution}, {K: "update_id", V: result.ID},
-		{K: "details", V: result.Result}}, "machine", "runtime", "tensorfs", "status"))
+		{K: "machine", V: row.MachineName}, {K: "runtime", V: result.To.Runtime}, {K: "tensorfs", V: result.To.TensorFS},
+		{K: "status", V: status}, {K: "previous_runtime", V: result.From.Runtime}, {K: "update_id", V: update.ID},
+	}, "machine", "runtime", "tensorfs", "status"))
+}
+
+// awaitRentalUpdate follows a rental's software update to its end.
+func awaitRentalUpdate(ctx *Context, c *localapi.Client, machine string, update api.RuntimeUpdate) (api.RuntimeUpdate, *exit.Error) {
+	said := ""
+	for update.Active() {
+		if !ctx.Mode().JSON && said != update.State {
+			messages := map[string]string{"preparing": "checking its software", "updating": "updating its software",
+				"waiting_activation": "waiting for its work to finish", "reconciling": "following an interrupted update"}
+			if message := messages[update.State]; message != "" {
+				fmt.Fprintf(ctx.Err, "%s: %s...\n", machine, message)
+			}
+			said = update.State
+		}
+		time.Sleep(time.Second)
+		var problem *exit.Error
+		if update, problem = c.RentalRuntimeUpdate(update.RentalID); problem != nil {
+			return update, problem
+		}
+	}
+	return update, nil
+}
+
+// bootSoftware is a new rental's software once the Hub's target is in place, for `rental new`
+// to show: the fields, or the note saying why it kept its image's.
+func bootSoftware(ctx *Context, rentalID, machine string) ([]output.Field, string) {
+	c, problem := dial(ctx)
+	if problem != nil {
+		return nil, "it keeps its image's software: " + problem.Message
+	}
+	update, problem := c.UpdateRentalRuntime(rentalID, api.RuntimeUpdateRequest{})
+	if problem == nil {
+		update, problem = awaitRentalUpdate(ctx, c, machine, update)
+	}
+	switch {
+	case problem != nil:
+		return nil, "it keeps its image's software: " + problem.Message
+	case update.State == "failed":
+		return nil, "it keeps its image's software: " + update.Error
+	}
+	var result runtimeUpdateResult
+	_ = json.Unmarshal(update.Result, &result)
+	return []output.Field{{K: "runtime", V: result.To.Runtime}, {K: "tensorfs", V: result.To.TensorFS}}, ""
 }

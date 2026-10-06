@@ -183,6 +183,10 @@ func handleRent(ctx *Context) *exit.Error {
 	ready := attachable
 	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release",
 		idleReleaseNote()}
+	software, kept := bootSoftware(ctx, ready.ID, row.MachineName)
+	if kept != "" {
+		notes = append(notes, kept)
+	}
 	if line, problem := fleet.status(records.Request{Hub: ctx.Cfg.HubURL}); problem == nil {
 		notes = append(notes, line)
 	}
@@ -209,6 +213,7 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "base_worker_profile", V: ready.BaseWorkerProfile},
 		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
 	}
+	fields = append(fields, software...)
 	if ready.Development {
 		fields = append(fields, output.Field{K: "ssh_address", V: ready.SSHAddress})
 	}
@@ -1224,12 +1229,8 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			idleText = idleClock(time.Since(since)) + " / " + idleClock(due.Sub(since))
 		}
 		state := rentalStateCell(r.State, r.Boot, now)
-		switch r.RuntimeUpdate {
-		case "":
-		case "unusable":
-			state, haveUpdate = "unusable (Runtime update unfinished)", true
-		default:
-			state, haveUpdate = state+" (updating Runtime)", true
+		if r.RuntimeUpdate != "" {
+			state, haveUpdate = state+" (updating its software)", true
 		}
 		if r.HubUnknown {
 			state += " (unknown to Hub)"

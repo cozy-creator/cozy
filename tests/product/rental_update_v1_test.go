@@ -82,7 +82,7 @@ func TestRentalUpdateRunsOnTheMachineAcrossADaemonCrash(t *testing.T) {
 	_ = daemon
 	eventually(t, root, "the resumed update settles", func() bool {
 		row, problem := store.RuntimeUpdate(parityRental)
-		return problem == nil && row != nil && !row.InProgress()
+		return problem == nil && row != nil && !row.Active()
 	})
 	settled, problem := store.RuntimeUpdate(parityRental)
 	fatal(t, problem)
