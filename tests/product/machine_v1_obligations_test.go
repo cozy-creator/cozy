@@ -40,7 +40,7 @@ func TestRuntimeObligationsPreventPrematureRentalRelease(t *testing.T) {
 				fatal(t, problem)
 			}
 			if scenario.state != "" {
-				fatal(t, store.AcceptRunV1(request.ID, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
+				fatal(t, store.AcceptRunV1(request.ID, "pr-owned-machine", &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 				fatal(t, store.ObserveRunV1(request.ID, &v1.RunEvent{Sequence: 1, Event: &v1.RunEvent_State{State: &v1.RunState{
 					Id: request.ID, Number: 1, State: scenario.state, Sequence: 1, Attempt: 1}}}, nil))
 			}

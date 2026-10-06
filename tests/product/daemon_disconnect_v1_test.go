@@ -48,7 +48,7 @@ func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
 	paused := v1RetainedRun(t, store, "paused", rental)
 	_, problem = store.MarkRunV1Sent(paused.ID)
 	fatal(t, problem)
-	fatal(t, store.AcceptRunV1(paused.ID, &v1.RunState{Id: paused.ID, Number: 1, State: "running", Attempt: 1}))
+	fatal(t, store.AcceptRunV1(paused.ID, rental, &v1.RunState{Id: paused.ID, Number: 1, State: "running", Attempt: 1}))
 	fatal(t, store.ObserveRunV1(paused.ID, &v1.RunEvent{Sequence: 1, Event: &v1.RunEvent_State{State: &v1.RunState{Id: paused.ID, Number: 1, State: "paused", Sequence: 1, Attempt: 1}}}, nil))
 	blocked := v1RetainedRun(t, store, "blocked", rental)
 	_, problem = store.BlockRetainedWork(blocked.ID, "fixture.blocked", "retained inputs")
@@ -56,7 +56,7 @@ func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
 	finished := v1RetainedRun(t, store, "finished", rental)
 	_, problem = store.MarkRunV1Sent(finished.ID)
 	fatal(t, problem)
-	fatal(t, store.AcceptRunV1(finished.ID, &v1.RunState{Id: finished.ID, Number: 2, State: "running", Attempt: 1}))
+	fatal(t, store.AcceptRunV1(finished.ID, rental, &v1.RunState{Id: finished.ID, Number: 2, State: "running", Attempt: 1}))
 	fatal(t, store.RecordRunOutcomeV1(finished.ID, records.RunEndV1{Outcome: &v1.Outcome{Status: "succeeded", Result: []byte(`{}`)},
 		Refused: exit.Named(exit.Unavailable, "output.write_failed", "this computer could not write the run's output")}))
 	kept := filepath.Join(root, "retained-output.txt")

@@ -56,7 +56,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machine}))
 			executing := arm.name == "rental executing"
 			if executing {
-				fatal(t, store.AcceptRunV1(request.ID, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
+				fatal(t, store.AcceptRunV1(request.ID, machine, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 			}
 			if arm.name == "rental cancel recorded while daemon down" {
 				_, problem := store.RequestMachineCancellation(request.ID, "cozy run cancel")
