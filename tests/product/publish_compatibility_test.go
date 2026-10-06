@@ -38,7 +38,7 @@ func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 		t.Fatal("fixture lost its Runtime dependency")
 	}
 	compatibleRuntime := "cozy-runtime[media]>=" + matched[1] + ",<1"
-	narrow := "tensorfs>=0.3.35,<0.4"
+	narrow := "tensorfs>=0.3.35,<0.5"
 	authored := strings.Replace(string(raw), matched[0], fmt.Sprintf("%q, %q", compatibleRuntime, narrow), 1)
 	must(t, os.WriteFile(path, []byte(authored), 0644))
 	lock := exec.Command("uv", "lock")
@@ -159,7 +159,7 @@ func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 		}
 	}
 	compact := strings.ReplaceAll(metadata, " ", "")
-	if !strings.Contains(compact, "Requires-Dist:cozy-runtime[media]<1,>="+matched[1]) || !strings.Contains(compact, "Requires-Dist:tensorfs<0.4,>=0.3.35") {
+	if !strings.Contains(compact, "Requires-Dist:cozy-runtime[media]<1,>="+matched[1]) || !strings.Contains(compact, "Requires-Dist:tensorfs<0.5,>=0.3.35") {
 		t.Fatalf("published wheel changed the declared compatibility bounds:\n%s", metadata)
 	}
 }

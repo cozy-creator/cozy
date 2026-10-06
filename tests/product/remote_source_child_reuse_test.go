@@ -37,12 +37,14 @@ name = %q
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [%s]
+[project.entry-points."cozy.application"]
+default = %q
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include = [%q]
-`, name, dependencies, module+".py")
+`, name, dependencies, module+":app", module+".py")
 	}
 	write(child, "pyproject.toml", metadata("source-child", "source_child", `"cozy-runtime>=0.18.32"`))
 	write(child, "package.toml", "[application]\nobject='source_child:app'\n")
