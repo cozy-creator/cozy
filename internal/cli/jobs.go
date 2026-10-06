@@ -756,6 +756,11 @@ func cancelJob(ctx *Context) *exit.Error {
 	if e := c.CancelJob(jobID, "cozy run cancel"); e != nil {
 		return e
 	}
+	if canceling, e := c.RecordedJob(jobID); e != nil {
+		return e
+	} else if e := startForCancel(ctx, canceling.Number, jobID, canceling.Status, canceling.MachineExecution); e != nil {
+		return e
+	}
 	// Cancellation is durable intent. Waiting for its effective outcome is explicit;
 	// an unavailable machine must not turn the default command into an endless wait.
 	if ctx.Inv.Bool("--await") {
