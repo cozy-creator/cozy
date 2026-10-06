@@ -390,3 +390,62 @@ func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
 		t.Fatalf("watch reattachment created cancel intent: %q", actor)
 	}
 }
+
+// Acceptance reached the machine, but its first state never reached this
+// controller. Reattachment needs only the id; local source has disappeared.
+func TestV1LostAcceptanceReattachesWithoutLocalPackage(t *testing.T) {
+	root, store, machine := nativeLifecycleHome(t)
+	frame, err := machine.Status(t.Context())
+	must(t, err)
+	var installation string
+	for _, environment := range frame.Environments {
+		if environment.Package == "local/native-lifecycle" {
+			installation = environment.Installation
+		}
+	}
+	if installation == "" {
+		t.Fatal("native fixture installation missing")
+	}
+	if code, out := runCozy(t, root, "down", "--json"); code != 0 {
+		t.Fatalf("fixture controller down [%d]: %s", code, out)
+	}
+	gate := filepath.Join(root, "lost-acceptance-gate")
+	must(t, os.WriteFile(gate, nil, 0o600))
+	payload, err := json.Marshal(map[string]any{"gate": gate, "size": 64})
+	must(t, err)
+	request, _, problem := store.Submit(records.Request{ID: "native-lost-acceptance", IdemKey: "native-lost-acceptance",
+		Package: "local/unavailable-package", LocalInstallationID: "unavailable-local-installation", Entrypoint: "make", Kind: "job",
+		Payload: payload, BodyDigest: childDigest("e"), MachineExecutionObserver: true})
+	fatal(t, problem)
+	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))
+	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machines.Local}))
+	stream, err := machine.Run(t.Context(), request.ID, 0, &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_JOB, Entrypoint: "make", Payload: payload,
+		Source: &v1.RunSpec_Installation{Installation: installation}})
+	must(t, err)
+	for {
+		event, err := stream.Recv()
+		must(t, err)
+		if outcome := event.GetOutcome(); outcome != nil {
+			if outcome.Status != "succeeded" {
+				t.Fatalf("machine-side held installation ended %s", outcome.Status)
+			}
+			break
+		}
+	}
+	accepted, problem := store.RunV1(request.ID)
+	fatal(t, problem)
+	if accepted {
+		t.Fatal("fixture accidentally recorded the machine's lost acceptance")
+	}
+	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
+		t.Fatalf("fixture controller up [%d]: %s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "watch", request.ID, "--json"); code != 0 || !strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("native attach rebuilt unavailable local source [%d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
+	}
+	accepted, problem = store.RunV1(request.ID)
+	fatal(t, problem)
+	if !accepted {
+		t.Fatal("reattachment did not record the native acceptance")
+	}
+}

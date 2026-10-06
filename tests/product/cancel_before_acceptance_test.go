@@ -37,6 +37,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 	for _, arm := range []struct{ name, machine string }{{"local machine never boots", machines.Local},
 		{"rental unavailable", "pr-deadpoddeadpoddead0"},
 		{"rental cancel recorded while daemon down", "pr-deadpoddeadpoddead0"},
+		{"rental native signing key lost", "pr-deadpoddeadpoddead0"},
 		{"local machine stopped while executing", machines.Local}} {
 		machine := arm.machine
 		t.Run(arm.name, func(t *testing.T) {
@@ -70,6 +71,9 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			if arm.name == "rental cancel recorded while daemon down" {
 				_, problem := store.RequestMachineCancellation(request.ID, "cozy run cancel")
 				fatal(t, problem)
+			}
+			if arm.name == "rental native signing key lost" {
+				must(t, os.Remove(home.Paths(root).RentalCreatorIdentity(machine)))
 			}
 			store.Close()
 			if !rented {
