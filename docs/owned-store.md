@@ -6,7 +6,8 @@ remains a library; authentication, execution records, scheduling and memory budg
 decisions remain with the daemon.
 
 The store's `owner.lock` is retained by the returned Store, its clones, and every
-live owner read lease. A second owner receives `STORE_BUSY` before catalog recovery.
+live owner read lease. Stores reopened normally in that same process also retain
+the existing claim. A second owner receives `STORE_BUSY` before catalog recovery.
 Dropping the embedding daemon's wrapper cannot release ownership while one of
 those handles still serves bytes. Normal process exit or death closes the lock;
 the next owner opens the persisted store using normal TensorFS recovery.
@@ -23,3 +24,9 @@ outside this API.
 
 Implementation and CPU process/storage regression proofs are tracked in
 [tracker #338](https://github.com/cozy-creator/tracker/issues/338).
+
+`cargo test -p tensorfs-core --test owned_store` exercises process death, path aliases,
+interoperation with the daemon's earlier direct lock, clone and lease lifetimes,
+GC beside owner leases, GC exclusion for another process's readers, and ownership
+refusal before catalog recovery. These are CPU storage proofs, not inference or
+GPU restart qualification.

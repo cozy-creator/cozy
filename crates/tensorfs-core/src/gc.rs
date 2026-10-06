@@ -209,7 +209,7 @@ pub(crate) fn unretained_manifests(store: &Store, wanted: &[ObjectRef]) -> Resul
     Ok(missing)
 }
 
-/// What the owner process's read leases pin (`meta::own`).
+/// What the owner process's read leases pin (`Store::ensure_owned`).
 fn pinned(store: &Store, owner: Option<&crate::meta::Owner>) -> Result<Vec<HeldKey>> {
     let Some(owner) = owner else {
         return Ok(vec![]);
@@ -530,7 +530,7 @@ mod tests {
         lease.release(&meta).unwrap();
 
         // The owner's lease is a pin: GC runs, keeps it, and takes what nothing holds.
-        meta::own(&store);
+        let _owner = Store::ensure_owned(&root).unwrap();
         let (lease, _) = read::acquire(&store, &meta, "m", vec![leased.clone()]).unwrap();
         collect(&root, false).unwrap();
         assert!(present(&leased) && !present(&garbage));
