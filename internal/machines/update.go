@@ -88,16 +88,10 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 	// too. Atomic placement preserves the current parent and its process identity. A
 	// failed or rolled-back update never reaches here and cannot replace the launcher.
 	if source.Host == "" {
-		active := filepath.Join(h.Root(), "var/lib/cozy/rust-machine/agent/current")
-		if _, err := os.Stat(active); err == nil {
-			host, err := h.placeHost(active)
-			if err != nil {
-				return nil, exit.Internalf("updated Runtime but cannot retain its machine for the next start: %s", err)
-			}
-			host.Name = "cozy-machine"
-			installed.Host = host
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, exit.Internalf("updated Runtime but cannot read its activated machine: %s", err)
+		if host, problem := h.retainActivatedHost(); problem != nil {
+			return nil, problem
+		} else if host != nil {
+			installed.Host = *host
 		}
 	}
 	for _, pair := range []struct {
@@ -113,6 +107,31 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 		return nil, exit.Internalf("updated Runtime but cannot retain installation metadata: %s", err)
 	}
 	return installed, nil
+}
+
+// retainActivatedHost makes a completed update the next launch's supervisor too. The
+// selected executable remains the machine's authority; a disconnected installer is not
+// needed to commit it. A pending activation belongs to the native supervisor's recovery:
+// its candidate must not replace that supervisor before readiness or rollback completes.
+func (h *Host) retainActivatedHost() (*installedArtifact, *exit.Error) {
+	engine := filepath.Join(h.Root(), "var/lib/cozy/rust-machine")
+	if _, err := os.Lstat(filepath.Join(engine, "update/pending.json")); err == nil {
+		return nil, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, exit.Internalf("cannot check the machine's pending activation: %s", err)
+	}
+	active := filepath.Join(engine, "agent/current")
+	if _, err := os.Stat(active); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, exit.Internalf("cannot read the activated machine: %s", err)
+	}
+	host, err := h.placeHost(active)
+	if err != nil {
+		return nil, exit.Internalf("cannot retain the activated machine for the next start: %s", err)
+	}
+	host.Name = "cozy-machine"
+	return &host, nil
 }
 
 // follow brings a machine boot to the Hub's target software unless its owner pinned the files
