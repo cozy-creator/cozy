@@ -78,15 +78,11 @@ func Resolve(st *records.Store, typed string) (Subject, *exit.Error) {
 			continue
 		}
 		found.Operation = op
-		if found.RentalID == "" {
-			found.RentalID = op.RentalID
-		}
-		if found.Machine == "" {
-			found.Machine = name
-		}
-		if found.Row == nil {
-			found.Hub = op.Hub
-		}
+	}
+	// Without a record the subject is the chosen ask's pod: a word several asks used names
+	// each pod in turn, and the newest one is meant, never the first that bore it.
+	if op := found.Operation; found.Row == nil && op != nil {
+		found.RentalID, found.Machine, found.Hub = op.RentalID, operationMachineName(op), op.Hub
 	}
 	return found, nil
 }
