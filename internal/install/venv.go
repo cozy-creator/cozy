@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/pelletier/go-toml/v2"
 )
 
 // EnvironmentReceipt is the environment record: exactly what produced this install's venv.
@@ -124,13 +127,27 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	}
 	// The export already applied the package's uv settings at lock time. Installing from
 	// its source directory would let uv re-read them, and a constraint-dependencies row
-	// is an unpinned requirement --require-hashes refuses.
+	// is an unpinned requirement --require-hashes refuses. Each package comes from the one
+	// source its lock records, a source per install: uv takes a name from the first index
+	// that has it, so a closure resolved through several indexes is not the locked one.
 	installRoot := filepath.Dir(venvDir)
-	if problem := runUV(installRoot, config.Frozen().Tool(), "locked_environment_refused",
-		"the exact locked closure is incompatible with the selected Python environment",
-		"pip", "install", "--no-deps", "--require-hashes", "--python",
-		home.VenvPython(venvDir), "--requirements", requirements); problem != nil {
+	sources, problem := lockedSources(published, body)
+	if problem != nil {
 		return nil, problem
+	}
+	for index, source := range sources {
+		file := filepath.Join(installRoot, fmt.Sprintf("locked-source-%d.txt", index))
+		if err := os.WriteFile(file, []byte(source), 0o600); err != nil {
+			return nil, exit.Internalf("cannot stage locked requirements: %s", err)
+		}
+		problem := runUV(installRoot, config.Frozen().Tool(), "locked_environment_refused",
+			"the exact locked closure is incompatible with the selected Python environment",
+			"pip", "install", "--no-deps", "--require-hashes", "--python",
+			home.VenvPython(venvDir), "--requirements", file)
+		_ = os.Remove(file)
+		if problem != nil {
+			return nil, problem
+		}
 	}
 	if problem := runUV(installRoot, config.Frozen().Tool(), "package_requirement_incompatible",
 		"the installed package requirements are not satisfied", "pip", "check", "--python",
@@ -198,6 +215,79 @@ func exportPublishedRequirements(sourceDir string, published *PublishedSource) (
 		return nil, exit.Internalf("cannot read locked requirements: %s", err)
 	}
 	return LockedRequirements(raw, published.IndexURL, appended)
+}
+
+// lockedSources splits the locked requirements by the source the release's uv.lock records
+// for each row, one requirements document per source, each naming only that index: a
+// registry package from its registry, the release's own wheels and its org's packages from
+// the org index, a direct URL from nowhere but itself.
+func lockedSources(published *PublishedSource, locked []byte) ([]string, *exit.Error) {
+	ref, problem := hub.ParseRef(published.Package)
+	if problem != nil {
+		return nil, problem
+	}
+	var lock struct {
+		Packages []struct {
+			Name    string `toml:"name"`
+			Version string `toml:"version"`
+			Source  struct {
+				Registry string `toml:"registry"`
+			} `toml:"source"`
+		} `toml:"package"`
+	}
+	if err := toml.Unmarshal(published.UVLock.Bytes, &lock); err != nil {
+		return nil, exit.New(exit.Structural, "the published uv.lock is unreadable")
+	}
+	registry := map[string]string{}
+	for _, row := range lock.Packages {
+		registry[normalizedRequirementName(row.Name)+"=="+row.Version] = row.Source.Registry
+	}
+	own := map[string]bool{}
+	for _, wheel := range append(append([]PublishedWheel{published.ProjectWheel}, published.Wheels...), published.LocalWheels...) {
+		own[normalizedRequirementName(wheel.Distribution)] = true
+	}
+	orgIndex := func(source string) bool {
+		index, err := url.Parse(source)
+		return err == nil && strings.Trim(index.Path, "/") == "v1/index/"+ref.Org+"/simple"
+	}
+	rows, order := map[string][]string{}, []string{}
+	for _, line := range strings.Split(string(locked), "\n") {
+		row := strings.TrimSpace(line)
+		if row == "" || strings.HasPrefix(row, "#") || strings.HasPrefix(row, "-") {
+			continue
+		}
+		name := normalizedRequirementName(row)
+		source := ""
+		switch rest := strings.TrimSpace(row[len(requirementName.FindString(row)):]); {
+		case strings.HasPrefix(rest, "@"):
+			source = "--no-index" // a direct URL is its own source
+		case own[name]:
+			source = "--index-url " + published.IndexURL
+		default:
+			version, _, _ := strings.Cut(strings.TrimPrefix(rest, "=="), " ")
+			version, _, _ = strings.Cut(version, ";")
+			recorded, known := registry[name+"=="+version]
+			switch {
+			case !known || recorded == "":
+				return nil, exit.Named(exit.Structural, "locked_environment_refused",
+					"the published uv.lock records no registry for %s==%s", name, version).
+					WithRemedy("publish a new release from a lock uv wrote")
+			case orgIndex(recorded):
+				source = "--index-url " + published.IndexURL
+			default:
+				source = "--index-url " + recorded
+			}
+		}
+		if rows[source] == nil {
+			order = append(order, source)
+		}
+		rows[source] = append(rows[source], row)
+	}
+	documents := make([]string, 0, len(order))
+	for _, source := range order {
+		documents = append(documents, source+"\n"+strings.Join(rows[source], "\n")+"\n")
+	}
+	return documents, nil
 }
 
 // runtimeScratchHome is the COZY_HOME every install-time cozy-runtime invocation gets:
