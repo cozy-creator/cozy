@@ -45,6 +45,8 @@ type managedRentals struct {
 	// boot brings a newly attached worker boot to the Hub's target software before it takes
 	// work: daemon setup installs it.
 	boot func(string)
+	// wakeMachine asks again about the runs a newly attached boot holds.
+	wakeMachine func(string)
 	// said holds the last line printed about each rental, so the fleet speaks once per change.
 	said   map[string]string
 	closed bool
@@ -1101,6 +1103,9 @@ func (m *managedRentals) reattach(ids []string) {
 	for _, id := range ids {
 		if m.boot != nil {
 			m.boot(id)
+		}
+		if m.wakeMachine != nil {
+			m.wakeMachine(id)
 		}
 	}
 	if len(ids) > 0 {

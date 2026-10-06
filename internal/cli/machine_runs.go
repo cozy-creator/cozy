@@ -80,6 +80,9 @@ func (m *machineRuns) Resume() {
 		return
 	}
 	for _, link := range links {
+		if link.Lost {
+			continue // its machine is gone: nothing of the run is left to observe
+		}
 		if awaiting, problem := m.store.MachinePublicationsAwaitingOwner(link.RequestID); link.Collected && !link.CancelRequested && len(link.PendingControl) == 0 && (problem != nil || len(awaiting) == 0) {
 			continue
 		}
@@ -88,6 +91,22 @@ func (m *machineRuns) Resume() {
 		}
 		request, problem := m.store.RequestRow(link.RequestID)
 		if problem == nil && request != nil {
+			_ = m.Start(*request)
+		}
+	}
+}
+
+// WakeMachine asks again about every run held on a machine that shows new evidence of life.
+func (m *machineRuns) WakeMachine(machine string) {
+	links, problem := m.store.MachineExecutions()
+	if problem != nil {
+		return
+	}
+	for _, link := range links {
+		if link.MachineID != machine || link.Collected || link.Abandoned || link.Lost {
+			continue
+		}
+		if request, problem := m.store.RequestRow(link.RequestID); problem == nil && request != nil {
 			_ = m.Start(*request)
 		}
 	}
