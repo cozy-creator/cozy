@@ -185,3 +185,61 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 		t.Fatalf("failed rental history lost its diagnosis: %+v", stored)
 	}
 }
+
+// A failure the previous daemon recorded, which released an unconfirmed run to the outbox,
+// is let go again by the next daemon on its first look: the run is placed again even though
+// no poll will ever show the rental changing.
+func TestARunReleasedBeforeARestartIsPlacedAgain(t *testing.T) {
+	root := filepath.Join(scratchBase, "v1-rental-failure-restart")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "down")
+		if !t.Failed() {
+			_ = os.RemoveAll(root)
+		}
+	})
+	hub := newFakeRentalHub(t, 0)
+	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubURL+"\n"+
+		"tensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	hub.packageReleases = map[string]any{"fake/lost@1": rentalReleaseFacts()}
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	hub.add("rental-lost", "nitian")
+	hub.setState("rental-lost", "failed", "readiness.receipt_conflict")
+	rental := records.Rental{AcceleratorCount: 1, ID: "rental-lost", MachineName: "nitian", SKU: "cpu",
+		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1"}
+	fatal(t, store.RecordRental(rental))
+	const id = "req-released-before-restart"
+	body, _ := canonical.Spell(canonical.Digest([]byte(id)))
+	_, _, problem = store.Submit(records.Request{ID: id, IdemKey: "idem-" + id, BodyDigest: body, Package: "fake/lost",
+		Release: "1", Entrypoint: "generate", Payload: []byte("{}"), Rental: true, Worker: "rental-lost", MachineExecutionObserver: true})
+	fatal(t, problem)
+	fatal(t, store.LinkMachineExecution(id, "rental-lost"))
+	if send, problem := store.MarkRunV1Sent(id); problem != nil || !send {
+		t.Fatalf("the run was not sent: %v %v", send, problem)
+	}
+	// What the previous daemon recorded before it stopped: the failure, and the run released.
+	rental.State = "failed"
+	rental.Failure = records.RentalFailure{Code: "readiness.receipt_conflict"}
+	fatal(t, store.RecordRental(rental))
+	if link, problem := store.MachineExecution(id); problem != nil || link.MachineID != "" {
+		t.Fatalf("the fixture's run was not released to the outbox: %+v %v", link, problem)
+	}
+
+	startDaemonProcess(t, root)
+	for deadline := time.Now().Add(60 * time.Second); ; time.Sleep(500 * time.Millisecond) {
+		events, problem := store.EventsAfter(id, 0, 1000)
+		fatal(t, problem)
+		for _, event := range events {
+			if event.Type == "request.parked" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the released run was not placed again after the restart\n%s", tail(filepath.Join(root, "daemon.log")))
+		}
+	}
+}
