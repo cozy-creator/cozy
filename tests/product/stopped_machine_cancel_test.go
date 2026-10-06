@@ -90,7 +90,8 @@ func TestCancelOnALocalMachineThatCannotStartSaysSo(t *testing.T) {
 	store.Close()
 	startDaemonProcess(t, root)
 	code, out := cozyWithin(t, root, 3*time.Minute, "run", "cancel", request.ID, "--await")
-	if code == 0 || !strings.Contains(out, "stays canceling") || !strings.Contains(out, "cozy machine start") {
+	if code == 0 || !strings.Contains(out, "stays canceling") || !strings.Contains(out, "cozy machine start") ||
+		!strings.Contains(out, "cannot open its store") {
 		t.Fatalf("an unstartable machine's cancel did not say so with its next step [exit %d]: %s", code, out)
 	}
 	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
