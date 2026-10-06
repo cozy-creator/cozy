@@ -36,13 +36,12 @@ import (
 )
 
 var (
-	failureDiagnosticsDirectory = flag.String("failure-diagnostics", "", "directory for filtered failure-only machine status snapshots")
-	machineHostBinary           = flag.String("machine-host", "", "the standalone cozy-machine executable each test machine runs")
-	requireMachineHost          = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
-	machineRuntimePython        = flag.String("machine-runtime-python", "", "Development interpreter for the standalone agent public-view media fixture")
-	machineRuntimeWheel         = flag.String("machine-runtime-wheel", "", "Runtime wheel the test machines run; default: the published Runtime")
-	machineUpdateWheel          = flag.String("machine-update-wheel", "", "Candidate Runtime wheel with a distinct bundled agent for local update proof")
-	machineTensorFSWheel        = flag.String("machine-tensorfs-wheel", "", "TensorFS wheel paired with -machine-runtime-wheel")
+	machineHostBinary    = flag.String("machine-host", "", "the standalone cozy-machine executable each test machine runs")
+	requireMachineHost   = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
+	machineRuntimePython = flag.String("machine-runtime-python", "", "Development interpreter for the standalone agent public-view media fixture")
+	machineRuntimeWheel  = flag.String("machine-runtime-wheel", "", "Runtime wheel the test machines run; default: the published Runtime")
+	machineUpdateWheel   = flag.String("machine-update-wheel", "", "Candidate Runtime wheel with a distinct bundled agent for local update proof")
+	machineTensorFSWheel = flag.String("machine-tensorfs-wheel", "", "TensorFS wheel paired with -machine-runtime-wheel")
 )
 
 // One installed machine layout for the whole run; each root's machine links its executables,

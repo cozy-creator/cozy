@@ -162,8 +162,7 @@ jobs:
             -machine-host="$MACHINE_HOST" -require-machine-host
             -machine-runtime-wheel="$RUNTIME_WHEEL" -machine-tensorfs-wheel="$TENSORFS_WHEEL"
             -script-runtime-wheel="$RUNTIME_WHEEL" -child-runtime-wheel="$RUNTIME_WHEEL"
-            -child-tensorfs-wheel="$TENSORFS_WHEEL" -tensorfs-fixture-wheel="$TENSORFS_WHEEL"
-            -failure-diagnostics="$RUNNER_TEMP/product-diagnostics")
+            -child-tensorfs-wheel="$TENSORFS_WHEEL" -tensorfs-fixture-wheel="$TENSORFS_WHEEL")
           [ "$FULL" = true ] || args+=(-test.short)
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-product-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.shard }}" \
@@ -176,14 +175,6 @@ jobs:
         with:
           name: product-logs-${{ matrix.shard }}
           path: ${{ runner.temp }}/product-logs
-          if-no-files-found: ignore
-          retention-days: 7
-      - name: Preserve filtered product failure snapshots
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: product-failure-snapshots-${{ matrix.shard }}
-          path: ${{ runner.temp }}/product-diagnostics/**/*.json
           if-no-files-found: ignore
           retention-days: 7
       - name: Release artifacts install and upgrade
