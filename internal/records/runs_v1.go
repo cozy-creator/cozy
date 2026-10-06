@@ -390,5 +390,42 @@ func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, end RunEn
 	if err := appendEventTx(tx, id, "client.machine_work_finished", int64(attempt), finished); err != nil {
 		return exit.Internalf("cannot record the run's end: %s", err)
 	}
+	if outcome.Status == "succeeded" {
+		return recordPublishedWeightsV1(tx, id, outcome.Outputs)
+	}
+	return nil
+}
+
+// recordPublishedWeightsV1 records the checkpoints the machine published to the run's weights
+// destination: each declared weights output's product is its checkpoint's manifest.
+func recordPublishedWeightsV1(tx *sql.Tx, id string, products []*v1.Product) *exit.Error {
+	var raw string
+	err := tx.QueryRow(`SELECT intent FROM request_model_transfers WHERE request_id=? AND state NOT IN ('completed','canceled','failed')`, id).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return exit.Internalf("cannot read the run's weights destination: %s", err)
+	}
+	var intent ModelTransferIntent
+	if json.Unmarshal([]byte(raw), &intent) != nil || intent.Destination == "" {
+		return nil
+	}
+	checkpoints := map[string]string{}
+	for _, product := range products {
+		for _, output := range intent.Outputs {
+			if product.Output == output.Name && product.Index == 0 && product.Digest != "" {
+				checkpoints[output.Name] = product.Digest
+			}
+		}
+	}
+	if len(checkpoints) == 0 {
+		return nil
+	}
+	encoded, _ := json.Marshal(checkpoints)
+	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='completed',checkpoints=?,updated_at=? WHERE request_id=?`,
+		string(encoded), now(), id); err != nil {
+		return exit.Internalf("cannot record the run's published checkpoints: %s", err)
+	}
 	return nil
 }
