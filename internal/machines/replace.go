@@ -23,7 +23,7 @@ type Replaced struct {
 }
 
 // wheelCache is uv's cache: where the Go agent's Runtime kept it under the root, and where
-// the machine keeps it (cozy-machine `published.rs`).
+// the machine keeps it (tensord `published.rs`).
 var wheelCache = [2]string{"var/lib/cozy/dependencies/uv-cache", "var/lib/cozy/rust-machine/published/uv-cache"}
 
 // carried are the paths a replacement moves from the old root into the new one, old then

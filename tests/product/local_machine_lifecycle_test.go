@@ -48,13 +48,13 @@ func (a fakeAgent) Status(_ *pb.StatusRequest, stream grpc.ServerStreamingServer
 	return stream.Send(a.frame)
 }
 
-// serveFakeMachineAgent is this test binary run as a root's cozy-machine: it names the API it
+// serveFakeMachineAgent is this test binary run as a root's tensord: it names the API it
 // serves, and serves the readiness receipt its launcher authenticates on cozy.machine.v1 Status,
 // under the launch's key and port, until stopped. It reads its launch as adoption reads an
 // agent's: from the process environment's file.
 func serveFakeMachineAgent() {
 	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Printf(`{"name":"cozy-machine","api":[%q]}`+"\n", machines.MachineAPI)
+		fmt.Printf(`{"name":"tensord","api":[%q]}`+"\n", machines.MachineAPI)
 		return
 	}
 	raw, _ := os.ReadFile("/proc/self/environ")
@@ -112,14 +112,14 @@ func fakeAgentMachine(t *testing.T, root string, executor time.Duration) (*machi
 	dir := filepath.Join(root, "machine")
 	self, err := os.Executable()
 	must(t, err)
-	agent := filepath.Join(dir, "root/opt/cozy/python/bin/cozy-machine")
+	agent := filepath.Join(dir, "root/opt/cozy/python/bin/tensord")
 	must(t, os.MkdirAll(filepath.Dir(agent), 0o755))
 	if os.Link(self, agent) != nil {
 		raw, err := os.ReadFile(self)
 		must(t, err)
 		must(t, os.WriteFile(agent, raw, 0o755)) //cozy:allow the test binary is the fake agent
 	}
-	program := filepath.Join(dir, "root/usr/local/bin/cozy-machine")
+	program := filepath.Join(dir, "root/usr/local/bin/tensord")
 	must(t, os.MkdirAll(filepath.Dir(program), 0o755))
 	if executor == 0 {
 		must(t, os.Symlink(agent, program))
@@ -127,11 +127,11 @@ func fakeAgentMachine(t *testing.T, root string, executor time.Duration) (*machi
 		script := fmt.Sprintf("#!/bin/sh\n[ \"$1\" = version ] && exec %s \"$@\"\nsleep %.1f\nexec %s\n", agent, executor.Seconds(), agent)
 		must(t, os.WriteFile(program, []byte(script), 0o755)) //cozy:allow stands in for systemd's executor
 	}
-	metadata := `{"host":{"name":"cozy-machine"},"host_pinned":true}`
+	metadata := `{"host":{"name":"tensord"},"host_pinned":true}`
 	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), []byte(metadata), 0o600))
 	resolved, err := filepath.EvalSymlinks(dir)
 	must(t, err)
-	unit := userunit.Name("cozy-machine-agent", resolved, false)
+	unit := userunit.Name("tensord-agent", resolved, false)
 	t.Cleanup(func() { _ = userunit.Stop(unit) })
 	return machines.NewHost(dir, "", nil), unit
 }
@@ -171,8 +171,8 @@ func recorded(dir string) bool {
 func TestALaunchWhoseUnitEndsInItsExecutorReportsTheHostExited(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "home")
 	h, unit := fakeAgentMachine(t, root, time.Second)
-	program := filepath.Join(root, "machine/root/usr/local/bin/cozy-machine")
-	agent := filepath.Join(root, "machine/root/opt/cozy/python/bin/cozy-machine")
+	program := filepath.Join(root, "machine/root/usr/local/bin/tensord")
+	agent := filepath.Join(root, "machine/root/opt/cozy/python/bin/tensord")
 	script := fmt.Sprintf("#!/bin/sh\n[ \"$1\" = version ] && exec %s \"$@\"\nsleep 1\n", agent)
 	must(t, os.WriteFile(program, []byte(script), 0o755)) //cozy:allow an executor that ends before any agent
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

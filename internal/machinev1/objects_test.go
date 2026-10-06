@@ -23,16 +23,16 @@ import (
 )
 
 var (
-	machineBinary   = flag.String("machine-binary", "", "a cozy-machine binary to serve these tests")
+	machineBinary   = flag.String("machine-binary", "", "a tensord binary to serve these tests")
 	installerPython = flag.String("installer-python", "", "the machine's package installer Python (cozy_machine_client importable)")
 	clientWheel     = flag.String("client-wheel", "", "the machine's CPU runner client wheel")
-	cpuFixture      = flag.String("cpu-fixture", "", "cozy-machine tests/fixtures/cpu_lifecycle")
+	cpuFixture      = flag.String("cpu-fixture", "", "tensord tests/fixtures/cpu_lifecycle")
 )
 
 // serve starts the real machine on a loopback port and answers a machine-scope client.
 func serve(t *testing.T, args ...string) pb.MachineClient {
 	if *machineBinary == "" {
-		t.Skip("requires -machine-binary=<cozy-machine>")
+		t.Skip("requires -machine-binary=<tensord>")
 	}
 	root := t.TempDir()
 	public, private, _ := ed25519.GenerateKey(nil)

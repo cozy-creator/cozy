@@ -21,7 +21,7 @@ func TestScopedLogoutPreservesOtherHubAndNeverStartsStoppedAgent(t *testing.T) {
 	firstKey := writeMachineCredential(t, root, origin)
 	otherKey := writeMachineCredential(t, root, other)
 	witness := filepath.Join(root, "agent-started")
-	binary := filepath.Join(root, "machine/root/usr/local/bin/cozy-machine")
+	binary := filepath.Join(root, "machine/root/usr/local/bin/tensord")
 	must(t, os.MkdirAll(filepath.Dir(binary), 0755))
 	must(t, os.WriteFile(binary, []byte("#!/bin/sh\ntouch "+witness+"\n"), 0755))
 	code, out := runCozy(t, root, "auth", "logout", "--json")

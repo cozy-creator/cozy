@@ -214,7 +214,7 @@ func savedVideo(t *testing.T, out string, ran *bytes.Buffer) []byte {
 // A finished output is read by range, and a capability for another output is refused.
 func TestCozy1FollowsAJobsFilmOnAV1Machine(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, port := cozy1Root(t)
 	project := filepath.Join(t.TempDir(), "cpu_longform")
@@ -296,7 +296,7 @@ func TestCozy1FollowsAJobsFilmOnAV1Machine(t *testing.T) {
 // its cursor and ends with the same film `cozy run --out` saved.
 func TestCozy1FollowsAGrowingVideoOnAV1Machine(t *testing.T) {
 	if *machineHostBinary == "" || *privateScriptRuntimeWheel == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -script-runtime-wheel")
+		t.Skip("requires -machine-host=<tensord> and -script-runtime-wheel")
 	}
 	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)

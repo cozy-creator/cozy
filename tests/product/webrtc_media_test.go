@@ -100,7 +100,7 @@ type scriptedRun struct {
 
 func newMediaMachine(t *testing.T) *mediaMachine {
 	if *machineHostBinary == "" || *privateScriptRuntimeWheel == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -script-runtime-wheel")
+		t.Skip("requires -machine-host=<tensord> and -script-runtime-wheel")
 	}
 	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)

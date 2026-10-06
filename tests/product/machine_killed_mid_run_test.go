@@ -57,7 +57,7 @@ def work(payload: Work, ctx: Context, out: Outputs, tel: Telemetry) -> Done:
 // neither while it happened, collects from the restarted machine.
 func TestAMachineKilledMidRunFailsItWithoutReplayAndKeepsFinishedRuns(t *testing.T) {
 	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host=<cozy-machine>")
+		t.Skip("requires -machine-host=<tensord>")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czk")
 	must(t, err)

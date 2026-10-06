@@ -20,7 +20,7 @@ import (
 )
 
 // `cozy machine install` makes this computer's machine the Rust machine a worker image runs:
-// the named executable at usr/local/bin/cozy-machine, exactly the Runtime and TensorFS wheels
+// the named executable at usr/local/bin/tensord, exactly the Runtime and TensorFS wheels
 // at opt/cozy/machine/wheels, uv beside it, and no Python worker. It starts as a persistent
 // machine, proves readiness through Status, installs and runs a local package, and installing
 // again updates it in place with Run kind: update.
@@ -74,7 +74,7 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 	if !slices.Equal(held, want) {
 		t.Fatalf("the machine holds %v, want exactly %v", held, want)
 	}
-	if fileSHA(t, filepath.Join(machineRoot, "usr/local/bin/cozy-machine")) != fileSHA(t, *machineHostBinary) {
+	if fileSHA(t, filepath.Join(machineRoot, "usr/local/bin/tensord")) != fileSHA(t, *machineHostBinary) {
 		t.Fatal("the installed machine differs from the named executable")
 	}
 	if _, err := os.Stat(filepath.Join(machineRoot, "usr/local/bin/uv")); err != nil {
