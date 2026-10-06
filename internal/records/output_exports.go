@@ -154,7 +154,11 @@ func settleOutputExport(q execer, requestID string, paths []string, failure *exi
 }
 
 func (s *Store) SkipOutputExport(requestID, reason string) *exit.Error {
-	if _, err := s.db.Exec(`UPDATE request_output_exports SET state='skipped',safe_error=?,
+	return skipOutputExport(s.db, requestID, reason)
+}
+
+func skipOutputExport(q execer, requestID, reason string) *exit.Error {
+	if _, err := q.Exec(`UPDATE request_output_exports SET state='skipped',safe_error=?,
 		updated_at=? WHERE request_id=? AND state IN ('pending','exporting','failed')`,
 		reason, now(), requestID); err != nil {
 		return exit.Internalf("cannot skip output export for %s: %s", requestID, err)
