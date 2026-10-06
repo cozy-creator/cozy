@@ -41,7 +41,7 @@
       say(state, [words[state], detail].filter(Boolean).join(" "));
     });
     $("video").addEventListener("playing", () => { if (!player.error) say("playing", player.final ? "Finished." : "Playing live."); });
-    $("video").addEventListener("ended", () => say("ended", "Finished."));
+    $("video").addEventListener("ended", () => say("ended", player.final ? "Finished." : "Waiting for the run to write more."));
     // WebKit autoplays only with enough data buffered, which a live edge never has.
     $("video").addEventListener("canplay", () => $("video").play().catch(() => {}), {once: true});
   } catch (e) {
