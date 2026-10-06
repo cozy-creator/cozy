@@ -945,7 +945,7 @@ func handleRunList(ctx *Context) *exit.Error {
 			WithRemedy("omit --watch for one snapshot, or use --json for automation")
 	}
 	if watching {
-		return watchRunList(ctx, client, limit, every)
+		return watchRunList(ctx, client, limit)
 	}
 	if ctx.Inv.Value("--limit") == "" {
 		limit = 50
@@ -954,20 +954,13 @@ func handleRunList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if every {
-		withHubColumn(ctx.Cfg, &list)
-	}
+	nameHubs(ctx.Cfg, &list)
 	return emit(ctx, list)
 }
 
-// withHubColumn shows each run's hub, by its name where it has one, ahead of its reason.
-func withHubColumn(cfg config.Config, list *output.List) {
-	at := slices.Index(list.Fields, "reason")
-	if at < 0 {
-		at = len(list.Fields)
-	}
-	list.Fields = slices.Insert(slices.Clone(list.Fields), at, "hub")
-	list.TypedFields = append(slices.Clone(list.TypedFields), "hub")
+// nameHubs names each run's hub where it has a name, for --full. A run goes straight to its
+// machine, which `run list` shows; the hub that rented the machine is not a column.
+func nameHubs(cfg config.Config, list *output.List) {
 	for _, row := range list.Rows {
 		row["hub"] = cfg.HubLabel(row["hub"])
 	}
@@ -1360,12 +1353,9 @@ func progressValue(life api.Lifecycle) string {
 	return stage + " " + overall
 }
 
-func watchRunList(ctx *Context, client *localapi.Client, limit int, every bool) *exit.Error {
-	history := runHistory{client: client, state: ctx.Inv.Value("--state"), packageName: ctx.Inv.Value("--package"), limit: limit, more: true}
-	if every {
-		cfg := ctx.Cfg
-		history.hubs = &cfg
-	}
+func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
+	cfg := ctx.Cfg
+	history := runHistory{client: client, state: ctx.Inv.Value("--state"), packageName: ctx.Inv.Value("--package"), limit: limit, more: true, hubs: &cfg}
 	return watchListPages(ctx, "id", history.refresh, history.next)
 }
 

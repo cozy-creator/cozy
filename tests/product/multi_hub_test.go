@@ -657,8 +657,10 @@ func TestRunsWithoutAHubStayListed(t *testing.T) {
 	if all := runs(); len(all) != 2 || all["req-hubless-local"] != hubA || all["req-hubless-rented"] != hubB {
 		t.Fatalf("the default listing is not every hub's: %+v", all)
 	}
-	if code, out := runCozy(t, root, "run", "list", "--no-watch"); code != 0 || !regexp.MustCompile(`(?m)^NUMBER .* HUB +REASON`).MatchString(out) {
-		t.Fatalf("the default listing does not name each run's hub [%d]:\n%s", code, out)
+	// A run goes straight to its machine: the list shows the machine, not the hub.
+	if code, out := runCozy(t, root, "run", "list", "--no-watch"); code != 0 || !regexp.MustCompile(`(?m)^NUMBER +TARGET +MACHINE `).MatchString(out) ||
+		regexp.MustCompile(`(?m)^NUMBER .*\bHUB\b`).MatchString(out) {
+		t.Fatalf("the default listing shows a hub column or no machine [%d]:\n%s", code, out)
 	}
 	if other := runs("--tensorhub=b"); len(other) != 1 || other["req-hubless-rented"] != hubB {
 		t.Fatalf("the rental's hub's listing lost its run: %+v", other)
