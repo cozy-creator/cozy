@@ -1,8 +1,11 @@
 package producttest
 
 import (
-	"bytes"
-	"database/sql"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,22 +14,28 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/flock"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/secret"
+	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
-// A frozen submission may already have run despite a lost acceptance reply.
-// Cancellation remains visible and pending until its machine closes the key or
-// returns an accepted receipt; unreachable is not proof of nonexecution.
+// A native Run may already have been accepted despite a lost first state frame.
+// Cancellation stays pending until the same machine can answer for the run;
+// an unreachable endpoint is not proof that work never started.
 //
 // This computer's stopped machine is proof: its unit and agent have ended, so nothing of the
 // run executes. Its cancel settles on record at once, whether the machine never answered or
 // was executing the run, and the intent is kept for the machine's journal (runs 2677-2679 and
 // 2801-2802 stayed canceling after `cozy machine stop` until the machine next started).
 func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host: the current native machine fixture")
+	}
 	for _, arm := range []struct{ name, machine string }{{"local machine never boots", machines.Local},
-		{"rental died", "pr-deadpoddeadpoddead0"}, {"left canceling by an older cozy", machines.Local},
+		{"rental unavailable", "pr-deadpoddeadpoddead0"},
 		{"local machine stopped while executing", machines.Local}} {
 		machine := arm.machine
 		t.Run(arm.name, func(t *testing.T) {
@@ -37,31 +46,27 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			fatal(t, problem)
 			rented := machine != machines.Local
 			if rented {
-				cert := filepath.Join(root, "pod.pem")
-				must(t, os.WriteFile(cert, []byte("pod"), 0o600))
-				fatal(t, store.RecordRental(records.Rental{ID: machine, MachineName: "deadpod", SKU: "cpu", AcceleratorModel: "CPU",
-					AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: "http://127.0.0.1:1"}))
+				layout, problem := home.Open(root)
+				fatal(t, problem)
+				identity, problem := rental.PendingCreatorIdentity(layout, "unavailable-native-run")
+				fatal(t, problem)
+				fatal(t, rental.Attach(layout, store, records.Rental{ID: machine, MachineName: "deadpod", SKU: "cpu", AcceleratorModel: "CPU",
+					AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, State: "ready", Address: "127.0.0.1:1", Hub: "http://127.0.0.1:1",
+					ExpectedWorkerID: "unavailable-native-machine", ExpectedWorkerBootID: "unavailable-native-boot"},
+					unavailableNativeCertificate(t), secret.New(""), identity))
 			}
 			request, _, problem := store.Submit(records.Request{ID: "req-stuck-cancel", IdemKey: "stuck-cancel", Package: "proof/stuck",
 				Entrypoint: "generate", Payload: []byte(`{}`), BodyDigest: childDigest("9"), MachineExecutionObserver: true,
 				Rental: rented, RequestedRental: map[bool]string{true: machine}[rented]})
 			fatal(t, problem)
 			fatal(t, store.LinkMachineExecution(request.ID, machine))
-			// The machine was preparing the release when it went away: sent, acceptance unknown.
-			fatal(t, store.RecordMachineSubmission(request.ID, &pb.MachineExecutionSubmit{SubmissionId: "stuck-cancel",
-				ExpectedExecutionWorkspaceId: "workspace", Offer: &pb.AttemptOffer{RequestId: request.ID},
-				PayloadCanonicalBytes: []byte(`{}`), ReleaseRoot: &pb.ReleaseRoot{Package: "proof/stuck", Release: "1.0.0", Entrypoint: "generate"}}))
+			// This is the marker the native transport writes before sending Run.
+			fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machine}))
 			executing := arm.name == "local machine stopped while executing"
 			if executing {
-				fatal(t, store.AcceptMachineExecution(request.ID, &pb.MachineExecutionReceipt{RequestId: request.ID, SubmissionId: "stuck-cancel",
-					AcceptedAtMs: 1000, WorkerId: "worker", WorkerBootId: "boot-1", ExecutionWorkspaceId: "workspace",
-					CaptureDigest: bytes.Repeat([]byte{1}, 32), InvocationSpecDigest: bytes.Repeat([]byte{2}, 32)}))
-				fatal(t, store.ObserveMachineExecution(request.ID, &pb.MachineExecutionState{RequestId: request.ID, WorkerId: "worker", WorkerBootId: "boot-1",
-					ExecutionWorkspaceId: "workspace", Generation: 1, AttemptOrdinal: 1, State: "running", Sequence: 1},
-					&pb.MachineExecutionEventPage{NextAfter: 1, HeadSequence: 1, Events: []*pb.MachineExecutionEvent{{Sequence: 1, AttemptOrdinal: 1, AtMs: 1001, Kind: "running", BodyCanonicalBytes: []byte(`{}`)}}}))
+				fatal(t, store.AcceptRunV1(request.ID, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 			}
 			store.Close()
-			left := arm.name == "left canceling by an older cozy"
 			if !rented {
 				// The full native suite provisions machines automatically. Hold this
 				// fixture's real lifecycle lock so it remains genuinely unavailable.
@@ -74,21 +79,9 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 				defer lease.Close()
 				defer flock.Release(lease)
 			}
-			if left {
-				// What cozy before this fix recorded for such a cancel.
-				db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))
-				must(t, err)
-				_, err = db.Exec(`UPDATE machine_executions SET cancel_requested=1 WHERE request_id=?`, request.ID)
-				must(t, err)
-				_, err = db.Exec(`UPDATE requests SET state='canceling' WHERE id=?`, request.ID)
-				must(t, err)
-				must(t, db.Close())
-			}
 			began := time.Now()
 			startDaemonProcess(t, root)
-			if left {
-				// The restarted daemon's observer settles what the older cozy left waiting.
-			} else if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 ||
+			if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 ||
 				!strings.Contains(out, map[bool]string{true: `"canceling"`, false: `"canceled"`}[rented]) {
 				t.Fatalf("cancel did not end the run [exit %d]: %s", code, out)
 			}
@@ -124,7 +117,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			if row.State != "canceling" || !owed || time.Since(began) > 10*time.Second {
 				t.Fatalf("the run is %s (owes the machine: %v) %s after its cancel", row.State, owed, time.Since(began))
 			}
-			// It stays pending: the daemon tries closure, never retransmits the submission.
+			// Intent stays pending without declaring an unknown acceptance canceled.
 			time.Sleep(2 * time.Second)
 			row, problem = store.RequestRow(request.ID)
 			fatal(t, problem)
@@ -135,4 +128,16 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			}
 		})
 	}
+}
+
+func unavailableNativeCertificate(t *testing.T) string {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Minute),
+		NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, DNSNames: []string{"localhost"}}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, public, private)
+	must(t, err)
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
