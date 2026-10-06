@@ -517,6 +517,29 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 	return out, nil
 }
 
+// EditableInstalls is every pinned install of a local source directory: its id, package and
+// source, and nothing else of the record.
+func (s *Store) EditableInstalls() ([]PackageInstall, *exit.Error) {
+	rows, err := s.db.Query(`SELECT i.id, i.package, i.source_ref FROM installs i JOIN pins p ON p.install_id = i.id
+		WHERE i.source_kind='local' AND i.source_ref<>'' ORDER BY i.package, i.major`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list editable installs: %s", err)
+	}
+	defer rows.Close()
+	var out []PackageInstall
+	for rows.Next() {
+		inst := PackageInstall{SourceKind: "local"}
+		if err := rows.Scan(&inst.ID, &inst.Package, &inst.SourceRef); err != nil {
+			return nil, exit.Internalf("cannot read an editable install: %s", err)
+		}
+		out = append(out, inst)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot list editable installs: %s", err)
+	}
+	return out, nil
+}
+
 // Unreferenced is every install no pin points at — gc's reclaim set.
 func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
