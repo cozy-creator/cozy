@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/capability"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 )
@@ -57,6 +58,13 @@ func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Cl
 
 // Close ends the connection.
 func (c *Client) Close() error { return c.conn.Close() }
+
+// Broken is a connection gRPC has given up on for now, or one closed: a caller dials anew
+// rather than wait out its reconnect backoff.
+func (c *Client) Broken() bool {
+	state := c.conn.GetState()
+	return state == connectivity.TransientFailure || state == connectivity.Shutdown
+}
 
 // Cap mints a cap for this machine: machine scope (run empty) or one run's outputs.
 func (c *Client) Cap(run string, outputs []string, lifetime time.Duration) (string, error) {

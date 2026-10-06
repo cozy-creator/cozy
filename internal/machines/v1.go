@@ -2,7 +2,9 @@ package machines
 
 import (
 	"context"
+	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -33,11 +35,45 @@ type V1 struct {
 	release func()
 }
 
+// Close ends this use of the machine; its connection stays open for the next.
 func (v *V1) Close() {
-	_ = v.Client.Close()
 	if v.release != nil {
 		v.release()
 	}
+}
+
+// connect is the one open connection to a machine identity (name, address, worker, boot,
+// process, pinned leaf and signing key): every call to the machine rides it, so only its
+// first, or its first after the identity changes, pays a TLS handshake. A connection gRPC
+// gave up on is dialed anew; Forget drops one when its rental ends.
+func (r *Resolver) connect(name, addr, workerID, bootID, lifetime string, pin *workertls.Pin, signer machinev1.Signer) (*machinev1.Client, error) {
+	identity := strings.Join([]string{addr, workerID, bootID, lifetime, string(pin.Digest()), string(signer.Public)}, "\x00")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if kept := r.v1[name]; kept != nil {
+		if kept.identity == identity && !kept.client.Broken() {
+			return kept.client, nil
+		}
+		_ = kept.client.Close()
+		delete(r.v1, name)
+	}
+	client, err := machinev1.Dial(addr, pin.TLSConfig(), workerID, signer)
+	if err != nil {
+		return nil, err
+	}
+	if r.v1 == nil {
+		r.v1 = map[string]*keptV1{}
+	}
+	r.v1[name] = &keptV1{client: client, identity: identity}
+	if r.Log != nil {
+		fmt.Fprintf(r.Log, "machine %s: connecting to %s (boot %s)\n", name, addr, bootID)
+	}
+	return client, nil
+}
+
+type keptV1 struct {
+	client   *machinev1.Client
+	identity string
 }
 
 // DialV1 resolves a machine as Dial does (this computer's, a rental, or an explicit endpoint)
@@ -65,7 +101,7 @@ func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.
 	if problem != nil {
 		return nil, problem
 	}
-	client, err := machinev1.Dial(t.addr, t.pin.TLSConfig(), t.workerID, t.key.Signer())
+	client, err := r.connect(name, t.addr, t.workerID, t.bootID, t.lifetime, t.pin, t.key.Signer())
 	if err != nil {
 		if machine.release != nil {
 			machine.release()
@@ -105,7 +141,7 @@ func (r *Resolver) DialEndpointV1(ep machineendpoint.Endpoint) (*V1, *exit.Error
 	if err != nil {
 		return nil, exit.New(exit.Credential, "invalid machine TLS leaf: %s", err)
 	}
-	client, err := machinev1.Dial(ep.Address, pin.TLSConfig(), ep.WorkerID, key.Signer())
+	client, err := r.connect(ep.Name(), ep.Address, ep.WorkerID, ep.WorkerBootID, "", pin, key.Signer())
 	if err != nil {
 		return nil, Transport(err)
 	}

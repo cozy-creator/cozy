@@ -639,6 +639,8 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	if providers := (&v1.ProviderAccess{Huggingface: m.resolver.cfg.HuggingFaceToken.Reveal(), Civitai: m.resolver.cfg.CivitaiToken.Reveal()}); providers.Huggingface != "" || providers.Civitai != "" {
 		spec.Providers = providers
 	}
+	ctx, stop := context.WithCancel(ctx) // the stream ends with this call; its connection stays
+	defer stop()
 	stream, err := machine.Run(ctx, row.ID, 0, spec)
 	if err != nil {
 		return nil, machines.Transport(err)
