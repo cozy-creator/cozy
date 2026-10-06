@@ -79,7 +79,7 @@ func TestPlannedSourceBytesTotalsTheDeclaredIngest(t *testing.T) {
 func TestRentalRequestCarriesTheDeclaredWorkload(t *testing.T) {
 	body, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		hub.DeclaredWorkload{SourceBytes: h3SourceBytes}, nil, "")
+		hub.DeclaredWorkload{SourceBytes: h3SourceBytes}, nil, "", "")
 	fatal(t, problem)
 
 	var wire map[string]any
@@ -107,7 +107,7 @@ func TestRentalRequestCarriesTheDeclaredWorkload(t *testing.T) {
 	// A serving rental declares nothing, and the field must stay OFF the wire so
 	// an undeclared rental is byte-identical to one authored before th-152.
 	serving, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
-		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil, "")
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil, "", "")
 	fatal(t, problem)
 	if strings.Contains(string(serving), "planned_source_bytes") {
 		t.Fatalf("an undeclared serving rental put planned_source_bytes on the wire: %s", serving)
@@ -184,7 +184,7 @@ func TestRentalRequestCarriesTheDeclaredServingSet(t *testing.T) {
 	}
 	body, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		hub.DeclaredWorkload{ServingModels: declared}, nil, "")
+		hub.DeclaredWorkload{ServingModels: declared}, nil, "", "")
 	fatal(t, problem)
 
 	var wire struct {
@@ -221,7 +221,7 @@ func TestRentalRequestCarriesTheDeclaredServingSet(t *testing.T) {
 	// Undeclared stays OFF the wire, so deploying this cannot change the request
 	// digest of a rental authored before th-155 and invalidate its idempotency key.
 	serving, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
-		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil, "")
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil, "", "")
 	fatal(t, problem)
 	if strings.Contains(string(serving), "serving_models") {
 		t.Fatalf("an undeclared rental put serving_models on the wire: %s", serving)
@@ -244,7 +244,7 @@ func TestAnIncompleteServingModelIsRefusedBeforeItIsSent(t *testing.T) {
 	} {
 		_, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
 			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-			hub.DeclaredWorkload{ServingModels: []hub.ServingModel{arm.model}}, nil, "")
+			hub.DeclaredWorkload{ServingModels: []hub.ServingModel{arm.model}}, nil, "", "")
 		if problem == nil {
 			t.Fatalf("a serving model with %s was authored onto the wire", arm.what)
 		}
