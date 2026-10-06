@@ -86,6 +86,7 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	}
 	var store *records.Store
 	var originalA, originalB, latestB machineChildProof
+	reader := storeReader(t)
 	checkTensor := func(producer machineChildProof, value int) {
 		t.Helper()
 		artifact, problem := records.DecodeModelArtifact(producer.Result)
@@ -93,7 +94,7 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		if artifact == nil {
 			t.Fatal("native result has no exact artifact")
 		}
-		command := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "private_child_read.py"),
+		command := exec.Command(reader, filepath.Join("testdata", "private_child_read.py"),
 			artifact.Manifest.Digest, strconv.Itoa(value), machineStore(root))
 		out, err := command.CombinedOutput()
 		if err != nil {
@@ -114,9 +115,8 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			must(t, os.WriteFile(file, []byte(strings.Replace(string(body), "value * factor for value", "value * factor + 1 for value", 1)), 0o600))
 		}
 		if cycle == 3 {
-			// A completed no-output caller no longer owns its intermediates. Return
-			// the final checkpoint explicitly before testing pruning and restart;
-			// changing only this caller must still reuse both operation results.
+			// The caller returns B's checkpoint; changing only the caller must still
+			// reuse both operation results.
 			body, err := os.ReadFile(script)
 			must(t, err)
 			body = []byte(strings.Replace(string(body), "async def main():", "from cozy_runtime.author import ModelArtifact\n\nasync def main() -> ModelArtifact:", 1))
@@ -172,8 +172,27 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		fatal(t, issue)
 		owed, issue := store.MachineExecutionOwesWork(parent.ID)
 		fatal(t, issue)
-		if link == nil || !link.Collected || owed != (cycle == 3) {
-			t.Fatalf("successful caller collection lost explicit result custody: link=%+v owed=%v", link, owed)
+		// The machine keeps its runs' checkpoints itself: a collected run owes this computer
+		// nothing, even one returning its checkpoint. checkTensor proves each one survives.
+		if link == nil || !link.Collected || owed {
+			t.Fatalf("a collected run still owes this computer work: link=%+v owed=%v", link, owed)
+		}
+		if cycle == 3 {
+			artifact, problem := records.DecodeModelArtifact(latestB.Result)
+			fatal(t, problem)
+			var shown struct {
+				Result struct {
+					Value struct {
+						Manifest struct {
+							Digest string `json:"digest"`
+						} `json:"manifest"`
+					} `json:"value"`
+				} `json:"result"`
+			}
+			must(t, json.Unmarshal([]byte(run("run", "show", strconv.Itoa(1+cycle))), &shown))
+			if artifact == nil || shown.Result.Value.Manifest.Digest != artifact.Manifest.Digest {
+				t.Fatalf("the caller's result is not B's checkpoint: %+v", shown)
+			}
 		}
 		if cycle == 1 {
 			// Only the failed predecessor still needs explicit abandonment.

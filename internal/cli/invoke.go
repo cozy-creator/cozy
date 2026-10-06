@@ -1566,7 +1566,7 @@ func exportedOutputs(life api.Lifecycle) []savedFile {
 	// to a Hub. Join their committed file paths, without inventing a receipt.
 	for _, o := range life.Output {
 		if o.Status == "completed" && o.Path != "" {
-			byPath[o.Path] = savedFile{Output: o.ID, Path: o.Path, Bytes: o.Length, Mime: o.MediaType, Digest: o.Sha256}
+			byPath[o.Path] = savedFile{Output: o.Name, Path: o.Path, Bytes: o.Length, Mime: o.MediaType, Digest: o.Sha256}
 		}
 	}
 	result := make([]savedFile, 0, len(life.OutputExport.Paths))

@@ -250,6 +250,20 @@ func machineStore(root string) string {
 	return filepath.Join(root, "tensorfs")
 }
 
+// storeReader is a Python that opens the machine's store. The plane-only TensorFS a machine's
+// executors install has no store, so this takes the full build from the package index.
+func storeReader(t *testing.T) string {
+	t.Helper()
+	env := filepath.Join(t.TempDir(), "store-reader")
+	python := filepath.Join(env, "bin", "python")
+	for _, args := range [][]string{{"venv", env, "--python", "3.12"}, {"pip", "install", "--python", python, "tensorfs"}} {
+		if out, err := exec.Command("uv", args...).CombinedOutput(); err != nil {
+			t.Fatalf("uv %s: %v\n%s", args[0], err, out)
+		}
+	}
+	return python
+}
+
 // machineInstallations holds the package environments this computer's machine prepared: one
 // generation each, its packages in `env` and an unpublished root's code in `source`.
 func machineInstallations(root string) string {
