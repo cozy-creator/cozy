@@ -2239,7 +2239,8 @@ type OutputTarget struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Run           string                 `protobuf:"bytes,1,opt,name=run,proto3" json:"run,omitempty"`
 	Output        string                 `protobuf:"bytes,2,opt,name=output,proto3" json:"output,omitempty"`
-	Index         uint32                 `protobuf:"varint,3,opt,name=index,proto3" json:"index,omitempty"` // a list item's 1-based index; 0 for a single output
+	Index         uint32                 `protobuf:"varint,3,opt,name=index,proto3" json:"index,omitempty"`  // a list item's 1-based index; 0 for a single output
+	Member        string                 `protobuf:"bytes,4,opt,name=member,proto3" json:"member,omitempty"` // one file of a tree output, by its manifest path; empty: the manifest
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2293,6 +2294,13 @@ func (x *OutputTarget) GetIndex() uint32 {
 		return x.Index
 	}
 	return 0
+}
+
+func (x *OutputTarget) GetMember() string {
+	if x != nil {
+		return x.Member
+	}
+	return ""
 }
 
 // The first frame describes the bytes (data may be empty); the rest carry data in order.
@@ -3391,11 +3399,12 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x06offset\x18\x04 \x01(\x04R\x06offset\x12\x15\n" +
 	"\x06if_rev\x18\x05 \x01(\x04R\x05ifRev\x12\x12\n" +
 	"\x04tail\x18\x06 \x01(\x04R\x04tailB\b\n" +
-	"\x06target\"N\n" +
+	"\x06target\"f\n" +
 	"\fOutputTarget\x12\x10\n" +
 	"\x03run\x18\x01 \x01(\tR\x03run\x12\x16\n" +
 	"\x06output\x18\x02 \x01(\tR\x06output\x12\x14\n" +
-	"\x05index\x18\x03 \x01(\rR\x05index\"\x80\x01\n" +
+	"\x05index\x18\x03 \x01(\rR\x05index\x12\x16\n" +
+	"\x06member\x18\x04 \x01(\tR\x06member\"\x80\x01\n" +
 	"\tReadFrame\x12\x10\n" +
 	"\x03rev\x18\x01 \x01(\x04R\x03rev\x12\x16\n" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x16\n" +

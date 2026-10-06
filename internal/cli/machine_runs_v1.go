@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -262,7 +263,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		}
 		var held *records.Product
 		if product := event.GetProduct(); product != nil {
-			if held = m.productV1(request, event.Sequence, product); held != nil && fetch != nil {
+			if held = m.productV1(ctx, machine, request, event.Sequence, product); held != nil && fetch != nil {
 				fetch.want(*held, product.AppendedFrom)
 			}
 		}
@@ -658,7 +659,7 @@ func loopbackHub(origin string) string {
 
 // productV1 is one output revision as this client records it, with the file it lands in;
 // nil for a revision this client cannot hold.
-func (m *machineRuns) productV1(request records.Request, sequence uint64, product *v1.Product) *records.Product {
+func (m *machineRuns) productV1(ctx context.Context, machine *machines.V1, request records.Request, sequence uint64, product *v1.Product) *records.Product {
 	if request.Number == 0 {
 		if numbered, problem := m.store.RequestByReference(request.ID); problem == nil && numbered != nil {
 			request.Number = numbered.Number
@@ -691,10 +692,34 @@ func (m *machineRuns) productV1(request records.Request, sequence uint64, produc
 	if item.List {
 		held.Op, held.Index = records.ProductAppend, product.Index-1
 	}
+	if media == resultfiles.TreeMediaType {
+		held.ContentBytes = treeContentBytes(ctx, machine, request.ID, held)
+	}
 	if export, problem := m.store.OutputExportOf(request.ID); problem == nil && export != nil && export.Directory != "" {
 		held.Path = filepath.Join(export.Directory, itemFile(run, item, media))
 	}
 	return &held
+}
+
+// treeContentBytes is a tree revision's member bytes, from its manifest (0 when unreadable).
+func treeContentBytes(ctx context.Context, machine *machines.V1, run string, product records.Product) int64 {
+	var manifest bytes.Buffer
+	if _, _, err := machine.ReadOutput(ctx, run, product.Output, outputIndexV1(product), 0, uint64(product.Rev), &manifest); err != nil {
+		return 0
+	}
+	var document struct {
+		Entries []struct {
+			Blob struct{ Length int64 } `json:"blob"`
+		} `json:"entries"`
+	}
+	if json.Unmarshal(manifest.Bytes(), &document) != nil {
+		return 0
+	}
+	var total int64
+	for _, entry := range document.Entries {
+		total += entry.Blob.Length
+	}
+	return total
 }
 
 // fetcherV1 keeps a run's outputs folder at each item's newest revision while the run goes on.
@@ -856,7 +881,7 @@ func (f *fetcherV1) stop() {
 // file is tried as a prefix first. `held` is told how many bytes are in hand as they arrive.
 func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product, from int64, held func(int64)) *exit.Error {
 	if product.MediaType == resultfiles.TreeMediaType {
-		return exit.Named(exit.Structural, "output_tree_unsupported", "tree outputs are not read over cozy.machine.v1 yet")
+		return readTreeV1(ctx, machine, run, directory, product)
 	}
 	if problem := resultfiles.Preflight(directory); problem != nil {
 		return problem
@@ -926,6 +951,73 @@ func (c *counted) Write(p []byte) (int, error) {
 	c.n += int64(n)
 	c.held(c.n)
 	return n, err
+}
+
+// readTreeV1 makes the directory at product.Path this revision's tree: its manifest, then each
+// member file it names, read and verified beside the folder, then placed whole.
+func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product) *exit.Error {
+	if problem := resultfiles.Preflight(directory); problem != nil {
+		return problem
+	}
+	staging, err := os.MkdirTemp(directory, ".cozy-tree-receiving-")
+	if err != nil {
+		return exit.Named(exit.Unavailable, "output_unwritable", "cannot write into %s: %s", directory, err)
+	}
+	defer os.RemoveAll(staging)
+	read := func(member, target, digest string) *exit.Error {
+		file, err := os.Create(target)
+		if err != nil {
+			return exit.Named(exit.Unavailable, "output_unwritable", "cannot stage a tree in %s: %s", directory, err)
+		}
+		hash := sha256.New()
+		_, _, err = machine.ReadMember(ctx, run, product.Output, outputIndexV1(product), member, uint64(product.Rev), io.MultiWriter(file, hash))
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return machines.Transport(err)
+		}
+		if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
+			return exit.Named(exit.Conflict, "output_revision_changed", "%s moved past revision %d while it was read", product.Output, product.Rev)
+		}
+		return nil
+	}
+	manifest := filepath.Join(staging, "manifest")
+	if problem := read("", manifest, product.Digest); problem != nil {
+		return problem
+	}
+	raw, err := os.ReadFile(manifest)
+	if err != nil {
+		return exit.Internalf("cannot read a tree manifest: %s", err)
+	}
+	var document struct {
+		Entries []struct {
+			Blob struct{ Length int64 } `json:"blob"`
+		} `json:"entries"`
+	}
+	_ = json.Unmarshal(raw, &document)
+	var contentBytes int64
+	for _, entry := range document.Entries {
+		contentBytes += entry.Blob.Length
+	}
+	members, problem := resultfiles.ParseTreeManifest(raw, contentBytes)
+	if problem != nil {
+		return problem
+	}
+	if err := os.Mkdir(manifest+".files", 0o700); err != nil {
+		return exit.Internalf("cannot stage a tree: %s", err)
+	}
+	for _, member := range members {
+		held := filepath.Join(manifest+".files", strings.TrimPrefix(member.Digest, "sha256:"))
+		if _, err := os.Stat(held); err == nil {
+			continue // a duplicate file is read once
+		}
+		if problem := read(member.Path, held, member.Digest); problem != nil {
+			return problem
+		}
+	}
+	_, problem = resultfiles.MaterializeTree(manifest, directory, filepath.Base(product.Path), product.Digest, product.Length, contentBytes)
+	return problem
 }
 
 // outputIndexV1 is the item's index as Read names it: 1-based in a list, 0 for one output.

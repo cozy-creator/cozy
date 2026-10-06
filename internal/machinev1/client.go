@@ -95,6 +95,11 @@ func (c *Client) ReadOutput(ctx context.Context, run, output string, index uint3
 	return c.read(ctx, &pb.ReadRequest{Target: &pb.ReadRequest_Output{Output: &pb.OutputTarget{Run: run, Output: output, Index: index}}, Offset: offset, IfRev: rev}, w)
 }
 
+// ReadMember copies one file of a tree output (by its manifest path) into w, at revision rev.
+func (c *Client) ReadMember(ctx context.Context, run, output string, index uint32, member string, rev uint64, w io.Writer) (*pb.ReadFrame, int64, error) {
+	return c.read(ctx, &pb.ReadRequest{Target: &pb.ReadRequest_Output{Output: &pb.OutputTarget{Run: run, Output: output, Index: index, Member: member}}, IfRev: rev}, w)
+}
+
 // ReadTriage copies a failed run's triage bundle into w.
 func (c *Client) ReadTriage(ctx context.Context, run string, w io.Writer) (*pb.ReadFrame, int64, error) {
 	return c.read(ctx, &pb.ReadRequest{Target: &pb.ReadRequest_Triage{Triage: run}}, w)
