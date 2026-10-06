@@ -24,9 +24,11 @@ type machineRuns struct {
 	fleet    *managedRentals
 	mu       sync.Mutex
 	running  map[string]chan struct{}
-	placed   map[string]string // the last placement decision recorded per waiting run
-	machines *machines.Resolver
-	updates  *rentalRuntimeUpdates
+	// hubAccess holds each machine's execution access, by hub, credential and leaf.
+	hubAccess sync.Map
+	placed    map[string]string // the last placement decision recorded per waiting run
+	machines  *machines.Resolver
+	updates   *rentalRuntimeUpdates
 	// submitting stops each request's submission work in flight (upload, preparation,
 	// staging) once its cancel is durable; guarded by mu.
 	submitting map[string]context.CancelFunc

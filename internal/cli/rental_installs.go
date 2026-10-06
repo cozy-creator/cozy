@@ -76,28 +76,38 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 // run used): its warm run, watched here to its outcome, with nothing queued. Interrupting stops
 // only the watch. false: the machine takes no such warm run, and the daemon's queue keeps it.
 func foregroundInstall(ctx *Context, ep *machineendpoint.Endpoint, machine string, selection records.RentalInstallSelection) (bool, *exit.Error) {
+	began := time.Now()
+	install, problem := foregroundPrewarm(ctx, ep, machine, selection)
+	if problem != nil {
+		return true, problem
+	}
+	return true, emitInstalled(ctx, install, began)
+}
+
+// foregroundPrewarm is foregroundInstall's warm run without its record: the settled
+// installation, shown by the rental's id as the daemon's queue shows it.
+func foregroundPrewarm(ctx *Context, ep *machineendpoint.Endpoint, machine string, selection records.RentalInstallSelection) (records.RentalInstall, *exit.Error) {
 	l := home.Paths(ctx.Cfg.Home)
 	st, problem := records.Open(l.DB)
 	if problem != nil {
-		return true, problem
+		return records.RentalInstall{}, problem
 	}
 	defer st.Close()
 	runs := endpointRuns(ctx, ep, l, st)
 	defer runs.cancel()
 	selection.Hub = either(selection.Hub, ctx.Cfg.HubURL)
 	install := records.RentalInstall{ID: records.NewID("rental-install"), RentalID: ep.Name(), State: "installing", Selection: selection}
-	began, watch := time.Now(), &installWatch{machine: machine, shownAt: time.Now()}
+	watch := &installWatch{machine: machine, shownAt: time.Now()}
 	result, problem := runs.prewarmV1(runs.ctx, install, func(p machines.InstallProgress) {
 		watch.report(ctx, p.Stage, p.TransferredBytes, p.TotalBytes)
 	})
 	if problem != nil {
 		named := *problem
 		named.Message = machine + ": " + problem.Message
-		return true, &named
+		return install, &named
 	}
-	// Shown as the daemon's queue shows it: by the rental's id.
-	install.Result, install.RentalID = result, either(ep.WorkspaceID, ep.Name())
-	return true, emitInstalled(ctx, install, began)
+	install.Result, install.RentalID, install.State = result, either(ep.WorkspaceID, ep.Name()), "succeeded"
+	return install, nil
 }
 
 // awaitRentalInstall watches one accepted installation until it settles, saying on stderr

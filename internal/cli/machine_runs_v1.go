@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
@@ -39,6 +40,10 @@ import (
 // under the request's id, and the same call streams its log to the outcome. Resubmitting is
 // attaching: the id is the idempotency, so nothing is frozen, closed or acknowledged. Outputs
 // are read with Read into the run's outputs folder as their revisions land.
+
+// errNoDescribe is a machine that cannot name a package's newest release and its interface
+// (describe/1): the client reads them at the Hub instead.
+var errNoDescribe = exit.Named(exit.Unavailable, "machine.describe_unsupported", "the machine cannot describe a release")
 
 // loopV1 follows one run on its machine until it is settled.
 func (m *machineRuns) loopV1(request records.Request) {
@@ -339,7 +344,11 @@ func (m *machineRuns) place(ctx context.Context, request records.Request, link *
 // tokens ride in the spec, which the machine holds in memory for the run's preparation only.
 func (m *machineRuns) specV1(ctx context.Context, request records.Request, machine *machines.V1) (*v1.RunSpec, *exit.Error) {
 	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_CALL, Entrypoint: request.Entrypoint, Payload: request.Payload,
-		AttentionKernel: request.AttentionKernel, Owner: m.runAccount(request)}
+		AttentionKernel: request.AttentionKernel}
+	if request.LocalInstallationID != "" || strings.HasPrefix(request.Package, "local/") {
+		// Only unpublished code names its owner: its org-relative defaults are the owner's.
+		spec.Owner = m.runAccount(request)
+	}
 	revision, problem := m.store.BindingRevision()
 	if problem != nil {
 		return nil, problem
@@ -357,13 +366,22 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		}
 		spec.KnownResults = known
 		if request.ModelTransfer != nil && request.ModelTransfer.Destination != "" {
-			// The machine publishes the job's weights outputs there itself, under this grant.
+			// The machine publishes the job's weights outputs there itself.
 			spec.WeightsDestination = request.ModelTransfer.Destination
-			grant, problem := authorizeV1Publication(ctx, machine, []string{spec.WeightsDestination})
-			if problem != nil {
-				return nil, problem
-			}
-			spec.Publication = grant
+		}
+	}
+	// One grant covers every repository the run may publish into: its weights destination and
+	// those the owner consented to (--allow-upload).
+	repositories, problem := m.store.RequestPublicationRepositories(request.ID)
+	if problem != nil {
+		return nil, problem
+	}
+	if spec.WeightsDestination != "" {
+		repositories = append(repositories, spec.WeightsDestination)
+	}
+	if len(repositories) > 0 {
+		if spec.Publication, problem = authorizeV1Publication(ctx, machine, repositories); problem != nil {
+			return nil, problem
 		}
 	}
 	began := time.Now()
@@ -502,6 +520,9 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		return nil, exit.Named(exit.Structural, "machine.warm_unsupported",
 			"this machine takes no warm runs or model uploads; %s", machines.RuntimeUpdate(row.RentalID))
 	}
+	if selection.Package != "" && selection.Release == "" && !slices.Contains(capabilities, "describe/1") {
+		return nil, errNoDescribe
+	}
 	if selection.HoldsLocally() && !slices.Contains(capabilities, "local-models/1") {
 		return nil, exit.Named(exit.Structural, "machine.local_models_unsupported",
 			"this machine holds no local files or local/ models; %s", machines.RuntimeUpdate(row.RentalID))
@@ -511,8 +532,11 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		origin = machine.Account.Base()
 	}
 	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_WARM, WeightsDestination: selection.Destination}
-	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
-		spec.Owner = caller.Account
+	if strings.HasPrefix(selection.Package, "local/") {
+		// Only unpublished code names its owner, as a call of it does: the same preparation key.
+		if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
+			spec.Owner = caller.Account
+		}
 	}
 	// Resolved under the same key as this computer's calls (owner, binding revision), so a
 	// call after a warm run reuses its preparation instead of resolving again.
@@ -586,6 +610,22 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	}
 }
 
+// Describe installs pkg's newest release on a machine at the machine's own Hub and answers
+// it with its interface: an install-only warm run with no release named (describe/1).
+func (m *machineRuns) Describe(ctx context.Context, machine, pkg, hub string) (api.ReleaseDescription, *exit.Error) {
+	row := records.RentalInstall{ID: records.NewID("describe"), RentalID: machine,
+		Selection: records.RentalInstallSelection{Package: pkg, Hub: hub}}
+	result, problem := m.prewarmV1(ctx, row, func(machines.InstallProgress) {})
+	if problem != nil && problem.ErrName() == "machine.warm_unsupported" {
+		problem = errNoDescribe
+	}
+	var described api.ReleaseDescription
+	if problem == nil && (json.Unmarshal(result, &described) != nil || described.Release == "" || len(described.Interface) == 0) {
+		problem = errNoDescribe
+	}
+	return described, problem
+}
+
 // writeTreesV1 writes each `--input-tree ref=dir` to the machine as writeTreeV1 does; the
 // spec names its manifest as an input of the tree media type under the payload's ref.
 func (m *machineRuns) writeTreesV1(ctx context.Context, request records.Request, machine *machines.V1, spec *v1.RunSpec) *exit.Error {
@@ -642,6 +682,12 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 	if account.CredentialIdentity() == "" {
 		return nil, nil
 	}
+	// One grant serves this machine's runs for the first half of its life: a warm run asks the
+	// Hub nothing.
+	key := origin + "\x00" + account.CredentialIdentity() + "\x00" + string(machine.Leaf)
+	if held, ok := m.hubAccess.Load(key); ok && time.Now().Before(held.(heldAccess).renew) {
+		return held.(heldAccess).grant, nil
+	}
 	access, problem := account.AuthorizeExecutionAccess(ctx, machine.Leaf)
 	if problem != nil {
 		return nil, problem
@@ -656,7 +702,16 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 			grant.ObjectHosts = append(grant.ObjectHosts, host)
 		}
 	}
+	if life := time.Until(access.ExpiresAt); life > 0 {
+		m.hubAccess.Store(key, heldAccess{grant: grant, renew: time.Now().Add(life / 2)})
+	}
 	return grant, nil
+}
+
+// heldAccess is a machine's execution access and when to ask for a fresh one.
+type heldAccess struct {
+	grant *v1.HubAccess
+	renew time.Time
 }
 
 // loopbackHub is origin as scheme://host[:port] when it names this computer, else "".
