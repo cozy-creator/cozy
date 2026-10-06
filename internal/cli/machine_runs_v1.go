@@ -511,6 +511,11 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
 		spec.Owner = caller.Account
 	}
+	// Resolved under the same key as this computer's calls (owner, binding revision), so a
+	// call after a warm run reuses its preparation instead of resolving again.
+	if spec.BindingRevision, problem = m.store.BindingRevision(); problem != nil {
+		return nil, problem
+	}
 	if selection.Warm != "" {
 		// A warm set member: the machine's whole set goes back with this one changed.
 		if !slices.Contains(capabilities, "warm/2") {
