@@ -49,6 +49,7 @@ type editableSync struct {
 	mu       sync.Mutex
 	trees    map[string]*editableTree // by source root
 	said     map[string]string        // last watch refusal logged per source root
+	read     string                   // the editable installs the watched set was last made from
 }
 
 type editableTree struct {
@@ -195,9 +196,22 @@ func (s *editableSync) reconcile() {
 		file.Close()
 	}
 	s.resolver.refreshMu.Unlock()
-	rows, problem := s.store.Installed()
+	rows, problem := s.store.EditableInstalls()
 	if problem != nil {
 		fmt.Fprintf(s.log, "editable watch: cannot read installs: %s\n", problem.Message)
+		return
+	}
+	// Every records write wakes this; only a changed editable install changes what is watched.
+	// An edit to a watched tree reaches its own tree, and its rebuild is a new install.
+	var read strings.Builder
+	for _, row := range rows {
+		fmt.Fprintf(&read, "%s\x00%s\x00%s\n", row.ID, row.Package, row.SourceRef)
+	}
+	s.mu.Lock()
+	unchanged := read.String() == s.read
+	s.read = read.String()
+	s.mu.Unlock()
+	if unchanged {
 		return
 	}
 	want := map[string]string{}
@@ -276,8 +290,7 @@ func (s *editableSync) reconcile() {
 	}
 }
 
-// sayOnce logs line for root unless it is what was last logged there; "" clears it. The
-// database changes on every write, and each change rescans every source.
+// sayOnce logs line for root unless it is what was last logged there; "" clears it.
 func (s *editableSync) sayOnce(root, line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

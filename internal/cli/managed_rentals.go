@@ -1365,8 +1365,12 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 		wasAttachable := localRentalAttachable(row)
 		row.State = remote.State
 		copyRentalFailure(&row, remote)
-		if problem := m.store.RecordRental(row); problem != nil {
-			return released, failed, rebooted, problem
+		// Written only when the Hub said something new: this runs every poll for every rental,
+		// and an ended one's write settles its runs again.
+		if row != *current {
+			if problem := m.store.RecordRental(row); problem != nil {
+				return released, failed, rebooted, problem
+			}
 		}
 		if remote.Attachable() && !wasAttachable {
 			// Reconcile changed the durable local rental to attachable. Wake
