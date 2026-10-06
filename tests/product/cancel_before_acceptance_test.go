@@ -36,6 +36,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 	}
 	for _, arm := range []struct{ name, machine string }{{"local machine never boots", machines.Local},
 		{"rental unavailable", "pr-deadpoddeadpoddead0"},
+		{"rental cancel recorded while daemon down", "pr-deadpoddeadpoddead0"},
 		{"local machine stopped while executing", machines.Local}} {
 		machine := arm.machine
 		t.Run(arm.name, func(t *testing.T) {
@@ -66,6 +67,10 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			if executing {
 				fatal(t, store.AcceptRunV1(request.ID, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 			}
+			if arm.name == "rental cancel recorded while daemon down" {
+				_, problem := store.RequestMachineCancellation(request.ID, "cozy run cancel")
+				fatal(t, problem)
+			}
 			store.Close()
 			if !rented {
 				// The full native suite provisions machines automatically. Hold this
@@ -88,7 +93,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 				events, problem := observations.EventsAfter(request.ID, 0, 100)
 				fatal(t, problem)
 				for _, event := range events {
-					t.Logf("%s: %s", event.Type, event.Payload)
+					t.Logf("%s: %v", event.Type, event.Payload)
 				}
 				observations.Close()
 				t.Fatalf("cancel did not end the run [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
