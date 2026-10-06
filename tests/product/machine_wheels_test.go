@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
@@ -215,4 +216,78 @@ def sdk(payload: Ask) -> SDK:
 		t.Fatalf("locking %s: %v\n%s", name, err, out)
 	}
 	return project
+}
+
+// An install over a running machine updates it in place, and it then runs its Runtime wheel's
+// bundled machine. Stopped and started again, it reaches readiness each time (cut condition 18:
+// every launch after an in-place update hung on a readiness key the new service never got).
+func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
+	if *machineRuntimeWheel == "" || *machineTensorFSWheel == "" {
+		t.Skip("requires a -machine-runtime-wheel/-machine-tensorfs-wheel pair")
+	}
+	if !bundlesMachine(t, *machineRuntimeWheel) {
+		t.Skip("requires a -machine-runtime-wheel that bundles a Rust machine")
+	}
+	if _, err := exec.LookPath("uv"); err != nil {
+		t.Skip("uv lays out the machine root")
+	}
+	h := newMachineHub(t)
+	root, err := os.MkdirTemp("", "czu")
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
+		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "machine", "stop")
+		_, _ = runCozy(t, root, "down")
+		if t.Failed() {
+			log, _ := os.ReadFile(filepath.Join(root, "machine", "host.log"))
+			t.Logf("evidence retained at %s\nlocal machine log:\n%s", root, log)
+		} else {
+			_ = removeAllForce(root)
+		}
+	})
+	version := func(wheel string) string { return strings.SplitN(filepath.Base(wheel), "-", 3)[1] }
+	ready := func(want string) {
+		t.Helper()
+		code, out := cozyWithin(t, root, 5*time.Minute, "machine", "start")
+		if code != 0 {
+			t.Fatalf("machine start [exit %d]\n%s", code, out)
+		}
+		code, out = runCozy(t, root, "machine", "show", "--json")
+		var shown map[string]any
+		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["phase"] != "ready" || shown["runtime_version"] != want {
+			t.Fatalf("the machine is not ready on %s [exit %d]\n%s", want, code, out)
+		}
+	}
+	first, second := localBuild(t, *machineRuntimeWheel, "first"), localBuild(t, *machineRuntimeWheel, "second")
+	if code, out := runCozy(t, root, "machine", "install", "--runtime-wheel", first, "--tensorfs-wheel", *machineTensorFSWheel); code != 0 {
+		t.Fatalf("machine install [exit %d]\n%s", code, out)
+	}
+	ready(version(first))
+	if code, out := runCozy(t, root, "machine", "install", "--runtime-wheel", second, "--tensorfs-wheel", *machineTensorFSWheel); code != 0 {
+		t.Fatalf("machine install over the running machine [exit %d]\n%s", code, out)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "machine", "root", "var/lib/cozy/rust-machine/agent/current")); err != nil {
+		t.Fatalf("the update in place did not activate the wheel's bundled machine: %v", err)
+	}
+	for range 2 {
+		if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
+			t.Fatalf("machine stop [exit %d]\n%s", code, out)
+		}
+		ready(version(second))
+	}
+}
+
+// bundlesMachine answers whether a Runtime wheel carries a cozy-machine executable.
+func bundlesMachine(t *testing.T, wheel string) bool {
+	t.Helper()
+	archive, err := zip.OpenReader(wheel)
+	must(t, err)
+	defer archive.Close()
+	for _, file := range archive.File {
+		if strings.HasSuffix(file.Name, ".data/scripts/cozy-machine") {
+			return true
+		}
+	}
+	return false
 }
