@@ -111,3 +111,26 @@ func TestCalciferKeepsAnExistingControllerUntilExplicitRestart(t *testing.T) {
 		t.Fatal("explicit restart kept the old process")
 	}
 }
+
+func TestCalciferDetachedLaunchHasItsOwnOSName(t *testing.T) {
+	root := t.TempDir()
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down") })
+	bin := t.TempDir()
+	// Only the external user-manager availability check is a fixture. The detached
+	// controller, its startup, ownership record and HTTP shutdown are real processes.
+	must(t, os.WriteFile(filepath.Join(bin, "systemctl"), []byte("#!/bin/sh\nexit 1\n"), 0o755))
+	command := exec.Command(cozyBin, "up", "--json", "--full")
+	command.Env = childEnv(t, root)
+	for i, entry := range command.Env {
+		if path, ok := strings.CutPrefix(entry, "PATH="); ok {
+			command.Env[i] = "PATH=" + bin + string(os.PathListSeparator) + path
+		}
+	}
+	if out, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("detached controller startup: %v\n%s", err, out)
+	}
+	requireCalciferIdentity(t, root)
+	if code, out := runCozy(t, root, "down", "--json", "--full"); code != 0 || calcifer.Probe(config.Config{Home: root}).Up {
+		t.Fatalf("detached controller stop [exit%d]: %s", code, out)
+	}
+}
