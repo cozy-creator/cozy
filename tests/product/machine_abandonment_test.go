@@ -104,4 +104,25 @@ func TestRunCancelAbandonCLIIsLocalAndSurvivesDaemonRestart(t *testing.T) {
 	if after == nil || !after.Abandoned || !bytes.Equal(after.Submission, before.Submission) || len(after.Receipt) != 0 || after.SubmissionClosed || !after.CancelRequested {
 		t.Fatal("ordinary CLI/restart lost unknown acceptance evidence")
 	}
+	events, problem := store.EventsAfter(request.ID, 0, 100)
+	fatal(t, problem)
+	var found bool
+	for _, event := range events {
+		if event.Type != "client.machine_abandoned" {
+			continue
+		}
+		var facts struct {
+			AcceptanceUnknown    bool `json:"acceptance_unknown"`
+			HadAcceptanceReceipt bool `json:"had_acceptance_receipt"`
+			RemoteStopConfirmed  bool `json:"remote_stop_confirmed"`
+		}
+		must(t, json.Unmarshal(event.Raw, &facts))
+		if !facts.AcceptanceUnknown || facts.HadAcceptanceReceipt || facts.RemoteStopConfirmed {
+			t.Fatalf("native local abandonment lost acceptance uncertainty: %s", event.Raw)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("ordinary CLI/restart lost its local abandonment audit fact")
+	}
 }

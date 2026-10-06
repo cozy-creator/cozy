@@ -37,11 +37,14 @@ func (s *Store) AbandonMachineExecution(id, actor, why string) (bool, *exit.Erro
 		return false, nil
 	}
 	var state string
-	if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, id).Scan(&state); err != nil {
+	var nativeSent bool
+	if err := tx.QueryRow(`SELECT state,
+ EXISTS(SELECT 1 FROM request_events WHERE request_id=requests.id AND type=?)
+ FROM requests WHERE id=?`, RunV1Sent, id).Scan(&state, &nativeSent); err != nil {
 		return false, exit.Internalf("cannot read abandoned run: %s", err)
 	}
 	facts := map[string]any{"actor": actor, "machine_id": link.MachineID, "scope": "local_abandonment", "machine_execution": true,
-		"had_acceptance_receipt": len(link.Receipt) > 0, "acceptance_unknown": len(link.Submission) > 0 && len(link.Receipt) == 0 && !link.SubmissionClosed,
+		"had_acceptance_receipt": len(link.Receipt) > 0, "acceptance_unknown": (nativeSent || len(link.Submission) > 0) && len(link.Receipt) == 0 && !link.SubmissionClosed,
 		"remote_stop_confirmed": false, "error_type": "request.abandoned", "error": cmp.Or(why, "the owner abandoned local tracking; remote stop and rental release are not confirmed")}
 	if err := appendEventTx(tx, id, "client.machine_abandoned", 0, facts); err != nil {
 		return false, exit.Internalf("cannot retain abandonment intent: %s", err)
