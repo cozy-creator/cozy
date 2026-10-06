@@ -152,7 +152,8 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		return exit.Internalf("cannot read lost machine cause: %s", err)
 	}
 	rows, err := tx.Query(`SELECT e.machine_id,r.id,r.state,r.retain_work,r.rental=1 AND r.requested_rental='',
- e.cancel_requested,length(e.submission)>0 OR length(e.receipt)>0,length(e.receipt)>0,length(e.outcome)>0
+ e.cancel_requested,length(e.submission)>0 OR length(e.receipt)>0 OR EXISTS(SELECT 1 FROM request_events sent
+ WHERE sent.request_id=r.id AND sent.type='`+RunV1Sent+`'),length(e.receipt)>0,length(e.outcome)>0
  FROM machine_executions e JOIN requests r ON r.id=e.request_id
  WHERE e.machine_id<>'' AND (e.machine_id=?1 OR `+executionRental+`=?1) AND (?2='' OR e.request_id=?2) AND `+machineExecutionOwed, machine, request)
 	if err != nil {
