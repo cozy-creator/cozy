@@ -33,7 +33,8 @@ import (
 // the file once and each revision after, live video is appended in place, and completion
 // replaces its fragmented preview with the indexed MP4. The result is the fold of the log.
 // Canceled after its second revision, a run keeps that revision as its result. The Hub is
-// asked nothing while the runs go on.
+// asked nothing while an accepted run's outputs are delivered. A new run may acquire
+// its machine-bound execution capability before admission.
 func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	integration(t)
 	if *privateScriptRuntimeWheel == "" || *machineHostBinary == "" {
@@ -42,7 +43,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)
 	hub := newMachineHub(t)
-	// The caller's account is read once per credential and kept; a run asks no Hub.
+	// The caller's account is read once per credential and kept.
 	hub.mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"name":"proof"}`))
 	})
@@ -59,6 +60,19 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		asked.Lock()
 		defer asked.Unlock()
 		return append([]string(nil), calls...)
+	}
+	noHubCallsSince := func(before int) {
+		t.Helper()
+		if asked := hubCalls()[before:]; len(asked) != 0 {
+			t.Fatalf("accepted output delivery asked the Hub:\n%s", strings.Join(asked, "\n"))
+		}
+	}
+	admissionOnlySince := func(before int) {
+		t.Helper()
+		asked := hubCalls()[before:]
+		if len(asked) > 1 || len(asked) == 1 && !strings.HasSuffix(asked[0], " POST /v1/execution-access") {
+			t.Fatalf("a new local run asked the Hub beyond its admission capability:\n%s", strings.Join(asked, "\n"))
+		}
 	}
 	root, err := os.MkdirTemp("", "cozy-output-log-")
 	must(t, err)
@@ -251,6 +265,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	}
 	// The machine itself serves the image, the current bytes of its third revision.
 	machineServesOutput(t, root, request.ID, "image", last.Digest, 3)
+	noHubCallsSince(before)
 
 	// Run 1591's shape: --input, --await, --json and --out, for a run that publishes and ends
 	// at once, its last revisions and its outcome landing together. --await returns once each
@@ -262,6 +277,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	}
 	input, out := filepath.Join(t.TempDir(), "input.json"), filepath.Join(t.TempDir(), "out")
 	must(t, os.WriteFile(input, []byte(fmt.Sprintf(`{"gate":%q}`, gate)), 0o600))
+	before = len(hubCalls())
 	awaited, err := cozy("run", "local/output-log-proof/grow", "--input", input, "--await", "--json", "--out", out).Output()
 	if err != nil {
 		t.Fatalf("the awaited run exited %v:\n%s", err, awaited)
@@ -281,6 +297,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 			t.Fatalf("%s is not its output's final revision: %v", saved.Path, err)
 		}
 	}
+	admissionOnlySince(before)
 
 	// A folder that refuses the outputs once the run is under way: --await exits non-zero,
 	// naming each output it could not deliver and the machine that keeps its bytes. Once the
@@ -292,6 +309,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	command = cozy("run", "local/output-log-proof/grow", "--input", input, "--await", "--json", "--out", refused)
 	var refusal bytes.Buffer
 	command.Stdout = &refusal
+	before = len(hubCalls())
 	must(t, command.Start())
 	landed(t, "the refused run's folder", func() bool { _, err := os.Stat(refused); return err == nil })
 	must(t, os.Chmod(refused, 0o500))
@@ -311,6 +329,8 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		} `json:"error"`
 	}
 	must(t, json.Unmarshal(refusal.Bytes(), &undelivered))
+	admissionOnlySince(before)
+	before = len(hubCalls())
 	must(t, os.Chmod(refused, 0o700))
 	if watched, err := cozy("run", "watch", fmt.Sprint(undelivered.Error.Details.Number), "--json").Output(); err != nil {
 		t.Fatalf("watching the run once its folder took the outputs exited %v:\n%s", err, watched)
@@ -318,11 +338,13 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	if files, err := os.ReadDir(refused); err != nil || len(files) != 4 {
 		t.Fatalf("the restored folder holds %d files, want the run's 4 outputs: %v", len(files), err)
 	}
+	noHubCallsSince(before)
 
 	// Canceled after its second revision, the run keeps that revision as its result.
 	gate = filepath.Join(t.TempDir(), "canceled")
 	command, stderr, request = start(gate)
 	revision(request, gate, 1)
+	before = len(hubCalls())
 	second := revision(request, gate, 2)
 	if out, err := cozy("run", "cancel", fmt.Sprint(request.Number)).CombinedOutput(); err != nil {
 		t.Fatalf("run cancel: %v %s", err, out)
@@ -363,6 +385,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	if !done || events[len(events)-1].Type != "run.canceled" && !slices.ContainsFunc(events, func(e records.Event) bool { return e.Type == "run.canceled" }) {
 		t.Fatal("the canceled run's image was not done incomplete at revision 2 before run.canceled")
 	}
+	noHubCallsSince(before)
 	// A growing video has one stable path. Live revisions append; the final indexed
 	// MP4 replaces the preview and remains the last revision at that same path.
 	gate = filepath.Join(t.TempDir(), "film")
@@ -425,6 +448,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		return shown
 	}
 	take(1)
+	before = len(hubCalls())
 	take(2)
 	film1 := filepath.Join(directory, fmt.Sprintf("%d-video.mp4", film.Number))
 	frames := func() int {
@@ -477,11 +501,9 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		t.Fatalf("the outputs folder is not exactly the runs' final files:\nhas  %v\nwant %v", present, finals)
 	}
 	t.Logf("the film as the CLI showed it:\n%s", filmed.String())
-	if asked := hubCalls()[before:]; len(asked) != 0 {
-		t.Fatalf("the Hub was asked %d things while the runs went on:\n%s", len(asked), strings.Join(asked, "\n"))
-	}
 	// The machine serves the finished film itself, its parts joined.
 	machineServesOutput(t, root, film.ID, "video", last.Digest, 3)
+	noHubCallsSince(before)
 }
 
 // machineServesOutput reads a run's output from this computer's machine over cozy.machine.v1,
