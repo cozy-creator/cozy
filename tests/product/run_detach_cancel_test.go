@@ -132,10 +132,13 @@ func TestClientDeathNeverCancels(t *testing.T) {
 			t.Fatalf("watch of canceled run %s is not loud about its actor [exit %d]\n%s", ref, code, out)
 		}
 	}
-	// …and the queued settlement still says it never ran.
-	if code, out := runCozy(t, root, "run", "watch", parkedID); code != 1 ||
-		!strings.Contains(out, "before any attempt was dispatched") {
-		t.Fatalf("the queued cancellation lost its pre-attempt cause [exit %d]\n%s", code, out)
+	// The queued cancellation never sent a spec or acquired native acceptance.
+	for _, mark := range []string{records.RunV1Sent, records.RunV1Accepted} {
+		found, problem := store.RunV1Marked(parkedID, mark)
+		fatal(t, problem)
+		if found {
+			t.Fatalf("queued cancellation acquired native dispatch mark %q", mark)
+		}
 	}
 	// …and in list, where the incident read as a quiet no-output end.
 	if code, out := runCozy(t, root, "run", "list"); code != 0 ||
