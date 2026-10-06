@@ -39,11 +39,14 @@ type MachineExecution struct {
 	Collected            bool
 	Abandoned            bool
 	SubmissionClosed     bool
+	Lost                 bool // its machine is gone: nothing more of the run is there to observe
 }
 
 const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected,
  EXISTS(SELECT 1 FROM request_events closed WHERE closed.request_id=machine_executions.request_id AND closed.type='machine.submission_closed'),
- NOT (` + machineExecutionAdmissionOpen + `)`
+ NOT (` + machineExecutionAdmissionOpen + `),
+ EXISTS(SELECT 1 FROM request_events loss WHERE loss.request_id=machine_executions.request_id AND loss.type='client.machine_lost'
+ AND json_extract(loss.payload,'$.machine_id')=machine_executions.machine_id)`
 
 type MachinePackageTransferProgress struct {
 	Operation string
@@ -209,7 +212,7 @@ func (s *Store) RequestExecutionTiming(id string) (int64, uint64, *exit.Error) {
 func scanMachineExecution(row interface{ Scan(...any) error }) (*MachineExecution, error) {
 	var value MachineExecution
 	err := row.Scan(&value.RequestID, &value.MachineID, &value.Submission, &value.Receipt,
-		&value.ObservedState, &value.RemoteCursor, &value.Outcome, &value.PendingControl, &value.CancelRequested, &value.Collected, &value.SubmissionClosed, &value.Abandoned)
+		&value.ObservedState, &value.RemoteCursor, &value.Outcome, &value.PendingControl, &value.CancelRequested, &value.Collected, &value.SubmissionClosed, &value.Abandoned, &value.Lost)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

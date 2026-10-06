@@ -114,6 +114,7 @@ func init() {
 	schema = append(schema, ownerMemoIndex)
 	schema = append(schema, rentalInstallsDDL, rentalInstallsIndex, runtimeUpdatesDDL, rentalIdleDDL, bindingRevisionDDL,
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex)
+	schema = append(schema, obligationIndexes...)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
