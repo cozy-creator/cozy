@@ -123,7 +123,10 @@ only-include = ["operation.py"]
 		}
 	}))
 	defer index.Close()
+	lock, err := os.ReadFile(filepath.Join(pack.Tree, "uv.lock"))
+	must(t, err)
 	receipt, problem := install.MaterializePublishedEnvironment(pack.Tree, filepath.Join(t.TempDir(), "venv"), &install.PublishedSource{
+		Package: "proof/python-export-proof", UVLock: install.ExactDocument{Bytes: lock},
 		IndexURL: index.URL, ProjectWheel: install.PublishedWheel{
 			Distribution: "python-export-proof", Version: "1.0.0", Filename: filepath.Base(pack.Wheel),
 			Digest: "sha256:" + hex.EncodeToString(wheelHash[:]), Length: int64(len(wheelBytes)),
