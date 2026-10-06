@@ -38,6 +38,10 @@ jobs:
           GOTOOLCHAIN: local
         run: |
           umask 0002
+          # The archives record file modes, which come from the checkout: re-create the tree
+          # under the same umask, as a local checkout is.
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          git checkout -- .
           go version
           scripts/release.sh "$TAG"
       - name: The build reproduces the gated SHA256SUMS, or nothing is published
