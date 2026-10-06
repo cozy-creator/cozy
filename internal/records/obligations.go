@@ -2,6 +2,14 @@ package records
 
 import "github.com/cozy-creator/cozy/internal/exit"
 
+// The idle watch asks for the census every second: each part reads only its own rows.
+var obligationIndexes = []string{
+	`CREATE INDEX IF NOT EXISTS requests_state ON requests(state)`,
+	`CREATE INDEX IF NOT EXISTS requests_retained_work ON requests(state) WHERE retain_work=1`,
+	`CREATE INDEX IF NOT EXISTS attempts_state ON attempts(state)`,
+	`CREATE INDEX IF NOT EXISTS request_output_exports_state ON request_output_exports(state)`,
+}
+
 // Obligation is a durable work or retention fact: what the idle exit waits on, what
 // `cozy down --all` tears down, and what a plain down reports still in flight.
 type Obligation struct {
