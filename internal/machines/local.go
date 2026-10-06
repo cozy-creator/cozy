@@ -84,8 +84,8 @@ func (h *Host) readinessEnvelope() string {
 	return filepath.Join(h.Root(), "run/cozy/bootstrap/readiness-envelope.json")
 }
 
-// Source is the software an install names: local files, or published versions (none: the
-// newest). Named files pin the machine; it then never follows the Hub's target.
+// Source is the software an install names: local files, or exact published versions. Named
+// files pin the machine; it then never follows the Hub's target.
 type Source struct {
 	Host, RuntimeWheel, TensorFSWheel string
 	RuntimeVersion, TensorFSVersion   string
@@ -191,8 +191,8 @@ type staged struct {
 	pinned, bundled bool
 }
 
-// stage fetches what source leaves unnamed (its published versions or the newest, the machine
-// its Runtime wheel bundles) and checks the machine serves MachineAPI.
+// stage fetches what source names as published versions (and the machine its Runtime wheel
+// bundles) and checks the machine serves MachineAPI.
 func (h *Host) stage(ctx context.Context, source Source) (*staged, *exit.Error) {
 	dir, err := os.MkdirTemp(h.dir, ".install-")
 	if err != nil {
@@ -201,6 +201,9 @@ func (h *Host) stage(ctx context.Context, source Source) (*staged, *exit.Error) 
 	out := &staged{dir: dir, agent: source.Host, wheels: []string{source.RuntimeWheel, source.TensorFSWheel}, pinned: source.pinned(), bundled: source.Host == ""}
 	problem := func() *exit.Error {
 		if source.RuntimeWheel == "" {
+			if source.RuntimeVersion == "" || source.TensorFSVersion == "" {
+				return unnamedSoftware()
+			}
 			for i, published := range [][2]string{{hostruntime.Distribution, source.RuntimeVersion}, {"tensorfs", source.TensorFSVersion}} {
 				if out.wheels[i], err = publishedWheel(ctx, published[0], published[1], dir); err != nil {
 					return exit.New(exit.Unavailable, "cannot fetch the published %s: %s", published[0], err)
@@ -380,7 +383,9 @@ func (h *Host) ensureLocked(ctx context.Context, account *hub.Client, start bool
 			if launch, problem = h.launchLocked(ctx); problem != nil {
 				return nil, problem
 			}
-			launch.Kept = h.follow(ctx, account)
+			if _, why, failed := h.follow(ctx, account); failed {
+				launch.Kept = why
+			}
 		}
 	}
 	return launch, nil

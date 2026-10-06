@@ -61,7 +61,7 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		}
 	}
 	if source.RuntimeWheel == "" {
-		// Unnamed software is the Hub's target; a Hub that names none, the newest release.
+		// Unnamed software is the Hub's target; with no target the install names nothing and is refused.
 		if target, problem := client(ctx).Software(installCtx); problem == nil {
 			source.RuntimeVersion, source.TensorFSVersion = target.Runtime, target.TensorFS
 		}

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -47,7 +48,7 @@ var errNoDescribe = exit.Named(exit.Unavailable, "machine.describe_unsupported",
 // loopV1 follows one run on its machine until it is settled.
 func (m *machineRuns) loopV1(request records.Request) {
 	defer m.enforceDeadlineV1(request)()
-	lastError, delay := "", time.Second
+	lastError, delay, followed := "", time.Second, false
 	for m.ctx.Err() == nil {
 		current, problem := m.store.RequestRow(request.ID)
 		if problem != nil || current == nil {
@@ -99,7 +100,20 @@ func (m *machineRuns) loopV1(request records.Request) {
 			lastError = problem.Message
 			// Before first dispatch a local refusal can end the request. Once possibly sent,
 			// missing credentials/source metadata cannot prove what its machine accepted.
-			if again, _ := m.store.RunV1(request.ID); !again && !sent && !link.CancelRequested && permanentRefusal(problem) {
+			// A machine older than this cozy refused the work at its door, so it never started,
+			// sent or not: the machine takes the Hub's target software and the work is sent once
+			// more, or the request fails naming the next step.
+			upgrade := problem.ErrName() == "machine.upgrade_required"
+			if upgrade && !followed {
+				followed = true
+				if next := m.followTargetV1(link.MachineID, current.Hub); next == "" {
+					lastError = ""
+					continue
+				} else {
+					problem = exit.Named(problem.Code, problem.ErrName(), "%s; %s", problem.Message, next)
+				}
+			}
+			if again, _ := m.store.RunV1(request.ID); !again && (!sent || upgrade) && !link.CancelRequested && permanentRefusal(problem) {
 				failed, failure := m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
 				if failed {
 					return
@@ -136,6 +150,45 @@ func (m *machineRuns) loopV1(request records.Request) {
 // permanentRefusal is a refusal resubmitting the same spec cannot change.
 func permanentRefusal(problem *exit.Error) bool {
 	return problem.Code != exit.Unavailable && problem.Code != exit.Deadline && problem.Code != exit.Canceled
+}
+
+// followTargetV1 updates a machine to the Hub's target software and answers "" once it runs
+// other software, else the next step its owner takes.
+func (m *machineRuns) followTargetV1(machine, origin string) string {
+	if machines.IsLocal(machine) {
+		changed, kept := m.machines.Host.FollowTarget(m.ctx, client(m.context.forHub(origin)))
+		if changed {
+			return ""
+		}
+		return cmp.Or(kept, "this machine runs the files it was installed from") +
+			"; `cozy machine install` takes the Hub's target software, or name newer wheels with --runtime-wheel/--tensorfs-wheel"
+	}
+	name := machine
+	if row, _ := m.store.RentalRow(machine); row != nil && row.MachineName != "" {
+		name = row.MachineName
+	}
+	update, problem := m.updates.follow(machine)
+	for problem == nil && update.Active() && m.ctx.Err() == nil {
+		select {
+		case <-m.ctx.Done():
+		case <-time.After(time.Second):
+		}
+		update, problem = m.store.RuntimeUpdate(machine)
+		if problem == nil && update == nil {
+			problem = exit.New(exit.Conflict, "its update record is gone")
+		}
+	}
+	var result runtimeUpdateResult
+	switch {
+	case problem != nil:
+		return fmt.Sprintf("it could not take the Hub's target software (%s); `cozy rental update %s` retries", problem.Message, name)
+	case update.State == "failed":
+		return fmt.Sprintf("its update to the Hub's target software failed (%s); `cozy rental update %s` retries, or `cozy rental end %s` and rent a new machine", update.Error, name, name)
+	case json.Unmarshal(update.Result, &result) == nil && !result.Unchanged:
+		return ""
+	}
+	return fmt.Sprintf("%s runs Runtime %s (%s); update it to a release that serves this run: `cozy rental update %s --runtime-version <version> --tensorfs-version <version>`",
+		name, result.From.Runtime, result.Note, name)
 }
 
 // catchUpV1 records what an accepted run's machine holds now, for a reader: its state and its
@@ -306,7 +359,8 @@ func (m *machineRuns) runRefusalV1(id string, err error, first bool) (bool, *exi
 	problem := machines.Transport(err)
 	if first {
 		switch status.Code(err) {
-		case codes.InvalidArgument, codes.FailedPrecondition, codes.AlreadyExists, codes.PermissionDenied, codes.Unauthenticated, codes.Unimplemented:
+		// UNIMPLEMENTED is a machine older than this cozy: the run loop updates it first.
+		case codes.InvalidArgument, codes.FailedPrecondition, codes.AlreadyExists, codes.PermissionDenied, codes.Unauthenticated:
 			failed, recordProblem := m.store.FailQueuedRequest(id, records.QueuedFailure(problem))
 			if recordProblem != nil {
 				return false, recordProblem

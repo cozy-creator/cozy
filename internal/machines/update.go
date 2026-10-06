@@ -3,8 +3,6 @@ package machines
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -17,8 +15,8 @@ import (
 )
 
 // updateLocked updates a running machine in place with Run kind: update over its
-// cozy.machine.v1 API: local wheels go up with Write, published versions (the source's, or
-// the newest) are fetched by the machine, and versions it already runs are not installed
+// cozy.machine.v1 API: local wheels go up with Write, the source's exact published versions
+// are fetched by the machine, and versions it already runs are not installed
 // again. The machine restarts its service on the candidate and rolls it back if it never
 // proves ready; this waits for the outcome.
 func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *exit.Error) {
@@ -54,14 +52,11 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 	}{{hostruntime.Distribution, source.RuntimeWheel, source.RuntimeVersion, running.GetRuntime(), &cohort.Runtime},
 		{"tensorfs", source.TensorFSWheel, source.TensorFSVersion, running.GetTensorfs(), &cohort.TensorFS}} {
 		if item.path == "" {
-			version := item.version
-			if version == "" {
-				if version, problem = NewestPublished(ctx, item.name); problem != nil {
-					return nil, problem
-				}
+			if item.version == "" {
+				return nil, unnamedSoftware()
 			}
-			*item.member = &machinev1.Member{Version: version}
-			current = current && version == item.running
+			*item.member = &machinev1.Member{Version: item.version}
+			current = current && item.version == item.running
 			continue
 		}
 		member, problem := writeWheel(ctx, client, item.path)
@@ -103,24 +98,45 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 }
 
 // follow brings a machine boot to the Hub's target software unless its owner pinned the files
-// it runs. It answers why the machine kept its software, or "": a machine that cannot follow
-// keeps serving what it runs.
-func (h *Host) follow(ctx context.Context, account *hub.Client) string {
-	installed, problem := h.Installed()
-	if account == nil || problem != nil || installed == nil || installed.Pinned {
-		return ""
+// it runs. It answers whether the software changed, else why not, and whether that was a
+// failure: a machine that cannot follow keeps serving what it runs.
+func (h *Host) follow(ctx context.Context, account *hub.Client) (changed bool, why string, failed bool) {
+	before, problem := h.Installed()
+	switch {
+	case account == nil || problem != nil || before == nil:
+		return false, "", false
+	case before.Pinned:
+		return false, "it runs the files it was installed from", false
 	}
 	target, problem := account.Software(ctx)
 	if problem != nil {
-		return "it keeps its software: the Hub's target could not be read: " + problem.Message
+		return false, "it keeps its software: the Hub's target could not be read: " + problem.Message, true
 	}
 	if target.Runtime == "" {
-		return ""
+		return false, "the Hub names no target software", false
 	}
-	if _, problem := h.updateLocked(ctx, Source{RuntimeVersion: target.Runtime, TensorFSVersion: target.TensorFS}); problem != nil {
-		return "it keeps its software: " + problem.Message
+	after, problem := h.updateLocked(ctx, Source{RuntimeVersion: target.Runtime, TensorFSVersion: target.TensorFS})
+	if problem != nil {
+		return false, "it keeps its software: " + problem.Message, true
 	}
-	return ""
+	if after.Runtime.Name == before.Runtime.Name && after.TensorFS.Name == before.TensorFS.Name {
+		return false, "it already runs the Hub's target software", false
+	}
+	return true, "", false
+}
+
+// FollowTarget brings the running machine to the Hub's target software, as a boot does: it
+// answers whether the software changed, else why not.
+func (h *Host) FollowTarget(ctx context.Context, account *hub.Client) (bool, string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	unlock, problem := h.lock(ctx)
+	if problem != nil {
+		return false, problem.Message
+	}
+	defer unlock()
+	changed, why, _ := h.follow(ctx, account)
+	return changed, why
 }
 
 // writeWheel sends one local wheel to the machine with Write and names it for an update.
@@ -150,24 +166,9 @@ func (h *Host) recordInstalled(installed Installed) error {
 	return writePrivate(h.path("installed.json"), raw)
 }
 
-// NewestPublished is a distribution's newest release on the package index.
-func NewestPublished(ctx context.Context, name string) (string, *exit.Error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://pypi.org/pypi/"+name+"/json", nil)
-	if err != nil {
-		return "", exit.Internalf("cannot address the package index: %s", err)
-	}
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return "", exit.Unavailablef("the package index did not answer: %s", err)
-	}
-	defer response.Body.Close()
-	var project struct {
-		Info struct {
-			Version string `json:"version"`
-		} `json:"info"`
-	}
-	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 32<<20)).Decode(&project) != nil || project.Info.Version == "" {
-		return "", exit.New(exit.Unavailable, "the package index has no release of %s", name)
-	}
-	return project.Info.Version, nil
+// unnamedSoftware refuses an install or update that names neither files nor versions: nothing
+// resolves "the newest release".
+func unnamedSoftware() *exit.Error {
+	return exit.Named(exit.Validation, "machine.software_unnamed", "the Hub names no target software and no wheels were named").
+		WithRemedy("name them: cozy machine install --runtime-wheel <wheel> --tensorfs-wheel <wheel>")
 }
