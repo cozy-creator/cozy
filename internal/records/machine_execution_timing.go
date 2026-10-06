@@ -3,6 +3,7 @@ package records
 import (
 	"encoding/json"
 	"math"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -90,4 +91,46 @@ func (s *Store) MachineExecutionIntervals(id string) ([]MachineExecutionInterval
 		return nil, exit.Internalf("cannot finish reading machine timing: %s", err)
 	}
 	return intervals, nil
+}
+
+// RunV1Span is when a cozy.machine.v1 run started running, when its machine ended it, and when
+// it last rested paused; each zero until it happened.
+func (s *Store) RunV1Span(id string) (started, ended, paused time.Time, problem *exit.Error) {
+	rows, err := s.db.Query(`SELECT type,at,payload FROM request_events WHERE request_id=?
+ AND type IN ('run.in_progress','client.machine_work_finished','request.paused') ORDER BY seq`, id)
+	if err != nil {
+		return started, ended, paused, exit.Internalf("cannot read the run's span: %s", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, at string
+		var raw []byte
+		if err := rows.Scan(&kind, &at, &raw); err != nil {
+			return started, ended, paused, exit.Internalf("cannot read the run's span: %s", err)
+		}
+		var stamps struct {
+			Started  int64 `json:"started_unix_ms"`
+			Finished int64 `json:"finished_unix_ms"`
+		}
+		_ = json.Unmarshal(raw, &stamps)
+		when, _ := time.Parse(time.RFC3339Nano, at)
+		switch {
+		case kind == "run.in_progress" && started.IsZero():
+			started = when
+			if stamps.Started > 0 {
+				started = time.UnixMilli(stamps.Started)
+			}
+		case kind == "client.machine_work_finished":
+			ended = when
+			if stamps.Finished > 0 {
+				ended = time.UnixMilli(stamps.Finished)
+			}
+		case kind == "request.paused":
+			paused = when
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return started, ended, paused, exit.Internalf("cannot read the run's span: %s", err)
+	}
+	return started, ended, paused, nil
 }
