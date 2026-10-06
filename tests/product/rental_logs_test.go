@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -104,5 +105,56 @@ func TestRentalLogsPrintsTheProviderBootLog(t *testing.T) {
 	}
 	if code, out := runCozy(t, root, "rental", "logs", "otter", "--attempt", "1"); code != 0 || !strings.Contains(out, want) {
 		t.Fatalf("an ended rental's log did not read by name [exit %d]:\n%s", code, out)
+	}
+}
+
+// A machine word names each pod that bore it in turn. Once their records are forgotten,
+// `cozy rental logs <word>` reads the newest of them, never the first, and an id still reads
+// its own pod's log (an older pod's log was printed for the newest, from I's runs on 8819).
+func TestRentalLogsByAReusedNameReadTheNewestPod(t *testing.T) {
+	root := filepath.Join(scratchBase, "rental-logs-reused")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	hub := newFakeRentalHub(t, 0)
+	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
+		"tensorhub_url: "+hubURL+"\ntensorhub_token: rental-idle-test\n"), 0o600))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	// Two asks this host made under the same word, each long settled: their records are gone.
+	for _, pod := range []string{"pr-mary-september", "pr-mary-october"} {
+		op, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: pod, Hub: hubURL, Reason: "manual",
+			HourlyRateUSDMicros: 100_000}, func(string) ([]byte, string, *exit.Error) {
+			return []byte(`{"name":"mary","sku":"cpu","accelerator_count":1}`), "sha256:" + pod, nil
+		})
+		fatal(t, problem)
+		fatal(t, store.AdvanceRentalOperation(op.Key, pod, "released"))
+	}
+	store.Close()
+	hub.mux.HandleFunc("GET /v1/rentals/{id}/boot-log", func(w http.ResponseWriter, r *http.Request) {
+		lines := []map[string]any{{"at": "2026-10-06T06:00:00Z", "step": "pulling_image", "line": "the log of " + r.PathValue("id")}}
+		if r.URL.Query().Get("after") == "1" {
+			lines = nil // one line, then the end of the log
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"attempt": 1, "attempts": 1, "booting": false, "next": 1, "lines": lines})
+	})
+	read := func(subject string) string {
+		t.Helper()
+		code, out := runCozy(t, root, "rental", "logs", subject, "--json")
+		var document struct {
+			Rental string `json:"rental"`
+		}
+		if code != 0 || json.Unmarshal([]byte(out), &document) != nil {
+			t.Fatalf("rental logs %s [exit %d]:\n%s", subject, code, out)
+		}
+		return document.Rental
+	}
+	if pod := read("mary"); pod != "pr-mary-october" {
+		t.Fatalf("the reused name read %s's log, not the newest pod's", pod)
+	}
+	if pod := read("pr-mary-september"); pod != "pr-mary-september" {
+		t.Fatalf("an older pod's id read %s's log", pod)
 	}
 }
