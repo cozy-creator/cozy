@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,10 +9,10 @@ import (
 	"testing"
 )
 
-// A job's memoized call that ran on a machine is recorded by this computer, and the package's
-// next job carries it as known: the same call is answered without running, the new one runs.
-// The machine keeps no operation cache of its own, so only this computer's records answer it.
-func TestMemoizedCallsAreAnsweredFromThisComputersRecords(t *testing.T) {
+// A job's memoized call that ran on a machine is held by that machine: the package's next job
+// has the same call answered without running, and the new one runs. This computer carries no
+// results; the machine answers where its results are.
+func TestMemoizedCallsAreAnsweredFromTheMachinesMemo(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
 		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
 	}
@@ -63,14 +62,6 @@ func TestMemoizedCallsAreAnsweredFromThisComputersRecords(t *testing.T) {
 		t.Fatalf("first survey answered %v after %s calls ran", got, measured())
 	}
 	if got := survey(3, 5); fmt.Sprint(got) != "[9 25]" || measured() != "3" {
-		t.Fatalf("second survey answered %v after %s calls ran; the known call for 3 ran again", got, measured())
-	}
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "creator.sqlite")+"?mode=ro")
-	must(t, err)
-	defer db.Close()
-	var recorded int
-	must(t, db.QueryRow(`SELECT COUNT(*) FROM request_events WHERE type='machine.memo.record'`).Scan(&recorded))
-	if recorded != 3 {
-		t.Fatalf("this computer recorded %d memoized results; want 3 (the answered call records none)", recorded)
+		t.Fatalf("second survey answered %v after %s calls ran; the held call for 3 ran again", got, measured())
 	}
 }
