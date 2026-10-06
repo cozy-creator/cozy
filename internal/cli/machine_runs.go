@@ -53,26 +53,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 	m.running[request.ID] = finished
 	m.mu.Unlock()
 	go func() {
-		defer func() {
-			m.endObservation(request.ID, finished)
-			// A control can be persisted after the final observation, while its
-			// Start still sees this goroutine running. Read after withdrawing our
-			// running marker so either that Start or this handoff owns the wakeup.
-			if m.ctx.Err() != nil {
-				return
-			}
-			link, problem := m.store.MachineExecution(request.ID)
-			if problem != nil || link == nil || link.Abandoned || !link.Collected || len(link.Receipt) == 0 || !link.CancelRequested && len(link.PendingControl) == 0 {
-				return
-			}
-			if owed, problem := m.machineWorkOwed(request.ID); problem != nil || !owed {
-				return
-			}
-			current, problem := m.store.RequestRow(request.ID)
-			if problem == nil && current != nil {
-				_ = m.Start(*current)
-			}
-		}()
+		defer m.endObservation(request.ID, finished)
 		if m.machines != nil {
 			m.loopV1(request)
 		}
@@ -121,19 +102,6 @@ func (m *machineRuns) Withdraw(request string) {
 	if stop != nil {
 		stop()
 	}
-}
-
-// machineWorkOwed is whether the execution still owes work or custody, or holds a sent
-// publication only its owner can settle.
-func (m *machineRuns) machineWorkOwed(request string) (bool, *exit.Error) {
-	if link, problem := m.store.MachineExecution(request); problem != nil || link != nil && link.Abandoned {
-		return false, problem
-	}
-	if owed, problem := m.store.MachineExecutionOwesWork(request); problem != nil || owed {
-		return owed, problem
-	}
-	awaiting, problem := m.store.MachinePublicationsAwaitingOwner(request)
-	return len(awaiting) > 0, problem
 }
 
 // recordPlacement makes a waiting run's placement decision durable, as a queued run's is:
