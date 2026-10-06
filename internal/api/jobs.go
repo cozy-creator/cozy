@@ -521,7 +521,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		return out, nil, e
 	}
 	if s.packages == nil {
-		return out, nil, exit.Unavailablef("this Cozy daemon resolves no packages")
+		return out, nil, exit.Unavailablef("this controller resolves no packages")
 	}
 	if sub.Worker != "" && !sub.Rental && !sub.RentalRequired {
 		return out, nil, exit.Named(exit.Validation, "rental.job_worker_without_rental",

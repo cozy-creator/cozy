@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -34,7 +34,7 @@ func TestDaemonIdleShutdown(t *testing.T) {
 	if log, _ := os.ReadFile(logPath); !strings.Contains(string(log), "nothing to manage for 1s; stopping") {
 		t.Fatalf("the idle exit did not say why it left\n%s", tail(logPath))
 	}
-	if state := daemon.Probe(probe); state.Up {
+	if state := calcifer.Probe(probe); state.Up {
 		t.Fatalf("the root is still owned after the idle exit: %s", state.Details)
 	}
 

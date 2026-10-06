@@ -1,5 +1,5 @@
 // Package api is Cozy's local client API server: the request-level CORE served on
-// loopback by the one Cozy daemon, plus an explicitly Cozy-only extension module.
+// loopback by the one Calcifer, plus an explicitly Cozy-only extension module.
 //
 // It is a client of internal/orchestrator and nothing else. Every submission still flows
 // orchestrator → worker protocol → runtime; this package adds an HTTP shape, a typed error
@@ -64,7 +64,7 @@ import (
 // names files the daemon ingests, while a network host uses its own upload surface.
 const MaxBody = 8 << 20
 
-// Server is the local client API. One per Cozy daemon.
+// Server is the local client API. One per Calcifer.
 type Server struct {
 	scopedEndpoint    string
 	machineExecutions MachineExecutions
@@ -349,7 +349,7 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 			if origin := r.Header.Get("Origin"); origin != "" && !s.allowedOrigin(origin) {
 				s.refuse(w, r, http.StatusForbidden, "origin_not_allowed",
 					fmt.Sprintf("Origin %q may not reach this route", origin),
-					"only a page served by this Cozy daemon may mutate or open a stream")
+					"only a page served by this controller may mutate or open a stream")
 				return
 			}
 		}

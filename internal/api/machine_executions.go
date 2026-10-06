@@ -78,7 +78,7 @@ type MachineWarmMember struct {
 
 func (s *Server) machineStatus(w http.ResponseWriter, r *http.Request) {
 	if s.machineExecutions == nil {
-		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+		s.refuseTyped(w, r, exit.Unavailablef("this controller runs no machines"))
 		return
 	}
 	status, problem := s.machineExecutions.Status(r.Context(), r.PathValue("machine"))
@@ -138,7 +138,7 @@ type MachineLog struct {
 
 func (s *Server) machineLog(w http.ResponseWriter, r *http.Request) {
 	if s.machineExecutions == nil {
-		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+		s.refuseTyped(w, r, exit.Unavailablef("this controller runs no machines"))
 		return
 	}
 	var tail uint64

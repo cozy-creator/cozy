@@ -71,7 +71,7 @@ cozy up
 # open http://127.0.0.1:8818/ (or the returned fallback URL when 8818 is occupied)
 ```
 
-`up` backgrounds one lightweight per-user Cozy daemon: web UI, local API, submission
+`up` backgrounds one lightweight per-user Calcifer: web UI, local API, submission
 records, output following, and private-rental sessions. It does not attach a log stream or load a package or
 model. Repeating `up` returns the same healthy URL with `changed: false`; concurrent callers
 converge on one daemon. A startup failure is returned directly as a bounded diagnostic and does

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -18,7 +18,7 @@ import (
 // nothing left for it to manage — no rental it owns, no request or attempt it owes, no
 // transfer, export, launch or teardown in flight, no client stream attached — and only
 // once that has stayed true for a while. User interaction is not the signal; the absence
-// of a CLI is not the signal. The next command brings the daemon back (ensureDaemon).
+// of a CLI is not the signal. The next command brings the daemon back (ensureCalcifer).
 //
 // The duration is a DEBOUNCE over an observed fact, never the decision. `managed` decides;
 // daemon.idle_shutdown_s says how long its answer must stay empty; the sample cadence is
@@ -130,7 +130,7 @@ func (w idleWatch) run(quit <-chan struct{}) {
 const claimLostSamples = 3
 
 type claimWatch struct {
-	held    *daemon.Held
+	held    *calcifer.Held
 	root    string
 	managed func() ([]string, *exit.Error)
 	stop    func()

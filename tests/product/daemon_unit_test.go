@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/userunit"
 )
 
@@ -22,7 +22,7 @@ func TestTheDaemonOutlivesTheScopeThatStartedIt(t *testing.T) {
 		t.Skip("requires a systemd user manager")
 	}
 	root := t.TempDir()
-	unit := userunit.Name("cozy-daemon", root, false)
+	unit := userunit.Name("calcifer", root, false)
 	t.Cleanup(func() { _ = userunit.Stop(unit) })
 	scope := "cozy-test-" + strings.ToLower(randomToken(t)[:8])
 	up := exec.Command("systemd-run", "--user", "--scope", "--quiet", "--unit="+scope, "--", cozyBin, "up", "--json")
@@ -33,7 +33,7 @@ func TestTheDaemonOutlivesTheScopeThatStartedIt(t *testing.T) {
 	// The scope ends as a session does: everything left in it is killed.
 	_ = exec.Command("systemctl", "--user", "stop", scope+".scope").Run()
 	time.Sleep(time.Second)
-	if !daemon.Probe(config.Config{Home: root}).Up || userunit.Property(unit, "ActiveState") != "active" {
+	if !calcifer.Probe(config.Config{Home: root}).Up || userunit.Property(unit, "ActiveState") != "active" {
 		t.Fatalf("the daemon did not outlive the scope that started it (unit %s is %q)", unit, userunit.Property(unit, "ActiveState"))
 	}
 	if code, out := runCozy(t, root, "down", "--json"); code != 0 {
@@ -49,7 +49,7 @@ func TestTheDaemonOutlivesTheScopeThatStartedIt(t *testing.T) {
 	}
 	pid := userunit.MainPID(unit)
 	argv, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
-	if pid == 0 || filepath.Base(strings.SplitN(string(argv), "\x00", 2)[0]) != "cozy-daemon" {
+	if pid == 0 || filepath.Base(strings.SplitN(string(argv), "\x00", 2)[0]) != "calcifer" {
 		t.Fatalf("the next command did not bring the daemon back as unit %s (pid %d: %q)", unit, pid, argv)
 	}
 }

@@ -137,7 +137,7 @@ func handleRent(ctx *Context) *exit.Error {
 		}
 	}
 
-	state, _, problem := ensureDaemon(ctx)
+	state, _, problem := ensureCalcifer(ctx)
 	if problem != nil {
 		return problem
 	}

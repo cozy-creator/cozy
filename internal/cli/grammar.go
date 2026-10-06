@@ -18,9 +18,9 @@ type CLI struct {
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
 	Machine MachineCmd `cmd:"" group:"Rentals" help:"This computer as a machine: the same Host a rental runs."`
 	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
-	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
-	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui; running work continues."`
-	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
+	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the calcifer and localhost web-ui."`
+	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop calcifer and localhost web-ui; running work continues."`
+	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the calcifer's own log."`
 
 	Completion CompletionCmd `cmd:"" group:"Lifecycle" help:"Print a bash, zsh or fish tab-completion script."`
 }
@@ -70,7 +70,7 @@ func (c *MachineLogsCmd) Run(r *Runtime) error {
 }
 
 type DaemonCmd struct {
-	Log DaemonLogCmd `cmd:"" help:"Print the cozy-daemon log ($COZY_HOME/daemon.log)."`
+	Log DaemonLogCmd `cmd:"" help:"Print the calcifer log ($COZY_HOME/daemon.log)."`
 }
 
 type DaemonLogCmd struct {

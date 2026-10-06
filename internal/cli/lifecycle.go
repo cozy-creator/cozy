@@ -5,8 +5,8 @@ import (
 	"io"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostgpu"
@@ -18,7 +18,7 @@ import (
 )
 
 func handleUp(ctx *Context) *exit.Error {
-	state, changed, problem := ensureDaemon(ctx)
+	state, changed, problem := ensureCalcifer(ctx)
 	if problem != nil {
 		return problem
 	}
@@ -57,7 +57,7 @@ func handleUp(ctx *Context) *exit.Error {
 
 func handleDown(ctx *Context) *exit.Error {
 	all := ctx.Inv.Bool("--all")
-	state := daemon.Probe(ctx.Cfg)
+	state := calcifer.Probe(ctx.Cfg)
 	if !state.Up {
 		if !all {
 			return emit(ctx, output.Record{Fields: []output.Field{{K: "daemon", V: "stopped"}, {K: "changed", V: false}}})
@@ -71,7 +71,7 @@ func handleDown(ctx *Context) *exit.Error {
 				{K: "daemon", V: "stopped"}, {K: "changed", V: false},
 			}})
 		}
-		state, _, problem = ensureDaemon(ctx)
+		state, _, problem = ensureCalcifer(ctx)
 		if problem != nil {
 			return problem
 		}
@@ -287,7 +287,7 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 func finishDaemonDown(ctx *Context, extra []output.Field, notes ...string) *exit.Error {
 	deadline := time.Now().Add(2 * orchestrator.StopGrace)
 	for time.Now().Before(deadline) {
-		if !daemon.Probe(ctx.Cfg).Up {
+		if !calcifer.Probe(ctx.Cfg).Up {
 			fields := []output.Field{{K: "daemon", V: "stopped"}, {K: "changed", V: true}}
 			fields = append(fields, extra...)
 			return emit(ctx, output.Record{Fields: fields, Notes: notes})

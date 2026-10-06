@@ -13,9 +13,9 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/accountauth"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -57,7 +57,7 @@ type Context struct {
 	Out              io.Writer
 	Err              io.Writer
 	Cfg              config.Config
-	Daemon           daemon.State
+	Daemon           calcifer.State
 	AccountAuth      *accountauth.Manager
 	namespace        packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
 	ingestBytes      int64                          // planned source bytes a native ingest declares for its rental
@@ -133,7 +133,7 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 		warnings: new([]records.Warning),
 	}
 	if daemon {
-		state, _, problem := ensureDaemon(ctx)
+		state, _, problem := ensureCalcifer(ctx)
 		if problem != nil {
 			return problem
 		}

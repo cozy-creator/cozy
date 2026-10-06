@@ -10,9 +10,9 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -102,7 +102,7 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 	if problem = store.RecordRental(records.Rental{ID: "rental-proof", MachineName: "kirukiru", State: "booting", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: hubPeer.URL}); problem != nil {
 		t.Fatal(problem)
 	}
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
+	held, problem := calcifer.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -184,7 +184,7 @@ func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.RentalIn
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{ID: "rental-proof", MachineName: "kirukiru", State: "booting", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: hubURL}))
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
+	held, problem := calcifer.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
 	fatal(t, problem)
 	defer held.Release()
 	_, problem = api.Mint(layout)

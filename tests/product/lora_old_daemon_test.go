@@ -9,9 +9,9 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localclient "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -39,7 +39,7 @@ func TestModelOverrideClientRequiresOnlyItsOperationCapability(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			client, problem := localclient.Open(config.Config{Home: root}, daemon.State{Addr: strings.TrimPrefix(server.URL, "http://")})
+			client, problem := localclient.Open(config.Config{Home: root}, calcifer.State{Addr: strings.TrimPrefix(server.URL, "http://")})
 			fatal(t, problem)
 			_, problem = client.Submit(api.Submission{Package: "proof/parent", Function: "compose", Models: []records.ModelRef{{
 				Choice: true, Package: "proof/parent", Slot: "child.models.model", Model: "proof/base",

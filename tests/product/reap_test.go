@@ -22,7 +22,7 @@ import (
 
 // ------------------------------------------------------------------ never leave a daemon
 //
-// A Cozy daemon detaches into its own session (internal/cli.detachProcess) — the correct
+// A Calcifer detaches into its own session (internal/cli.detachProcess) — the correct
 // behaviour for a background service, and the reason every daemon this suite causes to
 // exist outlives the test that caused it unless something ends it on purpose. Nothing
 // did: 143 unreachable daemons holding 3,403 threads accumulated over three days on one
@@ -130,7 +130,7 @@ func reapDaemonRoot(root string) {
 	}
 	for _, pid := range pids {
 		if alive(pid) {
-			fmt.Fprintf(os.Stderr, "cozy-daemon %d on %s survived SIGKILL\n", pid, root)
+			fmt.Fprintf(os.Stderr, "calcifer %d on %s survived SIGKILL\n", pid, root)
 		}
 	}
 }
@@ -192,7 +192,7 @@ func daemonOnRoot(root string) int {
 	return pids[0]
 }
 
-// daemonPidsOn names every live cozy-daemon whose COZY_HOME is root. Two sources, because
+// daemonPidsOn names every live calcifer whose COZY_HOME is root. Two sources, because
 // neither alone is complete: the lock record is what the product itself publishes, and
 // /proc also finds a daemon whose record was truncated by a shutdown it did not finish.
 func daemonPidsOn(root string) []int {
@@ -222,13 +222,17 @@ func daemonPidsOn(root string) []int {
 	return pids
 }
 
-// daemonHome answers the COZY_HOME of pid if — and only if — pid is a live Cozy daemon.
+// daemonHome answers the COZY_HOME of pid if — and only if — pid is a live Calcifer.
 // Both halves are checked against the kernel's copy: a pid read out of a stale lock file
 // may have been reused by an unrelated process, and killing that would be far worse than
 // leaving a daemon behind.
 func daemonHome(pid int) string {
 	argv, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
-	if err != nil || filepath.Base(string(splitNul(argv, 2)[0])) != daemonArgv0 {
+	if err != nil {
+		return ""
+	}
+	name := filepath.Base(string(splitNul(argv, 2)[0]))
+	if name != daemonArgv0 && name != "cozy-daemon" {
 		return ""
 	}
 	environ, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/environ")
@@ -243,7 +247,7 @@ func daemonHome(pid int) string {
 	return ""
 }
 
-const daemonArgv0 = "cozy-daemon"
+const daemonArgv0 = "calcifer"
 
 func splitNul(data []byte, n int) []string {
 	return strings.SplitN(strings.TrimRight(string(data), "\x00"), "\x00", n)

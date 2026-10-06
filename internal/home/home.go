@@ -24,7 +24,7 @@ type Layout struct {
 	DB       string // creator.sqlite — the one local SQLite lifecycle database
 	Installs string // one immutable directory per package install
 	Lock     string // installs/.lock — the install-filesystem single-writer flock
-	// Daemon is the Cozy daemon's lifetime ownership/address record (cl-001). The live
+	// Daemon is the Calcifer's lifetime ownership/address record (cl-001). The live
 	// owner holds its kernel lock and publishes the client address, worker socket and
 	// the per-launch CLI token under it, mode 0600. There is no separate client.cred.
 	Daemon  string
@@ -51,8 +51,8 @@ type Layout struct {
 	// pod's `/` for the same pod-supervisor Host, beside the controller's own grant for it
 	// (registration, owner key, launch record).
 	Machine string
-	// Log is the Cozy daemon's own log, bounded by rotation on an observed size
-	// (internal/daemon.OpenLog). Its one rotated predecessor is Log + ".1".
+	// Log is the Calcifer's own log, bounded by rotation on an observed size
+	// (internal/calcifer.OpenLog). Its one rotated predecessor is Log + ".1".
 	Log string
 }
 

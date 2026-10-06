@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -198,7 +198,7 @@ func runIDOf(path string) (string, bool) {
 // daemon cannot carry (it predates cozy.machine.v1): nil when no daemon runs (this CLI starts
 // its own) or the daemon runs v1 work itself.
 func foregroundRental(ctx *Context, name string) (*machineendpoint.Endpoint, *exit.Error) {
-	state := daemon.Probe(ctx.Cfg)
+	state := calcifer.Probe(ctx.Cfg)
 	if !state.Up || state.OperatorOwned {
 		return nil, nil
 	}

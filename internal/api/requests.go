@@ -227,7 +227,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// An inference root is Runtime's to execute on whichever machine runs it: its root
 		// bytes are frozen for native staging before anything is recorded.
 		if s.machineExecutions == nil {
-			s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+			s.refuseTyped(w, r, exit.Unavailablef("this controller runs no machines"))
 			return
 		}
 		spec.MachineExecutionObserver = true
@@ -467,7 +467,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 	// Only immutable package metadata is validated here. The scheduler chooses and records
 	// the machine after admission.
 	if s.packages == nil {
-		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
+		return out, exit.Unavailablef("this controller resolves no packages")
 	}
 	if strings.HasPrefix(sub.Package, "local/") {
 		refreshed, editable, leased, refreshProblem := s.leaseRefreshed(sub.Package)

@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -178,7 +178,7 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
 		t.Fatalf("up: %d %s", code, out)
 	}
-	started := daemon.Probe(config.Config{Home: root})
+	started := calcifer.Probe(config.Config{Home: root})
 	if !started.Up {
 		t.Fatal("the daemon did not start")
 	}
@@ -261,7 +261,7 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 	if witnessA.loggedIn("machine-a") == 0 || witnessB.loggedIn("machine-b") == 0 {
 		t.Fatal("a hub's own machine key was never used")
 	}
-	if after := daemon.Probe(config.Config{Home: root}); after.PID != started.PID {
+	if after := calcifer.Probe(config.Config{Home: root}); after.PID != started.PID {
 		t.Fatalf("a hub switch replaced the daemon: %d -> %d", started.PID, after.PID)
 	}
 }
