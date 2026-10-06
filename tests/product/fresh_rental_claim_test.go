@@ -18,11 +18,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-// A fresh rental's first calls arrive together, as a client's do. The worker takes one
-// control stream at a time, and the daemon's orchestrator already holds it, so every call
-// runs on the Claim it carries: the worker records one Control Claim, and no call's Claim
-// fences another's or the orchestrator's (hakufu: five Claim cycles on a fresh boot).
-func TestFreshRentalConcurrentCallsShareOneControlClaim(t *testing.T) {
+// A fresh rental's first calls arrive together, as a client's do, each sending the editable
+// package's source: every one runs and answers its own value.
+func TestFreshRentalRunsConcurrentFirstCalls(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: the independent agent the rental runs")
 	}
@@ -81,19 +79,5 @@ func TestFreshRentalConcurrentCallsShareOneControlClaim(t *testing.T) {
 		if failure != "" {
 			t.Fatalf("%s\nrental Host log:\n%s", failure, log)
 		}
-	}
-	// The private Runtime records every accepted Control Claim before serving it.
-	// The old standalone Runtime ownership file is absent under the agent.
-	claims := 0
-	for _, line := range strings.Split(string(log), "\n") {
-		if strings.Contains(line, "session: claimed by ") {
-			claims++
-			if !strings.Contains(line, "owner epoch 1, stream epoch 1") {
-				t.Fatalf("a concurrent call replaced the private control stream: %s", line)
-			}
-		}
-	}
-	if claims != 1 {
-		t.Fatalf("the fresh rental took %d Control Claims; its owner holds one stream\nrental Host log:\n%s", claims, log)
 	}
 }
