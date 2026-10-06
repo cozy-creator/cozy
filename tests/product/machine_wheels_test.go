@@ -248,23 +248,28 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 	})
 	version := func(wheel string) string { return strings.SplitN(filepath.Base(wheel), "-", 3)[1] }
 	var identity string
-	ready := func(want string) any {
+	ready := func(want string) int {
 		t.Helper()
 		code, out := cozyWithin(t, root, 5*time.Minute, "machine", "start")
 		if code != 0 {
 			t.Fatalf("machine start [exit %d]\n%s", code, out)
 		}
 		code, out = runCozy(t, root, "machine", "show", "--json")
-		var shown map[string]any
-		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["phase"] != "ready" || shown["runtime_version"] != want {
+		var shown struct {
+			Phase   string `json:"phase"`
+			Runtime string `json:"runtime_version"`
+			Machine string `json:"machine"`
+			PID     int    `json:"pid"`
+		}
+		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown.Phase != "ready" || shown.Runtime != want {
 			t.Fatalf("the machine is not ready on %s [exit %d]\n%s", want, code, out)
 		}
-		machine, _ := shown["machine"].(string)
+		machine := shown.Machine
 		if machine == "" || identity != "" && machine != identity {
 			t.Fatalf("the machine identity changed from %q to %q", identity, machine)
 		}
 		identity = machine
-		return shown["pid"]
+		return shown.PID
 	}
 	updateWheel := *machineRuntimeWheel
 	if *machineUpdateWheel != "" {
