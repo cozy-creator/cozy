@@ -247,28 +247,54 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 		}
 	})
 	version := func(wheel string) string { return strings.SplitN(filepath.Base(wheel), "-", 3)[1] }
-	ready := func(want string) {
+	var identity string
+	ready := func(want string) int {
 		t.Helper()
 		code, out := cozyWithin(t, root, 5*time.Minute, "machine", "start")
 		if code != 0 {
 			t.Fatalf("machine start [exit %d]\n%s", code, out)
 		}
 		code, out = runCozy(t, root, "machine", "show", "--json")
-		var shown map[string]any
-		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["phase"] != "ready" || shown["runtime_version"] != want {
+		var shown struct {
+			Phase   string `json:"phase"`
+			Runtime string `json:"runtime_version"`
+			Machine string `json:"machine"`
+			PID     int    `json:"pid"`
+		}
+		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown.Phase != "ready" || shown.Runtime != want {
 			t.Fatalf("the machine is not ready on %s [exit %d]\n%s", want, code, out)
 		}
+		machine := shown.Machine
+		if machine == "" || identity != "" && machine != identity {
+			t.Fatalf("the machine identity changed from %q to %q", identity, machine)
+		}
+		identity = machine
+		return shown.PID
 	}
-	first, second := localBuild(t, *machineRuntimeWheel, "first"), localBuild(t, *machineRuntimeWheel, "second")
+	updateWheel := *machineRuntimeWheel
+	if *machineUpdateWheel != "" {
+		updateWheel = *machineUpdateWheel
+	}
+	first, second := localBuild(t, *machineRuntimeWheel, "first"), localBuild(t, updateWheel, "second")
 	if code, out := runCozy(t, root, "machine", "install", "--runtime-wheel", first, "--tensorfs-wheel", *machineTensorFSWheel); code != 0 {
 		t.Fatalf("machine install [exit %d]\n%s", code, out)
 	}
-	ready(version(first))
+	parent := ready(version(first))
 	if code, out := runCozy(t, root, "machine", "install", "--runtime-wheel", second, "--tensorfs-wheel", *machineTensorFSWheel); code != 0 {
 		t.Fatalf("machine install over the running machine [exit %d]\n%s", code, out)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "machine", "root", "var/lib/cozy/rust-machine/agent/current")); err != nil {
 		t.Fatalf("the update in place did not activate the wheel's bundled machine: %v", err)
+	}
+	// A real upgrade starts with an older supervisor. Updating only its service leaves the
+	// next launch on the old parent, even when the new service contains a readiness fix.
+	launcher := filepath.Join(root, "machine", "root", "usr/local/bin/cozy-machine")
+	active := filepath.Join(root, "machine", "root", "var/lib/cozy/rust-machine/agent/current")
+	if fileSHA(t, launcher) != fileSHA(t, active) {
+		t.Fatal("the next launch still uses the old supervisor after a successful bundled update")
+	}
+	if current := ready(version(second)); current != parent {
+		t.Fatalf("updating the next-launch executable replaced the running parent: %v -> %v", parent, current)
 	}
 	for range 2 {
 		if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
