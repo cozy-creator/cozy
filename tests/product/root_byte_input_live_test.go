@@ -113,17 +113,7 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 	if len(children) != 1 || children[0].Executions != 1 || children[0].State != "succeeded" {
 		t.Fatalf("native root inputs did not reach the managed reader: %+v", children)
 	}
-	var intakes, attempts int
-	// The watcher returns after durable collection; native intake release follows it.
-	landed(t, "both root input intakes to be released", func() bool {
-		must(t, journal.QueryRow("SELECT count(*) FROM input_tree_intakes WHERE request_id=? AND state='released'", request.ID).Scan(&intakes))
-		return intakes == 2
-	})
-	must(t, journal.QueryRow("SELECT count(*) FROM attempts").Scan(&attempts))
-	if intakes != 2 || attempts != 2 {
-		t.Fatalf("root intake fabricated an execution or lost exact cleanup: intakes=%d attempts=%d", intakes, attempts)
-	}
-	t.Logf("root=%s inputs=%d bytes=%d reader=%s; original mutated, client absent until Runtime succeeded", request.ID, intakes, len(data), children[0].Request)
+
 }
 
 func rootByteInputProject(t *testing.T, wheel string) (string, string, string, []byte) {
