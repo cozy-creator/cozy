@@ -28,11 +28,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machines"
-	"github.com/cozy-creator/cozy/internal/rental"
-	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
 var (
@@ -273,34 +270,6 @@ func machineInstallations(root string) string {
 // the machine's own TensorFS Store.
 func machineJournal(root string) string {
 	return filepath.Join(machineStore(root), ".cozy-workspace", "journal.sqlite3")
-}
-
-// runtimePhase is the phase an agent's maintenance route reports (GET /v1/machine/runtime,
-// served until the cutover deletes it), read with a maintenance cap the owner signs.
-func runtimePhase(t *testing.T, addr string, pin *workertls.Pin, worker string, owner rental.CreatorIdentity) (string, error) {
-	t.Helper()
-	signer := owner.Signer()
-	token, err := capability.MintSigned(signer.Public, signer.Sign, capability.Grant{Machine: worker, Action: capability.Maintenance, Expires: time.Now().Add(5 * time.Minute).Unix()})
-	if err != nil {
-		return "", err
-	}
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://"+addr+"/v1/machine/runtime", nil)
-	if err != nil {
-		return "", err
-	}
-	request.Header.Set("Authorization", "Cozy-Cap "+token)
-	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
-	defer transport.CloseIdleConnections()
-	response, err := (&http.Client{Transport: transport, Timeout: 5 * time.Second}).Do(request)
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	var state struct{ Phase string }
-	if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&state) != nil {
-		return "", fmt.Errorf("the agent answered HTTP %d", response.StatusCode)
-	}
-	return state.Phase, nil
 }
 
 func transportLogs(root string) string {

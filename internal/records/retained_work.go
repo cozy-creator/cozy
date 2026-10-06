@@ -60,6 +60,13 @@ func retainRetryFrom(tx retryReader, request *Request, prior Request) *exit.Erro
 		// same machine, and the memoized results it reuses travel as its known results.
 		retained, stopped = true, Settled(prior.State) || RetainedState(prior.State)
 	} else if request.MachineExecutionObserver {
+		var nativeSent bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, prior.ID, RunV1Sent).Scan(&nativeSent); err != nil {
+			return exit.Internalf("cannot inspect predecessor native dispatch: %s", err)
+		}
+		if nativeSent {
+			return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s has unconfirmed native acceptance; observe or explicitly abandon it", prior.ID)
+		}
 		var machineRetained bool
 		// Preparation can block before any submission exists. Its retained client
 		// intent is retryable without inventing Runtime custody; a sent submission

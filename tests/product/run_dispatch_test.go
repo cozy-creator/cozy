@@ -66,6 +66,13 @@ func TestNativeDispatchAndCancellationChooseOneOrder(t *testing.T) {
 				if row.State != want {
 					t.Fatalf("dispatch allowed=%v left state %q, want %q", allowed, row.State, want)
 				}
+				if problem := s.SettleStoppedMachineCancellation(id); problem != nil {
+					t.Fatal(problem)
+				}
+				row, problem = s.RequestRow(id)
+				if problem != nil || row.State != want {
+					t.Fatalf("stopped machine falsely settled dispatch=%v: %+v %v", allowed, row, problem)
+				}
 				if sent, problem := s.RunV1Marked(id, records.RunV1Sent); problem != nil || sent != allowed {
 					t.Fatalf("dispatch allowed=%v, sent=%v: %v", allowed, sent, problem)
 				}

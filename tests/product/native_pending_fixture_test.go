@@ -29,3 +29,11 @@ func pendingNativeFixture(t *testing.T) (*records.Store, records.Request) {
 	t.Cleanup(func() { store.Close() })
 	return store, pendingNativeRequest(t, store)
 }
+
+func settled(state string) bool {
+	switch state {
+	case "succeeded", "failed", "canceled", "refused", "abandoned":
+		return true
+	}
+	return false
+}

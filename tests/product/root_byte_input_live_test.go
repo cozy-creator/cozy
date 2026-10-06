@@ -62,24 +62,21 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 	if link := awaitMachineReceipt(t, store, request.ID); link.Collected {
 		t.Fatalf("root input's execution was collected before the client left: %s", out)
 	}
-	inputs, problem := store.MachineInputs(request.ID)
-	fatal(t, problem)
-	if len(inputs) != 2 {
-		t.Fatalf("root byte intake omitted a native receipt: %+v", inputs)
-	}
+	// Native Run acceptance owns these immutable inputs. It emits no old worker intake
+	// receipt rows; the edit/client-exit/readback below proves the actual custody contract.
 	must(t, os.WriteFile(report, []byte("changed original file"), 0600))
 	must(t, os.WriteFile(filepath.Join(source, "report.json"), []byte("changed original tree"), 0600))
 	must(t, os.Remove(filepath.Join(source, "extra.txt")))
 	if code, out := runCozyPath(t, root, path, "down", "--json"); code != 0 {
 		t.Fatalf("detach client [%d]: %s", code, out)
 	}
-	journal, err := sql.Open("sqlite", "file:"+machineJournal(root)+"?mode=ro&_pragma=busy_timeout(5000)")
+	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine", "root", "var", "lib", "cozy", "rust-machine", "execution", "executions.sqlite3")+"?mode=ro&_pragma=busy_timeout(5000)")
 	must(t, err)
 	defer journal.Close()
 	deadline := time.Now().Add(3 * time.Minute)
 	for {
 		var state string
-		must(t, journal.QueryRow("SELECT state FROM executions WHERE request=?", request.ID).Scan(&state))
+		must(t, journal.QueryRow("SELECT state FROM executions WHERE request_id=?", request.ID).Scan(&state))
 		if state == "succeeded" {
 			break
 		}
@@ -88,10 +85,10 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	var collected int
-	must(t, journal.QueryRow("SELECT collected FROM executions WHERE request=?", request.ID).Scan(&collected))
-	if collected != 0 {
-		t.Fatal("root was collected while its client was absent")
+	held, problem := store.MachineExecution(request.ID)
+	fatal(t, problem)
+	if held.Collected {
+		t.Fatal("client recorded collection while absent")
 	}
 	code, out = runCozyPath(t, root, path, "run", "watch", "1", "--json")
 	if code != 0 {
@@ -119,7 +116,7 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 	var intakes, attempts int
 	// The watcher returns after durable collection; native intake release follows it.
 	landed(t, "both root input intakes to be released", func() bool {
-		must(t, journal.QueryRow("SELECT count(*) FROM input_tree_intakes WHERE request=? AND state='released'", request.ID).Scan(&intakes))
+		must(t, journal.QueryRow("SELECT count(*) FROM input_tree_intakes WHERE request_id=? AND state='released'", request.ID).Scan(&intakes))
 		return intakes == 2
 	})
 	must(t, journal.QueryRow("SELECT count(*) FROM attempts").Scan(&attempts))

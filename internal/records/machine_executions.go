@@ -326,9 +326,8 @@ func (s *Store) RequestMachineCancellation(id, actor string) (bool, *exit.Error)
 	return len(link.Receipt) > 0, nil
 }
 
-// SettleStoppedMachineCancellation ends a requested cancellation whose machine is stopped:
-// nothing runs there, so the run is canceled on record now. The intent stays recorded; the
-// machine's journal learns it when the machine next runs, and can then only end the run.
+// SettleStoppedMachineCancellation settles only work known not to have been sent. A stopped
+// native machine cannot acknowledge an earlier acceptance or the durable cancel fence.
 func (s *Store) SettleStoppedMachineCancellation(id string) *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -341,6 +340,13 @@ func (s *Store) SettleStoppedMachineCancellation(id string) *exit.Error {
 	}
 	if link == nil || link.Abandoned || !link.CancelRequested {
 		return nil
+	}
+	var native bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type IN (?,?))`, id, RunV1Sent, RunV1Accepted).Scan(&native); err != nil {
+		return exit.Internalf("cannot inspect stopped native cancellation: %s", err)
+	}
+	if native {
+		return nil // remains pending until its machine's fence/outcome is observed
 	}
 	if err := projectCancellationTx(tx, id, "canceled", "machine_stopped"); err != nil {
 		return exit.Internalf("cannot settle a stopped machine's cancellation: %s", err)

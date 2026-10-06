@@ -1,10 +1,12 @@
 package producttest
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -103,8 +105,11 @@ func TestPublicRunStatusProjectsStoppedFailuresAndPendingAcceptanceConsistently(
 	}
 	before, problem := o.store.MachineExecution(pending.ID)
 	fatal(t, problem)
-	if len(before.Submission) == 0 || len(before.Receipt) != 0 || len(before.PendingControl) != 0 {
+	if len(before.Submission) != 0 || len(before.Receipt) != 0 || len(before.PendingControl) != 0 {
 		t.Fatal("public observation invented acceptance or a control operation")
+	}
+	if sent, problem := o.store.RunV1Marked(pending.ID, records.RunV1Sent); problem != nil || !sent {
+		t.Fatal("public observation lost native dispatch evidence")
 	}
 	row, problem := o.store.RequestRow(pending.ID)
 	fatal(t, problem)
@@ -115,7 +120,7 @@ func TestPublicRunStatusProjectsStoppedFailuresAndPendingAcceptanceConsistently(
 
 func TestPublicRunStatusFreezesStoppedExecutionAtOriginalEvent(t *testing.T) {
 	o := hostOwner(t, "public-stopped-duration")
-	request, original := retainedLostObserver(t, o.store, "stopped-duration")
+	request, original := archivedLostObserver(t, o.store, o.l.DB)
 	ended, err := time.Parse(time.RFC3339Nano, original.At)
 	must(t, err)
 	defer publicationControlAPI(t, o)()
@@ -163,4 +168,28 @@ func TestPublicRunStatusWatchAcceptsOlderDaemonWithoutStopIdentity(t *testing.T)
 			}
 		})
 	}
+}
+
+func archivedLostObserver(t *testing.T, store *records.Store, path string) (records.Request, records.Event) {
+	t.Helper()
+	request, _, problem := store.Submit(records.Request{ID: "archive-run", IdemKey: "archived-history", Package: "local/private-proof", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), Worker: "lost-rental", Rental: true, RetainWork: true, MachineExecutionObserver: true})
+	fatal(t, problem)
+	fatal(t, store.LinkMachineExecution(request.ID, request.Worker))
+	raw, err := os.ReadFile("testdata/record-archive/receipt.bin")
+	must(t, err)
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	_, err = db.Exec(`UPDATE machine_executions SET receipt=? WHERE request_id=?`, raw, request.ID)
+	must(t, err)
+	_, err = db.Exec(`UPDATE requests SET ordinal=1,state='dispatching' WHERE id=?`, request.ID)
+	must(t, err)
+	changed, problem := store.BlockRetainedWork(request.ID, "request.state_lost", "the retained rental is unavailable")
+	fatal(t, problem)
+	if !changed {
+		t.Fatal("archived fixture did not block")
+	}
+	events, problem := store.EventsAfter(request.ID, 0, 100)
+	fatal(t, problem)
+	return request, events[len(events)-1]
 }

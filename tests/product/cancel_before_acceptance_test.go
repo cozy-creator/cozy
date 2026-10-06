@@ -91,7 +91,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			began := time.Now()
 			startDaemonProcess(t, root)
 			if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 ||
-				!strings.Contains(out, map[bool]string{true: `"canceling"`, false: `"canceled"`}[rented]) {
+				!strings.Contains(out, `"canceling"`) {
 				observations, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 				fatal(t, problem)
 				events, problem := observations.EventsAfter(request.ID, 0, 100)
@@ -102,28 +102,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 				observations.Close()
 				t.Fatalf("cancel did not end the run [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
 			}
-			if !rented {
-				// Nothing waits for the stopped machine: the run is canceled on record, a
-				// waiting `--await` ends, and the intent stays for the machine's journal.
-				var row *records.Request
-				store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
-				fatal(t, problem)
-				defer store.Close()
-				eventually(t, root, "the cancel settled on record", func() bool {
-					row, problem = store.RequestRow(request.ID)
-					fatal(t, problem)
-					return row.State == "canceled"
-				})
-				link, problem := store.MachineExecution(request.ID)
-				fatal(t, problem)
-				if !link.CancelRequested || executing != (len(link.Receipt) > 0) || time.Since(began) > 10*time.Second {
-					t.Fatalf("the settled cancel kept intent %v, receipt %d bytes, %s after it", link.CancelRequested, len(link.Receipt), time.Since(began))
-				}
-				if code, out := cozyWithin(t, root, 20*time.Second, "run", "cancel", request.ID, "--await", "--json"); code != 0 || !strings.Contains(out, `"canceled"`) {
-					t.Fatalf("an awaited cancel did not end canceled [exit %d]: %s", code, out)
-				}
-				return
-			}
+
 			store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)
 			defer store.Close()
@@ -140,7 +119,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			fatal(t, problem)
 			link, problem := store.MachineExecution(request.ID)
 			fatal(t, problem)
-			if row.State != "canceling" || len(link.Receipt) != 0 || !link.CancelRequested {
+			if row.State != "canceling" || executing != (len(link.Receipt) > 0) || !link.CancelRequested {
 				t.Fatalf("after its cancel the run is %s (receipt %d bytes, intent kept %v)", row.State, len(link.Receipt), link.CancelRequested)
 			}
 		})

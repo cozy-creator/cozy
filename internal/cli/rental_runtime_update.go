@@ -143,11 +143,6 @@ func (u *rentalRuntimeUpdates) Resume() {
 	}
 }
 
-// preflight holds work off a rental while its software update runs.
-func (u *rentalRuntimeUpdates) preflight(_ context.Context, _ records.Request, machine string) *exit.Error {
-	return u.machines.store.RuntimeUpdateHold(machine)
-}
-
 func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 	if _, exists := u.running.LoadOrStore(row.RentalID, true); exists {
 		return

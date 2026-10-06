@@ -64,6 +64,15 @@ func (m *machineRuns) loopV1(request records.Request) {
 		if accepted && link.Collected {
 			return
 		}
+		if !accepted && (len(link.Receipt) > 0 || len(link.Submission) > 0) {
+			// Archived worker submissions may already have run. A native submission would
+			// create a second execution; end only this controller's tracking, saying why.
+			if !records.Settled(current.State) {
+				_, _ = m.store.AbandonMachineExecution(request.ID, "cozy",
+					"this run was sent over cozy.worker.v1, which this cozy no longer speaks; whether it ran is unknown")
+			}
+			return
+		}
 		sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
 		if problem != nil {
 			return
@@ -134,6 +143,17 @@ func permanentRefusal(problem *exit.Error) bool {
 func (m *machineRuns) catchUpV1(ctx context.Context, request records.Request) *exit.Error {
 	link, problem := m.store.MachineExecution(request.ID)
 	if problem != nil || link == nil || link.Collected || link.Abandoned {
+		return problem
+	}
+	accepted, problem := m.store.RunV1(request.ID)
+	if problem != nil {
+		return problem
+	}
+	if !accepted && (len(link.Receipt) > 0 || len(link.Submission) > 0) {
+		if !records.Settled(request.State) {
+			_, problem = m.store.AbandonMachineExecution(request.ID, "cozy",
+				"this run was sent over cozy.worker.v1, which this cozy no longer speaks; whether it ran is unknown")
+		}
 		return problem
 	}
 	_, problem = m.stepV1(ctx, request, link, true, true)

@@ -46,3 +46,8 @@ func machineInputsIn(q interface {
 	}
 	return result, nil
 }
+
+// MachineInputs reads retained input custody from the owner's event history.
+func (s *Store) MachineInputs(request string) ([]MachineInput, *exit.Error) {
+	return machineInputsIn(s.db, request)
+}

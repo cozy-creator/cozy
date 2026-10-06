@@ -30,7 +30,7 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	// A frozen record emitted by the original binding producer, not a retired submission API.
 	saved, err := os.ReadFile("testdata/record-archive/submission.bin")
 	must(t, err)
-	db, err := sql.Open("sqlite3", layout.DB)
+	db, err := sql.Open("sqlite", layout.DB)
 	must(t, err)
 	defer db.Close()
 	_, err = db.Exec(`UPDATE machine_executions SET submission=? WHERE request_id=?`, saved, request.ID)

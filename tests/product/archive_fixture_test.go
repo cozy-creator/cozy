@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/custody"
 )
 
 // Fixture documents describe stored data directly. They do not recreate an old RPC graph.
@@ -33,6 +34,13 @@ func fixtureIdentity(value map[string]any) ([]byte, []byte, error) {
 
 func fixtureValue(value any, nested bool) any {
 	switch value := value.(type) {
+	case *custody.TreeRef:
+		return fixtureValue(map[string]any{
+			"producer_root_id": value.ProducerRootID,
+			"receipt_digest":   fixtureDigest(value.ReceiptDigest),
+			"manifest":         map[string]any{"digest": fixtureDigest(value.Manifest.Digest), "length": value.Manifest.Length},
+			"content_bytes":    value.ContentBytes,
+		}, true)
 	case map[string]any:
 		out := map[string]any{}
 		format, _ := value["_format"].(string)
