@@ -1980,13 +1980,7 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 	}
 	forgotten := false
 	if had {
-		local, problem := dial(w.ctx)
-		if problem != nil {
-			return problem.WithRemedy("the rental is gone at the hub, but its local credentials are kept until the daemon drops its connection")
-		}
-		if _, problem := local.DetachRental(w.id); problem != nil {
-			return problem.WithRemedy("the rental is gone at the hub, but its local credentials are kept until the daemon drops its connection")
-		}
+		var problem *exit.Error
 		if forgotten, problem = rental.Forget(l, st, w.id); problem != nil {
 			return problem
 		}

@@ -23,7 +23,7 @@ type machineRuns struct {
 	resolver *Resolver
 	fleet    *managedRentals
 	mu       sync.Mutex
-	running  map[string]bool
+	running  map[string]chan struct{}
 	placed   map[string]string // the last placement decision recorded per waiting run
 	machines *machines.Resolver
 	updates  *rentalRuntimeUpdates
@@ -34,7 +34,7 @@ type machineRuns struct {
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals, found *machines.Resolver) *machineRuns {
 	background, cancel := context.WithCancel(context.Background())
-	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, machines: found, running: map[string]bool{}, placed: map[string]string{}, submitting: map[string]context.CancelFunc{}}
+	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, machines: found, running: map[string]chan struct{}{}, placed: map[string]string{}, submitting: map[string]context.CancelFunc{}}
 }
 
 func (m *machineRuns) Start(request records.Request) *exit.Error {
@@ -43,18 +43,16 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 		m.mu.Unlock()
 		return exit.Named(exit.Unavailable, "daemon.closing", "the client observer has disconnected")
 	}
-	if m.running[request.ID] {
+	if m.running[request.ID] != nil {
 		m.mu.Unlock()
 		return nil
 	}
-	m.running[request.ID] = true
+	finished := make(chan struct{})
+	m.running[request.ID] = finished
 	m.mu.Unlock()
 	go func() {
 		defer func() {
-			m.mu.Lock()
-			delete(m.running, request.ID)
-			delete(m.placed, request.ID)
-			m.mu.Unlock()
+			m.endObservation(request.ID, finished)
 			// A control can be persisted after the final observation, while its
 			// Start still sees this goroutine running. Read after withdrawing our
 			// running marker so either that Start or this handoff owns the wakeup.
@@ -78,6 +76,14 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 		}
 	}()
 	return nil
+}
+
+func (m *machineRuns) endObservation(id string, finished chan struct{}) {
+	m.mu.Lock()
+	delete(m.running, id)
+	delete(m.placed, id)
+	close(finished)
+	m.mu.Unlock()
 }
 
 func (m *machineRuns) Resume() {
@@ -162,17 +168,43 @@ func (m *machineRuns) runName(request records.Request) string {
 // already is: the observer holds its machine's next event, and the reader takes the record.
 // One whose collection ended on a refusal is collected again at once.
 func (m *machineRuns) Refresh(parent context.Context, request records.Request) *exit.Error {
-	m.mu.Lock()
-	following := m.running[request.ID]
-	m.mu.Unlock()
-	if following {
-		return nil
+	for {
+		m.mu.Lock()
+		if m.ctx.Err() != nil {
+			m.mu.Unlock()
+			return exit.Named(exit.Unavailable, "daemon.closing", "the client observer has disconnected")
+		}
+		following := m.running[request.ID]
+		if following == nil {
+			finished := make(chan struct{})
+			m.running[request.ID] = finished
+			m.mu.Unlock()
+			problem := func() *exit.Error {
+				defer m.endObservation(request.ID, finished)
+				return m.catchUpV1(parent, request)
+			}()
+			// A cancel can arrive while catch-up owns the slot. Deliver that durable
+			// intent even if this reader detached or its connection failed.
+			started := m.Start(request)
+			if problem != nil {
+				return problem
+			}
+			return started
+		}
+		m.mu.Unlock()
+		if !m.collectionRefused(request.ID) {
+			return nil // live work is already observed; a reader never waits for it
+		}
+		// The previous observer may have recorded a refusal but not released its
+		// slot yet. Wait for that handoff, then retry collection as its sole owner.
+		select {
+		case <-following:
+		case <-parent.Done():
+			return exit.New(exit.Canceled, "machine observation detached")
+		case <-m.ctx.Done():
+			return exit.Named(exit.Unavailable, "daemon.closing", "the client observer has disconnected")
+		}
 	}
-	// What its machine holds now, then its log as it streams.
-	if problem := m.catchUpV1(parent, request); problem != nil {
-		return problem
-	}
-	return m.Start(request)
 }
 
 // collectionRefused is whether a finished result waits on its owner. A reader asking about

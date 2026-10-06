@@ -45,8 +45,6 @@ func (m *machineRuns) Prewarm(ctx context.Context, row records.RentalInstall, re
 	return m.prewarmV1(ctx, row, report)
 }
 
-func (m *machineRuns) Forget(machine string) { m.machines.Forget(machine) }
-
 // Status reads one machine's picture over cozy.machine.v1 as its owner.
 func (m *machineRuns) Status(ctx context.Context, machine string) (api.MachineStatus, *exit.Error) {
 	connection, problem := m.machines.DialV1(ctx, machine, "reading its status")

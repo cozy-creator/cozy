@@ -25,7 +25,8 @@ type V1 struct {
 	// Rented is a rental's machine: it reads its own Hub with the pod's capability, so a run
 	// sends it no Hub access.
 	Rented bool
-	// HubID, Owned and Account name the machine at its Hub, as Machine's methods do.
+	// HubID is a rental's identity, Owned an owned machine (this computer's), and Account the
+	// owner's client at the machine's Hub.
 	HubID   string
 	Owned   bool
 	Account *hub.Client
@@ -59,8 +60,8 @@ func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.
 		}
 		return r.DialEndpointV1(*ep)
 	}
-	machine := &Machine{Name: name}
-	t, problem := r.resolve(ctx, name, "", holder, true, machine)
+	machine := &placement{}
+	t, problem := r.resolve(ctx, name, holder, machine)
 	if problem != nil {
 		return nil, problem
 	}

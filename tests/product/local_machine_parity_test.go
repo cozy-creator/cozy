@@ -193,7 +193,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	must(t, os.WriteFile(filepath.Join(dir, "agent.json"), record, 0600))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	launch, problem := host.Ensure(ctx, "", nil, false)
+	launch, problem := host.Ensure(ctx, nil)
 	if problem != nil {
 		log, _ := os.ReadFile(filepath.Join(dir, "host.log"))
 		t.Fatalf("the provider Host did not boot: %s\n%s", problem.Message, log)

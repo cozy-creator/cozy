@@ -272,8 +272,6 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 	if saveProblem != nil {
 		return saveProblem
 	}
-	// Same boot, other software: the next call on the kept connection asks it again.
-	u.machines.machines.Forget(row.RentalID)
 	var outcomeResult struct{ From, To softwarePair }
 	_ = json.Unmarshal(outcome.GetResult(), &outcomeResult)
 	result.To = outcomeResult.To

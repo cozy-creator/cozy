@@ -125,7 +125,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Hub:     func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
 		UseRental:      func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
-		ObserveRental:  rental.ObserveWorker(st),
 		RentalKey:      func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
 		EndpointRental: rentalEndpoint(l, st),
 	}
@@ -160,7 +159,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	fleet.owner = c
-	fleet.forget = found.Forget
 	// Rental readiness is a queue-capacity edge. The fleet reconciler wakes
 	// pinned machine executions as soon as the hub publishes an attachable
 	// worker, including after a daemon restart.

@@ -158,7 +158,7 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	// A still-booting Runtime legitimately falls back to the account catalog,
 	// which this fixture deliberately does not serve.
 	machine := machines.NewHost(filepath.Join(root, "machine"), machineStore(root), nil)
-	_, problem := machine.Ensure(t.Context(), "", nil, true)
+	_, problem := machine.Ensure(t.Context(), nil)
 	fatal(t, problem)
 	eventually(t, root, "native machine readiness", func() bool {
 		frame, problem := machine.ReadStatus(t.Context())

@@ -17,7 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 )
 
-// Logging out erases this machine's local credential and the execution access it minted
+// Logging out erases this account's local device credential
 // whatever Tensorhub answers: an empty 2xx is a confirmation, and a refused or unreachable
 // revocation is a note.
 func TestLogoutAlwaysErasesTheLocalCredential(t *testing.T) {
@@ -58,15 +58,13 @@ func TestLogoutAlwaysErasesTheLocalCredential(t *testing.T) {
 			defer server.Close()
 			root := t.TempDir()
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
-			credential, access := writeMachineCredential(t, root, server.URL), writeExecutionAccess(t, root, server.URL)
+			credential := writeMachineCredential(t, root, server.URL)
 			code, out := runCozy(t, root, "auth", "logout", "--json")
 			if code != 0 || !strings.Contains(out, `"status":"logged out"`) || revoked != 1 {
 				t.Fatalf("logout failed [exit %d, %d revocations]: %s", code, revoked, out)
 			}
-			for _, path := range []string{credential, access} {
-				if _, err := os.Stat(path); !os.IsNotExist(err) {
-					t.Fatalf("%s survived logout: %v", path, err)
-				}
+			if _, err := os.Stat(credential); !os.IsNotExist(err) {
+				t.Fatalf("%s survived logout: %v", credential, err)
 			}
 			if row.note != strings.Contains(out, "did not confirm") {
 				t.Fatalf("revocation note mismatch: %s", out)
@@ -79,14 +77,12 @@ func TestLogoutAlwaysErasesTheLocalCredential(t *testing.T) {
 		server.Close()
 		root := t.TempDir()
 		must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+origin+"\n"), 0600))
-		credential, access := writeMachineCredential(t, root, origin), writeExecutionAccess(t, root, origin)
+		credential := writeMachineCredential(t, root, origin)
 		if code, out := runCozy(t, root, "auth", "logout", "--json"); code != 0 || !strings.Contains(out, `"status":"logged out"`) {
 			t.Fatalf("an unreachable hub blocked local logout [exit %d]: %s", code, out)
 		}
-		for _, path := range []string{credential, access} {
-			if _, err := os.Stat(path); !os.IsNotExist(err) {
-				t.Fatalf("%s survived logout: %v", path, err)
-			}
+		if _, err := os.Stat(credential); !os.IsNotExist(err) {
+			t.Fatalf("%s survived logout: %v", credential, err)
 		}
 	})
 }
@@ -101,18 +97,6 @@ func writeMachineCredential(t *testing.T, root, origin string) string {
 	must(t, err)
 	sum := sha256.Sum256([]byte(origin))
 	path := filepath.Join(root, "auth", hex.EncodeToString(sum[:])+".json")
-	must(t, os.MkdirAll(filepath.Dir(path), 0700))
-	must(t, os.WriteFile(path, raw, 0600))
-	return path
-}
-
-// writeExecutionAccess is the grant a run under this login left in the machine's cache.
-func writeExecutionAccess(t *testing.T, root, origin string) string {
-	t.Helper()
-	raw, err := json.Marshal(map[string]any{origin: map[string]any{"origin": origin, "token": "execution-token",
-		"expires_at": time.Now().Add(7 * 24 * time.Hour).Unix(), "credential_identity": "key:device-1"}})
-	must(t, err)
-	path := filepath.Join(root, "machine", "execution-access.json")
 	must(t, os.MkdirAll(filepath.Dir(path), 0700))
 	must(t, os.WriteFile(path, raw, 0600))
 	return path

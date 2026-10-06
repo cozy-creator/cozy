@@ -114,39 +114,7 @@ func TestALoopbackHubServesItsMachineWhileItsPublicOriginIsDown(t *testing.T) {
 		}
 	}
 
-	// A grant an older Cozy cached for the public origin is minted again for loopback.
-	cache := filepath.Join(root, "machine", "execution-access.json")
-	raw, err := os.ReadFile(cache)
-	must(t, err)
-	var cached map[string]map[string]any
-	must(t, json.Unmarshal(raw, &cached))
-	for _, grant := range cached {
-		grant["origin"] = public
-		grant["environment"].(map[string]any)["TENSORHUB_ORIGIN"] = public
-	}
-	raw, err = json.Marshal(cached)
-	must(t, err)
-	must(t, os.WriteFile(cache, raw, 0o600))
-	if minted := strings.Count(run(), "POST /v1/execution-access"); minted != 2 {
-		t.Fatalf("a grant cached for the public origin was minted %d times, want once more", minted-1)
-	}
-	raw, err = os.ReadFile(cache)
-	must(t, err)
-	if !strings.Contains(string(raw), `"origin":"`+h.server.URL+`"`) || strings.Contains(string(raw), `"origin":"`+public+`"`) {
-		t.Fatalf("the renewed grant is cached at the wrong origin: %s", raw)
-	}
-
-	raw, err = os.ReadFile(filepath.Join(root, "machine", "root", "var", "lib", "cozy", "machine", "hub-access.json"))
-	must(t, err)
-	var held struct {
-		Hubs []struct {
-			Origin      string            `json:"origin"`
-			Environment map[string]string `json:"environment"`
-		} `json:"hubs"`
-	}
-	must(t, json.Unmarshal(raw, &held))
-	if len(held.Hubs) != 1 || held.Hubs[0].Origin != h.server.URL || held.Hubs[0].Environment["TENSORHUB_ORIGIN"] != h.server.URL ||
-		held.Hubs[0].Environment["TENSORHUB_PUBLIC_ORIGIN"] != public {
-		t.Fatalf("the machine holds Hub access at %+v, want %s with public origin %s", held.Hubs, h.server.URL, public)
-	}
+	// A second native run still reaches the local Hub while its public origin is down.
+	// Access travels with each run; there is no standing machine credential cache.
+	run()
 }

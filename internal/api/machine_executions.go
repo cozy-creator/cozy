@@ -30,8 +30,6 @@ type MachineExecutions interface {
 	Status(ctx context.Context, machine string) (MachineStatus, *exit.Error)
 	// MachineLog is one log a machine keeps, at most its newest tailBytes when nonzero.
 	MachineLog(ctx context.Context, machine, log string, tailBytes uint64) (MachineLog, *exit.Error)
-	// Forget drops this daemon's kept connection to a machine, before its credentials go.
-	Forget(machine string)
 }
 
 // MachineStatus is what one machine reports of itself: identity, software, GPUs, the

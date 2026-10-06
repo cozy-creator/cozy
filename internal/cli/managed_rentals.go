@@ -40,8 +40,6 @@ type managedRentals struct {
 	// immediately rather than waiting for the next poll or a new CLI request.
 	wakeQueue func()
 	installs  *machines.Installs
-	// forget drops the daemon's kept connection to a machine whose rental ended.
-	forget func(string)
 	// boot brings a newly attached worker boot to the Hub's target software before it takes
 	// work: daemon setup installs it.
 	boot func(string)
@@ -972,9 +970,6 @@ func (m *managedRentals) settle(release *pendingRelease) *exit.Error {
 			return observed
 		}
 	}
-	if m.forget != nil {
-		m.forget(id)
-	}
 	if _, problem := rental.Forget(m.layout, m.store, id); problem != nil {
 		return problem
 	}
@@ -1095,14 +1090,10 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 	return problem
 }
 
-// reattach drops the kept connection to a newly attached boot, so its next use claims it, and
-// brings the boot to the target software first. Work bound to an old boot settles on its own;
+// reattach brings a newly attached boot to the target software first. Work bound to an old boot settles on its own;
 // the rental, its custody, installs and queue continue on the new worker.
 func (m *managedRentals) reattach(ids []string) {
 	for _, id := range ids {
-		if m.forget != nil {
-			m.forget(id)
-		}
 		if m.boot != nil {
 			m.boot(id)
 		}
@@ -1391,9 +1382,6 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 // pr-183abac284d1e16f5f0a).
 func (m *managedRentals) letGo(released, failed []string) *exit.Error {
 	for _, id := range append(failed, released...) {
-		if m.forget != nil {
-			m.forget(id)
-		}
 		if m.owner != nil {
 			m.owner.ForgetRental(id)
 		}

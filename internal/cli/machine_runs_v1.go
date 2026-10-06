@@ -211,7 +211,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			return m.runRefusalV1(request.ID, err, spec != nil && !sent)
 		}
 	}
-	head, opened := uint64(0), false
+	head, opened, terminal := uint64(0), false, false
 	// Output files are read apart from the stream: progress and the outcome never wait on bytes.
 	var fetch *fetcherV1
 	if !catchUp {
@@ -233,6 +233,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		}
 		if state := event.GetState(); state != nil && !opened {
 			head, opened = state.Sequence, true // the stream's first frame names the log's head
+			terminal = records.Settled(state.State)
 		}
 		if state := event.GetState(); state != nil && !accepted {
 			if problem := m.store.AcceptRunV1(request.ID, state); problem != nil {
@@ -267,7 +268,9 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		if problem := m.store.ObserveRunV1(request.ID, event, held); problem != nil {
 			return false, problem
 		}
-		if catchUp && (head <= uint64(max(link.RemoteCursor, 0)) || event.Sequence >= head) {
+		// A terminal snapshot is followed by its outcome even when our cursor already
+		// reaches the head. Read that outcome to retry a previously refused collection.
+		if catchUp && !terminal && (head <= uint64(max(link.RemoteCursor, 0)) || event.Sequence >= head) {
 			return false, nil
 		}
 	}
