@@ -37,7 +37,7 @@ func releaseConfirmationRecord(t *testing.T, root, hubURL, id string) (*records.
 	machine := ""
 	op, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "release-confirmation", Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100000}, func(name string) ([]byte, string, *exit.Error) {
 		machine = name
-		body, e := hub.RentalRequestBytes(name, "cpu", 1, strings.Repeat("ab", 32), base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil, "")
+		body, e := hub.RentalRequestBytes(name, "cpu", 1, strings.Repeat("ab", 32), base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil, "", "")
 		return body, "digest-" + name, e
 	})
 	fatal(t, problem)

@@ -73,7 +73,7 @@ func handleRent(ctx *Context) *exit.Error {
 				WithRemedy("use `cozy rental new` alone to list available machines")
 		}
 		hctx, cancel := hub.Context()
-		skus, e := client(ctx).RentalSKUs(hctx)
+		skus, e := client(ctx).RentalSKUs(hctx, rentalProviderFlag(ctx))
 		cancel()
 		if e != nil {
 			return e
@@ -124,7 +124,7 @@ func handleRent(ctx *Context) *exit.Error {
 		// Resuming it neither needs current stock nor admits a second purchase.
 		sku.PriceUSDMicrosPerHour = existing.HourlyRateUSDMicros
 	} else {
-		line, admitted, problem := fleet.admit(skuName, gpus)
+		line, admitted, problem := fleet.admit(skuName, gpus, rentalProviderFlag(ctx))
 		if problem != nil {
 			return problem
 		}
@@ -374,6 +374,10 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	if e != nil {
 		return nil, e
 	}
+	provider, e := rentalProvider(ctx, existing)
+	if e != nil {
+		return nil, e
+	}
 	if managedRequestID == "" {
 		workload, e = manualRentalWorkload(ctx, existing)
 		if e != nil {
@@ -434,13 +438,13 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	if existing != nil {
 		hourlyRateUSDMicros = existing.HourlyRateUSDMicros
 	} else if hourlyRateUSDMicros, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), creator.PublicKey(),
-		workload, development, image, hourlyRateUSDMicros); e != nil {
+		workload, development, image, provider, hourlyRateUSDMicros); e != nil {
 		return nil, e
 	}
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
 		body, e := hub.RentalRequestBytes(machineName, skuName, gpus, secret.HashHex(token),
-			creator.PublicKey(), workload, development, image)
+			creator.PublicKey(), workload, development, image, provider)
 		if e != nil {
 			return nil, "", e
 		}
@@ -472,9 +476,9 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 // workload choose the machine, so this, not the default-disk listing, is the rate the
 // renter consents to.
 func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHash, creatorKey string,
-	workload hub.DeclaredWorkload, development *hub.RentalDevelopment, image string, listed int64,
+	workload hub.DeclaredWorkload, development *hub.RentalDevelopment, image, provider string, listed int64,
 ) (int64, *exit.Error) {
-	body, e := hub.RentalRequestBytes("quote", skuName, gpus, tokenHash, creatorKey, workload, development, image)
+	body, e := hub.RentalRequestBytes("quote", skuName, gpus, tokenHash, creatorKey, workload, development, image, provider)
 	if e != nil {
 		return 0, e
 	}

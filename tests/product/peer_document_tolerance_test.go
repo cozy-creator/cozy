@@ -108,7 +108,7 @@ func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 		t.Fatalf("an unusable rental name was not replaced by the id: %+v", attached.Name)
 	}
 
-	skus, problem := client.RentalSKUs(t.Context())
+	skus, problem := client.RentalSKUs(t.Context(), "")
 	fatal(t, problem)
 	var names []string
 	for _, sku := range skus {
