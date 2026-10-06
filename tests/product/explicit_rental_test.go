@@ -10,10 +10,8 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
@@ -298,15 +296,5 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 				t.Fatalf("replay purchased capacity: %v", asks)
 			}
 		})
-	}
-}
-
-func TestRentalInventoryRefusesAnUnreadablePython(t *testing.T) {
-	inventory := &pb.ImageInventory{Interpreters: []*pb.PythonInterpreter{{Version: "broken", Abi: "cp312"}}}
-	if _, why := launch.InventoryPython(inventory, ">=3.12", ""); why == "" {
-		t.Fatal("an unreadable Python version was accepted")
-	}
-	if _, why := launch.InventoryPython(&pb.ImageInventory{Python: "3.12.11"}, ">=3.12", ""); !strings.Contains(why, "no available Python executor") {
-		t.Fatal(why)
 	}
 }

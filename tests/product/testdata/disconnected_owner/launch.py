@@ -18,10 +18,7 @@ environment = {
     "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL": bootstrap_key,
     "COZY_WORKER_INTERNAL_PORT": "19781",
     "COZY_MEDIA_INTERNAL_PORT": "19782",
-    "COZY_RECORD_OWNER_AUTH_JSON": json.dumps({
-        "control_public_key_ed25519_b64url": authority["control_public_key_ed25519_b64url"],
-        "media_token_sha256": authority["media_token_sha256"],
-    }, separators=(",", ":")),
+    "COZY_AUTHORIZED_KEYS": authority["control_public_key_ed25519_b64url"],
     "TENSORHUB_ORIGIN": "https://tensorhub.invalid",
 }
 env_path = root / "host-boot.env"

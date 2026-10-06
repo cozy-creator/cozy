@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/custody"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Submission is one local request. The orchestrator owns everything in it that decides
@@ -332,10 +332,10 @@ func normalizeWeightsOutputs(s Submission) ([]WeightsOutput, []byte, *exit.Error
 		return nil, nil, exit.Named(exit.Validation, "weights_output_not_job",
 			"weights outputs are valid only on a job submission")
 	}
-	if len(s.WeightsOutputs) > pb.MaxWeightsReceipts {
+	if len(s.WeightsOutputs) > custody.MaxWeightsReceipts {
 		return nil, nil, exit.Named(exit.Validation, "weights_output_count_cap",
 			"%d weights outputs exceeds the protocol cap of %d",
-			len(s.WeightsOutputs), pb.MaxWeightsReceipts)
+			len(s.WeightsOutputs), custody.MaxWeightsReceipts)
 	}
 	rows := append([]WeightsOutput(nil), s.WeightsOutputs...)
 	sort.Slice(rows, func(i, j int) bool { return rows[i].OutputID < rows[j].OutputID })

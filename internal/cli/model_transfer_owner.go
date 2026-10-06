@@ -18,7 +18,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/transfer"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 type modelTransferOwner struct {
@@ -136,13 +135,9 @@ func (o *modelTransferOwner) RefreshRemoteSource(parent context.Context,
 	}
 	capabilities := make([]orchestrator.ModelSourceCapability, 0, len(resolved.Access))
 	for _, access := range resolved.Access {
-		provider := map[string]pb.ModelSourceProvider{
-			"huggingface": pb.ModelSourceProvider_MODEL_SOURCE_PROVIDER_HUGGING_FACE,
-			"civitai":     pb.ModelSourceProvider_MODEL_SOURCE_PROVIDER_CIVITAI,
-		}[access.Provider]
-		if provider == pb.ModelSourceProvider_MODEL_SOURCE_PROVIDER_UNSPECIFIED {
-			return nil, exit.Named(exit.Validation, "model_transfer.provider_invalid",
-				"source capability names unsupported provider %s", access.Provider)
+		provider := access.Provider
+		if provider != "huggingface" && provider != "civitai" {
+			return nil, exit.Named(exit.Structural, "model_transfer.source_provider_invalid", "source capability names unsupported provider %s", provider)
 		}
 		capabilities = append(capabilities, orchestrator.ModelSourceCapability{
 			Member: access.Member, ObjectID: access.ObjectID, Length: access.Length,

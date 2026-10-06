@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"math"
 	"slices"
 	"strconv"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // device_memory_measurements is the measured working-memory ledger (proto-061 B):
@@ -237,12 +237,12 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 	}
 	// The orchestrator verified the worker's body before this transaction; a body
 	// that is not AttemptOutcomeBody/1 (a synthesized close) carries no measurement.
-	var body pb.AttemptOutcomeBody
-	if canonical.Unmarshal(t.Body, &body) != nil {
+	body, err := archive.Read(t.Body, archive.TerminalBody)
+	if err != nil {
 		return nil
 	}
-	peak := body.GetMetrics().GetWorkingPeakDeviceBytes()
-	total := body.GetMetrics().GetPeakDeviceMemoryBytes()
+	peak := uint64(max(0, body.Sub("metrics").Int("working_peak_device_bytes")))
+	total := uint64(max(0, body.Sub("metrics").Int("peak_device_memory_bytes")))
 	if peak == 0 && total == 0 {
 		return nil
 	}
@@ -270,7 +270,7 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
  entrypoint,models_digest,shape_cell,sku,working_peak_bytes,measured_at,
  total_peak_bytes,request_digest,exact_models_digest,gpu_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(request_id,attempt) DO NOTHING`, t.RequestID, t.Attempt, pkg, release, entrypoint,
-		ModelsDigest(req.Models), body.GetMetrics().GetShapeCell(), sku, int64(peak), now(),
+		ModelsDigest(req.Models), body.Sub("metrics").Str("shape_cell"), sku, int64(peak), now(),
 		int64(total), exactMemoryRequest(req), exactModelsDigest(req.Models), width); err != nil {
 		return exit.Internalf("cannot record the working memory of %s#%d: %s", t.RequestID, t.Attempt, err)
 	}

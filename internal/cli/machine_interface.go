@@ -2,8 +2,10 @@ package cli
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,8 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 // keptRelease is one published release as this computer read it: immutable, so a run's
@@ -98,13 +98,15 @@ func (r *Resolver) capturedResultInterface(request records.Request) (*launch.Pac
 		_, surface, problem := r.installPackageInterface(request.InstallID)
 		return surface, problem
 	}
-	var submission pb.MachineExecutionSubmit
-	var capture pb.MachineExecutionCapture
-	if link != nil && proto.Unmarshal(link.Submission, &submission) == nil && submission.ReleaseRoot != nil {
+	var submission archive.Submission
+	if link != nil {
+		submission, _ = archive.ReadSubmission(link.Submission)
+	}
+	if submission.Root != nil {
 		// The machine installed the committed release: its interface as a machine described
 		// it here, else as the Hub read that chose a machine to rent kept it.
-		root := submission.ReleaseRoot
-		if root.InstallationId != "" {
+		root := submission.Root
+		if root.InstallationID != "" {
 			// A root naming unpublished code: the interface is that code's own.
 			_, surface, problem := r.installPackageInterface(request.InstallID)
 			return surface, problem
@@ -124,13 +126,21 @@ func (r *Resolver) capturedResultInterface(request records.Request) (*launch.Pac
 		}
 		return launch.DecodePackageInterface(detail.PackageInterface)
 	}
-	if link == nil || proto.Unmarshal(link.Submission, &submission) != nil || canonical.Unmarshal(submission.CaptureCanonicalBytes, &capture) != nil {
+	if link == nil || len(submission.Capture) == 0 {
 		return nil, exit.New(exit.Conflict, "accepted execution metadata is unavailable")
 	}
-	for _, installed := range capture.InstalledPackages {
-		if installed.InstallationId == capture.RootInstallationId {
-			return launch.DecodePackageInterface(installed.PackageInterface)
+	capture, err := canonical.ReadObject(submission.Capture)
+	if err != nil || capture.Str("format") != "cozy.worker.v1.MachineExecutionCapture/2" {
+		return nil, exit.New(exit.Conflict, "accepted execution metadata is unavailable")
+	}
+	for _, installed := range capture.List("installed_packages") {
+		if installed.Str("installation_id") == capture.Str("root_installation_id") {
+			raw, err := base64.StdEncoding.Strict().DecodeString(installed.Str("package_interface"))
+			if err != nil {
+				return nil, exit.New(exit.Conflict, "accepted package interface is unreadable")
+			}
+			return launch.DecodePackageInterface(raw)
 		}
 	}
-	return nil, exit.New(exit.NotFound, "worker interface is absent from accepted execution")
+	return nil, exit.New(exit.NotFound, "package interface is absent from accepted execution")
 }

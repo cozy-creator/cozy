@@ -1,13 +1,8 @@
 package records
 
 import (
-	"database/sql"
 	"encoding/json"
-	"errors"
-
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 // This is recipient custody metadata in the existing observer journal. Native
@@ -54,82 +49,4 @@ func (s *Store) MachineModelRetentions(request string) ([]MachineModelRetention,
 		return nil, exit.Internalf("cannot finish model custody read: %s", err)
 	}
 	return holds, nil
-}
-
-func (s *Store) FreezeMachineModelRetention(request string, hold MachineModelRetention) *exit.Error {
-	hold.State = "pending"
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin model recipient custody: %s", err)
-	}
-	defer tx.Rollback()
-	var raw []byte
-	err = tx.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.model_retention' AND json_extract(payload,'$.retention_id')=? ORDER BY seq DESC LIMIT 1`, request, hold.RetentionID).Scan(&raw)
-	if err == nil {
-		var prior MachineModelRetention
-		if json.Unmarshal(raw, &prior) != nil {
-			return exit.Internalf("recorded model recipient custody is unreadable")
-		}
-		state := prior.State
-		prior.State = "pending"
-		expected, _ := json.Marshal(hold)
-		actual, _ := json.Marshal(prior)
-		if string(expected) != string(actual) || state == "releasing" || state == "released" {
-			return exit.New(exit.Conflict, "model recipient custody was changed or released")
-		}
-		return nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return exit.Internalf("cannot inspect prior model recipient custody: %s", err)
-	}
-	var outcomeBytes []byte
-	var outcome pb.AttemptOutcome
-	if err := tx.QueryRow(`SELECT e.outcome FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND length(e.outcome)>0 AND e.cancel_requested=0 AND r.state!='canceled'`, request).Scan(&outcomeBytes); err != nil || proto.Unmarshal(outcomeBytes, &outcome) != nil || outcome.OutcomeId != hold.OutcomeID {
-		return exit.New(exit.Conflict, "model collection has no uncanceled observed outcome")
-	}
-	if problem := appendMachineModelRetention(tx, request, hold); problem != nil {
-		return problem
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot freeze model recipient custody: %s", err)
-	}
-	return nil
-}
-
-func (s *Store) AdvanceMachineModelRetention(request, retention, state string) *exit.Error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin model custody update: %s", err)
-	}
-	defer tx.Rollback()
-	var raw []byte
-	var hold MachineModelRetention
-	if err := tx.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.model_retention' AND json_extract(payload,'$.retention_id')=? ORDER BY seq DESC LIMIT 1`, request, retention).Scan(&raw); err != nil || json.Unmarshal(raw, &hold) != nil {
-		return exit.New(exit.Conflict, "model recipient custody is absent or unreadable")
-	}
-	if hold.State == state {
-		return nil
-	}
-	if !(hold.State == "pending" && state == "held" || (hold.State == "pending" || hold.State == "held") && state == "releasing" || hold.State == "releasing" && state == "released") {
-		return exit.New(exit.Conflict, "model recipient custody transition is stale")
-	}
-	hold.State = state
-	if problem := appendMachineModelRetention(tx, request, hold); problem != nil {
-		return problem
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit model custody update: %s", err)
-	}
-	return nil
-}
-
-func appendMachineModelRetention(tx *sql.Tx, request string, hold MachineModelRetention) *exit.Error {
-	raw, err := json.Marshal(hold)
-	if err != nil || len(raw) > 16<<10 {
-		return exit.New(exit.Validation, "model recipient custody exceeds its metadata bound")
-	}
-	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,'machine.model_retention',0,?,?)`, request, raw, now()); err != nil {
-		return exit.Internalf("cannot record model recipient custody: %s", err)
-	}
-	return nil
 }

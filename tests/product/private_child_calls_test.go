@@ -5,10 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func childDigest(letter string) string { return "sha256:" + strings.Repeat(letter, 64) }
@@ -42,44 +40,6 @@ func TestUnpublishedChildReopenPreservesPriorOwnership(t *testing.T) {
 	fatal(t, problem)
 	if after.State != "paused" || !after.RetainWork || after.ReuseScope != before.ReuseScope || after.ControlRevision != before.ControlRevision || after.ParentCallIndex != -1 {
 		t.Fatalf("reopen changed retained ownership: before=%+v after=%+v", before, after)
-	}
-}
-
-func TestUnpublishedParentRetainsExactOrchestrationContract(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	parent := recordPrivateTransaction(t, store, "parent-capacity", "")
-	directive := &pb.JobDirective{InstallationId: childDigest("a"), JobDescriptorId: parent.PlanID, Orchestration: true, ResourceCaps: &pb.ResourceCaps{MaxRssBytes: 123456}}
-	raw, _, err := canonical.Identity(directive)
-	must(t, err)
-	fatal(t, store.CaptureOrchestrationDirective(parent.ID, raw))
-	fatal(t, store.CaptureOrchestrationDirective(parent.ID, raw))
-	directive.ResourceCaps.MaxRssBytes++
-	changed, _, err := canonical.Identity(directive)
-	must(t, err)
-	if problem := store.CaptureOrchestrationDirective(parent.ID, changed); problem == nil {
-		t.Fatal("parent capacity was replaced after capture")
-	}
-	store.Close()
-	store, problem = records.Open(path)
-	fatal(t, problem)
-	defer store.Close()
-	retained, problem := store.RequestRow(parent.ID)
-	fatal(t, problem)
-	if string(retained.OrchestrationDirective) != string(raw) {
-		t.Fatal("parent restart lost its exact capacity declaration")
-	}
-	_, problem = store.RequestPause(parent.ID, "test")
-	fatal(t, problem)
-	_, problem = store.CompleteRequestPause(parent.ID)
-	fatal(t, problem)
-	retry := *retained
-	retry.ID, retry.IdemKey, retry.RetryOf = "req-parent-capacity-new", "parent-capacity-new", parent.ID
-	retry, _, problem = store.Submit(retry)
-	fatal(t, problem)
-	if len(retry.OrchestrationDirective) != 0 {
-		t.Fatal("new parent inherited old execution capacity without resolving its new code")
 	}
 }
 

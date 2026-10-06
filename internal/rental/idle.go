@@ -5,12 +5,11 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // IdleTimeout is immutable. Configuration, request options and connection traffic
 // cannot change it. Only actual work and acknowledged manual keepalive reset it.
-const IdleTimeout = time.Duration(pb.RentalIdleTimeoutSeconds) * time.Second
+const IdleTimeout = time.Duration(records.RentalIdleTimeoutSeconds) * time.Second
 
 type Idleness = records.RentalIdleState
 

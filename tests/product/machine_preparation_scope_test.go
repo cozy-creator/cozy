@@ -7,7 +7,7 @@ import (
 )
 
 func TestMachinePackageUploadProgressBelongsToItsSubmittingRoot(t *testing.T) {
-	store, first, _ := machineObserverFixture(t)
+	store, first := pendingNativeFixture(t)
 	second, _, problem := store.Submit(records.Request{ID: "job-second", IdemKey: "second", Package: first.Package, Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	boot, revision := "retained-worker-boot", childDigest("7")
@@ -42,7 +42,7 @@ func TestMachinePackageUploadProgressBelongsToItsSubmittingRoot(t *testing.T) {
 }
 
 func TestMachinePackageRepairTransferPreservesRootAndBootScope(t *testing.T) {
-	store, first, _ := machineObserverFixture(t)
+	store, first := pendingNativeFixture(t)
 	boot, revision := "same-boot", childDigest("7")
 	progress, problem := store.MachinePackageTransfer(first.ID, boot, revision)
 	fatal(t, problem)

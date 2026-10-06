@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/archive"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // RetryModelTransferPublication changes only the unfinished destination transfer.
@@ -103,12 +103,12 @@ func verifiedProducerPublication(tx *sql.Tx, requestID string, ordinal int64) *e
 			return refuse()
 		}
 	}
-	invocation, err := canonical.Read(invocationBytes, &pb.InvocationSpec{})
+	invocation, err := archive.Read(invocationBytes, archive.Invocation)
 	if err != nil || len(invocation.Sub("job")) == 0 {
 		return refuse()
 	}
-	outcome, err := canonical.Read(outcomeBytes, &pb.AttemptOutcomeBody{})
-	if err != nil || outcome.Str("request_id") != requestID || outcome.Int("attempt_ordinal") != ordinal || outcome.Str("invocation_spec_digest") != invocationDigest || outcome.Int("status") != int64(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED) {
+	outcome, err := archive.Read(outcomeBytes, archive.TerminalBody)
+	if err != nil || outcome.Str("request_id") != requestID || outcome.Int("attempt_ordinal") != ordinal || outcome.Str("invocation_spec_digest") != invocationDigest || outcome.Int("status") != int64(1) {
 		return refuse()
 	}
 	receiptRefs := make(map[string][]byte)
@@ -156,7 +156,7 @@ func verifiedProducerPublication(tx *sql.Tx, requestID string, ordinal int64) *e
 		if _, err := canonical.Raw(manifest); err != nil {
 			return refuse()
 		}
-		receipt, err := canonical.Read(raw, &pb.WeightsReceipt{})
+		receipt, err := archive.Read(raw, archive.WeightsReceipt)
 		if err != nil || receipt.Str("request_id") != requestID || receipt.Str("output_slot") != slot || receipt.Str("invocation_spec_digest") != invocationDigest || receipt.Str("weights_transaction_id") != transaction {
 			return refuse()
 		}

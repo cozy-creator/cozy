@@ -8,7 +8,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func servingPlacementFixture(t *testing.T) ([]byte, []byte) {
@@ -31,9 +30,7 @@ func servingPlacementFixture(t *testing.T) ([]byte, []byte) {
 		}},
 	})
 	must(t, err)
-	invocation := assessmentDocument(t, &pb.InvocationSpec{Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
-		EntrypointBindingDigest: binding, AttemptBindingId: binding, BindingsDigest: bindings,
-	}}})
+	invocation := assessmentDocument(t, map[string]any{"serving": map[string]any{"entrypoint_binding_digest": binding, "attempt_binding_id": binding, "bindings_digest": bindings, "_format": "cozy.worker.v1.ServingInvocationSpec/1"}, "_format": "cozy.worker.v1.InvocationSpec/1"})
 	return set, invocation
 }
 

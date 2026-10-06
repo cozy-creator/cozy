@@ -1,6 +1,7 @@
 package records
 
 import (
+	"cmp"
 	"database/sql"
 	"strings"
 
@@ -15,7 +16,7 @@ const machineExecutionAdmissionOpen = `NOT EXISTS(SELECT 1 FROM request_events a
 
 // AbandonMachineExecution closes this client's execution intent. Every frozen
 // submission, receipt, outcome and pending-control byte remains available as evidence.
-func (s *Store) AbandonMachineExecution(id, actor string) (bool, *exit.Error) {
+func (s *Store) AbandonMachineExecution(id, actor, why string) (bool, *exit.Error) {
 	actor = strings.TrimSpace(actor)
 	if actor == "" {
 		return false, exit.New(exit.Validation, "local abandonment requires an explicit actor")
@@ -36,12 +37,15 @@ func (s *Store) AbandonMachineExecution(id, actor string) (bool, *exit.Error) {
 		return false, nil
 	}
 	var state string
-	if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, id).Scan(&state); err != nil {
+	var nativeSent bool
+	if err := tx.QueryRow(`SELECT state,
+ EXISTS(SELECT 1 FROM request_events WHERE request_id=requests.id AND type=?)
+ FROM requests WHERE id=?`, RunV1Sent, id).Scan(&state, &nativeSent); err != nil {
 		return false, exit.Internalf("cannot read abandoned run: %s", err)
 	}
 	facts := map[string]any{"actor": actor, "machine_id": link.MachineID, "scope": "local_abandonment", "machine_execution": true,
-		"had_acceptance_receipt": len(link.Receipt) > 0, "acceptance_unknown": len(link.Submission) > 0 && len(link.Receipt) == 0 && !link.SubmissionClosed,
-		"remote_stop_confirmed": false, "error_type": "request.abandoned", "error": "the owner abandoned local tracking; remote stop and rental release are not confirmed"}
+		"had_acceptance_receipt": len(link.Receipt) > 0, "acceptance_unknown": (nativeSent || len(link.Submission) > 0) && len(link.Receipt) == 0 && !link.SubmissionClosed,
+		"remote_stop_confirmed": false, "error_type": "request.abandoned", "error": cmp.Or(why, "the owner abandoned local tracking; remote stop and rental release are not confirmed")}
 	if err := appendEventTx(tx, id, "client.machine_abandoned", 0, facts); err != nil {
 		return false, exit.Internalf("cannot retain abandonment intent: %s", err)
 	}

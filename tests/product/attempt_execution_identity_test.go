@@ -7,16 +7,13 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func sealedExecution(t *testing.T, closed bool) (*records.Store, records.Terminal, string) {
 	t.Helper()
 	store, call, path := effectCancelFixture(t)
 	fatal(t, store.StopNativeCall(call.ID, "canceled", "fixture"))
-	body := assessmentDocument(t, &pb.AttemptOutcomeBody{RequestId: call.ParentRequestID, AttemptOrdinal: 1,
-		InvocationSpecDigest: childDigest("1"), Status: pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, ExecutionStarted: true,
-		Observation: &pb.ExecutionObservation{Environment: &pb.ExecutionEnvironment{RuntimeVersion: "fixture", Accelerator: "CPU", WorkerBootId: "private-boot"}}})
+	body := assessmentDocument(t, map[string]any{"request_id": call.ParentRequestID, "attempt_ordinal": 1, "invocation_spec_digest": childDigest("1"), "status": 1, "execution_started": true, "observation": map[string]any{"environment": map[string]any{"runtime_version": "fixture", "accelerator": "CPU", "worker_boot_id": "private-boot", "_format": "cozy.worker.v1.ExecutionEnvironment/1"}, "_format": "cozy.worker.v1.ExecutionObservation/1"}, "_format": "cozy.worker.v1.AttemptOutcomeBody/1"})
 	terminal := records.Terminal{RequestID: call.ParentRequestID, Attempt: 1, SessionID: "private-boot", InvocationDigest: childDigest("1"),
 		TerminalID: "execution-identity", TerminalDigest: assessmentDigest(body), Status: "SUCCEEDED", RequestState: "succeeded", Body: body}
 	_, problem := store.AcceptTerminal(terminal)

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/machines"
@@ -63,6 +62,15 @@ func (m *machineRuns) loopV1(request records.Request) {
 			return
 		}
 		if accepted && link.Collected {
+			return
+		}
+		if !accepted && (len(link.Receipt) > 0 || len(link.Submission) > 0) {
+			// Archived worker submissions may already have run. A native submission would
+			// create a second execution; end only this controller's tracking, saying why.
+			if !records.Settled(current.State) {
+				_, _ = m.store.AbandonMachineExecution(request.ID, "cozy",
+					"this run was sent over cozy.worker.v1, which this cozy no longer speaks; whether it ran is unknown")
+			}
 			return
 		}
 		sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
@@ -135,6 +143,17 @@ func permanentRefusal(problem *exit.Error) bool {
 func (m *machineRuns) catchUpV1(ctx context.Context, request records.Request) *exit.Error {
 	link, problem := m.store.MachineExecution(request.ID)
 	if problem != nil || link == nil || link.Collected || link.Abandoned {
+		return problem
+	}
+	accepted, problem := m.store.RunV1(request.ID)
+	if problem != nil {
+		return problem
+	}
+	if !accepted && (len(link.Receipt) > 0 || len(link.Submission) > 0) {
+		if !records.Settled(request.State) {
+			_, problem = m.store.AbandonMachineExecution(request.ID, "cozy",
+				"this run was sent over cozy.worker.v1, which this cozy no longer speaks; whether it ran is unknown")
+		}
 		return problem
 	}
 	_, problem = m.stepV1(ctx, request, link, true, true)
@@ -449,26 +468,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 
 // modelChoicesV1 are a run's model choices as a v1 spec names them.
 func modelChoicesV1(request records.Request, models []records.ModelRef) ([]*v1.ModelChoice, *exit.Error) {
-	choices, problem := orchestrator.ModelChoices(request, models)
-	if problem != nil {
-		return nil, problem
-	}
-	out := make([]*v1.ModelChoice, 0, len(choices))
-	for _, choice := range choices {
-		model := &v1.ModelChoice{Parameter: choice.Parameter, Repository: choice.Repository, Release: choice.Release,
-			Lane: choice.Lane, Source: choice.Source, Profiles: choice.Profiles}
-		if choice.Manifest != nil {
-			model.Manifest, _ = canonical.Spell(choice.Manifest.Digest)
-			model.ManifestLength = choice.Manifest.Length
-		}
-		for _, adapter := range choice.Adapters {
-			model.Adapters = append(model.Adapters, &v1.Adapter{Component: adapter.Component, Model: adapter.Model,
-				Release: adapter.Release, Lane: adapter.Lane, Manifest: adapter.Manifest, Scale: adapter.Scale,
-				Source: adapter.Source, Profiles: adapter.Profiles})
-		}
-		out = append(out, model)
-	}
-	return out, nil
+	return orchestrator.ModelChoices(request, models)
 }
 
 // warmSetV1 is the machine's warm set with the selection's member added, changed or (`off`)

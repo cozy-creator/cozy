@@ -7,7 +7,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func operationHistory(t *testing.T, store *records.Store, label string, parent records.Request, native ...bool) records.Request {
@@ -32,7 +31,7 @@ func TestOperationArtifactScopeRequiresNativeCacheAdoption(t *testing.T) {
 	first := offerChildParent(t, store, recordPrivateTransaction(t, store, "first", "workspace"))
 	source := offerChildParent(t, store, operationHistory(t, store, "native-source", first, true))
 	native := childDigest("4")
-	receipt, _, err := canonical.Identity(&pb.WeightsReceipt{OwnerAuthorityScope: "owner", RequestId: source.ID, InvocationSpecDigest: childDigest("1"), OutputSlot: "weights", WeightsTransactionId: childDigest("5"), TensorfsReceiptDigest: native, TensorfsReceiptCanonicalBytes: []byte(`{}`)})
+	receipt, _, err := fixtureIdentity(map[string]any{"owner_authority_scope": "owner", "request_id": source.ID, "invocation_spec_digest": childDigest("1"), "output_slot": "weights", "weights_transaction_id": childDigest("5"), "tensorfs_receipt_digest": native, "tensorfs_receipt_canonical_bytes": []byte(`{}`), "_format": "cozy.worker.v1.WeightsReceipt/1"})
 	must(t, err)
 	receiptDigest, _ := canonical.Spell(canonical.Digest(receipt))
 	fatal(t, store.RecordModelTransferWeights(records.ModelTransferWeights{RequestID: source.ID, Attempt: 1, OutputSlot: "weights", ManifestID: childDigest("6"), ManifestLength: 161, InvocationDigest: childDigest("1"), TransactionID: childDigest("5"), ReceiptDigest: receiptDigest, Receipt: receipt}))

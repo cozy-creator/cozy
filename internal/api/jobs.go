@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -26,7 +27,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	"github.com/cozy-creator/cozy/internal/scratch"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The job family is mounted under /v1/local/ because its typed input trees are local
@@ -1186,7 +1186,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 			if prior, problem := s.store.Attempts(row.ReusedFrom); problem == nil && len(prior) > 0 {
 				last := prior[len(prior)-1]
 				if last.State == "closed" && last.TerminalStatus == "SUCCEEDED" {
-					if doc, err := canonical.Read(last.TerminalBody, &pb.AttemptOutcomeBody{}); err == nil {
+					if doc, err := archive.Read(last.TerminalBody, archive.TerminalBody); err == nil {
 						state.Result = inlineJobResult(doc)
 					}
 				}
@@ -1205,7 +1205,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	if len(last.TerminalBody) == 0 {
 		return state
 	}
-	doc, err := canonical.Read(last.TerminalBody, &pb.AttemptOutcomeBody{})
+	doc, err := archive.Read(last.TerminalBody, archive.TerminalBody)
 	if err != nil {
 		return state
 	}

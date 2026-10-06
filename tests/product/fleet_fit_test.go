@@ -13,9 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // cl-174, the runs that filed it (2026-09-08 00:06–00:25Z, req-829410d83cf9a3d7996184dc,
@@ -93,11 +91,9 @@ func holdQueued(t *testing.T, store *records.Store, requestID, rentalID string) 
 		t.Fatal(problem.Message)
 	}
 	fatal(t, store.LinkMachineExecution(requestID, rentalID))
-	capture, spec := []byte(`{"capture":"held"}`), []byte(`{"invocation":"held"}`)
-	fatal(t, store.RecordMachineSubmission(requestID, &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "held",
-		SubmissionId: "idem-" + requestID, CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture),
-		Offer: &pb.AttemptOffer{RequestId: requestID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec,
-			InvocationSpecDigest: canonical.Digest(spec)}}))
+	_, problem := store.MarkRunV1Sent(requestID)
+	fatal(t, problem)
+
 }
 
 // submitExplicit submits the explicit-lane run and leaves once it is recorded: a client that

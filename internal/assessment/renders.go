@@ -3,12 +3,12 @@ package assessment
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // RenderInspection is the installed cozy-eval reader's association projection.
@@ -221,7 +221,7 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 				spell(attempt.InvocationCanonical) != attempt.InvocationDigest || spell(attempt.TerminalBody) != attempt.TerminalDigest {
 				return nil, renderRefusal()
 			}
-			spec, err := canonical.Read(attempt.InvocationCanonical, &pb.InvocationSpec{})
+			spec, err := archive.Read(attempt.InvocationCanonical, archive.Invocation)
 			if err != nil || spec.Str("payload_digest") != spell(request.Payload) {
 				return nil, renderRefusal()
 			}
@@ -241,8 +241,8 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 			} else if !servingModelMatches(*request, *attempt, target.binding, checkpoint) {
 				return nil, renderRefusal()
 			}
-			terminal, err := canonical.Read(attempt.TerminalBody, &pb.AttemptOutcomeBody{})
-			if err != nil || terminal.Str("request_id") != id || terminal.Int("attempt_ordinal") != request.Ordinal || terminal.Str("invocation_spec_digest") != attempt.InvocationDigest || terminal.Int("status") != int64(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED) || terminal["execution_started"] != true {
+			terminal, err := archive.Read(attempt.TerminalBody, archive.TerminalBody)
+			if err != nil || terminal.Str("request_id") != id || terminal.Int("attempt_ordinal") != request.Ordinal || terminal.Str("invocation_spec_digest") != attempt.InvocationDigest || terminal.Int("status") != int64(1) || terminal["execution_started"] != true {
 				return nil, renderRefusal()
 			}
 			outputs := terminal.Sub("output_manifest").List("outputs")

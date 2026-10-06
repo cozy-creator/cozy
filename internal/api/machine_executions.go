@@ -3,20 +3,17 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"math"
 	"net/http"
 	"regexp"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 type MachineExecutions interface {
@@ -232,11 +229,12 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	machine := s.machineWord(row, link)
 	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected, AbandonedLocally: link.Abandoned}
 	v1run, _ := s.store.RunV1(row.ID)
-	var receipt pb.MachineExecutionReceipt
 	if accepted := records.RunV1State(link); v1run && accepted != nil {
 		view.Worker, view.Number = link.MachineID, accepted.Number
-	} else if !v1run && proto.Unmarshal(link.Receipt, &receipt) == nil {
-		view.Worker, view.Number = receipt.WorkerId, receipt.Number
+	} else if !v1run {
+		if receipt, err := archive.ReadReceipt(link.Receipt); err == nil {
+			view.Worker, view.Number = receipt.WorkerID, receipt.Number
+		}
 	}
 	retaining, retentionProblem := s.store.MachineExecutionOwesWork(row.ID)
 	if retentionProblem != nil {
@@ -312,7 +310,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			state.Stage, _ = value["stage"].(string)
 		}
 	}
-	var terminal *pb.AttemptOutcomeBody
+	var terminal *archive.Terminal
 	if outcome := records.RunV1Outcome(link); v1run && outcome != nil {
 		// A cozy.machine.v1 run's outcome carries its result and typed reason.
 		if state.ErrorType == "" && outcome.Status != "succeeded" && outcome.Reason != nil {
@@ -325,20 +323,18 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			view.CollectionRefused, view.ObservationError = code, message
 		}
 	} else if len(link.Outcome) > 0 && !v1run {
-		var outcome pb.AttemptOutcome
-		var body pb.AttemptOutcomeBody
-		if proto.Unmarshal(link.Outcome, &outcome) == nil && canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body) == nil {
-			terminal = &body
-			if state.ErrorType == "" && body.Cause != nil && body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
-				state.Error = body.SafeMessage
-				state.ErrorType = strings.TrimPrefix(body.Cause.Code.String(), "CAUSE_CODE_")
-				if providerRefusal.MatchString(body.SafeMessage) {
+		if body, err := archive.ReadOutcome(link.Outcome); err == nil {
+			terminal = body
+			if state.ErrorType == "" && body.Cause != "" && body.Status != 1 {
+				state.Error = body.Message
+				state.ErrorType = body.Cause
+				if providerRefusal.MatchString(body.Message) {
 					state.ErrorType = "model_source.auth_required"
 					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the daemon config"
 				}
 			}
-			if view.Collected && body.Result != nil && len(body.Result.InlineResult) > 0 {
-				state.Result = json.RawMessage(body.Result.InlineResult)
+			if view.Collected && len(body.Result) > 0 {
+				state.Result = json.RawMessage(body.Result)
 			}
 			if !view.Collected {
 				view.ObservationError = "execution finished; result collection has not established recipient custody"
@@ -391,14 +387,14 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 // just as local attempts count dispatch-to-close. Paused/retry gaps and delayed
 // result collection are outside those intervals. An active interval alone uses
 // the current clock; a terminal interval never grows when read back later.
-func machineAttemptWallMS(row records.Request, link *records.MachineExecution, intervals []records.MachineExecutionInterval, terminal *pb.AttemptOutcomeBody, now int64) int64 {
-	var receipt pb.MachineExecutionReceipt
-	if proto.Unmarshal(link.Receipt, &receipt) != nil || receipt.RequestId != row.ID ||
-		receipt.AcceptedAtMs == 0 || receipt.AcceptedAtMs > math.MaxInt64 {
+func machineAttemptWallMS(row records.Request, link *records.MachineExecution, intervals []records.MachineExecutionInterval, terminal *archive.Terminal, now int64) int64 {
+	receipt, err := archive.ReadReceipt(link.Receipt)
+	if err != nil || receipt.RequestID != row.ID ||
+		receipt.AcceptedMS == 0 || receipt.AcceptedMS > math.MaxInt64 {
 		return 0
 	}
 	type span struct{ start, end int64 }
-	spans := map[int64]span{1: {start: int64(receipt.AcceptedAtMs)}}
+	spans := map[int64]span{1: {start: int64(receipt.AcceptedMS)}}
 	for _, interval := range intervals {
 		if interval.Attempt <= 0 {
 			continue
@@ -423,9 +419,9 @@ func machineAttemptWallMS(row records.Request, link *records.MachineExecution, i
 		if attempt == current && (value.start == 0 || value.end == 0) {
 			// Older observations may have retained the terminal without its event
 			// page. The outcome's own measured runtime is the bounded fallback.
-			if terminal != nil && terminal.AttemptOrdinal == uint64(attempt) && terminal.Metrics != nil &&
-				terminal.Metrics.RuntimeMs <= math.MaxInt64 && !slices.Contains(terminal.Metrics.UnverifiedFields, "runtime_ms") {
-				total += int64(terminal.Metrics.RuntimeMs)
+			if terminal != nil && terminal.Attempt == uint64(attempt) &&
+				terminal.RuntimeMS <= math.MaxInt64 && !slices.Contains(terminal.Unverified, "runtime_ms") {
+				total += int64(terminal.RuntimeMS)
 				continue
 			}
 			switch row.State {

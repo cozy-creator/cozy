@@ -1,9 +1,5 @@
 package orchestrator
 
-import (
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-)
-
 // THE JOB BRANCH (cl-004). A job is an ATTEMPT CLASS on this one orchestrator, not a
 // second scheduler: it reuses the request row, the ordinal law, the dispatch queue, the
 // terminal transaction, the requeue projection and the event plane unchanged. What
@@ -51,7 +47,6 @@ type JobPlan struct {
 	CPUSlotModelInputs  bool
 	Orchestration       bool
 	OrchestrationParent *JobPlan
-	FrozenDirective     *pb.JobDirective
 }
 
 const DefaultJobRSSCap int64 = 8 << 30

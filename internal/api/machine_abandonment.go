@@ -37,7 +37,7 @@ func (s *Server) abandonRequest(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusNotFound, "not_found", "no such recorded run on this host", "")
 		return
 	}
-	changed, problem := s.store.AbandonMachineExecution(row.ID, intent.Actor)
+	changed, problem := s.store.AbandonMachineExecution(row.ID, intent.Actor, "")
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return

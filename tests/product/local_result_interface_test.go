@@ -1,15 +1,15 @@
 package producttest
 
 import (
+	"database/sql"
+	"os"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
@@ -24,14 +24,17 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	fatal(t, problem)
 	entry, problem := surface.Function("main")
 	fatal(t, problem)
-	installed := &pb.InstalledPackage{InstallationId: "local-result-install", Package: "local/example", Release: "1.0.0", PackageInterface: raw}
-	capture, captureDigest, err := canonical.Identity(&pb.MachineExecutionCapture{RootInstallationId: installed.InstallationId, InstalledPackages: []*pb.InstalledPackage{installed}})
-	must(t, err)
-	request, _, problem := store.Submit(records.Request{ID: "job-local-result", IdemKey: "local-result", Package: installed.Package, Release: installed.Release, Entrypoint: "main", Kind: "job", PlanID: entry.DescriptorID, Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true, LocalInstallationID: installed.InstallationId})
+	request, _, problem := store.Submit(records.Request{ID: "job-local-result", IdemKey: "local-result", Package: "local/example", Release: "1.0.0", Entrypoint: "main", Kind: "job", PlanID: entry.DescriptorID, Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true, LocalInstallationID: "local-result-install"})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-owned-machine"))
-	spec := []byte(`{"invocation":"immutable"}`)
-	fatal(t, store.RecordMachineSubmission(request.ID, &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "persistent-workspace", SubmissionId: request.IdemKey, CaptureCanonicalBytes: capture, CaptureDigest: captureDigest, Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}))
+	// A frozen record emitted by the original binding producer, not a retired submission API.
+	saved, err := os.ReadFile("testdata/record-archive/submission.bin")
+	must(t, err)
+	db, err := sql.Open("sqlite", layout.DB)
+	must(t, err)
+	defer db.Close()
+	_, err = db.Exec(`UPDATE machine_executions SET submission=? WHERE request_id=?`, saved, request.ID)
+	must(t, err)
 	// The accepted graph retains the schema itself, so no install or source files
 	// are needed and mutable replacement pins cannot alter the output contract.
 	resolver := cli.NewResolver(store, config.Config{Home: root, HubURL: "http://127.0.0.1:1"})

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"sort"
 	"strings"
 	"time"
@@ -14,7 +15,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Entrypoint is the small dispatch projection of one entrypoint already bound inside
@@ -76,7 +76,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		return DesiredPlacement{}, exit.Named(exit.Conflict, "placement_set_identity_mismatch",
 			"PlacementSet bytes do not match %s", digest)
 	}
-	doc, err := canonical.Read(data, &pb.PlacementSet{})
+	doc, err := archive.Read(data, archive.Placement)
 	if err != nil {
 		return DesiredPlacement{}, exit.Named(exit.Conflict, "placement_set_invalid",
 			"PlacementSet is not its closed canonical /1 document: %s", err)

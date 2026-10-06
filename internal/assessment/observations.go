@@ -2,12 +2,12 @@ package assessment
 
 import (
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"reflect"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Environment contains only association facts from the validated report. Numerical
@@ -83,7 +83,7 @@ func VerifyObservations(st *records.Store, owner string, info RenderInspection, 
 		if attempt == nil || attempt.InvocationDigest != render.InvocationDigest || attempt.TerminalDigest != render.OutcomeDigest {
 			return refuse()
 		}
-		terminal, err := canonical.Read(attempt.TerminalBody, &pb.AttemptOutcomeBody{})
+		terminal, err := archive.Read(attempt.TerminalBody, archive.TerminalBody)
 		if err != nil {
 			return refuse()
 		}
@@ -109,7 +109,7 @@ func VerifyObservations(st *records.Store, owner string, info RenderInspection, 
 			if json.Unmarshal([]byte(request.Capture), &actual) != nil || !reflect.DeepEqual(actual, expected[index]) {
 				return refuse()
 			}
-			spec, err := canonical.Read(attempt.InvocationCanonical, &pb.InvocationSpec{})
+			spec, err := archive.Read(attempt.InvocationCanonical, archive.Invocation)
 			if err != nil {
 				return refuse()
 			}
