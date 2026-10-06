@@ -3,6 +3,7 @@ package machines
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -82,6 +83,23 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 	installed := &Installed{InstalledAt: time.Now().UTC(), Pinned: source.pinned(),
 		Host:    installedArtifact{Name: "cozy-machine " + frame.GetVersion()},
 		Runtime: installedArtifact{Name: hostruntime.Distribution + " " + frame.GetRuntime()}, TensorFS: installedArtifact{Name: "tensorfs " + frame.GetTensorfs()}}
+	// Activation replaces the service, while its stable parent keeps running. Once that
+	// update has succeeded, retain the activated executable as the next local supervisor
+	// too. Atomic placement preserves the current parent and its process identity. A
+	// failed or rolled-back update never reaches here and cannot replace the launcher.
+	if source.Host == "" {
+		active := filepath.Join(h.Root(), "var/lib/cozy/rust-machine/agent/current")
+		if _, err := os.Stat(active); err == nil {
+			host, err := h.placeHost(active)
+			if err != nil {
+				return nil, exit.Internalf("updated Runtime but cannot retain its machine for the next start: %s", err)
+			}
+			host.Name = "cozy-machine"
+			installed.Host = host
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, exit.Internalf("updated Runtime but cannot read its activated machine: %s", err)
+		}
+	}
 	for _, pair := range []struct {
 		file   string
 		target *installedArtifact

@@ -247,7 +247,8 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 		}
 	})
 	version := func(wheel string) string { return strings.SplitN(filepath.Base(wheel), "-", 3)[1] }
-	ready := func(want string) {
+	var identity string
+	ready := func(want string) any {
 		t.Helper()
 		code, out := cozyWithin(t, root, 5*time.Minute, "machine", "start")
 		if code != 0 {
@@ -258,6 +259,12 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["phase"] != "ready" || shown["runtime_version"] != want {
 			t.Fatalf("the machine is not ready on %s [exit %d]\n%s", want, code, out)
 		}
+		machine, _ := shown["machine"].(string)
+		if machine == "" || identity != "" && machine != identity {
+			t.Fatalf("the machine identity changed from %q to %q", identity, machine)
+		}
+		identity = machine
+		return shown["pid"]
 	}
 	updateWheel := *machineRuntimeWheel
 	if *machineUpdateWheel != "" {
@@ -267,7 +274,7 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 	if code, out := runCozy(t, root, "machine", "install", "--runtime-wheel", first, "--tensorfs-wheel", *machineTensorFSWheel); code != 0 {
 		t.Fatalf("machine install [exit %d]\n%s", code, out)
 	}
-	ready(version(first))
+	parent := ready(version(first))
 	if code, out := runCozy(t, root, "machine", "install", "--runtime-wheel", second, "--tensorfs-wheel", *machineTensorFSWheel); code != 0 {
 		t.Fatalf("machine install over the running machine [exit %d]\n%s", code, out)
 	}
@@ -280,6 +287,9 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 	active := filepath.Join(root, "machine", "root", "var/lib/cozy/rust-machine/agent/current")
 	if fileSHA(t, launcher) != fileSHA(t, active) {
 		t.Fatal("the next launch still uses the old supervisor after a successful bundled update")
+	}
+	if current := ready(version(second)); current != parent {
+		t.Fatalf("updating the next-launch executable replaced the running parent: %v -> %v", parent, current)
 	}
 	for range 2 {
 		if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
