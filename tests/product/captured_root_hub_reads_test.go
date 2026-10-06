@@ -14,10 +14,10 @@ import (
 )
 
 // A captured root naming its Model's repository without a lane reads that Model at its
-// machine's Hub once: the warm run reads nothing at any Hub. The model's owner changing it
-// from this computer tells the machine, and a new machine lifetime, which a change may have
-// missed, reads it again.
-func TestACapturedRootReadsItsModelOncePerMachineLifetime(t *testing.T) {
+// machine's Hub once: the warm run reads nothing at any Hub, nor does a new machine lifetime.
+// The model's owner changing it from this computer moves the binding revision every later run
+// carries, so the next run reads it again, even when the machine was stopped at the time.
+func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine runs the call")
 	}
@@ -111,7 +111,17 @@ func TestACapturedRootReadsItsModelOncePerMachineLifetime(t *testing.T) {
 	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 		t.Fatalf("machine stop [exit %d]\n%s", code, out)
 	}
-	if !model(run("new lifetime")) {
-		t.Fatal("a new machine lifetime's first run did not read its Model again")
+	if calls := run("new lifetime"); calls != "" {
+		t.Fatalf("a new machine lifetime's first run read: %q", calls)
+	}
+
+	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
+		t.Fatalf("machine stop [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "model", "yank", "proof/probe", "--release", "1.0.0"); code != 0 {
+		t.Fatalf("yank while the machine is stopped [exit %d]\n%s", code, out)
+	}
+	if !model(run("changed while stopped")) {
+		t.Fatal("the run after a change made while its machine was stopped did not read its Model again")
 	}
 }
