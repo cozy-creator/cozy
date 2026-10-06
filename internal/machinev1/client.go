@@ -28,7 +28,7 @@ type Signer struct {
 
 // Client is one machine. Its HTTP/2 receive windows are fixed at 16 MiB per stream and 32 MiB
 // per connection: BDP probing from 64 KiB lost 16% to a fixed window on a lossy 160 ms link
-// (cozy-machine read-bench); 16 MiB covers 150 Mbit/s at 800 ms.
+// (tensord read-bench); 16 MiB covers 150 Mbit/s at 800 ms.
 type Client struct {
 	conn    *grpc.ClientConn
 	Machine pb.MachineClient

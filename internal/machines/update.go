@@ -85,7 +85,7 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 		return nil, Transport(err)
 	}
 	installed := &Installed{InstalledAt: time.Now().UTC(), Pinned: source.pinned(),
-		Host:    installedArtifact{Name: "cozy-machine " + frame.GetVersion()},
+		Host:    installedArtifact{Name: "tensord " + frame.GetVersion()},
 		Runtime: installedArtifact{Name: hostruntime.Distribution + " " + frame.GetRuntime()}, TensorFS: installedArtifact{Name: "tensorfs " + frame.GetTensorfs()}}
 	for _, pair := range []struct {
 		file   string

@@ -25,7 +25,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-var cpuLongform = flag.String("cpu-longform", "", "cozy-machine tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
+var cpuLongform = flag.String("cpu-longform", "", "tensord tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
 
 var olderCozy = flag.String("older-cozy", "", "a released cozy whose daemon predates cozy.machine.v1 (0.1.26)")
 
@@ -34,7 +34,7 @@ var olderCozy = flag.String("older-cozy", "", "a released cozy whose daemon pred
 // invocable, the film published after every segment and saved to --out at its end.
 func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czj")
 	must(t, err)
@@ -127,7 +127,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 // owner key is replaced.
 func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "cze")
 	must(t, err)
@@ -311,7 +311,7 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 // the machine runs and waits while it is stopped, on cozy.machine.v1 as on the path before it.
 func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czs")
 	must(t, err)
@@ -377,7 +377,7 @@ func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 // is canceled on its machine, attributed to the deadline, whether or not a client waits.
 func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czt")
 	must(t, err)
@@ -430,14 +430,14 @@ func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 	landed(t, "the detached run to be canceled at its deadline", func() bool { return status("2") == "canceled" })
 }
 
-var cpuTree = flag.String("cpu-tree", "", "cozy-machine tests/fixtures/cpu_tree: a callable that reads one input Tree")
+var cpuTree = flag.String("cpu-tree", "", "tensord tests/fixtures/cpu_tree: a callable that reads one input Tree")
 
 // `cozy run <pkg>/count --asset data=<dir>` on a machine that serves cozy.machine.v1: the
 // directory's files and its tree manifest are written to the machine, which materializes the
 // tree for the callable.
 func TestMachineV1InputTreeReachesTheCallable(t *testing.T) {
 	if *machineHostBinary == "" || *cpuTree == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-tree=<cozy-machine>/tests/fixtures/cpu_tree")
+		t.Skip("requires -machine-host=<tensord> and -cpu-tree=<tensord>/tests/fixtures/cpu_tree")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czt")
 	must(t, err)

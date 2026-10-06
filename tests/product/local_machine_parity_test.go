@@ -163,7 +163,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 		"COZY_WORKER_INTERNAL_PORT": strconv.Itoa(workerPort), "COZY_MEDIA_INTERNAL_PORT": strconv.Itoa(mediaPort),
 		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL": receiptKey, "COZY_AUTHORIZED_KEYS": identity.PublicKey(),
 	})
-	command := exec.Command(filepath.Join(host.Root(), "usr/local/bin/cozy-machine"))
+	command := exec.Command(filepath.Join(host.Root(), "usr/local/bin/tensord"))
 	command.Dir = host.Root()
 	for name, value := range environment {
 		command.Env = append(command.Env, name+"="+value)

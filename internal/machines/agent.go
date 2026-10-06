@@ -11,16 +11,14 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-)
 
-// HubAccessCapability is the Go agent's delegated Hub access; the v1 API carries the token in
-// the run spec instead.
-const HubAccessCapability = "hub-access/1"
+	"github.com/cozy-creator/cozy/internal/exit"
+)
 
 // MachineAPI is the client API this controller drives a machine with (G/API.md).
 const MachineAPI = "cozy.machine.v1"
 
-// servesAPI says whether an executable is a cozy-machine serving MachineAPI, by its own
+// servesAPI says whether an executable is a tensord serving MachineAPI, by its own
 // `version --json`. Its implementation and release numbers are descriptive.
 func servesAPI(ctx context.Context, path string) bool {
 	out, err := exec.CommandContext(ctx, path, "version", "--json").Output()
@@ -28,7 +26,7 @@ func servesAPI(ctx context.Context, path string) bool {
 		Name string   `json:"name"`
 		API  []string `json:"api"`
 	}
-	return err == nil && json.Unmarshal(out, &version) == nil && version.Name == "cozy-machine" && slices.Contains(version.API, MachineAPI)
+	return err == nil && json.Unmarshal(out, &version) == nil && version.Name == "tensord" && slices.Contains(version.API, MachineAPI)
 }
 
 // servesAPI asks the installed machine's executable once per file: a daemon asks on every
@@ -48,7 +46,34 @@ func (h *Host) servesAPI(ctx context.Context) bool {
 	return h.serves
 }
 
-// bundledAgent writes the cozy-machine a Runtime wheel bundles (its data scripts) into dir.
+// refuseRenamedNative keeps an old-named native root out of the unreadable legacy
+// replacement path. This is a refusal census, never an executable alias or control path.
+func (h *Host) refuseRenamedNative(ctx context.Context) *exit.Error {
+	if h.servesAPI(ctx) {
+		return nil
+	}
+	previous := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
+	if _, err := os.Stat(previous); err != nil {
+		return nil
+	}
+	out, err := exec.CommandContext(ctx, previous, "version", "--json").Output()
+	if ctx.Err() != nil {
+		return exit.Named(exit.Unavailable, "machine.identity_unknown", "the existing machine identity could not be read; its root is preserved")
+	}
+	var identity struct {
+		API []string `json:"api"`
+	}
+	if err != nil || json.Unmarshal(out, &identity) != nil {
+		return exit.Named(exit.Unavailable, "machine.identity_unknown", "the existing machine identity could not be read; its root is preserved")
+	}
+	if !slices.Contains(identity.API, MachineAPI) {
+		return nil
+	}
+	return exit.Named(exit.Conflict, "machine.rename_required", "this root holds an older-named native machine; replacing it as a legacy worker would discard its journal").
+		WithRemedy("keep this root and its machine intact; install tensord in a separate machine home for the cutover")
+}
+
+// bundledAgent writes the tensord a Runtime wheel bundles (its data scripts) into dir.
 func bundledAgent(wheel, dir string) (string, error) {
 	archive, err := zip.OpenReader(wheel)
 	if err != nil {
@@ -56,7 +81,7 @@ func bundledAgent(wheel, dir string) (string, error) {
 	}
 	defer archive.Close()
 	for _, member := range archive.File {
-		if !strings.HasSuffix(member.Name, ".data/scripts/cozy-machine") {
+		if !strings.HasSuffix(member.Name, ".data/scripts/tensord") {
 			continue
 		}
 		reader, err := member.Open()
@@ -64,7 +89,7 @@ func bundledAgent(wheel, dir string) (string, error) {
 			return "", err
 		}
 		defer reader.Close()
-		path := filepath.Join(dir, "cozy-machine")
+		path := filepath.Join(dir, "tensord")
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
 		if err != nil {
 			return "", err
@@ -75,5 +100,5 @@ func bundledAgent(wheel, dir string) (string, error) {
 		}
 		return path, err
 	}
-	return "", fmt.Errorf("%s bundles no cozy-machine", filepath.Base(wheel))
+	return "", fmt.Errorf("%s bundles no tensord", filepath.Base(wheel))
 }

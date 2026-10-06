@@ -19,7 +19,7 @@ import (
 // is logged.
 func TestRunExitsPromptlyAfterItsOutcome(t *testing.T) {
 	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host=<cozy-machine>")
+		t.Skip("requires -machine-host=<tensord>")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czx")
 	must(t, err)

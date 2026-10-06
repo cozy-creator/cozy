@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	machineHostBinary    = flag.String("machine-host", "", "the standalone cozy-machine executable each test machine runs")
+	machineHostBinary    = flag.String("machine-host", "", "the standalone tensord executable each test machine runs")
 	requireMachineHost   = flag.Bool("require-machine-host", false, "fail, never skip, a local execution the run cannot host (CI)")
 	machineRuntimePython = flag.String("machine-runtime-python", "", "Development interpreter for the standalone agent public-view media fixture")
 	machineRuntimeWheel  = flag.String("machine-runtime-wheel", "", "Runtime wheel the test machines run; default: the published Runtime")
@@ -150,12 +150,12 @@ func provisionMachineIn(t *testing.T, root, parent string) {
 	})
 	// Everything `cozy machine install` lays out: the machine, its uv and the executor SDK
 	// wheels package environments install from.
-	for _, link := range []string{"usr/local/bin/cozy-machine", "usr/local/bin/uv", "opt/cozy/machine/wheels"} {
+	for _, link := range []string{"usr/local/bin/tensord", "usr/local/bin/uv", "opt/cozy/machine/wheels"} {
 		target, err := filepath.EvalSymlinks(filepath.Join(template, "root", link))
 		must(t, err)
 		path := filepath.Join(dir, "root", link)
 		must(t, os.MkdirAll(filepath.Dir(path), 0o755))
-		if strings.HasSuffix(link, "cozy-machine") {
+		if strings.HasSuffix(link, "tensord") {
 			// Its own path, so the running Host is found and stopped by this root's teardown.
 			if os.Link(target, path) != nil {
 				raw, err := os.ReadFile(target)
@@ -210,7 +210,7 @@ func skipWithoutMachine(t *testing.T, code int, output string) {
 	if *requireMachineHost {
 		t.Fatalf("local execution needs this computer's machine and the run has no -machine-host:\n%s", output)
 	}
-	t.Skip("local execution runs on this computer's machine; pass -machine-host=<standalone cozy-machine>")
+	t.Skip("local execution runs on this computer's machine; pass -machine-host=<standalone tensord>")
 }
 
 // A run that requires the machine Host proves it has one before any test relies on it.
@@ -232,10 +232,10 @@ func TestMachineHostIsPresentWhenRequired(t *testing.T) {
 func stubMachine(t *testing.T, root, script string) {
 	t.Helper()
 	dir := filepath.Join(root, "machine")
-	binary := filepath.Join(dir, "root", "usr", "local", "bin", "cozy-machine")
+	binary := filepath.Join(dir, "root", "usr", "local", "bin", "tensord")
 	must(t, os.MkdirAll(filepath.Dir(binary), 0o755))
 	must(t, os.WriteFile(binary, []byte(script), 0o700)) //cozy:allow sentinel Host proves whether a launch was attempted
-	metadata := `{"host":{"name":"cozy-machine"},"host_pinned":true}`
+	metadata := `{"host":{"name":"tensord"},"host_pinned":true}`
 	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), []byte(metadata), 0600))
 
 }

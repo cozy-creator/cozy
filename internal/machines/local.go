@@ -75,7 +75,7 @@ func (h *Host) Root() string            { return filepath.Join(h.dir, "root") }
 func (h *Host) path(name string) string { return filepath.Join(h.dir, name) }
 
 // The image layout the Host and Runtime share, rooted.
-func (h *Host) binary() string { return filepath.Join(h.Root(), "usr/local/bin/cozy-machine") }
+func (h *Host) binary() string { return filepath.Join(h.Root(), "usr/local/bin/tensord") }
 
 // wheels holds exactly the executor SDK the machine runs package code with: the Runtime and
 // TensorFS wheels, where a worker image keeps them.
@@ -117,7 +117,7 @@ func (h *Host) placeHost(source string) (installedArtifact, error) {
 		return installedArtifact{}, err
 	}
 	artifact := installedArtifact{Name: filepath.Base(source), SHA256: digest}
-	target := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
+	target := filepath.Join(h.Root(), "usr/local/bin/tensord")
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return artifact, err
 	}
@@ -154,6 +154,9 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 	}
 	previous, problem := h.Installed()
 	if problem != nil {
+		return nil, problem
+	}
+	if problem := h.refuseRenamedNative(ctx); problem != nil {
 		return nil, problem
 	}
 	if (source.RuntimeWheel == "") != (source.TensorFSWheel == "") ||
@@ -210,12 +213,12 @@ func (h *Host) stage(ctx context.Context, source Source) (*staged, *exit.Error) 
 		if out.agent == "" {
 			if out.agent, err = bundledAgent(out.wheels[0], dir); err != nil {
 				return exit.Named(exit.Structural, "machine.agent_unsupported", "%s", err).
-					WithRemedy("name a cozy-machine with --host")
+					WithRemedy("name a tensord with --host")
 			}
 		}
 		if !servesAPI(ctx, out.agent) {
-			return exit.Named(exit.Structural, "machine.agent_unsupported", "%s is not a cozy-machine serving %s", filepath.Base(out.agent), MachineAPI).
-				WithRemedy("install a current Runtime pair, or name a current cozy-machine with --host")
+			return exit.Named(exit.Structural, "machine.agent_unsupported", "%s is not a tensord serving %s", filepath.Base(out.agent), MachineAPI).
+				WithRemedy("install a current Runtime pair, or name a current tensord with --host")
 		}
 		return nil
 	}()
@@ -226,7 +229,7 @@ func (h *Host) stage(ctx context.Context, source Source) (*staged, *exit.Error) 
 	return out, nil
 }
 
-// place lays the root out as a worker image does: the machine at usr/local/bin/cozy-machine,
+// place lays the root out as a worker image does: the machine at usr/local/bin/tensord,
 // the executor SDK (Runtime and TensorFS wheels) at opt/cozy/machine/wheels and uv at
 // usr/local/bin/uv. The machine makes its own identity files, installer helper and package
 // environments there, as on a rental.
@@ -245,7 +248,7 @@ func (h *Host) place(staged *staged, uv string) (*Installed, *exit.Error) {
 		return nil, exit.Internalf("cannot install the machine: %s", err)
 	}
 	if staged.bundled {
-		installed.Host.Name = "cozy-machine"
+		installed.Host.Name = "tensord"
 	}
 	kept, err := h.keepWheels(staged.wheels)
 	if err != nil {
@@ -356,6 +359,9 @@ func (h *Host) Start(ctx context.Context, account *hub.Client) (*Launch, *exit.E
 }
 
 func (h *Host) ensureLocked(ctx context.Context, account *hub.Client, start bool) (*Launch, *exit.Error) {
+	if problem := h.refuseRenamedNative(ctx); problem != nil {
+		return nil, problem
+	}
 	var launch *Launch
 	if cached := h.cached; cached != nil && h.alive(cached.PID) && (cached.record.StartTicks == 0 || cached.record.StartTicks == processStartTicks(cached.PID)) {
 		launch = cached.Launch
@@ -565,6 +571,9 @@ func (h *Host) Stop(ctx context.Context) *exit.Error {
 		return problem
 	}
 	defer unlock()
+	if problem := h.refuseRenamedNative(ctx); problem != nil {
+		return problem
+	}
 	return h.stopLocked(ctx)
 }
 
@@ -735,7 +744,7 @@ func (h *Host) secret(name string) (string, *exit.Error) {
 }
 
 func (h *Host) record() (*hostRecord, *exit.Error) {
-	if userunit.Available() && userunit.MainPID(userunit.Name("cozy-machine", h.dir, false)) > 0 {
+	if userunit.Available() && userunit.MainPID(userunit.Name("tensord", h.dir, false)) > 0 {
 		return nil, exit.Named(exit.Conflict, "machine.legacy_process_running", "the retired machine unit still owns this root; stop it with the original CLI after its accepted work finishes")
 	}
 
@@ -768,7 +777,7 @@ func (h *Host) record() (*hostRecord, *exit.Error) {
 
 // Unit is the root's systemd user unit. Its name derives from the root, so whatever it runs
 // is this root's agent, launch record or not.
-func (h *Host) Unit() string { return userunit.Name("cozy-machine-agent", h.dir, false) }
+func (h *Host) Unit() string { return userunit.Name("tensord-agent", h.dir, false) }
 
 // running is the root's live agent's launch record, nil when none runs; a record whose agent
 // is gone is retired. An agent the root's unit runs without its record (an older cozy's stop
@@ -827,7 +836,7 @@ func (h *Host) alive(pid int) bool {
 		return false
 	}
 	target = strings.TrimSuffix(target, " (deleted)")
-	for _, relative := range []string{"usr/local/bin/cozy-machine", "opt/cozy/python/bin/cozy-machine"} {
+	for _, relative := range []string{"usr/local/bin/tensord", "opt/cozy/python/bin/tensord"} {
 		path := filepath.Join(h.Root(), relative)
 		if target == path {
 			return true
@@ -892,7 +901,7 @@ func processStartTicks(pid int) uint64 {
 }
 
 // guardLock is the one lock every machine on a root holds for its life: the Go agent's and
-// the Rust machine's alike (cozy-machine `machine::identity::hold`). runtimeLock is the Go
+// the Rust machine's alike (tensord `machine::identity::hold`). runtimeLock is the Go
 // agent's Python Runtime's, which can outlive its agent; it counts while such a Runtime can exist.
 const (
 	guardLock   = "var/lib/cozy/machine/agent.lock"

@@ -15,7 +15,7 @@ import (
 // The machine keeps no operation cache of its own, so only this computer's records answer it.
 func TestMemoizedCallsAreAnsweredFromThisComputersRecords(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czm")
 	must(t, err)
