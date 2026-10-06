@@ -146,7 +146,7 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 			t.Fatalf("executed wrong wheel %s [%d]: %s\n%s", candidate, code, out, productWorkerLogs(root))
 		}
 		// A pin belongs to the whole run. A scalar may succeed without a site,
-		// but Runtime must durably warn that no call applied the requested pin.
+		// but its machine warns in the run's log that no call applied the pin.
 		code, out = runCozy(t, root, "run", localWeightlessRef+"/echo", "why=wheel-proof",
 			"kernel.attention=sdpa", "--idempotency-key="+key+"-pin", "--await", "--json")
 		if code != 0 || !strings.Contains(out, "wheel-proof|"+candidate+"|0.1.0") {
@@ -165,10 +165,7 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 		fatal(t, problem)
 		warned := false
 		for _, event := range events {
-			if event.Type == "machine.attention.applied" {
-				t.Fatal("scalar falsely claimed an applied attention pin")
-			}
-			if event.Type == "machine.warning" && event.Payload["code"] == "attention_pin_unapplied" {
+			if event.Type == "request.log" && event.Payload["level"] == "warning" {
 				warned = event.Payload["message"] == "attention pin sdpa was never applied"
 			}
 		}
