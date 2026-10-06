@@ -2,11 +2,9 @@ package launch
 
 import (
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 )
@@ -68,56 +66,6 @@ func pythonMismatch(profile BaseProfile, requiresPython string) string {
 		" and this base is " + profile.PythonABI
 }
 
-// InventoryPython selects among the image's advertised package executors.
-func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected string, supported ...[]string) (string, string) {
-	if inventory == nil {
-		return "", "the rental image inventory is absent"
-	}
-	specifier := strings.TrimSpace(requiresPython)
-	if specifier == "" {
-		specifier = ">=0"
-	}
-	bounds, err := pep440.NewSpecifiers(specifier)
-	if err != nil {
-		return "", "the package reports invalid Requires-Python " + requiresPython
-	}
-	candidates := append([]*pb.PythonInterpreter(nil), inventory.Interpreters...)
-	for _, candidate := range candidates {
-		if candidate == nil {
-			return "", "the rental image reports an invalid Python executor"
-		}
-		if candidate.Abi != "cp"+strings.ReplaceAll(hostruntime.PythonMinor(candidate.Version), ".", "") {
-			return "", "the rental image reports an incompatible Python ABI"
-		}
-		if _, err := pep440.Parse(candidate.Version); err != nil {
-			return "", "the rental image reports an invalid Python version"
-		}
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		a, _ := pep440.Parse(candidates[i].Version)
-		b, _ := pep440.Parse(candidates[j].Version)
-		return a.LessThan(b)
-	})
-	allowed := map[string]bool{}
-	if len(supported) > 0 {
-		for _, minor := range supported[0] {
-			allowed[minor] = true
-		}
-	}
-	for _, candidate := range candidates {
-		if len(supported) > 0 && !allowed[hostruntime.PythonMinor(candidate.Version)] {
-			continue
-		}
-		version, _ := pep440.Parse(candidate.Version)
-		if bounds.Check(version) && (selected == "" || hostruntime.PythonMinor(candidate.Version) == hostruntime.PythonMinor(selected)) {
-			return candidate.Version, ""
-		}
-	}
-	return "", "no available Python executor satisfies " + requiresPython + " (captured Python " + selected + ")"
-}
-
-// ProvisionablePython admits a captured interpreter minor from an explicit Runtime
-// provisioning capability. It never adds a fictitious installed executor.
 func ProvisionablePython(minors []string, requires, selected string, supported ...[]string) bool {
 	if valid, _ := regexp.MatchString(`^3\.[1-9][0-9]*(\.(0|[1-9][0-9]*))?$`, selected); !valid {
 		return false

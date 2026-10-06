@@ -1,14 +1,10 @@
 package orchestrator
 
-import (
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-)
-
 // ModelSourceCapability is refreshed privileged access, never durable request meaning.
 type ModelSourceCapability struct {
 	Member, ObjectID, URL string
 	Length                int64
-	Provider              pb.ModelSourceProvider
+	Provider              string
 	ExpiresAtUnix         uint64
 }
 

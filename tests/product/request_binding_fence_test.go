@@ -1,13 +1,12 @@
 package producttest
 
 import (
+	"github.com/cozy-creator/cozy/internal/archive"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestRequestBindingChangesOnlyBeforeAnyAttempt(t *testing.T) {
@@ -17,7 +16,7 @@ func TestRequestBindingChangesOnlyBeforeAnyAttempt(t *testing.T) {
 			fatal(t, problem)
 			defer store.Close()
 			set, invocation := servingPlacementFixture(t)
-			spec, err := canonical.Read(invocation, &pb.InvocationSpec{})
+			spec, err := archive.Read(invocation, archive.Invocation)
 			must(t, err)
 			binding := spec.Sub("serving").Str("entrypoint_binding_digest")
 			old := "sha256:" + strings.Repeat("e", 64)

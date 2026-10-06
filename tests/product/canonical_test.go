@@ -5,198 +5,19 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"math"
 	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
-
-	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// TestCanonicalDocuments is the identity fence. Every document that crosses a repo or
-// process boundary is named by the sha256 of its canonical bytes, so two independent
-// writers in two languages must produce byte-identical documents or nothing downstream —
-// digests, plan ids, terminal admission — agrees at all. It is the cheapest test here and
-// the one whose failure is least visible any other way.
-//
-// It runs ALWAYS. The corpus is vendored at testdata/worker-protocol, digest-fenced
-// by vendored_test.go, so this needs no token, no sibling checkout and no flag. It
-// used to resolve a corpus off the local disk and t.Skipf when it was absent, which
-// is how it sat green and inert on every CI run while a whole wire minor of skew
-// went unnoticed. A skip is indistinguishable from a pass.
-func TestCanonicalDocuments(t *testing.T) {
-	fixtureDir := corpusDir
-	var manifest struct {
-		Canonical map[string]struct{ ID, Type, Document string } `json:"canonical"`
-		Tolerated map[string]struct{ ID, Type, Document string } `json:"tolerated"`
-		WireMinor uint32                                         `json:"wire_minor"`
-	}
-	data, err := os.ReadFile(filepath.Join(fixtureDir, "MANIFEST.json"))
-	must(t, err)
-	must(t, json.Unmarshal(data, &manifest))
-
-	// The corpus names the wire minor it was frozen at. This repo is the RecordOwner, so a
-	// stale vendored binding here advertises a minor the workers have already moved past on
-	// every Claim and DesiredWorkerState. The document bytes below do not move on an
-	// additive bump, so nothing else in this test would notice.
-	if manifest.WireMinor > pb.WireMinor || manifest.WireMinor < pb.MinCompatibleWireMinor {
-		t.Errorf("vendored wire range %d..%d excludes the frozen corpus's %d: re-vendor protocol/ from "+
-			"worker-protocol", pb.MinCompatibleWireMinor, pb.WireMinor, manifest.WireMinor)
-	}
-
-	// This Go writer against the frozen documents, and this Go reader back over them.
-	names := make([]string, 0, len(manifest.Canonical))
-	for name := range manifest.Canonical {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	arms := 0
-	for _, name := range names {
-		row := manifest.Canonical[name]
-		msg := messageFor(row.Type)
-		if msg == nil {
-			t.Errorf("%s: no binding for %s", name, row.Type)
-			continue
-		}
-		wire, err := os.ReadFile(filepath.Join(fixtureDir, "canonical", name+".bin"))
-		must(t, err)
-		frozen, err := os.ReadFile(filepath.Join(fixtureDir, "canonical", name+".json"))
-		must(t, err)
-		must(t, proto.Unmarshal(wire, msg))
-		mine, digest, cerr := canonical.Identity(msg)
-		if cerr != nil {
-			t.Errorf("%s: this writer refused the frozen message: %v", name, cerr)
-			continue
-		}
-		if !bytes.Equal(mine, frozen) {
-			t.Errorf("%s: this writer produced %d B, the frozen document is %d B", name, len(mine), len(frozen))
-		}
-		if spelled, _ := canonical.Spell(digest); spelled != row.ID {
-			t.Errorf("%s: id %s != frozen %s", name, spelled, row.ID)
-		}
-		// THE DOCUMENT VERSION IS PART OF THE IDENTITY (#536e). Every current
-		// pre-release document is spelled under the sole `/1` format.
-		if canonical.Format(msg) != row.Document {
-			t.Errorf("%s: format tag %s != frozen %s", name, canonical.Format(msg), row.Document)
-		}
-		if _, rerr := canonical.Read(frozen, msg); rerr != nil {
-			t.Errorf("%s: this reader refused the frozen document: %v", name, rerr)
-		}
-		arms++
-	}
-	// A corpus that shrank to nothing would otherwise pass this test green, which is the
-	// same vacuous pass a silent skip gives. Every canonical document must be exercised.
-	if arms != len(manifest.Canonical) || arms == 0 {
-		t.Fatalf("exercised %d of %d canonical documents", arms, len(manifest.Canonical))
-	}
-
-	// RED: every frozen SEMANTIC TWIN — one frozen document with exactly one writer rule
-	// broken — is refused by the code the fixture names.
-	for name, code := range map[string]string{
-		"twin_duplicate_key": "duplicate_key",
-		"twin_float":         "non_integer_number",
-		"twin_whitespace":    "noncanonical_encoding",
-	} {
-		body, err := os.ReadFile(filepath.Join(fixtureDir, "red", name+".json"))
-		must(t, err)
-		_, rerr := canonical.Read(body, &pb.InvocationSpec{})
-		if got := canonical.Code(rerr); got != code {
-			t.Errorf("%s: refused as %q, wanted %q", name, got, code)
-		}
-		arms++
-	}
-	// TOLERATED: a newer peer's unknown key (top-level or nested) and an absent collection
-	// read, keep the consumed members, and keep the identity of their exact bytes.
-	if len(manifest.Tolerated) == 0 {
-		t.Fatal("the corpus carries no tolerated documents")
-	}
-	for name, row := range manifest.Tolerated {
-		msg := messageFor(row.Type)
-		body, err := os.ReadFile(filepath.Join(fixtureDir, "tolerated", name+".json"))
-		must(t, err)
-		if msg == nil {
-			t.Errorf("%s: no binding for %s", name, row.Type)
-			continue
-		}
-		if _, rerr := canonical.Read(body, msg); rerr != nil {
-			t.Errorf("%s: a tolerated document was refused: %v", name, rerr)
-		}
-		if spelled, _ := canonical.Spell(canonical.Digest(body)); spelled != row.ID {
-			t.Errorf("%s: id %s != frozen %s", name, spelled, row.ID)
-		}
-		must(t, canonical.Unmarshal(body, proto.Clone(msg)))
-		arms++
-	}
-
-	// RED: the document plane's own refusals. The `format` tag domain-separates two
-	// documents with equal fields and is checked before any field is read.
-	spec, err := os.ReadFile(filepath.Join(fixtureDir, "canonical", "invocation_spec_serving.json"))
-	must(t, err)
-	if _, rerr := canonical.Read(spec, &pb.AttemptOutcomeBody{}); canonical.Code(rerr) != "unknown_format" {
-		t.Errorf("an InvocationSpec read as an AttemptOutcomeBody was not refused: %v", rerr)
-	}
-	if _, rerr := canonical.Read(spec[:len(spec)-1], &pb.InvocationSpec{}); rerr == nil {
-		t.Error("truncated canonical bytes were accepted")
-	}
-	// A `bytes` digest field that is not 32 bytes has no canonical spelling at all.
-	_, _, cerr := canonical.Identity(&pb.WorkerSnapshotBody{AcceptedPlacementSetDigest: []byte("abc")})
-	if canonical.Code(cerr) != "malformed_digest" {
-		t.Errorf("a 3-byte *_digest was not refused: %v", cerr)
-	}
-	// The protocol profile is narrower than JSON: a non-printable-ASCII field refuses
-	// rather than being spelled.
-	_, _, cerr = canonical.Identity(&pb.AttemptOutcomeBody{
-		RequestId: "req-1", AttemptOrdinal: 1, SafeMessage: "café"})
-	if canonical.Code(cerr) != "non_ascii_field" {
-		t.Errorf("a non-ASCII field was not refused: %v", cerr)
-	}
-	arms += 5 // the wire-minor agreement and the document plane's own refusals, above
-	t.Logf("%s: %d arms at wire minor %d (%d canonical documents, 3 semantic twins, "+
-		"%d tolerated documents, 4 plane refusals, 1 wire-minor agreement)",
-		fixtureDir, arms, manifest.WireMinor, len(manifest.Canonical), len(manifest.Tolerated))
-}
-
-func messageFor(name string) proto.Message {
-	switch name {
-	case "cozy.worker.v1.InvocationSpec":
-		return &pb.InvocationSpec{}
-	case "cozy.worker.v1.AttemptOutcomeBody":
-		return &pb.AttemptOutcomeBody{}
-	case "cozy.worker.v1.WeightsReceipt":
-		return &pb.WeightsReceipt{}
-	case "cozy.worker.v1.ClaimProof":
-		return &pb.ClaimProof{}
-	case "cozy.worker.v1.DownloadDelegation":
-		return &pb.DownloadDelegation{}
-	case "cozy.worker.v1.PlacementSet":
-		return &pb.PlacementSet{}
-	case "cozy.worker.v1.MachineExecutionCapture":
-		return &pb.MachineExecutionCapture{}
-	case "cozy.worker.v1.InstalledPackage":
-		return &pb.InstalledPackage{}
-	case "cozy.worker.v1.WorkerSnapshotBody":
-		return &pb.WorkerSnapshotBody{}
-	case "cozy.worker.v1.HostSnapshotBody":
-		return &pb.HostSnapshotBody{}
-	}
-	return nil
-}
-
-// TestNumberProfile is the cross-language float hazard, in isolation. Go and Python must
-// spell every double the same way or two canonical documents describing the same thing
-// digest differently, and the whole identity plane silently forks at the boundary.
-// `testdata/canonical/es6-numbers.txt` is Runtime's own oracle, pinned by digest.
 func TestNumberProfile(t *testing.T) {
 	corpus, err := os.ReadFile("testdata/canonical/es6-numbers.txt")
 	must(t, err)

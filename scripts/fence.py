@@ -349,7 +349,10 @@ def check_test_boundary() -> list[str]:
     return bad
 
 
-DOCUMENT_KINDS: dict[str, str] = {}
+DOCUMENT_KINDS: dict[str, str] = {
+    # #331/#334: immutable controller-owned intake metadata; no machine RPC identity.
+    "cozy.capture/1": "internal/localpackage/execution_capture.go",
+}
 # HMAC domain-separation tags are security protocol constants, not document formats. A peer repo
 # reproduces these exact bytes, so they remain single-owner fenced without inflating the document
 # count.

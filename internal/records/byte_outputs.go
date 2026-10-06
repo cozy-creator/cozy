@@ -6,8 +6,8 @@ import (
 	"math"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/custody"
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 const byteOutputsDDL = `CREATE TABLE IF NOT EXISTS byte_outputs (
@@ -39,16 +39,16 @@ func scanByteOutput(row interface{ Scan(...any) error }) (ByteOutput, error) {
 	err := row.Scan(&b.RequestID, &b.Attempt, &b.OutputID, &b.Digest, &b.Length, &b.MimeType, &b.ProducerRootID, &b.ReceiptDigest, &b.ManifestID, &b.ManifestLength, &b.ContentBytes)
 	return b, err
 }
-func (b ByteOutput) NativeRef() *pb.NativeByteTreeRef {
+func (b ByteOutput) NativeRef() *custody.TreeRef {
 	receipt, _ := canonical.Raw(b.ReceiptDigest)
 	manifest, _ := canonical.Raw(b.ManifestID)
-	return &pb.NativeByteTreeRef{ProducerRootId: b.ProducerRootID, ReceiptDigest: receipt, Manifest: &pb.Ref{Digest: manifest, Length: uint64(b.ManifestLength)}, ContentBytes: uint64(b.ContentBytes)}
+	return &custody.TreeRef{ProducerRootID: b.ProducerRootID, ReceiptDigest: receipt, Manifest: &custody.ObjectRef{Digest: manifest, Length: uint64(b.ManifestLength)}, ContentBytes: uint64(b.ContentBytes)}
 }
-func ValidateByteRef(ref *pb.NativeByteTreeRef) *exit.Error {
-	if ref == nil || ref.Manifest == nil || len(ref.ReceiptDigest) != 32 || len(ref.Manifest.Digest) != 32 || ref.Manifest.Length == 0 || ref.Manifest.Length > uint64(pb.MaxInlineControlBytes) || ref.ContentBytes > math.MaxInt64 {
+func ValidateByteRef(ref *custody.TreeRef) *exit.Error {
+	if ref == nil || ref.Manifest == nil || len(ref.ReceiptDigest) != 32 || len(ref.Manifest.Digest) != 32 || ref.Manifest.Length == 0 || ref.Manifest.Length > uint64(custody.MaxMetadataBytes) || ref.ContentBytes > math.MaxInt64 {
 		return exit.New(exit.Validation, "native byte output needs bounded exact receipt, manifest and content size")
 	}
-	if _, err := canonical.Raw(ref.ProducerRootId); err != nil {
+	if _, err := canonical.Raw(ref.ProducerRootID); err != nil {
 		return exit.New(exit.Validation, "native byte producer root is malformed")
 	}
 	return nil
@@ -73,7 +73,7 @@ func (s *Store) ByteOutputs(request string, attempt int64) ([]ByteOutput, *exit.
 	return result, nil
 }
 func recordByteOutputsTx(tx *sql.Tx, t Terminal) *exit.Error {
-	if len(t.ByteOutputs) > pb.MaxChildArtifactGrants {
+	if len(t.ByteOutputs) > custody.MaxChildArtifacts {
 		return exit.New(exit.Validation, "too many native byte outputs")
 	}
 	for _, b := range t.ByteOutputs {

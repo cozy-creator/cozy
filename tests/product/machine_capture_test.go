@@ -2,11 +2,11 @@ package producttest
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -16,7 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestCapturedChildModelChoicesSurviveReopenWithoutBroadeningScope(t *testing.T) {
@@ -62,8 +61,8 @@ func TestCapturedChildModelChoicesSurviveReopenWithoutBroadeningScope(t *testing
 	if !bytes.Equal(first.Canonical, second.Canonical) || !bytes.Equal(first.Digest, second.Digest) {
 		t.Fatal("reopening durable selections changed the capture")
 	}
-	var graph pb.MachineExecutionCapture
-	must(t, canonical.Unmarshal(second.Canonical, &graph))
+	var graph localpackage.CaptureDocument
+	must(t, json.Unmarshal(second.Canonical, &graph))
 	if len(graph.Bindings) != 2 || len(graph.ModelChoices) != 1 ||
 		graph.ModelChoices[0].Parameter != "local/motion/generate.models.model" {
 		t.Fatalf("override escaped the selected child: %+v", &graph)
@@ -104,8 +103,8 @@ func TestMachineCaptureIncludesInvocableServingSelfBindings(t *testing.T) {
 			return localpackage.Installation{}, nil
 		})
 	fatal(t, problem)
-	var doc pb.MachineExecutionCapture
-	must(t, canonical.Unmarshal(capture.Canonical, &doc))
+	var doc localpackage.CaptureDocument
+	must(t, json.Unmarshal(capture.Canonical, &doc))
 	if len(doc.Bindings) != 2 || len(doc.InstalledPackages) != 1 {
 		t.Fatalf("job and serving self bindings were not closed: %v", &doc)
 	}
@@ -113,7 +112,7 @@ func TestMachineCaptureIncludesInvocableServingSelfBindings(t *testing.T) {
 		if binding.Export != "long_form" && binding.Export != "segment" {
 			t.Fatalf("unmanaged function captured: %v", binding)
 		}
-		if binding.CallerInstallationId != binding.CalleeInstallationId {
+		if binding.CallerInstallationID != binding.CalleeInstallationID {
 			t.Fatal("self binding changed the captured revision")
 		}
 	}
@@ -151,13 +150,13 @@ func TestMachineCapturePreservesChildIdentityAcrossCallerEditsWithoutClientPaths
 			t.Fatal("caller source edit did not change capture")
 		}
 		previous = capture.Digest
-		var doc pb.MachineExecutionCapture
-		must(t, canonical.Unmarshal(capture.Canonical, &doc))
+		var doc localpackage.CaptureDocument
+		must(t, json.Unmarshal(capture.Canonical, &doc))
 		if len(doc.InstalledPackages) != 2 || len(doc.Bindings) != 2 {
 			t.Fatalf("self binding did not close: %v", &doc)
 		}
 		for _, row := range doc.Bindings {
-			got := row.CalleeInstallationId
+			got := row.CalleeInstallationID
 			if got != child.ID {
 				t.Fatal("caller edit changed child revision")
 			}

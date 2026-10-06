@@ -683,12 +683,7 @@ func finishRentalAttachment(l home.Layout, st *records.Store, row records.Rental
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
 	row.ExpectedWorkerID, row.ExpectedWorkerBootID = attachable.WorkerID, attachable.WorkerBootID
-	if !attachable.HoldsMediaHash(secret.HashHex(token)) {
-		return records.Rental{}, exit.New(exit.Failed,
-			"rental %s is attachable and its live credential set does not carry the token this host minted", attachable.ID).
-			WithRemedy("release it and rent again; a pod nobody can authenticate to still costs money").
-			WithNext("cozy rental end " + attachable.ID)
-	}
+
 	if attachable.CreatorPublicKey != creator.PublicKey() {
 		return records.Rental{}, exit.Named(exit.Conflict, "rental.creator_key_changed",
 			"rental %s did not retain the Creator key sent at create", attachable.ID).
@@ -1009,14 +1004,8 @@ func missingOf(r hub.Rental) string {
 	if r.Address == "" {
 		return "worker address"
 	}
-	if r.MediaAddress == "" {
-		return "media address"
-	}
 	if r.CertPEM == "" {
 		return "certificate to pin"
-	}
-	if len(r.MediaTokenSHA256) == 0 {
-		return "observed media-token hash set"
 	}
 	if r.WorkerID == "" || r.WorkerBootID == "" {
 		return "worker and boot identity"

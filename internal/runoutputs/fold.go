@@ -14,7 +14,6 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/resultfiles"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Part is one stored piece of an item's bytes; the bytes are the parts in order.
@@ -22,8 +21,6 @@ type Part struct {
 	Digest     string
 	Length     int64
 	DurationUs uint64
-	// Source is the machine hold the part is read through (ReadByteTreeObject).
-	Source *pb.NativeByteRetentionRequest
 }
 
 // Revision is an item's bytes as one log entry left them.

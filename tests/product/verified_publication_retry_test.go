@@ -4,16 +4,16 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// The released worker-protocol corpus supplies an actual matching job invocation,
+// Retained producer fixtures supply an actual matching job invocation,
 // successful outcome and native receipt. Only the historical bookkeeping failure
 // is constructed here; recovery must never construct a second producer attempt.
 func publicationRetryFixture(t *testing.T) (*records.Store, *sql.DB, string) {
@@ -26,16 +26,16 @@ func publicationRetryFixture(t *testing.T) (*records.Store, *sql.DB, string) {
 	must(t, err)
 	t.Cleanup(func() { db.Close() })
 	read := func(name string) []byte {
-		raw, err := os.ReadFile(filepath.Join("testdata", "worker-protocol", "canonical", name+".json"))
+		raw, err := os.ReadFile(filepath.Join("testdata", "record-archive", name+".json"))
 		must(t, err)
 		return raw
 	}
 	invocation := read("invocation_spec_job")
 	outcome := read("attempt_outcome_body_job_succeeded")
 	receipt := read("weights_receipt")
-	rec, err := canonical.Read(receipt, &pb.WeightsReceipt{})
+	rec, err := archive.Read(receipt, archive.WeightsReceipt)
 	must(t, err)
-	terminal, err := canonical.Read(outcome, &pb.AttemptOutcomeBody{})
+	terminal, err := archive.Read(outcome, archive.TerminalBody)
 	must(t, err)
 	id := rec.Str("request_id")
 	digest := func(raw []byte) string {

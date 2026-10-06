@@ -6,6 +6,11 @@ Capture, model choices, byte/model custody and measured device observations keep
 and become current domain/native values. Preserve active outboxes and historical readback in
 a small private archive reader that carries only the fields its consumers use.
 
+The `cozy.capture/1` document belongs to `internal/localpackage/execution_capture.go`.
+It records the immutable installation graph and interface selected at intake; the controller
+stores and hashes its JCS bytes for request replay. It is not sent as a machine protocol or
+used to compare client/server builds. Native model selections use `cozy.machine.v1` directly.
+
 Local launchers use the existing owner's `COZY_AUTHORIZED_KEYS`. Native rental attachment
 uses the retained Creator key and certificate pin; an obsolete media-token projection is no
 longer an attachment gate. Hub's still-required request field stays until its owner cuts it.
@@ -17,3 +22,11 @@ peer equality gate, image admission, rental, GPU operation, deployment or public
 
 Trackers: [331](https://github.com/cozy-creator/tracker/issues/331),
 [334](https://github.com/cozy-creator/tracker/issues/334).
+
+## Checkpoint and proof status
+
+The source/test migration is an explicitly unverified checkpoint. Current Go worker
+imports are zero; generated worker bindings and their corpus are removed, with only
+actual historical record fixtures retained. Native cancellation/dispatch tests and
+ordinary current consumer tests remain. Compilation and archive/native CPU checks are
+pending the shared Go test slot. This draft is not ready for merge.

@@ -12,11 +12,9 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestPublicRunStatusProjectsStoppedFailuresAndPendingAcceptanceConsistently(t *testing.T) {
@@ -35,8 +33,9 @@ func TestPublicRunStatusProjectsStoppedFailuresAndPendingAcceptanceConsistently(
 	pending, _, problem := o.store.Submit(records.Request{ID: "pending-acceptance", IdemKey: "pending-acceptance", Kind: "job", Package: "local/private-proof", Entrypoint: "prepare", Payload: []byte(`{}`), BodyDigest: childDigest("1"), RetainWork: true, MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, o.store.LinkMachineExecution(pending.ID, "local"))
-	capture, spec := []byte(`{"capture":"frozen"}`), []byte(`{"invocation":"frozen"}`)
-	fatal(t, o.store.RecordMachineSubmission(pending.ID, &pb.MachineExecutionSubmit{SubmissionId: pending.IdemKey, ExpectedExecutionWorkspaceId: "workspace", CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture), Offer: &pb.AttemptOffer{RequestId: pending.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}))
+	_, problem = o.store.MarkRunV1Sent(pending.ID)
+	fatal(t, problem)
+
 	_, problem = o.store.BlockRetainedWork(pending.ID, "connection.lost", "acceptance receipt has not arrived")
 	fatal(t, problem)
 	defer publicationControlAPI(t, o)()

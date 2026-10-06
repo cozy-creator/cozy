@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/cozy-creator/cozy/internal/archive"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -26,7 +27,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	"github.com/cozy-creator/cozy/internal/scratch"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The request-level contract: a 202 handle out of submit, a lifecycle document out of
@@ -1049,7 +1049,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 	if len(last.TerminalBody) == 0 {
 		return life
 	}
-	doc, err := canonical.Read(last.TerminalBody, &pb.AttemptOutcomeBody{})
+	doc, err := archive.Read(last.TerminalBody, archive.TerminalBody)
 	if err != nil {
 		return life
 	}

@@ -7,13 +7,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
 // ModelChoices is shared by release roots, frozen captures and private serving
 // preparation. Explicit child targets keep the complete package/slot identity.
-func ModelChoices(request records.Request, models []ModelRef) ([]*pb.ModelChoice, *exit.Error) {
-	var out []*pb.ModelChoice
+func ModelChoices(request records.Request, models []ModelRef) ([]*v1.ModelChoice, *exit.Error) {
+	var out []*v1.ModelChoice
 	for _, model := range models {
 		path := model.BindingSlot()
 		entrypoint, parameter, attributed := strings.Cut(path, ".models.")
@@ -30,7 +30,7 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*pb.ModelChoice
 				parameter = model.Package + "/" + path
 			}
 		}
-		choice := &pb.ModelChoice{Parameter: parameter, Repository: model.Model,
+		choice := &v1.ModelChoice{Parameter: parameter, Repository: model.Model,
 			Release: model.Release, Lane: model.Lane, Source: model.Source,
 			Profiles: model.Profiles, Adapters: downloadAdapters(model.Adapters)}
 		if model.Manifest != "" {
@@ -38,7 +38,8 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*pb.ModelChoice
 			if err != nil {
 				return nil, exit.Named(exit.Validation, "model.manifest_invalid", "%s names no exact manifest", path)
 			}
-			choice.Manifest = &pb.Ref{Digest: digest, Length: uint64(max(model.ManifestLength, 0))}
+			choice.Manifest, _ = canonical.Spell(digest)
+			choice.ManifestLength = uint64(max(model.ManifestLength, 0))
 		}
 		out = append(out, choice)
 	}
@@ -51,10 +52,10 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*pb.ModelChoice
 	return out, nil
 }
 
-func downloadAdapters(adapters []records.ModelAdapterRef) []*pb.DownloadAdapterRef {
-	out := make([]*pb.DownloadAdapterRef, 0, len(adapters))
+func downloadAdapters(adapters []records.ModelAdapterRef) []*v1.Adapter {
+	out := make([]*v1.Adapter, 0, len(adapters))
 	for _, a := range adapters {
-		out = append(out, &pb.DownloadAdapterRef{Component: a.Component, Model: a.Model, Release: a.Release, Lane: a.Lane, Manifest: a.Manifest, SourceComponent: a.SourceComponent, Scale: a.Scale, Source: a.Source, Profiles: a.Profiles})
+		out = append(out, &v1.Adapter{Component: a.Component, Model: a.Model, Release: a.Release, Lane: a.Lane, Manifest: a.Manifest, Scale: a.Scale, Source: a.Source, Profiles: a.Profiles})
 	}
 	return out
 }

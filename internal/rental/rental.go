@@ -334,18 +334,14 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 }
 
 // Reboot re-attaches a rental whose pod came back on a new boot. The Hub authenticated
-// that boot for this rental's attempt; it must still carry this host's media bearer and
-// Creator key. The Hub-verified certificate is pinned and the boot recorded.
+// that boot for this rental's attempt; it must still carry this host's Creator key.
+// The Hub-verified certificate is pinned and the boot recorded.
 func Reboot(l home.Layout, st *records.Store, id string, remote hub.Rental) *exit.Error {
-	token, problem := MediaToken(l, id)
-	if problem != nil {
-		return problem
-	}
 	creator, problem := loadCreatorIdentity(l.RentalCreatorIdentity(id))
 	if problem != nil {
 		return problem
 	}
-	if remote.ID != id || !remote.Attachable() || !remote.HoldsMediaHash(secret.HashHex(token)) || remote.CreatorPublicKey != creator.PublicKey() {
+	if remote.ID != id || !remote.Attachable() || remote.CreatorPublicKey != creator.PublicKey() {
 		return exit.Named(exit.Conflict, "rental.reboot_unauthenticated",
 			"rental %s came back without this host's credentials; its previous attachment is kept", id)
 	}

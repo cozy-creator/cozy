@@ -14,7 +14,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/rentalid"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The RENTAL routes (cl-015, on th-042's product surface). The hub owns the pod: it
@@ -218,28 +217,16 @@ type ExactDocument struct {
 	Length         int64  `json:"length"`
 }
 
-// Ready answers whether this rental carries the whole dial triple and an observed
-// media credential set. The caller still checks that set contains its bearer hash; Ready only
-// prevents a partial ready projection from being mistaken for a usable pod.
+// Ready answers whether this rental carries its native dial identity and Creator key.
 func (r Rental) Ready() bool {
-	return r.State == RentalReady && (!r.Development || r.SSHAddress != "") && r.Address != "" && r.MediaAddress != "" &&
-		r.CertPEM != "" && r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != "" &&
-		len(r.MediaTokenSHA256) > 0
+	return r.State == RentalReady && (!r.Development || r.SSHAddress != "") && r.Address != "" &&
+		r.CertPEM != "" && r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != ""
 }
 
 func (r Rental) Attachable() bool { return r.Ready() }
 
 // HoldsMediaHash answers whether the pod media plane's live set carries this hash.
 // Both bare and sha256-prefixed spellings describe the same value.
-func (r Rental) HoldsMediaHash(hash string) bool {
-	bare := strings.TrimPrefix(hash, "sha256:")
-	for _, h := range r.MediaTokenSHA256 {
-		if strings.TrimPrefix(h, "sha256:") == bare {
-			return true
-		}
-	}
-	return false
-}
 
 // wireRental is the answer's own shape.
 type wireRental struct {
@@ -489,11 +476,10 @@ type RentalSKU struct {
 	// requirements the label already contradicts is refused before the paid ask. It is
 	// deliberately NOT validated: a spelling this client cannot read means one fewer
 	// pre-spend check, never an unrentable catalog.
-	PythonProvisionableMinors []string                `json:"python_provisionable_minors"`
-	PythonInterpreters        []*pb.PythonInterpreter `json:"python_interpreters"`
-	BaseWorkerProfile         string                  `json:"base_worker_profile"`
-	ComputeCapability         string                  `json:"compute_capability"`
-	VRAMGB                    int64                   `json:"vram_gb"`
+	PythonProvisionableMinors []string `json:"python_provisionable_minors"`
+	BaseWorkerProfile         string   `json:"base_worker_profile"`
+	ComputeCapability         string   `json:"compute_capability"`
+	VRAMGB                    int64    `json:"vram_gb"`
 	// PriceUSDMicrosPerHour is the per-machine GPU list rate at this count — the unit the
 	// hub's offer matching and replan cap run on, and the accepted quote this client locks.
 	PriceUSDMicrosPerHour int64 `json:"price_usd_micros_per_hour"`
@@ -511,14 +497,13 @@ type RentalSKU struct {
 
 // RentalProduct is one catalog row as the hub publishes it: a product and its widths.
 type RentalProduct struct {
-	PythonProvisionableMinors []string                `json:"python_provisionable_minors"`
-	PythonInterpreters        []*pb.PythonInterpreter `json:"python_interpreters"`
-	Name                      string                  `json:"name"`
-	AcceleratorModel          string                  `json:"accelerator_model"`
-	BaseWorkerProfile         string                  `json:"base_worker_profile"`
-	ComputeCapability         string                  `json:"compute_capability"`
-	VRAMGB                    int64                   `json:"vram_gb"`
-	Widths                    []RentalWidth           `json:"widths"`
+	PythonProvisionableMinors []string      `json:"python_provisionable_minors"`
+	Name                      string        `json:"name"`
+	AcceleratorModel          string        `json:"accelerator_model"`
+	BaseWorkerProfile         string        `json:"base_worker_profile"`
+	ComputeCapability         string        `json:"compute_capability"`
+	VRAMGB                    int64         `json:"vram_gb"`
+	Widths                    []RentalWidth `json:"widths"`
 }
 
 // RentalWidth is one buyable GPU count and its per-machine prices.
@@ -536,7 +521,7 @@ func (p RentalProduct) Machines() []RentalSKU {
 	for _, width := range p.Widths {
 		out = append(out, RentalSKU{Name: p.Name, AcceleratorModel: p.AcceleratorModel,
 			AcceleratorCount: width.AcceleratorCount, PythonProvisionableMinors: p.PythonProvisionableMinors,
-			PythonInterpreters: p.PythonInterpreters, BaseWorkerProfile: p.BaseWorkerProfile,
+			BaseWorkerProfile: p.BaseWorkerProfile,
 			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB,
 			PriceUSDMicrosPerHour: width.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: width.StorageUSDMicrosPerHour,
 			VCPUCount: width.VCPUCount, MemoryGB: width.MemoryGB})
@@ -555,8 +540,8 @@ func RentalProducts(skus []RentalSKU) []RentalProduct {
 			i = len(out)
 			index[sku.Name] = i
 			out = append(out, RentalProduct{Name: sku.Name, AcceleratorModel: sku.AcceleratorModel,
-				PythonProvisionableMinors: sku.PythonProvisionableMinors, PythonInterpreters: sku.PythonInterpreters,
-				BaseWorkerProfile: sku.BaseWorkerProfile, ComputeCapability: sku.ComputeCapability,
+				PythonProvisionableMinors: sku.PythonProvisionableMinors,
+				BaseWorkerProfile:         sku.BaseWorkerProfile, ComputeCapability: sku.ComputeCapability,
 				VRAMGB: sku.VRAMGB})
 		}
 		out[i].Widths = append(out[i].Widths, RentalWidth{AcceleratorCount: sku.AcceleratorCount,

@@ -1,22 +1,7 @@
-// Package orchestrator is the local client's EMBEDDED ORCHESTRATOR (#455; the record-plane
-// owner of every worker this daemon runs): the scheduling role of the ONE long-lived
-// Cozy daemon `cozy run list` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
-// WORKER hosts the protocol and this side DIALS it: each spawned worker binds its own
-// local socket, and this owner claims it (Claim -> ClaimAck -> snapshot -> SnapshotAck)
-// before any dispatch. It is the authority for everything the runtime deliberately is
-// not: which request runs, which attempt ordinal exists, which devices a process may
-// see, and which terminal/result becomes visible.
-//
-// What it does NOT do, structurally rather than by policy: it never executes a model,
-// never chooses a placement or a plan, never authorizes a reader from inside the
-// runtime, and never mints a credential. A local grant is a CAS root plus an output
-// directory — there is no token field set anywhere in this package, which is what makes
-// "no fake cloud tokens" a fact a reader can check rather than a promise.
-//
-// The one law this package is written around: an accepted attempt is an OPEN OBLIGATION,
-// and no next ordinal may be minted until it has a terminal. Remote supervisors replay
-// their worker-local ledger; for a dead local Runtime child, this records authority writes
-// ABANDONED itself. Runtime is never asked to remember what died with it.
+// Package orchestrator records this controller's request intentions and observations.
+// Machines own execution attempts and input/output custody. The controller admits authored
+// work, retains cancellation intent, observes native runs and reconciles its own outboxes.
+// Observer teardown does not mutate a run.
 package orchestrator
 
 import (
@@ -34,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Options is the frozen input to one Cozy daemon. Every field is decided by the
@@ -50,19 +34,9 @@ type Options struct {
 	Log            io.Writer
 	// Rentals resolves an attached rental id to its dial spec; nil = this daemon attaches
 	// no rentals.
-	Rentals func(id string) (*RemoteTarget, *exit.Error)
-	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
-	RentalClaimProof RentalClaimProofSource
-	ModelTransfers   ModelTransferOwner
+	Rentals        func(id string) (*RemoteTarget, *exit.Error)
+	ModelTransfers ModelTransferOwner
 }
-
-type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
-
-// RentalPackageSetSource authors the desired download set for one selection. It takes
-// no worker connection: the document names content only and binds no rental, worker or
-// boot (owner ruling 2026-09-03).
-type RentalPackageSetSource func([]*pb.DownloadPackageRef,
-	[]*pb.DownloadModelRef) ([]byte, *exit.Error)
 
 type RentalObservation struct {
 	RentalID       string

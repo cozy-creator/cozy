@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/custody"
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 var modelTransferSlug = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$`)
@@ -192,7 +192,7 @@ func NormalizeModelTransferIntent(intent *ModelTransferIntent) *exit.Error {
 		_, digestErr := canonical.Raw("sha256:" + file.SHA256)
 		if file.Member == "" || file.Member <= previousFile || file.Length <= 0 ||
 			file.Length > maxExactJSONInteger-sourceBytes ||
-			len(file.Header) > pb.MaxModelSourceHeaderBytes || int64(len(file.Header)) > file.Length ||
+			len(file.Header) > custody.MaxSourceHeaderBytes || int64(len(file.Header)) > file.Length ||
 			digestErr != nil {
 			return exit.New(exit.Validation, "model transfer source inventory is invalid")
 		}

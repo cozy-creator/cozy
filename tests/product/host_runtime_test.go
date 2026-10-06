@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // TestHostRuntimeAdmission: the host tool answers typed CLI verbs and speaks no machine protocol
@@ -52,7 +51,7 @@ func TestHostRuntimeAdmission(t *testing.T) {
 
 	// (c) The protocol a Runtime names for its machine is not this tool's contract.
 	for name, protocol := range map[string]string{"worker": runtimeWireProtocol, "machine": "cozy.machine.v1",
-		"older-minor": fmt.Sprintf("cozy.worker.v1+minor.%d", pb.MinCompatibleWireMinor-1), "unnamed": ""} {
+		"older-minor": fmt.Sprintf("cozy.worker.v1+minor.%d", 0), "unnamed": ""} {
 		root, path = hostRuntimeRoot(t, name, stubRuntime(t, hostruntime.ToolFloor, protocol))
 		if code, out := runCozyPath(t, root, path, "up"); code != 0 || strings.Contains(out, "local runs refuse") {
 			t.Fatalf("a host tool naming protocol %q was refused [exit %d]\n%s", protocol, code, out)

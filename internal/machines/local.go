@@ -451,15 +451,6 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	mediaToken, problem := h.secret("media-token")
-	if problem != nil {
-		return nil, problem
-	}
-	mediaHash := sha256.Sum256([]byte(mediaToken))
-	auth, _ := json.Marshal(map[string]any{
-		"control_public_key_ed25519_b64url": owner.PublicKey(),
-		"media_token_sha256":                []string{hex.EncodeToString(mediaHash[:])},
-	})
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, exit.Internalf("cannot mint the machine receipt key: %s", err)
@@ -477,7 +468,7 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 		"COZY_WORKER_ID=" + id,
 		"COZY_MACHINE_LIFETIME=persistent",
 		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE=" + h.path("receipt-key"),
-		"COZY_RECORD_OWNER_AUTH_JSON=" + string(auth),
+		"COZY_AUTHORIZED_KEYS=" + owner.PublicKey(),
 	}, h.inherited...)
 	if h.store != "" {
 		base = append(base, "COZY_TENSORFS_ROOT="+h.store)

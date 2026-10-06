@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestAdmissionRequiresNativeIngestionRuntimeAndAcceptsSourceDevWheel(t *testing.T) {
@@ -25,7 +24,7 @@ func TestAdmissionRequiresNativeIngestionRuntimeAndAcceptsSourceDevWheel(t *test
 	} {
 		t.Run(test.version, func(t *testing.T) {
 			tool := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow stand-in Runtime command for host admission
-			script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '{\"distribution\":\"%s\",\"wire_protocol\":\"cozy.worker.v1+minor.%d\"}'\n", test.version, pb.WireMinor)
+			script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '{\"distribution\":\"%s\",\"wire_protocol\":\"cozy.worker.v1+minor.%d\"}'\n", test.version, 0)
 			if err := os.WriteFile(tool, []byte(script), 0700); err != nil { //cozy:allow stand-in Runtime command for host admission
 				t.Fatal(err)
 			}

@@ -11,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Constraints is the published release's own Requirements/RequiresPython and the degrees
@@ -279,20 +278,6 @@ func declaredDegrees(degrees []int) string {
 }
 
 func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
-	if len(sku.PythonInterpreters) > 0 || len(sku.PythonProvisionableMinors) > 0 {
-		policy := [][]string{}
-		if constraints.SupportedPythonMinors != nil {
-			policy = append(policy, constraints.SupportedPythonMinors)
-		}
-		_, reason := launch.InventoryPython(&pb.ImageInventory{Interpreters: sku.PythonInterpreters}, constraints.RequiresPython, constraints.PythonVersion, policy...)
-		if reason == "" || strings.HasPrefix(reason, "no available Python executor") && launch.ProvisionablePython(sku.PythonProvisionableMinors, constraints.RequiresPython, constraints.PythonVersion, policy...) {
-			return ""
-		}
-		return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + reason
-	}
-	if constraints.PythonVersion != "" {
-		return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": image does not report the captured Python executor"
-	}
 	profile, readable := launch.ParseBaseProfile(sku.BaseWorkerProfile)
 	if !readable {
 		return ""

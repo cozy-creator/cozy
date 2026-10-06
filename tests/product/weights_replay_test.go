@@ -6,7 +6,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // An exact replay of a weights receipt with its object inventory is the same fact: the
@@ -21,7 +20,7 @@ func TestWeightsReceiptReplayWithObjectsIsIdempotent(t *testing.T) {
 	producer, _, problem := store.SubmitChild(records.Request{ID: "req-replay-producer", IdemKey: "replay-producer", Kind: "job", Package: "local/source", Entrypoint: "source", Payload: []byte(`{}`), BodyDigest: childDigest("1"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("2"), ChildTargetDigest: childDigest("3"), ChildArtifacts: true, WeightsOutputs: `[{"output_id":"weights"}]`}, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	producer = offerChildParent(t, store, producer)
-	receipt, _, err := canonical.Identity(&pb.WeightsReceipt{OwnerAuthorityScope: "owner", RequestId: producer.ID, InvocationSpecDigest: childDigest("1"), OutputSlot: "weights", WeightsTransactionId: childDigest("5"), TensorfsReceiptDigest: childDigest("4"), TensorfsReceiptCanonicalBytes: []byte(`{}`)})
+	receipt, _, err := fixtureIdentity(map[string]any{"owner_authority_scope": "owner", "request_id": producer.ID, "invocation_spec_digest": childDigest("1"), "output_slot": "weights", "weights_transaction_id": childDigest("5"), "tensorfs_receipt_digest": childDigest("4"), "tensorfs_receipt_canonical_bytes": []byte(`{}`), "_format": "cozy.worker.v1.WeightsReceipt/1"})
 	must(t, err)
 	receiptDigest, _ := canonical.Spell(canonical.Digest(receipt))
 	weights := records.ModelTransferWeights{RequestID: producer.ID, Attempt: 1, OutputSlot: "weights", ManifestID: childDigest("6"), ManifestLength: 321, InvocationDigest: childDigest("1"), TransactionID: childDigest("5"), ReceiptDigest: receiptDigest, Receipt: receipt,

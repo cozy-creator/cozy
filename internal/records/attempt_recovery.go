@@ -4,10 +4,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"github.com/cozy-creator/cozy/internal/archive"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Recover rebinds an open obligation to its current peer. A sealed outcome keeps
@@ -50,7 +50,7 @@ func (s *Store) Recover(requestID string, attempt int64, sessionID string) *exit
 			} `json:"observation"`
 		}
 		if json.Unmarshal(body, &projection) == nil && projection.Observation.Environment.Boot != "" {
-			doc, read := canonical.Read(body, &pb.AttemptOutcomeBody{})
+			doc, read := archive.Read(body, archive.TerminalBody)
 			observedDigest, _ := canonical.Spell(canonical.Digest(body))
 			if read != nil || observedDigest != digest || doc.Str("request_id") != requestID || doc.Int("attempt_ordinal") != attempt || doc.Str("invocation_spec_digest") != assignedSpec {
 				return exit.Named(exit.Conflict, "attempt.execution_identity_unverified", "retained terminal cannot establish the original execution identity")

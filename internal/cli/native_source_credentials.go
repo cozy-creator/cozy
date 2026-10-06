@@ -4,27 +4,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/secret"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // SourceCredentials are the configured provider credentials, keyed by provider, that a
 // native source call presents. They travel only in a sent command or submission, never a record.
-func (r *Resolver) SourceCredentials() []*pb.SourceCredential {
-	var credentials []*pb.SourceCredential
-	for _, row := range []struct {
-		provider pb.NativeSourceOperation
-		token    secret.Value
-	}{
-		{pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_HUGGINGFACE, r.cfg.HuggingFaceToken},
-		{pb.NativeSourceOperation_NATIVE_SOURCE_OPERATION_CIVITAI, r.cfg.CivitaiToken},
-	} {
-		if row.token.Present() {
-			credentials = append(credentials, &pb.SourceCredential{Provider: row.provider, Credential: secret.NativeSourceCredential(row.token)})
-		}
-	}
-	return credentials
-}
 
 // NativeSourceEligible reads the captured descriptor, never source code or a mutable package pin.
 func (r *Resolver) NativeSourceEligible(parent records.Request, operation string) *exit.Error {

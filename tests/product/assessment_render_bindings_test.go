@@ -19,8 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 func assessmentRecord(t *testing.T, err *exit.Error) {
@@ -41,9 +39,9 @@ func assessmentJSON(t *testing.T, value any) []byte {
 	}
 	return raw
 }
-func assessmentDocument(t *testing.T, value proto.Message) []byte {
+func assessmentDocument(t *testing.T, value map[string]any) []byte {
 	t.Helper()
-	raw, err := canonical.Bytes(value)
+	raw, err := fixtureBytes(value)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +97,7 @@ func retainedRenderBindings(t *testing.T, serving, wrongModel bool) {
 		intent := assessmentJSON(t, map[string]any{"module": binding.Module, "export": binding.Export, "request": json.RawMessage(arguments)})
 		request, _, problem := st.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: assessmentDigest([]byte(id)), Kind: kind, Package: "local/render-install", Entrypoint: "render", InstallID: binding.ChildInstallID, RetainWork: true, ParentRequestID: parent.ID, ParentCallIndex: int64(i), ChildIntentDigest: assessmentDigest(intent), ChildTargetDigest: revision, Payload: payload, Models: []records.ModelRef{{Slot: "model", Manifest: checkpoint, ManifestLength: 1}}})
 		assessmentRecord(t, problem)
-		spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(payload), Inputs: []*pb.InputBinding{{InputId: "model:model", Digest: checkpoint, Length: 1}}, Spec: &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{InstallationId: binding.ChildInstallID}}})
+		spec := assessmentDocument(t, map[string]any{"payload_digest": assessmentDigest(payload), "inputs": []any{map[string]any{"input_id": "model:model", "digest": checkpoint, "length": 1, "_format": "cozy.worker.v1.InputBinding/1"}}, "job": map[string]any{"installation_id": binding.ChildInstallID, "_format": "cozy.worker.v1.JobInvocationSpec/1"}, "_format": "cozy.worker.v1.InvocationSpec/1"})
 		var prepared []byte
 		if serving {
 			resident := checkpoint
@@ -125,7 +123,7 @@ func retainedRenderBindings(t *testing.T, serving, wrongModel bool) {
 		}
 		media := imageBytes.Bytes()
 		mediaDigest := canonical.Digest(media)
-		terminal := assessmentDocument(t, &pb.AttemptOutcomeBody{RequestId: id, AttemptOrdinal: uint64(ordinal), InvocationSpecDigest: assessmentDigest(spec), Status: pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, ExecutionStarted: true, OutputManifest: &pb.OutputManifest{Outputs: []*pb.OutputEntry{{OutputId: "image", Digest: mediaDigest, Length: uint64(len(media)), MimeType: "image/png"}}}})
+		terminal := assessmentDocument(t, map[string]any{"request_id": id, "attempt_ordinal": uint64(ordinal), "invocation_spec_digest": assessmentDigest(spec), "status": 1, "execution_started": true, "output_manifest": map[string]any{"outputs": []any{map[string]any{"output_id": "image", "digest": fixtureDigest(mediaDigest), "length": uint64(len(media)), "mime_type": "image/png", "_format": "cozy.worker.v1.OutputEntry/1"}}, "_format": "cozy.worker.v1.OutputManifest/1"}, "_format": "cozy.worker.v1.AttemptOutcomeBody/1"})
 		_, problem = st.AcceptTerminal(records.Terminal{RequestID: id, Attempt: ordinal, SessionID: "boot", InvocationDigest: assessmentDigest(spec), TerminalID: "out-" + id, TerminalDigest: assessmentDigest(terminal), Status: "SUCCEEDED", Body: terminal, RequestState: "succeeded"})
 		assessmentRecord(t, problem)
 		info.Subject.Arms[name] = assessment.RenderArm{Checkpoint: checkpoint, Requests: []string{id}, Media: []string{assessmentDigest(media)}}
@@ -211,7 +209,7 @@ func assessmentServingPlacement(t *testing.T, binding records.ChildBinding, chec
 		"installation_id": binding.ChildInstallID, "package_interface": base64.StdEncoding.EncodeToString(fixturePackageInterface), "entrypoints": entries, "models": models, "bindings_digest": bindingsDigest,
 	}}})
 	must(t, err)
-	spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(payload), Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{EntrypointBindingDigest: entryDigest, AttemptBindingId: entryDigest, BindingsDigest: bindingsDigest}}})
+	spec := assessmentDocument(t, map[string]any{"payload_digest": assessmentDigest(payload), "serving": map[string]any{"entrypoint_binding_digest": entryDigest, "attempt_binding_id": entryDigest, "bindings_digest": bindingsDigest, "_format": "cozy.worker.v1.ServingInvocationSpec/1"}, "_format": "cozy.worker.v1.InvocationSpec/1"})
 	return set, spec
 }
 

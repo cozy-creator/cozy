@@ -5,8 +5,9 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+const RentalIdleTimeoutSeconds int64 = 900
 
 const rentalIdleDDL = `CREATE TABLE IF NOT EXISTS rental_idle (
  rental_id TEXT PRIMARY KEY REFERENCES rentals(id) ON DELETE CASCADE,
@@ -162,7 +163,7 @@ func (i RentalIdleState) ReleaseAt() (time.Time, bool) {
 	if i.Queued > 0 || i.Running > 0 || i.PendingPreparation > 0 || i.Since.IsZero() {
 		return time.Time{}, false
 	}
-	return i.Since.Add(time.Duration(pb.RentalIdleTimeoutSeconds) * time.Second), true
+	return i.Since.Add(time.Duration(RentalIdleTimeoutSeconds) * time.Second), true
 }
 func (i RentalIdleState) Due(at time.Time) bool {
 	deadline, ok := i.ReleaseAt()
