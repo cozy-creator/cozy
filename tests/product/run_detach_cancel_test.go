@@ -114,7 +114,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 	if _, _, problem := store.Submit(records.Request{
 		ID: parkedID, IdemKey: "idem-cl108-parked",
 		BodyDigest: "sha256:" + strings.Repeat("ab", 32),
-		Package:    "fake/parked", Entrypoint: "generate", Kind: "job", Payload: []byte("{}"),
+		Package:    "fake/parked", Entrypoint: "generate", Payload: []byte("{}"),
 		MachineExecutionObserver: true,
 	}); problem != nil {
 		t.Fatal(problem.Message)
