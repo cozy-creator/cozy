@@ -76,6 +76,7 @@ class Result(msgspec.Struct):
 @invocable(memoize=False)
 async def make(ctx: Context, out: Outputs, *, gate: str, size: int) -> Result:
     while not os.path.exists(gate):
+        ctx.raise_if_cancelled()
         await asyncio.sleep(0.05)
     ctx.raise_if_cancelled()
     return Result(out.save_bytes(bytes(i % 251 for i in range(size)), media_type="application/octet-stream"))
@@ -277,6 +278,7 @@ func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
 	}
 
 	// The machine produces exact authored bytes while its client daemon is gone.
+	t.Log("native bytes after daemon shutdown")
 	row, gate, directory := start("native-down-bytes")
 	down()
 	must(t, os.WriteFile(gate, nil, 0o600))
@@ -295,6 +297,7 @@ func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
 	}
 
 	// A locally durable explicit cancel waits through a controller restart.
+	t.Log("durable native cancel recorded while daemon is down")
 	row, _, _ = start("native-down-cancel")
 	down()
 	_, problem = store.RequestMachineCancellation(row.ID, "cozy run cancel")
@@ -311,6 +314,7 @@ func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
 	}
 
 	// If natural success already won, the late intent never changes that outcome.
+	t.Log("natural native success before late cancel")
 	row, gate, directory = start("native-success-before-cancel")
 	down()
 	must(t, os.WriteFile(gate, nil, 0o600))
@@ -331,6 +335,7 @@ func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
 	}
 
 	// One actual watcher survives a daemon restart and only observes the run.
+	t.Log("same native watcher across daemon restart")
 	row, gate, directory = start("native-watch-reconnect")
 	stdout, err := os.Create(filepath.Join(root, "watch.stdout"))
 	must(t, err)
