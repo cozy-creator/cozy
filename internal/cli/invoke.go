@@ -3022,9 +3022,10 @@ func describeOnMachine(ctx *Context, pkg string) (string, *launch.PackageInterfa
 }
 
 // describeFallback keeps a describe refusal that ends the run, and drops one that only says
-// the machine or daemon cannot describe (an older one, or no route): the Hub names it.
+// the machine or daemon cannot describe now (an older one, no route, or an unreachable
+// machine, whose run is still recorded and waits for it): the Hub names it.
 func describeFallback(problem *exit.Error) *exit.Error {
-	if problem == nil || problem.ErrName() == errNoDescribe.ErrName() || problem.Code == exit.NotFound ||
+	if problem == nil || problem.Code == exit.Unavailable || problem.Code == exit.NotFound ||
 		problem.ErrName() == "untyped_answer" || problem.ErrName() == "hub.untyped_refusal" {
 		return nil
 	}
