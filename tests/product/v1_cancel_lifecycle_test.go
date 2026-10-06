@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -12,7 +11,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -235,7 +233,3 @@ func TestV1CancelFencesDelayedNativeAcceptance(t *testing.T) {
 		}
 	}
 }
-
-// Keep this import for the upcoming actual daemon-restart watcher case.
-var _ = context.Background
-var _ = time.Second
