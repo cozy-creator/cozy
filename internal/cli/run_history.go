@@ -20,7 +20,7 @@ type runHistory struct {
 	limit              int
 	rows               []api.Lifecycle
 	more               bool
-	// hubs, when set, names each run's hub in its own column.
+	// hubs names each run's hub, for --full.
 	hubs *config.Config
 }
 
@@ -28,7 +28,7 @@ func (h *runHistory) snapshot() listSnapshot {
 	list := runListRows(h.rows)
 	list.Aggregates = nil // Loaded pages are not a census of all retained history.
 	if h.hubs != nil {
-		withHubColumn(*h.hubs, &list)
+		nameHubs(*h.hubs, &list)
 	}
 	return listSnapshot{list: list, more: h.more}
 }
