@@ -130,3 +130,41 @@ func TestPublishedInstallWithUVConstraintDependencies(t *testing.T) {
 		t.Fatalf("a release with uv constraint-dependencies did not install: %d %s %s", code, stdout, stderr)
 	}
 }
+
+// The org index carries an older release of a package the lock pins from PyPI. uv takes a name
+// from the first index that has it, so an install resolving the closure through both indexes
+// refused it (minimax-h3 1.26.0's diffusers==0.40.0 on both Hubs). Each locked package is
+// taken from the source its uv.lock records.
+func TestPublishedInstallTakesEachPackageFromItsLockedSource(t *testing.T) {
+	plan, wheel := reportingReleaseWithDependencies(t, `"cozy-runtime>=0.16.8", "idna==3.7"`, "")
+	root := t.TempDir()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/packages/proof/install-reporting/download", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(plan)
+	})
+	mux.HandleFunc("GET /v1/index/proof/simple/install-reporting/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `<a href="/project.whl/%s#sha256=%x">%s</a>`, plan.Downloads[0].Path, sha256.Sum256(wheel), plan.Downloads[0].Path)
+	})
+	mux.HandleFunc("GET /project.whl/{name}", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(wheel) })
+	// The org's own idna, older than the lock's: an index-resolved install stops here.
+	mux.HandleFunc("GET /v1/index/proof/simple/idna/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `<a href="/project.whl/idna-3.6-py3-none-any.whl#sha256=%s">idna-3.6-py3-none-any.whl</a>`, strings.Repeat("0", 64))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
+	code, stdout, stderr := runCozyStreams(t, root, "package", "install", "proof/install-reporting", "--version=1.0.1", "--json")
+	if code != 0 || !strings.Contains(stdout, `"status":"installed"`) {
+		t.Fatalf("a locked package the org index also names was not taken from its locked source: %d %s %s", code, stdout, stderr)
+	}
+	var installed []string
+	must(t, filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err == nil && entry.IsDir() && strings.HasPrefix(entry.Name(), "idna-") && strings.HasSuffix(entry.Name(), ".dist-info") {
+			installed = append(installed, entry.Name())
+		}
+		return nil
+	}))
+	if !slices.Equal(installed, []string{"idna-3.7.dist-info"}) {
+		t.Fatalf("installed idna %v, want the locked 3.7", installed)
+	}
+}
