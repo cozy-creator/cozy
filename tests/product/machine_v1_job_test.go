@@ -108,13 +108,15 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	if code, shown := runCozy(t, root, "run", "show", "1", "--json"); code != 0 || !strings.Contains(shown, "Video (segments 1-3)") {
 		t.Fatalf("run show does not name the film's last revision [exit %d]\n%s", code, shown)
 	}
-	// A job's model choice addresses one of its callables and reaches that child: this
-	// segment function declares no model slot, so its first child refuses it and the job
-	// fails naming that segment.
+	// A job's model choice for a slot that exists nowhere (this segment function declares no
+	// model slot) is a warning, never a refusal: the film is rendered all the same.
 	code, document = runCozy(t, root, "run", "local/cozy-machine-cpu-longform/long_form", "--input", in,
 		"--asset", "reference="+reference, "model.render_segment.models.base=alice/model", "--await", "--json")
-	if code == 0 || !strings.Contains(document, "segment 1 of 3") || !strings.Contains(document, "model choices name no declared model slot") {
-		t.Fatalf("the child did not receive the job's choice for it [exit %d]\n%s", code, document)
+	if code != 0 {
+		t.Fatalf("a choice naming no model slot failed the run [exit %d]\n%s", code, document)
+	}
+	if code, shown := runCozy(t, root, "run", "show", "2", "--json"); !strings.Contains(document+shown, "names no model slot") {
+		t.Fatalf("the ignored choice was not reported as a warning [exit %d]\n%s\n%s", code, document, shown)
 	}
 }
 

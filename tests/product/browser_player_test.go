@@ -639,6 +639,8 @@ func TestRunPlayPlaysALocalMachinesGrowingFilm(t *testing.T) {
 		return fmt.Sprintf(`!player().error && video().currentTime >= %v && ranges().some(([, e]) => e >= %v)`, seconds-0.1, seconds-0.05)
 	}
 	playerWait(t, page, "segment 1 plays while the run runs", shown(0.5))
+	// The film runs out at its live edge, says so, and plays on as the next segment lands.
+	playerWait(t, page, "segment 1 runs out at the live edge", `video().ended && document.getElementById("status").textContent.includes("Waiting")`)
 	must(t, os.WriteFile(filepath.Join(gate, "go-2"), nil, 0o600))
 	playerWait(t, page, "segment 2 plays as it lands", shown(1.0))
 	must(t, os.WriteFile(filepath.Join(gate, "go-3"), nil, 0o600))

@@ -483,7 +483,8 @@ class Media {
 
   restart() {
     const video = this.#player.video;
-    const resume = this.#url ? {time: video.currentTime, playing: !video.paused && !video.ended} : null;
+    // A replaced output keeps playing: also when the film had run out at its live edge.
+    const resume = this.#url ? {time: video.currentTime, playing: !video.paused || video.ended} : null;
     this.close();
     this.#resume = resume;
     const Source = globalThis.ManagedMediaSource ?? globalThis.MediaSource;
