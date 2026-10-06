@@ -539,7 +539,7 @@ func (c *RunCancelCmd) Run(r *Runtime) error {
 }
 
 type RunListCmd struct {
-	AllHubs bool   `help:"List runs on every hub, not only the current one."`
+	AllHubs bool   `help:"Every hub's runs: the default. --tensorhub=<hub> lists one hub's."`
 	State   string `help:"Filter by lifecycle state."`
 	Package string `predictor:"package" help:"Filter by package."`
 	Limit   *int   `help:"Maximum runs; snapshots default to 50, 0 reads all history. Live lists load more while scrolling."`
@@ -639,7 +639,7 @@ func (c *RentalEndCmd) Run(r *Runtime) error {
 }
 
 type RentalListCmd struct {
-	AllHubs bool `help:"List rentals on every hub, not only the current one."`
+	AllHubs bool `help:"Every hub's rentals: the default. --tensorhub=<hub> lists one hub's."`
 	Watch   bool `help:"Refresh continuously (requires a terminal)."`
 	NoWatch bool `help:"Print one snapshot even in a terminal."`
 }
