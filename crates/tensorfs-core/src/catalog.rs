@@ -1482,6 +1482,9 @@ impl WriterGuard {
 
     pub fn lock_rebuild(root: &Path) -> Result<RebuildGuard> {
         let directory = writer_markers(root)?;
+        // Owner pins live only in its process. Outside collectors must exclude that owner
+        // before taking recovery.lock, and retain the exclusion through the entire pass.
+        let owner = crate::meta::OwnerGuard::acquire(root)?;
         let recovery = File::options()
             .create(true)
             .truncate(false)
@@ -1515,7 +1518,7 @@ impl WriterGuard {
             }
             fs::remove_file(path).map_err(|error| io("reap dead writer marker", error))?;
         }
-        Ok(RebuildGuard { _file: recovery })
+        Ok(RebuildGuard { _file: recovery, _owner: owner })
     }
 }
 
@@ -1569,6 +1572,7 @@ fn live_holders(root: &Path) -> Result<String> {
 #[derive(Debug)]
 pub struct RebuildGuard {
     _file: File,
+    _owner: crate::meta::OwnerGuard,
 }
 
 impl Drop for WriterGuard {

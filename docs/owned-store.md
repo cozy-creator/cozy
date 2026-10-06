@@ -18,6 +18,21 @@ in the owner process pins individual objects so its own GC can run; other
 processes' read leases continue to exclude GC with the recovery lock. The owner
 registration is scoped to the live owner handles, rather than lasting forever.
 
+GC, catalog rebuild and destructive reclamation require the owner role or a
+shared hold on `owner.lock` for the whole operation. An outside process cannot
+see the daemon's in-memory object pins, so its destructive operation returns
+`STORE_BUSY` while that daemon owns the store. A shared destructive hold also
+prevents a daemon from claiming ownership partway through a collection; it does
+not register that outside collector as an in-process owner. Ordinary Store reads
+and writes remain available.
+
+Older full-store maintenance binaries do not consult `owner.lock` and cannot
+see a daemon's private read pins. Their destructive GC/reclaim/rebuild commands
+must run only after the owner and all leases have ended; online maintenance uses
+the owning daemon or the updated library. This restriction does not apply to
+ordinary reads or to Hub catalog planning on a separate census directory. There
+is no peer-version admission check.
+
 The daemon no longer needs to know the ownership lock filename or separately call
 `meta::own`. GPU custody, executor supervision and daemon restart adoption are
 outside this API.

@@ -75,9 +75,7 @@ fn canonical(root: &Path) -> PathBuf {
     fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
-/// Claim the owner role before opening the catalog. The caller holds the Store creation
-/// lock and has established a valid layout, so adding owner.lock cannot poison a new root.
-pub(crate) fn claim(root: &Path) -> Result<Arc<Owner>> {
+fn owner_file(root: &Path) -> Result<File> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -96,13 +94,25 @@ pub(crate) fn claim(root: &Path) -> Result<Arc<Owner>> {
             "Store owner lock is not a regular file",
         );
     }
-    if let Err(error) = lock.try_lock_exclusive() {
-        return if error.kind() == std::io::ErrorKind::WouldBlock {
-            refuse(Code::STORE_BUSY, "this TensorFS store already has an owner")
-        } else {
-            Err(io("lock Store owner", error))
-        };
+    Ok(lock)
+}
+
+fn owner_lock_error(error: std::io::Error) -> Refusal {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Refusal {
+            code: Code::STORE_BUSY,
+            detail: "this TensorFS store already has an owner or active collection".into(),
+        }
+    } else {
+        io("lock Store owner", error)
     }
+}
+
+/// Claim the owner role before opening the catalog. The caller holds the Store creation
+/// lock and has established a valid layout, so adding owner.lock cannot poison a new root.
+pub(crate) fn claim(root: &Path) -> Result<Arc<Owner>> {
+    let lock = owner_file(root)?;
+    lock.try_lock_exclusive().map_err(owner_lock_error)?;
     let owner = Arc::new(Owner {
         _lock: lock,
         gate: RwLock::default(),
@@ -122,6 +132,26 @@ pub(crate) fn owner(root: &Path) -> Option<Arc<Owner>> {
         .iter()
         .find(|(owned, _)| *owned == root)
         .and_then(|(_, owner)| owner.upgrade())
+}
+
+/// A destructive pass must see the owner's pins, or exclude an owner for its whole life.
+/// External passes take shared locks so reclamation can call ordinary GC while retaining
+/// its exclusion across root removal. Their recovery locks still serialize deletion.
+#[derive(Debug)]
+pub(crate) enum OwnerGuard {
+    Local { _owner: Arc<Owner> },
+    Shared { _file: File },
+}
+
+impl OwnerGuard {
+    pub(crate) fn acquire(root: &Path) -> Result<Self> {
+        if let Some(owner) = owner(root) {
+            return Ok(Self::Local { _owner: owner });
+        }
+        let file = owner_file(root)?;
+        FileExt::try_lock_shared(&file).map_err(owner_lock_error)?;
+        Ok(Self::Shared { _file: file })
+    }
 }
 
 #[derive(Debug, Clone)]

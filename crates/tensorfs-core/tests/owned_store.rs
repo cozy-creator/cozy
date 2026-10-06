@@ -90,6 +90,14 @@ fn owner_process() {
     } else {
         Store::ensure(&root).unwrap()
     };
+    if mode == "rebuild" {
+        let _guard = tensorfs_core::catalog::WriterGuard::lock_rebuild(&root).unwrap();
+        println!("OWNER_READY");
+        std::io::stdout().flush().unwrap();
+        let mut done = String::new();
+        std::io::stdin().read_line(&mut done).unwrap();
+        return;
+    }
     let meta = Meta::open(&store).unwrap();
     let object = put(&store, b"external reader");
     let (lease, _) = read::acquire(&store, &meta, "layout", vec![object]).unwrap();
@@ -230,6 +238,64 @@ fn another_process_reader_still_excludes_owner_gc() {
     drop(reader);
     tensorfs_core::gc::collect(&root, false).unwrap();
     drop(owner);
+}
+
+#[test]
+fn external_collection_cannot_unlink_an_owners_live_read_pin() {
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    let owner = Process::start(&root, "owned");
+    let shared = Store::open(&root)
+        .unwrap()
+        .bind_disk_budget(Some(1 << 20))
+        .unwrap();
+    let object = ObjectRef::of(b"external reader");
+    let path = shared.object_path(&object.sha256);
+    assert!(path.is_file());
+    assert_eq!(
+        tensorfs_core::gc::collect(&root, false).unwrap_err().code,
+        Code::STORE_BUSY
+    );
+    assert_eq!(
+        tensorfs_core::catalog::WriterGuard::lock_rebuild(&root)
+            .unwrap_err()
+            .code,
+        Code::STORE_BUSY
+    );
+    let absent = tensorfs_core::repository::RepositoryName {
+        org: "local".into(),
+        name: "absent".into(),
+    };
+    assert_eq!(
+        tensorfs_core::reclaim::run(
+            &shared,
+            &[absent],
+            tensorfs_core::reclaim::RunOptions {
+                assume_upstream: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .code,
+        Code::STORE_BUSY
+    );
+    assert!(path.is_file());
+    drop(owner);
+    tensorfs_core::gc::collect(&root, false).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn an_external_rebuild_excludes_a_new_owner_for_the_entire_pass() {
+    let scratch = Scratch::new();
+    let root = scratch.store();
+    let collector = Process::start(&root, "rebuild");
+    assert_eq!(
+        Store::ensure_owned(&root).unwrap_err().code,
+        Code::STORE_BUSY
+    );
+    drop(collector);
+    drop(Store::ensure_owned(&root).unwrap());
 }
 
 #[test]
