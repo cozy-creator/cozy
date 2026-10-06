@@ -950,11 +950,18 @@ func handleRunList(ctx *Context) *exit.Error {
 	if ctx.Inv.Value("--limit") == "" {
 		limit = 50
 	}
-	list, problem := runList(context.Background(), client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
+	list, older, problem := runList(context.Background(), client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
 	if problem != nil {
 		return problem
 	}
 	nameHubs(ctx.Cfg, &list)
+	switch {
+	case older != nil:
+		list.Total, list.More = len(list.Rows)+*older, "Use --limit 0 to show all."
+	case len(list.Rows) == limit:
+		// A daemon that does not count what it left out.
+		list.Trail = append(list.Trail, fmt.Sprintf("Showing the newest %d runs; older ones may not be shown. Use --limit 0 to show all.", limit))
+	}
 	return emit(ctx, list)
 }
 
@@ -966,33 +973,42 @@ func nameHubs(cfg config.Config, list *output.List) {
 	}
 }
 
-func runList(requestCtx context.Context, client *localapi.Client, state, packageName string, limit int) (output.List, *exit.Error) {
+// runList reads up to limit runs (0: all), newest first, and how many matching runs it left
+// out: nil when the daemon does not count them.
+func runList(requestCtx context.Context, client *localapi.Client, state, packageName string, limit int) (output.List, *int, *exit.Error) {
 	pkg := strings.TrimSpace(packageName)
 	var rows []api.Lifecycle
 	var before int64
+	none := 0
+	older := &none
 	for {
 		pageSize := 500
 		if limit > 0 {
 			pageSize = min(pageSize, limit-len(rows))
 		}
-		page, problem := client.RequestsBefore(requestCtx, state, pkg, pageSize, before)
+		history, problem := client.RequestPage(requestCtx, state, pkg, pageSize, before)
 		if problem != nil {
-			return output.List{}, problem
+			return output.List{}, nil, problem
 		}
+		page := history.Requests
 		if len(page) == 0 {
 			break
 		}
 		next := page[len(page)-1].Number
 		if next < 1 || (before > 0 && next >= before) {
-			return output.List{}, exit.New(exit.Conflict, "run history pagination did not advance; restart the Cozy daemon to load the current API")
+			return output.List{}, nil, exit.New(exit.Conflict, "run history pagination did not advance; restart the Cozy daemon to load the current API")
 		}
 		rows = append(rows, page...)
-		if len(page) < pageSize || (limit > 0 && len(rows) >= limit) {
+		if len(page) < pageSize {
+			break
+		}
+		if limit > 0 && len(rows) >= limit {
+			older = history.Older
 			break
 		}
 		before = next
 	}
-	return runListRows(rows), nil
+	return runListRows(rows), older, nil
 }
 
 func runListRows(rows []api.Lifecycle) output.List {

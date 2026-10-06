@@ -75,6 +75,8 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	if e != nil {
 		return e
 	}
+	matching := max(search.Total, len(resources))
+	more := searchMore(len(resources), limit)
 	if len(resources) > limit {
 		resources = resources[:limit]
 	}
@@ -88,14 +90,10 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 			}
 			cards = append(cards, card)
 		}
-		var notes []string
-		if search.Capped || search.Total > len(resources) {
-			notes = append(notes, fmt.Sprintf("Showing %d of %d matching models", len(resources), search.Total))
-		}
-		return emit(ctx, modelSearchView{Cards: cards, Notes: notes})
+		return emit(ctx, modelSearchView{Cards: cards, Matching: matching, More: more})
 	}
 	l := output.List{Name: kind + "s", Fields: []string{"ref", "latest"},
-		AllFields: []string{"ref", "latest", "created", "org", "name"}, Total: search.Total}
+		AllFields: []string{"ref", "latest", "created", "org", "name"}, Total: matching, More: more, Uncapped: true}
 	for _, r := range resources {
 		l.Rows = append(l.Rows, map[string]string{"ref": r.Ref(), "latest": r.LatestRelease,
 			"created": stamp(r.CreatedAt), "org": r.Org, "name": r.Name})
@@ -115,6 +113,18 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 		l.Next = []string{"cozy " + kind + " search"}
 	}
 	return emit(ctx, l)
+}
+
+// searchMore is how to see the matches a search left out: a higher --limit while the Hub
+// returned more than it showed, else a narrower search.
+func searchMore(returned, limit int) string {
+	switch {
+	case returned > limit && returned <= 100:
+		return fmt.Sprintf("Use --limit %d to show all.", returned)
+	case returned > limit:
+		return "Use --limit 100 to show more, or narrow the search."
+	}
+	return "Narrow the search to see the rest."
 }
 
 // handlePackageInfo lists one published package's releases, newest first, from the

@@ -756,13 +756,17 @@ func (c *Client) RentalListing(ctx context.Context) ([]Rental, int64, *exit.Erro
 	return rentals, out.BindingsRevision, nil
 }
 
-// RentalHistory is every rental of this account that bore `name`, ended ones included, newest
-// first. A Hub that does not filter by name answers its whole history; the filter here holds.
+// RentalHistory is every rental of this account that bore `name` (any name when blank), ended
+// ones included, newest first. A Hub that does not filter by name answers its whole history;
+// the filter here holds.
 func (c *Client) RentalHistory(ctx context.Context, name string) ([]Rental, *exit.Error) {
 	var out struct {
 		Rentals []wireRental `json:"rentals"`
 	}
-	query := url.Values{"state": {"all"}, "name": {strings.ToLower(name)}}
+	query := url.Values{"state": {"all"}}
+	if name != "" {
+		query.Set("name", strings.ToLower(name))
+	}
 	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals?" + query.Encode(), auth: true,
 		responseBytes: maxRentalListingBytes}, &out)
 	if e != nil {
@@ -770,7 +774,7 @@ func (c *Client) RentalHistory(ctx context.Context, name string) ([]Rental, *exi
 	}
 	var named []Rental
 	for _, wire := range out.Rentals {
-		if rental := wire.rental(); rentalid.Valid(wire.ID) && strings.EqualFold(rental.Name, name) {
+		if rental := wire.rental(); rentalid.Valid(wire.ID) && (name == "" || strings.EqualFold(rental.Name, name)) {
 			named = append(named, rental)
 		}
 	}

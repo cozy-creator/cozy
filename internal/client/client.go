@@ -348,17 +348,16 @@ func (c *Client) RecordedRequest(id string) (api.Lifecycle, *exit.Error) {
 	return life, e
 }
 
-// Requests lists ordinary invocations and jobs through the one request lifecycle
-// authority. Kind distinguishes their execution expectation without creating a
-// second public inventory.
-func (c *Client) Requests(ctx context.Context, status, packageName string, limit int) ([]api.Lifecycle, *exit.Error) {
-	return c.RequestsBefore(ctx, status, packageName, limit, 0)
+// RequestHistory is one page of run history, newest first, and how many matching runs are
+// older than it: nil from a daemon that does not count them.
+type RequestHistory struct {
+	Requests []api.Lifecycle `json:"requests"`
+	Older    *int            `json:"older"`
 }
 
-func (c *Client) RequestsBefore(ctx context.Context, status, packageName string, limit int, before int64) ([]api.Lifecycle, *exit.Error) {
-	var out struct {
-		Requests []api.Lifecycle `json:"requests"`
-	}
+// RequestPage reads the page of run history below run number `before` (0: the newest).
+func (c *Client) RequestPage(ctx context.Context, status, packageName string, limit int, before int64) (RequestHistory, *exit.Error) {
+	var out RequestHistory
 	path := fmt.Sprintf("/v1/requests?limit=%d", limit)
 	if c.allHubs {
 		path += "&hubs=all"
@@ -373,7 +372,7 @@ func (c *Client) RequestsBefore(ctx context.Context, status, packageName string,
 		path += "&package=" + url.QueryEscape(packageName)
 	}
 	problem := c.callContext(ctx, http.MethodGet, path, nil, &out)
-	return out.Requests, problem
+	return out, problem
 }
 
 // Cancel REQUESTS cancellation. The attempt's own journaled terminal settles it, so this

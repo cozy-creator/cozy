@@ -1389,9 +1389,20 @@ func (s *Store) RequestHub(id, fallbackHub string) (string, *exit.Error) {
 	return hub, nil
 }
 
-func (s *Store) requestsBefore(kind, state, packageName, hub, fallbackHub string, limit int, before int64, public bool) ([]Request, *exit.Error) {
-	// Number only narrow index facts across history; load payloads and other
-	// request documents only for the bounded selected page.
+// PublicRequestsOlder counts the runs PublicRequestsBefore would list below run number
+// `before`: what a listing that stopped there leaves out.
+func (s *Store) PublicRequestsOlder(state, packageName, hub, fallbackHub string, before int64) (int, *exit.Error) {
+	numbered, where, args := requestHistory("", state, packageName, hub, fallbackHub, before, true)
+	var count int
+	if err := s.db.QueryRow(numbered+` SELECT COUNT(*) FROM numbered`+where, args...).Scan(&count); err != nil {
+		return 0, exit.Internalf("cannot count requests: %s", err)
+	}
+	return count, nil
+}
+
+// requestHistory is every request numbered host-wide, and the conditions one listing keeps.
+// Number only narrow index facts across history; a page loads payloads only for its rows.
+func requestHistory(kind, state, packageName, hub, fallbackHub string, before int64, public bool) (string, string, []any) {
 	selectedState := "state"
 	if public && state != "" {
 		selectedState = publicRunStatusSQL()
@@ -1402,33 +1413,29 @@ func (s *Store) requestsBefore(kind, state, packageName, hub, fallbackHub string
 		selectedHub = requestHubSQL
 		args = append(args, strings.TrimRight(fallbackHub, "/"))
 	}
-	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
-  id,created_at,kind,` + selectedState + ` AS state,package,` + selectedHub + ` AS hub FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
+	numbered := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
+  id,created_at,kind,` + selectedState + ` AS state,package,` + selectedHub + ` AS hub FROM requests)`
 	where := []string{}
-	if before > 0 {
-		where = append(where, `number<?`)
-		args = append(args, before)
+	for _, condition := range []struct {
+		sql   string
+		value any
+		on    bool
+	}{{`number<?`, before, before > 0}, {`kind=?`, kind, kind != ""}, {`state=?`, state, state != ""},
+		{`package=?`, packageName, packageName != ""}, {`hub=?`, hub, hub != ""}} {
+		if condition.on {
+			where, args = append(where, condition.sql), append(args, condition.value)
+		}
 	}
-	if kind != "" {
-		where = append(where, `kind=?`)
-		args = append(args, kind)
+	if len(where) == 0 {
+		return numbered, "", args
 	}
-	if state != "" {
-		where = append(where, `state=?`)
-		args = append(args, state)
-	}
-	if packageName != "" {
-		where = append(where, `package=?`)
-		args = append(args, packageName)
-	}
-	if hub != "" {
-		where = append(where, `hub=?`)
-		args = append(args, hub)
-	}
-	if len(where) > 0 {
-		query += ` WHERE ` + strings.Join(where, " AND ")
-	}
-	query += ` ORDER BY created_at DESC, id DESC LIMIT ?) SELECT page.number, ` + requestCols +
+	return numbered, ` WHERE ` + strings.Join(where, " AND "), args
+}
+
+func (s *Store) requestsBefore(kind, state, packageName, hub, fallbackHub string, limit int, before int64, public bool) ([]Request, *exit.Error) {
+	numbered, where, args := requestHistory(kind, state, packageName, hub, fallbackHub, before, public)
+	query := numbered + `, page AS (SELECT number,id AS page_request_id FROM numbered` + where +
+		` ORDER BY created_at DESC, id DESC LIMIT ?) SELECT page.number, ` + requestCols +
 		` FROM requests JOIN page ON requests.id=page.page_request_id ORDER BY page.number DESC`
 	args = append(args, limit)
 	rows, err := s.db.Query(query, args...)

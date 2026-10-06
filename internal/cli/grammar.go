@@ -643,12 +643,14 @@ func (c *RentalEndCmd) Run(r *Runtime) error {
 
 type RentalListCmd struct {
 	AllHubs bool `help:"Every hub's rentals: the default. --tensorhub=<hub> lists one hub's."`
+	Ended   bool `help:"Ended rentals instead: why and when each ended, and what it cost."`
 	Watch   bool `help:"Refresh continuously (requires a terminal)."`
 	NoWatch bool `help:"Print one snapshot even in a terminal."`
 }
 
 func (c *RentalListCmd) Run(r *Runtime) error {
-	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch, "--all-hubs", c.AllHubs), nil, false)
+	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch, "--all-hubs", c.AllHubs,
+		"--ended", c.Ended), nil, false)
 }
 
 type RentalShowCmd struct {
