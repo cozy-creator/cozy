@@ -1,6 +1,6 @@
 //! The machine's launch contract: the environment a Hub (rental) or this computer's launcher
-//! (persistent) gives it. Same names and meaning as the Go agent's grant. Unknown names are
-//! reported and ignored, so a newer Hub never stops an older machine from booting.
+//! (persistent) gives it. Unknown names are reported and ignored, so a newer Hub never stops
+//! an older machine from booting.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 use std::{
@@ -22,7 +22,6 @@ const NAMES: &[&str] = &[
     "COZY_WORKER_INTERNAL_PORT",
     "COZY_WEBRTC_INTERNAL_PORT",
     "COZY_WEBRTC_PUBLIC_ADDRESS",
-    "COZY_RECORD_OWNER_AUTH_JSON",
     "COZY_AUTHORIZED_KEYS",
     "COZY_SSH_PUBLIC_KEY",
     "COZY_RENTAL_IDLE_SECONDS",
@@ -79,7 +78,7 @@ pub struct Grant {
 }
 
 /// The image's filesystem, rooted: "/" on a pod, a directory on an owned machine. The paths
-/// are the Go agent's, so a root keeps its identity whichever agent boots it.
+/// preserve the machine's identity across software updates.
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub root: PathBuf,
@@ -99,8 +98,7 @@ impl Layout {
             store: store.unwrap_or_else(|| root.join("var/lib/tensorfs")),
         }
     }
-    /// This service's execution journal and package generations: outside
-    /// `var/lib/cozy/machine`, whose ownership the Go agent claims when it boots the same root.
+    /// This service's execution journal and package generations.
     pub fn engine(&self) -> PathBuf {
         self.root.join("var/lib/cozy/rust-machine")
     }
@@ -184,22 +182,10 @@ impl Grant {
                 })
             }
         };
-        let mut authorized = Vec::new();
-        if let Some(text) = get("COZY_RECORD_OWNER_AUTH_JSON") {
-            #[derive(serde::Deserialize)]
-            struct OwnerAuth {
-                control_public_key_ed25519_b64url: String,
-            }
-            let auth: OwnerAuth = serde_json::from_str(text).map_err(|e| {
-                invalid(&format!(
-                    "COZY_RECORD_OWNER_AUTH_JSON is not an auth document: {e}"
-                ))
-            })?;
-            authorized.push(public_key(&auth.control_public_key_ed25519_b64url)?);
-        }
-        if let Some(text) = get("COZY_AUTHORIZED_KEYS") {
-            authorized = text.split(',').map(public_key).collect::<io::Result<_>>()?;
-        }
+        let authorized = match get("COZY_AUTHORIZED_KEYS") {
+            Some(text) => text.split(',').map(public_key).collect::<io::Result<_>>()?,
+            None => Vec::new(),
+        };
         // On a rental the Hub lease replaces this boot value once it is read.
         if authorized.is_empty() {
             return Err(invalid(
