@@ -23,10 +23,20 @@ peer equality gate, image admission, rental, GPU operation, deployment or public
 Trackers: [331](https://github.com/cozy-creator/tracker/issues/331),
 [334](https://github.com/cozy-creator/tracker/issues/334).
 
-## Checkpoint and proof status
+## Proof and review status
 
-The source/test migration is an explicitly unverified checkpoint. Current Go worker
-imports are zero; generated worker bindings and their corpus are removed, with only
-actual historical record fixtures retained. Native cancellation/dispatch tests and
-ordinary current consumer tests remain. Compilation and archive/native CPU checks are
-pending the shared Go test slot. This draft is not ready for merge.
+The source/type cut is validated on fetched master52b2b159. Product compilation and
+all-package compilation pass; go vet passes. Focused archive/capture/custody/recovery
+and native dispatch-marker checks pass. Actual native CPU consumers pass with merged
+machine9636781: nested callees, delayed acceptance/cancel, client/watcher exit, daemon
+restart, missing source reattach and immutable input readback after original edits.
+The frozen original binding-producer fixtures read without worker bindings, including
+additive archived fields. GPU observations and existing outbox/archive rows are preserved.
+
+Sent native work stays canceling when its machine is stopped, and acceptance-unknown
+cannot advertise retry from empty old blob columns. Old worker submissions/receipts are
+abandoned locally with an explicit uncertainty reason, never resent as native runs.
+
+This is source/CPU proof. Independent PR review and root merge checking still precede
+merge; candidate3 and the final real-machine hardcut condition12 are separate gates.
+No deployment, publication, provider rental or GPU qualification is claimed here.
