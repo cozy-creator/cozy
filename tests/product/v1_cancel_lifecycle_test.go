@@ -42,6 +42,27 @@ func nativeLifecycleHome(t *testing.T) (string, *records.Store, *machines.V1) {
 			_ = removeAllForce(root)
 		}
 	})
+	project := nativeLifecycleProject(t)
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		t.Fatalf("installing authored lifecycle fixture [%d]: %s", code, out)
+	}
+	warm := filepath.Join(root, "warm-gate")
+	must(t, os.WriteFile(warm, nil, 0o600))
+	if code, out := runCozy(t, root, "run", "local/native-lifecycle/make", "gate="+warm, "size=64", "--idempotency-key=native-warm", "--await", "--json"); code != 0 {
+		t.Fatalf("warming native fixture [%d]: %s", code, out)
+	}
+	store, problem := records.Open(home.Paths(root).DB)
+	fatal(t, problem)
+	t.Cleanup(func() { store.Close() })
+	resolver := &machines.Resolver{Host: machines.NewHost(filepath.Join(root, "machine"), "", nil)}
+	machine, problem := resolver.DialV1(machines.AttachOnly(t.Context()), machines.Local, "native lifecycle test")
+	fatal(t, problem)
+	t.Cleanup(machine.Close)
+	return root, store, machine
+}
+
+func nativeLifecycleProject(t *testing.T) string {
+	t.Helper()
 	project := t.TempDir()
 	sources, floor := "", "0.18.102"
 	if *machineRuntimeWheel != "" {
@@ -75,6 +96,8 @@ class Result(msgspec.Struct):
 
 @invocable(memoize=False)
 async def make(ctx: Context, out: Outputs, *, gate: str, size: int) -> Result:
+    with open(gate + ".entered", "wb"):
+        pass
     while not os.path.exists(gate):
         ctx.raise_if_cancelled()
         await asyncio.sleep(0.05)
@@ -87,22 +110,7 @@ app.job(make)
 	if out, err := exec.Command("uv", "lock", "--project", project).CombinedOutput(); err != nil {
 		t.Fatalf("locking authored lifecycle fixture: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
-		t.Fatalf("installing authored lifecycle fixture [%d]: %s", code, out)
-	}
-	warm := filepath.Join(root, "warm-gate")
-	must(t, os.WriteFile(warm, nil, 0o600))
-	if code, out := runCozy(t, root, "run", "local/native-lifecycle/make", "gate="+warm, "size=64", "--idempotency-key=native-warm", "--await", "--json"); code != 0 {
-		t.Fatalf("warming native fixture [%d]: %s", code, out)
-	}
-	store, problem := records.Open(home.Paths(root).DB)
-	fatal(t, problem)
-	t.Cleanup(func() { store.Close() })
-	resolver := &machines.Resolver{Host: machines.NewHost(filepath.Join(root, "machine"), "", nil)}
-	machine, problem := resolver.DialV1(machines.AttachOnly(t.Context()), machines.Local, "native lifecycle test")
-	fatal(t, problem)
-	t.Cleanup(machine.Close)
-	return root, store, machine
+	return project
 }
 
 func nativeLifecycleRequest(t *testing.T, store *records.Store, key string) *records.Request {

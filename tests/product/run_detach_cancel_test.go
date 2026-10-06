@@ -82,12 +82,23 @@ func TestClientDeathNeverCancels(t *testing.T) {
 	awaitInvocationStatus(t, root, surviving.ID, "completed")
 
 	// ------------------------------------------------ explicit cancel: live and queued
-	// The LIVE path: a real running attempt, canceled explicitly; the attempt's own
-	// journaled terminal settles it, attributed to its actor.
-	code, dout, _ := runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
-		"size=32", "seed=24", "delay_ms=4500")
+	// The LIVE path: the authored job has entered a closed gate, so natural success
+	// cannot win before explicit cancellation reaches the real running attempt.
+	if code, out := runCozy(t, root, "package", "install", nativeLifecycleProject(t), "--editable"); code != 0 {
+		t.Fatalf("installing live cancel fixture [%d]: %s", code, out)
+	}
+	gate := filepath.Join(root, "live-cancel-gate")
+	code, dout, _ := runCozyStreams(t, root, "--json", "run", "local/native-lifecycle/make",
+		"gate="+gate, "size=64")
 	dref := submittedRunReference(t, code, dout)
 	awaitRunReferenceStatus(t, root, dref, "in_progress")
+	landed(t, "authored live job entered its closed gate", func() bool {
+		_, err := os.Stat(gate + ".entered")
+		return err == nil
+	})
+	if _, err := os.Stat(gate); !os.IsNotExist(err) {
+		t.Fatalf("live cancellation fixture gate is not closed: %v", err)
+	}
 	if code, out := runCozy(t, root, "run", "cancel", dref, "--await", "--json"); code != 0 ||
 		!strings.Contains(out, `"status":"canceled"`) ||
 		!strings.Contains(out, `"canceled_by":"cozy run cancel"`) {
@@ -103,7 +114,8 @@ func TestClientDeathNeverCancels(t *testing.T) {
 	if _, _, problem := store.Submit(records.Request{
 		ID: parkedID, IdemKey: "idem-cl108-parked",
 		BodyDigest: "sha256:" + strings.Repeat("ab", 32),
-		Package:    "fake/parked", Entrypoint: "generate", Payload: []byte("{}"),
+		Package:    "fake/parked", Entrypoint: "generate", Kind: "job", Payload: []byte("{}"),
+		MachineExecutionObserver: true,
 	}); problem != nil {
 		t.Fatal(problem.Message)
 	}
