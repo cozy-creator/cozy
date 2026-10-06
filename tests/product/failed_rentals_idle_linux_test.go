@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,7 +31,23 @@ func TestEndedRentalsTheHubRepeatsLeaveTheDaemonIdle(t *testing.T) {
 			"accelerator_count": 1, "hourly_rate_usd_micros": 1, "failure_code": "supervisor_never_started"}
 		h.mu.Unlock()
 	}
+	// Settled runs this computer kept: each poll that re-reported the failed rentals read all
+	// of their records again to find the runs to place elsewhere.
+	for i := range 200 {
+		id := fmt.Sprintf("settled-run-%03d", i)
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/settled", Entrypoint: "main", Kind: "job",
+			Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
+		fatal(t, problem)
+	}
 	store.Close()
+	db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))
+	must(t, err)
+	_, err = db.Exec(`UPDATE machine_executions SET submission=randomblob(150000), collected=1,
+ machine_id='pr-ended-'||printf('%04d', rowid % 30)`)
+	must(t, err)
+	_, err = db.Exec(`UPDATE requests SET state='succeeded' WHERE id LIKE 'settled-run-%'`)
+	must(t, err)
+	must(t, db.Close())
 
 	daemon := startDaemonProcess(t, root)
 	wal := filepath.Join(root, "creator.sqlite-wal")
@@ -42,7 +59,7 @@ func TestEndedRentalsTheHubRepeatsLeaveTheDaemonIdle(t *testing.T) {
 		t.Fatal("the daemon never asked the Hub about its rentals")
 	}
 	written, _ := os.Stat(wal)
-	before, began := cpuTime(t, daemon.cmd.Process.Pid), time.Now()
+	before, began, read0 := cpuTime(t, daemon.cmd.Process.Pid), time.Now(), readBytes(t, daemon.cmd.Process.Pid)
 	time.Sleep(5 * time.Second)
 	busy, elapsed := cpuTime(t, daemon.cmd.Process.Pid)-before, time.Since(began)
 	h.mu.Lock()
@@ -51,8 +68,9 @@ func TestEndedRentalsTheHubRepeatsLeaveTheDaemonIdle(t *testing.T) {
 	if after, _ := os.Stat(wal); written != nil && after != nil && !after.ModTime().Equal(written.ModTime()) {
 		t.Errorf("the daemon wrote its records while the Hub said nothing new (%d rental reads)", asked)
 	}
-	if busy > elapsed/50 {
-		t.Fatalf("the daemon used %s of CPU in %s polling %d ended rentals", busy, elapsed, 30)
+	readNow := readBytes(t, daemon.cmd.Process.Pid) - read0
+	if busy > elapsed/50 || readNow > 4<<20 {
+		t.Fatalf("the daemon used %s of CPU and read %d bytes in %s polling %d ended rentals", busy, readNow, elapsed, 30)
 	}
-	t.Logf("the daemon used %s of CPU in %s and asked the Hub %d times", busy, elapsed, asked)
+	t.Logf("the daemon used %s of CPU and read %d bytes in %s, and asked the Hub %d times", busy, readNow, elapsed, asked)
 }

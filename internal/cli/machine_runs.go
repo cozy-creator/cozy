@@ -99,16 +99,13 @@ func (m *machineRuns) Resume() {
 // PlaceReleased follows again every run back in the outbox: released from a machine proven
 // gone before it confirmed the run, it is placed on another under the same identity.
 func (m *machineRuns) PlaceReleased() {
-	links, problem := m.store.MachineExecutions()
+	ids, problem := m.store.UnplacedMachineExecutions()
 	if problem != nil {
 		fmt.Fprintf(m.context.Out, "released runs: %s\n", problem.Message)
 		return
 	}
-	for _, link := range links {
-		if link.MachineID != "" || link.Lost || link.Abandoned || len(link.Receipt) > 0 {
-			continue
-		}
-		if request, problem := m.store.RequestRow(link.RequestID); problem == nil && request != nil && !records.Settled(request.State) {
+	for _, id := range ids {
+		if request, problem := m.store.RequestRow(id); problem == nil && request != nil && !records.Settled(request.State) {
 			_ = m.Start(*request)
 		}
 	}
