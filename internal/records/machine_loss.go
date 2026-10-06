@@ -204,6 +204,8 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		}
 		if lost != "" {
 			message = lost
+		} else if cause != "" {
+			message += " (" + cause + ")"
 		}
 		detail := map[string]any{
 			"machine_id": value.machine, "error_type": "machine_execution.state_lost", "error": message,

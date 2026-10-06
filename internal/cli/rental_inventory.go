@@ -160,6 +160,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			BaseWorkerImageDigest: live[row.ID].BaseWorkerImageDigest,
 			BaseWorkerImageTag:    live[row.ID].BaseWorkerImageTag,
 			HubUnknown:            census.hubUnknown[row.ID],
+			UnreachableSince:      live[row.ID].UnreachableSince,
 		}
 		costOf(&summary, live[row.ID])
 		if update, problem := st.RuntimeUpdate(row.ID); problem != nil {
@@ -187,6 +188,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			MediaAddress: seen.MediaAddress, Hub: origin, RentedAt: seen.CreatedAt,
 			Boot:                  seen.Boot,
 			BaseWorkerImageDigest: seen.BaseWorkerImageDigest, BaseWorkerImageTag: seen.BaseWorkerImageTag,
+			UnreachableSince: seen.UnreachableSince,
 		})
 		costOf(&result.Unrecorded[len(result.Unrecorded)-1], seen)
 	}

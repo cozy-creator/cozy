@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -1102,8 +1103,73 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		}
 		return emit(ctx, record)
 	}
-	return exit.Named(exit.NotFound, "rental.unknown", "no listed rental is named %q", subject).
+	return showEndedRental(ctx, subject)
+}
+
+// showEndedRental answers `cozy rental show` for a rental no longer listed: by id, or by name
+// (the newest that bore it), from the history of every hub this host is signed in to, the
+// current one first. It says how the rental ended, when, and what it cost, by the Hub's clock.
+func showEndedRental(ctx *Context, subject string) *exit.Error {
+	origins := []string{ctx.Cfg.HubURL}
+	for _, origin := range ctx.Cfg.Hubs {
+		if !slices.Contains(origins, origin) {
+			origins = append(origins, origin)
+		}
+	}
+	for _, origin := range origins {
+		scoped := ctx.forHub(origin)
+		if !scoped.Cfg.HubToken.Present() && !accountauth.New(scoped.Cfg).CredentialPresent() {
+			continue
+		}
+		owner := client(scoped)
+		call, cancel := hub.Context()
+		found, problem := owner.RentalHistory(call, subject)
+		if problem == nil && len(found) == 0 && rentalid.Valid(subject) {
+			var one hub.Rental
+			if one, problem = owner.RentalView(call, subject); problem == nil {
+				found = []hub.Rental{one}
+			}
+		}
+		cancel()
+		if problem != nil && problem.ErrName() != "rental.not_found" {
+			return problem
+		}
+		if len(found) > 0 {
+			return emit(ctx, endedRentalRecord(ctx, ctx.Cfg.HubLabel(origin), found[0]))
+		}
+	}
+	return exit.Named(exit.NotFound, "rental.unknown", "no rental is named %q on any hub this host is signed in to", subject).
 		WithNext("cozy rental list")
+}
+
+func endedRentalRecord(ctx *Context, hubName string, r hub.Rental) output.Record {
+	spent := rentalSpend(api.RentalSummary{SpendUSDMicros: r.SpendUSDMicros, SpendBasis: r.SpendBasis})
+	cause := r.EndCause()
+	fields := []output.Field{{K: "rental", V: r.ID}, {K: "machine", V: r.Name}, {K: "hub", V: hubName},
+		{K: "state", V: humanRentalState(r.State)}, {K: "ended by", V: orNone(cause)},
+		{K: "rented", V: stamp(r.CreatedAt)}, {K: "ended", V: orNone(stamp(r.EndedAt))}, {K: "spent", V: spent},
+		{K: "gpus", V: gpuCell(r.AcceleratorModel, r.AcceleratorCount)},
+		{K: "$/hour", V: rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour))}}
+	typed := []output.Field{{K: "rental_id", V: r.ID}, {K: "machine", V: r.Name}, {K: "hub", V: hubName},
+		{K: "state", V: r.State}, {K: "rented_at", V: r.CreatedAt},
+		{K: "accelerator", V: r.AcceleratorModel}, {K: "accelerator_count", V: r.AcceleratorCount},
+		{K: "hourly_rate_usd_micros", V: r.HourlyRateUSDMicros}}
+	for key, value := range map[string]string{"release_cause": cause, "ended_at": r.EndedAt, "spend_basis": r.SpendBasis} {
+		if value != "" {
+			typed = append(typed, output.Field{K: key, V: value})
+		}
+	}
+	if r.SpendBasis != "" {
+		typed = append(typed, output.Field{K: "spend_usd_micros", V: r.SpendUSDMicros})
+	}
+	if mode := ctx.Mode(); !mode.Human || mode.JSON {
+		fields = typed
+	}
+	record := output.Record{Fields: fields, AllFields: fields, Next: []string{"cozy rental logs " + r.ID}}
+	if !hub.RentalAbsent(r.State) {
+		record.Next = []string{"cozy rental list"}
+	}
+	return record
 }
 
 // rentalStatus is what a ready rental's machine reports of itself. One that cannot answer
@@ -1174,7 +1240,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		TypedFields: []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
 			"spend_usd_micros", "spend_basis", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour",
-			"vcpu_count", "memory_gb"},
+			"vcpu_count", "memory_gb", "unreachable_since"},
 		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
@@ -1182,7 +1248,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"spend_usd_micros", "spend_basis", "failure_code",
 			"base_worker_image_digest", "base_worker_image_tag",
 			"provider", "provider_resource_id", "provider_host_id", "provider_state",
-			"container_state", "boot"},
+			"container_state", "boot", "unreachable_since"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
 			"Current spend per hour: " + usdPerHourBare(burn) + spend},
@@ -1232,6 +1298,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if r.Unverified {
 			state += " (unverified)"
 		}
+		if since, err := time.Parse(time.RFC3339Nano, r.UnreachableSince); err == nil && r.State == hub.RentalReady {
+			state += " (unreachable " + idleClock(now.Sub(since)) + ")"
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU), "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
 			"state": state, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
@@ -1271,7 +1340,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
 			"idle_since_at": idleSince, "release_due_at": releaseDue,
 			"base_worker_image_digest": either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest),
-			"base_worker_image_tag":    r.BaseWorkerImageTag} {
+			"base_worker_image_tag":    r.BaseWorkerImageTag, "unreachable_since": r.UnreachableSince} {
 			if value != "" {
 				typed[key] = value
 			}

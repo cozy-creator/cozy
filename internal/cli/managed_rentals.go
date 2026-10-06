@@ -1320,6 +1320,10 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			delete(m.said, row.ID)
 			if row.State != hub.RentalReleased {
 				row.State = hub.RentalReleased
+				// Why it ended is the cause its unfinished runs settle with.
+				if row.Failure.Code == "" {
+					row.Failure.Code = remote.EndCause()
+				}
 				if problem := m.store.RecordRental(row); problem != nil {
 					return released, failed, rebooted, problem
 				}
