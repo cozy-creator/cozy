@@ -323,6 +323,8 @@ pub struct Store {
     disk: crate::disk::Filesystem,
     /// The pull whose batch sync covers this handle's admissions (persistent disk).
     epoch: Option<std::sync::Arc<crate::unsynced::Epoch>>,
+    /// The embedding process's exclusive owner role, retained by clones and read pins.
+    owner: Option<std::sync::Arc<crate::meta::Owner>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -332,6 +334,7 @@ impl std::fmt::Debug for Store {
             .field("observed", &self.progress.is_some())
             .field("repo_cache", &self.cache.as_ref().map(|c| c.root()))
             .field("disk", &self.disk)
+            .field("owned", &self.owner.is_some())
             .finish()
     }
 }
@@ -443,6 +446,21 @@ impl Store {
     /// Open the Store at `root`, creating it when absent or empty. Concurrent calls on one
     /// new root serialize on the root directory: exactly one creates it, the rest open it.
     pub fn ensure(root: &Path) -> Result<Store> {
+        Self::ensure_with_owner(root, false)
+    }
+
+    /// Open or initialize a Store and claim its exclusive owner role for an embedding
+    /// daemon. Contention returns `STORE_BUSY` before opening or recovering the catalog.
+    ///
+    /// The claim lasts through every clone, same-process reopened Store, and owner read
+    /// lease. Those leases pin individual objects so this process's GC can run while they
+    /// are served. Other processes may still open the Store normally; their read leases
+    /// continue to exclude GC. Dropping the last owner handle releases the claim.
+    pub fn ensure_owned(root: &Path) -> Result<Store> {
+        Self::ensure_with_owner(root, true)
+    }
+
+    fn ensure_with_owner(root: &Path, owned: bool) -> Result<Store> {
         match fs::symlink_metadata(root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir_all(root)
@@ -465,9 +483,18 @@ impl Store {
             .map_err(|error| io(format!("read Store root {}", root.display()), error))?
             .is_none();
         if empty {
-            Store::init_locked(root)
+            let mut store = Store::init_locked(root)?;
+            if owned {
+                store.owner = Some(crate::meta::claim(root)?);
+            }
+            Ok(store)
         } else {
             validate_store_root(root)?;
+            let owner = if owned {
+                Some(crate::meta::claim(root)?)
+            } else {
+                crate::meta::owner(root)
+            };
             let catalog_path = root.join("tensorfs.sqlite");
             match fs::symlink_metadata(&catalog_path) {
                 Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
@@ -482,7 +509,9 @@ impl Store {
             }
             let trust = crate::catalog::Trust::of(root);
             trust.validate()?;
-            open_validated(root)
+            let mut store = open_validated(root)?;
+            store.owner = owner;
+            Ok(store)
         }
     }
 
@@ -537,6 +566,7 @@ impl Store {
             trust: crate::catalog::Trust::of(root),
             disk: crate::disk::filesystem(root),
             epoch: None,
+            owner: None,
         })
     }
 
@@ -2249,6 +2279,7 @@ fn open_validated(root: &Path) -> Result<Store> {
         trust: crate::catalog::Trust::of(root),
         disk: crate::disk::filesystem(root),
         epoch: None,
+        owner: crate::meta::owner(root),
     };
     crate::unsynced::recover(&store)?;
     Ok(store)

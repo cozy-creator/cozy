@@ -4,9 +4,10 @@
 //! readers; SQLite retains resumable derived writes.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -52,8 +53,10 @@ pub fn now_nanos_unique() -> u128 {
 /// The store's owner process (the machine). Its read leases pin their objects here instead
 /// of holding `recovery.lock` shared, so its own GC keeps them and runs while layouts are
 /// served. Leases taken by any other process still exclude GC.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct Owner {
+    /// Every owned Store clone and read pin retains this same exclusive claim.
+    _lock: File,
     /// Held shared while a lease admits its objects, exclusive while GC plans and deletes.
     pub(crate) gate: RwLock<()>,
     pins: Mutex<(u64, HashMap<u64, Vec<ObjectRef>>)>,
@@ -66,19 +69,60 @@ impl Owner {
     }
 }
 
-static OWNERS: Mutex<Vec<(PathBuf, Arc<Owner>)>> = Mutex::new(Vec::new());
+static OWNERS: Mutex<Vec<(PathBuf, Weak<Owner>)>> = Mutex::new(Vec::new());
 
 fn canonical(root: &Path) -> PathBuf {
     fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
-/// This process owns `store`: its read leases become in-process pins.
-pub fn own(store: &Store) {
-    let root = canonical(store.root());
-    let mut owners = OWNERS.lock().unwrap();
-    if !owners.iter().any(|(owned, _)| *owned == root) {
-        owners.push((root, Arc::default()));
+fn owner_file(root: &Path) -> Result<File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(crate::store::O_NOFOLLOW | rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(root.join("owner.lock"))
+        .map_err(|error| io("open Store owner lock", error))?;
+    if !lock
+        .metadata()
+        .map_err(|error| io("stat Store owner lock", error))?
+        .is_file()
+    {
+        return refuse(
+            Code::NOT_REGULAR_FILE,
+            "Store owner lock is not a regular file",
+        );
     }
+    Ok(lock)
+}
+
+fn owner_lock_error(error: std::io::Error) -> Refusal {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Refusal {
+            code: Code::STORE_BUSY,
+            detail: "this TensorFS store already has an owner or active collection".into(),
+        }
+    } else {
+        io("lock Store owner", error)
+    }
+}
+
+/// Claim the owner role before opening the catalog. The caller holds the Store creation
+/// lock and has established a valid layout, so adding owner.lock cannot poison a new root.
+pub(crate) fn claim(root: &Path) -> Result<Arc<Owner>> {
+    let lock = owner_file(root)?;
+    lock.try_lock_exclusive().map_err(owner_lock_error)?;
+    let owner = Arc::new(Owner {
+        _lock: lock,
+        gate: RwLock::default(),
+        pins: Mutex::default(),
+    });
+    let root = canonical(root);
+    let mut owners = OWNERS.lock().unwrap();
+    owners.retain(|(_, owner)| owner.strong_count() != 0);
+    owners.push((root, Arc::downgrade(&owner)));
+    Ok(owner)
 }
 
 pub(crate) fn owner(root: &Path) -> Option<Arc<Owner>> {
@@ -87,7 +131,27 @@ pub(crate) fn owner(root: &Path) -> Option<Arc<Owner>> {
     owners
         .iter()
         .find(|(owned, _)| *owned == root)
-        .map(|(_, owner)| owner.clone())
+        .and_then(|(_, owner)| owner.upgrade())
+}
+
+/// A destructive pass must see the owner's pins, or exclude an owner for its whole life.
+/// External passes take shared locks so reclamation can call ordinary GC while retaining
+/// its exclusion across root removal. Their recovery locks still serialize deletion.
+#[derive(Debug)]
+pub(crate) enum OwnerGuard {
+    Local { _owner: Arc<Owner> },
+    Shared { _file: File },
+}
+
+impl OwnerGuard {
+    pub(crate) fn acquire(root: &Path) -> Result<Self> {
+        if let Some(owner) = owner(root) {
+            return Ok(Self::Local { _owner: owner });
+        }
+        let file = owner_file(root)?;
+        FileExt::try_lock_shared(&file).map_err(owner_lock_error)?;
+        Ok(Self::Shared { _file: file })
+    }
 }
 
 #[derive(Debug, Clone)]

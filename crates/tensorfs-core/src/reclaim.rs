@@ -566,6 +566,11 @@ pub fn run(store: &Store, drop: &[RepositoryName], options: RunOptions) -> Resul
         );
     }
 
+    // Keep owner exclusion across the probe, root removal and final collection. A process
+    // cannot begin serving private read pins between those stages. Ordinary writers and
+    // this pass's nested GC compose with the external shared owner lock.
+    let _owner = crate::meta::OwnerGuard::acquire(store.root())?;
+
     // EXCLUSIVITY IS PROVED BEFORE ANYTHING IS DONE, not discovered at the end.
     //
     // Phase 3 is `gc::collect`, which takes the store-wide recovery lock — and a read lease
