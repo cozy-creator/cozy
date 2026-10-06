@@ -332,8 +332,8 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	}
 	if request.IsJob() {
 		spec.Kind = v1.RunKind_RUN_KIND_JOB
-		// Its memoized calls' results this computer already holds, from any machine.
-		known, problem := m.store.KnownResults(request.Package)
+		// The memoized results this computer already holds, from any run on any machine.
+		known, problem := m.store.KnownResults()
 		if problem != nil {
 			return nil, problem
 		}

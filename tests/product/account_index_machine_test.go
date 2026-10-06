@@ -103,10 +103,11 @@ def add(payload: AddRequest) -> AddResult:
 	return project
 }
 
-// A package's account-index dependency installs on every machine through that machine's own
-// Hub grant. The lock names the author's Hub, which no machine reaches; each machine resolves
-// the same account path at its grant origin, the rental exactly as this computer's machine.
-func TestAccountIndexResolvesAtEachMachinesOwnHub(t *testing.T) {
+// A package's account-index dependency is part of its captured closure: the editable install
+// resolves it at the author's Hub that its lock names, and its exact bytes travel with every
+// run to every machine. No machine reads a Hub for it, so it installs on this computer's
+// machine and on a rental alike while the author's Hub is unreachable.
+func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	// Rental authority is current-attempt scoped, not a blanket fixture grant.
 	for _, valid := range []bool{false, true} {
@@ -180,8 +181,8 @@ func TestAccountIndexResolvesAtEachMachinesOwnHub(t *testing.T) {
 			t.Fatalf("add on the %s machine [exit %d]\n%s", venue.name, code, out)
 		}
 	}
-	if machineServed.Load() == 0 {
-		t.Fatal("no machine fetched the dependency at its own Hub")
+	if served := machineServed.Load(); served != 0 {
+		t.Fatalf("a machine fetched the captured dependency from a Hub %d times", served)
 	}
 }
 

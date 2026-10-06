@@ -49,13 +49,14 @@ func (s *Store) OwnerMemoResults(hub, operation, key string) ([]json.RawMessage,
 	return out, nil
 }
 
-// KnownResults are the newest result of each memoized computation the package's runs reported,
-// for its next job's spec: a machine answers a matching call from one without running it.
-func (s *Store) KnownResults(pkg string) ([]*v1.MemoResult, *exit.Error) {
-	rows, err := s.db.Query(`SELECT e.payload FROM request_events e JOIN requests r ON r.id=e.request_id
-		WHERE e.type='machine.memo.record' AND r.package=? ORDER BY e.seq DESC`, pkg)
+// KnownResults are the newest result of each memoized computation this computer's runs
+// reported, for a job's spec: a machine answers a matching call from one without running it.
+// A computation digest names the callee's code (its package's installed files), its export and
+// its input, so a result is valid for any caller: an edited script, another package, a retry.
+func (s *Store) KnownResults() ([]*v1.MemoResult, *exit.Error) {
+	rows, err := s.db.Query(`SELECT payload FROM request_events WHERE type='machine.memo.record' ORDER BY seq DESC`)
 	if err != nil {
-		return nil, exit.Internalf("cannot read the package's known results: %s", err)
+		return nil, exit.Internalf("cannot read the known results: %s", err)
 	}
 	defer rows.Close()
 	var known []*v1.MemoResult

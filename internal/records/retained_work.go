@@ -49,7 +49,17 @@ func retainRetryFrom(tx retryReader, request *Request, prior Request) *exit.Erro
 		}
 	}
 	retained, stopped := prior.RetainWork, prior.State == "paused" || prior.State == "blocked" || prior.State == "succeeded" && retainedResult
+	var v1run bool
 	if request.MachineExecutionObserver {
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, prior.ID, RunV1Accepted).Scan(&v1run); err != nil {
+			return exit.Internalf("cannot inspect the predecessor's machine API: %s", err)
+		}
+	}
+	if v1run {
+		// A cozy.machine.v1 machine hands no retained custody on: a retry is a new run on the
+		// same machine, and the memoized results it reuses travel as its known results.
+		retained, stopped = true, Settled(prior.State) || RetainedState(prior.State)
+	} else if request.MachineExecutionObserver {
 		var machineRetained bool
 		// Preparation can block before any submission exists. Its retained client
 		// intent is retryable without inventing Runtime custody; a sent submission
