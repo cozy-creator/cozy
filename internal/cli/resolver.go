@@ -558,12 +558,12 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 // run on a known machine reads no Hub), else Tensorhub's release card (choosing a machine).
 func (r *Resolver) releaseInterface(origin string, ref hub.Ref, release string) ([]string, *launch.PackageInterface, *exit.Error) {
 	if _, installed, problem := r.store.ActivePackage(ref.String()); problem == nil && installed != nil &&
-		installed.SourceKind == "tensorhub" && installed.Version == release {
+		installed.SourceKind == "tensorhub" && installed.Version == release && installed.Hub == either(origin, r.cfg.HubURL) {
 		if held, packageInterface, problem := r.installPackageInterface(installed.ID); problem == nil {
 			return strings.Split(held.Closure, "\n"), packageInterface, nil
 		}
 	}
-	if kept := readKeptRelease(home.Paths(r.cfg.Home).Root, ref.String(), release); kept.Interface != nil {
+	if kept := readKeptRelease(home.Paths(r.cfg.Home).Root, either(origin, r.cfg.HubURL), ref.String(), release); kept.Interface != nil {
 		packageInterface, problem := launch.DecodePackageInterface(kept.Interface)
 		return kept.Requirements, packageInterface, problem
 	}
