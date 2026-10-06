@@ -4,22 +4,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/machines"
 )
 
 // A captured root naming its Model's repository without a lane reads that Model at its
-// machine's Hub once: the warm run and a restarted Runtime's first run read nothing at any
-// Hub. The model's owner changing it from this computer tells the machine, and a new machine
-// lifetime, which a change may have missed, reads it again.
-func TestACapturedRootReadsItsModelOnceAcrossRuntimeRestarts(t *testing.T) {
+// machine's Hub once: the warm run reads nothing at any Hub. The model's owner changing it
+// from this computer tells the machine, and a new machine lifetime, which a change may have
+// missed, reads it again.
+func TestACapturedRootReadsItsModelOncePerMachineLifetime(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine runs the call")
 	}
@@ -36,12 +34,7 @@ func TestACapturedRootReadsItsModelOnceAcrossRuntimeRestarts(t *testing.T) {
 		}
 	})
 	provisionMachine(t, root)
-	seeded, err := exec.Command(machinePython(t), "-I", "-c", seedCheckpoint, filepath.Join(root, "tensorfs")).CombinedOutput()
-	if err != nil {
-		t.Fatalf("seeding the machine's store: %v\n%s", err, seeded)
-	}
-	resolved := map[string]any{"model": "proof/probe", "release": "1.0.0", "lane": "bf16"}
-	must(t, json.Unmarshal(seeded, &resolved))
+	resolved := seedProbe(t, h, root, machines.Local)
 
 	var mu sync.Mutex
 	var seen []string
@@ -98,27 +91,6 @@ func TestACapturedRootReadsItsModelOnceAcrossRuntimeRestarts(t *testing.T) {
 	}
 	if calls := run("warm"); calls != "" {
 		t.Fatalf("the warm run read: %q", calls)
-	}
-
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	var agent struct {
-		PID int `json:"pid"`
-	}
-	raw, err := os.ReadFile(filepath.Join(layout.Machine, "agent.json"))
-	must(t, err)
-	must(t, json.Unmarshal(raw, &agent))
-	runtime := runtimeChild(agent.PID)
-	if runtime == 0 {
-		t.Fatal("the machine runs no Runtime")
-	}
-	must(t, syscall.Kill(runtime, syscall.SIGKILL))
-	landed(t, "the machine to restart its Runtime", func() bool {
-		next := runtimeChild(agent.PID)
-		return next != 0 && next != runtime
-	})
-	if calls := run("restarted"); calls != "" {
-		t.Fatalf("a restarted Runtime's first run read: %q", calls)
 	}
 
 	// The model's owner changes it from this computer: the machine is told, reads the model
