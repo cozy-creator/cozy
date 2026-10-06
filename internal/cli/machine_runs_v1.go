@@ -29,6 +29,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/runoutputs"
 	"github.com/cozy-creator/cozy/internal/scratch"
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // A run on a machine that serves cozy.machine.v1 is one Run call: its spec (code, payload,
@@ -57,11 +60,14 @@ func (m *machineRuns) loopV1(request records.Request) {
 		if accepted && link.Collected {
 			return
 		}
+		sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
+		if problem != nil {
+			return
+		}
 		// Unsent work never starts after cancellation. Sent work still needs its machine's
 		// outcome, even when acceptance was lost or a stopped local machine settled it here.
 		if !accepted && (link.CancelRequested || records.Settled(current.State) || slices.Contains([]string{"pausing", "paused", "blocked"}, current.State)) {
-			sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
-			if problem != nil || !link.CancelRequested || !sent {
+			if !link.CancelRequested || !sent {
 				return
 			}
 		}
@@ -69,10 +75,18 @@ func (m *machineRuns) loopV1(request records.Request) {
 		if done {
 			return
 		}
+		// stepV1 may have crossed the durable dispatch boundary before losing its reply.
+		if marked, readProblem := m.store.RunV1Marked(request.ID, records.RunV1Sent); readProblem != nil {
+			return
+		} else {
+			sent = marked
+		}
 		if problem != nil && problem.Message != lastError && m.ctx.Err() == nil {
 			fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, problem.Message)
 			lastError = problem.Message
-			if again, _ := m.store.RunV1(request.ID); !again && !link.CancelRequested && permanentRefusal(problem) {
+			// Before first dispatch a local refusal can end the request. Once possibly sent,
+			// missing credentials/source metadata cannot prove what its machine accepted.
+			if again, _ := m.store.RunV1(request.ID); !again && !sent && !link.CancelRequested && permanentRefusal(problem) {
 				failed, failure := m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
 				if failed {
 					return
@@ -143,9 +157,13 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		return false, problem
 	}
 	began := time.Now()
+	sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
+	if problem != nil {
+		return false, problem
+	}
 	// Only a submission may start this computer's machine; observing attaches to a running one.
 	dial := ctx
-	if accepted || link.CancelRequested {
+	if accepted || sent || link.CancelRequested {
 		dial = machines.AttachOnly(ctx)
 	}
 	machine, problem := m.machines.DialV1(dial, link.MachineID, m.runHolder(request, "running"))
@@ -153,8 +171,23 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		return false, problem
 	}
 	defer machine.Close()
+	var stream grpc.ServerStreamingClient[v1.RunEvent]
+	var first *v1.RunEvent
+	if !accepted && sent && !link.CancelRequested {
+		// Acceptance can outlive its reply. Attach before touching local source or credentials
+		// for a new submission: that source may no longer be here, while the run still exists.
+		observing, err := machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), nil)
+		if err == nil {
+			first, err = observing.Recv()
+		}
+		if err == nil {
+			stream = observing
+		} else if status.Code(err) != codes.NotFound {
+			return false, machines.Transport(err)
+		}
+	}
 	var spec *v1.RunSpec
-	if !accepted && !link.CancelRequested {
+	if stream == nil && !accepted && !link.CancelRequested {
 		m.submissionStage(request.ID, "connect", link.MachineID, began)
 		if spec, problem = m.specV1(ctx, request, machine); problem != nil {
 			return false, problem
@@ -171,9 +204,12 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			return false, problem
 		}
 	}
-	stream, err := machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), spec)
-	if err != nil {
-		return false, machines.Transport(err)
+	if stream == nil {
+		var err error
+		stream, err = machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), spec)
+		if err != nil {
+			return m.runRefusalV1(request.ID, err, spec != nil && !sent)
+		}
 	}
 	head, opened := uint64(0), false
 	// Output files are read apart from the stream: progress and the outcome never wait on bytes.
@@ -183,12 +219,17 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		defer fetch.stop()
 	}
 	for {
-		event, err := stream.Recv()
+		event := first
+		first = nil
+		var err error
+		if event == nil {
+			event, err = stream.Recv()
+		}
 		if errors.Is(err, io.EOF) {
 			return false, nil
 		}
 		if err != nil {
-			return false, machines.Transport(err)
+			return m.runRefusalV1(request.ID, err, spec != nil && !sent && !opened)
 		}
 		if state := event.GetState(); state != nil && !opened {
 			head, opened = state.Sequence, true // the stream's first frame names the log's head
@@ -230,6 +271,23 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			return false, nil
 		}
 	}
+}
+
+// An explicit first-submission rejection can end a request without acceptance. Other
+// failures, including a retry after a lost reply, leave the possible remote run unresolved.
+func (m *machineRuns) runRefusalV1(id string, err error, first bool) (bool, *exit.Error) {
+	problem := machines.Transport(err)
+	if first {
+		switch status.Code(err) {
+		case codes.InvalidArgument, codes.FailedPrecondition, codes.AlreadyExists, codes.PermissionDenied, codes.Unauthenticated, codes.Unimplemented:
+			failed, recordProblem := m.store.FailQueuedRequest(id, records.QueuedFailure(problem))
+			if recordProblem != nil {
+				return false, recordProblem
+			}
+			return failed, problem
+		}
+	}
+	return false, problem
 }
 
 // place gives a run its machine once: a named rental, a rental the fleet selects, an explicit

@@ -18,7 +18,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rentalid"
@@ -281,7 +280,7 @@ func noAddress(id, state string) *exit.Error {
 }
 
 // Resolver is what the daemon entrypoint hands the orchestrator as `Options.Rentals`. It
-// is the DIAL-TIME resolution of Creator mTLS identity and media bearer. It reads the
+// is the dial-time resolution of the machine pin and Creator signing identity. It reads the
 // store on EVERY call rather than closing over a
 // snapshot: `cozy rental new` is a records-plane act that runs against a daemon already up, so
 // a resolver that cached would refuse the rental the user just made until a restart.
@@ -305,10 +304,6 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			return nil, exit.Unavailablef("rental %s is not attached on this host", id).
 				WithRemedy("resume the original rental operation so control, certificate, and token publish together")
 		}
-		token, e := MediaToken(l, id)
-		if e != nil {
-			return nil, e
-		}
 		if _, e := loadCreatorIdentity(l.RentalCreatorIdentity(id)); e != nil {
 			return nil, e.WithRemedy("end and re-rent; a lost per-rental Creator key cannot be rotated into the live pod")
 		}
@@ -325,15 +320,6 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		spec := &orchestrator.WorkerConnection{
 			RentalID: row.ID, Addr: row.Address, CACert: cert,
 			WorkerID: row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID,
-		}
-		if row.MediaAddress != "" {
-			// ONE PROVISIONED IDENTITY, TWO LISTENERS (#506b, tonight's tier). The pod's
-			// media server holds its OWN keys — cl-014's rule, and this host pins the same
-			// PEM only because the stand-in provisioner mints one certificate covering both
-			// names. What this host never does is MINT anything: the bearer the media plane
-			// checks is the rental's provisioned media bearer, whose digest reached the pod
-			// as a launch grant from whoever provisioned it.
-			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
 		// THE WIDTH TRAVELS WITH THE DIAL IDENTITY. It is the paid `accelerator_count`,
 		// spelled as the device envelope the pod's worker holds, and a CPU rental holds
