@@ -365,6 +365,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			state.AttemptWallMS = machineAttemptWallMS(row, link, intervals, terminal, time.Now().UnixMilli())
 		}
 	}
+	if v1run {
+		state.AttemptWallMS = s.runV1WallMS(row, time.Now())
+	}
 	if measured, known, problem := s.store.MachineRunExecutionMS(row.ID, max(row.Ordinal, 1), state.Status == "in_progress"); problem != nil {
 		view.ObservationError = problem.Message
 	} else {
@@ -381,6 +384,26 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		}
 	}
 	return state
+}
+
+// runV1WallMS is an unsettled cozy.machine.v1 run's time on its machine so far: from its start
+// to now, or to its pause while it rests paused; 0 before it started. A settled run's wall_ms
+// and execution_ms say the rest.
+func (s *Server) runV1WallMS(row records.Request, now time.Time) int64 {
+	if records.Settled(row.State) {
+		return 0
+	}
+	started, ended, paused, problem := s.store.RunV1Span(row.ID)
+	if problem != nil || started.IsZero() {
+		return 0
+	}
+	switch {
+	case !ended.IsZero():
+		now = ended
+	case row.State == "paused" && !paused.IsZero():
+		now = paused
+	}
+	return max(now.Sub(started).Milliseconds(), 0)
 }
 
 // Machine attempts belong to Runtime. Count each admission-to-outcome interval,
