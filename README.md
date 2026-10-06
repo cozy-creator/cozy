@@ -25,12 +25,13 @@ automatically for bash and fish, and for zsh when `~/.local/share/zsh/site-funct
 The host-tool step alone is:
 
 ```sh
-uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=0.18.67'
+uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=0.19.0'
 ```
 
 Keep `--python 3.12`: uv
 [ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
-so an unqualified install can select an interpreter Runtime cannot use. Runtime 0.18.67 is the
+so an unqualified install can select an interpreter Runtime cannot use. An older tool is never
+refused: Cozy installs its own matching one (uv) and describes with it. Runtime 0.18.67 is the
 controller minimum: the first release with the worker wire this Cozy speaks, org-relative
 default lanes, and native model ingestion. Existing
 captured package environments keep their declared SDK ranges; new caller-capable

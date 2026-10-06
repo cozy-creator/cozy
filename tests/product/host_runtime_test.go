@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
+
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
@@ -118,7 +120,8 @@ func hostRuntimeRoot(t *testing.T, name, script string) (root, path string) {
 func runCozyPath(t *testing.T, root, path string, args ...string) (int, string) {
 	t.Helper()
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-	cmd.Env = childEnv(t, root, "PATH="+path)
+	// Its own cache: a matching tool this Cozy installed for the user is not this test's.
+	cmd.Env = childEnv(t, root, "PATH="+path, "XDG_CACHE_HOME="+filepath.Join(root, "cache"))
 	data, _ := cmd.CombinedOutput()
 	code := 0
 	if cmd.ProcessState != nil {
@@ -143,4 +146,103 @@ func refusalOf(t *testing.T, out string) refusal {
 		t.Fatalf("not one refusal document: %v\n%s", err, out)
 	}
 	return doc.Error
+}
+
+// TestAnOldHostToolIsBroughtForward: a cozy-runtime on PATH older than the Runtime this Cozy is
+// released with is never refused. This Cozy installs its own matching tool through uv and
+// describes with it: a caller whose result is another local package's type describes (the old
+// tool could not). Without uv it keeps the old tool and says what may be missing.
+func TestAnOldHostToolIsBroughtForward(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in runtime is a POSIX shell script")
+	}
+	uv, err := exec.LookPath("uv")
+	if err != nil {
+		t.Skip("uv installs this Cozy's own tool")
+	}
+	cache, err := exec.Command(uv, "cache", "dir").Output()
+	must(t, err)
+	old := "#!/bin/sh\nif [ \"$2\" = version ]; then echo '{\"distribution\": \"0.18.84\"}'; exit 0; fi\n" +
+		"echo 'this stand-in only answers version' >&2\nexit 2\n"
+	stub := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(stub, "cozy-runtime"), []byte(old), 0o700)) //cozy:allow a stand-in tool, not this host's
+	run := func(t *testing.T, root string, withUV bool, args ...string) (int, string) {
+		t.Helper()
+		path := stub + ":/usr/bin:/bin"
+		if withUV {
+			bin := t.TempDir()
+			must(t, os.Symlink(uv, filepath.Join(bin, "uv")))
+			path = stub + ":" + bin + ":/usr/bin:/bin"
+		}
+		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
+		cmd.Env = childEnv(t, root, "PATH="+path, "XDG_CACHE_HOME="+filepath.Join(root, "cache"),
+			"UV_CACHE_DIR="+strings.TrimSpace(string(cache)))
+		data, _ := cmd.CombinedOutput()
+		return cmd.ProcessState.ExitCode(), string(data)
+	}
+
+	// Offline: the old tool stays, with the warning; nothing is refused.
+	root, _ := hostRuntimeRoot(t, "old-offline", "")
+	code, out := run(t, root, false, "up")
+	if code != 0 || strings.Contains(out, "local runs refuse") ||
+		!strings.Contains(out, "reading packages with cozy-runtime 0.18.84") ||
+		!strings.Contains(out, "may be missing") {
+		t.Fatalf("an old tool without uv was not kept with a warning [exit %d]\n%s", code, out)
+	}
+	_, _ = run(t, root, false, "down")
+
+	// With uv: this Cozy's own tool, at its release, describes the two-package caller.
+	root, _ = hostRuntimeRoot(t, "old-forward", "")
+	project := filepath.Join(root, "project")
+	child := filepath.Join(project, "child")
+	must(t, os.MkdirAll(child, 0o755))
+	write := func(path, body string) { must(t, os.WriteFile(path, []byte(body), 0o600)) }
+	pyproject := func(name, module, dependencies, sources string) string {
+		return fmt.Sprintf("[project]\nname=%q\nversion=\"0.1.0\"\nrequires-python=\">=3.12,<3.13\"\n"+
+			"dependencies=[%s]\n%s[project.entry-points.\"cozy.application\"]\ndefault=\"%s:app\"\n"+
+			"[build-system]\nrequires=[\"hatchling\"]\nbuild-backend=\"hatchling.build\"\n"+
+			"[tool.hatch.build.targets.wheel]\nonly-include=[\"%s.py\"]\n", name, dependencies, sources, module, module)
+	}
+	write(filepath.Join(child, "pyproject.toml"), pyproject("labelled-child", "label_child", "", ""))
+	write(filepath.Join(child, "package.toml"), "[application]\nobject=\"label_child:app\"\n")
+	write(filepath.Join(child, "label_child.py"), "import msgspec\n"+
+		"from cozy_runtime.author import App, Context, invocable\n"+
+		"class Result(msgspec.Struct):\n    labels: list[str]\n"+
+		"@invocable\nasync def inspect(ctx: Context, *, count: int) -> Result:\n    return Result([str(count)])\n"+
+		"app=App()\napp.job(inspect)\n")
+	write(filepath.Join(project, "pyproject.toml"), pyproject("labelled-parent", "label_parent",
+		`"labelled-child>=0.1.0"`, "[tool.uv.sources]\nlabelled-child={path=\"./child\"}\n"))
+	write(filepath.Join(project, "package.toml"), "[application]\nobject=\"label_parent:app\"\n")
+	write(filepath.Join(project, "label_parent.py"), "from cozy_runtime.author import App, Context, invocable\n"+
+		"from label_child import Result, inspect\n"+
+		"@invocable\nasync def run(ctx: Context, *, count: int) -> Result:\n    return await inspect(count=count)\n"+
+		"app=App()\napp.job(run)\n")
+	lock := exec.Command(uv, "lock", "--no-progress", "--project", project)
+	lock.Env = append(os.Environ(), "UV_CACHE_DIR="+strings.TrimSpace(string(cache)))
+	if data, err := lock.CombinedOutput(); err != nil {
+		t.Fatalf("lock fixture: %v\n%s", err, data)
+	}
+	code, out = run(t, root, true, "package", "install", project, "--editable", "--json")
+	if code != 0 {
+		t.Fatalf("the caller was not described with this Cozy's own tool [exit %d]\n%s", code, out)
+	}
+	own := filepath.Join(root, "cache", "cozy", "host-runtime", "bin", "cozy-runtime")
+	raw, err := exec.Command(own, "--json", "version").Output()
+	var version struct{ Distribution string }
+	if err != nil || json.Unmarshal(raw, &version) != nil {
+		t.Fatalf("this Cozy's own tool is not installed at %s: %v %s", own, err, raw)
+	}
+	if found, err := pep440.Parse(version.Distribution); err != nil || found.LessThan(pep440.MustParse(hostruntime.ToolRelease)) {
+		t.Fatalf("this Cozy's own tool is release %q, older than %s", version.Distribution, hostruntime.ToolRelease)
+	}
+	interfaces, _ := filepath.Glob(filepath.Join(root, "installs", "*", "documents", "package-interface.json"))
+	described := ""
+	for _, path := range interfaces {
+		raw, _ := os.ReadFile(path)
+		described += string(raw)
+	}
+	if !strings.Contains(described, `"labels"`) {
+		t.Fatalf("the installed interface does not carry the callee's Result: %v\n%s", interfaces, out)
+	}
+	_, _ = run(t, root, true, "down")
 }
