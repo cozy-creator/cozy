@@ -46,7 +46,7 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 	if problem != nil {
 		return problem
 	}
-	state, _, problem := ensureDaemon(ctx)
+	state, _, problem := ensureCalcifer(ctx)
 	if problem != nil {
 		return problem
 	}

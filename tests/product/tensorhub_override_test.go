@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 )
 
 func TestTensorhubFlagOverridesFileAndEnvironment(t *testing.T) {
@@ -82,7 +82,7 @@ func TestTensorhubFlagDoesNotBindTheDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("daemon startup failed: %v %s", err, out)
 	}
-	state := daemon.Probe(config.Config{Home: root})
+	state := calcifer.Probe(config.Config{Home: root})
 	if !state.Up {
 		t.Fatalf("daemon did not start as a multi-hub daemon: %+v", state)
 	}
@@ -91,7 +91,7 @@ func TestTensorhubFlagDoesNotBindTheDaemon(t *testing.T) {
 			t.Fatalf("%v was refused by the multi-hub daemon: %d %s", args, code, outText)
 		}
 	}
-	if after := daemon.Probe(config.Config{Home: root}); after.PID != state.PID {
+	if after := calcifer.Probe(config.Config{Home: root}); after.PID != state.PID {
 		t.Fatalf("a hub selection restarted the daemon: %d -> %d", state.PID, after.PID)
 	}
 }

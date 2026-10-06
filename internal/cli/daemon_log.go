@@ -22,7 +22,7 @@ func handleDaemonLog(ctx *Context) *exit.Error {
 	file, err := os.Open(layout.Log)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return exit.New(exit.NotFound, "no daemon log at %s: no Cozy daemon has run on this root",
+			return exit.New(exit.NotFound, "no daemon log at %s: no Calcifer has run on this root",
 				layout.Log).WithNext("cozy up")
 		}
 		return exit.Internalf("cannot open the daemon log %s: %s", layout.Log, err)

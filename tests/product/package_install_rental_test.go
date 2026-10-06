@@ -11,9 +11,9 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -82,7 +82,7 @@ func TestPackageInstallRental(t *testing.T) {
 			check(problem)
 			defer store.Close()
 			check(store.RecordRental(records.Rental{ID: "rental-proof", MachineName: "kirukiru", State: "ready", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: hubPeer.URL}))
-			held, problem := daemon.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
+			held, problem := calcifer.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
 			check(problem)
 			defer held.Release()
 			_, problem = api.Mint(layout)

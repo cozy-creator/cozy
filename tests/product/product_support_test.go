@@ -18,8 +18,8 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -186,7 +186,7 @@ func publicationControlAPI(t *testing.T, o *owner, configure ...func(*api.Option
 	if v6 != nil {
 		_ = v6.Close()
 	}
-	held, problem := daemon.Hold(o.l, addr, "")
+	held, problem := calcifer.Hold(o.l, addr, "")
 	fatal(t, problem)
 	creds, problem := api.Mint(o.l)
 	fatal(t, problem)
@@ -239,7 +239,7 @@ func submission(planID, pkg, idem string, body map[string]any) orchestrator.Subm
 
 // ------------------------------------------------------------- a real hidden daemon process
 
-// daemonProcess is one Cozy daemon this suite owns. The separate process is the point:
+// daemonProcess is one Calcifer this suite owns. The separate process is the point:
 // the suite is a CLIENT, which is the seat a real client occupies.
 type daemonProcess struct {
 	root, addr, token string
@@ -261,7 +261,11 @@ func startDaemonBinary(t *testing.T, binary, root string, imposed ...string) *da
 	log, err := os.Create(filepath.Join(root, "daemon-test.log"))
 	must(t, err)
 	cmd := exec.Command(binary)
-	cmd.Args[0] = "cozy-daemon"
+	cmd.Args[0] = "calcifer"
+	if binary != cozyBin {
+		// An explicitly supplied older-controller fixture still has its old private entry.
+		cmd.Args[0] = "cozy-daemon"
+	}
 	cmd.Env = childEnv(t, root, imposed...)
 	cmd.Stdout, cmd.Stderr = log, log
 	setProcessGroup(cmd)
@@ -295,7 +299,7 @@ func startDaemonBinary(t *testing.T, binary, root string, imposed ...string) *da
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("the Cozy daemon did not publish its address in 30s\n%s", tail(filepath.Join(root, "daemon.log")))
+	t.Fatalf("the Calcifer did not publish its address in 30s\n%s", tail(filepath.Join(root, "daemon.log")))
 	return nil
 }
 
@@ -428,7 +432,7 @@ func runCozyStreamsWith(t *testing.T, root string, imposed []string, args ...str
 	return code, stdout.String(), stderr.String()
 }
 
-// childEnv is the ONE chokepoint every daemon-capable child process passes: a Cozy daemon
+// childEnv is the ONE chokepoint every daemon-capable child process passes: a Calcifer
 // can only ever be started by a process that got its COZY_HOME from here. Registering the
 // root here is therefore the same thing as registering every daemon that can exist, and a
 // test cannot forget to do it. See reap_test.go for what the registration arms.

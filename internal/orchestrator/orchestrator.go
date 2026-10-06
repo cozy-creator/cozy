@@ -21,7 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Options is the frozen input to one Cozy daemon. Every field is decided by the
+// Options is the frozen input to one Calcifer. Every field is decided by the
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
 	// StartMachineExecution transfers and observes an execution owned by Runtime.
@@ -316,7 +316,7 @@ const (
 	ExcludedDiskShort = "disk_short"
 )
 
-// Orchestrator is the Cozy daemon's scheduling role.
+// Orchestrator is the Calcifer's scheduling role.
 type Orchestrator struct {
 	opt Options
 
@@ -367,7 +367,7 @@ type wait struct {
 }
 
 // Open builds the orchestrator. No listener binds here: the owner DIALS each worker's
-// own socket (#436); a second Cozy daemon on one root fails on the daemon lock instead.
+// own socket (#436); a second Calcifer on one root fails on the daemon lock instead.
 func Open(opt Options) (*Orchestrator, *exit.Error) {
 	if opt.Log == nil {
 		opt.Log = io.Discard

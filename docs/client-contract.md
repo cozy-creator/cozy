@@ -1,6 +1,6 @@
 # Cozy local client API — v1
 
-This document describes the HTTP API implemented by the Cozy daemon. The routes in the
+This document describes the HTTP API implemented by the Calcifer. The routes in the
 CORE module are the proposed common request-level API for
 future Tensorhub and private-rental servers, but no cross-host parity is claimed until
 those servers exist and pass shared conformance tests. The LOCAL module is Cozy-only.
@@ -354,7 +354,7 @@ ids into invocation assets; it will never send a host filesystem path.
 
 ### The job family is local
 
-A job is an ATTEMPT CLASS in the same Cozy daemon, not a second scheduler: the same
+A job is an ATTEMPT CLASS in the same Calcifer, not a second scheduler: the same
 orchestrator places and dispatches it, and the same record owner gives it an ordinal,
 settles its terminal transaction, and streams it over the same durable event route
 (`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and

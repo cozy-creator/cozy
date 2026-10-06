@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -75,7 +75,7 @@ func TestDetachedMachineJobReturnsQueuedRun(t *testing.T) {
 			defer local.Close()
 			layout, problem := home.Open(t.TempDir())
 			check(problem)
-			held, problem := daemon.Hold(layout, strings.TrimPrefix(local.URL, "http://"), "")
+			held, problem := calcifer.Hold(layout, strings.TrimPrefix(local.URL, "http://"), "")
 			check(problem)
 			defer held.Release()
 			_, problem = api.Mint(layout)

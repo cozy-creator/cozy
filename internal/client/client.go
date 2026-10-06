@@ -29,14 +29,14 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-// Client is one CLI process's connection to the running Cozy daemon.
+// Client is one CLI process's connection to the running Calcifer.
 type Client struct {
 	fixedTransport bool
 	base           string
@@ -73,7 +73,7 @@ func (c *Client) reattach(ctx context.Context) bool {
 		return false
 	}
 	for {
-		if st := daemon.Probe(c.cfg); st.Up && st.Addr != "" {
+		if st := calcifer.Probe(c.cfg); st.Up && st.Addr != "" {
 			if next, e := Open(c.cfg, st); e == nil {
 				c.base, c.token = next.base, next.token
 				return true
@@ -104,7 +104,7 @@ func (c *Client) AllHubs() *Client {
 // Open reads the running daemon's address and its 0600 credential. It never probes:
 // the caller already passed the shared exit-9 gate, and a second probe here would be a
 // second spelling of "is it up".
-func Open(cfg config.Config, st daemon.State) (*Client, *exit.Error) {
+func Open(cfg config.Config, st calcifer.State) (*Client, *exit.Error) {
 	l, e := home.Open(cfg.Home)
 	if e != nil {
 		return nil, e
@@ -211,14 +211,14 @@ func (c *Client) exchange(ctx context.Context, method, path string, body, out an
 	res, err := c.http.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return exit.New(exit.Canceled, "the Cozy daemon request was canceled: %s", ctx.Err())
+			return exit.New(exit.Canceled, "Calcifer request was canceled: %s", ctx.Err())
 		}
 		return c.unreachable(err)
 	}
 	defer res.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
 	if err != nil {
-		return exit.Internalf("the Cozy daemon answer could not be read: %s", err)
+		return exit.Internalf("Calcifer answer could not be read: %s", err)
 	}
 	if res.StatusCode >= 300 {
 		return Refusal(res.StatusCode, data)
@@ -227,7 +227,7 @@ func (c *Client) exchange(ctx context.Context, method, path string, body, out an
 		return nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return exit.Internalf("the Cozy daemon answered %s with a body this client cannot read: %s",
+		return exit.Internalf("Calcifer answered %s with a body this client cannot read: %s",
 			path, err)
 	}
 	return nil
@@ -237,7 +237,7 @@ func (c *Client) exchange(ctx context.Context, method, path string, body, out an
 // refusal document, a transport failure. It carries the SAME remedy every server-backed
 // verb's exit-9 gate carries, because it is the same condition arriving later.
 func (c *Client) unreachable(err error) *exit.Error {
-	return exit.Named(exit.Unavailable, "daemon_unreachable", "the Cozy daemon stopped answering on %s: %s", c.Addr(), err).
+	return exit.Named(exit.Unavailable, "daemon_unreachable", "Calcifer stopped answering on %s: %s", c.Addr(), err).
 		WithRemedy("it may have stopped mid-request; retry or run `cozy up`").
 		WithNext("cozy up", "cozy run list")
 }
@@ -261,7 +261,7 @@ func Refusal(status int, data []byte) *exit.Error {
 			body = body[:200] + "…"
 		}
 		return exit.Named(code, "untyped_answer",
-			"the Cozy daemon answered %d with no typed envelope: %s", status, body)
+			"Calcifer answered %d with no typed envelope: %s", status, body)
 	}
 	e := exit.Named(code, doc.Error.Code, "%s", doc.Error.Message)
 	if doc.Error.Remedy != "" {

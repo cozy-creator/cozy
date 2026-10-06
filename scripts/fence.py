@@ -645,16 +645,16 @@ def check_web_boundary() -> list[str]:
     for required in ("web/index.html", "web/app.css", "web/app.js", "web/embed.go"):
         if not pathlib.Path(required).is_file():
             bad.append(f"[web] missing {required}")
-    daemon = pathlib.Path("internal/cli/daemon.go").read_text()
-    for required in ("os.DevNull", "command.StderrPipe()", "maxDaemonStartupDiagnostic",
-                     "readBoundedDiagnostic", "daemonStartupFailure"):
+    daemon = pathlib.Path("internal/cli/calcifer.go").read_text()
+    for required in ("os.DevNull", "command.StderrPipe()", "maxCalciferStartupDiagnostic",
+                     "readBoundedDiagnostic", "calciferStartupFailure"):
         if required not in daemon:
             bad.append(f"[web] daemon startup boundary missing {required!r}")
-    if "daemon.OpenLog(layout.Log)" not in daemon:
-        bad.append("[web] the daemon does not write its own bounded log (daemon.OpenLog)")
-    daemon_log = pathlib.Path("internal/daemon/log.go")
+    if "calcifer.OpenLog(layout.Log)" not in daemon:
+        bad.append("[web] the daemon does not write its own bounded log (calcifer.OpenLog)")
+    daemon_log = pathlib.Path("internal/calcifer/log.go")
     if not daemon_log.is_file() or "const LogBytes = 32 << 20" not in daemon_log.read_text():
-        bad.append("[web] the daemon log is not bounded by rotation on observed bytes (daemon.LogBytes)")
+        bad.append("[web] the daemon log is not bounded by rotation on observed bytes (calcifer.LogBytes)")
     if "time.After" in (daemon_log.read_text() if daemon_log.is_file() else ""):
         bad.append("[web] the daemon log rotates on a timer; the bound is bytes")
     if "func handleDaemonLog" not in pathlib.Path("internal/cli/daemon_log.go").read_text():

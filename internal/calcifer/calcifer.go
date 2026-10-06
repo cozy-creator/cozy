@@ -1,7 +1,7 @@
-// Package daemon owns ONE spelling of "is the Cozy daemon running", and it is an OS
+// Package daemon owns ONE spelling of "is Calcifer running", and it is an OS
 // fact rather than a file's contents.
 //
-// The running Cozy daemon holds an exclusive advisory lock on `<home>/daemon.lock` for
+// The running Calcifer holds an exclusive advisory lock on `<home>/daemon.lock` for
 // its whole life. The kernel drops that lock when the process dies — including under
 // SIGKILL — so a reader that CAN take the lock has proof the daemon is gone, and one
 // that cannot has proof of the opposite. There is no pidfile, no heartbeat and no grace
@@ -12,7 +12,7 @@
 // the address is data the live owner publishes, never evidence that it lives. The same
 // record carries the per-launch CLI token (cl-116): the file is mode 0600, rewritten on
 // every launch, and there is no separate client.cred handoff file.
-package daemon
+package calcifer
 
 import (
 	"errors"
@@ -58,7 +58,7 @@ func Probe(cfg config.Config) State {
 		// Taking it IS the proof of absence. Release immediately: probing must never
 		// look like holding.
 		_ = flock.Release(f)
-		st.Details = "the daemon lock is free — no Cozy daemon owns this root"
+		st.Details = "the daemon lock is free — no Calcifer owns this root"
 		return st
 	}
 	st.Up = true
@@ -91,7 +91,7 @@ func Probe(cfg config.Config) State {
 	return st
 }
 
-// Held is the live Cozy daemon's own claim on this root. It exists only inside the
+// Held is the live Calcifer's own claim on this root. It exists only inside the
 // daemon process; nothing reads it, and nothing outlives it.
 type Held struct{ f *os.File }
 
@@ -113,7 +113,7 @@ func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 	if err := flock.Exclusive(f); err != nil {
 		f.Close()
 		return nil, exit.New(exit.Conflict,
-			"another Cozy daemon already owns %s", l.Root).
+			"another Calcifer already owns %s", l.Root).
 			WithRemedy("one daemon per local root; stop it with `cozy down`").
 			WithNext("cozy run list", "cozy down")
 	}
@@ -174,7 +174,7 @@ func (h *Held) Claimed() bool {
 
 // Unavailable is the typed refusal every server-dependent verb shares.
 func (s State) Unavailable() *exit.Error {
-	return exit.Unavailablef("the Cozy daemon is not running (%s)", s.Addr).
+	return exit.Unavailablef("Calcifer is not running (%s)", s.Addr).
 		WithRemedy("start it with `cozy up`; it binds %s, loopback only", s.Addr).
 		WithNext("cozy up")
 }

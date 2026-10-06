@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/reclaim"
@@ -48,7 +48,7 @@ func TestFreshHomeIsMinimal(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 
-	held, problem := daemon.Hold(l, "127.0.0.1:0", l.Root+"/worker.sock")
+	held, problem := calcifer.Hold(l, "127.0.0.1:0", l.Root+"/worker.sock")
 	fatal(t, problem)
 	defer held.Release()
 	creds, problem := api.Mint(l)

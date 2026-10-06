@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/cli"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
 )
@@ -260,7 +260,7 @@ func TestRunWatchDrawsInPlace(t *testing.T) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
+	held, problem := calcifer.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
 	fatal(t, problem)
 	defer held.Release()
 	_, problem = api.Mint(layout)

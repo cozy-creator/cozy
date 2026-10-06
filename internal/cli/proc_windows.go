@@ -10,7 +10,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func ignoreDaemonBrokenPipe() {}
+func ignoreCalciferBrokenPipe() {}
 
 // detachProcess starts the daemon in its own process group and with no console attached, which is
 // what "survives the terminal that started it" means here.

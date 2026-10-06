@@ -154,7 +154,7 @@ func machineUpload(ctx *Context, rentalID string, parsed modelsource.Source, des
 			return foregroundInstall(ctx, ep, name, selection)
 		}
 	}
-	state, _, problem := ensureDaemon(ctx)
+	state, _, problem := ensureCalcifer(ctx)
 	if problem != nil {
 		return true, problem
 	}

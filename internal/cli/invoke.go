@@ -60,7 +60,7 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 		return ctx.foregroundClient, nil
 	}
 	if ctx.Daemon.Addr == "" {
-		state, _, problem := ensureDaemon(ctx)
+		state, _, problem := ensureCalcifer(ctx)
 		if problem != nil {
 			return nil, problem
 		}
@@ -974,7 +974,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		}
 		next := page[len(page)-1].Number
 		if next < 1 || (before > 0 && next >= before) {
-			return output.List{}, exit.New(exit.Conflict, "run history pagination did not advance; restart the Cozy daemon to load the current API")
+			return output.List{}, exit.New(exit.Conflict, "run history pagination did not advance; restart the Calcifer to load the current API")
 		}
 		rows = append(rows, page...)
 		if len(page) < pageSize || (limit > 0 && len(rows) >= limit) {

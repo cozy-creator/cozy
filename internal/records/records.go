@@ -3,7 +3,7 @@
 // (cozy-creator.md "Records"). There is no state.json and no second lifecycle store;
 // any JSON output is a derived read.
 //
-// Seam for cl-001: the Cozy daemon adopts THIS package as its lifecycle store and
+// Seam for cl-001: the Calcifer adopts THIS package as its lifecycle store and
 // adds its own tables (worker sessions, requests, attempts, outputs) to the same
 // database. Nothing here assumes a CLI caller; Open takes a path.
 //

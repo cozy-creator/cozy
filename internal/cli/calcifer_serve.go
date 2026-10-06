@@ -10,8 +10,8 @@ import (
 	"syscall"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -25,9 +25,9 @@ import (
 	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
-// serveDaemon is the private process entrypoint shared by explicit `up` and
+// serveCalcifer is the private process entrypoint shared by explicit `up` and
 // commands that ensure the daemon is running.
-func serveDaemon(ctx *Context) *exit.Error {
+func serveCalcifer(ctx *Context) *exit.Error {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return e
@@ -48,7 +48,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 
 	// Already running is idempotent 0 printing the live status.
-	if st := daemon.Probe(ctx.Cfg); st.Up {
+	if st := calcifer.Probe(ctx.Cfg); st.Up {
 		return emit(ctx, output.Record{Fields: []output.Field{
 			{K: "daemon", V: "running"}, {K: "address", V: st.Addr},
 			{K: "socket", V: st.Socket}, {K: "pid", V: st.PID}, {K: "since", V: st.Since},
@@ -87,7 +87,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	// The claim: a second daemon on this root fails here. It comes after the bind so a
 	// port conflict is reported as a port conflict, and before anything is written.
-	held, e := daemon.Hold(l, addr, socket)
+	held, e := calcifer.Hold(l, addr, socket)
 	if e != nil {
 		closeListeners()
 		return e
@@ -224,7 +224,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	go func() { defer close(installsStopped); installs.Run(installContext) }()
 	defer func() { cancelInstalls(); <-installsStopped }()
 
-	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
+	fmt.Fprintf(ctx.Out, "Calcifer up: api %s (%s, loopback only) · worker socket %s\n",
 		addr, strings.Join(bound, "+"), socket)
 	fmt.Fprintf(ctx.Out, "  install sweep: reclaimed %d of %d director(ies), freed %s exclusive%s\n",
 		swept.Removed, swept.Scanned, output.Bytes(swept.Bytes), sweepNote)
@@ -247,7 +247,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	fmt.Fprintf(ctx.Out, "  claim: %s; this daemon stops if that record stops naming it\n", l.Daemon)
 
-	httpServer := daemon.NewHTTPServer(handler)
+	httpServer := calcifer.NewHTTPServer(handler)
 	go func() { _ = httpServer.Serve(v4) }()
 	if v6 != nil {
 		go func() { _ = httpServer.Serve(v6) }()

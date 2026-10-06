@@ -55,7 +55,7 @@ func (c Credentials) AdmitsCLI(presented string) bool { return c.CLI.Equal(prese
 // carrier site, so the raw value is read where it becomes a carrier and nowhere else —
 // the `secret` fence family holds that.
 //
-// A record without a token means the Cozy daemon is not running or has not finished
+// A record without a token means the Calcifer is not running or has not finished
 // launching on this root. That is exactly the exit-9 condition every server-backed verb
 // already shares, so it refuses with the same remedy.
 func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {

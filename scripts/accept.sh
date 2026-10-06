@@ -60,10 +60,10 @@ check "retired exit command refuses instead of aliasing" "$([ "$CODE" = 2 ] && p
 
 run up --json
 check "up returns only useful daemon facts" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q '"url":"http://127.0.0.1:' && printf '%s' "$OUT" | grep -q '"changed":true' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data)"' && echo 1 || echo 0)" "$OUT"
-check "up writes the daemon's own bounded log" "$([ -s "$COZY_HOME/daemon.log" ] && grep -q 'Cozy daemon up:' "$COZY_HOME/daemon.log" && echo 1 || echo 0)" "$COZY_HOME/daemon.log"
+check "up writes the daemon's own bounded log" "$([ -s "$COZY_HOME/daemon.log" ] && grep -q 'Calcifer up:' "$COZY_HOME/daemon.log" && echo 1 || echo 0)" "$COZY_HOME/daemon.log"
 
 run daemon log
-check "daemon log prints the daemon's words" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Cozy daemon up:' && echo 1 || echo 0)" "$OUT"
+check "daemon log prints the daemon's words" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Calcifer up:' && echo 1 || echo 0)" "$OUT"
 
 run down
 check "down stops the explicit daemon" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'daemon: +stopped' && echo 1 || echo 0)" "$OUT"

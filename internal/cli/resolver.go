@@ -33,7 +33,7 @@ import (
 // loader, and the driver's writer are all gone, and the live driver installs a package
 // exactly as a user does.
 
-// Resolver is the Cozy daemon's package resolver.
+// Resolver is Calcifer's package resolver.
 type Resolver struct {
 	mu        sync.Mutex
 	refreshMu sync.Mutex
@@ -248,7 +248,7 @@ func (r *Resolver) namespace() (packagepublish.Namespace, *exit.Error) {
 // credential and kept, so a run asks no Hub.
 func (r *Resolver) namespaceAt(origin string) (packagepublish.Namespace, *exit.Error) {
 	cfg := r.cfg.ForHub(origin)
-	c := hub.New(cfg, "cozy-daemon").WithTokenSource(accountauth.New(cfg))
+	c := hub.New(cfg, "calcifer").WithTokenSource(accountauth.New(cfg))
 	ctx, cancel := hub.Context()
 	defer cancel()
 	account, problem := c.CurrentAccount(ctx)
@@ -279,7 +279,7 @@ func (r *Resolver) catalog(origin string) *hub.Client {
 	if c := r.catalogs[cfg.HubURL]; c != nil {
 		return c
 	}
-	c := hub.New(cfg, "cozy-daemon")
+	c := hub.New(cfg, "calcifer")
 	r.catalogs[cfg.HubURL] = c
 	return c
 }
@@ -689,7 +689,7 @@ func jobsOf(facts *launch.Facts) ([]launch.JobFacts, *exit.Error) {
 func (r *Resolver) activeInstall(ref string) (*records.PackageInstall, *exit.Error) {
 	pkg, major, hasMajor := splitMajor(ref)
 	if r.store == nil {
-		return nil, exit.Unavailablef("this Cozy daemon has no install records")
+		return nil, exit.Unavailablef("this controller has no install records")
 	}
 	pins, e := r.store.Pins(pkg)
 	if e != nil {

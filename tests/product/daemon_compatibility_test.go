@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
 )
@@ -139,7 +139,7 @@ func TestDaemonHeldRecordNeverFallsBackToConfiguredPort(t *testing.T) {
 	layout, lock, pid, _ := compatibilityOwner(t)
 	_, err := lock.WriteAt([]byte("pid="+strconv.Itoa(pid)+"\n"), 0)
 	must(t, err)
-	state := daemon.Probe(config.Config{Home: layout.Root, Port: 8080})
+	state := calcifer.Probe(config.Config{Home: layout.Root, Port: 8080})
 	if !state.Up || state.Addr != "" || state.OperatorOwned {
 		t.Fatalf("incomplete owner record became a configured address or operator: %+v", state)
 	}
@@ -210,7 +210,7 @@ func TestDaemonReadinessWaitCanBeInterruptedWithoutStoppingOwner(t *testing.T) {
 		t.Fatal("interrupting caller stopped the owner")
 	default:
 	}
-	if state := daemon.Probe(config.Config{Home: layout.Root}); !state.Up || state.PID != pid {
+	if state := calcifer.Probe(config.Config{Home: layout.Root}); !state.Up || state.PID != pid {
 		t.Fatalf("interruption changed owner: %+v", state)
 	}
 }
@@ -256,14 +256,14 @@ func TestConcurrentCLIStartsConvergeOnOneEphemeralDaemon(t *testing.T) {
 	if t.Failed() {
 		t.FailNow()
 	}
-	state := daemon.Probe(config.Config{Home: root})
+	state := calcifer.Probe(config.Config{Home: root})
 	if !state.Up || state.PID <= 0 || state.Addr == "" || strings.HasSuffix(state.Addr, ":0") {
 		t.Fatalf("concurrent startup did not publish one bound daemon: %+v", state)
 	}
 	if output, err := compatibilityCLI(t, root, "run", "list", "--json"); err != nil {
 		t.Fatalf("winner did not remain ready: %v %s", err, output)
 	}
-	if next := daemon.Probe(config.Config{Home: root}); next.PID != state.PID {
+	if next := calcifer.Probe(config.Config{Home: root}); next.PID != state.PID {
 		t.Fatal("a subsequent client replaced the startup winner")
 	}
 }
