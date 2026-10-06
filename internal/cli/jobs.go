@@ -738,11 +738,7 @@ func modelQuantizeHint(ctx *Context, state api.JobState) string {
 
 // ---------------------------------------------------------------------- job cancel
 
-func handleJobCancel(ctx *Context) *exit.Error {
-	return cancelJob(ctx, "cozy job cancel")
-}
-
-func cancelJob(ctx *Context, actor string) *exit.Error {
+func cancelJob(ctx *Context) *exit.Error {
 	c, e := dial(ctx)
 	if e != nil {
 		return e
@@ -758,7 +754,7 @@ func cancelJob(ctx *Context, actor string) *exit.Error {
 		fields := append(jobFields(ctx.Mode(), state, true), output.Field{K: "changed", V: false})
 		return emit(ctx, compactRecord(fields, "job", "status", "changed", "canceled_by"))
 	}
-	if e := c.CancelJob(jobID, actor); e != nil {
+	if e := c.CancelJob(jobID, "cozy run cancel"); e != nil {
 		return e
 	}
 	// Cancellation is durable intent. Waiting for its effective outcome is explicit;
