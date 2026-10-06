@@ -139,9 +139,10 @@ func (s *Store) LoseMachine(machine, message string) *exit.Error {
 }
 
 // settleLostMachine ends every obligation on a rental proven gone, its runs and those that
-// reached it as an explicit endpoint. A run whose offer never left this host is released to
-// be placed again, charging nothing. A sent offer may have executed, and that execution and
-// its bytes died with the machine.
+// reached it as an explicit endpoint. A run its machine never confirmed stays in the outbox:
+// released to be placed again under the same identity, charging nothing; the gone machine
+// cannot run it, and a late acceptance from it is refused (AcceptRunV1). A confirmed run may
+// have executed: it ends FAILED with its machine's loss, and its owner resubmits.
 func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
 	return settleLost(tx, machine, "", "")
 }
@@ -152,8 +153,7 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		return exit.Internalf("cannot read lost machine cause: %s", err)
 	}
 	rows, err := tx.Query(`SELECT e.machine_id,r.id,r.state,r.retain_work,r.rental=1 AND r.requested_rental='',
- e.cancel_requested,length(e.submission)>0 OR length(e.receipt)>0 OR EXISTS(SELECT 1 FROM request_events sent
- WHERE sent.request_id=r.id AND sent.type='`+RunV1Sent+`'),length(e.receipt)>0,length(e.outcome)>0
+ e.cancel_requested,length(e.submission)>0 OR `+runV1SentHere+`,length(e.receipt)>0,length(e.outcome)>0
  FROM machine_executions e JOIN requests r ON r.id=e.request_id
  WHERE e.machine_id<>'' AND (e.machine_id=?1 OR `+executionRental+`=?1) AND (?2='' OR e.request_id=?2) AND `+machineExecutionOwed, machine, request)
 	if err != nil {
@@ -161,13 +161,13 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 	}
 	type observation struct {
 		machine, id, state                                          string
-		retained, placeable, cancel, submitted, accepted, hasResult bool
+		retained, placeable, cancel, sent, accepted, hasResult bool
 	}
 	var observations []observation
 	for rows.Next() {
 		var value observation
 		if err := rows.Scan(&value.machine, &value.id, &value.state, &value.retained, &value.placeable,
-			&value.cancel, &value.submitted, &value.accepted, &value.hasResult); err != nil {
+			&value.cancel, &value.sent, &value.accepted, &value.hasResult); err != nil {
 			rows.Close()
 			return exit.Internalf("cannot read destroyed machine observer: %s", err)
 		}
@@ -179,8 +179,8 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		return exit.Internalf("cannot finish destroyed machine observers: %s", err)
 	}
 	for _, value := range observations {
-		if !value.submitted && value.placeable && !value.retained && (value.state == "submitted" || value.state == "queued") {
-			if problem := releaseUnsentTx(tx, value.id, value.machine, cause); problem != nil {
+		if !value.accepted && value.placeable && !value.retained && (value.state == "submitted" || value.state == "queued") {
+			if problem := releaseUnconfirmedTx(tx, value.id, value.machine, cause); problem != nil {
 				return problem
 			}
 			continue
@@ -197,8 +197,10 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		message := "its rental ended before it finished"
 		if settledRequestState(value.state) {
 			message = "its rental ended; anything not yet collected from it is gone"
-		} else if !value.submitted {
+		} else if !value.sent {
 			message = "its rental ended before the run was sent to it"
+		} else if !value.accepted {
+			message = "its rental ended before it confirmed the run"
 		}
 		if lost != "" {
 			message = lost
@@ -236,10 +238,11 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 	return nil
 }
 
-// releaseUnsentTx unlinks and unpins the run. Input bytes the lost machine held are
-// staged again wherever the run is placed; `machine` stays as the run's history.
-func releaseUnsentTx(tx *sql.Tx, id, machine, cause string) *exit.Error {
-	if _, err := tx.Exec(`UPDATE machine_executions SET machine_id='' WHERE request_id=?`, id); err != nil {
+// releaseUnconfirmedTx puts the run back in the outbox: unlinked, unpinned and unsent, with
+// the same identity. Input bytes the lost machine held are staged again wherever the run is
+// placed; `machine` stays as the run's history.
+func releaseUnconfirmedTx(tx *sql.Tx, id, machine, cause string) *exit.Error {
+	if _, err := tx.Exec(`UPDATE machine_executions SET machine_id='',remote_cursor=0 WHERE request_id=?`, id); err != nil {
 		return exit.Internalf("cannot release unsent execution: %s", err)
 	}
 	if _, err := tx.Exec(`UPDATE requests SET worker='' WHERE id=?`, id); err != nil {
@@ -258,7 +261,7 @@ func releaseUnsentTx(tx *sql.Tx, id, machine, cause string) *exit.Error {
 			return exit.Internalf("cannot restage input from lost machine: %s", err)
 		}
 	}
-	reason := "rented machine " + machine + " was lost before this run was submitted"
+	reason := "rented machine " + machine + " was lost before it confirmed this run"
 	if cause != "" {
 		reason += " (" + cause + ")"
 	}

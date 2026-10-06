@@ -31,7 +31,7 @@ func endpointRunOnRental(t *testing.T, store *records.Store, root, label string,
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, ep.Name()))
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": ep.Name()}))
-	fatal(t, store.AcceptRunV1(request.ID, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
+	fatal(t, store.AcceptRunV1(request.ID, ep.Name(), &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 	if cancel {
 		_, problem := store.RequestMachineCancellation(request.ID, "")
 		fatal(t, problem)

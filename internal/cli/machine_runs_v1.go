@@ -319,7 +319,11 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			terminal = records.Settled(state.State)
 		}
 		if state := event.GetState(); state != nil && !accepted {
-			if problem := m.store.AcceptRunV1(request.ID, state); problem != nil {
+			if problem := m.store.AcceptRunV1(request.ID, link.MachineID, state); problem != nil {
+				if problem.ErrName() == "machine_execution.acceptance_stale" {
+					// Released from this machine and sent on: it must not run here too.
+					_, _ = machine.Control(ctx, request.ID, v1.Action_ACTION_CANCEL)
+				}
 				return false, problem
 			}
 			accepted = true

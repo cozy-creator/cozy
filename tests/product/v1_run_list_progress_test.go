@@ -33,7 +33,7 @@ func TestRunListShowsTheMachinesLastProgress(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-unreachable"))
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": "pr-unreachable"}))
-	fatal(t, store.AcceptRunV1(request.ID, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
+	fatal(t, store.AcceptRunV1(request.ID, "pr-unreachable", &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 	sequence := uint64(1)
 	report := func(store *records.Store, attempt uint32, progress *v1.Progress) {
 		t.Helper()

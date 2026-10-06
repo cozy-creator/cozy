@@ -15,15 +15,18 @@ import (
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
-// The owner's ruling as behaviour: "it's fine for cozy-daemon to assign work to specific pods,
-// but when that pod fails it should recover those jobs and schedule them elsewhere if
-// possible". When a rental fails, what crossed to its machine over cozy.machine.v1 decides:
+// The owner's rulings as behaviour: "when that pod fails it should recover those jobs and
+// schedule them elsewhere if possible", and a request waits in an outbox until a worker
+// confirms it; after that it is no longer ours, and a worker failure means the user resubmits.
+// When a rental is proven failed, what its machine confirmed over cozy.machine.v1 decides:
 //
-//	never sent              released and placed again; nothing ran
-//	selected with --rental  settled with the lost rental's cause; it may not move
-//	sent, or accepted       lost with the machine that may have run it, saying so
-//	private transaction     fails as retained work; its bytes died with the pod
-//	succeeded               keeps its success: a real outcome is never overwritten
+//	never sent, or sent and unconfirmed   back in the outbox and placed again, same identity
+//	selected with --rental                settled with the lost rental's cause; it may not move
+//	confirmed                             failed with the machine's loss, saying so
+//	private transaction                   fails as retained work; its bytes died with the pod
+//	succeeded                             keeps its success: a real outcome is never overwritten
+//
+// A rental that is only unreachable (degraded) proves nothing: its unconfirmed run waits on it.
 //
 // The daemon is the real process against a hub that moves the rental to `failed` the way
 // Tensorhub does, only after proving provider absence.
@@ -49,12 +52,14 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 
 	// The pod is degraded while it holds the work: nothing can attach to it, so the runs wait
 	// on it rather than failing for an unrelated transport reason first.
-	hub.add("rental-lost", "nitian")
-	hub.setState("rental-lost", "degraded", "")
-	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "rental-lost", MachineName: "nitian", SKU: "cpu",
-		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1"}))
+	for id, name := range map[string]string{"rental-lost": "nitian", "rental-unreachable": "kochiya"} {
+		hub.add(id, name)
+		hub.setState(id, "degraded", "")
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: id, MachineName: name, SKU: "cpu",
+			AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1"}))
+	}
 	type arm struct {
-		kind, selected                string
+		kind, selected, rental        string
 		sent, accepted, retained, won bool
 	}
 	arms := map[string]arm{
@@ -64,19 +69,26 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 		"req-lost-running":   {sent: true, accepted: true},
 		"job-lost-retained":  {kind: "job", sent: true, accepted: true, retained: true},
 		"req-lost-succeeded": {sent: true, accepted: true, won: true},
+		"req-unreachable":    {sent: true, rental: "rental-unreachable"},
 	}
 	for id, arm := range arms {
+		if arm.rental == "" {
+			arm.rental = "rental-lost"
+			arms[id] = arm
+		}
 		body, _ := canonical.Spell(canonical.Digest([]byte(id)))
 		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: "idem-" + id, BodyDigest: body, Package: "fake/lost",
-			Release: "1", Entrypoint: "generate", Kind: arm.kind, Payload: []byte("{}"), Rental: true, Worker: "rental-lost",
+			Release: "1", Entrypoint: "generate", Kind: arm.kind, Payload: []byte("{}"), Rental: true, Worker: arm.rental,
 			RequestedRental: arm.selected, RetainWork: arm.retained, MachineExecutionObserver: true})
 		fatal(t, problem)
-		fatal(t, store.LinkMachineExecution(id, "rental-lost"))
+		fatal(t, store.LinkMachineExecution(id, arm.rental))
 		if arm.sent {
-			fatal(t, store.AppendEvent(id, records.RunV1Sent, 0, map[string]any{"machine": "rental-lost"}))
+			if send, problem := store.MarkRunV1Sent(id); problem != nil || !send {
+				t.Fatalf("%s was not sent: %v %v", id, send, problem)
+			}
 		}
 		if arm.accepted {
-			fatal(t, store.AcceptRunV1(id, &v1.RunState{Id: id, Number: 1, State: "running", Attempt: 1}))
+			fatal(t, store.AcceptRunV1(id, arm.rental, &v1.RunState{Id: id, Number: 1, State: "running", Attempt: 1}))
 		}
 		if arm.won {
 			// Its result is still on the machine: this client could not write it yet.
@@ -90,15 +102,24 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 	hub.setState("rental-lost", "failed", "readiness.receipt_conflict")
 
 	// Recovered means nothing still waits on the corpse, and each released run was placed
-	// again. This hub offers no machine, which is weather: the run waits and says so.
+	// again: after its release it waits for a machine and says so.
 	replanned := func(id string) bool {
-		return strings.Contains(lastEventField(t, store, id, "request.parked", "reason"), "offered no CPU product")
+		events, problem := store.EventsAfter(id, 0, 1000)
+		fatal(t, problem)
+		released := false
+		for _, event := range events {
+			released = released || event.Type == "request.queued" && event.Payload["machine_id"] == "rental-lost"
+			if released && event.Type == "request.parked" {
+				return true
+			}
+		}
+		return false
 	}
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		queued, running, problem := store.RentalRunCounts("rental-lost")
 		fatal(t, problem)
-		if queued == 0 && running == 0 && replanned("req-lost-queued-a") && replanned("req-lost-queued-b") {
+		if queued == 0 && running == 0 && replanned("req-lost-queued-a") && replanned("req-lost-queued-b") && replanned("req-lost-sent") {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -123,11 +144,18 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 			said[event.Type] = event.Payload
 		}
 		switch {
-		case !arm.sent && arm.selected == "":
+		case arm.rental == "rental-unreachable":
+			if settled(row.State) || link.MachineID != "rental-unreachable" || said["request.queued"] != nil || !owed {
+				t.Fatalf("%s left a machine that is only unreachable: %+v link=%q events=%v", id, row, link.MachineID, said)
+			}
+		case !arm.accepted && arm.selected == "" && !arm.retained:
 			queued := said["request.queued"]
 			if settled(row.State) || link.MachineID != "" || row.Worker != "" || row.Machine != "nitian" ||
 				queued["machine_id"] != "rental-lost" || !strings.Contains(fmt.Sprint(queued["reason"]), "readiness.receipt_conflict") {
 				t.Fatalf("%s was not released to be placed again: %+v link=%q events=%v\n%s", id, row, link.MachineID, said, tail(logPath))
+			}
+			if row.ID != id {
+				t.Fatalf("%s was placed again under another identity: %s", id, row.ID)
 			}
 		case row.Machine != "nitian":
 			t.Fatalf("%s lost the machine word it ran against: %q", id, row.Machine)

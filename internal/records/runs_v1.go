@@ -16,9 +16,16 @@ import (
 // the same request events a worker.v1 run's import writes, so every reader renders it alike.
 const RunV1Accepted = "machine.api_v1"
 
-// RunV1Sent marks permission to send a run's spec: the machine may hold it before
-// its acceptance is recorded here. Cancellation after this mark needs a machine outcome.
+// RunV1Sent marks permission to send a run's spec to one machine (its payload's `machine`):
+// that machine may hold it before its acceptance is recorded here. Cancellation after this
+// mark needs that machine's outcome. A run released from a machine proven gone is unsent
+// again: its next machine gets a mark of its own.
 const RunV1Sent = "machine.api_v1_sent"
+
+// runV1SentHere is whether the run was sent to the machine it is linked to now; e aliases
+// machine_executions.
+const runV1SentHere = `EXISTS(SELECT 1 FROM request_events sent WHERE sent.request_id=e.request_id
+ AND sent.type='` + RunV1Sent + `' AND json_extract(sent.payload,'$.machine')=e.machine_id)`
 
 // MarkRunV1Sent orders dispatch against cancellation in the same database transaction.
 // If cancellation wins, no spec may be sent. If dispatch wins, cancellation must be
@@ -33,8 +40,8 @@ func (s *Store) MarkRunV1Sent(id string) (bool, *exit.Error) {
 	var canceled, abandoned, sent bool
 	err = tx.QueryRow(`SELECT e.machine_id, r.state, e.cancel_requested,
  EXISTS(SELECT 1 FROM request_events WHERE request_id=r.id AND type='client.machine_abandoned'),
- EXISTS(SELECT 1 FROM request_events WHERE request_id=r.id AND type=?)
- FROM requests r JOIN machine_executions e ON e.request_id=r.id WHERE r.id=?`, RunV1Sent, id).
+ `+runV1SentHere+`
+ FROM requests r JOIN machine_executions e ON e.request_id=r.id WHERE r.id=?`, id).
 		Scan(&machine, &state, &canceled, &abandoned, &sent)
 	if err != nil {
 		return false, exit.Internalf("cannot read machine dispatch: %s", err)
@@ -58,10 +65,15 @@ func (s *Store) RunV1(id string) (bool, *exit.Error) {
 	return s.RunV1Marked(id, RunV1Accepted)
 }
 
-// RunV1Marked is whether the run carries one of the marks above.
+// RunV1Marked is whether the run carries one of the marks above; RunV1Sent, for the machine
+// the run is linked to now.
 func (s *Store) RunV1Marked(id, mark string) (bool, *exit.Error) {
 	var found bool
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, id, mark).Scan(&found); err != nil {
+	query, args := `SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, []any{id, mark}
+	if mark == RunV1Sent {
+		query, args = `SELECT EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=? AND `+runV1SentHere+`)`, []any{id}
+	}
+	if err := s.db.QueryRow(query, args...).Scan(&found); err != nil {
 		return false, exit.Internalf("cannot read the run's machine API: %s", err)
 	}
 	return found, nil
@@ -85,9 +97,10 @@ func RunV1Outcome(link *MachineExecution) *v1.Outcome {
 	return &outcome
 }
 
-// AcceptRunV1 records the machine's acceptance once: its first RunState, the marker event,
-// and the request projected from that state.
-func (s *Store) AcceptRunV1(id string, state *v1.RunState) *exit.Error {
+// AcceptRunV1 records the acceptance of the machine the run is linked to, once: its first
+// RunState, the marker event, and the request projected from that state. An acceptance from
+// any other machine (one the run was released from) is refused: the run is never run twice.
+func (s *Store) AcceptRunV1(id, machine string, state *v1.RunState) *exit.Error {
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(state)
 	if err != nil {
 		return exit.Internalf("cannot retain the run's acceptance: %s", err)
@@ -97,12 +110,20 @@ func (s *Store) AcceptRunV1(id string, state *v1.RunState) *exit.Error {
 		return exit.Internalf("cannot begin the run's acceptance: %s", err)
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec(`UPDATE machine_executions SET receipt=? WHERE request_id=? AND length(receipt)=0`, raw, id)
+	result, err := tx.Exec(`UPDATE machine_executions SET receipt=? WHERE request_id=? AND machine_id=? AND length(receipt)=0`, raw, id, machine)
 	if err != nil {
 		return exit.Internalf("cannot record the run's acceptance: %s", err)
 	}
 	if n, _ := result.RowsAffected(); n == 0 {
-		return nil // accepted before
+		var linked bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions WHERE request_id=? AND machine_id=? AND length(receipt)>0)`, id, machine).Scan(&linked); err != nil {
+			return exit.Internalf("cannot read the run's acceptance: %s", err)
+		}
+		if linked {
+			return nil // accepted before
+		}
+		return exit.Named(exit.Conflict, "machine_execution.acceptance_stale",
+			"machine %s accepted run %s after the run was released from it; that acceptance is refused", machine, id)
 	}
 	if err := appendEventTx(tx, id, RunV1Accepted, int64(state.Attempt), map[string]any{"number": state.Number, "state": state.State}); err != nil {
 		return exit.Internalf("cannot record the run's acceptance: %s", err)

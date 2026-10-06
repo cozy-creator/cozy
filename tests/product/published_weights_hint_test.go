@@ -25,7 +25,7 @@ func TestARunThatPublishedItsWeightsNamesTheCheckpointAndThePublishCommand(t *te
 			Outputs: []records.ModelTransferOutput{{Name: "fp8"}}}})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "local"))
-	fatal(t, store.AcceptRunV1(request.ID, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
+	fatal(t, store.AcceptRunV1(request.ID, "local", &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 	checkpoint := "sha256:" + strings.Repeat("67", 32)
 	fatal(t, store.RecordRunOutcomeV1(request.ID, records.RunEndV1{Outcome: &v1.Outcome{Status: "succeeded",
 		Result:  []byte(`{"manifest":{"digest":"` + checkpoint + `","length":164},"output_slot":"fp8"}`),

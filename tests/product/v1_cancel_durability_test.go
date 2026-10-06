@@ -23,7 +23,7 @@ func TestACancelAndItsActorAreRecordedTogether(t *testing.T) {
 	fatal(t, store.LinkMachineExecution(request.ID, "local"))
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": "local"}))
 	running := &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}
-	fatal(t, store.AcceptRunV1(request.ID, running))
+	fatal(t, store.AcceptRunV1(request.ID, "local", running))
 
 	durable := func(actor string) {
 		t.Helper()
