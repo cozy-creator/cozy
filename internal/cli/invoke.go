@@ -2923,8 +2923,20 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	if problem.Code != exit.NotFound || strings.HasPrefix(target.Package, "local/") {
 		return Target{}, nil, problem
 	}
-	// A release this client has not installed is read once at the Hub: its immutable static
-	// description types the request and its results.
+	// A release this client has not installed: the one it read last, else the one the machine
+	// that runs it names at its own Hub. Only a run with no machine yet reads the Hub, once.
+	root := home.Paths(ctx.Cfg.Home).Root
+	if release, surface := keptNewestRelease(root, ctx.Cfg.HubURL, target.Package); release != "" {
+		target.Release = release
+		return target, surface, nil
+	}
+	if release, surface, problem := describeOnMachine(ctx, target.Package); problem != nil {
+		return Target{}, nil, problem
+	} else if release != "" {
+		keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, release)
+		target.Release = release
+		return target, surface, nil
+	}
 	ref, problem := hub.ParseRef(target.Package)
 	if problem != nil {
 		return Target{}, nil, problem
@@ -2960,8 +2972,58 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	target.Release = release
 	// The run's results, and its rental's machine class, read this immutable release with
 	// no further Hub call.
-	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, release, detail.PackageInterface, requirements)
+	keepReleaseInterface(root, target.Package, release, detail.PackageInterface, requirements)
+	keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, release)
 	return target, packageInterface, nil
+}
+
+// describeOnMachine is pkg's newest release and its interface as the machine the run goes to
+// installs it at its own Hub (describe/1), so the client reads no Hub. "" when the run has no
+// machine yet, or the machine or daemon cannot describe.
+func describeOnMachine(ctx *Context, pkg string) (string, *launch.PackageInterface, *exit.Error) {
+	machine, known, problem := knownMachine(ctx)
+	if problem != nil || !known {
+		return "", nil, problem
+	}
+	var described api.ReleaseDescription
+	if ctx.endpoint != nil {
+		install, problem := foregroundPrewarm(ctx, ctx.endpoint, machine, records.RentalInstallSelection{Package: pkg})
+		if problem != nil || json.Unmarshal(install.Result, &described) != nil {
+			return "", nil, describeFallback(problem)
+		}
+	} else {
+		c, problem := dial(ctx)
+		if problem != nil {
+			return "", nil, problem
+		}
+		if described, problem = c.DescribeRelease(machine, pkg); problem != nil {
+			return "", nil, describeFallback(problem)
+		}
+	}
+	if described.Release == "" || len(described.Interface) == 0 {
+		return "", nil, nil
+	}
+	raw, err := canonical.NormalizeJCS(described.Interface)
+	if err != nil {
+		return "", nil, exit.Named(exit.Conflict, "machine.package_interface_invalid", "the machine described an invalid package interface")
+	}
+	surface, problem := launch.DecodePackageInterface(raw)
+	if problem != nil {
+		return "", nil, exit.Named(exit.Conflict, "machine.package_interface_invalid",
+			"the machine described an invalid package interface: %s", problem.Message)
+	}
+	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, pkg, described.Release, raw, nil)
+	return described.Release, surface, nil
+}
+
+// describeFallback keeps a describe refusal that ends the run, and drops one that only says
+// the machine or daemon cannot describe (an older one, or no route): the Hub names it.
+func describeFallback(problem *exit.Error) *exit.Error {
+	if problem == nil || problem.ErrName() == errNoDescribe.ErrName() || problem.Code == exit.NotFound ||
+		problem.ErrName() == "untyped_answer" || problem.ErrName() == "hub.untyped_refusal" {
+		return nil
+	}
+	return problem
 }
 
 // knownMachine is the machine a run names without renting one: this computer's, or a named

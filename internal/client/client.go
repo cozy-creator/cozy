@@ -400,6 +400,14 @@ func (c *Client) MachineStatus(machine string) (api.MachineStatus, *exit.Error) 
 	return status, problem
 }
 
+// DescribeRelease is pkg's newest release and interface as a machine installs it at its own
+// Hub (describe/1).
+func (c *Client) DescribeRelease(machine, pkg string) (api.ReleaseDescription, *exit.Error) {
+	var described api.ReleaseDescription
+	problem := c.call(http.MethodPost, "/v1/local/machines/"+url.PathEscape(machine)+"/describe", map[string]string{"package": pkg}, &described)
+	return described, problem
+}
+
 // MachineLog reads one log a machine ("local" or a rental id) keeps, its newest tailBytes when
 // nonzero.
 func (c *Client) MachineLog(machine, log string, tailBytes uint64) (api.MachineLog, *exit.Error) {

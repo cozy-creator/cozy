@@ -43,6 +43,38 @@ func keepReleaseInterface(root, pkg, release string, raw []byte, requirements []
 	}
 }
 
+// newestReleasePath names the release of pkg at hub this client last read, so a later run of
+// a package it never installed names that release with no Hub or machine call.
+func newestReleasePath(root, hubURL, pkg string) string {
+	name := sha256.Sum256([]byte(hubURL + "\x00" + pkg))
+	return filepath.Join(root, "releases", "newest", hex.EncodeToString(name[:16]))
+}
+
+func keepNewestRelease(root, hubURL, pkg, release string) {
+	path := newestReleasePath(root, hubURL, pkg)
+	if os.MkdirAll(filepath.Dir(path), 0o700) == nil && os.WriteFile(path+".tmp", []byte(release), 0o600) == nil {
+		_ = os.Rename(path+".tmp", path)
+	}
+}
+
+// keptNewestRelease is the release keepNewestRelease named and its kept interface, or "".
+func keptNewestRelease(root, hubURL, pkg string) (string, *launch.PackageInterface) {
+	raw, err := os.ReadFile(newestReleasePath(root, hubURL, pkg))
+	if err != nil {
+		return "", nil
+	}
+	release := string(raw)
+	kept := readKeptRelease(root, pkg, release)
+	if kept.Interface == nil {
+		return "", nil
+	}
+	surface, problem := launch.DecodePackageInterface(kept.Interface)
+	if problem != nil {
+		return "", nil
+	}
+	return release, surface
+}
+
 // readKeptRelease is the kept release, or none; a file holding only an interface has no
 // closure.
 func readKeptRelease(root, pkg, release string) keptRelease {

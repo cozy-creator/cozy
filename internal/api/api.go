@@ -252,6 +252,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/rentals/{rental_id}/keepalive":      s.keepRentalAlive,
 		"GET /v1/local/rentals":                             s.listRentals,
 		"GET /v1/local/machines/{machine}/status":           s.machineStatus,
+		"POST /v1/local/machines/{machine}/describe":        s.describeRelease,
 		"GET /v1/local/machines/{machine}/logs/{log}":       s.machineLog,
 		"POST /v1/local/rentals/{rental_id}/prepare":        s.prepareRentalPackage,
 		"GET /v1/local/rentals/{rental_id}/installs/{id}":   s.rentalInstallState,

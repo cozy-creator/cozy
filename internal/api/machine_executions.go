@@ -92,6 +92,45 @@ func (s *Server) machineStatus(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, status)
 }
 
+// ReleaseDescription is a package's newest release at a machine's own Hub and its interface,
+// as that machine installed it (describe/1).
+type ReleaseDescription struct {
+	Release   string          `json:"release"`
+	Interface json.RawMessage `json:"interface"`
+}
+
+type releaseDescriber interface {
+	Describe(ctx context.Context, machine, pkg, hub string) (ReleaseDescription, *exit.Error)
+}
+
+// describeRelease asks one machine to install a package's newest release at its own Hub and
+// name it, so a client that never installed the package types its run with no Hub read.
+func (s *Server) describeRelease(w http.ResponseWriter, r *http.Request) {
+	describer, ok := s.machineExecutions.(releaseDescriber)
+	if !ok {
+		s.refuseTyped(w, r, exit.Named(exit.Unavailable, "machine.describe_unsupported", "this Cozy daemon describes no releases"))
+		return
+	}
+	var body struct {
+		Package string `json:"package"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body) != nil || body.Package == "" {
+		s.refuseTyped(w, r, exit.New(exit.Validation, "a description names one package"))
+		return
+	}
+	hub, problem := s.hubOf(r)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	described, problem := describer.Describe(r.Context(), r.PathValue("machine"), body.Package, hub)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	s.ok(w, r, http.StatusOK, described)
+}
+
 // MachineLog is one log a machine keeps, oldest line first. Unavailable says why the machine
 // could not answer, for a machine whose agent predates the read: a note, never a failure.
 type MachineLog struct {
