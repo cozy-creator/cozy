@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -231,5 +232,148 @@ func TestV1CancelFencesDelayedNativeAcceptance(t *testing.T) {
 			}
 			break
 		}
+	}
+}
+
+func nativeLifecycleOutcome(t *testing.T, machine *machines.V1, id string) string {
+	t.Helper()
+	stream, err := machine.Run(t.Context(), id, 0, nil)
+	must(t, err)
+	for {
+		event, err := stream.Recv()
+		must(t, err)
+		if outcome := event.GetOutcome(); outcome != nil {
+			return outcome.Status
+		}
+	}
+}
+
+func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
+	root, store, machine := nativeLifecycleHome(t)
+	start := func(key string) (*records.Request, string, string) {
+		gate := filepath.Join(root, key+"-gate")
+		directory := filepath.Join(root, key+"-out")
+		if code, out := runCozy(t, root, "run", "local/native-lifecycle/make", "gate="+gate, "size=200000",
+			"--idempotency-key="+key, "--out="+directory, "--json"); code != 0 {
+			t.Fatalf("submitting native %s [%d]: %s", key, code, out)
+		}
+		return nativeLifecycleRequest(t, store, key), gate, directory
+	}
+	down := func() {
+		if code, out := runCozy(t, root, "down", "--json"); code != 0 {
+			t.Fatalf("stopping only the fixture controller [%d]: %s", code, out)
+		}
+	}
+	up := func() {
+		if code, out := runCozy(t, root, "up", "--json"); code != 0 {
+			t.Fatalf("restarting fixture controller [%d]: %s", code, out)
+		}
+	}
+	waitState := func(id, state string) {
+		landed(t, "native outcome projected after reattach", func() bool {
+			row, _ := store.RequestRow(id)
+			return row != nil && row.State == state
+		})
+	}
+
+	// The machine produces exact authored bytes while its client daemon is gone.
+	row, gate, directory := start("native-down-bytes")
+	down()
+	must(t, os.WriteFile(gate, nil, 0o600))
+	if ended := nativeLifecycleOutcome(t, machine, row.ID); ended != "succeeded" {
+		t.Fatalf("controller shutdown changed the machine's outcome: %s", ended)
+	}
+	up()
+	if code, out := runCozy(t, root, "run", "watch", row.ID, "--json"); code != 0 {
+		t.Fatalf("reattaching to native bytes [%d]: %s", code, out)
+	}
+	nativeLifecycleBytes(t, directory, 200000)
+	actor, _, _, problem := store.CancelAttribution(row.ID)
+	fatal(t, problem)
+	if actor != "" {
+		t.Fatalf("observation shutdown recorded a cancellation actor: %q", actor)
+	}
+
+	// A locally durable explicit cancel waits through a controller restart.
+	row, _, _ = start("native-down-cancel")
+	down()
+	_, problem = store.RequestMachineCancellation(row.ID, "cozy run cancel")
+	fatal(t, problem)
+	actor, _, _, problem = store.CancelAttribution(row.ID)
+	fatal(t, problem)
+	if actor != "cozy run cancel" {
+		t.Fatal("offline explicit cancellation lost its actor")
+	}
+	up()
+	waitState(row.ID, "canceled")
+	if ended := nativeLifecycleOutcome(t, machine, row.ID); ended != "canceled" {
+		t.Fatalf("durable explicit cancel did not reach the native machine: %s", ended)
+	}
+
+	// If natural success already won, the late intent never changes that outcome.
+	row, gate, directory = start("native-success-before-cancel")
+	down()
+	must(t, os.WriteFile(gate, nil, 0o600))
+	if ended := nativeLifecycleOutcome(t, machine, row.ID); ended != "succeeded" {
+		t.Fatalf("native natural completion ended %s", ended)
+	}
+	_, problem = store.RequestMachineCancellation(row.ID, "cozy run cancel")
+	fatal(t, problem)
+	up()
+	waitState(row.ID, "succeeded")
+	if code, out := runCozy(t, root, "run", "watch", row.ID, "--json"); code != 0 {
+		t.Fatalf("late cancel changed native success [%d]: %s", code, out)
+	}
+	nativeLifecycleBytes(t, directory, 200000)
+	if code, out := runCozy(t, root, "run", "cancel", row.ID, "--json"); code != 0 ||
+		!strings.Contains(out, `"changed":false`) || !strings.Contains(out, `"status":"completed"`) {
+		t.Fatalf("cancel after native success was not a no-op [%d]: %s", code, out)
+	}
+
+	// One actual watcher survives a daemon restart and only observes the run.
+	row, gate, directory = start("native-watch-reconnect")
+	stdout, err := os.Create(filepath.Join(root, "watch.stdout"))
+	must(t, err)
+	defer stdout.Close()
+	stderr, err := os.Create(filepath.Join(root, "watch.stderr"))
+	must(t, err)
+	defer stderr.Close()
+	watcher := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "run", "watch", row.ID, "--json")
+	watcher.Env, watcher.Stdout, watcher.Stderr = childEnv(t, root), stdout, stderr
+	must(t, watcher.Start())
+	finished := make(chan error, 1)
+	go func() { finished <- watcher.Wait() }()
+	t.Cleanup(func() { _ = watcher.Process.Kill() })
+	landed(t, "watcher opened its event stream", func() bool {
+		data, _ := os.ReadFile(stderr.Name())
+		return len(data) > 0
+	})
+	down()
+	select {
+	case err := <-finished:
+		t.Fatalf("watcher exited when its controller disconnected: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	must(t, os.WriteFile(gate, nil, 0o600))
+	if ended := nativeLifecycleOutcome(t, machine, row.ID); ended != "succeeded" {
+		t.Fatalf("watcher/controller loss canceled the native run: %s", ended)
+	}
+	up()
+	select {
+	case err := <-finished:
+		must(t, err)
+	case <-time.After(time.Minute):
+		t.Fatal("same watcher did not reattach to the completed native run")
+	}
+	data, err := os.ReadFile(stdout.Name())
+	must(t, err)
+	if !strings.Contains(string(data), `"status":"completed"`) {
+		t.Fatalf("same watcher missed the native terminal: %s", data)
+	}
+	nativeLifecycleBytes(t, directory, 200000)
+	actor, _, _, problem = store.CancelAttribution(row.ID)
+	fatal(t, problem)
+	if actor != "" {
+		t.Fatalf("watch reattachment created cancel intent: %q", actor)
 	}
 }
