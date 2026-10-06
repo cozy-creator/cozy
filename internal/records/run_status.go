@@ -25,8 +25,7 @@ var runStatusGroups = []runStatusGroup{
 // A sent offer with no receipt is still reconciling possible acceptance, not a
 // stopped failure that authorizes a new manual submission.
 const pendingMachineAcceptanceSQL = `EXISTS(SELECT 1 FROM machine_executions e
- WHERE e.request_id=requests.id AND (length(e.submission)>0 OR
- EXISTS(SELECT 1 FROM request_events sent WHERE sent.request_id=e.request_id AND sent.type='` + RunV1Sent + `')) AND length(e.receipt)=0
+ WHERE e.request_id=requests.id AND (length(e.submission)>0 OR ` + runV1SentHere + `) AND length(e.receipt)=0
  AND e.cancel_requested=0 AND NOT ` + machineExecutionLost + `)`
 
 func PublicRunStatus(state string, acceptancePending bool) string {

@@ -61,7 +61,7 @@ func retainRetryFrom(tx retryReader, request *Request, prior Request) *exit.Erro
 		retained, stopped = true, Settled(prior.State) || RetainedState(prior.State)
 	} else if request.MachineExecutionObserver {
 		var nativeSent bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, prior.ID, RunV1Sent).Scan(&nativeSent); err != nil {
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=? AND `+runV1SentHere+`)`, prior.ID).Scan(&nativeSent); err != nil {
 			return exit.Internalf("cannot inspect predecessor native dispatch: %s", err)
 		}
 		if nativeSent {

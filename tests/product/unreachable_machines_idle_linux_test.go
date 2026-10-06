@@ -26,7 +26,7 @@ func TestRunsOnUnreachableMachinesLeaveTheDaemonIdle(t *testing.T) {
 			Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 		fatal(t, problem)
 		fatal(t, store.LinkMachineExecution(id, machine))
-		fatal(t, store.AcceptRunV1(id, &v1.RunState{Id: id, Number: uint64(i + 1), State: "running", Attempt: 1}))
+		fatal(t, store.AcceptRunV1(id, machine, &v1.RunState{Id: id, Number: uint64(i + 1), State: "running", Attempt: 1}))
 		if i%2 == 0 {
 			fatal(t, store.LoseMachineExecution(id, machine, "its rental ended before it finished"))
 		}
