@@ -179,8 +179,10 @@ func (m *machineRuns) Refresh(parent context.Context, request records.Request) *
 			finished := make(chan struct{})
 			m.running[request.ID] = finished
 			m.mu.Unlock()
-			problem := m.catchUpV1(parent, request)
-			m.endObservation(request.ID, finished)
+			problem := func() *exit.Error {
+				defer m.endObservation(request.ID, finished)
+				return m.catchUpV1(parent, request)
+			}()
 			// A cancel can arrive while catch-up owns the slot. Deliver that durable
 			// intent even if this reader detached or its connection failed.
 			started := m.Start(request)
