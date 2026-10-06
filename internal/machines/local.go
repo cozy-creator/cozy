@@ -505,7 +505,17 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, record host
 	}
 	defer log.Close()
 	offset, _ := log.Seek(0, io.SeekEnd)
+	exited := func() *exit.Error {
+		output := logSince(h.path("host.log"), offset)
+		if strings.Contains(output, "address already in use") {
+			return exit.Named(exit.Unavailable, "machine.host_port_taken", "the machine Host's port was taken")
+		}
+		return exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness: %s", output)
+	}
 	pid, err := h.spawn(env, log)
+	if errors.Is(err, errExitedAtStart) {
+		return nil, record, exited()
+	}
 	if err != nil {
 		return nil, record, exit.Internalf("cannot start the machine Host: %s", err)
 	}
@@ -519,17 +529,16 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, record host
 	}
 	launch, problem := h.await(ctx, &record)
 	if problem != nil && problem.ErrName() == "machine.host_exited" {
-		output := logSince(h.path("host.log"), offset)
-		if strings.Contains(output, "address already in use") {
-			return nil, record, exit.Named(exit.Unavailable, "machine.host_port_taken", "the machine Host's port was taken")
-		}
-		return nil, record, exit.Named(exit.Structural, "machine.host_exited", "the machine Host exited before readiness: %s", output)
+		return nil, record, exited()
 	}
 	if problem != nil && problem.Code == exit.Credential {
 		_ = terminate(pid)
 	}
 	return launch, record, problem
 }
+
+// errExitedAtStart is a Host whose process ended before its start returned.
+var errExitedAtStart = errors.New("the machine Host exited as it started")
 
 // spawn starts the Host detached from whatever started this process: as its own user unit
 // where user systemd runs (it outlives the daemon's unit and any session scope), else in
@@ -548,7 +557,7 @@ func (h *Host) spawn(env []string, log *os.File) (int, error) {
 		if pid := userunit.MainPID(unit); pid > 0 {
 			return pid, nil
 		}
-		return 0, fmt.Errorf("the machine Host unit %s started no process", unit)
+		return 0, errExitedAtStart // its unit has no process left: host.log says why
 	}
 	command := exec.Command(h.binary())
 	command.Env, command.Dir = env, h.Root()
