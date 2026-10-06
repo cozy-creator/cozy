@@ -29,6 +29,8 @@ func TestAdmissionRequiresNativeIngestionRuntimeAndAcceptsSourceDevWheel(t *test
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", filepath.Dir(tool))
+			// No own tool to fall back to: a fresh cache, and no uv on PATH to install one.
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
 			_, problem := hostruntime.Path(nil)
 			if test.admitted {
 				if problem != nil {
@@ -36,7 +38,7 @@ func TestAdmissionRequiresNativeIngestionRuntimeAndAcceptsSourceDevWheel(t *test
 				}
 				return
 			}
-			if problem == nil || problem.Name != "host_runtime_below_floor" || !strings.Contains(problem.Error(), "native model ingestion") || !strings.Contains(problem.Remedy, "cozy-runtime[media,model-execution]>="+hostruntime.ToolFloor) {
+			if problem == nil || problem.Name != "host_runtime_below_floor" || !strings.Contains(problem.Error(), "native model ingestion") || !strings.Contains(problem.Remedy, "cozy-runtime[media,model-execution]>="+hostruntime.ToolRelease) {
 				t.Fatalf("missing early upgrade refusal: %+v", problem)
 			}
 		})

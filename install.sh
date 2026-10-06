@@ -36,7 +36,7 @@ got="${got%% *}"
 tar -xzf "$stage/$asset" -C "$stage" cozy
 now="$("$stage/cozy" -v)" || fail "the new cozy does not run; nothing was replaced"
 
-host_tools() { uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=0.18.67'; }
+host_tools() { uv tool install --force --refresh-package cozy-runtime --python 3.12 'cozy-runtime[media,model-execution]>=0.19.0'; }
 host_tools || fail "host tool installation failed; cozy was not replaced"
 tools="$(uv tool dir --bin)"
 
