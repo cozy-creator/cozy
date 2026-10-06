@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -372,6 +373,19 @@ func (s *Store) RecordRunOutcomeV1(id string, end RunEndV1) *exit.Error {
 	return nil
 }
 
+// MachineStopped is a run whose machine stopped while running it. It is never run again on its
+// own: its owner runs it again.
+const MachineStopped = "machine_stopped"
+
+// plainReasonV1 is a failure as its owner reads it. A machine that stopped mid-run says so in
+// its own words (machines before cozy-machine 0.1.1 sent no code for it).
+func plainReasonV1(reason *v1.Reason) (string, string) {
+	if reason.Code == MachineStopped || strings.HasPrefix(reason.Message, "owner lost before durable result custody") {
+		return MachineStopped, "the machine running it stopped mid-run, and the run was not retried"
+	}
+	return reason.Code, reason.Message
+}
+
 // recordRunEndV1 settles the run from its outcome, once.
 func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, end RunEndV1) *exit.Error {
 	outcome := end.Outcome
@@ -391,7 +405,8 @@ func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, end RunEn
 	}
 	facts := map[string]any{"machine_execution": true, "status": status, "outputs": []any{}, "output": output}
 	if reason := outcome.Reason; reason != nil && outcome.Status != "succeeded" {
-		facts["error"], facts["error_type"], facts["error_code"] = reason.Message, reason.Code, reason.Code
+		code, message := plainReasonV1(reason)
+		facts["error"], facts["error_type"], facts["error_code"] = message, code, code
 	}
 	payload, _ := json.Marshal(facts)
 	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) SELECT ?,?,?,?,?

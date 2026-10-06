@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -230,9 +231,14 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 	if code, out := runCozy(t, root, "hub", "use", "b", "--json"); code != 0 {
 		t.Fatalf("hub use b: %d %s", code, out)
 	}
-	code, out = runCozy(t, root, "rental", "list", "--no-watch")
+	// Every hub is listed by default: switching hubs hides nothing. A view narrowed to b
+	// still names a's billing rental.
+	if all := list(); len(all.Rentals) != 1 || all.Rentals[0]["hub"] != hubA {
+		t.Fatalf("switching hubs hid a's billing rental: %+v", all)
+	}
+	code, out = runCozy(t, root, "rental", "list", "--no-watch", "--tensorhub=b")
 	if code != 0 || !strings.Contains(out, "1 rental running on hub a") {
-		t.Fatalf("switching hubs hid a's billing rental: %d %s", code, out)
+		t.Fatalf("hub b's view hid a's billing rental: %d %s", code, out)
 	}
 	if all := list("--all-hubs"); len(all.Rentals) != 1 || all.Rentals[0]["hub"] != hubA {
 		t.Fatalf("--all-hubs lost a's rental: %+v", all)
@@ -645,8 +651,14 @@ func TestRunsWithoutAHubStayListed(t *testing.T) {
 		}
 		return hubs
 	}
-	if current := runs(); len(current) != 1 || current["req-hubless-local"] != hubA {
+	if current := runs("--tensorhub=a"); len(current) != 1 || current["req-hubless-local"] != hubA {
 		t.Fatalf("the configured hub's listing lost its run: %+v", current)
+	}
+	if all := runs(); len(all) != 2 || all["req-hubless-local"] != hubA || all["req-hubless-rented"] != hubB {
+		t.Fatalf("the default listing is not every hub's: %+v", all)
+	}
+	if code, out := runCozy(t, root, "run", "list", "--no-watch"); code != 0 || !regexp.MustCompile(`(?m)^NUMBER .* HUB +REASON`).MatchString(out) {
+		t.Fatalf("the default listing does not name each run's hub [%d]:\n%s", code, out)
 	}
 	if other := runs("--tensorhub=b"); len(other) != 1 || other["req-hubless-rented"] != hubB {
 		t.Fatalf("the rental's hub's listing lost its run: %+v", other)

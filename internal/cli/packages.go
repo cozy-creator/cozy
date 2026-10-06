@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -218,6 +219,12 @@ func handleLs(ctx *Context) *exit.Error {
 		Bytes:     []string{"size", "dependencies"},
 	}
 	inventory, pythonProblem := hostruntime.PythonExecutors(context.Background())
+	if !everyHub(ctx) {
+		// --tensorhub lists only what came from that hub.
+		rows = slices.DeleteFunc(rows, func(inst records.PackageInstall) bool {
+			return inst.SourceKind != "tensorhub" || ctx.forHub(inst.Hub).Cfg.HubURL != ctx.Cfg.HubURL
+		})
+	}
 	for _, inst := range rows {
 		pythonStatus := "supported"
 		if pythonProblem != nil {
@@ -257,12 +264,7 @@ func handleLs(ctx *Context) *exit.Error {
 		l.Next = []string{"cozy package search"}
 		return emit(ctx, l)
 	}
-	for _, inst := range rows {
-		if inst.SourceKind == "tensorhub" && ctx.forHub(inst.Hub).Cfg.HubURL != ctx.Cfg.HubURL {
-			l.Fields = append(l.Fields, "hub")
-			break
-		}
-	}
+	l.Fields = append(l.Fields, "hub")
 	return emit(ctx, l)
 }
 

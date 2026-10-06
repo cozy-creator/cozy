@@ -134,23 +134,37 @@ func TestRentalListFallsBackToLocalRecordsWhenHubUnreachable(t *testing.T) {
 		t.Fatalf("the degraded board presents unreconciled totals or blames auth\n%s", out)
 	}
 
-	code, out = runCozy(t, root, "--json", "rental", "list")
-	if code == 0 {
-		t.Fatalf("the JSON board exited 0 with the hub unreachable\n%s", out)
+	// Every hub's board names the hub that did not answer; one narrowed to it carries its
+	// error as the board's own.
+	type hubProblem struct {
+		Hub     string `json:"hub"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
 	}
-	var document struct {
-		Rentals  []map[string]any `json:"rentals"`
-		Live     *bool            `json:"live"`
-		Running  *int             `json:"machines_running"`
-		HubError struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"hub_error"`
-	}
-	must(t, json.Unmarshal([]byte(out), &document))
-	if document.Live == nil || *document.Live || document.Running != nil ||
-		document.HubError.Code != "hub.unreachable" || len(document.Rentals) != 1 ||
-		document.Rentals[0]["machine"] != "leonmitchelli" {
-		t.Fatalf("the JSON board does not mark local records as unverified\n%s", out)
+	for _, narrowed := range []bool{false, true} {
+		args := []string{"--json", "rental", "list"}
+		if narrowed {
+			args = append(args, "--tensorhub="+hubURL)
+		}
+		code, out = runCozy(t, root, args...)
+		if code == 0 {
+			t.Fatalf("the JSON board exited 0 with the hub unreachable\n%s", out)
+		}
+		var document struct {
+			Rentals    []map[string]any `json:"rentals"`
+			Live       *bool            `json:"live"`
+			Running    *int             `json:"machines_running"`
+			HubError   hubProblem       `json:"hub_error"`
+			Unreadable []hubProblem     `json:"unreadable_hubs"`
+		}
+		must(t, json.Unmarshal([]byte(out), &document))
+		reason := document.HubError.Code
+		if !narrowed && len(document.Unreadable) == 1 && document.Unreadable[0].Hub == hubURL {
+			reason = document.Unreadable[0].Code
+		}
+		if document.Live == nil || *document.Live || document.Running != nil || reason != "hub.unreachable" ||
+			len(document.Rentals) != 1 || document.Rentals[0]["machine"] != "leonmitchelli" {
+			t.Fatalf("the JSON board (narrowed %v) does not mark local records as unverified\n%s", narrowed, out)
+		}
 	}
 }
