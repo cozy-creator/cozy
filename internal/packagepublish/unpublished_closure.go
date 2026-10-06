@@ -4,15 +4,19 @@ package packagepublish
 // publication retains its existing registry-custody path.
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -193,6 +197,14 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 		p.DependencyWheels = append(p.DependencyWheels, DependencyWheel{Filename: filepath.Base(path), Path: path})
 	}
 	p.DependencyRequirements = RegistryRequirements(public)
+	declared, problem := sdkRequirements(p.Wheel)
+	if problem != nil {
+		return problem
+	}
+	requirements = append(slices.DeleteFunc(requirements, func(pin string) bool {
+		name, _, _ := strings.Cut(pin, "==")
+		return sdkPair[name]
+	}), declared...)
 	requirements = append(requirements, "cozy-runtime>="+hostruntime.PackageFloor)
 	sort.Strings(requirements)
 	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
@@ -201,6 +213,32 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 	}
 	p.Wheel = sealed
 	return nil
+}
+
+// sdkPair is what every machine supplies itself: an exact pin on either would refuse each
+// machine whose Runtime differs from the capturing one. The author's own bounds still hold.
+var sdkPair = map[string]bool{"cozy-runtime": true, "tensorfs": true}
+
+func sdkRequirements(projectWheel string) ([]string, *exit.Error) {
+	metadata, problem := wheel.Metadata(projectWheel)
+	if problem != nil {
+		return nil, problem
+	}
+	headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(metadata))).ReadMIMEHeader()
+	if err != nil && err != io.EOF {
+		return nil, exit.New(exit.Validation, "captured project wheel metadata is malformed")
+	}
+	var declared []string
+	for _, raw := range headers.Values("Requires-Dist") {
+		req, problem := parseRequirement(raw)
+		if problem != nil {
+			return nil, problem
+		}
+		if sdkPair[req.name] {
+			declared = append(declared, raw)
+		}
+	}
+	return declared, nil
 }
 
 func fetchCapturedWheel(ctx context.Context, client *http.Client, row RegistryRow, path string) *exit.Error {
