@@ -43,10 +43,14 @@ func (c *Orchestrator) RetryOutputExport(requestID string) {
 		c.logf("output export %s has no readable request", requestID)
 		return
 	}
-	// A machine accepted the run: its observer writes the fold of the run's products,
-	// whatever the terminal.
+	// A machine accepted the run: while its observer follows it, the observer writes the fold
+	// of the run's products, whatever the terminal. Once it owes nothing more (abandoned, its
+	// machine gone, or settled), a run that ended without success has nothing to export.
 	if link, problem := c.opt.Store.MachineExecution(requestID); problem != nil || link != nil && len(link.Receipt) > 0 {
-		return
+		owed, owedProblem := c.opt.Store.MachineExecutionOwesWork(requestID)
+		if problem != nil || owedProblem != nil || owed || request.State == "succeeded" {
+			return
+		}
 	}
 	if request.State != "succeeded" {
 		if request.State == "failed" || request.State == "canceled" || request.State == "refused" ||

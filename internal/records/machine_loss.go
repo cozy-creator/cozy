@@ -212,6 +212,10 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		if err := appendEventTx(tx, value.id, "client.machine_lost", 0, detail); err != nil {
 			return exit.Internalf("cannot record destroyed machine: %s", err)
 		}
+		// Nothing more is collected from a machine that is gone.
+		if problem := skipOutputExport(tx, value.id, message); problem != nil {
+			return problem
+		}
 		next := value.state
 		if !settledRequestState(value.state) {
 			next = "failed"
