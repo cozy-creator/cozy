@@ -160,7 +160,7 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		return exit.Internalf("cannot read destroyed machine observers: %s", err)
 	}
 	type observation struct {
-		machine, id, state                                          string
+		machine, id, state                                     string
 		retained, placeable, cancel, sent, accepted, hasResult bool
 	}
 	var observations []observation

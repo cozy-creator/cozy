@@ -30,17 +30,18 @@ func TestRentalCensusDoesNotHideSameIDFromAnotherHub(t *testing.T) {
 		Rows   []map[string]any `json:"rentals"`
 		Others []map[string]any `json:"other_hubs"`
 	}
-	// The current hub's listing holds its own observation and names the other hub's
-	// rental rather than listing it.
-	code, out := runCozy(t, root, "rental", "list", "--json", "--full")
+	// A listing narrowed to the current hub holds its own observation and names the other
+	// hub's rental rather than listing it.
+	code, out := runCozy(t, root, "rental", "list", "--json", "--full", "--tensorhub="+origin)
 	var listed listing
 	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || listed.Count != 1 || listed.Rate != 40_000 ||
 		len(listed.Rows) != 1 || listed.Rows[0]["hub"] != origin || listed.Rows[0]["machine"] != "current" ||
 		len(listed.Others) != 1 || listed.Others[0]["hub"] != "http://127.0.0.1:1" {
 		t.Fatalf("same ID in another Hub hid or repriced the current account's rental: exit=%d %s", code, out)
 	}
-	// Every hub's listing holds both, each on its own hub; the unreachable one is unverified.
-	code, out = runCozy(t, root, "rental", "list", "--all-hubs", "--json", "--full")
+	// Every hub's listing, the default, holds both, each on its own hub; the unreachable
+	// one is unverified.
+	code, out = runCozy(t, root, "rental", "list", "--json", "--full")
 	listed = listing{}
 	if json.Unmarshal([]byte(out), &listed) != nil || len(listed.Rows) != 2 {
 		t.Fatalf("every-hub listing lost a same-ID rental: exit=%d %s", code, out)

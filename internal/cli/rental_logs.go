@@ -127,5 +127,5 @@ func rentalLogSubject(ctx *Context, typed string) (id, origin string, problem *e
 		return typed, "", nil
 	}
 	return "", "", exit.Named(exit.NotFound, "rental.unknown", "no rental is named %q", typed).
-		WithNext("cozy rental list --all-hubs")
+		WithNext("cozy rental list")
 }

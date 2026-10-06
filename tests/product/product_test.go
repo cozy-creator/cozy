@@ -72,7 +72,11 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("package list --json lacks integer size and dependencies [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "package", "list")
-	if code != 0 || !regexp.MustCompile(`SIZE +DEPENDENCIES\n`).MatchString(out) ||
+	if narrowed, listed := runCozy(t, root, "package", "list", "--json", "--tensorhub=http://127.0.0.1:9"); narrowed != 0 ||
+		strings.Contains(listed, localWeightlessRef) {
+		t.Fatalf("package list narrowed to a hub listed a local install [exit %d]\n%s", narrowed, listed)
+	}
+	if code != 0 || !regexp.MustCompile(`SIZE +DEPENDENCIES +HUB\n`).MatchString(out) ||
 		!strings.Contains(out, units.Bytes(listed.Packages[0].Size)+"  "+units.Bytes(listed.Packages[0].Dependencies)) {
 		t.Fatalf("package list does not show SIZE and DEPENDENCIES in units [exit %d]\n%s", code, out)
 	}

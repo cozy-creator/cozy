@@ -26,6 +26,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -922,7 +923,8 @@ func handleRunList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if ctx.Inv.Bool("--all-hubs") {
+	every := everyHub(ctx)
+	if every {
 		client = client.AllHubs()
 	}
 	limit := 0
@@ -943,7 +945,7 @@ func handleRunList(ctx *Context) *exit.Error {
 			WithRemedy("omit --watch for one snapshot, or use --json for automation")
 	}
 	if watching {
-		return watchRunList(ctx, client, limit)
+		return watchRunList(ctx, client, limit, every)
 	}
 	if ctx.Inv.Value("--limit") == "" {
 		limit = 50
@@ -952,13 +954,23 @@ func handleRunList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if ctx.Inv.Bool("--all-hubs") {
-		list.Fields, list.TypedFields = append(list.Fields, "hub"), append(list.TypedFields, "hub")
-		for _, row := range list.Rows {
-			row["hub"] = ctx.Cfg.HubLabel(row["hub"])
-		}
+	if every {
+		withHubColumn(ctx.Cfg, &list)
 	}
 	return emit(ctx, list)
+}
+
+// withHubColumn shows each run's hub, by its name where it has one, ahead of its reason.
+func withHubColumn(cfg config.Config, list *output.List) {
+	at := slices.Index(list.Fields, "reason")
+	if at < 0 {
+		at = len(list.Fields)
+	}
+	list.Fields = slices.Insert(slices.Clone(list.Fields), at, "hub")
+	list.TypedFields = append(slices.Clone(list.TypedFields), "hub")
+	for _, row := range list.Rows {
+		row["hub"] = cfg.HubLabel(row["hub"])
+	}
 }
 
 func runList(requestCtx context.Context, client *localapi.Client, state, packageName string, limit int) (output.List, *exit.Error) {
@@ -1348,8 +1360,12 @@ func progressValue(life api.Lifecycle) string {
 	return stage + " " + overall
 }
 
-func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
+func watchRunList(ctx *Context, client *localapi.Client, limit int, every bool) *exit.Error {
 	history := runHistory{client: client, state: ctx.Inv.Value("--state"), packageName: ctx.Inv.Value("--package"), limit: limit, more: true}
+	if every {
+		cfg := ctx.Cfg
+		history.hubs = &cfg
+	}
 	return watchListPages(ctx, "id", history.refresh, history.next)
 }
 

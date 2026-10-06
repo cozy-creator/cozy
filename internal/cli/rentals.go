@@ -1029,7 +1029,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 		return exit.Usagef("--watch requires interactive terminal output").
 			WithRemedy("omit --watch for one snapshot, or use --json for automation")
 	}
-	allHubs := ctx.Inv.Bool("--all-hubs")
+	allHubs := everyHub(ctx)
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -1103,7 +1103,7 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		return emit(ctx, record)
 	}
 	return exit.Named(exit.NotFound, "rental.unknown", "no listed rental is named %q", subject).
-		WithNext("cozy rental list --all-hubs")
+		WithNext("cozy rental list")
 }
 
 // rentalStatus is what a ready rental's machine reports of itself. One that cannot answer
@@ -1199,6 +1199,11 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if problem.Remedy != "" {
 			list.Trail = append(list.Trail, "Try: "+problem.Remedy)
 		}
+	} else if len(inventory.UnreadableHubs) > 0 {
+		// Hubs that did not answer leave no account total: their machines may still be billing.
+		list.Lead = []string{"Showing this host's last local records, which may be out of date, for the hubs that did not answer; " +
+			"account totals and machines this host never recorded there are unknown."}
+		list.Aggregates = []output.Field{{K: "live", V: jsonFact{false}}}
 	} else {
 		list.Aggregates = append(list.Aggregates, output.Field{K: "live", V: jsonFact{true}})
 	}
@@ -1464,7 +1469,7 @@ func hubRentalsView(cfg config.Config, list *output.List, inventory api.RentalIn
 		if label == other.Hub {
 			use = "--tensorhub=" + other.Hub
 		}
-		list.Lead = append(list.Lead, fmt.Sprintf("%d %s running on hub %s; see `cozy rental list --all-hubs` or `%s`",
+		list.Lead = append(list.Lead, fmt.Sprintf("%d %s running on hub %s; see `cozy rental list` or `%s`",
 			other.Rentals, rentals, label, use))
 		others = append(others, map[string]any{"hub": other.Hub, "rentals": other.Rentals})
 	}

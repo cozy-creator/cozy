@@ -6,6 +6,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -19,11 +20,16 @@ type runHistory struct {
 	limit              int
 	rows               []api.Lifecycle
 	more               bool
+	// hubs, when set, names each run's hub in its own column.
+	hubs *config.Config
 }
 
 func (h *runHistory) snapshot() listSnapshot {
 	list := runListRows(h.rows)
 	list.Aggregates = nil // Loaded pages are not a census of all retained history.
+	if h.hubs != nil {
+		withHubColumn(*h.hubs, &list)
+	}
 	return listSnapshot{list: list, more: h.more}
 }
 
