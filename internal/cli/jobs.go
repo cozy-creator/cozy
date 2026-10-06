@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // THE JOB VERBS (cl-004): `submit` · `status` · `ls` · `follow` · `cancel`. They are
@@ -256,7 +257,7 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 		if state.Status == "paused" {
 			rec.Next = append(rec.Next, "cozy run resume "+reference)
 		} else if state.Status == "failed" && state.RetryAvailable {
-			rec.Next = append(rec.Next, "cozy run <updated-script-or-package> --retry "+reference)
+			rec.Next = append(rec.Next, rerun(state.Package, state.Function, reference))
 		} else if state.Status != "pausing" && !invocationSettled(state.Status) {
 			rec.Next = append(rec.Next, "cozy run pause "+reference)
 		}
@@ -632,11 +633,15 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	}
 	err := exit.Named(code, status, "job %s ended %s", state.JobID, humanStatus)
 	if status == "failed" && state.RetryAvailable {
-		err.WithNext("cozy run <updated-script-or-package> --retry " + runReference(state.Number, state.JobID))
+		err.WithNext(rerun(state.Package, state.Function, runReference(state.Number, state.JobID)))
 	}
 	if state.Error != "" {
 		err.Message = fmt.Sprintf("job %s ended %s: %s — %s",
 			state.JobID, humanStatus, state.ErrorType, state.Error)
+	}
+	if state.ErrorType == records.MachineStopped {
+		err = exit.Named(code, records.MachineStopped, "run %s ended failed: %s", runReference(state.Number, state.JobID), state.Error).
+			WithNext(rerun(state.Package, state.Function, runReference(state.Number, state.JobID)))
 	}
 	// A canceled job is LOUD about WHO ended it (cl-108).
 	if mapTerminal(status) == "canceled" && state.CanceledBy != "" {
@@ -813,4 +818,13 @@ func awaitMachineCollection(ctx *Context, state api.JobState) (api.JobState, *ex
 	}
 	state.Status = publicObservedStatus(state.Status)
 	return state, nil
+}
+
+// rerun is how a failed run is run again from its own inputs: a published package by name,
+// a script or project from its (possibly updated) source.
+func rerun(pkg, function, reference string) string {
+	if pkg == "" || strings.HasPrefix(pkg, "local/") {
+		return "cozy run <updated-script-or-package> --retry " + reference
+	}
+	return "cozy run " + pkg + "/" + function + " --retry " + reference
 }

@@ -201,3 +201,9 @@ func adoptInstallHub(ctx *Context, install records.PackageInstall) {
 	scoped := ctx.forHub(origin)
 	ctx.Cfg, ctx.AccountAuth = scoped.Cfg, scoped.AccountAuth
 }
+
+// everyHub is whether a list shows every hub's rows: always, unless --tensorhub names one.
+// --all-hubs is the default and kept for scripts.
+func everyHub(ctx *Context) bool {
+	return ctx.Cfg.HubURLSource != "flag" || ctx.Inv.Bool("--all-hubs")
+}
