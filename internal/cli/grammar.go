@@ -590,7 +590,7 @@ type RentalUpdateCmd struct {
 	Rental        string `arg:"" predictor:"rental" help:"Existing rental name or id."`
 	RuntimeWheel  string `name:"runtime-wheel" predictor:"file" help:"Development only: install this local native Runtime wheel on your private rental."`
 	TensorFSWheel string `name:"tensorfs-wheel" predictor:"file" help:"Development only: pair --runtime-wheel with this local native TensorFS wheel."`
-	Runtime       string `name:"runtime-version" help:"Install this published Runtime release; with no wheel or version, the newest pair."`
+	Runtime       string `name:"runtime-version" help:"Install this published Runtime release; with no wheel or version, the Hub's target pair."`
 	TensorFS      string `name:"tensorfs-version" help:"Install this published TensorFS release."`
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -41,13 +42,15 @@ type runtimeUpdateWheel struct {
 	Length   int64  `json:"length"`
 }
 
-// runtimeUpdateSelection is what an update installs: local wheels or published versions.
-// Nothing named is the Hub's target software.
+// runtimeUpdateSelection is what an update installs: local wheels or exact published
+// versions. Target is a boot's own follow: the versions the rental's Hub names when the update
+// runs. Nothing named installs nothing.
 type runtimeUpdateSelection struct {
 	LocalRuntime    *runtimeUpdateWheel `json:"local_runtime,omitempty"`
 	LocalTensorFS   *runtimeUpdateWheel `json:"local_tensorfs,omitempty"`
 	RuntimeVersion  string              `json:"runtime_version,omitempty"`
 	TensorFSVersion string              `json:"tensorfs_version,omitempty"`
+	Target          bool                `json:"target,omitempty"`
 }
 
 type softwarePair struct {
@@ -68,12 +71,23 @@ type runtimeUpdateResult struct {
 // takes work. Only a new boot is followed, so an explicit update stands until the pod boots
 // again.
 func (u *rentalRuntimeUpdates) Boot(id string) {
-	if _, problem := u.Start(id, api.RuntimeUpdateRequest{}); problem != nil {
+	if _, problem := u.follow(id); problem != nil {
 		fmt.Fprintf(u.machines.context.Out, "rental %s keeps its software: %s\n", id, problem.Message)
 	}
 }
 
+// follow starts (or joins) the update of the rental's boot to its Hub's target software.
+func (u *rentalRuntimeUpdates) follow(id string) (*records.RuntimeUpdate, *exit.Error) {
+	return u.begin(id, api.RuntimeUpdateRequest{}, true)
+}
+
+// Start is an update a client asked for. It installs only what it names: an empty request,
+// as a client older than the Hub's target sends, changes nothing.
 func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
+	return u.begin(id, options, false)
+}
+
+func (u *rentalRuntimeUpdates) begin(id string, options api.RuntimeUpdateRequest, target bool) (*records.RuntimeUpdate, *exit.Error) {
 	if options.TensorFSWheel != "" && options.RuntimeWheel == "" {
 		return nil, exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
 	}
@@ -93,13 +107,13 @@ func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest
 		return nil, problem
 	}
 	if current != nil && current.Active() && current.BootID == row.ExpectedWorkerBootID {
-		if options != (api.RuntimeUpdateRequest{}) {
+		if options != (api.RuntimeUpdateRequest{}) || target && !strings.Contains(string(current.Selection), `"target":true`) {
 			return nil, exit.Named(exit.Unavailable, "rental.maintenance", "this rental is already updating its software; wait for it to end")
 		}
 		u.run(*current) // the update in progress is the one asked for
 		return current, nil
 	}
-	selection := runtimeUpdateSelection{RuntimeVersion: options.RuntimeVersion, TensorFSVersion: options.TensorFSVersion}
+	selection := runtimeUpdateSelection{RuntimeVersion: options.RuntimeVersion, TensorFSVersion: options.TensorFSVersion, Target: target}
 	var snapshots []*scratch.Dir
 	defer func() {
 		for _, snapshot := range snapshots {
@@ -189,6 +203,11 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 	if len(row.Selection) > 0 && json.Unmarshal(row.Selection, &selection) != nil {
 		return exit.New(exit.Structural, "recorded software update selection is unreadable")
 	}
+	if selection == (runtimeUpdateSelection{}) {
+		row.State, row.Error = "succeeded", ""
+		row.Result, _ = json.Marshal(runtimeUpdateResult{Unchanged: true, Note: "the update named no software"})
+		return nil
+	}
 	pin, err := workertls.LoadPin(identity.CACert)
 	if err != nil {
 		return exit.New(exit.Credential, "the machine's TLS identity cannot be read")
@@ -237,7 +256,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 	if cohort.TensorFS, problem = member(selection.LocalTensorFS, selection.TensorFSVersion); problem != nil {
 		return problem
 	}
-	if cohort.Runtime == nil && cohort.TensorFS == nil {
+	if selection.Target {
 		target, problem := client(u.machines.fleet.atRental(row.RentalID)).Software(ctx)
 		if problem != nil {
 			return problem
@@ -246,6 +265,9 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			return finish("the Hub names no target software")
 		}
 		cohort.Runtime, cohort.TensorFS = &machinev1.Member{Version: target.Runtime}, &machinev1.Member{Version: target.TensorFS}
+		// Recorded as exact versions: a daemon that resumes this update installs what was resolved.
+		selection.RuntimeVersion, selection.TensorFSVersion = target.Runtime, target.TensorFS
+		row.Selection, _ = json.Marshal(selection)
 	}
 	if published(cohort.Runtime, result.From.Runtime) && published(cohort.TensorFS, result.From.TensorFS) {
 		return finish("it already runs this software")
@@ -311,6 +333,21 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 			*into = absolute
 		}
 	}
+	if request == (api.RuntimeUpdateRequest{}) {
+		// Nothing named is the Hub's target, named here: a daemon older than this cozy reads an
+		// empty request as the newest published pair.
+		hctx, cancel := hub.Context()
+		target, problem := client(ctx).Software(hctx)
+		cancel()
+		if problem != nil {
+			return problem
+		}
+		if target.Runtime == "" {
+			return exit.Named(exit.Validation, "rental.no_target_software", "the Hub names no target software for %s", row.MachineName).
+				WithRemedy("name it: cozy rental update %s --runtime-version <version> --tensorfs-version <version>", row.MachineName)
+		}
+		request.RuntimeVersion, request.TensorFSVersion = target.Runtime, target.TensorFS
+	}
 	c, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -360,12 +397,23 @@ func awaitRentalUpdate(ctx *Context, c *localapi.Client, machine string, update 
 
 // bootSoftware is a new rental's software once the Hub's target is in place, for `rental new`
 // to show: the fields, or the note saying why it kept its image's.
+// The versions are named, never left empty: a daemon older than this cozy reads an empty
+// request as the newest published pair, and a Hub naming no target asks for nothing.
 func bootSoftware(ctx *Context, rentalID, machine string) ([]output.Field, string) {
+	hctx, cancel := hub.Context()
+	target, problem := client(ctx).Software(hctx)
+	cancel()
+	if problem != nil {
+		return nil, "it keeps its image's software: the Hub's target could not be read: " + problem.Message
+	}
+	if target.Runtime == "" {
+		return nil, ""
+	}
 	c, problem := dial(ctx)
 	if problem != nil {
 		return nil, "it keeps its image's software: " + problem.Message
 	}
-	update, problem := c.UpdateRentalRuntime(rentalID, api.RuntimeUpdateRequest{})
+	update, problem := c.UpdateRentalRuntime(rentalID, api.RuntimeUpdateRequest{RuntimeVersion: target.Runtime, TensorFSVersion: target.TensorFS})
 	if problem == nil {
 		update, problem = awaitRentalUpdate(ctx, c, machine, update)
 	}
