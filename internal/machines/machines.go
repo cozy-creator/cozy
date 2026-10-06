@@ -6,6 +6,8 @@ package machines
 import (
 	"context"
 	"fmt"
+	"io"
+	"sync"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -46,6 +48,22 @@ type Resolver struct {
 	// its id and its own creator key, which its machine authorizes. nil: the endpoint is
 	// signed with this computer's machine owner key.
 	EndpointRental func(*machineendpoint.Endpoint) (*EndpointRental, *exit.Error)
+
+	mu sync.Mutex
+	// v1 is each machine's open cozy.machine.v1 connection (connect).
+	v1 map[string]*keptV1
+	// Log, when set, notes each new machine connection.
+	Log io.Writer
+}
+
+// Forget drops a machine's open connection: its rental ended or its pod booted anew.
+func (r *Resolver) Forget(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if kept := r.v1[name]; kept != nil {
+		_ = kept.client.Close()
+		delete(r.v1, name)
+	}
 }
 
 // target is a machine's dial identity before its Claim.
