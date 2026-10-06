@@ -55,7 +55,7 @@ func (m *machineRuns) loopV1(request records.Request) {
 			return
 		}
 		link, problem := m.store.MachineExecution(request.ID)
-		if problem != nil || link == nil || link.Abandoned {
+		if problem != nil || link == nil || link.Abandoned || link.Lost {
 			return
 		}
 		accepted, problem := m.store.RunV1(request.ID)
@@ -130,6 +130,12 @@ func (m *machineRuns) loopV1(request records.Request) {
 				}
 				_ = m.store.AppendEvent(request.ID, "request.parked", 0, parked)
 			}
+		}
+		// A remote machine holding this run that cannot be reached is asked again only on new
+		// evidence: a reader, the rental attaching again, or the daemon's restart. A timer
+		// would dial a gone pod forever.
+		if problem != nil && (accepted || sent) && !machines.IsLocal(link.MachineID) {
+			return
 		}
 		switch {
 		case problem == nil:
