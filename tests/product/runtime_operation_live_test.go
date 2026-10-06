@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -170,39 +171,34 @@ async def main(ctx):
 		}
 	}
 
-	// The machine's Runtime prepares its builtin operations once, in its own interpreter:
-	// NumPy is a core Runtime dependency, so the operations need no separate environment.
-	descriptors, err := filepath.Glob(filepath.Join(machineInstallations(root), "*", "installation.json"))
+	// The Runtime's operations are a callee App of the caller's own environment: quantize ran
+	// as package runtime/operations in its caller's generation (its numerical dependencies are
+	// the Runtime's own), not in an environment of its own.
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine/root/var/lib/cozy/rust-machine/execution/executions.sqlite3")+"?mode=ro")
 	must(t, err)
-	interpreter := ""
-	for _, descriptor := range descriptors {
-		raw, err := os.ReadFile(descriptor)
-		must(t, err)
-		var installation struct {
-			Package string `json:"package"`
-			Python  string `json:"python"`
-		}
-		must(t, json.Unmarshal(raw, &installation))
-		if installation.Package == "runtime/operations" {
-			interpreter = installation.Python
+	defer db.Close()
+	rows, err := db.Query("SELECT id, invocation FROM executions ORDER BY id")
+	must(t, err)
+	defer rows.Close()
+	generations := map[string]string{}
+	var builtin []string
+	for rows.Next() {
+		var id string
+		var raw []byte
+		must(t, rows.Scan(&id, &raw))
+		var invocation struct{ Package, Generation, Parent string }
+		must(t, json.Unmarshal(raw, &invocation))
+		generations[id] = invocation.Generation
+		if invocation.Package == "runtime/operations" && invocation.Generation != "" {
+			builtin = append(builtin, invocation.Parent+" "+invocation.Generation)
 		}
 	}
-	runtimePython, err := filepath.EvalSymlinks(filepath.Join(root, "machine", "root", "opt", "cozy", "python"))
-	must(t, err)
-	if interpreter != filepath.Join(runtimePython, "bin", "python") {
-		t.Fatalf("builtin operations were not prepared in the machine Runtime's interpreter %s: %q (of %v)",
-			filepath.Join(runtimePython, "bin", "python"), interpreter, descriptors)
+	must(t, rows.Err())
+	if len(builtin) != 1 {
+		t.Fatalf("quantize did not run once as runtime/operations: %v", builtin)
 	}
-	out, err := exec.Command(interpreter, "-I", "-c", `import importlib.metadata as m, sys
-import numpy
-from cozy_runtime.derive.operations import app
-from cozy_runtime.author import describe
-assert describe(app)
-assert [item for item in m.requires(sys.argv[1]) if item.startswith("numpy")], m.requires(sys.argv[1])
-print("numpy==" + m.version("numpy"))
-`, hostruntime.Distribution).CombinedOutput()
-	t.Logf("Runtime numerical callee: %s", out)
-	if err != nil || !strings.Contains(string(out), "numpy==") {
-		t.Fatalf("Runtime quantizer lost its numerical dependency: %v\n%s", err, out)
+	parent, generation, _ := strings.Cut(builtin[0], " ")
+	if generations[parent] != generation {
+		t.Fatalf("quantize ran outside its caller's environment: %s, its caller %s", generation, generations[parent])
 	}
 }
