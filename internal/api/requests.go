@@ -1137,16 +1137,26 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("hubs") == "all" {
 		hub = ""
 	}
-	rows, e := s.store.PublicRequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), hub, s.cfg.HubURL, limit, before)
+	packageName := strings.TrimSpace(r.URL.Query().Get("package"))
+	rows, e := s.store.PublicRequestsBefore(state, packageName, hub, s.cfg.HubURL, limit, before)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
+	}
+	// older is how many matching runs this page leaves below it, so a listing that stops
+	// here can say what it did not show.
+	older := 0
+	if len(rows) == limit {
+		if older, e = s.store.PublicRequestsOlder(state, packageName, hub, s.cfg.HubURL, rows[len(rows)-1].Number); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
 	}
 	out := make([]Lifecycle, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, s.lifecycleOf(row))
 	}
-	s.ok(w, r, http.StatusOK, map[string]any{"requests": out, "count": len(out)})
+	s.ok(w, r, http.StatusOK, map[string]any{"requests": out, "count": len(out), "older": older})
 }
 
 // ------------------------------------------------------------------------- cancel

@@ -16,14 +16,16 @@ import (
 // hub's catalog order; info lists them all unless the caller selects one.
 type modelSearchView struct {
 	Cards []hub.ModelCard
-	Notes []string
+	// Matching is how many models matched, shown or not; More says how to see the rest.
+	Matching int
+	More     string
 }
 
 func (view modelSearchView) Emit(w io.Writer, mode output.Mode) error {
 	fields := []string{"model", "family", "release", "lanes"}
 	list := output.List{Name: "models", Fields: fields, AllFields: fields,
 		TypedFields: fields, TypedAllFields: fields,
-		TypedRows: []map[string]any{}, Notes: append([]string(nil), view.Notes...)}
+		TypedRows: []map[string]any{}, Uncapped: true, More: view.More}
 	truncated := false
 	for _, card := range view.Cards {
 		count := 0
@@ -71,7 +73,7 @@ func (view modelSearchView) Emit(w io.Writer, mode output.Mode) error {
 	if truncated {
 		list.Notes = append(list.Notes, "Use --full for complete values, or cozy model info <model> for details.")
 	}
-	list.Total = len(list.Rows)
+	list.Total = max(view.Matching, len(list.Rows))
 	if len(list.Rows) == 0 {
 		list.Next = []string{"cozy model search"}
 	}

@@ -41,6 +41,9 @@ type List struct {
 	Rows      []map[string]string
 	// Uncapped preserves an explicitly paginated inventory's rows in snapshot output.
 	Uncapped bool
+	// More is how to see the rows Total counts beyond Rows. Blank, or while the row cap hides
+	// loaded rows, the footer says "Use --full to show all."
+	More string
 	// TypedFields, TypedAllFields, and TypedRows optionally provide the logical
 	// machine document separately from the terminal table. A table cell may be a
 	// formatted duration, percentage, or dash; JSON/TOON must instead carry the
@@ -331,7 +334,11 @@ func writeHumanListFooter(rendered *strings.Builder, list List, shown, total int
 	document map[string]any, full bool,
 ) {
 	if omitted := total - shown; omitted > 0 {
-		fmt.Fprintf(rendered, "%d more not shown. Use --full to show all.\n", omitted)
+		more := list.More
+		if more == "" || shown < len(list.Rows) {
+			more = "Use --full to show all."
+		}
+		fmt.Fprintf(rendered, "%d more not shown. %s\n", omitted, more)
 	}
 	wroteAggregate := false
 	for _, aggregate := range list.Aggregates {

@@ -607,7 +607,8 @@ cozy rental new h100-sxm5-80gb \
 cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candidate image
 
 cozy rental list                   # current rented machines, live on a terminal
-cozy rental show otter             # one rental's facts, including accrued spend
+cozy rental list --ended           # ended rentals: why and when each ended, and what it cost
+cozy rental show otter             # one rental's facts, including accrued spend, ended or not
 cozy rental logs otter -f          # the provider's boot log, followed while it boots
 cozy rental logs otter --tensorfs  # TensorFS's transport decisions: hedges, lane grants, wins, pull walks
 cozy run org/package/generate --rental=otter prompt="moonlit lake"
@@ -762,9 +763,9 @@ model transfer, publication and published package install keeps the hub it was c
 and work on it (ending a rental, keepalive, collection, publication, `package update-all`, a
 local run's model bindings) goes to that hub with that hub's own machine login; a credential
 is only ever sent to the origin it was issued for, so each hub needs its own
-`cozy auth login --tensorhub=<hub>`. `cozy rental list` and `cozy run list` show the current
-hub; `--all-hubs` shows every hub, and `rental list` names other hubs with live rentals. A hub
-that cannot be read is named on its own line, its rentals shown unverified, and every other hub
+`cozy auth login --tensorhub=<hub>`. `cozy rental list` and `cozy run list` show every hub;
+`--tensorhub=<hub>` narrows them to one, and `rental list` then names other hubs with live
+rentals. A hub that cannot be read is named on its own line, its rentals shown unverified, and every other hub
 is still listed. `tensorhub_token` belongs to the configured hub only, and `cozy hub use`
 refuses to move it until it is removed.
 
@@ -825,8 +826,9 @@ cozy model search flux --full
 
 A one-field list uses `- value` bullets; multiple selected fields become a compact table. The
 collection length is already its count. Compact lists show at most 20 rows; `--full` shows
-all fetched rows. For `run list`, `--limit` controls how many rows are fetched (50 by default),
-not the compact display cap. `omitted` reports withheld rows, and
+all fetched rows. For `run list` and searches, `--limit` controls how many rows are fetched
+(`run list`: 50 by default, 0 for all). A list that leaves rows out says how many and how to see
+them; `omitted` reports the count, and
 diagnostic fields appear only under `--full` or an explicit `--fields` selection. Human errors
 state the problem and repair directly; `--json` retains the stable class, code, message, remedy,
 and contextual next action.

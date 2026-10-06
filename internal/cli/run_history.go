@@ -73,10 +73,11 @@ func (h *runHistory) load(ctx context.Context, before int64, count int, appendPa
 		h.more = false
 		return h.snapshot(), nil
 	}
-	page, problem := h.client.RequestsBefore(ctx, h.state, h.packageName, count, before)
+	history, problem := h.client.RequestPage(ctx, h.state, h.packageName, count, before)
 	if problem != nil {
 		return listSnapshot{}, problem
 	}
+	page := history.Requests
 	if len(page) > 0 {
 		next := page[len(page)-1].Number
 		if next < 1 || (before > 0 && next >= before) {
