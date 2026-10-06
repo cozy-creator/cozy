@@ -688,13 +688,21 @@ func (w wireRental) named(what string) *exit.Error {
 // serves one malformed row must not thereby hide the ten good ones (cl-193). An odd name
 // is folded or replaced by the id, since a billing pod must stay nameable.
 func (c *Client) Rentals(ctx context.Context) ([]Rental, *exit.Error) {
+	rentals, _, problem := c.RentalListing(ctx)
+	return rentals, problem
+}
+
+// RentalListing is Rentals with the account's bindings revision the listing carries (0 from a
+// Hub that states none): a rebind from another computer or the Hub moves it.
+func (c *Client) RentalListing(ctx context.Context) ([]Rental, int64, *exit.Error) {
 	var out struct {
-		Rentals []wireRental `json:"rentals"`
+		Rentals          []wireRental `json:"rentals"`
+		BindingsRevision int64        `json:"bindings_revision"`
 	}
 	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals", auth: true,
 		responseBytes: maxRentalListingBytes}, &out)
 	if e != nil {
-		return nil, e
+		return nil, 0, e
 	}
 	rentals := make([]Rental, 0, len(out.Rentals))
 	for _, wire := range out.Rentals {
@@ -703,7 +711,7 @@ func (c *Client) Rentals(ctx context.Context) ([]Rental, *exit.Error) {
 		}
 		rentals = append(rentals, wire.rental())
 	}
-	return rentals, nil
+	return rentals, out.BindingsRevision, nil
 }
 
 // Rental reads one rental's current state using the renter's account authority.

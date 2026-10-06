@@ -48,6 +48,7 @@ type machineHub struct {
 	mu                                            sync.Mutex
 	grants                                        map[string]string // more of the grant, as a Hub adds a port for an image that serves it
 	authorityWorker, authorityToken, authorityKey string            // current provider attempt only
+	polledBindings                                int64             // the bindings revision the last authority poll carried
 }
 
 func newMachineHub(t *testing.T) *machineHub {
@@ -64,7 +65,13 @@ func newMachineHub(t *testing.T) *machineHub {
 				http.Error(w, "worker authority refused", http.StatusForbidden)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"worker_id": worker, "authorized_keys": []string{key}, "lease_seconds": 30})
+			h.fakeRentalHub.mu.Lock()
+			bindings := h.bindings
+			h.fakeRentalHub.mu.Unlock()
+			h.mu.Lock()
+			h.polledBindings = bindings
+			h.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"worker_id": worker, "authorized_keys": []string{key}, "lease_seconds": 30, "bindings_revision": bindings})
 		case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
 			w.WriteHeader(http.StatusNoContent)
 		default:

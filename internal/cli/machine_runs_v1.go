@@ -432,7 +432,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		// Only unpublished code names its owner: its org-relative defaults are the owner's.
 		spec.Owner = m.runAccount(request)
 	}
-	revision, problem := m.store.BindingRevision()
+	revision, problem := m.store.BindingRevision(m.context.forHub(request.Hub).Cfg.HubURL)
 	if problem != nil {
 		return nil, problem
 	}
@@ -604,7 +604,7 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	}
 	// Resolved under the same key as this computer's calls (owner, binding revision), so a
 	// call after a warm run reuses its preparation instead of resolving again.
-	if spec.BindingRevision, problem = m.store.BindingRevision(); problem != nil {
+	if spec.BindingRevision, problem = m.store.BindingRevision(m.context.forHub(origin).Cfg.HubURL); problem != nil {
 		return nil, problem
 	}
 	if selection.Warm != "" {

@@ -46,11 +46,14 @@ func reservePort(t *testing.T) int {
 // release one rental — the way Tensorhub does: a DELETE moves the pod to `released`, and
 // every later read says so.
 type fakeRentalHub struct {
-	mu              sync.Mutex
-	rentals         map[string]map[string]any
-	packageReleases map[string]any
-	skus            []map[string]any
-	rent            func(map[string]any) map[string]any
+	mu      sync.Mutex
+	rentals map[string]map[string]any
+	// bindings is the account's bindings revision the rental listing and a rental's authority
+	// poll state; listedBindings is the one the last listing carried.
+	bindings, listedBindings int64
+	packageReleases          map[string]any
+	skus                     []map[string]any
+	rent                     func(map[string]any) map[string]any
 	// quote answers POST /v1/rental-quotes; nil quotes the listed price of the SKU asked for.
 	quote func(map[string]any) (int, string)
 	// spendCap stands in for Tensorhub's owner fleet cap: a paid ask whose SKU
@@ -118,7 +121,8 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 			return fmt.Sprint(rows[i]["rental_id"]) < fmt.Sprint(rows[j]["rental_id"])
 		})
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"rentals": rows})
+		h.listedBindings = h.bindings
+		_ = json.NewEncoder(w).Encode(map[string]any{"rentals": rows, "bindings_revision": h.bindings})
 	})
 	mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
