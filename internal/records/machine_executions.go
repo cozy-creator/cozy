@@ -825,7 +825,11 @@ func (s *Store) RequestMachineCancellation(id, actor string) (bool, *exit.Error)
 	}
 	if len(link.Receipt) == 0 {
 		state, scope := "canceled", "before_machine_submission"
-		if len(link.Submission) > 0 && !link.SubmissionClosed {
+		var sent bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, id, RunV1Sent).Scan(&sent); err != nil {
+			return false, exit.Internalf("cannot inspect machine dispatch before cancellation: %s", err)
+		}
+		if sent || len(link.Submission) > 0 && !link.SubmissionClosed {
 			state, scope = "canceling", "machine_acceptance_unknown"
 		}
 		if err := projectCancellationTx(tx, id, state, scope); err != nil {

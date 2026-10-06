@@ -29,8 +29,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/runoutputs"
 	"github.com/cozy-creator/cozy/internal/scratch"
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // A run on a machine that serves cozy.machine.v1 is one Run call: its spec (code, payload,
@@ -59,12 +57,13 @@ func (m *machineRuns) loopV1(request records.Request) {
 		if accepted && link.Collected {
 			return
 		}
-		// Work its machine never accepted is sent only while it is due: never once settled,
-		// paused or blocked (a daemon restart must not start it). A canceled run whose spec was
-		// sent has its cancel delivered.
-		if !accepted && (records.Settled(current.State) || slices.Contains([]string{"pausing", "paused", "blocked"}, current.State)) {
-			m.tellCancelV1(*current, link)
-			return
+		// Unsent work never starts after cancellation. Sent work still needs its machine's
+		// outcome, even when acceptance was lost or a stopped local machine settled it here.
+		if !accepted && (link.CancelRequested || records.Settled(current.State) || slices.Contains([]string{"pausing", "paused", "blocked"}, current.State)) {
+			sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
+			if problem != nil || !link.CancelRequested || !sent {
+				return
+			}
 		}
 		done, problem := m.stepV1(m.ctx, *current, link, accepted, false)
 		if done {
@@ -73,11 +72,17 @@ func (m *machineRuns) loopV1(request records.Request) {
 		if problem != nil && problem.Message != lastError && m.ctx.Err() == nil {
 			fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, problem.Message)
 			lastError = problem.Message
-			if again, _ := m.store.RunV1(request.ID); !again && permanentRefusal(problem) {
-				_, _ = m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
-				return
+			if again, _ := m.store.RunV1(request.ID); !again && !link.CancelRequested && permanentRefusal(problem) {
+				failed, failure := m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
+				if failed {
+					return
+				}
+				if failure == nil {
+					continue // a concurrent control changed the request; deliver its intent
+				}
+				problem = failure
 			}
-			if !accepted {
+			if !accepted && !link.CancelRequested {
 				parked := map[string]any{"reason": problem.Message, "wait": orchestrator.WaitRental}
 				if current.Machine != "" {
 					parked["waiting_on"] = current.Machine
@@ -96,38 +101,6 @@ func (m *machineRuns) loopV1(request records.Request) {
 		select {
 		case <-m.ctx.Done():
 			return
-		case <-time.After(delay):
-		}
-	}
-}
-
-// tellCancelV1 delivers a cancel that settled here before the machine's acceptance was
-// recorded: the spec was sent, so the machine may be running it. The id is idempotent, and the
-// machine is told until it answers (a machine holding no such run answers that).
-func (m *machineRuns) tellCancelV1(request records.Request, link *records.MachineExecution) {
-	if request.State != "canceled" || link.MachineID == "" {
-		return
-	}
-	sent, _ := m.store.RunV1Marked(request.ID, records.RunV1Sent)
-	told, _ := m.store.RunV1Marked(request.ID, records.RunV1CancelTold)
-	if !sent || told {
-		return
-	}
-	for delay := time.Second; m.ctx.Err() == nil; delay = min(2*delay, 5*time.Second) {
-		machine, problem := m.machines.DialV1(machines.AttachOnly(m.ctx), link.MachineID, m.runHolder(request, "canceling"))
-		if problem == nil {
-			_, err := machine.Control(m.ctx, request.ID, v1.Action_ACTION_CANCEL)
-			machine.Close()
-			if code := status.Code(err); err == nil || code != codes.Unavailable && code != codes.DeadlineExceeded && code != codes.Canceled {
-				_ = m.store.AppendEvent(request.ID, records.RunV1CancelTold, 0, map[string]any{"answer": code.String()})
-				return
-			}
-		} else if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
-			fmt.Fprintf(m.context.Out, "machine execution %s: its cancel was not delivered: %s\n", request.ID, problem.Message)
-			return
-		}
-		select {
-		case <-m.ctx.Done():
 		case <-time.After(delay):
 		}
 	}
@@ -172,7 +145,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 	began := time.Now()
 	// Only a submission may start this computer's machine; observing attaches to a running one.
 	dial := ctx
-	if accepted {
+	if accepted || link.CancelRequested {
 		dial = machines.AttachOnly(ctx)
 	}
 	machine, problem := m.machines.DialV1(dial, link.MachineID, m.runHolder(request, "running"))
@@ -181,23 +154,21 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 	}
 	defer machine.Close()
 	var spec *v1.RunSpec
-	if !accepted {
+	if !accepted && !link.CancelRequested {
 		m.submissionStage(request.ID, "connect", link.MachineID, began)
 		if spec, problem = m.specV1(ctx, request, machine); problem != nil {
 			return false, problem
 		}
 	}
-	if accepted && link.CancelRequested {
+	if link.CancelRequested {
 		if _, err := machine.Control(ctx, request.ID, v1.Action_ACTION_CANCEL); err != nil {
 			return false, machines.Transport(err)
 		}
 	}
 	began = time.Now()
 	if spec != nil {
-		if sent, _ := m.store.RunV1Marked(request.ID, records.RunV1Sent); !sent {
-			if problem := m.store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": link.MachineID}); problem != nil {
-				return false, problem
-			}
+		if send, problem := m.store.MarkRunV1Sent(request.ID); problem != nil || !send {
+			return false, problem
 		}
 	}
 	stream, err := machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), spec)

@@ -16,12 +16,42 @@ import (
 // the same request events a worker.v1 run's import writes, so every reader renders it alike.
 const RunV1Accepted = "machine.api_v1"
 
-// RunV1Sent marks a run whose spec was sent to its machine: the machine may hold it before
-// its acceptance is recorded here. RunV1CancelTold marks that such a run's cancel reached it.
-const (
-	RunV1Sent       = "machine.api_v1_sent"
-	RunV1CancelTold = "machine.api_v1_cancel_told"
-)
+// RunV1Sent marks permission to send a run's spec: the machine may hold it before
+// its acceptance is recorded here. Cancellation after this mark needs a machine outcome.
+const RunV1Sent = "machine.api_v1_sent"
+
+// MarkRunV1Sent orders dispatch against cancellation in the same database transaction.
+// If cancellation wins, no spec may be sent. If dispatch wins, cancellation must be
+// delivered even when the connection fails before the machine records acceptance.
+func (s *Store) MarkRunV1Sent(id string) (bool, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot begin machine dispatch: %s", err)
+	}
+	defer tx.Rollback()
+	var machine, state string
+	var canceled, abandoned, sent bool
+	err = tx.QueryRow(`SELECT e.machine_id, r.state, e.cancel_requested,
+ EXISTS(SELECT 1 FROM request_events WHERE request_id=r.id AND type='client.machine_abandoned'),
+ EXISTS(SELECT 1 FROM request_events WHERE request_id=r.id AND type=?)
+ FROM requests r JOIN machine_executions e ON e.request_id=r.id WHERE r.id=?`, RunV1Sent, id).
+		Scan(&machine, &state, &canceled, &abandoned, &sent)
+	if err != nil {
+		return false, exit.Internalf("cannot read machine dispatch: %s", err)
+	}
+	if machine == "" || canceled || abandoned || Settled(state) || state == "pausing" || state == "paused" || state == "blocked" {
+		return false, nil
+	}
+	if !sent {
+		if err := appendEventTx(tx, id, RunV1Sent, 0, map[string]any{"machine": machine}); err != nil {
+			return false, exit.Internalf("cannot record machine dispatch: %s", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot commit machine dispatch: %s", err)
+	}
+	return true, nil
+}
 
 // RunV1 is whether the run's machine accepted it over cozy.machine.v1.
 func (s *Store) RunV1(id string) (bool, *exit.Error) {
