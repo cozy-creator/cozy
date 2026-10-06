@@ -452,6 +452,16 @@ func (h *Host) launchLocked(ctx context.Context) (*Launch, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "machine.not_installed", "this computer has no machine installed").
 			WithRemedy("cozy machine install")
 	}
+	// A machine update may have completed after its observing installer disconnected.
+	// Reconcile before a fresh launch mints a key; never restart a running parent here.
+	if host, problem := h.retainActivatedHost(); problem != nil {
+		return nil, problem
+	} else if host != nil {
+		installed.Host = *host
+		if err := h.recordInstalled(*installed); err != nil {
+			return nil, exit.Internalf("cannot retain the activated machine's installation record: %s", err)
+		}
+	}
 	owner, problem := rental.OwnerIdentityAt(h.path("owner.pem"))
 	if problem != nil {
 		return nil, problem
