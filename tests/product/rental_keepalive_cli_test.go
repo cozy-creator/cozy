@@ -22,7 +22,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // statusRental gives a fresh root a ready rental named "tessa" whose machine is the real one
@@ -225,64 +224,3 @@ func TestRentalShowReportsTheMachinesStatus(t *testing.T) {
 
 // A pod whose machine predates cozy.machine.v1 (the old agent, or a dual-arm pod on that arm)
 // is kept alive all the same: the command claims it with the rental's ClaimProof over worker.v1,
-// with a daemon running and with none. Version skew is allowed; an older machine is not refused.
-func TestRentalKeepaliveWorksOnAMachineThatPredatesV1(t *testing.T) {
-	root := t.TempDir()
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-	identity, problem := rental.PendingCreatorIdentity(layout, "older-machine")
-	fatal(t, problem)
-	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
-	must(t, err)
-	var resets int
-	var deadline int64
-	pod := &fakePod{controlKey: public, keepalive: func(request *pb.KeepRentalAliveRequest) *pb.KeepRentalAliveResult {
-		resets++
-		now := time.Now()
-		deadline = now.Add(15 * time.Minute).UnixMilli()
-		return &pb.KeepRentalAliveResult{RequestId: request.RequestId, WorkerId: podWorkerID, WorkerBootId: podBootID,
-			AcknowledgedAtUnixMs: now.UnixMilli(), IdleDeadlineUnixMs: deadline}
-	}}
-	connection, certPath := startFakePod(t, root, pod)
-	cert, err := os.ReadFile(certPath)
-	must(t, err)
-	hub := newFakeRentalHub(t, 0)
-	hub.publishListing()
-	hub.add(podRental, "comfy")
-	row := records.Rental{ID: podRental, MachineName: "comfy", State: "ready", SKU: "cpu", AcceleratorModel: "fake-4090",
-		AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: hub.server.URL, Address: connection.Addr,
-		MediaAddress: connection.Media.Addr, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
-	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token, identity))
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	keepalive := func(want int) {
-		t.Helper()
-		code, out := runCozy(t, root, "rental", "keepalive", "comfy", "--json", "--full")
-		var result struct {
-			ReleaseDue string `json:"release_due"`
-		}
-		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &result) != nil || resets != want {
-			t.Fatalf("keepalive on an older machine [exit %d, %d resets]\n%s", code, resets, out)
-		}
-		due, err := time.Parse(time.RFC3339Nano, result.ReleaseDue)
-		if err != nil || due.UnixMilli() != deadline {
-			t.Fatalf("the command reported %q, the machine holds %d", result.ReleaseDue, deadline)
-		}
-		current, p := store.RentalRow(podRental)
-		fatal(t, p)
-		idle, p := rental.ObserveIdle(store, *current)
-		fatal(t, p)
-		if time.Since(idle.Since) > time.Minute {
-			t.Fatalf("the local idle clock was not reset: %s", idle.Since)
-		}
-	}
-	keepalive(1)
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); err == nil {
-		t.Fatal("rental keepalive started a daemon")
-	}
-	startDaemonProcess(t, root)
-	keepalive(2)
-}

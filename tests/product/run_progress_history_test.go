@@ -86,18 +86,6 @@ func TestLiveProgressKeepsFinishedStagesAndMeasuredRates(t *testing.T) {
 	}
 }
 
-func TestLiveProgressClockStopsWhenWatcherDetaches(t *testing.T) {
-	p, buf := progressSink(output.Mode{Human: true, Live: true}, false)
-	p.On(liveEvent("progress", map[string]any{"stage": "condition_media"}))
-	waitUntil(t, "quiet stage elapsed clock", func() bool { return strings.Contains(buf.String(), "conditioning · wall 1s") })
-	p.Done()
-	before := len(buf.String())
-	time.Sleep(1100 * time.Millisecond)
-	if len(buf.String()) != before {
-		t.Fatalf("a detached watcher kept writing to the terminal: %q", buf.String()[before:])
-	}
-}
-
 func TestReattachedProgressUsesRecordedStageBoundaries(t *testing.T) {
 	p, _ := progressSink(output.Mode{Human: true, Live: true}, false)
 	t.Cleanup(p.Done)

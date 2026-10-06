@@ -7,9 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
-	"github.com/cozy-creator/cozy/internal/machinev1"
 	"os"
 	"runtime"
+
+	"github.com/cozy-creator/cozy/internal/machinev1"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"

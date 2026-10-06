@@ -15,10 +15,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 func TestRentalModelSelectorFreezesLatestMatchingLane(t *testing.T) {
@@ -43,19 +41,6 @@ func TestRentalModelSelectorFreezesLatestMatchingLane(t *testing.T) {
 		if model.Release != test.release || model.Manifest != digest {
 			t.Fatalf("selection not frozen: %+v", model)
 		}
-	}
-}
-func TestStandaloneModelDownloadDocumentHasNoBinding(t *testing.T) {
-	refs := orchestrator.DownloadModelRefs([]orchestrator.ModelRef{{Model: "paul/minimax-h3", CatalogRepository: "paul/minimax-h3", Release: "2.0", Lane: "fp8-pruned", Manifest: "sha256:" + strings.Repeat("a", 64)}})
-	if len(refs) != 1 || refs[0].Package != "" || refs[0].Slot != "" {
-		t.Fatalf("standalone selection lost or bound: %v", refs)
-	}
-	raw, problem := rental.DownloadSet(nil, refs)
-	if problem != nil {
-		t.Fatal(problem)
-	}
-	if !strings.Contains(string(raw), `"packages":[]`) {
-		t.Fatal(string(raw))
 	}
 }
 func TestModelLaneAndDigestSyntaxAreDistinct(t *testing.T) {

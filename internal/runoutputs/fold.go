@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -45,23 +44,6 @@ type Revision struct {
 	Parts []Part
 }
 
-// ETag is the revision's HTTP entity tag.
-func (r Revision) ETag() string { return fmt.Sprintf(`"r%d"`, r.Rev) }
-
-// PrefixOf answers whether this revision's bytes begin every later revision up to `now`:
-// true when each revision after it appended.
-func (r Revision) PrefixOf(now Revision) bool {
-	if r.Rev > now.Rev || len(r.Parts) > len(now.Parts) {
-		return false
-	}
-	for i, part := range r.Parts {
-		if now.Parts[i].Digest != part.Digest || now.Parts[i].Length != part.Length {
-			return false
-		}
-	}
-	return true
-}
-
 // Item is one output of a run at its current revision.
 type Item struct {
 	ID string
@@ -84,122 +66,6 @@ func (i Item) Name(run string) string {
 		return fmt.Sprintf("%s-%s-%d", run, i.Output, i.Index)
 	}
 	return run + "-" + i.Output
-}
-
-// Revision answers the item's revision `rev`, if it had one.
-func (i Item) Revision(rev uint32) (Revision, bool) {
-	if rev == 0 || int(rev) > len(i.History) {
-		return Revision{}, false
-	}
-	return i.History[rev-1], true
-}
-
-type key struct {
-	output string
-	index  uint32
-}
-
-// Fold is a run's items, built from its log's product entries in order.
-type Fold struct {
-	run   string
-	items map[key]*Item
-	order []*Item
-	last  uint64
-}
-
-// New folds the output log of run `run` (its number, or machine/number).
-func New(run string) *Fold {
-	return &Fold{run: run, items: map[key]*Item{}}
-}
-
-// Add folds one product entry. An entry at or before the last one folded is a replay and
-// changes nothing. It answers the item as the entry left it and whether the entry added it.
-func (f *Fold) Add(sequence uint64, product *pb.RunProduct) (Item, bool, error) {
-	if sequence <= f.last {
-		return Item{}, false, nil
-	}
-	revision, problem := revisionOf(sequence, product)
-	if problem != nil {
-		return Item{}, false, problem
-	}
-	list := product.Op == pb.RunProductOp_RUN_PRODUCT_OP_APPEND
-	k := key{output: product.Output}
-	if list {
-		k.index = product.Index + 1
-	} else if product.Op != pb.RunProductOp_RUN_PRODUCT_OP_SET {
-		return Item{}, false, fmt.Errorf("product entry %d has no operation", sequence)
-	}
-	f.last = sequence
-	item, known := f.items[k]
-	if !known {
-		item = &Item{OutputIndex: len(f.order), Output: product.Output, Index: k.index, List: list,
-			Type: TypeOf(product.MediaType)}
-		item.ID = f.run + "/" + product.Output
-		if list {
-			item.ID = fmt.Sprintf("%s/%d", item.ID, k.index)
-		}
-		f.items[k] = item
-		f.order = append(f.order, item)
-	} else if item.List != list {
-		return Item{}, false, fmt.Errorf("output %q is both a single output and a list", product.Output)
-	}
-	revision.Rev = uint32(len(item.History) + 1)
-	if known && item.Current.PrefixOf(revision) && len(revision.Parts) > len(item.Current.Parts) {
-		from := item.Current.Length
-		revision.AppendedFrom = &from
-	}
-	item.Current = revision
-	item.History = append(item.History, revision)
-	return *item, !known, nil
-}
-
-// Items are the run's items in the order they were first added.
-func (f *Fold) Items() []Item {
-	items := make([]Item, len(f.order))
-	for i, item := range f.order {
-		items[i] = *item
-	}
-	return items
-}
-
-// Item answers an item by its output and 1-based list index (0 for a single output).
-func (f *Fold) Item(output string, index uint32) (Item, bool) {
-	item, ok := f.items[key{output, index}]
-	if !ok {
-		return Item{}, false
-	}
-	return *item, true
-}
-
-func revisionOf(sequence uint64, product *pb.RunProduct) (Revision, error) {
-	if product == nil || product.Output == "" || product.Content == nil {
-		return Revision{}, fmt.Errorf("product entry %d is incomplete", sequence)
-	}
-	digest, err := canonical.Spell(product.Content.Digest)
-	if err != nil {
-		return Revision{}, fmt.Errorf("product entry %d names no sha256", sequence)
-	}
-	revision := Revision{Sequence: sequence, Length: int64(product.Content.Length), Digest: digest,
-		MediaType: product.MediaType, Label: product.Label}
-	if len(product.Parts) == 0 {
-		revision.Parts = []Part{{Digest: digest, Length: revision.Length, Source: product.Source}}
-		return revision, nil
-	}
-	var total int64
-	for _, part := range product.Parts {
-		spelled, err := canonical.Spell(part.GetContent().GetDigest())
-		if err != nil {
-			return Revision{}, fmt.Errorf("product entry %d has a part with no sha256", sequence)
-		}
-		length := int64(part.Content.Length)
-		total += length
-		revision.DurationUs += part.DurationUs
-		revision.Parts = append(revision.Parts, Part{Digest: spelled, Length: length, DurationUs: part.DurationUs, Source: part.Source})
-	}
-	if total != revision.Length {
-		return Revision{}, fmt.Errorf("product entry %d's parts are %d bytes, not %d", sequence, total, revision.Length)
-	}
-	return revision, nil
 }
 
 // TypeOf is an item's Responses-style type, from its media type.

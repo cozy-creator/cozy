@@ -383,13 +383,6 @@ func publishedWheel(t *testing.T, distribution, version string) string {
 	return ""
 }
 
-func writeInstallFile(t *testing.T, path string, body []byte, mode os.FileMode) {
-	t.Helper()
-	if err := os.WriteFile(path, body, mode); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // The isolated Hub fixture supplies a syntactic delegated JWT. The real Hub verifies its
 // authority; the agent only needs its stable issuer/account identity to guard replacement.
 func executionGrantToken(issuer, principal string, serial int32) string {

@@ -1,42 +1,10 @@
 package producttest
 
 import (
-	"context"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
-
-func (p *fakePod) RetainDerivedResult(ctx context.Context, call *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error) {
-	if p.derivedRetain == nil {
-		return nil, status.Error(codes.Unimplemented, "derived retain not configured")
-	}
-	return p.derivedRetain(ctx, call)
-}
-
-func (p *fakePod) NativeArtifactTransfer(ctx context.Context, call *pb.NativeArtifactTransferCall) (*pb.NativeArtifactTransferStatus, error) {
-	if p.artifactTransfer == nil {
-		return nil, status.Error(codes.Unimplemented, "artifact transfer not configured")
-	}
-	return p.artifactTransfer(ctx, call)
-}
-
-func (p *fakePod) ReleaseDerivedRetention(ctx context.Context, call *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error) {
-	if p.derivedRelease == nil {
-		return nil, status.Error(codes.Unimplemented, "derived release not configured")
-	}
-	return p.derivedRelease(ctx, call)
-}
-
-func (p *fakePod) ReleaseDerivedResult(ctx context.Context, call *pb.DerivedResultReleaseCall) (*pb.DerivedResultReleaseResult, error) {
-	if p.resultRelease == nil {
-		return nil, status.Error(codes.Unimplemented, "result release not configured")
-	}
-	return p.resultRelease(ctx, call)
-}
 
 func TestCancelledAncestorWaitsForNestedCompletedCustody(t *testing.T) {
 	store := successReleaseStore(t)

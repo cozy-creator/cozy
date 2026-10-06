@@ -1,11 +1,7 @@
 package orchestrator
 
 import (
-	"strings"
-
-	"github.com/cozy-creator/cozy/internal/home"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 // THE JOB BRANCH (cl-004). A job is an ATTEMPT CLASS on this one orchestrator, not a
@@ -60,60 +56,7 @@ type JobPlan struct {
 
 const DefaultJobRSSCap int64 = 8 << 30
 
-func jobDirectiveWithLimit(plan *JobPlan, outputLimit uint64) *pb.JobDirective {
-	if plan.FrozenDirective != nil {
-		return proto.Clone(plan.FrozenDirective).(*pb.JobDirective)
-	}
-	directive := &pb.JobDirective{
-		InstallationId:  plan.InstallationID,
-		JobDescriptorId: plan.DescriptorID,
-		ResourceCaps: &pb.ResourceCaps{
-			DeviceRequired: gpuCountOf(plan) > 0,
-			MaxRssBytes:    uint64(plan.RSSCap),
-		},
-		// The DIRECTIVE's publication contract is the worker-level authorization;
-		// the per-attempt one rides the InvocationSpec, because a worker that
-		// drains a queue publishes into a different scratch repo per request.
-		PublicationContract: &pb.PublicationContract{
-			GrantId: home.ScratchRepo("local", "queue"),
-			Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, outputLimit),
-		},
-		DeviceCount:   uint32(gpuCountOf(plan)),
-		Orchestration: plan.Orchestration,
-	}
-	if plan.OrchestrationParent != nil {
-		directive.OrchestrationParent = jobDirectiveWithLimit(plan.OrchestrationParent, outputLimit)
-	}
-	return directive
-}
-
-// gpuCountOf is the job's device FLOOR: how many accelerators the attempt may not start
-// without. It is 0 or 1 and stays 0 or 1 on a wide pod, deliberately (cl-179).
-//
-// A width is not a floor. `JobDirective.device_count` is, in the runtime's own words, a
-// floor and never concurrency; a job is one bounded attempt over a derive-only view of its model
-// inputs — it shards nothing, so a job on a four-card pod needs one card and would be
-// refused by a floor of four. Sequence parallelism is Runtime's grant to a serving call,
-// not a job resource cap. What keeps a job off a wide pod is the selection
-// side, where a wide product is excluded for a job outright rather than bought and idled.
-func gpuCountOf(p *JobPlan) int64 {
-	if p.NeedsAccelerator {
-		return 1
-	}
-	return 0
-}
-
 // ------------------------------------------------------------------ the publication root
-
-func splitList(joined string) []string {
-	out := []string{}
-	for _, v := range strings.Split(joined, ",") {
-		if v = strings.TrimSpace(v); v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
-}
 
 // ------------------------------------------------------------------ the publication
 

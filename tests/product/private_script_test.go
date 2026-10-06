@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -14,124 +13,6 @@ import (
 )
 
 var privateScriptRuntimeWheel = flag.String("script-runtime-wheel", "", "Exact Runtime wheel used for local script product proofs")
-
-// A real Python library is captured with a script, even when its version and
-// pyproject stay unchanged. The corrected run must use the edited library while
-// preserving the failed run's source and execution history.
-func TestPrivateScriptCapturesEditableDependencyAndRetries(t *testing.T) {
-	integration(t)
-	root, err := os.MkdirTemp("", "cozy-script-proof-")
-	must(t, err)
-	t.Cleanup(func() {
-		path := ""
-		for _, value := range childEnv(t, root) {
-			if strings.HasPrefix(value, "PATH=") {
-				path = strings.TrimPrefix(value, "PATH=")
-			}
-		}
-		compositionDown(t, root, path)
-		if t.Failed() {
-			t.Log("script retry evidence retained", root)
-		} else {
-			must(t, removeAllForce(root))
-		}
-	})
-	project := t.TempDir()
-	lib := filepath.Join(project, "algorithm")
-	must(t, os.MkdirAll(lib, 0o700))
-	must(t, os.WriteFile(filepath.Join(lib, "pyproject.toml"), []byte(`[project]
-name = "private-script-algorithm"
-version = "0.0.1"
-requires-python = ">=3.12"
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-[tool.hatch.build.targets.wheel]
-only-include = ["algorithm.py"]
-`), 0o600))
-	module := filepath.Join(lib, "algorithm.py")
-	must(t, os.WriteFile(module, []byte("def compute(value):\n    raise ValueError('candidate failed quality gate')\n"), 0o600))
-	script := filepath.Join(project, "experiment.py")
-	runtimeSource := ""
-	if wheel := *privateScriptRuntimeWheel; wheel != "" {
-		runtimeSource = "# cozy-runtime = {path = " + strconv.Quote(wheel) + "}\n"
-	}
-	code := `# /// script
-# requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime>=` + runtimeFixtureVersion(t, *privateScriptRuntimeWheel) + `", "private-script-algorithm"]
-# [tool.uv.sources]
-# private-script-algorithm = {path = "./algorithm", editable = true}
-` + runtimeSource + `# ///
-from pathlib import Path
-from algorithm import compute
-
-OUTPUT = ` + strconv.Quote(filepath.Join(root, "result.txt")) + `
-
-def helper(value):
-    return compute(value)
-
-def main(ctx):
-    ctx.raise_if_cancelled()
-    Path(OUTPUT).write_text(str(helper(7)))
-`
-	must(t, os.WriteFile(script, []byte(code), 0o600))
-	if status, out := runCozy(t, root, "run", script, "--describe", "--json"); status != 0 {
-		t.Fatalf("single job script with local library refused before execution [%d]: %s", status, out)
-	}
-	status, out := runCozy(t, root, "run", script, "--await", "--json")
-	if status == 0 || !strings.Contains(out, "candidate failed quality gate") {
-		t.Fatalf("first candidate did not fail through the real job [%d]: %s", status, out)
-	}
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	first, problem := store.RequestByReference("1")
-	fatal(t, problem)
-	if first == nil || first.State != "failed" || !first.RetainWork {
-		t.Fatalf("failed run lost retention: %+v", first)
-	}
-	original, problem := store.MachineExecution(first.ID)
-	fatal(t, problem)
-	if original == nil || len(original.Receipt) == 0 || len(original.Submission) == 0 {
-		t.Fatal("failed run lost its retained Runtime capture")
-	}
-	must(t, os.WriteFile(module, []byte("def compute(value):\n    return value + 100\n"), 0o600))
-	status, out = runCozy(t, root, "run", script, "--retry", "1", "--await", "--json")
-	if status != 0 {
-		t.Fatalf("edited dependency was not used on retry [%d]: %s", status, out)
-	}
-	written, err := os.ReadFile(filepath.Join(root, "result.txt"))
-	must(t, err)
-	if string(written) != "107" {
-		t.Fatalf("edited script did not write its actual result: %q", written)
-	}
-	second, problem := store.RequestByReference("2")
-	fatal(t, problem)
-	if second == nil || second.RetryOf != first.ID || second.ID == first.ID || second.LocalInstallationID == first.LocalInstallationID {
-		t.Fatalf("corrected run replaced original history: first=%+v second=%+v", first, second)
-	}
-	status, resumed := runCozy(t, root, "run", "resume", "1", "--json")
-	if status != 0 {
-		t.Fatalf("resume the retained original capture [%d]: %s", status, resumed)
-	}
-	status, resumed = runCozy(t, root, "run", "watch", "1", "--json")
-	if status == 0 || !strings.Contains(resumed, "candidate failed quality gate") {
-		t.Fatalf("resuming the original capture used edited source [%d]: %s", status, resumed)
-	}
-	held, problem := store.MachineExecution(first.ID)
-	fatal(t, problem)
-	if held == nil || string(held.Submission) != string(original.Submission) {
-		t.Fatal("retry or resume rewrote immutable Runtime capture")
-	}
-	machineChildren(t, root, store, "1")
-	machineChildren(t, root, store, "2")
-	unchanged, problem := store.RequestRow(first.ID)
-	fatal(t, problem)
-	if unchanged.State != "failed" || unchanged.BodyDigest != first.BodyDigest {
-		t.Fatal("retry rewrote failed request")
-	}
-	t.Logf("%s failed; %s uses edited library; original source/environment preserved", first.ID, second.ID)
-}
 
 func TestPrivateScriptRequiresMainWithoutExecutingSource(t *testing.T) {
 	root, err := os.MkdirTemp("", "cozy-script-count-")

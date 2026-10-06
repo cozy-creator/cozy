@@ -16,8 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc/metadata"
 )
 
 func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T) {
@@ -91,34 +89,6 @@ func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testi
 	use, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
 	fatal(t, problem)
 	use()
-}
-
-func TestRentalDependencyVerdictIsSharedByRootAndServingPreparation(t *testing.T) {
-	fields := map[string]string{"package": "paul/minimax-h3", "distribution": "cozy-runtime", "required": "cozy-runtime>=0.18.4,<1", "installed": "0.18.2"} //cozy:allow dependency metadata fixture, not a binary invocation
-	raw, err := json.Marshal(fields)
-	must(t, err)
-	event := &pb.PrepareEvent{SafeCode: "package_runtime_incompatible", SafeDetail: string(raw)}
-	fromEvent := orchestrator.RuntimeRequirementEvent(event)
-	fromTrailer := orchestrator.RuntimeRequirementTrailer(metadata.Pairs(
-		"cozy-requirement-package", fields["package"], "cozy-requirement-distribution", fields["distribution"],
-		"cozy-requirement-required", fields["required"], "cozy-requirement-installed", fields["installed"]))
-	for _, problem := range []*exit.Error{fromEvent, fromTrailer} {
-		if problem == nil || problem.ErrName() != "machine_execution.runtime_requirement" ||
-			!strings.Contains(problem.Message, "cozy-runtime 0.18.2") || !strings.Contains(problem.Message, "requires cozy-runtime>=0.18.4,<1") {
-			t.Fatalf("lost actionable dependency facts: %v", problem)
-		}
-	}
-	event.SafeDetail = `{"package":"x"}`
-	if orchestrator.RuntimeRequirementEvent(event) != nil {
-		t.Fatal("incomplete error became update authority")
-	}
-	fields["distribution"] = "torch"
-	raw, err = json.Marshal(fields)
-	must(t, err)
-	event.SafeCode, event.SafeDetail = "package_sdk_incompatible", string(raw)
-	if problem := orchestrator.RuntimeRequirementEvent(event); problem == nil || problem.ErrName() != "machine_execution.package_requirement" {
-		t.Fatalf("non-updatable distribution became Runtime update authority: %v", problem)
-	}
 }
 
 func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {

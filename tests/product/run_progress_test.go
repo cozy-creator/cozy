@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,9 +17,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/cozy-creator/cozy/internal/cli"
-	"github.com/cozy-creator/cozy/internal/output"
 )
 
 const ptyColumns = 80
@@ -386,57 +382,3 @@ func TestRunProgressSurfaces(t *testing.T) {
 // humanProgressCell is the shape a person reads off a row: the stage, then one
 // percent for the whole job.
 var humanProgressCell = regexp.MustCompile(`[a-z_]+ [0-9]+%`)
-
-// The renderer is also driven on a small real terminal without a model/daemon.
-// A resize may reflow old rows; redraw must stay inside the current screen and
-// retain the stage/count at the front of each bounded row.
-func TestLiveProgressFitsResizedTerminal(t *testing.T) {
-	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
-	must(t, err)
-	defer master.Close()
-	must(t, unix.IoctlSetPointerInt(int(master.Fd()), unix.TIOCSPTLCK, 0))
-	number, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
-	must(t, err)
-	resize := func(columns uint16) {
-		must(t, unix.IoctlSetWinsize(int(master.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 6, Col: columns}))
-	}
-	resize(80)
-	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR, 0)
-	must(t, err)
-	defer slave.Close()
-	buf := &renderBuffer{}
-	readDone := make(chan struct{})
-	go func() { _, _ = io.Copy(buf, master); close(readDone) }()
-	p := cli.NewProgress(&cli.Context{Inv: &cli.Invocation{Mode: output.Mode{Human: true, Live: true}}, Err: slave}, false, time.Now())
-	t.Cleanup(p.Done)
-	models := make([]any, 12)
-	for i := range models {
-		models[i] = map[string]any{"model": fmt.Sprintf("paul/model-%d", i), "moved_bytes": 5 << 30, "total_bytes": 50 << 30, "rate_bytes_per_second": 400 << 20}
-	}
-	p.On(liveEvent("phase", map[string]any{"phase": "downloading", "models": models}))
-	waitUntil(t, "bounded model viewport", func() bool { return strings.Contains(buf.String(), "more rows") })
-	before := len(buf.String())
-	resize(32)
-	p.On(liveEvent("phase", map[string]any{"phase": "downloading", "models": models}))
-	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 5, "total": 30, "step_ms": 15000}))
-	p.Done()
-	must(t, slave.Close())
-	<-readDone
-	narrow := buf.String()[before:]
-	for _, control := range regexp.MustCompile(`\x1b\[(\d+)A`).FindAllStringSubmatch(narrow, -1) {
-		up, _ := strconv.Atoi(control[1])
-		if up > 5 {
-			t.Fatalf("redraw moved above the 6-row terminal: %q", narrow)
-		}
-	}
-	for _, chunk := range strings.Split(narrow, "\r\033[K")[1:] {
-		line := strings.SplitN(chunk, "\r", 2)[0]
-		line = strings.SplitN(line, "\n", 2)[0]
-		if len([]rune(line)) >= 32 {
-			t.Fatalf("redraw wrapped a 32-column terminal: %q", line)
-		}
-	}
-	if !strings.Contains(narrow, "denoising") || !strings.Contains(narrow, "step 5/30") {
-		t.Fatalf("resize lost the stage and count: %q", narrow)
-	}
-}

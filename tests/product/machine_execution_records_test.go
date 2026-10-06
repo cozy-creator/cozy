@@ -11,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -278,54 +277,6 @@ func TestRuntimeObligationsPreventPrematureRentalRelease(t *testing.T) {
 				t.Fatal("release protection depended on a local attempt")
 			}
 		})
-	}
-}
-
-func TestMachineInvocationCarriesFrozenDeadlineAndRefusesUnstagedInputs(t *testing.T) {
-	request := records.Request{ID: "job-deadline", IdemKey: "deadline", Kind: "job", Package: "local/example", Entrypoint: "main", Org: "local", Payload: []byte(`{}`), PlanID: childDigest("2"), LocalInstallationID: childDigest("3"), DeadlineUnixMS: 1900000000123}
-	plan := &orchestrator.JobPlan{Function: "main", DescriptorID: request.PlanID}
-	root := machineCaptureRevision(t, request.Package, 3)
-	request.LocalInstallationID = root.ID
-	capture, problem := localpackage.CaptureExecution(root.ID, root,
-		func(string) ([]records.ChildBinding, *exit.Error) { return nil, nil },
-		func(string, string) (localpackage.Installation, *exit.Error) { return root, nil })
-	fatal(t, problem)
-	submission, problem := orchestrator.MachineJobSubmission(request, capture, plan, nil)
-	fatal(t, problem)
-	var spec pb.InvocationSpec
-	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
-	if spec.DeadlineUnixMs != request.DeadlineUnixMS {
-		t.Fatal("machine execution dropped its deadline")
-	}
-	if !submission.PreparedState.GetJob().Orchestration {
-		t.Fatal("CPU captured root occupied its managed children's device lane")
-	}
-	request.Models = []records.ModelRef{{Slot: "model", Manifest: childDigest("4"), ManifestLength: 123}}
-	submission, problem = orchestrator.MachineJobSubmission(request, capture, plan, nil)
-	fatal(t, problem)
-	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
-	if len(spec.Inputs) != 2 || spec.Inputs[1].InputId != "model:model" || spec.Inputs[1].Digest != childDigest("4") || spec.Inputs[1].Length != 123 || submission.Offer.Grant.Inputs[0].Url != "model://"+childDigest("4") {
-		t.Fatal("root Model input lost its exact content/access binding")
-	}
-	if submission.Offer.Grant.Inputs[0].CatalogModel != nil {
-		t.Fatal("private Model input acquired inferred catalog authority")
-	}
-	request.Models[0].Model = "alice/checkpoint"
-	request.Models[0].CatalogRepository = "alice/checkpoint"
-	catalog, problem := orchestrator.MachineJobSubmission(request, capture, plan, nil)
-	fatal(t, problem)
-	if catalog.Offer.Grant.Inputs[0].GetCatalogModel().GetRepository() != "alice/checkpoint" ||
-		!bytes.Equal(catalog.Offer.InvocationSpecDigest, submission.Offer.InvocationSpecDigest) {
-		t.Fatal("catalog source was dropped or changed content invocation identity")
-	}
-	request.Models[0].CatalogRepository = "other/checkpoint"
-	if _, problem := orchestrator.MachineJobSubmission(request, capture, plan, nil); problem == nil {
-		t.Fatal("a catalog origin different from the selected model was accepted")
-	}
-	request.Models[0].CatalogRepository = ""
-	request.Models[0].ManifestLength = 0
-	if _, problem := orchestrator.MachineJobSubmission(request, capture, plan, nil); problem == nil || problem.Code != exit.Structural {
-		t.Fatalf("unidentified Model input was accepted: %v", problem)
 	}
 }
 

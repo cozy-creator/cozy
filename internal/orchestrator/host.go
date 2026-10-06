@@ -10,13 +10,6 @@ package orchestrator
 // and cancel for the package already serving waited behind package B's download.
 
 import (
-	"encoding/json"
-	"strings"
-	"time"
-
-	"google.golang.org/grpc/metadata"
-
-	"github.com/cozy-creator/cozy/internal/exit"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -71,70 +64,4 @@ func (c *Orchestrator) ObservePrepareEvent(instanceID, machine, label string, ev
 	sample.HasBytes = event.GetTotalBytes() > 0 || event.GetTransferredBytes() > 0
 	sample.Moved, sample.Total = event.GetTransferredBytes(), event.GetTotalBytes()
 	c.ObservePhase(instanceID, sample)
-}
-
-// PrepareStagePayload is one ended Host preparation stage as a `request.preparing` payload.
-func PrepareStagePayload(label string, stage pb.PrepareStage, began time.Time, last *pb.PrepareEvent) map[string]any {
-	if stage == pb.PrepareStage_PREPARE_STAGE_UNSPECIFIED || last == nil {
-		return nil
-	}
-	payload := map[string]any{
-		"stage":           strings.ToLower(trimEnum(pb.PrepareStage_name[int32(stage)], "PREPARE_STAGE_")),
-		"label":           label,
-		"started_unix_ms": began.UnixMilli(),
-		"ms":              time.Since(began).Milliseconds(),
-	}
-	if last.GetTotalBytes() > 0 || last.GetTransferredBytes() > 0 {
-		payload["transferred_bytes"], payload["total_bytes"] = last.GetTransferredBytes(), last.GetTotalBytes()
-	}
-	var origin, cached uint64
-	for _, model := range last.GetModelProgress() {
-		origin, cached = origin+model.GetOriginBytes(), cached+model.GetCachedBytes()
-	}
-	if origin > 0 || cached > 0 {
-		payload["origin_bytes"], payload["cached_bytes"] = origin, cached
-	}
-	return payload
-}
-
-// RuntimeRequirementTrailer preserves authenticated worker dependency facts for both preparation paths.
-func RuntimeRequirementTrailer(trailer metadata.MD) *exit.Error {
-	first := func(key string) string {
-		values := trailer.Get(key)
-		if len(values) == 1 && len(values[0]) <= 2048 {
-			return values[0]
-		}
-		return ""
-	}
-	packageName, distribution := first("cozy-requirement-package"), first("cozy-requirement-distribution")
-	required, installed := first("cozy-requirement-required"), first("cozy-requirement-installed")
-	if packageName == "" || distribution == "" || required == "" || installed == "" {
-		return nil
-	}
-	name := "machine_execution.package_requirement"
-	if distribution == "cozy-runtime" || distribution == "tensorfs" { //cozy:allow distribution metadata, not a binary invocation
-		name = "machine_execution.runtime_requirement"
-	}
-	return exit.Named(exit.Structural, name, "%s requires %s; this worker has %s %s", packageName, required, distribution, installed)
-}
-
-// RuntimeRequirementEvent decodes the Host's bounded dependency verdict. It is
-// shared by ordinary serving and Runtime-owned root preparation.
-func RuntimeRequirementEvent(event *pb.PrepareEvent) *exit.Error {
-	if event.SafeCode != "package_runtime_incompatible" && event.SafeCode != "package_sdk_incompatible" {
-		return nil
-	}
-	if len(event.SafeDetail) > 8192 {
-		return nil
-	}
-	var detail struct {
-		Package      string `json:"package"`
-		Distribution string `json:"distribution"`
-		Required     string `json:"required"`
-		Installed    string `json:"installed"`
-	}
-	if json.Unmarshal([]byte(event.SafeDetail), &detail) != nil {
-		return nil
-	}
-	return RuntimeRequirementTrailer(metadata.Pairs("cozy-requirement-package", detail.Package, "cozy-requirement-distribution", detail.Distribution, "cozy-requirement-required", detail.Required, "cozy-requirement-installed", detail.Installed))
 }

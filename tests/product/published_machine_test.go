@@ -9,35 +9,12 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
-
-func TestPublishedMachineJobPreservesInstallationIdentity(t *testing.T) {
-	buildID := "published-installation"
-	raw, digest, err := canonical.Identity(&pb.MachineExecutionCapture{RootInstallationId: buildID,
-		InstalledPackages: []*pb.InstalledPackage{{InstallationId: buildID, Package: "alice/ops", Release: "1.0.0", PackageInterface: []byte("{}")}}})
-	must(t, err)
-	request := records.Request{ID: "published-root", IdemKey: "published-root", Kind: "job", Package: "alice/ops", Release: "1.0.0", PlanID: childDigest("9"), Payload: []byte(`{}`), Org: "local"}
-	plan := &orchestrator.JobPlan{Function: "main", DescriptorID: request.PlanID, InstallationID: buildID}
-	submitted, problem := orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan, nil)
-	fatal(t, problem)
-	var spec pb.InvocationSpec
-	must(t, canonical.Unmarshal(submitted.Offer.InvocationSpecCanonicalBytes, &spec))
-	if spec.GetJob().InstallationId != buildID || submitted.PreparedState.GetJob().InstallationId != buildID || request.LocalInstallationID != "" {
-		t.Fatal("published code acquired a private revision identity")
-	}
-	plan.InstallationID = "other-installation"
-	if _, problem := orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan, nil); problem == nil {
-		t.Fatal("a different prepared build was accepted")
-	}
-}
 
 type publishedRouteResolver struct{ api.Resolver }
 

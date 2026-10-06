@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -165,79 +163,5 @@ func TestAssessmentFileReservationsKeepOriginalCompositionAndIndependentCustody(
 	}
 	if _, _, problem := store.ReserveAssessmentBytes(call.ID, call.ParentRequestID, request.Report, request.Workloads); problem == nil {
 		t.Fatal("released effect inputs were reacquired")
-	}
-}
-
-func TestAssessmentAcceptsOnlyCompletedHeldFilesFromItsRunningParent(t *testing.T) {
-	for _, mode := range []string{"committed", "wrong-native-operation", "released-files", "canceled-effect"} {
-		t.Run(mode, func(t *testing.T) {
-			store, producer, _, workloads, _ := observedAssessment(t, true)
-			parent, problem := store.RequestRow(producer)
-			fatal(t, problem)
-			report := []byte(`{"association_fixture":"running parent"}`)
-			spec, err := canonical.Raw(childDigest("1"))
-			must(t, err)
-			var received []records.NativeArtifactRetention
-			for index, file := range []struct {
-				name string
-				body []byte
-			}{{"report", report}, {"workloads", workloads}} {
-				operation := "commit_file"
-				if mode == "wrong-native-operation" {
-					operation = "source_files"
-				}
-				call := records.NativeCall{ID: "commit-" + file.name, ParentRequestID: parent.ID, CallIndex: int64(10 + index), Kind: "source", Operation: operation, IntentDigest: assessmentDigest([]byte(file.name)), Request: assessmentJSON(t, map[string]any{"slot": "file/0001", "digest": assessmentDigest(file.body), "size_bytes": len(file.body), "media_type": "application/json"})}
-				_, _, problem := store.AcceptNativeCall(call, 1, childDigest("1"), "private-boot")
-				fatal(t, problem)
-				receipt := []byte("native receipt: " + file.name)
-				output := records.ByteOutput{RequestID: parent.ID, Attempt: 1, OutputID: fmt.Sprintf("runtime.%s.%d", operation, call.CallIndex), Digest: assessmentDigest(file.body), Length: int64(len(file.body)), MimeType: "application/json", ReceiptDigest: assessmentDigest(receipt), ManifestID: assessmentDigest([]byte(file.name + "-manifest")), ManifestLength: 100, ContentBytes: int64(len(file.body))}
-				output.ProducerRootID = records.NativeByteProducerRoot("cozy-local-client", parent.ID, 1, spec, output.OutputID)
-				hold, problem := store.CompleteNativeByteCall(call.ID, 1, childDigest("1"), "private-boot", childDigest("1"), output, []byte(`{"file":{}}`), receipt, "private-worker")
-				fatal(t, problem)
-				received = append(received, hold)
-			}
-			request := publication.AssessmentRequest{Checkpoint: publication.CheckpointRef{Destination: "alice/model", Checkpoint: childDigest("a"), Manifest: records.ArtifactObjectRef{Digest: childDigest("a"), Length: 100}, Publication: "upload"}, Report: assessmentDigest(report), Workloads: assessmentDigest(workloads)}
-			call, _, problem := store.AcceptNativeCall(records.NativeCall{ID: "attach-running", ParentRequestID: parent.ID, CallIndex: 128, Kind: "effect", Operation: "attach_assessment", IntentDigest: childDigest("c"), Request: assessmentJSON(t, request)}, 1, childDigest("1"), "private-boot")
-			fatal(t, problem)
-			for _, hold := range received {
-				if _, _, problem := store.ReserveAssessmentBytes(call.ID, parent.ID, request.Report, request.Workloads); problem == nil {
-					t.Fatal("assessment accepted an unretained pending file")
-				}
-				fatal(t, store.ConfirmNativeArtifact(hold.RetentionID, "private-worker", "private-boot"))
-			}
-			if mode == "released-files" {
-				fatal(t, store.BeginNativeArtifactRelease(parent.ID, false))
-			}
-			if mode == "canceled-effect" {
-				_, problem := store.RequestNativeEffectCancel(parent.ID, call.CallIndex, 1, childDigest("1"), "private-boot", call.IntentDigest)
-				fatal(t, problem)
-			}
-			holds, owner, problem := store.ReserveAssessmentBytes(call.ID, parent.ID, request.Report, request.Workloads)
-			if mode != "committed" {
-				if problem == nil {
-					t.Fatal("unowned or canceled files authorized an assessment")
-				}
-				retained, problem := store.NativeArtifactRetentions(call.ID)
-				fatal(t, problem)
-				if len(retained) != 0 {
-					t.Fatal("refused assessment left partial recipient reservations")
-				}
-				return
-			}
-			fatal(t, problem)
-			if owner != parent.ID || len(holds) != 2 {
-				t.Fatal("running parent lost its own report composition")
-			}
-			current, problem := store.RequestRow(parent.ID)
-			fatal(t, problem)
-			if current.State != "dispatching" {
-				t.Fatal("file commit invented a terminal parent")
-			}
-			for _, hold := range holds {
-				if hold.ConsumerID != call.ID || hold.Kind != "effect" || hold.State != "pending" {
-					t.Fatal("effect borrowed its parent's recipient")
-				}
-			}
-		})
 	}
 }

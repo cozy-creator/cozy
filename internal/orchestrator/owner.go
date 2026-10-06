@@ -1,13 +1,6 @@
 package orchestrator
 
 import (
-	"strings"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -33,24 +26,6 @@ const (
 	RecordOwnerID    = recordOwnerID
 	RecordOwnerEpoch = recordOwnerEpoch
 )
-
-// dialWorker opens the channel: local sockets use the per-spawn proof; rented workers
-// pin the exact readiness certificate and authenticate Claim with Creator's signature.
-func dialWorker(addr string, remote *WorkerConnection) (*grpc.ClientConn, error) {
-	if remote != nil && remote.CACert != "" {
-		pin, err := workertls.LoadPin(remote.CACert)
-		if err != nil {
-			return nil, err
-		}
-		creds := credentials.NewTLS(pin.TLSConfig())
-		return grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
-	}
-	target := addr
-	if strings.HasPrefix(addr, "unix:") || strings.HasPrefix(addr, "/") {
-		target = "unix:" + strings.TrimPrefix(addr, "unix:")
-	}
-	return grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-}
 
 // onClaimAck binds the claimed boot to the worker slot: identity checks, the durable
 // binding, and the session registry (the ClaimAck is the flip's Register successor).

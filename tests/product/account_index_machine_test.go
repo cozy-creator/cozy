@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-
-	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
 const indexAccount = "author"
@@ -183,26 +181,5 @@ func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 	}
 	if served := machineServed.Load(); served != 0 {
 		t.Fatalf("a machine fetched the captured dependency from a Hub %d times", served)
-	}
-}
-
-func TestCapturedAccountIndexDocumentNeedsOnlyAuthoredDependencyAuthority(t *testing.T) {
-	for _, test := range []struct {
-		name, text    string
-		uses, invalid bool
-	}{
-		{"offline", "[project]\nname='offline'\nversion='1'\n", false, false},
-		{"bound-private", "[tool.uv.sources]\nprivate={index='tensorhub'}\n[[tool.uv.index]]\nname='tensorhub'\nurl='https://authored.example/v1/index/me/simple/'\n", true, false},
-		{"conditional-private", "[tool.uv.sources]\nprivate=[{index='tensorhub',marker=\"sys_platform == 'linux'\"}]\n", true, false},
-		{"unselected-index", "[[tool.uv.index]]\nname='tensorhub'\nurl='https://unselected.example/'\n", false, false},
-		{"missing", "", false, true},
-		{"invalid", "[tool.uv.sources\n", false, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			uses, problem := packagepublish.UsesAccountIndexDocument([]byte(test.text))
-			if (problem != nil) != test.invalid || uses != test.uses {
-				t.Fatalf("captured dependency authority: uses=%v problem=%v", uses, problem)
-			}
-		})
 	}
 }

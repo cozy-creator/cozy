@@ -7,42 +7,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/rental"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // cl-179: WIDTH. A rental is bought at a width and the pod must deliver it; Runtime alone
 // decides which of those cards each call uses.
-
-// modelBearingPlacement is a prepared placement that HOLDS WEIGHTS: one model, one
-// entrypoint binding it. Weight is the whole question a pin turns on — a group shards a
-// model's attention, so a weightless placement is never pinned to one.
-func modelBearingPlacement(t *testing.T) func([]byte, string, string) *pb.Placement {
-	return func(download []byte, pkg, release string) *pb.Placement {
-		placement := podPlacement(download, pkg, release, "")
-		doc, err := canonical.Read(download, &pb.DownloadDelegation{})
-		must(t, err)
-		placement.Entrypoints = nil
-		for _, row := range doc.List("models") {
-			manifest, err := canonical.Raw(row.Str("manifest"))
-			must(t, err)
-			id := "model-" + row.Str("slot")
-			placement.Models = append(placement.Models, &pb.Model{Id: id, Repo: row.Str("model"),
-				Version: row.Str("release"), Lane: row.Str("lane"),
-				Manifest: &pb.Ref{Digest: manifest, Length: 164}})
-			name := strings.TrimSuffix(row.Str("slot"), ".models.model")
-			placement.Entrypoints = append(placement.Entrypoints,
-				&pb.Entrypoint{Name: name, EntrypointBindingDigest: sha256Of([]byte("entrypoint:" + pkg)),
-					Slots: []*pb.Slot{{Slot: "model", ReferenceModelId: id,
-						Components: []*pb.Component{{Component: "dit", ModelId: id}}}}})
-		}
-		return placement
-	}
-}
 
 // TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree is the PRE-SPEND half.
 // Width is not capacity — every GPU of a group holds the full weights — so the only thing

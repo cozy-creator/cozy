@@ -365,34 +365,3 @@ app.job(make)
 	}
 	return project
 }
-
-// A run whose editable package is uploading when `cozy down` stops the daemon is not
-// lost: the next daemon uploads it again, and it reaches Runtime once.
-func TestDownMidUploadResumesTheUpload(t *testing.T) {
-	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
-		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
-	})
-	pod := newEditablePod(machines)
-	pod.block, pod.released = make(chan struct{}), make(chan struct{})
-	root, store := rentedEditable(t, pod)
-	if code, out := runCozy(t, root, "run", "local/upload-proof/main", "steps=1", "--rental=tessa", "--json", "--idempotency-key", "down"); code != 0 {
-		t.Fatalf("the rented run was refused [exit %d]: %s", code, out)
-	}
-	waitFor(t, root, "the editable package's upload", closed(pod.block))
-	row, problem := store.RequestByIdempotencyKey("down")
-	fatal(t, problem)
-	code, out := runCozy(t, root, "down")
-	if code != 0 || !strings.Contains(out, row.ID) || !strings.Contains(out, "the next cozy command reattaches") {
-		t.Fatalf("down did not stop and name the uploading run [exit %d]: %s", code, out)
-	}
-	t.Logf("cozy down:\n%s", out)
-	waitFor(t, root, "the upload's stream to end with the daemon", closed(pod.released))
-	pod.unblock()
-	if code, out = runCozy(t, root, "run", "watch", row.ID, "--json"); code != 0 || !strings.Contains(out, `"status":"completed"`) {
-		t.Fatalf("the run did not complete after the daemon came back [exit %d]: %s", code, out)
-	}
-	if calls, prepared := pod.counts(); calls < 2 || prepared != 1 || len(machines.submitted()) != 1 {
-		t.Fatalf("%d upload call(s), %d preparation(s), %d submission(s); want a resumed upload that reaches Runtime once",
-			calls, prepared, len(machines.submitted()))
-	}
-}

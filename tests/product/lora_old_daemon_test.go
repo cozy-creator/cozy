@@ -1,11 +1,9 @@
 package producttest
 
 import (
-	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,8 +15,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
-
-var previousDaemonBinary = flag.String("previous-daemon-binary", "", "official Cozy 0.1.21 binary for mixed client/daemon qualification")
 
 func TestModelOverrideClientRequiresOnlyItsOperationCapability(t *testing.T) {
 	for _, response := range []string{`{}`, `{"model_overrides":false}`, `{"model_overrides":true,"future_hint":"ignored"}`} {
@@ -66,58 +62,5 @@ func TestModelOverrideClientRequiresOnlyItsOperationCapability(t *testing.T) {
 				t.Fatalf("ordinary base override required new capability: %d reads, %d submissions", reads.Load(), submitted.Load())
 			}
 		})
-	}
-}
-
-func TestNewModelOverrideClientPreservesAnOfficialOldDaemon(t *testing.T) {
-	if *previousDaemonBinary == "" {
-		t.Skip("requires -previous-daemon-binary pointing to the official 0.1.21 artifact")
-	}
-	version, err := exec.Command(*previousDaemonBinary, "-v").CombinedOutput()
-	must(t, err)
-	if strings.TrimSpace(string(version)) != "0.1.21" {
-		t.Fatalf("expected official 0.1.21 daemon fixture, got %s", version)
-	}
-	h := newLadderHub(t)
-	h.bind(goodLadder())
-	machine := newReleaseMachine()
-	machine.changed = make(chan struct{})
-	root, layout := rentedLadderHome(t, h, &fakePod{machine: machine}, nil)
-	owner := startDaemonBinary(t, *previousDaemonBinary, root)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-	base := []string{"run", ladderPackage + "/long_form", "model.source=" + sourceJobModel,
-		"--source-profile", "source=fixture/diffusers/1", "--rental=tessa", "--json"}
-	code, out := runCozy(t, root, append(base, "--idempotency-key", "old-owner-active")...)
-	if code != 0 {
-		t.Fatalf("ordinary job could not use the old daemon [exit %d]: %s", code, out)
-	}
-	var active *records.Request
-	waitFor(t, root, "old daemon's ordinary job acceptance", func() bool {
-		active, _ = store.RequestByIdempotencyKey("old-owner-active")
-		return active != nil && machine.accepted(active.ID)
-	})
-	machine.begin(active.ID)
-	for _, args := range [][]string{
-		{"--lora", "generate.models.model:fl2va_dit=proof/style@1.0.0,0.5"},
-		{"model.generate.models.model=proof/base@1.0.0/bf16"},
-	} {
-		argv := append(append([]string(nil), base...), args...)
-		code, out := runCozy(t, root, argv...)
-		if code == 0 || !strings.Contains(out, "daemon.model_overrides_unavailable") || !strings.Contains(out, "restart the daemon") {
-			t.Fatalf("new selection did not ask for an operation-specific daemon update [exit %d]: %s", code, out)
-		}
-	}
-	if machine.submits.Load() != 1 {
-		t.Fatalf("a downgraded request reached the machine: %d submissions", machine.submits.Load())
-	}
-	if state := daemon.Probe(config.Config{Home: root}); !state.Up || state.PID != owner.cmd.Process.Pid {
-		t.Fatal("operation preflight replaced the old daemon")
-	}
-	retained, problem := store.RequestRow(active.ID)
-	fatal(t, problem)
-	if records.Settled(retained.State) || !machine.accepted(active.ID) {
-		t.Fatal("operation refusal changed the ordinary job already in flight")
 	}
 }

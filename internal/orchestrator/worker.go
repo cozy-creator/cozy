@@ -306,57 +306,6 @@ func (p DesiredPlacement) PlacementID() string {
 	return "plc-" + strings.TrimPrefix(p.InstanceID(), "ins-")
 }
 
-// entrypointServes answers whether a placement row binds the request's function to its
-// exact selection (h3a-018): every slot the pod bound for the function references a
-// manifest the request accepts for that slot — its pin, or a rung of its ladder — under
-// the same adapters. It answers the binding the pod authored for the function.
-func entrypointServes(row canonical.Doc, logical LogicalPackage) (string, bool) {
-	requested := make(map[string]ModelRef, len(logical.Models))
-	for _, model := range logical.Models {
-		requested[model.Slot] = model
-	}
-	manifests := map[string]string{}
-	modelRows := map[string]canonical.Doc{}
-	for _, model := range row.List("models") {
-		manifests[model.Str("id")] = model.Sub("manifest").Str("digest")
-		modelRows[model.Str("id")] = model
-	}
-	for _, entrypoint := range row.List("entrypoints") {
-		if entrypoint.Str("name") != logical.Function {
-			continue
-		}
-		slots := entrypoint.List("slots")
-		if len(slots) == 0 || len(logical.Models) == 0 {
-			// A binding that names no slots, or a request that names no models (the
-			// package's own defaults), has no selection to disagree with; the placement's
-			// model rows are the evidence (selectionServes).
-			return entrypoint.Str("entrypoint_binding_digest"),
-				selectionServes(logical.Models, placementModels(logical.Package, row))
-		}
-		if len(slots) != len(requested) {
-			return "", false
-		}
-		for _, slot := range slots {
-			model, ok := requested[logical.Function+".models."+slot.Str("slot")]
-			held := manifests[slot.Str("reference_model_id")]
-			if !ok || held == "" {
-				return "", false
-			}
-			if _, fits := rungHolding(model, held); !fits ||
-				!records.SameAdapters(model.Adapters, placementAdapters(slot, modelRows)) {
-				return "", false
-			}
-		}
-		return entrypoint.Str("entrypoint_binding_digest"), true
-	}
-	return "", false
-}
-
-func validDigest(value string) bool {
-	_, err := canonical.Raw(value)
-	return err == nil
-}
-
 // ReportCadence is the worker's OWN ObservedWorkerState period, a protocol fact rather
 // than a number chosen here: the worker reports durably on this cadence so an owner can
 // always see a desired state it issued that has not converged.
@@ -452,16 +401,6 @@ type PlacementAcquisitionFacts struct {
 	Model   AcquisitionLegFacts `json:"model"`
 }
 
-// trimEnum renders a protocol enum by its own name, minus the type prefix proto3's
-// package-level value scoping forces onto it. The NUMBERS are normative; this is for a
-// person reading `cozy run list`.
-func trimEnum(name, prefix string) string {
-	if name == "" {
-		return "UNSPECIFIED"
-	}
-	return strings.TrimPrefix(name, prefix)
-}
-
 // ClassicRetired names work accepted for the retired classic worker session, local or
 // rented. Every machine now runs work as a machine execution; such work is never revived.
 func ClassicRetired() *exit.Error {
@@ -547,10 +486,4 @@ func (c *Orchestrator) ResumeQueuedRequests() *exit.Error {
 		c.start(req)
 	}
 	return nil
-}
-
-func logicalOf(req records.Request) LogicalPackage {
-	return LogicalPackage{Package: req.Package, Release: req.Release, Function: req.Entrypoint,
-		PlanID: req.PlanID, Models: append([]ModelRef(nil), req.Models...),
-		NeedsAccelerator: req.NeedsAccelerator}
 }

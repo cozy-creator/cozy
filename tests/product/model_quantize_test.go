@@ -1,21 +1,15 @@
 package producttest
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 
-	"google.golang.org/grpc"
-
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // quantizerJob is a package's quantizer for one lane: a model input and one weights output
@@ -90,39 +84,5 @@ func TestModelQuantizeRunsTheServingPackagesQuantizer(t *testing.T) {
 			len(row.ModelTransfer.Outputs) != 1 || row.ModelTransfer.Outputs[0].Name != "fp8" {
 			t.Fatalf("%s is not the fp8 conversion of the checkpoint into %s: %+v", key, destination, row)
 		}
-	}
-}
-
-// On a machine the run names, the verb first has that machine hold the checkpoint, as `cozy
-// model download <checkpoint> --rental` does, and then queues the quantizer there.
-func TestModelQuantizeHasItsMachineHoldTheCheckpoint(t *testing.T) {
-	var held atomic.Int32
-	pod := &fakePod{prepareModels: func(_ *pb.PreparePackageSetCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
-		held.Add(1)
-		setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{})
-		if err != nil {
-			return err
-		}
-		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED,
-			PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: setDigest, PlacementSetCanonicalBytes: setBytes}})
-	}}
-	root, stand := attachedRental(t, pod)
-	digest := "sha256:" + strings.Repeat("c", 64)
-	stand.mux.HandleFunc("GET /v1/models/resolve", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.ModelResolution{Model: "proof/source", ManifestID: digest, ManifestLength: 64,
-			Bytes: 1 << 20, Objects: 1, Components: []string{"model"}, ComponentBytes: map[string]int64{"model": 1 << 20}})
-	})
-	installQuantizer(t, root, "proof/quantize", []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[`+quantizerJob("fp8")+`]}`))
-	code, out := runCozy(t, root, "model", "quantize", "proof/source#"+digest, "--fp8", "--rental=attached", "--json", "--idempotency-key", "held")
-	if code != 0 || held.Load() != 1 {
-		t.Fatalf("the machine did not hold the checkpoint before the run (%d holds): %d %s", held.Load(), code, out)
-	}
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	row, problem := store.RequestByIdempotencyKey("held")
-	fatal(t, problem)
-	if row == nil || row.Entrypoint != "fp8" || row.RequestedRental != podRental || len(row.Models) != 1 || row.Models[0].Manifest != digest {
-		t.Fatalf("the quantizer was not queued on the rental: %+v", row)
 	}
 }

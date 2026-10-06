@@ -90,9 +90,6 @@ func foregroundInstall(ctx *Context, ep *machineendpoint.Endpoint, machine strin
 	result, problem := runs.prewarmV1(runs.ctx, install, func(p machines.InstallProgress) {
 		watch.report(ctx, p.Stage, p.TransferredBytes, p.TotalBytes)
 	})
-	if problem == errNotV1 {
-		return false, nil
-	}
 	if problem != nil {
 		named := *problem
 		named.Message = machine + ": " + problem.Message

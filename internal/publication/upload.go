@@ -2,8 +2,9 @@ package publication
 
 import (
 	"context"
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"sort"
+
+	"github.com/cozy-creator/cozy/internal/canonical"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"

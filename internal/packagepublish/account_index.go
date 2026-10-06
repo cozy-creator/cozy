@@ -66,14 +66,6 @@ func UsesAccountIndex(project string) (bool, *exit.Error) {
 	return uses, nil
 }
 
-// UsesAccountIndexDocument reads a frozen installation's metadata. Its reserved
-// index may already be bound by Creator; only authored dependency selectors decide
-// whether the machine needs the request's explicitly selected Hub authority.
-func UsesAccountIndexDocument(raw []byte) (bool, *exit.Error) {
-	uses, _, problem := accountIndexDocument(raw)
-	return uses, problem
-}
-
 func accountIndexDocument(raw []byte) (bool, string, *exit.Error) {
 	if len(raw) == 0 || len(raw) > maxProjectMetadataBytes {
 		return false, "", exit.Named(exit.Validation, "project_metadata_unreadable", "pyproject.toml must be non-empty and at most %d bytes", maxProjectMetadataBytes)

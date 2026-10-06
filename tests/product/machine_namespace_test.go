@@ -3,8 +3,6 @@ package producttest
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +12,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/machines"
-	"github.com/cozy-creator/cozy/internal/userunit"
 )
 
 func TestLegacyLiveRecordRefusesNewNamespace(t *testing.T) {
@@ -199,127 +196,4 @@ func TestStaleProcessGenerationDoesNotAuthorizeTermination(t *testing.T) {
 	if err := process.Process.Signal(syscall.Signal(0)); err != nil {
 		t.Fatalf("stale process generation authorized termination: %v", err)
 	}
-}
-
-func TestLiveRuntimeMissingMetadataPreservesPausedWork(t *testing.T) {
-	_, h, launch := scopedMachine(t, true)
-	journal := func() string {
-		t.Helper()
-		script := `import sqlite3,sys,json
-c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
-r=c.execute("SELECT state,desired,generation,ordinal,collected,retention_waived FROM executions WHERE owner='cozy-local-client' AND request='scoped-paused'").fetchone()
-assert r and r[0]=='paused',r
-print(json.dumps(r))`
-		out, err := exec.Command(machinePython(t), "-I", "-c", script, filepath.Join(h.Root(), "var/lib/tensorfs/.cozy-workspace/journal.sqlite3")).CombinedOutput()
-		if err != nil {
-			t.Fatalf("read retained execution: %v %s", err, out)
-		}
-		return string(out)
-	}
-	beforeJournal := journal()
-	path := filepath.Join(filepath.Dir(h.Root()), "installed.json")
-	body, err := os.ReadFile(path)
-	must(t, err)
-	must(t, os.Remove(path))
-	defer func() { must(t, os.WriteFile(path, body, 0600)) }()
-	authority := func() string {
-		t.Helper()
-		files := map[string]*string{}
-		for _, relative := range []string{"var/lib/cozy/machine/hub-access.json", "run/cozy/bootstrap/machine-hubs.json"} {
-			data, err := os.ReadFile(filepath.Join(h.Root(), relative))
-			if os.IsNotExist(err) {
-				files[relative] = nil
-				continue
-			}
-			must(t, err)
-			value := string(data)
-			files[relative] = &value
-		}
-		data, err := json.Marshal(files)
-		must(t, err)
-		return string(data)
-	}
-	before := authority()
-	_, problem := h.Install(t.Context(), machines.Source{}, "must-not-run-uv")
-	if problem == nil || problem.ErrName() != "machine.installation_unreadable" {
-		t.Fatalf("missing metadata admitted live bootstrap: %v", problem)
-	}
-	if authority() != before {
-		t.Fatal("refused bootstrap changed machine authority")
-	}
-	awaitScopedMachine(t, h, launch)
-	if journal() != beforeJournal {
-		t.Fatal("refused bootstrap changed retained execution")
-	}
-}
-
-// A live agent whose launch record is missing is read back from its systemd user unit and
-// adopted. Without a user manager there is no unit to read it from: the launch is refused and
-// the agent keeps running untouched.
-func TestMissingLaunchRecordAdoptsKernelOwnedRuntime(t *testing.T) {
-	_, h, launch := scopedMachine(t, true)
-	dir := filepath.Dir(h.Root())
-	recordPath := filepath.Join(dir, "agent.json")
-	record, err := os.ReadFile(recordPath)
-	must(t, err)
-	paths := []string{filepath.Join(dir, "receipt-key")}
-	pin, problem := h.Pin()
-	fatal(t, problem)
-	transport := &http.Transport{TLSClientConfig: pin.TLSConfig()}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport}
-	readReceipt := func() []byte {
-		t.Helper()
-		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://"+launch.MediaAddr+"/v1/bootstrap/receipt", nil)
-		must(t, err)
-		response, err := client.Do(request)
-		must(t, err)
-		defer response.Body.Close()
-		if response.StatusCode != http.StatusOK {
-			t.Fatalf("receipt read: HTTP %d", response.StatusCode)
-		}
-		body, err := io.ReadAll(response.Body)
-		must(t, err)
-		return body
-	}
-	receiptBefore := readReceipt()
-	before := map[string][]byte{}
-	for _, path := range paths {
-		body, err := os.ReadFile(path)
-		must(t, err)
-		before[path] = body
-	}
-	// Restore only this isolated fixture's original ownership records for cleanup.
-	defer func() {
-		must(t, os.WriteFile(recordPath, record, 0600))
-		for path, body := range before {
-			must(t, os.WriteFile(path, body, 0600))
-		}
-	}()
-	must(t, os.Remove(recordPath))
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancel()
-	adopts := userunit.Available()
-	adopted, problem := machines.NewHost(dir, "", nil).Ensure(ctx, "", nil, true)
-	if adopts && (problem != nil || adopted.PID != launch.PID || adopted.BootID != launch.BootID) {
-		t.Errorf("launch did not adopt the running kernel owner %d: %+v, %v", launch.PID, adopted, problem)
-	}
-	if !adopts && (problem == nil || (problem.ErrName() != "machine.process_untracked" && problem.ErrName() != "machine.busy")) {
-		t.Errorf("launch ignored an existing kernel owner: %v", problem)
-	}
-	for path, body := range before {
-		after, err := os.ReadFile(path)
-		if err != nil || string(after) != string(body) {
-			t.Errorf("launch changed the running owner's %s", filepath.Base(path))
-		}
-	}
-	if _, err := os.Stat(recordPath); adopts && err != nil {
-		t.Errorf("the adopted owner has no launch record: %v", err)
-	} else if !adopts && !os.IsNotExist(err) {
-		t.Error("launch replaced missing ownership with another process")
-	}
-	if string(readReceipt()) != string(receiptBefore) {
-		t.Error("launch changed the running owner's public identity receipt")
-	}
-	awaitScopedMachine(t, h, launch)
 }

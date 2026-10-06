@@ -176,35 +176,6 @@ func hubGrantMinter(hubURL string) orchestrator.WeightsGrantMinter {
 	}
 }
 
-func TestHeldObjectsReuseOneGrantWindowWithoutAnExpiry(t *testing.T) {
-	clock := newGrantClock()
-	origin := newExpiringOrigin(clock)
-	defer origin.server.Close()
-	ids := walkObjects()
-	var mints atomic.Int64
-	hubServer := standInGrantHub(origin, &mints, clock, ids...)
-	defer hubServer.Close()
-	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
-	start := clock.Now()
-	for index, id := range ids {
-		decision, problem := window.Spendable(context.Background(), id, ids[index:],
-			start.Add(time.Duration(index)*time.Hour))
-		if problem != nil || !decision.Held || decision.URL != "" || decision.ObjectID != id {
-			t.Fatalf("object %d: decision=%+v problem=%v", index, decision, problem)
-		}
-	}
-	if got := mints.Load(); got != 1 {
-		t.Fatalf("%d already-held objects needed %d grant requests, want one cached window", len(ids), got)
-	}
-	window.Expire()
-	if _, problem := window.Spendable(context.Background(), ids[0], ids, start); problem != nil {
-		t.Fatal(problem)
-	}
-	if got := mints.Load(); got != 2 {
-		t.Fatalf("explicit invalidation made %d grant requests, want 2", got)
-	}
-}
-
 func TestHeldDecisionSurvivesExpiredURLInSameWindow(t *testing.T) {
 	clock := newGrantClock()
 	origin := newExpiringOrigin(clock)
@@ -296,6 +267,35 @@ func TestAnUpFrontMintCannotOutliveItsOwnLifetime(t *testing.T) {
 	}
 	t.Fatal("every up-front grant outlived the walk; this control can no longer detect the " +
 		"defect the point-of-use mint exists to remove")
+}
+
+func TestHeldObjectsReuseOneGrantWindowWithoutAnExpiry(t *testing.T) {
+	clock := newGrantClock()
+	origin := newExpiringOrigin(clock)
+	defer origin.server.Close()
+	ids := walkObjects()
+	var mints atomic.Int64
+	hubServer := standInGrantHub(origin, &mints, clock, ids...)
+	defer hubServer.Close()
+	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
+	start := clock.Now()
+	for index, id := range ids {
+		decision, problem := window.Spendable(context.Background(), id, ids[index:],
+			start.Add(time.Duration(index)*time.Hour))
+		if problem != nil || !decision.Held || decision.URL != "" || decision.ObjectID != id {
+			t.Fatalf("object %d: decision=%+v problem=%v", index, decision, problem)
+		}
+	}
+	if got := mints.Load(); got != 1 {
+		t.Fatalf("%d already-held objects needed %d grant requests, want one cached window", len(ids), got)
+	}
+	window.Expire()
+	if _, problem := window.Spendable(context.Background(), ids[0], ids, start); problem != nil {
+		t.Fatal(problem)
+	}
+	if got := mints.Load(); got != 2 {
+		t.Fatalf("explicit invalidation made %d grant requests, want 2", got)
+	}
 }
 
 // TestAnExpiredGrantIsReMintedRatherThanReplayed is the credential-replay arm. A refusal that

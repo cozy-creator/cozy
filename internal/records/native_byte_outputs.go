@@ -3,7 +3,6 @@ package records
 import (
 	"bytes"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,15 +10,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
-
-// NativeByteProducerRoot follows the ordinary Runtime byte ledger identity. The
-// producer is the recorded original attempt, independently of reply correlation.
-func NativeByteProducerRoot(owner, request string, attempt int64, spec []byte, slot string) string {
-	raw, _ := json.Marshal([]any{"byte-output", owner, request, attempt, hex.EncodeToString(spec), slot})
-	raw, _ = canonical.NormalizeJCS(raw)
-	digest, _ := canonical.Spell(canonical.Digest(raw))
-	return digest
-}
 
 func (s *Store) NativeByteOutput(service string) (*ByteOutput, *exit.Error) {
 	b, err := scanByteOutput(s.db.QueryRow(`SELECT `+byteOutputCols+` FROM byte_outputs WHERE native_service_id=?`, service))

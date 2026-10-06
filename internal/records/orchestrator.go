@@ -668,22 +668,6 @@ type ModelAdapterRef struct {
 	Profiles        []string `json:"profiles,omitempty"`
 }
 
-// SameAdapters compares execution/custody identity, excluding sizing observations.
-func SameAdapters(a, b []ModelAdapterRef) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i, left := range a {
-		right := b[i]
-		if left.Component != right.Component || left.Model != right.Model || left.Release != right.Release ||
-			left.Lane != right.Lane || left.Manifest != right.Manifest || left.SourceComponent != right.SourceComponent || left.Scale != right.Scale ||
-			left.Source != right.Source || !slices.Equal(left.Profiles, right.Profiles) {
-			return false
-		}
-	}
-	return true
-}
-
 // BindingSlot is the slot's one identity: its package interface model path. A job keeps
 // Slot as the bare invocation parameter and carries the path beside it.
 func (m ModelRef) BindingSlot() string {

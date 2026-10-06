@@ -39,53 +39,43 @@ import (
 // attaching: the id is the idempotency, so nothing is frozen, closed or acknowledged. Outputs
 // are read with Read into the run's outputs folder as their revisions land.
 
-// errNotV1 is a machine that serves no cozy.machine.v1: its run takes the worker.v1 path.
-var errNotV1 = exit.Named(exit.Unavailable, "machine.v1_absent", "the machine serves no cozy.machine.v1")
-
-// loopV1 follows one run on a v1 machine until it is settled. It answers true when the run
-// belongs to the worker.v1 path instead (a machine without v1, or a run sent there earlier).
-func (m *machineRuns) loopV1(request records.Request) bool {
+// loopV1 follows one run on its machine until it is settled.
+func (m *machineRuns) loopV1(request records.Request) {
 	defer m.enforceDeadlineV1(request)()
 	lastError, delay := "", time.Second
 	for m.ctx.Err() == nil {
 		current, problem := m.store.RequestRow(request.ID)
 		if problem != nil || current == nil {
-			return false
+			return
 		}
 		link, problem := m.store.MachineExecution(request.ID)
 		if problem != nil || link == nil || link.Abandoned {
-			return false
+			return
 		}
 		accepted, problem := m.store.RunV1(request.ID)
 		if problem != nil {
-			return false
-		}
-		if !accepted && (len(link.Receipt) > 0 || len(link.Submission) > 0) {
-			return true
+			return
 		}
 		if accepted && link.Collected {
-			return false
+			return
 		}
 		// Work its machine never accepted is sent only while it is due: never once settled,
 		// paused or blocked (a daemon restart must not start it). A canceled run whose spec was
 		// sent has its cancel delivered.
 		if !accepted && (records.Settled(current.State) || slices.Contains([]string{"pausing", "paused", "blocked"}, current.State)) {
 			m.tellCancelV1(*current, link)
-			return false
+			return
 		}
 		done, problem := m.stepV1(m.ctx, *current, link, accepted, false)
-		if problem == errNotV1 {
-			return true
-		}
 		if done {
-			return false
+			return
 		}
 		if problem != nil && problem.Message != lastError && m.ctx.Err() == nil {
 			fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, problem.Message)
 			lastError = problem.Message
 			if again, _ := m.store.RunV1(request.ID); !again && permanentRefusal(problem) {
 				_, _ = m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
-				return false
+				return
 			}
 			if !accepted {
 				parked := map[string]any{"reason": problem.Message, "wait": orchestrator.WaitRental}
@@ -105,11 +95,10 @@ func (m *machineRuns) loopV1(request records.Request) bool {
 		}
 		select {
 		case <-m.ctx.Done():
-			return false
+			return
 		case <-time.After(delay):
 		}
 	}
-	return false
 }
 
 // tellCancelV1 delivers a cancel that settled here before the machine's acceptance was
@@ -193,11 +182,6 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 	defer machine.Close()
 	var spec *v1.RunSpec
 	if !accepted {
-		if _, err := machine.Status(ctx); status.Code(err) == codes.Unimplemented {
-			return false, errNotV1
-		} else if err != nil {
-			return false, machines.Transport(err)
-		}
 		m.submissionStage(request.ID, "connect", link.MachineID, began)
 		if spec, problem = m.specV1(ctx, request, machine); problem != nil {
 			return false, problem
@@ -466,8 +450,7 @@ func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection)
 
 // prewarmV1 makes an installation present as a warm run named by the installation: its code
 // installed (no entrypoint), its Hub models downloaded, a provider source made and, with a
-// destination, uploaded under a publication authorization granted to this machine. errNotV1
-// is a machine that serves no cozy.machine.v1, or none that takes this installation.
+// destination, uploaded under a publication authorization granted to this machine.
 func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) (json.RawMessage, *exit.Error) {
 	selection := row.Selection
 	machine, problem := m.machines.DialV1(ctx, row.RentalID, "installing "+either(selection.Package, "models"))
@@ -479,14 +462,13 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		return nil, exit.Unavailablef("the rental's worker restarted before preparation; the installation is claimed again on its new boot")
 	}
 	frame, err := machine.Status(ctx)
-	if status.Code(err) == codes.Unimplemented {
-		return nil, errNotV1
-	} else if err != nil {
+	if err != nil {
 		return nil, machines.Transport(err)
 	}
 	capabilities := frame.GetCapabilities()
 	if !slices.Contains(capabilities, "warm/1") || selection.Destination != "" && !slices.Contains(capabilities, "upload/1") {
-		return nil, errNotV1
+		return nil, exit.Named(exit.Structural, "machine.warm_unsupported",
+			"this machine takes no warm runs or model uploads; %s", machines.RuntimeUpdate(row.RentalID))
 	}
 	if selection.HoldsLocally() && !slices.Contains(capabilities, "local-models/1") {
 		return nil, exit.Named(exit.Structural, "machine.local_models_unsupported",

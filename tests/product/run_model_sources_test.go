@@ -172,43 +172,6 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 	}
 }
 
-func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
-	root, mu, posts, digest, manifest := runModelCatalog(t)
-	startDaemonProcess(t, root)
-	if accepted := queuedTransfer(t, root, "model", "download", "proof/source#"+digest, "local/checkpoint-proof", "--json", "--full"); len(accepted.Models) != 1 || accepted.Models[0].Manifest != digest {
-		t.Fatalf("checkpoint download lost its checkpoint: %+v", accepted)
-	}
-	args := []string{"run", "proof/quantize/quantize", "steps=7",
-		"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
-		"--upload-to", "proof/output", "--rental-only", "--json", "--idempotency-key", "retained-model-job"}
-	code, out := runCozy(t, root, args...)
-	if code != 0 {
-		t.Fatalf("digest-only job did not queue: %d %s", code, out)
-	}
-	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer st.Close()
-	row, problem := st.RequestByIdempotencyKey("retained-model-job")
-	fatal(t, problem)
-	if row == nil || len(row.Models) != 2 {
-		t.Fatal("retained inputs missing from request")
-	}
-	for _, model := range row.Models {
-		if !model.HubCheckpoint || !model.Downloadable() || model.Manifest != digest || model.ManifestLength != int64(len(manifest)) || model.Release != "" || model.Lane != "" || model.ComponentBytes["model"] != 100 {
-			t.Fatal("job lost Hub facts or invented release metadata")
-		}
-	}
-	waitUntil(t, "retained checkpoint identity reaches sizing boundary", func() bool { mu.Lock(); defer mu.Unlock(); return len(*posts) > 0 })
-	mu.Lock()
-	body := append([]byte(nil), (*posts)[0]...)
-	mu.Unlock()
-	request, problem := hub.ParseRentalRequestBytes(body)
-	fatal(t, problem)
-	if len(request.ServingModels) != 1 || request.ServingModels[0].Manifest != digest || request.ServingModels[0].Release != "" || request.ServingModels[0].Lane != "" {
-		t.Fatal("rental declaration lost exact release-less checkpoint")
-	}
-}
-
 func TestManualRentalAcceptsRetainedCheckpointIdentity(t *testing.T) {
 	root, mu, posts, digest, _ := runModelCatalog(t)
 	startDaemonProcess(t, root)

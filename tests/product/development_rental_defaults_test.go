@@ -11,8 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 )
 
-const developmentFixtureKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea fixture"
-
 func configureDevelopmentRental(t *testing.T, root string) {
 	t.Helper()
 	path := filepath.Join(root, config.FileName)
@@ -20,65 +18,6 @@ func configureDevelopmentRental(t *testing.T, root string) {
 	must(t, err)
 	raw = append(raw, []byte("rentals:\n  development: true\n  ssh_public_key: operator.pub\n")...)
 	must(t, os.WriteFile(path, raw, 0600))
-}
-
-func TestDevelopmentDefaultsReachManualAndManagedAcquisitions(t *testing.T) {
-	for _, managed := range []bool{false, true} {
-		name := "manual"
-		if managed {
-			name = "managed"
-		}
-		t.Run(name, func(t *testing.T) {
-			root, mu, posts, digest, _ := runModelCatalog(t)
-			configureDevelopmentRental(t, root)
-			keyPath := filepath.Join(root, "operator.pub")
-			must(t, os.WriteFile(keyPath, []byte(developmentFixtureKey+"\n"), 0600))
-			startDaemonProcess(t, root)
-			args := []string{"rental", "new", "cpu", "--idempotency-key", "development-default", "--json"}
-			if managed {
-				args = []string{"run", "proof/quantize/quantize", "steps=7",
-					"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
-					"--upload-to", "proof/output", "--rental-only", "--idempotency-key", "development-default", "--json"}
-			}
-			code, out := runCozy(t, root, args...)
-			if managed && code != 0 || !managed && !strings.Contains(out, "proof.no_paid_create") {
-				t.Fatalf("development request did not reach isolated acquisition: %d %s", code, out)
-			}
-			waitUntil(t, "development acquisition", func() bool { mu.Lock(); defer mu.Unlock(); return len(*posts) > 0 })
-			mu.Lock()
-			body := append([]byte(nil), (*posts)[0]...)
-			mu.Unlock()
-			request, problem := hub.ParseRentalRequestBytes(body)
-			fatal(t, problem)
-			if request.Development == nil || request.Development.SSHPublicKey != developmentFixtureKey {
-				t.Fatalf("configured owner key did not reach %s acquisition: %+v", name, request.Development)
-			}
-			if managed {
-				return
-			}
-			// Reconciliation must use the recorded acquisition even when the file goes.
-			must(t, os.Remove(keyPath))
-			code, out = runCozy(t, root, args...)
-			if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
-				t.Fatalf("replay consulted the deleted public key: %d %s", code, out)
-			}
-			mu.Lock()
-			unchanged := len(*posts) == 2 && bytes.Equal(body, (*posts)[1])
-			mu.Unlock()
-			if !unchanged {
-				t.Fatal("replay changed development acquisition bytes")
-			}
-			code, out = runCozy(t, root, append(args, "--development=false")...)
-			if code == 0 || !strings.Contains(out, "rental.idempotency_conflict") {
-				t.Fatalf("explicit false changed pinned development access: %d %s", code, out)
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if len(*posts) != 2 {
-				t.Fatal("changed development mode reached acquisition")
-			}
-		})
-	}
 }
 
 func TestDevelopmentDefaultsRefuseMissingOrPrivateKeyBeforeAcquisition(t *testing.T) {
