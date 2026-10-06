@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,7 +18,13 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // A run reports its work as it happens, over the real CLI, daemon, Host and Runtime. The
@@ -243,7 +250,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		t.Fatalf("run.completed does not carry the run's output: %+v", output)
 	}
 	// The machine itself serves the image, the current bytes of its third revision.
-	machineServesOutput(t, root, "image", last.Digest, 3)
+	machineServesOutput(t, root, request.ID, "image", last.Digest, 3)
 
 	// Run 1591's shape: --input, --await, --json and --out, for a run that publishes and ends
 	// at once, its last revisions and its outcome landing together. --await returns once each
@@ -401,17 +408,17 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		// Scalar products use op=set on every revision; AppendedFrom describes
 		// whether the stable file can retain its already-published byte prefix.
 		if indexedMP4(data) {
-			if shown.Op != "set" || shown.AppendedFrom != nil || len(shown.Parts) != 1 || shown.Parts[0].DurationUs != uint64(k)*500000 {
+			if shown.Op != "set" || shown.AppendedFrom != nil || shown.DurationUs != uint64(k)*500000 {
 				t.Fatalf("indexed revision %d did not replace its preview whole: %+v", k, shown)
 			}
 			assertIndexedFilm(t, data, takes, 12*k, 24)
 		} else if k == 2 && (shown.Op != "set" || shown.AppendedFrom == nil || *shown.AppendedFrom != int64(len(takes[k-2])) || !bytes.HasPrefix(data, takes[k-2])) {
 			t.Fatalf("film revision %d did not append in place to revision %d: %+v", k, k-1, shown)
 		}
-		if !indexedMP4(data) && k < 3 && (len(shown.Parts) != k+1 || shown.Parts[0].DurationUs != 0 || shown.Parts[k].DurationUs != 500000) {
-			t.Fatalf("live film revision %d lost its init and half-second fragments: %+v", k, shown.Parts)
+		if !indexedMP4(data) && k < 3 && shown.DurationUs != uint64(k)*500000 {
+			t.Fatalf("live film revision %d lost its half-second fragments: %+v", k, shown)
 		}
-		if k == 3 && (shown.Op != "set" || shown.AppendedFrom != nil || len(shown.Parts) != 1 || shown.Parts[0].DurationUs != 1500000) {
+		if k == 3 && (shown.Op != "set" || shown.AppendedFrom != nil || shown.DurationUs != 1500000) {
 			t.Fatalf("the completed film did not replace its preview with one indexed MP4: %+v", shown)
 		}
 		takes = append(takes, data)
@@ -441,9 +448,6 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		t.Fatalf("the finished video file should play 3 segments: %d frames", count)
 	}
 	last = revisions()[2]
-	if len(last.Parts) != 1 || last.Parts[0].Digest != last.Digest || last.Parts[0].Length != last.Length {
-		t.Fatalf("the completed part does not name the final MP4: %+v", last.Parts)
-	}
 	movie, err := os.ReadFile(last.Path)
 	if err != nil || digestOf(movie) != last.Digest || !bytes.Equal(movie, takes[2]) {
 		t.Fatalf("the final MP4 is not the last revision: %v", err)
@@ -476,10 +480,37 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	if asked := hubCalls()[before:]; len(asked) != 0 {
 		t.Fatalf("the Hub was asked %d things while the runs went on:\n%s", len(asked), strings.Join(asked, "\n"))
 	}
-	// The machine serves the finished film itself, its parts joined, and keeps serving it with its
-	// Runtime stopped: a finished run's media never wakes the Runtime or renews idle.
-	filmRun := machineServesOutput(t, root, "video", last.Digest, 3)
-	machineServesOutputAsleep(t, root, filmRun, "video", last.Digest, 3)
+	// The machine serves the finished film itself, its parts joined.
+	machineServesOutput(t, root, film.ID, "video", last.Digest, 3)
+}
+
+// machineServesOutput reads a run's output from this computer's machine over cozy.machine.v1,
+// as the CLI's downloads do: the revision whole, its tail from an offset (where a cut download
+// resumes), and a read of an older revision refused.
+func machineServesOutput(t *testing.T, root, run, output, digest string, revisions uint64) {
+	t.Helper()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil),
+		UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
+		RentalKey: func(string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentity{}, nil }}
+	machine, problem := found.DialV1(t.Context(), machines.Local, "run outputs")
+	fatal(t, problem)
+	defer machine.Close()
+	var whole bytes.Buffer
+	meta, _, err := machine.ReadOutput(t.Context(), run, output, 0, 0, 0, &whole)
+	if err != nil || meta.Rev != revisions || digestOf(whole.Bytes()) != digest {
+		t.Fatalf("the machine served %s of %s as %+v with %d bytes: %v", output, run, meta, whole.Len(), err)
+	}
+	middle := uint64(whole.Len() / 2)
+	var tail bytes.Buffer
+	if _, _, err := machine.ReadOutput(t.Context(), run, output, 0, middle, revisions, &tail); err != nil ||
+		!bytes.Equal(tail.Bytes(), whole.Bytes()[middle:]) {
+		t.Fatalf("a read of %s from byte %d answered %d bytes: %v", output, middle, tail.Len(), err)
+	}
+	if _, _, err := machine.ReadOutput(t.Context(), run, output, 0, 0, 1, io.Discard); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a read of %s at its first revision answered %v", output, err)
+	}
 }
 
 func digestOf(data []byte) string {

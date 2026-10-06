@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -879,6 +880,8 @@ func (f *fetcherV1) stop() {
 // they match the digest, never editing it in place. `from` > 0 says the revision extends the
 // file's bytes from there, so only the tail is read; -1 says nothing is known, and a shorter
 // file is tried as a prefix first. `held` is told how many bytes are in hand as they arrive.
+// The bytes read stay beside the file until they are whole, so a read the connection cut
+// continues from where it stopped, at the same revision.
 func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product, from int64, held func(int64)) *exit.Error {
 	if product.MediaType == resultfiles.TreeMediaType {
 		return readTreeV1(ctx, machine, run, directory, product)
@@ -892,36 +895,60 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 	if held == nil {
 		held = func(int64) {}
 	}
-	read := func(offset int64) *exit.Error {
-		temporary, err := os.CreateTemp(directory, ".cozy-output-*")
-		if err != nil {
-			return exit.Named(exit.Unavailable, "output_unwritable", "cannot write into %s: %s", directory, err)
+	base := filepath.Base(product.Path)
+	partial := filepath.Join(directory, "."+base+"."+strings.TrimPrefix(product.Digest, "sha256:")[:16]+".cozy-part")
+	unwritable := func(err error) *exit.Error {
+		return exit.Named(exit.Unavailable, "output_unwritable", "cannot write into %s: %s", directory, err)
+	}
+	read := func(prefix int64) *exit.Error {
+		file, problem := lockPartial(partial)
+		if problem != nil {
+			return unwritable(problem)
 		}
-		defer os.Remove(temporary.Name())
-		if offset > 0 {
-			if prior, err := os.Open(product.Path); err == nil {
-				_, err = io.CopyN(temporary, prior, offset)
-				prior.Close()
-				if err != nil {
-					offset = 0
-					_, _ = temporary.Seek(0, io.SeekStart)
-					_ = temporary.Truncate(0)
+		if digestOf(product.Path) == product.Digest { // another read of this run placed it
+			_ = os.Remove(partial)
+			file.Close()
+			return nil
+		}
+		offset, err := file.Seek(0, io.SeekEnd)
+		if err == nil && offset > product.Length {
+			offset, err = 0, file.Truncate(0)
+		}
+		if err == nil && offset == 0 && prefix > 0 {
+			if prior, openErr := os.Open(product.Path); openErr == nil {
+				if offset, err = io.CopyN(file, prior, prefix); err != nil {
+					offset, err = 0, file.Truncate(0)
 				}
+				prior.Close()
 			}
 		}
+		if err != nil {
+			file.Close()
+			return unwritable(err)
+		}
 		_, _, err = machine.ReadOutput(ctx, run, product.Output, outputIndexV1(product), uint64(offset), uint64(product.Rev),
-			&counted{w: temporary, n: offset, held: held})
-		if closeErr := temporary.Close(); err == nil {
+			&counted{w: file, n: offset, held: held})
+		if closeErr := file.Close(); err == nil {
 			err = closeErr
 		}
 		if err != nil {
+			// Bytes of a revision the machine no longer serves are no one's prefix.
+			if code := status.Code(err); code == codes.FailedPrecondition || code == codes.OutOfRange {
+				_ = os.Remove(partial)
+			}
 			return machines.Transport(err)
 		}
-		if digestOf(temporary.Name()) != product.Digest {
+		if digestOf(partial) != product.Digest {
+			_ = os.Remove(partial)
 			return exit.Named(exit.Conflict, "output_revision_changed", "%s moved past revision %d while it was read", product.Output, product.Rev)
 		}
-		if err := os.Rename(temporary.Name(), product.Path); err != nil {
+		if err := os.Rename(partial, product.Path); err != nil {
 			return exit.Named(exit.Unavailable, "output_unwritable", "cannot place %s: %s", product.Path, err)
+		}
+		// The item's file is whole: what was read of its older revisions is not needed.
+		stale, _ := filepath.Glob(filepath.Join(directory, "."+globEscape(base)+".*.cozy-part"))
+		for _, path := range stale {
+			_ = os.Remove(path)
 		}
 		return nil
 	}
@@ -937,6 +964,45 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 		}
 	}
 	return read(0)
+}
+
+// lockPartial opens the partial file at path, waiting while another read of the same
+// revision holds it; one that read moved or removed meanwhile is opened again.
+func lockPartial(path string) (*os.File, error) {
+	for {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+			file.Close()
+			return nil, err
+		}
+		held, err := file.Stat()
+		at, atErr := os.Stat(path)
+		if err == nil && atErr == nil && os.SameFile(held, at) {
+			return file, nil
+		}
+		file.Close()
+		if err != nil {
+			return nil, err
+		}
+		if atErr != nil && !errors.Is(atErr, os.ErrNotExist) {
+			return nil, atErr
+		}
+	}
+}
+
+// globEscape quotes a file name for filepath.Glob.
+func globEscape(name string) string {
+	var quoted strings.Builder
+	for _, r := range name {
+		if strings.ContainsRune(`*?[\`, r) {
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteRune(r)
+	}
+	return quoted.String()
 }
 
 // counted reports how many bytes a read holds as they arrive.
