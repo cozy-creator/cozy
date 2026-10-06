@@ -84,11 +84,14 @@ func (h *Host) readinessEnvelope() string {
 	return filepath.Join(h.Root(), "run/cozy/bootstrap/readiness-envelope.json")
 }
 
-// Source optionally names the machine executable and the paired Runtime and TensorFS wheels;
-// without them, the newest published pair and the machine its Runtime wheel bundles.
+// Source is the software an install names: local files, or published versions (none: the
+// newest). Named files pin the machine; it then never follows the Hub's target.
 type Source struct {
 	Host, RuntimeWheel, TensorFSWheel string
+	RuntimeVersion, TensorFSVersion   string
 }
+
+func (s Source) pinned() bool { return s.Host != "" || s.RuntimeWheel != "" || s.TensorFSWheel != "" }
 
 type installedArtifact struct {
 	Name   string `json:"name"`
@@ -101,7 +104,8 @@ type Installed struct {
 	Runtime     installedArtifact `json:"runtime"`
 	TensorFS    installedArtifact `json:"tensorfs"`
 	InstalledAt time.Time         `json:"installed_at"`
-	HostPinned  bool              `json:"host_pinned,omitempty"`
+	// Pinned: its owner named the files it runs, so it never follows the Hub's target.
+	Pinned bool `json:"pinned,omitempty"`
 	// Replaced is set when this install replaced a machine that predated MachineAPI.
 	Replaced *Replaced `json:"replaced,omitempty"`
 }
@@ -183,22 +187,23 @@ func (h *Host) Install(ctx context.Context, source Source, uv string) (*Installe
 type staged struct {
 	dir, agent string
 	wheels     []string
-	pinned     bool
+	// pinned: the install named files; bundled: its machine came from the Runtime wheel.
+	pinned, bundled bool
 }
 
-// stage fetches what source leaves unnamed (the newest published pair, the machine its Runtime
-// wheel bundles) and checks the machine serves MachineAPI.
+// stage fetches what source leaves unnamed (its published versions or the newest, the machine
+// its Runtime wheel bundles) and checks the machine serves MachineAPI.
 func (h *Host) stage(ctx context.Context, source Source) (*staged, *exit.Error) {
 	dir, err := os.MkdirTemp(h.dir, ".install-")
 	if err != nil {
 		return nil, exit.Internalf("cannot stage the machine install: %s", err)
 	}
-	out := &staged{dir: dir, agent: source.Host, wheels: []string{source.RuntimeWheel, source.TensorFSWheel}, pinned: source.Host != ""}
+	out := &staged{dir: dir, agent: source.Host, wheels: []string{source.RuntimeWheel, source.TensorFSWheel}, pinned: source.pinned(), bundled: source.Host == ""}
 	problem := func() *exit.Error {
 		if source.RuntimeWheel == "" {
-			for i, distribution := range []string{hostruntime.Distribution, "tensorfs"} {
-				if out.wheels[i], err = publishedWheel(ctx, distribution, dir); err != nil {
-					return exit.New(exit.Unavailable, "cannot fetch the published %s: %s", distribution, err)
+			for i, published := range [][2]string{{hostruntime.Distribution, source.RuntimeVersion}, {"tensorfs", source.TensorFSVersion}} {
+				if out.wheels[i], err = publishedWheel(ctx, published[0], published[1], dir); err != nil {
+					return exit.New(exit.Unavailable, "cannot fetch the published %s: %s", published[0], err)
 				}
 			}
 		}
@@ -235,11 +240,11 @@ func (h *Host) place(staged *staged, uv string) (*Installed, *exit.Error) {
 		return nil, problem
 	}
 	var err error
-	installed := Installed{InstalledAt: time.Now().UTC(), HostPinned: staged.pinned}
+	installed := Installed{InstalledAt: time.Now().UTC(), Pinned: staged.pinned}
 	if installed.Host, err = h.placeHost(staged.agent); err != nil {
 		return nil, exit.Internalf("cannot install the machine: %s", err)
 	}
-	if !staged.pinned {
+	if staged.bundled {
 		installed.Host.Name = "cozy-machine"
 	}
 	kept, err := h.keepWheels(staged.wheels)
@@ -297,6 +302,9 @@ type Launch struct {
 	// Reads is the origin the machine reads the asked hub at when that is not its own
 	// hub: each run of it names this (wire 67). "" at its own hub.
 	Reads string
+	// Kept says why a machine this launch started kept its software instead of the Hub's
+	// target, or "".
+	Kept string
 }
 
 func (l *Launch) at(reads string) *Launch {
@@ -345,8 +353,9 @@ func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client,
 	return h.ensureLocked(ctx, hubOrigin, client, !attach)
 }
 
-// Start starts the machine, or attaches to the running one, after any command changing it.
-func (h *Host) Start(ctx context.Context) (*Launch, *exit.Error) {
+// Start starts the machine, or attaches to the running one, after any command changing it. A
+// machine it starts follows the target software account's Hub names.
+func (h *Host) Start(ctx context.Context, account *hub.Client) (*Launch, *exit.Error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	unlock, problem := h.lock(ctx)
@@ -357,7 +366,7 @@ func (h *Host) Start(ctx context.Context) (*Launch, *exit.Error) {
 	if problem := h.recoverReplace(ctx); problem != nil {
 		return nil, problem
 	}
-	return h.ensureLocked(ctx, "", nil, true)
+	return h.ensureLocked(ctx, "", account, true)
 }
 
 func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.Client, start bool) (*Launch, *exit.Error) {
@@ -385,6 +394,7 @@ func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.C
 			if launch, problem = h.launchLocked(ctx); problem != nil {
 				return nil, problem
 			}
+			launch.Kept = h.follow(ctx, client)
 		}
 	}
 	h.ResumeExecutionAccessCleanup(ctx, launch)

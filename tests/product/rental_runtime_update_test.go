@@ -23,7 +23,7 @@ import (
 func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T) {
 	f := updateFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
-	update, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, "", nil)
+	update, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, nil)
 	fatal(t, problem)
 	update.Selection = []byte(`{"wheels":[]}`)
 	update.State = "updating"
@@ -133,7 +133,7 @@ func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 	}
 	selection, err := json.Marshal(map[string]any{"local_runtime": map[string]any{"path": candidate, "digest": "sha256:exact", "length": 22}, "local_tensorfs": map[string]any{"path": tensorfs, "digest": "sha256:tensorfs", "length": 22}})
 	must(t, err)
-	initial, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, "", selection)
+	initial, problem := f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, selection)
 	fatal(t, problem)
 	f.store.Close()
 	reopened, problem := records.Open(f.layout.DB)

@@ -60,6 +60,12 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 			return problem
 		}
 	}
+	if source.RuntimeWheel == "" {
+		// Unnamed software is the Hub's target; a Hub that names none, the newest release.
+		if target, problem := client(ctx).Software(installCtx); problem == nil {
+			source.RuntimeVersion, source.TensorFSVersion = target.Runtime, target.TensorFS
+		}
+	}
 	installed, problem := host.Install(installCtx, source, uv)
 	if problem != nil {
 		return problem
@@ -169,8 +175,12 @@ func handleMachineStart(ctx *Context) *exit.Error {
 	}
 	startCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if _, problem := host.Start(startCtx); problem != nil {
+	launch, problem := host.Start(startCtx, client(ctx))
+	if problem != nil {
 		return problem
+	}
+	if launch.Kept != "" {
+		fmt.Fprintln(ctx.Err, "machine: "+launch.Kept)
 	}
 	return handleMachineShow(ctx)
 }

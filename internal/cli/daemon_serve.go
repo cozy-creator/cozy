@@ -133,6 +133,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	defer machines.cancel()
 	updates := &rentalRuntimeUpdates{machines: machines}
 	machines.updates = updates
+	fleet.boot = updates.Boot
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution: machines.Start,

@@ -42,6 +42,9 @@ type managedRentals struct {
 	installs  *machines.Installs
 	// forget drops the daemon's kept connection to a machine whose rental ended.
 	forget func(string)
+	// boot brings a newly attached worker boot to the Hub's target software before it takes
+	// work: daemon setup installs it.
+	boot func(string)
 	// said holds the last line printed about each rental, so the fleet speaks once per change.
 	said   map[string]string
 	closed bool
@@ -593,9 +596,6 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 	if spent {
 		return orchestrator.ExcludedSpent, nil
 	}
-	if hold := m.store.RuntimeUpdateHold(row.ID); hold != nil && hold.ErrName() == "rental.unusable" {
-		return orchestrator.ExcludedUnusable, nil
-	}
 	return "", nil
 }
 
@@ -664,6 +664,9 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	delete(m.buying, operationKey)
 	if problem == nil {
 		m.observeDiskLocked(row.ID, bought)
+		if m.boot != nil {
+			m.boot(row.ID)
+		}
 	}
 	return row, problem
 }
@@ -1092,13 +1095,16 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 	return problem
 }
 
-// reattach drops the kept connection to a rebooted rental, so its next use claims the new boot.
-// Work bound to the old boot settles on its own; the rental, its custody, installs and
-// queue continue on the new worker.
+// reattach drops the kept connection to a newly attached boot, so its next use claims it, and
+// brings the boot to the target software first. Work bound to an old boot settles on its own;
+// the rental, its custody, installs and queue continue on the new worker.
 func (m *managedRentals) reattach(ids []string) {
 	for _, id := range ids {
 		if m.forget != nil {
 			m.forget(id)
+		}
+		if m.boot != nil {
+			m.boot(id)
 		}
 	}
 	if len(ids) > 0 {
@@ -1338,9 +1344,9 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			if _, problem := finishRentalAttachment(m.layout, m.store, row, remote, operation.Key, token, creator); problem != nil {
 				return released, failed, rebooted, problem
 			}
-			// The rental just crossed acquiring -> attachable. Re-ask pinned
-			// machine executions now; they may have been parked before restart.
-			m.wakeQueueAsync()
+			// The rental just crossed acquiring -> attachable: its boot is attached as a
+			// rebooted one is, and parked machine executions are asked again.
+			rebooted = append(rebooted, row.ID)
 			continue
 		}
 		if remote.Attachable() && localRentalAttachable(row) && remote.WorkerID == row.ExpectedWorkerID &&
