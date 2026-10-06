@@ -326,37 +326,6 @@ func (s *Store) RequestMachineCancellation(id, actor string) (bool, *exit.Error)
 	return len(link.Receipt) > 0, nil
 }
 
-// SettleStoppedMachineCancellation settles only work known not to have been sent. A stopped
-// native machine cannot acknowledge an earlier acceptance or the durable cancel fence.
-func (s *Store) SettleStoppedMachineCancellation(id string) *exit.Error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot settle a stopped machine's cancellation: %s", err)
-	}
-	defer tx.Rollback()
-	link, err := scanMachineExecution(tx.QueryRow(`SELECT `+machineExecutionColumns+` FROM machine_executions WHERE request_id=?`, id))
-	if err != nil {
-		return exit.Internalf("cannot read a stopped machine's cancellation: %s", err)
-	}
-	if link == nil || link.Abandoned || !link.CancelRequested {
-		return nil
-	}
-	var native bool
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type IN (?,?))`, id, RunV1Sent, RunV1Accepted).Scan(&native); err != nil {
-		return exit.Internalf("cannot inspect stopped native cancellation: %s", err)
-	}
-	if native {
-		return nil // remains pending until its machine's fence/outcome is observed
-	}
-	if err := projectCancellationTx(tx, id, "canceled", "machine_stopped"); err != nil {
-		return exit.Internalf("cannot settle a stopped machine's cancellation: %s", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit a stopped machine's cancellation: %s", err)
-	}
-	return nil
-}
-
 // projectCancellationTx moves an unfinished run to `state` with its event. A finished run
 // keeps its terminal: what settles after it is a note, never a second status.
 func projectCancellationTx(tx *sql.Tx, id, state, scope string) error {

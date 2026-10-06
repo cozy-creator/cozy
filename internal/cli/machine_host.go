@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machines"
@@ -183,6 +184,35 @@ func handleMachineStart(ctx *Context) *exit.Error {
 		fmt.Fprintln(ctx.Err, "machine: "+launch.Kept)
 	}
 	return handleMachineShow(ctx)
+}
+
+// startForCancel starts this computer's stopped machine for a canceled run still waiting on
+// it, as `cozy machine start` does: the daemon then delivers the cancel and the run settles
+// as its machine says (canceled, or completed if it finished first). A machine that cannot
+// start leaves the run canceling, and the caller is told why and what to do next.
+func startForCancel(ctx *Context, number int64, id, status string, view *api.MachineExecutionView) *exit.Error {
+	if status != "canceling" || view == nil || view.Machine != machines.Local || view.AbandonedLocally {
+		return nil
+	}
+	host, problem := localMachineHost(ctx)
+	if problem != nil {
+		return problem
+	}
+	if current, problem := host.Status(); problem == nil && current.Running {
+		return nil
+	}
+	startCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if _, problem := host.Start(startCtx, client(ctx)); problem != nil {
+		remedy := problem.Remedy
+		if remedy == "" {
+			remedy = "`cozy machine start` shows why it cannot start; the cancel is delivered as soon as the machine runs"
+		}
+		return exit.Named(problem.Code, "run.cancel_waits_for_machine",
+			"run %s stays canceling: this computer's machine could not start to take the cancel: %s", runReference(number, id), problem.Message).
+			WithRemedy("%s", remedy).WithNext("cozy machine start", "cozy run cancel "+runReference(number, id)+" --await")
+	}
+	return nil
 }
 
 func handleMachineStop(ctx *Context) *exit.Error {

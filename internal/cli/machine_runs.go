@@ -220,31 +220,14 @@ func (m *machineRuns) collectionRefused(id string) bool {
 	return problem == nil && code != ""
 }
 
-// Control wakes delivery of a durable cancel without waiting on its machine.
+// Control wakes delivery of a durable cancel without waiting on its machine. A run on this
+// computer's stopped machine stays canceling until the machine runs again: `cozy run cancel`
+// starts it, as any local run does, and the run settles as its machine says.
 // Pause/resume retain their synchronous generation-checked control path.
 func (m *machineRuns) Control(parent context.Context, request records.Request, action string) *exit.Error {
 	if action == "cancel" {
 		m.Withdraw(request.ID)
-		if link, problem := m.store.MachineExecution(request.ID); problem == nil && link != nil {
-			m.settleStoppedCancellation(link)
-		}
 		return m.Start(request)
 	}
 	return m.controlV1(parent, request, action)
-}
-
-// settleStoppedCancellation settles a requested cancel whose run is on this computer's machine
-// while that machine is stopped: its unit and agent have ended, so nothing of the run executes.
-// The observer still delivers the cancel when the machine next runs. `cozy machine stop` used
-// to leave such runs canceling until the next start, and `--await` waited with them.
-func (m *machineRuns) settleStoppedCancellation(link *records.MachineExecution) {
-	if link.MachineID != machines.Local || !link.CancelRequested || link.Abandoned || m.machines == nil || m.machines.Host == nil {
-		return
-	}
-	if status, problem := m.machines.Host.Status(); problem != nil || status.Running {
-		return
-	}
-	if problem := m.store.SettleStoppedMachineCancellation(link.RequestID); problem != nil {
-		fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", link.RequestID, problem.Message)
-	}
 }

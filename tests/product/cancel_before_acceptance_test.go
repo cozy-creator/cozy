@@ -13,9 +13,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/secret"
@@ -24,21 +22,16 @@ import (
 
 // A native Run may already have been accepted despite a lost first state frame.
 // Cancellation stays pending until the same machine can answer for the run;
-// an unreachable endpoint is not proof that work never started.
-//
-// This computer's stopped machine is proof: its unit and agent have ended, so nothing of the
-// run executes. Its cancel settles on record at once, whether the machine never answered or
-// was executing the run, and the intent is kept for the machine's journal (runs 2677-2679 and
-// 2801-2802 stayed canceling after `cozy machine stop` until the machine next started).
+// an unreachable endpoint is not proof that work never started. This computer's own
+// stopped machine is started to take the cancel (stopped_machine_cancel_test.go).
 func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: the current native machine fixture")
 	}
-	for _, arm := range []struct{ name, machine string }{{"local machine never boots", machines.Local},
-		{"rental unavailable", "pr-deadpoddeadpoddead0"},
+	for _, arm := range []struct{ name, machine string }{{"rental unavailable", "pr-deadpoddeadpoddead0"},
 		{"rental cancel recorded while daemon down", "pr-deadpoddeadpoddead0"},
 		{"rental native signing key lost", "pr-deadpoddeadpoddead0"},
-		{"local machine stopped while executing", machines.Local}} {
+		{"rental executing", "pr-deadpoddeadpoddead0"}} {
 		machine := arm.machine
 		t.Run(arm.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -46,25 +39,22 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 				[]byte("tensorhub_url: http://127.0.0.1:1\ntensorhub_token: unreachable\n"), 0o600))
 			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)
-			rented := machine != machines.Local
-			if rented {
-				layout, problem := home.Open(root)
-				fatal(t, problem)
-				identity, problem := rental.PendingCreatorIdentity(layout, "unavailable-native-run")
-				fatal(t, problem)
-				fatal(t, rental.Attach(layout, store, records.Rental{ID: machine, MachineName: "deadpod", SKU: "cpu", AcceleratorModel: "CPU",
-					AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, State: "ready", Address: "127.0.0.1:1", Hub: "http://127.0.0.1:1",
-					ExpectedWorkerID: "unavailable-native-machine", ExpectedWorkerBootID: "unavailable-native-boot"},
-					unavailableNativeCertificate(t), secret.New(""), identity))
-			}
+			layout, problem := home.Open(root)
+			fatal(t, problem)
+			identity, problem := rental.PendingCreatorIdentity(layout, "unavailable-native-run")
+			fatal(t, problem)
+			fatal(t, rental.Attach(layout, store, records.Rental{ID: machine, MachineName: "deadpod", SKU: "cpu", AcceleratorModel: "CPU",
+				AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, State: "ready", Address: "127.0.0.1:1", Hub: "http://127.0.0.1:1",
+				ExpectedWorkerID: "unavailable-native-machine", ExpectedWorkerBootID: "unavailable-native-boot"},
+				unavailableNativeCertificate(t), secret.New(""), identity))
 			request, _, problem := store.Submit(records.Request{ID: "req-stuck-cancel", IdemKey: "stuck-cancel", Package: "proof/stuck",
 				Entrypoint: "generate", Payload: []byte(`{}`), BodyDigest: childDigest("9"), MachineExecutionObserver: true,
-				Rental: rented, RequestedRental: map[bool]string{true: machine}[rented]})
+				Rental: true, RequestedRental: machine})
 			fatal(t, problem)
 			fatal(t, store.LinkMachineExecution(request.ID, machine))
 			// This is the marker the native transport writes before sending Run.
 			fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machine}))
-			executing := arm.name == "local machine stopped while executing"
+			executing := arm.name == "rental executing"
 			if executing {
 				fatal(t, store.AcceptRunV1(request.ID, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 			}
@@ -76,18 +66,6 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 				must(t, os.Remove(home.Paths(root).RentalCreatorIdentity(machine)))
 			}
 			store.Close()
-			if !rented {
-				// The full native suite provisions machines automatically. Hold this
-				// fixture's real lifecycle lock so it remains genuinely unavailable.
-				provisionMachine(t, root)
-				dir := filepath.Join(root, "machine")
-				must(t, os.MkdirAll(dir, 0700))
-				lease, err := os.OpenFile(filepath.Join(dir, "host.lock"), os.O_CREATE|os.O_RDWR, 0600)
-				must(t, err)
-				must(t, flock.Exclusive(lease))
-				defer lease.Close()
-				defer flock.Release(lease)
-			}
 			began := time.Now()
 			startDaemonProcess(t, root)
 			if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 ||
