@@ -83,7 +83,15 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			startDaemonProcess(t, root)
 			if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 ||
 				!strings.Contains(out, map[bool]string{true: `"canceling"`, false: `"canceled"`}[rented]) {
-				t.Fatalf("cancel did not end the run [exit %d]: %s", code, out)
+				observations, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+				fatal(t, problem)
+				events, problem := observations.EventsAfter(request.ID, 0, 100)
+				fatal(t, problem)
+				for _, event := range events {
+					t.Logf("%s: %s", event.Type, event.Payload)
+				}
+				observations.Close()
+				t.Fatalf("cancel did not end the run [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
 			}
 			if !rented {
 				// Nothing waits for the stopped machine: the run is canceled on record, a
