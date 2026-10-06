@@ -227,6 +227,29 @@ func (s *Store) MachineExecution(id string) (*MachineExecution, *exit.Error) {
 	return value, nil
 }
 
+// UnplacedMachineExecutions are the runs in the outbox: on no machine, never accepted, and
+// neither abandoned nor lost.
+func (s *Store) UnplacedMachineExecutions() ([]string, *exit.Error) {
+	rows, err := s.db.Query(`SELECT e.request_id FROM machine_executions e WHERE e.machine_id='' AND length(e.receipt)=0
+ AND NOT `+machineExecutionAbandoned+` AND NOT `+machineExecutionLost+` ORDER BY e.rowid`)
+	if err != nil {
+		return nil, exit.Internalf("cannot read the outbox: %s", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, exit.Internalf("cannot read the outbox: %s", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot read the outbox: %s", err)
+	}
+	return ids, nil
+}
+
 func (s *Store) MachineExecutions() ([]MachineExecution, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + machineExecutionColumns + ` FROM machine_executions ORDER BY rowid`)
 	if err != nil {

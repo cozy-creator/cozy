@@ -50,8 +50,11 @@ type managedRentals struct {
 	// wakeMachine asks again about the runs a newly attached boot holds.
 	wakeMachine func(string)
 	// said holds the last line printed about each rental, so the fleet speaks once per change.
-	said   map[string]string
-	closed bool
+	said map[string]string
+	// letGone holds the failed rentals this daemon has let go: a failure is acted on once, not
+	// on every poll that repeats it.
+	letGone map[string]bool
+	closed  bool
 	// census is each Tensorhub's account view, by origin. One daemon serves every hub;
 	// each rental is reconciled, released and counted against the hub it was bought
 	// from, with that hub's own credential.
@@ -1382,7 +1385,11 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			// retries its existing execution without a second submission.
 			m.wakeQueueAsync()
 		}
-		if row.State == hub.RentalFailed {
+		if row.State == hub.RentalFailed && !m.letGone[row.ID] {
+			if m.letGone == nil {
+				m.letGone = map[string]bool{}
+			}
+			m.letGone[row.ID] = true
 			failed = append(failed, row.ID)
 		}
 	}
