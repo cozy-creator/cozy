@@ -1,15 +1,19 @@
 package producttest
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
-	"github.com/cozy-creator/cozy/internal/machines"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/machines"
 )
 
 // probeHeader is proof/probe's canonical CozyTensors header, as TensorFS produced it.
@@ -19,45 +23,86 @@ const probeHeader = "hW1jb3p5dGVuc29ycy8xgYJkdW5ldFgceyJoaWRkZW5fc2l6ZSI6NCwibGF
 	"oCBg2V2YWx1ZYEAgQCBglggR2b5Mbu3DtQx40s05Pn8XdqBdOlvQ6is152Hme/NQ9IZAgSBgmR1bm" +
 	"V0gYVmd2VpZ2h0AYEBAIGEZXZhbHVlAYEBRAAAAAA="
 
-// seedCheckpoint lands proof/probe@1.0.0/bf16 in a machine's TensorFS store with the machine's
-// own Python, as a cold pull would: the canonical CozyTensors header TensorFS produced, its
-// asset, and the released lane. It answers the manifest digest and length.
-const seedCheckpoint = `# //cozy:allow a fixture lands the one checkpoint a cold pull would, in the machine's own store
-import base64, hashlib, json, os, sys, tempfile
-import tensorfs
-root = sys.argv[1]
-store = tensorfs.Store.open(root) if os.path.isdir(root) else tensorfs.Store.init(root)
-header = base64.b64decode("` + probeHeader + `")
-ref = lambda raw: {"length": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
-with tempfile.TemporaryDirectory() as scratch:
-    for name, raw in (("header.cbor", header), ("vocab.txt", b"vocab\n")):
-        path = os.path.join(scratch, name)
-        open(path, "wb").write(raw)
-        store.put_file(path, "sha256:" + ref(raw)["sha256"], len(raw))
-raw = json.dumps({"entries": [{"blob": ref(header), "kind": "cozytensors", "path": "model.cozytensors"}]},
-    sort_keys=True, separators=(",", ":")).encode()
-manifest = "sha256:" + hashlib.sha256(raw).hexdigest()
-store.put_manifest(raw, manifest, len(raw))
-operation = store.begin_operation("seed", "proof", "probe")
-operation.hold_manifest(manifest, len(raw))
-operation.commit_release(None, "1.0.0", "bf16", manifest, len(raw))
-print(json.dumps({"manifest_id": manifest, "manifest_length": len(raw)}))
-`
-
-// seedProbe lands proof/probe@1.0.0/bf16 in the stores of both parity machines and answers the
-// Hub's resolution of it.
-func seedProbe(t *testing.T, h *machineHub, root string) map[string]any {
+// probeCheckpoint is proof/probe@1.0.0/bf16 as TensorFS made it: its manifest and its
+// objects (the canonical CozyTensors header and its asset), by sha256.
+func probeCheckpoint(t *testing.T) ([]byte, map[string][]byte) {
 	t.Helper()
-	python := machinePython(t)
-	var resolved map[string]any
-	for _, store := range []string{filepath.Join(root, "tensorfs"), filepath.Join(h.provider, "var", "lib", "tensorfs")} {
-		out, err := exec.Command(python, "-I", "-c", seedCheckpoint, store).CombinedOutput()
-		if err != nil {
-			t.Fatalf("seeding %s: %v\n%s", store, err, out)
-		}
-		must(t, json.Unmarshal(out, &resolved))
+	header, err := base64.StdEncoding.DecodeString(probeHeader)
+	must(t, err)
+	digest := func(raw []byte) string {
+		sum := sha256.Sum256(raw)
+		return hex.EncodeToString(sum[:])
 	}
-	resolved["model"], resolved["release"], resolved["lane"] = "proof/probe", "1.0.0", "bf16"
+	manifest, err := json.Marshal(map[string]any{"entries": []any{map[string]any{
+		"blob": map[string]any{"length": len(header), "sha256": digest(header)}, "kind": "cozytensors", "path": "model.cozytensors"}}})
+	must(t, err)
+	objects := map[string][]byte{}
+	for _, raw := range [][]byte{manifest, header, []byte("vocab\n")} {
+		objects[digest(raw)] = raw
+	}
+	return manifest, objects
+}
+
+// seedProbe lands proof/probe@1.0.0/bf16 in each named machine's store (this computer's, or a
+// rental's name) as a user does, with `cozy model download` from the stand-in Hub, and
+// answers the Hub's resolution of it.
+func seedProbe(t *testing.T, h *machineHub, root string, venues ...string) map[string]any {
+	t.Helper()
+	manifest, objects := probeCheckpoint(t)
+	ref := func(raw []byte) map[string]any {
+		sum := sha256.Sum256(raw)
+		return map[string]any{"length": len(raw), "sha256": hex.EncodeToString(sum[:])}
+	}
+	var closure []any
+	bytes := 0
+	for digest, raw := range objects {
+		if digest != ref(manifest)["sha256"] {
+			closure = append(closure, ref(raw))
+			bytes += len(raw)
+		}
+	}
+	resolved := map[string]any{"model": "proof/probe", "release": "1.0.0", "lane": "bf16", "bytes": bytes,
+		"manifest_id": "sha256:" + ref(manifest)["sha256"].(string), "manifest_length": len(manifest)}
+	doors := h.worker.Config.Handler
+	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/tensorfs/closure":
+			_ = json.NewEncoder(w).Encode(map[string]any{"complete": true, "lane": "bf16", "model": "proof/probe", "release": "1.0.0",
+				"manifest": ref(manifest), "objects": closure, "presign_max_digests": 64, "scope": "runtime"})
+		case r.URL.Path == "/v1/tensorfs/presign":
+			var asked struct{ Digests []string }
+			_ = json.NewDecoder(r.Body).Decode(&asked)
+			urls := map[string]string{}
+			for _, digest := range asked.Digests {
+				urls[digest] = h.access.URL + "/o/" + digest
+			}
+			now := time.Now().Unix()
+			_ = json.NewEncoder(w).Encode(map[string]any{"expires_at_unix": now + 3600, "server_time_unix": now, "urls": urls})
+		case strings.HasPrefix(r.URL.Path, "/o/") && objects[strings.TrimPrefix(r.URL.Path, "/o/")] != nil:
+			_, _ = w.Write(objects[strings.TrimPrefix(r.URL.Path, "/o/")])
+		default:
+			doors.ServeHTTP(w, r)
+		}
+	})
+	account := h.server.Config.Handler
+	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/models/resolve" && strings.HasPrefix(r.URL.Query().Get("ref"), "proof/probe"):
+			_ = json.NewEncoder(w).Encode(resolved)
+		default:
+			account.ServeHTTP(w, r)
+		}
+	})
+	for _, venue := range venues {
+		args := []string{"model", "download", "proof/probe#" + resolved["manifest_id"].(string), "--await", "--json"}
+		if venue != machines.Local {
+			args = append(args, "--rental="+venue)
+		}
+		if code, out := runCozy(t, root, args...); code != 0 {
+			t.Fatalf("seeding proof/probe on %s [exit %d]\n%s", venue, code, out)
+		}
+	}
+	h.server.Config.Handler, h.worker.Config.Handler = account, doors
 	return resolved
 }
 
@@ -108,7 +153,7 @@ def touch(payload: TouchRequest, source: Probe) -> TouchResult:
 // and kept both. Rental authority still refreshes independently of content reuse.
 func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
-	resolved := seedProbe(t, h, root)
+	resolved := seedProbe(t, h, root, machines.Local, "tessa")
 	// This proof measures content reuse after the machine can describe releases.
 	// A still-booting Runtime legitimately falls back to the account catalog,
 	// which this fixture deliberately does not serve.
