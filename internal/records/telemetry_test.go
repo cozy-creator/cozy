@@ -27,7 +27,7 @@ func TestTelemetryRowsAreBatchedInOrderAndKept(t *testing.T) {
 		},
 		func() *exit.Error { return s.LinkMachineExecution("run", "machine") },
 		func() *exit.Error {
-			return s.AcceptRunV1("run", &v1.RunState{Id: "run", Number: 1, State: "running", Attempt: 1})
+			return s.AcceptRunV1("run", "machine", &v1.RunState{Id: "run", Number: 1, State: "running", Attempt: 1})
 		},
 	} {
 		if problem := step(); problem != nil {

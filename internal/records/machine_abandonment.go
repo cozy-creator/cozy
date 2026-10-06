@@ -38,9 +38,8 @@ func (s *Store) AbandonMachineExecution(id, actor, why string) (bool, *exit.Erro
 	}
 	var state string
 	var nativeSent bool
-	if err := tx.QueryRow(`SELECT state,
- EXISTS(SELECT 1 FROM request_events WHERE request_id=requests.id AND type=?)
- FROM requests WHERE id=?`, RunV1Sent, id).Scan(&state, &nativeSent); err != nil {
+	if err := tx.QueryRow(`SELECT r.state, `+runV1SentHere+`
+ FROM requests r JOIN machine_executions e ON e.request_id=r.id WHERE r.id=?`, id).Scan(&state, &nativeSent); err != nil {
 		return false, exit.Internalf("cannot read abandoned run: %s", err)
 	}
 	facts := map[string]any{"actor": actor, "machine_id": link.MachineID, "scope": "local_abandonment", "machine_execution": true,

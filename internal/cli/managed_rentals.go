@@ -42,6 +42,8 @@ type managedRentals struct {
 	installs  *machines.Installs
 	// forget closes the daemon's connection to a machine whose rental ended.
 	forget func(string)
+	// placeReleased places again the runs a rental proven gone left in the outbox.
+	placeReleased func()
 	// boot brings a newly attached worker boot to the Hub's target software before it takes
 	// work: daemon setup installs it.
 	boot func(string)
@@ -1403,6 +1405,9 @@ func (m *managedRentals) letGo(released, failed []string) *exit.Error {
 		if _, problem := rental.Forget(m.layout, m.store, id); problem != nil {
 			return problem
 		}
+	}
+	if len(released)+len(failed) > 0 && m.placeReleased != nil {
+		m.placeReleased()
 	}
 	return nil
 }
