@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
@@ -44,6 +46,7 @@ import (
 func (m *machineRuns) loopV1(request records.Request) {
 	defer m.enforceDeadlineV1(request)()
 	lastError, delay := "", time.Second
+	followed := false
 	for m.ctx.Err() == nil {
 		current, problem := m.store.RequestRow(request.ID)
 		if problem != nil || current == nil {
@@ -71,7 +74,7 @@ func (m *machineRuns) loopV1(request records.Request) {
 				return
 			}
 		}
-		done, problem := m.stepV1(m.ctx, *current, link, accepted, false)
+		done, problem := m.stepV1(m.ctx, *current, link, accepted, false, &followed)
 		if done {
 			return
 		}
@@ -120,6 +123,52 @@ func (m *machineRuns) loopV1(request records.Request) {
 	}
 }
 
+// followTargetV1 updates a machine to the Hub's target software and answers "" once it runs
+// other software, else the next step its owner takes.
+func (m *machineRuns) followTargetV1(ctx context.Context, machine, origin string) string {
+	if machines.IsLocal(machine) {
+		changed, kept := m.machines.Host.FollowTarget(ctx, client(m.context.forHub(origin)))
+		if changed {
+			return ""
+		}
+		return cmp.Or(kept, "this machine runs the files it was installed from") +
+			"; `cozy machine install` takes the Hub's target software, or name newer wheels with --runtime-wheel/--tensorfs-wheel"
+	}
+	name := machine
+	if row, _ := m.store.RentalRow(machine); row != nil && row.MachineName != "" {
+		name = row.MachineName
+	}
+	target, problem := client(m.context.forHub(origin)).Software(ctx)
+	if problem != nil {
+		return "the Hub target could not be read: " + problem.Message
+	}
+	if target.Runtime == "" {
+		return "the Hub names no target software; name exact versions with cozy rental update"
+	}
+	update, problem := m.updates.Start(machine, api.RuntimeUpdateRequest{RuntimeVersion: target.Runtime, TensorFSVersion: target.TensorFS})
+	for problem == nil && update.Active() && ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+		}
+		update, problem = m.store.RuntimeUpdate(machine)
+		if problem == nil && update == nil {
+			problem = exit.New(exit.Conflict, "its update record is gone")
+		}
+	}
+	var result runtimeUpdateResult
+	switch {
+	case problem != nil:
+		return fmt.Sprintf("it could not take the Hub's target software (%s); `cozy rental update %s` retries", problem.Message, name)
+	case update.State == "failed":
+		return fmt.Sprintf("its update to the Hub's target software failed (%s); `cozy rental update %s` retries, or `cozy rental end %s` and rent a new machine", update.Error, name, name)
+	case json.Unmarshal(update.Result, &result) == nil && !result.Unchanged:
+		return ""
+	}
+	return fmt.Sprintf("%s runs Runtime %s (%s); update it to a release that serves this run: `cozy rental update %s --runtime-version <version> --tensorfs-version <version>`",
+		name, result.From.Runtime, result.Note, name)
+}
+
 // permanentRefusal is a refusal resubmitting the same spec cannot change.
 func permanentRefusal(problem *exit.Error) bool {
 	return problem.Code != exit.Unavailable && problem.Code != exit.Deadline && problem.Code != exit.Canceled
@@ -132,14 +181,14 @@ func (m *machineRuns) catchUpV1(ctx context.Context, request records.Request) *e
 	if problem != nil || link == nil || link.Collected || link.Abandoned {
 		return problem
 	}
-	_, problem = m.stepV1(ctx, request, link, true, true)
+	_, problem = m.stepV1(ctx, request, link, true, true, nil)
 	return problem
 }
 
 // stepV1 places the run if it has no machine, connects, submits or attaches, and records the
 // log until the stream ends; done once the outcome is recorded.
 // `catchUp` ends it at the log's head as the machine named it when the stream opened.
-func (m *machineRuns) stepV1(parent context.Context, request records.Request, link *records.MachineExecution, accepted, catchUp bool) (bool, *exit.Error) {
+func (m *machineRuns) stepV1(parent context.Context, request records.Request, link *records.MachineExecution, accepted, catchUp bool, followed *bool) (bool, *exit.Error) {
 	ctx, stop := context.WithCancel(parent)
 	defer stop()
 	if !catchUp {
@@ -198,6 +247,16 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			return false, machines.Transport(err)
 		}
 	}
+	var upgrade func() string
+	if followed != nil {
+		upgrade = func() string {
+			if *followed {
+				return "the selected software still cannot serve this operation; choose a compatible target"
+			}
+			*followed = true
+			return m.followTargetV1(ctx, link.MachineID, request.Hub)
+		}
+	}
 	began = time.Now()
 	if spec != nil {
 		if send, problem := m.store.MarkRunV1Sent(request.ID); problem != nil || !send {
@@ -208,7 +267,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		var err error
 		stream, err = machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), spec)
 		if err != nil {
-			return m.runRefusalV1(request.ID, err, spec != nil && !sent)
+			return m.runRefusalV1(request.ID, err, spec != nil, upgrade)
 		}
 	}
 	head, opened, terminal := uint64(0), false, false
@@ -229,7 +288,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			return false, nil
 		}
 		if err != nil {
-			return m.runRefusalV1(request.ID, err, spec != nil && !sent && !opened)
+			return m.runRefusalV1(request.ID, err, spec != nil && !opened, upgrade)
 		}
 		if state := event.GetState(); state != nil && !opened {
 			head, opened = state.Sequence, true // the stream's first frame names the log's head
@@ -278,9 +337,16 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 
 // An explicit first-submission rejection can end a request without acceptance. Other
 // failures, including a retry after a lost reply, leave the possible remote run unresolved.
-func (m *machineRuns) runRefusalV1(id string, err error, first bool) (bool, *exit.Error) {
+func (m *machineRuns) runRefusalV1(id string, err error, first bool, upgrade func() string) (bool, *exit.Error) {
 	problem := machines.Transport(err)
 	if first {
+		if problem.ErrName() == "machine.upgrade_required" && upgrade != nil {
+			if why := upgrade(); why == "" {
+				return false, nil // the rejected spec was never accepted; retry on the selected software
+			} else {
+				problem = exit.Named(problem.Code, problem.ErrName(), "%s; %s", problem.Message, why)
+			}
+		}
 		switch status.Code(err) {
 		case codes.InvalidArgument, codes.FailedPrecondition, codes.AlreadyExists, codes.PermissionDenied, codes.Unauthenticated, codes.Unimplemented:
 			failed, recordProblem := m.store.FailQueuedRequest(id, records.QueuedFailure(problem))

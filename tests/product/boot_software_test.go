@@ -124,6 +124,14 @@ func TestARentalBootFollowsTheHubsTarget(t *testing.T) {
 	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["status"] != "unchanged: it already runs this software" {
 		t.Fatalf("rental update with nothing named [exit %d]\n%s", code, out)
 	}
+	// The cozy names the target's versions: a daemon older than it reads an empty request as the
+	// newest published pair.
+	asked, problem := store.RuntimeUpdate(parityRental)
+	fatal(t, problem)
+	var selection map[string]any
+	if json.Unmarshal(asked.Selection, &selection) != nil || selection["runtime_version"] != booted["runtime"] || selection["tensorfs_version"] != booted["tensorfs"] {
+		t.Fatalf("rental update sent no versions: %s", asked.Selection)
+	}
 }
 
 // This computer's machine follows the Hub's target when it starts, unless its owner pinned it

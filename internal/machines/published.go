@@ -14,13 +14,12 @@ import (
 	"strings"
 )
 
-// publishedWheel fetches a distribution's release wheel for this computer (version, or the
-// newest) from the package index into dir, checking the index's sha256, and answers its path.
+// publishedWheel fetches an exact release for this computer and verifies the index digest.
 func publishedWheel(ctx context.Context, distribution, version, dir string) (string, error) {
-	release := distribution
-	if version != "" {
-		release += "/" + version
+	if version == "" {
+		return "", fmt.Errorf("an exact %s version is required", distribution)
 	}
+	release := distribution + "/" + version
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://pypi.org/pypi/"+release+"/json", nil)
 	if err != nil {
 		return "", err

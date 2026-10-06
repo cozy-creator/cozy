@@ -11,6 +11,7 @@ import (
 const runtimeUpdatesDDL = `CREATE TABLE IF NOT EXISTS rental_runtime_updates (
   rental_id TEXT PRIMARY KEY,
   operation_id TEXT NOT NULL,
+  request_id TEXT NOT NULL DEFAULT '',
   worker_boot_id TEXT NOT NULL,
   state TEXT NOT NULL,
   selection BLOB NOT NULL DEFAULT x'',

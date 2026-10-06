@@ -380,7 +380,9 @@ func (h *Host) ensureLocked(ctx context.Context, account *hub.Client, start bool
 			if launch, problem = h.launchLocked(ctx); problem != nil {
 				return nil, problem
 			}
-			launch.Kept = h.follow(ctx, account)
+			if _, why, failed := h.follow(ctx, account); failed {
+				launch.Kept = why
+			}
 		}
 	}
 	return launch, nil

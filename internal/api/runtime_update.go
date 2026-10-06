@@ -22,7 +22,7 @@ func (s *Server) startRuntimeUpdate(w http.ResponseWriter, r *http.Request) {
 	var body *RuntimeUpdateRequest
 	var trailing any
 	if decoder.Decode(&body) != nil || body == nil || decoder.Decode(&trailing) != io.EOF {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "Runtime update takes one object with optional runtime_wheel and tensorfs_wheel paths", "send {} for the public release")
+		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "Runtime update takes one object with optional runtime_wheel and tensorfs_wheel paths", "name exact versions or local wheel files; an empty request changes nothing")
 		return
 	}
 	if s.runtimeUpdate == nil {

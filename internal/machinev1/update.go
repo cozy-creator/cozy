@@ -31,7 +31,11 @@ type Cohort struct {
 func (c Cohort) spec() (*pb.RunSpec, error) {
 	payload := map[string]string{}
 	var inputs []*pb.InputFile
-	for field, member := range map[string]*Member{"runtime": c.Runtime, "tensorfs": c.TensorFS} {
+	for _, item := range []struct {
+		field  string
+		member *Member
+	}{{"runtime", c.Runtime}, {"tensorfs", c.TensorFS}} {
+		field, member := item.field, item.member
 		switch {
 		case member == nil:
 		case member.Wheel != "":
@@ -62,6 +66,15 @@ func (c *Client) Update(ctx context.Context, id string, cohort Cohort, each func
 	if err != nil {
 		return nil, err
 	}
+	return c.followUpdate(ctx, id, spec, each)
+}
+
+// AttachUpdate observes an existing update without resolving or resending software.
+func (c *Client) AttachUpdate(ctx context.Context, id string, each func(*pb.RunEvent)) (*pb.Outcome, error) {
+	return c.followUpdate(ctx, id, nil, each)
+}
+
+func (c *Client) followUpdate(ctx context.Context, id string, spec *pb.RunSpec, each func(*pb.RunEvent)) (*pb.Outcome, error) {
 	var after uint64
 	for {
 		stream, err := c.Run(ctx, id, after, spec)

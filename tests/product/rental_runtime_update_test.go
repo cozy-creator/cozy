@@ -62,7 +62,10 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 	}
 }
 
-func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testing.T) {
+// An update never waits on the daemon's own uses of the rental: the machine waits for its
+// running work before it restarts. While the update's record holds the rental, new uses wait;
+// other rentals are not held.
+func TestRentalMaintenanceLeavesRunningWorkToTheMachine(t *testing.T) {
 	f := updateFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
 	c, problem := orchestrator.Open(orchestrator.Options{Store: f.store, Layout: f.layout, Rentals: rental.Resolver(f.layout, f.store)})
@@ -70,25 +73,23 @@ func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testi
 	defer c.Close(orchestrator.StopGrace)
 	release, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
 	fatal(t, problem)
+	defer release()
+	_, problem = f.store.BeginRuntimeUpdate(f.rentalID, updateBootID, nil)
+	fatal(t, problem)
 	called := false
-	updater := func(context.Context, *orchestrator.WorkerConnection) *exit.Error { called = true; return nil }
-	if problem := c.MaintainRental(context.Background(), f.rentalID, updater); problem == nil || problem.ErrName() != "rental.maintenance_busy" ||
-		!strings.Contains(problem.Message, "run 7 reading its execution") || called {
-		t.Fatalf("active transport was interrupted, or its refusal did not name it: %v", problem)
-	}
-	release()
 	fatal(t, c.MaintainRental(context.Background(), f.rentalID, func(context.Context, *orchestrator.WorkerConnection) *exit.Error {
-		if _, problem := c.UseRental(f.rentalID, "run 7 reading its execution"); problem == nil {
-			t.Fatal("the target accepted transport during maintenance")
+		called = true
+		if _, problem := c.UseRental(f.rentalID, "run 8 preparing"); problem == nil || problem.ErrName() != "rental.maintenance" {
+			t.Fatalf("a new use was admitted during the update: %v", problem)
 		}
-		other, problem := c.UseRental("another-rental", "run 8 preparing")
+		other, problem := c.UseRental("another-rental", "run 9 preparing")
 		fatal(t, problem)
 		other()
 		return nil
 	}))
-	use, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
-	fatal(t, problem)
-	use()
+	if !called {
+		t.Fatal("the update waited on the daemon's own use of the rental")
+	}
 }
 
 func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {

@@ -367,12 +367,7 @@ type Orchestrator struct {
 	closing bool
 	// starting names the machine executions whose start is in flight.
 	starting map[string]bool
-	// rentalUses names each transport or preparation using a rental, so maintenance can
-	// say what it waits for.
-	rentalUses        map[string]map[uint64]string
-	rentalUseSeq      uint64
-	rentalMaintenance map[string]bool
-	events            []string
+	events   []string
 
 	// phases is the preparation-phase lane (phase.go): what a request is doing before
 	// its first attempt exists. Live-only and observational.
@@ -399,18 +394,16 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		opt.Log = io.Discard
 	}
 	c := &Orchestrator{
-		opt:               opt,
-		done:              make(chan struct{}),
-		waits:             map[string]*wait{},
-		outputExporting:   map[string]bool{},
-		starting:          map[string]bool{},
-		parked:            map[string]string{},
-		rentalUses:        map[string]map[uint64]string{},
-		rentalMaintenance: map[string]bool{},
-		phases:            newPhases(),
-		transferWake:      make(map[string]chan struct{}),
-		transferRunning:   make(map[string]bool),
-		transferWork:      make(map[string]*transferWork),
+		opt:             opt,
+		done:            make(chan struct{}),
+		waits:           map[string]*wait{},
+		outputExporting: map[string]bool{},
+		starting:        map[string]bool{},
+		parked:          map[string]string{},
+		phases:          newPhases(),
+		transferWake:    make(map[string]chan struct{}),
+		transferRunning: make(map[string]bool),
+		transferWork:    make(map[string]*transferWork),
 	}
 	c.closingCtx, c.cancelClosing = context.WithCancel(context.Background())
 	return c, nil
