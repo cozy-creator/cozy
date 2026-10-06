@@ -93,10 +93,6 @@ func (w *WeightsGrantWindow) Stale(now time.Time) bool {
 	return w.life <= 0 || now.Sub(w.mintedAt) >= w.life/2
 }
 
-// Expire drops the window so the next send mints instead of re-presenting what it holds.
-// Re-sending a URL that would not spend is a lie about time; being authorized again is not.
-func (w *WeightsGrantWindow) Expire() { w.held, w.life = nil, 0 }
-
 // DeclaredLife is the SHORTEST life in the mint, so the refill is driven by the first grant
 // that will go cold rather than the last.
 func (g WeightsGrantMint) DeclaredLife() time.Duration {
@@ -115,3 +111,7 @@ func (g WeightsGrantMint) DeclaredLife() time.Duration {
 	}
 	return time.Duration(shortest) * time.Second
 }
+
+// Expire drops the window so the next send mints instead of re-presenting what it holds.
+// Re-sending a URL that would not spend is a lie about time; being authorized again is not.
+func (w *WeightsGrantWindow) Expire() { w.held, w.life = nil, 0 }

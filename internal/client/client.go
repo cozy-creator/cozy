@@ -440,16 +440,6 @@ func (c *Client) RentalRuntimeUpdate(rentalID string) (api.RuntimeUpdate, *exit.
 	return result, problem
 }
 
-// DetachRental drops the daemon's kept connection to one rented machine.
-func (c *Client) DetachRental(rentalID string) (bool, *exit.Error) {
-	var out struct {
-		Changed bool `json:"changed"`
-	}
-	e := c.call(http.MethodDelete,
-		"/v1/local/rentals/"+url.PathEscape(rentalID)+"/claim", nil, &out)
-	return out.Changed, e
-}
-
 // Down stops the daemon. A plain down never cancels work and names what is in flight.
 // Under all=true, the daemon requests cancellation and returns the exact paid obligations
 // the caller must terminate and confirm through Tensorhub before retrying.

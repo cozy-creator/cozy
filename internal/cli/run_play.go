@@ -146,7 +146,7 @@ func playMachine(ctx *Context, layout home.Layout, store *records.Store, row rec
 		if p != nil {
 			return nil, nil, p
 		}
-		launch, p := host.Ensure(machines.AttachOnly(context.Background()), "", nil, false)
+		launch, p := host.Ensure(machines.AttachOnly(context.Background()), nil)
 		if p != nil {
 			return nil, nil, p
 		}

@@ -1,9 +1,5 @@
 package orchestrator
 
-import (
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-)
-
 // THE RECORDOWNER SIDE of th-024's orientation (#436/#446/#454, renamed by #481 — bare
 // "owner" is retired and the formal role is RecordOwner): the WORKER hosts `WorkerControl`
 // and THIS side dials it, claims it, reconciles its ONE snapshot, and only then
@@ -26,15 +22,3 @@ const (
 	RecordOwnerID    = recordOwnerID
 	RecordOwnerEpoch = recordOwnerEpoch
 )
-
-// onClaimAck binds the claimed boot to the worker slot: identity checks, the durable
-// binding, and the session registry (the ClaimAck is the flip's Register successor).
-// ObservationFromClaimAck is what a rented worker's ClaimAck reads back about the pod.
-func ObservationFromClaimAck(rentalID string, ack *pb.ClaimAck) RentalObservation {
-	resources := ack.GetResources()
-	return RentalObservation{
-		RentalID: rentalID, Accelerator: resources.GetDeviceName(),
-		DeviceCount: int(resources.GetDeviceCount()), Backend: resources.GetBackend(),
-		WorkerInstance: ack.WorkerInstanceId, WorkerID: ack.WorkerId, WorkerBootID: ack.WorkerBootId,
-	}
-}

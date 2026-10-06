@@ -31,7 +31,7 @@ func TestLegacyLiveRecordRefusesNewNamespace(t *testing.T) {
 	receipt := filepath.Join(h.Root(), "run/cozy/bootstrap/readiness-envelope.json")
 	must(t, os.MkdirAll(filepath.Dir(receipt), 0700))
 	must(t, os.WriteFile(receipt, []byte("old receipt"), 0600))
-	_, problem := h.Ensure(context.Background(), "", nil, true)
+	_, problem := h.Ensure(context.Background(), nil)
 	if problem == nil || problem.ErrName() != "machine.legacy_process_running" {
 		t.Fatalf("new lifecycle admitted over old process: %v", problem)
 	}
@@ -133,7 +133,7 @@ func TestBootstrapRefusesKernelOwnedRootWithoutClientRecords(t *testing.T) {
 			must(t, os.WriteFile(filepath.Join(dir, "installed.json"), []byte(`{"host":{"module":"github.com/cozy-creator/cozy-runtime/machine-agent"},"host_pinned":true}`), 0600))
 			receiptKey := filepath.Join(dir, "receipt-key")
 			must(t, os.WriteFile(receiptKey, []byte("retained private key"), 0600))
-			_, problem = h.Ensure(t.Context(), "", nil, true)
+			_, problem = h.Ensure(t.Context(), nil)
 			if problem == nil || problem.ErrName() != "machine.busy" {
 				t.Fatalf("Ensure ignored kernel ownership: %v", problem)
 			}
@@ -168,7 +168,7 @@ func TestEnsureRefusesConcurrentHostMutationWithoutWaiting(t *testing.T) {
 	defer flock.Release(file)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	_, problem := machines.NewHost(dir, "", nil).Ensure(ctx, "", nil, true)
+	_, problem := machines.NewHost(dir, "", nil).Ensure(ctx, nil)
 	if ctx.Err() != nil || problem == nil || problem.ErrName() != "machine.busy" {
 		t.Fatalf("Ensure waited for another controller's lifecycle lock: %v (context %v)", problem, ctx.Err())
 	}

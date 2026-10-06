@@ -4,15 +4,9 @@
 package machines
 
 import (
-	"cmp"
 	"context"
 	"fmt"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
@@ -21,10 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 )
 
@@ -33,69 +24,6 @@ const Local = "local"
 
 // IsLocal answers whether a machine name is this computer's.
 func IsLocal(name string) bool { return name == Local }
-
-// Machine is one dialed, claimed machine: a pinned TLS connection to its Host and the
-// owner's Claim for its current worker lifetime.
-type Machine struct {
-	Name      string
-	Conn      *grpc.ClientConn
-	Host      pb.PodHostClient
-	Claim     *pb.Claim
-	Protocol  *pb.ProtocolInfoResult
-	WireMinor uint32
-	// Hub is the delegated catalog origin this request names in ReleaseRoot.hub.
-	// An empty value is work that needs no Hub.
-	Hub string
-	// CertificateDER is the pinned leaf, the identity publication authority binds, and
-	// CertificateDigest its sha256.
-	CertificateDER    []byte
-	CertificateDigest []byte
-
-	claimAck *pb.ClaimAck
-	hub      *hub.Client
-	hubID    string // the rental identity; empty for an independently owned machine
-	owned    bool
-	release  func()
-	kept     bool // the connection is the Resolver's, kept for the machine's next call
-	// Seen is what this claimed connection learned of its Runtime, shared by every use of
-	// the connection and gone with it (Resolver.Forget, a new lifetime).
-	Seen *Lifetime
-}
-
-type Lifetime struct {
-	Workspace atomic.Pointer[pb.MachineExecutionWorkspace] // nil asks the Runtime again
-	Closure   sync.Map                                     // workspaces whose submission-closure route answered
-	Held      sync.Map                                     // unpublished installations prepared on this Runtime
-}
-
-// Close ends this use of the machine. A kept connection stays open for the next one.
-func (m *Machine) Close() error {
-	var err error
-	if !m.kept {
-		err = m.Conn.Close()
-	}
-	if m.release != nil {
-		m.release()
-	}
-	return err
-}
-
-// HubID is the rental identity; independently owned machines have no Hub identity.
-func (m *Machine) HubID() string { return m.hubID }
-
-// Account is the signed-in owner's client at the hub this machine belongs to.
-func (m *Machine) Account() *hub.Client { return m.hub }
-
-// Owned says whether this is an owned machine, such as this computer's, not a rental.
-func (m *Machine) Owned() bool { return m.owned }
-
-// RentalID is the rental behind a rented machine, and "" for an owned one.
-func (m *Machine) RentalID() string {
-	if m.owned {
-		return ""
-	}
-	return m.hubID
-}
 
 // Resolver finds machines by name.
 type Resolver struct {
@@ -110,52 +38,14 @@ type Resolver struct {
 	Hub       func(origin string) *hub.Client
 	// Rentals reads a rental's dial identity; RentalHub is the client for the hub it was
 	// bought from; UseRental holds it against release while in use.
-	Rentals       func(string) (*orchestrator.RemoteTarget, *exit.Error)
-	RentalHub     func(string) *hub.Client
-	UseRental     func(id, holder string) (func(), *exit.Error)
-	ObserveRental func(orchestrator.RentalObservation) *exit.Error
-	RentalKey     func(string) (rental.CreatorIdentity, *exit.Error)
+	Rentals   func(string) (*orchestrator.RemoteTarget, *exit.Error)
+	RentalHub func(string) *hub.Client
+	UseRental func(id, holder string) (func(), *exit.Error)
+	RentalKey func(string) (rental.CreatorIdentity, *exit.Error)
 	// EndpointRental is the rental an explicit endpoint reaches when it is one of this host's:
 	// its id and its own creator key, which its machine authorizes. nil: the endpoint is
 	// signed with this computer's machine owner key.
 	EndpointRental func(*machineendpoint.Endpoint) (*EndpointRental, *exit.Error)
-	// Held answers whether this daemon's orchestrator holds the boot's control stream. A
-	// worker takes one control stream at a time, so a second Control Claim would fence the
-	// orchestrator's; its accepted Claim already names this owner.
-	Held func(bootID string) bool
-
-	mu sync.Mutex
-	// claimed names the worker boots this daemon has Control Claimed: a boot's Runtime keeps
-	// its owner across Host and Runtime restarts, so each boot is Claimed once.
-	claimed map[string]bool
-	// dialing names each machine identity a Dial is connecting to; concurrent Dials wait
-	// for it and share its connection and Claim instead of Claiming against each other.
-	dialing map[string]chan struct{}
-	// kept is one open, claimed connection per machine lifetime: every call to a machine
-	// rides it, so a call costs its own round trip and never a TLS handshake or probe.
-	kept map[string]*keptMachine
-}
-
-type keptMachine struct {
-	*Machine
-	identity string
-}
-
-// Forget drops a machine's kept connection and Claim record. Its next call dials, claims
-// and asks the Runtime what it is again: a Runtime update keeps the worker boot, so nothing
-// in the dial identity says the Runtime and its capabilities changed.
-func (r *Resolver) Forget(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if kept := r.kept[name]; kept != nil {
-		kept.Conn.Close()
-		delete(r.kept, name)
-	}
-	for key := range r.claimed {
-		if strings.HasPrefix(key, name+"\x00") {
-			delete(r.claimed, key)
-		}
-	}
 }
 
 // target is a machine's dial identity before its Claim.
@@ -166,106 +56,6 @@ type target struct {
 	lifetime                     string // what else ends the worker process: a local Host's pid
 }
 
-// Dial connects to a machine and authenticates as its owner; holder names what the caller
-// is doing there, which a rental's maintenance refusal names. The caller closes it.
-func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *exit.Error) {
-	return r.DialAt(ctx, name, "", holder, true)
-}
-
-// DialAt selects a catalog/account context without changing the machine's lifecycle.
-// Every accepted run and every API call stays on the same local or rented endpoint.
-func (r *Resolver) DialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
-	return r.dialAt(ctx, name, origin, holder, named)
-}
-
-func (r *Resolver) dialAt(ctx context.Context, name, origin, holder string, named bool) (*Machine, *exit.Error) {
-	if problem := r.scoped(name); problem != nil {
-		return nil, problem
-	}
-	machine := &Machine{Name: name}
-	if machineendpoint.IsName(name) {
-		if r.Endpoint == nil {
-			return nil, exit.Named(exit.Unavailable, "machine.endpoint_unavailable", "this controller cannot resolve the explicit endpoint")
-		}
-		ep, problem := r.Endpoint(name)
-		if problem != nil {
-			return nil, problem
-		}
-		if ep == nil {
-			return nil, exit.New(exit.NotFound, "explicit machine endpoint is not retained")
-		}
-		return r.dialEndpointAt(ctx, *ep, origin)
-	}
-	t, problem := r.resolve(ctx, name, origin, holder, named, machine)
-	if problem != nil {
-		return nil, problem
-	}
-	lifetime := name + "\x00" + t.bootID + "\x00" + t.lifetime
-	identity := lifetime + "\x00" + t.addr + "\x00" + t.workerID + "\x00" + string(t.pin.Digest())
-	r.mu.Lock()
-	if r.claimed == nil {
-		r.claimed, r.kept = map[string]bool{}, map[string]*keptMachine{}
-		r.dialing = map[string]chan struct{}{}
-	}
-	for {
-		if kept := r.kept[name]; kept != nil && kept.identity == identity {
-			r.mu.Unlock()
-			use := *kept.Machine
-			use.release, use.kept, use.Hub, use.hub = machine.release, true, machine.Hub, machine.hub
-			return &use, nil
-		}
-		dialing := r.dialing[identity]
-		if dialing == nil {
-			break
-		}
-		r.mu.Unlock()
-		select {
-		case <-dialing:
-		case <-ctx.Done():
-			if machine.release != nil {
-				machine.release()
-			}
-			return nil, Transport(status.FromContextError(ctx.Err()).Err())
-		}
-		r.mu.Lock()
-	}
-	done := make(chan struct{})
-	r.dialing[identity] = done
-	defer func() {
-		r.mu.Lock()
-		delete(r.dialing, identity)
-		r.mu.Unlock()
-		close(done)
-	}()
-	boot := name + "\x00" + t.bootID
-	claimed := r.claimed[boot] || !machine.owned && r.Held != nil && r.Held(t.bootID)
-	r.mu.Unlock()
-	if problem := machine.dial(ctx, t, !claimed); problem != nil {
-		if machine.release != nil {
-			machine.release()
-		}
-		return nil, problem
-	}
-	r.mu.Lock()
-	r.claimed[boot] = true
-	if previous := r.kept[name]; previous != nil {
-		previous.Conn.Close() // the machine's earlier lifetime
-	}
-	kept := *machine
-	kept.release, kept.claimAck = nil, nil
-	r.kept[name] = &keptMachine{Machine: &kept, identity: identity}
-	machine.kept = true
-	r.mu.Unlock()
-	if ack := machine.claimAck; ack != nil && !machine.owned && r.ObserveRental != nil {
-		// The first Claim of a rented worker's lifetime reads back what the pod is.
-		if problem := r.ObserveRental(orchestrator.ObservationFromClaimAck(machine.hubID, ack)); problem != nil {
-			machine.Close()
-			return nil, problem
-		}
-	}
-	return machine, nil
-}
-
 // scoped refuses a machine outside Only.
 func (r *Resolver) scoped(name string) *exit.Error {
 	if r.Only == "" || name == r.Only {
@@ -274,16 +64,24 @@ func (r *Resolver) scoped(name string) *exit.Error {
 	return exit.Named(exit.Unavailable, "machine.endpoint_scope", "this foreground run reaches only %s, not machine %s", r.Only, name)
 }
 
+// placement is what resolving a machine learns beside its dial identity: its Hub client and
+// identity, whether it is owned, and the rental use to release.
+type placement struct {
+	hub     *hub.Client
+	hubID   string
+	owned   bool
+	release func()
+}
+
 // resolve names a machine's dial identity: this computer's (started if needed), or a
 // rental's (held for holder until machine.release). The endpoint form is resolved apart.
-func (r *Resolver) resolve(ctx context.Context, name, origin, holder string, named bool, machine *Machine) (target, *exit.Error) {
+func (r *Resolver) resolve(ctx context.Context, name, holder string, machine *placement) (target, *exit.Error) {
 	if IsLocal(name) {
-		accountOrigin := cmp.Or(origin, r.HubOrigin)
 		var client *hub.Client
 		if r.Hub != nil {
-			client = r.Hub(accountOrigin)
+			client = r.Hub(r.HubOrigin)
 		}
-		launch, problem := r.Host.Ensure(ctx, origin, client, named)
+		launch, problem := r.Host.Ensure(ctx, client)
 		if problem != nil {
 			return target{}, problem
 		}
@@ -295,7 +93,7 @@ func (r *Resolver) resolve(ctx context.Context, name, origin, holder string, nam
 		if problem != nil {
 			return target{}, problem
 		}
-		machine.hub, machine.owned, machine.Hub = client, true, launch.Reads
+		machine.hub, machine.owned = client, true
 		return target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
 			lifetime: fmt.Sprint(launch.PID)}, nil
 	}
@@ -328,118 +126,6 @@ func (r *Resolver) resolve(ctx context.Context, name, origin, holder string, nam
 		machine.hub = r.RentalHub(identity.RentalID)
 	}
 	return target{name: name, addr: identity.Addr, workerID: identity.WorkerID, bootID: identity.WorkerBootID, pin: pin, key: key}, nil
-}
-
-func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.Error {
-	options := append([]grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(t.pin.TLSConfig())),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20))}, machinev1.SkewInterceptors()...)
-	connection, err := grpc.NewClient(t.addr, options...)
-	if err != nil {
-		return Transport(err)
-	}
-	m.Conn, m.Host, m.CertificateDER, m.CertificateDigest = connection, pb.NewPodHostClient(connection), t.pin.DER(), t.pin.Digest()
-	m.Seen = &Lifetime{}
-	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
-	info, err := m.Host.ProtocolInfo(probe, &pb.ProtocolInfoRequest{})
-	cancel()
-	if err != nil {
-		connection.Close()
-		if status.Code(err) == codes.FailedPrecondition {
-			// A machine past cozy.worker.v1 keeps only this call, to say so.
-			return machinev1.NewerThanCozy("machine %s: %s", m.Name, status.Convert(err).Message())
-		}
-		return Transport(err)
-	}
-	m.Protocol, m.WireMinor = info, info.WireMinor
-	claim, ack, problem := claim(ctx, connection, t, info.WireMinor, controlClaim)
-	if problem != nil {
-		connection.Close()
-		return problem
-	}
-	m.Claim, m.claimAck = claim, ack
-	return nil
-}
-
-// claim authenticates this owner to the worker lifetime the target names: the owner key's
-// Ed25519 signature over ClaimProof/1, presented on every call. The first connection to a
-// lifetime also opens one Control Claim, which records the owner and its protocol level.
-func claim(ctx context.Context, connection *grpc.ClientConn, t target, wireMinor uint32, control bool) (*pb.Claim, *pb.ClaimAck, *exit.Error) {
-	transcript, err := canonical.Bytes(&pb.ClaimProof{RecordOwnerEpoch: orchestrator.RecordOwnerEpoch,
-		WorkerId: t.workerID, WorkerBootId: t.bootID, WorkerTlsCertificateDigest: t.pin.Digest()})
-	if err != nil {
-		return nil, nil, exit.Internalf("cannot author the machine ClaimProof: %s", err)
-	}
-	claim := &pb.Claim{RecordOwnerEpoch: orchestrator.RecordOwnerEpoch, RecordOwnerId: orchestrator.RecordOwnerID,
-		WorkerId: t.workerID, WorkerBootId: t.bootID, WireMinor: min(pb.WireMinor, wireMinor), Proof: t.key.Sign(transcript)}
-	if !control {
-		return claim, nil, nil
-	}
-	ack, problem := controlClaim(ctx, pb.NewWorkerControlClient(connection), claim)
-	if problem != nil {
-		return nil, nil, problem
-	}
-	return claim, ack, nil
-}
-
-func controlClaim(parent context.Context, client pb.WorkerControlClient, claim *pb.Claim) (*pb.ClaimAck, *exit.Error) {
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	defer cancel()
-	for {
-		ack, problem := controlClaimOnce(ctx, client, claim)
-		if problem != nil || ack.Rejection != pb.ClaimRejection_CLAIM_REJECTION_UNDURABLE {
-			return ack, problem
-		}
-		// Not durable yet: its readiness barrier is still committing, or it is restarting
-		// to reopen its store. It is claimed again rather than refused.
-		select {
-		case <-ctx.Done():
-			return nil, Transport(status.FromContextError(ctx.Err()).Err())
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-}
-
-func controlClaimOnce(ctx context.Context, client pb.WorkerControlClient, claim *pb.Claim) (*pb.ClaimAck, *exit.Error) {
-	stream, err := client.Control(ctx)
-	if err != nil {
-		return nil, Transport(err)
-	}
-	defer stream.CloseSend()
-	if err := stream.Send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: claim}}); err != nil {
-		return nil, Transport(err)
-	}
-	for {
-		frame, err := stream.Recv()
-		if err != nil {
-			return nil, Transport(err)
-		}
-		if failure := frame.GetBootFailure(); failure != nil {
-			return nil, exit.Named(exit.Structural, "machine.boot_failed", "the machine's Runtime failed to boot: %s", failure.String())
-		}
-		ack := frame.GetClaimAck()
-		if ack == nil {
-			continue
-		}
-		if !ack.Accepted && ack.Rejection == pb.ClaimRejection_CLAIM_REJECTION_UNDURABLE {
-			return ack, nil
-		}
-		if !ack.Accepted || ack.WorkerId != claim.WorkerId || ack.WorkerBootId != claim.WorkerBootId {
-			return nil, exit.New(exit.Credential, "the machine refused its owner's Claim (%s)", ack.Rejection)
-		}
-		return ack, nil // no SnapshotAck: this stream only records the owner
-	}
-}
-
-// ValidateNewWork gates a new preparation or execution on the machine's protocol range.
-// Observation, collection, cancellation and release reach any peer.
-func (m *Machine) ValidateNewWork() *exit.Error {
-	if !m.owned {
-		return orchestrator.ValidateWorkerProtocol(m.Protocol, m.Name)
-	}
-	if problem := orchestrator.ValidateWorkerProtocol(m.Protocol, ""); problem != nil {
-		return problem.WithRemedy("install the current worker cohort: cozy machine install")
-	}
-	return nil
 }
 
 // Transport names a failed machine RPC the way every machine caller reports it.

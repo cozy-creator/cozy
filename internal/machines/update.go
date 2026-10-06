@@ -22,7 +22,7 @@ import (
 // again. The machine restarts its service on the candidate and rolls it back if it never
 // proves ready; this waits for the outcome.
 func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *exit.Error) {
-	launch, problem := h.ensureLocked(ctx, "", nil, true)
+	launch, problem := h.ensureLocked(ctx, nil, true)
 	if problem != nil {
 		return nil, problem
 	}

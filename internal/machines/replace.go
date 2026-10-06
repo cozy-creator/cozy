@@ -100,7 +100,7 @@ func (h *Host) replaceLocked(ctx context.Context, staged *staged, uv string) (*I
 		}
 	}
 	// Proof: the new machine starts, seals its receipt and answers Status as this machine.
-	launch, problem := h.ensureLocked(ctx, "", nil, true)
+	launch, problem := h.ensureLocked(ctx, true)
 	if problem != nil {
 		return undo(problem)
 	}

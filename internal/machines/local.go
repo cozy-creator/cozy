@@ -299,21 +299,9 @@ type Launch struct {
 	Leaf             []byte
 	GPUs             []ReceiptGPU
 	PID              int
-	// Reads is the origin the machine reads the asked hub at when that is not its own
-	// hub: each run of it names this (wire 67). "" at its own hub.
-	Reads string
 	// Kept says why a machine this launch started kept its software instead of the Hub's
 	// target, or "".
 	Kept string
-}
-
-func (l *Launch) at(reads string) *Launch {
-	if l == nil {
-		return nil
-	}
-	out := *l
-	out.Reads = reads
-	return &out
 }
 
 type attachKey struct{}
@@ -330,10 +318,8 @@ func stopped() *exit.Error {
 		WithRemedy("`cozy machine start`, or the next local run, starts it")
 }
 
-// Ensure starts the machine independently of any Hub, or attaches to the running one. A named
-// Hub receives a scoped execution credential only after the agent proves its TLS identity; it
-// never owns this machine's identity or lifecycle. Empty hubOrigin is entirely offline.
-func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client, _ bool) (*Launch, *exit.Error) {
+// Ensure starts the machine independently of any Hub, or attaches to the running one.
+func (h *Host) Ensure(ctx context.Context, account *hub.Client) (*Launch, *exit.Error) {
 	attach, _ := ctx.Value(attachKey{}).(bool)
 	if _, err := os.Stat(h.path("agent.json")); attach && errors.Is(err, os.ErrNotExist) {
 		return nil, stopped() // one file read: background work asks often while the machine is stopped
@@ -350,7 +336,7 @@ func (h *Host) Ensure(ctx context.Context, hubOrigin string, client *hub.Client,
 	if problem := h.recoverReplace(ctx); problem != nil {
 		return nil, problem
 	}
-	return h.ensureLocked(ctx, hubOrigin, client, !attach)
+	return h.ensureLocked(ctx, account, !attach)
 }
 
 // Start starts the machine, or attaches to the running one, after any command changing it. A
@@ -366,10 +352,10 @@ func (h *Host) Start(ctx context.Context, account *hub.Client) (*Launch, *exit.E
 	if problem := h.recoverReplace(ctx); problem != nil {
 		return nil, problem
 	}
-	return h.ensureLocked(ctx, "", account, true)
+	return h.ensureLocked(ctx, account, true)
 }
 
-func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.Client, start bool) (*Launch, *exit.Error) {
+func (h *Host) ensureLocked(ctx context.Context, account *hub.Client, start bool) (*Launch, *exit.Error) {
 	var launch *Launch
 	if cached := h.cached; cached != nil && h.alive(cached.PID) && (cached.record.StartTicks == 0 || cached.record.StartTicks == processStartTicks(cached.PID)) {
 		launch = cached.Launch
@@ -394,15 +380,10 @@ func (h *Host) ensureLocked(ctx context.Context, hubOrigin string, client *hub.C
 			if launch, problem = h.launchLocked(ctx); problem != nil {
 				return nil, problem
 			}
-			launch.Kept = h.follow(ctx, client)
+			launch.Kept = h.follow(ctx, account)
 		}
 	}
-	h.ResumeExecutionAccessCleanup(ctx, launch)
-	if hubOrigin == "" {
-		return launch.at(""), nil
-	}
-	reads, problem := h.attachAccess(ctx, launch, hubOrigin, client)
-	return launch.at(reads), problem
+	return launch, nil
 }
 
 func (h *Host) remember(launch *Launch, record hostRecord) *Launch {

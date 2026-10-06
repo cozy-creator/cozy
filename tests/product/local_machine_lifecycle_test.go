@@ -177,7 +177,7 @@ func TestALaunchWhoseUnitEndsInItsExecutorReportsTheHostExited(t *testing.T) {
 	must(t, os.WriteFile(program, []byte(script), 0o755)) //cozy:allow an executor that ends before any agent
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, problem := h.Ensure(ctx, "", nil, true); problem == nil || problem.ErrName() != "machine.host_exited" || userunit.Running(unit) {
+	if _, problem := h.Ensure(ctx, nil); problem == nil || problem.ErrName() != "machine.host_exited" || userunit.Running(unit) {
 		t.Fatalf("a launch whose unit ended in its executor answered %v (unit running %v)", problem, userunit.Running(unit))
 	}
 }
@@ -188,7 +188,7 @@ func TestStopEndsAnAgentStillInSystemdsExecutor(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "home")
 	h, unit := fakeAgentMachine(t, root, 3*time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	_, problem := h.Ensure(ctx, "", nil, true)
+	_, problem := h.Ensure(ctx, nil)
 	cancel()
 	if problem == nil || problem.ErrName() != "machine.host_starting" || !userunit.Running(unit) {
 		t.Fatalf("the launch did not give up while its unit was starting: %v (unit running %v)", problem, userunit.Running(unit))
@@ -211,7 +211,7 @@ func TestStopEndsAnAgentStillInSystemdsExecutor(t *testing.T) {
 func TestAnAgentWithoutItsRecordIsAdoptedAndStopped(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "home")
 	h, unit := fakeAgentMachine(t, root, 0)
-	launched, problem := h.Ensure(context.Background(), "", nil, true)
+	launched, problem := h.Ensure(context.Background(), nil)
 	fatal(t, problem)
 	dir := filepath.Join(root, "machine")
 	must(t, os.Remove(filepath.Join(dir, "agent.json")))
@@ -240,18 +240,18 @@ func TestAttachingNeverStartsAStoppedMachine(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "home")
 	h, unit := fakeAgentMachine(t, root, 0)
 	attach := machines.AttachOnly(context.Background())
-	if _, problem := h.Ensure(attach, "", nil, true); problem == nil || problem.ErrName() != "machine.stopped" || userunit.Running(unit) {
+	if _, problem := h.Ensure(attach, nil); problem == nil || problem.ErrName() != "machine.stopped" || userunit.Running(unit) {
 		t.Fatalf("attaching to a stopped machine answered %v (unit running %v)", problem, userunit.Running(unit))
 	}
-	launched, problem := h.Ensure(context.Background(), "", nil, true)
+	launched, problem := h.Ensure(context.Background(), nil)
 	fatal(t, problem)
-	if attached, problem := h.Ensure(attach, "", nil, true); problem != nil || attached.PID != launched.PID {
+	if attached, problem := h.Ensure(attach, nil); problem != nil || attached.PID != launched.PID {
 		t.Fatalf("attaching to running agent %d answered %+v, %v", launched.PID, attached, problem)
 	}
 	if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 		t.Fatalf("machine stop [exit %d]\n%s", code, out)
 	}
-	if _, problem := h.Ensure(attach, "", nil, true); problem == nil || problem.ErrName() != "machine.stopped" || userunit.Running(unit) {
+	if _, problem := h.Ensure(attach, nil); problem == nil || problem.ErrName() != "machine.stopped" || userunit.Running(unit) {
 		t.Fatalf("attaching after stop answered %v (unit running %v)", problem, userunit.Running(unit))
 	}
 }

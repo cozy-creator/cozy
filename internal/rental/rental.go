@@ -333,16 +333,6 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 	}
 }
 
-// ObserveWorker turns a remote ClaimAck into the rental's durable actual-hardware
-// readback. It is wired into the orchestrator so no remote session can become
-// dispatchable without crossing this records boundary.
-func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit.Error {
-	return func(observed orchestrator.RentalObservation) *exit.Error {
-		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator, observed.Backend,
-			observed.WorkerInstance, observed.WorkerID, observed.WorkerBootID, observed.DeviceCount)
-	}
-}
-
 // Reboot re-attaches a rental whose pod came back on a new boot. The Hub authenticated
 // that boot for this rental's attempt; it must still carry this host's media bearer and
 // Creator key. The Hub-verified certificate is pinned and the boot recorded.

@@ -149,18 +149,6 @@ func (p *RunProgress) Detach(text string) {
 	fmt.Fprint(p.ctx.Err, strings.TrimLeft(text, "\n"))
 }
 
-// Frame is the region at a moment on a terminal width columns wide, unstyled: the settled
-// block once the run ended or the watcher left. The product suite golden-tests it.
-func (p *RunProgress) Frame(at time.Time, width int) []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	rows := p.frame(at, width, 0)
-	for i, row := range rows {
-		rows[i] = clampLine(row, width)
-	}
-	return rows
-}
-
 // onLive folds one event into the view and schedules a frame.
 func (p *RunProgress) onLive(e localapi.Event) {
 	v := &p.view
@@ -1053,4 +1041,16 @@ func callTimingText(call callPhaseEvent, at time.Time, complete bool) string {
 		}
 	}
 	return text
+}
+
+// Frame is the region at a moment on a terminal width columns wide, unstyled: the settled
+// block once the run ended or the watcher left. The product suite golden-tests it.
+func (p *RunProgress) Frame(at time.Time, width int) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rows := p.frame(at, width, 0)
+	for i, row := range rows {
+		rows[i] = clampLine(row, width)
+	}
+	return rows
 }

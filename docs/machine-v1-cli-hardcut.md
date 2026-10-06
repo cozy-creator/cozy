@@ -35,3 +35,20 @@ inventory, promotion hold or image accounting is introduced here.
 
 Proof receipts and a per-failure census are retained under
 outputs/codex-apim-takeover-20261006/. This initial checkpoint is under review.
+
+## Machine client cut (C2)
+
+The incremental APIM afadc633 patch is adopted onto corrected C1 head1eb82a97 in
+an owned worktree. Dial/Claim/kept connections, standing Hub execution-access caches,
+detach routes and old keepalive fallback are removed. Ensure starts or attaches
+without a Hub call; each native run carries its own delegated access. The current
+warm-run fixture is retained, and CI/logout assertions no longer require the retired
+diagnostics and credential-cache implementation. An older rental is told to update
+its machine software, not replace its base image.
+
+The product test binary compiles. This is a draft checkpoint: the old down-mid-run
+fixture still used worker.v1 internally and is removed here, but its useful lifecycle
+coverage must be replaced by native tests before merging. C1 native cancellation,
+reattachment and output-custody proof also gates this stack. Remaining worker.v1
+domain/record types are the next slice, not part of a claim that this patch deletes
+every old-protocol dependency.
