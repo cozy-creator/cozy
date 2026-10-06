@@ -449,3 +449,81 @@ func TestV1LostAcceptanceReattachesWithoutLocalPackage(t *testing.T) {
 		t.Fatal("reattachment did not record the native acceptance")
 	}
 }
+
+// Run reached the machine and is executing there, but its acceptance never reached this
+// controller, and the owner cancels while the controller is down. Unreachable is not proof
+// that nothing ran: the cancel waits as canceling, the next controller attaches by id and
+// delivers it, and the run ends canceled by its actor, on the machine and here.
+func TestV1CancelWhileDownReachesARunWhoseAcceptanceWasLost(t *testing.T) {
+	root, store, machine := nativeLifecycleHome(t)
+	frame, err := machine.Status(t.Context())
+	must(t, err)
+	var installation string
+	for _, environment := range frame.Environments {
+		if environment.Package == "local/native-lifecycle" {
+			installation = environment.Installation
+		}
+	}
+	if installation == "" {
+		t.Fatal("native fixture installation missing")
+	}
+	if code, out := runCozy(t, root, "down", "--json"); code != 0 {
+		t.Fatalf("fixture controller down [%d]: %s", code, out)
+	}
+	gate := filepath.Join(root, "lost-cancel-gate")
+	payload, err := json.Marshal(map[string]any{"gate": gate, "size": 64})
+	must(t, err)
+	request, _, problem := store.Submit(records.Request{ID: "native-lost-cancel", IdemKey: "native-lost-cancel",
+		Package: "local/native-lifecycle", Entrypoint: "make", Kind: "job", Payload: payload,
+		BodyDigest: childDigest("f"), MachineExecutionObserver: true})
+	fatal(t, problem)
+	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))
+	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machines.Local}))
+	stream, err := machine.Run(t.Context(), request.ID, 0, &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_JOB, Entrypoint: "make", Payload: payload,
+		Source: &v1.RunSpec_Installation{Installation: installation}})
+	must(t, err)
+	landed(t, "the job executing behind its closed gate", func() bool {
+		_, err := os.Stat(gate + ".entered")
+		return err == nil
+	})
+	if accepted, problem := store.RunV1(request.ID); problem != nil || accepted {
+		t.Fatalf("the controller recorded an acceptance it never saw: %v %v", accepted, problem)
+	}
+	if _, problem := store.RequestMachineCancellation(request.ID, "cozy run cancel"); problem != nil {
+		t.Fatal(problem.Message)
+	}
+	row, problem := store.RequestRow(request.ID)
+	fatal(t, problem)
+	if row.State != "canceling" {
+		t.Fatalf("a cancel of sent work settled without its machine: %s", row.State)
+	}
+	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
+		t.Fatalf("fixture controller up [%d]: %s", code, out)
+	}
+	landed(t, "the cancel delivered and settled", func() bool {
+		row, _ := store.RequestRow(request.ID)
+		return row != nil && row.State == "canceled"
+	})
+	for {
+		event, err := stream.Recv()
+		must(t, err)
+		if outcome := event.GetOutcome(); outcome != nil {
+			if outcome.Status != "canceled" {
+				t.Fatalf("the machine's run ended %s", outcome.Status)
+			}
+			break
+		}
+	}
+	actor, _, _, problem := store.CancelAttribution(request.ID)
+	fatal(t, problem)
+	events, problem := store.EventsAfter(request.ID, 0, 1000)
+	fatal(t, problem)
+	for _, event := range events {
+		if event.Payload["scope"] == "before_machine_submission" {
+			t.Fatalf("sent work was settled as never submitted: %s %v", event.Type, event.Payload)
+		}
+	}
+	if accepted, problem := store.RunV1(request.ID); problem != nil || !accepted || actor != "cozy run cancel" {
+		t.Fatalf("the cancel lost its acceptance (%v) or actor (%q)", accepted, actor)
+	}
+}
