@@ -332,8 +332,20 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	admissionOnlySince(before)
 	before = len(hubCalls())
 	must(t, os.Chmod(refused, 0o700))
-	if watched, err := cozy("run", "watch", fmt.Sprint(undelivered.Error.Details.Number), "--json").Output(); err != nil {
-		t.Fatalf("watching the run once its folder took the outputs exited %v:\n%s", err, watched)
+	// Concurrent readers share one retry; neither may return the previous refusal
+	// while the other is successfully delivering these same retained outputs.
+	var watchers [2]*exec.Cmd
+	var watched [2]bytes.Buffer
+	for i := range watchers {
+		watchers[i] = cozy("run", "watch", fmt.Sprint(undelivered.Error.Details.Number), "--json")
+		watchers[i].Stdout = &watched[i]
+		must(t, watchers[i].Start())
+		t.Cleanup(func() { _ = watchers[i].Process.Kill() })
+	}
+	for i, watcher := range watchers {
+		if err := watcher.Wait(); err != nil {
+			t.Fatalf("watcher %d returned before restored output delivery: %v:\n%s", i, err, watched[i].String())
+		}
 	}
 	if files, err := os.ReadDir(refused); err != nil || len(files) != 4 {
 		t.Fatalf("the restored folder holds %d files, want the run's 4 outputs: %v", len(files), err)
