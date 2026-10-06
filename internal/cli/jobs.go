@@ -751,8 +751,7 @@ func cancelJob(ctx *Context) *exit.Error {
 	// ALREADY TERMINAL = IDEMPOTENT 0 printing the terminal. A cancel that arrives after
 	// the terminal is late, not wrong.
 	if settled(state.Status) && !state.Retaining {
-		fields := append(jobFields(ctx.Mode(), state, true), output.Field{K: "changed", V: false})
-		return emit(ctx, compactRecord(fields, "job", "status", "changed", "canceled_by"))
+		return emitJobCancellation(ctx, state, false)
 	}
 	if e := c.CancelJob(jobID, "cozy run cancel"); e != nil {
 		return e
@@ -768,8 +767,16 @@ func cancelJob(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	fields := append(jobFields(ctx.Mode(), final, true), output.Field{K: "changed", V: true})
-	return emit(ctx, compactRecord(fields, "job", "status", "changed", "canceled_by"))
+	return emitJobCancellation(ctx, final, true)
+}
+
+func emitJobCancellation(ctx *Context, state api.JobState, changed bool) *exit.Error {
+	fields := append(jobFields(ctx.Mode(), state, true), output.Field{K: "changed", V: changed})
+	defaults := []string{"job", "status", "changed"}
+	if state.CanceledBy != "" {
+		defaults = append(defaults, "canceled_by")
+	}
+	return emit(ctx, compactRecord(fields, defaults...))
 }
 
 func settled(status string) bool {
