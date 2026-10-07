@@ -28,6 +28,7 @@ type callPhaseEvent struct {
 	Status       string `json:"status,omitempty"`
 	AtUnixMS     int64  `json:"at_unix_ms"`
 	CalledUnixMS int64  `json:"called_unix_ms"`
+	Memoized     bool   `json:"memoized,omitempty"`
 	callTiming
 }
 

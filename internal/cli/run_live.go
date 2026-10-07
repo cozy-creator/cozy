@@ -666,6 +666,9 @@ func doneRows(done []liveDone, width int) []string {
 		}
 		if d.stage != nil && d.stage.call != nil {
 			timing = callTimingText(*d.stage.call, time.UnixMilli(d.stage.call.AtUnixMS), true)
+			if d.stage.call.Memoized && !d.failed {
+				timing = "reused (memo)"
+			}
 		}
 		rows = append(rows, "  "+mark+" "+label+strings.Repeat(" ", column-textCells(label))+"  "+timing)
 	}
@@ -1011,7 +1014,7 @@ func (p *RunProgress) finishLiveCall(e localapi.Event) {
 	if json.Unmarshal(raw, &call) != nil || call.Request == "" || (!call.callTiming.present() && p.view.calls[call.Request] == nil) {
 		return
 	}
-	phase := callPhaseEvent{Request: call.Request, Parent: call.Parent, Index: call.Index, Attempt: call.Attempt, Module: call.Module, Export: call.Export, Label: call.Label, Phase: "terminal", Status: call.Status, AtUnixMS: eventTime(e).UnixMilli(), CalledUnixMS: call.CalledUnixMS, callTiming: call.callTiming}
+	phase := callPhaseEvent{Request: call.Request, Parent: call.Parent, Index: call.Index, Attempt: call.Attempt, Module: call.Module, Export: call.Export, Label: call.Label, Phase: "terminal", Status: call.Status, AtUnixMS: eventTime(e).UnixMilli(), CalledUnixMS: call.CalledUnixMS, Memoized: call.Memoized, callTiming: call.callTiming}
 	p.applyCallPhase(phase, true)
 }
 

@@ -256,7 +256,8 @@ func insertCallV1(tx *sql.Tx, id string, attempt int64, call *v1.Call) error {
 	_ = json.Unmarshal(call.Measurements, &measured)
 	record := map[string]any{"request": call.Run, "parent": id, "index": call.Index, "attempt": attempt,
 		"export": call.Function, "label": call.Label, "status": call.Status, "error": call.GetReason().GetMessage(),
-		"called_unix_ms": call.CalledAtMs, "stages": measured.Attribution.Stages, "steps": measured.Attribution.Steps}
+		"called_unix_ms": call.CalledAtMs, "stages": measured.Attribution.Stages, "steps": measured.Attribution.Steps,
+		"memoized": call.Memoized, "computation_digest": call.ComputationDigest}
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return err
