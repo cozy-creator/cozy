@@ -27,17 +27,17 @@ type keptRelease struct {
 	Requirements []string        `json:"requirements,omitempty"`
 }
 
-func releaseInterfacePath(root, pkg, release string) string {
-	name := sha256.Sum256([]byte(pkg + "@" + release))
+func releaseInterfacePath(root, hubURL, pkg, release string) string {
+	name := sha256.Sum256([]byte(hubURL + "\x00" + pkg + "@" + release))
 	return filepath.Join(root, "releases", "interfaces", hex.EncodeToString(name[:16])+".json")
 }
 
-func keepReleaseInterface(root, pkg, release string, raw []byte, requirements []string) {
+func keepReleaseInterface(root, hubURL, pkg, release string, raw []byte, requirements []string) {
 	if requirements == nil {
-		requirements = readKeptRelease(root, pkg, release).Requirements
+		requirements = readKeptRelease(root, hubURL, pkg, release).Requirements
 	}
 	doc, err := json.Marshal(keptRelease{Interface: raw, Requirements: requirements})
-	path := releaseInterfacePath(root, pkg, release)
+	path := releaseInterfacePath(root, hubURL, pkg, release)
 	if err == nil && os.MkdirAll(filepath.Dir(path), 0o700) == nil && os.WriteFile(path+".tmp", doc, 0o600) == nil {
 		_ = os.Rename(path+".tmp", path)
 	}
@@ -64,7 +64,7 @@ func keptNewestRelease(root, hubURL, pkg string) (string, *launch.PackageInterfa
 		return "", nil
 	}
 	release := string(raw)
-	kept := readKeptRelease(root, pkg, release)
+	kept := readKeptRelease(root, hubURL, pkg, release)
 	if kept.Interface == nil {
 		return "", nil
 	}
@@ -77,8 +77,8 @@ func keptNewestRelease(root, hubURL, pkg string) (string, *launch.PackageInterfa
 
 // readKeptRelease is the kept release, or none; a file holding only an interface has no
 // closure.
-func readKeptRelease(root, pkg, release string) keptRelease {
-	raw, err := os.ReadFile(releaseInterfacePath(root, pkg, release))
+func readKeptRelease(root, hubURL, pkg, release string) keptRelease {
+	raw, err := os.ReadFile(releaseInterfacePath(root, hubURL, pkg, release))
 	if err != nil {
 		return keptRelease{}
 	}
@@ -111,7 +111,7 @@ func (r *Resolver) capturedResultInterface(request records.Request) (*launch.Pac
 			_, surface, problem := r.installPackageInterface(request.InstallID)
 			return surface, problem
 		}
-		if kept := readKeptRelease(home.Paths(r.cfg.Home).Root, root.Package, root.Release); kept.Interface != nil {
+		if kept := readKeptRelease(home.Paths(r.cfg.Home).Root, either(request.Hub, r.cfg.HubURL), root.Package, root.Release); kept.Interface != nil {
 			return launch.DecodePackageInterface(kept.Interface)
 		}
 		ref, problem := hub.ParseRef(root.Package)
