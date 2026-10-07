@@ -1810,18 +1810,20 @@ func (x *Reason) GetOrigin() string {
 
 // One settled call the run made: a child run, or an effect such as its weights publication.
 type Call struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Run           string                 `protobuf:"bytes,1,opt,name=run,proto3" json:"run,omitempty"`      // the child run's id
-	Index         uint32                 `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"` // its index among the run's calls
-	Function      string                 `protobuf:"bytes,3,opt,name=function,proto3" json:"function,omitempty"`
-	Label         string                 `protobuf:"bytes,4,opt,name=label,proto3" json:"label,omitempty"`   // the author's label for it
-	Status        string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"` // succeeded, failed, canceled
-	CalledAtMs    int64                  `protobuf:"varint,6,opt,name=called_at_ms,json=calledAtMs,proto3" json:"called_at_ms,omitempty"`
-	FinishedAtMs  int64                  `protobuf:"varint,7,opt,name=finished_at_ms,json=finishedAtMs,proto3" json:"finished_at_ms,omitempty"`
-	Measurements  []byte                 `protobuf:"bytes,8,opt,name=measurements,proto3" json:"measurements,omitempty"` // its executor's, as canonical JSON (Outcome.measurements)
-	Reason        *Reason                `protobuf:"bytes,9,opt,name=reason,proto3" json:"reason,omitempty"`             // why it did not succeed
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Run               string                 `protobuf:"bytes,1,opt,name=run,proto3" json:"run,omitempty"`      // the child run's id
+	Index             uint32                 `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"` // its index among the run's calls
+	Function          string                 `protobuf:"bytes,3,opt,name=function,proto3" json:"function,omitempty"`
+	Label             string                 `protobuf:"bytes,4,opt,name=label,proto3" json:"label,omitempty"`   // the author's label for it
+	Status            string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"` // succeeded, failed, canceled
+	CalledAtMs        int64                  `protobuf:"varint,6,opt,name=called_at_ms,json=calledAtMs,proto3" json:"called_at_ms,omitempty"`
+	FinishedAtMs      int64                  `protobuf:"varint,7,opt,name=finished_at_ms,json=finishedAtMs,proto3" json:"finished_at_ms,omitempty"`
+	Measurements      []byte                 `protobuf:"bytes,8,opt,name=measurements,proto3" json:"measurements,omitempty"`                                     // its executor's, as canonical JSON (Outcome.measurements)
+	Reason            *Reason                `protobuf:"bytes,9,opt,name=reason,proto3" json:"reason,omitempty"`                                                 // why it did not succeed
+	Memoized          bool                   `protobuf:"varint,10,opt,name=memoized,proto3" json:"memoized,omitempty"`                                           // answered from a result this machine held; nothing ran
+	ComputationDigest string                 `protobuf:"bytes,11,opt,name=computation_digest,json=computationDigest,proto3" json:"computation_digest,omitempty"` // a memoized call's computation (sha256:<hex>), ran or answered
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Call) Reset() {
@@ -1915,6 +1917,20 @@ func (x *Call) GetReason() *Reason {
 		return x.Reason
 	}
 	return nil
+}
+
+func (x *Call) GetMemoized() bool {
+	if x != nil {
+		return x.Memoized
+	}
+	return false
+}
+
+func (x *Call) GetComputationDigest() string {
+	if x != nil {
+		return x.ComputationDigest
+	}
+	return ""
 }
 
 type ControlRequest struct {
@@ -3229,7 +3245,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x06Reason\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x16\n" +
-	"\x06origin\x18\x03 \x01(\tR\x06origin\"\x95\x02\n" +
+	"\x06origin\x18\x03 \x01(\tR\x06origin\"\xe0\x02\n" +
 	"\x04Call\x12\x10\n" +
 	"\x03run\x18\x01 \x01(\tR\x03run\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\rR\x05index\x12\x1a\n" +
@@ -3240,7 +3256,10 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"calledAtMs\x12$\n" +
 	"\x0efinished_at_ms\x18\a \x01(\x03R\ffinishedAtMs\x12\"\n" +
 	"\fmeasurements\x18\b \x01(\fR\fmeasurements\x12/\n" +
-	"\x06reason\x18\t \x01(\v2\x17.cozy.machine.v1.ReasonR\x06reason\"Q\n" +
+	"\x06reason\x18\t \x01(\v2\x17.cozy.machine.v1.ReasonR\x06reason\x12\x1a\n" +
+	"\bmemoized\x18\n" +
+	" \x01(\bR\bmemoized\x12-\n" +
+	"\x12computation_digest\x18\v \x01(\tR\x11computationDigest\"Q\n" +
 	"\x0eControlRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12/\n" +
 	"\x06action\x18\x02 \x01(\x0e2\x17.cozy.machine.v1.ActionR\x06action\"\xc1\x01\n" +

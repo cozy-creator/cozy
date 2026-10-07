@@ -99,7 +99,9 @@ type reportCall struct {
 	Module      string        `json:"module,omitempty"`
 	Function    string        `json:"function,omitempty"`
 	Label       string        `json:"label,omitempty"`
-	Status      string        `json:"status,omitempty"` // empty until Runtime records it settled
+	Status      string        `json:"status,omitempty"`      // empty until Runtime records it settled
+	Memoized    bool          `json:"memoized,omitempty"`    // answered from a result its machine held; nothing ran
+	Computation string        `json:"computation,omitempty"` // a memoized call's computation, ran or answered
 	Error       string        `json:"error,omitempty"`
 	Runtime     string        `json:"runtime,omitempty"` // the SDK its executor loaded
 	GPUs        []reportGPU   `json:"gpus,omitempty"`    // its grants' cards, then its release's records
@@ -305,6 +307,8 @@ type callEvent struct {
 	CalledUnixMS int64                  `json:"called_unix_ms"`
 	Stages       map[string]triageTrack `json:"stages"`
 	Steps        map[string]triageTrack `json:"steps"`
+	Memoized     bool                   `json:"memoized"`           // answered from a result its machine held
+	Computation  string                 `json:"computation_digest"` // a memoized call's computation
 }
 
 func handleRunShow(ctx *Context) *exit.Error {
@@ -450,6 +454,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			}
 			c.Parent, c.Index, c.Attempt, c.Module, c.Function = record.Parent, record.Index, record.Attempt, record.Module, record.Export
 			c.Label, c.Status, c.Error = record.Label, record.Status, record.Error
+			c.Memoized, c.Computation = record.Memoized, record.Computation
 			c.StartUnixMS = record.CalledUnixMS
 			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
 			c.callTiming = record.callTiming
@@ -1012,6 +1017,9 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 }
 
 func (c reportCall) state() string {
+	if c.Memoized && c.Status == "succeeded" {
+		return "reused (memo)"
+	}
 	if c.Status != "" {
 		return c.Status
 	}
