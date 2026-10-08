@@ -125,6 +125,15 @@ raise RuntimeError("directory source must not execute during description")
 // The ordinary endpoint command uploads the captured directory and executes its
 // relative helper on a real CPU machine; no prior editable install is needed.
 func TestRunDirectoryExecutesOnExplicitEndpoint(t *testing.T) {
+	runDirectoryOnExplicitEndpoint(t, false)
+}
+
+func TestRunDirectoryEntrypointUsesItsCaptureWithoutAnActivePin(t *testing.T) {
+	runDirectoryOnExplicitEndpoint(t, true)
+}
+
+func runDirectoryOnExplicitEndpoint(t *testing.T, serving bool) {
+	t.Helper()
 	if *machineHostBinary == "" || *privateScriptRuntimeWheel == "" {
 		t.Skip("requires a real machine and paired Runtime fixture wheel")
 	}
@@ -157,6 +166,9 @@ func TestRunDirectoryExecutesOnExplicitEndpoint(t *testing.T) {
 	must(t, os.WriteFile(endpoint, document, 0600))
 	project, _, source := directoryProofProject(t)
 	source = strings.Replace(source, "raise RuntimeError(\"directory source must not execute during description\")\n", "", 1)
+	if serving {
+		source = strings.Replace(source, "@app.job\ndef verify_value", "@app.entrypoint\ndef verify_value", 1)
+	}
 	must(t, os.WriteFile(filepath.Join(project, "directory_proof", "__init__.py"), []byte(source), 0600))
 	code, out := runCozy(t, root, "run", project+"/verify-value", "--machine-endpoint-file", endpoint, "--await", "--json")
 	if code != 0 || !strings.Contains(out, `"value":8`) {
@@ -169,6 +181,11 @@ func TestRunDirectoryExecutesOnExplicitEndpoint(t *testing.T) {
 	fatal(t, problem)
 	if request == nil || request.LocalInstallationID == "" || request.InstallID == "" || request.State != "succeeded" {
 		t.Fatalf("source capture was not durably executed: %+v", request)
+	}
+	pins, problem := store.Pins("local/directory-proof")
+	fatal(t, problem)
+	if len(pins) != 0 {
+		t.Fatal("explicit source execution silently installed an active package pin")
 	}
 	if _, err := os.Stat(filepath.Join(project, "uv.lock")); !os.IsNotExist(err) {
 		t.Fatalf("run wrote an author lock: %v", err)

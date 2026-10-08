@@ -338,10 +338,16 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	}
 	began := ctx.commandStarted
 	submitting := time.Now()
+	installID := target.InstallID
+	if strings.HasPrefix(target.Package, "local/") && !target.Snapshot {
+		// A named editable reference asks admission to refresh its live source.
+		// Explicit directory/script captures already own an immutable install.
+		installID = ""
+	}
 	handle, e := c.Submit(api.Submission{
 		MachineEndpoint: ctx.endpoint,
 		Package:         target.Package, Function: target.Function, Input: input,
-		LocalAssets: assets, InstallID: target.InstallID,
+		LocalAssets: assets, InstallID: installID,
 		Release: target.Release, Rental: managedRental,
 		PackageInterface: target.Interface,
 		RentalRequired:   ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "",
