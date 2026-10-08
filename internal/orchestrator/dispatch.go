@@ -29,7 +29,7 @@ type Submission struct {
 	Package                  string // org/name
 	Entrypoint               string // the function
 	PlanID                   string // the entrypoint_binding_plan_id this attempt binds
-	Release                  string // immutable remote package release; empty for local execution
+	Release                  string // explicit published release; empty lets the machine select it
 	// LocalInstallationID is the exact staged wheel-set identity for one editable rental.
 	LocalInstallationID string
 	Models              []ModelRef

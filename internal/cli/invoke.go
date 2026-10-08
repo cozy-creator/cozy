@@ -2913,7 +2913,8 @@ func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 
 // ------------------------------------------------------------------- target parsing
 
-// Target is one installed package and optional callable selected for invocation.
+// Target is one package and optional callable selected for invocation. Interface
+// describes its inputs; an empty published Release leaves selection to the machine.
 type Target struct {
 	Package        string
 	Function       string
