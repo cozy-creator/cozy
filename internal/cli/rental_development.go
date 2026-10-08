@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -203,4 +204,20 @@ func rentalImage(ctx *Context, existing *records.RentalOperation) (string, *exit
 			WithRemedy("resume without --image or use a new operation key")
 	}
 	return req.Image, nil
+}
+
+func rentalMachineExclusions(ctx *Context, existing *records.RentalOperation, provider string) ([]string, *exit.Error) {
+	supplied := ctx.Inv.Values["--exclude-provider-machine"]
+	selected, problem := hub.RentalMachineExclusions(provider, supplied)
+	if problem != nil || existing == nil {
+		return selected, problem
+	}
+	req, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
+	if problem != nil {
+		return nil, problem
+	}
+	if len(supplied) > 0 && !slices.Equal(selected, req.ExcludedProviderMachines) {
+		return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict", "rental operation already names different excluded provider machines").WithRemedy("resume without --exclude-provider-machine or use a new operation key")
+	}
+	return req.ExcludedProviderMachines, nil
 }

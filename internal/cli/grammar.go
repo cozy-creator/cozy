@@ -645,9 +645,10 @@ type RentalNewCmd struct {
 	SourceProfiles []string `name:"source-profile" help:"Reviewed TensorFS source profile of the one --model provider source (repeatable; several compose one model)."`
 	DiskGB         int      `name:"disk-gb" help:"Container disk to rent, in GB; the Hub picks an offer whose disk allows it."`
 	// Provider is a development override: Tensorhub places a rental, RunPod first. Hidden.
-	Provider       string `name:"provider" hidden:"" help:"Development only: force the marketplace (runpod or vast)."`
-	IdempotencyKey string `help:"Stable paid-operation identity."`
-	Timeout        string `help:"Caller wait deadline; does not release the rental."`
+	Provider                 string   `name:"provider" hidden:"" help:"Development only: force the marketplace (runpod or vast)."`
+	ExcludedProviderMachines []string `name:"exclude-provider-machine" hidden:"" help:"Development only: exclude this Vast machine ID; repeatable, requires --provider=vast."`
+	IdempotencyKey           string   `help:"Stable paid-operation identity."`
+	Timeout                  string   `help:"Caller wait deadline; does not release the rental."`
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
@@ -666,7 +667,7 @@ func (c *RentalNewCmd) Run(r *Runtime) error {
 	return r.call(handleRent, []string{c.SKU}, flags, values(
 		"--gpus", gpus, "--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models,
 		"--source-profile", c.SourceProfiles, "--disk-gb", disk, "--ssh-public-key", c.SSHPublicKey, "--image", c.Image,
-		"--provider", c.Provider), false)
+		"--provider", c.Provider, "--exclude-provider-machine", c.ExcludedProviderMachines), false)
 }
 
 type RentalEndCmd struct {

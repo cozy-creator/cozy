@@ -69,7 +69,7 @@ func handleRent(ctx *Context) *exit.Error {
 		_, developmentSet := ctx.Inv.Bools["--development"]
 		if ctx.Inv.Value("--idempotency-key") != "" || ctx.Inv.Value("--gpus") != "" ||
 			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || developmentSet || ctx.Inv.Value("--ssh-public-key") != "" ||
-			ctx.Inv.Value("--image") != "" || ctx.Inv.Value("--disk-gb") != "" || len(ctx.Inv.Values["--source-profile"]) != 0 {
+			ctx.Inv.Value("--image") != "" || ctx.Inv.Value("--disk-gb") != "" || len(ctx.Inv.Values["--source-profile"]) != 0 || len(ctx.Inv.Values["--exclude-provider-machine"]) != 0 {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
 		}
@@ -379,6 +379,10 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	if e != nil {
 		return nil, e
 	}
+	excluded, e := rentalMachineExclusions(ctx, existing, provider)
+	if e != nil {
+		return nil, e
+	}
 	if managedRequestID == "" {
 		workload, e = manualRentalWorkload(ctx, existing)
 		if e != nil {
@@ -438,14 +442,27 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	}
 	if existing != nil {
 		hourlyRateUSDMicros = existing.HourlyRateUSDMicros
+		// An unsent or unconfirmed paid intent may resume against a rolled-back
+		// Hub. Reconfirm only this requested feature; keep its retained rate.
+		if existing.RentalID == "" && len(excluded) > 0 {
+			hctx, cancel := hub.Context()
+			confirmed, problem := c.QuoteRental(hctx, existing.RequestBody)
+			cancel()
+			if problem != nil {
+				return nil, problem
+			}
+			if problem = confirmedMachineExclusions(confirmed, excluded); problem != nil {
+				return nil, problem
+			}
+		}
 	} else if hourlyRateUSDMicros, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), creator.PublicKey(),
-		workload, development, image, provider, hourlyRateUSDMicros); e != nil {
+		workload, development, image, provider, excluded, hourlyRateUSDMicros); e != nil {
 		return nil, e
 	}
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
 		body, e := hub.RentalRequestBytes(machineName, skuName, gpus, secret.HashHex(token),
-			creator.PublicKey(), workload, development, image, provider)
+			creator.PublicKey(), workload, development, image, provider, excluded...)
 		if e != nil {
 			return nil, "", e
 		}
@@ -477,9 +494,9 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 // workload choose the machine, so this, not the default-disk listing, is the rate the
 // renter consents to.
 func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHash, creatorKey string,
-	workload hub.DeclaredWorkload, development *hub.RentalDevelopment, image, provider string, listed int64,
+	workload hub.DeclaredWorkload, development *hub.RentalDevelopment, image, provider string, excluded []string, listed int64,
 ) (int64, *exit.Error) {
-	body, e := hub.RentalRequestBytes("quote", skuName, gpus, tokenHash, creatorKey, workload, development, image, provider)
+	body, e := hub.RentalRequestBytes("quote", skuName, gpus, tokenHash, creatorKey, workload, development, image, provider, excluded...)
 	if e != nil {
 		return 0, e
 	}
@@ -489,6 +506,10 @@ func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHas
 	if e != nil {
 		return 0, e
 	}
+	if e = confirmedMachineExclusions(quote, excluded); e != nil {
+		return 0, e
+	}
+
 	if ctx.Err != nil && !ctx.Mode().JSON {
 		// The machine it names is the one bought: a product can be priced at another tier.
 		line := fmt.Sprintf("%s%s with a %d GB disk: %s", orchestrator.MachineLabel(skuName, gpus),
@@ -2190,4 +2211,11 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 		{K: "state", V: "ended"}, {K: "changed", V: destroyed},
 		{K: "forgotten", V: forgotten},
 	}, Summary: summary, Notes: notes, Next: []string{"cozy rental list"}})
+}
+
+func confirmedMachineExclusions(quote hub.RentalQuote, excluded []string) *exit.Error {
+	if len(excluded) > 0 && !slices.Equal(quote.ExcludedProviderMachines, excluded) {
+		return exit.Named(exit.Structural, "rental.machine_exclusion_unsupported", "Tensorhub did not confirm the excluded provider machines; no new rental POST was sent").WithRemedy("update this Hub to support provider-machine exclusions")
+	}
+	return nil
 }

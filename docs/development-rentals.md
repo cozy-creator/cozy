@@ -46,3 +46,9 @@ creates a Hub rental, changes the selected Hub, or accepts a credential in argv.
 It sends the credential only in the selected provider's Authorization header and
 never follows HTTP redirects. The hidden `--provider-url` development override
 requires HTTPS, except for a literal loopback address used by local test servers.
+
+To skip a known Vast host for a new development rental, use the hidden explicit
+selection `--provider=vast --exclude-provider-machine=150864` (repeat the exclusion
+flag for more machine IDs). This excludes the provider's machine ID at quote and
+acquisition, across retries and replans. It does not name a rental/instance ID or an IP.
+The Hub must confirm the applied exclusions before the CLI submits the paid request.
