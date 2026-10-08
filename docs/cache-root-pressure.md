@@ -6,10 +6,10 @@ repository compare-and-set. An existing unmarked or mixed repository is never
 retroactively marked. Ordinary local repository mutations invalidate the marker,
 including no-op writes. Missing, mismatched, or interrupted markers preserve roots.
 
-Pressure collection is an explicit managed-store action. Runtime excludes every
-accepted, preparing, pending, and live placement while holding its existing
-control/preparation fences. TensorFS alone chooses roots and reclaims bytes using
-its existing dedup-aware planner, retaining native source, derive, and operation
+Pressure collection is an explicit managed-store action. TensorD supplies a keep list
+covering live executors, in-progress acquisitions, and model inputs/preparations of
+unfinished runs. The embedded TensorFS library chooses eligible roots and reclaims bytes
+using its existing dedup-aware planner, retaining native source, derive, and operation
 holds. The native exclusive recovery lock spans eligibility, root removal, and GC;
 live readers or writers return STORE_BUSY before any root is changed. Cache roots
 are never removed just because their age exceeds a threshold.

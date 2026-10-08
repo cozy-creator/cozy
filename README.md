@@ -3,6 +3,15 @@
 The [consumer interfaces](docs/interfaces.md) define Python, Rust and CLI ownership,
 the full Python+CLI distribution, typed transaction results and their lifetimes.
 
+TensorFS is a library used by both TensorD and Runtime, with no separate TensorFS daemon.
+TensorD makes model weights available to Runtime: it coordinates machine-wide memory
+policy, uses TensorFS to acquire serialized weight bytes and metadata, and fills and
+retains shared CPU weight buffers. It can also retain exported GPU allocation handles.
+Runtime constructs Python/PyTorch models and performs GPU allocation, copies, mapping and
+unmapping through TensorFS's weight-plane/device APIs, within TensorD's grants. Stored
+weight bytes, prepared CPU buffers and GPU-resident tensors are distinct representations;
+retaining their bytes does not construct or execute a model.
+
 TensorFS stores every domain repository as the same graph:
 
 ```text
@@ -115,6 +124,9 @@ system.
 
 Install `tensorfs[torch]` for the default Python inference interface. Plain `import tensorfs` and the storage/metadata APIs remain Torch-free. Reads return owned tensors; closing the reader does not invalidate them.
 
+This example opens a standalone Store explicitly. Managed Runtime execution uses the
+source capabilities and buffers TensorD supplies instead of opening the managed Store.
+
 ```python
 import tensorfs
 
@@ -127,7 +139,7 @@ The reader also accepts an existing scoped `SourceCapability`, which it borrows 
 
 Plain encodings return `torch.Tensor`; the two current rowwise FP8 encodings return released TorchAO 0.18.0 `Float8Tensor` with exact encoded bytes and scales. Other codecs refuse before allocation/read. The default FP8 object has upstream weight-only semantics when used by a standard `nn.Linear`; that upstream forward may dequantize. TensorFS performs no load-time dequantization or requantization.
 
-`get(..., out=tensor)` fills an exact caller-owned destination and preserves its execution options. An omitted `device` uses `out.device`, or CPU when no output is provided; an explicit device must match the output. Source access is checked or leased before allocating destination storage. `allocator=callback` alternatively allocates each validated physical `TensorAllocation`. Runtime uses these options after its own memory admission. Caller-provided output may be partially written if a read fails; no successful tensor result is returned. Physical destination version counters are incremented even after a partial write so Runtime residency checks cannot reuse an old verdict.
+`get(..., out=tensor)` fills an exact caller-owned destination and preserves its execution options. An omitted `device` uses `out.device`, or CPU when no output is provided; an explicit device must match the output. Source access is checked or leased before allocating destination storage. `allocator=callback` alternatively allocates each validated physical `TensorAllocation`. In managed execution, Runtime plans these operations within TensorD's memory grants. Caller-provided output may be partially written if a read fails; no successful tensor result is returned. Physical destination version counters are incremented even after a partial write so Runtime residency checks cannot reuse an old verdict.
 
 `tensorfs.from_parts(spec, parts, *, mm_config=None, kernel_preference=None, act_quant_kwargs=None)` adopts existing physical Torch allocations without copying. `spec` is `tensorfs.derived.Tensor`; it retains the native logical dtype/shape, encoding ID and `Part` metadata. Execution options must be the reviewed upstream objects; they cannot override stored geometry. Runtime supplies its activation/GEMM policy and owns Parameter assignment and LoRA. `tensorfs.physical_tensors(value)` exposes supported physical leaves for census without reconstructing logical weights.
 
@@ -171,8 +183,11 @@ generic `IO_FAILED` an out-of-space write used to raise bought on rented hardwar
 
 ## Ensure: model download
 
-`ensure` is the one entry for making a model resident, used by the machine daemon
-(`tfs ensure`) and the Runtime (`tensorfs.ensure`); `tfs fetch` and `tensorfs.pull` stay.
+`ensure` makes a model's serialized bytes and metadata resident in the Store. TensorD
+uses the embedded Rust acquisition API for its managed Store; standalone Store owners can
+use `tfs ensure` or `tensorfs.ensure`. This does not construct a Python/PyTorch model or
+make its tensors GPU-resident. Managed Runtime receives the resulting sources and buffers
+from TensorD. `tfs fetch` and `tensorfs.pull` remain lower-level acquisition interfaces.
 
 ```bash
 tfs capabilities                      # ensure/1, get-range/1, deliver/1, pressure/1
@@ -492,7 +507,7 @@ unreviewed member refuses. Unique keysets need no member. Equal headers with no 
 admit multiple assignments and refuse; a provider adapter may supply a member only when its own
 pinned metadata binds that exact member to the downloaded path.
 
-Pod Runtime uses the compiled facade directly—never the CLI or a subprocess:
+Standalone Python Store owners can use the compiled source-preparation facade directly:
 
 ```python
 prepared = store.prepare_model_source(
@@ -509,6 +524,10 @@ prepared = store.prepare_model_source(
 # Only after the operation is adopted or explicitly abandoned:
 store.release_model_source(operation_id)
 ```
+
+TensorD performs managed source acquisition/preparation through the corresponding Rust
+APIs. Runtime's package jobs use scoped source/output interfaces for their tensor work;
+the direct Store example above does not describe a managed executor opening the Store.
 
 The sorted roster contains all members from the outset. Headers are exact JSON index bytes or
 the safetensors eight-byte length plus header JSON. Every body length is pinned; only members in
