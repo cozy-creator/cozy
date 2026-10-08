@@ -597,14 +597,29 @@ func (c *RunShowCmd) Run(r *Runtime) error {
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
-	Keepalive RentalKeepaliveCmd `cmd:"" help:"Explicitly reset this rental's fixed 15-minute idle deadline once."`
-	Update    RentalUpdateCmd    `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
-	SSHInfo   RentalSSHInfoCmd   `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
-	List      RentalListCmd      `cmd:"" help:"List rented machines, live on a terminal."`
-	Show      RentalShowCmd      `cmd:"" help:"Show one rental: state, rate, accrued spend and every other fact."`
-	Logs      RentalLogsCmd      `cmd:"" help:"Print the provider's boot log of a rental's attempt, kept after its pod is gone, or with --tensorfs its machine's TensorFS log."`
-	New       RentalNewCmd       `cmd:"" help:"Start a private rental, or list available machine types."`
-	End       RentalEndCmd       `cmd:"" help:"End a private rental and stop billing."`
+	Keepalive   RentalKeepaliveCmd   `cmd:"" help:"Explicitly reset this rental's fixed 15-minute idle deadline once."`
+	Update      RentalUpdateCmd      `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
+	SSHInfo     RentalSSHInfoCmd     `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
+	List        RentalListCmd        `cmd:"" help:"List rented machines, live on a terminal."`
+	Show        RentalShowCmd        `cmd:"" help:"Show one rental: state, rate, accrued spend and every other fact."`
+	Logs        RentalLogsCmd        `cmd:"" help:"Print the provider's boot log of a rental's attempt, kept after its pod is gone, or with --tensorfs its machine's TensorFS log."`
+	New         RentalNewCmd         `cmd:"" help:"Start a private rental, or list available machine types."`
+	End         RentalEndCmd         `cmd:"" help:"End a private rental and stop billing."`
+	EndExternal RentalEndExternalCmd `cmd:"" name:"end-external" help:"Development: destroy an explicitly identified Vast instance that has no Hub rental record."`
+}
+
+type RentalEndExternalCmd struct {
+	Provider      string `required:"" enum:"vast" help:"External provider; currently vast."`
+	ResourceID    int64  `name:"resource-id" required:"" help:"Exact provider instance id to destroy."`
+	ExpectedLabel string `name:"expected-label" required:"" help:"Require this provider label before requesting deletion."`
+	TokenStdin    bool   `name:"token-stdin" help:"Read the provider API key from standard input; it is never saved."`
+	ProviderURL   string `name:"provider-url" default:"https://console.vast.ai" hidden:"" help:"Development proxy API origin; credentials never follow redirects."`
+}
+
+func (c *RentalEndExternalCmd) Run(r *Runtime) error {
+	return r.call(handleExternalRentalEnd, nil, bools("--token-stdin", c.TokenStdin), values(
+		"--provider", c.Provider, "--resource-id", strconv.FormatInt(c.ResourceID, 10),
+		"--expected-label", c.ExpectedLabel, "--provider-url", c.ProviderURL), false)
 }
 
 type RentalUpdateCmd struct {
