@@ -1044,7 +1044,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 		return exit.Usagef("--watch requires interactive terminal output").
 			WithRemedy("omit --watch for one snapshot, or use --json for automation")
 	}
-	allHubs := everyHub(ctx)
+	const allHubs = true
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -1163,13 +1163,13 @@ func showEndedRental(ctx *Context, subject string) *exit.Error {
 // spans that this host is signed in to, the latest ended first, each with why and when it
 // ended and what it cost. A hub that cannot answer is named, never silently left out.
 func endedRentals(ctx *Context) (output.List, *exit.Error) {
-	origins := []string{ctx.Cfg.HubURL}
-	if everyHub(ctx) {
-		for _, origin := range ctx.Cfg.Hubs {
-			if !slices.Contains(origins, origin) {
-				origins = append(origins, origin)
-			}
-		}
+	store, _ := existingRecords(ctx)
+	if store != nil {
+		defer store.Close()
+	}
+	origins, problem := rentalInventoryOrigins(ctx, store)
+	if problem != nil {
+		return output.List{}, problem
 	}
 	fields := []string{"machine", "gpus", "ended by", "ended", "spent"}
 	if len(origins) > 1 {
@@ -1366,8 +1366,8 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 	} else if len(inventory.UnreadableHubs) > 0 {
 		// Hubs that did not answer leave no account total: their machines may still be billing.
-		list.Lead = []string{"Showing this host's last local records, which may be out of date, for the hubs that did not answer; " +
-			"account totals and machines this host never recorded there are unknown."}
+		list.Lead = []string{"Showing the last known rentals, which may be out of date, for the hubs that did not answer; " +
+			"account totals and machines not previously observed there are unknown."}
 		list.Aggregates = []output.Field{{K: "live", V: jsonFact{false}}}
 	} else {
 		list.Aggregates = append(list.Aggregates, output.Field{K: "live", V: jsonFact{true}})
@@ -1485,6 +1485,10 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	// spending — showed an empty fleet. The hub is asked what it bills this account
 	// for, and any live rental with no local row is a row here, marked as such.
 	for _, seen := range unrecorded {
+		state := rentalStateCell(seen.State, seen.Boot, now) + " (other client)"
+		if seen.Unverified {
+			state += " (unverified)"
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			// The hub publishes no Cozy SKU NAME for a rental, only the accelerator it
 			// bought. The card is what the SKU column exists to tell a reader — the
@@ -1495,7 +1499,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"gpus":    gpuCell(seen.AcceleratorModel, seen.AcceleratorCount),
 			// Billed to this account, attached to another Creator home: its work is not
 			// observable here, which the RUNNING/QUEUED dashes also say.
-			"state":   rentalStateCell(seen.State, seen.Boot, now) + " (other client)",
+			"state":   state,
 			"failure": "—", "uptime": rentalUptime(seen.RentedAt),
 			"running": "—", "queued": "—", "idle": "—",
 			"rental": seen.ID, "bought for": "—",
@@ -1518,6 +1522,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 		if seen.Boot != nil {
 			typed["boot"] = seen.Boot
+		}
+		if seen.Unverified {
+			typed["unverified"] = true
 		}
 		spendFields(typed, seen)
 		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -13,8 +14,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
-// readRentalInventory is one hub's reconciled fleet, or with allHubs every hub's this
-// host holds rentals on. A listing of one hub still counts this host's live rentals
+// readRentalInventory is one hub's reconciled fleet, or with allHubs every known
+// account's fleet. A listing of one hub still counts this host's live rentals
 // on the others, so switching hubs never hides a machine that is billing. The hubs are
 // asked before the fleet lock is taken, so a purchase or release in flight never holds
 // the listing.
@@ -22,13 +23,21 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 	origin = fleet.origin(origin)
 	origins := []string{origin}
 	if allHubs {
-		held, problem := fleet.origins()
+		held, problem := rentalInventoryOrigins(fleet.ctx, st)
 		if problem != nil {
 			return api.RentalInventory{}, problem
 		}
 		if !slices.Contains(held, origin) {
 			held = append(held, origin)
 		}
+		fleet.mu.Lock()
+		for known := range fleet.census {
+			if !slices.Contains(held, known) {
+				held = append(held, known)
+			}
+		}
+		fleet.mu.Unlock()
+		slices.Sort(held)
 		origins = held
 	}
 	asked := map[string]*exit.Error{}
@@ -58,7 +67,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 		}
 		if result.HubUnanswered != nil {
 			merged.UnreadableHubs = append(merged.UnreadableHubs, api.HubProblem{Hub: each, Error: result.HubUnanswered})
-			for _, rows := range [][]api.RentalSummary{result.Rentals, result.Pending} {
+			for _, rows := range [][]api.RentalSummary{result.Rentals, result.Unrecorded, result.Pending} {
 				for i := range rows {
 					rows[i].Unverified = true
 				}
@@ -72,6 +81,51 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 		merged.Pending = append(merged.Pending, result.Pending...)
 	}
 	return merged.Current(), nil
+}
+
+// Inventory covers account-side rentals too: a signed-in Hub need not have a
+// locally attached rental yet. Records remain relevant even after a Hub is unnamed
+// or its credential is removed. This is discovery, never a configuration change.
+func rentalInventoryOrigins(ctx *Context, st *records.Store) ([]string, *exit.Error) {
+	seen := map[string]bool{ctx.Cfg.HubURL: true}
+	for _, origin := range accountauth.KnownOrigins(ctx.Cfg.Home) {
+		seen[origin] = true
+	}
+	configured := []string{ctx.Cfg.ConfiguredHubURL}
+	for _, origin := range ctx.Cfg.Hubs {
+		configured = append(configured, origin)
+	}
+	for _, origin := range configured {
+		if origin == "" {
+			continue
+		}
+		scoped := ctx.forHub(origin)
+		if scoped.Cfg.HubToken.Present() || accountauth.New(scoped.Cfg).CredentialPresent() {
+			seen[scoped.Cfg.HubURL] = true
+		}
+	}
+	if st != nil {
+		rows, problem := st.Rentals()
+		if problem != nil {
+			return nil, problem
+		}
+		operations, problem := st.ActiveRentalOperations()
+		if problem != nil {
+			return nil, problem
+		}
+		for _, row := range rows {
+			seen[ctx.forHub(row.Hub).Cfg.HubURL] = true
+		}
+		for _, operation := range operations {
+			seen[ctx.forHub(operation.Hub).Cfg.HubURL] = true
+		}
+	}
+	origins := make([]string, 0, len(seen))
+	for origin := range seen {
+		origins = append(origins, origin)
+	}
+	slices.Sort(origins)
+	return origins, nil
 }
 
 // otherHubRentals counts this host's live rental records on hubs other than origin.

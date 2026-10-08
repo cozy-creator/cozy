@@ -131,14 +131,13 @@ func TestUnreachableRentalListingReturnsTypedFailure(t *testing.T) {
 	server.Close()
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+url+"\n"), 0600))
-	// Every hub's listing names the hub that did not answer and claims no totals; one
-	// narrowed to it fails with its typed error.
+	// Every listing names the hub that did not answer and claims no totals.
 	code, out := runCozy(t, root, "rental", "list", "--json")
 	if code == 0 || !strings.Contains(out, `"unreadable_hubs"`) || strings.Contains(out, `"machines_running"`) {
 		t.Fatalf("closed Hub port became zero fleet: %d %s", code, out)
 	}
 	code, out = runCozy(t, root, "rental", "list", "--json", "--tensorhub="+url)
-	if code == 0 || !strings.Contains(out, `"error"`) || strings.Contains(out, `"machines_running":0`) {
+	if code == 0 || !strings.Contains(out, `"unreadable_hubs"`) || strings.Contains(out, `"machines_running":0`) {
 		t.Fatalf("closed Hub port became zero fleet in its own view: %d %s", code, out)
 	}
 }

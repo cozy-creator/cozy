@@ -774,7 +774,11 @@ selected Hub's execution access to the rental's pinned certificate. The rental's
 credential stays at its owning Hub. Each Hub uses its own `cozy auth login --tensorhub=<hub>`.
 
 One daemon can retain runs and rentals created under earlier selections without restarting.
-`cozy rental list` and `cozy run list` show every Hub; `--tensorhub=<hub>` narrows them to one.
+`cozy rental list` shows rentals across every known Hub, including signed-in Hubs
+whose rentals were created by another client. A Hub that cannot answer leaves its
+last observed rentals visible as unverified. `--tensorhub=<hub>` selects the source
+for new work; it does not narrow the rental inventory. `cozy run list` shows every
+Hub by default and can be narrowed with `--tensorhub=<hub>`.
 A Hub that cannot be read is named on its own line, with its rentals shown unverified.
 `tensorhub_token` belongs to the configured Hub only, and `cozy hub use` refuses to move it
 until it is removed.
