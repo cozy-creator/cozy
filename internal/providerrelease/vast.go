@@ -83,7 +83,11 @@ func Vast(ctx context.Context, origin string, id int64, expectedLabel string, to
 		var envelope struct {
 			Success *bool `json:"success"`
 		}
-		if json.Unmarshal(body, &envelope) == nil && envelope.Success != nil && !*envelope.Success {
+		decoded := json.Unmarshal(body, &envelope)
+		if decoded != nil && method == http.MethodGet {
+			return response.StatusCode, nil, exit.New(exit.Unavailable, "provider response is not a valid instance envelope")
+		}
+		if decoded == nil && envelope.Success != nil && !*envelope.Success {
 			return response.StatusCode, nil, exit.New(exit.Failed, "provider refused %s for instance %d", method, id)
 		}
 		return response.StatusCode, body, nil
@@ -129,7 +133,7 @@ func Vast(ctx context.Context, origin string, id int64, expectedLabel string, to
 		for {
 			absent, problem = read()
 			if problem != nil {
-				return result, problem
+				return result, problem.WithRemedy("the release may already have succeeded; retry the same provider resource id to confirm absence")
 			}
 			if absent {
 				break

@@ -123,6 +123,7 @@ func TestExternalProviderCleanupRefusesUnprovenIdentityAndFailureResponses(t *te
 		{"null-envelope-is-not-absence", 200, `null`, 200, "", 0},
 		{"array-is-not-single-instance", 200, `{"instances":[]}`, 200, "", 0},
 		{"null-with-failure-is-not-absence", 200, `{"success":false,"instances":null}`, 200, "", 0},
+		{"malformed-success-is-not-absence", 200, `{"success":"no","instances":null}`, 200, "", 0},
 		{"unauthorized", 401, token, 200, "", 0},
 		{"forbidden", 403, token, 200, "", 0},
 		{"read-failed", 503, token, 200, "", 0},
@@ -263,6 +264,48 @@ func TestExternalProviderCleanupAcceptsExplicitNullAbsence(t *testing.T) {
 			}
 			if !reflect.DeepEqual(methods, want) {
 				t.Fatalf("unexpected provider calls: %v", methods)
+			}
+		})
+	}
+}
+
+func TestExternalProviderCleanupNamesUnconfirmedReadbackAfterDelete(t *testing.T) {
+	for _, response := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"unavailable", 503, `provider unavailable`},
+		{"malformed", 200, `{}`},
+		{"unauthorized", 401, `credential refused`},
+	} {
+		t.Run(response.name, func(t *testing.T) {
+			var mu sync.Mutex
+			deleted := false
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				if r.Method == "DELETE" {
+					deleted = true
+					fmt.Fprint(w, `{"success":true}`)
+					return
+				}
+				if deleted {
+					w.WriteHeader(response.status)
+					fmt.Fprint(w, response.body)
+					return
+				}
+				fmt.Fprint(w, `{"instances":{"id":42,"label":"owned-proof"}}`)
+			}))
+			defer provider.Close()
+			code, out := runExternalCleanup(t, t.TempDir(), provider.URL, "explicit-token", "--token-stdin")
+			if code == 0 || !strings.Contains(out, "release may already have succeeded") || !strings.Contains(out, "retry the same provider resource id") || strings.Contains(out, `"provider_absent":true`) {
+				t.Fatalf("confirmation failure omitted reconciliation: exit%d %s", code, out)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !deleted {
+				t.Fatal("fixture did not reach DELETE")
 			}
 		})
 	}
