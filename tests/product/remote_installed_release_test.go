@@ -14,14 +14,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Real CLI submission must preserve the version chosen at install even when the
-// catalog publishes a newer version. This catalog supplies metadata only and has
+// Real CLI submission leaves the release unselected even when this computer installed
+// an older version. Only the execution machine chooses the published release. This catalog supplies metadata only and has
 // no acquisition endpoint, so the proof cannot buy a machine or download weights.
-func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
+func TestRentalRunLeavesPublishedReleaseSelectionToMachine(t *testing.T) {
 	for _, installed := range []bool{true, false} {
-		name, want := "uninstalled uses latest", "2.10.0"
+		name := "uninstalled"
 		if installed {
-			name, want = "installed stays pinned", "2.9.0"
+			name = "older installed release"
 		}
 		t.Run(name, func(t *testing.T) {
 			iface := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[{"name":"compute","models":[],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[]}]}`)
@@ -57,7 +57,7 @@ func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 				must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(dir)), 0700))
 				must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0600))
 				_, problem = store.Activate(records.PackageInstall{ID: "inst-pinned", Package: "proof/releases", Major: 2,
-					Version: "2.9.0", SourceKind: "tensorhub", Dir: dir,
+					Version: "2.9.0", SourceKind: "tensorhub", Hub: server.URL, Dir: dir,
 					Platform: "linux-x86"})
 				fatal(t, problem)
 			}
@@ -72,8 +72,8 @@ func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 			defer store.Close()
 			row, problem := store.RequestByIdempotencyKey("release-proof")
 			fatal(t, problem)
-			if row == nil || row.Release != want || row.InstallID != "" {
-				t.Fatalf("remote request did not pin published release %s: %+v", want, row)
+			if row == nil || row.Release != "" || row.InstallID != "" {
+				t.Fatalf("remote request selected a client-side release: %+v", row)
 			}
 		})
 	}
