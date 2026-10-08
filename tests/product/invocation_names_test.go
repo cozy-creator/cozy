@@ -92,7 +92,7 @@ func TestInvocationSeparatorsSubmitRegisteredJobName(t *testing.T) {
 				}
 				select {
 				case submission := <-submitted:
-					if submission.Package != "proof/names" || submission.Function != registered || submission.Release != "1.0.0" {
+					if submission.Package != "proof/names" || submission.Function != registered || submission.Release != "" || len(submission.PackageInterface) == 0 {
 						t.Fatalf("submission lost its authored target: %+v", submission)
 					}
 				default:
