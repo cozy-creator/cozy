@@ -58,6 +58,9 @@ func TestAuthoredModelDefaultPrecedence(t *testing.T) {
 				t.Fatalf("default never reached request: %d %s row=%+v", code, out, row)
 			}
 			model := row.Models[0]
+			if model.Choice != (mode == "explicit") {
+				t.Fatalf("%s lost explicit-versus-default selection provenance: %+v", mode, model)
+			}
 			if model.Model != ladderModel || model.Release != ladderRelease {
 				t.Fatalf("wrong default target: %+v", model)
 			}

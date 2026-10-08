@@ -595,8 +595,8 @@ type AssetBinding struct {
 // spelling before it rents anything, records this row with the request, and sends it
 // only to the attached worker in the desired download set.
 type ModelRef struct {
-	// Choice is the caller's own `model.<param>=` selection, left for the machine that runs
-	// the call to resolve (worker-protocol ModelChoice); no ladder or rung is read for it.
+	// Choice identifies the caller's own `model.<param>=` selection, distinct from advisory
+	// default/sizing facts, even when the client also read its selected checkpoint metadata.
 	Choice bool `json:"choice,omitempty"`
 	// Source is a Choice naming a provider checkpoint (hf://org/repo@commit, civitai://id)
 	// that the machine resolves, narrows to Profiles (or the one it selects) and converts.
