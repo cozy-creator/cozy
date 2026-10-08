@@ -232,28 +232,8 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 		row.Result, _ = json.Marshal(result)
 		return nil
 	}
-	member := func(local *runtimeUpdateWheel, version string) (*machinev1.Member, *exit.Error) {
-		if local == nil {
-			if version == "" {
-				return nil, nil
-			}
-			return &machinev1.Member{Version: version}, nil
-		}
-		file, err := os.Open(local.Path)
-		if err != nil {
-			return nil, exit.New(exit.Conflict, "the frozen update wheel %s is gone: %s", local.Filename, err)
-		}
-		defer file.Close()
-		if err := machine.Write(ctx, local.Digest, uint64(local.Length), file); err != nil {
-			return nil, machines.Transport(err)
-		}
-		return &machinev1.Member{Wheel: local.Filename, Digest: local.Digest, Length: uint64(local.Length)}, nil
-	}
-	cohort := machinev1.Cohort{Agent: "bundled"}
-	if cohort.Runtime, problem = member(selection.LocalRuntime, selection.RuntimeVersion); problem != nil {
-		return problem
-	}
-	if cohort.TensorFS, problem = member(selection.LocalTensorFS, selection.TensorFSVersion); problem != nil {
+	cohort, problem := runtimeUpdateCohort(ctx, machine, selection, "bundled")
+	if problem != nil {
 		return problem
 	}
 	if selection.Target {
@@ -302,6 +282,35 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 	}
 	row.Result, _ = json.Marshal(result)
 	return nil
+}
+
+// runtimeUpdateCohort is shared by rental maintenance and explicit owned endpoints.
+// A missing member remains nil: the machine preserves its current wheel.
+func runtimeUpdateCohort(ctx context.Context, machine *machinev1.Client, selection runtimeUpdateSelection, agent string) (machinev1.Cohort, *exit.Error) {
+	member := func(local *runtimeUpdateWheel, version string) (*machinev1.Member, *exit.Error) {
+		if local == nil {
+			if version == "" {
+				return nil, nil
+			}
+			return &machinev1.Member{Version: version}, nil
+		}
+		file, err := os.Open(local.Path)
+		if err != nil {
+			return nil, exit.New(exit.Conflict, "the frozen update wheel %s is gone: %s", local.Filename, err)
+		}
+		defer file.Close()
+		if err := machine.Write(ctx, local.Digest, uint64(local.Length), file); err != nil {
+			return nil, machines.Transport(err)
+		}
+		return &machinev1.Member{Wheel: local.Filename, Digest: local.Digest, Length: uint64(local.Length)}, nil
+	}
+	cohort := machinev1.Cohort{Agent: agent}
+	var problem *exit.Error
+	if cohort.Runtime, problem = member(selection.LocalRuntime, selection.RuntimeVersion); problem != nil {
+		return cohort, problem
+	}
+	cohort.TensorFS, problem = member(selection.LocalTensorFS, selection.TensorFSVersion)
+	return cohort, problem
 }
 
 // published answers whether a cohort member leaves the running version as it is.
