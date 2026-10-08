@@ -296,9 +296,12 @@ checked from headers before any transfer or allocation. Re-running the same inge
 its completed checkpoint from any rental without downloading again, reattaches to a live run,
 or retries a stopped one on the same rental so the pod resumes from its journals. The checkpoint has no release label; publish one with `cozy model publish`.
 
-`cozy package update-all` upgrades installed Tensorhub packages to newer published
-releases, without downloading model weights. It keeps local/editable packages,
-development versions, and versions newer than the registry unchanged. Each package
+`cozy package update-all` upgrades packages installed from the selected Tensorhub to newer
+published releases, without downloading model weights. It skips packages from other
+Tensorhubs and reports their source; it never contacts their registries or changes their
+source implicitly. Legacy installs without a recorded source are resolved again at the
+selected Tensorhub. It keeps local/editable packages, development versions, and known-source
+versions newer than the registry unchanged. Each package
 is reported as updated, current, failed, or skipped; a failure leaves its previous
 install active and does not stop other packages.
 

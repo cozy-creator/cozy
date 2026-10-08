@@ -18,10 +18,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func updateAllInstall(t *testing.T, layout home.Layout, store *records.Store, n int, pkg, version, source string) records.PackageInstall {
+func updateAllInstall(t *testing.T, layout home.Layout, store *records.Store, n int, pkg, version, source, origin string) records.PackageInstall {
 	t.Helper()
 	prior := cleanupTestInstall(layout, fmt.Sprintf("%016x", n), version)
 	prior.Package, prior.SourceRef, prior.SourceKind = pkg, pkg+"@"+version, source
+	prior.Hub = origin
 	must(t, os.MkdirAll(prior.Dir, 0700))
 	must(t, os.WriteFile(filepath.Join(prior.Dir, "prior.py"), []byte("# retained working install\n"), 0600))
 	_, problem := store.Activate(prior)
@@ -37,6 +38,9 @@ func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
 	priors := map[string]records.PackageInstall{}
 	for i, entry := range []struct{ pkg, version, source string }{
 		{"a-failed/install-reporting", "1.0.0", "tensorhub"},
@@ -47,10 +51,9 @@ func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
 		{"private/dependency", "1.0.0", "wheel"},
 		{"z-updated/install-reporting", "1.0.0", "tensorhub"},
 	} {
-		priors[entry.pkg] = updateAllInstall(t, layout, store, i+1, entry.pkg, entry.version, entry.source)
+		priors[entry.pkg] = updateAllInstall(t, layout, store, i+1, entry.pkg, entry.version, entry.source, server.URL)
 	}
 	var downloads atomic.Int32
-	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/{org}/install-reporting", func(w http.ResponseWriter, r *http.Request) {
 		if r.PathValue("org") == "development" {
 			t.Error("development pin attempted a registry update")
@@ -81,8 +84,6 @@ func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
 		t.Errorf("bulk code update made an unexpected request: %s %s", r.Method, r.URL.Path)
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
-	server := httptest.NewServer(mux)
-	defer server.Close()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
 	code, out := runCozy(t, root, "package", "update-all", "--json")
 	var result struct {
@@ -135,7 +136,7 @@ func TestPackageUpdateAllEmptyAndSkippedOutput(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	for i := 0; i < 22; i++ {
-		updateAllInstall(t, layout, store, i+1, fmt.Sprintf("local/project-%02d", i), "1.0.0", "local")
+		updateAllInstall(t, layout, store, i+1, fmt.Sprintf("local/project-%02d", i), "1.0.0", "local", "")
 	}
 	store.Close()
 	code, out = runCozy(t, root, "package", "update-all", "--json")
@@ -158,11 +159,13 @@ func TestPackageUpdateAllPreservesConcurrentLocalSelection(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	const pkg = "proof/install-reporting"
-	prior := updateAllInstall(t, layout, store, 1, pkg, "1.0.0", "tensorhub")
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	prior := updateAllInstall(t, layout, store, 1, pkg, "1.0.0", "tensorhub", server.URL)
 	replacement := cleanupTestInstall(layout, "dddddddddddddddd", "2.0.0")
 	replacement.Package, replacement.SourceKind = pkg, "local"
 	must(t, os.MkdirAll(replacement.Dir, 0700))
-	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/proof/install-reporting", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "install-reporting"}, Releases: []hub.ReleaseSummary{{Release: "1.0.1"}}})
 	})
@@ -179,8 +182,6 @@ func TestPackageUpdateAllPreservesConcurrentLocalSelection(t *testing.T) {
 		t.Errorf("changed selection reached installation: %s %s", r.Method, r.URL.Path)
 		w.WriteHeader(500)
 	})
-	server := httptest.NewServer(mux)
-	defer server.Close()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
 	code, out := runCozy(t, root, "package", "update-all", "--json")
 	if code != 1 || !strings.Contains(out, `"error_code":"package.update_changed"`) {
@@ -193,5 +194,40 @@ func TestPackageUpdateAllPreservesConcurrentLocalSelection(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(prior.Dir, "prior.py")); err != nil {
 		t.Fatalf("bulk update removed previous bytes: %v", err)
+	}
+}
+
+func TestPackageUpdateAllResolvesUnknownLegacySource(t *testing.T) {
+	var downloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/proof/legacy":
+			_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "legacy"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/packages/proof/legacy/download":
+			downloads.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":"proof.download_observed","message":"configured source resolved again"}}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	prior := updateAllInstall(t, layout, store, 1, "proof/legacy", "1.0.0", "tensorhub", "")
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
+	code, out := runCozy(t, root, "package", "update-all", "--json")
+	if code != 1 || downloads.Load() != 1 || !strings.Contains(out, "proof.download_observed") {
+		t.Fatalf("unknown source was trusted solely because version matched [exit %d]: %s", code, out)
+	}
+	_, retained, problem := store.ActivePackage(prior.Package)
+	fatal(t, problem)
+	if retained == nil || retained.ID != prior.ID {
+		t.Fatalf("source resolution failure replaced prior install: %+v", retained)
 	}
 }

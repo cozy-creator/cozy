@@ -469,9 +469,9 @@ func packageCardHub(t *testing.T, asked *sync.Map) *httptest.Server {
 	return server
 }
 
-// Each published install is checked against the hub it came from, and a hub that cannot
-// be read fails only its own packages.
-func TestPackageUpdateAllUsesEachInstallsHub(t *testing.T) {
+// A bulk update reads only the selected Hub. Foreign installs stay selected without
+// contacting their source or rebinding their package name to the current registry.
+func TestPackageUpdateAllUsesOnlySelectedHub(t *testing.T) {
 	root := t.TempDir()
 	var askedA, askedB sync.Map
 	hubA, hubB := packageCardHub(t, &askedA), packageCardHub(t, &askedB)
@@ -494,11 +494,11 @@ func TestPackageUpdateAllUsesEachInstallsHub(t *testing.T) {
 	type updated struct {
 		Packages []map[string]any `json:"packages"`
 	}
-	update := func(wantCode int) map[string]map[string]any {
+	update := func(args ...string) map[string]map[string]any {
 		t.Helper()
-		code, out := runCozy(t, root, "package", "update-all", "--json", "--full")
-		if code != wantCode {
-			t.Fatalf("package update-all exited %d, want %d: %s", code, wantCode, out)
+		code, out := runCozy(t, root, append([]string{"package", "update-all", "--json", "--full"}, args...)...)
+		if code != 0 {
+			t.Fatalf("package update-all exited %d: %s", code, out)
 		}
 		var doc updated
 		must(t, json.Unmarshal([]byte(out), &doc))
@@ -508,21 +508,39 @@ func TestPackageUpdateAllUsesEachInstallsHub(t *testing.T) {
 		}
 		return rows
 	}
-	rows := update(0)
-	if rows["proof/alpha"]["status"] != "current" || rows["proof/beta"]["status"] != "current" ||
+	rows := update()
+	if rows["proof/alpha"]["status"] != "current" || rows["proof/beta"]["status"] != "skipped" ||
 		rows["proof/alpha"]["hub"] != "a" || rows["proof/beta"]["hub"] != "b" {
-		t.Fatalf("installs were not checked against their own hubs: %+v", rows)
+		t.Fatalf("update did not preserve the foreign install: %+v", rows)
 	}
 	if _, crossed := askedA.Load("proof/beta"); crossed {
 		t.Fatal("hub a was asked for hub b's package")
 	}
+	askedB.Range(func(key, _ any) bool {
+		t.Errorf("unselected hub b was contacted for %v", key)
+		return true
+	})
+	if !strings.Contains(rows["proof/beta"]["detail"].(string), "installed from b") {
+		t.Fatalf("skipped package lost its source: %+v", rows)
+	}
+	rows = update("--tensorhub=b")
+	if rows["proof/alpha"]["status"] != "skipped" || rows["proof/beta"]["status"] != "current" {
+		t.Fatalf("explicit hub selection was ignored: %+v", rows)
+	}
 	if _, crossed := askedB.Load("proof/alpha"); crossed {
 		t.Fatal("hub b was asked for hub a's package")
 	}
+	if code, out := runCozy(t, root, "hub", "use", "b", "--json"); code != 0 {
+		t.Fatalf("hub use b: %d %s", code, out)
+	}
+	rows = update()
+	if rows["proof/alpha"]["status"] != "skipped" || rows["proof/beta"]["status"] != "current" {
+		t.Fatalf("configured hub selection was ignored: %+v", rows)
+	}
 	hubB.Close()
-	rows = update(1)
-	if rows["proof/alpha"]["status"] != "current" || rows["proof/beta"]["status"] != "failed" {
-		t.Fatalf("an unreachable hub failed more than its own packages: %+v", rows)
+	rows = update("--tensorhub=a")
+	if rows["proof/alpha"]["status"] != "current" || rows["proof/beta"]["status"] != "skipped" {
+		t.Fatalf("an unreachable foreign hub affected this update: %+v", rows)
 	}
 	code, out := runCozy(t, root, "package", "list", "--json", "--full")
 	if code != 0 || !strings.Contains(out, `"hub":"b"`) || !strings.Contains(out, `"hub":"a"`) {

@@ -27,13 +27,11 @@ func handlePackageUpdateAll(ctx *Context) *exit.Error {
 	counts := map[string]int{"updated": 0, "current": 0, "failed": 0, "skipped": 0}
 	otherHub := false
 	for _, prior := range installed {
-		// Each install is checked against the hub it came from; an unreadable hub fails
-		// only its own packages.
-		scoped := ctx.forHub(prior.Hub)
-		row := updateInstalledPackage(scoped, prior)
+		row := updateInstalledPackage(ctx, prior)
 		if prior.SourceKind == "tensorhub" {
-			row["hub"] = ctx.Cfg.HubLabel(scoped.Cfg.HubURL)
-			otherHub = otherHub || scoped.Cfg.HubURL != ctx.Cfg.HubURL
+			origin := either(prior.Hub, ctx.Cfg.HubURL)
+			row["hub"] = ctx.Cfg.HubLabel(origin)
+			otherHub = otherHub || origin != ctx.Cfg.HubURL
 		}
 		list.Rows = append(list.Rows, row)
 		counts[row["status"]]++
@@ -67,6 +65,10 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 		row["detail"] = "local or unpublished install; no registry update"
 		return row
 	}
+	if prior.Hub != "" && strings.TrimRight(prior.Hub, "/") != strings.TrimRight(ctx.Cfg.HubURL, "/") {
+		row["detail"] = "installed from " + ctx.Cfg.HubLabel(prior.Hub) + "; selected Tensorhub is " + ctx.Cfg.HubLabel(ctx.Cfg.HubURL)
+		return row
+	}
 	if !immutablePackageVersion.MatchString(prior.Version) {
 		row["detail"] = "development or prerelease selection preserved; use package install --version to change it"
 		return row
@@ -85,7 +87,7 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 	if problem != nil {
 		return fail(problem)
 	}
-	if latest == prior.Version {
+	if prior.Hub != "" && latest == prior.Version {
 		row["status"] = "current"
 		return row
 	}
@@ -93,7 +95,7 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 	if problem != nil {
 		return fail(problem)
 	}
-	if newest != latest {
+	if prior.Hub != "" && newest != latest {
 		row["detail"] = "installed version is newer than the registry; preserved"
 		return row
 	}
