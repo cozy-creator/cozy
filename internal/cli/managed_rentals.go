@@ -339,9 +339,13 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	// choice (cl-210). A request sized by its own model slots retains only those;
 	// unrelated captures must not inflate its residency or preparation selection. Its
 	// own selection is made once and supersedes any callee default for the same slot.
+	metadata, problem := rentalMetadata(scoped, req)
+	if problem != nil {
+		return none, "", problem
+	}
 	var childModels []records.ModelRef
 	if req.InstallID == "" {
-		childModels, problem = resolver.PublishedChildModels(scoped, req)
+		childModels, problem = resolver.PublishedChildModels(scoped, metadata)
 	} else {
 		childModels, problem = resolver.UnpublishedChildModels(req)
 	}
@@ -370,7 +374,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
 	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
 	// a machine that would be bought are held to the same declared degrees (cl-179).
-	constraints, constraintProblem := RentalConstraints(scoped, req)
+	constraints, constraintProblem := RentalConstraints(scoped, metadata)
 	if constraintProblem != nil {
 		return none, "", constraintProblem
 	}
@@ -1532,10 +1536,35 @@ func settledRequest(state string) bool {
 	return false
 }
 
+// rentalMetadata reads the current release only to size a new rental. The returned copy
+// is never the submitted request: a bare invocation stays unversioned, and its machine
+// resolves the release from the selected Hub when it executes.
+func rentalMetadata(ctx *Context, req records.Request) (records.Request, *exit.Error) {
+	if req.Release != "" || req.Package == "" || strings.HasPrefix(req.Package, "local/") {
+		return req, nil
+	}
+	ref, problem := hub.ParseRef(req.Package)
+	if problem != nil {
+		return req, problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	card, problem := client(ctx).PackageCard(hctx, ref)
+	if problem != nil {
+		return req, problem
+	}
+	req.Release, problem = newestPackageRelease(card.Releases)
+	return req, problem
+}
+
 // RentalConstraints reads the selected local install or published release's immutable
 // requirements and interface. Missing facts refuse selection before spending.
 func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
 	var out rental.Constraints
+	var problem *exit.Error
+	if req, problem = rentalMetadata(ctx, req); problem != nil {
+		return out, problem
+	}
 	var declared *launch.PackageInterface
 	if req.InstallID != "" && strings.HasPrefix(req.Package, "local/") {
 		_, store, problem := rentalStores(ctx)

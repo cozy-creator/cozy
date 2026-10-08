@@ -667,7 +667,7 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	}
 }
 
-// Describe installs pkg's newest release on a machine at the machine's own Hub and answers
+// Describe installs pkg's newest release on a machine at the request's selected Hub and answers
 // it with its interface: an install-only warm run with no release named (describe/1).
 func (m *machineRuns) Describe(ctx context.Context, machine, pkg, hub string) (api.ReleaseDescription, *exit.Error) {
 	row := records.RentalInstall{ID: records.NewID("describe"), RentalID: machine,
@@ -736,11 +736,8 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 // whose owner is not signed in carries none; the machine then refuses only what needs a Hub.
 func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *machines.V1, required bool) (*v1.HubAccess, *exit.Error) {
 	account := client(m.context.forHub(origin))
-	// The pod already has access to its rental Hub. Another selected source needs the
-	// owner's grant for that source; the rental's lifecycle credential never crosses Hubs.
-	if machine.Rented && machine.Account != nil && machine.Account.Base() == account.Base() {
-		return nil, nil
-	}
+	// Every published request names its selected source explicitly, including when that
+	// source also rented the machine. The pod's default Hub cannot select a run's source.
 	if account.CredentialIdentity() == "" {
 		if machine.Rented && required {
 			return nil, exit.Named(exit.Credential, "hub.execution_access_required",

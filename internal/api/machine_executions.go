@@ -89,7 +89,7 @@ func (s *Server) machineStatus(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, status)
 }
 
-// ReleaseDescription is a package's newest release at a machine's own Hub and its interface,
+// ReleaseDescription is a package's newest release at the request's selected Hub and its interface,
 // as that machine installed it (describe/1).
 type ReleaseDescription struct {
 	Release   string          `json:"release"`
@@ -100,7 +100,7 @@ type releaseDescriber interface {
 	Describe(ctx context.Context, machine, pkg, hub string) (ReleaseDescription, *exit.Error)
 }
 
-// describeRelease asks one machine to install a package's newest release at its own Hub and
+// describeRelease asks one machine to install a package's newest release at the request's selected Hub and
 // name it, so a client that never installed the package types its run with no Hub read.
 func (s *Server) describeRelease(w http.ResponseWriter, r *http.Request) {
 	describer, ok := s.machineExecutions.(releaseDescriber)
