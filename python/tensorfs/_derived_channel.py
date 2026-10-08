@@ -347,8 +347,8 @@ def serve_derived(
     checkpoint: tuple[str, int] | None,
     check_current: Callable[[], None],
     admit_io: Callable[[str, int], ContextManager[None]],
-    record_checkpoint: Callable[[dict[str, Any]], None],
-    record_receipt: Callable[[dict[str, Any]], None],
+    record_checkpoint: Callable[[CheckpointReceipt], None],
+    record_receipt: Callable[[DerivedReceipt], None],
 ) -> None:
     """Serve one prebound writer until terminal/peer loss, then fence its live handle.
 
@@ -485,7 +485,7 @@ def serve_derived_replay(
     fd: int,
     *,
     check_current: Callable[[], None],
-    record_receipt: Callable[[dict[str, Any]], None],
+    record_receipt: Callable[[DerivedReceipt], None],
 ) -> None:
     """Deliver retained native custody selected by the trusted execution owner."""
     channel = _Channel(fd)
@@ -496,7 +496,7 @@ def serve_derived_replay(
         _fields(request, "receipt", ())
         check_current()
         facts = dict(receipt)
-        record_receipt(facts)
+        record_receipt(cast(DerivedReceipt, facts))
         channel.send({"result": facts})
     except EOFError:
         return

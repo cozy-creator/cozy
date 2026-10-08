@@ -34,10 +34,13 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from os import PathLike
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING
 
 from . import errors
-from .records import CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt
+from .records import (
+    CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt, FitResult,
+    Asset, Encoding, TensorLogical, InlinePart, SegmentedPart, Tensor, Header, EnsureEvent, EnsureResult, Relief,
+)
 from ._tensors import (
     TensorAccessError,
     TensorAllocation,
@@ -114,64 +117,10 @@ if TYPE_CHECKING or STORE:
     )
 
 
-class Asset(TypedDict):
-    """One logical non-tensor file carried by a CozyTensors artifact."""
-
-    logical_sha256: str
-    logical_length: int
-    media_type: str
-    segments: list[ObjectRef]
-
-
-class Encoding(TypedDict):
-    """One encoding definition and the digest tensor rows cite."""
-
-    id: str
-    definition: object
-
-
-class TensorLogical(TypedDict):
-    """The execution-visible tensor schema, independent of stored packing."""
-
-    logical_dtype: str
-    shape: list[int]
-
-
-class InlinePart(TypedDict):
-    dtype: str
-    shape: list[int]
-    inline: bytes
-
-
-class SegmentedPart(TypedDict):
-    dtype: str
-    shape: list[int]
-    segments: list[ObjectRef]
-
-
-type TensorPart = InlinePart | SegmentedPart
-
-
-class Tensor(TypedDict):
-    logical: TensorLogical
-    encoding: str
-    parts: dict[str, TensorPart]
-
-
-class Header(TypedDict):
-    """The exact Python projection returned by :func:`parse_header`."""
-
-    format: Literal["cozytensors/1"]
-    configs: dict[str, bytes]
-    assets: dict[str, Asset]
-    encodings: list[Encoding]
-    components: dict[str, dict[str, Tensor]]
-
-
 def parse_header(data: bytes, closure: Closure | None = None) -> Header:
     """Parse a verified CozyTensors header into TensorFS's typed Python projection."""
 
-    return cast(Header, _parse_header(data, closure))
+    return _parse_header(data, closure)
 
 
 @dataclass(frozen=True)
@@ -192,7 +141,7 @@ def fit(
     encoded_leaves: bool,
     device: str | None = None,
     observations: bytes | None = None,
-) -> dict[str, object]:
+) -> FitResult:
     """Compare a transient factory census with one CozyTensors header."""
     rows = [
         (
@@ -203,51 +152,14 @@ def fit(
         )
         for tensor in requirements
     ]
-    return cast(
-        dict[str, object],
-        _fit(
-            rows,
-            header,
-            custody=custody,
-            encoded_leaves=encoded_leaves,
-            device=device,
-            observations=observations,
-        ),
+    return _fit(
+        rows,
+        header,
+        custody=custody,
+        encoded_leaves=encoded_leaves,
+        device=device,
+        observations=observations,
     )
-
-
-class EnsureEvent(TypedDict):
-    """One :func:`ensure` progress sample."""
-
-    model: str
-    step: str
-    phase: Literal["resolving", "waiting", "collecting", "fetching"]
-    bytes_done: int
-    bytes_total: int
-    #: Bytes per second over the last sample.
-    rate: float
-    attempt: int
-
-
-class EnsureResult(TypedDict):
-    """What :func:`ensure` did. ``bytes_fetched``, ``bytes_cached`` and
-    ``cache_written_bytes`` over ``bytes_total`` are the cache observation."""
-
-    model: str
-    release: str
-    lane: str
-    scope: str
-    manifest: str
-    manifest_length: int
-    bytes_total: int
-    bytes_held: int
-    bytes_fetched: int
-    bytes_cached: int
-    cache_written_bytes: int
-    collected_bytes: int
-    attempts: int
-    joined: bool
-    seconds: float
 
 
 def ensure(
@@ -276,37 +188,23 @@ def ensure(
     ``CredentialRequired``, ``CapacityExhausted``, ``Stalled``, ``HubRefused``, ...); a raising
     ``progress`` cancels and its exception is re-raised."""
 
-    return cast(
-        EnsureResult,
-        _ensure(
-            store,
-            ref,
-            hub=hub,
-            lane=lane,
-            step=step,
-            credential=credential,
-            ca_file=ca_file,
-            allowed_hosts=allowed_hosts,
-            allow_local=allow_local,
-            keep=keep,
-            streams=streams,
-            streams_start=streams_start,
-            sample_seconds=sample_seconds,
-            cancellation=cancellation,
-            progress=None if progress is None else lambda event: progress(cast(EnsureEvent, event)),
-        ),
+    return _ensure(
+        store,
+        ref,
+        hub=hub,
+        lane=lane,
+        step=step,
+        credential=credential,
+        ca_file=ca_file,
+        allowed_hosts=allowed_hosts,
+        allow_local=allow_local,
+        keep=keep,
+        streams=streams,
+        streams_start=streams_start,
+        sample_seconds=sample_seconds,
+        cancellation=cancellation,
+        progress=progress,
     )
-
-
-class Relief(TypedDict):
-    """One :func:`relieve` pass."""
-
-    pressure: bool
-    collected_bytes: int
-    capacity_bytes: int
-    available_bytes: int
-    #: Why a GC tier could not run (e.g. a live reader), when one could not.
-    unable: str | None
 
 
 def relieve(store: Store, *, keep: Sequence[str] = ()) -> Relief:
@@ -314,7 +212,7 @@ def relieve(store: Store, *, keep: Sequence[str] = ()) -> Relief:
     its reserve), run the GC policy (unreferenced, delivered products, cached lanes) until
     more than 1/5 is free. Manifests in ``keep`` and in live downloads are never evicted."""
 
-    return cast(Relief, _relieve(store, keep=keep))
+    return _relieve(store, keep=keep)
 
 
 #: Feature names a caller detects instead of versions: ``"ensure/1"``, ``"get-range/1"``,

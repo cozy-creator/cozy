@@ -257,7 +257,7 @@ class TensorReader:
         self._source = source
         self._manifest = manifest
         self._raw_header: bytes | None = None
-        self._header: dict[str, Any] = {}
+        self._header: Mapping[str, Any] = {}
         if isinstance(source, SourceCapability):
             if manifest is not None:
                 raise TensorAccessError(

@@ -11,10 +11,14 @@ import base64
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 from ._derived_channel import DerivedTransaction, serve_derived, serve_derived_replay
-from .records import CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt
+from .records import (
+    CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt, InspectedSource,
+    DeclarationTargets, DeclarationConfigs, DeclarationFiles, DerivationArguments, PartDeclaration,
+    TensorDeclaration, TargetDeclaration, ConfigDeclaration,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +75,7 @@ class SourceInspection:
     identities: Mapping[tuple[str, str], str] = field(default_factory=dict)
 
     @classmethod
-    def from_native(cls, value: Mapping[str, Any]) -> SourceInspection:
+    def from_native(cls, value: InspectedSource) -> SourceInspection:
         """Project Store.inspect_derived_source facts without validating them again."""
         source = value["source"]
         return cls(
@@ -166,21 +170,15 @@ class Derivation:
     def native_arguments(
         self,
         max_new_bytes: int,
-    ) -> (
-        tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[tuple[str, str]], int]
-        | tuple[
-            dict[str, Any], dict[str, Any], dict[str, Any], list[tuple[str, str]], int,
-            dict[str, str],
-        ]
-    ):
+    ) -> DerivationArguments:
         """Marshal into Store.derived_declaration/estimate/begin, never validate twice."""
-        targets: dict[str, Any] = {}
+        targets: DeclarationTargets = {}
         for name, target in self.targets.items():
-            additions: dict[str, Any] = {}
+            additions: dict[str, TensorDeclaration] = {}
             for key, tensor in target.add.items():
-                parts: dict[str, Any] = {}
+                parts: dict[str, PartDeclaration] = {}
                 for role, part in tensor.parts.items():
-                    value: dict[str, Any] = {
+                    value: PartDeclaration = {
                         "dtype": part.dtype,
                         "shape": list(part.shape),
                     }
@@ -199,18 +197,18 @@ class Derivation:
                     "encoding": tensor.encoding,
                     "parts": parts,
                 }
-            value = {"drop": list(target.drop), "add": additions}
+            target_value: TargetDeclaration = {"drop": list(target.drop), "add": additions}
             if target.source or target.source_component:
-                value.update(
-                    source=target.source, source_component=target.source_component
-                )
-            targets[name] = value
-        configs: dict[str, Any] = {}
+                target_value["source"] = target.source
+                target_value["source_component"] = target.source_component
+            targets[name] = target_value
+        configs: DeclarationConfigs = {}
         for name, config in self.configs.items():
-            value = {"kind": config.kind}
+            config_value: ConfigDeclaration = {"kind": config.kind}
             if config.source or config.source_config:
-                value.update(source=config.source, source_config=config.source_config)
-            configs[name] = value
+                config_value["source"] = config.source
+                config_value["source_config"] = config.source_config
+            configs[name] = config_value
         arguments = (
             {
                 name: (source.manifest, source.length)
@@ -223,10 +221,10 @@ class Derivation:
         )
         if not self.files:
             return arguments
-        return (
-            *arguments,
-            {name: base64.b64encode(data).decode("ascii") for name, data in self.files.items()},
-        )
+        files: DeclarationFiles = {
+            name: base64.b64encode(data).decode("ascii") for name, data in self.files.items()
+        }
+        return (*arguments, files)
 
 
 class OutputCapability:
