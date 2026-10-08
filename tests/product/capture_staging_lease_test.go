@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -173,5 +175,20 @@ class CustomHook(BuildHookInterface):
 	}
 	if _, err := os.Stat(filepath.Join(caller, "uv.lock")); !os.IsNotExist(err) {
 		t.Fatalf("capture changed author lock: %v", err)
+	}
+}
+
+func TestProjectMetadataRefusalNamesTheLostPreparedFile(t *testing.T) {
+	project, _, _ := directoryProofProject(t)
+	must(t, os.WriteFile(filepath.Join(project, "uv.lock"), []byte("version=1\n"), 0600))
+	prepared, problem := packagepublish.PrepareLocalFrom(project)
+	fatal(t, problem)
+	defer prepared.Close()
+	path := filepath.Join(project, "pyproject.toml")
+	must(t, os.Remove(path))
+	_, readError := os.ReadFile(path)
+	problem = prepared.Build(context.Background())
+	if problem == nil || problem.ErrName() != "project_metadata_unreadable" || !strings.Contains(problem.Message, path) || !strings.Contains(problem.Message, readError.Error()) {
+		t.Fatalf("lost source metadata refusal omits its path/cause: %v", problem)
 	}
 }
