@@ -453,13 +453,17 @@ type projectMetadata struct {
 func readProjectDocument(path string) (projectMetadata, *exit.Error) {
 	var document projectMetadata
 	raw, err := os.ReadFile(path)
-	if err != nil || len(raw) == 0 || len(raw) > maxProjectMetadataBytes {
+	if err != nil {
 		return document, exit.Named(exit.Validation, "project_metadata_unreadable",
-			"pyproject.toml must be a non-empty TOML file at or below %d bytes", maxProjectMetadataBytes)
+			"cannot read project metadata %q: %s", path, err)
+	}
+	if len(raw) == 0 || len(raw) > maxProjectMetadataBytes {
+		return document, exit.Named(exit.Validation, "project_metadata_unreadable",
+			"project metadata %q contains %d bytes; pyproject.toml must be non-empty and at or below %d bytes", path, len(raw), maxProjectMetadataBytes)
 	}
 	if err := toml.Unmarshal(raw, &document); err != nil {
 		return document, exit.Named(exit.Validation, "project_metadata_invalid",
-			"pyproject.toml is not valid TOML: %v", err)
+			"project metadata %q is not valid TOML: %v", path, err)
 	}
 	return document, nil
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
 func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
@@ -129,15 +130,12 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*recor
 		return Target{Package: held.Package, InstallID: held.ID, Release: held.Version, Snapshot: true,
 			releaseCapture: writer.Unlock}, surface, nil
 	}
-	if err := os.MkdirAll(layout.Tmp, 0700); err != nil {
-		return Target{}, nil, exit.Internalf("cannot create invocation staging: %s", err)
+	stage, problem := scratch.Temp(layout.Tmp, "invocation-source-")
+	if problem != nil {
+		return Target{}, nil, problem
 	}
-	stage, err := os.MkdirTemp(layout.Tmp, "invocation-source-")
-	if err != nil {
-		return Target{}, nil, exit.Internalf("cannot stage invocation source: %s", err)
-	}
-	defer os.RemoveAll(stage)
-	frozen, problem := packagepublish.SnapshotSource(pack.Tree, filepath.Join(stage, "source"))
+	defer stage.Release()
+	frozen, problem := packagepublish.SnapshotSource(pack.Tree, filepath.Join(stage.Path, "source"))
 	if problem != nil {
 		return Target{}, nil, problem
 	}
