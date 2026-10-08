@@ -235,9 +235,19 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	must(t, err)
 	must(t, os.WriteFile(pyproject, []byte(strings.ReplaceAll(string(raw), `version="0.0.1"`, `version="0.0.2"`)), 0o600))
 	newerCode := filepath.Join(newer, "machine_parity.py")
-	raw, err = os.ReadFile(newerCode)
-	must(t, err)
-	must(t, os.WriteFile(newerCode, []byte(strings.ReplaceAll(string(raw), "payload.value + 1", "payload.value + 100")), 0o600))
+	must(t, os.WriteFile(newerCode, []byte(`from typing import Annotated
+import msgspec
+from cozy_runtime.author import App, AssetBound, FileAsset, Outputs
+class AddRequest(msgspec.Struct):
+    value: int
+class AddResult(msgspec.Struct):
+    value: int
+    report: Annotated[FileAsset, AssetBound(max_bytes=1024, media_types=("text/plain",))]
+app = App()
+@app.job
+def add(payload: AddRequest, out: Outputs) -> AddResult:
+    return AddResult(payload.value + 100, out.save_bytes(b"newer release output\n", media_type="text/plain"))
+`), 0o600))
 	publishParityReleaseAt(t, moving, root, newer, "0.0.2")
 	var newestReads atomic.Int32
 	movingCatalog := moving.worker.Config.Handler
@@ -257,6 +267,21 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	code, out = runCozy(t, root, "run", parityPublished+"/add", "value=41", "--rental=tessa", "--await", "--json", "--idempotency-key=machine-selected-release")
 	if code != 0 || !strings.Contains(out, `"value":141`) || newestReads.Load() < 2 {
 		t.Fatalf("schema lookup pinned the machine's actual release [exit %d, newest reads %d]\n%s", code, newestReads.Load(), out)
+	}
+	movingRequest, problem := store.RequestByIdempotencyKey("machine-selected-release")
+	fatal(t, problem)
+	products, problem := store.Products(movingRequest.ID)
+	fatal(t, problem)
+	heldReport := false
+	for _, product := range products {
+		if product.Output == "report" && product.Path != "" {
+			report, err := os.ReadFile(product.Path)
+			must(t, err)
+			heldReport = string(report) == "newer release output\n"
+		}
+	}
+	if !heldReport {
+		t.Fatalf("the actual release's new output was lost because the advisory schema had no files: %+v", products)
 	}
 
 	row, problem := store.RentalRow(parityRental)
