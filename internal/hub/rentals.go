@@ -359,11 +359,12 @@ type RentalRequest struct {
 	Development *RentalDevelopment `json:"development,omitempty"`
 	Name        string             `json:"name"`
 	// Provider names the marketplace (`--provider`); omitted buys from the hub's default.
-	Provider         string `json:"provider,omitempty"`
-	SKU              string `json:"sku"`
-	AcceleratorCount int    `json:"accelerator_count"`
-	MediaTokenSHA256 string `json:"media_token_sha256"`
-	CreatorPublicKey string `json:"creator_public_key"`
+	Provider                 string   `json:"provider,omitempty"`
+	ExcludedProviderMachines []string `json:"excluded_provider_machines,omitempty"`
+	SKU                      string   `json:"sku"`
+	AcceleratorCount         int      `json:"accelerator_count"`
+	MediaTokenSHA256         string   `json:"media_token_sha256"`
+	CreatorPublicKey         string   `json:"creator_public_key"`
 	// Image names one worker image registered with the hub (digest, tag, or
 	// kind) in place of the machine's default; empty boots the default.
 	Image string `json:"image,omitempty"`
@@ -426,20 +427,25 @@ const maxServingModels = 32
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
 func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPublicKey string,
-	workload DeclaredWorkload, development *RentalDevelopment, image, provider string,
+	workload DeclaredWorkload, development *RentalDevelopment, image, provider string, excluded ...string,
 ) ([]byte, *exit.Error) {
+	excluded, problem := RentalMachineExclusions(provider, excluded)
+	if problem != nil {
+		return nil, problem
+	}
 	req := RentalRequest{
-		Development:        development,
-		Name:               strings.TrimSpace(name),
-		Provider:           provider,
-		SKU:                strings.TrimSpace(sku),
-		AcceleratorCount:   gpus,
-		MediaTokenSHA256:   strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
-		CreatorPublicKey:   strings.TrimSpace(creatorPublicKey),
-		PlannedSourceBytes: workload.SourceBytes,
-		ServingModels:      canonicalServingModels(workload.ServingModels),
-		ContainerDiskGB:    workload.ContainerDiskGB,
-		Image:              image,
+		Development:              development,
+		Name:                     strings.TrimSpace(name),
+		Provider:                 provider,
+		ExcludedProviderMachines: excluded,
+		SKU:                      strings.TrimSpace(sku),
+		AcceleratorCount:         gpus,
+		MediaTokenSHA256:         strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
+		CreatorPublicKey:         strings.TrimSpace(creatorPublicKey),
+		PlannedSourceBytes:       workload.SourceBytes,
+		ServingModels:            canonicalServingModels(workload.ServingModels),
+		ContainerDiskGB:          workload.ContainerDiskGB,
+		Image:                    image,
 	}
 	if len(image) > 512 || strings.TrimSpace(image) != image || strings.ContainsAny(image, " \t\r\n\x00") {
 		return nil, exit.Usagef("--image names one registered worker image by digest, tag, or kind")
@@ -478,6 +484,25 @@ func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPub
 		return nil, exit.Internalf("cannot encode the closed rental request: %s", err)
 	}
 	return raw, nil
+}
+
+// RentalMachineExclusions validates an explicit provider-specific development selection.
+func RentalMachineExclusions(provider string, values []string) ([]string, *exit.Error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	if provider != "vast" || len(values) > 64 {
+		return nil, exit.Usagef("--exclude-provider-machine requires --provider=vast and at most64 machine IDs")
+	}
+	out := append([]string(nil), values...)
+	for _, id := range out {
+		n, err := strconv.ParseInt(id, 10, 64)
+		if err != nil || n <= 0 || strconv.FormatInt(n, 10) != id {
+			return nil, exit.Usagef("--exclude-provider-machine names a positive Vast machine ID")
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out), nil
 }
 
 // ParseRentalRequestBytes reopens the persisted paid intent. Acquisition replay
@@ -889,11 +914,12 @@ type RentalSKUStatus struct {
 // RentalQuote is what one exact rental request will lock: its disk and declared
 // workload choose the machine, so it can differ from the default-disk listing.
 type RentalQuote struct {
-	PriceUSDMicrosPerHour   int64 `json:"price_usd_micros_per_hour"`
-	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
-	ContainerDiskGB         int   `json:"container_disk_gb"`
-	VCPUCount               int   `json:"vcpu_count,omitempty"`
-	MemoryGB                int   `json:"memory_gb,omitempty"`
+	ExcludedProviderMachines []string `json:"excluded_provider_machines,omitempty"`
+	PriceUSDMicrosPerHour    int64    `json:"price_usd_micros_per_hour"`
+	StorageUSDMicrosPerHour  int64    `json:"storage_usd_micros_per_hour"`
+	ContainerDiskGB          int      `json:"container_disk_gb"`
+	VCPUCount                int      `json:"vcpu_count,omitempty"`
+	MemoryGB                 int      `json:"memory_gb,omitempty"`
 }
 
 // QuoteRental prices the exact body a rental POST would send.
