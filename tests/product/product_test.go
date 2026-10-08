@@ -261,7 +261,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("human run list columns/order are not useful [exit %d]\n%s", code, out)
 	}
 
-	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job",
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile-job",
 		"size=8", "seed=11", "--await", "--json")
 	if code != 0 || !strings.Contains(out, `"status":"completed"`) {
 		t.Fatalf("captured local job did not complete [exit %d]\n%s", code, out)

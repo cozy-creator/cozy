@@ -136,6 +136,11 @@ func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInte
 	if target.Function == "" {
 		return emitFunctions(ctx, target, packageInterface)
 	}
+	name, problem := invocationFunctionName(target.Function, packageInterface)
+	if problem != nil {
+		return problem
+	}
+	target.Function = name
 	callable, problem := packageInterface.Function(target.Function)
 	if problem != nil {
 		return unknownFunction(target, packageInterface)
@@ -190,6 +195,33 @@ func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInte
 		ctx.Inv.Bools["--follow"] = true
 	}
 	return handleJobSubmit(ctx, target, callable)
+}
+
+// Invocation spelling is forgiving; stored requests and model slots keep the author's name.
+func invocationFunctionName(name string, surface *launch.PackageInterface) (string, *exit.Error) {
+	names := surface.Names()
+	for unavailable := range surface.Unavailable {
+		names = append(names, unavailable)
+	}
+	var matches []string
+	normalized := strings.ReplaceAll(name, "-", "_")
+	for _, candidate := range names {
+		if candidate == name {
+			return name, nil
+		}
+		if strings.ReplaceAll(candidate, "-", "_") == normalized {
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) > 1 {
+		sort.Strings(matches)
+		return "", exit.Usagef("function %q matches more than one registered name", name).
+			WithRemedy("use an exact name: %s", strings.Join(matches, ", "))
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	return name, nil
 }
 
 func validateRunPlacement(ctx *Context) *exit.Error {

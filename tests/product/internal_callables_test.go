@@ -85,13 +85,19 @@ func TestInternalCallablesAreAbsentFromCLIAndRefuseDirectRun(t *testing.T) {
 	if code != 0 || strings.Contains(out, `"segment"`) || strings.Contains(out, "internal_job") || !strings.Contains(out, "long_form") || !strings.Contains(out, "generate") {
 		t.Fatalf("public list: %d %s", code, out)
 	}
-	for _, name := range []string{"segment", "internal_job"} {
+	for _, name := range []string{"segment", "internal_job", "internal-job"} {
 		for _, extra := range [][]string{nil, {"--describe"}} {
 			args := append([]string{"run", "proof/internal/" + name, "--rental-only", "--json"}, extra...)
 			code, out = runCozy(t, root, args...)
 			if code == 0 || !strings.Contains(out, `"code":"callable_internal"`) {
 				t.Fatalf("internal root escaped: %d %s", code, out)
 			}
+		}
+	}
+	for _, name := range []string{"long_form", "long-form"} {
+		code, out = runCozy(t, root, "run", "proof/internal/"+name, "--describe")
+		if code != 0 || !strings.Contains(out, "proof/internal/long_form") {
+			t.Fatalf("job spelling did not resolve to its registered name: %s: %d %s", name, code, out)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(root, "creator.sqlite")); err == nil {
