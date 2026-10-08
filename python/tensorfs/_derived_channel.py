@@ -14,10 +14,10 @@ import socket
 import struct
 import threading
 from collections.abc import Buffer, Callable, Mapping
-from typing import TYPE_CHECKING, Any, ContextManager, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, ContextManager, Literal, cast
 
 from . import errors
-from .records import CheckpointReceipt, DerivedReceipt, PartReceipt
+from .records import CheckpointReceipt, DerivedReceipt, PartReceipt, Reader
 
 if TYPE_CHECKING:  # a type only: the writer exists in the full build, the channel in both
     from ._ext import DerivedWriter
@@ -28,10 +28,6 @@ _BYTES = 1
 _CHUNK = 1 << 20
 _METADATA = 64 << 20
 _READ = 64 << 20
-
-
-class Reader(Protocol):
-    def read(self, size: int = -1) -> bytes: ...
 
 
 class _BufferReader:

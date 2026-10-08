@@ -147,3 +147,25 @@ Rust consumers already use `ObjectRef`, `ReceiptFacts`, typed Store/read/derived
 and explicit ownership. This Python contract cleanup does not add parallel Rust wrappers.
 Open-ended encoding definitions and channel envelopes stay at their existing dynamic
 boundary; fixed native outputs no longer erase their contract into `Any`.
+
+## Owner-assigned writer attempts
+
+An embedding owner that does not already possess a durable writer session uses Rust
+`derived::begin_next(store, meta, transaction, declaration, checkpoint)` or
+`derived::channel::Writer::begin_next(...)`. The first returns `NextBegin` containing
+`writer_session_id` and the existing `Begin` holds/views. The channel constructor owns
+those same guards and uses the assigned session throughout its lifetime.
+
+TensorFS chooses the next session above the durable transaction's highest session and
+any retained restore fence, under the existing transaction lock. This works after an old
+owner used a large timestamp, after restart, and when two authorized attempts open
+concurrently. A stale channel's cleanup cannot fence the newer session. The owner still
+checks that an execution is authorized/current before opening a replacement; this API
+does not authorize the replacement itself. A newer attempt fences the older writer.
+
+The existing explicit `begin(..., writer_session, ...)` API is unchanged. No clock,
+process-global counter, daemon-specific journal, Python wrapper or new on-disk format is
+introduced. Only an observed row changing during native validation is retried; different
+declarations, terminal states, invalid sources and exhausted integer space refuse.
+Native proofs are in `derived/next_attempt_tests.rs`; TensorD adoption belongs to
+[tracker #341](https://github.com/cozy-creator/tracker/issues/341).

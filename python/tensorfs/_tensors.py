@@ -8,9 +8,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module, metadata
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from . import _ext
+from .records import Header, SegmentedPart
 from .derived import Part, SourceCapability, Tensor
 
 _PLAIN = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
@@ -257,7 +258,7 @@ class TensorReader:
         self._source = source
         self._manifest = manifest
         self._raw_header: bytes | None = None
-        self._header: Mapping[str, Any] = {}
+        self._header: Header | None = None
         if isinstance(source, SourceCapability):
             if manifest is not None:
                 raise TensorAccessError(
@@ -379,10 +380,10 @@ class TensorReader:
             )
             self._source.check()
             return
-        assert self._raw_header is not None and self._manifest is not None
+        assert self._raw_header is not None and self._manifest is not None and self._header is not None
         refs = {_ext.object_id(self._raw_header): len(self._raw_header)}
         for part in self._header["components"][component][key]["parts"].values():
-            for segment in part.get("segments", ()):
+            for segment in cast(SegmentedPart, part)["segments"] if "segments" in part else ():
                 refs["sha256:" + segment["sha256"].removeprefix("sha256:")] = segment[
                     "length"
                 ]

@@ -14,7 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TypedDict, cast
 
 import tensorfs
-from tensorfs import errors
+from tensorfs import errors, records
+from record_contract import check
 
 
 class ObjectRef(TypedDict):
@@ -131,6 +132,7 @@ def prove(binary: str, root: Path) -> None:
         result = cast(PullResult, tensorfs.pull(
             store, origin, "proof/model@1.0.0", lane="plain", allow_local=True, streams=1,
             cancellation=tensorfs.PullCancellation(), progress=lambda available, total: resumed.append((available, total))))
+        check(result, records.PullResult)
         assert result["bytes_held"] > 0 and resumed[0][0] == result["bytes_held"]
         assert resumed[-1][0] == result["bytes_total"]
         assert all(hits[digest] == count for digest, count in completed.items()), "resume re-downloaded admitted objects"

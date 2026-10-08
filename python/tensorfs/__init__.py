@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING
 
 from . import errors
 from .records import (
-    CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt, FitResult,
+    CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt, FitResult, TensorPart,
     Asset, Encoding, TensorLogical, InlinePart, SegmentedPart, Tensor, Header, EnsureEvent, EnsureResult, Relief,
 )
 from ._tensors import (

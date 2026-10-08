@@ -231,7 +231,7 @@ class SelectedSource(TypedDict):
     members: list[SourceMember]
     allowed_hosts: list[str]
     credential_hosts: list[str]
-    skipped: list[str]
+    skipped: NotRequired[list[str]]
 
 class MaterializedSource(TypedDict):
     artifact: TreeRoot
@@ -513,7 +513,7 @@ type DerivationArguments = tuple[
     DeclarationSources, DeclarationTargets, DeclarationConfigs, list[TensorKey], int,
 ] | tuple[
     DeclarationSources, DeclarationTargets, DeclarationConfigs, list[TensorKey], int,
-    DeclarationFiles,
+    DeclarationFiles | None,
 ]
 
 
