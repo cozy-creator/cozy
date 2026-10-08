@@ -75,6 +75,13 @@ its own localhost.
 
 A named rental remains controlled through its recorded machine identity and original
 rental Hub. New runs, package installs and model downloads still use the CLI's selected
-Hub. Rentals already holding that Hub's pod capability can reuse it; another selected
-source uses its own execution grant. A local unpublished run with no Hub model inputs can
+Hub. Every published request carries that source's own execution grant, even when the
+same Hub rented the machine. A local unpublished run with no Hub model inputs can
 still execute offline. A remote published source requires login to the selected Hub.
+
+A bare remote `org/package/function` invocation names no release. The selected machine
+provides its input schema and resolves the actual release when preparing execution. A
+booting machine may use selected-Hub schema metadata for CLI input parsing and capacity
+selection; that metadata never becomes a client-side version pin. A package missing from
+the selected Hub fails even when this computer or the worker holds it from another Hub.
+Only an explicit local source path takes the local-code upload path.

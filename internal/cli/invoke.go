@@ -2986,7 +2986,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 		return Target{}, nil, problem
 	}
 	// A release this client has not installed: the one it read last, else the one the machine
-	// that runs it names at its own Hub. Only a run with no machine yet reads the Hub, once.
+	// that runs it names at the selected Hub. Only a run with no machine yet reads the Hub, once.
 	root := home.Paths(ctx.Cfg.Home).Root
 	if release, surface := keptNewestRelease(root, ctx.Cfg.HubURL, target.Package); release != "" {
 		target.Release = release
@@ -3068,7 +3068,7 @@ func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.Packa
 }
 
 // describeOnMachine is pkg's newest release and its interface as the machine the run goes to
-// installs it at its own Hub (describe/1), so the client reads no Hub. "" when the run has no
+// installs it at the selected Hub (describe/1), so the client reads no Hub. "" when the run has no
 // machine yet, or the machine or daemon cannot describe.
 func describeOnMachine(ctx *Context, pkg string) (string, *launch.PackageInterface, *exit.Error) {
 	machine, known, problem := knownMachine(ctx)

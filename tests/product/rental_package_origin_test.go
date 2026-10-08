@@ -69,9 +69,13 @@ func TestForeignPublishedInstallDoesNotSatisfyMissingSelectedPackage(t *testing.
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{ID: "pr-old-hub", MachineName: "tessa", State: "ready",
 		Hub: original, AcceleratorModel: "CPU", AcceleratorCount: 1, Address: "127.0.0.1:1", CertPath: "unused", HourlyRateUSDMicros: 100_000}))
-	code, out := runCozy(t, root, "run", "proof/quantize/quantize", "--rental=tessa", "--describe", "--json")
-	if code == 0 || !strings.Contains(out, "package.not_found") || reads.Load() == 0 {
-		t.Fatalf("foreign install satisfied a missing package instead of consulting the selected Hub [exit %d]\n%s", code, out)
+	for _, placement := range [][]string{{"--rental=tessa"}, nil} {
+		before := reads.Load()
+		args := append([]string{"run", "proof/quantize/quantize", "--describe", "--json"}, placement...)
+		code, out := runCozy(t, root, args...)
+		if code == 0 || !strings.Contains(out, "package.not_found") || reads.Load() == before {
+			t.Fatalf("foreign install satisfied a missing package instead of consulting the selected Hub [exit %d, placement %v]\n%s", code, placement, out)
+		}
 	}
 }
 
@@ -172,7 +176,11 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	fixtureExecutionAccess(t, root, source.server, source.worker.Config.Handler)
 	run("source-explicit", "--tensorhub=source")
 
-	// The machine already holds this package, but a different selected Hub has none.
+	// This computer's machine holds the source package too; neither machine may use it
+	// implicitly when a different selected Hub has none.
+	if code, out := runCozy(t, root, "run", parityPublished+"/add", "value=41", "--tensorhub=source", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":42`) {
+		t.Fatalf("local source package setup [exit %d]\n%s", code, out)
+	}
 	missing := newMachineHub(t)
 	var missingReads atomic.Int32
 	missingCatalog := missing.worker.Config.Handler
@@ -182,9 +190,14 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 		}
 		missingCatalog.ServeHTTP(w, r)
 	})
+	fixtureExecutionAccess(t, root, missing.server, missing.worker.Config.Handler)
 	configure(missing.server.URL)
-	if code, out := runCozy(t, root, "run", parityPublished+"/add", "value=41", "--rental=tessa", "--await", "--json"); code == 0 || missingReads.Load() == 0 {
-		t.Fatalf("the machine reused another Hub's package when its selected source had none [exit %d, source reads %d]\n%s", code, missingReads.Load(), out)
+	for _, placement := range [][]string{{"--rental=tessa"}, nil} {
+		before := missingReads.Load()
+		args := append([]string{"run", parityPublished + "/add", "value=41", "--await", "--json"}, placement...)
+		if code, out := runCozy(t, root, args...); code == 0 || missingReads.Load() == before {
+			t.Fatalf("the machine reused another Hub's package when its selected source had none [exit %d, placement %v, source reads %d]\n%s", code, placement, missingReads.Load(), out)
+		}
 	}
 
 	// Identical package/version spelling at another source means different code and interface.
@@ -197,6 +210,7 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	changed = strings.ReplaceAll(changed, "def echo(", "def other_echo(")
 	must(t, os.WriteFile(codePath, []byte(changed), 0o600))
 	publishParityRelease(t, other, root, project)
+	fixtureExecutionAccess(t, root, other.server, other.worker.Config.Handler)
 	configure(other.server.URL)
 	code, out := runCozy(t, root, "run", parityPublished+"/add", "value=41", "--rental=tessa", "--await", "--json", "--idempotency-key=other-source")
 	if code != 0 || !strings.Contains(out, `"value":141`) {
@@ -209,6 +223,40 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	fatal(t, problem)
 	if otherRequest.Release != "" || otherRequest.Hub != other.server.URL {
 		t.Fatalf("the client pinned or redirected the other source: %+v", otherRequest)
+	}
+
+	// A release can change after schema description but before execution. The machine,
+	// not the schema lookup, selects the release for the actual bare invocation.
+	moving := newMachineHub(t)
+	publishParityRelease(t, moving, root, parityProject(t))
+	newer := parityProject(t)
+	pyproject := filepath.Join(newer, "pyproject.toml")
+	raw, err = os.ReadFile(pyproject)
+	must(t, err)
+	must(t, os.WriteFile(pyproject, []byte(strings.ReplaceAll(string(raw), `version="0.0.1"`, `version="0.0.2"`)), 0o600))
+	newerCode := filepath.Join(newer, "machine_parity.py")
+	raw, err = os.ReadFile(newerCode)
+	must(t, err)
+	must(t, os.WriteFile(newerCode, []byte(strings.ReplaceAll(string(raw), "payload.value + 1", "payload.value + 100")), 0o600))
+	publishParityReleaseAt(t, moving, root, newer, "0.0.2")
+	var newestReads atomic.Int32
+	movingCatalog := moving.worker.Config.Handler
+	moving.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/packages/"+parityPublished {
+			release := "0.0.1"
+			if newestReads.Add(1) > 1 {
+				release = "0.0.2"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"releases": []map[string]string{{"release": release}}})
+			return
+		}
+		movingCatalog.ServeHTTP(w, r)
+	})
+	fixtureExecutionAccess(t, root, moving.server, moving.worker.Config.Handler)
+	configure(moving.server.URL)
+	code, out = runCozy(t, root, "run", parityPublished+"/add", "value=41", "--rental=tessa", "--await", "--json", "--idempotency-key=machine-selected-release")
+	if code != 0 || !strings.Contains(out, `"value":141`) || newestReads.Load() < 2 {
+		t.Fatalf("schema lookup pinned the machine's actual release [exit %d, newest reads %d]\n%s", code, newestReads.Load(), out)
 	}
 
 	row, problem := store.RentalRow(parityRental)

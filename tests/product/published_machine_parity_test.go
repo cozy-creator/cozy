@@ -63,7 +63,7 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 		mu.Unlock()
 		// Its first published call explicitly delegates content access; identity and
 		// lifecycle remain local, and subsequent calls reuse the bounded grant.
-		if venue == "local" && key == "cold" && len(calls) == 1 && calls[0] == "POST /v1/execution-access" {
+		if key == "cold" && len(calls) == 1 && calls[0] == "POST /v1/execution-access" {
 			calls = nil
 		}
 		if len(calls) != 0 {
@@ -93,6 +93,11 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 // locked closure every machine installs. The wheel is served beside it, not by a Hub.
 func publishParityRelease(t *testing.T, h *machineHub, root, project string) {
 	t.Helper()
+	publishParityReleaseAt(t, h, root, project, parityVersion)
+}
+
+func publishParityReleaseAt(t *testing.T, h *machineHub, root, project, release string) {
+	t.Helper()
 	// A release pins the published closure: the machine's own Runtime wheel is no release.
 	pyproject := filepath.Join(project, "pyproject.toml")
 	raw, err := os.ReadFile(pyproject)
@@ -108,7 +113,7 @@ func publishParityRelease(t *testing.T, h *machineHub, root, project string) {
 	if out, err := exec.Command("uv", "build", "--wheel", "--project", project, "-o", dist).CombinedOutput(); err != nil {
 		t.Fatalf("building the parity wheel: %v\n%s", err, out)
 	}
-	name := "machine_parity-" + parityVersion + "-py3-none-any.whl"
+	name := "machine_parity-" + release + "-py3-none-any.whl"
 	wheel, err := os.ReadFile(filepath.Join(dist, name))
 	must(t, err)
 	files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(wheel) }))
@@ -122,12 +127,12 @@ func publishParityRelease(t *testing.T, h *machineHub, root, project string) {
 	must(t, err)
 	locked := string(closure) + "machine-parity @ " + files.URL + "/" + name + " --hash=sha256:" + hex.EncodeToString(sum[:]) + "\n"
 	path := "/v1/packages/" + parityPublished
-	releases := map[string][]byte{path: []byte(`{"releases":[{"release":"` + parityVersion + `"}]}`),
-		path + "/releases/" + parityVersion + "/locked-requirements": []byte(locked)}
-	detail, err := json.Marshal(map[string]any{"release": map[string]string{"release": parityVersion},
+	releases := map[string][]byte{path: []byte(`{"releases":[{"release":"` + release + `"}]}`),
+		path + "/releases/" + release + "/locked-requirements": []byte(locked)}
+	detail, err := json.Marshal(map[string]any{"release": map[string]string{"release": release},
 		"package_interface": json.RawMessage(iface), "requires_python": ">=3.12,<3.13"})
 	must(t, err)
-	releases[path+"/releases/"+parityVersion] = detail
+	releases[path+"/releases/"+release] = detail
 	doors := h.worker.Config.Handler
 	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if body, ok := releases[r.URL.Path]; ok {
