@@ -14,8 +14,9 @@ daemon. A Python installation does not grant authority over a managed execution'
 | Standalone library users | Explicit Store construction and normal coordinated reads/writes |
 | Tensorhub | CLI metadata operations over explicitly staged files and census directories |
 
-Managed Runtime model loading requires the machine's existing `model_sources` offer.
-Missing access refuses that operation; it cannot select `Store.open` by omission. Explicit
+Constructing a managed Runtime model requires the machine's existing `model_sources` offer.
+Missing access refuses that operation; it cannot select `Store.open` by omission. Reusing
+an existing construction keeps its held grants and does not acquire new authority. Explicit
 standalone checkpoint construction is a separate Runtime API. Job source/output channels
 require the existing `weights` grant, even when the installed library contains a Store.
 Work without model or weights requirements remains usable without these offers.
