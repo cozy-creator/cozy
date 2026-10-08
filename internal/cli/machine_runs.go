@@ -232,7 +232,17 @@ func (m *machineRuns) collectionRefused(id string) bool {
 func (m *machineRuns) Control(parent context.Context, request records.Request, action string) *exit.Error {
 	if action == "cancel" {
 		if m.foreground {
-			return m.controlV1(parent, request, action)
+			accepted, problem := m.store.RunV1(request.ID)
+			if problem != nil {
+				return problem
+			}
+			sent, problem := m.store.RunV1Marked(request.ID, records.RunV1Sent)
+			if problem != nil {
+				return problem
+			}
+			if accepted || sent {
+				return m.controlV1(parent, request, action)
+			}
 		}
 		m.Withdraw(request.ID)
 		return m.Start(request)

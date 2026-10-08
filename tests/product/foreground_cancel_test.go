@@ -22,24 +22,33 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 // The remote acknowledgement is deliberately withheld. Persisting local intent
 // must not let a short-lived foreground controller close before its Control arrives.
 type foregroundCancelMachine struct {
 	v1.UnimplementedMachineServer
-	entered chan struct{}
-	ack     chan struct{}
-	finish  chan struct{}
-	reads   chan struct{}
-	once    sync.Once
-	calls   atomic.Int32
-	applied atomic.Bool
+	entered     chan struct{}
+	ack         chan struct{}
+	finish      chan struct{}
+	reads       chan struct{}
+	once        sync.Once
+	calls       atomic.Int32
+	applied     atomic.Bool
+	unavailable atomic.Bool
 }
 
 func (m *foregroundCancelMachine) Control(ctx context.Context, request *v1.ControlRequest) (*v1.RunState, error) {
 	m.calls.Add(1)
+	if m.unavailable.Load() {
+		return nil, status.Error(codes.Unavailable, "fixture transport unavailable")
+	}
+	if strings.HasSuffix(request.Id, "-queued") {
+		return nil, status.Error(codes.NotFound, "this queued run was never sent")
+	}
 	m.once.Do(func() { close(m.entered) })
 	select {
 	case <-m.ack:
@@ -94,6 +103,22 @@ func TestForegroundCancelDeliversBeforeExitAndAwaitStillWaitsForTerminal(t *test
 			defer server.Stop()
 			ep := &machineendpoint.Endpoint{Format: machineendpoint.Format, Address: listener.Addr().String(), WorkerID: "fixture-worker", WorkerBootID: "fixture-boot", WorkspaceID: "fixture",
 				CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}))}
+			// Start the persistent owner before recording held queue intent, so its
+			// startup recovery cannot win dispatch before this explicit cancel.
+			startDaemonProcess(t, root)
+			queued, _, problem := store.SubmitWithEvent(records.Request{ID: "req-" + kind + "-queued", IdemKey: kind + "-queued", Package: "proof/foreground", Entrypoint: "main", Kind: kind,
+				Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true}, map[string]any{"machine_endpoint": ep})
+			fatal(t, problem)
+			fatal(t, store.LinkMachineExecution(queued.ID, ep.Name()))
+			if code, out := runCozy(t, root, "run", "cancel", queued.ID, "--json"); code != 0 || !strings.Contains(out, `"status":"canceled"`) {
+				state, _ := store.RequestRow(queued.ID)
+				link, _ := store.MachineExecution(queued.ID)
+				t.Logf("queued state=%s receipt=%d controls=%d", state.State, len(link.Receipt), machine.calls.Load())
+				t.Fatalf("unsent cancellation: %d %s", code, out)
+			}
+			if machine.calls.Load() != 0 {
+				t.Fatal("locally canceled unsent work reached the remote machine")
+			}
 			row, _, problem := store.SubmitWithEvent(records.Request{ID: "req-foreground-" + kind, IdemKey: kind, Package: "proof/foreground", Entrypoint: "main", Kind: kind,
 				Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true}, map[string]any{"machine_endpoint": ep})
 			fatal(t, problem)
@@ -170,6 +195,24 @@ func TestForegroundCancelDeliversBeforeExitAndAwaitStillWaitsForTerminal(t *test
 			fatal(t, problem)
 			if actor != "cozy run cancel" {
 				t.Fatalf("cancellation lost its explicit actor: %q", actor)
+			}
+			machine.unavailable.Store(true)
+			refused, _, problem := store.SubmitWithEvent(records.Request{ID: "req-" + kind + "-unavailable", IdemKey: kind + "-unavailable", Package: "proof/foreground", Entrypoint: "main", Kind: kind,
+				Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true}, map[string]any{"machine_endpoint": ep})
+			fatal(t, problem)
+			fatal(t, store.LinkMachineExecution(refused.ID, ep.Name()))
+			fatal(t, store.AppendEvent(refused.ID, records.RunV1Sent, 0, map[string]any{"machine": ep.Name()}))
+			if code, out := runCozy(t, root, "run", "cancel", refused.ID, "--json"); code != 0 || !strings.Contains(out, `"status":"canceling"`) {
+				t.Fatalf("unavailable transport lost pending cancellation: %d %s", code, out)
+			}
+			retained, problem := store.RequestRow(refused.ID)
+			fatal(t, problem)
+			link, problem := store.MachineExecution(refused.ID)
+			fatal(t, problem)
+			actor, _, _, problem = store.CancelAttribution(refused.ID)
+			fatal(t, problem)
+			if retained.State != "canceling" || !link.CancelRequested || actor != "cozy run cancel" {
+				t.Fatalf("transport refusal discarded explicit intent: %+v %+v %q", retained, link, actor)
 			}
 		})
 	}
