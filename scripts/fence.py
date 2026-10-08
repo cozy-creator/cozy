@@ -122,6 +122,9 @@ REVEAL_SITES = {
     # cl-005: the local model-source client puts the selected provider token
     # directly into that provider's Authorization header.
     "internal/modelsource/provider.go",
+    # Explicit external-resource cleanup sends the stdin credential only to its
+    # selected provider Authorization header; redirects are never followed.
+    "internal/providerrelease/vast.go",
 }
 
 # The contract document's own tables use `| \`METHOD /path\` | scope |`, which the CAS

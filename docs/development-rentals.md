@@ -28,3 +28,19 @@ Use `--development=false` or `rentals.development: false` to explicitly select a
 immutable private worker. Shared/public worker image policy is separate. Existing
 images without guarded replacement and durable update support require a current
 maintenance-capable image; the update command never replaces or buys a rental.
+
+## End a known external provider resource
+
+A machine created outside Tensorhub has no Hub rental record. For development
+cleanup, `cozy rental end-external --provider vast --resource-id ID
+--expected-label LABEL --token-stdin` accepts one explicitly supplied provider API
+key on standard input. The command checks that exact instance and label, destroys
+that instance, then waits for the provider to report it absent. Repeat the same
+command after an interrupted observation. A stopped instance still consumes
+storage and is not reported as released.
+
+This command never discovers provider accounts, reads repository dotenv files,
+creates a Hub rental, changes the selected Hub, or accepts a credential in argv.
+It sends the credential only in the selected provider's Authorization header and
+never follows HTTP redirects. The hidden `--provider-url` development override
+requires HTTPS, except for a literal loopback address used by local test servers.
