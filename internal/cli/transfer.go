@@ -116,9 +116,7 @@ func (s storeUsage) Human() string {
 // computer's machine, the one local runs read.
 func handleMachineModelDownload(ctx *Context) *exit.Error {
 	machine := strings.TrimSpace(ctx.Inv.Value("--rental"))
-	if machine != "" {
-		adoptRentalHub(ctx, machine)
-	} else {
+	if machine == "" {
 		machine = machines.Local
 	}
 	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--idempotency-key") != "" {

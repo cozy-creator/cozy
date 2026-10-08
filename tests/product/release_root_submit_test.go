@@ -34,7 +34,7 @@ func installedHere(t *testing.T, root, hubURL, pkg, release string) {
 	sum := sha256.Sum256([]byte(pkg + "@" + release))
 	id := fmt.Sprintf("%x", sum[:8])
 	installed := records.PackageInstall{ID: id, Package: pkg, Major: 1, Version: release,
-		SourceKind: "tensorhub", SourceRef: pkg + "@" + release, Verified: true, Dir: layout.InstallDir(id)}
+		SourceKind: "tensorhub", SourceRef: pkg + "@" + release, Hub: hubURL, Verified: true, Dir: layout.InstallDir(id)}
 	iface, err := canonical.NormalizeJCS(detail.PackageInterface)
 	must(t, err)
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0o700))

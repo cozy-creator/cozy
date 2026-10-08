@@ -34,7 +34,6 @@ func handleModelQuantize(ctx *Context) *exit.Error {
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
-	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	close, problem := foregroundTarget(ctx)
 	if problem != nil {
 		return problem
@@ -190,8 +189,8 @@ func servingQuantizer(ctx *Context, lane string, ref hub.Ref, checkpoint string)
 	}
 	var found []string
 	for _, install := range installed {
-		// A run of an install uses the hub it came from (adoptInstallHub); the model is this one's.
-		if install.SourceKind != "tensorhub" || install.Hub != "" && install.Hub != strings.TrimRight(ctx.Cfg.HubURL, "/") ||
+		// The run and its model resolve against the command's configured Hub.
+		if !install.PublishedAt(ctx.Cfg.HubURL) ||
 			len(found) > 0 && found[len(found)-1] == install.Package {
 			continue
 		}

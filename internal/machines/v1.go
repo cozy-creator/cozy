@@ -24,8 +24,8 @@ type V1 struct {
 	// to it. Local is this computer's machine, which reads a loopback Hub there.
 	Leaf  []byte
 	Local bool
-	// Rented is a rental's machine: it reads its own Hub with the pod's capability, so a run
-	// sends it no Hub access.
+	// Rented is a rental's machine: it can read its own Hub with the pod's capability.
+	// A run that selects another Hub carries separate account-authorized access.
 	Rented bool
 	// HubID is a rental's identity, Owned an owned machine (this computer's), and Account the
 	// owner's client at the machine's Hub.

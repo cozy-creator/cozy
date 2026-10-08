@@ -40,9 +40,14 @@ func machinePublication(ctx context.Context, account *hub.Client, machine, machi
 // authorizeV1Publication grants a cozy.machine.v1 machine publication into repositories; the
 // machine renews the grant's bearer itself, with its sender proof (the run's execution access, or
 // a rental's own worker capability).
-func authorizeV1Publication(ctx context.Context, machine *machines.V1, repositories []string) (string, *exit.Error) {
+func authorizeV1Publication(ctx context.Context, machine *machines.V1, origin string, repositories []string) (string, *exit.Error) {
 	if machine.Account == nil || (!machine.Owned && machine.HubID == "") || len(machine.Leaf) == 0 {
 		return "", exit.Named(exit.Structural, "publication.machine_identity_required", "publication authority requires the machine's Hub identity and pinned certificate")
+	}
+	if origin != "" && machine.Account.Base() != origin {
+		return "", exit.Named(exit.Structural, "publication.source_hub_unsupported",
+			"this machine's publication authority is at %s, but this command selected %s", machine.Account.Base(), origin).
+			WithRemedy("publish from a machine authorized at %s; no publication was sent to another Hub", origin)
 	}
 	names, problem := hub.NormalizePublicationRepositories(repositories)
 	if problem != nil {

@@ -365,6 +365,13 @@ func scanInstallFields(rows interface{ Scan(...any) error }, withHub bool) (Pack
 
 // Activate is THE install transaction: the install row and the pin swap commit
 // together or not at all. A crash before Commit leaves the previous pin — and the
+// PublishedAt reports whether this install's published identity belongs to this Hub.
+// An old install with no recorded origin cannot supply another Hub's release metadata.
+func (inst PackageInstall) PublishedAt(origin string) bool {
+	return inst.SourceKind == "tensorhub" && inst.Hub != "" &&
+		strings.TrimRight(inst.Hub, "/") == strings.TrimRight(origin, "/")
+}
+
 // previous install's venv — exactly as it was.
 func (s *Store) Activate(inst PackageInstall) (superseded string, e *exit.Error) {
 	return s.recordInstall(inst, true)

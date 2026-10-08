@@ -188,20 +188,6 @@ func existingRecords(ctx *Context) (*records.Store, bool) {
 	return store, true
 }
 
-// adoptInstallHub points a run of a published install at the hub it came from, so its
-// model bindings are that hub's. An explicit --tensorhub is kept.
-func adoptInstallHub(ctx *Context, install records.PackageInstall) {
-	if install.SourceKind != "tensorhub" || install.Hub == "" || ctx.Cfg.HubURLSource == "flag" {
-		return
-	}
-	origin, invalid := config.HubOrigin(install.Hub)
-	if invalid != nil {
-		return
-	}
-	scoped := ctx.forHub(origin)
-	ctx.Cfg, ctx.AccountAuth = scoped.Cfg, scoped.AccountAuth
-}
-
 // everyHub is whether a list shows every hub's rows: always, unless --tensorhub names one.
 // --all-hubs is the default and kept for scripts.
 func everyHub(ctx *Context) bool {

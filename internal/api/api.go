@@ -192,23 +192,6 @@ func (s *Server) requestHub(row records.Request) string {
 	return s.cfg.HubURL
 }
 
-// submissionHub is the hub new work belongs to. Work on a named rental that the client
-// did not place on a hub itself belongs to that rental's hub.
-func (s *Server) submissionHub(r *http.Request, rentalID string) (string, *exit.Error) {
-	selected, problem := s.hubOf(r)
-	if problem != nil || rentalID == "" || strings.TrimSpace(r.Header.Get(HubHeader)) != "" {
-		return selected, problem
-	}
-	row, problem := s.store.RentalRow(rentalID)
-	if problem != nil || row == nil {
-		return selected, problem
-	}
-	if origin, invalid := config.HubOrigin(row.Hub); invalid == nil {
-		return origin, nil
-	}
-	return selected, nil
-}
-
 // activateRecorded starts capacity selection only after the HTTP authority has durably
 // recorded the request. Provider acquisition and worker preparation may take minutes; neither
 // belongs under the short shutdown-admission gate.

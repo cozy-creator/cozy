@@ -588,7 +588,7 @@ func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, 
 	return "Bearer " + token
 }
 
-func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
+func TestLocalRunKeepsConfiguredHubDespiteCachedInstall(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires independent machine agent")
 	}
@@ -612,26 +612,26 @@ func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
 	fatal(t, problem)
 	store.Close()
 	provisionMachine(t, root)
-	fixtureExecutionAccess(t, root, hubA, hubA.Config.Handler)
-	// The machine resolves the call's Models; the release it runs is read from the hub the
-	// install came from, never from the current one.
+	fixtureExecutionAccess(t, root, hubB, hubB.Config.Handler)
+	// The machine resolves the call's Models; the release it runs is read from the Hub the
+	// command selected, independently of cached install provenance.
 	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")
 	// A queued run reaches its machine after the command returns.
 	for deadline := time.Now().Add(time.Minute); ; time.Sleep(50 * time.Millisecond) {
-		if _, asked := askedA.Load("proof/alpha/releases/1.0.0"); asked {
+		if _, asked := askedB.Load("proof/alpha/releases/1.0.0"); asked {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the install's hub was not asked for its release: %d %s", code, out)
+			t.Fatalf("the selected Hub was not asked for its release: %d %s", code, out)
 		}
 	}
 	crossed := false
-	askedB.Range(func(key, _ any) bool {
+	askedA.Range(func(key, _ any) bool {
 		crossed = crossed || strings.HasPrefix(key.(string), "proof/alpha")
 		return true
 	})
 	if crossed {
-		t.Fatal("the current hub was asked for another hub's install")
+		t.Fatal("the cached install overrode the selected Hub")
 	}
 }
 

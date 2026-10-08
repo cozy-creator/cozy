@@ -457,7 +457,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		repositories = append(repositories, spec.WeightsDestination)
 	}
 	if len(repositories) > 0 {
-		if spec.Publication, problem = authorizeV1Publication(ctx, machine, repositories); problem != nil {
+		if spec.Publication, problem = authorizeV1Publication(ctx, machine, request.Hub, repositories); problem != nil {
 			return nil, problem
 		}
 	}
@@ -509,9 +509,9 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	if spec.Models, problem = modelChoicesV1(request, request.Models); problem != nil {
 		return nil, problem
 	}
-	// A rental's machine reads its own Hub as the pod; any other gets the account's access.
-	if request.Hub != "" && !machine.Rented {
-		if access, problem := m.hubAccessV1(ctx, request.Hub, machine); problem != nil {
+	// The selected Hub supplies package/model access independently of rental ownership.
+	if request.Hub != "" {
+		if access, problem := m.hubAccessV1(ctx, request.Hub, machine, request.LocalInstallationID == "" && request.InstallID == "" || len(request.Models) > 0); problem != nil {
 			return nil, problem
 		} else {
 			spec.Hub = access
@@ -619,14 +619,11 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, ManifestLength: uint64(max(model.ManifestLength, 0)),
 			Source: model.Source, Profiles: model.Profiles})
 	}
-	// A rental reads its own Hub with the pod's capability; any other machine with this access.
-	if !machine.Rented {
-		if spec.Hub, problem = m.hubAccessV1(ctx, origin, machine); problem != nil {
-			return nil, problem
-		}
+	if spec.Hub, problem = m.hubAccessV1(ctx, origin, machine, true); problem != nil {
+		return nil, problem
 	}
 	if selection.Destination != "" && !strings.HasPrefix(selection.Destination, "local/") {
-		if spec.Publication, problem = authorizeV1Publication(ctx, machine, []string{selection.Destination}); problem != nil {
+		if spec.Publication, problem = authorizeV1Publication(ctx, machine, origin, []string{selection.Destination}); problem != nil {
 			return nil, problem
 		}
 	}
@@ -737,9 +734,19 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 // hubAccessV1 is the signed-in account's execution access at origin, bound to the machine's
 // leaf: the machine reads its Hub with it during the run's preparation and forgets it. A run
 // whose owner is not signed in carries none; the machine then refuses only what needs a Hub.
-func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *machines.V1) (*v1.HubAccess, *exit.Error) {
+func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *machines.V1, required bool) (*v1.HubAccess, *exit.Error) {
 	account := client(m.context.forHub(origin))
+	// The pod already has access to its rental Hub. Another selected source needs the
+	// owner's grant for that source; the rental's lifecycle credential never crosses Hubs.
+	if machine.Rented && machine.Account != nil && machine.Account.Base() == account.Base() {
+		return nil, nil
+	}
 	if account.CredentialIdentity() == "" {
+		if machine.Rented && required {
+			return nil, exit.Named(exit.Credential, "hub.execution_access_required",
+				"reading %s on this rental requires execution access", account.Base()).
+				WithRemedy("sign in with `cozy auth login <email> --tensorhub=%s`", account.Base())
+		}
 		return nil, nil
 	}
 	// One grant serves this machine's runs for the first half of its life: a warm run asks the

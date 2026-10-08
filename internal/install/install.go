@@ -308,7 +308,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	if !req.Snapshot && prior != nil && priorInstall != nil && priorInstall.SourceKind == inst.SourceKind &&
 		priorInstall.Package == inst.Package && priorInstall.Version == inst.Version &&
-		inst.SourceKind == "tensorhub" && (priorInstall.Hub == "" || priorInstall.Hub == inst.Hub) {
+		inst.SourceKind == "tensorhub" && priorInstall.PublishedAt(inst.Hub) {
 		res.Idempotent = true
 		res.Install = *priorInstall
 		_ = os.RemoveAll(installDir)

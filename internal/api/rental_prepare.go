@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machines"
@@ -109,21 +108,6 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := r.PathValue("rental_id")
-	// The selection was resolved on the command's hub; a machine installs only what its own
-	// hub serves.
-	machineHub, problem := machines.InstallHub(s.store, id)
-	if problem == nil && machineHub != "" {
-		selected, refused := s.submissionHub(r, id)
-		if problem = refused; problem == nil {
-			if origin, invalid := config.HubOrigin(machineHub); invalid == nil && origin != selected {
-				problem = rentalHubMismatch(id, machineHub, selected)
-			}
-		}
-	}
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
 
 	if s.rentalInstall == nil {
 		s.refuseTyped(w, r, exit.Unavailablef("rental installation queue is unavailable"))
