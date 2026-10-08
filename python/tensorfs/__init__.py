@@ -37,6 +37,7 @@ from os import PathLike
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 from . import errors
+from .records import CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt
 from ._tensors import (
     TensorAccessError,
     TensorAllocation,
@@ -72,8 +73,8 @@ from ._ext import (
     seed_digests,
 )
 
-# A plane-only build (what Rust-machine executors install) carries headers, plans, fit and
-# the weight plane; the store, downloader, ingest and GC exist only in the full build.
+# The ordinary Python wheel always includes the full extension and CLI. Rust can
+# still build without store features; installed code is never a managed executor grant.
 # The channel protocols above (derived outputs, tensor reads) import in both: what serves
 # them, a store, exists only in the full build.
 if TYPE_CHECKING or STORE:
@@ -111,13 +112,6 @@ if TYPE_CHECKING or STORE:
         transfer_object,
         transfer_manifest,
     )
-
-
-class ObjectRef(TypedDict):
-    """One content-addressed body segment."""
-
-    sha256: str
-    length: int
 
 
 class Asset(TypedDict):
@@ -353,6 +347,9 @@ __all__ = [
     "Header",
     "InlinePart",
     "ObjectRef",
+    "DerivedReceipt",
+    "CheckpointReceipt",
+    "PartReceipt",
     "SegmentedPart",
     "Tensor",
     "TensorLogical",

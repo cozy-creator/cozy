@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from typing import get_type_hints
 
 import tensorfs
 from tensorfs.derived import (
@@ -32,12 +33,36 @@ from tensorfs.derived import (
     serve_source,
 )
 from tensorfs._derived_channel import _Channel
+from tensorfs.records import (
+    CheckpointReceipt, DerivedReceipt, DerivedSource, InheritObservation,
+    ObjectRef, PartReceipt,
+)
 
 WORK = "sha256:" + "ab" * 32
 
 
 def identity(number):
     return "sha256:" + f"{number:064x}"
+
+
+def record_matches(record, schema):
+    """Check public annotations against native-produced facts; additive fields are allowed."""
+    assert schema.__required_keys__ <= record.keys(), (schema.__name__, record)
+    for name, kind in get_type_hints(schema).items():
+        if kind in (str, int):
+            assert type(record[name]) is kind, (name, record[name])
+    return record
+
+
+def receipt_matches(receipt):
+    record_matches(receipt, DerivedReceipt)
+    record_matches(receipt["inherit_observation"], InheritObservation)
+    for obj in [receipt["header"], receipt["manifest"], *receipt["added_objects"]]:
+        record_matches(obj, ObjectRef)
+    for source in receipt["sources"]:
+        record_matches(source, DerivedSource)
+        record_matches(source["header"], ObjectRef)
+        record_matches(source["manifest"], ObjectRef)
 
 
 def declaration(length, source=None):
@@ -131,8 +156,13 @@ def exercise():
         size = 2 << 20
         original = declaration(size)
         native = open_writer(store, 1, original, size)
-        native.add_part("model", "weight", "value", io.BytesIO(b"a" * size))
+        part = native.add_part("model", "weight", "value", io.BytesIO(b"a" * size))
+        record_matches(part, PartReceipt)
         source_receipt = native.commit()
+        receipt_matches(source_receipt)
+        assert tensorfs.ObjectRef is ObjectRef
+        assert tensorfs.DerivedReceipt is DerivedReceipt
+        assert tensorfs.derived.DerivedReceipt is DerivedReceipt
         ref = source_receipt["manifest"]
         plan = declaration(size, Source("sha256:" + ref["sha256"], ref["length"]))
         assert (
@@ -167,12 +197,19 @@ def exercise():
                 return bytes(value ^ 3 for value in into)
 
         producer = Lazy()
-        tx.add_part("model", "copy", "value", producer)
+        part = tx.add_part("model", "copy", "value", producer)
+        record_matches(part, PartReceipt)
         assert producer.reads >= 2
         assert tx.completed_parts() == [("model", "copy", "value")]
         checkpoint = tx.checkpoint()
+        record_matches(checkpoint, CheckpointReceipt)
+        assert checkpoint["head"] is None or isinstance(checkpoint["head"], str)
         assert owner.checkpoints[-1] == checkpoint
         result = tx.commit()
+        receipt_matches(result)
+        assert tx.commit() is result
+        newer = {**result, "future_observation": {"kept": True}}
+        assert DerivedTransaction.replay(newer).commit() == newer
         assert owner.receipts == [result], (
             "commit returned before owner recorded receipt"
         )

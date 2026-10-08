@@ -52,7 +52,7 @@ REGIONS = {
     "vae": [["vae/dec#value", "vae/gain#value"]],
 }
 UNET_INLINE = 256 + 4 + 192
-HOST_KEYS = {"budget", "used", "ready_bytes", "registered_bytes", "memfd_bytes", "cached_bytes",
+HOST_KEYS = {"budget", "used", "ready_bytes", "registered_bytes", "memfd_bytes", "sealed_bytes", "cached_bytes",
              "direct_bytes", "buffered_bytes", "inline_bytes", "direct_refused", "map_refused",
              "disk_read_bytes", "fills",
              "fill_bytes", "fill_ns", "evictions", "evicted_bytes", "register_failed", "trims"}
@@ -194,7 +194,7 @@ def main(work: Path):
 
     # ---- pinned fill
     trim = p.set_pinned_budget(ws.nbytes)
-    check("trim rows carry the documented keys", set(trim) == TRIM_KEYS and trim["freed"] == 0, trim)
+    check("trim rows carry the documented keys", TRIM_KEYS <= trim.keys() and trim["freed"] == 0, trim)
     evict_page_cache(root)
     t0 = p.want(ws, "pinned", regions=[0], priority=1)
     t1 = p.want(ws, "pinned", regions=[1, 2], priority=0)
@@ -204,8 +204,9 @@ def main(work: Path):
     st = p.stats()
     host = st["host"]
     unet_bytes = sum(len(data[q["what"]]) for q in parts)
+    # Require the fields the consumer uses, while allowing newer producers to add observations.
     check("stats rows carry the documented keys",
-          set(st) == STATS_KEYS and set(host) == HOST_KEYS and set(st["sets"][0]) == SET_KEYS
+          STATS_KEYS <= st.keys() and HOST_KEYS <= host.keys() and SET_KEYS <= st["sets"][0].keys()
           and st["devices"] == [] and st["stages"] == [] and st["regions"] == []
           and st["poisoned"] is None, st)
     check("pinned tier holds every region",

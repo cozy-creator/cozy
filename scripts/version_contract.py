@@ -155,6 +155,8 @@ def installed_version(path: pathlib.Path) -> str:
         raise ValueError(
             f"tensorfs.__version__ {tensorfs.__version__!r} != wheel version {expected!r}"
         )
+    if not tensorfs.STORE or not hasattr(tensorfs, "Store"):
+        raise ValueError("tensorfs must install the full Store API as well as the CLI")
     installed_tfs = pathlib.Path(sysconfig.get_path("scripts")) / "tfs"
     if not os.access(installed_tfs, os.X_OK):
         raise ValueError(f"install put no executable tfs at {installed_tfs}")
