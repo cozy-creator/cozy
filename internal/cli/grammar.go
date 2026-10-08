@@ -642,7 +642,7 @@ func (c *RentalEndCmd) Run(r *Runtime) error {
 }
 
 type RentalListCmd struct {
-	AllHubs bool `help:"Every hub's rentals: the default. --tensorhub=<hub> lists one hub's."`
+	AllHubs bool `help:"Retained for scripts; rental listings always include every known Hub."`
 	Ended   bool `help:"Ended rentals instead: why and when each ended, and what it cost."`
 	Watch   bool `help:"Refresh continuously (requires a terminal)."`
 	NoWatch bool `help:"Print one snapshot even in a terminal."`

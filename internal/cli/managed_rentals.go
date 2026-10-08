@@ -1095,11 +1095,9 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 	case problem != nil:
 	case asked != nil:
 		problem = asked
-		if hub.Unanswered(asked) {
-			// The census is as unknown as the rows: a later cached read must not
-			// present the previous listing as current.
-			census.listed, census.listingProblem, census.unrecorded, census.live = false, asked, nil, nil
-		}
+		// Keep the last observed machines visible, but never present stale totals
+		// as current, including after an authentication failure.
+		census.listed, census.listingProblem = false, asked
 	case only != nil:
 	default:
 		m.applyListingLocked(origin, listing, listed, listingProblem)
@@ -1244,31 +1242,31 @@ func (m *managedRentals) inFlightLocked() (map[string]bool, *exit.Error) {
 	return busy, nil
 }
 
-// applyListingLocked refreshes one hub's unrecorded set. A listing this hub does
-// not publish, or cannot answer right now, leaves the set EMPTY and the reason
-// recorded — never an assertion that there is nothing there.
+// applyListingLocked replaces a census only with a complete successful answer.
+// An unavailable listing retains its last rows as unverified, never current totals.
 func (m *managedRentals) applyListingLocked(origin string, remote []hub.Rental, listed bool, problem *exit.Error) {
 	census := m.censusLocked(origin)
-	census.listed, census.listingProblem, census.unrecorded, census.live = listed, problem, nil, nil
+	census.listed, census.listingProblem = listed, problem
 	if problem != nil || !listed {
 		return
 	}
+	var live, unrecorded []hub.Rental
 	for _, seen := range remote {
 		if hub.RentalAbsent(seen.State) {
 			continue
 		}
 		row, rowProblem := m.store.RentalRow(seen.ID)
 		if rowProblem != nil {
-			census.listingProblem = rowProblem
-			census.unrecorded, census.live = nil, nil
+			census.listed, census.listingProblem = false, rowProblem
 			return
 		}
-		census.live = append(census.live, seen)
+		live = append(live, seen)
 		if row != nil && m.origin(row.Hub) == origin {
 			continue
 		}
-		census.unrecorded = append(census.unrecorded, seen)
+		unrecorded = append(unrecorded, seen)
 	}
+	census.live, census.unrecorded = live, unrecorded
 }
 
 // sayUnrecordedLocked is the DAEMON's alarm, and it belongs to the sweep rather than

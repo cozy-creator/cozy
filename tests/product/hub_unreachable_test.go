@@ -121,7 +121,7 @@ func TestRentalListFallsBackToLocalRecordsWhenHubUnreachable(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Tensorhub unreachable at " + hubURL + " (connection refused)",
-		"last local records, which may be out of date",
+		"last known rentals, which may be out of date",
 		"leonmitchelli",
 		"ready (unverified)",
 	} {
@@ -134,16 +134,15 @@ func TestRentalListFallsBackToLocalRecordsWhenHubUnreachable(t *testing.T) {
 		t.Fatalf("the degraded board presents unreconciled totals or blames auth\n%s", out)
 	}
 
-	// Every hub's board names the hub that did not answer; one narrowed to it carries its
-	// error as the board's own.
+	// The board names the Hub that did not answer even with an explicit source override.
 	type hubProblem struct {
 		Hub     string `json:"hub"`
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	}
-	for _, narrowed := range []bool{false, true} {
+	for _, withOverride := range []bool{false, true} {
 		args := []string{"--json", "rental", "list"}
-		if narrowed {
+		if withOverride {
 			args = append(args, "--tensorhub="+hubURL)
 		}
 		code, out = runCozy(t, root, args...)
@@ -154,17 +153,16 @@ func TestRentalListFallsBackToLocalRecordsWhenHubUnreachable(t *testing.T) {
 			Rentals    []map[string]any `json:"rentals"`
 			Live       *bool            `json:"live"`
 			Running    *int             `json:"machines_running"`
-			HubError   hubProblem       `json:"hub_error"`
 			Unreadable []hubProblem     `json:"unreadable_hubs"`
 		}
 		must(t, json.Unmarshal([]byte(out), &document))
-		reason := document.HubError.Code
-		if !narrowed && len(document.Unreadable) == 1 && document.Unreadable[0].Hub == hubURL {
+		reason := ""
+		if len(document.Unreadable) == 1 && document.Unreadable[0].Hub == hubURL {
 			reason = document.Unreadable[0].Code
 		}
 		if document.Live == nil || *document.Live || document.Running != nil || reason != "hub.unreachable" ||
 			len(document.Rentals) != 1 || document.Rentals[0]["machine"] != "leonmitchelli" {
-			t.Fatalf("the JSON board (narrowed %v) does not mark local records as unverified\n%s", narrowed, out)
+			t.Fatalf("the JSON board (source override %v) does not mark local records as unverified\n%s", withOverride, out)
 		}
 	}
 }

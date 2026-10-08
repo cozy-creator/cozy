@@ -223,21 +223,20 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 		t.Fatalf("hub a's listing is wrong: %+v", current)
 	}
 	// Hub b's fleet is read with b's credential; a's live rental is named, not hidden.
-	if other := list("--tensorhub=b"); other.Hub != hubB || len(other.Rentals) != 0 ||
-		len(other.OtherHubs) != 1 || other.OtherHubs[0]["hub"] != hubA {
+	if other := list("--tensorhub=b"); other.Hub != hubB || len(other.Rentals) != 1 ||
+		other.Rentals[0]["hub"] != hubA || len(other.OtherHubs) != 0 {
 		t.Fatalf("hub b's listing is wrong: %+v", other)
 	}
 
 	if code, out := runCozy(t, root, "hub", "use", "b", "--json"); code != 0 {
 		t.Fatalf("hub use b: %d %s", code, out)
 	}
-	// Every hub is listed by default: switching hubs hides nothing. A view narrowed to b
-	// still names a's billing rental.
+	// Every hub is listed, including with an explicit source for new work.
 	if all := list(); len(all.Rentals) != 1 || all.Rentals[0]["hub"] != hubA {
 		t.Fatalf("switching hubs hid a's billing rental: %+v", all)
 	}
 	code, out = runCozy(t, root, "rental", "list", "--no-watch", "--tensorhub=b")
-	if code != 0 || !strings.Contains(out, "1 rental running on hub a") {
+	if code != 0 || !strings.Contains(out, "alpha") || !strings.Contains(out, "HUB") {
 		t.Fatalf("hub b's view hid a's billing rental: %d %s", code, out)
 	}
 	if all := list("--all-hubs"); len(all.Rentals) != 1 || all.Rentals[0]["hub"] != hubA {

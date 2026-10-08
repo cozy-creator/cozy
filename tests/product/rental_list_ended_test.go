@@ -16,7 +16,7 @@ import (
 
 // `cozy rental list --ended` lists the ended rentals of every hub this host is signed in to,
 // the latest ended first: why each ended, when, and what it cost. The default list leaves
-// them out and says where they are; --tensorhub narrows to one hub; a long history says how
+// them out and says where they are; --tensorhub preserves every hub; a long history says how
 // many rows it hid and how to see them.
 func TestRentalListEndedSaysWhyWhenAndWhatEachCost(t *testing.T) {
 	other := newAccountHubWith(t, func(mux *http.ServeMux) {
@@ -94,8 +94,8 @@ func TestRentalListEndedSaysWhyWhenAndWhatEachCost(t *testing.T) {
 		*heron.Spend != 1_250_000 || heron.SpendBasis != "provider_billed" {
 		t.Fatalf("heron: %+v", heron)
 	}
-	if scoped := list("--tensorhub", "other"); len(scoped) != 1 || scoped[0].Machine != "kanna" {
-		t.Fatalf("--tensorhub=other lists another hub's ended rentals: %+v", scoped)
+	if scoped := list("--tensorhub", "other"); len(scoped) != 3 || scoped[0].Machine != "kanna" {
+		t.Fatalf("--tensorhub=other hides another hub's ended rentals: %+v", scoped)
 	}
 	code, human := runCozy(t, root, "rental", "list", "--ended")
 	for _, want := range []string{"Ended rentals: 3 · accrued $70.85 est.", "ENDED BY", "idle_unreached", "released_by_pod",
