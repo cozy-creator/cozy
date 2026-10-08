@@ -492,7 +492,7 @@ fn inherited_assets_conflict_on_content_metadata_or_segments_and_allow_explicit_
         )
         .unwrap()
         .obj;
-    for case in 0..4 {
+    for case in 0..5 {
         let mut other = header.clone();
         let mut files = vec![];
         match case {
@@ -509,6 +509,12 @@ fn inherited_assets_conflict_on_content_metadata_or_segments_and_allow_explicit_
             3 => {
                 other.assets.remove(0);
                 files.push((path.into(), Entry::File(replacement_object.clone())));
+            }
+            4 => {
+                // A named asset path cannot hide mismatching content by using an
+                // object that also happens to back a tensor in this source.
+                let tensor_object = header.components[0].1[0].1.parts[0].1.segments()[0].clone();
+                files.push((path.into(), Entry::File(tensor_object)));
             }
             _ => unreachable!(),
         }
