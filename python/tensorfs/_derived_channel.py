@@ -17,6 +17,7 @@ from collections.abc import Buffer, Callable, Mapping
 from typing import TYPE_CHECKING, Any, ContextManager, Literal, Protocol, cast
 
 from . import errors
+from .records import CheckpointReceipt, DerivedReceipt, PartReceipt
 
 if TYPE_CHECKING:  # a type only: the writer exists in the full build, the channel in both
     from ._ext import DerivedWriter
@@ -130,12 +131,17 @@ class _Channel:
 
 
 class DerivedTransaction:
-    """Executor-side handle for one writer. FD ownership transfers to this object."""
+    """Executor-side handle for one granted writer attempt.
+
+    FD ownership transfers here. Closing, including context exit, only disconnects
+    this handle: it neither commits nor abandons the resumable transaction. The
+    owner controls retry, abandonment and retained-result lifetime.
+    """
 
     def __init__(self, fd: int) -> None:
         self._channel: _Channel | None = _Channel(fd)
         self._lock = threading.RLock()
-        self.receipt: dict[str, Any] | None = None
+        self.receipt: DerivedReceipt | None = None
 
     @classmethod
     def replay(cls, receipt: Mapping[str, Any]) -> DerivedTransaction:
@@ -143,7 +149,7 @@ class DerivedTransaction:
         value = cls.__new__(cls)
         value._channel = None
         value._lock = threading.RLock()
-        value.receipt = dict(receipt)
+        value.receipt = cast(DerivedReceipt, dict(receipt))
         return value
 
     @classmethod
@@ -155,7 +161,7 @@ class DerivedTransaction:
             if not isinstance(receipt, dict):
                 value.close()
                 raise ChannelRefusal("WRONG_TYPE", "native receipt must be an object")
-            value.receipt = receipt
+            value.receipt = cast(DerivedReceipt, receipt)
             value.close()
         return value
 
@@ -183,8 +189,8 @@ class DerivedTransaction:
     def completed_configs(self) -> list[str]:
         return cast(list[str], self._call("completed_configs"))
 
-    def checkpoint(self) -> dict[str, Any]:
-        return cast(dict[str, Any], self._call("checkpoint"))
+    def checkpoint(self) -> CheckpointReceipt:
+        return cast(CheckpointReceipt, self._call("checkpoint"))
 
     def source_read_into(
         self,
@@ -258,18 +264,18 @@ class DerivedTransaction:
 
     def add_part(
         self, component: str, key: str, role: str, reader: Reader | Buffer
-    ) -> dict[str, Any]:
+    ) -> PartReceipt:
         return cast(
-            dict[str, Any],
+            PartReceipt,
             self._add("part", reader, component=component, key=key, role=role),
         )
 
     def add_config(self, name: str, reader: Reader | Buffer) -> None:
         self._add("config", reader, name=name)
 
-    def commit(self) -> dict[str, Any]:
+    def commit(self) -> DerivedReceipt:
         if self.receipt is None:
-            self.receipt = cast(dict[str, Any], self._call("commit"))
+            self.receipt = cast(DerivedReceipt, self._call("commit"))
             self.close()
         return self.receipt
 

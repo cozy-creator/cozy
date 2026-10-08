@@ -1,5 +1,8 @@
 # TensorFS
 
+The [consumer interfaces](docs/interfaces.md) define Python, Rust and CLI ownership,
+the full Python+CLI distribution, typed transaction results and their lifetimes.
+
 TensorFS stores every domain repository as the same graph:
 
 ```text
@@ -631,4 +634,3 @@ before acquire. The original transaction can be disposed independently. Native G
 these manifest roots directly from the filesystem, without relying on request or transaction
 metadata. Eligibility and authorization belong to the caller; this API provides storage
 retention and never schedules computation or publishes a model repository.
-

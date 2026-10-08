@@ -20,10 +20,10 @@ torch = ["torch>=2.11", "torchao==0.18.0", "numpy>=1.26"]
 manifest-path = "crates/tensorfs-py/Cargo.toml"
 module-name = "tensorfs._ext"
 python-source = "python"
-features = ["extension-module"]
+features = ["extension-module", "store"]
 # One artifact, one version (tfs-051): the wheel carries the `tfs` binary at
 # .data/scripts/, so `pip install tensorfs==<v>` yields module AND CLI everywhere.
 # maturin cannot build a bin target beside a pyo3 extension, so the binary is staged
-# here by scripts/build-wheel.sh before maturin runs; a bare `maturin build` without
-# the staged binary FAILS rather than emitting a wheel with no tfs.
+# here by scripts/build-wheel.sh before maturin runs. The wheel contract checks both
+# the executable and full installed extension; use that script for local builds.
 data = "wheel-data"
