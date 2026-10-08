@@ -58,7 +58,8 @@ retains transaction authority and checks the attempt behind that channel.
 - `DerivedReceipt`: transaction and declaration identity, source facts, header, manifest,
   added objects and inheritance observations.
 
-The four types are also exported from `tensorfs`. `DerivedSource` and `InheritObservation`
+The four types are also exported from `tensorfs` and `tensorfs.derived`, so package
+authors can annotate their existing scoped interface. `DerivedSource` and `InheritObservation`
 name nested records in `tensorfs.records`. A checkpoint's existing nullable prefixed
 `head` field stays unchanged; this typing change introduces no new document format.
 Native Store writers and scoped channels return the same ordinary dictionaries. Rust

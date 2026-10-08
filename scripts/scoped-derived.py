@@ -162,6 +162,7 @@ def exercise():
         receipt_matches(source_receipt)
         assert tensorfs.ObjectRef is ObjectRef
         assert tensorfs.DerivedReceipt is DerivedReceipt
+        assert tensorfs.derived.DerivedReceipt is DerivedReceipt
         ref = source_receipt["manifest"]
         plan = declaration(size, Source("sha256:" + ref["sha256"], ref["length"]))
         assert (

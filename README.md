@@ -336,11 +336,13 @@ bash scripts/wheel-smoke.sh
 ```
 
 One artifact, one version (tfs-051): the wheel ships the `tfs` binary beside the module, so
-`pip install tensorfs==<v>` yields both, and `tfs version` prints
+`uv pip install tensorfs==<v>` from that wheel yields both, and `tfs version` prints
 `tfs <version> sha256:<digest of its own bytes>` — the line tensorhub and cozy-creator check
-at startup and refuse on. `scripts/build-wheel.sh` is the one wheel build; a bare
-`maturin build` refuses until it has staged the binary. The sdist carries sources only —
-installs come from the wheel.
+at startup. `scripts/build-wheel.sh` stages the binary and checks the wheel contract;
+installed-wheel validation also requires the full Store API. The sdist carries sources
+only, so source builders must stage the CLI with that script before building a wheel.
+Ordinary installations use the wheel. Managed Runtime access depends on explicit owner
+grants, not on installing a reduced Python variant.
 
 The CBOR gate runs the production Rust codec and an independent Python codec over the same
 green and red vectors.

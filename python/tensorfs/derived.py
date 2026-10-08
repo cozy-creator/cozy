@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ._derived_channel import DerivedTransaction, serve_derived, serve_derived_replay
+from .records import CheckpointReceipt, DerivedReceipt, ObjectRef, PartReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +263,10 @@ __all__ = [
     "Derivation",
     "OutputCapability",
     "DerivedTransaction",
+    "ObjectRef",
+    "DerivedReceipt",
+    "CheckpointReceipt",
+    "PartReceipt",
     "derive",
     "serve_derived",
     "serve_derived_replay",
