@@ -125,7 +125,9 @@ func endpointRuns(ctx *Context, ep *machineendpoint.Endpoint, l home.Layout, st 
 	found.EndpointRental = rentalEndpoint(l, st)
 	found.RentalHub = func(id string) *hub.Client { return client(fleet.atRental(id)) }
 	found.Only = ep.Name()
-	return newMachineRuns(&background, l, st, NewResolver(st, ctx.Cfg), fleet, found)
+	runs := newMachineRuns(&background, l, st, NewResolver(st, ctx.Cfg), fleet, found)
+	runs.foreground = true
+	return runs
 }
 
 // endpointForRecordedRun keeps watch/cancel on the recorded target after the

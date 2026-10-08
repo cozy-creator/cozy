@@ -15,15 +15,18 @@ import (
 // machineRuns is a client transport and observer. Stopping it closes connections
 // and upload/observation work; it never sends an execution cancellation.
 type machineRuns struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	context  *Context
-	layout   home.Layout
-	store    *records.Store
-	resolver *Resolver
-	fleet    *managedRentals
-	mu       sync.Mutex
-	running  map[string]chan struct{}
+	ctx     context.Context
+	cancel  context.CancelFunc
+	context *Context
+	// A foreground controller closes with its CLI command. Explicit controls must
+	// reach the machine before that command returns; observation remains detachable.
+	foreground bool
+	layout     home.Layout
+	store      *records.Store
+	resolver   *Resolver
+	fleet      *managedRentals
+	mu         sync.Mutex
+	running    map[string]chan struct{}
 	// hubAccess holds each machine's execution access, by hub, credential and leaf.
 	hubAccess sync.Map
 	placed    map[string]string // the last placement decision recorded per waiting run
@@ -222,12 +225,15 @@ func (m *machineRuns) collectionRefused(id string) bool {
 	return problem == nil && code != ""
 }
 
-// Control wakes delivery of a durable cancel without waiting on its machine. A run on this
-// computer's stopped machine stays canceling until the machine runs again: `cozy run cancel`
-// starts it, as any local run does, and the run settles as its machine says.
-// Pause/resume retain their synchronous generation-checked control path.
+// Control wakes the daemon's durable cancellation delivery. A foreground controller
+// instead waits for the machine's acknowledgement before its CLI owner can close it;
+// --await separately observes the terminal outcome. A stopped local machine stays
+// canceling until `cozy run cancel` starts it. Pause/resume keep their synchronous path.
 func (m *machineRuns) Control(parent context.Context, request records.Request, action string) *exit.Error {
 	if action == "cancel" {
+		if m.foreground {
+			return m.controlV1(parent, request, action)
+		}
 		m.Withdraw(request.ID)
 		return m.Start(request)
 	}
