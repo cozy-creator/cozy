@@ -190,4 +190,16 @@ func runDirectoryOnExplicitEndpoint(t *testing.T, serving bool) {
 	if _, err := os.Stat(filepath.Join(project, "uv.lock")); !os.IsNotExist(err) {
 		t.Fatalf("run wrote an author lock: %v", err)
 	}
+	if serving {
+		// Named editable calls still follow the author's live tree. Their inferred
+		// active install must not become an accidental exact-snapshot selection.
+		if code, out := runCozy(t, root, "package", "install", project, "--editable", "--json"); code != 0 {
+			t.Fatalf("editable install: %d %s", code, out)
+		}
+		must(t, os.WriteFile(filepath.Join(project, "directory_proof", "helper.py"), []byte("def increment(value): return value + 2\n"), 0600))
+		code, out = runCozy(t, root, "run", "local/directory-proof/verify-value", "--machine-endpoint-file", endpoint, "--await", "--json")
+		if code != 0 || !strings.Contains(out, `"value":9`) {
+			t.Fatalf("named editable serving source did not refresh: %d %s", code, out)
+		}
+	}
 }
