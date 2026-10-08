@@ -131,6 +131,16 @@ func (m *machineRuns) loopV1(request records.Request) {
 				_ = m.store.AppendEvent(request.ID, "request.parked", 0, parked)
 			}
 		}
+		// The stream's authority can expire before the machine refreshes its owner lease.
+		// Recover only observation of a durably accepted run, after a fresh authenticated
+		// Status succeeds. A refusal never authorizes another submission or control.
+		if problem != nil && problem.ErrName() == "machine_execution.observation_unauthorized" {
+			if held, readProblem := m.store.RunV1(request.ID); readProblem == nil && held && m.renewObservationV1(*current, link.MachineID) {
+				lastError, delay = "", time.Second
+				continue
+			}
+			return
+		}
 		// A remote machine holding this run that cannot be reached is asked again only on new
 		// evidence: a reader, the rental attaching again, or the daemon's restart. A timer
 		// would dial a gone pod forever.
@@ -151,6 +161,42 @@ func (m *machineRuns) loopV1(request records.Request) {
 		case <-time.After(delay):
 		}
 	}
+}
+
+// renewObservationV1 asks whether the same owner is authorized again. Status is read-only;
+// a permanently revoked key remains refused, with capped backoff rather than a busy loop.
+// Rental resolution uses the fleet's refreshed identity and refuses ended rentals. A gone
+// machine or another refusal leaves recovery to a reader or new fleet evidence as before.
+func (m *machineRuns) renewObservationV1(request records.Request, machineID string) bool {
+	delay := time.Second
+	for m.ctx.Err() == nil {
+		link, problem := m.store.MachineExecution(request.ID)
+		if problem != nil || link == nil || link.Collected || link.Abandoned || link.Lost || link.MachineID != machineID {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(machines.AttachOnly(m.ctx), 10*time.Second)
+		machine, problem := m.machines.DialV1(ctx, machineID, m.runHolder(request, "observing"))
+		if problem != nil {
+			cancel()
+			return false
+		}
+		frame, err := machine.Status(ctx)
+		machine.Close()
+		cancel()
+		if err == nil {
+			return frame.GetWorkerId() == machine.WorkerID
+		}
+		if status.Code(err) != codes.PermissionDenied && status.Code(err) != codes.Unauthenticated {
+			return false
+		}
+		select {
+		case <-m.ctx.Done():
+			return false
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, 30*time.Second)
+	}
+	return false
 }
 
 // permanentRefusal is a refusal resubmitting the same spec cannot change.
@@ -377,6 +423,9 @@ func (m *machineRuns) runRefusalV1(id string, err error, first bool) (bool, *exi
 			}
 			return failed, problem
 		}
+	}
+	if !first && (status.Code(err) == codes.PermissionDenied || status.Code(err) == codes.Unauthenticated) {
+		problem = exit.Named(exit.Credential, "machine_execution.observation_unauthorized", "machine execution observation is not authorized: %s", status.Convert(err).Message())
 	}
 	return false, problem
 }
