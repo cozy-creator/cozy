@@ -111,7 +111,7 @@ func MaterializeTree(source, directory, name, digest string, length, contentByte
 	destination := filepath.Join(directory, name)
 	replaced := ""
 	if _, err := os.Lstat(destination); err == nil {
-		if verifyExportedTree(destination, members) == nil {
+		if VerifyExportedTree(destination, members) == nil {
 			return destination, nil
 		}
 		// Another revision of the tree: the new one takes its name whole.
@@ -199,7 +199,9 @@ func MaterializeTree(source, directory, name, digest string, length, contentByte
 	return destination, nil
 }
 
-func verifyExportedTree(directory string, members []TreeMember) *exit.Error {
+// VerifyExportedTree checks every path, length and digest against a verified manifest.
+// A directory's existence alone never permits reusing an earlier download.
+func VerifyExportedTree(directory string, members []TreeMember) *exit.Error {
 	info, err := os.Lstat(directory)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return exit.New(exit.Conflict, "tree export destination changed")

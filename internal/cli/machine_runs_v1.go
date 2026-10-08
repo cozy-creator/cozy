@@ -1269,6 +1269,11 @@ func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string
 	if problem != nil {
 		return problem
 	}
+	// The live fetcher may already have placed this revision before final collection.
+	// Reuse it only after checking the complete local closure against this manifest.
+	if resultfiles.VerifyExportedTree(product.Path, members) == nil {
+		return nil
+	}
 	if err := os.Mkdir(manifest+".files", 0o700); err != nil {
 		return exit.Internalf("cannot stage a tree: %s", err)
 	}
@@ -1290,7 +1295,6 @@ func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string
 			return problem
 		}
 	}
-	progress(received, transferBytes)
 	_, problem = resultfiles.MaterializeTree(manifest, directory, filepath.Base(product.Path), product.Digest, product.Length, contentBytes)
 	return problem
 }
