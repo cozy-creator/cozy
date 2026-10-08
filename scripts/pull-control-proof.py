@@ -87,7 +87,15 @@ def prove(binary: str, root: Path) -> None:
             body = bodies[digest]
             with lock:
                 hits[digest] = hits.get(digest, 0) + 1
-            self.send_response(200)
+            full_length = len(body)
+            requested = self.headers.get("Range")
+            if requested:
+                first, last = (int(value) for value in requested.removeprefix("bytes=").split("-"))
+                body = body[first:last + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {first}-{first + len(body) - 1}/{full_length}")
+            else:
+                self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             with lock:

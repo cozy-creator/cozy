@@ -80,10 +80,21 @@ def prove(binary: str, root: Path) -> None:
 
         def do_GET(self) -> None:
             body = bodies[self.path.rsplit("/", 1)[-1]]
-            self.send_response(200)
+            full_length = len(body)
+            requested = self.headers.get("Range")
+            if requested:
+                first, last = (int(value) for value in requested.removeprefix("bytes=").split("-"))
+                body = body[first:last + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {first}-{first + len(body) - 1}/{full_length}")
+            else:
+                self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # The cancellation/callback arms deliberately disconnect downloads.
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     origin = f"http://127.0.0.1:{server.server_port}"
