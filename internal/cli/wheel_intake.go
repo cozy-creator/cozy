@@ -14,6 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
 // Wheel intake extends the same bindings/revision path as source dependencies.
@@ -46,17 +47,13 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	if problem != nil {
 		return problem
 	}
-	if i.staging == "" {
-		if err := os.MkdirAll(i.layout.Tmp, 0o700); err != nil {
-			return exit.Internalf("cannot create callable wheel staging")
-		}
-		var err error
-		i.staging, err = os.MkdirTemp(i.layout.Tmp, "child-interfaces-")
-		if err != nil {
-			return exit.Internalf("cannot create callable wheel staging")
+	if i.staging == nil {
+		i.staging, problem = scratch.Temp(i.layout.Tmp, "child-interfaces-")
+		if problem != nil {
+			return problem
 		}
 	}
-	stage, err := os.MkdirTemp(i.staging, "selected-wheels-")
+	stage, err := os.MkdirTemp(i.staging.Path, "selected-wheels-")
 	if err != nil {
 		return exit.Internalf("cannot capture selected callable wheels")
 	}

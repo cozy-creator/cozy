@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
 // childIntake is bounded installation staging under the caller's existing
@@ -24,7 +25,7 @@ type childIntake struct {
 	layout            home.Layout
 	store             *records.Store
 	created           []string
-	staging           string
+	staging           *scratch.Dir
 	ownedPackage      bool
 	prepared          *install.Result
 	remoteEnvironment *records.PackageInstall
@@ -58,7 +59,7 @@ func (i *childIntake) Close() {
 	if i.ownedPackage {
 		i.Package.Close()
 	}
-	_ = os.RemoveAll(i.staging)
+	i.staging.Release()
 	for _, id := range i.created {
 		_, _ = install.Reclaim(i.layout, i.store, id)
 	}
