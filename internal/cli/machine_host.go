@@ -135,6 +135,9 @@ func replacedMachineRuns(ctx *Context) ([]records.Request, *exit.Error) {
 }
 
 func handleMachineShow(ctx *Context) *exit.Error {
+	if ctx.Inv.Value("--machine-endpoint-file") != "" {
+		return showEndpoint(ctx)
+	}
 	host, problem := localMachineHost(ctx)
 	if problem != nil {
 		return problem

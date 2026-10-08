@@ -88,6 +88,17 @@ explicitly stops the local machine (its systemd user unit, record or not); it st
 until `cozy machine start` or the next local run, and the daemon never starts it to observe or
 collect accepted work. Optional `machine.webrtc_port` in the Cozy config
 enables its WebRTC media listener; Hub grants cannot change machine listening ports.
+
+For development on an explicitly pinned owned worker, `cozy machine show
+--machine-endpoint-file <file>` reads its live status. `cozy machine update
+--machine-endpoint-file <file> --runtime-wheel <wheel> --idempotency-key <id>`
+uploads the wheel and follows the machine's durable update. Omitted Runtime or
+TensorFS members keep their installed wheels; `--keep-agent` also keeps the machine
+executable. To resume observation after disconnecting, repeat the endpoint and key
+with `--observe`, without wheel or version flags. This uses the existing owner key
+and pinned TLS identity, creates no rental record, and does not start the local
+machine or change the configured Hub.
+
 Software replacement waits for confirmed idle state and retains the machine identity,
 execution journal, installed packages, and outputs. A stable bootstrap process owns
 Runtime lifetime while the public agent changes; losing an observer does not cancel

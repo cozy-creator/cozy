@@ -27,6 +27,7 @@ type CLI struct {
 
 type MachineCmd struct {
 	Install MachineInstallCmd `cmd:"" help:"Install a worker cohort's Host and Runtime as this computer's machine."`
+	Update  MachineUpdateCmd  `cmd:"" help:"Development: update an explicitly pinned owned endpoint; accepted work finishes before activation."`
 	Show    MachineShowCmd    `cmd:"" help:"Show this computer's machine."`
 	Start   MachineStartCmd   `cmd:"" help:"Start this computer's machine, or adopt the running one."`
 	Stop    MachineStopCmd    `cmd:"" help:"Stop this computer's machine; it stays stopped until it is started or a local run starts it."`
@@ -43,10 +44,30 @@ func (c *MachineInstallCmd) Run(r *Runtime) error {
 	return r.call(handleMachineInstall, nil, nil, values("--host", c.Host, "--runtime-wheel", c.RuntimeWheel, "--tensorfs-wheel", c.TensorFSWheel), false)
 }
 
-type MachineShowCmd struct{}
+type MachineShowCmd struct {
+	MachineEndpointFile string `name:"machine-endpoint-file" predictor:"file" help:"Development: inspect this pinned owned endpoint instead of this computer's machine."`
+}
 
 func (c *MachineShowCmd) Run(r *Runtime) error {
-	return r.call(handleMachineShow, nil, nil, nil, false)
+	return r.call(handleMachineShow, nil, nil, values("--machine-endpoint-file", c.MachineEndpointFile), false)
+}
+
+type MachineUpdateCmd struct {
+	MachineEndpointFile string `name:"machine-endpoint-file" required:"" predictor:"file" help:"Pinned owned machine endpoint; no rental is registered or created."`
+	IdempotencyKey      string `name:"idempotency-key" required:"" help:"Stable update identity; reuse it to observe the same accepted update."`
+	RuntimeWheel        string `name:"runtime-wheel" predictor:"file" help:"Install this local Runtime wheel."`
+	TensorFSWheel       string `name:"tensorfs-wheel" predictor:"file" help:"Install this local TensorFS wheel; omitted keeps the installed TensorFS."`
+	RuntimeVersion      string `name:"runtime-version" help:"Install this published Runtime version instead of a local wheel."`
+	TensorFSVersion     string `name:"tensorfs-version" help:"Install this published TensorFS version instead of a local wheel."`
+	KeepAgent           bool   `name:"keep-agent" help:"Keep the running machine executable instead of using one bundled in the Runtime wheel."`
+	Observe             bool   `help:"Only follow the accepted update; no wheels or versions are submitted."`
+}
+
+func (c *MachineUpdateCmd) Run(r *Runtime) error {
+	return r.call(handleEndpointUpdate, nil, bools("--keep-agent", c.KeepAgent, "--observe", c.Observe), values(
+		"--machine-endpoint-file", c.MachineEndpointFile, "--idempotency-key", c.IdempotencyKey,
+		"--runtime-wheel", c.RuntimeWheel, "--tensorfs-wheel", c.TensorFSWheel,
+		"--runtime-version", c.RuntimeVersion, "--tensorfs-version", c.TensorFSVersion), false)
 }
 
 type MachineStartCmd struct{}
