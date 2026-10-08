@@ -450,7 +450,7 @@ type RunCmd struct {
 
 type RunExecuteCmd struct {
 	MachineEndpointFile string   `name:"machine-endpoint-file" predictor:"file" help:"Run on this explicitly pinned owned machine using the controller's existing signing identity; never register or rent a machine."`
-	Target              string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
+	Target              string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], explicit ./project[/function], or a Python script."`
 	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
 	Out                 string   `help:"Output directory." predictor:"dir"`
 	Timeout             string   `help:"Request deadline."`
