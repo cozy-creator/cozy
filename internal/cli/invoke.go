@@ -2960,6 +2960,9 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 		}
 		return scriptTarget(ctx)
 	}
+	if explicitPackageDirectory(ctx.Inv.Args[0]) {
+		return directoryTarget(ctx)
+	}
 	target, problem := parseTarget(ctx.Inv.Args[0])
 	if problem != nil {
 		return Target{}, nil, problem

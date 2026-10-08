@@ -57,6 +57,47 @@ func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) 
 	return target, surface, nil
 }
 
+// directoryTarget captures an explicitly addressed authored package. Named org/package
+// references never enter this path, even when a matching local directory exists.
+func directoryTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
+	directory := filepath.Clean(ctx.Inv.Args[0])
+	function := ""
+	if info, err := os.Stat(directory); err != nil || !info.IsDir() {
+		parent := filepath.Dir(directory)
+		if info, err := os.Stat(filepath.Join(parent, "package.toml")); err == nil && info.Mode().IsRegular() {
+			function, directory = filepath.Base(directory), parent
+		} else {
+			return Target{}, nil, exit.Named(exit.NotFound, "local_package_not_found",
+				"local package directory %q does not exist", ctx.Inv.Args[0]).
+				WithRemedy("use ./project or ./project/function for an authored package")
+		}
+	}
+	var pack *packagepublish.Package
+	var problem *exit.Error
+	if _, err := os.Stat(filepath.Join(directory, "uv.lock")); err == nil {
+		pack, problem = packagepublish.PrepareLocalFrom(directory)
+	} else {
+		// A one-off local run needs no publication lock and does not write one
+		// into the author's working tree. Resolve in the existing owned copy.
+		pack, problem = packagepublish.PrepareUnpublishedFrom(context.Background(), directory, commandNamespace(ctx))
+	}
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	defer pack.Close()
+	target, surface, problem := snapshotTarget(ctx, pack)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	target.Function = function
+	if target.Function == "" {
+		if names := surface.PublicNames(); len(names) == 1 {
+			target.Function = names[0]
+		}
+	}
+	return target, surface, nil
+}
+
 // snapshotTarget uses the ordinary installer while keeping the user's editable
 // pin unchanged. Both the program and its environment are owned by the run.
 func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*records.PackageInstall) (Target, *launch.PackageInterface, *exit.Error) {
