@@ -30,9 +30,20 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*v1.ModelChoice
 				parameter = model.Package + "/" + path
 			}
 		}
+		// An unselected ladder is sizing metadata, not a base-model override. The
+		// machine selects its authored/owner rung from measured hardware. Flattening
+		// it to repository+release loses the lane and suppresses that selection.
+		advisoryLadder := !model.Choice && len(model.Ladder) > 0 && !model.Pinned() && model.Lane == "" && model.Source == ""
+		if advisoryLadder && len(model.Adapters) == 0 {
+			continue
+		}
 		choice := &v1.ModelChoice{Parameter: parameter, Repository: model.Model,
 			Release: model.Release, Lane: model.Lane, Source: model.Source,
 			Profiles: model.Profiles, Adapters: downloadAdapters(model.Adapters)}
+		if advisoryLadder {
+			// Explicit adapters still apply to the base the machine selects.
+			choice.Repository, choice.Release = "", ""
+		}
 		if model.Manifest != "" {
 			digest, err := canonical.Raw(model.Manifest)
 			if err != nil {
