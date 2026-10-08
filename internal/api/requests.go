@@ -479,6 +479,13 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
 	if strings.HasPrefix(sub.Package, "local/") {
+		if sub.InstallID != "" {
+			var problem *exit.Error
+			if *lease, problem = install.LeaseInstall(s.layout, s.store, sub.InstallID); problem != nil {
+				return out, problem
+			}
+			return s.resolveLocalServing(ctx, sub, out, sub.InstallID)
+		}
 		refreshed, editable, leased, refreshProblem := s.leaseRefreshed(sub.Package)
 		*lease = leased
 		if refreshProblem != nil {
