@@ -1034,17 +1034,17 @@ func (f *fetcherV1) run() {
 }
 
 // progress reports a read the run's end waits on, at most once a second.
-func (f *fetcherV1) progress(product records.Product) func(int64) {
+func (f *fetcherV1) progress(product records.Product) func(int64, int64) {
 	began, last := time.Now(), time.Time{}
-	return func(held int64) {
+	return func(held, total int64) {
 		f.mu.Lock()
 		finishing := f.finishing
 		f.mu.Unlock()
-		if !finishing || time.Since(last) < time.Second && held < product.Length {
+		if !finishing || time.Since(last) < time.Second && held < total {
 			return
 		}
 		last = time.Now()
-		sample := map[string]any{"stage": "saving " + product.Output, "position": held, "total": product.Length, "unit": "bytes"}
+		sample := map[string]any{"stage": "saving " + product.Output, "position": held, "total": total, "unit": "bytes"}
 		if elapsed := time.Since(began).Seconds(); elapsed > 0 {
 			sample["rate"] = float64(held) / elapsed
 		}
@@ -1072,9 +1072,12 @@ func (f *fetcherV1) stop() {
 // file is tried as a prefix first. `held` is told how many bytes are in hand as they arrive.
 // The bytes read stay beside the file until they are whole, so a read the connection cut
 // continues from where it stopped, at the same revision.
-func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product, from int64, held func(int64)) *exit.Error {
+func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product, from int64, progress func(int64, int64)) *exit.Error {
+	if progress == nil {
+		progress = func(int64, int64) {}
+	}
 	if product.MediaType == resultfiles.TreeMediaType {
-		return readTreeV1(ctx, machine, run, directory, product)
+		return readTreeV1(ctx, machine, run, directory, product, progress)
 	}
 	if problem := resultfiles.Preflight(directory); problem != nil {
 		return problem
@@ -1082,9 +1085,7 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 	if digestOf(product.Path) == product.Digest {
 		return nil
 	}
-	if held == nil {
-		held = func(int64) {}
-	}
+	held := func(n int64) { progress(n, product.Length) }
 	base := filepath.Base(product.Path)
 	partial := filepath.Join(directory, "."+base+"."+strings.TrimPrefix(product.Digest, "sha256:")[:16]+".cozy-part")
 	unwritable := func(err error) *exit.Error {
@@ -1211,7 +1212,7 @@ func (c *counted) Write(p []byte) (int, error) {
 
 // readTreeV1 makes the directory at product.Path this revision's tree: its manifest, then each
 // member file it names, read and verified beside the folder, then placed whole.
-func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product) *exit.Error {
+func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product, progress func(int64, int64)) *exit.Error {
 	if problem := resultfiles.Preflight(directory); problem != nil {
 		return problem
 	}
@@ -1220,13 +1221,21 @@ func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string
 		return exit.Named(exit.Unavailable, "output_unwritable", "cannot write into %s: %s", directory, err)
 	}
 	defer os.RemoveAll(staging)
+	var received, transferBytes int64
 	read := func(member, target, digest string) *exit.Error {
 		file, err := os.Create(target)
 		if err != nil {
 			return exit.Named(exit.Unavailable, "output_unwritable", "cannot stage a tree in %s: %s", directory, err)
 		}
 		hash := sha256.New()
-		_, _, err = machine.ReadMember(ctx, run, product.Output, outputIndexV1(product), member, uint64(product.Rev), io.MultiWriter(file, hash))
+		var writer io.Writer = io.MultiWriter(file, hash)
+		if member != "" {
+			writer = &counted{w: writer, n: received, held: func(n int64) {
+				received = n
+				progress(received, transferBytes)
+			}}
+		}
+		_, _, err = machine.ReadMember(ctx, run, product.Output, outputIndexV1(product), member, uint64(product.Rev), writer)
 		if closeErr := file.Close(); err == nil {
 			err = closeErr
 		}
@@ -1263,6 +1272,15 @@ func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string
 	if err := os.Mkdir(manifest+".files", 0o700); err != nil {
 		return exit.Internalf("cannot stage a tree: %s", err)
 	}
+	// The transfer reads shared blobs once, even when several tree paths name them.
+	seen := map[string]bool{}
+	for _, member := range members {
+		if !seen[member.Digest] {
+			transferBytes += member.Length
+			seen[member.Digest] = true
+		}
+	}
+	progress(0, transferBytes)
 	for _, member := range members {
 		held := filepath.Join(manifest+".files", strings.TrimPrefix(member.Digest, "sha256:"))
 		if _, err := os.Stat(held); err == nil {
@@ -1272,6 +1290,7 @@ func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string
 			return problem
 		}
 	}
+	progress(received, transferBytes)
 	_, problem = resultfiles.MaterializeTree(manifest, directory, filepath.Base(product.Path), product.Digest, product.Length, contentBytes)
 	return problem
 }
