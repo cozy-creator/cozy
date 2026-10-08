@@ -37,7 +37,9 @@ cleanup, `cozy rental end-external --provider vast --resource-id ID
 key on standard input. The command checks that exact instance and label, destroys
 that instance, then waits for the provider to report it absent. Repeat the same
 command after an interrupted observation. A stopped instance still consumes
-storage and is not reported as released.
+storage and is not reported as released. Authenticated HTTP 404 and the provider’s
+explicit `{"instances":null}` response both mean absent; missing or malformed
+instance data remains an error.
 
 This command never discovers provider accounts, reads repository dotenv files,
 creates a Hub rental, changes the selected Hub, or accepts a credential in argv.
