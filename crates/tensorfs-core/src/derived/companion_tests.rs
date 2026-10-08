@@ -285,3 +285,369 @@ fn companion_paths_size_count_and_quotas_are_native_refusals() {
     let bytes = d.canonical_work_bytes().unwrap();
     assert!(!String::from_utf8(bytes).unwrap().contains("\"files\""));
 }
+
+fn retained_header(
+    store: &Store,
+    header: &Header,
+    repo: &str,
+    files: Vec<(String, Entry)>,
+) -> ObjectRef {
+    let href = checkpoint::put_doc(store, header).unwrap();
+    let closure = checkpoint::load_closure(store, header).unwrap();
+    let mut draft = Draft::of(&build_manifest(header, &href, &closure).unwrap());
+    draft.entries.extend(files);
+    draft.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let manifest = store.put_manifest(&draft.seal().unwrap()).unwrap().obj;
+    store
+        .apply_repository(
+            None,
+            &Mutation::PutCheckpoint {
+                repo: RepositoryName::new("research", repo).unwrap(),
+                manifest: manifest.clone(),
+            },
+            &Fault::default(),
+        )
+        .unwrap();
+    manifest
+}
+
+fn header_only_source(store: &Store, meta: &Meta, id: &str) -> (ObjectRef, Header, Vec<u8>) {
+    let writer = begin(
+        store,
+        meta,
+        id,
+        1,
+        super::tests::created_declaration(),
+        None,
+    )
+    .unwrap();
+    let part = write_weight(store, meta, id);
+    let receipt = commit(store, meta, id, 1).unwrap();
+    release(meta, writer);
+    let mut header = checkpoint::load_header(store, &receipt.header).unwrap();
+    // Large, segmented tokenizer data must not pass through the small inline-file API.
+    let bytes = vec![0x61; MAX_COMPANION_BYTES + 23];
+    let segments = bytes
+        .chunks(40_000)
+        .map(|chunk| {
+            store
+                .put_stream(
+                    &mut &chunk[..],
+                    Some(&ObjectRef::of(chunk)),
+                    &Fault::default(),
+                )
+                .unwrap()
+                .obj
+        })
+        .collect();
+    let asset = Asset {
+        logical_sha256: ObjectRef::of(&bytes).sha256,
+        logical_length: bytes.len() as u64,
+        media_type: "application/json; charset=utf-8".into(),
+        segments,
+    };
+    for path in [
+        "tokenizer/merges.txt",
+        "tokenizer/vocab.json",
+        "tokenizer_2/merges.txt",
+        "tokenizer_2/vocab.json",
+    ] {
+        header.assets.push((path.into(), asset.clone()));
+    }
+    let shared = part.segments()[0].clone();
+    header.assets.push((
+        "weight-copy.txt".into(),
+        Asset {
+            logical_sha256: shared.sha256.clone(),
+            logical_length: shared.length,
+            media_type: "text/plain".into(),
+            segments: vec![shared],
+        },
+    ));
+    let manifest = retained_header(store, &header, "header-only", vec![]);
+    dispose(store, meta, id).unwrap();
+    (manifest, header, bytes)
+}
+
+fn inherit(manifest: ObjectRef) -> Declaration {
+    let mut d = super::tests::created_declaration();
+    d.sources = vec![Source {
+        alias: "source".into(),
+        manifest,
+    }];
+    d.components[0].source = Some("source".into());
+    d.components[0].source_component = Some("model".into());
+    d.components[0].add.clear();
+    d.max_new_bytes = 0;
+    d
+}
+
+#[test]
+fn header_only_segmented_assets_survive_commit_adoption_and_gc_by_reference() {
+    let (store, meta, id) = fixture();
+    let (manifest, header, bytes) = header_only_source(&store, &meta, &id);
+    assert_eq!(
+        checkpoint::load_manifest(&store, &manifest)
+            .unwrap()
+            .entries()
+            .len(),
+        1
+    );
+    let next = format!("sha256:{}", "c4".repeat(32));
+    let mut d = inherit(manifest.clone());
+    d.files = vec![("marker.txt".into(), b"derived\n".to_vec())];
+    d.max_new_bytes = 8;
+    let writer = begin(&store, &meta, &next, 1, d.clone(), None).unwrap();
+    // The live source lease protects every inherited segment after the repository goes away.
+    let repo = RepositoryName::new("research", "header-only").unwrap();
+    let observed = std::fs::read(store.repository_path(&repo)).unwrap();
+    store
+        .apply_repository(
+            Some(&observed),
+            &Mutation::DeleteRepository { repo },
+            &Fault::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        crate::gc::collect(store.root(), false).unwrap_err().code,
+        Code::STORE_BUSY
+    );
+    let receipt = commit(&store, &meta, &next, 1).unwrap();
+    release(&meta, writer);
+    assert_eq!(receipt.added_objects, vec![ObjectRef::of(&d.files[0].1)]);
+    let derived_header = checkpoint::load_header(&store, &receipt.header).unwrap();
+    assert_eq!(&derived_header.assets[1..], header.assets.as_slice());
+    let derived_manifest = checkpoint::load_manifest(&store, &receipt.manifest).unwrap();
+    assert_eq!(
+        derived_manifest
+            .entries()
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect::<Vec<_>>(),
+        ["marker.txt", "model.cozytensors"]
+    );
+    // A segmented logical whole is never materialized just to retain its asset role.
+    assert!(store.record_valid(&ObjectRef::of(&bytes).sha256).is_err());
+    for adopted in [false, true] {
+        if adopted {
+            adopt(&store, &meta, &next, "derived-assets").unwrap();
+        }
+        crate::gc::collect(store.root(), false).unwrap();
+        for (name, asset) in &header.assets {
+            let mut actual = Vec::new();
+            checkpoint::read_asset(&store, name, asset, &mut actual).unwrap();
+            assert_eq!(
+                actual,
+                if name == "weight-copy.txt" {
+                    vec![0x31; 2048]
+                } else {
+                    bytes.clone()
+                }
+            );
+        }
+        let walk = checkpoint::walk_cozytensors(&store, &derived_manifest).unwrap();
+        let shared = &header.assets.last().unwrap().1.segments[0];
+        assert!(walk
+            .objects
+            .iter()
+            .any(|r| r.kind == "part" && r.obj == *shared));
+        assert!(walk
+            .objects
+            .iter()
+            .any(|r| r.kind == "model_asset" && r.obj == *shared));
+        assert_eq!(
+            walk.distinct().iter().filter(|r| ***r == *shared).count(),
+            1
+        );
+    }
+    dispose(&store, &meta, &next).unwrap();
+    crate::gc::collect(store.root(), false).unwrap();
+    for (_, asset) in &header.assets {
+        for segment in &asset.segments {
+            assert!(store.record_valid(&segment.sha256).is_err());
+        }
+    }
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn inherited_assets_conflict_on_content_metadata_or_segments_and_allow_explicit_replacement() {
+    let (store, meta, id) = fixture();
+    let (manifest, header, bytes) = header_only_source(&store, &meta, &id);
+    let path = "tokenizer/merges.txt";
+    let whole = store
+        .put_stream(
+            &mut bytes.as_slice(),
+            Some(&ObjectRef::of(&bytes)),
+            &Fault::default(),
+        )
+        .unwrap()
+        .obj;
+    let replacement = b"replacement tokenizer";
+    let replacement_object = store
+        .put_stream(
+            &mut &replacement[..],
+            Some(&ObjectRef::of(replacement)),
+            &Fault::default(),
+        )
+        .unwrap()
+        .obj;
+    for case in 0..4 {
+        let mut other = header.clone();
+        let mut files = vec![];
+        match case {
+            0 => other.assets[0].1.media_type = "text/plain".into(),
+            1 => other.assets[0].1.segments = vec![whole.clone()],
+            2 => {
+                other.assets[0].1 = Asset {
+                    logical_sha256: replacement_object.sha256.clone(),
+                    logical_length: replacement_object.length,
+                    media_type: "text/plain".into(),
+                    segments: vec![replacement_object.clone()],
+                }
+            }
+            3 => {
+                other.assets.remove(0);
+                files.push((path.into(), Entry::File(replacement_object.clone())));
+            }
+            _ => unreachable!(),
+        }
+        let other_manifest = retained_header(&store, &other, &format!("conflict-{case}"), files);
+        let mut d = inherit(manifest.clone());
+        d.sources.push(Source {
+            alias: "other".into(),
+            manifest: other_manifest,
+        });
+        let mut component = d.components[0].clone();
+        component.target = "other-model".into();
+        component.source = Some("other".into());
+        d.components.push(component);
+        d.order.push(("other-model".into(), "weight".into()));
+        let next = format!("sha256:{:064x}", case + 100);
+        let refusal = begin(&store, &meta, &next, 1, d.clone(), None)
+            .err()
+            .unwrap();
+        assert_eq!(
+            refusal.code,
+            Code::TRANSACTION_CONFLICT,
+            "conflict case {case}: {refusal:?}"
+        );
+        if case % 2 == 0 {
+            d.files.push((path.into(), replacement.to_vec()));
+            d.max_new_bytes = replacement.len() as u64;
+        } else {
+            d.objects.push((path.into(), replacement_object.clone()));
+        }
+        let writer = begin(&store, &meta, &next, 1, d, None).unwrap();
+        let receipt = commit(&store, &meta, &next, 1).unwrap();
+        release(&meta, writer);
+        let replaced = checkpoint::load_header(&store, &receipt.header).unwrap();
+        assert_eq!(
+            replaced.assets[0],
+            (
+                path.into(),
+                Asset {
+                    logical_sha256: replacement_object.sha256.clone(),
+                    logical_length: replacement_object.length,
+                    media_type: "application/octet-stream".into(),
+                    segments: vec![replacement_object.clone()],
+                }
+            )
+        );
+        assert_eq!(replaced.assets[1..], header.assets[1..]);
+    }
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn matching_manifest_companion_keeps_header_asset_metadata_and_empty_replacement_removes_asset() {
+    let (store, meta, id) = fixture();
+    let (_, header, bytes) = header_only_source(&store, &meta, &id);
+    let whole = store
+        .put_stream(
+            &mut bytes.as_slice(),
+            Some(&ObjectRef::of(&bytes)),
+            &Fault::default(),
+        )
+        .unwrap()
+        .obj;
+    let source = retained_header(
+        &store,
+        &header,
+        "matching",
+        vec![
+            ("tokenizer/merges.txt".into(), Entry::File(whole.clone())),
+            // A future kind is retained as a manifest entry without changing known asset semantics.
+            (
+                "future.bin".into(),
+                Entry::Other {
+                    kind: "future".into(),
+                    blob: whole,
+                },
+            ),
+        ],
+    );
+    let next = format!("sha256:{}", "c5".repeat(32));
+    let d = inherit(source);
+    let writer = begin(&store, &meta, &next, 1, d.clone(), None).unwrap();
+    let receipt = commit(&store, &meta, &next, 1).unwrap();
+    release(&meta, writer);
+    assert_eq!(
+        checkpoint::load_header(&store, &receipt.header)
+            .unwrap()
+            .assets,
+        header.assets
+    );
+    let manifest = checkpoint::load_manifest(&store, &receipt.manifest).unwrap();
+    assert!(matches!(manifest.entries()[0].1, Entry::Other { .. }));
+    assert!(receipt.added_objects.is_empty());
+    let mut empty = d;
+    empty.files.push(("tokenizer/merges.txt".into(), vec![]));
+    let next = format!("sha256:{}", "c6".repeat(32));
+    let writer = begin(&store, &meta, &next, 1, empty, None).unwrap();
+    let receipt = commit(&store, &meta, &next, 1).unwrap();
+    release(&meta, writer);
+    assert_eq!(
+        checkpoint::load_header(&store, &receipt.header)
+            .unwrap()
+            .assets,
+        header.assets[1..]
+    );
+    assert!(checkpoint::load_manifest(&store, &receipt.manifest)
+        .unwrap()
+        .entries()
+        .iter()
+        .any(|(path, entry)| path == "tokenizer/merges.txt"
+            && *entry == Entry::File(ObjectRef::of(&[]))));
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn header_only_assets_share_companion_path_collision_rules() {
+    let (store, meta, id) = fixture();
+    let (manifest, header, _) = header_only_source(&store, &meta, &id);
+    let next = format!("sha256:{}", "c7".repeat(32));
+    let mut d = inherit(manifest);
+    d.files = vec![("tokenizer".into(), vec![])];
+    assert_eq!(
+        begin(&store, &meta, &next, 1, d, None).err().unwrap().code,
+        Code::PATH_ILLEGAL
+    );
+    for path in ["model.cozytensors", "tokenizer"] {
+        let mut collision = header.clone();
+        collision
+            .assets
+            .push((path.into(), header.assets[0].1.clone()));
+        collision.assets.sort_by(|a, b| a.0.cmp(&b.0));
+        let manifest = retained_header(&store, &collision, path, vec![]);
+        assert_eq!(
+            begin(&store, &meta, &next, 1, inherit(manifest), None)
+                .err()
+                .unwrap()
+                .code,
+            Code::PATH_ILLEGAL,
+            "path {path}"
+        );
+    }
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
