@@ -547,7 +547,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 			resolved, problem := s.resolveLocalJob(ctx, sub, out, refreshed)
 			return resolved, nil, problem
 		}
-		release, problem := s.installedRelease(sub.Package, sub.Release, sub.InstallID)
+		release, problem := s.installedRelease(hub, sub.Package, sub.Release, sub.InstallID)
 		if problem != nil {
 			return out, nil, problem
 		}

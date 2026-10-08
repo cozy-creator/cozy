@@ -64,7 +64,7 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 		existing.Close()
 		return nil, nil, problem
 	}
-	if existingInstall != nil && existingInstall.SourceKind == "tensorhub" &&
+	if existingInstall != nil && existingInstall.PublishedAt(ctx.Cfg.HubURL) &&
 		existingInstall.Package == ref.String() && existingInstall.Version == release {
 		defer existing.Close()
 		result := &install.Result{Install: *existingInstall, Idempotent: true}

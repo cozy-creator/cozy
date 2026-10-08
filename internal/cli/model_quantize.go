@@ -190,7 +190,7 @@ func servingQuantizer(ctx *Context, lane string, ref hub.Ref, checkpoint string)
 	var found []string
 	for _, install := range installed {
 		// The run and its model resolve against the command's configured Hub.
-		if install.SourceKind != "tensorhub" || install.Hub != "" && install.Hub != strings.TrimRight(ctx.Cfg.HubURL, "/") ||
+		if !install.PublishedAt(ctx.Cfg.HubURL) ||
 			len(found) > 0 && found[len(found)-1] == install.Package {
 			continue
 		}

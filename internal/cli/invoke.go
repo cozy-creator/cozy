@@ -731,7 +731,7 @@ func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstal
 	if problem != nil {
 		return nil, problem
 	}
-	if row == nil || row.Package != target.Package {
+	if row == nil || row.Package != target.Package || row.SourceKind == "tensorhub" && !row.PublishedAt(ctx.Cfg.HubURL) {
 		return nil, exit.New(exit.NotFound, "installed package %s is no longer available", target.Package)
 	}
 	return row, nil
@@ -2971,7 +2971,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 			target.InstallID = facts.Install.ID
 		} else {
 			// The run's results are read against the release's interface with no Hub call.
-			keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, target.Release, facts.PackageInterface.Raw,
+			keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, ctx.Cfg.HubURL, target.Package, target.Release, facts.PackageInterface.Raw,
 				strings.Split(facts.Install.Closure, "\n"))
 		}
 		return target, facts.PackageInterface, nil
@@ -3028,7 +3028,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	target.Release = release
 	// The run's results, and its rental's machine class, read this immutable release with
 	// no further Hub call.
-	keepReleaseInterface(root, target.Package, release, detail.PackageInterface, requirements)
+	keepReleaseInterface(root, ctx.Cfg.HubURL, target.Package, release, detail.PackageInterface, requirements)
 	keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, release)
 	return target, packageInterface, nil
 }
@@ -3068,7 +3068,7 @@ func describeOnMachine(ctx *Context, pkg string) (string, *launch.PackageInterfa
 		return "", nil, exit.Named(exit.Conflict, "machine.package_interface_invalid",
 			"the machine described an invalid package interface: %s", problem.Message)
 	}
-	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, pkg, described.Release, raw, nil)
+	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, ctx.Cfg.HubURL, pkg, described.Release, raw, nil)
 	return described.Release, surface, nil
 }
 
@@ -3231,6 +3231,9 @@ func leasedInstallFacts(ctx *Context, pkg string) (*launch.Facts, *install.Lease
 		active, problem := installedPackage(store, pkg)
 		if problem != nil {
 			return nil, nil, problem
+		}
+		if active.SourceKind == "tensorhub" && !active.PublishedAt(ctx.Cfg.HubURL) {
+			return nil, nil, exit.New(exit.NotFound, "%s is not installed from %s", pkg, ctx.Cfg.HubURL)
 		}
 		lease, problem := install.LeaseInstall(layout, store, active.ID)
 		if problem != nil && problem.Code == exit.NotFound {

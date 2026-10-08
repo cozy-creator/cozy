@@ -481,7 +481,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		}
 		return s.resolveLocalServing(ctx, sub, out, refreshed)
 	}
-	release, e := s.installedRelease(sub.Package, sub.Release, sub.InstallID)
+	release, e := s.installedRelease(hub, sub.Package, sub.Release, sub.InstallID)
 	if e != nil {
 		return out, e
 	}
@@ -515,7 +515,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 
 // installedRelease is the published release a local install pins. A machine prepares the
 // release itself, so the install names only which release a caller meant.
-func (s *Server) installedRelease(pkg, release, installID string) (string, *exit.Error) {
+func (s *Server) installedRelease(origin, pkg, release, installID string) (string, *exit.Error) {
 	if installID == "" {
 		return release, nil
 	}
@@ -526,7 +526,7 @@ func (s *Server) installedRelease(pkg, release, installID string) (string, *exit
 	if installed == nil {
 		return release, nil
 	}
-	if installed.SourceKind != "tensorhub" || installed.Package != pkg || release != "" && release != installed.Version {
+	if !installed.PublishedAt(origin) || installed.Package != pkg || release != "" && release != installed.Version {
 		return "", exit.Named(exit.Conflict, "install_package_mismatch", "install %s is not %s %s from Tensorhub", installID, pkg, release)
 	}
 	return installed.Version, nil
