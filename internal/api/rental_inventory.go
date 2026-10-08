@@ -57,6 +57,9 @@ func (inventory RentalInventory) Current() RentalInventory {
 }
 
 type RentalSummary struct {
+	Provider            string          `json:"provider,omitempty"`
+	ProviderMachineID   string          `json:"provider_machine_id,omitempty"`
+	ProviderResourceID  string          `json:"provider_resource_id,omitempty"`
 	ID                  string          `json:"rental_id"`
 	MachineName         string          `json:"machine"`
 	SKU                 string          `json:"sku,omitempty"`

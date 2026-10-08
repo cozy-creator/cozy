@@ -66,12 +66,13 @@ func RentalAbsent(state string) bool {
 // Rental is one rented pod as the hub reports it. No plaintext media bearer or private
 // Creator key is part of this view.
 type Rental struct {
-	Development      bool
-	SSHAddress       string
-	ID               string
-	Name             string
-	State            string
-	AcceleratorModel string
+	Provider, ProviderMachineID, ProviderResourceID string
+	Development                                     bool
+	SSHAddress                                      string
+	ID                                              string
+	Name                                            string
+	State                                           string
+	AcceleratorModel                                string
 	// AcceleratorCount is the pod's WIDTH: how many accelerators this rental delivers,
 	// and therefore the size of the device envelope its worker holds and the only degree
 	// a group placement on it may be pinned to. One for a one-card pod, and one for a CPU
@@ -252,6 +253,9 @@ func (r Rental) EndCause() string {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
+	Provider              string         `json:"provider,omitempty"`
+	ProviderMachineID     string         `json:"provider_machine_id,omitempty"`
+	ProviderResourceID    string         `json:"provider_resource_id,omitempty"`
 	Development           bool           `json:"development,omitempty"`
 	SSHAddress            string         `json:"ssh_address,omitempty"`
 	ID                    string         `json:"rental_id"`
@@ -321,6 +325,7 @@ func (w wireRental) machineName() string {
 
 func (w wireRental) rental() Rental {
 	return Rental{
+		Provider: w.Provider, ProviderMachineID: w.ProviderMachineID, ProviderResourceID: w.ProviderResourceID,
 		Development: w.Development, SSHAddress: w.SSHAddress, ID: w.ID, Name: w.machineName(), State: w.State,
 		AcceleratorModel: w.AcceleratorModel, AcceleratorCount: w.AcceleratorCount,
 		Address: w.WorkerAddress, CertPEM: w.CertPEM,

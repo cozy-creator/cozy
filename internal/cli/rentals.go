@@ -1197,11 +1197,11 @@ func endedRentals(ctx *Context) (output.List, *exit.Error) {
 		fields = append(fields, "hub")
 	}
 	list := output.List{Name: "ended_rentals", Fields: fields,
-		AllFields: []string{"machine", "rental", "gpus", "state", "ended by", "rented", "ended", "$/hour", "spent", "hub"},
+		AllFields: []string{"machine", "rental", "gpus", "state", "ended by", "rented", "ended", "$/hour", "spent", "hub", "provider", "provider machine", "provider resource"},
 		TypedFields: []string{"machine", "rental_id", "hub", "state", "release_cause", "ended_at",
 			"spend_usd_micros", "spend_basis"},
 		TypedAllFields: []string{"machine", "rental_id", "hub", "state", "release_cause", "rented_at", "ended_at",
-			"accelerator", "accelerator_count", "hourly_rate_usd_micros", "spend_usd_micros", "spend_basis"},
+			"accelerator", "accelerator_count", "hourly_rate_usd_micros", "spend_usd_micros", "spend_basis", "provider", "provider_machine_id", "provider_resource_id"},
 		Next: []string{"cozy rental show <machine>"}}
 	type ended struct {
 		hub    string
@@ -1243,6 +1243,7 @@ func endedRentals(ctx *Context) (output.List, *exit.Error) {
 	for _, row := range rows {
 		r := row.rental
 		list.Rows = append(list.Rows, map[string]string{"machine": r.Name, "rental": r.ID,
+			"provider": r.Provider, "provider machine": r.ProviderMachineID, "provider resource": r.ProviderResourceID,
 			"gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount), "state": humanRentalState(r.State),
 			"ended by": orNone(r.EndCause()), "rented": stamp(r.CreatedAt), "ended": orNone(stamp(r.EndedAt)),
 			"$/hour": rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour)),
@@ -1251,6 +1252,7 @@ func endedRentals(ctx *Context) (output.List, *exit.Error) {
 		typed := map[string]any{"machine": r.Name, "rental_id": r.ID, "hub": row.hub, "state": r.State,
 			"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros}
 		for key, value := range map[string]string{"release_cause": r.EndCause(), "rented_at": r.CreatedAt,
+			"provider": r.Provider, "provider_machine_id": r.ProviderMachineID, "provider_resource_id": r.ProviderResourceID,
 			"ended_at": r.EndedAt, "accelerator": r.AcceleratorModel} {
 			if value != "" {
 				typed[key] = value
@@ -1286,6 +1288,15 @@ func endedRentalRecord(ctx *Context, hubName string, r hub.Rental) output.Record
 		fields = typed
 	}
 	record := output.Record{Fields: fields, AllFields: fields, Next: []string{"cozy rental logs " + r.ID}}
+	for _, identity := range [][3]string{{"provider", "provider", r.Provider}, {"provider machine", "provider_machine_id", r.ProviderMachineID}, {"provider resource", "provider_resource_id", r.ProviderResourceID}} {
+		if identity[2] != "" {
+			key := identity[0]
+			if mode := ctx.Mode(); !mode.Human || mode.JSON {
+				key = identity[1]
+			}
+			record.AllFields = append(record.AllFields, output.Field{K: key, V: identity[2]})
+		}
+	}
 	if !hub.RentalAbsent(r.State) {
 		record.Next = []string{"cozy rental list"}
 	}
@@ -1353,7 +1364,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "uptime", "running", "queued", "idle"},
 		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "compute", "storage", "spent", "failure", "uptime", "running", "queued", "idle",
 			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
-			"idle_since", "release_due", "image", "provider", "provider resource",
+			"idle_since", "release_due", "image", "provider", "provider machine", "provider resource",
 			"provider host", "provider state", "container state"},
 		// The machine document carries the underlying facts, never the table's
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
@@ -1367,7 +1378,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"hourly_rate_usd_micros", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour", "vcpu_count", "memory_gb",
 			"spend_usd_micros", "spend_basis", "failure_code",
 			"base_worker_image_digest", "base_worker_image_tag",
-			"provider", "provider_resource_id", "provider_host_id", "provider_state",
+			"provider", "provider_machine_id", "provider_resource_id", "provider_host_id", "provider_state",
 			"container_state", "boot", "unreachable_since"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
@@ -1432,8 +1443,8 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"media":       r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
 			"idle_since": idleSince, "release_due": releaseDue,
-			"image": either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": r.Failure.Provider,
-			"provider resource": r.Failure.ProviderResourceID, "provider host": r.Failure.ProviderHostID,
+			"image": either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": either(r.Provider, r.Failure.Provider),
+			"provider machine": r.ProviderMachineID, "provider resource": either(r.ProviderResourceID, r.Failure.ProviderResourceID), "provider host": r.Failure.ProviderHostID,
 			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
 			"$/hour":  rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour)),
 			"compute": costCell(r.ComputeUSDMicrosPerHour), "storage": costCell(r.StorageUSDMicrosPerHour),
@@ -1456,6 +1467,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 		spendFields(typed, r)
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
+			"provider": either(r.Provider, r.Failure.Provider), "provider_machine_id": r.ProviderMachineID, "provider_resource_id": either(r.ProviderResourceID, r.Failure.ProviderResourceID),
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub, "runtime_update": r.RuntimeUpdate,
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
 			"idle_since_at": idleSince, "release_due_at": releaseDue,
@@ -1481,8 +1493,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if r.Failure.Code != "" {
 			haveFailure = true
 			typed["failure_code"] = r.Failure.Code
-			typed["provider"] = r.Failure.Provider
-			typed["provider_resource_id"], typed["provider_host_id"] = r.Failure.ProviderResourceID, r.Failure.ProviderHostID
+			typed["provider_host_id"] = r.Failure.ProviderHostID
 			typed["provider_state"], typed["container_state"] = r.Failure.ProviderState, r.Failure.ContainerState
 		}
 		list.TypedRows = append(list.TypedRows, typed)
@@ -1527,7 +1538,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"accelerator": acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount) + machineShape(seen.VCPUCount, seen.MemoryGB),
 			"address":     seen.Address, "media": seen.MediaAddress, "hub": seen.Hub,
 			"rented": orNone(seen.RentedAt), "ready": "—", "idle_since": "", "release_due": "",
-			"image": either(seen.BaseWorkerImageTag, seen.BaseWorkerImageDigest), "provider": "", "provider resource": "", "provider host": "",
+			"image": either(seen.BaseWorkerImageTag, seen.BaseWorkerImageDigest), "provider": seen.Provider, "provider machine": seen.ProviderMachineID, "provider resource": seen.ProviderResourceID, "provider host": "",
 			"provider state": "", "container state": "",
 			"$/hour":  rentalHourlyRate(costPerHour(seen.HourlyRateUSDMicros, seen.ComputeUSDMicrosPerHour, seen.StorageUSDMicrosPerHour)),
 			"compute": costCell(seen.ComputeUSDMicrosPerHour), "storage": costCell(seen.StorageUSDMicrosPerHour),
@@ -1549,6 +1560,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 		spendFields(typed, seen)
 		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,
+			"provider": seen.Provider, "provider_machine_id": seen.ProviderMachineID, "provider_resource_id": seen.ProviderResourceID,
 			"address": seen.Address, "media_address": seen.MediaAddress,
 			"hub": seen.Hub, "rented_at": seen.RentedAt,
 			"base_worker_image_digest": seen.BaseWorkerImageDigest, "base_worker_image_tag": seen.BaseWorkerImageTag} {
