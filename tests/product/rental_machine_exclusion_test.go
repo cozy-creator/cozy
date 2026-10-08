@@ -93,3 +93,49 @@ func TestRentalMachineExclusionsRefuseUnawareHubBeforePaidPost(t *testing.T) {
 		t.Fatalf("unaware Hub reached paid POST: posts%d exit%d %s", posts, code, out)
 	}
 }
+
+func TestRentalMachineExclusionsReconfirmUnsentResumeAgainstOlderHub(t *testing.T) {
+	root, _, stand := rentalEndRoot(t, "exclude-resume-old-hub")
+	defer runCozy(t, root, "down")
+	stand.setSKUs(map[string]any{"name": "rtx-4060", "accelerator_model": "NVIDIA GeForce RTX 4060", "accelerator_count": 1, "base_worker_profile": "proof", "compute_capability": "8.9", "vram_gb": 8, "price_usd_micros_per_hour": 260000})
+	var mu sync.Mutex
+	aware, posts := true, 0
+	stand.quote = func(req map[string]any) (int, string) {
+		mu.Lock()
+		confirmed := aware
+		mu.Unlock()
+		body := map[string]any{"price_usd_micros_per_hour": 260000, "container_disk_gb": 321}
+		if confirmed {
+			body["excluded_provider_machines"] = req["excluded_provider_machines"]
+		}
+		raw, _ := json.Marshal(body)
+		return 200, string(raw)
+	}
+	original := stand.server.Config.Handler
+	stand.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/v1/rentals" {
+			mu.Lock()
+			posts++
+			mu.Unlock()
+			w.WriteHeader(503)
+			_, _ = w.Write([]byte(`{"error":{"code":"proof.no_create","message":"no paid request accepted"}}`))
+			return
+		}
+		original.ServeHTTP(w, r)
+	})
+	args := []string{"rental", "new", "rtx-4060", "--provider=vast", "--idempotency-key=exclude-unsent", "--development=false", "--json"}
+	_, out := runCozy(t, root, append(args, "--exclude-provider-machine=150864")...)
+	if !strings.Contains(out, "proof.no_create") {
+		t.Fatalf("did not retain unsent intent: %s", out)
+	}
+	mu.Lock()
+	before := posts
+	aware = false
+	mu.Unlock()
+	code, out := runCozy(t, root, args...)
+	mu.Lock()
+	defer mu.Unlock()
+	if code == 0 || !strings.Contains(out, "rental.machine_exclusion_unsupported") || posts != before {
+		t.Fatalf("older Hub received resumed paid POST: posts%d->%d exit%d %s", before, posts, code, out)
+	}
+}

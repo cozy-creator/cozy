@@ -442,6 +442,19 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	}
 	if existing != nil {
 		hourlyRateUSDMicros = existing.HourlyRateUSDMicros
+		// An unsent or unconfirmed paid intent may resume against a rolled-back
+		// Hub. Reconfirm only this requested feature; keep its retained rate.
+		if existing.RentalID == "" && len(excluded) > 0 {
+			hctx, cancel := hub.Context()
+			confirmed, problem := c.QuoteRental(hctx, existing.RequestBody)
+			cancel()
+			if problem != nil {
+				return nil, problem
+			}
+			if problem = confirmedMachineExclusions(confirmed, excluded); problem != nil {
+				return nil, problem
+			}
+		}
 	} else if hourlyRateUSDMicros, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), creator.PublicKey(),
 		workload, development, image, provider, excluded, hourlyRateUSDMicros); e != nil {
 		return nil, e
@@ -493,8 +506,8 @@ func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHas
 	if e != nil {
 		return 0, e
 	}
-	if len(excluded) > 0 && !slices.Equal(quote.ExcludedProviderMachines, excluded) {
-		return 0, exit.Named(exit.Structural, "rental.machine_exclusion_unsupported", "Tensorhub did not confirm the excluded provider machines; no rental was submitted").WithRemedy("update this Hub to support provider-machine exclusions")
+	if e = confirmedMachineExclusions(quote, excluded); e != nil {
+		return 0, e
 	}
 
 	if ctx.Err != nil && !ctx.Mode().JSON {
@@ -2198,4 +2211,11 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 		{K: "state", V: "ended"}, {K: "changed", V: destroyed},
 		{K: "forgotten", V: forgotten},
 	}, Summary: summary, Notes: notes, Next: []string{"cozy rental list"}})
+}
+
+func confirmedMachineExclusions(quote hub.RentalQuote, excluded []string) *exit.Error {
+	if len(excluded) > 0 && !slices.Equal(quote.ExcludedProviderMachines, excluded) {
+		return exit.Named(exit.Structural, "rental.machine_exclusion_unsupported", "Tensorhub did not confirm the excluded provider machines; no new rental POST was sent").WithRemedy("update this Hub to support provider-machine exclusions")
+	}
+	return nil
 }
