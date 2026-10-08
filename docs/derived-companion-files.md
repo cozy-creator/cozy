@@ -36,13 +36,23 @@ intent and no byte is new; the object becomes the same manifest entry and header
 and a commit refuses when the Store does not hold it. Uploads attach a pipeline's pinned
 tokenizers this way, since they exceed the inline bound.
 
-TensorFS inherits existing ordinary companions by exact reference from source
-checkpoints. Header/tensor backing objects listed redundantly as ordinary source
-files are excluded unless that same path is a declared header asset with matching content.
-An explicit asset role survives byte deduplication with tensor data. Equal multi-source names and contents deduplicate; differing
-contents at one name require an explicitly declared replacement. Tensor parts retain
-the same references. The source manifest remains the authority for the inherited
-file set; no global cache path or network lookup enters the derivation.
+TensorFS inherits both ordinary manifest companions and header assets by reference
+from source checkpoints. An asset present only in the header keeps its logical digest,
+length, media type and ordered segment references; it does not need a whole-file CAS
+object or a manifest entry. Retaining large assets does not consume the inline-file
+limit or write budget. Header/tensor backing objects listed redundantly as ordinary
+source files are excluded unless that same path is a declared header asset with
+matching content. An explicit asset role survives byte deduplication with tensor data.
+
+Equal multi-source companion entries or complete asset records deduplicate. Differing
+asset contents, metadata or segmentation at one name require an explicitly declared
+replacement. An inherited asset and manifest companion at the same path must agree on
+logical digest and length; the header's media type and segments remain authoritative.
+Declaring `files` or a verified object at that path replaces both inherited forms,
+using the ordinary single-object, `application/octet-stream` asset representation
+(an empty ordinary file has no header asset). All inherited names share the normal
+companion path rules. Tensor parts retain the same references; no global cache path
+or network lookup enters the derivation.
 
 Crash recovery retains the small frozen file bytes in the work/checkpoint record.
 A retry can recreate these objects at commit without repeating tensor work. The

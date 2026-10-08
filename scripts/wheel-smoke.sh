@@ -59,6 +59,7 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/fit-runs.py
 "$work/venv/bin/python" scripts/derived-resume.py
 "$work/venv/bin/python" scripts/derived-declaration.py
+"$work/venv/bin/python" scripts/derived-assets.py
 "$work/venv/bin/python" scripts/derived-graft.py
 "$work/venv/bin/python" scripts/derived-retention.py
 "$work/venv/bin/python" scripts/read-model-parts.py

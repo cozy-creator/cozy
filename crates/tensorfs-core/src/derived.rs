@@ -1004,11 +1004,9 @@ fn companion_files(
             // A named asset is an explicit semantic role, even when CAS deduplication
             // makes its bytes identical to a tensor part. Only unindexed backing aliases
             // disappear from the derived manifest.
-            let named_asset = source.header.assets.iter().any(|(name, asset)| {
-                name == path
-                    && asset.logical_sha256 == object.sha256
-                    && asset.logical_length == object.length
-            });
+            // Keep any explicitly named asset path for companion_assets to check.
+            // Filtering a mismatching object here would hide a header/file conflict.
+            let named_asset = source.header.assets.iter().any(|(name, _)| name == path);
             if (backing.contains(&(object.sha256.clone(), object.length)) && !named_asset)
                 || explicit.contains(path.as_str())
             {
@@ -1041,6 +1039,66 @@ fn companion_files(
         .collect();
     validate_companion_paths(&mut paths)?;
     Ok(files)
+}
+
+/// Header assets are an independent source of model inputs, not just an index of
+/// manifest companions. Keep their segmented representation and media metadata intact.
+fn companion_assets(
+    declaration: &Declaration,
+    sources: &[SourceData],
+    files: &BTreeMap<String, Entry>,
+) -> Result<Vec<(String, Asset)>> {
+    let explicit: HashSet<_> = declaration
+        .files
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .chain(declaration.objects.iter().map(|(path, _)| path.as_str()))
+        .collect();
+    let mut assets = BTreeMap::new();
+    for source in sources {
+        for (path, asset) in &source.header.assets {
+            if explicit.contains(path.as_str()) {
+                continue;
+            }
+            if let Some(previous) = assets.insert(path.clone(), asset.clone()) {
+                if previous != *asset {
+                    return refuse(Code::TRANSACTION_CONFLICT,
+                        format!("sources disagree on asset {path:?}; explicitly declare replacement bytes"));
+                }
+            }
+        }
+    }
+    for (path, entry) in files {
+        let object = entry.blob();
+        match assets.get(path) {
+            Some(asset) => {
+                if asset.logical_sha256 != object.sha256 || asset.logical_length != object.length {
+                    return refuse(Code::TRANSACTION_CONFLICT,
+                        format!("header asset and companion disagree on {path:?}; explicitly declare replacement bytes"));
+                }
+            }
+            None if matches!(entry, Entry::File(_)) && object.length != 0 => {
+                assets.insert(
+                    path.clone(),
+                    Asset {
+                        logical_sha256: object.sha256.clone(),
+                        logical_length: object.length,
+                        media_type: "application/octet-stream".into(),
+                        segments: vec![object.clone()],
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    // Header-only assets and manifest companions share a namespace, including the
+    // reserved header path. A matching name in both represents one logical file.
+    let mut paths: Vec<_> = assets.keys().chain(files.keys()).cloned().collect();
+    paths.sort();
+    paths.dedup();
+    paths.push("model.cozytensors".into());
+    validate_companion_paths(&mut paths)?;
+    Ok(assets.into_iter().collect())
 }
 
 fn selected_components(declaration: &Declaration, source_alias: &str) -> Vec<String> {
@@ -2133,21 +2191,7 @@ fn build_header(
     configs.sort_by(|a, b| a.0.cmp(&b.0));
     let header = Header {
         configs,
-        assets: companion_files(declaration, sources)?
-            .into_iter()
-            .filter_map(|(path, entry)| match entry {
-                Entry::File(object) if object.length != 0 => {
-                    let asset = Asset {
-                        logical_sha256: object.sha256.clone(),
-                        logical_length: object.length,
-                        media_type: "application/octet-stream".into(),
-                        segments: vec![object],
-                    };
-                    Some((path, asset))
-                }
-                _ => None,
-            })
-            .collect(),
+        assets: companion_assets(declaration, sources, &companion_files(declaration, sources)?)?,
         encodings,
         components,
     };
