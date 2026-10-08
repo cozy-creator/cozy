@@ -559,7 +559,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tensorfs-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64",
  "fs2",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-plane"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "libc",
  "libloading",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-py"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "pyo3",
  "tensorfs-core",

@@ -141,6 +141,7 @@ jobs:
       # floor matches the extension beside it.
       - uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.15.0
           target: x86_64
           args: --release --locked --target-dir target/manylinux --out dist
           manylinux: auto

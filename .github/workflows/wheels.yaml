@@ -43,6 +43,7 @@ jobs:
       - if: runner.os == 'Linux'
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.15.0
           target: ${{ matrix.target }}
           args: --release --locked --out dist
           manylinux: auto
