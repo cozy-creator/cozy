@@ -35,7 +35,7 @@ type vastInstance struct {
 }
 
 // Vast destroys exactly the requested instance after verifying its provider label.
-// A stopped instance is still present; only an authenticated 404 proves absence.
+// A stopped instance is still present; Vast reports absence as 404 or instances:null.
 func Vast(ctx context.Context, origin string, id int64, expectedLabel string, token secret.Value) (Result, *exit.Error) {
 	result := Result{Provider: "vast", ResourceID: id, Label: expectedLabel}
 	if id <= 0 || expectedLabel == "" || !token.Present() {
@@ -83,7 +83,11 @@ func Vast(ctx context.Context, origin string, id int64, expectedLabel string, to
 		var envelope struct {
 			Success *bool `json:"success"`
 		}
-		if json.Unmarshal(body, &envelope) == nil && envelope.Success != nil && !*envelope.Success {
+		decoded := json.Unmarshal(body, &envelope)
+		if decoded != nil && method == http.MethodGet {
+			return response.StatusCode, nil, exit.New(exit.Unavailable, "provider response is not a valid instance envelope")
+		}
+		if decoded == nil && envelope.Success != nil && !*envelope.Success {
 			return response.StatusCode, nil, exit.New(exit.Failed, "provider refused %s for instance %d", method, id)
 		}
 		return response.StatusCode, body, nil
@@ -97,12 +101,21 @@ func Vast(ctx context.Context, origin string, id int64, expectedLabel string, to
 			return true, nil
 		}
 		var envelope struct {
-			Instance *vastInstance `json:"instances"`
+			Instance json.RawMessage `json:"instances"`
 		}
-		if json.Unmarshal(body, &envelope) != nil || envelope.Instance == nil || envelope.Instance.ID != id {
+		if json.Unmarshal(body, &envelope) != nil || len(envelope.Instance) == 0 {
 			return false, exit.New(exit.Unavailable, "provider did not identify requested instance %d", id)
 		}
-		if envelope.Instance.Label != expectedLabel {
+		// Vast's authenticated single-instance endpoint returns explicit null for
+		// a resource that is no longer present. A missing member is not that answer.
+		if string(envelope.Instance) == "null" {
+			return true, nil
+		}
+		var instance vastInstance
+		if json.Unmarshal(envelope.Instance, &instance) != nil || instance.ID != id {
+			return false, exit.New(exit.Unavailable, "provider did not identify requested instance %d", id)
+		}
+		if instance.Label != expectedLabel {
 			return false, exit.Named(exit.Conflict, "provider.resource_identity_changed", "provider instance %d does not have the expected label", id)
 		}
 		return false, nil
@@ -120,7 +133,7 @@ func Vast(ctx context.Context, origin string, id int64, expectedLabel string, to
 		for {
 			absent, problem = read()
 			if problem != nil {
-				return result, problem
+				return result, problem.WithRemedy("the release may already have succeeded; retry the same provider resource id to confirm absence")
 			}
 			if absent {
 				break

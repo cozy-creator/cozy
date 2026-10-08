@@ -119,7 +119,11 @@ func TestExternalProviderCleanupRefusesUnprovenIdentityAndFailureResponses(t *te
 	}{
 		{"wrong-label", 200, `{"instances":{"id":42,"label":"somebody-else"}}`, 200, "", 0},
 		{"wrong-id", 200, `{"instances":{"id":43,"label":"owned-proof"}}`, 200, "", 0},
-		{"null-is-not-absence", 200, `{"instances":null}`, 200, "", 0},
+		{"missing-instances-is-not-absence", 200, `{}`, 200, "", 0},
+		{"null-envelope-is-not-absence", 200, `null`, 200, "", 0},
+		{"array-is-not-single-instance", 200, `{"instances":[]}`, 200, "", 0},
+		{"null-with-failure-is-not-absence", 200, `{"success":false,"instances":null}`, 200, "", 0},
+		{"malformed-success-is-not-absence", 200, `{"success":"no","instances":null}`, 200, "", 0},
 		{"unauthorized", 401, token, 200, "", 0},
 		{"forbidden", 403, token, 200, "", 0},
 		{"read-failed", 503, token, 200, "", 0},
@@ -220,5 +224,89 @@ func TestExternalProviderCleanupInterruptedReadbackDoesNotClaimRelease(t *testin
 	defer mu.Unlock()
 	if deletes != 1 {
 		t.Fatalf("sent%d deletes", deletes)
+	}
+}
+
+// Live Vast readback and its own CLI use HTTP200 instances:null for an absent
+// resource, both before deletion and after a previously accepted deletion.
+func TestExternalProviderCleanupAcceptsExplicitNullAbsence(t *testing.T) {
+	for _, present := range []bool{false, true} {
+		t.Run(fmt.Sprintf("initially-present-%t", present), func(t *testing.T) {
+			var mu sync.Mutex
+			var methods []string
+			exists := present
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				methods = append(methods, r.Method)
+				if r.Method == "DELETE" {
+					exists = false
+					fmt.Fprint(w, `{"success":true}`)
+					return
+				}
+				if exists {
+					fmt.Fprint(w, `{"instances":{"id":42,"label":"owned-proof"}}`)
+					return
+				}
+				fmt.Fprint(w, `{"instances": null}`)
+			}))
+			defer provider.Close()
+			code, out := runExternalCleanup(t, t.TempDir(), provider.URL, "explicit-token", "--token-stdin")
+			var got providerrelease.Result
+			if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &got) != nil || !got.ProviderAbsent || got.State != "absent" || got.Changed != present {
+				t.Fatalf("null absence: exit%d %s", code, out)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			want := []string{"GET"}
+			if present {
+				want = []string{"GET", "DELETE", "GET"}
+			}
+			if !reflect.DeepEqual(methods, want) {
+				t.Fatalf("unexpected provider calls: %v", methods)
+			}
+		})
+	}
+}
+
+func TestExternalProviderCleanupNamesUnconfirmedReadbackAfterDelete(t *testing.T) {
+	for _, response := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"unavailable", 503, `provider unavailable`},
+		{"malformed", 200, `{}`},
+		{"unauthorized", 401, `credential refused`},
+	} {
+		t.Run(response.name, func(t *testing.T) {
+			var mu sync.Mutex
+			deleted := false
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				if r.Method == "DELETE" {
+					deleted = true
+					fmt.Fprint(w, `{"success":true}`)
+					return
+				}
+				if deleted {
+					w.WriteHeader(response.status)
+					fmt.Fprint(w, response.body)
+					return
+				}
+				fmt.Fprint(w, `{"instances":{"id":42,"label":"owned-proof"}}`)
+			}))
+			defer provider.Close()
+			code, out := runExternalCleanup(t, t.TempDir(), provider.URL, "explicit-token", "--token-stdin")
+			if code == 0 || !strings.Contains(out, "release may already have succeeded") || !strings.Contains(out, "retry the same provider resource id") || strings.Contains(out, `"provider_absent":true`) {
+				t.Fatalf("confirmation failure omitted reconciliation: exit%d %s", code, out)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !deleted {
+				t.Fatal("fixture did not reach DELETE")
+			}
+		})
 	}
 }
