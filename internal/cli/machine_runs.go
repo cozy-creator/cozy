@@ -15,18 +15,18 @@ import (
 // machineRuns is a client transport and observer. Stopping it closes connections
 // and upload/observation work; it never sends an execution cancellation.
 type machineRuns struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	context *Context
+	ctx      context.Context
+	cancel   context.CancelFunc
+	context  *Context
+	layout   home.Layout
+	store    *records.Store
+	resolver *Resolver
+	fleet    *managedRentals
+	mu       sync.Mutex
+	running  map[string]chan struct{}
 	// A foreground controller closes with its CLI command. Explicit controls must
 	// reach the machine before that command returns; observation remains detachable.
 	foreground bool
-	layout     home.Layout
-	store      *records.Store
-	resolver   *Resolver
-	fleet      *managedRentals
-	mu         sync.Mutex
-	running    map[string]chan struct{}
 	// hubAccess holds each machine's execution access, by hub, credential and leaf.
 	hubAccess sync.Map
 	placed    map[string]string // the last placement decision recorded per waiting run
