@@ -49,7 +49,10 @@ echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 # a pod runs (tfs-077). A `__getattr__` back in the stub, a binding whose parameters moved,
 # a refusal class the facade forgot to re-export: all of them stop here.
 "$work/venv/bin/python" scripts/stub_conform.py
+"$work/venv/bin/python" scripts/typed-consumer.py
 "$work/venv/bin/python" scripts/source-artifacts.py
+"$work/venv/bin/python" scripts/ensure-proof.py "$work/venv/bin/tfs"
+"$work/venv/bin/python" scripts/pull-control-proof.py "$work/venv/bin/tfs"
 "$work/venv/bin/python" scripts/import-tree.py
 "$work/venv/bin/python" scripts/keyed-roots.py
 "$work/venv/bin/python" scripts/trust-index.py

@@ -107,3 +107,65 @@ object-storage operations, database coordination and actual cloud deletion.
 Keep each operation's format/result compatibility independent of deployment identity.
 Administrative commands that do mutate a local Store still obey its ownership and
 collector rules; metadata planning on a separate census is not such a mutation.
+
+## Typed consumer contracts
+
+[Tracker #340](https://github.com/cozy-creator/tracker/issues/340) completes the native
+Python input/result descriptions in `tensorfs.records`. These are ordinary dictionary
+projections and named aliases of existing tuple inputs; parameter lists, on-disk
+formats, canonical bytes and Python runtime representations are unchanged.
+
+| Consumer operations | Input/result records | Native producer |
+|---|---|---|
+| Standalone or owner content admission, copying, walking | `PutResult`, `VerifyResult`, `WalkObject`, `CheckoutResult` | `store.rs`, `project.rs`, `checkpoint.rs` |
+| Verified acquisition and streamed reads | `ObjectKey`, `ReadItem`, `BatchItem`, `ReadReceipt`, `StreamResult` | `read.rs`, `receipt.rs` |
+| Repository pointers and retained roots | `ReleaseLane`, `ReleaseRow`, `LocalRow`, `TreeRoot`, `CheckpointRoot`, `KeyedRoot` | `repository.rs`, root modules |
+| Owner source preparation and acquisition | `SourceMember`, `SourceProfile`, `SourceCarrier`, `SelectedSource`, `PreparedModelSource`, `PreparedSelection`, `FetchPlan`, `PullResult`, `EnsureEvent`, `EnsureResult` | `providers`, `source_model.rs`, `ingest`, `fetch.rs`, `ensure.rs` |
+| Native derived inputs | `DeclarationSources`, `DeclarationTargets`, `DeclarationConfigs`, `DeclarationFiles`, `DerivationArguments` | `derived.rs`; native Python declaration parser |
+| Scoped inspection and writer recovery | `InspectedSource`, `SourceFacts`, `DerivedLookup`, `DispositionResult`, `RetainedResult` | `derived.rs`, `derived/retention.rs` |
+| Store pressure and maintenance | `Relief`, `GCResult` | `reclaim.rs`, `gc.rs` |
+| Document and compatibility inspection | `Header`, `ManifestDocument`, `DocumentResult`, `CapabilityResult`, `FitResult` | `header.rs`, `manifest.rs`, `corpus.rs`, `machine.rs` |
+
+Package authors keep using the typed `Derivation` inputs in `tensorfs.derived`.
+`native_arguments()` now describes the same native map/tuple shapes to the type checker.
+Direct Store callers may use the declaration records explicitly. The native parser still
+checks all cross-field, dtype, geometry and custody constraints; annotations do not replace it.
+`Reader` describes the existing bounded `.read(size)` source accepted by native writes.
+
+Trusted-owner `serve_derived` callbacks receive `CheckpointReceipt` and `DerivedReceipt`;
+`serve_derived_replay` also passes `DerivedReceipt`. A callback that consumes only some
+fields can accept `Mapping[str, object]`. Callers storing receipts without mutating them
+should use that mapping type rather than require a mutable `dict[str, Any]`.
+
+`ObjectKey` names the existing `(object_id, length)` tuple, while `ObjectRef` names the
+canonical `{sha256, length}` mapping. The aliases document existing native arguments;
+they are not additional storage objects or grants. Source/roster aliases document each
+field order beside their definitions. `SourceInspection.from_native` takes the actual
+`InspectedSource` producer shape; callers should pass native inspection results directly.
+
+Rust consumers already use `ObjectRef`, `ReceiptFacts`, typed Store/read/derived methods
+and explicit ownership. This Python contract cleanup does not add parallel Rust wrappers.
+Open-ended encoding definitions and channel envelopes stay at their existing dynamic
+boundary; fixed native outputs no longer erase their contract into `Any`.
+
+## Owner-assigned writer attempts
+
+An embedding owner that does not already possess a durable writer session uses Rust
+`derived::begin_next(store, meta, transaction, declaration, checkpoint)` or
+`derived::channel::Writer::begin_next(...)`. The first returns `NextBegin` containing
+`writer_session_id` and the existing `Begin` holds/views. The channel constructor owns
+those same guards and uses the assigned session throughout its lifetime.
+
+TensorFS chooses the next session above the durable transaction's highest session and
+any retained restore fence, under the existing transaction lock. This works after an old
+owner used a large timestamp, after restart, and when two authorized attempts open
+concurrently. A stale channel's cleanup cannot fence the newer session. The owner still
+checks that an execution is authorized/current before opening a replacement; this API
+does not authorize the replacement itself. A newer attempt fences the older writer.
+
+The existing explicit `begin(..., writer_session, ...)` API is unchanged. No clock,
+process-global counter, daemon-specific journal, Python wrapper or new on-disk format is
+introduced. Only an observed row changing during native validation is retried; different
+declarations, terminal states, invalid sources and exhausted integer space refuse.
+Native proofs are in `derived/next_attempt_tests.rs`; TensorD adoption belongs to
+[tracker #341](https://github.com/cozy-creator/tracker/issues/341).

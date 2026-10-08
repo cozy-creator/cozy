@@ -2289,6 +2289,25 @@ fn release_guards(meta: &Meta, writer_hold: Option<Hold>, source_leases: Vec<(St
     }
 }
 
+fn require_open_transaction(previous: &TransactionRow, transaction: &str) -> Result<()> {
+    match previous.state {
+        TransactionState::Committed(_) => {
+            return refuse(
+                Code::TRANSACTION_CLOSED,
+                format!("{transaction} is committed; recover it with derived_lookup"),
+            )
+        }
+        TransactionState::Abandoned => {
+            return refuse(
+                Code::TRANSACTION_CLOSED,
+                format!("{transaction} was durably abandoned and cannot reopen"),
+            )
+        }
+        TransactionState::Open => {}
+    }
+    Ok(())
+}
+
 // One epoch/declaration decision for inspection and writer creation. The returned
 // row is an isolated candidate; only begin publishes it under the native CAS.
 fn planned_row(
@@ -2299,21 +2318,7 @@ fn planned_row(
     source_facts: &[SourceFact],
 ) -> Result<TransactionRow> {
     if let Some(previous) = initial {
-        match previous.state {
-            TransactionState::Committed(_) => {
-                return refuse(
-                    Code::TRANSACTION_CLOSED,
-                    format!("{transaction} is committed; recover it with derived_lookup"),
-                )
-            }
-            TransactionState::Abandoned => {
-                return refuse(
-                    Code::TRANSACTION_CLOSED,
-                    format!("{transaction} was durably abandoned and cannot reopen"),
-                )
-            }
-            TransactionState::Open => {}
-        }
+        require_open_transaction(previous, transaction)?;
         if previous.declaration.as_deref() != Some(declaration_text)
             || previous.source_facts.as_slice() != source_facts
         {
@@ -2368,16 +2373,80 @@ pub fn finish_writer(store: &Store) -> Result<()> {
     store.finish_admitted()
 }
 
+/// A writer attempt whose monotonically increasing session was allocated by TensorFS.
+/// The embedding owner supplies transaction authority, never a wall-clock epoch.
+pub struct NextBegin {
+    pub writer_session_id: u64,
+    pub begun: Begin,
+}
+
+#[derive(Clone, Copy)]
+enum SessionRequest {
+    Explicit(u64),
+    Next,
+}
+
+fn next_session(previous: u64) -> Result<u64> {
+    previous
+        .checked_add(1)
+        .filter(|session| *session <= limits::INT_MAX as u64)
+        .ok_or_else(|| Refusal {
+            code: Code::NUMBER_RANGE,
+            detail: "derived writer session space is exhausted".into(),
+        })
+}
+
 pub fn begin(
     store: &Store,
     meta: &Meta,
     transaction: &str,
     writer_session: u64,
-    mut declaration: Declaration,
+    declaration: Declaration,
     checkpoint: Option<&ObjectRef>,
 ) -> Result<Begin> {
+    begin_requested(
+        store,
+        meta,
+        transaction,
+        SessionRequest::Explicit(writer_session),
+        declaration,
+        checkpoint,
+    )
+    .map(|result| result.begun)
+}
+
+/// Begin the next owner-authorized writer attempt using the durable transaction fence.
+/// Concurrent begins allocate distinct sessions; an older live writer becomes fenced.
+/// Byte verification stays outside SQLite's writer lock. Only a changed observed row is
+/// retried; declaration conflicts, terminal states and invalid sources still refuse.
+pub fn begin_next(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    declaration: Declaration,
+    checkpoint: Option<&ObjectRef>,
+) -> Result<NextBegin> {
+    begin_requested(
+        store,
+        meta,
+        transaction,
+        SessionRequest::Next,
+        declaration,
+        checkpoint,
+    )
+}
+
+fn begin_requested(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    session: SessionRequest,
+    mut declaration: Declaration,
+    checkpoint: Option<&ObjectRef>,
+) -> Result<NextBegin> {
     let transaction = transaction_id(transaction)?;
-    if writer_session == 0 || writer_session > limits::INT_MAX as u64 {
+    if matches!(session, SessionRequest::Explicit(value) if value == 0 || value > limits::INT_MAX as u64)
+    {
         return refuse(
             Code::NUMBER_RANGE,
             "WriterSessionId must be positive and inside the canonical integer range",
@@ -2481,71 +2550,96 @@ pub fn begin(
     };
     // Byte verification can update the verification catalog. Keep it outside the SQL
     // writer transaction, then compare the observed row before assigning this epoch.
-    let initial = meta.derived_row(&transaction)?;
-    let mut row = match planned_row(
-        initial.as_ref(),
-        &transaction,
-        writer_session,
-        &declaration_text,
-        &source_facts,
-    ) {
-        Ok(row) => row,
+    let assigned = (|| {
+        loop {
+            let initial = meta.derived_row(&transaction)?;
+            if matches!(session, SessionRequest::Next) {
+                if let Some(previous) = initial.as_ref() {
+                    require_open_transaction(previous, &transaction)?;
+                }
+            }
+            let proposed = match session {
+                SessionRequest::Explicit(value) => value,
+                SessionRequest::Next => {
+                    next_session(initial.as_ref().map_or(0, |row| row.highest_session))?
+                }
+            };
+            let mut row = planned_row(
+                initial.as_ref(),
+                &transaction,
+                proposed,
+                &declaration_text,
+                &source_facts,
+            )?;
+            merge_progress(store, &mut row, incoming.as_ref())?;
+            build_header(
+                &declaration,
+                &sources,
+                &row.added_parts,
+                &row.added_configs,
+                true,
+            )?;
+
+            let mut txn = meta.txn_for(&transaction)?;
+            let current = txn.rows.iter_mut().find(|row| row.id == transaction);
+            if current.as_deref() != initial.as_ref() {
+                if matches!(session, SessionRequest::Next) {
+                    // A real state change permits revalidation. No other refusal is retried.
+                    continue;
+                }
+                return refuse(
+                    Code::TRANSACTION_CONFLICT,
+                    "derived work changed while beginning; retry with current writer epoch",
+                );
+            }
+            let restored = roots::read(store, &transaction)?.and_then(|root| root.restore_epoch);
+            let writer_session = match session {
+                SessionRequest::Explicit(value) => {
+                    if restored.is_some_and(|epoch| epoch > value) {
+                        return refuse(
+                            Code::WRITER_FENCED,
+                            "writer is behind the retained restore epoch",
+                        );
+                    }
+                    value
+                }
+                SessionRequest::Next => {
+                    // Allocate while holding the same native lock that publishes this row.
+                    // A retained restore root can predate the transaction metadata's recovery.
+                    let highest = initial.as_ref().map_or(0, |row| row.highest_session);
+                    next_session(highest.max(restored.unwrap_or(0)))?
+                }
+            };
+            row.highest_session = row.highest_session.max(writer_session);
+            row.current_session = Some(writer_session);
+            roots::rewrite_parts(store, &transaction, &added_objects(&row))?;
+            retain_progress(store, &row, checkpoint)?;
+            match current {
+                Some(current) => *current = row,
+                None => txn.rows.push(row),
+            }
+            txn.commit()?;
+            return Ok(writer_session);
+        }
+    })();
+    let writer_session_id = match assigned {
+        Ok(value) => value,
         Err(error) => {
             release_guards(meta, Some(writer_hold), source_leases);
             return Err(error);
         }
     };
-    let merged = merge_progress(store, &mut row, incoming.as_ref()).and_then(|()| {
-        build_header(
-            &declaration,
-            &sources,
-            &row.added_parts,
-            &row.added_configs,
-            true,
-        )?;
-        Ok(())
-    });
-    if let Err(error) = merged {
-        release_guards(meta, Some(writer_hold), source_leases);
-        return Err(error);
-    }
-    let committed = (|| {
-        let mut txn = meta.txn_for(&transaction)?;
-        let current = txn.rows.iter_mut().find(|row| row.id == transaction);
-        if current.as_deref() != initial.as_ref() {
-            return refuse(
-                Code::TRANSACTION_CONFLICT,
-                "derived work changed while beginning; retry with current writer epoch",
-            );
-        }
-        if roots::read(store, &transaction)?
-            .and_then(|root| root.restore_epoch)
-            .is_some_and(|epoch| epoch > writer_session)
-        {
-            return refuse(
-                Code::WRITER_FENCED,
-                "writer is behind the retained restore epoch",
-            );
-        }
-        roots::rewrite_parts(store, &transaction, &added_objects(&row))?;
-        retain_progress(store, &row, checkpoint)?;
-        match current {
-            Some(current) => *current = row.clone(),
-            None => txn.rows.push(row.clone()),
-        }
-        txn.commit()
-    })();
-    if let Err(error) = committed {
-        release_guards(meta, Some(writer_hold), source_leases);
-        return Err(error);
-    }
-    Ok(Begin {
-        writer_hold,
-        source_leases,
-        source_views,
-        additions: Additions::of(&declaration),
+    Ok(NextBegin {
+        writer_session_id,
+        begun: Begin {
+            writer_hold,
+            source_leases,
+            source_views,
+            additions: Additions::of(&declaration),
+        },
     })
 }
+
 
 fn progress_row(row: &TransactionRow) -> TransactionRow {
     let mut progress = row.clone();
@@ -3925,6 +4019,9 @@ pub fn dispose(store: &Store, meta: &Meta, transaction: &str) -> Result<Disposit
         disposition: desired,
     })
 }
+
+#[cfg(test)]
+mod next_attempt_tests;
 
 #[cfg(test)]
 mod tests {

@@ -10,6 +10,8 @@ import tempfile
 import threading
 
 import tensorfs
+from tensorfs import records
+from record_contract import check
 from tensorfs.errors import Refusal
 
 
@@ -72,6 +74,8 @@ def main() -> None:
                                       ["chosen.safetensors"], huggingface=endpoint, allow_local=True)
             civitai = store.resolve_source("civitai://42", ["civitai/files/92696"],
                                            civitai=endpoint, allow_local=True)
+            check(hf, records.SelectedSource)
+            check(civitai, records.SelectedSource)
             assert hf["content_manifest_digest"] != civitai["content_manifest_digest"]
             assert civitai["members"][0][0] == "civitai/files/92696"
             assert hf["selection_sha256"] != civitai["selection_sha256"]
@@ -95,6 +99,7 @@ def main() -> None:
             result = store.materialize_source(owner, hf["members"], allowed_hosts=hf["allowed_hosts"],
                                               credential_hosts=hf["credential_hosts"], allow_local=True,
                                               progress=lambda present, total: reports.append((present, total)))
+            check(result, records.MaterializedSource)
             assert result["transferred_bytes"] == len(body)
             assert reports[0] == (0, len(body)) and reports[-1] == (len(body), len(body)), reports
             assert result["artifact"]["manifest_digest"] == hf["content_manifest_digest"]
@@ -109,6 +114,7 @@ def main() -> None:
             assert "http" not in root["receipt"].decode()
             assert tensorfs.object_id(root["receipt"]) == root["receipt_digest"]
             adopted = store.retain_tree_root(owner, recipient)
+            check(adopted, records.TreeRoot)
             assert adopted["producer"] == owner
             assert adopted["receipt"] == root["receipt"]
             store.release_tree_root(owner)

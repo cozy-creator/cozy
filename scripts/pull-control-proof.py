@@ -14,7 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TypedDict, cast
 
 import tensorfs
-from tensorfs import errors
+from tensorfs import errors, records
+from record_contract import check
 
 
 class ObjectRef(TypedDict):
@@ -86,7 +87,15 @@ def prove(binary: str, root: Path) -> None:
             body = bodies[digest]
             with lock:
                 hits[digest] = hits.get(digest, 0) + 1
-            self.send_response(200)
+            full_length = len(body)
+            requested = self.headers.get("Range")
+            if requested:
+                first, last = (int(value) for value in requested.removeprefix("bytes=").split("-"))
+                body = body[first:last + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {first}-{first + len(body) - 1}/{full_length}")
+            else:
+                self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             with lock:
@@ -131,6 +140,7 @@ def prove(binary: str, root: Path) -> None:
         result = cast(PullResult, tensorfs.pull(
             store, origin, "proof/model@1.0.0", lane="plain", allow_local=True, streams=1,
             cancellation=tensorfs.PullCancellation(), progress=lambda available, total: resumed.append((available, total))))
+        check(result, records.PullResult)
         assert result["bytes_held"] > 0 and resumed[0][0] == result["bytes_held"]
         assert resumed[-1][0] == result["bytes_total"]
         assert all(hits[digest] == count for digest, count in completed.items()), "resume re-downloaded admitted objects"

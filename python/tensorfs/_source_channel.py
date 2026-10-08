@@ -5,11 +5,12 @@ from __future__ import annotations
 import contextlib
 import threading
 from collections.abc import Callable, Sequence
-from typing import Any, ContextManager
+from typing import Any, ContextManager, cast
 
 from . import _ext
 from ._derived_channel import ChannelRefusal, _Channel, _CHUNK, _METADATA, _fields
 from .derived import Source, SourceInspection
+from .records import Header, InspectedSource
 
 _READ_LIMIT = 64 << 20
 
@@ -53,7 +54,7 @@ class SourceClient:
                     data = bytearray(length)
                     self._receive_into(memoryview(data))
                     config["data"] = bytes(data)
-                result = SourceInspection.from_native(value)
+                result = SourceInspection.from_native(cast(InspectedSource, value))
                 if result.source != self.source:
                     raise ChannelRefusal("TRANSACTION_CONFLICT", "source inspection changed identity")
                 return result
@@ -105,7 +106,7 @@ def serve_source(
     channel = _Channel(fd)
     lease: _ext.ReadLease | None = None
     raw_header: bytes | None = None
-    header: dict[str, Any] | None = None
+    header: Header | None = None
     try:
         while True:
             request = channel.receive()

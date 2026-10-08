@@ -14,10 +14,10 @@ import socket
 import struct
 import threading
 from collections.abc import Buffer, Callable, Mapping
-from typing import TYPE_CHECKING, Any, ContextManager, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, ContextManager, Literal, cast
 
 from . import errors
-from .records import CheckpointReceipt, DerivedReceipt, PartReceipt
+from .records import CheckpointReceipt, DerivedReceipt, PartReceipt, Reader
 
 if TYPE_CHECKING:  # a type only: the writer exists in the full build, the channel in both
     from ._ext import DerivedWriter
@@ -28,10 +28,6 @@ _BYTES = 1
 _CHUNK = 1 << 20
 _METADATA = 64 << 20
 _READ = 64 << 20
-
-
-class Reader(Protocol):
-    def read(self, size: int = -1) -> bytes: ...
 
 
 class _BufferReader:
@@ -347,8 +343,8 @@ def serve_derived(
     checkpoint: tuple[str, int] | None,
     check_current: Callable[[], None],
     admit_io: Callable[[str, int], ContextManager[None]],
-    record_checkpoint: Callable[[dict[str, Any]], None],
-    record_receipt: Callable[[dict[str, Any]], None],
+    record_checkpoint: Callable[[CheckpointReceipt], None],
+    record_receipt: Callable[[DerivedReceipt], None],
 ) -> None:
     """Serve one prebound writer until terminal/peer loss, then fence its live handle.
 
@@ -485,7 +481,7 @@ def serve_derived_replay(
     fd: int,
     *,
     check_current: Callable[[], None],
-    record_receipt: Callable[[dict[str, Any]], None],
+    record_receipt: Callable[[DerivedReceipt], None],
 ) -> None:
     """Deliver retained native custody selected by the trusted execution owner."""
     channel = _Channel(fd)
@@ -496,7 +492,7 @@ def serve_derived_replay(
         _fields(request, "receipt", ())
         check_current()
         facts = dict(receipt)
-        record_receipt(facts)
+        record_receipt(cast(DerivedReceipt, facts))
         channel.send({"result": facts})
     except EOFError:
         return

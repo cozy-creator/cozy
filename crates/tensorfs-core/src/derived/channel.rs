@@ -173,6 +173,28 @@ impl Writer {
         checkpoint: Option<&ObjectRef>,
     ) -> Result<Writer> {
         let begun = begin(store, &meta, transaction, session, declaration, checkpoint)?;
+        Self::from_begin(store, meta, transaction, session, begun)
+    }
+
+    /// Open an owner-authorized replacement attempt with a durable native session ID.
+    pub fn begin_next(
+        store: &Store,
+        meta: std::sync::Arc<Meta>,
+        transaction: &str,
+        declaration: Declaration,
+        checkpoint: Option<&ObjectRef>,
+    ) -> Result<Writer> {
+        let next = super::begin_next(store, &meta, transaction, declaration, checkpoint)?;
+        Self::from_begin(store, meta, transaction, next.writer_session_id, next.begun)
+    }
+
+    fn from_begin(
+        store: &Store,
+        meta: std::sync::Arc<Meta>,
+        transaction: &str,
+        session: u64,
+        begun: super::Begin,
+    ) -> Result<Writer> {
         let writer_store = match writer_store(store) {
             Ok(store) => store,
             Err(error) => {
@@ -191,7 +213,6 @@ impl Writer {
             holds: Mutex::new(Some((begun.writer_hold, begun.source_leases))),
         })
     }
-
     fn source_read_into(&self, alias: &str, component: &str, key: &str, role: &str, offset: u64, into: &mut [u8]) -> Result<()> {
         let holds = self.holds.lock().unwrap();
         let (_, leases) = holds.as_ref().ok_or_else(released)?;
