@@ -5,6 +5,12 @@ exclusive owner role. It is for an embedding daemon, such as TensorD. TensorFS
 remains a library; authentication, execution records, scheduling and memory budget
 decisions remain with the daemon.
 
+This owner role covers the managed Store's serialized objects and metadata. Shared CPU
+buffers and exported GPU allocations have separate descriptor/mapping lifetimes in
+`tensorfs-plane`. TensorD coordinates their retention; Runtime constructs models and
+performs executor-side GPU operations using the library. A Store claim alone does not
+construct a model or make its tensors GPU-resident.
+
 The store's `owner.lock` is retained by the returned Store, its clones, and every
 live owner read lease. Stores reopened normally in that same process also retain
 the existing claim. A second owner receives `STORE_BUSY` before catalog recovery.

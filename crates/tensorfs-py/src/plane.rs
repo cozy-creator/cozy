@@ -261,8 +261,9 @@ impl PyPlane {
 
     /// Register one weight set over a sealed layout (`fill_sealed`, or one still filling: each
     /// region is used once Ready); `fd` stays the caller's. `files`: `(sha256, length, fd)` per
-    /// object, the verified object files its machine handed over, from which the regions it did
-    /// not stage copy (each fd is duplicated; the caller keeps and closes its own).
+    /// object, the verified object files its owner supplied for regions not staged in that
+    /// shared CPU layout (each fd is duplicated; the caller keeps and closes its own).
+    /// Runtime performs GPU copies/mappings through its local plane using those sources.
     #[pyo3(signature = (name, plan, regions, fd, files = None))]
     fn register_sealed(
         &self,
@@ -843,7 +844,7 @@ macro_rules! add_errors {
     ($m:expr; $($e:ident),*) => { $($m.add(stringify!($e), $m.py().get_type::<$e>())?;)* };
 }
 
-/// A whole-tier claim on a pinned-tier memfd for a process without a plane (the Worker): a
+/// A whole-tier claim on a pinned-tier memfd for an owner without a plane (such as TensorD): a
 /// new descriptor the caller owns; closing it ends the claim.
 #[pyfunction]
 fn hold_tier(py: Python<'_>, fd: i32) -> PyResult<i32> {
@@ -859,8 +860,10 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     tensorfs_plane::host::release_hold(hold).or_raise(py)
 }
 
-/// Fill a weight set's layout once through the verified read path and seal it (the machine's
-/// half of a sealed layout; `Plane.register_sealed` adopts it). CONSUMES `lease`. Returns the
+/// Fill a shared CPU weight layout through the verified read path and seal it (the owner's
+/// half of buffer sharing; `Plane.register_sealed` adopts it). TensorD uses the corresponding
+/// Rust host-buffer APIs. This does not construct a model or transfer it to a GPU.
+/// CONSUMES `lease`. Returns the
 /// sealed memfd (the caller's) and each read mode's bytes. `staged`: only those regions, the
 /// rest holes an adopter reads from the object files (`Plane.register_sealed(files=)`).
 #[cfg(feature = "store")]

@@ -1,4 +1,7 @@
 //! One GPU: its primary context, event pool, VMM arena ledger and copy movers.
+//! These operations run in the caller's process. In Cozy that caller is Runtime's
+//! executor, using TensorD's memory grants; TensorD may retain exported allocation fds
+//! for reuse while Runtime performs the imports, mappings and tensor construction.
 //!
 //! The arena is varena's core with two changes: a region is backed by slab-sized physical
 //! handles (the caller's `slab_bytes`, or one handle per region) instead of one per 2 MiB, and

@@ -240,7 +240,7 @@ pub(crate) struct Timing {
 
 pub(crate) struct Core {
     /// Latched on the first ambiguous driver outcome or lost lease: every later call refuses
-    /// and the runtime replaces the executor.
+    /// and its supervisor (TensorD in Cozy) replaces the executor after Runtime reports it.
     pub poisoned: Option<String>,
     pub sets: Vec<Option<Ws>>,
     pub arenas: Vec<Arena>,

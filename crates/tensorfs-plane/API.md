@@ -1,13 +1,24 @@
 # tensorfs.plane — Python API (v3.5, 2026-10-02)
 
-The weight plane moves bytes; cozy-runtime decides. The plane never measures free memory,
-never picks victims among equals, never reorders a schedule. It ships inside the `tensorfs`
-wheel (`from tensorfs import plane`), so it takes TensorFS `Store`, `ReadLease` and
-`ReadPlan` objects directly. Changes to this file are announced in its changelog below.
+The weight plane supplies memory and transfer mechanisms in the process that calls it.
+In Cozy, TensorD coordinates machine-wide memory policy and makes model weights available
+to Runtime. It uses TensorFS to fill and retain shared CPU buffers and can retain exported
+GPU allocation handles. Runtime constructs models and drives GPU allocation, copies,
+mapping and unmapping through the plane/device APIs within TensorD's grants. Retaining
+allocation handles is separate from executing those GPU operations.
+
+The plane applies caller-supplied budgets, regions and priorities; it does not measure
+free memory or reorder the caller's execution schedule. TensorFS is a library on both
+sides, with no separate daemon. The Python facade ships in the `tensorfs` wheel
+(`from tensorfs import plane`). It accepts explicit `Store`/`ReadLease` access for standalone
+or owner-side use; managed Runtime uses supplied buffers and verified object descriptors.
+Both paths use `ReadPlan` to describe the serialized weight bytes and their layout.
+Changes to this file are announced in its changelog below.
 
 ## Units
 
 - **Weight set**: one component of one checkpoint (a `ReadPlan` scope), registered once.
+  It identifies the component's byte layout, not a constructed Python/PyTorch model.
 - **Region**: a policy-declared group of tensors (a block from `paging.partition()`, plus
   `common`). The plane never infers regions.
 - **Layout**: every byte has ONE offset, the same in the pinned tier (memfd), the device VA
@@ -36,6 +47,10 @@ p.close()                    # closes every weight set; refuses while leases/cur
 Budgets start at 0: set them before `want`.
 
 ## Register
+
+This form uses an explicitly opened Store and consumes its lease. Managed executors
+instead adopt the shared CPU layouts through `register_sealed`, or attach retained GPU
+allocations as described below; they do not open the managed Store for missing sources.
 
 ```python
 src = p.source(store, lease) # tensorfs.Store + tensorfs.ReadLease; the lease is CONSUMED
@@ -241,8 +256,9 @@ stream cannot drain is `Poisoned`.
 
 **Poison is latched plane-wide**: an ambiguous driver outcome (a failed unmap or rollback, an
 undrainable copy failure, a driver mapping that disagrees with the books) or a lease dropped
-unreleased makes every later call raise `Poisoned` with the first cause; the runtime replaces
-the executor. A poisoned plane never unmaps, unregisters or frees a range while it lives
+unreleased makes every later call raise `Poisoned` with the first cause. Runtime reports the
+failure and TensorD supervises replacement of the executor. A poisoned plane never unmaps,
+unregisters or frees a range while it lives
 (copies may still touch it): `ws.close()`, `cur.close()` and `p.close()` raise `Poisoned`.
 Capacity never poisons (`BudgetExceeded`, `Shortfall` leave the plane usable).
 
@@ -270,13 +286,14 @@ an unclosed plane ends.
   their object ranges and the region grouping: register with the same plan and regions.
 - `ws.host_fd` is a separate, never-locked description: a process that keeps it (or a dup) keeps
   the memfd alive but no claim.
-- **Keeping a tier without a plane** (the Worker between executors): `h = plane.hold_tier(fd)`
+- **Keeping a tier without a plane** (an owner such as TensorD between executors): `h = plane.hold_tier(fd)`
   claims every region (one shared lock over the whole file, on a new description); while it is
   held, no plane eviction or close punches the tier. `plane.release_tier(h)` closes it and punches
   every Ready region no plane claims, returning the bytes punched. Bound held tiers with the
   holder's own budget (`os.fstat(fd).st_blocks * 512` is the memfd's RAM).
 - A host-only `Plane(devices=[])` (never loads libcuda) can fill a tier before any executor
-  holds a GPU; executors adopt and register it.
+  holds a GPU; executors adopt and register that CPU buffer. This prepares weight bytes,
+  not a Python model or GPU tensor. TensorD uses the corresponding Rust host-buffer APIs.
 - A memfd from a plane before v3.1 (state page `TFSPLN01`) is a different layout: adopting it
   raises `Invalid`; register a fresh one.
 
@@ -284,6 +301,9 @@ an unclosed plane ends.
 
 The device-tier counterpart of the host tier: one process fills a region, every process on
 the GPU maps the same physical bytes read-only, and the bytes outlive the filler.
+In Cozy, Runtime performs these export/import/mapping operations through its local plane.
+TensorD can retain and hand out the exported allocation handles under its custody and
+budget policy. The receiving Runtime creates its own mappings and tensor views.
 
 ```python
 p.device_sharing(device) -> bool        # POSIX-fd VMM export on this GPU and driver
@@ -316,6 +336,9 @@ ws.digest                               # the layout identity both sides must sh
 
 ## Changelog
 
+- 2026-10-08 documentation clarification: distinguish stored bytes, prepared CPU buffers
+  and GPU tensors; describe TensorD's machine policy/retention and Runtime's model/device
+  operations. API version, public names and behavior are unchanged.
 - v3.5 2026-10-02: device memory across processes: `device_sharing`, `export_device`,
   `attach_device`, `ws.digest`, `shared_bytes` in device and set stats, events `exported`,
   `attached`, `detached`.

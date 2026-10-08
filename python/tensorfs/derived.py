@@ -106,9 +106,10 @@ class SourceInspection:
 
 @dataclass(frozen=True, slots=True)
 class SourceCapability(Source):
-    """An exact source whose trusted owner admits metadata inspection before derive.
+    """Access to one exact artifact's tensor metadata, configs and bounded part reads.
 
-    The owner binds the callable to this source and the accepted input scope.
+    The owner binds these operations to this source and the accepted input scope; the
+    capability supplies usable model data through its inspection and read operations.
     Constructing this data object never grants Store access or broader I/O.
     """
 

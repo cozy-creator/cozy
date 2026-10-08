@@ -1,18 +1,35 @@
 # TensorFS consumer interfaces
 
 Implementation is tracked in [tracker #339](https://github.com/cozy-creator/tracker/issues/339).
-TensorFS remains a library embedded by TensorD (`cozy-machine`). It has no separate
-daemon. A Python installation does not grant authority over a managed execution's store.
+TensorFS is a library used by TensorD (`cozy-machine`) and Runtime's executor processes.
+TensorD embeds its Rust storage and shared-buffer mechanisms; Runtime calls its Python
+facade and native weight-plane/device APIs. TensorFS has no separate daemon. A Python
+installation does not grant authority over a managed execution's store.
 
 ## Consumers
 
 | Consumer | Interface |
 |---|---|
-| TensorD | Rust `Store::ensure_owned`, acquisition, native transactions, roots and collection |
-| Runtime | Granted model sources and buffers, header parsing, read plans and `tensorfs.plane` |
+| TensorD | Makes model weights available; coordinates machine-wide memory policy, owns the managed Store, fills/retains shared CPU buffers and can retain exported GPU allocation handles through TensorFS |
+| Runtime | Constructs Python/PyTorch models; parses granted sources and performs executor-side GPU allocation, copies, mapping and unmapping through `tensorfs.plane` and device APIs within TensorD's grants |
 | Package code | `SourceCapability`, `OutputCapability`, `Derivation`, `DerivedTransaction` |
 | Standalone library users | Explicit Store construction and normal coordinated reads/writes |
 | Tensorhub | CLI metadata operations over explicitly staged files and census directories |
+
+The word *weights* spans three representations with different lifetimes:
+
+| Representation | Meaning and responsibility |
+|---|---|
+| Serialized weight bytes and metadata | Immutable Store objects plus headers/manifests describing tensor parts, encodings, configs and assets; TensorD acquires and retains managed content through TensorFS |
+| Prepared CPU weight buffers | Memory layouts filled from verified bytes, including shared sealed buffers; TensorD fills/retains them through TensorFS, and Runtime maps/reads the supplied buffers and verified object files |
+| GPU-resident tensors | Allocations and tensor views used by a constructed model; Runtime performs device operations through TensorFS and its framework, while TensorD supplies budgets and can retain exported allocation handles for reuse |
+
+TensorD's source and buffer delivery makes model data available. Runtime still constructs
+the model, binds its parameters and executes it. TensorD can request executor preparation
+or prefetch that includes GPU work; those device operations still run in Runtime.
+TensorFS implements storage, layout, read and memory operations in whichever process
+calls the library; it is not another
+machine-wide policy authority. See the [weight-plane contract](../crates/tensorfs-plane/API.md).
 
 Constructing a managed Runtime model requires the machine's existing `model_sources` offer.
 Missing access refuses that operation; it cannot select `Store.open` by omission. Reusing
@@ -41,9 +58,10 @@ proofs do not imply release or installed/deployed adoption.
 
 ## References, capabilities and receipts
 
-An `ObjectRef` is the existing `{sha256, length}` dictionary. A `derived.Source` names a
-manifest; neither grants access. A live `SourceCapability` is bound to an accepted input
-by its owner. It provides inspection and bounded reads, and may use an owner channel.
+An `ObjectRef` is the existing `{sha256, length}` dictionary. A `derived.Source` names an
+exact content manifest; neither grants access by itself. A live `SourceCapability` binds
+that content to the owner's inspection and bounded-read operations. It provides actual
+tensor metadata, canonical configs and part bytes, and may use an owner channel.
 Granted sealed buffers can instead be consumed locally by the weight plane. Neither
 mechanism opens an arbitrary store path when access is missing.
 
