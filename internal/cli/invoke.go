@@ -84,7 +84,6 @@ func foregroundTarget(ctx *Context) (func(), *exit.Error) {
 	if problem != nil || ep == nil {
 		return nil, problem
 	}
-	adoptRentalHub(ctx, name)
 	close, problem := endpointController(ctx, ep)
 	if problem != nil {
 		return nil, problem
@@ -122,7 +121,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
-	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	target, packageInterface, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
@@ -2976,7 +2974,6 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 			keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, target.Release, facts.PackageInterface.Raw,
 				strings.Split(facts.Install.Closure, "\n"))
 		}
-		adoptInstallHub(ctx, facts.Install)
 		return target, facts.PackageInterface, nil
 	}
 	if problem.Code != exit.NotFound || strings.HasPrefix(target.Package, "local/") {

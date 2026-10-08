@@ -56,7 +56,6 @@ func sourceProfileNames(profiles map[string]string) []string {
 }
 
 func handleModelUpload(ctx *Context) *exit.Error {
-	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	if handled, problem := nativeModelUpload(ctx); handled {
 		return problem
 	}
@@ -67,7 +66,6 @@ func handleModelDownload(ctx *Context) *exit.Error {
 	if len(ctx.Inv.Args) < 2 || strings.TrimSpace(ctx.Inv.Args[1]) == "" {
 		return handleMachineModelDownload(ctx)
 	}
-	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	return handleModelTransfer(ctx, "model-download")
 }
 

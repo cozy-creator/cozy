@@ -174,11 +174,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	named := sub.RequestedRental
-	if named == "" {
-		named = sub.Worker
-	}
-	selectedHub, e := s.submissionHub(r, named)
+	selectedHub, e := s.hubOf(r)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -503,7 +499,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 	if problem := launch.ValidateAttentionOverride(out.AttentionKernel); problem != nil {
 		return out, nil, problem
 	}
-	if problem := s.validateRequestedRental(out.RequestedRental, hub); problem != nil {
+	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
 		return out, nil, problem
 	}
 	if len(out.Payload) == 0 {

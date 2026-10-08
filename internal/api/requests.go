@@ -156,7 +156,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	selectedHub, e := s.submissionHub(r, sub.RequestedRental)
+	selectedHub, e := s.hubOf(r)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -458,7 +458,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		AttentionKernel: sub.AttentionKernel,
 		OutputDirectory: sub.OutputDirectory,
 	}
-	if problem := s.validateRequestedRental(out.RequestedRental, hub); problem != nil {
+	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
 		return out, problem
 	}
 	if len(out.Payload) == 0 {

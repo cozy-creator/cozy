@@ -102,22 +102,6 @@ func InstallTarget(store *records.Store, name string) (string, *exit.Error) {
 	return row.ID, nil
 }
 
-// InstallHub is the Tensorhub a machine installs from: a rental's own, or "" for this
-// computer's machine, which installs from the hub the daemon addresses.
-func InstallHub(store *records.Store, machine string) (string, *exit.Error) {
-	if machine == Local {
-		return "", nil
-	}
-	row, problem := store.RentalRow(machine)
-	if problem != nil {
-		return "", problem
-	}
-	if row == nil {
-		return "", exit.New(exit.NotFound, "rental %s is not recorded on this host", machine)
-	}
-	return row.Hub, nil
-}
-
 // installFence is the worker boot an installation is claimed on and whether the machine
 // takes it now, or why its installations end. This computer's machine is always present
 // and has no boot fence.
