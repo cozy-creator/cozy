@@ -1,4 +1,4 @@
-package cli
+package producttest
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/pem"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,8 +17,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
-	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
@@ -117,7 +114,7 @@ func (p *observerLeasePeer) Control(context.Context, *v1.ControlRequest) (*v1.Ru
 	return nil, status.Error(codes.PermissionDenied, "observation cannot control work")
 }
 
-func observerLeaseFixture(t *testing.T, peer *observerLeasePeer) (*machineRuns, records.Request) {
+func observerLeaseFixture(t *testing.T, peer *observerLeasePeer) (string, *records.Store, records.Request, *daemonProcess) {
 	t.Helper()
 	layout, problem := home.Open(t.TempDir())
 	if problem != nil {
@@ -151,30 +148,16 @@ func observerLeaseFixture(t *testing.T, peer *observerLeasePeer) (*machineRuns, 
 	v1.RegisterMachineServer(server, peer)
 	go server.Serve(listener)
 	ep := &machineendpoint.Endpoint{Format: machineendpoint.Format, Address: listener.Addr().String(), WorkerID: "lease-worker", WorkerBootID: "lease-boot", WorkspaceID: "observer-proof", CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}))}
-	found := &machines.Resolver{Host: host, Endpoint: func(string) (*machineendpoint.Endpoint, *exit.Error) { return ep, nil }}
-	cfg := config.Config{Home: layout.Root}
-	ctx := &Context{Cfg: cfg, Out: io.Discard}
-	m := newMachineRuns(ctx, layout, store, NewResolver(store, cfg), nil, found)
-	request, _, problem := store.Submit(records.Request{ID: "lease-run", IdemKey: "lease-run", Package: "proof/lease", Release: "1", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: "sha256:" + strings.Repeat("1", 64), MachineExecutionObserver: true})
+	request, _, problem := store.SubmitWithEvent(records.Request{ID: "lease-run", IdemKey: "lease-run", Package: "proof/lease", Release: "1", Entrypoint: "main", Kind: "serving", Payload: []byte(`{}`), BodyDigest: "sha256:" + strings.Repeat("1", 64), MachineExecutionObserver: true}, map[string]any{"machine_endpoint": ep})
 	if problem != nil {
 		t.Fatal(problem)
 	}
 	if problem = store.LinkMachineExecution(request.ID, ep.Name()); problem != nil {
 		t.Fatal(problem)
 	}
-	t.Cleanup(func() {
-		m.cancel()
-		m.mu.Lock()
-		done := m.running[request.ID]
-		m.mu.Unlock()
-		if done != nil {
-			<-done
-		}
-		found.Forget(ep.Name())
-		server.Stop()
-		store.Close()
-	})
-	return m, request
+	t.Cleanup(func() { server.Stop(); store.Close() })
+	controller := startDaemonProcess(t, layout.Root)
+	return layout.Root, store, request, controller
 }
 
 func observerEventually(t *testing.T, until func() bool) {
@@ -191,19 +174,18 @@ func observerEventually(t *testing.T, until func() bool) {
 }
 
 func TestAcceptedRunObserverRecoversItsLeaseWithoutResubmission(t *testing.T) {
-	t.Parallel()
 	peer := new(observerLeasePeer)
-	m, request := observerLeaseFixture(t, peer)
-	if problem := m.Start(request); problem != nil {
-		t.Fatal(problem)
-	}
-	observerEventually(t, func() bool { row, _ := m.store.MachineExecution(request.ID); return row != nil && row.Collected })
-	row, problem := m.store.RequestRow(request.ID)
+	root, store, request, _ := observerLeaseFixture(t, peer)
+	observerEventually(t, func() bool { row, _ := store.MachineExecution(request.ID); return row != nil && row.Collected })
+	row, problem := store.RequestRow(request.ID)
 	if problem != nil || row.State != "succeeded" {
 		t.Fatalf("terminal collection: %+v %v", row, problem)
 	}
 	if peer.specs.Load() != 1 || peer.attaches.Load() != 1 || peer.controls.Load() != 0 {
 		t.Fatalf("specs=%d attaches=%d controls=%d", peer.specs.Load(), peer.attaches.Load(), peer.controls.Load())
+	}
+	if code, out := runCozy(t, root, "run", "watch", request.ID, "--json"); code != 0 || !strings.Contains(out, `"status":"completed"`) || !strings.Contains(out, `"answer":7`) {
+		t.Fatalf("ordinary watch missed terminal outcome: %d %s", code, out)
 	}
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
@@ -215,22 +197,22 @@ func TestAcceptedRunObserverRecoversItsLeaseWithoutResubmission(t *testing.T) {
 func TestRevokedRunObserverBacksOffAndDetachDoesNotControlWork(t *testing.T) {
 	for _, denyRun := range []bool{false, true} {
 		t.Run(map[bool]string{false: "Status-denied", true: "Status-allowed-Run-denied"}[denyRun], func(t *testing.T) {
-			t.Parallel()
 			peer := &observerLeasePeer{denyStatus: !denyRun, denyRun: denyRun}
-			m, request := observerLeaseFixture(t, peer)
-			if problem := m.Start(request); problem != nil {
-				t.Fatal(problem)
-			}
+			_, store, request, owner := observerLeaseFixture(t, peer)
 			observerEventually(t, func() bool { peer.mu.Lock(); defer peer.mu.Unlock(); return len(peer.statusTimes) >= 2 })
 			time.Sleep(300 * time.Millisecond)
-			m.cancel()
-			observerEventually(t, func() bool { m.mu.Lock(); defer m.mu.Unlock(); return m.running[request.ID] == nil })
+			must(t, owner.cmd.Process.Signal(os.Interrupt))
+			select {
+			case <-owner.exited:
+			case <-time.After(5 * time.Second):
+				t.Fatal("observer daemon did not detach")
+			}
 			peer.mu.Lock()
 			defer peer.mu.Unlock()
 			if len(peer.statusTimes) != 2 || peer.statusTimes[1].Sub(peer.statusTimes[0]) < 1800*time.Millisecond {
 				t.Fatalf("refusal busy loop: %v", peer.statusTimes)
 			}
-			row, _ := m.store.RequestRow(request.ID)
+			row, _ := store.RequestRow(request.ID)
 			if records.Settled(row.State) || peer.specs.Load() != 1 || peer.controls.Load() != 0 {
 				t.Fatalf("revocation/detach changed accepted work: state=%s specs=%d controls=%d", row.State, peer.specs.Load(), peer.controls.Load())
 			}
@@ -240,11 +222,8 @@ func TestRevokedRunObserverBacksOffAndDetachDoesNotControlWork(t *testing.T) {
 
 func TestFirstSubmissionAuthorizationRefusalIsNotRetried(t *testing.T) {
 	peer := &observerLeasePeer{denyFirst: true}
-	m, request := observerLeaseFixture(t, peer)
-	if problem := m.Start(request); problem != nil {
-		t.Fatal(problem)
-	}
-	observerEventually(t, func() bool { row, _ := m.store.RequestRow(request.ID); return row != nil && records.Settled(row.State) })
+	_, store, request, _ := observerLeaseFixture(t, peer)
+	observerEventually(t, func() bool { row, _ := store.RequestRow(request.ID); return row != nil && records.Settled(row.State) })
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 	if len(peer.statusTimes) != 0 || peer.specs.Load() != 1 || peer.attaches.Load() != 0 {
