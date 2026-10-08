@@ -49,6 +49,7 @@ var errNoDescribe = exit.Named(exit.Unavailable, "machine.describe_unsupported",
 func (m *machineRuns) loopV1(request records.Request) {
 	defer m.enforceDeadlineV1(request)()
 	lastError, delay, followed := "", time.Second, false
+	authorityDelay := time.Second
 	for m.ctx.Err() == nil {
 		current, problem := m.store.RequestRow(request.ID)
 		if problem != nil || current == nil {
@@ -135,7 +136,10 @@ func (m *machineRuns) loopV1(request records.Request) {
 		// Recover only observation of a durably accepted run, after a fresh authenticated
 		// Status succeeds. A refusal never authorizes another submission or control.
 		if problem != nil && problem.ErrName() == "machine_execution.observation_unauthorized" {
-			if held, readProblem := m.store.RunV1(request.ID); readProblem == nil && held && m.renewObservationV1(*current, link.MachineID) {
+			if latest, _ := m.store.MachineExecution(request.ID); latest != nil && latest.RemoteCursor > link.RemoteCursor {
+				authorityDelay = time.Second // the prior stream made actual progress
+			}
+			if held, readProblem := m.store.RunV1(request.ID); readProblem == nil && held && m.renewObservationV1(*current, link.MachineID, &authorityDelay) {
 				lastError, delay = "", time.Second
 				continue
 			}
@@ -167,9 +171,14 @@ func (m *machineRuns) loopV1(request records.Request) {
 // a permanently revoked key remains refused, with capped backoff rather than a busy loop.
 // Rental resolution uses the fleet's refreshed identity and refuses ended rentals. A gone
 // machine or another refusal leaves recovery to a reader or new fleet evidence as before.
-func (m *machineRuns) renewObservationV1(request records.Request, machineID string) bool {
-	delay := time.Second
+func (m *machineRuns) renewObservationV1(request records.Request, machineID string, delay *time.Duration) bool {
 	for m.ctx.Err() == nil {
+		select {
+		case <-m.ctx.Done():
+			return false
+		case <-time.After(*delay):
+		}
+		*delay = min(*delay+*delay, 30*time.Second)
 		link, problem := m.store.MachineExecution(request.ID)
 		if problem != nil || link == nil || link.Collected || link.Abandoned || link.Lost || link.MachineID != machineID {
 			return false
@@ -189,12 +198,6 @@ func (m *machineRuns) renewObservationV1(request records.Request, machineID stri
 		if status.Code(err) != codes.PermissionDenied && status.Code(err) != codes.Unauthenticated {
 			return false
 		}
-		select {
-		case <-m.ctx.Done():
-			return false
-		case <-time.After(delay):
-		}
-		delay = min(2*delay, 30*time.Second)
 	}
 	return false
 }
