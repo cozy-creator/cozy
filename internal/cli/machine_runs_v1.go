@@ -457,7 +457,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		repositories = append(repositories, spec.WeightsDestination)
 	}
 	if len(repositories) > 0 {
-		if spec.Publication, problem = authorizeV1Publication(ctx, machine, repositories); problem != nil {
+		if spec.Publication, problem = authorizeV1Publication(ctx, machine, request.Hub, repositories); problem != nil {
 			return nil, problem
 		}
 	}
@@ -623,7 +623,7 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		return nil, problem
 	}
 	if selection.Destination != "" && !strings.HasPrefix(selection.Destination, "local/") {
-		if spec.Publication, problem = authorizeV1Publication(ctx, machine, []string{selection.Destination}); problem != nil {
+		if spec.Publication, problem = authorizeV1Publication(ctx, machine, origin, []string{selection.Destination}); problem != nil {
 			return nil, problem
 		}
 	}

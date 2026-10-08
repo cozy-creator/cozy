@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -39,14 +40,14 @@ func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 					`@1.0.0/bf16"}]}],"request":{"fields":[]},"result":{"fields":[]}}],"jobs":[]}`)
 			}
 			a, b := surface("from_a", "model-a"), surface("from_b", "model-b")
-			served := 0
+			var served atomic.Int32
 			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/v1/packages/"+pkg+"/releases/"+otherRelease {
 					t.Errorf("selected source received unexpected path %s", r.URL.Path)
 					http.NotFound(w, r)
 					return
 				}
-				served++
+				served.Add(1)
 				_ = json.NewEncoder(w).Encode(map[string]any{"release": map[string]string{"release": otherRelease},
 					"package_interface": json.RawMessage(b), "execution_requirements": []string{"cozy-runtime>=0.19.0"}})
 			}))
@@ -71,8 +72,8 @@ func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 				t.Fatal(problem)
 			}
 			entry, problem := selected.Function("from_b")
-			if problem != nil || entry.Models[0].Default("proof").Model != "proof/model-b" || served != 1 {
-				t.Fatalf("selected Hub reused foreign installed metadata: entry=%+v error=%v reads=%d", entry, problem, served)
+			if problem != nil || entry.Models[0].Default("proof").Model != "proof/model-b" || served.Load() != 1 {
+				t.Fatalf("selected Hub reused foreign installed metadata: entry=%+v error=%v reads=%d", entry, problem, served.Load())
 			}
 			keepReleaseInterface(root, first, pkg, "1.0.0", a, nil)
 			keepNewestRelease(root, first, pkg, "1.0.0")
