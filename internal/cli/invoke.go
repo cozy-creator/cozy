@@ -593,6 +593,7 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 		if problem != nil {
 			return nil, problem
 		}
+		row.Choice = spec.Explicit
 		out = append(out, row)
 	}
 	return out, nil
