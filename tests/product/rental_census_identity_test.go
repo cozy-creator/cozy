@@ -25,18 +25,16 @@ func TestRentalCensusDoesNotHideSameIDFromAnotherHub(t *testing.T) {
 	fatal(t, store.RecordRental(records.Rental{ID: "rental-collision", MachineName: "elsewhere",
 		Hub: "http://127.0.0.1:1", State: "ready", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
 	type listing struct {
-		Count  int              `json:"machines_running"`
-		Rate   int64            `json:"hourly_spend_usd_micros"`
+		Count  *int             `json:"machines_running"`
+		Rate   *int64           `json:"hourly_spend_usd_micros"`
 		Rows   []map[string]any `json:"rentals"`
 		Others []map[string]any `json:"other_hubs"`
 	}
-	// A listing narrowed to the current hub holds its own observation and names the other
-	// hub's rental rather than listing it.
+	// An explicit source keeps both inventories; unavailable totals stay unknown.
 	code, out := runCozy(t, root, "rental", "list", "--json", "--full", "--tensorhub="+origin)
 	var listed listing
-	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || listed.Count != 1 || listed.Rate != 40_000 ||
-		len(listed.Rows) != 1 || listed.Rows[0]["hub"] != origin || listed.Rows[0]["machine"] != "current" ||
-		len(listed.Others) != 1 || listed.Others[0]["hub"] != "http://127.0.0.1:1" {
+	if code != 1 || json.Unmarshal([]byte(out), &listed) != nil || listed.Count != nil || listed.Rate != nil ||
+		len(listed.Rows) != 2 || len(listed.Others) != 0 {
 		t.Fatalf("same ID in another Hub hid or repriced the current account's rental: exit=%d %s", code, out)
 	}
 	// Every hub's listing, the default, holds both, each on its own hub; the unreachable
@@ -51,7 +49,9 @@ func TestRentalCensusDoesNotHideSameIDFromAnotherHub(t *testing.T) {
 		byMachine[row["machine"].(string)] = row
 	}
 	if byMachine["current"]["hub"] != origin || byMachine["current"]["unverified"] == true ||
-		byMachine["elsewhere"]["hub"] != "http://127.0.0.1:1" || byMachine["elsewhere"]["unverified"] != true {
+		byMachine["current"]["hourly_rate_usd_micros"] != float64(40_000) ||
+		byMachine["elsewhere"]["hub"] != "http://127.0.0.1:1" || byMachine["elsewhere"]["unverified"] != true ||
+		byMachine["elsewhere"]["hourly_rate_usd_micros"] != float64(100_000) {
 		t.Fatalf("same-ID rentals were not kept on their own hubs: %s", out)
 	}
 }
