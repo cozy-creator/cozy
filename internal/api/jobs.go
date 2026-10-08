@@ -268,7 +268,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		defer func() { lease.Release() }()
 		spec, inputDeclaration, e = s.resolveJob(r.Context(), selectedHub, sub, &lease)
 		spec.Warnings = ignoredWarnings(sub.Package, sub.Function, sub.Ignored)
-		if e == nil && spec.OutputExport != nil {
+		if e == nil && spec.OutputExport != nil && (sub.Release != "" || len(sub.PackageInterface) == 0 || len(spec.OutputExport.Outputs) > 0 || sub.OutputDirectory != "") {
 			e = resultfiles.Preflight(spec.OutputExport.Directory)
 		}
 		if e == nil {

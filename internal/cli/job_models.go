@@ -164,7 +164,7 @@ func conversionRunKey(ctx *Context, sub api.JobSubmission) (string, string, *exi
 		models = append(models, model.Slot+"="+model.Manifest)
 	}
 	sort.Strings(models)
-	identity, err := json.Marshal([]any{strings.TrimRight(ctx.Cfg.HubURL, "/"), sub.Package, sub.Function, sub.Release, sub.InstallID, sub.Org,
+	identity, err := json.Marshal([]any{sub.Package, sub.Function, sub.Release, sub.InstallID, sub.Org,
 		sub.Input, models, sub.ModelTransfer.Destination})
 	if err != nil {
 		return "", "", exit.Internalf("cannot name the conversion: %s", err)
@@ -175,7 +175,7 @@ func conversionRunKey(ctx *Context, sub api.JobSubmission) (string, string, *exi
 		return "", "", problem
 	}
 	defer store.Close()
-	return store.ResumableRun("conversion-"+hex.EncodeToString(digest[:]), sub.RequestedRental, true)
+	return store.ResumableRun("conversion-"+hex.EncodeToString(digest[:]), ctx.Cfg.HubURL, sub.RequestedRental, true)
 }
 
 // A job grants exact manifest bytes, whereas a serving binding names a model

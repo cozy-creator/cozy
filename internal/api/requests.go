@@ -222,7 +222,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// destination — here, where the path is finally resolved, before an input is
 		// bound or a row recorded. A doomed export refuses in milliseconds instead
 		// of after GPU minutes.
-		if spec.OutputExport != nil {
+		if spec.OutputExport != nil && (sub.Release != "" || len(sub.PackageInterface) == 0 || len(spec.OutputExport.Outputs) > 0 || sub.OutputDirectory != "") {
 			if e := resultfiles.Preflight(spec.OutputExport.Directory); e != nil {
 				s.refuseTyped(w, r, e)
 				return
@@ -556,14 +556,9 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 	if len(paths) == 0 && len(launch.AssetLists(entrypoint.Result)) == 0 && (out.Kind == "job" || len(out.Outputs) == 0) {
 		return nil
 	}
-	intent := &records.OutputExportIntent{Directory: out.OutputDirectory}
-	if intent.Directory == "" {
-		intent.Directory = s.layout.PackageOutputs(out.Package)
-	}
-	if !filepath.IsAbs(intent.Directory) || filepath.Clean(intent.Directory) != intent.Directory ||
-		len(intent.Directory) > 4096 {
-		return exit.Named(exit.Validation, "output_export_directory_malformed",
-			"output directory must be one canonical absolute path")
+	intent, problem := s.outputExportIntent(out)
+	if problem != nil {
+		return problem
 	}
 	fixed := 0
 	for _, outputID := range out.Outputs {
@@ -599,6 +594,18 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 	}
 	out.OutputExport = intent
 	return nil
+}
+
+func (s *Server) outputExportIntent(out *orchestrator.Submission) (*records.OutputExportIntent, *exit.Error) {
+	directory := out.OutputDirectory
+	if directory == "" {
+		directory = s.layout.PackageOutputs(out.Package)
+	}
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory || len(directory) > 4096 {
+		return nil, exit.Named(exit.Validation, "output_export_directory_malformed",
+			"output directory must be one canonical absolute path")
+	}
+	return &records.OutputExportIntent{Directory: directory}, nil
 }
 
 func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,

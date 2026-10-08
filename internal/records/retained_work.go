@@ -1,9 +1,12 @@
 package records
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -488,7 +491,12 @@ func (s *Store) CompleteRetainedCancellation(id string) (bool, *exit.Error) {
 // again, and that Runtime's own memo answers when nothing changed. A completed run that
 // never reached its destination is not complete. It returns the key to submit and the run
 // that key retries.
-func (s *Store) ResumableRun(base, machine string, replayCompleted bool) (string, string, *exit.Error) {
+func (s *Store) ResumableRun(base, origin, machine string, replayCompleted bool) (string, string, *exit.Error) {
+	// These are automatically resumed new commands. The same computation and model
+	// destination on another Hub is different work; explicit retries use their own
+	// predecessor identity and never come through this lookup.
+	hub := sha256.Sum256([]byte(strings.TrimRight(origin, "/")))
+	base += "/hub/" + hex.EncodeToString(hub[:])
 	key, retryOf := base, ""
 	for {
 		row, problem := s.RequestByIdempotencyKey(key)

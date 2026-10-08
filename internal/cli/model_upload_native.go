@@ -307,8 +307,8 @@ func ingestRunKey(layout home.Layout, origin string, script []byte, rentalID str
 		return "", "", problem
 	}
 	defer store.Close()
-	digest := sha256.Sum256(append([]byte(strings.TrimRight(origin, "/")+"\x00"), script...))
-	return store.ResumableRun("model-upload-"+hex.EncodeToString(digest[:]), rentalID, false)
+	digest := sha256.Sum256(script)
+	return store.ResumableRun("model-upload-"+hex.EncodeToString(digest[:]), origin, rentalID, false)
 }
 
 func quote(value string) string { raw, _ := json.Marshal(value); return string(raw) }

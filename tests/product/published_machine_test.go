@@ -42,7 +42,7 @@ func (publishedRouteObserver) Control(context.Context, records.Request, string) 
 // Every rented published job is a Runtime execution, as is a local published install.
 func TestPublishedMachineRoutingOwnsEveryRentedJob(t *testing.T) {
 	o := hostOwner(t, "published-machine-routing")
-	_, problem := o.store.Activate(records.PackageInstall{ID: "published-local-install", Package: "alice/ops", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir(), Platform: "linux-x86_64"})
+	_, problem := o.store.Activate(records.PackageInstall{ID: "published-local-install", Package: "alice/ops", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Hub: o.cfg.HubURL, Dir: t.TempDir(), Platform: "linux-x86_64"})
 	fatal(t, problem)
 	fatal(t, o.store.RecordRental(records.Rental{ID: "rental-pinned", MachineName: "otter", SKU: "cpu", AcceleratorModel: "CPU", State: "ready", Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1", AcceleratorCount: 1, HourlyRateUSDMicros: 1}))
 	const bearer = "published-machine-routing-fixture"

@@ -32,13 +32,15 @@ func (s *Server) resolveDescribedCall(raw json.RawMessage, kind string, out orch
 	if problem := validateInputs(entry, &out); problem != nil {
 		return out, nil, problem
 	}
-	// Model choice syntax remains validated here; the selected package on the machine
-	// owns whether each choice names an actual model parameter of its callable.
+	// Manifest syntax and duplicate overrides remain validated here; the selected
+	// package on the machine owns whether each choice names an actual model parameter.
 	if _, problem := orchestrator.ModelChoices(records.Request{Package: out.Package, Entrypoint: out.Entrypoint}, out.Models); problem != nil {
 		return out, nil, problem
 	}
 	out.PlanID, out.Release, out.InstallID = "", "", ""
-	out.Outputs = launch.OutputSlots(entry.Result)
+	if len(out.Outputs) == 0 {
+		out.Outputs = launch.OutputSlots(entry.Result)
+	}
 	out.NeedsAccelerator = len(entry.Models) > 0
 	if entry.Accelerator != nil {
 		out.NeedsAccelerator = *entry.Accelerator
@@ -55,6 +57,15 @@ func (s *Server) resolveDescribedCall(raw json.RawMessage, kind string, out orch
 	}
 	if problem := s.deriveOutputExport(entry, &out); problem != nil {
 		return out, nil, problem
+	}
+	// The selected release can acquire new output fields after this description.
+	// Product frames from Runtime own the actual outputs; retain their destination
+	// even when this advisory schema is scalar-only, without creating a directory.
+	if out.OutputExport == nil {
+		out.OutputExport, problem = s.outputExportIntent(&out)
+		if problem != nil {
+			return out, nil, problem
+		}
 	}
 	return out, entry, nil
 }
