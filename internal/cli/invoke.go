@@ -343,13 +343,14 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package:         target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, Rental: managedRental,
-		RentalRequired:  ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "",
-		RentNew:         ctx.Inv.Bool("--rent-new"),
-		RequestedRental: selectedRental,
-		Models:          models,
-		OutputDirectory: outputDirectory,
-		AttentionKernel: overrides.AttentionKernel,
-		Ignored:         ignored,
+		PackageInterface: target.Interface,
+		RentalRequired:   ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "",
+		RentNew:          ctx.Inv.Bool("--rent-new"),
+		RequestedRental:  selectedRental,
+		Models:           models,
+		OutputDirectory:  outputDirectory,
+		AttentionKernel:  overrides.AttentionKernel,
+		Ignored:          ignored,
 	}, key)
 	releaseSnapshotReader(target)
 	if e != nil {
@@ -2918,6 +2919,7 @@ type Target struct {
 	Function       string
 	InstallID      string
 	Release        string
+	Interface      json.RawMessage
 	Snapshot       bool
 	releaseCapture func()
 	// lease holds the resolved install until the daemon has recorded the submission.

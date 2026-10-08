@@ -56,10 +56,14 @@ Idempotency-Key: <caller's key>
 entrypoint's declared set — binding by field path is what makes a two-output result
 unswappable.
 
-`install_id` is Cozy's local, opaque exact-install selector. The CLI resolves the
-package's installed release and sends its id; the daemon verifies that the install
-belongs to `package` and records it with the request. Other clients may omit it and use
-the active package pointer.
+`install_id` is Cozy's local, opaque exact-install selector for captured local code.
+For an unversioned published invocation, the CLI supplies `package_interface`, the contract
+described by the selected machine or source Hub, and leaves `release` absent. The daemon uses
+that contract to validate public inputs and derive output exports, preserving an empty
+release in the durable request. The worker selects the package release and validates its
+actual callable and model inputs when accepting the run. Supplying this metadata requires
+the OS-protected CLI credential; it does not authorize machine outputs or pin package code.
+An explicit `release` continues to select that release.
 
 The `model`, `lane`, and `adapter` fields are reserved but not resolved by Cozy yet.
 Any non-empty value refuses as `501 override_unresolved`; it is never silently ignored.

@@ -98,7 +98,7 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 		return true, problem
 	}
 	if ctx.Inv.Value("--idempotency-key") == "" {
-		key, retryOf, problem := ingestRunKey(layout, script, rentalID)
+		key, retryOf, problem := ingestRunKey(layout, ctx.Cfg.HubURL, script, rentalID)
 		if problem != nil {
 			return true, problem
 		}
@@ -301,13 +301,13 @@ func narrowSourceToProfiles(ctx *Context, source publishSource, profiles []strin
 // one resumed on its own rental. A completed one runs again: the pod's Runtime, not this
 // script, decides the result (its version and the source's configs are in its memo key),
 // and its memo answers when nothing changed.
-func ingestRunKey(layout home.Layout, script []byte, rentalID string) (string, string, *exit.Error) {
+func ingestRunKey(layout home.Layout, origin string, script []byte, rentalID string) (string, string, *exit.Error) {
 	store, problem := records.Open(layout.DB)
 	if problem != nil {
 		return "", "", problem
 	}
 	defer store.Close()
-	digest := sha256.Sum256(script)
+	digest := sha256.Sum256(append([]byte(strings.TrimRight(origin, "/")+"\x00"), script...))
 	return store.ResumableRun("model-upload-"+hex.EncodeToString(digest[:]), rentalID, false)
 }
 
