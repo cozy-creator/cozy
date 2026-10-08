@@ -4,9 +4,16 @@ Marshal only. Every byte-level fact — hashing, canonical bytes, geometry, veri
 leases, the reader pool — comes from the extension, and `scripts/fence.py` enforces that
 this package computes none of them. What lives here is types and names.
 
+TensorFS is a library used in TensorD and Runtime's executor processes. TensorD makes
+weight sources and shared CPU buffers available and coordinates machine-wide memory
+policy. Runtime constructs models and performs GPU operations through the local plane
+and device APIs within those grants; TensorD may retain exported GPU allocation handles.
+Serialized Store content, prepared CPU buffers and GPU tensors have distinct lifetimes.
+
 The default inference reader returns owned Torch tensors (install `tensorfs[torch]`).
 Torch loads only when tensor access is requested. Storage and metadata remain lightweight.
-The lower-level read interface still fills caller-owned buffers::
+The following standalone Store example fills caller-owned buffers. Managed Runtime uses
+owner-supplied sources and buffers instead of opening the managed Store::
 
     import torch, tensorfs
 

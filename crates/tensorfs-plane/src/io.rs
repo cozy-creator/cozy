@@ -73,8 +73,9 @@ impl Fds {
 
 /// Where a weight set's bytes come from when its plane fills them: a TensorFS read lease (the
 /// GC hold and the verified door) with descriptors opened through the store's verification;
-/// or object files a machine verified and handed over (`files`: a plane-only executor reads
-/// only those); or nothing, for a sealed layout that holds every byte (`sealed`).
+/// or verified object files supplied by the owner (`files`: a managed Runtime executor
+/// reads only those granted files); or nothing, for a sealed CPU layout that holds every
+/// byte (`sealed`). Source access does not construct a model or make a GPU tensor.
 pub struct Source {
     #[cfg(feature = "store")]
     lease: RwLock<Option<ReadLease>>,

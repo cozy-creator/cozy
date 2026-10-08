@@ -256,8 +256,9 @@ stream cannot drain is `Poisoned`.
 
 **Poison is latched plane-wide**: an ambiguous driver outcome (a failed unmap or rollback, an
 undrainable copy failure, a driver mapping that disagrees with the books) or a lease dropped
-unreleased makes every later call raise `Poisoned` with the first cause; the runtime replaces
-the executor. A poisoned plane never unmaps, unregisters or frees a range while it lives
+unreleased makes every later call raise `Poisoned` with the first cause. Runtime reports the
+failure and TensorD supervises replacement of the executor. A poisoned plane never unmaps,
+unregisters or frees a range while it lives
 (copies may still touch it): `ws.close()`, `cur.close()` and `p.close()` raise `Poisoned`.
 Capacity never poisons (`BudgetExceeded`, `Shortfall` leave the plane usable).
 
@@ -335,6 +336,9 @@ ws.digest                               # the layout identity both sides must sh
 
 ## Changelog
 
+- 2026-10-08 documentation clarification: distinguish stored bytes, prepared CPU buffers
+  and GPU tensors; describe TensorD's machine policy/retention and Runtime's model/device
+  operations. API version, public names and behavior are unchanged.
 - v3.5 2026-10-02: device memory across processes: `device_sharing`, `export_device`,
   `attach_device`, `ws.digest`, `shared_bytes` in device and set stats, events `exported`,
   `attached`, `detached`.

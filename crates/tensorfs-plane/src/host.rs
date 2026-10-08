@@ -1,7 +1,8 @@
 //! The pinned host tier for one weight set: a sparse memfd laid out exactly like the weight
 //! set, mapped `MAP_SHARED`. Only filled regions consume RAM; eviction punches the region's
-//! hole. The fd is the handle a Worker passes between processes: any process that adopts it
-//! sees the same bytes and the same per-region Ready words.
+//! hole. An embedding owner such as TensorD passes the fd between processes: each adopter
+//! sees the same prepared CPU bytes and the same per-region Ready words. Runtime uses those
+//! bytes to populate model tensors; the host layout itself is not a constructed model.
 //!
 //! Cross-process safety rests on two facts. Contents are immutable (content-addressed), so two
 //! processes filling one region write identical bytes. And every process that has a region
@@ -10,9 +11,11 @@
 //! to let go frees the RAM and no process ever loses pages it still registers. The kernel drops
 //! a dead holder's claims.
 //!
-//! A sealed layout (`fill_sealed`) is the machine's: filled once through the verified read
-//! path, every region Ready, then sealed so no process can write, resize or punch it. Executors
-//! adopt it read-only (`adopt_sealed`); its RAM goes when the last descriptor and mapping do.
+//! A sealed layout (`fill_sealed`) is filled through TensorFS's verified read path by its
+//! owner (TensorD in Cozy). It is sealed against new writable mappings, resizing and punching;
+//! the filler's existing mapping can finish the regions. Executors adopt it read-only
+//! (`adopt_sealed`) and wait for each region's Ready state. Its CPU RAM goes when the last
+//! descriptor and mapping do; GPU allocations have separate lifetimes.
 //!
 //! A streamed layout (`window::open_window`) is a sealed memfd too, for a weight set larger than
 //! the host may hold: a few slots, each holding whichever region its machine staged there, and
@@ -166,7 +169,7 @@ fn reopen_as(fd: RawFd, access: libc::c_int) -> Result<OwnedFd> {
 }
 
 /// A claim on every region of the memfd behind `fd` for a process that keeps a tier without
-/// a plane (the Worker between executors): a new description holding one shared OFD lock over
+/// a plane (for example, TensorD between executors): a new description holding one shared OFD lock over
 /// the whole file. While it is held, no plane punches any region (an eviction there only ends
 /// that plane's claim). End it with `release_hold`, which punches what no plane claims; merely
 /// closing it leaves those regions resident until the memfd's last descriptor and mapping go.
@@ -280,7 +283,7 @@ impl HostMem {
         Self::adopt_owned(reserved, layout, false, true)
     }
 
-    /// Adopt a memfd another process (the Worker) created. Reopening through /proc gives this
+    /// Adopt a memfd another process (such as TensorD) created. Reopening through /proc gives this
     /// process its own open file description, so its OFD locks conflict with other holders'
     /// (a dup or an inherited fd would share theirs).
     pub fn adopt(fd: RawFd, layout: &Layout) -> Result<HostMem> {

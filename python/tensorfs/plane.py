@@ -1,6 +1,9 @@
 """The weight plane (`crates/tensorfs-plane/API.md`), compiled in `tensorfs._ext.plane`.
 
-Typed in `plane.pyi`. The plane moves bytes; cozy-runtime decides.
+Typed in `plane.pyi`. TensorD coordinates machine-wide memory policy and shared weight
+lifetimes. Runtime constructs models and uses the plane/device APIs for GPU allocation,
+copies and mappings within TensorD's grants. The library also supplies TensorD's shared
+CPU-buffer mechanisms; it is not a separate daemon or policy authority.
 """
 
 from typing import TYPE_CHECKING
@@ -31,7 +34,8 @@ from ._ext.plane import (
     reserve,
 )
 
-# Store-backed sources and the machine's fill exist only in the full build.
+# Store-backed sources and owner-side CPU fills use the native store feature, enabled
+# in every supported Python wheel. Managed executor access still requires supplied sources.
 if TYPE_CHECKING or _STORE:
     from ._ext.plane import Source, fill_sealed
 

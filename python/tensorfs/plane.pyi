@@ -1,5 +1,9 @@
 """The weight plane: pinned host tier, per-GPU VMM arenas, copy streams, streaming cursors.
 
+TensorD coordinates machine-wide budgets and shared-buffer/handle retention. Runtime
+constructs models and performs GPU allocation, copies and mappings through this local
+library within those grants. A prepared CPU layout is distinct from a GPU tensor.
+
 The contract is `crates/tensorfs-plane/API.md`. `scripts/stub_conform.py` holds this stub
 against the compiled `tensorfs._ext.plane`, name for name and parameter for parameter. The
 TypedDicts describe returned rows only; they do not exist at runtime.
@@ -270,9 +274,10 @@ class Plane:
         fd: int,
         files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
-        """A weight set over a sealed layout (`fill_sealed`, or one its machine is still filling:
-        each region is used once Ready): no store, no fill, no punch. A region the machine did
-        not stage copies from `files` (`(sha256, length, fd)` per verified object file)."""
+        """Adopt the owner's shared CPU layout (`fill_sealed`, possibly still filling),
+        using each region once Ready. This opens no Store and neither fills nor reclaims
+        that CPU layout. Regions not staged there copy from the granted `files`
+        (`(sha256, length, fd)` per verified object file). GPU operations run in this plane."""
     def set_vram_budget(self, device: int, nbytes: int) -> Trim: ...
     def set_pinned_budget(self, nbytes: int) -> Trim: ...
     def want(
@@ -360,7 +365,8 @@ def fill_sealed(
     reserved: int | None = None,
     staged: Sequence[int] | None = None,
 ) -> tuple[int, SealedFill]:
-    """Fill a weight set's layout through the verified read path and seal it; CONSUMES `lease`.
+    """Prepare a shared CPU layout through verified reads and seal it; CONSUMES `lease`.
+    This is an owner-side byte operation, not Python model construction or a GPU transfer.
     Returns the sealed memfd (the caller's) and each read mode's bytes. `staged`: only those
     regions, the rest holes an adopter reads from object files."""
 

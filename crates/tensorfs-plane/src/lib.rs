@@ -1,7 +1,13 @@
-//! tensorfs-plane: the weight plane. It owns pinned host memory and GPU memory and executes
-//! fills, prefetch, eviction and streaming exactly as its one client (cozy-runtime's policy)
-//! directs. It never measures free memory, never chooses among equals, never reorders a
-//! schedule. `tensorfs-core` supplies verified bytes and stays CUDA-free.
+//! tensorfs-plane: memory and transfer mechanisms used in the calling process.
+//! In Cozy, TensorD coordinates machine-wide budgets and retention and uses TensorFS to
+//! prepare shared CPU weight buffers. Runtime constructs models and drives GPU allocation,
+//! copies, mapping and unmapping through the plane/device APIs within those grants.
+//! TensorD can retain exported GPU allocation handles; retaining bytes does not construct
+//! a model or perform its GPU operations. TensorFS is a library on both sides, not a daemon.
+//!
+//! A plane applies caller-supplied budgets, regions and priorities for fills, prefetch,
+//! eviction and streaming. It does not measure free memory or reorder the caller's schedule.
+//! `tensorfs-core` supplies verified serialized bytes and metadata and stays CUDA-free.
 
 pub mod cuda;
 pub mod cursor;

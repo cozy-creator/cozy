@@ -27,8 +27,8 @@ The word *weights* spans three representations with different lifetimes:
 TensorD's source and buffer delivery makes model data available. Runtime still constructs
 the model, binds its parameters and executes it. TensorD can request executor preparation
 or prefetch that includes GPU work; those device operations still run in Runtime.
-TensorFS implements the storage, layout,
-read and memory operations in whichever process calls the library; it is not another
+TensorFS implements storage, layout, read and memory operations in whichever process
+calls the library; it is not another
 machine-wide policy authority. See the [weight-plane contract](../crates/tensorfs-plane/API.md).
 
 Constructing a managed Runtime model requires the machine's existing `model_sources` offer.
