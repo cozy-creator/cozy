@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -44,6 +46,32 @@ func TestNamedRentalKeepsConfiguredHubDespiteCachedInstall(t *testing.T) {
 		"model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--rental=tessa", "--json")
 	if request == nil || request.Hub != selected || request.RequestedRental != "pr-selected" {
 		t.Fatalf("configured package Hub and selected machine did not survive submission: %+v\n%s", request, out)
+	}
+}
+
+// A published install from another Hub is never converted into an implicit local source.
+func TestForeignPublishedInstallDoesNotSatisfyMissingSelectedPackage(t *testing.T) {
+	root, _, _, _, _ := runModelCatalog(t)
+	original := configuredHub(t, root)
+	installedHere(t, root, original, "proof/quantize", "1.0.0")
+	var reads atomic.Int32
+	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
+			reads.Add(1)
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"package.not_found","message":"no package at this Hub"}}`))
+	}))
+	defer missing.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+missing.URL+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	fatal(t, store.RecordRental(records.Rental{ID: "pr-old-hub", MachineName: "tessa", State: "ready",
+		Hub: original, AcceleratorModel: "CPU", AcceleratorCount: 1, Address: "127.0.0.1:1", CertPath: "unused", HourlyRateUSDMicros: 100_000}))
+	code, out := runCozy(t, root, "run", "proof/quantize/quantize", "--rental=tessa", "--describe", "--json")
+	if code == 0 || !strings.Contains(out, "package.not_found") || reads.Load() == 0 {
+		t.Fatalf("foreign install satisfied a missing package instead of consulting the selected Hub [exit %d]\n%s", code, out)
 	}
 }
 
@@ -115,7 +143,7 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 		fatal(t, problem)
 		link, problem := store.MachineExecution(request.ID)
 		fatal(t, problem)
-		if request.Hub != source.server.URL || request.RequestedRental != parityRental || link == nil || link.MachineID != parityRental || !link.Collected {
+		if request.Release != "" || request.Hub != source.server.URL || request.RequestedRental != parityRental || link == nil || link.MachineID != parityRental || !link.Collected {
 			t.Fatalf("source or machine changed: request=%+v link=%+v", request, link)
 		}
 	}
@@ -143,6 +171,45 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	// Static credentials are origin-bound; this source's machine key authorizes the override.
 	fixtureExecutionAccess(t, root, source.server, source.worker.Config.Handler)
 	run("source-explicit", "--tensorhub=source")
+
+	// The machine already holds this package, but a different selected Hub has none.
+	missing := newMachineHub(t)
+	var missingReads atomic.Int32
+	missingCatalog := missing.worker.Config.Handler
+	missing.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/packages/"+parityPublished) {
+			missingReads.Add(1)
+		}
+		missingCatalog.ServeHTTP(w, r)
+	})
+	configure(missing.server.URL)
+	if code, out := runCozy(t, root, "run", parityPublished+"/add", "value=41", "--rental=tessa", "--await", "--json"); code == 0 || missingReads.Load() == 0 {
+		t.Fatalf("the machine reused another Hub's package when its selected source had none [exit %d, source reads %d]\n%s", code, missingReads.Load(), out)
+	}
+
+	// Identical package/version spelling at another source means different code and interface.
+	other := newMachineHub(t)
+	project := parityProject(t)
+	codePath := filepath.Join(project, "machine_parity.py")
+	raw, err := os.ReadFile(codePath)
+	must(t, err)
+	changed := strings.ReplaceAll(string(raw), "payload.value + 1", "payload.value + 100")
+	changed = strings.ReplaceAll(changed, "def echo(", "def other_echo(")
+	must(t, os.WriteFile(codePath, []byte(changed), 0o600))
+	publishParityRelease(t, other, root, project)
+	configure(other.server.URL)
+	code, out := runCozy(t, root, "run", parityPublished+"/add", "value=41", "--rental=tessa", "--await", "--json", "--idempotency-key=other-source")
+	if code != 0 || !strings.Contains(out, `"value":141`) {
+		t.Fatalf("same package/version at another Hub reused the earlier source's code [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", parityPublished+"/other_echo", "value=41", "--rental=tessa", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":82`) {
+		t.Fatalf("same package/version at another Hub reused the earlier source's interface [exit %d]\n%s", code, out)
+	}
+	otherRequest, problem := store.RequestByIdempotencyKey("other-source")
+	fatal(t, problem)
+	if otherRequest.Release != "" || otherRequest.Hub != other.server.URL {
+		t.Fatalf("the client pinned or redirected the other source: %+v", otherRequest)
+	}
 
 	row, problem := store.RentalRow(parityRental)
 	fatal(t, problem)

@@ -2964,6 +2964,9 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	if problem != nil {
 		return Target{}, nil, problem
 	}
+	if remoteRun(ctx) && !strings.HasPrefix(target.Package, "local/") && ctx.Inv.Value("--warm") == "" {
+		return remoteInvocationTarget(ctx, target)
+	}
 	// An installed package is validated against its installed interface with no hub read;
 	// the machine that runs it prepares that release itself.
 	facts, lease, problem := leasedInstallFacts(ctx, target.Package)
@@ -2996,6 +2999,34 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 		target.Release = release
 		return target, surface, nil
 	}
+	return catalogInvocationTarget(ctx, target)
+}
+
+// remoteInvocationTarget gets an advisory input schema from the selected machine. A
+// bare published invocation carries no release selection: the machine resolves its
+// actual release from this request's Hub when it prepares execution. A machine still
+// booting can use that Hub's catalog schema so accepting work does not require readiness.
+func remoteInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
+	_, surface, problem := describeOnMachine(ctx, target.Package)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	if surface == nil {
+		target, surface, problem = catalogInvocationTarget(ctx, target)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+	}
+	target.Release = ""
+	target.Interface = surface.Raw
+	return target, surface, nil
+}
+
+// catalogInvocationTarget reads schema metadata only from the configured Hub. Remote
+// callers discard its release selection before submission; it remains useful for local
+// pinned installations and for reading their results.
+func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
+	root := home.Paths(ctx.Cfg.Home).Root
 	ref, problem := hub.ParseRef(target.Package)
 	if problem != nil {
 		return Target{}, nil, problem
