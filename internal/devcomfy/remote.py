@@ -77,6 +77,7 @@ def serve(root):
         try:
             result = module.observe(**payload, directory=root / "checkpoint",
                                     deadline=time.monotonic() + remaining + 1,
+                                    require_existing_state=request.get("observer_attempts", 0) > 1,
                                     check_cancelled=lambda: None)
         except Exception as exc:
             result = {"status": "failed", "detail": f"{type(exc).__name__}: {exc}",
@@ -139,6 +140,12 @@ def dispatch(request):
                 return {"status": "prepared", "prompt_id": status(root).get("prompt_id", "")}
             state = status(root)
             if state["status"] == "observer_stopped":
+                held = json.loads(path.read_text())
+                attempted = held.get("observer_attempts", 0)
+                if (attempted or (root / "process.json").exists()) and not (root / "checkpoint/state.json").is_file():
+                    raise ValueError("Original submission checkpoint is missing; no new Comfy submission sent")
+                held["observer_attempts"] = attempted + 1
+                atomic(path, held)  # A crash before process.json is still a prior attempt.
                 # A resumed observer reads the original durable post_attempted
                 # marker. A lost POST acknowledgement can never POST again.
                 with (root / "observer.log").open("ab") as log:

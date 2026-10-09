@@ -113,6 +113,7 @@ def observe(
     deadline: float,
     check_cancelled: Callable[[], None],
     expected_steps: int = 8,
+    require_existing_state: bool = False,
 ) -> dict[str, Any]:
     if type(expected_steps) is not int or expected_steps not in (8, 30):
         raise ValueError("H3 trace expects exactly8 Turbo or30 regular denoising steps")
@@ -142,6 +143,8 @@ def observe(
         if state["fingerprint"] != fingerprint:
             raise ValueError("A resumed observer cannot change its submitted graph or server")
     else:
+        if require_existing_state:
+            raise ValueError("Original submission checkpoint is missing; no new Comfy submission sent")
         state = {
             "fingerprint": fingerprint,
             "prompt_id": str(uuid.uuid4()),

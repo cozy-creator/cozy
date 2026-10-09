@@ -172,6 +172,19 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(result["prompt_id"], self.posts[0]["prompt_id"])
 
+    def test_missing_submission_checkpoint_after_acceptance_never_posts_again(self):
+        remote.dispatch(self.request)
+        self.wait(lambda: self.posts)
+        owner = self.query()["process"]
+        os.kill(owner["pid"], signal.SIGTERM)
+        self.wait(lambda: remote.identity(owner["pid"]) is None)
+        root = self.root / "state" / ("a" * 64)
+        (root / "checkpoint/state.json").unlink()
+        (root / "process.json").unlink()  # Only the pre-spawn durable attempt marker remains.
+        with self.assertRaisesRegex(ValueError, "checkpoint is missing"):
+            remote.dispatch(self.request)
+        self.assertEqual(len(self.posts), 1)
+
     def test_completed_replay_never_resubmits_and_fetch_refuses_unknown_path(self):
         self.history_ready.set()
         remote.dispatch(self.request)
