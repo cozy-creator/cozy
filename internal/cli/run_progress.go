@@ -140,7 +140,7 @@ func (f stepFacts) countLabel() string {
 		return " · " + output.Bytes(f.current) + " / " + output.Bytes(f.total)
 	}
 	if f.scoped {
-		return fmt.Sprintf(" · step %d/%d", f.current, f.total)
+		return fmt.Sprintf(" · %d/%d", f.current, f.total)
 	}
 	return fmt.Sprintf(" %d/%d", f.current, f.total)
 }
@@ -157,11 +157,14 @@ func (f stepFacts) timing() string {
 		}
 		return line
 	}
-	if !f.counted || f.perStep <= 0 {
+	if !f.counted || !f.hasStageETA {
 		return ""
 	}
-	remaining := time.Duration(float64(f.total-f.current) * f.perStep * float64(time.Second))
-	return fmt.Sprintf(" · %.2fs/step avg · ETA ~%s", f.perStep, shortDuration(remaining))
+	line := ""
+	if f.stageEstimate.Rate > 0 {
+		line = fmt.Sprintf(" · %.2fs/unit", 1/f.stageEstimate.Rate)
+	}
+	return line + " · ETA ~" + shortDuration(time.Duration(f.stageEstimate.RemainingMS)*time.Millisecond)
 }
 
 func phaseRows(fields map[string]any) []string {

@@ -815,8 +815,11 @@ type Lifecycle struct {
 	OverallFraction  *float64              `json:"overall_fraction,omitempty"`
 	Position         *int64                `json:"position,omitempty"`
 	Total            *int64                `json:"total,omitempty"`
-	RemainingMS      *int64                `json:"remaining_ms,omitempty"`
-	StepMS           *float64              `json:"step_ms,omitempty"`
+	// RemainingMS is read-only compatibility with older daemons; future-stage time is unknown.
+	RemainingMS *int64 `json:"remaining_ms,omitempty"`
+	// StageRemainingMS estimates only the current counted stage; later stages are unknown.
+	StageRemainingMS *int64   `json:"stage_remaining_ms,omitempty"`
+	StepMS           *float64 `json:"step_ms,omitempty"`
 	// ProgressUnit names what Position and Total count ("bytes" for a transfer or
 	// conversion stage); ProgressRate is that unit per second, as Runtime measured it.
 	ProgressUnit string   `json:"progress_unit,omitempty"`
@@ -1258,15 +1261,19 @@ func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
 	if life.MachineExecution == nil {
 		return
 	}
-	value, problem := s.store.LatestMachineProgress(row.ID, int64(life.Attempt))
-	if problem != nil {
+	samples, problem := s.store.MachineProgressSamples(row.ID, int64(life.Attempt))
+	if problem != nil || len(samples) == 0 {
 		return
 	}
-	progress, ok := orchestrator.DecodeProgressSnapshot(value)
+	progress, ok := orchestrator.DecodeProgressSnapshot(samples[0])
 	if !ok {
 		return
 	}
-	progress.RemainingMS, progress.Estimated = s.store.MachineProgressEstimate(row.ID, int64(life.Attempt))
+	var previous orchestrator.ProgressSnapshot
+	if len(samples) > 1 {
+		previous, _ = orchestrator.DecodeProgressSnapshot(samples[1])
+	}
+	estimate, estimated := progress.EstimateStage(previous)
 	life.OverallFraction = progress.OverallFraction
 	if life.Status == "in_progress" {
 		life.ProgressStage = progress.Stage
@@ -1275,8 +1282,8 @@ func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
 		life.Total = progress.Total
 		life.StepMS = progress.StepMS
 		life.ProgressUnit, life.ProgressRate = progress.Unit, progress.Rate
-		if progress.Estimated {
-			life.RemainingMS = &progress.RemainingMS
+		if estimated {
+			life.StageRemainingMS = &estimate.RemainingMS
 		}
 	}
 }

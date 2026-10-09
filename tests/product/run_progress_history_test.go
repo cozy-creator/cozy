@@ -58,10 +58,11 @@ func TestLiveProgressKeepsFinishedStagesAndMeasuredRates(t *testing.T) {
 	// Reported within one frame, conditioning may be a sibling of denoising; denoising
 	// reporting again, with conditioning silent, makes them a sequence.
 	p.On(liveEvent("progress", map[string]any{"stage": "denoise"}))
-	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 5, "total": 30, "step_ms": 15000}))
+	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 4, "total": 30, "step_ms": 15000, "sample_unix_ms": 60000}))
+	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 5, "total": 30, "step_ms": 15000, "sample_unix_ms": 75000}))
 	at := time.Now()
 	denoise := liveFrame(p, at)
-	for _, want := range []string{"✓ conditioning", "▸ denoising", "step 5/30", "15.00s/step avg", "ETA ~6m15s"} {
+	for _, want := range []string{"✓ conditioning", "▸ denoising", "5/30", "15.00s/unit", "ETA ~6m15s"} {
 		if !strings.Contains(denoise, want) {
 			t.Fatalf("denoising display lacks %q: %q", want, denoise)
 		}
@@ -75,8 +76,8 @@ func TestLiveProgressKeepsFinishedStagesAndMeasuredRates(t *testing.T) {
 	if got := liveFrame(p, at); got != denoise {
 		t.Fatalf("old lifecycle events replaced the live stage: %q", got)
 	}
-	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 5, "total": 30, "step_ms": 90000}))
-	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 6, "total": 30, "step_ms": 15000}))
+	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 5, "total": 30, "step_ms": 90000, "sample_unix_ms": 75000}))
+	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 6, "total": 30, "step_ms": 15000, "sample_unix_ms": 90000}))
 	if got := liveFrame(p, time.Now()); !strings.Contains(got, "ETA ~6m0s") {
 		t.Fatalf("duplicate step biased measured ETA: %q", got)
 	}

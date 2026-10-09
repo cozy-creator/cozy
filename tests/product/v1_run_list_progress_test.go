@@ -75,7 +75,7 @@ func TestRunListShowsTheMachinesLastProgress(t *testing.T) {
 	store = open()
 	report(store, 2, nil)
 	store.Close()
-	if row = list(); row.ProgressStage != "" || row.OverallFraction != nil || row.StageFraction != nil {
+	if row = list(); row.ProgressStage != "" || row.OverallFraction != nil || row.StageFraction != nil || row.StageRemainingMS != nil {
 		t.Fatalf("a retried attempt took the last one's progress: %+v", row)
 	}
 	store = open()
