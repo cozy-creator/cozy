@@ -79,3 +79,18 @@ func foreignPackageRemoval(ctx *Context, inst records.PackageInstall) *exit.Erro
 	}
 	return problem.WithRemedy("the installation came from %s; explicitly use --tensorhub=%s to remove it", inst.Hub, ctx.Cfg.HubLabel(inst.Hub))
 }
+
+// Put selected-Hub packages before diagnostic local captures and the list's row
+// cap. Preserve the existing alphabetical order within each source scope.
+func installHubPriority(ctx *Context, inst records.PackageInstall) int {
+	switch installHubScope(ctx, inst) {
+	case "selected hub":
+		return 0
+	case "other hub":
+		return 1
+	case "local":
+		return 2
+	default:
+		return 3
+	}
+}
