@@ -18,9 +18,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// A multi-lane model input resolves at the CLI (th-241): the authored default's ladder with
-// its rung bound to the card's bf16 checkpoint, an explicit override to the fp32 lane's. The
-// actual CPU machine then downloads real TensorFS objects, reading no model at the Hub, and
+// A multi-lane model input keeps its lane: the authored default's ladder picks bf16 and an
+// explicit override fp32. The run names them (th-245); the actual CPU machine resolves each
+// release lane with the Hub's closure, anonymously, downloads real TensorFS objects and
 // executes a job that never loads the Model. This complements the serving-wire regression
 // without claiming accelerator serving qualification.
 func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *testing.T) {
@@ -40,7 +40,7 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 		}
 	}
 	var mu sync.Mutex
-	var machineReads []string
+	var machineReads, asked []string
 	var access *fakeHubAccess
 	digest := "sha256:" + manifestRef["sha256"].(string)
 	card, err := json.Marshal(map[string]any{"model": map[string]string{"org": "proof", "name": "probe"},
@@ -65,7 +65,12 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 		case strings.HasPrefix(r.URL.Path, "/v1/models/proof/probe/releases/1.0.0/lanes/") && strings.HasSuffix(r.URL.Path, "/manifest"):
 			_, _ = w.Write(manifest) // the CLI sizes a pinned job input by its manifest
 		case r.URL.Path == "/v1/tensorfs/closure":
-			encode(map[string]any{"complete": true, "model": "proof/probe", "release": "1.0.0", "lane": "bf16", "manifest": manifestRef, "objects": closure, "presign_max_digests": 64, "scope": "runtime"})
+			var named struct{ Ref, Lane string }
+			_ = json.NewDecoder(r.Body).Decode(&named)
+			mu.Lock()
+			asked = append(asked, named.Ref+" "+named.Lane)
+			mu.Unlock()
+			encode(map[string]any{"complete": true, "model": "proof/probe", "release": "1.0.0", "lane": named.Lane, "manifest": manifestRef, "objects": closure, "presign_max_digests": 64, "scope": "runtime"})
 		case r.URL.Path == "/v1/tensorfs/presign":
 			var asked struct{ Digests []string }
 			_ = json.NewDecoder(r.Body).Decode(&asked)
@@ -136,5 +141,9 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 	defer mu.Unlock()
 	if len(machineReads) == 0 || slices.ContainsFunc(machineReads, func(read string) bool { return !strings.HasSuffix(read, " ") }) {
 		t.Fatalf("the machine's content reads are absent or carried a credential: %q", machineReads)
+	}
+	if !slices.Contains(asked, "proof/probe@1.0.0 bf16") || !slices.Contains(asked, "proof/probe@1.0.0 fp32") ||
+		slices.ContainsFunc(asked, func(ref string) bool { return strings.HasPrefix(ref, "proof/probe@sha256:") }) {
+		t.Fatalf("the machine did not resolve each lane by name: %q", asked)
 	}
 }

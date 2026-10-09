@@ -57,6 +57,8 @@ type machineHub struct {
 	// hubAccess answers the account routes a run's Hub access takes, and a machine's trade of
 	// its run capability where it reads the Hub.
 	hubAccess *fakeHubAccess
+	// closures are the refs and lanes machines asked the Hub's closure for, in order.
+	closures []string
 }
 
 func newMachineHub(t *testing.T) *machineHub {

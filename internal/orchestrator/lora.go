@@ -30,29 +30,23 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*v1.ModelChoice
 		choice := &v1.ModelChoice{Parameter: parameter, Repository: model.Model,
 			Release: model.Release, Lane: model.Lane, Source: model.Source,
 			Profiles: model.Profiles, Adapters: downloadAdapters(model.Adapters)}
-		// Exact for the machine (th-241): it resolves nothing at a Hub. A pinned checkpoint, or
-		// the binding's ladder with every rung's checkpoint, of which the machine takes the
-		// widest its GPUs fit.
+		// Names for the machine (th-245): it resolves the release and lane at the Hub. A hash
+		// travels only for a checkpoint by hash: the owner's at the Hub, or one the machine holds.
 		switch {
 		case model.Source != "":
-		case model.Manifest != "":
+		case model.Release == "" && model.Manifest != "":
 			digest, err := canonical.Raw(model.Manifest)
 			if err != nil {
 				return nil, exit.Named(exit.Validation, "model.manifest_invalid", "%s names no exact manifest", path)
 			}
 			choice.Manifest, _ = canonical.Spell(digest)
 			choice.ManifestLength = uint64(max(model.ManifestLength, 0))
-		case len(model.Ladder) > 0:
+		case model.Model == "":
+			return nil, exit.Named(exit.Internal, "model.choice_unresolved", "%s reached its machine with no model", path)
+		case model.Lane == "":
 			for _, rung := range model.Ladder {
-				digest, err := canonical.Raw(rung.Manifest)
-				if err != nil {
-					return nil, exit.Named(exit.Validation, "model.manifest_invalid", "a rung of %s names no exact manifest", path)
-				}
-				manifest, _ := canonical.Spell(digest)
-				choice.Rungs = append(choice.Rungs, &v1.ModelRung{Gpu: rung.GPU, Gpus: uint32(max(rung.GPUs, 0)), Lane: rung.Lane, Manifest: manifest})
+				choice.Rungs = append(choice.Rungs, &v1.ModelRung{Gpu: rung.GPU, Gpus: uint32(max(rung.GPUs, 0)), Lane: rung.Lane})
 			}
-		default:
-			return nil, exit.Named(exit.Internal, "model.choice_unresolved", "%s reached its machine with no exact checkpoint", path)
 		}
 		out = append(out, choice)
 	}
@@ -68,7 +62,11 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*v1.ModelChoice
 func downloadAdapters(adapters []records.ModelAdapterRef) []*v1.Adapter {
 	out := make([]*v1.Adapter, 0, len(adapters))
 	for _, a := range adapters {
-		out = append(out, &v1.Adapter{Component: a.Component, Model: a.Model, Release: a.Release, Lane: a.Lane, Manifest: a.Manifest, Scale: a.Scale, Source: a.Source, Profiles: a.Profiles})
+		adapter := &v1.Adapter{Component: a.Component, Model: a.Model, Release: a.Release, Lane: a.Lane, Scale: a.Scale, Source: a.Source, Profiles: a.Profiles}
+		if a.Release == "" {
+			adapter.Manifest = a.Manifest
+		}
+		out = append(out, adapter)
 	}
 	return out
 }

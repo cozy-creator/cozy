@@ -459,6 +459,11 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		// Only unpublished code names its owner: its org-relative defaults are the owner's.
 		spec.Owner = m.runAccount(request)
 	}
+	revision, problem := m.store.BindingRevision(m.context.forHub(request.Hub).Cfg.HubURL)
+	if problem != nil {
+		return nil, problem
+	}
+	spec.CatalogRevision = revision
 	if problem := m.writeTreesV1(ctx, request, machine, spec); problem != nil {
 		return nil, problem
 	}
@@ -485,11 +490,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 			m.submissionStage(request.ID, "package", revision.Package, began)
 		}
 	} else {
-		release, problem := m.releaseV1(ctx, request.Hub, request.Package, request.Release, machine)
-		if problem != nil {
-			return nil, problem
-		}
-		spec.Source = &v1.RunSpec_Release{Release: release}
+		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: request.Package, Release: request.Release}}
 	}
 	began = time.Now()
 	for _, asset := range request.Assets {
@@ -545,10 +546,8 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	return spec, nil
 }
 
-// modelChoicesV1 are a run's model choices as a v1 spec names them.
-// runModels are every model choice a run's machine needs (th-241: it resolves nothing at a
-// Hub): the run's own and, for a run that composes children, its callees' bindings, every rung
-// resolved here.
+// runModels are every model choice a run's machine needs: the run's own and, for a run that
+// composes children, its callees' bindings, each sent by name (th-245).
 //
 // The callees' bindings are kept under the catalog revision, as the run's own are
 // (exactRunModels): a warm run reads nothing at any Hub.
@@ -590,13 +589,14 @@ func (m *machineRuns) childModels(request records.Request) ([]records.ModelRef, 
 	return children, problem
 }
 
+// modelChoicesV1 are a run's model choices as a v1 spec names them.
 func modelChoicesV1(request records.Request, models []records.ModelRef) ([]*v1.ModelChoice, *exit.Error) {
 	return orchestrator.ModelChoices(request, models)
 }
 
 // warmSetV1 is the machine's warm set with the selection's member added, changed or (`off`)
 // removed; the other members are sent back as the machine reported them.
-func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection, release *v1.Release) (*v1.WarmSet, *exit.Error) {
+func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection) (*v1.WarmSet, *exit.Error) {
 	set := &v1.WarmSet{}
 	for _, item := range current {
 		if item.GetRelease().GetPackage() == selection.Package && item.GetEntrypoint() == selection.Entrypoint {
@@ -616,9 +616,7 @@ func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection,
 	if problem != nil {
 		return nil, problem
 	}
-	if release == nil {
-		release = &v1.Release{Package: selection.Package, Release: selection.Release}
-	}
+	release := &v1.Release{Package: selection.Package, Release: selection.Release}
 	set.Items = append(set.Items, &v1.WarmItem{Source: &v1.WarmItem_Release{Release: release},
 		Entrypoint: selection.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1)})
 	return set, nil
@@ -655,11 +653,10 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		origin = machine.Account.Base()
 	}
 	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_WARM, WeightsDestination: selection.Destination}
-	var release *v1.Release
-	if selection.Package != "" && !strings.HasPrefix(selection.Package, "local/") {
-		if release, problem = m.releaseV1(ctx, origin, selection.Package, selection.Release, machine); problem != nil {
-			return nil, problem
-		}
+	// Resolved under the same key as this computer's calls (owner, catalog revision), so a call
+	// after a warm run reuses its preparation.
+	if spec.CatalogRevision, problem = m.store.BindingRevision(m.context.forHub(origin).Cfg.HubURL); problem != nil {
+		return nil, problem
 	}
 	if strings.HasPrefix(selection.Package, "local/") {
 		// Only unpublished code names its owner, as a call of it does: the same preparation key.
@@ -673,17 +670,21 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			return nil, exit.Named(exit.Structural, "machine.warm_set_unsupported",
 				"this machine keeps no warm set; %s", machines.RuntimeUpdate(row.RentalID))
 		}
-		if spec.Set, problem = warmSetV1(frame.GetWarm(), selection, release); problem != nil {
+		if spec.Set, problem = warmSetV1(frame.GetWarm(), selection); problem != nil {
 			return nil, problem
 		}
 		selection.Models = nil
-	} else if release != nil {
-		spec.Source = &v1.RunSpec_Release{Release: release}
+	} else if selection.Package != "" && !strings.HasPrefix(selection.Package, "local/") {
+		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}}
 	}
 	for _, model := range selection.Models {
-		spec.Models = append(spec.Models, &v1.ModelChoice{Parameter: either(model.Slot, model.Model), Repository: model.Model,
-			Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, ManifestLength: uint64(max(model.ManifestLength, 0)),
-			Source: model.Source, Profiles: model.Profiles})
+		choice := &v1.ModelChoice{Parameter: either(model.Slot, model.Model), Repository: model.Model,
+			Release: model.Release, Lane: model.Lane, Source: model.Source, Profiles: model.Profiles}
+		if model.Release == "" {
+			// By hash: the owner's checkpoint at the Hub, or one the machine holds (th-245).
+			choice.Manifest, choice.ManifestLength = model.Manifest, uint64(max(model.ManifestLength, 0))
+		}
+		spec.Models = append(spec.Models, choice)
 	}
 	owner := ""
 	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
@@ -731,43 +732,6 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			return json.RawMessage(outcome.Result), nil
 		}
 	}
-}
-
-// releaseV1 is a published release as a machine installs it reading no Hub (th-241): its card
-// (package interface and Python version) and its locked requirements, written to the machine
-// as an object. No release named is the Hub's newest.
-func (m *machineRuns) releaseV1(ctx context.Context, origin, pkg, release string, machine *machines.V1) (*v1.Release, *exit.Error) {
-	account := client(m.context.forHub(origin))
-	ref, problem := hub.ParseRef(pkg)
-	if problem != nil {
-		return nil, problem
-	}
-	if release == "" {
-		card, problem := account.PackageCard(ctx, ref)
-		if problem != nil {
-			return nil, problem
-		}
-		if release, problem = newestPackageRelease(card.Releases); problem != nil {
-			return nil, problem
-		}
-	}
-	detail, problem := account.PackageRelease(ctx, ref, release)
-	if problem != nil {
-		return nil, problem
-	}
-	if detail.Release.Release != release || len(detail.PackageInterface) == 0 {
-		return nil, exit.Named(exit.Conflict, "rental.package_release_invalid", "Tensorhub returned no card for %s@%s", pkg, release)
-	}
-	lock, problem := account.PackageLockedRequirements(ctx, ref, release)
-	if problem != nil {
-		return nil, problem
-	}
-	object, err := machinev1.WriteBytes(ctx, machine.Machine, lock)
-	if err != nil {
-		return nil, machines.Transport(err)
-	}
-	return &v1.Release{Package: pkg, Release: release, PackageInterface: detail.PackageInterface,
-		PythonVersion: detail.PythonVersion, LockedRequirements: object.Digest}, nil
 }
 
 // writeTreesV1 writes each `--input-tree ref=dir` to the machine as writeTreeV1 does; the

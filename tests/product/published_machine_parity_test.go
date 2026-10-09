@@ -26,15 +26,14 @@ const (
 )
 
 // A published release on a known machine is one message to that machine, with the real Host
-// and Runtime on this computer's machine and on a rental. The CLI reads the release's card,
-// its lock and its published closure once per catalog revision and hands them to whichever
-// machine runs it (th-241); after that no run reads a Hub, and no machine ever reads a package.
+// and Runtime on this computer's machine and on a rental. The run names the release (th-245):
+// the CLI reads its card once per catalog revision for its own checks, each machine reads the
+// card and lock at its Hub by name once to install it, and after that no run reads a Hub.
 func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 	h, root, _, store := parityMachines(t)
 	publishParityRelease(t, h, root, parityProject(t))
 	var mu sync.Mutex
-	var seen []string
-	var machineReads []string
+	var seen, machineReads []string
 	doors := h.worker.Config.Handler
 	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
@@ -53,11 +52,13 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 		}
 		served.ServeHTTP(w, r)
 	})
+	release := "/v1/packages/" + parityPublished + "/releases/" + parityVersion
+	installs := []string{"GET " + release, "GET " + release + "/locked-requirements"}
 	carded := false
 	run := func(venue, key string, args ...string) {
 		t.Helper()
 		mu.Lock()
-		seen = nil
+		seen, machineReads = nil, nil
 		mu.Unlock()
 		idem := "published-" + venue + "-" + key
 		code, out := runCozy(t, root, append([]string{"run", parityPublished + "/add", "value=41", "--await", "--json", "--idempotency-key", idem}, args...)...)
@@ -73,21 +74,20 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 			t.Fatalf("published add on %s was not a collected execution on %s: %+v", venue, want, link)
 		}
 		mu.Lock()
-		calls := append([]string(nil), seen...)
-		if len(machineReads) != 0 {
-			t.Fatalf("a machine read a package at its Hub: %v", machineReads)
-		}
+		calls, reads := append([]string(nil), seen...), append([]string(nil), machineReads...)
 		mu.Unlock()
-		// The first run reads the release's card; the first on each machine names the Hub's
-		// account and token endpoint for its capability. Nothing else, and nothing after.
 		if key == "cold" {
 			calls = slices.DeleteFunc(calls, hubAccessCall)
+			if slices.Sort(reads); !slices.Equal(slices.Compact(reads), installs) {
+				t.Fatalf("the cold run on %s did not install the release by name: %v", venue, reads)
+			}
+		} else if len(reads) != 0 {
+			t.Fatalf("the %s run on %s read a package at its Hub: %v", key, venue, reads)
 		}
 		if !carded {
-			card := len(calls) > 0 && !slices.ContainsFunc(calls, func(call string) bool {
+			if len(calls) == 0 || slices.ContainsFunc(calls, func(call string) bool {
 				return !strings.Contains(call, " /v1/packages/"+parityPublished)
-			})
-			if !card || !slices.Contains(calls, "GET /v1/packages/"+parityPublished+"/releases/"+parityVersion+"/locked-requirements") {
+			}) {
 				t.Fatalf("the first run on %s did not read only the release's card: %v", venue, calls)
 			}
 			carded, calls = true, nil
@@ -104,8 +104,8 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 			run(venue.name, key, venue.args...)
 		}
 	}
-	// A stopped machine boots for the next run, which carries the card the CLI keeps: its
-	// startup check finds no update pending, so the run reads no Hub either.
+	// A stopped machine boots for the next run and keeps its installation: its startup check
+	// finds no update pending, so the run reads no Hub either.
 	for i := range 3 {
 		if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 			t.Fatalf("machine stop [exit %d]\n%s", code, out)
@@ -159,8 +159,8 @@ func publishParityReleaseAt(t *testing.T, h *machineHub, root, project, release 
 		"package_interface": json.RawMessage(iface), "requires_python": ">=3.12,<3.13"})
 	must(t, err)
 	releases[path+"/releases/"+release] = detail
-	// The CLI reads the release's card and locked requirements and hands them to the machine
-	// with the run (th-241); `cozy package install` reads its download plan and project index.
+	// The CLI reads the release's card for its own checks; a machine reads the card and locked
+	// requirements by name (th-245); `cozy package install` reads its download plan and project index.
 	exact := func(raw []byte) hub.ExactDocument {
 		return hub.ExactDocument{CanonicalBytes: raw, Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(raw)), Length: int64(len(raw))}
 	}
@@ -174,6 +174,14 @@ func publishParityReleaseAt(t *testing.T, h *machineHub, root, project, release 
 		Downloads: []hub.PackageInstallDownload{{Kind: "project_wheel", Path: name, Distribution: "machine-parity", Version: release,
 			Digest: fmt.Sprintf("sha256:%x", sum), Length: int64(len(wheel)), Tags: []string{"py3-none-any"}, ImportRoots: []string{"machine_parity"}}}})
 	must(t, err)
+	doors := h.worker.Config.Handler
+	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := releases[r.URL.Path]; ok && r.Method == http.MethodGet {
+			_, _ = w.Write(body)
+			return
+		}
+		doors.ServeHTTP(w, r)
+	})
 	account := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if body, ok := releases[r.URL.Path]; ok && r.Method == http.MethodGet {

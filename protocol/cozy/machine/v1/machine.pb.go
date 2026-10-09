@@ -427,16 +427,20 @@ type RunSpec struct {
 	//	*RunSpec_Release
 	//	*RunSpec_Installation
 	//	*RunSpec_Local
-	Source             isRunSpec_Source `protobuf_oneof:"source"`
-	Entrypoint         string           `protobuf:"bytes,6,opt,name=entrypoint,proto3" json:"entrypoint,omitempty"`
-	Payload            []byte           `protobuf:"bytes,7,opt,name=payload,proto3" json:"payload,omitempty"` // canonical JSON object of the function's parameters
-	Inputs             []*InputFile     `protobuf:"bytes,8,rep,name=inputs,proto3" json:"inputs,omitempty"`   // objects uploaded with Write, bound to payload fields
-	Models             []*ModelChoice   `protobuf:"bytes,9,rep,name=models,proto3" json:"models,omitempty"`
-	AttentionKernel    string           `protobuf:"bytes,12,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
-	WeightsDestination string           `protobuf:"bytes,13,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"` // org/name: a job's weights outputs, or a warm run's source model
-	Hub                *HubAccess       `protobuf:"bytes,14,opt,name=hub,proto3" json:"hub,omitempty"`                                                         // where the run reads, and its capability there
-	Owner              string           `protobuf:"bytes,15,opt,name=owner,proto3" json:"owner,omitempty"`                                                     // the account that org-relative references of local code name
-	Providers          *ProviderAccess  `protobuf:"bytes,16,opt,name=providers,proto3" json:"providers,omitempty"`                                             // provider tokens for source models, memory only like hub
+	Source     isRunSpec_Source `protobuf_oneof:"source"`
+	Entrypoint string           `protobuf:"bytes,6,opt,name=entrypoint,proto3" json:"entrypoint,omitempty"`
+	Payload    []byte           `protobuf:"bytes,7,opt,name=payload,proto3" json:"payload,omitempty"` // canonical JSON object of the function's parameters
+	Inputs     []*InputFile     `protobuf:"bytes,8,rep,name=inputs,proto3" json:"inputs,omitempty"`   // objects uploaded with Write, bound to payload fields
+	Models     []*ModelChoice   `protobuf:"bytes,9,rep,name=models,proto3" json:"models,omitempty"`
+	// The catalog revision the caller made its choices under (th-245): a held resolution is reused
+	// only under the same one, so a publish, yank, bind or retarget the caller knows of resolves
+	// once more at the Hub.
+	CatalogRevision    string          `protobuf:"bytes,10,opt,name=catalog_revision,json=catalogRevision,proto3" json:"catalog_revision,omitempty"`
+	AttentionKernel    string          `protobuf:"bytes,12,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
+	WeightsDestination string          `protobuf:"bytes,13,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"` // org/name: a job's weights outputs, or a warm run's source model
+	Hub                *HubAccess      `protobuf:"bytes,14,opt,name=hub,proto3" json:"hub,omitempty"`                                                         // where the run reads, and its capability there
+	Owner              string          `protobuf:"bytes,15,opt,name=owner,proto3" json:"owner,omitempty"`                                                     // the account that org-relative references of local code name
+	Providers          *ProviderAccess `protobuf:"bytes,16,opt,name=providers,proto3" json:"providers,omitempty"`                                             // provider tokens for source models, memory only like hub
 	// RUN_KIND_WARM (`warm/2`): the caller's whole warm set, replacing its previous one; no items
 	// clears it. The run installs and downloads every member, and its result lists each one's
 	// `level` and `held_back`. Absent: the set is left as it is.
@@ -542,6 +546,13 @@ func (x *RunSpec) GetModels() []*ModelChoice {
 		return x.Models
 	}
 	return nil
+}
+
+func (x *RunSpec) GetCatalogRevision() string {
+	if x != nil {
+		return x.CatalogRevision
+	}
+	return ""
 }
 
 func (x *RunSpec) GetAttentionKernel() string {
@@ -661,19 +672,14 @@ func (x *ProviderAccess) GetCivitai() string {
 	return ""
 }
 
+// A published release by name (th-245): a machine that holds no installation of it reads its
+// card and locked requirements at the Hub by name.
 type Release struct {
-	state   protoimpl.MessageState `protogen:"open.v1"`
-	Package string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // org/name
-	Release string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
-	// The release as its Hub publishes it, so the machine installs it reading no Hub (th-241):
-	// its package interface (canonical JSON), its Python version, and its locked requirements
-	// as an object the caller wrote with Write (sha256:<hex>). Needed only when the signer
-	// holds no installation of the release yet.
-	PackageInterface   []byte `protobuf:"bytes,3,opt,name=package_interface,json=packageInterface,proto3" json:"package_interface,omitempty"`
-	PythonVersion      string `protobuf:"bytes,4,opt,name=python_version,json=pythonVersion,proto3" json:"python_version,omitempty"`
-	LockedRequirements string `protobuf:"bytes,5,opt,name=locked_requirements,json=lockedRequirements,proto3" json:"locked_requirements,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // org/name
+	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"` // empty: the Hub's newest
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Release) Reset() {
@@ -716,27 +722,6 @@ func (x *Release) GetPackage() string {
 func (x *Release) GetRelease() string {
 	if x != nil {
 		return x.Release
-	}
-	return ""
-}
-
-func (x *Release) GetPackageInterface() []byte {
-	if x != nil {
-		return x.PackageInterface
-	}
-	return nil
-}
-
-func (x *Release) GetPythonVersion() string {
-	if x != nil {
-		return x.PythonVersion
-	}
-	return ""
-}
-
-func (x *Release) GetLockedRequirements() string {
-	if x != nil {
-		return x.LockedRequirements
 	}
 	return ""
 }
@@ -865,19 +850,21 @@ func (x *InputFile) GetOrder() uint32 {
 	return 0
 }
 
-// One model slot's choice. A Hub model is exact (th-241: the machine resolves nothing at a
-// Hub): `manifest` pins one checkpoint, or `rungs` are the slot's binding with every rung's
-// checkpoint resolved, of which the machine takes the widest its GPUs fit. The caller sends
-// one for every model slot the run may load, a callee's included (`<package>/<path>`).
+// One model slot's choice, by name (th-245: the machine resolves it at the Hub). A Hub model is
+// `repository` at `release` (empty: the newest) in `lane`, else the widest rung of `rungs` its GPUs
+// fit, else the release's only lane. `manifest` names a checkpoint by hash only: the owner's
+// private one at the Hub (with `repository`; the run's capability names it) or one this machine
+// holds (without). The caller sends one for every model slot the run may load, a callee's
+// included (`<package>/<path>`).
 type ModelChoice struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Parameter      string                 `protobuf:"bytes,1,opt,name=parameter,proto3" json:"parameter,omitempty"` // a root slot parameter or full slot path
 	Repository     string                 `protobuf:"bytes,2,opt,name=repository,proto3" json:"repository,omitempty"`
 	Release        string                 `protobuf:"bytes,3,opt,name=release,proto3" json:"release,omitempty"`
 	Lane           string                 `protobuf:"bytes,4,opt,name=lane,proto3" json:"lane,omitempty"`
-	Manifest       string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>, an exact checkpoint
+	Manifest       string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>
 	ManifestLength uint64                 `protobuf:"varint,6,opt,name=manifest_length,json=manifestLength,proto3" json:"manifest_length,omitempty"`
-	Adapters       []*Adapter             `protobuf:"bytes,7,rep,name=adapters,proto3" json:"adapters,omitempty"` // each exact: a manifest, or a provider source
+	Adapters       []*Adapter             `protobuf:"bytes,7,rep,name=adapters,proto3" json:"adapters,omitempty"` // each by name, a hash of the owner's, or a provider source
 	// A provider source (hf://<org>/<repo>@<rev>[/member], civitai://<version>[/file]) the
 	// machine makes the slot's model from, under these reviewed profiles (none: the one its
 	// headers select); never with repository or manifest.
@@ -988,17 +975,14 @@ func (x *ModelChoice) GetRungs() []*ModelRung {
 	return nil
 }
 
-// One rung of a binding: on GPUs matching `gpu`, `gpus` of them run the slot's `lane`, whose
-// checkpoint is `manifest`.
+// One rung of a binding: on GPUs matching `gpu`, `gpus` of them run the slot's `lane`.
 type ModelRung struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Gpu            string                 `protobuf:"bytes,1,opt,name=gpu,proto3" json:"gpu,omitempty"` // "*", or the tokens a GPU name contains, in order ("h100", "rtx 5090")
-	Gpus           uint32                 `protobuf:"varint,2,opt,name=gpus,proto3" json:"gpus,omitempty"`
-	Lane           string                 `protobuf:"bytes,3,opt,name=lane,proto3" json:"lane,omitempty"`
-	Manifest       string                 `protobuf:"bytes,4,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>
-	ManifestLength uint64                 `protobuf:"varint,5,opt,name=manifest_length,json=manifestLength,proto3" json:"manifest_length,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Gpu           string                 `protobuf:"bytes,1,opt,name=gpu,proto3" json:"gpu,omitempty"` // "*", or the tokens a GPU name contains, in order ("h100", "rtx 5090")
+	Gpus          uint32                 `protobuf:"varint,2,opt,name=gpus,proto3" json:"gpus,omitempty"`
+	Lane          string                 `protobuf:"bytes,3,opt,name=lane,proto3" json:"lane,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ModelRung) Reset() {
@@ -1052,28 +1036,14 @@ func (x *ModelRung) GetLane() string {
 	return ""
 }
 
-func (x *ModelRung) GetManifest() string {
-	if x != nil {
-		return x.Manifest
-	}
-	return ""
-}
-
-func (x *ModelRung) GetManifestLength() uint64 {
-	if x != nil {
-		return x.ManifestLength
-	}
-	return 0
-}
-
 type Adapter struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Component string                 `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
 	Model     string                 `protobuf:"bytes,2,opt,name=model,proto3" json:"model,omitempty"`
 	Release   string                 `protobuf:"bytes,3,opt,name=release,proto3" json:"release,omitempty"`
 	Lane      string                 `protobuf:"bytes,4,opt,name=lane,proto3" json:"lane,omitempty"`
-	Manifest  string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"`
-	Scale     string                 `protobuf:"bytes,6,opt,name=scale,proto3" json:"scale,omitempty"` // canonical decimal; empty means 1
+	Manifest  string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>, the owner's checkpoint by hash; else model at release, lane
+	Scale     string                 `protobuf:"bytes,6,opt,name=scale,proto3" json:"scale,omitempty"`       // canonical decimal; empty means 1
 	// A provider source (civitai://<version>, hf://…) made here and normalized at ingest,
 	// under these reviewed profiles (none: the one its headers select); never with model.
 	Source        string   `protobuf:"bytes,7,opt,name=source,proto3" json:"source,omitempty"`
@@ -3229,7 +3199,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\theld_back\x18\a \x01(\tR\bheldBackB\b\n" +
 	"\x06source\":\n" +
 	"\aWarmSet\x12/\n" +
-	"\x05items\x18\x01 \x03(\v2\x19.cozy.machine.v1.WarmItemR\x05items\"\x9a\x05\n" +
+	"\x05items\x18\x01 \x03(\v2\x19.cozy.machine.v1.WarmItemR\x05items\"\xbf\x05\n" +
 	"\aRunSpec\x12,\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x18.cozy.machine.v1.RunKindR\x04kind\x124\n" +
 	"\arelease\x18\x02 \x01(\v2\x18.cozy.machine.v1.ReleaseH\x00R\arelease\x12$\n" +
@@ -3241,23 +3211,21 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\apayload\x18\a \x01(\fR\apayload\x122\n" +
 	"\x06inputs\x18\b \x03(\v2\x1a.cozy.machine.v1.InputFileR\x06inputs\x124\n" +
 	"\x06models\x18\t \x03(\v2\x1c.cozy.machine.v1.ModelChoiceR\x06models\x12)\n" +
+	"\x10catalog_revision\x18\n" +
+	" \x01(\tR\x0fcatalogRevision\x12)\n" +
 	"\x10attention_kernel\x18\f \x01(\tR\x0fattentionKernel\x12/\n" +
 	"\x13weights_destination\x18\r \x01(\tR\x12weightsDestination\x12,\n" +
 	"\x03hub\x18\x0e \x01(\v2\x1a.cozy.machine.v1.HubAccessR\x03hub\x12\x14\n" +
 	"\x05owner\x18\x0f \x01(\tR\x05owner\x12=\n" +
 	"\tproviders\x18\x10 \x01(\v2\x1f.cozy.machine.v1.ProviderAccessR\tproviders\x12*\n" +
 	"\x03set\x18\x12 \x01(\v2\x18.cozy.machine.v1.WarmSetR\x03setB\b\n" +
-	"\x06sourceJ\x04\b\n" +
-	"\x10\vJ\x04\b\v\x10\fJ\x04\b\x11\x10\x12J\x04\b\x13\x10\x14\"L\n" +
+	"\x06sourceJ\x04\b\v\x10\fJ\x04\b\x11\x10\x12J\x04\b\x13\x10\x14\"L\n" +
 	"\x0eProviderAccess\x12 \n" +
 	"\vhuggingface\x18\x01 \x01(\tR\vhuggingface\x12\x18\n" +
-	"\acivitai\x18\x02 \x01(\tR\acivitai\"\xc2\x01\n" +
+	"\acivitai\x18\x02 \x01(\tR\acivitai\"O\n" +
 	"\aRelease\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
-	"\arelease\x18\x02 \x01(\tR\arelease\x12+\n" +
-	"\x11package_interface\x18\x03 \x01(\fR\x10packageInterface\x12%\n" +
-	"\x0epython_version\x18\x04 \x01(\tR\rpythonVersion\x12/\n" +
-	"\x13locked_requirements\x18\x05 \x01(\tR\x12lockedRequirements\")\n" +
+	"\arelease\x18\x02 \x01(\tR\areleaseJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06\")\n" +
 	"\vLocalSource\x12\x1a\n" +
 	"\bmanifest\x18\x01 \x01(\tR\bmanifest\"\x86\x01\n" +
 	"\tInputFile\x12\x14\n" +
@@ -3280,13 +3248,11 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x06source\x18\b \x01(\tR\x06source\x12\x1a\n" +
 	"\bprofiles\x18\t \x03(\tR\bprofiles\x120\n" +
 	"\x05rungs\x18\n" +
-	" \x03(\v2\x1a.cozy.machine.v1.ModelRungR\x05rungs\"\x8a\x01\n" +
+	" \x03(\v2\x1a.cozy.machine.v1.ModelRungR\x05rungs\"Q\n" +
 	"\tModelRung\x12\x10\n" +
 	"\x03gpu\x18\x01 \x01(\tR\x03gpu\x12\x12\n" +
 	"\x04gpus\x18\x02 \x01(\rR\x04gpus\x12\x12\n" +
-	"\x04lane\x18\x03 \x01(\tR\x04lane\x12\x1a\n" +
-	"\bmanifest\x18\x04 \x01(\tR\bmanifest\x12'\n" +
-	"\x0fmanifest_length\x18\x05 \x01(\x04R\x0emanifestLength\"\xd1\x01\n" +
+	"\x04lane\x18\x03 \x01(\tR\x04laneJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06\"\xd1\x01\n" +
 	"\aAdapter\x12\x1c\n" +
 	"\tcomponent\x18\x01 \x01(\tR\tcomponent\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x18\n" +
