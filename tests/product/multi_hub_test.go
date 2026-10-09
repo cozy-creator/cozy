@@ -536,9 +536,9 @@ func TestPackageUpdateAllUpdatesEachInstallFromItsOwnHub(t *testing.T) {
 // A local run of a published install reads its model bindings from the hub it was
 // installed from, not from whichever hub is current.
 // fixtureExecutionAccess signs root in at server with a device key and routes its machine's
-// reads to worker: content and packages by name, anonymously (th-245), and content by hash with
-// the token a run's capability trades for (th-241), which it returns as its Authorization. The
-// CLI's own catalog reads, which carry its sign-in, reach the account API. The fixture
+// content reads to worker: anonymous ones (released content), and those that carry the token a
+// run's capability trades for (Tensorhub th-241), which it returns as its Authorization. Package
+// reads by name, the CLI's and the machine's (th-245), reach the account API. The fixture
 // deliberately exposes no owned-machine registration or lifecycle API.
 func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, worker http.Handler) string {
 	t.Helper()
@@ -552,9 +552,8 @@ func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, 
 			t.Error("owned machine attempted registration")
 			http.Error(w, "no machine registry", http.StatusGone)
 		case access.serve(w, r), access.serveMachine(w, r):
-		case strings.HasPrefix(r.URL.Path, "/v1/tensorfs/") || strings.HasPrefix(r.URL.Path, "/o/") ||
-			strings.HasPrefix(r.URL.Path, "/v1/packages/") && r.Header.Get("Authorization") == "":
-			// What the machine reads: anonymously, or by hash with the run's token.
+		case strings.HasPrefix(r.URL.Path, "/v1/tensorfs/") || strings.HasPrefix(r.URL.Path, "/o/"):
+			// What the machine reads: content anonymously, or by hash with the run's token.
 			if authorization := r.Header.Get("Authorization"); authorization != "" && authorization != token {
 				http.Error(w, "the machine presented another credential", http.StatusForbidden)
 				return
@@ -667,9 +666,9 @@ func TestRunsWithoutAHubStayListed(t *testing.T) {
 	}
 }
 
-// One persistent agent serves runs of distinct Hubs without restarting. Each run names its
-// release at the Hub the CLI selected (th-245), and the machine reads it and its content only
-// at that Hub's doors, with no other Hub's credential.
+// One persistent agent serves runs of distinct Hubs without restarting. Each run reads its
+// release by name at the Hub the CLI selected (th-245), and the machine reads content only at
+// that Hub's doors, with no other Hub's credential.
 func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine reads the releases")
@@ -758,7 +757,7 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 		return record
 	}
 
-	// The machine reads the release by name at the run's Hub as it prepares it.
+	// Each run reads its release by name at its own Hub.
 	carried := func(api *sync.Map, path string) bool {
 		for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
 			if _, asked := api.Load(path); asked {
@@ -768,16 +767,16 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 		return false
 	}
 	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")
-	if !carried(&doorA.asked, "/v1/packages/proof/alpha/releases/1.0.0/locked-requirements") {
-		t.Fatalf("the machine did not read hub a's release there: %d %s", code, out)
+	if !carried(&apiA, "/v1/packages/proof/alpha/releases/1.0.0") {
+		t.Fatalf("the run did not read hub a's release: %d %s", code, out)
 	}
 	first := launched()
 	if first.PID == 0 {
 		t.Fatalf("the launched Host's record names no process or protocol range: %+v", first)
 	}
 	code, out = runCozy(t, root, "run", "proof/beta/generate", "--tensorhub", "b", "--json")
-	if !carried(&doorB.asked, "/v1/packages/proof/beta/releases/1.0.0/locked-requirements") {
-		t.Fatalf("the machine did not read the release at its hub: %d %s", code, out)
+	if !carried(&apiB, "/v1/packages/proof/beta/releases/1.0.0") {
+		t.Fatalf("the run did not read the release of its hub: %d %s", code, out)
 	}
 	for other, pkg := range map[*sync.Map]string{&apiA: "proof/beta", &doorA.asked: "proof/beta", &apiB: "proof/alpha", &doorB.asked: "proof/alpha"} {
 		other.Range(func(path, _ any) bool {

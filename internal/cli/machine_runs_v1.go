@@ -826,7 +826,12 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 				"this run publishes to or reads private models at %s, which needs your sign-in there", account.Base()).
 				WithRemedy("sign in with `cozy auth login <email> --tensorhub=%s`", account.Base())
 		}
-		return nil, nil
+		// Released content needs no sign-in, only where the Hub is (th-245); a rental reads a
+		// Hub on this computer at its own.
+		if loopbackHub(origin) != "" && !machine.Local {
+			return nil, nil
+		}
+		return &v1.HubAccess{Origin: origin}, nil
 	}
 	key := origin + "\x00" + account.CredentialIdentity()
 	held, ok := m.hubEnvironments.Load(key)

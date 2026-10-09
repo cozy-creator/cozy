@@ -101,6 +101,7 @@ func TestAModelDownloadNamesItsReleaseAndLane(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	t.Logf("the machine asked the closure for: %q", asked)
 	if len(asked) == 0 || asked[0] != "proof/probe@1.0.0 bf16" || slices.ContainsFunc(asked, func(ask string) bool {
 		return strings.HasPrefix(ask, "proof/probe@sha256:") || strings.Contains(ask, "DPoP")
 	}) {
