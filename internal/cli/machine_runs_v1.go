@@ -169,9 +169,16 @@ func (m *machineRuns) loopV1(request records.Request) {
 
 // renewObservationV1 asks whether the same owner is authorized again. Status is read-only;
 // a permanently revoked key remains refused, with capped backoff rather than a busy loop.
-// Rental resolution uses the fleet's refreshed identity and refuses ended rentals. A gone
-// machine or another refusal leaves recovery to a reader or new fleet evidence as before.
+// Rental resolution uses the fleet's refreshed identity and refuses ended rentals. A
+// temporary resolution or transport failure cannot finish this authority recovery either.
 func (m *machineRuns) renewObservationV1(request records.Request, machineID string, delay *time.Duration) bool {
+	lastFailure := ""
+	note := func(reason string) {
+		if reason != lastFailure && m.ctx.Err() == nil {
+			fmt.Fprintf(m.context.Out, "machine execution %s: observation recovery: %s\n", request.ID, reason)
+			lastFailure = reason
+		}
+	}
 	for m.ctx.Err() == nil {
 		select {
 		case <-m.ctx.Done():
@@ -183,19 +190,43 @@ func (m *machineRuns) renewObservationV1(request records.Request, machineID stri
 		if problem != nil || link == nil || link.Collected || link.Abandoned || link.Lost || link.MachineID != machineID {
 			return false
 		}
+		// Rental resolution reports not-ready for terminal states too. Do not keep probing
+		// a machine the owner has given back merely because that error is Unavailable.
+		rental, problem := m.store.RentalRow(machineID)
+		if problem != nil {
+			note(problem.Message)
+			return false
+		}
+		if rental != nil && records.RentalTerminalState(rental.State) {
+			note("rental is terminal; observation recovery stopped")
+			return false
+		}
 		ctx, cancel := context.WithTimeout(machines.AttachOnly(m.ctx), 10*time.Second)
 		machine, problem := m.machines.DialV1(ctx, machineID, m.runHolder(request, "observing"))
 		if problem != nil {
 			cancel()
+			note(problem.Message)
+			if problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
+				continue
+			}
 			return false
 		}
 		frame, err := machine.Status(ctx)
 		machine.Close()
 		cancel()
 		if err == nil {
+			if frame.GetWorkerId() != machine.WorkerID {
+				note("Status answered with a different machine identity")
+			}
 			return frame.GetWorkerId() == machine.WorkerID
 		}
-		if status.Code(err) != codes.PermissionDenied && status.Code(err) != codes.Unauthenticated {
+		note(status.Convert(err).Message())
+		switch status.Code(err) {
+		case codes.PermissionDenied, codes.Unauthenticated, codes.Unavailable, codes.DeadlineExceeded,
+			codes.ResourceExhausted, codes.Aborted, codes.Canceled:
+			// Only a successful fresh Status authorizes nil-spec observation again.
+			// Parent cancellation exits the loop; it never controls the remote run.
+		default:
 			return false
 		}
 	}
