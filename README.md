@@ -144,6 +144,13 @@ cozy package install . --editable
 cozy package list
 ```
 
+Package names resolve through the configured Hub, or the explicit `--tensorhub`
+override for that command. `cozy package list` shows installations from that Hub
+and local source installations. Use `cozy package list --all-hubs` to inspect every
+installed origin. Installing a name from Hub A does not make it available when
+Hub B is selected. Removal also respects the selected origin; an installation
+from another Hub requires an explicit Hub selection. Rental listing remains global.
+
 `--rental` installs published code and Python dependencies on that existing rental,
 without downloading model weights or changing the local package installation.
 Omit `--version` to select the newest published release. Rental installs are queued
@@ -308,9 +315,9 @@ its completed checkpoint from any rental without downloading again, reattaches t
 or retries a stopped one on the same rental so the pod resumes from its journals. The checkpoint has no release label; publish one with `cozy model publish`.
 
 `cozy package update-all` upgrades packages installed from the selected Tensorhub to newer
-published releases, without downloading model weights. It skips packages from other
-Tensorhubs and reports their source; it never contacts their registries or changes their
-source implicitly. Legacy installs without a recorded source are resolved again at the
+published releases, without downloading model weights. Its list includes the selected
+Hub's packages and local sources; known installations from other Hubs are excluded.
+Legacy installs without a recorded source are resolved again at the
 selected Tensorhub. It keeps local/editable packages, development versions, and known-source
 versions newer than the registry unchanged. Each package
 is reported as updated, current, failed, or skipped; a failure leaves its previous

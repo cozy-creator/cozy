@@ -2922,7 +2922,14 @@ func parseTarget(raw string) (Target, *exit.Error) {
 	return target, nil
 }
 
-func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
+func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInterface, failure *exit.Error) {
+	defer func() {
+		if failure != nil {
+			if target, problem := parseTarget(ctx.Inv.Args[0]); problem == nil {
+				failure = packageHubProblem(ctx, target.Package, failure)
+			}
+		}
+	}()
 	if isScriptTarget(ctx.Inv.Args[0]) {
 		if ambiguousScriptTarget(ctx.Inv.Args[0]) {
 			fmt.Fprintf(ctx.Err, "running the local file %s; spell a package as org/name/function\n", ctx.Inv.Args[0])

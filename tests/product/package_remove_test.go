@@ -28,6 +28,7 @@ func TestPackageRemoveReportsSweptInstall(t *testing.T) {
 	fatal(t, problem)
 	unpinned := cleanupTestInstall(l, "eeeeeeeeeeeeeeee", "1.0.0")
 	unpinned.BytesExcl = 4096
+	unpinned.Hub = testDefaultHub
 	_, problem = store.Activate(unpinned)
 	fatal(t, problem)
 	fatal(t, store.Unpin(unpinned.Package, unpinned.Major))

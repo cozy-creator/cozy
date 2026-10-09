@@ -128,7 +128,7 @@ func resolveRegistryPackage(ctx *Context, value, version string) (hub.Ref, hub.P
 	if problem == nil && (plan.Release == "" || release != "" && !sameRelease(plan.Release, release)) {
 		problem = exit.Internalf("Tensorhub answered release %q for requested %q", plan.Release, release)
 	}
-	return ref, plan, problem
+	return ref, plan, packageHubProblem(ctx, ref.String(), problem)
 }
 
 func requirePackageUpdatePin(st *records.Store, pkg, expected string) *exit.Error {
