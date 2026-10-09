@@ -1058,12 +1058,12 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"position", "total", "queued", "execution", "attempt_wall", "attempts", "created", "reason", "hub"},
 		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
-			"stage_remaining_ms", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining", "retry_available"},
+			"stage_remaining_ms", "execution_ms", "execution_known", "execution_elapsed_ms", "error_type", "error_code", "error", "retaining", "retry_available"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "rental_boot", "wait_reason", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
-			"position", "total", "progress_unit", "progress_rate", "stage_remaining_ms", "queued_ms", "execution_ms", "execution_known", "attempt_wall_ms", "attempts",
+			"position", "total", "progress_unit", "progress_rate", "stage_remaining_ms", "queued_ms", "execution_ms", "execution_known", "execution_elapsed_ms", "attempt_wall_ms", "attempts",
 			"created_at", "error_type", "error_code", "error", "triage", "retaining", "retry_available", "hub"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
@@ -1101,7 +1101,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"position":         integerValue(life.Position),
 			"total":            integerValue(life.Total),
 			"queued":           seconds(life.QueuedMS),
-			"execution":        executionValue(life.ExecutionMS, life.ExecutionKnown, life.MachineExecution != nil),
+			"execution":        executionCell(life),
 			"attempt_wall":     seconds(life.AttemptWallMS),
 			"attempts":         strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 			"reason": reasonCell(life),
@@ -1117,6 +1117,9 @@ func runListRows(rows []api.Lifecycle) output.List {
 			if !life.ExecutionKnown {
 				typed["execution_ms"] = nil
 			}
+		}
+		if life.ExecutionElapsedMS != nil && life.Status == "in_progress" {
+			typed["execution_elapsed_ms"] = *life.ExecutionElapsedMS
 		}
 		if life.Hub != "" {
 			list.Rows[len(list.Rows)-1]["hub"], typed["hub"] = life.Hub, life.Hub
@@ -2574,7 +2577,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	// Two facts, never one sum: how long the request waited, and how long it ran.
 	fields = append(fields,
 		output.Field{K: "queued", V: seconds(life.QueuedMS)},
-		output.Field{K: "execution", V: executionValue(life.ExecutionMS, life.ExecutionKnown, life.MachineExecution != nil)},
+		output.Field{K: "execution", V: executionCell(life)},
 		output.Field{K: "submit_ms", V: submitted.Milliseconds()})
 	if wallMS, known := recordedRunWall(life.CreatedAt, terminal); known {
 		fields = append(fields, output.Field{K: "wall_ms", V: wallMS})
@@ -3314,6 +3317,13 @@ func eventText(e *localapi.Event, key string) string {
 
 // seconds spells a millisecond count as the CLI's duration cell.
 func seconds(ms int64) string { return fmt.Sprintf("%.1fs", float64(ms)/1000) }
+
+func executionCell(life api.Lifecycle) string {
+	if life.Status == "in_progress" && life.ExecutionElapsedMS != nil {
+		return seconds(*life.ExecutionElapsedMS) + " elapsed"
+	}
+	return executionValue(life.ExecutionMS, life.ExecutionKnown, life.MachineExecution != nil)
+}
 
 func executionValue(ms int64, known, machine bool) string {
 	if machine && !known {

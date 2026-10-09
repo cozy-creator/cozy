@@ -859,13 +859,17 @@ type JobState struct {
 	Attempts         int                   `json:"attempts"`
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
-	QueuePosition    *int                 `json:"queue_position,omitempty"`
-	QueueDepth       *int                 `json:"queue_depth,omitempty"`
-	Progress         map[string]any       `json:"progress,omitempty"`
-	Stage            string               `json:"stage,omitempty"`
-	QueuedMS         int64                `json:"queued_ms"`
-	ExecutionMS      int64                `json:"execution_ms"`
-	ExecutionKnown   bool                 `json:"execution_known"`
+	QueuePosition  *int           `json:"queue_position,omitempty"`
+	QueueDepth     *int           `json:"queue_depth,omitempty"`
+	Progress       map[string]any `json:"progress,omitempty"`
+	Stage          string         `json:"stage,omitempty"`
+	QueuedMS       int64          `json:"queued_ms"`
+	ExecutionMS    int64          `json:"execution_ms"`
+	ExecutionKnown bool           `json:"execution_known"`
+
+	// ExecutionElapsedMS is the current Runtime-started wall interval, not measured execution.
+	ExecutionElapsedMS *int64 `json:"execution_elapsed_ms,omitempty"`
+
 	AttemptWallMS    int64                `json:"attempt_wall_ms,omitempty"`
 	Metrics          map[string]any       `json:"metrics,omitempty"`
 	ErrorType        string               `json:"error_type,omitempty"`

@@ -377,6 +377,14 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		// A cozy.machine.v1 machine measures the run's own running time, every attempt summed.
 		state.ExecutionMS, state.ExecutionKnown = int64(outcome.ExecutionMs), true
 	}
+	if v1run && state.Status == "in_progress" && records.RunV1Outcome(link) == nil {
+		elapsed, known, problem := s.store.RunV1RunningElapsedMS(row.ID, int64(state.Attempt), time.Now())
+		if problem != nil {
+			view.ObservationError = problem.Message
+		} else if known {
+			state.ExecutionElapsedMS = &elapsed
+		}
+	}
 	if state.Status == "canceled" {
 		// A canceled run says WHO (cl-108), as a job without a machine does.
 		if actor, _, _, problem := s.store.CancelAttribution(row.ID); problem == nil {

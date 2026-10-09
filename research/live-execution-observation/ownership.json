@@ -1,0 +1,6 @@
+{
+  "owner": "/root/fusion_resume",
+  "purpose": "Recover accepted observers after direct stream timeouts and show a separate live Runtime-started execution timer",
+  "branch": "fix/live-execution-timer-20261009",
+  "base_sha": "68b5274aa5927dbb5759ca0ce03c06cab3a4461d"
+}
