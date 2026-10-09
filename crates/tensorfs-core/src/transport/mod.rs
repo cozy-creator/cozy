@@ -65,8 +65,8 @@ pub use ledger::{
 pub use memory::{memory_available, streams_within, transfer_streams, STREAM_MEMORY};
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
-    fetch_wanted, narrow, origin_url, pull, resolve_closure, FetchObserver, Fetched, ObjectSource,
-    ObjectUrls, PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
+    fetch_wanted, narrow, pull, resolve_closure, FetchObserver, Fetched, ObjectSource, ObjectUrls,
+    PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
 };
 pub use publish::{publish, Publication, Published};
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};

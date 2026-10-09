@@ -1,6 +1,4 @@
 //! `tfs ensure <root> <ref> --hub <base>`: make one model resident (proto-063 M2a).
-//! `tfs ensure <root> <org/name@sha256:hex> --origin <base>`: a public checkpoint, read
-//! anonymously from the object origin (th-243); no hub, no credential.
 //!
 //! STDOUT is JSON lines and nothing else: `ensure.progress` samples, then exactly one
 //! `ensure.result` (exit 0) or `ensure.refused` (exit 1). Usage errors exit 2.
@@ -81,14 +79,9 @@ fn refused(refusal: &Refusal, model: &str, step: &str) -> String {
 }
 
 pub fn cmd_ensure(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
-    let origin = flag(flags, "origin");
-    let hub = match (flag(flags, "hub"), origin) {
-        (Some(hub), None) => hub,
-        (None, Some(_)) => "",
-        _ => {
-            eprintln!("exactly one of --hub <base-url> or --origin <object-origin> is required");
-            return ExitCode::from(2);
-        }
+    let Some(hub) = flag(flags, "hub") else {
+        eprintln!("--hub <base-url> is required");
+        return ExitCode::from(2);
     };
     let out = Mutex::new(std::io::stdout());
     let model = refspec.split('@').next().unwrap_or_default();
@@ -112,10 +105,8 @@ pub fn cmd_ensure(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
             Some(path) => String::from_utf8_lossy(&read(path)?).into_owned(),
             None => std::env::var("TFS_CREDENTIAL").unwrap_or_default(),
         };
-        let credential = match origin {
-            Some(_) => transport::credential_from_spec("", Vec::new())?,
-            None => transport::credential_from_spec(spec.trim(), vec![transport::base_host(hub)?])?,
-        };
+        let credential =
+            transport::credential_from_spec(spec.trim(), vec![transport::base_host(hub)?])?;
         Ok((Store::open(root)?, credential))
     };
     let (store, credential) = match setup() {
@@ -132,10 +123,7 @@ pub fn cmd_ensure(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
         .map(str::to_string)
         .collect();
     let on_event = |event: &Event| say(&out, progress(event));
-    let mut request = match origin {
-        Some(origin) => Request::public(&store, origin, refspec, &policy),
-        None => Request::new(&store, hub, refspec, &credential, &policy),
-    };
+    let mut request = Request::new(&store, hub, refspec, &credential, &policy);
     request.lane = flag(flags, "lane").unwrap_or("");
     request.step = step;
     request.keep = &keep;

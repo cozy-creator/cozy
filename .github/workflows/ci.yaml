@@ -57,7 +57,7 @@ jobs:
       - if: steps.scope.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
       - if: steps.scope.outputs.run == 'true'
-        run: cargo test -p tensorfs-core --test fetch_faults --test ensure --test public_origin -- --test-threads=2
+        run: cargo test -p tensorfs-core --test fetch_faults --test ensure -- --test-threads=2
       - if: steps.scope.outputs.run == 'true'
         run: "cargo test -p tensorfs-core --lib transport:: -- --test-threads=2"
 

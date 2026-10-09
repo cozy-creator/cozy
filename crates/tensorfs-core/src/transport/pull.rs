@@ -32,18 +32,12 @@
 //! **A 403 is judged by the LEASE it refused.** One the hub's own declared life says was
 //! already spent is re-minted, and one minted moments ago is terminal, because a refusal of
 //! a fresh capability is not about time.
-//!
-//! **A public checkpoint asks the hub nothing (th-243).** With `origin` set, the ref is
-//! pinned by digest and every object is read anonymously at `<origin>/sha256/<hex>`: the
-//! manifest and header first, the closure walked from them here, then the same ranged walk.
-//! No closure, no presign, no credential; the origin's URL never expires, so a refusal is
-//! the object no longer being public, never a re-mint.
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
 use crate::ids::{Doc, ObjectRef};
 use crate::store::Store;
-use crate::transport::credential::{presenting, Anonymous, Ask, CredentialProvider};
+use crate::transport::credential::{presenting, Ask, CredentialProvider};
 use crate::transport::http::{self, Client};
 use crate::transport::hub;
 use crate::transport::ledger::{Deadline, Ledger, PULL_STREAMS};
@@ -681,9 +675,6 @@ pub struct PullRequest<'a> {
     /// A closure the caller already resolved with [`resolve_closure`]; the pull asks the
     /// hub nothing more about it.
     pub closure: Option<&'a hub::Closure>,
-    /// The anonymous content-addressed object origin (th-243). Set: the checkpoint is
-    /// public, `refspec` names it by digest, and `base` and `credential` are never used.
-    pub origin: Option<&'a str>,
 }
 
 impl<'a> PullRequest<'a> {
@@ -709,7 +700,6 @@ impl<'a> PullRequest<'a> {
             on_plan: None,
             on_object: None,
             closure: None,
-            origin: None,
         }
     }
 }
@@ -719,15 +709,13 @@ fn pull_policy(request: &PullRequest<'_>) -> SourcePolicy {
     let mut policy = request.policy.clone();
     // One resolution per host for this pull, however many objects it asks for.
     policy.resolved = Default::default();
-    // Naming a hub base or an object origin IS declaring it, and a loopback one declares a
-    // local deployment.
-    let base = request.origin.unwrap_or(request.base);
-    if let Ok(host) = policy::base_host(base) {
+    // Naming a hub base IS declaring it, and a loopback hub declares a local deployment.
+    if let Ok(host) = policy::base_host(request.base) {
         if !policy.allows_host(&host) {
             policy.allowed_hosts.push(host);
         }
     }
-    if policy::is_loopback_origin(base) {
+    if policy::is_loopback_origin(request.base) {
         policy.allow_local = true;
     }
     policy
@@ -753,9 +741,6 @@ pub fn resolve_closure(request: &PullRequest<'_>) -> Result<hub::Closure> {
         {
             return Ok(closure);
         }
-    }
-    if let Some(origin) = request.origin {
-        return origin_closure(request, origin, &pull_policy(request), &ledger);
     }
     hub::closure_all(
         shared_client(),
@@ -797,7 +782,6 @@ pub fn narrow(
             on_plan: None,
             on_object: None,
             closure: Some(&part),
-            origin: request.origin,
         };
         pull(&pull_part).map(drop)
     };
@@ -914,11 +898,9 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     // one page is one call, which is every model we own today; nothing about the walk
     // changes when one day it is not.
     // A Store-answered closure authorizes no presign; if its objects went since, ask.
-    let closure = match (request.origin, request.closure) {
-        (Some(_), Some(closure)) => closure.clone(),
-        (Some(origin), None) => origin_closure(request, origin, &policy, &ledger)?,
-        (None, Some(closure)) if closure.presign_max_digests > 0 => closure.clone(),
-        (None, _) => hub::closure_all(
+    let closure = match request.closure {
+        Some(closure) if closure.presign_max_digests > 0 => closure.clone(),
+        _ => hub::closure_all(
             client,
             request.base,
             request.refspec,
@@ -957,34 +939,24 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         // batches, the last one before anything records the checkpoint.
         let epoch = crate::unsynced::Epoch::begin(request.store)?;
         let store = request.store.syncing(epoch.clone());
-        let (leases, public);
-        let (urls, credential): (&dyn ObjectUrls, &dyn CredentialProvider) = match request.origin {
-            Some(origin) => {
-                public = OriginUrls { origin };
-                (&public, &Anonymous)
-            }
-            None => {
-                leases = Leases {
-                    client,
-                    base: request.base,
-                    credential: request.credential,
-                    policy: &policy,
-                    deadline: request.deadline,
-                    ledger: &ledger,
-                    wanted: &plan.wanted,
-                    window: closure.presign_max_digests,
-                    held: Mutex::new(BTreeMap::new()),
-                    minting: Minting::default(),
-                };
-                (&leases, request.credential)
-            }
+        let leases = Leases {
+            client,
+            base: request.base,
+            credential: request.credential,
+            policy: &policy,
+            deadline: request.deadline,
+            ledger: &ledger,
+            wanted: &plan.wanted,
+            window: closure.presign_max_digests,
+            held: Mutex::new(BTreeMap::new()),
+            minting: Minting::default(),
         };
         let walked = fetch_wanted_bounded(
             &store,
             &plan,
-            urls,
+            &leases,
             &policy,
-            credential,
+            request.credential,
             request.deadline,
             &ledger,
             request.streams,
@@ -1114,131 +1086,6 @@ fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
         // Served only when nothing is wanted, so it authorizes no presign.
         presign_max_digests: 0,
         components: Vec::new(),
-    })
-}
-
-/// An object's address at the anonymous origin: its digest is the whole of it.
-pub fn origin_url(origin: &str, sha256: &str) -> String {
-    format!("{}/sha256/{sha256}", origin.trim_end_matches('/'))
-}
-
-/// URLs at the anonymous origin. Nothing is minted and nothing expires, so an origin that
-/// refuses one has stopped serving the object (withdrawn), and asking again cannot help.
-struct OriginUrls<'a> {
-    origin: &'a str,
-}
-
-impl ObjectUrls for OriginUrls<'_> {
-    fn url_for(&self, _at: usize, object: &ObjectRef, stale: bool) -> Result<String> {
-        if stale {
-            return refuse(
-                Code::TRANSFER_FAILED,
-                format!(
-                    "{}: the public origin refused it — it is no longer public, and no \
-                     credential is spellable for a public read",
-                    object.id()
-                ),
-            );
-        }
-        Ok(origin_url(self.origin, &object.sha256))
-    }
-}
-
-/// The closure of a public checkpoint, from the origin alone: the digest-pinned manifest
-/// and its header (each verified against its digest before the Store admits it), then the
-/// CozyTensors walk over them. The hub is never asked.
-fn origin_closure(
-    request: &PullRequest<'_>,
-    origin: &str,
-    policy: &SourcePolicy,
-    ledger: &Ledger,
-) -> Result<hub::Closure> {
-    let mut parts = request.refspec.split('@');
-    let model = parts.next().unwrap_or_default();
-    let rest: Vec<&str> = parts.collect();
-    let (release, pinned) = match rest.as_slice() {
-        [digest] => ("", *digest),
-        [release, digest] if !release.is_empty() => (*release, *digest),
-        _ => ("", ""),
-    };
-    let Some(hex) = pinned
-        .strip_prefix("sha256:")
-        .filter(|hex| crate::ids::hex64("public checkpoint", hex).is_ok())
-    else {
-        return refuse(
-            Code::MALFORMED_DIGEST,
-            format!(
-                "a public checkpoint is read by digest: {:?} is not org/name[@release]@sha256:<hex>",
-                request.refspec
-            ),
-        );
-    };
-    if model.split_once('/').is_none() {
-        return refuse(Code::MALFORMED_DIGEST, format!("{model:?} is not org/name"));
-    }
-    let fetch = |sha256: &str, cap: u64| -> Result<Vec<u8>> {
-        let (bytes, _) = super::api_get(
-            &origin_url(origin, sha256),
-            policy,
-            &Anonymous,
-            cap,
-            request.deadline,
-            ledger,
-        )?;
-        if crate::sha256::hex_digest(&bytes) != sha256 {
-            return refuse(
-                Code::OBJECT_ID_MISMATCH,
-                format!("the public origin's sha256:{sha256} bytes disagree with their digest"),
-            );
-        }
-        Ok(bytes)
-    };
-    let bytes = match std::fs::read(request.store.manifest_path(hex)) {
-        Ok(held) if crate::sha256::hex_digest(&held) == hex => held,
-        _ => fetch(hex, crate::manifest::Manifest::MAX_BYTES as u64)?,
-    };
-    let manifest_ref = ObjectRef {
-        sha256: hex.to_string(),
-        length: bytes.len() as u64,
-    };
-    let document = crate::manifest::Manifest::parse(&bytes)?;
-    if request.store.put_manifest(&document)?.obj != manifest_ref {
-        return refuse(
-            Code::OBJECT_ID_MISMATCH,
-            format!("{} is not a canonical Manifest", manifest_ref.id()),
-        );
-    }
-    if let Some(header) = document.header() {
-        if !request.store.contains(&header.sha256) {
-            let bytes = fetch(&header.sha256, header.length)?;
-            request.store.put_stream(
-                &mut bytes.as_slice(),
-                Some(header),
-                &crate::store::Fault::default(),
-            )?;
-        }
-    }
-    let walked = crate::checkpoint::walk_cozytensors(request.store, &document)?;
-    let objects = walked
-        .distinct()
-        .into_iter()
-        .filter(|object| object.sha256 != manifest_ref.sha256)
-        .cloned()
-        .collect();
-    Ok(hub::Closure {
-        model: model.to_string(),
-        release: release.to_string(),
-        lane: if release.is_empty() {
-            String::new()
-        } else {
-            request.lane.to_string()
-        },
-        scope: "runtime".to_string(),
-        manifest: manifest_ref,
-        objects,
-        components: Vec::new(),
-        complete: true,
-        presign_max_digests: 0,
     })
 }
 

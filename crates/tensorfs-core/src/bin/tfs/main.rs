@@ -42,7 +42,6 @@ const USAGE: &str = "usage: tfs <verb> ...
   checkpoint write <root> [--plain] [--blocks <n>] [--no-configs]
   fetch <root> <ref> --hub <base>, push <root> <sha256> --grant-file <f>
   ensure <root> <ref> --hub <base>
-  ensure <root> <org/name@sha256:hex> --origin <object-origin>
   repo-cache restore|resume|chain ...
   ingest bank <dialect> <converter> ..., ingest source-members|source-plan|plan|run|install|reap ...";
 
@@ -59,7 +58,7 @@ const VALUED: &[&str] = &[
     "config", "content-type", "credential-file", "disk-budget", "expect", "expect-length", "fault",
     "grant-file", "header", "holds", "hub", "inventory", "isolation-tier", "keep", "lane",
     "manifest", "max-download-bytes", "max-download-objects", "max-redirects", "member", "need",
-    "observed", "order", "origin", "out", "part-mib", "plan", "progress-bytes", "range", "ready", "refs",
+    "observed", "order", "out", "part-mib", "plan", "progress-bytes", "range", "ready", "refs",
     "registry", "repo-cache", "rlimit-as-mb", "rlimit-fsize-mb", "rows", "sample-seconds",
     "scale", "session", "slow-ms", "source", "source-name", "source-plan", "source-profile",
     "spec-variant", "step", "streams", "target", "tenant", "timeout", "url",
