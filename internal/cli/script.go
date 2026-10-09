@@ -135,7 +135,7 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*recor
 		return Target{}, nil, problem
 	}
 	defer stage.Release()
-	frozen, problem := packagepublish.SnapshotSource(pack.Tree, filepath.Join(stage.Path, "source"))
+	frozen, problem := packagepublish.SnapshotSource(context.Background(), pack.Tree, filepath.Join(stage.Path, "source"))
 	if problem != nil {
 		return Target{}, nil, problem
 	}

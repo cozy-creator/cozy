@@ -22,8 +22,8 @@ func serveGitProject(t *testing.T) (repository, commit string) {
 	root := t.TempDir()
 	git := func(dir string, args ...string) string {
 		t.Helper()
-		command := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=fixture",
-			"-c", "user.email=fixture@example.invalid", "-c", "init.defaultBranch=main"}, args...)...)
+		command := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=Paul Fidika",
+			"-c", "user.email=paul@fidika.com", "-c", "init.defaultBranch=main"}, args...)...)
 		out, err := command.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)

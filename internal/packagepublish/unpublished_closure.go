@@ -33,6 +33,7 @@ type capturedLock struct {
 		Version string `toml:"version"`
 		Source  struct {
 			Registry string `toml:"registry"`
+			Git      string `toml:"git"`
 		} `toml:"source"`
 		Wheels []struct {
 			URL  string `toml:"url"`
@@ -100,6 +101,10 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 		matched[name] = true
 		if expected[name] != entry.Version {
 			continue
+		}
+		if entry.Source.Git != "" {
+			return nil, nil, exit.Named(exit.Validation, "registry_dependency_git_undeclared",
+				"%s is locked to a Git source without a retained declared wheel", name)
 		}
 		row := registryPackage{Name: name, Version: entry.Version, Index: entry.Source.Registry}
 		for _, candidate := range entry.Wheels {
@@ -197,16 +202,10 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 		p.DependencyWheels = append(p.DependencyWheels, DependencyWheel{Filename: filepath.Base(path), Path: path})
 	}
 	p.DependencyRequirements = RegistryRequirements(public)
-	declared, problem := sdkRequirements(p.Wheel)
+	requirements, problem = PrivateWheelRequirements(p.Wheel, requirements)
 	if problem != nil {
 		return problem
 	}
-	requirements = append(slices.DeleteFunc(requirements, func(pin string) bool {
-		name, _, _ := strings.Cut(pin, "==")
-		return sdkPair[name]
-	}), declared...)
-	requirements = append(requirements, "cozy-runtime>="+hostruntime.PackageFloor)
-	sort.Strings(requirements)
 	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
 	if problem := wheel.PinDependencies(p.Wheel, sealed, requirements); problem != nil {
 		return problem
@@ -218,6 +217,23 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 // sdkPair is what every machine supplies itself: an exact pin on either would refuse each
 // machine whose Runtime differs from the capturing one. The author's own bounds still hold.
 var sdkPair = map[string]bool{"cozy-runtime": true, "tensorfs": true}
+
+// PrivateWheelRequirements freezes ordinary dependencies while retaining the
+// author's compatibility bounds for the Runtime/TensorFS pair supplied by the
+// receiving machine. Callable children and the root must obey the same rule.
+func PrivateWheelRequirements(projectWheel string, requirements []string) ([]string, *exit.Error) {
+	declared, problem := sdkRequirements(projectWheel)
+	if problem != nil {
+		return nil, problem
+	}
+	requirements = append(slices.DeleteFunc(append([]string(nil), requirements...), func(pin string) bool {
+		name, _, _ := strings.Cut(pin, "==")
+		return sdkPair[name]
+	}), declared...)
+	requirements = append(requirements, "cozy-runtime>="+hostruntime.PackageFloor)
+	sort.Strings(requirements)
+	return requirements, nil
+}
 
 func sdkRequirements(projectWheel string) ([]string, *exit.Error) {
 	metadata, problem := wheel.Metadata(projectWheel)

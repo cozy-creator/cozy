@@ -1,6 +1,7 @@
 package install
 
 import (
+	"context"
 	"path/filepath"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -9,7 +10,7 @@ import (
 
 func snapshotSource(installDir string, local *LocalSource) (string, *exit.Error) {
 	root := filepath.Join(installDir, "source")
-	frozen, problem := packagepublish.SnapshotSource(local.Tree, root)
+	frozen, problem := packagepublish.SnapshotSource(context.Background(), local.Tree, root)
 	if problem != nil {
 		return "", problem
 	}
