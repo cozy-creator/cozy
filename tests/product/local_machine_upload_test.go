@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 )
 
 // weightsProject is local/weights-proof: one job that derives a small checkpoint into its
@@ -80,26 +79,16 @@ app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),))
 // for the publication it makes during the run.
 func TestAConversionShowsItsCheckpointUploadAsACall(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
-	// The machine's grant to publish into the destination the owner consented to, and the
-	// short token its Runtime renews with its own worker capability.
-	grant := func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": "machine-grant", "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
-	}
-	refuse := func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"error":{"code":"publication.destination_refused","message":"the destination refuses this checkpoint"}}`))
-	}
-	h.mux.HandleFunc("POST /v1/machine-authorizations", grant)
+	// The machine's grant to publish into the destination the owner consented to comes from
+	// the stand-in Hub's grant routes; its publication doors refuse the checkpoint.
 	worker := h.worker.Config.Handler
 	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/worker/machine-authorizations/"):
-			grant(w, r)
-		case strings.HasPrefix(r.URL.Path, "/v1/models/"):
-			refuse(w, r)
-		default:
-			worker.ServeHTTP(w, r)
+		if strings.HasPrefix(r.URL.Path, "/v1/models/") {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"publication.destination_refused","message":"the destination refuses this checkpoint"}}`))
+			return
 		}
+		worker.ServeHTTP(w, r)
 	})
 	if code, out := runCozy(t, root, "package", "install", weightsProject(t), "--editable"); code != 0 {
 		t.Fatalf("installing the weights package [exit %d]\n%s", code, out)

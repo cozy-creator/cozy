@@ -8,12 +8,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// RevokeDeviceKey revokes one machine key server-side. Any 2xx answer, with or
-// without a body, is the confirmation; a refusal arrives as a typed error.
+// AuthAPI is where the Hub serves AuthKit's versioned JSON API.
+const AuthAPI = "/v1/auth/v1"
+
+// RevokeDeviceKey revokes one machine key server-side; AuthKit requires a
+// recent sign-in. Any 2xx answer, with or without a body, is the
+// confirmation; a refusal arrives as a typed error.
 func (c *Client) RevokeDeviceKey(ctx context.Context, id string) *exit.Error {
 	return c.do(ctx, call{
 		method: http.MethodDelete,
-		path:   "/v1/auth/device-keys/" + url.PathEscape(id),
+		path:   AuthAPI + "/me/sign-in-keys/" + url.PathEscape(id),
 		auth:   true,
 	}, nil)
 }
@@ -22,9 +26,8 @@ func (c *Client) RevokeDeviceKey(ctx context.Context, id string) *exit.Error {
 // other key on its account. AuthKit requires the token to carry email proof.
 func (c *Client) RevokeOtherDeviceKeys(ctx context.Context) *exit.Error {
 	return c.do(ctx, call{
-		method: http.MethodPost,
-		path:   "/v1/auth/device-keys/revoke-others",
-		body:   map[string]any{},
+		method: http.MethodDelete,
+		path:   AuthAPI + "/device-keys",
 		auth:   true,
 	}, nil)
 }

@@ -54,6 +54,8 @@ type machineHub struct {
 	// as a Hub the pod cannot reach; leased counts the polls answered.
 	lease, leased int
 	unreachable   bool
+	// oauth answers the machine-grant routes on the account API.
+	oauth *fakeGrants
 }
 
 func newMachineHub(t *testing.T) *machineHub {
@@ -93,15 +95,16 @@ func newMachineHub(t *testing.T) *machineHub {
 	}))
 	t.Cleanup(h.access.Close)
 	served := h.server.Config.Handler
+	h.oauth = newFakeGrants(h.server.URL, h.server.URL, "rental-idle-test")
+	h.oauth.origin = h.access.URL
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authorized := r.Header.Get("Authorization") == "Bearer rental-idle-test"
+		if h.oauth.serve(w, r) {
+			return
+		}
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines":
 			t.Error("owned machine attempted Hub registration")
 			http.Error(w, "registration is not a local machine lifecycle", http.StatusGone)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access" && authorized:
-			_ = json.NewEncoder(w).Encode(map[string]any{"token": executionGrantToken(h.server.URL, "fixture-account", 1), "expires_at": time.Now().Add(time.Hour),
-				"environment": map[string]string{"TENSORHUB_ORIGIN": h.access.URL, "TENSORHUB_PUBLIC_ORIGIN": h.server.URL}})
 		case strings.HasPrefix(r.URL.Path, "/v1/tensorfs/"):
 			h.worker.Config.Handler.ServeHTTP(w, r)
 		default:

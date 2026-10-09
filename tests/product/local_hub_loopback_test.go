@@ -39,6 +39,7 @@ func TestALoopbackHubServesItsMachineWhileItsPublicOriginIsDown(t *testing.T) {
 	}
 
 	h := newMachineHub(t)
+	grants := newFakeGrants(h.server.URL, public, "rental-idle-test")
 	var mu sync.Mutex
 	var reads []string
 	served := h.server.Config.Handler
@@ -46,14 +47,10 @@ func TestALoopbackHubServesItsMachineWhileItsPublicOriginIsDown(t *testing.T) {
 		mu.Lock()
 		reads = append(reads, r.Method+" "+r.URL.Path)
 		mu.Unlock()
+		if grants.serve(w, r) {
+			return
+		}
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access":
-			if r.Header.Get("Authorization") != "Bearer rental-idle-test" {
-				http.Error(w, "account required", http.StatusUnauthorized)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"token": executionGrantToken(public, "fixture-account", 1), "expires_at": time.Now().Add(time.Hour),
-				"environment": map[string]string{"TENSORHUB_ORIGIN": public, "TENSORHUB_PUBLIC_ORIGIN": public}})
 		case r.URL.Path == "/v1/accounts/current":
 			_, _ = w.Write([]byte(`{"name":"proof"}`))
 		case r.URL.Path == "/v1/models/proof/probe":

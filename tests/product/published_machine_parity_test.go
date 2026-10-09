@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -62,10 +63,10 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 		mu.Lock()
 		calls := append([]string(nil), seen...)
 		mu.Unlock()
-		// Its first published call explicitly delegates content access; identity and
-		// lifecycle remain local, and subsequent calls reuse the bounded grant.
-		if key == "cold" && len(calls) == 1 && calls[0] == "POST /v1/execution-access" {
-			calls = nil
+		// Its first published call grants the machine content access; identity and
+		// lifecycle remain local, and subsequent calls rely on the grant the machine holds.
+		if key == "cold" {
+			calls = slices.DeleteFunc(calls, grantCall)
 		}
 		if len(calls) != 0 {
 			t.Fatalf("the %s run on %s made %d Hub requests; want none: %v", key, venue, len(calls), calls)

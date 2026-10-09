@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"github.com/cozy-creator/cozy/internal/archive"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/archive"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"

@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"bytes"
 	"path/filepath"
 	"testing"
 
@@ -33,33 +32,5 @@ func TestSubmissionIntentCommitsWithItsRequest(t *testing.T) {
 	fatal(t, problem)
 	if len(repositories) != 1 || repositories[0] != "alice/model" || duration != 60000 || deadline != 1900000000123 {
 		t.Fatal("reopening the committed request lost its consent or deadline")
-	}
-}
-
-func TestMachinePublicationIntentCannotChangeAcrossClientRestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	request, _, problem := store.Submit(records.Request{ID: "job-publication-intent", IdemKey: "publication-intent", Package: "local/example", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
-	fatal(t, problem)
-	raw := []byte(`{"authorization_id":"9a4c3c53-564b-4497-8398-ac0f55bcc2cc","machine":"private-machine","machine_id":"private-machine","repositories":[{"org":"alice","name":"model"}],"permissions":["assessment","checkpoint","release"],"expires_at_unix":1900000000,"certificate_der_b64url":"cHVibGljLW1ldGFkYXRh"}`)
-	if problem := store.RecordMachinePublicationIntent(request.ID, raw); problem == nil {
-		t.Fatal("publication authority was recorded before machine selection")
-	}
-	fatal(t, store.LinkMachineExecution(request.ID, "private-machine"))
-	fatal(t, store.RecordMachinePublicationIntent(request.ID, raw))
-	store.Close()
-	store, problem = records.Open(path)
-	fatal(t, problem)
-	defer store.Close()
-	held, problem := store.MachinePublicationIntent(request.ID)
-	fatal(t, problem)
-	if !bytes.Equal(held, raw) {
-		t.Fatal("recovery changed the frozen publication authority")
-	}
-	fatal(t, store.RecordMachinePublicationIntent(request.ID, raw))
-	changed := bytes.Replace(raw, []byte(`"name":"model"`), []byte(`"name":"another"`), 1)
-	if problem := store.RecordMachinePublicationIntent(request.ID, changed); problem == nil {
-		t.Fatal("an ambiguous authorization retry expanded its repository scope")
 	}
 }

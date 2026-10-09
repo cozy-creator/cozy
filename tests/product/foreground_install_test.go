@@ -4,15 +4,14 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -44,19 +43,15 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 		case r.URL.Path == "/v1/models/resolve":
 			_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/model", "manifest_id": manifest,
 				"manifest_length": 128, "bytes": 4096, "components": []string{"transformer"}})
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/machine-authorizations":
-			raw, _ := io.ReadAll(r.Body)
-			var body map[string]any
-			_ = json.Unmarshal(raw, &body)
-			if strings.Contains(string(raw), "quantized") {
-				_ = json.NewEncoder(w).Encode(map[string]any{"token": "machine-grant", "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
-				return
-			}
+		case r.URL.Path == "/v1/auth/oauth2/authorize" && publicationRequest(r.URL.Query()) &&
+			!strings.Contains(r.URL.Query().Get("authorization_details"), "quantized"):
+			var detail []map[string]any
+			_ = json.Unmarshal([]byte(r.URL.Query().Get("authorization_details")), &detail)
 			mu.Lock()
-			grants = append(grants, body)
+			grants = append(grants, detail...)
 			mu.Unlock()
-			w.WriteHeader(http.StatusConflict)
-			_, _ = w.Write([]byte(`{"error":{"code":"publication.grant_refused","message":"the stand-in hub grants nothing"}}`))
+			back := url.Values{"error": {"access_denied"}, "error_description": {"the stand-in hub grants nothing"}, "state": {r.URL.Query().Get("state")}}
+			http.Redirect(w, r, r.URL.Query().Get("redirect_uri")+"?"+back.Encode(), http.StatusSeeOther)
 		default:
 			served.ServeHTTP(w, r)
 		}
@@ -125,10 +120,10 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 	mu.Lock()
 	asked := append([]map[string]any(nil), grants...)
 	mu.Unlock()
-	if code == 0 || !strings.Contains(out, "publication.grant_refused") || len(asked) != 1 {
+	if code == 0 || !strings.Contains(out, "hub.grant_refused") || len(asked) != 1 {
 		t.Fatalf("the upload did not ask the Hub to grant the rental [exit %d, %d grants]\n%s", code, len(asked), out)
 	}
-	if grant, _ := asked[0]["requested_grant"].(map[string]any); grant["machine_id"] != parityRental {
+	if asked[0]["machine_id"] != parityRental {
 		t.Fatalf("the grant does not name the rental: %v", asked[0])
 	}
 

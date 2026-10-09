@@ -41,7 +41,7 @@ func newAccountHubWith(t *testing.T, extra func(*http.ServeMux)) *httptest.Serve
 	problem := func(code, message string) map[string]any {
 		return map[string]any{"error": map[string]string{"code": code, "message": message}}
 	}
-	mux.HandleFunc("POST /v1/auth/device-keys/enroll/begin", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/auth/v1/device-keys/enroll/begin", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			PublicKey string `json:"public_key"`
 		}
@@ -60,7 +60,7 @@ func newAccountHubWith(t *testing.T, extra func(*http.ServeMux)) *httptest.Serve
 		reply(w, 202, map[string]string{"enrollment_id": id, "challenge": base64.RawURLEncoding.EncodeToString(challenge),
 			"expires_at": time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339Nano)})
 	})
-	mux.HandleFunc("POST /v1/auth/device-keys/enroll/finish", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/auth/v1/device-keys/enroll/finish", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ID        string `json:"enrollment_id"`
 			Code      string `json:"code"`
@@ -82,7 +82,7 @@ func newAccountHubWith(t *testing.T, extra func(*http.ServeMux)) *httptest.Serve
 		})
 	})
 	// A later command signs in with the enrolled machine key: the same user as enrollment.
-	mux.HandleFunc("POST /v1/auth/device-keys/login/begin", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/auth/v1/device-keys/login/begin", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			DeviceKeyID string `json:"device_key_id"`
 		}
@@ -101,7 +101,7 @@ func newAccountHubWith(t *testing.T, extra func(*http.ServeMux)) *httptest.Serve
 		reply(w, 200, map[string]string{"challenge_id": "login-" + id, "challenge": base64.RawURLEncoding.EncodeToString(challenge),
 			"expires_at": time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339Nano)})
 	})
-	mux.HandleFunc("POST /v1/auth/device-keys/login/finish", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/auth/v1/device-keys/login/finish", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ChallengeID string `json:"challenge_id"`
 			Signature   string `json:"signature"`

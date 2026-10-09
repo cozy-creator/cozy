@@ -55,7 +55,7 @@ func TestCachedAccountSessionFollowsPersistedDeviceKeyChanges(t *testing.T) {
 	var logins atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/auth/device-keys/login/begin":
+		case "/v1/auth/v1/device-keys/login/begin":
 			var request struct {
 				Key string `json:"device_key_id"`
 			}
@@ -65,7 +65,7 @@ func TestCachedAccountSessionFollowsPersistedDeviceKeyChanges(t *testing.T) {
 			logins.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]any{"challenge_id": request.Key,
 				"challenge": base64.RawURLEncoding.EncodeToString(make([]byte, 32)), "expires_at": time.Now().Add(time.Minute)})
-		case "/v1/auth/device-keys/login/finish":
+		case "/v1/auth/v1/device-keys/login/finish":
 			var request struct {
 				Key string `json:"challenge_id"`
 			}

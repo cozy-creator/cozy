@@ -103,7 +103,7 @@ func machineKeyLogin(deviceID string, public ed25519.PublicKey, bearer string, n
 	challenge := bytes.Repeat([]byte{7}, 32)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/auth/device-keys/login/begin":
+		case "/v1/auth/v1/device-keys/login/begin":
 			var body map[string]string
 			if json.NewDecoder(r.Body).Decode(&body) != nil || body["device_key_id"] != deviceID {
 				http.Error(w, `{"error":{"code":"auth.unknown_machine","message":"unknown machine"}}`, http.StatusUnauthorized)
@@ -111,7 +111,7 @@ func machineKeyLogin(deviceID string, public ed25519.PublicKey, bearer string, n
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"challenge_id": "login-" + deviceID,
 				"challenge": base64.RawURLEncoding.EncodeToString(challenge), "expires_at": time.Now().Add(time.Minute).UTC().Format(time.RFC3339)})
-		case "/v1/auth/device-keys/login/finish":
+		case "/v1/auth/v1/device-keys/login/finish":
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			signature, err := base64.RawURLEncoding.DecodeString(body["signature"])
@@ -535,8 +535,9 @@ func TestPackageUpdateAllUpdatesEachInstallFromItsOwnHub(t *testing.T) {
 
 // A local run of a published install reads its model bindings from the hub it was
 // installed from, not from whichever hub is current.
-// fixtureExecutionAccess delegates only catalog/storage requests to a machine leaf.
-// The fixture deliberately exposes no owned-machine registration or lifecycle API.
+// fixtureExecutionAccess grants only catalog/storage reads to a machine's leaf key and
+// returns the Authorization its reads carry. The fixture deliberately exposes no
+// owned-machine registration or lifecycle API.
 func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, worker http.Handler) string {
 	t.Helper()
 	public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -544,33 +545,21 @@ func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, 
 	const deviceID = "fixture-device"
 	plantMachineKey(t, root, server.URL, deviceID, private)
 	accountToken := "account-" + randomToken(t)
-	token := executionGrantToken(server.URL, "fixture-account", 1)
+	grants := newFakeGrants(server.URL, server.URL, accountToken)
 	account := server.Config.Handler
 	server.Config.Handler = machineKeyLogin(deviceID, public, accountToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/machines":
 			t.Error("owned machine attempted registration")
 			http.Error(w, "no machine registry", http.StatusGone)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access":
-			if r.Header.Get("Authorization") != "Bearer "+accountToken {
-				http.Error(w, "this Hub requires its own current device login", http.StatusForbidden)
-				return
-			}
-			var body struct {
-				Leaf string `json:"delegate_certificate_der_b64url"`
-			}
-			if json.NewDecoder(r.Body).Decode(&body) != nil || body.Leaf == "" {
-				http.Error(w, "missing leaf", http.StatusBadRequest)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": time.Now().Add(time.Hour), "environment": map[string]string{"TENSORHUB_ORIGIN": server.URL, "TENSORHUB_PUBLIC_ORIGIN": server.URL}})
-		case r.Header.Get("Authorization") == "Bearer "+token:
+		case grants.serve(w, r):
+		case r.Header.Get("Authorization") == "DPoP "+grants.token:
 			worker.ServeHTTP(w, r)
 		default:
 			account.ServeHTTP(w, r)
 		}
 	}))
-	return "Bearer " + token
+	return "DPoP " + grants.token
 }
 
 func TestLocalRunKeepsConfiguredHubDespiteCachedInstall(t *testing.T) {
@@ -827,29 +816,23 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	})
 }
 
-func TestExecutionAccessToleratesNewHubSettings(t *testing.T) {
-	certServer, ca := hubTLSServer(t, http.NotFoundHandler())
-	t.Cleanup(certServer.Close)
+func TestExecutionEnvironmentToleratesNewHubSettings(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/execution-access" {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/execution-environment" {
 			http.NotFound(w, r)
 			return
 		}
 		if r.Header.Get("Authorization") != "Bearer fixture" {
-			t.Error("execution grant did not use the account credential")
-		}
-		var body map[string]any
-		if json.NewDecoder(r.Body).Decode(&body) != nil || body["delegate_certificate_der_b64url"] != base64.RawURLEncoding.EncodeToString(ca) {
-			t.Error("execution grant was not certificate-bound")
+			t.Error("the execution environment did not use the account credential")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": "delegated-execution-only", "expires_at": time.Now().Add(time.Hour),
-			"environment": map[string]string{"TENSORHUB_ORIGIN": "https://hub.example", "TENSORHUB_FUTURE_FACT": "1", "COZY_WEBRTC_INTERNAL_PORT": "8445", "SOME_NEW_SETTING": "x"}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"environment": map[string]string{"TENSORHUB_ORIGIN": "https://hub.example",
+			"TENSORHUB_PUBLIC_ORIGIN": "https://hub.example", "TENSORHUB_FUTURE_FACT": "1", "COZY_WEBRTC_INTERNAL_PORT": "8445", "SOME_NEW_SETTING": "x"}})
 	}))
 	t.Cleanup(server.Close)
-	access, problem := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "").AuthorizeExecutionAccess(context.Background(), ca)
+	environment, problem := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "").ExecutionEnvironment(context.Background())
 	fatal(t, problem)
-	if len(access.Environment) != 1 || access.Environment["TENSORHUB_ORIGIN"] != "https://hub.example" {
-		t.Fatalf("non-access environment reached the machine: %v", access.Environment)
+	if len(environment.Environment) != 2 || environment.Environment["TENSORHUB_ORIGIN"] != "https://hub.example" {
+		t.Fatalf("non-access environment reached the machine: %v", environment.Environment)
 	}
 }

@@ -1,10 +1,11 @@
 package producttest
 
 import (
-	"github.com/cozy-creator/cozy/internal/archive"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/archive"
 
 	"github.com/cozy-creator/cozy/internal/records"
 )
