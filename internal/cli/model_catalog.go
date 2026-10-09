@@ -184,7 +184,7 @@ func (view modelInfoView) Emit(w io.Writer, mode output.Mode) error {
 			missingDate = true
 		}
 		releases = append(releases, map[string]any{"release": release.Release, "release_ref": card.Model.Ref() + "@" + release.Release,
-			"revision": release.Revision, "release_created": created, "yanked": release.Yanked, "lanes": lanes})
+			"revision": release.Revision, "release_created": created, "yanked": release.Yanked, "default_lane": release.DefaultLane, "lanes": lanes})
 	}
 	note := "Tensorhub does not provide a last-modified timestamp."
 	if missingDate {
@@ -208,6 +208,9 @@ func (view modelInfoView) Emit(w io.Writer, mode output.Mode) error {
 		}
 		fields := []output.Field{{K: "release", V: release.Release}, {K: "revision", V: release.Revision},
 			{K: "release_created", V: releases[i]["release_created"]}, {K: "release_ref", V: releases[i]["release_ref"]}}
+		if release.DefaultLane != "" {
+			fields = append(fields, output.Field{K: "default_lane", V: release.DefaultLane})
+		}
 		if release.Yanked {
 			fields = append(fields, output.Field{K: "status", V: "yanked"})
 		}

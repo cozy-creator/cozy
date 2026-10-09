@@ -268,10 +268,11 @@ func registryWheelIdentityBound(name, version string, selected registryWheel, ma
 }
 
 // orgIndexWheelIdentity is the identity discipline for a row locked to the
-// publisher's own org index (th-113): the hub's stable file URL shape
-// /v1/index/<org>/files/<sha256hex>/<filename>, whose path digest IS the
-// wheel's sha256. The index page advertises no size, so the lock's 0 is legal
-// here and the hub's committed claim supplies the length at declare.
+// publisher's own org index: a file under /v1/index/<org>/ named by its release
+// (/v1/index/<org>/<package>/<release>/<filename>, th-245) whose lock sha256 the
+// Hub verifies against the committed release that claims the filename. The index
+// page advertises no size, so the lock's 0 is legal here and the hub's committed
+// claim supplies the length at declare.
 func orgIndexWheelIdentity(name, version, account string, selected registryWheel, targetPython ...string) (string, *exit.Error) {
 	digest := selected.Hashes["sha256"]
 	if len(digest) != 64 || strings.ToLower(digest) != digest || selected.Size < 0 || selected.Size > MaxRegistryWheelBytes {
@@ -289,11 +290,9 @@ func orgIndexWheelIdentity(name, version, account string, selected registryWheel
 			"%s==%s wheel is not an exact org index file object", name, version)
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if len(parts) != 6 || parts[0] != "v1" || parts[1] != "index" || parts[2] != account ||
-		parts[3] != "files" || parts[4] != digest {
+	if len(parts) != 6 || parts[0] != "v1" || parts[1] != "index" || parts[2] != account || parts[3] == "simple" {
 		return "", exit.Named(exit.Validation, "registry_dependency_origin_refused",
-			"%s==%s wheel is not this package's own org index file for its locked sha256",
-			name, version)
+			"%s==%s wheel is not a file of this package's own org index", name, version)
 	}
 	filename, err := url.PathUnescape(parts[5])
 	if err != nil || filepath.Base(filename) != filename {

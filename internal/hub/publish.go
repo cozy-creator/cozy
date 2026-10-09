@@ -344,6 +344,7 @@ type ModelRelease struct {
 	Lanes            []ModelReleaseLane `json:"lanes"`
 	RepositorySHA256 string             `json:"repository_sha256"`
 	Changed          bool               `json:"changed"`
+	DefaultLane      string             `json:"default_lane"`
 }
 
 func modelReleasePath(ref Ref, release string) string {
@@ -372,7 +373,7 @@ func (c *Client) ModelRelease(ctx context.Context, ref Ref, release string) (Mod
 }
 
 func (c *Client) UpdateModelRelease(ctx context.Context, ref Ref, release string,
-	expectedRevision int64, setLanes map[string]string, removeLanes []string, reason string,
+	expectedRevision int64, setLanes map[string]string, removeLanes []string, defaultLane, reason string,
 ) (ModelRelease, *exit.Error) {
 	if setLanes == nil {
 		setLanes = map[string]string{}
@@ -384,7 +385,7 @@ func (c *Client) UpdateModelRelease(ctx context.Context, ref Ref, release string
 	e := c.do(ctx, call{method: http.MethodPost, path: modelReleasePath(ref, release),
 		auth: true, reason: reason, patient: true,
 		body: map[string]any{"expected_revision": expectedRevision,
-			"set_lanes": setLanes, "remove_lanes": removeLanes}}, &out)
+			"set_lanes": setLanes, "remove_lanes": removeLanes, "default_lane": defaultLane}}, &out)
 	return out, e
 }
 

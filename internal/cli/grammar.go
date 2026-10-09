@@ -450,15 +450,16 @@ func (c *ModelQuantizeCmd) Run(r *Runtime) error {
 }
 
 type ModelPublishCmd struct {
-	Ref        string   `arg:"" name:"model" help:"Tensorhub model repository (org/name)."`
-	Release    string   `help:"Mutable release label." required:""`
-	Lanes      []string `name:"lane" help:"Set a lane pointer as name=checkpoint-id."`
-	RemoveLane []string `help:"Remove a lane pointer by name; yank the release instead of removing its last lane."`
+	Ref         string   `arg:"" name:"model" help:"Tensorhub model repository (org/name)."`
+	Release     string   `help:"Mutable release label." required:""`
+	Lanes       []string `name:"lane" help:"Set a lane pointer as name=checkpoint-id."`
+	RemoveLane  []string `help:"Remove a lane pointer by name; yank the release instead of removing its last lane."`
+	DefaultLane string   `help:"The lane a ref naming this release and no lane reads, e.g. fp8-pruned."`
 }
 
 func (c *ModelPublishCmd) Run(r *Runtime) error {
 	return r.call(handleModelPublish, []string{c.Ref}, nil,
-		values("--release", c.Release, "--lane", c.Lanes, "--remove-lane", c.RemoveLane), false)
+		values("--release", c.Release, "--lane", c.Lanes, "--remove-lane", c.RemoveLane, "--default-lane", c.DefaultLane), false)
 }
 
 type ModelRetargetCmd struct {

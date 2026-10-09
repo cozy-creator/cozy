@@ -19,7 +19,8 @@ import (
 
 // `cozy model download` names the model (th-245): this computer's machine resolves its release
 // lane with the Hub's closure, anonymously, and downloads the checkpoint the closure names, by
-// release and lane, and by the name alone. No hash travels and no capability is traded.
+// release and lane, and by the name alone, which reads the release's default lane once its
+// owner names one. No hash travels and no capability is traded.
 func TestAModelDownloadNamesItsReleaseAndLane(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine downloads the model")
@@ -52,7 +53,10 @@ func TestAModelDownloadNamesItsReleaseAndLane(t *testing.T) {
 			mu.Lock()
 			asked = append(asked, strings.TrimSpace(named.Ref+" "+named.Lane+" "+r.Header.Get("Authorization")))
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"complete": true, "lane": "bf16", "model": "proof/probe", "release": "1.0.0",
+			if named.Lane == "" {
+				named.Lane = "bf16"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"complete": true, "lane": named.Lane, "model": "proof/probe", "release": "1.0.0",
 				"manifest": row(manifest), "objects": closure, "presign_max_digests": 64, "scope": "runtime"})
 		case r.URL.Path == "/v1/tensorfs/presign":
 			var ask struct{ Digests []string }
@@ -69,9 +73,27 @@ func TestAModelDownloadNamesItsReleaseAndLane(t *testing.T) {
 			doors.ServeHTTP(w, r)
 		}
 	})
-	account, card := h.server.Config.Handler, probeModel(t, map[string]any{"manifest_id": "sha256:" + digest, "bytes": len(closure)})
+	// Two lanes of one checkpoint; the release's default lane (th-245) is what a ref with no
+	// lane reads, and the owner sets it with `model publish --default-lane`.
+	defaultLane, published := "", ""
+	account := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !card(w, r) {
+		lane := func(name string) map[string]any {
+			return map[string]any{"lane": name, "manifest_id": "sha256:" + digest, "components": []string{}, "bytes": len(closure)}
+		}
+		release := map[string]any{"release": "1.0.0", "revision": 1, "default_lane": defaultLane, "lanes": []any{lane("bf16"), lane("fp8-pruned")}}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/proof/probe":
+			_ = json.NewEncoder(w).Encode(map[string]any{"model": map[string]string{"org": "proof", "name": "probe"}, "releases": []any{release}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/proof/probe/releases/1.0.0":
+			var body struct {
+				DefaultLane string `json:"default_lane"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			published, defaultLane = body.DefaultLane, body.DefaultLane
+			_ = json.NewEncoder(w).Encode(map[string]any{"release": "1.0.0", "revision": 1, "changed": true, "default_lane": defaultLane,
+				"lanes": []any{map[string]string{"lane": "bf16", "checkpoint_id": "sha256:" + digest}, map[string]string{"lane": "fp8-pruned", "checkpoint_id": "sha256:" + digest}}})
+		default:
 			account.ServeHTTP(w, r)
 		}
 	})
@@ -94,18 +116,25 @@ func TestAModelDownloadNamesItsReleaseAndLane(t *testing.T) {
 		t.Fatalf("machine install [exit %d]\n%s", code, out)
 	}
 	h.hubAccess.signIn(t, root)
-	for _, ref := range []string{"proof/probe@1.0.0/bf16", "proof/probe"} {
+	download := func(ref string) {
+		t.Helper()
 		if code, out := runCozy(t, root, "model", "download", ref, "--await", "--json"); code != 0 {
 			t.Fatalf("model download %s [exit %d]\n%s", ref, code, out)
 		}
 	}
+	download("proof/probe@1.0.0/bf16")
+	if code, out := runCozy(t, root, "model", "publish", "proof/probe", "--release", "1.0.0", "--default-lane", "fp8-pruned", "--json"); code != 0 || published != "fp8-pruned" || !strings.Contains(out, `"default_lane":"fp8-pruned"`) {
+		t.Fatalf("model publish --default-lane [exit %d] sent %q\n%s", code, published, out)
+	}
+	download("proof/probe")
+	download("proof/probe@1.0.0")
 	mu.Lock()
 	defer mu.Unlock()
 	t.Logf("the machine asked the closure for: %q", asked)
-	if len(asked) == 0 || asked[0] != "proof/probe@1.0.0 bf16" || slices.ContainsFunc(asked, func(ask string) bool {
+	if len(asked) < 2 || asked[0] != "proof/probe@1.0.0 bf16" || !slices.Contains(asked, "proof/probe@1.0.0 fp8-pruned") || slices.ContainsFunc(asked, func(ask string) bool {
 		return strings.HasPrefix(ask, "proof/probe@sha256:") || strings.Contains(ask, "DPoP")
 	}) {
-		t.Fatalf("the machine did not resolve the model by name, anonymously: %q", asked)
+		t.Fatalf("the machine did not resolve the model by name and default lane, anonymously: %q", asked)
 	}
 	if trades := h.hubAccess.trades(); len(trades) != 0 {
 		t.Fatalf("a public model download traded a capability: %d", len(trades))

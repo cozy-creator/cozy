@@ -209,6 +209,8 @@ type ModelReleaseSummary struct {
 	ReleaseSummary
 	Revision int64              `json:"revision"`
 	Lanes    []ModelLaneSummary `json:"lanes"`
+	// DefaultLane is the lane a ref naming this release and no lane reads (th-245).
+	DefaultLane string `json:"default_lane"`
 }
 
 type ModelCard struct {

@@ -924,12 +924,20 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 					CatalogRepository: ref.String(), Release: release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
 			}
 		}
-		if len(manifestLanes) != 1 {
+		// Else the release's default lane (th-245), else its only manifest.
+		for _, lane := range selected.Lanes {
+			if wantedLane == "" && lane.Lane == selected.DefaultLane {
+				manifest, wantedLane = lane.ManifestID, lane.Lane
+			}
+		}
+		if manifest == "" && len(manifestLanes) != 1 {
 			return empty, exit.Usagef("model %s@%s has %d manifests", ref.String(), release, len(manifestLanes)).
 				WithRemedy("append /<lane> or #sha256:<digest> to select one exact manifest")
 		}
 		for digest := range manifestLanes {
-			manifest = digest
+			if manifest == "" {
+				manifest = digest
+			}
 		}
 	}
 	if _, err := canonical.Raw(manifest); err != nil {
@@ -938,6 +946,9 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	}
 	lanes := manifestLanes[manifest]
 	sort.Strings(lanes)
+	if wantedLane != "" {
+		lanes = []string{wantedLane}
+	}
 	if problem := requireCheckpointComponents(raw, slot, manifestComponents[manifest]); problem != nil {
 		return empty, problem
 	}

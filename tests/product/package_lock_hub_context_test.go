@@ -34,9 +34,9 @@ func TestPackageLockUsesTheNamedHubContextsLogin(t *testing.T) {
 				http.NotFound(w, r)
 				return
 			}
-			fmt.Fprintf(w, `<a href="/v1/index/proof/files/%s/%s#sha256=%s">%s</a><br>`, digest, filename, digest, filename)
+			fmt.Fprintf(w, `<a href="/v1/index/proof/%s/1.0.0/%s#sha256=%s">%s</a><br>`, dependency, filename, digest, filename)
 		})
-		mux.HandleFunc("GET /v1/index/proof/files/{digest}/{filename}", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("GET /v1/index/proof/"+dependency+"/1.0.0/{filename}", func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(wheel)
 		})
 	})

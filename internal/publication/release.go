@@ -36,7 +36,7 @@ type ReleaseReceipt struct {
 
 type Releases interface {
 	ModelRelease(context.Context, hub.Ref, string) (hub.ModelRelease, *exit.Error)
-	UpdateModelRelease(context.Context, hub.Ref, string, int64, map[string]string, []string, string) (hub.ModelRelease, *exit.Error)
+	UpdateModelRelease(context.Context, hub.Ref, string, int64, map[string]string, []string, string, string) (hub.ModelRelease, *exit.Error)
 }
 
 func ReleaseLanes(release hub.ModelRelease) (map[string]string, *exit.Error) {
@@ -153,7 +153,7 @@ func ApplyRelease(ctx context.Context, client Releases, intent ReleaseIntent, se
 	if problem := beforeSend(); problem != nil {
 		return ReleaseReceipt{}, problem
 	}
-	updated, problem := client.UpdateModelRelease(ctx, ref, intent.Request.Release, intent.BaselineRevision, intent.Request.Lanes, nil, "local script release publication")
+	updated, problem := client.UpdateModelRelease(ctx, ref, intent.Request.Release, intent.BaselineRevision, intent.Request.Lanes, nil, "", "local script release publication")
 	if problem != nil {
 		return ReleaseReceipt{}, problem
 	}
