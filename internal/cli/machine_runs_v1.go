@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -878,12 +879,14 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 	if local := loopbackHub(origin); machine.Local && local != "" && loopbackHub(reads) == "" {
 		reads = local // this computer's machine reads a Hub on this computer there
 	}
-	access := &v1.HubAccess{Origin: reads, CaDer: environment.TrustRoot}
+	access := &v1.HubAccess{Origin: reads, CaDer: environment.TrustRoot,
+		ObjectOrigin: environment.Environment["TENSORHUB_OBJECT_ORIGIN"]}
 	for _, host := range strings.Split(environment.Environment["TENSORHUB_OBJECT_STORAGE_HOSTS"], ",") {
 		if host = strings.TrimSpace(host); host != "" {
 			access.ObjectHosts = append(access.ObjectHosts, host)
 		}
 	}
+	operations = m.unpublished(ctx, access.ObjectOrigin, operations)
 	if len(operations) == 0 {
 		return access, nil
 	}
@@ -919,6 +922,49 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 		return nil, problem
 	}
 	return access, nil
+}
+
+// unpublished drops each read of a checkpoint the object origin already serves: the machine
+// reads that one anonymously by digest there, so the Hub never learns it is used (th-243).
+// An origin that cannot be asked keeps the read, which the run's token still authorizes.
+func (m *machineRuns) unpublished(ctx context.Context, origin string, operations []any) []any {
+	if origin == "" {
+		return operations
+	}
+	kept := operations[:0:0]
+	for _, operation := range operations {
+		op, read := operation.(map[string]string)
+		if !read || op["type"] != "tensorhub_model_read" || !m.public(ctx, origin, op["manifest"]) {
+			kept = append(kept, operation)
+		}
+	}
+	return kept
+}
+
+// public says whether origin serves the manifest: a HEAD of <origin>/sha256/<hex>.
+func (m *machineRuns) public(ctx context.Context, origin, manifest string) bool {
+	hexDigest, ok := strings.CutPrefix(manifest, "sha256:")
+	if !ok || len(hexDigest) != 64 {
+		return false
+	}
+	key := origin + "\x00" + hexDigest
+	if _, held := m.publicCheckpoints.Load(key); held {
+		return true
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, strings.TrimRight(origin, "/")+"/sha256/"+hexDigest, nil)
+	if err != nil {
+		return false
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return false
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return false
+	}
+	m.publicCheckpoints.Store(key, true)
+	return true
 }
 
 // loopbackHub is origin as scheme://host[:port] when it names this computer, else "".

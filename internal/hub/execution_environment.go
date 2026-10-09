@@ -15,8 +15,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// ExecutionEnvironment is where a machine reaches this Hub and its object storage, and the
-// resource a run capability for it names (TENSORHUB_PUBLIC_ORIGIN).
+// ExecutionEnvironment is where a machine reaches this Hub and its object storage, the
+// resource a run capability for it names (TENSORHUB_PUBLIC_ORIGIN), and where it reads public
+// checkpoints by digest (TENSORHUB_OBJECT_ORIGIN, th-243).
 type ExecutionEnvironment struct {
 	Environment map[string]string `json:"environment"`
 	TrustRoot   []byte            `json:"-"`
@@ -32,7 +33,7 @@ func (c *Client) ExecutionEnvironment(ctx context.Context) (ExecutionEnvironment
 	}
 	for name := range out.Environment {
 		switch name {
-		case "TENSORHUB_ORIGIN", "TENSORHUB_PUBLIC_ORIGIN", "TENSORHUB_OBJECT_STORAGE_HOSTS":
+		case "TENSORHUB_ORIGIN", "TENSORHUB_PUBLIC_ORIGIN", "TENSORHUB_OBJECT_STORAGE_HOSTS", "TENSORHUB_OBJECT_ORIGIN":
 		default:
 			delete(out.Environment, name)
 		}
