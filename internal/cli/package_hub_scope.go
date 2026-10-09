@@ -24,7 +24,10 @@ func installHubScope(ctx *Context, inst records.PackageInstall) string {
 	if inst.SourceKind != "tensorhub" {
 		return "local"
 	}
-	if ctx.forHub(inst.Hub).Cfg.HubURL == ctx.Cfg.HubURL {
+	if inst.Hub == "" {
+		return "unknown hub"
+	}
+	if inst.PublishedAt(ctx.Cfg.HubURL) {
 		return "selected hub"
 	}
 	return "other hub"
@@ -61,4 +64,18 @@ func packageHubProblem(ctx *Context, pkg string, problem *exit.Error) *exit.Erro
 	copy.Remedy = fmt.Sprintf("the installed %s@%s came from %s; add --tensorhub=%s to explicitly use that Hub for this command", pkg, installed.Version, origin, label)
 	copy.Next = []string{"cozy package info " + pkg + " --tensorhub=" + label, "cozy hub list"}
 	return &copy
+}
+
+// Local source captures have no catalog owner. Published identities need a known,
+// matching origin even if an older install has the same package name/version.
+func installedInScope(ctx *Context, inst records.PackageInstall) bool {
+	return inst.SourceKind != "tensorhub" || inst.PublishedAt(ctx.Cfg.HubURL)
+}
+
+func foreignPackageRemoval(ctx *Context, inst records.PackageInstall) *exit.Error {
+	problem := exit.Named(exit.Conflict, "package.other_hub", "%s is not installed from selected Hub %s; its installation was preserved", inst.Package, selectedHubText(ctx))
+	if inst.Hub == "" {
+		return problem.WithRemedy("this installation has no recorded Hub; inspect it with cozy package list --all-hubs --full")
+	}
+	return problem.WithRemedy("the installation came from %s; explicitly use --tensorhub=%s to remove it", inst.Hub, ctx.Cfg.HubLabel(inst.Hub))
 }

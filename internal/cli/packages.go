@@ -220,10 +220,9 @@ func handleLs(ctx *Context) *exit.Error {
 		Notes:     []string{"Selected Hub for package references: " + selectedHubText(ctx) + "."},
 	}
 	inventory, pythonProblem := hostruntime.PythonExecutors(context.Background())
-	if !everyHub(ctx) {
-		// --tensorhub lists only what came from that hub.
+	if !ctx.Inv.Bool("--all-hubs") {
 		rows = slices.DeleteFunc(rows, func(inst records.PackageInstall) bool {
-			return inst.SourceKind != "tensorhub" || ctx.forHub(inst.Hub).Cfg.HubURL != ctx.Cfg.HubURL
+			return !installedInScope(ctx, inst)
 		})
 	}
 	for _, inst := range rows {
@@ -262,20 +261,21 @@ func handleLs(ctx *Context) *exit.Error {
 			"installed":     inst.CreatedAt,
 		})
 	}
+	l.Fields = append(l.Fields, "hub", "scope")
+	if ctx.Inv.Bool("--all-hubs") {
+		l.Notes = append(l.Notes, "Showing all installed Hubs; package references still use the selected Hub unless --tensorhub is explicit.")
+	} else {
+		l.Notes = append(l.Notes, "Use --all-hubs to include installations from other Hubs.")
+	}
 	if len(l.Rows) == 0 {
 		l.Next = []string{"cozy package search"}
-		return emit(ctx, l)
-	}
-	l.Fields = append(l.Fields, "hub", "scope")
-	if everyHub(ctx) {
-		l.Notes = append(l.Notes, "Installed inventory includes every Hub; other-Hub installs require an explicit --tensorhub=<hub> for package references.")
 	}
 	return emit(ctx, l)
 }
 
 // installHub names the hub a published install came from; a local install has none.
 func installHub(ctx *Context, inst records.PackageInstall) string {
-	if inst.SourceKind != "tensorhub" {
+	if inst.SourceKind != "tensorhub" || inst.Hub == "" {
 		return ""
 	}
 	return ctx.Cfg.HubLabel(ctx.forHub(inst.Hub).Cfg.HubURL)
@@ -332,6 +332,13 @@ func handleRm(ctx *Context) *exit.Error {
 			return e
 		}
 		for _, p := range targets {
+			inst, problem := st.Install(p.InstallID)
+			if problem != nil {
+				return problem
+			}
+			if inst != nil && !installedInScope(ctx, *inst) {
+				return foreignPackageRemoval(ctx, *inst)
+			}
 			n, e := install.Remove(l, st, p.Package, p.Major)
 			if e != nil {
 				return e
@@ -368,6 +375,15 @@ func handleRm(ctx *Context) *exit.Error {
 			}
 		}
 		if !selected {
+			continue
+		}
+		// Unreferenced rows omit their origin; read the complete install before
+		// reclaiming so a same-name package from another Hub stays untouched.
+		full, problem := st.Install(superseded.ID)
+		if problem != nil {
+			return problem
+		}
+		if full == nil || !installedInScope(ctx, *full) {
 			continue
 		}
 		n, problem := install.Reclaim(l, st, superseded.ID)

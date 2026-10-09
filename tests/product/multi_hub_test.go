@@ -508,8 +508,7 @@ func TestPackageUpdateAllUsesOnlySelectedHub(t *testing.T) {
 		return rows
 	}
 	rows := update()
-	if rows["proof/alpha"]["status"] != "current" || rows["proof/beta"]["status"] != "skipped" ||
-		rows["proof/alpha"]["hub"] != "a" || rows["proof/beta"]["hub"] != "b" {
+	if len(rows) != 1 || rows["proof/alpha"]["status"] != "current" || rows["proof/alpha"]["hub"] != "a" {
 		t.Fatalf("update did not preserve the foreign install: %+v", rows)
 	}
 	if _, crossed := askedA.Load("proof/beta"); crossed {
@@ -519,11 +518,8 @@ func TestPackageUpdateAllUsesOnlySelectedHub(t *testing.T) {
 		t.Errorf("unselected hub b was contacted for %v", key)
 		return true
 	})
-	if !strings.Contains(rows["proof/beta"]["detail"].(string), "installed from b") {
-		t.Fatalf("skipped package lost its source: %+v", rows)
-	}
 	rows = update("--tensorhub=b")
-	if rows["proof/alpha"]["status"] != "skipped" || rows["proof/beta"]["status"] != "current" {
+	if len(rows) != 1 || rows["proof/beta"]["status"] != "current" {
 		t.Fatalf("explicit hub selection was ignored: %+v", rows)
 	}
 	if _, crossed := askedB.Load("proof/alpha"); crossed {
@@ -533,15 +529,15 @@ func TestPackageUpdateAllUsesOnlySelectedHub(t *testing.T) {
 		t.Fatalf("hub use b: %d %s", code, out)
 	}
 	rows = update()
-	if rows["proof/alpha"]["status"] != "skipped" || rows["proof/beta"]["status"] != "current" {
+	if len(rows) != 1 || rows["proof/beta"]["status"] != "current" {
 		t.Fatalf("configured hub selection was ignored: %+v", rows)
 	}
 	hubB.Close()
 	rows = update("--tensorhub=a")
-	if rows["proof/alpha"]["status"] != "current" || rows["proof/beta"]["status"] != "skipped" {
+	if len(rows) != 1 || rows["proof/alpha"]["status"] != "current" {
 		t.Fatalf("an unreachable foreign hub affected this update: %+v", rows)
 	}
-	code, out := runCozy(t, root, "package", "list", "--json", "--full")
+	code, out := runCozy(t, root, "package", "list", "--json", "--full", "--all-hubs")
 	if code != 0 || !strings.Contains(out, `"hub":"b"`) || !strings.Contains(out, `"hub":"a"`) {
 		t.Fatalf("package list does not show each install's hub: %d %s", code, out)
 	}

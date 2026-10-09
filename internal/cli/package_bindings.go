@@ -33,7 +33,7 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 	c := client(ctx)
 	rows, problem := c.PackageBindings(hctx, ref)
 	if problem != nil {
-		return problem
+		return packageHubProblem(ctx, ref.String(), problem)
 	}
 	release := ""
 	if v := ctx.Inv.Values["--version"]; len(v) > 0 {
@@ -42,7 +42,7 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 	if release == "" {
 		card, problem := c.PackageCard(hctx, ref)
 		if problem != nil {
-			return problem
+			return packageHubProblem(ctx, ref.String(), problem)
 		}
 		if release, problem = newestPackageRelease(card.Releases); problem != nil {
 			return problem

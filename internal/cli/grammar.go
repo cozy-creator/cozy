@@ -179,7 +179,7 @@ type PackageCmd struct {
 	Install   PackageInstallCmd   `cmd:"" help:"Install a published package or explicit local directory."`
 	Recover   PackageRecoverCmd   `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
 	Remove    PackageRemoveCmd    `cmd:"" help:"Delete source-code."`
-	List      PackageListCmd      `cmd:"" help:"List installed packages and their scope relative to the selected Hub."`
+	List      PackageListCmd      `cmd:"" help:"List packages installed from the selected Hub and local sources."`
 	Info      PackageInfoCmd      `cmd:"" help:"Show a published package's releases."`
 	Lock      PackageLockCmd      `cmd:"" help:"Lock this package's dependencies for the current Tensorhub and account."`
 	Publish   PackagePublishCmd   `cmd:"" help:"Publish a package release."`
@@ -283,10 +283,12 @@ func (c *PackageRemoveCmd) Run(r *Runtime) error {
 	return r.call(handleRm, c.Refs, nil, nil, false)
 }
 
-type PackageListCmd struct{}
+type PackageListCmd struct {
+	AllHubs bool `help:"Include installations from every Hub."`
+}
 
 func (c *PackageListCmd) Run(r *Runtime) error {
-	return r.call(handleLs, nil, nil, nil, false)
+	return r.call(handleLs, nil, bools("--all-hubs", c.AllHubs), nil, false)
 }
 
 type PackageLockCmd struct {
