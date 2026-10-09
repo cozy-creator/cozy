@@ -265,7 +265,8 @@ type PackageInstallCmd struct {
 	Ref      string `arg:"" name:"package-or-directory" predictor:"dir-or-ref" help:"Published org/name or explicit directory such as . or ./project."`
 	Version  string `help:"Install this release instead of the newest, e.g. 1.2.3."`
 	Editable bool   `help:"Keep an explicit local directory live for development."`
-	Rental   string `predictor:"rental" help:"Install published code and dependencies on this existing rental name or id, without model weights."`
+	Rental   string `predictor:"rental" help:"Install published code and dependencies on this existing rental name or id, without model weights; waits for the outcome."`
+	NoWait   bool   `name:"no-wait" help:"With --rental, answer once the installation is queued instead of waiting for its outcome."`
 }
 
 type PackageUpdateAllCmd struct{}
@@ -296,7 +297,7 @@ func (c *PackageYankCmd) Run(r *Runtime) error {
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
-	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable),
+	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable, "--no-wait", c.NoWait),
 		values("--version", c.Version, "--rental", c.Rental), false)
 }
 
@@ -316,11 +317,12 @@ func (c *PackageRemoveCmd) Run(r *Runtime) error {
 }
 
 type PackageListCmd struct {
-	AllHubs bool `help:"Every hub's installations: the default. --tensorhub=<hub> lists one hub's."`
+	AllHubs bool   `help:"Every hub's installations: the default. --tensorhub=<hub> lists one hub's."`
+	Rental  string `predictor:"rental" help:"List the packages this rental's machine holds instead of this computer's."`
 }
 
 func (c *PackageListCmd) Run(r *Runtime) error {
-	return r.call(handleLs, nil, bools("--all-hubs", c.AllHubs), nil, false)
+	return r.call(handleLs, nil, bools("--all-hubs", c.AllHubs), values("--rental", c.Rental), false)
 }
 
 type PackageLockCmd struct {

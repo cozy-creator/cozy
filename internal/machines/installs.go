@@ -171,7 +171,7 @@ func (q *Installs) Run(ctx context.Context) {
 					continue
 				}
 				if ended != nil {
-					q.report(q.store.SettleRentalInstall(row.ID, "failed", nil, ended))
+					q.settle(row, "failed", nil, ended)
 					if held, ok := running[row.RentalID]; ok && held.id == row.ID {
 						held.cancel()
 					}
@@ -204,7 +204,7 @@ func (q *Installs) Run(ctx context.Context) {
 							state = "queued"
 						}
 					}
-					q.report(q.store.SettleRentalInstall(row.ID, state, result, problem))
+					q.settle(row, state, result, problem)
 					select {
 					case done <- completion{rental: row.RentalID, retry: state == "queued"}:
 					case <-ctx.Done():
@@ -213,6 +213,19 @@ func (q *Installs) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// settle records an installation's end, or its return to the queue, and logs each outcome.
+func (q *Installs) settle(row records.RentalInstall, state string, result json.RawMessage, problem *exit.Error) {
+	if failed := q.store.SettleRentalInstall(row.ID, state, result, problem); failed != nil || state == "queued" {
+		q.report(failed)
+		return
+	}
+	line := fmt.Sprintf("%s on %s %s: %s", row.ID, row.RentalID, state, row.Selection.Target())
+	if problem != nil {
+		line += ": " + problem.Message
+	}
+	fmt.Fprintln(q.log, line)
 }
 
 func (q *Installs) report(problem *exit.Error) {

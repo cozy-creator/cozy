@@ -142,6 +142,7 @@ cozy package install org/name --version 1.2.3
 cozy package install org/name --rental=kirukiru
 cozy package install . --editable
 cozy package list
+cozy package list --rental=kirukiru
 ```
 
 Package names resolve at the current hub, or at `--tensorhub=<hub>` for one command;
@@ -155,7 +156,9 @@ same name under another org at this hub, each with the command that works.
 `--rental` installs published code and Python dependencies on that existing rental,
 without downloading model weights or changing the local package installation.
 Omit `--version` to select the newest published release. Rental installs are queued
-durably while the worker boots and delivered automatically once it is ready. See
+durably while the worker boots and delivered automatically once it is ready; the command
+waits for the outcome (Ctrl-C detaches, `--no-wait` returns once queued), and
+`cozy package list --rental=NAME` lists what that machine holds. See
 [package and model preparation](docs/worker-preparation.md) for explicit model prewarming.
 
 An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) creates a

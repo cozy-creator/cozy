@@ -60,6 +60,11 @@ func TestPackageInstallRental(t *testing.T) {
 					_, _ = w.Write([]byte(`{"machine_v1":true}`))
 					return
 				}
+				if r.Method == "GET" && r.URL.Path == "/v1/local/rentals/rental-proof/installs/install-proof" { // the command follows it
+					_ = json.NewEncoder(w).Encode(api.RentalInstallStatus{RentalInstall: records.RentalInstall{ID: "install-proof", RentalID: "rental-proof",
+						State: "succeeded", Selection: records.RentalInstallSelection{Package: "paul/minimax-h3", Release: test.selected}}})
+					return
+				}
 				if r.Method != "POST" || r.URL.Path != "/v1/local/rentals/rental-proof/prepare" || r.Header.Get("Authorization") == "" {
 					t.Errorf("unexpected daemon request: %s %s", r.Method, r.URL)
 					http.Error(w, "unexpected request", 500)
@@ -106,7 +111,7 @@ func TestPackageInstallRental(t *testing.T) {
 				if err == nil || preparations.Load() != 0 {
 					t.Fatalf("bad release reached preparation: %v, %d", err, preparations.Load())
 				}
-			} else if err != nil || preparations.Load() != 1 || !strings.Contains(out.String(), `"release":"`+test.selected+`"`) {
+			} else if err != nil || preparations.Load() != 1 || !strings.Contains(out.String(), `"status":"succeeded","target":"paul/minimax-h3@`+test.selected+`"`) {
 				t.Fatalf("rental install: %v; preparations=%d; output=%s", err, preparations.Load(), &out)
 			}
 			if resolutions.Load() != 1 {

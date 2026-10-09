@@ -35,16 +35,17 @@ The rental must already have a local record (booting or ready). A pending
 acquisition that has not produced a rental record cannot yet receive install
 intents. Neither command creates or purchases a rental.
 
-Both commands return a durable queued install ID. Creator resolves
+Both commands queue a durable install. Creator resolves
 and records the exact release and checkpoint at acceptance. A booting rental is
 kept queued; the daemon delivers its accepted installs in order once its worker
 is ready. The CLI may disconnect, and a restarted daemon resumes the same exact
 selection without re-resolving latest or buying another rental.
 
 The queue is managed in the background. Completion requires a verified Host receipt;
-acceptance is not completion. `cozy model download --rental=NAME --await` waits for
-that receipt, printing the machine's stage and bytes as it goes, and reports the elapsed
-time; interrupting it stops only the wait. Failed boot, rental termination, or a changed
+acceptance is not completion. `cozy package install --rental=NAME` (unless `--no-wait`)
+and `cozy model download --rental=NAME --await` wait for that receipt, printing the
+machine's stage and bytes as it goes, and report the elapsed time or the failure;
+interrupting detaches without cancelling. The daemon logs each outcome. Failed boot, rental termination, or a changed
 worker identity ends the install with a typed failure. Interrupted transfers
 reuse the worker's retained download progress when Creator reconnects. The queue
 stores exact logical selections, not presigned URLs. The worker refreshes download

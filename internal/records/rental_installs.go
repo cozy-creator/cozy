@@ -1,6 +1,7 @@
 package records
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -68,6 +69,35 @@ func (s RentalInstallSelection) HoldsLocally() bool {
 		local = local || strings.HasPrefix(model.Model, "local/")
 	}
 	return local
+}
+
+// Target names what a selection puts on its machine.
+func (s RentalInstallSelection) Target() string {
+	if s.Warm != "" {
+		return s.Package + "/" + s.Entrypoint + " warm=" + s.Warm
+	}
+	if s.Package != "" {
+		return s.Package + "@" + s.Release
+	}
+	models := make([]string, 0, len(s.Models))
+	for _, model := range s.Models {
+		if s.Destination != "" {
+			models = append(models, cmp.Or(model.Source, model.Model, model.Manifest)+" -> "+s.Destination)
+			continue
+		}
+		name := model.Model
+		if model.Release != "" {
+			name += "@" + model.Release
+		}
+		if model.Lane != "" {
+			name += "/" + model.Lane
+		}
+		if model.Release == "" {
+			name += "#" + model.Manifest
+		}
+		models = append(models, name)
+	}
+	return strings.Join(models, ", ")
 }
 
 func (r RentalInstall) Active() bool { return r.State == "queued" || r.State == "installing" }

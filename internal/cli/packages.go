@@ -205,7 +205,32 @@ func emitInstallResult(ctx *Context, res *install.Result, cleanup ...output.Fiel
 	return emit(ctx, rec)
 }
 
+// rentalPackages is `cozy package list --rental=<name>`: the packages that rental's machine holds,
+// each with the level it holds it at.
+func rentalPackages(ctx *Context) *exit.Error {
+	rentalID, problem := requestedRental(ctx)
+	if problem != nil {
+		return problem
+	}
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	status, problem := client.MachineStatus(rentalID)
+	if problem != nil {
+		return problem
+	}
+	l := output.List{Name: "packages", Fields: []string{"package", "release", "level"}, AllFields: []string{"package", "release", "level", "installation"}}
+	for _, env := range status.Environments {
+		l.Rows = append(l.Rows, map[string]string{"package": env.Package, "release": env.Release, "level": env.Level, "installation": env.Installation})
+	}
+	return emit(ctx, l)
+}
+
 func handleLs(ctx *Context) *exit.Error {
+	if ctx.Inv.Value("--rental") != "" {
+		return rentalPackages(ctx)
+	}
 	_, st, _, e := open(ctx.Cfg, false)
 	if e != nil {
 		return e
