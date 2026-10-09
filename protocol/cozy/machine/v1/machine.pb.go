@@ -1181,9 +1181,6 @@ type HubAccess struct {
 	// a public-only run.
 	Capability    string `protobuf:"bytes,7,opt,name=capability,proto3" json:"capability,omitempty"`
 	TokenEndpoint string `protobuf:"bytes,8,opt,name=token_endpoint,json=tokenEndpoint,proto3" json:"token_endpoint,omitempty"` // the Hub's authorization server's, as its metadata names it
-	// The Hub's anonymous content-addressed object origin (th-243): every public checkpoint is
-	// read there at <object_origin>/sha256/<hex>, never at the Hub. Https, or http on loopback.
-	ObjectOrigin  string `protobuf:"bytes,9,opt,name=object_origin,json=objectOrigin,proto3" json:"object_origin,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1249,13 +1246,6 @@ func (x *HubAccess) GetCapability() string {
 func (x *HubAccess) GetTokenEndpoint() string {
 	if x != nil {
 		return x.TokenEndpoint
-	}
-	return ""
-}
-
-func (x *HubAccess) GetObjectOrigin() string {
-	if x != nil {
-		return x.ObjectOrigin
 	}
 	return ""
 }
@@ -3305,7 +3295,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\bmanifest\x18\x05 \x01(\tR\bmanifest\x12\x14\n" +
 	"\x05scale\x18\x06 \x01(\tR\x05scale\x12\x16\n" +
 	"\x06source\x18\a \x01(\tR\x06source\x12\x1a\n" +
-	"\bprofiles\x18\b \x03(\tR\bprofiles\"\xdb\x01\n" +
+	"\bprofiles\x18\b \x03(\tR\bprofiles\"\xb6\x01\n" +
 	"\tHubAccess\x12\x16\n" +
 	"\x06origin\x18\x01 \x01(\tR\x06origin\x12\x15\n" +
 	"\x06ca_der\x18\x04 \x01(\fR\x05caDer\x12!\n" +
@@ -3313,8 +3303,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\n" +
 	"capability\x18\a \x01(\tR\n" +
 	"capability\x12%\n" +
-	"\x0etoken_endpoint\x18\b \x01(\tR\rtokenEndpoint\x12#\n" +
-	"\robject_origin\x18\t \x01(\tR\fobjectOriginJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x06\x10\a\"\xfd\x02\n" +
+	"\x0etoken_endpoint\x18\b \x01(\tR\rtokenEndpointJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x06\x10\a\"\xfd\x02\n" +
 	"\bRunEvent\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12\x13\n" +
 	"\x05at_ms\x18\x02 \x01(\x03R\x04atMs\x121\n" +
