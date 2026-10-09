@@ -226,7 +226,8 @@ impl Scope {
             // can assign different meaning to their first or last occurrence.
             let name = name.to_ascii_lowercase();
             // Which bytes are asked for is not who is asking: chunks share a connection.
-            if name == "range" {
+            // Neither is a per-request proof (RFC 9449): the token beside it is.
+            if name == "range" || name == "dpop" {
                 continue;
             }
             hash.update(&(name.len() as u64).to_le_bytes());
@@ -710,6 +711,10 @@ impl<'l> Response<'l> {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    pub(crate) fn headers(&self) -> &[(String, String)] {
+        &self.headers
     }
 
     pub fn into_body(self) -> BodyReader<'l> {

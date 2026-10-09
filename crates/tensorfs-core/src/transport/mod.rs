@@ -32,8 +32,10 @@
 //! to a loopback listener it starts itself, and nothing here reads the environment.
 
 mod api;
+mod credential;
 mod decisions;
 mod download;
+mod dpop;
 mod http;
 mod hub;
 mod ledger;
@@ -47,13 +49,15 @@ pub(crate) mod sources;
 #[cfg(test)]
 mod tests;
 
-pub use api::{api_get, fetch_prefix, probe_length, Prefix};
-pub use download::{fetch_ranged, Ranged, CHUNK_BYTES, PART_BYTES};
-pub use http::{trust_roots, Client};
-pub use hub::{
-    closure, closure_all, credential_from_spec, hub_call, presign, Anonymous, Closure,
-    CredentialProvider, HostToken, Presigned, ScopedHeaders,
+pub use api::{api_get, fetch_prefix, form_post, probe_length, Prefix};
+pub use credential::{
+    credential_from_spec, Anonymous, Answer, Ask, Both, CredentialProvider, HostToken,
+    ScopedHeaders,
 };
+pub use download::{fetch_ranged, Ranged, CHUNK_BYTES, PART_BYTES};
+pub use dpop::{AccessToken, DpopCredential, DpopKey};
+pub use http::{trust_roots, Client};
+pub use hub::{closure, closure_all, hub_call, presign, Closure, Presigned};
 pub use ledger::{
     Deadline, Ledger, PullCancellation, FETCH_ATTEMPTS, PULL_STREAMS, SAMPLE_SECONDS, STALL_FACTOR,
     STILL_SAMPLES, STREAMS,

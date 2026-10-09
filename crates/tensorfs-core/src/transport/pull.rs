@@ -37,8 +37,9 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
 use crate::ids::{Doc, ObjectRef};
 use crate::store::Store;
+use crate::transport::credential::{presenting, Ask, CredentialProvider};
 use crate::transport::http::{self, Client};
-use crate::transport::hub::{self, CredentialProvider};
+use crate::transport::hub;
 use crate::transport::ledger::{Deadline, Ledger, PULL_STREAMS};
 use crate::transport::policy::{self, SourcePolicy};
 use std::collections::BTreeMap;
@@ -122,20 +123,26 @@ pub(super) fn open_object<'l>(
     let mut target = url.to_string();
     for _hop in 0..=policy.max_redirects {
         let checked = policy.check(&target)?;
-        let mut headers = credential.headers(&checked.host);
-        headers.extend_from_slice(extra);
-        let response = http::request(
-            client,
-            &checked,
-            "GET",
-            &headers,
-            None,
-            deadline,
-            ledger,
-            http::Judge::Stream,
-            None,
-            Code::TRANSFER_FAILED,
-        )?;
+        let ask = Ask {
+            method: "GET",
+            url: &checked,
+        };
+        let response = presenting(credential, &ask, |presented| {
+            let mut headers = presented.to_vec();
+            headers.extend_from_slice(extra);
+            http::request(
+                client,
+                &checked,
+                "GET",
+                &headers,
+                None,
+                deadline,
+                ledger,
+                http::Judge::Stream,
+                None,
+                Code::TRANSFER_FAILED,
+            )
+        })?;
         let status = response.status;
         hop(&checked, status);
         if (300..400).contains(&status) {

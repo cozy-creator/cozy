@@ -3,8 +3,8 @@
 //! no hub. The ledger tests run at millisecond resolution: the cadence is configuration,
 //! the RULE under test is production's.
 
+use super::credential::{credential_from_spec, Anonymous, HostToken};
 use super::download::{fetch_ranged, Ranged};
-use super::hub::{credential_from_spec, Anonymous, HostToken};
 use super::ledger::{Deadline, Ledger};
 use super::policy::{self, blocked, CheckedUrl, SourcePolicy};
 use super::pull::{absolute_location, pull, Fetched, ObjectSource, PullRequest};

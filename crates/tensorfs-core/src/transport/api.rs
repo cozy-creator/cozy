@@ -5,8 +5,8 @@
 //! admits bytes — a listing names members; the fetch plane moves them.
 
 use crate::err::{refuse, Code, Refusal, Result};
+use crate::transport::credential::{presenting, Ask, CredentialProvider};
 use crate::transport::http::{self, Client};
-use crate::transport::hub::CredentialProvider;
 use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::SourcePolicy;
 use crate::transport::pull::absolute_location;
@@ -38,6 +38,67 @@ pub fn api_get(
     let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
     let body = response.read_capped(cap)?;
     Ok((body, next))
+}
+
+/// One form POST (`application/x-www-form-urlencoded`) to a caller-validated URL, never
+/// redirected: an OAuth token endpoint, under a proof-only `DpopCredential`. Answers the
+/// status and the body, capped at `max_bytes`; what a refusal means is the caller's to read.
+pub fn form_post(
+    url: &str,
+    form: &[(&str, &str)],
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    max_bytes: u64,
+    deadline: Deadline,
+) -> Result<(u16, Vec<u8>)> {
+    let checked = policy.check(url)?;
+    let body = form
+        .iter()
+        .map(|(name, value)| format!("{}={}", form_escape(name), form_escape(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let ledger = Ledger::new();
+    let ask = Ask {
+        method: "POST",
+        url: &checked,
+    };
+    let response = presenting(credential, &ask, |presented| {
+        let mut headers = vec![
+            (
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("accept".to_string(), "application/json".to_string()),
+        ];
+        headers.extend_from_slice(presented);
+        http::request(
+            shared_client(),
+            &checked,
+            "POST",
+            &headers,
+            Some(body.as_bytes()),
+            deadline,
+            &ledger,
+            http::Judge::Deadline,
+            None,
+            Code::TRANSFER_FAILED,
+        )
+    })?;
+    let status = response.status;
+    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    Ok((status, response.read_capped(cap)?))
+}
+
+fn form_escape(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// The exact byte length of one origin object, learned from a one-byte ranged GET —
@@ -175,26 +236,33 @@ fn open_following_with<'l>(
     let mut target = url.to_string();
     for _hop in 0..=policy.max_redirects {
         let checked = policy.check(&target)?;
-        let mut headers = credential.headers(&checked.host);
-        headers.extend_from_slice(extra);
-        let response = http::request(
-            shared_client(),
-            &checked,
-            "GET",
-            &headers,
-            None,
-            deadline,
-            ledger,
-            // The one plane tfs-106 deliberately left as it was. A foreign source read is
-            // not serving a hub call and has the source lane's own per-part retry above it,
-            // so arming a plane here would change a path this lane did not measure. It is
-            // therefore still bounded by the caller's deadline alone, and a foreign source
-            // that accepts a connection and stops sending to a caller who set no deadline
-            // still waits. Named here so the next reader finds a decision, not an oversight.
-            http::Judge::Deadline,
-            None,
-            Code::TRANSFER_FAILED,
-        )?;
+        let ask = Ask {
+            method: "GET",
+            url: &checked,
+        };
+        let response = presenting(credential, &ask, |presented| {
+            let mut headers = presented.to_vec();
+            headers.extend_from_slice(extra);
+            http::request(
+                shared_client(),
+                &checked,
+                "GET",
+                &headers,
+                None,
+                deadline,
+                ledger,
+                // The one plane tfs-106 deliberately left as it was. A foreign source read
+                // is not serving a hub call and has the source lane's own per-part retry
+                // above it, so arming a plane here would change a path this lane did not
+                // measure. It is therefore still bounded by the caller's deadline alone, and
+                // a foreign source that accepts a connection and stops sending to a caller
+                // who set no deadline still waits. Named here so the next reader finds a
+                // decision, not an oversight.
+                http::Judge::Deadline,
+                None,
+                Code::TRANSFER_FAILED,
+            )
+        })?;
         if (300..400).contains(&response.status) {
             let Some(location) = response.header("location").map(str::to_string) else {
                 return refuse(Code::REDIRECT_REFUSED, "origin redirected with no Location");

@@ -33,108 +33,19 @@
 //! Responses are ordinary RFC 8259 JSON from a Go peer: any UTF-8, HTML-escaped or not,
 //! `null` for an absent value. Fields this build does not read are ignored.
 //!
-//! **The credential arrives as a provider trait, never a credential type**, so one
-//! implementation serves whatever a caller holds. It is asked per host, so a credential
-//! stays scoped to the hosts its provider names and cannot leak onto a presigned object
-//! host or a redirect target. Published checkpoints need none; a machine reads its
-//! owner's unpublished checkpoints by presenting its worker capability
-//! (`worker <id> <token>` → `x-cozy-worker-id` + `x-cozy-worker-token`), which the hub
-//! scopes to the machine owner's account.
+//! The credential is a `CredentialProvider` (`credential.rs`). Published checkpoints need
+//! none; a machine reads its owner's unpublished checkpoints with its worker capability or
+//! its owner's sender-constrained grant (`dpop.rs`), which the hub scopes to that account.
 
 use crate::canon::{self, as_arr, as_obj, as_str, as_uint, Value};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{hex64, ObjectRef};
 use crate::jcs::{self, Json};
 use crate::limits;
+use crate::transport::credential::{presenting, Ask, CredentialProvider};
 use crate::transport::http::Client;
 use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::SourcePolicy;
-
-/// The headers that present a credential to `host`. Asked per request and per redirect
-/// hop; an empty answer presents nothing, which is what a presigned URL wants.
-pub trait CredentialProvider: Sync {
-    fn headers(&self, host: &str) -> Vec<(String, String)>;
-}
-
-/// No credential at all.
-pub struct Anonymous;
-
-impl CredentialProvider for Anonymous {
-    fn headers(&self, _host: &str) -> Vec<(String, String)> {
-        Vec::new()
-    }
-}
-
-/// One bearer token, presented only to the hosts it names (tfs-052's shape).
-pub struct HostToken {
-    pub hosts: Vec<String>,
-    pub token: String,
-}
-
-impl CredentialProvider for HostToken {
-    fn headers(&self, host: &str) -> Vec<(String, String)> {
-        if self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
-            vec![(
-                "authorization".to_string(),
-                format!("Bearer {}", self.token),
-            )]
-        } else {
-            Vec::new()
-        }
-    }
-}
-
-/// Arbitrary presentation headers, scoped to named hosts — the generic impl a caller
-/// builds when its credential is not a bearer.
-pub struct ScopedHeaders {
-    pub hosts: Vec<String>,
-    pub headers: Vec<(String, String)>,
-}
-
-impl CredentialProvider for ScopedHeaders {
-    fn headers(&self, host: &str) -> Vec<(String, String)> {
-        if self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
-            self.headers.clone()
-        } else {
-            Vec::new()
-        }
-    }
-}
-
-/// The ONE credential spelling every surface passes (tfs-050): exactly one scoped value,
-/// handed explicitly — a file, one deliberately-set variable — never inherited.
-///
-/// - `bearer <token>`      → `authorization: Bearer <token>`
-/// - `worker <id> <token>` → `x-cozy-worker-id` + `x-cozy-worker-token`: a machine's
-///   worker capability, which the hub's closure and presign read as its owner's grant
-/// - empty                 → anonymous: published checkpoints only.
-pub fn credential_from_spec(spec: &str, hosts: Vec<String>) -> Result<ScopedHeaders> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return Ok(ScopedHeaders {
-            hosts,
-            headers: Vec::new(),
-        });
-    }
-    let parts: Vec<&str> = spec.split_whitespace().collect();
-    let headers = match parts.as_slice() {
-        ["bearer", token] => {
-            vec![("authorization".to_string(), format!("Bearer {token}"))]
-        }
-        ["worker", id, token] => vec![
-            ("x-cozy-worker-id".to_string(), id.to_string()),
-            ("x-cozy-worker-token".to_string(), token.to_string()),
-        ],
-        _ => {
-            return refuse(
-                Code::CREDENTIAL_REQUIRED,
-                "a credential is `bearer <token>`, `worker <id> <token>` or empty — one \
-                 scoped value, passed explicitly",
-            )
-        }
-    };
-    Ok(ScopedHeaders { hosts, headers })
-}
 
 /// What `closure` answered: one exact manifest, the object rows it reaches, and the
 /// resolved identity the local index row needs.
@@ -583,8 +494,6 @@ fn call_once(
 ) -> std::result::Result<Value, Retryable> {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
     let checked = policy.check(&url).map_err(Retryable::from)?;
-    let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
-    headers.extend(credential.headers(&checked.host));
     // A hub that did not answer, or whose answer died on the wire, is weather, not a
     // verdict: the same request may reach it on the next connection.
     let weather = |refusal: Refusal| match refusal.code {
@@ -601,24 +510,33 @@ fn call_once(
         },
         _ => Retryable::from(refusal),
     };
-    let response = crate::transport::http::request(
-        client,
-        &checked,
+    let ask = Ask {
         method,
-        &headers,
-        (method != "GET").then_some(body),
-        deadline,
-        ledger,
-        // THE CONTROL PLANE (tfs-106). Every wait in this exchange answers to the pull's own
-        // progress. It is not a bound on how long a mint may take — a hub is entitled to be
-        // slow, and a mint outstanding while sixteen streams keep landing objects is left
-        // entirely alone. It is a bound on a call that is serving a transfer which has
-        // itself stopped, which is the only shape `Leases::minting` can wedge in, and the
-        // shape that cost `gayong` and `weed` fifteen billed minutes at zero bytes.
-        crate::transport::http::Judge::Transfer,
-        None,
-        Code::HUB_UNREACHABLE,
-    )
+        url: &checked,
+    };
+    let response = presenting(credential, &ask, |presented| {
+        let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+        headers.extend_from_slice(presented);
+        crate::transport::http::request(
+            client,
+            &checked,
+            method,
+            &headers,
+            (method != "GET").then_some(body),
+            deadline,
+            ledger,
+            // THE CONTROL PLANE (tfs-106). Every wait in this exchange answers to the pull's
+            // own progress. It is not a bound on how long a mint may take — a hub is entitled
+            // to be slow, and a mint outstanding while sixteen streams keep landing objects
+            // is left entirely alone. It is a bound on a call that is serving a transfer
+            // which has itself stopped, which is the only shape `Leases::minting` can wedge
+            // in, and the shape that cost `gayong` and `weed` fifteen billed minutes at zero
+            // bytes.
+            crate::transport::http::Judge::Transfer,
+            None,
+            Code::HUB_UNREACHABLE,
+        )
+    })
     .map_err(weather)?;
     let status = response.status;
     let raw = response

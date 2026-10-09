@@ -12,7 +12,7 @@ required-features = ["store"]
 # The store, downloader, ingest, GC and everything that opens one. Without it: documents,
 # headers, read plans and the fit function only (what a plane-only executor links).
 default = ["store"]
-store = ["dep:fs2", "dep:rusqlite", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:nix"]
+store = ["dep:fs2", "dep:rusqlite", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:nix", "dep:ring"]
 
 [dependencies]
 base64 = "0.22"
@@ -28,6 +28,8 @@ rustix = { version = "1.1.4", default-features = false, features = ["fs", "std",
 # there; scripts/fence.py refuses it anywhere else so a second mover cannot grow.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
+# DPoP proofs (RFC 9449, ES256): the same ring rustls already links.
+ring = { version = "0.17", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["fs", "user"], optional = true }

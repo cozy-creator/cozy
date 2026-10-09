@@ -31,8 +31,8 @@
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{Doc, ObjectRef};
 use crate::store::Store;
+use crate::transport::credential::{presenting, Ask, CredentialProvider};
 use crate::transport::http::{self, Client};
-use crate::transport::hub::CredentialProvider;
 use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::SourcePolicy;
 use std::sync::OnceLock;
@@ -201,44 +201,49 @@ pub fn push_object(
         attempt += 1;
         let last = attempt == PUT_ATTEMPTS;
         let checked = policy.check(&grant.url)?;
-        let mut headers = vec![
-            (
-                "content-type".to_string(),
-                if content_type.is_empty() {
-                    "application/octet-stream".to_string()
-                } else {
-                    content_type.to_string()
-                },
-            ),
-            ("if-none-match".to_string(), "*".to_string()),
-        ];
-        let credentials = credential.headers(&checked.host);
-        headers.extend(credentials.iter().cloned());
-        // The grant's own spelling is the one the signature covers, so it replaces a
-        // default or a credential header of the same name rather than joining it.
-        for (name, value) in &grant.headers {
-            match headers.iter_mut().find(|(held, _)| held == name) {
-                Some(slot) => slot.1 = value.clone(),
-                None => headers.push((name.clone(), value.clone())),
+        let ask = Ask {
+            method: "PUT",
+            url: &checked,
+        };
+        let sent = presenting(credential, &ask, |credentials| {
+            let mut headers = vec![
+                (
+                    "content-type".to_string(),
+                    if content_type.is_empty() {
+                        "application/octet-stream".to_string()
+                    } else {
+                        content_type.to_string()
+                    },
+                ),
+                ("if-none-match".to_string(), "*".to_string()),
+            ];
+            headers.extend_from_slice(credentials);
+            // The grant's own spelling is the one the signature covers, so it replaces a
+            // default or a credential header of the same name rather than joining it.
+            for (name, value) in &grant.headers {
+                match headers.iter_mut().find(|(held, _)| held == name) {
+                    Some(slot) => slot.1 = value.clone(),
+                    None => headers.push((name.clone(), value.clone())),
+                }
             }
-        }
-        let sent = http::send(
-            client,
-            &checked,
-            "PUT",
-            &headers,
-            Some(payload),
-            // One origin's pushes share kept-alive sockets: a grant's URL and signed
-            // conditions are per object, the connection is scoped by the credentials.
-            Some(&credentials),
-            deadline,
-            ledger,
-            // A peer that stops answering — during the handshake, a write, or after the
-            // last body byte — is judged by that silence, never waited on forever.
-            http::Judge::Silence,
-            Some(ledger.floor()),
-            Code::TRANSFER_FAILED,
-        );
+            http::send(
+                client,
+                &checked,
+                "PUT",
+                &headers,
+                Some(payload),
+                // One origin's pushes share kept-alive sockets: a grant's URL and signed
+                // conditions are per object, the connection is scoped by the credentials.
+                Some(credentials),
+                deadline,
+                ledger,
+                // A peer that stops answering — during the handshake, a write, or after the
+                // last body byte — is judged by that silence, never waited on forever.
+                http::Judge::Silence,
+                Some(ledger.floor()),
+                Code::TRANSFER_FAILED,
+            )
+        });
         let response = match sent {
             Ok(response) => response,
             Err(refusal) => match refusal.code {

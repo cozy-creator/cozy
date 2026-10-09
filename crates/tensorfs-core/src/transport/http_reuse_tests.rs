@@ -9,6 +9,7 @@ impl<T: Read + Write> Io for T {}
 
 #[derive(Clone)]
 struct Ask {
+    method: String,
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -36,6 +37,9 @@ impl Reply {
         }
     }
 }
+
+#[path = "dpop_tests.rs"]
+mod dpop;
 
 struct Origin {
     url: String,
@@ -125,6 +129,7 @@ impl Origin {
                         }
                         let text = String::from_utf8(header).unwrap();
                         let ask = Ask {
+                            method: text.split_whitespace().next().unwrap().into(),
                             path: text
                                 .lines()
                                 .next()
@@ -520,7 +525,7 @@ fn tls_range_fixture_measures_setup_reuse_with_identical_bytes_and_requests() {
 
 struct CloseRequests;
 impl CredentialProvider for CloseRequests {
-    fn headers(&self, _: &str) -> Vec<(String, String)> {
+    fn headers(&self, _: &crate::transport::Ask) -> Vec<(String, String)> {
         vec![("connection".into(), "close".into())]
     }
 }
