@@ -99,7 +99,10 @@ func holdCheckpoint(ctx *Context, source string) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	_, problem = watchRentalInstall(ctx, client, either(ctx.Inv.Value("--rental"), machine), install)
+	_, detached, problem := watchRentalInstall(ctx, client, either(ctx.Inv.Value("--rental"), machine), install)
+	if detached {
+		return exit.New(exit.Canceled, "detached before the machine held the checkpoint; nothing was quantized")
+	}
 	return problem
 }
 
