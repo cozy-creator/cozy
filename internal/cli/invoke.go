@@ -168,9 +168,6 @@ func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInte
 		}
 	}
 	if callable.Kind != "job" {
-		if len(ctx.Inv.Values["--allow-upload"]) > 0 {
-			return exit.Usagef("--allow-upload applies only to Runtime-owned job transactions")
-		}
 		if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
 			return exit.Usagef("--timeout requires --await for serving callables").
 				WithRemedy("a detached serving call has no client waiting to enforce a caller deadline")
@@ -315,14 +312,10 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return exit.Usagef("a provider-source model runs on a named machine").
 			WithRemedy("add --rental=<name>; the machine resolves, narrows and converts the source itself")
 	}
-	if !chosen || managedRental && selectedRental == "" {
-		// Choosing a machine to rent reads the ladders; so do editable code and provider
-		// sources.
-		children := capturedModelChoices(models)
-		if models, e = resolveInvocationModels(ctx, target, ep, overrides.Models); e != nil {
-			return e
-		}
-		models = append(models, children...)
+	// Every slot is resolved here, whatever machine runs the call (th-241): it reads no
+	// binding, model card or resolution at a Hub.
+	if models, e = exactRunModels(ctx, target, ep, overrides.Models, models, resolveInvocationModels); e != nil {
+		return e
 	}
 	if models, e = applyModelAdapters(ctx, target, ep, models, overrides.Overlays); e != nil {
 		return e
@@ -469,9 +462,9 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 	for parameter := range profiles {
 		return nil, false, exit.Usagef("--source-profile %s names no model parameter of %s", parameter, target.Function)
 	}
-	// Unpublished code is a root naming its installation, whose open slots the machine
-	// resolves under the owner the root names. Code that calls other unpublished code goes by
-	// capture instead, and resolves its own slots, unless every slot names one provider source.
+	// Unpublished code is a root naming its installation; its open slots resolve here under the
+	// owner the root names (exactRunModels). Code that calls other unpublished code goes by
+	// capture instead, unless every slot names one provider source.
 	if (strings.HasPrefix(target.Package, "local/") || target.Snapshot) && !oneSource(ep, out) {
 		calls, problem := callsUnpublished(ctx, target.InstallID)
 		if problem != nil || calls {
@@ -540,6 +533,110 @@ func pinnedProviderSource(ctx *Context, raw string) (string, *exit.Error) {
 		return "", problem
 	}
 	return source.Canonical, nil
+}
+
+// exactRunModels are a run's model choices as its machine takes them (th-241: it resolves
+// nothing at a Hub): every Hub slot of ep resolved here, an explicit choice to its exact
+// checkpoint and an unchosen slot to its binding's ladder with every rung's checkpoint, beside
+// the provider sources the caller named and its captured children's choices, each pinned.
+//
+// Kept under the catalog revision this client knows, as a machine once kept its own: a warm
+// run reads nothing at any Hub, and a publish, yank or bind (here or stated by the Hub) moves
+// the revision and so resolves again.
+func exactRunModels(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string,
+	chosen []orchestrator.ModelRef,
+	resolve func(*Context, Target, *launch.Entrypoint, map[string]string) ([]orchestrator.ModelRef, *exit.Error),
+) ([]orchestrator.ModelRef, *exit.Error) {
+	kept := keptRunModelsPath(ctx, target, ep, overrides, chosen)
+	if raw, err := os.ReadFile(kept); kept != "" && err == nil {
+		var models []orchestrator.ModelRef
+		if json.Unmarshal(raw, &models) == nil {
+			return models, nil
+		}
+	}
+	models, problem := resolveRunModels(ctx, target, ep, overrides, chosen, resolve)
+	if raw, err := json.Marshal(models); problem == nil && kept != "" && err == nil &&
+		os.MkdirAll(filepath.Dir(kept), 0o700) == nil && os.WriteFile(kept+".tmp", raw, 0o600) == nil {
+		_ = os.Rename(kept+".tmp", kept)
+	}
+	return models, problem
+}
+
+// keptRunModelsPath names one run's resolved models: its Hub, code, callable and declared
+// slots, choices, the signed-in credential (org-relative names are its account's) and the
+// catalog revision. "" when the revision cannot be read.
+func keptRunModelsPath(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string, chosen []orchestrator.ModelRef) string {
+	_, store, _, problem := open(ctx.Cfg, false)
+	if problem != nil {
+		return ""
+	}
+	revision, problem := store.BindingRevision(ctx.Cfg.HubURL)
+	store.Close()
+	if problem != nil {
+		return ""
+	}
+	identity, err := json.Marshal([]any{"run-models/1", ctx.Cfg.HubURL, target.Package, target.Release, target.InstallID,
+		ep.Name, ep.Models, overrides, chosen, client(ctx).CredentialIdentity(), revision})
+	if err != nil {
+		return ""
+	}
+	name := sha256.Sum256(identity)
+	return filepath.Join(home.Paths(ctx.Cfg.Home).Root, "releases", "models", hex.EncodeToString(name[:16])+".json")
+}
+
+func resolveRunModels(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string,
+	chosen []orchestrator.ModelRef,
+	resolve func(*Context, Target, *launch.Entrypoint, map[string]string) ([]orchestrator.ModelRef, *exit.Error),
+) ([]orchestrator.ModelRef, *exit.Error) {
+	var out []orchestrator.ModelRef
+	sourced := map[string]bool{}
+	for _, model := range chosen {
+		if model.Source != "" && model.Callable == "" {
+			sourced[model.BindingSlot()] = true
+			out = append(out, model)
+		}
+	}
+	hubSlots := *ep
+	hubSlots.Models = slices.DeleteFunc(slices.Clone(ep.Models), func(slot launch.Slot) bool { return sourced[slot.Path] })
+	if len(hubSlots.Models) > 0 {
+		resolved, problem := resolve(ctx, target, &hubSlots, overrides)
+		if problem != nil {
+			return nil, problem
+		}
+		out = append(out, resolved...)
+	}
+	for _, child := range capturedModelChoices(chosen) {
+		pinned, problem := pinModelChoice(ctx, child)
+		if problem != nil {
+			return nil, problem
+		}
+		out = append(out, pinned)
+	}
+	return out, nil
+}
+
+// pinModelChoice is a named model choice at its exact checkpoint: a provider source or a pinned
+// manifest as it is, else the release and lane it names resolved at the Hub.
+func pinModelChoice(ctx *Context, model orchestrator.ModelRef) (orchestrator.ModelRef, *exit.Error) {
+	if model.Source != "" || model.Manifest != "" {
+		return model, nil
+	}
+	spec := model.Model
+	if model.Release != "" {
+		spec += "@" + model.Release
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	resolved, problem := client(ctx).ResolveModel(hctx, spec, model.Lane)
+	if problem != nil {
+		return model, problem
+	}
+	if resolved.Model != model.Model || resolved.ManifestID == "" {
+		return model, exit.Named(exit.Conflict, "rental.model_resolution_changed",
+			"Tensorhub returned no exact checkpoint for %s", spec)
+	}
+	model.Release, model.Lane, model.Manifest, model.ManifestLength = resolved.Release, resolved.Lane, resolved.ManifestID, resolved.ManifestLength
+	return model, nil
 }
 
 // invocationModelSpec is one slot's selection before the card is read: an explicit
@@ -2983,22 +3080,18 @@ func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInt
 		return Target{}, nil, problem
 	}
 	// A release this client has not installed: the one kept under the current catalog revision,
-	// else the newest the machine names at the selected Hub, else the Hub's own answer. Every
-	// machine is sent that exact release, so a warm run reads no Hub; a publish, yank or bind
-	// moves the revision.
+	// else the selected Hub's newest. Every machine is sent that exact release with its card,
+	// so a machine reads no Hub to install it; a publish, yank or bind moves the revision.
 	root, revision := home.Paths(ctx.Cfg.Home).Root, catalogRevision(ctx)
 	if release, surface := keptNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision); release != "" {
 		target.Release = release
 		return target, surface, nil
 	}
-	release, surface, problem := describeOnMachine(ctx, target.Package)
-	if problem == nil && release == "" {
-		target, surface, problem = catalogInvocationTarget(ctx, target)
-		release = target.Release
-	}
+	target, surface, problem = catalogInvocationTarget(ctx, target)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
+	release := target.Release
 	keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision, release)
 	target.Release = release
 	return target, surface, nil
@@ -3015,8 +3108,7 @@ func catalogRevision(ctx *Context) string {
 	return revision
 }
 
-// catalogInvocationTarget is the selected Hub's newest release of target and its interface,
-// read when no machine can describe it.
+// catalogInvocationTarget is the selected Hub's newest release of target and its interface.
 func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
 	root := home.Paths(ctx.Cfg.Home).Root
 	ref, problem := hub.ParseRef(target.Package)
@@ -3056,56 +3148,6 @@ func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.Packa
 	// no further Hub call.
 	keepReleaseInterface(root, ctx.Cfg.HubURL, target.Package, release, detail.PackageInterface, requirements)
 	return target, packageInterface, nil
-}
-
-// describeOnMachine is pkg's newest release and its interface as the machine the run goes to
-// installs it at the selected Hub (describe/1), so the client reads no Hub. "" when the run has no
-// machine yet, or the machine or daemon cannot describe.
-func describeOnMachine(ctx *Context, pkg string) (string, *launch.PackageInterface, *exit.Error) {
-	machine, known, problem := knownMachine(ctx)
-	if problem != nil || !known {
-		return "", nil, problem
-	}
-	var described api.ReleaseDescription
-	if ctx.endpoint != nil {
-		install, problem := foregroundPrewarm(ctx, ctx.endpoint, machine, records.RentalInstallSelection{Package: pkg})
-		if problem != nil || json.Unmarshal(install.Result, &described) != nil {
-			return "", nil, describeFallback(problem)
-		}
-	} else {
-		c, problem := dial(ctx)
-		if problem != nil {
-			return "", nil, problem
-		}
-		if described, problem = c.DescribeRelease(machine, pkg); problem != nil {
-			return "", nil, describeFallback(problem)
-		}
-	}
-	if described.Release == "" || len(described.Interface) == 0 {
-		return "", nil, nil
-	}
-	raw, err := canonical.NormalizeJCS(described.Interface)
-	if err != nil {
-		return "", nil, exit.Named(exit.Conflict, "machine.package_interface_invalid", "the machine described an invalid package interface")
-	}
-	surface, problem := launch.DecodePackageInterface(raw)
-	if problem != nil {
-		return "", nil, exit.Named(exit.Conflict, "machine.package_interface_invalid",
-			"the machine described an invalid package interface: %s", problem.Message)
-	}
-	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, ctx.Cfg.HubURL, pkg, described.Release, raw, nil)
-	return described.Release, surface, nil
-}
-
-// describeFallback keeps a describe refusal that ends the run, and drops one that only says
-// the machine or daemon cannot describe now (an older one, no route, or an unreachable
-// machine, whose run is still recorded and waits for it): the Hub names it.
-func describeFallback(problem *exit.Error) *exit.Error {
-	if problem == nil || problem.Code == exit.Unavailable || problem.Code == exit.NotFound ||
-		problem.ErrName() == "untyped_answer" || problem.ErrName() == "hub.untyped_refusal" {
-		return nil
-	}
-	return problem
 }
 
 // knownMachine is the machine a run names without renting one: this computer's, or a named

@@ -89,10 +89,10 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 	return models, problem
 }
 
-// jobModelChoices are a published job's explicit Model choices, unresolved, for the machine
-// that runs it to resolve, provider sources included. It answers false when the client must
-// resolve them itself: choosing a machine to rent reads the ladders, unless every slot names
-// one provider source, whose rental the source sizes (sourceRentalBytes).
+// jobModelChoices are a published job's explicit Model choices as the caller named them,
+// provider sources included. It answers false when choosing a machine to rent reads the
+// ladders, unless every slot names one provider source, whose rental the source sizes
+// (sourceRentalBytes).
 func jobModelChoices(ctx *Context, target Target, job *launch.Entrypoint, overrides map[string]string,
 	rental string) ([]orchestrator.ModelRef, bool, *exit.Error) {
 	models, chosen, problem := modelChoices(ctx, target, job, overrides)
@@ -189,7 +189,8 @@ func jobManifestInputs(ctx *Context, job *launch.Entrypoint, models []orchestrat
 	}
 	for i := range models {
 		model := &models[i]
-		if model.ManifestLength == 0 {
+		// A ladder's rung is the machine's to pick (th-241): each rung names its checkpoint.
+		if model.ManifestLength == 0 && model.Pinned() {
 			ref, problem := hub.ParseRef(model.Model)
 			if problem != nil {
 				return nil, problem

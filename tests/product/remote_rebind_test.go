@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,9 +11,9 @@ import (
 )
 
 // A rebind made from another computer or the Hub reaches every machine without a request of
-// its own: the account's bindings revision rides the rental listing this computer polls (its
-// own machine) and each rental's authority poll (that rental's machine). Each machine reads
-// the package's binding and its Model once more, then nothing again.
+// its own: the account's bindings revision rides the rental listing this computer polls. The
+// CLI reads the package's binding and its Model once more and hands every machine the exact
+// choice (th-241), then nothing is read again; no machine reads a binding or Model at a Hub.
 func TestARebindMadeElsewhereReachesEveryMachine(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root, machines.Local, "tessa")
@@ -33,18 +32,17 @@ func TestARebindMadeElsewhereReachesEveryMachine(t *testing.T) {
 	}
 	publishParityRelease(t, h, root, probeProject(t, "proof/probe@1.0.0/bf16"))
 	binding := `{"bindings":[{"slot":"touch.models.source","model":"proof/probe","release":"1.0.0","revision":1,"ladder":[{"gpu":"*","lane":"bf16"}]}]}`
-	doors := h.worker.Config.Handler
-	h.worker.Config.Handler = count("machine", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.worker.Config.Handler = count("machine", h.worker.Config.Handler)
+	account, probe := h.server.Config.Handler, probeModel(t, resolved)
+	h.server.Config.Handler = count("account", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/packages/"+parityPublished+"/bindings":
 			_, _ = w.Write([]byte(binding))
-		case r.URL.Path == "/v1/models/resolve" && r.URL.Query().Get("ref") == "proof/probe@1.0.0" && r.URL.Query().Get("lane") == "bf16":
-			_ = json.NewEncoder(w).Encode(resolved)
+		case probe(w, r):
 		default:
-			doors.ServeHTTP(w, r)
+			account.ServeHTTP(w, r)
 		}
 	}))
-	h.server.Config.Handler = count("account", h.server.Config.Handler)
 	run := func(venue string, args ...string) string {
 		t.Helper()
 		mu.Lock()
@@ -56,10 +54,14 @@ func TestARebindMadeElsewhereReachesEveryMachine(t *testing.T) {
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		return strings.Join(seen, "\n")
+		calls := strings.Join(seen, "\n")
+		if strings.Contains(calls, "machine GET /v1/packages/") || strings.Contains(calls, "machine GET /v1/models/") {
+			t.Fatalf("a machine read the catalog at its Hub on %s: %q", venue, calls)
+		}
+		return calls
 	}
 	read := func(calls string) bool {
-		return strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/bindings") && strings.Contains(calls, "machine GET /v1/models/resolve")
+		return strings.Contains(calls, "account GET /v1/packages/"+parityPublished+"/bindings") && strings.Contains(calls, "account GET /v1/models/proof/probe")
 	}
 	venues := map[string][]string{"local": nil, "tessa": {"--rental=tessa"}}
 	for venue, args := range venues {
@@ -77,21 +79,22 @@ func TestARebindMadeElsewhereReachesEveryMachine(t *testing.T) {
 		h.fakeRentalHub.mu.Lock()
 		listed := h.listedBindings
 		h.fakeRentalHub.mu.Unlock()
-		h.mu.Lock()
-		polled := h.polledBindings
-		h.mu.Unlock()
-		if listed == 7 && polled == 7 {
+		if listed == 7 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the new revision was not carried: listing %d, authority poll %d", listed, polled)
+			t.Fatalf("the new revision was not carried: listing %d", listed)
 		}
 	}
-	time.Sleep(time.Second) // the poll's answer is applied after it is served
+	time.Sleep(time.Second) // the listing's answer is applied after it is served
+	first := true
 	for venue, args := range venues {
-		if calls := run(venue, args...); !read(calls) {
+		if calls := run(venue, args...); first && !read(calls) {
 			t.Fatalf("the run on %s after a rebind elsewhere did not read the binding again: %q", venue, calls)
+		} else if !first && calls != "" {
+			t.Fatalf("the run on %s read again what the CLI resolved for another machine: %q", venue, calls)
 		}
+		first = false
 		if calls := run(venue, args...); calls != "" {
 			t.Fatalf("the warm run on %s after the rebind read: %q", venue, calls)
 		}

@@ -48,6 +48,9 @@ func probeCheckpoint(t *testing.T) ([]byte, map[string][]byte) {
 // answers the Hub's resolution of it.
 func seedProbe(t *testing.T, h *machineHub, root string, venues ...string) map[string]any {
 	t.Helper()
+	// A checkpoint of the caller's own named by digest is a private read: the run carries a
+	// capability its device key signs (th-241).
+	h.hubAccess.signIn(t, root)
 	manifest, objects := probeCheckpoint(t)
 	ref := func(raw []byte) map[string]any {
 		sum := sha256.Sum256(raw)
@@ -106,6 +109,29 @@ func seedProbe(t *testing.T, h *machineHub, root string, venues ...string) map[s
 	return resolved
 }
 
+// probeModel answers proof/probe's model card and its bf16 lane's manifest, as the CLI reads
+// them to bind each rung of a ladder to its exact checkpoint and size the job (th-241). It
+// answers false for any other request.
+func probeModel(t *testing.T, resolved map[string]any) func(http.ResponseWriter, *http.Request) bool {
+	t.Helper()
+	manifest, _ := probeCheckpoint(t)
+	card, err := json.Marshal(map[string]any{"model": map[string]string{"org": "proof", "name": "probe"},
+		"releases": []any{map[string]any{"release": "1.0.0", "lanes": []any{map[string]any{"lane": "bf16",
+			"manifest_id": resolved["manifest_id"], "components": []string{}, "bytes": resolved["bytes"]}}}}})
+	must(t, err)
+	return func(w http.ResponseWriter, r *http.Request) bool {
+		switch r.URL.Path {
+		case "/v1/models/proof/probe":
+			_, _ = w.Write(card)
+		case "/v1/models/proof/probe/releases/1.0.0/lanes/bf16/manifest":
+			_, _ = w.Write(manifest)
+		default:
+			return false
+		}
+		return true
+	}
+}
+
 // probeProject is the parity package with a CPU job reading one Model slot by its authored
 // default lane: a derive-only Manifest capability, so the job never loads it.
 func probeProject(t *testing.T, lane string) string {
@@ -148,15 +174,14 @@ def touch(payload: TouchRequest, source: Probe) -> TouchResult:
 	return project
 }
 
-// A warm run of a published release makes no Hub content request, from the CLI or machine:
-// the machine read the owner's binding and resolved its lane at its own Hub on the cold run
-// and kept both. Rental authority still refreshes independently of content reuse.
+// A warm run of a published release makes no Hub content request, from the CLI or machine
+// (th-241): the CLI read the owner's binding and the model card on the cold run and kept the
+// ladder under its catalog revision; the machine reads no binding or model at a Hub at all.
+// Rental authority still refreshes independently of content reuse.
 func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root, machines.Local, "tessa")
-	// This proof measures content reuse after the machine can describe releases.
-	// A still-booting Runtime legitimately falls back to the account catalog,
-	// which this fixture deliberately does not serve.
+	// This proof measures content reuse once the machine is ready.
 	machine := machines.NewHost(filepath.Join(root, "machine"), machineStore(root), nil)
 	_, problem := machine.Ensure(t.Context(), nil)
 	fatal(t, problem)
@@ -179,18 +204,20 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	}
 	publishParityRelease(t, h, root, probeProject(t, "proof/probe@1.0.0/bf16"))
 	binding := `{"bindings":[{"slot":"touch.models.source","model":"proof/probe","release":"1.0.0","revision":1,"ladder":[{"gpu":"*","lane":"bf16"}]}]}`
-	doors := h.worker.Config.Handler
-	h.worker.Config.Handler = count("machine", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.worker.Config.Handler = count("machine", h.worker.Config.Handler)
+	account, probe := h.server.Config.Handler, probeModel(t, resolved)
+	h.server.Config.Handler = count("account", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/packages/"+parityPublished+"/bindings":
 			_, _ = w.Write([]byte(binding))
-		case r.URL.Path == "/v1/models/resolve" && r.URL.Query().Get("ref") == "proof/probe@1.0.0" && r.URL.Query().Get("lane") == "bf16":
-			_ = json.NewEncoder(w).Encode(resolved)
+		case probe(w, r):
 		default:
-			doors.ServeHTTP(w, r)
+			account.ServeHTTP(w, r)
 		}
 	}))
-	h.server.Config.Handler = count("account", h.server.Config.Handler)
+	catalog := func(calls string) bool {
+		return strings.Contains(calls, "machine GET /v1/packages/") || strings.Contains(calls, "machine GET /v1/models/")
+	}
 
 	for _, venue := range []struct {
 		name string
@@ -208,8 +235,8 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			calls := append([]string(nil), seen...)
 			mu.Unlock()
 			t.Logf("%s run on %s: %v", key, venue.name, calls)
-			if key == "cold" && !strings.Contains(strings.Join(calls, "\n"), "machine GET /v1/models/resolve") {
-				t.Fatalf("the cold run on %s never resolved its Model at the machine's Hub: %v", venue.name, calls)
+			if catalog(strings.Join(calls, "\n")) {
+				t.Fatalf("the %s run on %s read the catalog from its machine: %v", key, venue.name, calls)
 			}
 			if key == "warm" && len(calls) != 0 {
 				t.Fatalf("the warm run on %s made %d Hub requests; want none: %v", venue.name, len(calls), calls)
@@ -217,14 +244,15 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 		}
 	}
 
-	// The owner's change to the package reaches every machine this computer knows, over the
-	// machine connection: each reads the package and its Model once more, then nothing again.
+	// The owner's change to the package moves the catalog revision: the CLI reads the binding
+	// once more for whichever machine runs next, then nothing again; no machine reads it.
 	h.mux.HandleFunc("DELETE /v1/packages/"+parityPublished+"/releases/"+parityVersion, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"release":"` + parityVersion + `","state":"yanked","changed":true}`))
 	})
 	if code, out := runCozy(t, root, "package", "yank", parityPublished, "--version", parityVersion); code != 0 || strings.Contains(out, "keeps what it read") || strings.Contains(out, "no machine was told") {
 		t.Fatalf("yank did not reach every machine [exit %d]\n%s", code, out)
 	}
+	changed := true
 	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {
 		for _, key := range []string{"changed", "warm again"} {
 			mu.Lock()
@@ -236,18 +264,16 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			mu.Lock()
 			calls := strings.Join(seen, "\n")
 			mu.Unlock()
-			read := strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/bindings") && strings.Contains(calls, "machine GET /v1/models/resolve")
-			if (key == "changed") != read || key == "warm again" && calls != "" {
+			read := strings.Contains(calls, "account GET /v1/packages/"+parityPublished+"/bindings")
+			if changed != read || catalog(calls) || !changed && calls != "" {
 				t.Fatalf("the %s run on %s read: %q", key, venue, calls)
 			}
+			changed = false
 		}
 	}
 
 	// Unpublished code is no different. Its org-relative default names the caller's account,
-	// read once and kept, which the root carries as its owner; the machine resolves the slot.
-	h.mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"name":"proof"}`))
-	})
+	// read once and kept; the CLI binds the default's rungs and the machine reads no model.
 	if code, out := runCozy(t, root, "package", "install", probeProject(t, "probe@1.0.0/bf16"), "--editable"); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
@@ -263,7 +289,7 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			calls := strings.Join(seen, "\n")
 			mu.Unlock()
 			t.Logf("%s local/ run on %s: %q", key, venue, calls)
-			if key == "cold" && !strings.Contains(calls, "machine GET /v1/models/resolve") || key == "warm" && calls != "" {
+			if catalog(calls) || key == "warm" && calls != "" {
 				t.Fatalf("the %s local/ run on %s read: %q", key, venue, calls)
 			}
 		}

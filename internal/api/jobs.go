@@ -39,7 +39,6 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
-	AllowPublish    []string               `json:"allow_publish,omitempty"`
 	TimeoutMS       int64                  `json:"timeout_ms,omitempty"`
 	RequestedRental string                 `json:"requested_rental,omitempty"`
 	LocalAssets     []records.AssetBinding `json:"local_assets,omitempty"`
@@ -142,7 +141,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
 	if (len(sub.LocalAssets) > 0 || len(sub.Trees) > 0 || sub.Worker != "" || sub.RequestedRental != "" || len(sub.Models) > 0 ||
-		sub.ModelTransfer != nil || sub.RetryOf != "" || sub.OutputDirectory != "" || len(sub.AllowPublish) > 0) &&
+		sub.ModelTransfer != nil || sub.RetryOf != "" || sub.OutputDirectory != "") &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
@@ -288,19 +287,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if sub.MachineEndpoint != nil {
 		spec.MachineEndpoint, spec.Worker = sub.MachineEndpoint, sub.MachineEndpoint.Name()
 	}
-	grants := sub.AllowPublish
 	if destination := machineDestination(spec); destination != "" {
-		// The machine publishes the job's outputs itself; the destination is its grant.
-		grants = append(append([]string(nil), grants...), destination)
-	}
-	if len(grants) > 0 {
-		spec.AllowPublish, e = hub.NormalizePublicationRepositories(grants)
-		if e != nil {
+		// The machine publishes the job's outputs itself, under the run's capability.
+		if e = hub.ValidPublicationDestination(destination); e != nil {
 			s.refuseTyped(w, r, e)
-			return
-		}
-		if (spec.LocalInstallationID == "" && !publishedMachineJob(spec)) || s.machineExecutions == nil {
-			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-upload requires a Runtime-owned transaction on a machine with its own certificate identity"))
 			return
 		}
 	}
@@ -387,9 +377,9 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 }
 
 // Every root uses Runtime submission. A job publishes its weights outputs to their
-// destination from the machine it runs on, rented or this computer's, under a grant bound
-// to that machine's Host leaf. Source acquisition has no machine-side staging path and
-// stays with its own coordinator.
+// destination from the machine it runs on, rented or this computer's, under the run's
+// capability for that machine's leaf. Source acquisition has no machine-side staging path
+// and stays with its own coordinator.
 func publishedMachineJob(spec orchestrator.Submission) bool {
 	if spec.ModelTransfer != nil {
 		return machineDestination(spec) != ""
@@ -774,13 +764,6 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.AttentionKernel != "" {
 		doc["attention_kernel"] = spec.AttentionKernel
-	}
-	if len(spec.AllowPublish) > 0 {
-		values := make([]canonical.Value, 0, len(spec.AllowPublish))
-		for _, repository := range spec.AllowPublish {
-			values = append(values, repository)
-		}
-		doc["allow_publish"] = values
 	}
 	if assets := assetIdentity(spec.Assets); len(assets) > 0 {
 		doc["assets"] = assets

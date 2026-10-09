@@ -522,7 +522,6 @@ type RunExecuteCmd struct {
 	Trees               []string `name:"input-tree" predictor:"binding-dir" help:"Bind a job input tree as ref=directory."`
 	Org                 string   `help:"Job publication organization (defaults to local)."`
 	UploadTo            string   `help:"Upload the job's declared weight outputs as private checkpoints to org/model; no release is published."`
-	AllowUpload         []string `help:"Allow this rented transaction to upload checkpoints, and publish releases, only to org/model (repeatable)."`
 	SourceProfiles      []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
 	Await               bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
 	Describe            bool     `help:"Print the callable's request contract instead of running it."`
@@ -543,7 +542,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
-		"--upload-to", c.UploadTo, "--allow-upload", c.AllowUpload, "--source-profile", c.SourceProfiles,
+		"--upload-to", c.UploadTo, "--source-profile", c.SourceProfiles,
 		"--warm", c.Warm), !c.Describe)
 }
 

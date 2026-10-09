@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -261,6 +262,30 @@ func (c *Client) PackageRelease(ctx context.Context, ref Ref,
 		storeRelease(kept, out)
 	}
 	return out, e
+}
+
+// PackageLockedRequirements is a release's locked requirements export, the exact document
+// a machine installs the release from; immutable, so kept once read.
+func (c *Client) PackageLockedRequirements(ctx context.Context, ref Ref, release string) ([]byte, *exit.Error) {
+	var kept struct {
+		Release string `json:"release"`
+		Lock    string `json:"lock"`
+	}
+	path := c.releaseCachePath("locked-requirements", ref, release, "")
+	if loadRelease(path, &kept) && kept.Release == release && kept.Lock != "" {
+		return []byte(kept.Lock), nil
+	}
+	var raw []byte
+	if e := c.do(ctx, call{method: http.MethodGet, path: packageReleasePath(ref, release) + "/locked-requirements",
+		responseBytes: 16 << 20, raw: &raw}, nil); e != nil {
+		return nil, e
+	}
+	if len(raw) == 0 || !utf8.Valid(raw) {
+		return nil, exit.Named(exit.Conflict, "hub.locked_requirements_invalid", "Tensorhub returned no locked requirements for %s@%s", ref, release)
+	}
+	kept.Release, kept.Lock = release, string(raw)
+	storeRelease(path, kept)
+	return raw, nil
 }
 
 func (c *Client) PackageSourceArchive(ctx context.Context, ref Ref, release string) (PackageSourceArchive, *exit.Error) {

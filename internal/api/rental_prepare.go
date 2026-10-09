@@ -70,14 +70,14 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 				s.refuseTyped(w, r, problem)
 				return
 			}
-		} else if _, problem := hub.NormalizePublicationRepositories([]string{body.Destination}); problem != nil {
+		} else if problem := hub.ValidPublicationDestination(body.Destination); problem != nil {
 			s.refuseTyped(w, r, problem)
 			return
 		}
 		downloads = nil
 	}
 	if body.Warm != "" {
-		// A warm set member: the machine resolves its function's model choices itself.
+		// A warm set member: its function's models arrive resolved (exact or exact rungs).
 		if body.Package == "" || body.Entrypoint == "" || body.Destination != "" {
 			s.refuseTyped(w, r, exit.New(exit.Validation, "a warm set member names one package function"))
 			return

@@ -432,15 +432,11 @@ type RunSpec struct {
 	Payload            []byte           `protobuf:"bytes,7,opt,name=payload,proto3" json:"payload,omitempty"` // canonical JSON object of the function's parameters
 	Inputs             []*InputFile     `protobuf:"bytes,8,rep,name=inputs,proto3" json:"inputs,omitempty"`   // objects uploaded with Write, bound to payload fields
 	Models             []*ModelChoice   `protobuf:"bytes,9,rep,name=models,proto3" json:"models,omitempty"`
-	BindingRevision    string           `protobuf:"bytes,10,opt,name=binding_revision,json=bindingRevision,proto3" json:"binding_revision,omitempty"` // the owner's binding revision the caller knows
 	AttentionKernel    string           `protobuf:"bytes,12,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
 	WeightsDestination string           `protobuf:"bytes,13,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"` // org/name: a job's weights outputs, or a warm run's source model
-	Hub                *HubAccess       `protobuf:"bytes,14,opt,name=hub,proto3" json:"hub,omitempty"`                                                         // tokens are held in memory only
+	Hub                *HubAccess       `protobuf:"bytes,14,opt,name=hub,proto3" json:"hub,omitempty"`                                                         // where the run reads, and its capability there
 	Owner              string           `protobuf:"bytes,15,opt,name=owner,proto3" json:"owner,omitempty"`                                                     // the account that org-relative references of local code name
 	Providers          *ProviderAccess  `protobuf:"bytes,16,opt,name=providers,proto3" json:"providers,omitempty"`                                             // provider tokens for source models, memory only like hub
-	// A fresh `tensorhub_machine_publication` code for this machine's leaf: the machine redeems
-	// it at submission and writes the run's weights destination under that grant.
-	Publication *HubAuthorization `protobuf:"bytes,19,opt,name=publication,proto3" json:"publication,omitempty"`
 	// RUN_KIND_WARM (`warm/2`): the caller's whole warm set, replacing its previous one; no items
 	// clears it. The run installs and downloads every member, and its result lists each one's
 	// `level` and `held_back`. Absent: the set is left as it is.
@@ -548,13 +544,6 @@ func (x *RunSpec) GetModels() []*ModelChoice {
 	return nil
 }
 
-func (x *RunSpec) GetBindingRevision() string {
-	if x != nil {
-		return x.BindingRevision
-	}
-	return ""
-}
-
 func (x *RunSpec) GetAttentionKernel() string {
 	if x != nil {
 		return x.AttentionKernel
@@ -586,13 +575,6 @@ func (x *RunSpec) GetOwner() string {
 func (x *RunSpec) GetProviders() *ProviderAccess {
 	if x != nil {
 		return x.Providers
-	}
-	return nil
-}
-
-func (x *RunSpec) GetPublication() *HubAuthorization {
-	if x != nil {
-		return x.Publication
 	}
 	return nil
 }
@@ -680,11 +662,18 @@ func (x *ProviderAccess) GetCivitai() string {
 }
 
 type Release struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // org/name
-	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Package string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // org/name
+	Release string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
+	// The release as its Hub publishes it, so the machine installs it reading no Hub (th-241):
+	// its package interface (canonical JSON), its Python version, and its locked requirements
+	// as an object the caller wrote with Write (sha256:<hex>). Needed only when the signer
+	// holds no installation of the release yet.
+	PackageInterface   []byte `protobuf:"bytes,3,opt,name=package_interface,json=packageInterface,proto3" json:"package_interface,omitempty"`
+	PythonVersion      string `protobuf:"bytes,4,opt,name=python_version,json=pythonVersion,proto3" json:"python_version,omitempty"`
+	LockedRequirements string `protobuf:"bytes,5,opt,name=locked_requirements,json=lockedRequirements,proto3" json:"locked_requirements,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *Release) Reset() {
@@ -727,6 +716,27 @@ func (x *Release) GetPackage() string {
 func (x *Release) GetRelease() string {
 	if x != nil {
 		return x.Release
+	}
+	return ""
+}
+
+func (x *Release) GetPackageInterface() []byte {
+	if x != nil {
+		return x.PackageInterface
+	}
+	return nil
+}
+
+func (x *Release) GetPythonVersion() string {
+	if x != nil {
+		return x.PythonVersion
+	}
+	return ""
+}
+
+func (x *Release) GetLockedRequirements() string {
+	if x != nil {
+		return x.LockedRequirements
 	}
 	return ""
 }
@@ -855,20 +865,25 @@ func (x *InputFile) GetOrder() uint32 {
 	return 0
 }
 
+// One model slot's choice. A Hub model is exact (th-241: the machine resolves nothing at a
+// Hub): `manifest` pins one checkpoint, or `rungs` are the slot's binding with every rung's
+// checkpoint resolved, of which the machine takes the widest its GPUs fit. The caller sends
+// one for every model slot the run may load, a callee's included (`<package>/<path>`).
 type ModelChoice struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Parameter      string                 `protobuf:"bytes,1,opt,name=parameter,proto3" json:"parameter,omitempty"` // a root slot parameter or full slot path
 	Repository     string                 `protobuf:"bytes,2,opt,name=repository,proto3" json:"repository,omitempty"`
 	Release        string                 `protobuf:"bytes,3,opt,name=release,proto3" json:"release,omitempty"`
 	Lane           string                 `protobuf:"bytes,4,opt,name=lane,proto3" json:"lane,omitempty"`
-	Manifest       string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>, optional exact checkpoint
+	Manifest       string                 `protobuf:"bytes,5,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>, an exact checkpoint
 	ManifestLength uint64                 `protobuf:"varint,6,opt,name=manifest_length,json=manifestLength,proto3" json:"manifest_length,omitempty"`
-	Adapters       []*Adapter             `protobuf:"bytes,7,rep,name=adapters,proto3" json:"adapters,omitempty"`
+	Adapters       []*Adapter             `protobuf:"bytes,7,rep,name=adapters,proto3" json:"adapters,omitempty"` // each exact: a manifest, or a provider source
 	// A provider source (hf://<org>/<repo>@<rev>[/member], civitai://<version>[/file]) the
 	// machine makes the slot's model from, under these reviewed profiles (none: the one its
 	// headers select); never with repository or manifest.
-	Source        string   `protobuf:"bytes,8,opt,name=source,proto3" json:"source,omitempty"`
-	Profiles      []string `protobuf:"bytes,9,rep,name=profiles,proto3" json:"profiles,omitempty"`
+	Source        string       `protobuf:"bytes,8,opt,name=source,proto3" json:"source,omitempty"`
+	Profiles      []string     `protobuf:"bytes,9,rep,name=profiles,proto3" json:"profiles,omitempty"`
+	Rungs         []*ModelRung `protobuf:"bytes,10,rep,name=rungs,proto3" json:"rungs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -966,6 +981,91 @@ func (x *ModelChoice) GetProfiles() []string {
 	return nil
 }
 
+func (x *ModelChoice) GetRungs() []*ModelRung {
+	if x != nil {
+		return x.Rungs
+	}
+	return nil
+}
+
+// One rung of a binding: on GPUs matching `gpu`, `gpus` of them run the slot's `lane`, whose
+// checkpoint is `manifest`.
+type ModelRung struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Gpu            string                 `protobuf:"bytes,1,opt,name=gpu,proto3" json:"gpu,omitempty"` // "*", or the tokens a GPU name contains, in order ("h100", "rtx 5090")
+	Gpus           uint32                 `protobuf:"varint,2,opt,name=gpus,proto3" json:"gpus,omitempty"`
+	Lane           string                 `protobuf:"bytes,3,opt,name=lane,proto3" json:"lane,omitempty"`
+	Manifest       string                 `protobuf:"bytes,4,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex>
+	ManifestLength uint64                 `protobuf:"varint,5,opt,name=manifest_length,json=manifestLength,proto3" json:"manifest_length,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ModelRung) Reset() {
+	*x = ModelRung{}
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ModelRung) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ModelRung) ProtoMessage() {}
+
+func (x *ModelRung) ProtoReflect() protoreflect.Message {
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ModelRung.ProtoReflect.Descriptor instead.
+func (*ModelRung) Descriptor() ([]byte, []int) {
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *ModelRung) GetGpu() string {
+	if x != nil {
+		return x.Gpu
+	}
+	return ""
+}
+
+func (x *ModelRung) GetGpus() uint32 {
+	if x != nil {
+		return x.Gpus
+	}
+	return 0
+}
+
+func (x *ModelRung) GetLane() string {
+	if x != nil {
+		return x.Lane
+	}
+	return ""
+}
+
+func (x *ModelRung) GetManifest() string {
+	if x != nil {
+		return x.Manifest
+	}
+	return ""
+}
+
+func (x *ModelRung) GetManifestLength() uint64 {
+	if x != nil {
+		return x.ManifestLength
+	}
+	return 0
+}
+
 type Adapter struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Component string                 `protobuf:"bytes,1,opt,name=component,proto3" json:"component,omitempty"`
@@ -984,7 +1084,7 @@ type Adapter struct {
 
 func (x *Adapter) Reset() {
 	*x = Adapter{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[9]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -996,7 +1096,7 @@ func (x *Adapter) String() string {
 func (*Adapter) ProtoMessage() {}
 
 func (x *Adapter) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[9]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1009,7 +1109,7 @@ func (x *Adapter) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Adapter.ProtoReflect.Descriptor instead.
 func (*Adapter) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{9}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *Adapter) GetComponent() string {
@@ -1068,21 +1168,26 @@ func (x *Adapter) GetProfiles() []string {
 	return nil
 }
 
+// A Hub a run reads. Public content is read anonymously.
 type HubAccess struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
 	Origin      string                 `protobuf:"bytes,1,opt,name=origin,proto3" json:"origin,omitempty"`
 	CaDer       []byte                 `protobuf:"bytes,4,opt,name=ca_der,json=caDer,proto3" json:"ca_der,omitempty"`                   // an origin's private CA, when it has one
 	ObjectHosts []string               `protobuf:"bytes,5,rep,name=object_hosts,json=objectHosts,proto3" json:"object_hosts,omitempty"` // the Hub's object-storage hosts downloads may follow
-	// A fresh `tensorhub_execution` code: the machine redeems it at submission and holds the
-	// grant in memory for its signer at this origin. Absent: the grant it already holds.
-	Authorization *HubAuthorization `protobuf:"bytes,6,opt,name=authorization,proto3" json:"authorization,omitempty"`
+	// The owner's capability for this run's private operations (th-241): a compact JWS its
+	// device key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),
+	// naming each operation in `authorization_details`. The machine trades it once, at the
+	// run's first private operation, at `token_endpoint` (AuthKit's JWT-bearer grant). Empty:
+	// a public-only run.
+	Capability    string `protobuf:"bytes,7,opt,name=capability,proto3" json:"capability,omitempty"`
+	TokenEndpoint string `protobuf:"bytes,8,opt,name=token_endpoint,json=tokenEndpoint,proto3" json:"token_endpoint,omitempty"` // the Hub's authorization server's, as its metadata names it
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HubAccess) Reset() {
 	*x = HubAccess{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[10]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1094,7 +1199,7 @@ func (x *HubAccess) String() string {
 func (*HubAccess) ProtoMessage() {}
 
 func (x *HubAccess) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[10]
+	mi := &file_cozy_machine_v1_machine_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1107,7 +1212,7 @@ func (x *HubAccess) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HubAccess.ProtoReflect.Descriptor instead.
 func (*HubAccess) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{10}
+	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *HubAccess) GetOrigin() string {
@@ -1131,86 +1236,16 @@ func (x *HubAccess) GetObjectHosts() []string {
 	return nil
 }
 
-func (x *HubAccess) GetAuthorization() *HubAuthorization {
+func (x *HubAccess) GetCapability() string {
 	if x != nil {
-		return x.Authorization
-	}
-	return nil
-}
-
-// An authorization code for client `cozy-machine`, bound to this machine's leaf (`dpop_jkt`).
-type HubAuthorization struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Issuer        string                 `protobuf:"bytes,1,opt,name=issuer,proto3" json:"issuer,omitempty"` // the token endpoint is issuer + "/oauth2/token"
-	Code          string                 `protobuf:"bytes,2,opt,name=code,proto3" json:"code,omitempty"`
-	CodeVerifier  string                 `protobuf:"bytes,3,opt,name=code_verifier,json=codeVerifier,proto3" json:"code_verifier,omitempty"` // PKCE
-	RedirectUri   string                 `protobuf:"bytes,4,opt,name=redirect_uri,json=redirectUri,proto3" json:"redirect_uri,omitempty"`
-	Resource      string                 `protobuf:"bytes,5,opt,name=resource,proto3" json:"resource,omitempty"` // the resource the code was requested for
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *HubAuthorization) Reset() {
-	*x = HubAuthorization{}
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[11]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *HubAuthorization) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*HubAuthorization) ProtoMessage() {}
-
-func (x *HubAuthorization) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_machine_v1_machine_proto_msgTypes[11]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use HubAuthorization.ProtoReflect.Descriptor instead.
-func (*HubAuthorization) Descriptor() ([]byte, []int) {
-	return file_cozy_machine_v1_machine_proto_rawDescGZIP(), []int{11}
-}
-
-func (x *HubAuthorization) GetIssuer() string {
-	if x != nil {
-		return x.Issuer
+		return x.Capability
 	}
 	return ""
 }
 
-func (x *HubAuthorization) GetCode() string {
+func (x *HubAccess) GetTokenEndpoint() string {
 	if x != nil {
-		return x.Code
-	}
-	return ""
-}
-
-func (x *HubAuthorization) GetCodeVerifier() string {
-	if x != nil {
-		return x.CodeVerifier
-	}
-	return ""
-}
-
-func (x *HubAuthorization) GetRedirectUri() string {
-	if x != nil {
-		return x.RedirectUri
-	}
-	return ""
-}
-
-func (x *HubAuthorization) GetResource() string {
-	if x != nil {
-		return x.Resource
+		return x.TokenEndpoint
 	}
 	return ""
 }
@@ -3194,7 +3229,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\theld_back\x18\a \x01(\tR\bheldBackB\b\n" +
 	"\x06source\":\n" +
 	"\aWarmSet\x12/\n" +
-	"\x05items\x18\x01 \x03(\v2\x19.cozy.machine.v1.WarmItemR\x05items\"\xfe\x05\n" +
+	"\x05items\x18\x01 \x03(\v2\x19.cozy.machine.v1.WarmItemR\x05items\"\x9a\x05\n" +
 	"\aRunSpec\x12,\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x18.cozy.machine.v1.RunKindR\x04kind\x124\n" +
 	"\arelease\x18\x02 \x01(\v2\x18.cozy.machine.v1.ReleaseH\x00R\arelease\x12$\n" +
@@ -3206,22 +3241,23 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\apayload\x18\a \x01(\fR\apayload\x122\n" +
 	"\x06inputs\x18\b \x03(\v2\x1a.cozy.machine.v1.InputFileR\x06inputs\x124\n" +
 	"\x06models\x18\t \x03(\v2\x1c.cozy.machine.v1.ModelChoiceR\x06models\x12)\n" +
-	"\x10binding_revision\x18\n" +
-	" \x01(\tR\x0fbindingRevision\x12)\n" +
 	"\x10attention_kernel\x18\f \x01(\tR\x0fattentionKernel\x12/\n" +
 	"\x13weights_destination\x18\r \x01(\tR\x12weightsDestination\x12,\n" +
 	"\x03hub\x18\x0e \x01(\v2\x1a.cozy.machine.v1.HubAccessR\x03hub\x12\x14\n" +
 	"\x05owner\x18\x0f \x01(\tR\x05owner\x12=\n" +
-	"\tproviders\x18\x10 \x01(\v2\x1f.cozy.machine.v1.ProviderAccessR\tproviders\x12C\n" +
-	"\vpublication\x18\x13 \x01(\v2!.cozy.machine.v1.HubAuthorizationR\vpublication\x12*\n" +
+	"\tproviders\x18\x10 \x01(\v2\x1f.cozy.machine.v1.ProviderAccessR\tproviders\x12*\n" +
 	"\x03set\x18\x12 \x01(\v2\x18.cozy.machine.v1.WarmSetR\x03setB\b\n" +
-	"\x06sourceJ\x04\b\v\x10\fJ\x04\b\x11\x10\x12\"L\n" +
+	"\x06sourceJ\x04\b\n" +
+	"\x10\vJ\x04\b\v\x10\fJ\x04\b\x11\x10\x12J\x04\b\x13\x10\x14\"L\n" +
 	"\x0eProviderAccess\x12 \n" +
 	"\vhuggingface\x18\x01 \x01(\tR\vhuggingface\x12\x18\n" +
-	"\acivitai\x18\x02 \x01(\tR\acivitai\"=\n" +
+	"\acivitai\x18\x02 \x01(\tR\acivitai\"\xc2\x01\n" +
 	"\aRelease\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
-	"\arelease\x18\x02 \x01(\tR\arelease\")\n" +
+	"\arelease\x18\x02 \x01(\tR\arelease\x12+\n" +
+	"\x11package_interface\x18\x03 \x01(\fR\x10packageInterface\x12%\n" +
+	"\x0epython_version\x18\x04 \x01(\tR\rpythonVersion\x12/\n" +
+	"\x13locked_requirements\x18\x05 \x01(\tR\x12lockedRequirements\")\n" +
 	"\vLocalSource\x12\x1a\n" +
 	"\bmanifest\x18\x01 \x01(\tR\bmanifest\"\x86\x01\n" +
 	"\tInputFile\x12\x14\n" +
@@ -3230,7 +3266,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x06length\x18\x03 \x01(\x04R\x06length\x12\x1d\n" +
 	"\n" +
 	"media_type\x18\x04 \x01(\tR\tmediaType\x12\x14\n" +
-	"\x05order\x18\x05 \x01(\rR\x05order\"\xa8\x02\n" +
+	"\x05order\x18\x05 \x01(\rR\x05order\"\xda\x02\n" +
 	"\vModelChoice\x12\x1c\n" +
 	"\tparameter\x18\x01 \x01(\tR\tparameter\x12\x1e\n" +
 	"\n" +
@@ -3242,7 +3278,15 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x0fmanifest_length\x18\x06 \x01(\x04R\x0emanifestLength\x124\n" +
 	"\badapters\x18\a \x03(\v2\x18.cozy.machine.v1.AdapterR\badapters\x12\x16\n" +
 	"\x06source\x18\b \x01(\tR\x06source\x12\x1a\n" +
-	"\bprofiles\x18\t \x03(\tR\bprofiles\"\xd1\x01\n" +
+	"\bprofiles\x18\t \x03(\tR\bprofiles\x120\n" +
+	"\x05rungs\x18\n" +
+	" \x03(\v2\x1a.cozy.machine.v1.ModelRungR\x05rungs\"\x8a\x01\n" +
+	"\tModelRung\x12\x10\n" +
+	"\x03gpu\x18\x01 \x01(\tR\x03gpu\x12\x12\n" +
+	"\x04gpus\x18\x02 \x01(\rR\x04gpus\x12\x12\n" +
+	"\x04lane\x18\x03 \x01(\tR\x04lane\x12\x1a\n" +
+	"\bmanifest\x18\x04 \x01(\tR\bmanifest\x12'\n" +
+	"\x0fmanifest_length\x18\x05 \x01(\x04R\x0emanifestLength\"\xd1\x01\n" +
 	"\aAdapter\x12\x1c\n" +
 	"\tcomponent\x18\x01 \x01(\tR\tcomponent\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x18\n" +
@@ -3251,18 +3295,15 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\bmanifest\x18\x05 \x01(\tR\bmanifest\x12\x14\n" +
 	"\x05scale\x18\x06 \x01(\tR\x05scale\x12\x16\n" +
 	"\x06source\x18\a \x01(\tR\x06source\x12\x1a\n" +
-	"\bprofiles\x18\b \x03(\tR\bprofiles\"\xb2\x01\n" +
+	"\bprofiles\x18\b \x03(\tR\bprofiles\"\xb6\x01\n" +
 	"\tHubAccess\x12\x16\n" +
 	"\x06origin\x18\x01 \x01(\tR\x06origin\x12\x15\n" +
 	"\x06ca_der\x18\x04 \x01(\fR\x05caDer\x12!\n" +
-	"\fobject_hosts\x18\x05 \x03(\tR\vobjectHosts\x12G\n" +
-	"\rauthorization\x18\x06 \x01(\v2!.cozy.machine.v1.HubAuthorizationR\rauthorizationJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04\"\xa2\x01\n" +
-	"\x10HubAuthorization\x12\x16\n" +
-	"\x06issuer\x18\x01 \x01(\tR\x06issuer\x12\x12\n" +
-	"\x04code\x18\x02 \x01(\tR\x04code\x12#\n" +
-	"\rcode_verifier\x18\x03 \x01(\tR\fcodeVerifier\x12!\n" +
-	"\fredirect_uri\x18\x04 \x01(\tR\vredirectUri\x12\x1a\n" +
-	"\bresource\x18\x05 \x01(\tR\bresource\"\xfd\x02\n" +
+	"\fobject_hosts\x18\x05 \x03(\tR\vobjectHosts\x12\x1e\n" +
+	"\n" +
+	"capability\x18\a \x01(\tR\n" +
+	"capability\x12%\n" +
+	"\x0etoken_endpoint\x18\b \x01(\tR\rtokenEndpointJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x06\x10\a\"\xfd\x02\n" +
 	"\bRunEvent\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12\x13\n" +
 	"\x05at_ms\x18\x02 \x01(\x03R\x04atMs\x121\n" +
@@ -3473,44 +3514,44 @@ func file_cozy_machine_v1_machine_proto_rawDescGZIP() []byte {
 var file_cozy_machine_v1_machine_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_cozy_machine_v1_machine_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
 var file_cozy_machine_v1_machine_proto_goTypes = []any{
-	(RunKind)(0),             // 0: cozy.machine.v1.RunKind
-	(WarmLevel)(0),           // 1: cozy.machine.v1.WarmLevel
-	(Action)(0),              // 2: cozy.machine.v1.Action
-	(*RunRequest)(nil),       // 3: cozy.machine.v1.RunRequest
-	(*WarmItem)(nil),         // 4: cozy.machine.v1.WarmItem
-	(*WarmSet)(nil),          // 5: cozy.machine.v1.WarmSet
-	(*RunSpec)(nil),          // 6: cozy.machine.v1.RunSpec
-	(*ProviderAccess)(nil),   // 7: cozy.machine.v1.ProviderAccess
-	(*Release)(nil),          // 8: cozy.machine.v1.Release
-	(*LocalSource)(nil),      // 9: cozy.machine.v1.LocalSource
-	(*InputFile)(nil),        // 10: cozy.machine.v1.InputFile
-	(*ModelChoice)(nil),      // 11: cozy.machine.v1.ModelChoice
-	(*Adapter)(nil),          // 12: cozy.machine.v1.Adapter
-	(*HubAccess)(nil),        // 13: cozy.machine.v1.HubAccess
-	(*HubAuthorization)(nil), // 14: cozy.machine.v1.HubAuthorization
-	(*RunEvent)(nil),         // 15: cozy.machine.v1.RunEvent
-	(*RunState)(nil),         // 16: cozy.machine.v1.RunState
-	(*Progress)(nil),         // 17: cozy.machine.v1.Progress
-	(*Product)(nil),          // 18: cozy.machine.v1.Product
-	(*LogLine)(nil),          // 19: cozy.machine.v1.LogLine
-	(*Outcome)(nil),          // 20: cozy.machine.v1.Outcome
-	(*Reason)(nil),           // 21: cozy.machine.v1.Reason
-	(*Call)(nil),             // 22: cozy.machine.v1.Call
-	(*ControlRequest)(nil),   // 23: cozy.machine.v1.ControlRequest
-	(*ReadRequest)(nil),      // 24: cozy.machine.v1.ReadRequest
-	(*OutputTarget)(nil),     // 25: cozy.machine.v1.OutputTarget
-	(*ReadFrame)(nil),        // 26: cozy.machine.v1.ReadFrame
-	(*StatusRequest)(nil),    // 27: cozy.machine.v1.StatusRequest
-	(*StatusFrame)(nil),      // 28: cozy.machine.v1.StatusFrame
-	(*WebRTC)(nil),           // 29: cozy.machine.v1.WebRTC
-	(*Model)(nil),            // 30: cozy.machine.v1.Model
-	(*Checkpoint)(nil),       // 31: cozy.machine.v1.Checkpoint
-	(*Gpu)(nil),              // 32: cozy.machine.v1.Gpu
-	(*Hub)(nil),              // 33: cozy.machine.v1.Hub
-	(*Environment)(nil),      // 34: cozy.machine.v1.Environment
-	(*Disk)(nil),             // 35: cozy.machine.v1.Disk
-	(*WriteFrame)(nil),       // 36: cozy.machine.v1.WriteFrame
-	(*WriteResult)(nil),      // 37: cozy.machine.v1.WriteResult
+	(RunKind)(0),           // 0: cozy.machine.v1.RunKind
+	(WarmLevel)(0),         // 1: cozy.machine.v1.WarmLevel
+	(Action)(0),            // 2: cozy.machine.v1.Action
+	(*RunRequest)(nil),     // 3: cozy.machine.v1.RunRequest
+	(*WarmItem)(nil),       // 4: cozy.machine.v1.WarmItem
+	(*WarmSet)(nil),        // 5: cozy.machine.v1.WarmSet
+	(*RunSpec)(nil),        // 6: cozy.machine.v1.RunSpec
+	(*ProviderAccess)(nil), // 7: cozy.machine.v1.ProviderAccess
+	(*Release)(nil),        // 8: cozy.machine.v1.Release
+	(*LocalSource)(nil),    // 9: cozy.machine.v1.LocalSource
+	(*InputFile)(nil),      // 10: cozy.machine.v1.InputFile
+	(*ModelChoice)(nil),    // 11: cozy.machine.v1.ModelChoice
+	(*ModelRung)(nil),      // 12: cozy.machine.v1.ModelRung
+	(*Adapter)(nil),        // 13: cozy.machine.v1.Adapter
+	(*HubAccess)(nil),      // 14: cozy.machine.v1.HubAccess
+	(*RunEvent)(nil),       // 15: cozy.machine.v1.RunEvent
+	(*RunState)(nil),       // 16: cozy.machine.v1.RunState
+	(*Progress)(nil),       // 17: cozy.machine.v1.Progress
+	(*Product)(nil),        // 18: cozy.machine.v1.Product
+	(*LogLine)(nil),        // 19: cozy.machine.v1.LogLine
+	(*Outcome)(nil),        // 20: cozy.machine.v1.Outcome
+	(*Reason)(nil),         // 21: cozy.machine.v1.Reason
+	(*Call)(nil),           // 22: cozy.machine.v1.Call
+	(*ControlRequest)(nil), // 23: cozy.machine.v1.ControlRequest
+	(*ReadRequest)(nil),    // 24: cozy.machine.v1.ReadRequest
+	(*OutputTarget)(nil),   // 25: cozy.machine.v1.OutputTarget
+	(*ReadFrame)(nil),      // 26: cozy.machine.v1.ReadFrame
+	(*StatusRequest)(nil),  // 27: cozy.machine.v1.StatusRequest
+	(*StatusFrame)(nil),    // 28: cozy.machine.v1.StatusFrame
+	(*WebRTC)(nil),         // 29: cozy.machine.v1.WebRTC
+	(*Model)(nil),          // 30: cozy.machine.v1.Model
+	(*Checkpoint)(nil),     // 31: cozy.machine.v1.Checkpoint
+	(*Gpu)(nil),            // 32: cozy.machine.v1.Gpu
+	(*Hub)(nil),            // 33: cozy.machine.v1.Hub
+	(*Environment)(nil),    // 34: cozy.machine.v1.Environment
+	(*Disk)(nil),           // 35: cozy.machine.v1.Disk
+	(*WriteFrame)(nil),     // 36: cozy.machine.v1.WriteFrame
+	(*WriteResult)(nil),    // 37: cozy.machine.v1.WriteResult
 }
 var file_cozy_machine_v1_machine_proto_depIdxs = []int32{
 	6,  // 0: cozy.machine.v1.RunRequest.spec:type_name -> cozy.machine.v1.RunSpec
@@ -3523,47 +3564,46 @@ var file_cozy_machine_v1_machine_proto_depIdxs = []int32{
 	9,  // 7: cozy.machine.v1.RunSpec.local:type_name -> cozy.machine.v1.LocalSource
 	10, // 8: cozy.machine.v1.RunSpec.inputs:type_name -> cozy.machine.v1.InputFile
 	11, // 9: cozy.machine.v1.RunSpec.models:type_name -> cozy.machine.v1.ModelChoice
-	13, // 10: cozy.machine.v1.RunSpec.hub:type_name -> cozy.machine.v1.HubAccess
+	14, // 10: cozy.machine.v1.RunSpec.hub:type_name -> cozy.machine.v1.HubAccess
 	7,  // 11: cozy.machine.v1.RunSpec.providers:type_name -> cozy.machine.v1.ProviderAccess
-	14, // 12: cozy.machine.v1.RunSpec.publication:type_name -> cozy.machine.v1.HubAuthorization
-	5,  // 13: cozy.machine.v1.RunSpec.set:type_name -> cozy.machine.v1.WarmSet
-	12, // 14: cozy.machine.v1.ModelChoice.adapters:type_name -> cozy.machine.v1.Adapter
-	14, // 15: cozy.machine.v1.HubAccess.authorization:type_name -> cozy.machine.v1.HubAuthorization
-	16, // 16: cozy.machine.v1.RunEvent.state:type_name -> cozy.machine.v1.RunState
-	17, // 17: cozy.machine.v1.RunEvent.progress:type_name -> cozy.machine.v1.Progress
-	18, // 18: cozy.machine.v1.RunEvent.product:type_name -> cozy.machine.v1.Product
-	19, // 19: cozy.machine.v1.RunEvent.log:type_name -> cozy.machine.v1.LogLine
-	20, // 20: cozy.machine.v1.RunEvent.outcome:type_name -> cozy.machine.v1.Outcome
-	22, // 21: cozy.machine.v1.RunEvent.call:type_name -> cozy.machine.v1.Call
-	21, // 22: cozy.machine.v1.Outcome.reason:type_name -> cozy.machine.v1.Reason
-	18, // 23: cozy.machine.v1.Outcome.outputs:type_name -> cozy.machine.v1.Product
-	21, // 24: cozy.machine.v1.Call.reason:type_name -> cozy.machine.v1.Reason
-	2,  // 25: cozy.machine.v1.ControlRequest.action:type_name -> cozy.machine.v1.Action
-	25, // 26: cozy.machine.v1.ReadRequest.output:type_name -> cozy.machine.v1.OutputTarget
-	16, // 27: cozy.machine.v1.StatusFrame.runs:type_name -> cozy.machine.v1.RunState
-	32, // 28: cozy.machine.v1.StatusFrame.gpus:type_name -> cozy.machine.v1.Gpu
-	33, // 29: cozy.machine.v1.StatusFrame.hubs:type_name -> cozy.machine.v1.Hub
-	34, // 30: cozy.machine.v1.StatusFrame.environments:type_name -> cozy.machine.v1.Environment
-	35, // 31: cozy.machine.v1.StatusFrame.disk:type_name -> cozy.machine.v1.Disk
-	30, // 32: cozy.machine.v1.StatusFrame.models:type_name -> cozy.machine.v1.Model
-	29, // 33: cozy.machine.v1.StatusFrame.webrtc:type_name -> cozy.machine.v1.WebRTC
-	4,  // 34: cozy.machine.v1.StatusFrame.warm:type_name -> cozy.machine.v1.WarmItem
-	31, // 35: cozy.machine.v1.Model.checkpoints:type_name -> cozy.machine.v1.Checkpoint
-	27, // 36: cozy.machine.v1.Machine.Status:input_type -> cozy.machine.v1.StatusRequest
-	3,  // 37: cozy.machine.v1.Machine.Run:input_type -> cozy.machine.v1.RunRequest
-	23, // 38: cozy.machine.v1.Machine.Control:input_type -> cozy.machine.v1.ControlRequest
-	24, // 39: cozy.machine.v1.Machine.Read:input_type -> cozy.machine.v1.ReadRequest
-	36, // 40: cozy.machine.v1.Machine.Write:input_type -> cozy.machine.v1.WriteFrame
-	28, // 41: cozy.machine.v1.Machine.Status:output_type -> cozy.machine.v1.StatusFrame
-	15, // 42: cozy.machine.v1.Machine.Run:output_type -> cozy.machine.v1.RunEvent
-	16, // 43: cozy.machine.v1.Machine.Control:output_type -> cozy.machine.v1.RunState
-	26, // 44: cozy.machine.v1.Machine.Read:output_type -> cozy.machine.v1.ReadFrame
-	37, // 45: cozy.machine.v1.Machine.Write:output_type -> cozy.machine.v1.WriteResult
-	41, // [41:46] is the sub-list for method output_type
-	36, // [36:41] is the sub-list for method input_type
-	36, // [36:36] is the sub-list for extension type_name
-	36, // [36:36] is the sub-list for extension extendee
-	0,  // [0:36] is the sub-list for field type_name
+	5,  // 12: cozy.machine.v1.RunSpec.set:type_name -> cozy.machine.v1.WarmSet
+	13, // 13: cozy.machine.v1.ModelChoice.adapters:type_name -> cozy.machine.v1.Adapter
+	12, // 14: cozy.machine.v1.ModelChoice.rungs:type_name -> cozy.machine.v1.ModelRung
+	16, // 15: cozy.machine.v1.RunEvent.state:type_name -> cozy.machine.v1.RunState
+	17, // 16: cozy.machine.v1.RunEvent.progress:type_name -> cozy.machine.v1.Progress
+	18, // 17: cozy.machine.v1.RunEvent.product:type_name -> cozy.machine.v1.Product
+	19, // 18: cozy.machine.v1.RunEvent.log:type_name -> cozy.machine.v1.LogLine
+	20, // 19: cozy.machine.v1.RunEvent.outcome:type_name -> cozy.machine.v1.Outcome
+	22, // 20: cozy.machine.v1.RunEvent.call:type_name -> cozy.machine.v1.Call
+	21, // 21: cozy.machine.v1.Outcome.reason:type_name -> cozy.machine.v1.Reason
+	18, // 22: cozy.machine.v1.Outcome.outputs:type_name -> cozy.machine.v1.Product
+	21, // 23: cozy.machine.v1.Call.reason:type_name -> cozy.machine.v1.Reason
+	2,  // 24: cozy.machine.v1.ControlRequest.action:type_name -> cozy.machine.v1.Action
+	25, // 25: cozy.machine.v1.ReadRequest.output:type_name -> cozy.machine.v1.OutputTarget
+	16, // 26: cozy.machine.v1.StatusFrame.runs:type_name -> cozy.machine.v1.RunState
+	32, // 27: cozy.machine.v1.StatusFrame.gpus:type_name -> cozy.machine.v1.Gpu
+	33, // 28: cozy.machine.v1.StatusFrame.hubs:type_name -> cozy.machine.v1.Hub
+	34, // 29: cozy.machine.v1.StatusFrame.environments:type_name -> cozy.machine.v1.Environment
+	35, // 30: cozy.machine.v1.StatusFrame.disk:type_name -> cozy.machine.v1.Disk
+	30, // 31: cozy.machine.v1.StatusFrame.models:type_name -> cozy.machine.v1.Model
+	29, // 32: cozy.machine.v1.StatusFrame.webrtc:type_name -> cozy.machine.v1.WebRTC
+	4,  // 33: cozy.machine.v1.StatusFrame.warm:type_name -> cozy.machine.v1.WarmItem
+	31, // 34: cozy.machine.v1.Model.checkpoints:type_name -> cozy.machine.v1.Checkpoint
+	27, // 35: cozy.machine.v1.Machine.Status:input_type -> cozy.machine.v1.StatusRequest
+	3,  // 36: cozy.machine.v1.Machine.Run:input_type -> cozy.machine.v1.RunRequest
+	23, // 37: cozy.machine.v1.Machine.Control:input_type -> cozy.machine.v1.ControlRequest
+	24, // 38: cozy.machine.v1.Machine.Read:input_type -> cozy.machine.v1.ReadRequest
+	36, // 39: cozy.machine.v1.Machine.Write:input_type -> cozy.machine.v1.WriteFrame
+	28, // 40: cozy.machine.v1.Machine.Status:output_type -> cozy.machine.v1.StatusFrame
+	15, // 41: cozy.machine.v1.Machine.Run:output_type -> cozy.machine.v1.RunEvent
+	16, // 42: cozy.machine.v1.Machine.Control:output_type -> cozy.machine.v1.RunState
+	26, // 43: cozy.machine.v1.Machine.Read:output_type -> cozy.machine.v1.ReadFrame
+	37, // 44: cozy.machine.v1.Machine.Write:output_type -> cozy.machine.v1.WriteResult
+	40, // [40:45] is the sub-list for method output_type
+	35, // [35:40] is the sub-list for method input_type
+	35, // [35:35] is the sub-list for extension type_name
+	35, // [35:35] is the sub-list for extension extendee
+	0,  // [0:35] is the sub-list for field type_name
 }
 
 func init() { file_cozy_machine_v1_machine_proto_init() }

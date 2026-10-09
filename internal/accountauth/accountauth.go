@@ -211,6 +211,46 @@ func (m *Manager) MintCapability(g capability.Grant) (string, *exit.Error) {
 	return token, nil
 }
 
+// RunCapability is what one run may do at this Hub for the signed-in user (th-241): the
+// private operations (RFC 9396 authorization_details) a machine whose leaf thumbprint is
+// Workload performs for run Run until Expires. The machine trades it, once, for a token.
+type RunCapability struct {
+	UserID, Audience, Workload, Run string
+	Operations                      []any
+	Expires                         time.Time
+}
+
+// SignRunCapability signs c with this origin's device key, offline: the compact JWS AuthKit's
+// JWT-bearer grant takes inside the machine's assertion.
+func (m *Manager) SignRunCapability(c RunCapability) (string, *exit.Error) {
+	stored, private, problem := m.load()
+	if problem != nil {
+		return "", problem
+	}
+	now := m.now()
+	if c.UserID == "" || c.Audience == "" || c.Workload == "" || len(c.Operations) == 0 || !c.Expires.After(now) {
+		return "", exit.Internalf("a run capability names its user, Hub, machine, operations and expiry")
+	}
+	jti := make([]byte, 24)
+	if _, err := rand.Read(jti); err != nil {
+		return "", exit.Internalf("cannot draw a capability id: %s", err)
+	}
+	header, err := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "authkit-capability+jwt", "kid": stored.DeviceKeyID})
+	if err != nil {
+		return "", exit.Internalf("cannot encode the capability: %s", err)
+	}
+	claims, err := json.Marshal(map[string]any{
+		"sub": c.UserID, "aud": c.Audience, "cnf": map[string]string{"jkt": c.Workload}, "run": c.Run,
+		"jti": rawBase64.EncodeToString(jti), "iat": now.Unix(), "exp": c.Expires.Unix(),
+		"authorization_details": c.Operations,
+	})
+	if err != nil {
+		return "", exit.Internalf("cannot encode the capability: %s", err)
+	}
+	input := rawBase64.EncodeToString(header) + "." + rawBase64.EncodeToString(claims)
+	return input + "." + rawBase64.EncodeToString(ed25519.Sign(private, []byte(input))), nil
+}
+
 // CredentialPresent reports whether this Tensorhub origin has a local machine
 // record. It does not read or validate secret bytes.
 func (m *Manager) CredentialPresent() bool {
@@ -241,7 +281,7 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 	if problem := m.post(ctx, hub.AuthAPI+"/device-keys/login/begin", map[string]string{
 		"device_key_id": stored.DeviceKeyID,
 	}, &begun); problem != nil {
-		return Session{}, problem
+		return Session{}, m.keyRefused(problem)
 	}
 	challenge, problem := challengeBytes(begun.Challenge)
 	if problem != nil || begun.ChallengeID == "" {
@@ -255,7 +295,7 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 		"challenge_id": begun.ChallengeID,
 		"signature":    rawBase64.EncodeToString(signature),
 	}, &answer); problem != nil {
-		return Session{}, problem
+		return Session{}, m.keyRefused(problem)
 	}
 	m.session, problem = answer.session(stored.Email, started)
 	return m.session, problem
@@ -531,6 +571,16 @@ func authRefusal(status int, data []byte) *exit.Error {
 		problem.WithRemedy("%s", answer.Error.Remedy)
 	}
 	return problem
+}
+
+// keyRefused names a device-key sign-in the Hub refuses for what it is: this computer's key
+// was revoked or is unknown there, not a wrong password.
+func (m *Manager) keyRefused(problem *exit.Error) *exit.Error {
+	if problem.Code != exit.Credential {
+		return problem
+	}
+	return exit.Named(exit.Credential, "auth.device_key_refused",
+		"%s no longer accepts this computer's sign-in key (revoked or unknown there)", m.hub).WithNext(m.loginCommand())
 }
 
 // loginCommand names the login that creates this origin's credential. The default

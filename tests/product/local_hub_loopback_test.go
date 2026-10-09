@@ -39,25 +39,23 @@ func TestALoopbackHubServesItsMachineWhileItsPublicOriginIsDown(t *testing.T) {
 	}
 
 	h := newMachineHub(t)
-	grants := newFakeGrants(h.server.URL, public, "rental-idle-test")
+	access := newFakeHubAccess(h.server.URL, public, "rental-idle-test")
 	var mu sync.Mutex
-	var reads []string
-	served := h.server.Config.Handler
+	var reads, credentialed []string
+	served, probe := h.server.Config.Handler, probeModel(t, map[string]any{"manifest_id": "sha256:" + ref(manifest)["sha256"].(string), "bytes": len(header) + len(vocab)})
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		reads = append(reads, r.Method+" "+r.URL.Path)
+		// A public run's machine reads with no credential (th-241).
+		if r.Header.Get("DPoP") != "" || strings.HasPrefix(r.URL.Path, "/v1/tensorfs/") && r.Header.Get("Authorization") != "" {
+			credentialed = append(credentialed, r.Method+" "+r.URL.Path)
+		}
 		mu.Unlock()
-		if grants.serve(w, r) {
+		if access.serve(w, r) {
 			return
 		}
 		switch {
-		case r.URL.Path == "/v1/accounts/current":
-			_, _ = w.Write([]byte(`{"name":"proof"}`))
-		case r.URL.Path == "/v1/models/proof/probe":
-			_, _ = w.Write([]byte(`{"releases":[{"release":"1.0.0","lanes":[{"lane":"bf16","bytes":1}]}]}`))
-		case r.URL.Path == "/v1/models/resolve" && r.URL.Query().Get("ref") == "proof/probe@1.0.0" && r.URL.Query().Get("lane") == "bf16":
-			_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/probe", "release": "1.0.0", "lane": "bf16",
-				"manifest_id": "sha256:" + ref(manifest)["sha256"].(string), "manifest_length": len(manifest)})
+		case probe(w, r):
 		case r.URL.Path == "/v1/tensorfs/closure":
 			_ = json.NewEncoder(w).Encode(map[string]any{"complete": true, "lane": "bf16", "model": "proof/probe", "release": "1.0.0",
 				"manifest": ref(manifest), "objects": []any{ref(header), ref(vocab)}, "presign_max_digests": 64, "scope": "runtime"})
@@ -104,14 +102,19 @@ func TestALoopbackHubServesItsMachineWhileItsPublicOriginIsDown(t *testing.T) {
 		return seen
 	}
 	seen := run()
-	for _, read := range []string{"GET /v1/models/proof/probe", "GET /v1/models/resolve", "POST /v1/tensorfs/closure", "POST /v1/tensorfs/presign",
+	// The CLI reads the model card; the machine pulls the checkpoint's bytes at the loopback origin.
+	for _, read := range []string{"GET /v1/models/proof/probe", "POST /v1/tensorfs/closure", "POST /v1/tensorfs/presign",
 		"GET /o/" + ref(header)["sha256"].(string)} {
 		if !strings.Contains(seen, read) {
-			t.Errorf("the machine did not read %q at the Hub's loopback origin; it saw:\n%s", read, seen)
+			t.Errorf("%q was not read at the Hub's loopback origin; it saw:\n%s", read, seen)
 		}
 	}
 
 	// A second native run still reaches the local Hub while its public origin is down.
-	// Access travels with each run; there is no standing machine credential cache.
 	run()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(credentialed) != 0 {
+		t.Fatalf("a public run's machine presented a credential: %q", credentialed)
+	}
 }

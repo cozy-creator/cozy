@@ -120,11 +120,11 @@ machine, `--host` can retain the running agent; a different agent must be bundle
 the selected Runtime wheel. The stable bootstrap itself changes with the image or
 service bootstrap, and its identity is reported separately from the running agent.
 
-Execution access is an OAuth grant of the Hub for the machine's own TLS key: the CLI approves
-it with the current device key, and the machine holds and refreshes it in memory. Revoking
-that device key or signing out ends it; another account's runs get their own grant. A
-publication grant is fresh per run and outlives sign-out. Updates require their advertised
-capabilities. Retired Hosts and
+A machine reads public packages and models with no credential. A run that reads your
+unpublished checkpoints or publishes to your repositories carries a capability this CLI signs
+offline with its device key, for that machine's TLS key and exactly those operations, until
+the run's deadline (at most 24 hours). The machine trades it once for a Hub token; revoking
+the device key ends it. Updates require their advertised capabilities. Retired Hosts and
 agents lacking transactional replacement are refused before new work or updates;
 they require a current image or service bootstrap. Existing accepted work and its
 authority are preserved. There is no legacy submission or credential fallback.

@@ -22,35 +22,37 @@ func ModelChoices(request records.Request, models []ModelRef) ([]*v1.ModelChoice
 		}
 		child := model.Package != "" && model.Package != request.Package || attributed && entrypoint != request.Entrypoint
 		if child {
-			if !model.Choice && len(model.Adapters) == 0 {
-				continue // advisory child sizing is not an explicit override
-			}
 			parameter = path
 			if model.Package != "" && model.Package != request.Package {
 				parameter = model.Package + "/" + path
 			}
 		}
-		// An unselected ladder is sizing metadata, not a base-model override. The
-		// machine selects its authored/owner rung from measured hardware. Flattening
-		// it to repository+release loses the lane and suppresses that selection.
-		advisoryLadder := !model.Choice && len(model.Ladder) > 0 && !model.Pinned() && model.Lane == "" && model.Source == ""
-		if advisoryLadder && len(model.Adapters) == 0 {
-			continue
-		}
 		choice := &v1.ModelChoice{Parameter: parameter, Repository: model.Model,
 			Release: model.Release, Lane: model.Lane, Source: model.Source,
 			Profiles: model.Profiles, Adapters: downloadAdapters(model.Adapters)}
-		if advisoryLadder {
-			// Explicit adapters still apply to the base the machine selects.
-			choice.Repository, choice.Release = "", ""
-		}
-		if model.Manifest != "" {
+		// Exact for the machine (th-241): it resolves nothing at a Hub. A pinned checkpoint, or
+		// the binding's ladder with every rung's checkpoint, of which the machine takes the
+		// widest its GPUs fit.
+		switch {
+		case model.Source != "":
+		case model.Manifest != "":
 			digest, err := canonical.Raw(model.Manifest)
 			if err != nil {
 				return nil, exit.Named(exit.Validation, "model.manifest_invalid", "%s names no exact manifest", path)
 			}
 			choice.Manifest, _ = canonical.Spell(digest)
 			choice.ManifestLength = uint64(max(model.ManifestLength, 0))
+		case len(model.Ladder) > 0:
+			for _, rung := range model.Ladder {
+				digest, err := canonical.Raw(rung.Manifest)
+				if err != nil {
+					return nil, exit.Named(exit.Validation, "model.manifest_invalid", "a rung of %s names no exact manifest", path)
+				}
+				manifest, _ := canonical.Spell(digest)
+				choice.Rungs = append(choice.Rungs, &v1.ModelRung{Gpu: rung.GPU, Gpus: uint32(max(rung.GPUs, 0)), Lane: rung.Lane, Manifest: manifest})
+			}
+		default:
+			return nil, exit.Named(exit.Internal, "model.choice_unresolved", "%s reached its machine with no exact checkpoint", path)
 		}
 		out = append(out, choice)
 	}

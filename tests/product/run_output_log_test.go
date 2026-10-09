@@ -69,7 +69,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	}
 	admissionOnlySince := func(before int) {
 		t.Helper()
-		if asked := slices.DeleteFunc(hubCalls()[before:], grantCall); len(asked) != 0 {
+		if asked := slices.DeleteFunc(hubCalls()[before:], hubAccessCall); len(asked) != 0 {
 			t.Fatalf("a new local run asked the Hub beyond its admission capability:\n%s", strings.Join(asked, "\n"))
 		}
 	}

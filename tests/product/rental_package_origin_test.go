@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"encoding/json"
-	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -108,9 +107,9 @@ func TestAMissingPackageNamesItsHubAndWhereItExists(t *testing.T) {
 }
 
 // The same contract with real CLI, daemon, machine and Runtime. The package exists only on
-// the selected source Hub. Its execution grant advertises a separate remotely reachable
-// catalog address (the role a local Hub's public/ngrok URL has), and the rental's Hub never
-// receives package requests or the source Hub's account credential.
+// the selected source Hub. The CLI reads its release there and hands the machine the card
+// with the run (th-241): no machine reads a package at any Hub, and the rental's Hub never
+// receives package requests.
 func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	rentalHub, root, layout, store := parityMachines(t)
 	source := newMachineHub(t)
@@ -123,41 +122,22 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	}
 	configure("source")
 	var mu sync.Mutex
-	var catalogReads, grantLeaves []string
+	var catalogReads []string
 	wrongReads := []string{}
-	grantToken := fixtureGrantToken(source.server.URL+"/v1/auth", source.server.URL)
-	catalog := source.access.Config.Handler
-	source.access.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
-			mu.Lock()
-			catalogReads = append(catalogReads, r.URL.Path)
-			mu.Unlock()
-			if r.Header.Get("Authorization") != "DPoP "+grantToken || r.Header.Get("DPoP") == "" || r.Header.Get("X-Cozy-Worker-Token") != "" {
-				t.Error("source catalog was not read with its delegated execution access")
-				http.Error(w, "execution access required", http.StatusForbidden)
-				return
+	record := func(reads *[]string, next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
+				mu.Lock()
+				*reads = append(*reads, r.URL.Host+r.URL.Path)
+				mu.Unlock()
 			}
-		}
-		catalog.ServeHTTP(w, r)
-	})
-	account := source.server.Config.Handler
-	source.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/auth/oauth2/authorize" {
-			mu.Lock()
-			grantLeaves = append(grantLeaves, r.URL.Query().Get("dpop_jkt"))
-			mu.Unlock()
-		}
-		account.ServeHTTP(w, r)
-	})
-	ownerCatalog := rentalHub.worker.Config.Handler
-	rentalHub.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/v1/packages/") || r.Header.Get("Authorization") == "DPoP "+grantToken {
-			mu.Lock()
-			wrongReads = append(wrongReads, r.URL.Path)
-			mu.Unlock()
-		}
-		ownerCatalog.ServeHTTP(w, r)
-	})
+			next.ServeHTTP(w, r)
+		})
+	}
+	source.server.Config.Handler = record(&catalogReads, source.server.Config.Handler)
+	for _, wrong := range []*httptest.Server{source.access, source.worker, rentalHub.server, rentalHub.access, rentalHub.worker} {
+		wrong.Config.Handler = record(&wrongReads, wrong.Config.Handler)
+	}
 	run := func(key string, extra ...string) {
 		t.Helper()
 		args := append([]string{"run", parityPublished + "/add", "value=41", "--rental=tessa", "--await", "--json", "--idempotency-key", key}, extra...)
@@ -176,7 +156,7 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	run("source-cold") // The rental describes the selected Hub's newest release itself.
 
 	// Reproduce cached install provenance from a different Hub without changing its release.
-	response, err := source.worker.Client().Get(source.worker.URL + "/v1/packages/" + parityPublished + "/releases/" + parityVersion)
+	response, err := http.Get(source.server.URL + "/v1/packages/" + parityPublished + "/releases/" + parityVersion)
 	must(t, err)
 	var detail struct {
 		Interface json.RawMessage `json:"package_interface"`
@@ -205,8 +185,8 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	}
 	missing := newMachineHub(t)
 	var missingReads atomic.Int32
-	missingCatalog := missing.worker.Config.Handler
-	missing.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	missingCatalog := missing.server.Config.Handler
+	missing.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/packages/"+parityPublished) {
 			missingReads.Add(1)
 		}
@@ -218,7 +198,7 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 		before := missingReads.Load()
 		args := append([]string{"run", parityPublished + "/add", "value=41", "--await", "--json"}, placement...)
 		if code, out := runCozy(t, root, args...); code == 0 || missingReads.Load() == before {
-			t.Fatalf("the machine reused another Hub's package when its selected source had none [exit %d, placement %v, source reads %d]\n%s", code, placement, missingReads.Load(), out)
+			t.Fatalf("a machine reused another Hub's package when its selected source had none [exit %d, placement %v, source reads %d]\n%s", code, placement, missingReads.Load(), out)
 		}
 	}
 
@@ -247,8 +227,8 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 		t.Fatalf("the client pinned or redirected the other source: %+v", otherRequest)
 	}
 
-	// The machine names the newest release once per catalog revision: a newer one reaches a
-	// run once this client's yank moves the revision, and the output it added is collected.
+	// The CLI names the newest release once per catalog revision: a newer one reaches a run
+	// once this client's yank moves the revision, and the output it added is collected.
 	moving := newMachineHub(t)
 	publishParityRelease(t, moving, root, parityProject(t))
 	newer := parityProject(t)
@@ -274,9 +254,9 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
 	var newest atomic.Value
 	newest.Store("0.0.1")
 	var newestReads atomic.Int32
-	movingCatalog := moving.worker.Config.Handler
-	moving.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/packages/"+parityPublished {
+	movingCatalog := moving.server.Config.Handler
+	moving.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/packages/"+parityPublished {
 			newestReads.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]any{"releases": []map[string]string{{"release": newest.Load().(string)}}})
 			return
@@ -320,16 +300,10 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
 
 	row, problem := store.RentalRow(parityRental)
 	fatal(t, problem)
-	certificate, err := os.ReadFile(row.CertPath)
-	must(t, err)
-	leaf, _ := pem.Decode(certificate)
-	if leaf == nil {
-		t.Fatal("rental has no pinned certificate")
-	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(catalogReads) == 0 || len(grantLeaves) == 0 || grantLeaves[0] != leafJKT(t, leaf.Bytes) || len(wrongReads) != 0 {
-		t.Fatalf("catalog/grant routing: catalog=%v grants=%d wrong=%v", catalogReads, len(grantLeaves), wrongReads)
+	if len(catalogReads) == 0 || len(wrongReads) != 0 {
+		t.Fatalf("catalog routing: catalog=%v wrong=%v", catalogReads, wrongReads)
 	}
 	if row.Hub != rentalHub.server.URL {
 		t.Fatal("running another source changed the rental's lifecycle authority")

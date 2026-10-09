@@ -8,17 +8,21 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// The actual CPU machine resolves a multi-lane model input, downloads real
-// TensorFS objects and executes a job that never loads the Model. This complements
-// the serving-wire regression without claiming accelerator serving qualification.
+// A multi-lane model input resolves at the CLI (th-241): the authored default's ladder with
+// its rung bound to the card's bf16 checkpoint, an explicit override to the fp32 lane's. The
+// actual CPU machine then downloads real TensorFS objects, reading no model at the Hub, and
+// executes a job that never loads the Model. This complements the serving-wire regression
+// without claiming accelerator serving qualification.
 func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires real CPU native machine fixture")
@@ -36,32 +40,30 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 		}
 	}
 	var mu sync.Mutex
-	var lanes []string
-	var grants *fakeGrants
+	var machineReads []string
+	var access *fakeHubAccess
+	digest := "sha256:" + manifestRef["sha256"].(string)
+	card, err := json.Marshal(map[string]any{"model": map[string]string{"org": "proof", "name": "probe"},
+		"releases": []any{map[string]any{"release": "1.0.0", "lanes": []any{
+			map[string]any{"lane": "bf16", "manifest_id": digest, "components": []string{}, "bytes": 4096},
+			map[string]any{"lane": "fp32", "manifest_id": digest, "components": []string{}, "bytes": 4096}}}}})
+	must(t, err)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := "http://" + r.Host
 		encode := func(value any) { _ = json.NewEncoder(w).Encode(value) }
-		if grants.serve(w, r) {
+		if access.serve(w, r) {
 			return
 		}
-		switch {
-		case r.URL.Path == "/v1/accounts/current":
-			encode(map[string]any{"name": "proof"})
-		case r.URL.Path == "/v1/models/resolve":
-			lane := r.URL.Query().Get("lane")
-			if !strings.HasPrefix(r.Header.Get("Authorization"), "DPoP ") || r.Header.Get("DPoP") == "" {
-				t.Error("model resolution did not use machine execution access")
-				http.Error(w, "wrong authority", 403)
-				return
-			}
-			if r.URL.Query().Get("ref") != "proof/probe@1.0.0" || lane != "bf16" && lane != "fp32" {
-				http.Error(w, "multiple lanes require the authored or explicit selection", 404)
-				return
-			}
+		if strings.HasPrefix(r.URL.Path, "/v1/tensorfs/") {
 			mu.Lock()
-			lanes = append(lanes, lane)
+			machineReads = append(machineReads, r.URL.Path+" "+r.Header.Get("Authorization"))
 			mu.Unlock()
-			encode(map[string]any{"model": "proof/probe", "release": "1.0.0", "lane": lane, "bytes": 4096, "manifest_id": "sha256:" + manifestRef["sha256"].(string), "manifest_length": len(manifest)})
+		}
+		switch {
+		case r.URL.Path == "/v1/models/proof/probe":
+			_, _ = w.Write(card)
+		case strings.HasPrefix(r.URL.Path, "/v1/models/proof/probe/releases/1.0.0/lanes/") && strings.HasSuffix(r.URL.Path, "/manifest"):
+			_, _ = w.Write(manifest) // the CLI sizes a pinned job input by its manifest
 		case r.URL.Path == "/v1/tensorfs/closure":
 			encode(map[string]any{"complete": true, "model": "proof/probe", "release": "1.0.0", "lane": "bf16", "manifest": manifestRef, "objects": closure, "presign_max_digests": 64, "scope": "runtime"})
 		case r.URL.Path == "/v1/tensorfs/presign":
@@ -81,7 +83,7 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 		}
 	}))
 	defer server.Close()
-	grants = newFakeGrants(server.URL, server.URL, "fixture-account")
+	access = newFakeHubAccess(server.URL, server.URL, "fixture-account")
 	root, err := os.MkdirTemp("", "czlad-")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: fixture-account\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
@@ -103,23 +105,36 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 	}
 	project := probeProject(t, "proof/probe@1.0.0/bf16")
 	for _, which := range []string{"authored", "explicit"} {
-		mu.Lock()
-		before := len(lanes)
-		mu.Unlock()
-		args := []string{"run", project + "/touch", "value=1", "--await", "--json"}
-		want := "bf16"
+		args := []string{"run", project + "/touch", "value=1", "--await", "--json", "--idempotency-key=" + which}
 		if which == "explicit" {
 			args = append(args, "model.source=proof/probe@1.0.0/fp32")
-			want = "fp32"
 		}
 		if code, out := runCozy(t, root, args...); code != 0 || !strings.Contains(out, `"value":2`) {
 			t.Fatalf("%s model input: %d %s", which, code, out)
 		}
-		mu.Lock()
-		got := append([]string(nil), lanes[before:]...)
-		mu.Unlock()
-		if len(got) != 1 || got[0] != want {
-			t.Fatalf("%s selected model lane %v, expected %s at configured Hub", which, got, want)
+		store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+		fatal(t, problem)
+		request, problem := store.RequestByIdempotencyKey(which)
+		store.Close()
+		fatal(t, problem)
+		if request == nil || len(request.Models) != 1 {
+			t.Fatalf("%s run recorded no one model: %+v", which, request)
 		}
+		model := request.Models[0]
+		switch which {
+		case "authored":
+			if model.Pinned() || len(model.Ladder) != 1 || model.Ladder[0].Lane != "bf16" || model.Ladder[0].Manifest != digest {
+				t.Fatalf("the authored default is not its ladder bound to bf16's checkpoint: %+v", model)
+			}
+		case "explicit":
+			if model.Lane != "fp32" || model.Manifest != digest {
+				t.Fatalf("the explicit override is not fp32's checkpoint: %+v", model)
+			}
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(machineReads) == 0 || slices.ContainsFunc(machineReads, func(read string) bool { return !strings.HasSuffix(read, " ") }) {
+		t.Fatalf("the machine's content reads are absent or carried a credential: %q", machineReads)
 	}
 }
