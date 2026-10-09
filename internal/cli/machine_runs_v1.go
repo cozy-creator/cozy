@@ -96,6 +96,15 @@ func (m *machineRuns) loopV1(request records.Request) {
 		} else {
 			sent = marked
 		}
+		if !accepted {
+			// The same stream may have recorded acceptance before it disconnected.
+			// Do not present that running work as waiting for a rental.
+			held, readProblem := m.store.RunV1(request.ID)
+			if readProblem != nil {
+				return
+			}
+			accepted = held
+		}
 		if problem != nil && problem.Message != lastError && m.ctx.Err() == nil {
 			fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, problem.Message)
 			lastError = problem.Message
@@ -132,22 +141,31 @@ func (m *machineRuns) loopV1(request records.Request) {
 				_ = m.store.AppendEvent(request.ID, "request.parked", 0, parked)
 			}
 		}
-		// The stream's authority can expire before the machine refreshes its owner lease.
-		// Recover only observation of a durably accepted run, after a fresh authenticated
-		// Status succeeds. A refusal never authorizes another submission or control.
-		if problem != nil && problem.ErrName() == "machine_execution.observation_unauthorized" {
+		// An accepted run outlives both an expiring stream key and a broken TCP stream.
+		// Fresh authenticated Status authorizes observation only: the next loop reads the
+		// accepted marker and attaches at the same cursor with no spec or control.
+		if problem != nil && (problem.ErrName() == "machine_execution.observation_unauthorized" ||
+			problem.ErrName() == "machine_execution.transport_unavailable") {
 			if latest, _ := m.store.MachineExecution(request.ID); latest != nil && latest.RemoteCursor > link.RemoteCursor {
 				authorityDelay = time.Second // the prior stream made actual progress
 			}
-			if held, readProblem := m.store.RunV1(request.ID); readProblem == nil && held && m.renewObservationV1(*current, link.MachineID, &authorityDelay) {
-				lastError, delay = "", time.Second
-				continue
+			held, readProblem := m.store.RunV1(request.ID)
+			if readProblem != nil {
+				return
 			}
-			return
+			if held {
+				if m.renewObservationV1(*current, link.MachineID, &authorityDelay) {
+					lastError, delay = "", time.Second
+					continue
+				}
+				return
+			}
+			if problem.ErrName() == "machine_execution.observation_unauthorized" {
+				return
+			}
 		}
-		// A remote machine holding this run that cannot be reached is asked again only on new
-		// evidence: a reader, the rental attaching again, or the daemon's restart. A timer
-		// would dial a gone pod forever.
+		// Other unresolved remote failures require new evidence. In particular, losing
+		// the first submission's reply is not permission to submit another spec.
 		if problem != nil && (accepted || sent) && !machines.IsLocal(link.MachineID) {
 			return
 		}

@@ -1,12 +1,36 @@
 package records
 
 import (
+	"database/sql"
 	"encoding/json"
 	"math"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
+
+// RunV1RunningElapsedMS is a wall-clock display for the current running interval,
+// not a substitute for Runtime's measured execution counter. Only Runtime's
+// explicit transition timestamp can start it; import/receipt time cannot.
+func (s *Store) RunV1RunningElapsedMS(id string, attempt int64, now time.Time) (int64, bool, *exit.Error) {
+	var raw []byte
+	err := s.db.QueryRow(`SELECT payload FROM request_events
+ WHERE request_id=? AND attempt=? AND type='run.in_progress'
+ ORDER BY seq DESC LIMIT 1`, id, attempt).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, exit.Internalf("cannot read Runtime's execution start: %s", err)
+	}
+	var stamp struct {
+		Started int64 `json:"started_unix_ms"`
+	}
+	if json.Unmarshal(raw, &stamp) != nil || stamp.Started <= 0 || stamp.Started > now.UnixMilli() {
+		return 0, false, nil
+	}
+	return now.UnixMilli() - stamp.Started, true, nil
+}
 
 // MachineRunExecutionMS consumes cumulative Runtime observations. A wall interval
 // cannot recover cooperative execution for an older producer or a missing attempt.

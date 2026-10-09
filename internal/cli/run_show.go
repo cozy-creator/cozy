@@ -36,11 +36,15 @@ type runReport struct {
 	QueuedMS       int64  `json:"queued_ms"`
 	ExecutionMS    *int64 `json:"execution_ms"`
 	ExecutionKnown bool   `json:"execution_known"`
-	AttemptWallMS  int64  `json:"attempt_wall_ms,omitempty"`
-	WallMS         int64  `json:"wall_ms,omitempty"`
-	Waiting        string `json:"waiting,omitempty"`
-	ErrorType      string `json:"error_type,omitempty"`
-	Error          string `json:"error,omitempty"`
+
+	// ExecutionElapsedMS is the current Runtime-started wall interval, not measured execution.
+	ExecutionElapsedMS *int64 `json:"execution_elapsed_ms,omitempty"`
+
+	AttemptWallMS int64  `json:"attempt_wall_ms,omitempty"`
+	WallMS        int64  `json:"wall_ms,omitempty"`
+	Waiting       string `json:"waiting,omitempty"`
+	ErrorType     string `json:"error_type,omitempty"`
+	Error         string `json:"error,omitempty"`
 	// Warnings are what the run reported without failing: its admission's and its machine's.
 	Warnings []records.Warning `json:"warnings,omitempty"`
 	Stages   []reportStage     `json:"stages"`
@@ -348,7 +352,8 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		ErrorType: life.ErrorType, Error: life.Error,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS,
 		ExecutionKnown: life.ExecutionKnown || life.MachineExecution == nil, AttemptWallMS: life.AttemptWallMS,
-		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
+		ExecutionElapsedMS: life.ExecutionElapsedMS,
+		Events:             evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
 	if report.ExecutionKnown {
 		measured := life.ExecutionMS
 		report.ExecutionMS = &measured
@@ -396,6 +401,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				}
 				if json.Unmarshal(event.Payload, &running) == nil && running.StartedUnixMS > 0 {
 					machineStarted = running.StartedUnixMS // on the machine's clock, as its steps
+					started = time.UnixMilli(running.StartedUnixMS)
 				} else {
 					machineStarted = at.UnixMilli()
 				}
@@ -902,7 +908,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		}
 	}
 	execution := "—"
-	if r.ExecutionMS != nil {
+	if r.ExecutionElapsedMS != nil && r.Status == "in_progress" {
+		execution = span(float64(*r.ExecutionElapsedMS)) + " elapsed"
+	} else if r.ExecutionMS != nil {
 		execution = span(float64(*r.ExecutionMS))
 	}
 	fmt.Fprintf(w, "\nqueued %s · execution %s", span(float64(r.QueuedMS)), execution)

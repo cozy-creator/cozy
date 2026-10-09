@@ -809,12 +809,16 @@ type Lifecycle struct {
 	QueuedMS         int64                 `json:"queued_ms"`
 	ExecutionMS      int64                 `json:"execution_ms"`
 	ExecutionKnown   bool                  `json:"execution_known"`
-	AttemptWallMS    int64                 `json:"attempt_wall_ms,omitempty"`
-	ProgressStage    string                `json:"progress_stage,omitempty"`
-	StageFraction    *float64              `json:"stage_fraction,omitempty"`
-	OverallFraction  *float64              `json:"overall_fraction,omitempty"`
-	Position         *int64                `json:"position,omitempty"`
-	Total            *int64                `json:"total,omitempty"`
+
+	// ExecutionElapsedMS is the current Runtime-started wall interval, not measured execution.
+	ExecutionElapsedMS *int64 `json:"execution_elapsed_ms,omitempty"`
+
+	AttemptWallMS   int64    `json:"attempt_wall_ms,omitempty"`
+	ProgressStage   string   `json:"progress_stage,omitempty"`
+	StageFraction   *float64 `json:"stage_fraction,omitempty"`
+	OverallFraction *float64 `json:"overall_fraction,omitempty"`
+	Position        *int64   `json:"position,omitempty"`
+	Total           *int64   `json:"total,omitempty"`
 	// RemainingMS is read-only compatibility with older daemons; future-stage time is unknown.
 	RemainingMS *int64 `json:"remaining_ms,omitempty"`
 	// StageRemainingMS estimates only the current counted stage; later stages are unknown.
@@ -981,7 +985,8 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS, ExecutionKnown: state.ExecutionKnown,
-			AttemptWallMS: state.AttemptWallMS, QueuedMS: state.QueuedMS,
+			ExecutionElapsedMS: state.ExecutionElapsedMS,
+			AttemptWallMS:      state.AttemptWallMS, QueuedMS: state.QueuedMS,
 			Result: state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Output: state.Output,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,

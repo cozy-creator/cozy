@@ -39,6 +39,10 @@ type observerLeasePeer struct {
 	public                         ed25519.PublicKey
 	denyStatus, denyRun, denyFirst bool
 	transientStatus                codes.Code
+	streamFailure                  codes.Code
+	disconnect                     bool
+	loseFirstReply                 bool
+	dropConnection                 func()
 	mu                             sync.Mutex
 	id                             string
 	statusTimes, runTimes          []time.Time
@@ -103,6 +107,9 @@ func (p *observerLeasePeer) Run(request *v1.RunRequest, stream grpc.ServerStream
 		return status.Error(codes.PermissionDenied, "owner remains revoked")
 	}
 	if first {
+		if p.loseFirstReply {
+			return status.Error(codes.Unavailable, "first reply was lost")
+		}
 		if err := stream.Send(&v1.RunEvent{Sequence: 1, Event: &v1.RunEvent_State{State: &v1.RunState{Id: id, Number: 1, State: "running", Sequence: 1, Attempt: 1}}}); err != nil {
 			return err
 		}
@@ -113,6 +120,14 @@ func (p *observerLeasePeer) Run(request *v1.RunRequest, stream grpc.ServerStream
 			case <-stream.Context().Done():
 				return stream.Context().Err()
 			}
+		}
+		if p.disconnect {
+			p.dropConnection()
+			<-stream.Context().Done()
+			return stream.Context().Err()
+		}
+		if p.streamFailure != codes.OK {
+			return status.Error(p.streamFailure, "read tcp: connection timed out")
 		}
 		return status.Error(codes.PermissionDenied, "the key that opened this stream no longer authorizes it")
 	}
@@ -128,6 +143,30 @@ func (p *observerLeasePeer) Run(request *v1.RunRequest, stream grpc.ServerStream
 func (p *observerLeasePeer) Control(context.Context, *v1.ControlRequest) (*v1.RunState, error) {
 	p.controls.Add(1)
 	return nil, status.Error(codes.PermissionDenied, "observation cannot control work")
+}
+
+type observerListener struct {
+	net.Listener
+	mu   sync.Mutex
+	last net.Conn
+}
+
+func (l *observerListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.mu.Lock()
+		l.last = conn
+		l.mu.Unlock()
+	}
+	return conn, err
+}
+
+func (l *observerListener) drop() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.last != nil {
+		_ = l.last.Close()
+	}
 }
 
 func observerLeaseFixture(t *testing.T, peer *observerLeasePeer, rented ...bool) (string, *records.Store, records.Request, *daemonProcess) {
@@ -165,6 +204,9 @@ func observerLeaseFixture(t *testing.T, peer *observerLeasePeer, rented ...bool)
 	if err != nil {
 		t.Fatal(err)
 	}
+	tracked := &observerListener{Listener: listener}
+	peer.dropConnection = tracked.drop
+	listener = tracked
 	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}})))
 	v1.RegisterMachineServer(server, peer)
 	go server.Serve(listener)
@@ -343,5 +385,57 @@ func TestFirstSubmissionAuthorizationRefusalIsNotRetried(t *testing.T) {
 	defer peer.mu.Unlock()
 	if len(peer.statusTimes) != 0 || peer.specs.Load() != 1 || peer.attaches.Load() != 0 {
 		t.Fatal("first submission refusal retried")
+	}
+}
+
+// The TCP arm closes a real accepted TLS connection after Creator records the
+// running event. Recovery uses a new authenticated Status and the same nil-spec
+// cursor attach, even when that first read-only probe is temporarily unavailable.
+func TestAcceptedRunObserverRecoversBrokenStreamWithoutResubmission(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		disconnect bool
+		failure    codes.Code
+	}{
+		{"tcp_disconnect", true, codes.OK},
+		{"deadline", false, codes.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			peer := &observerLeasePeer{expiring: make(chan struct{}), expireRelease: make(chan struct{}),
+				disconnect: test.disconnect, streamFailure: test.failure, transientStatus: codes.Unavailable}
+			_, store, request, _ := observerLeaseFixture(t, peer, true)
+			observerEventually(t, func() bool { held, _ := store.RunV1(request.ID); return held })
+			close(peer.expireRelease)
+			observerEventually(t, func() bool { row, _ := store.MachineExecution(request.ID); return row != nil && row.Collected })
+			row, problem := store.RequestRow(request.ID)
+			if problem != nil || row.State != "succeeded" || peer.specs.Load() != 1 || peer.attaches.Load() != 1 || peer.controls.Load() != 0 {
+				t.Fatalf("recovery changed accepted work: row=%+v error=%v specs=%d attaches=%d controls=%d", row, problem, peer.specs.Load(), peer.attaches.Load(), peer.controls.Load())
+			}
+			events, problem := store.EventsAfter(request.ID, 0, 100)
+			fatal(t, problem)
+			for _, event := range events {
+				if event.Type == "request.parked" {
+					t.Fatal("accepted execution was presented as waiting for a rental")
+				}
+			}
+			peer.mu.Lock()
+			defer peer.mu.Unlock()
+			if len(peer.statusTimes) != 2 || peer.statusTimes[1].Sub(peer.statusTimes[0]) < 1800*time.Millisecond {
+				t.Fatalf("transport recovery skipped fresh authority/backoff: %v", peer.statusTimes)
+			}
+		})
+	}
+}
+
+func TestUncertainFirstStreamFailureDoesNotTriggerAcceptedRecovery(t *testing.T) {
+	peer := &observerLeasePeer{loseFirstReply: true}
+	_, store, request, _ := observerLeaseFixture(t, peer, true)
+	observerEventually(t, func() bool { return peer.specs.Load() == 1 })
+	time.Sleep(1500 * time.Millisecond)
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	accepted, problem := store.RunV1(request.ID)
+	if problem != nil || accepted || peer.specs.Load() != 1 || peer.attaches.Load() != 0 || len(peer.statusTimes) != 0 || peer.controls.Load() != 0 {
+		t.Fatalf("uncertain submission was retried or promoted: accepted=%v problem=%v specs=%d attaches=%d status=%d controls=%d", accepted, problem, peer.specs.Load(), peer.attaches.Load(), len(peer.statusTimes), peer.controls.Load())
 	}
 }
