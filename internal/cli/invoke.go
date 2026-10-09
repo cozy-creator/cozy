@@ -1409,7 +1409,7 @@ func progressValue(life api.Lifecycle) string {
 
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
 	cfg := ctx.Cfg
-	history := runHistory{client: client, state: ctx.Inv.Value("--state"), packageName: ctx.Inv.Value("--package"), limit: limit, more: true, hubs: &cfg}
+	history := runHistory{client: following(ctx, client), state: ctx.Inv.Value("--state"), packageName: ctx.Inv.Value("--package"), limit: limit, more: true, hubs: &cfg}
 	return watchListPages(ctx, "id", history.refresh, history.next)
 }
 
