@@ -112,7 +112,7 @@ func TestPackageInstallRental(t *testing.T) {
 			if resolutions.Load() != 1 {
 				t.Fatalf("resolutions=%d", resolutions.Load())
 			}
-			_, installed, problem := store.ActivePackage("paul/minimax-h3")
+			_, installed, problem := store.ActivePackage(hubPeer.URL, "paul/minimax-h3")
 			check(problem)
 			if installed != nil {
 				t.Fatal("rental installation changed local package inventory")

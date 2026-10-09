@@ -145,10 +145,10 @@ cozy package list
 ```
 
 Package names resolve at the current hub, or at `--tensorhub=<hub>` for one command;
-the same org/name at two hubs is two packages. `cozy package list` shows every hub's
-installations with a HUB column, published ones before local captures; `--tensorhub`
-narrows it. `remove` and `update-all` act on each installation through its own hub
-unless `--tensorhub` narrows them. A name the hub lacks is answered with that hub and,
+the same org/name at two hubs is two packages, installed side by side. `cozy package list`
+shows every hub's installations with a HUB column, published ones before local captures;
+`--tensorhub` narrows it. `remove` and `update-all` act on each hub's installation
+through that hub unless `--tensorhub` narrows them. A name the hub lacks is answered with that hub and,
 from this computer's records alone, the other hub it was installed or run from and the
 same name under another org at this hub, each with the command that works.
 

@@ -106,13 +106,11 @@ type Server struct {
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.
-// A remote request and package listing use ResolvePlacement; only an explicit local
-// start may require the target environment through Resolve.
+// Only an explicit local start may require the target environment.
 type Resolver interface {
 	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
 	PrepareLocal(context.Context, string) (localpackage.Installation, *exit.Error)
 	LocalInstallation(string, string) (localpackage.Installation, *exit.Error)
-	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	ResolveRemoteRelease(hub, pkg, release, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
@@ -122,7 +120,7 @@ type Resolver interface {
 	// Jobs names the `@job` functions one installed package registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
 	// digest through this and never lets a client name one (cl-004).
-	Jobs(pkg string) ([]launch.JobFacts, *exit.Error)
+	Jobs(hub, pkg string) ([]launch.JobFacts, *exit.Error)
 	JobsInstall(installID string) ([]launch.JobFacts, *exit.Error)
 }
 

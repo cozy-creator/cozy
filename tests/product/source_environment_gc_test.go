@@ -24,14 +24,14 @@ func TestUnreferencedRetainsNewestLocalEnvironment(t *testing.T) {
 	if _, problem := store.Activate(first); problem != nil {
 		t.Fatal(problem)
 	}
-	if problem := store.Unpin(first.Package, first.Major); problem != nil {
+	if problem := store.Unpin(first.PinHub(), first.Package, first.Major); problem != nil {
 		t.Fatal(problem)
 	}
 	second := install("second", "second")
 	if _, problem := store.Activate(second); problem != nil {
 		t.Fatal(problem)
 	}
-	if problem := store.Unpin(second.Package, second.Major); problem != nil {
+	if problem := store.Unpin(second.PinHub(), second.Package, second.Major); problem != nil {
 		t.Fatal(problem)
 	}
 	rows, problem := store.Unreferenced()

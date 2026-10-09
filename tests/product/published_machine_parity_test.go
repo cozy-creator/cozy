@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
@@ -140,5 +141,30 @@ func publishParityReleaseAt(t *testing.T, h *machineHub, root, project, release 
 			return
 		}
 		doors.ServeHTTP(w, r)
+	})
+	// `cozy package install` reads the release's download plan and project index at the Hub.
+	exact := func(raw []byte) hub.ExactDocument {
+		return hub.ExactDocument{CanonicalBytes: raw, Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(raw)), Length: int64(len(raw))}
+	}
+	document := func(name string) hub.ExactDocument {
+		raw, err := os.ReadFile(filepath.Join(project, name))
+		must(t, err)
+		return exact(raw)
+	}
+	plan, err := json.Marshal(hub.PackageDownloadPlan{Release: release, PackageConfig: document("package.toml"),
+		PackageInterface: exact(iface), Pyproject: document("pyproject.toml"), UVLock: document("uv.lock"),
+		Downloads: []hub.PackageInstallDownload{{Kind: "project_wheel", Path: name, Distribution: "machine-parity", Version: release,
+			Digest: fmt.Sprintf("sha256:%x", sum), Length: int64(len(wheel)), Tags: []string{"py3-none-any"}, ImportRoots: []string{"machine_parity"}}}})
+	must(t, err)
+	account := h.server.Config.Handler
+	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case path + "/download":
+			_, _ = w.Write(plan)
+		case "/v1/index/proof/simple/machine-parity/":
+			_, _ = fmt.Fprintf(w, `<a href="%s/%s#sha256=%x">%s</a>`, files.URL, name, sum, name)
+		default:
+			account.ServeHTTP(w, r)
+		}
 	})
 }

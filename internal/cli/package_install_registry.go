@@ -55,17 +55,16 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 	if problem != nil {
 		return nil, nil, problem
 	}
-	_, existingInstall, problem := existing.ActivePackage(ref.String())
+	_, existingInstall, problem := existing.ActivePackage(ctx.Cfg.HubURL, ref.String())
 	if problem != nil {
 		existing.Close()
 		return nil, nil, problem
 	}
-	if problem := requirePackageUpdatePin(existing, ref.String(), expectedInstallID); problem != nil {
+	if problem := requirePackageUpdatePin(existing, ctx.Cfg.HubURL, ref.String(), expectedInstallID); problem != nil {
 		existing.Close()
 		return nil, nil, problem
 	}
-	if existingInstall != nil && existingInstall.PublishedAt(ctx.Cfg.HubURL) &&
-		existingInstall.Package == ref.String() && existingInstall.Version == release {
+	if existingInstall != nil && existingInstall.SourceKind == "tensorhub" && existingInstall.Version == release {
 		defer existing.Close()
 		result := &install.Result{Install: *existingInstall, Idempotent: true}
 		return result, nil, nil
@@ -89,7 +88,7 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 	if problem != nil {
 		return nil, nil, problem
 	}
-	if problem := requirePackageUpdatePin(st, ref.String(), expectedInstallID); problem != nil {
+	if problem := requirePackageUpdatePin(st, ctx.Cfg.HubURL, ref.String(), expectedInstallID); problem != nil {
 		st.Close()
 		writer.Unlock()
 		return nil, nil, problem
@@ -131,11 +130,11 @@ func resolveRegistryPackage(ctx *Context, value, version string) (hub.Ref, hub.P
 	return ref, plan, packageHubProblem(ctx, ref.String(), problem)
 }
 
-func requirePackageUpdatePin(st *records.Store, pkg, expected string) *exit.Error {
+func requirePackageUpdatePin(st *records.Store, hub, pkg, expected string) *exit.Error {
 	if expected == "" {
 		return nil
 	}
-	_, installed, problem := st.ActivePackage(pkg)
+	_, installed, problem := st.ActivePackage(hub, pkg)
 	if problem != nil {
 		return problem
 	}

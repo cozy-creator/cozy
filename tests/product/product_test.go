@@ -507,7 +507,7 @@ func activeInstall(t *testing.T, root, packageRef string) records.PackageInstall
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	_, install, problem := store.ActivePackage(packageRef)
+	_, install, problem := store.ActivePackage("", packageRef)
 	fatal(t, problem)
 	if install == nil {
 		t.Fatalf("editable package %s has no active install", packageRef)

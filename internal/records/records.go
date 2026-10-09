@@ -1,5 +1,5 @@
 // Package records is the ONE local lifecycle authority: package installs and the
-// one active pin per package, as rows in ONE local SQLite database
+// one active pin per package at each hub, as rows in ONE local SQLite database
 // (cozy-creator.md "Records"). There is no state.json and no second lifecycle store;
 // any JSON output is a derived read.
 //
@@ -54,9 +54,11 @@ type PackageInstall struct {
 	Hub string
 }
 
-// Pin is the package's one active install. Major remains recorded for package metadata
-// and removal output; activating any release replaces the package's previous pin.
+// Pin is a package's one active install at one hub ("" for local sources): the same
+// org/name at two hubs is two packages. Major remains recorded for package metadata and
+// removal output; activating any release replaces that hub's previous pin.
 type Pin struct {
+	Hub         string
 	Package     string
 	Major       int
 	InstallID   string // names a PackageInstall row's id
@@ -68,7 +70,7 @@ type Store struct {
 	telemetry telemetryV1
 }
 
-const schemaVersion = 49
+const schemaVersion = 50
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -97,12 +99,24 @@ CREATE TABLE IF NOT EXISTS installs (
 
 const pinsDDL = `
 CREATE TABLE IF NOT EXISTS pins (
-  package     TEXT    NOT NULL,
+  hub          TEXT    NOT NULL DEFAULT '',
+  package      TEXT    NOT NULL,
   major        INTEGER NOT NULL,
   install_id   TEXT    NOT NULL REFERENCES installs(id),
   activated_at TEXT    NOT NULL,
-  PRIMARY KEY (package)
+  PRIMARY KEY (hub, package)
 )`
+
+// pinsByHub carries schema 49, whose pins were keyed by package alone, to hub-keyed pins:
+// each pin moves under its install's recorded origin (PinHub).
+var pinsByHub = []string{
+	strings.Replace(pinsDDL, "EXISTS pins (", "EXISTS pins_by_hub (", 1),
+	`INSERT INTO pins_by_hub(hub,package,major,install_id,activated_at)
+	 SELECT CASE WHEN p.package LIKE 'local/%' THEN '' ELSE rtrim(i.hub, '/') END, p.package, p.major, p.install_id, p.activated_at
+	 FROM pins p JOIN installs i ON i.id=p.install_id`,
+	`DROP TABLE pins`,
+	`ALTER TABLE pins_by_hub RENAME TO pins`,
+}
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orchestratorSchema,
@@ -144,9 +158,9 @@ func OpenForDaemon(path string) (*Store, *exit.Error) {
 	return store, nil
 }
 
-// open accepts an empty database, the current schema, or a newer one. The current schema
-// evolves additively: verifySchema adds any table, column or index the authored DDL has and
-// the database lacks. An older numbered schema is refused; this build carries no migrations.
+// open accepts an empty database, the current schema, schema 49 (migrated), or a newer one.
+// The current schema evolves additively: verifySchema adds any table, column or index the
+// authored DDL has and the database lacks. Any other older schema is refused.
 func open(path string) (*Store, *exit.Error) {
 	// No `file:` prefix: the driver hands an unprefixed name to SQLite verbatim, so a
 	// local root containing `%` or `#` stays a path instead of becoming a URI to decode.
@@ -173,11 +187,10 @@ func open(path string) (*Store, *exit.Error) {
 			return nil, e
 		}
 	case version < schemaVersion:
-		db.Close()
-		return nil, exit.Named(exit.Conflict, "records_schema_unsupported",
-			"records database %s has schema %d; this Creator reads schema %d and does not migrate older records",
-			path, version, schemaVersion).
-			WithRemedy("move %s aside and run the command again; a new database is created", path)
+		if e := migrate(db, path, version); e != nil {
+			db.Close()
+			return nil, e
+		}
 	case version > schemaVersion:
 		// A newer Creator wrote this database. This build reads and writes only the tables
 		// and columns it knows, and it changes nothing else: no re-stamp, no added or
@@ -252,6 +265,37 @@ func initialize(db *sql.DB, path string) *exit.Error {
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit records initialization in %s: %s", path, err)
+	}
+	return nil
+}
+
+// migrate keys schema 49's package pins by hub in one transaction; any other older schema
+// is refused. A database another process migrated meanwhile is accepted as it is.
+func migrate(db *sql.DB, path string, version int) *exit.Error {
+	if version != schemaVersion-1 {
+		return exit.Named(exit.Conflict, "records_schema_unsupported",
+			"records database %s has schema %d; this Creator reads schema %d and migrates only %d",
+			path, version, schemaVersion, schemaVersion-1).
+			WithRemedy("move %s aside and run the command again; a new database is created", path)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin the records migration in %s: %s", path, err)
+	}
+	defer tx.Rollback()
+	if now, err := databaseVersion(tx); err != nil || now != version {
+		if now == schemaVersion {
+			return nil
+		}
+		return schemaChanged(path, now)
+	}
+	for _, statement := range append(pinsByHub, fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)) {
+		if _, err := tx.Exec(statement); err != nil {
+			return exit.Internalf("cannot key package pins by hub in %s: %s", path, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit the records migration in %s: %s", path, err)
 	}
 	return nil
 }
@@ -340,8 +384,7 @@ func scanInstall(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 	return scanInstallFields(rows, false)
 }
 
-// installHubCols is installCols plus the install's hub, for readers of the current
-// schema. Package recovery reads a backup through installCols alone.
+// installHubCols is installCols plus the install's hub, for readers of the current schema.
 func installHubCols(alias string) string { return installCols(alias) + "," + alias + "hub" }
 
 func scanInstallHub(rows interface{ Scan(...any) error }) (PackageInstall, error) {
@@ -372,6 +415,18 @@ func (inst PackageInstall) PublishedAt(origin string) bool {
 		strings.TrimRight(inst.Hub, "/") == strings.TrimRight(origin, "/")
 }
 
+// PinHub is the hub this install's pin is keyed under: the hub it came from.
+func (inst PackageInstall) PinHub() string { return ReferenceHub(inst.Hub, inst.Package) }
+
+// ReferenceHub is the pin hub a package reference resolves under at hub: local/ captures
+// belong to no hub.
+func ReferenceHub(hub, pkg string) string {
+	if strings.HasPrefix(pkg, "local/") {
+		return ""
+	}
+	return strings.TrimRight(hub, "/")
+}
+
 // previous install's venv — exactly as it was.
 func (s *Store) Activate(inst PackageInstall) (superseded string, e *exit.Error) {
 	return s.recordInstall(inst, true)
@@ -392,8 +447,7 @@ func (s *Store) recordInstall(inst PackageInstall, activate bool) (string, *exit
 	defer tx.Rollback()
 
 	var prior string
-	err = tx.QueryRow(`SELECT install_id FROM pins WHERE package=?
-		ORDER BY activated_at DESC LIMIT 1`, inst.Package).Scan(&prior)
+	err = tx.QueryRow(`SELECT install_id FROM pins WHERE hub=? AND package=?`, inst.PinHub(), inst.Package).Scan(&prior)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", exit.Internalf("cannot read the current pin: %s", err)
 	}
@@ -412,12 +466,12 @@ func (s *Store) recordInstall(inst PackageInstall, activate bool) (string, *exit
 		return "", exit.Internalf("cannot insert install %s: %s", inst.ID, err)
 	}
 	if activate {
-		if _, err := tx.Exec(`DELETE FROM pins WHERE package=?`, inst.Package); err != nil {
+		if _, err := tx.Exec(`DELETE FROM pins WHERE hub=? AND package=?`, inst.PinHub(), inst.Package); err != nil {
 			return "", exit.Internalf("cannot replace the active pin for %s: %s", inst.Package, err)
 		}
-		if _, err := tx.Exec(`INSERT INTO pins(package,major,install_id,activated_at)
-			VALUES(?,?,?,?)`,
-			inst.Package, inst.Major, inst.ID, inst.CreatedAt); err != nil {
+		if _, err := tx.Exec(`INSERT INTO pins(hub,package,major,install_id,activated_at)
+			VALUES(?,?,?,?,?)`,
+			inst.PinHub(), inst.Package, inst.Major, inst.ID, inst.CreatedAt); err != nil {
 			return "", exit.Internalf("cannot activate the pin for %s@v%d: %s", inst.Package, inst.Major, err)
 		}
 	} else {
@@ -431,12 +485,12 @@ func (s *Store) recordInstall(inst PackageInstall, activate bool) (string, *exit
 	return prior, nil
 }
 
-// ActivePackage returns the package's one active install.
-func (s *Store) ActivePackage(pkg string) (*Pin, *PackageInstall, *exit.Error) {
+// ActivePackage returns the one active install a reference to pkg at hub resolves to.
+func (s *Store) ActivePackage(hub, pkg string) (*Pin, *PackageInstall, *exit.Error) {
 	var p Pin
-	err := s.db.QueryRow(`SELECT package,major,install_id,activated_at FROM pins
-		WHERE package=? ORDER BY activated_at DESC LIMIT 1`, pkg).
-		Scan(&p.Package, &p.Major, &p.InstallID, &p.ActivatedAt)
+	err := s.db.QueryRow(`SELECT hub,package,major,install_id,activated_at FROM pins
+		WHERE hub=? AND package=?`, ReferenceHub(hub, pkg), pkg).
+		Scan(&p.Hub, &p.Package, &p.Major, &p.InstallID, &p.ActivatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil
 	}
@@ -449,11 +503,11 @@ func (s *Store) ActivePackage(pkg string) (*Pin, *PackageInstall, *exit.Error) {
 
 // ActivePin returns the package pin only when it has the requested major. Removal uses
 // this after listing the active pin; installation uses ActivePackage.
-func (s *Store) ActivePin(pkg string, major int) (*Pin, *PackageInstall, *exit.Error) {
+func (s *Store) ActivePin(hub, pkg string, major int) (*Pin, *PackageInstall, *exit.Error) {
 	var p Pin
-	err := s.db.QueryRow(`SELECT package,major,install_id,activated_at FROM pins
-		WHERE package=? AND major=?`, pkg, major).
-		Scan(&p.Package, &p.Major, &p.InstallID, &p.ActivatedAt)
+	err := s.db.QueryRow(`SELECT hub,package,major,install_id,activated_at FROM pins
+		WHERE hub=? AND package=? AND major=?`, ReferenceHub(hub, pkg), pkg, major).
+		Scan(&p.Hub, &p.Package, &p.Major, &p.InstallID, &p.ActivatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil
 	}
@@ -507,7 +561,7 @@ func (s *Store) SourceEnvironments(pkg, version string) ([]PackageInstall, *exit
 func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installHubCols("i.") + `
 		FROM installs i JOIN pins p ON p.install_id = i.id
-		ORDER BY i.package, i.major`)
+		ORDER BY i.package, p.hub, i.major`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list installed packages: %s", err)
 	}
@@ -577,10 +631,10 @@ func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	return out, nil
 }
 
-// Pins returns the package's active pin, if any.
+// Pins returns the package's active pin at every hub.
 func (s *Store) Pins(pkg string) ([]Pin, *exit.Error) {
-	rows, err := s.db.Query(`SELECT package,major,install_id,activated_at FROM pins
-		WHERE package=? ORDER BY major`, pkg)
+	rows, err := s.db.Query(`SELECT hub,package,major,install_id,activated_at FROM pins
+		WHERE package=? ORDER BY hub, major`, pkg)
 	if err != nil {
 		return nil, exit.Internalf("cannot list pins for %s: %s", pkg, err)
 	}
@@ -588,7 +642,7 @@ func (s *Store) Pins(pkg string) ([]Pin, *exit.Error) {
 	var out []Pin
 	for rows.Next() {
 		var p Pin
-		if err := rows.Scan(&p.Package, &p.Major, &p.InstallID, &p.ActivatedAt); err != nil {
+		if err := rows.Scan(&p.Hub, &p.Package, &p.Major, &p.InstallID, &p.ActivatedAt); err != nil {
 			return nil, exit.Internalf("cannot read a pin: %s", err)
 		}
 		out = append(out, p)
@@ -598,8 +652,8 @@ func (s *Store) Pins(pkg string) ([]Pin, *exit.Error) {
 
 // Unpin drops one pin. The install row survives as unreferenced until gc — `rm`
 // removes the install, gc reclaims the bytes.
-func (s *Store) Unpin(pkg string, major int) *exit.Error {
-	if _, err := s.db.Exec(`DELETE FROM pins WHERE package=?`, pkg); err != nil {
+func (s *Store) Unpin(hub, pkg string, major int) *exit.Error {
+	if _, err := s.db.Exec(`DELETE FROM pins WHERE hub=? AND package=?`, ReferenceHub(hub, pkg), pkg); err != nil {
 		return exit.Internalf("cannot remove the pin for %s@v%d: %s", pkg, major, err)
 	}
 	return nil

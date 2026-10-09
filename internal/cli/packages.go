@@ -336,15 +336,17 @@ func handleRm(ctx *Context) *exit.Error {
 		if e != nil {
 			return e
 		}
+		// One pin per hub: every hub's installation of the name, unless --tensorhub narrows.
+		targets = slices.DeleteFunc(targets, func(p records.Pin) bool {
+			return !everyHub(ctx) && p.Hub != records.ReferenceHub(ctx.Cfg.HubURL, p.Package)
+		})
+		if len(targets) == 0 {
+			if other, _ := st.Pins(ref.Package); len(other) > 0 {
+				return foreignPackageRemoval(ctx, other[0].Hub, ref.Package)
+			}
+		}
 		for _, p := range targets {
-			inst, problem := st.Install(p.InstallID)
-			if problem != nil {
-				return problem
-			}
-			if inst != nil && !inHubScope(ctx, *inst) {
-				return foreignPackageRemoval(ctx, *inst)
-			}
-			n, e := install.Remove(l, st, p.Package, p.Major)
+			n, e := install.Remove(l, st, p.Hub, p.Package, p.Major)
 			if e != nil {
 				return e
 			}

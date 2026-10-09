@@ -67,6 +67,10 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 		row["detail"] = "local or unpublished install; no registry update"
 		return row
 	}
+	if prior.Hub == "" {
+		row["detail"] = "no recorded hub; reinstall it to update it"
+		return row
+	}
 	if !immutablePackageVersion.MatchString(prior.Version) {
 		row["detail"] = "development or prerelease selection preserved; use package install --version to change it"
 		return row
@@ -85,7 +89,7 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 	if problem != nil {
 		return fail(problem)
 	}
-	if prior.Hub != "" && latest == prior.Version {
+	if latest == prior.Version {
 		row["status"] = "current"
 		return row
 	}
@@ -93,7 +97,7 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 	if problem != nil {
 		return fail(problem)
 	}
-	if prior.Hub != "" && newest != latest {
+	if newest != latest {
 		row["detail"] = "installed version is newer than the registry; preserved"
 		return row
 	}

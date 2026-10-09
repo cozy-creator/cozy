@@ -97,7 +97,7 @@ func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
 		t.Fatalf("bulk update summary: %s; downloads=%d", out, downloads.Load())
 	}
 	for _, row := range result.Packages {
-		_, active, problem := store.ActivePackage(row["package"])
+		_, active, problem := store.ActivePackage(server.URL, row["package"])
 		fatal(t, problem)
 		prior := priors[row["package"]]
 		if row["status"] == "updated" {
@@ -118,7 +118,7 @@ func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
 			}
 		}
 	}
-	fatal(t, store.Unpin("a-failed/install-reporting", 1))
+	fatal(t, store.Unpin(server.URL, "a-failed/install-reporting", 1))
 	code, out = runCozy(t, root, "package", "update-all", "--json")
 	if code != 0 || json.Unmarshal([]byte(out), &result) != nil || result.Updated != 0 || result.Current != 2 || result.Failed != 0 || downloads.Load() != 2 {
 		t.Fatalf("already current packages were installed again: %d %s", code, out)
@@ -164,7 +164,7 @@ func TestPackageUpdateAllPreservesConcurrentLocalSelection(t *testing.T) {
 	defer server.Close()
 	prior := updateAllInstall(t, layout, store, 1, pkg, "1.0.0", "tensorhub", server.URL)
 	replacement := cleanupTestInstall(layout, "dddddddddddddddd", "2.0.0")
-	replacement.Package, replacement.SourceKind = pkg, "local"
+	replacement.Package, replacement.SourceKind, replacement.Hub = pkg, "local", server.URL
 	must(t, os.MkdirAll(replacement.Dir, 0700))
 	mux.HandleFunc("GET /v1/packages/proof/install-reporting", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "install-reporting"}, Releases: []hub.ReleaseSummary{{Release: "1.0.1"}}})
@@ -187,47 +187,12 @@ func TestPackageUpdateAllPreservesConcurrentLocalSelection(t *testing.T) {
 	if code != 1 || !strings.Contains(out, `"error_code":"package.update_changed"`) {
 		t.Fatalf("concurrent selection was not refused: %d %s", code, out)
 	}
-	_, active, problem := store.ActivePackage(pkg)
+	_, active, problem := store.ActivePackage(server.URL, pkg)
 	fatal(t, problem)
 	if active == nil || active.ID != replacement.ID || active.SourceKind != "local" {
 		t.Fatalf("concurrent local choice was overwritten: %+v", active)
 	}
 	if _, err := os.Stat(filepath.Join(prior.Dir, "prior.py")); err != nil {
 		t.Fatalf("bulk update removed previous bytes: %v", err)
-	}
-}
-
-func TestPackageUpdateAllResolvesUnknownLegacySource(t *testing.T) {
-	var downloads atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/proof/legacy":
-			_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "legacy"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/packages/proof/legacy/download":
-			downloads.Add(1)
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"error":{"code":"proof.download_observed","message":"configured source resolved again"}}`))
-		default:
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-	}))
-	defer server.Close()
-	root := t.TempDir()
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-	prior := updateAllInstall(t, layout, store, 1, "proof/legacy", "1.0.0", "tensorhub", "")
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
-	code, out := runCozy(t, root, "package", "update-all", "--json")
-	if code != 1 || downloads.Load() != 1 || !strings.Contains(out, "proof.download_observed") {
-		t.Fatalf("unknown source was trusted solely because version matched [exit %d]: %s", code, out)
-	}
-	_, retained, problem := store.ActivePackage(prior.Package)
-	fatal(t, problem)
-	if retained == nil || retained.ID != prior.ID {
-		t.Fatalf("source resolution failure replaced prior install: %+v", retained)
 	}
 }
