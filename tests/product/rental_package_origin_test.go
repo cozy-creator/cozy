@@ -76,6 +76,9 @@ func TestForeignPublishedInstallDoesNotSatisfyMissingSelectedPackage(t *testing.
 		if code == 0 || !strings.Contains(out, "package.not_found") || reads.Load() == before {
 			t.Fatalf("foreign install satisfied a missing package instead of consulting the selected Hub [exit %d, placement %v]\n%s", code, placement, out)
 		}
+		if !strings.Contains(out, "selected Hub "+missing.URL) || !strings.Contains(out, "installed proof/quantize@1.0.0 came from "+original) || !strings.Contains(out, "--tensorhub="+original) {
+			t.Fatalf("missing package hid selected Hub or installed provenance [placement %v]\n%s", placement, out)
+		}
 	}
 }
 

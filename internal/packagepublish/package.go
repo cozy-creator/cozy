@@ -99,7 +99,14 @@ func prepareFrom(projectDir string) (*Package, *exit.Error) {
 // Build runs the standard PEP 517 backend and builds local dependency wheels.
 // It is deliberately separate from Prepare so committed replays do no builds.
 func (p *Package) Build(ctx context.Context) *exit.Error {
-	return p.build(ctx, nil)
+	return p.build(ctx, nil, false)
+}
+
+// BuildForCapture leaves dependency custody to CaptureUnpublishedClosure, which
+// reads the installed selection. Publication account policy does not apply to a
+// private invocation's already-locked Hub dependencies.
+func (p *Package) BuildForCapture(ctx context.Context) *exit.Error {
+	return p.build(ctx, nil, true)
 }
 
 // BuildForPublish builds the release for one namespace. It also rejects lock rows
@@ -107,10 +114,10 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 // index, and writes the account into org-relative model references. Declared
 // compatibility bounds are preserved in the package metadata.
 func (p *Package) BuildForPublish(ctx context.Context, namespace Namespace, prebuiltWheels ...string) *exit.Error {
-	return p.build(ctx, &namespace, prebuiltWheels...)
+	return p.build(ctx, &namespace, false, prebuiltWheels...)
 }
 
-func (p *Package) build(ctx context.Context, namespace *Namespace, prebuiltWheels ...string) *exit.Error {
+func (p *Package) build(ctx context.Context, namespace *Namespace, capture bool, prebuiltWheels ...string) *exit.Error {
 	publish := namespace != nil
 	if p.Root != "" || p.Wheel != "" {
 		return exit.Internalf("package publication wheel staging was built more than once")
@@ -165,11 +172,14 @@ func (p *Package) build(ctx context.Context, namespace *Namespace, prebuiltWheel
 	}
 	// The locked registry closure is recorded whether it is reached directly or only
 	// through a vendored wheel's own requirements.
-	registry, problem := collectRegistryRows(ctx, project, root, account, dependencies, python)
-	if problem != nil {
-		p.Close()
-		p.Root = ""
-		return problem
+	var registry []RegistryRow
+	if !capture {
+		registry, problem = collectRegistryRows(ctx, project, root, account, dependencies, python)
+		if problem != nil {
+			p.Close()
+			p.Root = ""
+			return problem
+		}
 	}
 	description, problem := describe(ctx, p.Tree, root, account)
 	p.InterfaceNotice = description.notice

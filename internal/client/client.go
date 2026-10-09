@@ -87,11 +87,21 @@ func (c *Client) reattach(ctx context.Context) bool {
 	}
 }
 
-// lostDaemon answers whether a failed exchange means the daemon went away: the
-// connection failed, or, once a restart is suspected, the new daemon does not yet
-// accept the credential this client last read.
-func lostDaemon(problem *exit.Error, recovering bool) bool {
-	return problem != nil && (problem.ErrName() == "daemon_unreachable" || recovering && problem.ErrName() == "unauthenticated")
+// lostDaemon answers whether a failed exchange means the daemon this client addressed went
+// away: the connection failed, or a daemon refused this client's credential while the record
+// now carries another (a restart, however quick, mints a fresh one).
+func (c *Client) lostDaemon(problem *exit.Error) bool {
+	if problem == nil {
+		return false
+	}
+	switch problem.ErrName() {
+	case "daemon_unreachable":
+		return true
+	case "unauthenticated":
+		next, e := Open(c.cfg, daemon.State{})
+		return e == nil && next.token != c.token
+	}
+	return false
 }
 
 // AllHubs widens this client's run history to every hub's runs.
@@ -187,7 +197,7 @@ func (c *Client) callContext(ctx context.Context, method, path string, body, out
 	recovering := false
 	for {
 		problem := c.exchange(ctx, method, path, body, out, headers...)
-		if c.reattached == nil || method != http.MethodGet || !lostDaemon(problem, recovering) {
+		if c.reattached == nil || method != http.MethodGet || !c.lostDaemon(problem) {
 			if recovering && problem == nil {
 				c.reattached()
 			}

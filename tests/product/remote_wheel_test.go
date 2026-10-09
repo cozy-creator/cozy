@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -16,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
@@ -31,7 +33,7 @@ func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
 	archive := zip.NewWriter(file)
 	for name, body := range map[string]string{
 		"remote_callable.py":                               "from cozy_runtime.author import App\napp=App()\n",
-		"remote_callable-1.0.0.dist-info/METADATA":         "Metadata-Version: 2.1\nName: remote-callable\nVersion: 1.0.0\nRequires-Python: >=3.12\nRequires-Dist: cozy-runtime>=0.18.0\n",
+		"remote_callable-1.0.0.dist-info/METADATA":         "Metadata-Version: 2.1\nName: remote-callable\nVersion: 1.0.0\nRequires-Python: >=3.12\nRequires-Dist: cozy-runtime[media]>=0.18.0,<0.30\nRequires-Dist: tensorfs>=0.3.74,<0.5\nRequires-Dist: msgspec>=0.19\n",
 		"remote_callable-1.0.0.dist-info/WHEEL":            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
 		"remote_callable-1.0.0.dist-info/entry_points.txt": "[cozy.application]\ndefault=remote_callable:app\n",
 		"remote_callable-1.0.0.dist-info/RECORD":           "",
@@ -73,9 +75,19 @@ func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
 		t.Fatal("remote wheel omitted its required Runtime closure")
 	}
 	dependencies["cozy-runtime"] = packagepublish.CapturedDependency{Name: "cozy-runtime", Version: hostruntime.PackageFloor, Requirement: "cozy-runtime==" + hostruntime.PackageFloor} //cozy:allow captured distribution row, nothing shells out
+	dependencies["tensorfs"] = packagepublish.CapturedDependency{Name: "tensorfs", Version: "0.3.92", Requirement: "tensorfs==0.3.92"}
+	dependencies["msgspec"] = packagepublish.CapturedDependency{Name: "msgspec", Version: "0.21.1", Requirement: "msgspec==0.21.1"}
 	result, problem := install.CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected)
 	if problem != nil {
 		t.Fatal(problem)
+	}
+	metadata, problem := wheel.Metadata(result.CapturedProjectWheel)
+	fatal(t, problem)
+	text := string(metadata)
+	if strings.Contains(text, "cozy-runtime==") || strings.Contains(text, "tensorfs==") ||
+		!strings.Contains(text, "cozy-runtime[media]>=0.18.0,<0.30") ||
+		!strings.Contains(text, "tensorfs>=0.3.74,<0.5") || !strings.Contains(text, "msgspec==0.21.1") {
+		t.Fatalf("captured callable pinned the client SDK or relaxed its author's bounds:\n%s", text)
 	}
 	if !result.RemoteSnapshot {
 		t.Fatal("wheel did not use remote capture")

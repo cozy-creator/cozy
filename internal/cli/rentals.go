@@ -1101,6 +1101,9 @@ func handleRentalList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	if watching {
+		client = following(ctx, client)
+	}
 	var last time.Time
 	fetch := func(call context.Context) (output.List, *exit.Error) {
 		reconcile := last.IsZero() || time.Since(last) >= pollCadence

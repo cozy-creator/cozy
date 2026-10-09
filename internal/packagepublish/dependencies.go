@@ -114,6 +114,7 @@ type dependencyCollector struct {
 	root        string
 	captureOnly bool
 	selected    map[string]string
+	gitPins     map[string]gitPin
 }
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
@@ -348,7 +349,14 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 // collectGit builds the wheel of a git source at its pinned commit and carries it like a
 // local wheel: machines install those exact bytes from the Hub and never reach the repository.
 func (c *dependencyCollector) collectGit(req requirement, pin gitPin) *exit.Error {
-	if c.scanOnly || c.captureOnly {
+	if c.gitPins == nil {
+		c.gitPins = map[string]gitPin{}
+	}
+	if previous, ok := c.gitPins[req.name]; ok && previous != pin {
+		return exit.Named(exit.Validation, "local_dependency_duplicate", "dependency %s declares conflicting pinned Git sources", req.name)
+	}
+	c.gitPins[req.name] = pin
+	if c.scanOnly || c.captureOnly && c.selected[req.name] == "" {
 		return nil
 	}
 	source := "git+" + pin.url + "@" + pin.commit

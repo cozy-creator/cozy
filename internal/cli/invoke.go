@@ -1409,7 +1409,7 @@ func progressValue(life api.Lifecycle) string {
 
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
 	cfg := ctx.Cfg
-	history := runHistory{client: client, state: ctx.Inv.Value("--state"), packageName: ctx.Inv.Value("--package"), limit: limit, more: true, hubs: &cfg}
+	history := runHistory{client: following(ctx, client), state: ctx.Inv.Value("--state"), packageName: ctx.Inv.Value("--package"), limit: limit, more: true, hubs: &cfg}
 	return watchListPages(ctx, "id", history.refresh, history.next)
 }
 
@@ -2922,7 +2922,14 @@ func parseTarget(raw string) (Target, *exit.Error) {
 	return target, nil
 }
 
-func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
+func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInterface, failure *exit.Error) {
+	defer func() {
+		if failure != nil {
+			if target, problem := parseTarget(ctx.Inv.Args[0]); problem == nil {
+				failure = packageHubProblem(ctx, target.Package, failure)
+			}
+		}
+	}()
 	if isScriptTarget(ctx.Inv.Args[0]) {
 		if ambiguousScriptTarget(ctx.Inv.Args[0]) {
 			fmt.Fprintf(ctx.Err, "running the local file %s; spell a package as org/name/function\n", ctx.Inv.Args[0])

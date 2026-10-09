@@ -144,8 +144,10 @@ func captureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 			exact = append(exact, name+"=="+dependency.Version)
 		}
 	}
-	exact = append(exact, "cozy-runtime>="+hostruntime.PackageFloor)
-	sort.Strings(exact)
+	exact, problem = packagepublish.PrivateWheelRequirements(original, exact)
+	if problem != nil {
+		return fail(problem)
+	}
 	executablePath := filepath.Join(dir, "wheels", filepath.Base(original))
 	if problem := wheel.PinDependencies(original, executablePath, exact); problem != nil {
 		return fail(problem)

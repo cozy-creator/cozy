@@ -138,7 +138,7 @@ func handlePackageInfo(ctx *Context) *exit.Error {
 	defer cancel()
 	card, problem := client(ctx).PackageCard(hctx, ref)
 	if problem != nil {
-		return problem
+		return packageHubProblem(ctx, ref.String(), problem)
 	}
 	l := output.List{Name: "releases", Fields: []string{"release", "published", "yanked"},
 		AllFields: []string{"release", "published", "yanked", "yanked_at"},

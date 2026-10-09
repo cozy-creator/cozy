@@ -45,7 +45,7 @@ func StagePrepared(ctx context.Context, layout home.Layout, install records.Pack
 		return Open(layout, install, install.ID)
 	}
 	if pack.Wheel == "" {
-		if problem := pack.Build(ctx); problem != nil {
+		if problem := pack.BuildForCapture(ctx); problem != nil {
 			return Installation{}, problem
 		}
 	}
@@ -85,7 +85,7 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	if project == "" {
 		project = install.SourceRef
 	}
-	pack, problem := packagepublish.SnapshotSource(project, filepath.Join(stage, "source"))
+	pack, problem := packagepublish.SnapshotSource(ctx, project, filepath.Join(stage, "source"))
 	if problem != nil {
 		return Installation{}, problem
 	}

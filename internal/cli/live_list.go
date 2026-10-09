@@ -10,6 +10,8 @@ import (
 
 	"golang.org/x/term"
 
+	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/output"
 )
@@ -39,6 +41,12 @@ func watchList(ctx *Context, anchor string,
 		list, problem := fetch(call)
 		return listSnapshot{list: list}, problem
 	}, nil)
+}
+
+// following keeps a board on the daemon across its restarts. The board redraws every
+// second, so the reattachment is not announced.
+func following(ctx *Context, c *localapi.Client) *localapi.Client {
+	return c.Following(func() { ctx.Daemon = daemon.Probe(ctx.Cfg) })
 }
 
 type listSnapshot struct {

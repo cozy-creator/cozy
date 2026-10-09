@@ -73,10 +73,10 @@ func TestProductPath(t *testing.T) {
 	}
 	code, out = runCozy(t, root, "package", "list")
 	if narrowed, listed := runCozy(t, root, "package", "list", "--json", "--tensorhub=http://127.0.0.1:9"); narrowed != 0 ||
-		strings.Contains(listed, localWeightlessRef) {
-		t.Fatalf("package list narrowed to a hub listed a local install [exit %d]\n%s", narrowed, listed)
+		!strings.Contains(listed, localWeightlessRef) {
+		t.Fatalf("package list with explicit hub hid a local source install [exit %d]\n%s", narrowed, listed)
 	}
-	if code != 0 || !regexp.MustCompile(`SIZE +DEPENDENCIES +HUB\n`).MatchString(out) ||
+	if code != 0 || !regexp.MustCompile(`SIZE +DEPENDENCIES +HUB +SCOPE\n`).MatchString(out) ||
 		!strings.Contains(out, units.Bytes(listed.Packages[0].Size)+"  "+units.Bytes(listed.Packages[0].Dependencies)) {
 		t.Fatalf("package list does not show SIZE and DEPENDENCIES in units [exit %d]\n%s", code, out)
 	}

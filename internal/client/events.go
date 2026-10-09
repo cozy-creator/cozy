@@ -63,7 +63,7 @@ func (c *Client) WatchContext(ctx context.Context, requestID string, from int64,
 			cursor = last
 			attempts = 0 // progress resets the budget: a long run is not a broken one
 		}
-		if c.reattached != nil && lostDaemon(e, recovering) {
+		if c.reattached != nil && c.lostDaemon(e) {
 			// The run is durable and the daemon owns it; a restarted daemon replays the
 			// stream from this cursor.
 			if !c.reattach(ctx) {
