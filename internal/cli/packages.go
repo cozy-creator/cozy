@@ -215,8 +215,9 @@ func handleLs(ctx *Context) *exit.Error {
 	l := output.List{
 		Name:      "packages",
 		Fields:    []string{"package", "version", "python", "python_status", "size", "dependencies"},
-		AllFields: []string{"package", "major", "version", "python", "python_status", "size", "dependencies", "placement_set", "install_id", "source", "hub", "synced", "verified", "installed"},
+		AllFields: []string{"package", "major", "version", "python", "python_status", "size", "dependencies", "placement_set", "install_id", "source", "hub", "scope", "synced", "verified", "installed"},
 		Bytes:     []string{"size", "dependencies"},
+		Notes:     []string{"Selected Hub for package references: " + selectedHubText(ctx) + "."},
 	}
 	inventory, pythonProblem := hostruntime.PythonExecutors(context.Background())
 	if !everyHub(ctx) {
@@ -255,6 +256,7 @@ func handleLs(ctx *Context) *exit.Error {
 			"placement_set": inst.PlacementSetDigest,
 			"source":        inst.SourceKind + " " + inst.SourceRef,
 			"hub":           installHub(ctx, inst),
+			"scope":         installHubScope(ctx, inst),
 			"synced":        synced,
 			"verified":      fmt.Sprintf("%t", inst.Verified),
 			"installed":     inst.CreatedAt,
@@ -264,7 +266,10 @@ func handleLs(ctx *Context) *exit.Error {
 		l.Next = []string{"cozy package search"}
 		return emit(ctx, l)
 	}
-	l.Fields = append(l.Fields, "hub")
+	l.Fields = append(l.Fields, "hub", "scope")
+	if everyHub(ctx) {
+		l.Notes = append(l.Notes, "Installed inventory includes every Hub; other-Hub installs require an explicit --tensorhub=<hub> for package references.")
+	}
 	return emit(ctx, l)
 }
 
