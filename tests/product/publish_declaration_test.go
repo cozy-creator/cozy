@@ -171,7 +171,7 @@ version = "2.0.16"
 index = "http://127.0.0.1:1/v1/index/paul/simple/"
 
 [[packages.wheels]]
-url = "http://127.0.0.1:1/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/sdxl-2.0.16-py3-none-any.whl"
+url = "http://127.0.0.1:1/v1/index/paul/sdxl/2.0.16/sdxl-2.0.16-py3-none-any.whl"
 
 [packages.wheels.hashes]
 sha256 = "f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7"
@@ -188,17 +188,16 @@ func TestSameOrgIndexRowsAreDeclaredForCustodyShare(t *testing.T) {
 	sdxl := rows[1]
 	if sdxl.Version != "2.0.16" || sdxl.Size != 0 ||
 		sdxl.SHA256 != "f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7" ||
-		sdxl.URL != "http://127.0.0.1:1/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/sdxl-2.0.16-py3-none-any.whl" {
+		sdxl.URL != "http://127.0.0.1:1/v1/index/paul/sdxl/2.0.16/sdxl-2.0.16-py3-none-any.whl" {
 		t.Fatalf("org row = %+v, want the exact lock facts with size 0", sdxl)
 	}
 
-	// The URL must be the org's own file door for the locked sha256.
-	swapped := strings.Replace(orgIndexPylock,
-		"/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/",
-		"/v1/index/paul/files/"+strings.Repeat("0", 64)+"/", 1)
-	if _, problem := packagepublish.RegistryRowsFromLock([]byte(swapped), nil, "paul"); problem == nil ||
+	// The URL must be a file door of the org's own index: a release's file (th-245); the Hub
+	// checks the locked sha256 against the release that claims it.
+	simple := strings.Replace(orgIndexPylock, "/v1/index/paul/sdxl/2.0.16/", "/v1/index/paul/simple/sdxl/", 1)
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(simple), nil, "paul"); problem == nil ||
 		problem.Name != "registry_dependency_origin_refused" {
-		t.Fatalf("digest-swapped file URL answered %v", problem)
+		t.Fatalf("a page URL as a file answered %v", problem)
 	}
 
 	// Another org's namespace is not this publisher's to link.

@@ -23,9 +23,9 @@ func accountIndex(wheel []byte, open *atomic.Bool, served *atomic.Int64) http.Ha
 	filename := orgRelativeWheelName("1.0.0")
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/index/"+indexAccount+"/simple/"+orgRelativeDependency+"/", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, `<a href="/v1/index/%s/files/%s/%s#sha256=%s">%s</a><br>`, indexAccount, digest, filename, digest, filename)
+		fmt.Fprintf(w, `<a href="/v1/index/%s/%s/1.0.0/%s#sha256=%s">%s</a><br>`, indexAccount, orgRelativeDependency, filename, digest, filename)
 	})
-	mux.HandleFunc("GET /v1/index/"+indexAccount+"/files/"+digest+"/"+filename, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/index/"+indexAccount+"/"+orgRelativeDependency+"/1.0.0/"+filename, func(w http.ResponseWriter, _ *http.Request) {
 		served.Add(1)
 		_, _ = w.Write(wheel)
 	})
@@ -158,7 +158,7 @@ func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 
 	project := indexProject(t, h.server.URL)
 	if lock, err := os.ReadFile(filepath.Join(project, "uv.lock")); err != nil ||
-		!bytes.Contains(lock, []byte(h.server.URL+"/v1/index/"+indexAccount+"/files/")) {
+		!bytes.Contains(lock, []byte(h.server.URL+"/v1/index/"+indexAccount+"/"+orgRelativeDependency+"/1.0.0/")) {
 		t.Fatalf("the lock does not name the author's Hub: %v", err)
 	}
 	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {

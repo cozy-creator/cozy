@@ -54,9 +54,6 @@ func releaseLaneChanges(setSpecs, removeSpecs []string) (map[string]string, []st
 		removed[name] = true
 		remove = append(remove, name)
 	}
-	if len(set) == 0 && len(remove) == 0 {
-		return nil, nil, exit.Usagef("model publish requires --lane name=checkpoint-id or --remove-lane name")
-	}
 	sort.Strings(remove)
 	return set, remove, nil
 }
@@ -94,6 +91,14 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	defaultLane := strings.TrimSpace(ctx.Inv.Value("--default-lane"))
+	if defaultLane != "" {
+		if defaultLane, problem = modelLabel("--default-lane", defaultLane); problem != nil {
+			return problem
+		}
+	} else if len(set) == 0 && len(remove) == 0 {
+		return exit.Usagef("model publish requires --lane name=checkpoint-id, --remove-lane name or --default-lane name")
+	}
 	c, problem := ownedPublication(ctx, ref)
 	if problem != nil {
 		return problem
@@ -128,14 +133,17 @@ func handleModelPublish(ctx *Context) *exit.Error {
 			WithNext("cozy model yank " + ref.String() + " --release " + release)
 	}
 	reason := "cozy model publish " + ref.String() + "@" + release
-	updated, problem := c.UpdateModelRelease(hctx, ref, release, expectedRevision, set, remove, reason)
+	updated, problem := c.UpdateModelRelease(hctx, ref, release, expectedRevision, set, remove, defaultLane, reason)
 	if problem != nil {
 		return problem
+	}
+	if defaultLane != "" && updated.DefaultLane != defaultLane {
+		return exit.Internalf("Tensorhub did not record the default lane")
 	}
 	if updated.Release != release || updated.Revision < 1 || updated.Yanked {
 		return exit.Internalf("Tensorhub returned an invalid model release update")
 	}
-	if updated.Changed {
+	if updated.Changed && len(set)+len(remove) > 0 {
 		if updated.Revision <= expectedRevision {
 			return exit.Internalf("Tensorhub returned an invalid model release update")
 		}
@@ -156,9 +164,9 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	return emitModelChange(ctx, ref, updated.Changed, compactRecord([]output.Field{
 		{K: "model", V: ref.String()}, {K: "release", V: release},
-		{K: "revision", V: updated.Revision}, {K: "lanes", V: lanes},
+		{K: "revision", V: updated.Revision}, {K: "lanes", V: lanes}, {K: "default_lane", V: updated.DefaultLane},
 		{K: "status", V: "published"}, {K: "changed", V: updated.Changed},
-	}, "model", "release", "revision", "lanes", "status", "changed"))
+	}, "model", "release", "revision", "lanes", "default_lane", "status", "changed"))
 }
 
 func handleModelRetarget(ctx *Context) *exit.Error {
