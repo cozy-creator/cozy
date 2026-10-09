@@ -88,6 +88,8 @@ func TestRunListBoardFollowsAQuickDaemonRestart(t *testing.T) {
 
 	cfg, e := config.Load()
 	fatal(t, e)
+	// The process config is frozen by whichever test loaded it first.
+	cfg.Home, cfg.Port = root, port
 	following, e := localapi.Open(cfg, daemon.Probe(cfg))
 	fatal(t, e)
 	following = following.Following(func() {})
