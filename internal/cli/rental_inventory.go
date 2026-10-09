@@ -197,6 +197,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			return result, problem
 		}
 		summary := api.RentalSummary{
+			Provider: live[row.ID].Provider, ProviderMachineID: live[row.ID].ProviderMachineID, ProviderResourceID: live[row.ID].ProviderResourceID,
 			ID: row.ID, MachineName: row.MachineName, SKU: row.SKU, State: row.State,
 			AcceleratorModel: row.AcceleratorModel, AcceleratorCount: row.AcceleratorCount,
 			HourlyRateUSDMicros: row.HourlyRateUSDMicros,
@@ -235,6 +236,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 	for _, seen := range census.unrecorded {
 		hubNamed[seen.ID], hubNamed[seen.Name] = true, true
 		result.Unrecorded = append(result.Unrecorded, api.RentalSummary{
+			Provider: seen.Provider, ProviderMachineID: seen.ProviderMachineID, ProviderResourceID: seen.ProviderResourceID,
 			ID: seen.ID, MachineName: seen.Name, State: seen.State,
 			AcceleratorModel: seen.AcceleratorModel, AcceleratorCount: seen.AcceleratorCount,
 			HourlyRateUSDMicros: seen.HourlyRateUSDMicros, Address: seen.Address,
