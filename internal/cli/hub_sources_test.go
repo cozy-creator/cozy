@@ -76,9 +76,9 @@ func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 				t.Fatalf("selected Hub reused foreign installed metadata: entry=%+v error=%v reads=%d", entry, problem, served.Load())
 			}
 			keepReleaseInterface(root, first, pkg, "1.0.0", a, nil)
-			keepNewestRelease(root, first, pkg, "1.0.0")
+			keepNewestRelease(root, first, pkg, "", "1.0.0")
 			keepReleaseInterface(root, source.URL, pkg, otherRelease, b, nil)
-			keepNewestRelease(root, source.URL, pkg, otherRelease)
+			keepNewestRelease(root, source.URL, pkg, "", otherRelease)
 			for _, scope := range []struct{ origin, release, function, model string }{
 				{source.URL, otherRelease, "from_b", "proof/model-b"},
 				{first, "1.0.0", "from_a", "proof/model-a"},

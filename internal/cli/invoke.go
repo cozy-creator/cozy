@@ -349,14 +349,13 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package:         target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: installID,
 		Release: target.Release, Rental: managedRental,
-		PackageInterface: target.Interface,
-		RentalRequired:   ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "",
-		RentNew:          ctx.Inv.Bool("--rent-new"),
-		RequestedRental:  selectedRental,
-		Models:           models,
-		OutputDirectory:  outputDirectory,
-		AttentionKernel:  overrides.AttentionKernel,
-		Ignored:          ignored,
+		RentalRequired:  ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "",
+		RentNew:         ctx.Inv.Bool("--rent-new"),
+		RequestedRental: selectedRental,
+		Models:          models,
+		OutputDirectory: outputDirectory,
+		AttentionKernel: overrides.AttentionKernel,
+		Ignored:         ignored,
 	}, key)
 	releaseSnapshotReader(target)
 	if e != nil {
@@ -2910,7 +2909,6 @@ type Target struct {
 	Function       string
 	InstallID      string
 	Release        string
-	Interface      json.RawMessage
 	Snapshot       bool
 	releaseCapture func()
 	// lease holds the resolved install until the daemon has recorded the submission.
@@ -2966,9 +2964,6 @@ func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInt
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	if remoteRun(ctx) && !strings.HasPrefix(target.Package, "local/") && ctx.Inv.Value("--warm") == "" {
-		return remoteInvocationTarget(ctx, target)
-	}
 	// An installed package is validated against its installed interface with no hub read;
 	// the machine that runs it prepares that release itself.
 	facts, lease, problem := leasedInstallFacts(ctx, target.Package)
@@ -2987,46 +2982,41 @@ func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInt
 	if problem.Code != exit.NotFound || strings.HasPrefix(target.Package, "local/") {
 		return Target{}, nil, problem
 	}
-	// A release this client has not installed: the one it read last, else the one the machine
-	// that runs it names at the selected Hub. Only a run with no machine yet reads the Hub, once.
-	root := home.Paths(ctx.Cfg.Home).Root
-	if release, surface := keptNewestRelease(root, ctx.Cfg.HubURL, target.Package); release != "" {
+	// A release this client has not installed: the one kept under the current catalog revision,
+	// else the newest the machine names at the selected Hub, else the Hub's own answer. Every
+	// machine is sent that exact release, so a warm run reads no Hub; a publish, yank or bind
+	// moves the revision.
+	root, revision := home.Paths(ctx.Cfg.Home).Root, catalogRevision(ctx)
+	if release, surface := keptNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision); release != "" {
 		target.Release = release
 		return target, surface, nil
 	}
-	if release, surface, problem := describeOnMachine(ctx, target.Package); problem != nil {
-		return Target{}, nil, problem
-	} else if release != "" {
-		keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, release)
-		target.Release = release
-		return target, surface, nil
+	release, surface, problem := describeOnMachine(ctx, target.Package)
+	if problem == nil && release == "" {
+		target, surface, problem = catalogInvocationTarget(ctx, target)
+		release = target.Release
 	}
-	return catalogInvocationTarget(ctx, target)
-}
-
-// remoteInvocationTarget gets an advisory input schema from the selected machine. A
-// bare published invocation carries no release selection: the machine resolves its
-// actual release from this request's Hub when it prepares execution. A machine still
-// booting can use that Hub's catalog schema so accepting work does not require readiness.
-func remoteInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
-	_, surface, problem := describeOnMachine(ctx, target.Package)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	if surface == nil {
-		target, surface, problem = catalogInvocationTarget(ctx, target)
-		if problem != nil {
-			return Target{}, nil, problem
-		}
-	}
-	target.Release = ""
-	target.Interface = surface.Raw
+	keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision, release)
+	target.Release = release
 	return target, surface, nil
 }
 
-// catalogInvocationTarget reads schema metadata only from the configured Hub. Remote
-// callers discard its release selection before submission; it remains useful for local
-// pinned installations and for reading their results.
+// catalogRevision is the catalog revision this client's runs at the selected Hub carry.
+func catalogRevision(ctx *Context) string {
+	_, store, _, problem := open(ctx.Cfg, false)
+	if problem != nil {
+		return ""
+	}
+	defer store.Close()
+	revision, _ := store.BindingRevision(ctx.Cfg.HubURL)
+	return revision
+}
+
+// catalogInvocationTarget is the selected Hub's newest release of target and its interface,
+// read when no machine can describe it.
 func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
 	root := home.Paths(ctx.Cfg.Home).Root
 	ref, problem := hub.ParseRef(target.Package)
@@ -3065,7 +3055,6 @@ func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.Packa
 	// The run's results, and its rental's machine class, read this immutable release with
 	// no further Hub call.
 	keepReleaseInterface(root, ctx.Cfg.HubURL, target.Package, release, detail.PackageInterface, requirements)
-	keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, release)
 	return target, packageInterface, nil
 }
 

@@ -44,14 +44,10 @@ type Submission struct {
 	Input           json.RawMessage           `json:"input"`
 	// InstallID is the immutable local install selected by the CLI. It is opaque to users;
 	// omitting it asks the daemon to resolve the active package pointer.
-	InstallID string `json:"install_id,omitempty"`
-	Release   string `json:"release,omitempty"`
-	// PackageInterface is the CLI's described contract for an unversioned published
-	// call. It supplies admission/export metadata; the machine selects and validates
-	// the actual release when it executes the request.
-	PackageInterface json.RawMessage `json:"package_interface,omitempty"`
-	Outputs          []string        `json:"outputs,omitempty"`
-	PlanID           string          `json:"plan_id,omitempty"`
+	InstallID string   `json:"install_id,omitempty"`
+	Release   string   `json:"release,omitempty"`
+	Outputs   []string `json:"outputs,omitempty"`
+	PlanID    string   `json:"plan_id,omitempty"`
 	// LocalAssets is the local API's out-of-band input set. Source paths remain borrowed
 	// and are reverified before local reads or remote upload. The typed payload carries
 	// only its opaque reference.
@@ -131,11 +127,6 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	if problem := launch.ValidateAttentionOverride(sub.AttentionKernel); problem != nil {
 		s.refuseTyped(w, r, problem)
-		return
-	}
-	if len(sub.PackageInterface) > 0 && !s.cliAuthenticated(r) {
-		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
-			"described package metadata requires the OS-protected CLI credential", "")
 		return
 	}
 	if (len(sub.LocalAssets) > 0 || sub.OutputDirectory != "" || sub.RequestedRental != "" || sub.MachineEndpoint != nil) && !s.cliAuthenticated(r) {
@@ -222,7 +213,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// destination — here, where the path is finally resolved, before an input is
 		// bound or a row recorded. A doomed export refuses in milliseconds instead
 		// of after GPU minutes.
-		if spec.OutputExport != nil && (sub.Release != "" || len(sub.PackageInterface) == 0 || len(spec.OutputExport.Outputs) > 0 || sub.OutputDirectory != "") {
+		if spec.OutputExport != nil {
 			if e := resultfiles.Preflight(spec.OutputExport.Directory); e != nil {
 				s.refuseTyped(w, r, e)
 				return
@@ -496,10 +487,6 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 				"%s is not one editable local package", sub.Package)
 		}
 		return s.resolveLocalServing(ctx, sub, out, refreshed)
-	}
-	if sub.Release == "" && sub.InstallID == "" && len(sub.PackageInterface) > 0 {
-		resolved, _, problem := s.resolveDescribedCall(sub.PackageInterface, "entrypoint", out)
-		return resolved, problem
 	}
 	release, e := s.installedRelease(hub, sub.Package, sub.Release, sub.InstallID)
 	if e != nil {

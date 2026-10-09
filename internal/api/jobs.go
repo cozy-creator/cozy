@@ -39,22 +39,21 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
-	AllowPublish     []string               `json:"allow_publish,omitempty"`
-	TimeoutMS        int64                  `json:"timeout_ms,omitempty"`
-	RequestedRental  string                 `json:"requested_rental,omitempty"`
-	LocalAssets      []records.AssetBinding `json:"local_assets,omitempty"`
-	Package          string                 `json:"package"`
-	Function         string                 `json:"function"`
-	Input            json.RawMessage        `json:"input"`
-	InstallID        string                 `json:"install_id,omitempty"`
-	Release          string                 `json:"release,omitempty"`
-	PackageInterface json.RawMessage        `json:"package_interface,omitempty"`
-	Rental           bool                   `json:"rental,omitempty"`
-	RentNew          bool                   `json:"rent_new,omitempty"`
-	RentalRequired   bool                   `json:"rental_required,omitempty"`
-	RetainWork       bool                   `json:"retain_work,omitempty"`
-	RetryOf          string                 `json:"retry_of,omitempty"`
-	OutputDirectory  string                 `json:"output_directory,omitempty"`
+	AllowPublish    []string               `json:"allow_publish,omitempty"`
+	TimeoutMS       int64                  `json:"timeout_ms,omitempty"`
+	RequestedRental string                 `json:"requested_rental,omitempty"`
+	LocalAssets     []records.AssetBinding `json:"local_assets,omitempty"`
+	Package         string                 `json:"package"`
+	Function        string                 `json:"function"`
+	Input           json.RawMessage        `json:"input"`
+	InstallID       string                 `json:"install_id,omitempty"`
+	Release         string                 `json:"release,omitempty"`
+	Rental          bool                   `json:"rental,omitempty"`
+	RentNew         bool                   `json:"rent_new,omitempty"`
+	RentalRequired  bool                   `json:"rental_required,omitempty"`
+	RetainWork      bool                   `json:"retain_work,omitempty"`
+	RetryOf         string                 `json:"retry_of,omitempty"`
+	OutputDirectory string                 `json:"output_directory,omitempty"`
 	// Worker pins an internal production step to the already-attached rental that
 	// prepared its source Manifests. It is admitted only with the CLI credential.
 	Worker string `json:"worker,omitempty"`
@@ -137,11 +136,6 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
 			"a job submission names a package and a job function",
 			`{"package":"org/name","function":"census","input":{…}}`)
-		return
-	}
-	if len(sub.PackageInterface) > 0 && !s.cliAuthenticated(r) {
-		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
-			"described package metadata requires the OS-protected CLI credential", "")
 		return
 	}
 	// A job's trees name HOST DIRECTORIES that become read/write worker grants — the same
@@ -268,7 +262,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		defer func() { lease.Release() }()
 		spec, inputDeclaration, e = s.resolveJob(r.Context(), selectedHub, sub, &lease)
 		spec.Warnings = ignoredWarnings(sub.Package, sub.Function, sub.Ignored)
-		if e == nil && spec.OutputExport != nil && (sub.Release != "" || len(sub.PackageInterface) == 0 || len(spec.OutputExport.Outputs) > 0 || sub.OutputDirectory != "") {
+		if e == nil && spec.OutputExport != nil {
 			e = resultfiles.Preflight(spec.OutputExport.Directory)
 		}
 		if e == nil {
@@ -556,10 +550,6 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		if len(sub.Trees) > 0 && (s.machineExecutions == nil || (out.Rental && out.RequestedRental == "" && out.Worker == "")) {
 			return out, nil, exit.Named(exit.Validation, "rental.job_tree_worker_required",
 				"Tree inputs require a named private Runtime worker")
-		}
-		if sub.Release == "" && sub.InstallID == "" && len(sub.PackageInterface) > 0 {
-			out.Trees = append([]string(nil), sub.Trees...)
-			return s.resolveDescribedCall(sub.PackageInterface, "job", out)
 		}
 		release, problem := s.installedRelease(hub, sub.Package, sub.Release, sub.InstallID)
 		if problem != nil {

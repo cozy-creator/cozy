@@ -169,7 +169,7 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 		fatal(t, problem)
 		link, problem := store.MachineExecution(request.ID)
 		fatal(t, problem)
-		if request.Release != "" || request.Hub != source.server.URL || request.RequestedRental != parityRental || link == nil || link.MachineID != parityRental || !link.Collected {
+		if request.Release != parityVersion || request.Hub != source.server.URL || request.RequestedRental != parityRental || link == nil || link.MachineID != parityRental || !link.Collected {
 			t.Fatalf("source or machine changed: request=%+v link=%+v", request, link)
 		}
 	}
@@ -243,12 +243,12 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	}
 	otherRequest, problem := store.RequestByIdempotencyKey("other-source")
 	fatal(t, problem)
-	if otherRequest.Release != "" || otherRequest.Hub != other.server.URL {
+	if otherRequest.Release != parityVersion || otherRequest.Hub != other.server.URL {
 		t.Fatalf("the client pinned or redirected the other source: %+v", otherRequest)
 	}
 
-	// A release can change after schema description but before execution. The machine,
-	// not the schema lookup, selects the release for the actual bare invocation.
+	// The machine names the newest release once per catalog revision: a newer one reaches a
+	// run once this client's yank moves the revision, and the output it added is collected.
 	moving := newMachineHub(t)
 	publishParityRelease(t, moving, root, parityProject(t))
 	newer := parityProject(t)
@@ -271,26 +271,38 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
     return AddResult(payload.value + 100, out.save_bytes(b"newer release output\n", media_type="text/plain"))
 `), 0o600))
 	publishParityReleaseAt(t, moving, root, newer, "0.0.2")
+	var newest atomic.Value
+	newest.Store("0.0.1")
 	var newestReads atomic.Int32
 	movingCatalog := moving.worker.Config.Handler
 	moving.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/packages/"+parityPublished {
-			release := "0.0.1"
-			if newestReads.Add(1) > 1 {
-				release = "0.0.2"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"releases": []map[string]string{{"release": release}}})
+			newestReads.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"releases": []map[string]string{{"release": newest.Load().(string)}}})
 			return
 		}
 		movingCatalog.ServeHTTP(w, r)
 	})
+	moving.mux.HandleFunc("DELETE /v1/packages/"+parityPublished+"/releases/"+parityVersion, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"release":"` + parityVersion + `","state":"yanked","changed":true}`))
+	})
 	fixtureExecutionAccess(t, root, moving.server, moving.worker.Config.Handler)
 	configure(moving.server.URL)
-	code, out = runCozy(t, root, "run", parityPublished+"/add", "value=41", "--rental=tessa", "--await", "--json", "--idempotency-key=machine-selected-release")
-	if code != 0 || !strings.Contains(out, `"value":141`) || newestReads.Load() < 2 {
-		t.Fatalf("schema lookup pinned the machine's actual release [exit %d, newest reads %d]\n%s", code, newestReads.Load(), out)
+	moved := func(key, want string, reads int32) {
+		t.Helper()
+		code, out := runCozy(t, root, "run", parityPublished+"/add", "value=41", "--rental=tessa", "--await", "--json", "--idempotency-key="+key)
+		if code != 0 || !strings.Contains(out, want) || newestReads.Load() != reads {
+			t.Fatalf("%s [exit %d, newest reads %d]\n%s", key, code, newestReads.Load(), out)
+		}
 	}
-	movingRequest, problem := store.RequestByIdempotencyKey("machine-selected-release")
+	moved("kept-release", `"value":42`, 1)
+	newest.Store("0.0.2")
+	moved("kept-release-warm", `"value":42`, 1)
+	if code, out := runCozy(t, root, "package", "yank", parityPublished, "--version", parityVersion); code != 0 {
+		t.Fatalf("yank [exit %d]\n%s", code, out)
+	}
+	moved("newer-release", `"value":141`, 2)
+	movingRequest, problem := store.RequestByIdempotencyKey("newer-release")
 	fatal(t, problem)
 	products, problem := store.Products(movingRequest.ID)
 	fatal(t, problem)
@@ -302,8 +314,8 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
 			heldReport = string(report) == "newer release output\n"
 		}
 	}
-	if !heldReport {
-		t.Fatalf("the actual release's new output was lost because the advisory schema had no files: %+v", products)
+	if !heldReport || movingRequest.Release != "0.0.2" {
+		t.Fatalf("the newer release's output was not collected: %+v %+v", movingRequest, products)
 	}
 
 	row, problem := store.RentalRow(parityRental)
