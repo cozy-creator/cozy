@@ -544,15 +544,14 @@ retain their existing generation-checked control behavior.
 ### Machine run duration
 
 Machine lifecycle and job documents carry `execution_known` beside `execution_ms`.
-Execution is measured cooperative author work across the root and its children, with
-concurrent work counted once. Preparation and a fully blocked workflow do not count.
-`cozy run list` and detailed `run show` print `—` with `execution_ms: null` in their
-JSON when Runtime did not measure this duration, including older retained runs.
-The API's numeric field remains zero with `execution_known: false`; formatted watch
-output uses `execution: "—"`. Live totals advance only with a new measured snapshot.
+Execution is the run's time running on its machine, every attempt summed; preparation,
+queueing and pauses do not count. While the run is live it is its running intervals so
+far, by its machine's clock: it ticks while running and holds while paused. At the end
+the machine's own measurement replaces it. `cozy run list`, `run show` and `run watch`
+print `—` (`execution_ms: null` in list and show JSON; zero with `execution_known: false`
+in the API) before a run first runs, and for an ended run its machine did not measure.
 
-`attempt_wall_ms` preserves the separate admission-to-outcome intervals, excluding
-paused/retry gaps. `wall_ms` in a detailed run report remains the overall elapsed run
+`attempt_wall_ms` is the running intervals as this client observed them, also for an
+ended run. `wall_ms` in a detailed run report remains the overall elapsed run
 duration. `queued_ms` describes the existing controller queue; asynchronous waits are
-not relabeled as GPU queue time. A retry contributes execution only when each attempt
-has a complete measurement. Missing observations never become zero-duration proof.
+not relabeled as GPU queue time. Missing observations never become zero-duration proof.

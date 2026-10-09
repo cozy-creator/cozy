@@ -141,8 +141,8 @@ func (s *Store) AcceptRunV1(id, machine string, state *v1.RunState) *exit.Error 
 // projectRunV1 moves the request to the machine's state. A terminal word waits for the
 // outcome, which carries the result; a canceled request stays canceled; a requested cancel
 // shows canceling until the machine ends the run.
-// startedMS is when the machine started the run running (its clock), 0 when not known.
-func projectRunV1(tx *sql.Tx, id string, state *v1.RunState, startedMS int64) error {
+// atMS is when the machine entered the state (its clock), 0 when not known.
+func projectRunV1(tx *sql.Tx, id string, state *v1.RunState, atMS int64) error {
 	var current string
 	var cancel bool
 	if err := tx.QueryRow(`SELECT r.state, COALESCE(e.cancel_requested,0) FROM requests r LEFT JOIN machine_executions e ON e.request_id=r.id WHERE r.id=?`, id).Scan(&current, &cancel); err != nil {
@@ -164,17 +164,20 @@ func projectRunV1(tx *sql.Tx, id string, state *v1.RunState, startedMS int64) er
 	if cancel {
 		next = "canceling"
 	}
-	if next == "dispatching" && current != "dispatching" {
-		running := map[string]any{"machine_execution": true}
-		if startedMS > 0 {
-			running["started_unix_ms"] = startedMS
+	stamped := func(key string) map[string]any {
+		payload := map[string]any{"machine_execution": true}
+		if atMS > 0 {
+			payload[key] = atMS
 		}
-		if err := appendEventTx(tx, id, "run.in_progress", int64(state.Attempt), running); err != nil {
+		return payload
+	}
+	if next == "dispatching" && current != "dispatching" {
+		if err := appendEventTx(tx, id, "run.in_progress", int64(state.Attempt), stamped("started_unix_ms")); err != nil {
 			return err
 		}
 	}
 	if next == "paused" && current != "paused" {
-		if err := appendEventTx(tx, id, "request.paused", int64(state.Attempt), map[string]any{"machine_execution": true}); err != nil {
+		if err := appendEventTx(tx, id, "request.paused", int64(state.Attempt), stamped("paused_unix_ms")); err != nil {
 			return err
 		}
 	}

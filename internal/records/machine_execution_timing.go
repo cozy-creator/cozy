@@ -2,61 +2,10 @@ package records
 
 import (
 	"encoding/json"
-	"math"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
-
-// MachineRunExecutionMS consumes cumulative Runtime observations. A wall interval
-// cannot recover cooperative execution for an older producer or a missing attempt.
-// Live values stay at the latest measurement: observing a stalled/offline machine
-// must not start a client-side execution clock.
-func (s *Store) MachineRunExecutionMS(id string, current int64, running bool) (int64, bool, *exit.Error) {
-	rows, err := s.db.Query(`SELECT attempt,payload FROM request_events
- WHERE request_id=? AND type='machine.run.timing' ORDER BY seq`, id)
-	if err != nil {
-		return 0, false, exit.Internalf("cannot read measured machine timing: %s", err)
-	}
-	defer rows.Close()
-	type measurement struct {
-		Attempt     int64    `json:"attempt"`
-		ExecutionMS *float64 `json:"execution_ms"`
-		Terminal    bool     `json:"terminal"`
-	}
-	latest := map[int64]measurement{}
-	for rows.Next() {
-		var attempt int64
-		var raw []byte
-		if err := rows.Scan(&attempt, &raw); err != nil {
-			return 0, false, exit.Internalf("cannot read measured machine timing: %s", err)
-		}
-		var value measurement
-		if json.Unmarshal(raw, &value) != nil || value.Attempt != attempt {
-			value = measurement{}
-		}
-		latest[attempt] = value
-	}
-	if err := rows.Err(); err != nil {
-		return 0, false, exit.Internalf("cannot finish measured machine timing: %s", err)
-	}
-	var total float64
-	if current <= 0 || int64(len(latest)) != current {
-		return 0, false, nil
-	}
-	for attempt := int64(1); attempt <= current; attempt++ {
-		value := latest[attempt]
-		if value.ExecutionMS == nil || *value.ExecutionMS < 0 || math.IsNaN(*value.ExecutionMS) || math.IsInf(*value.ExecutionMS, 0) ||
-			(!value.Terminal && (attempt != current || !running)) {
-			return 0, false, nil
-		}
-		total += *value.ExecutionMS
-	}
-	if total >= math.MaxInt64 {
-		return 0, false, nil
-	}
-	return int64(math.Round(total)), true, nil
-}
 
 type MachineExecutionInterval struct {
 	Attempt               int64
@@ -93,44 +42,49 @@ func (s *Store) MachineExecutionIntervals(id string) ([]MachineExecutionInterval
 	return intervals, nil
 }
 
-// RunV1Span is when a cozy.machine.v1 run started running, when its machine ended it, and when
-// it last rested paused; each zero until it happened.
-func (s *Store) RunV1Span(id string) (started, ended, paused time.Time, problem *exit.Error) {
+// RunV1RunningMS is how long a cozy.machine.v1 run has run on its machine, by that machine's
+// clock: each interval from its start running to its pause or end, summed. While live, an
+// interval still open counts to now. ran says whether it ever started running.
+func (s *Store) RunV1RunningMS(id string, now time.Time, live bool) (ms int64, ran bool, problem *exit.Error) {
 	rows, err := s.db.Query(`SELECT type,at,payload FROM request_events WHERE request_id=?
- AND type IN ('run.in_progress','client.machine_work_finished','request.paused') ORDER BY seq`, id)
+ AND type IN ('run.in_progress','request.paused','client.machine_work_finished') ORDER BY seq`, id)
 	if err != nil {
-		return started, ended, paused, exit.Internalf("cannot read the run's span: %s", err)
+		return 0, false, exit.Internalf("cannot read the run's running time: %s", err)
 	}
 	defer rows.Close()
+	var since time.Time
 	for rows.Next() {
 		var kind, at string
 		var raw []byte
 		if err := rows.Scan(&kind, &at, &raw); err != nil {
-			return started, ended, paused, exit.Internalf("cannot read the run's span: %s", err)
+			return 0, false, exit.Internalf("cannot read the run's running time: %s", err)
 		}
 		var stamps struct {
 			Started  int64 `json:"started_unix_ms"`
+			Paused   int64 `json:"paused_unix_ms"`
 			Finished int64 `json:"finished_unix_ms"`
 		}
 		_ = json.Unmarshal(raw, &stamps)
 		when, _ := time.Parse(time.RFC3339Nano, at)
+		if machine := max(stamps.Started, stamps.Paused, stamps.Finished); machine > 0 {
+			when = time.UnixMilli(machine)
+		}
 		switch {
-		case kind == "run.in_progress" && started.IsZero():
-			started = when
-			if stamps.Started > 0 {
-				started = time.UnixMilli(stamps.Started)
+		case kind == "run.in_progress":
+			ran = true
+			if since.IsZero() {
+				since = when
 			}
-		case kind == "client.machine_work_finished":
-			ended = when
-			if stamps.Finished > 0 {
-				ended = time.UnixMilli(stamps.Finished)
-			}
-		case kind == "request.paused":
-			paused = when
+		case !since.IsZero():
+			ms += max(when.Sub(since).Milliseconds(), 0)
+			since = time.Time{}
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return started, ended, paused, exit.Internalf("cannot read the run's span: %s", err)
+		return 0, false, exit.Internalf("cannot read the run's running time: %s", err)
 	}
-	return started, ended, paused, nil
+	if live && !since.IsZero() {
+		ms += max(now.Sub(since).Milliseconds(), 0)
+	}
+	return ms, ran, nil
 }

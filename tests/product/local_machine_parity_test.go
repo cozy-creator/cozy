@@ -287,7 +287,7 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 		}
 		// Progress and timing are observations, not lifecycle transitions. Their
 		// sample count and position vary with scheduling on each venue.
-		if kind == "machine.progress" || kind == "request.progress" || kind == "machine.run.timing" {
+		if kind == "machine.progress" || kind == "request.progress" {
 			continue
 		}
 		if kind == "request.preparing" {
