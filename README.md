@@ -144,12 +144,13 @@ cozy package install . --editable
 cozy package list
 ```
 
-Package names resolve through the configured Hub, or the explicit `--tensorhub`
-override for that command. `cozy package list` shows installations from that Hub
-and local source installations. Use `cozy package list --all-hubs` to inspect every
-installed origin. Installing a name from Hub A does not make it available when
-Hub B is selected. Removal also respects the selected origin; an installation
-from another Hub requires an explicit Hub selection. Rental listing remains global.
+Package names resolve at the current hub, or at `--tensorhub=<hub>` for one command;
+the same org/name at two hubs is two packages. `cozy package list` shows every hub's
+installations with a HUB column, published ones before local captures; `--tensorhub`
+narrows it. `remove` and `update-all` act on each installation through its own hub
+unless `--tensorhub` narrows them. A name the hub lacks is answered with that hub and,
+from this computer's records alone, the other hub it was installed or run from and the
+same name under another org at this hub, each with the command that works.
 
 `--rental` installs published code and Python dependencies on that existing rental,
 without downloading model weights or changing the local package installation.

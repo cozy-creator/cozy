@@ -2928,6 +2928,8 @@ func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInt
 			if target, problem := parseTarget(ctx.Inv.Args[0]); problem == nil {
 				failure = packageHubProblem(ctx, target.Package, failure)
 			}
+		} else if !strings.HasPrefix(resolved.Package, "local/") && len(ctx.Cfg.Hubs) > 1 {
+			packagePublishStatus(ctx, "Package %s from hub %s", resolved.Package, ctx.Cfg.HubText(ctx.Cfg.HubURL))
 		}
 	}()
 	if isScriptTarget(ctx.Inv.Args[0]) {

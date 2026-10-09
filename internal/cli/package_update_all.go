@@ -26,19 +26,22 @@ func handlePackageUpdateAll(ctx *Context) *exit.Error {
 	}
 	counts := map[string]int{"updated": 0, "current": 0, "failed": 0, "skipped": 0}
 	for _, prior := range installed {
-		if prior.Hub != "" && !installedInScope(ctx, prior) {
+		if !inHubScope(ctx, prior) {
 			continue
 		}
-		row := updateInstalledPackage(ctx, prior)
+		// Each installation updates from the hub it came from, with that hub's credential.
+		row := updateInstalledPackage(ctx.forHub(prior.Hub), prior)
 		if prior.SourceKind == "tensorhub" {
-			origin := either(prior.Hub, ctx.Cfg.HubURL)
-			row["hub"] = ctx.Cfg.HubLabel(origin)
+			row["hub"] = ctx.Cfg.HubLabel(either(prior.Hub, ctx.Cfg.HubURL))
 		}
 		list.Rows = append(list.Rows, row)
 		counts[row["status"]]++
 	}
+	list.Fields = append(list.Fields, "hub")
 	list.AllFields = append(list.AllFields, "hub")
-	list.Notes = []string{"Selected Hub: " + selectedHubText(ctx) + "; other-Hub installations are untouched."}
+	if !everyHub(ctx) {
+		list.Notes = []string{"Only installations from hub " + ctx.Cfg.HubText(ctx.Cfg.HubURL) + "; omit --tensorhub to update every hub's."}
+	}
 	for _, status := range []string{"updated", "current", "failed", "skipped"} {
 		list.Aggregates = append(list.Aggregates, output.Field{K: status, V: counts[status]})
 	}
@@ -62,10 +65,6 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 	}
 	if prior.SourceKind != "tensorhub" {
 		row["detail"] = "local or unpublished install; no registry update"
-		return row
-	}
-	if prior.Hub != "" && strings.TrimRight(prior.Hub, "/") != strings.TrimRight(ctx.Cfg.HubURL, "/") {
-		row["detail"] = "installed from " + ctx.Cfg.HubLabel(prior.Hub) + "; selected Tensorhub is " + ctx.Cfg.HubLabel(ctx.Cfg.HubURL)
 		return row
 	}
 	if !immutablePackageVersion.MatchString(prior.Version) {

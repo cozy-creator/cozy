@@ -174,12 +174,12 @@ func (c *HubRemoveCmd) Run(r *Runtime) error {
 }
 
 type PackageCmd struct {
-	UpdateAll PackageUpdateAllCmd `cmd:"" help:"Update installed published packages to newer releases without downloading model weights; local and development installs are skipped."`
+	UpdateAll PackageUpdateAllCmd `cmd:"" help:"Update installed published packages, each from its own hub, to newer releases without downloading model weights; local and development installs are skipped."`
 	Search    PackageSearchCmd    `cmd:"" help:"Search for AI magic."`
 	Install   PackageInstallCmd   `cmd:"" help:"Install a published package or explicit local directory."`
 	Recover   PackageRecoverCmd   `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
 	Remove    PackageRemoveCmd    `cmd:"" help:"Delete source-code."`
-	List      PackageListCmd      `cmd:"" help:"List packages installed from the selected Hub and local sources."`
+	List      PackageListCmd      `cmd:"" help:"List installed packages from every hub, with each one's hub."`
 	Info      PackageInfoCmd      `cmd:"" help:"Show a published package's releases."`
 	Lock      PackageLockCmd      `cmd:"" help:"Lock this package's dependencies for the current Tensorhub and account."`
 	Publish   PackagePublishCmd   `cmd:"" help:"Publish a package release."`
@@ -284,7 +284,7 @@ func (c *PackageRemoveCmd) Run(r *Runtime) error {
 }
 
 type PackageListCmd struct {
-	AllHubs bool `help:"Include installations from every Hub."`
+	AllHubs bool `help:"Every hub's installations: the default. --tensorhub=<hub> lists one hub's."`
 }
 
 func (c *PackageListCmd) Run(r *Runtime) error {

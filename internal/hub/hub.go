@@ -61,6 +61,8 @@ func CanonicalName(name string) string { return strings.ToLower(strings.TrimSpac
 // Client is one configured hub package. It holds no state between calls.
 type Client struct {
 	base   string
+	named  string // the hub as a person knows it: "local (http://127.0.0.1:8819)"
+	label  string // its --tensorhub spelling
 	token  secret.Value
 	source string // where the token came from, for the remedy text
 	http   *http.Client
@@ -85,6 +87,8 @@ type TokenSource interface {
 func New(cfg config.Config, agent string) *Client {
 	return &Client{
 		base:    strings.TrimRight(cfg.HubURL, "/"),
+		named:   cfg.HubText(cfg.HubURL),
+		label:   cfg.HubLabel(cfg.HubURL),
 		token:   cfg.HubToken,
 		source:  cfg.HubTokenSource,
 		http:    &http.Client{Timeout: Timeout},
@@ -530,10 +534,15 @@ func (c *Client) refusal(status int, raw []byte) *exit.Error {
 	if env.Error.Remedy != "" {
 		e.WithRemedy("%s", env.Error.Remedy)
 	}
+	// Absence is a fact about one hub; with several configured, a bare "no X" misleads.
+	if code == exit.NotFound && c.named != "" {
+		e.Message += " on hub " + c.named
+		e.Details = map[string]any{"tensorhub": c.base}
+	}
 	if code == exit.Credential {
 		// The one next step the hub cannot write for us: it does not know where this
-		// Creator stores its machine credential.
-		e.WithNext("cozy auth login <email>")
+		// Creator stores its machine credential, or which hub this command addressed.
+		e.WithNext("cozy auth login <email> --tensorhub=" + c.label)
 		if c.source == "unset" && c.tokens == nil {
 			e.WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token (%s)", e.Remedy)
 		}

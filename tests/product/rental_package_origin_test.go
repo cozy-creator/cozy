@@ -49,35 +49,61 @@ func TestNamedRentalKeepsConfiguredHubDespiteCachedInstall(t *testing.T) {
 	}
 }
 
-// A published install from another Hub is never converted into an implicit local source.
-func TestForeignPublishedInstallDoesNotSatisfyMissingSelectedPackage(t *testing.T) {
+// The owner's report: the list showed fidika/minimax-h3 (installed from tensorhub.com) while
+// the current hub was local, where his account is paul. A run of it on a local hub rental
+// finds nothing at local, uses no other hub's install, and says so: the hub it searched,
+// where this computer got that package, the same name at local, and both working commands,
+// never the hub's publisher remedy.
+func TestAMissingPackageNamesItsHubAndWhereItExists(t *testing.T) {
 	root, _, _, _, _ := runModelCatalog(t)
-	original := configuredHub(t, root)
-	installedHere(t, root, original, "proof/quantize", "1.0.0")
+	prod := configuredHub(t, root)
+	installedHere(t, root, prod, "proof/quantize", "1.0.0")
 	var reads atomic.Int32
-	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
 			reads.Add(1)
 		}
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"error":{"code":"package.not_found","message":"no package at this Hub"}}`))
+		_, _ = w.Write([]byte(`{"error":{"code":"package.not_found","message":"no package proof/quantize","remedy":"publish its first immutable release"}}`))
 	}))
-	defer missing.Close()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+missing.URL+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	defer local.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: local\nhubs:\n  local: "+local.URL+
+		"\n  prod: "+prod+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	fatal(t, store.RecordRental(records.Rental{ID: "pr-old-hub", MachineName: "tessa", State: "ready",
-		Hub: original, AcceleratorModel: "CPU", AcceleratorCount: 1, Address: "127.0.0.1:1", CertPath: "unused", HourlyRateUSDMicros: 100_000}))
+	fatal(t, store.RecordRental(records.Rental{ID: "pr-local-hub", MachineName: "tessa", State: "ready",
+		Hub: local.URL, AcceleratorModel: "CPU", AcceleratorCount: 1, Address: "127.0.0.1:1", CertPath: "unused", HourlyRateUSDMicros: 100_000}))
+	mine := records.PackageInstall{ID: "mine-quantize", Package: "mine/quantize", Major: 1, Version: "1.0.3", SourceKind: "tensorhub",
+		SourceRef: "mine/quantize@1.0.3", Hub: local.URL, Verified: true, Dir: filepath.Join(root, "installs", "mine-quantize")}
+	_, problem = store.Activate(mine)
+	fatal(t, problem)
+	code, out := runCozy(t, root, "package", "info", "proof/quantize")
+	if code == 0 || !strings.Contains(out, "Error: no package proof/quantize on hub local (") ||
+		!strings.Contains(out, "Next: cozy package info proof/quantize --tensorhub=prod\n") {
+		t.Fatalf("human error does not name the hub and the working command [exit %d]\n%s", code, out)
+	}
 	for _, placement := range [][]string{{"--rental=tessa"}, nil} {
 		before := reads.Load()
-		args := append([]string{"run", "proof/quantize/quantize", "--describe", "--json"}, placement...)
+		args := append([]string{"run", "Proof/quantize/quantize", "--describe", "--json"}, placement...)
 		code, out := runCozy(t, root, args...)
 		if code == 0 || !strings.Contains(out, "package.not_found") || reads.Load() == before {
-			t.Fatalf("foreign install satisfied a missing package instead of consulting the selected Hub [exit %d, placement %v]\n%s", code, placement, out)
+			t.Fatalf("another hub's install satisfied a missing package instead of the current hub [exit %d, placement %v]\n%s", code, placement, out)
 		}
-		if !strings.Contains(out, "selected Hub "+missing.URL) || !strings.Contains(out, "installed proof/quantize@1.0.0 came from "+original) || !strings.Contains(out, "--tensorhub="+original) {
-			t.Fatalf("missing package hid selected Hub or installed provenance [placement %v]\n%s", placement, out)
+		typed := strings.Join(append([]string{"run", "Proof/quantize/quantize", "--describe", "--json"}, placement...), " ")
+		for _, want := range []string{
+			"no package proof/quantize on hub local (" + local.URL + ")",
+			"proof/quantize@1.0.0 is installed from hub prod (" + prod + ")",
+			"mine/quantize@1.0.3 is installed from hub local (" + local.URL + ")",
+			`"cozy ` + typed + ` --tensorhub=prod"`,
+			`"cozy ` + strings.Replace(typed, "Proof/quantize", "mine/quantize", 1) + `"`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("missing %q [placement %v]\n%s", want, placement, out)
+			}
+		}
+		if strings.Contains(out, "publish its first") {
+			t.Fatalf("a reader was told to publish [placement %v]\n%s", placement, out)
 		}
 	}
 }

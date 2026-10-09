@@ -95,3 +95,18 @@ func TestTensorhubFlagDoesNotBindTheDaemon(t *testing.T) {
 		t.Fatalf("a hub selection restarted the daemon: %d -> %d", state.PID, after.PID)
 	}
 }
+
+// TENSORHUB_URL outranks the saved current hub in its shell; `hub use` and `hub list` say so
+// instead of claiming a switch that shell will not see.
+func TestHubUseNamesAnEnvironmentOverride(t *testing.T) {
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("hubs:\n  local: http://127.0.0.1:9\n"), 0o600))
+	for _, args := range [][]string{{"hub", "use", "local"}, {"hub", "list"}} {
+		cmd := exec.Command(cozyBin, args...)
+		cmd.Env = childEnv(t, root, "TENSORHUB_URL="+testDefaultHub)
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "TENSORHUB_URL in this environment selects the hub") {
+			t.Fatalf("%v hid the environment override: %v\n%s", args, err, out)
+		}
+	}
+}
