@@ -2608,7 +2608,7 @@ func compactValue(v map[string]any) string {
 	keys := make([]string, 0, len(v))
 	for k := range v {
 		switch k {
-		case "live", "seq":
+		case "live", "seq", "sample_unix_ms": // Creator's envelope, not the Runtime's diagnostic
 			continue
 		}
 		keys = append(keys, k)
