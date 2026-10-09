@@ -281,7 +281,7 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 	if problem := m.post(ctx, hub.AuthAPI+"/device-keys/login/begin", map[string]string{
 		"device_key_id": stored.DeviceKeyID,
 	}, &begun); problem != nil {
-		return Session{}, problem
+		return Session{}, m.keyRefused(problem)
 	}
 	challenge, problem := challengeBytes(begun.Challenge)
 	if problem != nil || begun.ChallengeID == "" {
@@ -295,7 +295,7 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 		"challenge_id": begun.ChallengeID,
 		"signature":    rawBase64.EncodeToString(signature),
 	}, &answer); problem != nil {
-		return Session{}, problem
+		return Session{}, m.keyRefused(problem)
 	}
 	m.session, problem = answer.session(stored.Email, started)
 	return m.session, problem
@@ -571,6 +571,16 @@ func authRefusal(status int, data []byte) *exit.Error {
 		problem.WithRemedy("%s", answer.Error.Remedy)
 	}
 	return problem
+}
+
+// keyRefused names a device-key sign-in the Hub refuses for what it is: this computer's key
+// was revoked or is unknown there, not a wrong password.
+func (m *Manager) keyRefused(problem *exit.Error) *exit.Error {
+	if problem.Code != exit.Credential {
+		return problem
+	}
+	return exit.Named(exit.Credential, "auth.device_key_refused",
+		"%s no longer accepts this computer's sign-in key (revoked or unknown there)", m.hub).WithNext(m.loginCommand())
 }
 
 // loginCommand names the login that creates this origin's credential. The default
