@@ -30,9 +30,12 @@ type machineRuns struct {
 	// hubEnvironments are each Hub's execution environment, by hub and credential, and
 	// hubTokenEndpoints where machines trade run capabilities for it, by hub.
 	hubEnvironments, hubTokenEndpoints sync.Map
-	placed    map[string]string // the last placement decision recorded per waiting run
-	machines  *machines.Resolver
-	updates   *rentalRuntimeUpdates
+	// publicCheckpoints are the manifests an object origin serves, by origin and digest. A
+	// published checkpoint stays published, so an answer is kept for good.
+	publicCheckpoints sync.Map
+	placed            map[string]string // the last placement decision recorded per waiting run
+	machines          *machines.Resolver
+	updates           *rentalRuntimeUpdates
 	// submitting stops each request's submission work in flight (upload, preparation,
 	// staging) once its cancel is durable; guarded by mu.
 	submitting map[string]context.CancelFunc

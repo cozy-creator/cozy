@@ -1,8 +1,8 @@
 repository=https://github.com/cozy-creator/tensord
 path=proto/cozy/machine/v1/machine.proto
-commit=f1805f81cba6238d3f1a0b92d77b5915539c487b
-machine.proto=sha256:079b17412f9e7c3f4df9409bc4585cb0a3dd96fcd17ddd3745eb2c7ea797c4d0
-machine.pb.go=sha256:8a709e38a3e9424b8f248db50869cf9553d9bb5df8afc4e46c8d09c562a22bd1
+commit=bfad4f9b780571c8f52bde2b18055e71e836bd1c
+machine.proto=sha256:84fb8eda884d99217e2161f507f5c0f98c9d0fd5eb77b82142dc75ab2e630782
+machine.pb.go=sha256:e829085e70d569db0bb0e7e51bdf67da54b4975267b7d4294782b4a3282e7ce1
 machine_grpc.pb.go=sha256:105c6ba7356fc594427b08d8373be940ff57f9713e26dd4885ea5d94acd99e7e
 
 Generated with protoc-gen-go and protoc-gen-go-grpc (--go_opt=M, the proto unchanged).
