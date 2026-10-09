@@ -695,6 +695,21 @@ removed when the rental ends, and a lost Creator key requires a new rental.
 Rentals continue billing until Tensorhub confirms their termination. `cozy rental end`
 and `cozy down --all` request termination; a plain `cozy down` does not.
 
+## Credits
+
+Tensorhub sells prepaid USD credit: $1 buys $1 of usage at provider cost.
+
+```bash
+cozy credits                       # balance, what running work holds, what is available
+cozy credits history               # deposits, spend, refunds and expiries, newest first
+cozy credits buy 25                # pay $25 by card in Stripe Checkout; waits until it lands
+cozy credits buy 25 --no-wait      # print the Checkout URL and return
+```
+
+One purchase is $10 to $500 (the hub's bounds; others are refused before any checkout). The
+browser opens Stripe's hosted page; `--no-browser` only prints its URL. Each purchase expires
+365 days after it lands. Refunds are made by the Tensorhub operator.
+
 ## Release GPU memory or stop Cozy
 
 These commands have deliberately different scopes:
