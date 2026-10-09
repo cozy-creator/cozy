@@ -119,3 +119,10 @@ func leafJKT(t *testing.T, der []byte) string {
 func publicationRequest(asked url.Values) bool {
 	return strings.Contains(asked.Get("authorization_details"), "tensorhub_machine_publication")
 }
+
+// grantCall is whether a recorded "METHOD /path" call is one of the machine-grant routes a
+// cold run makes: discovery, the code flow, and the machine's redemption.
+func grantCall(call string) bool {
+	_, path, _ := strings.Cut(call, " ")
+	return path == "/v1/execution-environment" || strings.HasPrefix(path, "/v1/auth/")
+}

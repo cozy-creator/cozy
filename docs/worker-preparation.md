@@ -66,12 +66,12 @@ Runtime selects and materializes a model when that child is actually called.
 
 A local Hub control address can differ from its remotely reachable address. The CLI uses
 its configured `tensorhub_url` for catalog and authorization requests. The selected Hub's
-`POST /v1/execution-access` response supplies the remote `TENSORHUB_ORIGIN` from the Hub's
+`GET /v1/execution-environment` supplies the remote `TENSORHUB_ORIGIN` from the Hub's
 `server.public_origin` configuration. For a Hub running at `http://127.0.0.1:8819`, that
 public origin can be its exposed HTTPS ngrok address. The remote machine reads package
-releases, locked dependencies, model metadata and storage URLs there using execution
-access bound to its pinned certificate. It never treats the controller's loopback URL as
-its own localhost.
+releases, locked dependencies, model metadata and storage URLs there with an execution
+grant bound to its pinned leaf key. It never treats the controller's loopback URL as its
+own localhost.
 
 A named rental remains controlled through its recorded machine identity and original
 rental Hub. New runs, package installs and model downloads still use the CLI's selected

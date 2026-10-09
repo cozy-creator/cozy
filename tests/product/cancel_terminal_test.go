@@ -1,8 +1,9 @@
 package producttest
 
 import (
-	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"testing"
+
+	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
 // The store half of that race: the intent survives for the observer to send.

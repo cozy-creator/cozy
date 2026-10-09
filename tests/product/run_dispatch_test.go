@@ -2,11 +2,12 @@ package producttest
 
 import (
 	"fmt"
-	"github.com/cozy-creator/cozy/internal/records"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/records"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )

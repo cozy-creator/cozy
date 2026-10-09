@@ -10,7 +10,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -349,14 +348,6 @@ func publishedWheel(t *testing.T, distribution, version string) string {
 	}
 	t.Fatalf("%s %s publishes no linux x86_64 wheel", distribution, version)
 	return ""
-}
-
-// The isolated Hub fixture supplies a syntactic delegated JWT. The real Hub verifies its
-// authority; the agent only needs its stable issuer/account identity to guard replacement.
-func executionGrantToken(issuer, principal string, serial int32) string {
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"typ":"delegated-access+jwt"}`))
-	body, _ := json.Marshal(map[string]any{"iss": issuer, "delegated_sub": principal, "permissions": []string{"cozy.execution-access"}, "jti": serial, "attributes": map[string]any{"execution_device_key_id": "fixture-device"}})
-	return header + "." + base64.RawURLEncoding.EncodeToString(body) + "." + base64.RawURLEncoding.EncodeToString([]byte("fixture-signature"))
 }
 
 func installWheel(t *testing.T, name, version, entrypoint string) string {
