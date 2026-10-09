@@ -1,0 +1,6 @@
+{
+  "owner": "/root/fusion_resume",
+  "purpose": "Retry accepted same-ID run observation through transient authority-recovery probe failures, preserving auth and read-only semantics",
+  "branch": "fix/run-observer-transient-recovery-20261008",
+  "base_sha": "9f16c3514bb8fea3325d9de7e842ee841f173aae"
+}
