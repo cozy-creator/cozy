@@ -248,6 +248,12 @@ impl FetchPlan {
                 );
             }
         }
+        self.complete_objects(store)
+    }
+
+    /// The residency half alone: every declared object is installed and vouched for. What a
+    /// pull of part of a checkpoint proves, whose closure walk this Store cannot yet make.
+    pub fn complete_objects(&self, store: &Store) -> Result<()> {
         for o in self.held.iter().chain(self.wanted.iter()) {
             let resident = if self.manifest.as_ref().is_some_and(|m| m.sha256 == o.sha256) {
                 manifest_presence(store, o)?
