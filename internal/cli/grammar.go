@@ -17,12 +17,43 @@ type CLI struct {
 	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
 	Machine MachineCmd `cmd:"" group:"Rentals" help:"This computer as a machine: the same Host a rental runs."`
+	Credits CreditsCmd `cmd:"" group:"Rentals" help:"Your prepaid Tensorhub credit: balance, history, and buying more."`
 	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui; running work continues."`
 	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
 
 	Completion CompletionCmd `cmd:"" group:"Lifecycle" help:"Print a bash, zsh or fish tab-completion script."`
+}
+
+type CreditsCmd struct {
+	Balance CreditsBalanceCmd `cmd:"" default:"1" hidden:"" help:"Show your balance, what running work holds, and what is available."`
+	History CreditsHistoryCmd `cmd:"" help:"List your credit's deposits, spend, refunds and expiries, newest first."`
+	Buy     CreditsBuyCmd     `cmd:"" help:"Buy credit with a card through Stripe Checkout."`
+}
+
+type CreditsBalanceCmd struct{}
+
+func (c *CreditsBalanceCmd) Run(r *Runtime) error {
+	return r.call(handleCredits, nil, nil, nil, false)
+}
+
+type CreditsHistoryCmd struct {
+	Cursor string `help:"Continue from this page cursor."`
+}
+
+func (c *CreditsHistoryCmd) Run(r *Runtime) error {
+	return r.call(handleCreditsHistory, nil, nil, values("--cursor", c.Cursor), false)
+}
+
+type CreditsBuyCmd struct {
+	USD       string `arg:"" name:"usd" help:"Dollars to buy, such as 10 or 25.50."`
+	NoBrowser bool   `name:"no-browser" help:"Print the Checkout URL instead of opening a browser."`
+	NoWait    bool   `name:"no-wait" help:"Answer the Checkout URL at once instead of waiting for the payment to land."`
+}
+
+func (c *CreditsBuyCmd) Run(r *Runtime) error {
+	return r.call(handleCreditsBuy, []string{c.USD}, bools("--no-browser", c.NoBrowser, "--no-wait", c.NoWait), nil, false)
 }
 
 type MachineCmd struct {
