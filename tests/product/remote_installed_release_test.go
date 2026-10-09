@@ -14,14 +14,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Real CLI submission leaves the release unselected even when this computer installed
-// an older version. Only the execution machine chooses the published release. This catalog supplies metadata only and has
+// Real CLI submission must preserve the version chosen at install even when the
+// catalog publishes a newer version. This catalog supplies metadata only and has
 // no acquisition endpoint, so the proof cannot buy a machine or download weights.
-func TestRentalRunLeavesPublishedReleaseSelectionToMachine(t *testing.T) {
+func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 	for _, installed := range []bool{true, false} {
-		name := "uninstalled"
+		name, want := "uninstalled uses latest", "2.10.0"
 		if installed {
-			name = "older installed release"
+			name, want = "installed stays pinned", "2.9.0"
 		}
 		t.Run(name, func(t *testing.T) {
 			iface := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[{"name":"compute","models":[],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[]}]}`)
@@ -72,8 +72,8 @@ func TestRentalRunLeavesPublishedReleaseSelectionToMachine(t *testing.T) {
 			defer store.Close()
 			row, problem := store.RequestByIdempotencyKey("release-proof")
 			fatal(t, problem)
-			if row == nil || row.Release != "" || row.InstallID != "" {
-				t.Fatalf("remote request selected a client-side release: %+v", row)
+			if row == nil || row.Release != want || row.InstallID != "" {
+				t.Fatalf("remote request did not pin published release %s: %+v", want, row)
 			}
 		})
 	}

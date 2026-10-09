@@ -123,7 +123,7 @@ func submitH3Reference(t *testing.T, release string) {
 	if code != 0 || row == nil {
 		t.Fatalf("real CLI/API refused before recording the request: exit=%d %s", code, output)
 	}
-	if row.State != "submitted" || row.Package != "paul/minimax-h3" || row.Entrypoint != "reference_media_to_video" || row.Release != "" || len(row.Assets) != 2 || len(row.Models) != 1 || row.Models[0].Manifest != manifest {
+	if row.State != "submitted" || row.Package != "paul/minimax-h3" || row.Entrypoint != "reference_media_to_video" || row.Release != release || len(row.Assets) != 2 || len(row.Models) != 1 || row.Models[0].Manifest != manifest {
 		t.Fatalf("retained request identities differ: %+v", row)
 	}
 	for i, path := range []string{image0, image1} {

@@ -43,27 +43,29 @@ func keepReleaseInterface(root, hubURL, pkg, release string, raw []byte, require
 	}
 }
 
-// newestReleasePath names the release of pkg at hub this client last read, so a later run of
-// a package it never installed names that release with no Hub or machine call.
+// newestReleasePath names the release of pkg at hub this client last read, and the catalog
+// revision it read it under, so a later run under that revision names it with no Hub or
+// machine call.
 func newestReleasePath(root, hubURL, pkg string) string {
 	name := sha256.Sum256([]byte(hubURL + "\x00" + pkg))
 	return filepath.Join(root, "releases", "newest", hex.EncodeToString(name[:16]))
 }
 
-func keepNewestRelease(root, hubURL, pkg, release string) {
+func keepNewestRelease(root, hubURL, pkg, revision, release string) {
 	path := newestReleasePath(root, hubURL, pkg)
-	if os.MkdirAll(filepath.Dir(path), 0o700) == nil && os.WriteFile(path+".tmp", []byte(release), 0o600) == nil {
+	if os.MkdirAll(filepath.Dir(path), 0o700) == nil && os.WriteFile(path+".tmp", []byte(revision+"\n"+release), 0o600) == nil {
 		_ = os.Rename(path+".tmp", path)
 	}
 }
 
-// keptNewestRelease is the release keepNewestRelease named and its kept interface, or "".
-func keptNewestRelease(root, hubURL, pkg string) (string, *launch.PackageInterface) {
+// keptNewestRelease is the release keepNewestRelease named under revision and its kept
+// interface, or "".
+func keptNewestRelease(root, hubURL, pkg, revision string) (string, *launch.PackageInterface) {
 	raw, err := os.ReadFile(newestReleasePath(root, hubURL, pkg))
-	if err != nil {
+	under, release, _ := strings.Cut(string(raw), "\n")
+	if err != nil || under != revision || release == "" {
 		return "", nil
 	}
-	release := string(raw)
 	kept := readKeptRelease(root, hubURL, pkg, release)
 	if kept.Interface == nil {
 		return "", nil

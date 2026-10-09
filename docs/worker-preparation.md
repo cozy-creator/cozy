@@ -79,9 +79,11 @@ Hub. Every published request carries that source's own execution grant, even whe
 same Hub rented the machine. A local unpublished run with no Hub model inputs can
 still execute offline. A remote published source requires login to the selected Hub.
 
-A bare remote `org/package/function` invocation names no release. The selected machine
-provides its input schema and resolves the actual release when preparing execution. A
-booting machine may use selected-Hub schema metadata for CLI input parsing and capacity
-selection; that metadata never becomes a client-side version pin. A package missing from
-the selected Hub fails even when this computer or the worker holds it from another Hub.
+A bare `org/package/function` invocation takes one path on every machine, this computer's
+or a rental: the installed release, else the newest this client kept under its current
+catalog revision, else the newest the machine names at the selected Hub (the Hub's own
+answer only when no machine can say yet). The run carries that exact release, so a warm
+run reads nothing at any Hub. A publish, yank or bind moves the revision, and the next run
+asks again. A package missing from the selected Hub fails even when this computer or the
+worker holds it from another Hub.
 Only an explicit local source path takes the local-code upload path.
