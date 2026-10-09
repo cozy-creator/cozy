@@ -53,6 +53,7 @@ type Context struct {
 	exitCode         int       // a completed aggregate can report partial failures without a second document
 	teardown         bool      // `down --all`: hand each rental to its hub once; never wait on one
 	commandStarted   time.Time // includes capture and resolution before a request exists
+	argv             []string  // the command as typed, for a remedy that retypes it
 	Inv              *Invocation
 	Out              io.Writer
 	Err              io.Writer
@@ -114,6 +115,7 @@ type handler func(*Context) *exit.Error
 // Runtime is injected into the selected Kong command's Run method.
 type Runtime struct {
 	exitCode int
+	argv     []string
 	Cfg      config.Config
 	Out      io.Writer
 	Err      io.Writer
@@ -124,7 +126,7 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 	values map[string][]string, daemon bool,
 ) error {
 	ctx := &Context{
-		commandStarted: time.Now(),
+		commandStarted: time.Now(), argv: r.argv,
 		Inv: &Invocation{
 			Args: append([]string(nil), args...), Bools: flags,
 			Values: values, Mode: r.Mode,
@@ -157,6 +159,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	typed := append([]string(nil), args...)
 	args = helpArgs(args)
 	wantsJSON := jsonRequested(args)
 	terminal := config.ReadTerminal()
@@ -216,7 +219,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return output.ShellCode(out)
 	}
 
-	runtime := &Runtime{Cfg: cfg, Out: stdout, Err: stderr, Mode: mode}
+	runtime := &Runtime{argv: typed, Cfg: cfg, Out: stdout, Err: stderr, Mode: mode}
 	if err := parsed.Run(runtime); err != nil {
 		problem := projectError(err)
 		_ = output.EmitError(stdout, problem, mode)

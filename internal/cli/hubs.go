@@ -74,8 +74,11 @@ func handleHubList(ctx *Context) *exit.Error {
 		list.Rows = append(list.Rows, row)
 		list.TypedRows = append(list.TypedRows, typed)
 	}
-	if ctx.Cfg.HubURLSource == "flag" {
+	switch ctx.Cfg.HubURLSource {
+	case "flag":
 		list.Trail = append(list.Trail, "--tensorhub selects this command's hub only; `cozy hub use` changes the current one.")
+	case "env":
+		list.Trail = append(list.Trail, envHubNote)
 	}
 	return emit(ctx, list)
 }
@@ -124,11 +127,17 @@ func handleHubUse(ctx *Context) *exit.Error {
 	}, "hub", "url")
 	record.Summary = []string{"Commands now use " + selected.HubLabel(origin) + " (" + origin + ")."}
 	record.Notes = []string{"existing runs and rentals keep their own hub; the daemon serves every hub"}
+	if ctx.Cfg.HubURLSource == "env" {
+		record.Summary = []string{"Saved " + selected.HubLabel(origin) + " as the current hub.", envHubNote}
+	}
 	if !accountauth.New(selected).CredentialPresent() {
 		record.Next = []string{"cozy auth login <email>"}
 	}
 	return emit(ctx, record)
 }
+
+// envHubNote: TENSORHUB_URL outranks the saved current hub in the shell that sets it.
+const envHubNote = "TENSORHUB_URL in this environment selects the hub and overrides `cozy hub use` until it is unset."
 
 func handleHubAdd(ctx *Context) *exit.Error {
 	name := ctx.Inv.Args[0]

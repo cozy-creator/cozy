@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,9 +16,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Default inventory follows the selected Hub; local captures remain visible.
-// Global inventory is explicit and never contacts any Hub.
-func TestPackageListDefaultsToSelectedHubAndLocalSources(t *testing.T) {
+// Inventory spans every hub by default, published installs before local captures so a page
+// of captures never hides them; --tensorhub narrows to that hub and local sources. Listing
+// never contacts a Hub.
+func TestPackageListShowsEveryHubPublishedFirst(t *testing.T) {
 	root := t.TempDir()
 	var reads atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -32,18 +34,21 @@ func TestPackageListDefaultsToSelectedHubAndLocalSources(t *testing.T) {
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	for id, row := range map[string]records.PackageInstall{
+	installs := map[string]records.PackageInstall{
 		"1111111111111111": {Package: "proof/hub-a", Hub: a.URL, SourceKind: "tensorhub"},
 		"2222222222222222": {Package: "proof/hub-b", Hub: b.URL, SourceKind: "tensorhub"},
-		"3333333333333333": {Package: "local/source", SourceKind: "local"},
-	} {
+	}
+	for i := range 25 { // more local captures than one page, all sorting before proof/
+		installs[fmt.Sprintf("3333333333333%03d", i)] = records.PackageInstall{Package: fmt.Sprintf("local/capture-%02d", i), SourceKind: "local"}
+	}
+	for id, row := range installs {
 		row.ID, row.Major, row.Version, row.Verified = id, 1, "1.0.0", true
 		row.SourceRef, row.Dir = row.Package+"@1.0.0", layout.InstallDir(id)
 		_, problem := store.Activate(row)
 		fatal(t, problem)
 	}
 	store.Close()
-	list := func(args ...string) map[string]string {
+	list := func(args ...string) []string {
 		t.Helper()
 		code, out := runCozy(t, root, append([]string{"package", "list", "--json", "--full"}, args...)...)
 		if code != 0 {
@@ -54,35 +59,36 @@ func TestPackageListDefaultsToSelectedHubAndLocalSources(t *testing.T) {
 			Notes    []string
 		}
 		must(t, json.Unmarshal([]byte(out), &doc))
-		if !strings.Contains(strings.Join(doc.Notes, " "), "Selected Hub for package references:") {
-			t.Fatalf("list hides selected Hub: %s", out)
+		if !strings.Contains(strings.Join(doc.Notes, " "), "org/name references resolve at hub ") {
+			t.Fatalf("list hides the hub references resolve at: %s", out)
 		}
-		rows := map[string]string{}
+		var rows []string
 		for _, row := range doc.Packages {
-			rows[row.Package] = row.Hub + ":" + row.Scope
+			rows = append(rows, row.Package+"="+row.Hub+":"+row.Scope)
 		}
 		return rows
 	}
 	rows := list()
-	if len(rows) != 2 || rows["proof/hub-a"] != "a:selected hub" || rows["proof/hub-b"] != "" || rows["local/source"] != ":local" {
-		t.Fatalf("selected inventory scopes: %+v", rows)
+	if len(rows) != 27 || rows[0] != "proof/hub-a=a:current hub" || rows[1] != "proof/hub-b=b:other hub" || rows[2] != "local/capture-00=:local" {
+		t.Fatalf("every-hub inventory: %v", rows)
 	}
 	rows = list("--tensorhub=b")
-	if len(rows) != 2 || rows["proof/hub-b"] != "b:selected hub" || rows["local/source"] != ":local" {
-		t.Fatalf("explicit Hub scope: %+v", rows)
+	if len(rows) != 26 || rows[0] != "proof/hub-b=b:current hub" {
+		t.Fatalf("explicit hub narrowing: %v", rows)
 	}
-	rows = list("--all-hubs")
-	if len(rows) != 3 || rows["proof/hub-b"] != "b:other hub" {
-		t.Fatalf("explicit global inventory: %+v", rows)
+	code, out := runCozy(t, root, "package", "list")
+	if code != 0 || !strings.Contains(out, "proof/hub-a") || !strings.Contains(out, "proof/hub-b") || !strings.Contains(out, "more not shown") {
+		t.Fatalf("one page of local captures hid published installs: %d %s", code, out)
 	}
 	if reads.Load() != 0 {
 		t.Fatalf("inventory contacted Hub %d times", reads.Load())
 	}
 }
 
-// A named removal cannot silently operate on another Hub's active or superseded
-// installation. Explicit selection removes only that origin, without Hub traffic.
-func TestPackageRemovePreservesOtherHubInstallations(t *testing.T) {
+// Removal is work on an installation, so it uses the installation's own hub: the name the
+// list shows removes it with no flag. An explicit --tensorhub naming another hub keeps it, and
+// keeps another hub's superseded install of the same name.
+func TestPackageRemoveUsesTheInstallationsHub(t *testing.T) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -93,31 +99,57 @@ func TestPackageRemovePreservesOtherHubInstallations(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: a\nhubs:\n  a: "+a+"\n  b: "+b+"\n"), 0o600))
 	prior := updateAllInstall(t, layout, store, 1, "proof/shared", "1.0.0", "tensorhub", a)
 	active := updateAllInstall(t, layout, store, 2, "proof/shared", "1.0.1", "tensorhub", b)
-	code, out := runCozy(t, root, "package", "remove", "proof/shared", "--json")
-	if code == 0 || !strings.Contains(out, "package.other_hub") || !strings.Contains(out, "--tensorhub=b") {
-		t.Fatalf("foreign removal did not refuse with explicit origin: %d %s", code, out)
+	code, out := runCozy(t, root, "package", "remove", "proof/shared", "--tensorhub=a", "--json")
+	if code == 0 || !strings.Contains(out, "package.other_hub") || !strings.Contains(out, "installed from hub b ("+b+")") {
+		t.Fatalf("removal through another hub did not refuse naming the installation's hub: %d %s", code, out)
 	}
 	_, got, problem := store.ActivePackage("proof/shared")
 	fatal(t, problem)
 	if got == nil || got.ID != active.ID {
-		t.Fatal("foreign active install was unpinned")
-	}
-	if _, err := os.Stat(filepath.Join(active.Dir, "prior.py")); err != nil {
-		t.Fatalf("foreign active files changed: %v", err)
+		t.Fatal("an install from another hub than --tensorhub was unpinned")
 	}
 	code, out = runCozy(t, root, "package", "remove", "proof/shared", "--tensorhub=b", "--json")
 	if code != 0 || !strings.Contains(out, `"changed":true`) {
-		t.Fatalf("explicit Hub removal failed: %d %s", code, out)
+		t.Fatalf("explicit hub removal failed: %d %s", code, out)
 	}
 	if _, err := os.Stat(active.Dir); !os.IsNotExist(err) {
-		t.Fatalf("selected Hub files survived removal: %v", err)
+		t.Fatalf("selected hub files survived removal: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(prior.Dir, "prior.py")); err != nil {
-		t.Fatalf("another Hub's superseded files were reclaimed: %v", err)
+		t.Fatalf("--tensorhub=b reclaimed hub a's superseded files: %v", err)
 	}
-	retained, problem := store.Install(prior.ID)
+	code, out = runCozy(t, root, "package", "remove", "proof/shared", "--json")
+	if code != 0 || !strings.Contains(out, `"changed":true`) {
+		t.Fatalf("removal by name without a flag failed: %d %s", code, out)
+	}
+	if _, err := os.Stat(prior.Dir); !os.IsNotExist(err) {
+		t.Fatalf("hub a's superseded files survived removal by name: %v", err)
+	}
+}
+
+// A package this computer only ran (on a rental, with nothing installed here) is still
+// traced to the hub it ran from, with no Hub asked but the one searched.
+func TestAMissingPackageNamesTheHubItRanFrom(t *testing.T) {
+	root := t.TempDir()
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"package.not_found","message":"no package","remedy":"publish its first immutable release"}}`))
+	}))
+	defer local.Close()
+	const prod = "http://127.0.0.1:1"
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: local\nhubs:\n  local: "+local.URL+"\n  prod: "+prod+"\n"), 0o600))
+	layout, problem := home.Open(root)
 	fatal(t, problem)
-	if retained == nil {
-		t.Fatal("another Hub's superseded record was removed")
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	_, _, problem = store.Submit(records.Request{ID: "req-ran-on-prod", IdemKey: "ran-on-prod", BodyDigest: "sha256:" + strings.Repeat("ab", 32),
+		Package: "proof/ran", Entrypoint: "generate", Payload: []byte("{}"), Hub: prod})
+	fatal(t, problem)
+	store.Close()
+	code, out := runCozy(t, root, "package", "info", "proof/ran")
+	if code == 0 || !strings.Contains(out, "Error: no package proof/ran on hub local ("+local.URL+")") ||
+		!strings.Contains(out, "Try: proof/ran ran from hub prod ("+prod+")") ||
+		!strings.Contains(out, "Next: cozy package info proof/ran --tensorhub=prod\n") || strings.Contains(out, "publish its first") {
+		t.Fatalf("a package this computer ran elsewhere was not traced to its hub [exit %d]\n%s", code, out)
 	}
 }

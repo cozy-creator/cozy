@@ -185,8 +185,11 @@ func emitInstallResult(ctx *Context, res *install.Result, cleanup ...output.Fiel
 		{K: "closure", V: strings.ReplaceAll(inst.Closure, "\n", " ")},
 		{K: "placement_set", V: inst.PlacementSetDigest},
 	}
+	keys := []string{"package", "version", "status"}
+	if hub := installHub(ctx, inst); hub != "" {
+		fields, keys = append(fields, output.Field{K: "hub", V: hub}), append(keys, "hub")
+	}
 	if res.Idempotent {
-		keys := []string{"package", "version", "status"}
 		rec := compactRecord(fields, keys...)
 		rec.Next = []string{runExample(inst)}
 		return emit(ctx, rec)
@@ -196,7 +199,7 @@ func emitInstallResult(ctx *Context, res *install.Result, cleanup ...output.Fiel
 		output.Field{K: "timings", V: timingsText(res.Timings)},
 	)
 	fields = append(fields, cleanup...)
-	rec := compactRecord(fields, "package", "version", "status", "disk")
+	rec := compactRecord(fields, append(keys, "disk")...)
 	rec.Notes = append(rec.Notes, res.Warnings...)
 	rec.Next = []string{runExample(inst), "cozy package list"}
 	return emit(ctx, rec)
@@ -217,14 +220,18 @@ func handleLs(ctx *Context) *exit.Error {
 		Fields:    []string{"package", "version", "python", "python_status", "size", "dependencies"},
 		AllFields: []string{"package", "major", "version", "python", "python_status", "size", "dependencies", "placement_set", "install_id", "source", "hub", "scope", "synced", "verified", "installed"},
 		Bytes:     []string{"size", "dependencies"},
-		Notes:     []string{"Selected Hub for package references: " + selectedHubText(ctx) + "."},
+		Notes:     []string{"org/name references resolve at hub " + ctx.Cfg.HubText(ctx.Cfg.HubURL) + "; another hub's need --tensorhub=<hub>."},
 	}
 	inventory, pythonProblem := hostruntime.PythonExecutors(context.Background())
-	if !ctx.Inv.Bool("--all-hubs") {
-		rows = slices.DeleteFunc(rows, func(inst records.PackageInstall) bool {
-			return !installedInScope(ctx, inst)
-		})
+	rows = slices.DeleteFunc(rows, func(inst records.PackageInstall) bool { return !inHubScope(ctx, inst) })
+	// Published installations first: a page of local captures must not hide them.
+	captured := func(inst records.PackageInstall) int {
+		if inst.SourceKind == "tensorhub" {
+			return 0
+		}
+		return 1
 	}
+	slices.SortStableFunc(rows, func(a, b records.PackageInstall) int { return captured(a) - captured(b) })
 	for _, inst := range rows {
 		pythonStatus := "supported"
 		if pythonProblem != nil {
@@ -262,10 +269,8 @@ func handleLs(ctx *Context) *exit.Error {
 		})
 	}
 	l.Fields = append(l.Fields, "hub", "scope")
-	if ctx.Inv.Bool("--all-hubs") {
-		l.Notes = append(l.Notes, "Showing all installed Hubs; package references still use the selected Hub unless --tensorhub is explicit.")
-	} else {
-		l.Notes = append(l.Notes, "Use --all-hubs to include installations from other Hubs.")
+	if !everyHub(ctx) {
+		l.Notes = append(l.Notes, "Showing that hub's and local installations; omit --tensorhub to list every hub's.")
 	}
 	if len(l.Rows) == 0 {
 		l.Next = []string{"cozy package search"}
@@ -336,7 +341,7 @@ func handleRm(ctx *Context) *exit.Error {
 			if problem != nil {
 				return problem
 			}
-			if inst != nil && !installedInScope(ctx, *inst) {
+			if inst != nil && !inHubScope(ctx, *inst) {
 				return foreignPackageRemoval(ctx, *inst)
 			}
 			n, e := install.Remove(l, st, p.Package, p.Major)
@@ -378,12 +383,12 @@ func handleRm(ctx *Context) *exit.Error {
 			continue
 		}
 		// Unreferenced rows omit their origin; read the complete install before
-		// reclaiming so a same-name package from another Hub stays untouched.
+		// reclaiming so --tensorhub leaves a same-name package from another hub untouched.
 		full, problem := st.Install(superseded.ID)
 		if problem != nil {
 			return problem
 		}
-		if full == nil || !installedInScope(ctx, *full) {
+		if full == nil || !inHubScope(ctx, *full) {
 			continue
 		}
 		n, problem := install.Reclaim(l, st, superseded.ID)

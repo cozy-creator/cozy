@@ -362,6 +362,15 @@ func (c Config) HubLabel(origin string) string {
 	return origin
 }
 
+// HubText names a hub in prose with both spellings, as "local (http://127.0.0.1:8819)".
+func (c Config) HubText(origin string) string {
+	origin = strings.TrimRight(origin, "/")
+	if label := c.HubLabel(origin); label != origin {
+		return label + " (" + origin + ")"
+	}
+	return origin
+}
+
 // ResolveHub turns a hub name, in any case, or URL into its origin and name.
 func ResolveHub(value string, hubs map[string]string) (string, string, *exit.Error) {
 	value = strings.TrimSpace(value)
