@@ -28,7 +28,7 @@ func TestScopedProgressKeepsChildTimingSeparateFromOverallWork(t *testing.T) {
 	child := liveFrame(p, time.Now())
 	p.On(liveEvent("progress", map[string]any{"stage": "Assembling video", "overall_fraction": .95}))
 	got := child + "\n" + liveFrame(p, time.Now())
-	for _, want := range []string{"Shot 2 of 7 · Generating video", "3/8", "1.00s/unit", " 20%", " 95%"} {
+	for _, want := range []string{"Shot 2 of 7 · Generating video", "3/8", " 20%", " 95%"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("scoped progress lacks %q: %q", want, got)
 		}

@@ -62,7 +62,7 @@ func TestLiveProgressKeepsFinishedStagesAndMeasuredRates(t *testing.T) {
 	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 5, "total": 30, "step_ms": 15000, "sample_unix_ms": 75000}))
 	at := time.Now()
 	denoise := liveFrame(p, at)
-	for _, want := range []string{"✓ conditioning", "▸ denoising", "5/30", "15.00s/unit", "ETA ~6m15s"} {
+	for _, want := range []string{"✓ conditioning", "▸ denoising", "5/30", "ETA ~6m15s"} {
 		if !strings.Contains(denoise, want) {
 			t.Fatalf("denoising display lacks %q: %q", want, denoise)
 		}

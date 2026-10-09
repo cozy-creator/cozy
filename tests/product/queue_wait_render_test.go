@@ -68,7 +68,7 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 		t.Fatalf("first progress sample conflated stage and overall facts: %q", got)
 	}
 	p.On(frame(0.60, 0.20, 60))
-	if got := liveFrame(p, time.Now()); !strings.Contains(got, "0.02s/unit · ETA ~0.8s") ||
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "ETA ~0.8s") ||
 		!regexp.MustCompile(`overall █+░+  20%$`).MatchString(got) {
 		t.Fatalf("measured timing did not stay on the current stage: %q", got)
 	}
@@ -83,7 +83,7 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 		t.Fatalf("redirected progress did not retain the first untimed count: %q", got)
 	}
 	p.On(frame(0.60, 0.20, 60))
-	if got := buf.String(); !strings.Contains(got, "tile_steps 60/100 · 60% stage · 0.02s/unit · ETA ~0.8s · 20% overall") {
+	if got := buf.String(); !strings.Contains(got, "tile_steps 60/100 · 60% stage · ETA ~0.8s · 20% overall") {
 		t.Fatalf("redirected progress did not advance its stage ETA: %q", got)
 	}
 	p.Done()
@@ -111,7 +111,7 @@ func TestProgressStageETAAccountsForCoalescedSamples(t *testing.T) {
 				"step_ms": float64(42000), "sample_unix_ms": position * 42000,
 			}}})
 	}
-	if got := liveFrame(p, time.Now()); !strings.Contains(got, "42.00s/unit · ETA ~16m48s") ||
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "ETA ~16m48s") ||
 		!regexp.MustCompile(`overall █+░+  20%$`).MatchString(got) {
 		t.Fatalf("stage ETA did not use the elapsed source interval for three counted units: %q", got)
 	}

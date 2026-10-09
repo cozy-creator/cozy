@@ -52,7 +52,6 @@ type ProgressSnapshot struct {
 // StageEstimate is an estimate at the latest observed pace, scoped to one counted stage.
 type StageEstimate struct {
 	RemainingMS int64
-	Rate        float64 // Counted units per second, never callbacks per second.
 }
 
 func (current ProgressSnapshot) EstimateStage(previous ProgressSnapshot) (StageEstimate, bool) {
@@ -68,7 +67,8 @@ func (current ProgressSnapshot) EstimateStage(previous ProgressSnapshot) (StageE
 	if current.Rate != nil {
 		rate = *current.Rate
 	} else if current.Stage == previous.Stage && previous.Position != nil && previous.Total != nil {
-		if *previous.Total != *current.Total || *previous.Position < 0 || *current.Position <= *previous.Position {
+		if current.Unit != previous.Unit || *previous.Total != *current.Total ||
+			*previous.Position < 0 || *current.Position <= *previous.Position {
 			return StageEstimate{}, false
 		}
 		if !current.SampleAt.IsZero() && !previous.SampleAt.IsZero() && current.SampleAt.After(previous.SampleAt) {
@@ -87,7 +87,7 @@ func (current ProgressSnapshot) EstimateStage(previous ProgressSnapshot) (StageE
 	if math.IsNaN(remaining) || math.IsInf(remaining, 0) || remaining >= float64(math.MaxInt64/int64(time.Millisecond)) {
 		return StageEstimate{}, false
 	}
-	return StageEstimate{RemainingMS: int64(remaining), Rate: rate}, true
+	return StageEstimate{RemainingMS: int64(remaining)}, true
 }
 
 type progressCoordinate struct {

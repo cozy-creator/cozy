@@ -160,11 +160,7 @@ func (f stepFacts) timing() string {
 	if !f.counted || !f.hasStageETA {
 		return ""
 	}
-	line := ""
-	if f.stageEstimate.Rate > 0 {
-		line = fmt.Sprintf(" · %.2fs/unit", 1/f.stageEstimate.Rate)
-	}
-	return line + " · ETA ~" + shortDuration(time.Duration(f.stageEstimate.RemainingMS)*time.Millisecond)
+	return " · ETA ~" + shortDuration(time.Duration(f.stageEstimate.RemainingMS)*time.Millisecond)
 }
 
 func phaseRows(fields map[string]any) []string {

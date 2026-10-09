@@ -175,7 +175,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	if strings.ContainsAny(stderr, "\r\033") {
 		t.Fatalf("piped progress carries terminal control bytes\n%q", stderr)
 	}
-	stepLine := regexp.MustCompile(`^  tile_steps (\d+)/100 · (\d+)% stage · [0-9.]+s/unit · ETA ~[0-9hms.]+ · (\d+)% overall · elapsed [0-9ms.]+$`)
+	stepLine := regexp.MustCompile(`^  tile_steps (\d+)/100 · (\d+)% stage · ETA ~[0-9hms.]+ · (\d+)% overall · elapsed [0-9ms.]+$`)
 	previous, matched := -1, 0
 	for _, line := range strings.Split(stderr, "\n") {
 		if !strings.Contains(line, "tile_steps") {
@@ -229,8 +229,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("terminal rewrites never showed the step bar\n%q", tty)
 	}
 	if plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(tty, ""); !strings.Contains(plain, "▸ tile_steps · ") ||
-		!strings.Contains(plain, "s/unit") || !strings.Contains(plain, "ETA ~") {
-		t.Fatalf("terminal run never showed elapsed, measured speed and stage ETA\n%q", tty)
+		!strings.Contains(plain, "ETA ~") {
+		t.Fatalf("terminal run never showed elapsed and measured stage ETA\n%q", tty)
 	}
 
 	// --await --json: stdout remains one final result; stderr carries typed JSONL events.

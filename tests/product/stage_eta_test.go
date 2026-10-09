@@ -49,6 +49,16 @@ func TestMeasuredStageETARequiresValidUnitsAndSourceTiming(t *testing.T) {
 			}
 		})
 	}
+	changedUnit := sample("decode_video", 187, 362, 101880, 1879.7)
+	changedUnit.Unit = "frames"
+	if _, known := changedUnit.EstimateStage(previous); known {
+		t.Fatal("changed units inherited the previous sample rate")
+	}
+	explicitRate := 20.0
+	changedUnit.Rate = &explicitRate
+	if got, known := changedUnit.EstimateStage(previous); !known || got.RemainingMS != 8750 {
+		t.Fatalf("explicit current rate was coupled to prior units: %+v %v", got, known)
+	}
 	for _, rate := range []float64{0, 20} {
 		value, ok := orchestrator.DecodeProgressSnapshot(map[string]any{"stage": "frames", "position": 100., "total": 400., "rate": rate, "unit": "frames"})
 		if !ok {
@@ -84,7 +94,7 @@ func TestLiveETAUsesStageUnitsAndNeverProjectsWeightedFutureStages(t *testing.T)
 		"overall_fraction": .90, "step_ms": 1879.7, "sample_unix_ms": 720000}))
 	p.On(liveEvent("progress", map[string]any{"stage": "decode_video", "position": 187, "total": 362,
 		"overall_fraction": .91, "step_ms": 1879.7, "sample_unix_ms": 721880}))
-	if got = liveFrame(p, time.Now()); !strings.Contains(got, "187/362") || !strings.Contains(got, "0.11s/unit") || !strings.Contains(got, "ETA ~19s") {
+	if got = liveFrame(p, time.Now()); !strings.Contains(got, "187/362") || !strings.Contains(got, "ETA ~19s") {
 		t.Fatalf("live decode used chunk duration as a frame duration: %s", got)
 	}
 }

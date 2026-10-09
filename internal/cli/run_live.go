@@ -700,9 +700,6 @@ func (s *liveStage) rows(ran time.Duration, held *stall, width int, at time.Time
 	case s.counted:
 		row += fmt.Sprintf("  %d/%d", s.current, s.total)
 		if s.hasETA {
-			if s.estimate.Rate > 0 {
-				row += fmt.Sprintf(" · %.2fs/unit", 1/s.estimate.Rate)
-			}
 			row += " · ETA ~" + shortDuration(time.Duration(s.estimate.RemainingMS)*time.Millisecond)
 		}
 	}
