@@ -103,7 +103,7 @@ func machineKeyLogin(deviceID string, public ed25519.PublicKey, bearer string, n
 	challenge := bytes.Repeat([]byte{7}, 32)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/auth/device-keys/login/begin":
+		case "/v1/auth/v1/device-keys/login/begin":
 			var body map[string]string
 			if json.NewDecoder(r.Body).Decode(&body) != nil || body["device_key_id"] != deviceID {
 				http.Error(w, `{"error":{"code":"auth.unknown_machine","message":"unknown machine"}}`, http.StatusUnauthorized)
@@ -111,7 +111,7 @@ func machineKeyLogin(deviceID string, public ed25519.PublicKey, bearer string, n
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"challenge_id": "login-" + deviceID,
 				"challenge": base64.RawURLEncoding.EncodeToString(challenge), "expires_at": time.Now().Add(time.Minute).UTC().Format(time.RFC3339)})
-		case "/v1/auth/device-keys/login/finish":
+		case "/v1/auth/v1/device-keys/login/finish":
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			signature, err := base64.RawURLEncoding.DecodeString(body["signature"])

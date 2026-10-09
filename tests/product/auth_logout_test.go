@@ -36,18 +36,18 @@ func TestLogoutAlwaysErasesTheLocalCredential(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			revoked := 0
 			mux := http.NewServeMux()
-			mux.HandleFunc("POST /v1/auth/device-keys/login/begin", func(w http.ResponseWriter, _ *http.Request) {
+			mux.HandleFunc("POST /v1/auth/v1/device-keys/login/begin", func(w http.ResponseWriter, _ *http.Request) {
 				challenge := make([]byte, 32)
 				_, _ = rand.Read(challenge)
 				_ = json.NewEncoder(w).Encode(map[string]string{"challenge_id": "challenge-1",
 					"challenge": base64.RawURLEncoding.EncodeToString(challenge), "expires_at": time.Now().Add(time.Minute).Format(time.RFC3339Nano)})
 			})
-			mux.HandleFunc("POST /v1/auth/device-keys/login/finish", func(w http.ResponseWriter, _ *http.Request) {
+			mux.HandleFunc("POST /v1/auth/v1/device-keys/login/finish", func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"token_set":  map[string]any{"access_token": "machine-token", "token_type": "Bearer", "expires_in": 600},
 					"device_key": map[string]any{"id": "device-1"}})
 			})
-			mux.HandleFunc("DELETE /v1/auth/device-keys/{id}", func(w http.ResponseWriter, r *http.Request) {
+			mux.HandleFunc("DELETE /v1/auth/v1/me/sign-in-keys/{id}", func(w http.ResponseWriter, r *http.Request) {
 				if r.PathValue("id") != "device-1" || r.Header.Get("Authorization") != "Bearer machine-token" {
 					t.Errorf("unexpected revocation: %s %s", r.PathValue("id"), r.Header.Get("Authorization"))
 				}

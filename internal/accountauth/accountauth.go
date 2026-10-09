@@ -78,7 +78,7 @@ func (m *Manager) BeginEmailProof(ctx context.Context) (*Enrollment, time.Time, 
 		Challenge    string `json:"challenge"`
 		ExpiresAt    string `json:"expires_at"`
 	}
-	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/begin", map[string]string{
+	if problem := m.post(ctx, hub.AuthAPI+"/device-keys/enroll/begin", map[string]string{
 		"email": stored.Email, "public_key": rawBase64.EncodeToString(public),
 	}, &begun); problem != nil {
 		return nil, time.Time{}, problem
@@ -108,7 +108,7 @@ func (m *Manager) FinishEmailProof(ctx context.Context, enrollment *Enrollment, 
 	}
 	var answer tokenAnswer
 	started := m.now()
-	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/finish", map[string]string{
+	if problem := m.post(ctx, hub.AuthAPI+"/device-keys/enroll/finish", map[string]string{
 		"enrollment_id": enrollment.id,
 		"code":          code,
 		"signature":     rawBase64.EncodeToString(sign(enrollment.private, enrollDomain, enrollment.challenge)),
@@ -238,7 +238,7 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 		Challenge   string `json:"challenge"`
 		ExpiresAt   string `json:"expires_at"`
 	}
-	if problem := m.post(ctx, "/v1/auth/device-keys/login/begin", map[string]string{
+	if problem := m.post(ctx, hub.AuthAPI+"/device-keys/login/begin", map[string]string{
 		"device_key_id": stored.DeviceKeyID,
 	}, &begun); problem != nil {
 		return Session{}, problem
@@ -251,7 +251,7 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 	signature := sign(private, loginDomain, challenge)
 	var answer tokenAnswer
 	started := m.now()
-	if problem := m.post(ctx, "/v1/auth/device-keys/login/finish", map[string]string{
+	if problem := m.post(ctx, hub.AuthAPI+"/device-keys/login/finish", map[string]string{
 		"challenge_id": begun.ChallengeID,
 		"signature":    rawBase64.EncodeToString(signature),
 	}, &answer); problem != nil {
@@ -276,7 +276,7 @@ func (m *Manager) BeginEnrollment(ctx context.Context, email string) (*Enrollmen
 		Challenge    string `json:"challenge"`
 		ExpiresAt    string `json:"expires_at"`
 	}
-	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/begin", map[string]string{
+	if problem := m.post(ctx, hub.AuthAPI+"/device-keys/enroll/begin", map[string]string{
 		"email": email, "public_key": rawBase64.EncodeToString(public),
 	}, &begun); problem != nil {
 		return nil, time.Time{}, problem
@@ -305,7 +305,7 @@ func (m *Manager) FinishEnrollment(ctx context.Context, enrollment *Enrollment, 
 	}
 	var answer tokenAnswer
 	started := m.now()
-	if problem := m.post(ctx, "/v1/auth/device-keys/enroll/finish", map[string]string{
+	if problem := m.post(ctx, hub.AuthAPI+"/device-keys/enroll/finish", map[string]string{
 		"enrollment_id": enrollment.id,
 		"code":          code,
 		"signature":     rawBase64.EncodeToString(sign(enrollment.private, enrollDomain, enrollment.challenge)),
