@@ -533,7 +533,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		if deadline := time.UnixMilli(int64(request.DeadlineUnixMS)); request.DeadlineUnixMS > 0 && deadline.Before(expires) {
 			expires = deadline
 		}
-		operations := m.privateOperations(request.Hub, m.runAccount(request), spec)
+		operations := m.privateOperations(m.runAccount(request), spec)
 		if access, problem := m.hubAccessV1(ctx, request.Hub, machine, request.ID, operations, expires); problem != nil {
 			return nil, problem
 		} else {
@@ -646,7 +646,7 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
 		owner = caller.Account
 	}
-	operations := m.privateOperations(origin, owner, spec)
+	operations := m.privateOperations(owner, spec)
 	if spec.Hub, problem = m.hubAccessV1(ctx, origin, machine, row.ID, operations, time.Now().Add(capabilityLife)); problem != nil {
 		return nil, problem
 	}
@@ -757,10 +757,10 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 // capabilityLife caps a run capability: a run past it reads only public content.
 const capabilityLife = 24 * time.Hour
 
-// privateOperations are what a run does at origin that is not public (th-241): reading one of
+// privateOperations are what a run does at its Hub that is not public (th-241): reading one of
 // the owner's checkpoints by its exact manifest, and publishing into its weights destination.
 // Everything else the machine reads anonymously.
-func (m *machineRuns) privateOperations(origin, owner string, spec *v1.RunSpec) []any {
+func (m *machineRuns) privateOperations(owner string, spec *v1.RunSpec) []any {
 	var operations []any
 	seen := map[string]bool{}
 	read := func(model, manifest string) {
@@ -785,8 +785,9 @@ func (m *machineRuns) privateOperations(origin, owner string, spec *v1.RunSpec) 
 
 // hubAccessV1 is where the machine reads origin, and, for a run with private operations, the
 // owner's capability for them: signed offline with this computer's device key for the
-// machine's leaf, which the machine trades once at its first private operation. Public reads
-// need nothing, and nothing here asks the Hub to authorize anything. A run whose owner is not
+// machine's leaf, which the machine trades once at its first private operation, at the token
+// endpoint beside it. Public reads need nothing, and nothing here asks the Hub to authorize
+// anything. A run whose owner is not
 // signed in carries no Hub access; the machine then refuses only what needs one.
 func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *machines.V1, run string, operations []any, expires time.Time) (*v1.HubAccess, *exit.Error) {
 	hubContext := m.context.forHub(origin)
@@ -822,6 +823,15 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 	if len(operations) == 0 {
 		return access, nil
 	}
+	tokens, ok := m.hubTokenEndpoints.Load(origin)
+	if !ok {
+		endpoint, problem := account.TokenEndpoint(ctx)
+		if problem != nil {
+			return nil, problem
+		}
+		tokens, _ = m.hubTokenEndpoints.LoadOrStore(origin, endpoint)
+	}
+	access.TokenEndpoint = tokens.(string)
 	user, problem := account.CurrentAccount(ctx)
 	if problem != nil {
 		return nil, problem

@@ -21,9 +21,9 @@ import (
 
 // fakeHubAccess answers a fixture Hub's side of a run's Hub access (Tensorhub th-241): the
 // device-key sign-in `cozy auth login` left (it answers bearer), the execution environment,
-// the current account with its AuthKit user id, and, for a real machine, the RFC 9728 and
-// OpenID metadata and the JWT-bearer token endpoint it trades a run capability at. A
-// capability needs no Hub call from the CLI: it signs one offline with its device key.
+// the current account with its AuthKit user id, the RFC 9728 and OpenID metadata naming the
+// token endpoint, and, for a real machine, that JWT-bearer token endpoint. The CLI signs a
+// capability offline with its device key: nothing asks the Hub to authorize it.
 type fakeHubAccess struct {
 	server, origin, public, bearer string
 	deviceKeyID, userID           string
@@ -77,23 +77,23 @@ func (a *fakeHubAccess) serve(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"name": "proof", "user_id": a.userID})
+	case r.Method == http.MethodGet && r.URL.Path == "/.well-known/oauth-protected-resource":
+		_ = json.NewEncoder(w).Encode(map[string]any{"resource": a.public, "authorization_servers": []string{a.server + "/v1/auth"}})
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/.well-known/openid-configuration":
+		// The machine reaches the token endpoint where it reads the Hub.
+		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": a.server + "/v1/auth", "token_endpoint": a.origin + "/v1/auth/oauth2/token",
+			"grant_types_supported": []string{"urn:ietf:params:oauth:grant-type:jwt-bearer"}})
 	default:
 		return false
 	}
 	return true
 }
 
-// serveMachine answers r when it is one of the routes a machine trades a capability through,
-// at the origin it reads the Hub at. It verifies nothing: TensorD's AuthKit tests and the
-// Hub's own prove the trade; this records what the machine presented.
+// serveMachine answers the token endpoint a machine trades a capability at, where it reads
+// the Hub. It verifies nothing: TensorD's AuthKit tests and the Hub's own prove the trade;
+// this records what the machine presented.
 func (a *fakeHubAccess) serveMachine(w http.ResponseWriter, r *http.Request) bool {
-	issuer := a.origin + "/v1/auth"
 	switch {
-	case r.Method == http.MethodGet && r.URL.Path == "/.well-known/oauth-protected-resource":
-		_ = json.NewEncoder(w).Encode(map[string]any{"resource": a.public, "authorization_servers": []string{issuer}})
-	case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/.well-known/openid-configuration":
-		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": issuer, "token_endpoint": issuer + "/oauth2/token",
-			"grant_types_supported": []string{"urn:ietf:params:oauth:grant-type:jwt-bearer"}})
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/auth/oauth2/token":
 		_ = r.ParseForm()
 		var claims struct {
@@ -113,7 +113,7 @@ func (a *fakeHubAccess) serveMachine(w http.ResponseWriter, r *http.Request) boo
 			_, _ = w.Write([]byte(`{"error":"invalid_grant","reason":"refused","error_description":"the stand-in hub grants nothing"}`))
 			return true
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": fixtureCapabilityToken(issuer, a.public), "token_type": "DPoP", "expires_in": 900})
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": fixtureCapabilityToken(a.server+"/v1/auth", a.public), "token_type": "DPoP", "expires_in": 900})
 	default:
 		return false
 	}

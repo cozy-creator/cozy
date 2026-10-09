@@ -27,8 +27,9 @@ type machineRuns struct {
 	// A foreground controller closes with its CLI command. Explicit controls must
 	// reach the machine before that command returns; observation remains detachable.
 	foreground bool
-	// hubEnvironments are each Hub's execution environment, by hub and credential.
-	hubEnvironments sync.Map
+	// hubEnvironments are each Hub's execution environment, by hub and credential, and
+	// hubTokenEndpoints where machines trade run capabilities for it, by hub.
+	hubEnvironments, hubTokenEndpoints sync.Map
 	placed    map[string]string // the last placement decision recorded per waiting run
 	machines  *machines.Resolver
 	updates   *rentalRuntimeUpdates

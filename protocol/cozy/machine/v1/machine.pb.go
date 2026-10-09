@@ -1065,10 +1065,12 @@ type HubAccess struct {
 	CaDer       []byte                 `protobuf:"bytes,4,opt,name=ca_der,json=caDer,proto3" json:"ca_der,omitempty"`                   // an origin's private CA, when it has one
 	ObjectHosts []string               `protobuf:"bytes,5,rep,name=object_hosts,json=objectHosts,proto3" json:"object_hosts,omitempty"` // the Hub's object-storage hosts downloads may follow
 	// The owner's capability for this run's private operations (th-241): a compact JWS its
-	// device key signed for this machine's leaf (`cnf.jkt`), naming each operation in
-	// `authorization_details`. The machine trades it once, at the run's first private
-	// operation, for a token (AuthKit's JWT-bearer grant). Empty: a public-only run.
+	// device key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),
+	// naming each operation in `authorization_details`. The machine trades it once, at the
+	// run's first private operation, at `token_endpoint` (AuthKit's JWT-bearer grant). Empty:
+	// a public-only run.
 	Capability    string `protobuf:"bytes,7,opt,name=capability,proto3" json:"capability,omitempty"`
+	TokenEndpoint string `protobuf:"bytes,8,opt,name=token_endpoint,json=tokenEndpoint,proto3" json:"token_endpoint,omitempty"` // the Hub's authorization server's, as its metadata names it
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1127,6 +1129,13 @@ func (x *HubAccess) GetObjectHosts() []string {
 func (x *HubAccess) GetCapability() string {
 	if x != nil {
 		return x.Capability
+	}
+	return ""
+}
+
+func (x *HubAccess) GetTokenEndpoint() string {
+	if x != nil {
+		return x.TokenEndpoint
 	}
 	return ""
 }
@@ -3166,14 +3175,15 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\bmanifest\x18\x05 \x01(\tR\bmanifest\x12\x14\n" +
 	"\x05scale\x18\x06 \x01(\tR\x05scale\x12\x16\n" +
 	"\x06source\x18\a \x01(\tR\x06source\x12\x1a\n" +
-	"\bprofiles\x18\b \x03(\tR\bprofiles\"\x8f\x01\n" +
+	"\bprofiles\x18\b \x03(\tR\bprofiles\"\xb6\x01\n" +
 	"\tHubAccess\x12\x16\n" +
 	"\x06origin\x18\x01 \x01(\tR\x06origin\x12\x15\n" +
 	"\x06ca_der\x18\x04 \x01(\fR\x05caDer\x12!\n" +
 	"\fobject_hosts\x18\x05 \x03(\tR\vobjectHosts\x12\x1e\n" +
 	"\n" +
 	"capability\x18\a \x01(\tR\n" +
-	"capabilityJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x06\x10\a\"\xfd\x02\n" +
+	"capability\x12%\n" +
+	"\x0etoken_endpoint\x18\b \x01(\tR\rtokenEndpointJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x06\x10\a\"\xfd\x02\n" +
 	"\bRunEvent\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12\x13\n" +
 	"\x05at_ms\x18\x02 \x01(\x03R\x04atMs\x121\n" +
