@@ -17,7 +17,7 @@ func TestAV1RunsExecutionTicksHoldsPausedAndExcludesItsWait(t *testing.T) {
 	if code, out := runCozy(t, root, "package", "install", restartProject(t), "--editable"); code != 0 {
 		t.Fatalf("installing the restart package [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "run", "local/restart-proof/slow", "seconds=8", "--json", "--idempotency-key", "timed"); code != 0 {
+	if code, out := runCozy(t, root, "run", "local/restart-proof/paced", "seconds=8", "--json", "--idempotency-key", "timed"); code != 0 {
 		t.Fatalf("submitting the job [exit %d]\n%s", code, out)
 	}
 	request, problem := store.RequestByIdempotencyKey("timed")
