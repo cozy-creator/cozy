@@ -48,7 +48,7 @@ func (c *Client) Watch(ctx context.Context, each func(*pb.StatusFrame) error) er
 // version, capabilities and its sealed readiness receipt (empty until sealed), with the TLS
 // leaf that served them, which the receipt must name.
 func Identity(ctx context.Context, addr string, tlsConfig *tls.Config) (*pb.StatusFrame, []byte, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	conn, err := grpc.NewClient(addr, dialing(tlsConfig)...)
 	if err != nil {
 		return nil, nil, err
 	}
