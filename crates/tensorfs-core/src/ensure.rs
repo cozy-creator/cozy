@@ -56,6 +56,8 @@ pub struct Request<'a> {
     /// The transport ledger's resolution; configuration, never a verdict.
     pub sample_seconds: f64,
     pub on_event: Option<&'a (dyn Fn(&Event) + Sync)>,
+    /// The anonymous object origin of a public checkpoint (th-243); see [`Request::public`].
+    pub origin: Option<&'a str>,
 }
 
 impl<'a> Request<'a> {
@@ -80,6 +82,21 @@ impl<'a> Request<'a> {
             streams: transport::PULL_STREAMS,
             sample_seconds: transport::SAMPLE_SECONDS,
             on_event: None,
+            origin: None,
+        }
+    }
+
+    /// A public checkpoint, `org/name[@release]@sha256:<hex>`, read anonymously by digest
+    /// from the object origin `origin`: no hub, no credential.
+    pub fn public(
+        store: &'a Store,
+        origin: &'a str,
+        refspec: &'a str,
+        policy: &'a SourcePolicy,
+    ) -> Request<'a> {
+        Request {
+            origin: Some(origin),
+            ..Request::new(store, "", refspec, &transport::Anonymous, policy)
         }
     }
 
@@ -90,6 +107,7 @@ impl<'a> Request<'a> {
         pull.cancellation = self.cancellation.clone();
         pull.streams = self.streams;
         pull.sample_seconds = self.sample_seconds;
+        pull.origin = self.origin;
         pull
     }
 
