@@ -710,6 +710,11 @@ One purchase is $10 to $500 (the hub's bounds; others are refused before any che
 browser opens Stripe's hosted page; `--no-browser` only prints its URL. Each purchase expires
 365 days after it lands. Refunds are made by the Tensorhub operator.
 
+A new account starts with a small credit. Rentals may run your balance a little below zero (the
+hub's overdraft floor, about -$2); past it they are shut off, even mid-run, and what was spent past
+zero is repaid from your next purchase. Below the hub's warning, `cozy credits` and run and rental
+commands warn you, and Tensorhub emails you once.
+
 ## Release GPU memory or stop Cozy
 
 These commands have deliberately different scopes:

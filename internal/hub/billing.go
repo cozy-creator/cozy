@@ -37,6 +37,27 @@ func (c *Client) Balance(ctx context.Context) (Balance, *exit.Error) {
 	return out, problem
 }
 
+// Credit is the caller's net balance (balance less every hold and anything owed) against
+// the Hub's warning and its overdraft floor: rentals keep running into debt down to the
+// floor and are shut off past it (th-242). nil for an account that never touches credit.
+type Credit struct {
+	Available int64 `json:"available_usd_micros"`
+	Warning   int64 `json:"warning_usd_micros"`
+	Floor     int64 `json:"floor_usd_micros"`
+}
+
+// Low is whether the owner is to be warned.
+func (c *Credit) Low() bool { return c != nil && c.Available < c.Warning }
+
+// Credit reads the caller's credit.
+func (c *Client) Credit(ctx context.Context) (*Credit, *exit.Error) {
+	var out struct {
+		Credit *Credit `json:"credit"`
+	}
+	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/credit", auth: true}, &out)
+	return out.Credit, problem
+}
+
 // CreditTransaction is one movement of the user's credit.
 type CreditTransaction struct {
 	ID        string    `json:"id"`
