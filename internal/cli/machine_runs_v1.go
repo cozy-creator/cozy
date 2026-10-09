@@ -821,24 +821,24 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 // capabilityLife caps a run capability: a run past it reads only public content.
 const capabilityLife = 24 * time.Hour
 
-// privateOperations are what a run does at its Hub that is not public (th-241): reading one of
-// the owner's checkpoints by its exact manifest, and publishing into its weights destination.
-// Everything else the machine reads anonymously.
+// privateOperations are what a run does at its Hub that is not public (th-241): reading a
+// checkpoint of the owner's named by its digest alone (a release's lanes are published), and
+// publishing into its weights destination. Everything else the machine reads anonymously.
 func (m *machineRuns) privateOperations(owner string, spec *v1.RunSpec) []any {
 	var operations []any
 	seen := map[string]bool{}
-	read := func(model, manifest string) {
+	read := func(model, release, manifest string) {
 		ref, problem := hub.ParseRef(model)
-		if problem != nil || owner == "" || ref.Org != owner || manifest == "" || seen[model+"@"+manifest] {
+		if problem != nil || owner == "" || ref.Org != owner || release != "" || manifest == "" || seen[model+"@"+manifest] {
 			return
 		}
 		seen[model+"@"+manifest] = true
 		operations = append(operations, map[string]string{"type": "tensorhub_model_read", "model": model, "manifest": manifest})
 	}
 	for _, choice := range spec.GetModels() {
-		read(choice.GetRepository(), choice.GetManifest())
+		read(choice.GetRepository(), choice.GetRelease(), choice.GetManifest())
 		for _, adapter := range choice.GetAdapters() {
-			read(adapter.GetModel(), adapter.GetManifest())
+			read(adapter.GetModel(), adapter.GetRelease(), adapter.GetManifest())
 		}
 	}
 	if destination := strings.TrimPrefix(spec.GetWeightsDestination(), "model://"); destination != "" && !strings.HasPrefix(destination, "local/") {
@@ -899,6 +899,10 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 	user, problem := account.CurrentAccount(ctx)
 	if problem != nil {
 		return nil, problem
+	}
+	if user.UserID == "" {
+		return nil, exit.Named(exit.Unavailable, "hub.account_user_absent",
+			"%s states no user id for account %s, so this run's private work cannot carry a capability", origin, user.Name)
 	}
 	workload, problem := hub.LeafThumbprint(machine.Leaf)
 	if problem != nil {

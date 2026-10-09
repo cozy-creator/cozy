@@ -470,8 +470,18 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 		if model.Choice {
 			continue // resolved at invocation (exactRunModels)
 		}
-		if model.Package != pkg || model.Slot == "" || model.Model == "" ||
-			model.ManifestLength <= 0 || model.ManifestLength > (int64(1)<<53)-1 {
+		// Exact: a pinned checkpoint with its manifest's length, or a ladder every rung of which
+		// names its checkpoint, of which the machine pins one (th-241).
+		exact := []string{model.Manifest}
+		if !model.Pinned() {
+			exact = exact[:0]
+			for _, rung := range model.Ladder {
+				exact = append(exact, rung.Manifest)
+			}
+		} else if model.ManifestLength <= 0 || model.ManifestLength > (int64(1)<<53)-1 {
+			exact = nil
+		}
+		if model.Package != pkg || model.Slot == "" || model.Model == "" || len(exact) == 0 {
 			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
 				"remote job %s carries an incomplete model Manifest binding", function)
 		}
@@ -479,9 +489,11 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 			return empty, nil, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
 				"remote job %s repeats model parameter %s", function, model.Slot)
 		}
-		if _, err := canonical.Raw(model.Manifest); err != nil {
-			return empty, nil, exit.Named(exit.Validation, "rental.job_model_manifest_invalid",
-				"remote job %s model parameter %s has no exact Manifest digest", function, model.Slot)
+		for _, manifest := range exact {
+			if _, err := canonical.Raw(manifest); err != nil {
+				return empty, nil, exit.Named(exit.Validation, "rental.job_model_manifest_invalid",
+					"remote job %s model parameter %s has no exact Manifest digest", function, model.Slot)
+			}
 		}
 		byParam[model.Slot] = index
 	}

@@ -59,6 +59,9 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 	if code, out := runCozy(t, root, install...); code != 0 {
 		t.Fatalf("machine install [exit %d]\n%s", code, out)
 	}
+	// The caller's own checkpoint named by digest is a private read: the run carries a
+	// capability its device key signs (th-241).
+	h.hubAccess.signIn(t, root)
 	code, out := runCozy(t, root, "model", "download", "proof/model#"+manifest, "--json")
 	var accepted struct {
 		ID     string `json:"id"`

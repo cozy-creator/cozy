@@ -189,7 +189,8 @@ func jobManifestInputs(ctx *Context, job *launch.Entrypoint, models []orchestrat
 	}
 	for i := range models {
 		model := &models[i]
-		if model.ManifestLength == 0 {
+		// A ladder's rung is the machine's to pick (th-241): each rung names its checkpoint.
+		if model.ManifestLength == 0 && model.Pinned() {
 			ref, problem := hub.ParseRef(model.Model)
 			if problem != nil {
 				return nil, problem

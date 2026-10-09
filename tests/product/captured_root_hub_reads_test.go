@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,10 +12,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
-// A captured root naming its Model's repository without a lane reads that Model at its
-// machine's Hub once: the warm run reads nothing at any Hub, nor does a new machine lifetime.
-// The model's owner changing it from this computer moves the binding revision every later run
-// carries, so the next run reads it again, even when the machine was stopped at the time.
+// A captured root naming its Model's repository without a lane has the CLI read that Model once
+// (th-241: the machine reads no model at a Hub): the warm run reads nothing at any Hub, nor
+// does a new machine lifetime. The model's owner changing it from this computer moves the
+// catalog revision, so the next run reads it again, even when the machine was stopped then.
 func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine runs the call")
@@ -49,22 +48,15 @@ func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 			handler.ServeHTTP(w, r)
 		})
 	}
-	doors := h.worker.Config.Handler
-	h.worker.Config.Handler = count("machine", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.worker.Config.Handler = count("machine", h.worker.Config.Handler)
+	account, probe := h.server.Config.Handler, probeModel(t, resolved)
+	h.server.Config.Handler = count("account", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/v1/models/proof/probe":
-			_, _ = w.Write([]byte(`{"releases":[{"release":"1.0.0","lanes":[{"lane":"bf16","bytes":1}]}]}`))
-		case r.URL.Path == "/v1/models/resolve" && r.URL.Query().Get("ref") == "proof/probe@1.0.0" && r.URL.Query().Get("lane") == "bf16":
-			_ = json.NewEncoder(w).Encode(resolved)
+		case probe(w, r):
 		default:
-			doors.ServeHTTP(w, r)
+			account.ServeHTTP(w, r)
 		}
 	}))
-	// The caller's account, which a root of unpublished code carries as its owner: read once.
-	h.mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"name":"proof"}`))
-	})
-	h.server.Config.Handler = count("account", h.server.Config.Handler)
 
 	if code, out := runCozy(t, root, "package", "install", probeProject(t, "proof/probe@1.0.0/bf16"), "--editable"); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
@@ -75,19 +67,22 @@ func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 		seen = nil
 		mu.Unlock()
 		code, out := runCozy(t, root, "run", parityPackage+"/touch", "value=1", "model.source=proof/probe", "--await", "--json")
-		if code != 0 || !strings.Contains(out, `"value":2`) {
-			t.Fatalf("%s run [exit %d]\n%s", key, code, out)
-		}
 		mu.Lock()
 		defer mu.Unlock()
+		if code != 0 || !strings.Contains(out, `"value":2`) {
+			t.Fatalf("%s run [exit %d, read %q]\n%s", key, code, seen, out)
+		}
 		t.Logf("%s run read: %q", key, seen)
 		return strings.Join(seen, "\n")
 	}
 	model := func(calls string) bool {
-		return strings.Contains(calls, "machine GET /v1/models/proof/probe") && strings.Contains(calls, "machine GET /v1/models/resolve")
+		if strings.Contains(calls, "machine GET /v1/models/") {
+			t.Fatalf("the machine read a model at its Hub: %q", calls)
+		}
+		return strings.Contains(calls, "account GET /v1/models/proof/probe")
 	}
 	if !model(run("cold")) {
-		t.Fatal("the cold run did not read its Model at the machine's Hub")
+		t.Fatal("the cold run did not read its Model")
 	}
 	if calls := run("warm"); calls != "" {
 		t.Fatalf("the warm run read: %q", calls)

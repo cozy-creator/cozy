@@ -135,15 +135,8 @@ func publishParityReleaseAt(t *testing.T, h *machineHub, root, project, release 
 		"package_interface": json.RawMessage(iface), "requires_python": ">=3.12,<3.13"})
 	must(t, err)
 	releases[path+"/releases/"+release] = detail
-	doors := h.worker.Config.Handler
-	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if body, ok := releases[r.URL.Path]; ok {
-			_, _ = w.Write(body)
-			return
-		}
-		doors.ServeHTTP(w, r)
-	})
-	// `cozy package install` reads the release's download plan and project index at the Hub.
+	// The CLI reads the release's card and locked requirements and hands them to the machine
+	// with the run (th-241); `cozy package install` reads its download plan and project index.
 	exact := func(raw []byte) hub.ExactDocument {
 		return hub.ExactDocument{CanonicalBytes: raw, Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(raw)), Length: int64(len(raw))}
 	}
@@ -159,6 +152,10 @@ func publishParityReleaseAt(t *testing.T, h *machineHub, root, project, release 
 	must(t, err)
 	account := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := releases[r.URL.Path]; ok {
+			_, _ = w.Write(body)
+			return
+		}
 		switch r.URL.Path {
 		case path + "/download":
 			_, _ = w.Write(plan)

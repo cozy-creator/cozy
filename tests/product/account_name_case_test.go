@@ -129,7 +129,7 @@ func newAccountHubWith(t *testing.T, extra func(*http.ServeMux)) *httptest.Serve
 			reply(w, 409, problem("account.name_required", "choose an account name"))
 			return
 		}
-		reply(w, 200, map[string]string{"name": name})
+		reply(w, 200, map[string]string{"name": name, "user_id": "user-fixture"})
 	})
 	mux.HandleFunc("PUT /v1/accounts/{account}", func(w http.ResponseWriter, r *http.Request) {
 		name, user := r.PathValue("account"), r.Header.Get("Authorization")
@@ -145,7 +145,7 @@ func newAccountHubWith(t *testing.T, extra func(*http.ServeMux)) *httptest.Serve
 			return
 		}
 		hub.owners[name], hub.accounts[user] = user, name
-		reply(w, 200, map[string]string{"name": name})
+		reply(w, 200, map[string]string{"name": name, "user_id": "user-fixture"})
 	})
 	mux.HandleFunc("GET /v1/models/{org}/{name}", func(w http.ResponseWriter, r *http.Request) {
 		if r.PathValue("org") != "paul" || r.PathValue("name") != "sdxl" {

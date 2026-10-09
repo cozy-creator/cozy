@@ -100,16 +100,13 @@ def main(payload: Request) -> Result:
 		releases[prefix], releases[prefix+"/locked-requirements"] = detail, []byte(locked)
 		plans[version] = hub.PackageDownloadPlan{Release: version, Downloads: []hub.PackageInstallDownload{{Kind: "project_wheel", Path: filepath.Base(path)}}}
 	}
-	worker := h.worker.Config.Handler
-	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// The CLI reads each release's card and hands it to the machine (th-241).
+	account := h.server.Config.Handler
+	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if body, found := releases[r.URL.Path]; found {
 			_, _ = w.Write(body)
 			return
 		}
-		worker.ServeHTTP(w, r)
-	})
-	account := h.server.Config.Handler
-	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" && r.URL.Path == "/v1/packages/proof/install-interface-probe/download" {
 			plan, found := plans[r.URL.Query().Get("release")]
 			if !found {

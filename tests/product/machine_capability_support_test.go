@@ -27,6 +27,8 @@ import (
 type fakeHubAccess struct {
 	server, origin, public, bearer string
 	deviceKeyID, userID           string
+	// account is the signed-in account's name.
+	account string
 	device                        ed25519.PrivateKey
 	// refuse, when set, answers every trade invalid_grant.
 	refuse bool
@@ -39,7 +41,7 @@ type fakeHubAccess struct {
 func newFakeHubAccess(server, public, bearer string) *fakeHubAccess {
 	_, device, _ := ed25519.GenerateKey(rand.Reader)
 	return &fakeHubAccess{server: server, origin: public, public: public, bearer: bearer,
-		deviceKeyID: "dk-fixture", userID: "user-fixture", device: device}
+		deviceKeyID: "dk-fixture", userID: "user-fixture", account: "proof", device: device}
 }
 
 // signIn writes home's device-key credential for the fixture Hub, as `cozy auth login` does.
@@ -76,7 +78,7 @@ func (a *fakeHubAccess) serve(w http.ResponseWriter, r *http.Request) bool {
 			http.Error(w, "account required", http.StatusUnauthorized)
 			return true
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"name": "proof", "user_id": a.userID})
+		_ = json.NewEncoder(w).Encode(map[string]string{"name": a.account, "user_id": a.userID})
 	case r.Method == http.MethodGet && r.URL.Path == "/.well-known/oauth-protected-resource":
 		_ = json.NewEncoder(w).Encode(map[string]any{"resource": a.public, "authorization_servers": []string{a.server + "/v1/auth"}})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/.well-known/openid-configuration":

@@ -145,9 +145,7 @@ func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 	laptopOpen.Store(true)
 	machineOpen.Store(true)
 	var laptopServed, machineServed atomic.Int64
-	h.mux.HandleFunc("GET /v1/accounts/current", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"name":"` + indexAccount + `"}`))
-	})
+	h.hubAccess.account = indexAccount
 	h.mux.Handle("GET /v1/index/", accountIndex(wheel, &laptopOpen, &laptopServed))
 	machineIndex, doors := accountIndex(wheel, &machineOpen, &machineServed), h.worker.Config.Handler
 	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

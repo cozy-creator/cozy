@@ -83,7 +83,7 @@ func machineKeyHub(t *testing.T, witness *hubWitness, deviceID string, public ed
 			http.Error(w, `{"error":{"code":"invalid_credentials","message":"authenticate"}}`, http.StatusUnauthorized)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"name": account})
+		_ = json.NewEncoder(w).Encode(map[string]string{"name": account, "user_id": "user-" + account})
 	})
 	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(r) {
@@ -536,8 +536,9 @@ func TestPackageUpdateAllUpdatesEachInstallFromItsOwnHub(t *testing.T) {
 // A local run of a published install reads its model bindings from the hub it was
 // installed from, not from whichever hub is current.
 // fixtureExecutionAccess signs root in at server with a device key and routes its machine's
-// reads to worker: anonymous ones (public content), and those that carry the token a run's
-// capability trades for (Tensorhub th-241), which it returns as its Authorization. The
+// content reads to worker: anonymous ones (public content), and those that carry the token a
+// run's capability trades for (Tensorhub th-241), which it returns as its Authorization. The
+// CLI's own catalog reads reach the account API. The
 // fixture deliberately exposes no owned-machine registration or lifecycle API.
 func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, worker http.Handler) string {
 	t.Helper()
@@ -551,7 +552,12 @@ func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, 
 			t.Error("owned machine attempted registration")
 			http.Error(w, "no machine registry", http.StatusGone)
 		case access.serve(w, r), access.serveMachine(w, r):
-		case r.Header.Get("Authorization") == "" || r.Header.Get("Authorization") == token:
+		case strings.HasPrefix(r.URL.Path, "/v1/tensorfs/") || strings.HasPrefix(r.URL.Path, "/o/"):
+			// What the machine reads: content by digest, anonymously or with the run's token.
+			if authorization := r.Header.Get("Authorization"); authorization != "" && authorization != token {
+				http.Error(w, "the machine presented another credential", http.StatusForbidden)
+				return
+			}
 			worker.ServeHTTP(w, r)
 		default:
 			account.ServeHTTP(w, r)
@@ -660,8 +666,9 @@ func TestRunsWithoutAHubStayListed(t *testing.T) {
 	}
 }
 
-// One persistent agent serves distinct Hub grants without restarting, and never uses
-// one account's access credential for another catalog.
+// One persistent agent serves runs of distinct Hubs without restarting. Each run carries its
+// release's card from the Hub the CLI selected (th-241), and the machine reads content only at
+// that Hub's doors, with no other Hub's credential.
 func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine reads the releases")
@@ -716,20 +723,21 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 			}
 		})
 	}
-	// Each hub's own API, as the command reads it.
+	// Each hub's own API, as the command reads it: its catalog and model resolution.
 	var apiA, apiB sync.Map
-	api := func(asked *sync.Map) http.Handler {
+	var catalogA, catalogB door
+	api := func(asked *sync.Map, catalog http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			asked.Store(r.URL.Path, true)
 			if r.URL.Path != "/v1/models/resolve" {
-				http.NotFound(w, r)
+				catalog.ServeHTTP(w, r)
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/model", "manifest_id": manifest, "manifest_length": 128,
 				"bytes": 4096, "components": []string{"transformer"}})
 		})
 	}
-	hubA, hubB := httptest.NewServer(api(&apiA)), httptest.NewServer(api(&apiB))
+	hubA, hubB := httptest.NewServer(api(&apiA, catalog(&catalogA, "proof/alpha"))), httptest.NewServer(api(&apiB, catalog(&catalogB, "proof/beta")))
 	t.Cleanup(hubA.Close)
 	t.Cleanup(hubB.Close)
 	root := t.TempDir()
@@ -749,17 +757,34 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 		return record
 	}
 
+	// The CLI reads the release's card as it submits the run, after accepting it.
+	carried := func(api *sync.Map, path string) bool {
+		for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+			if _, asked := api.Load(path); asked {
+				return true
+			}
+		}
+		return false
+	}
 	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")
-	if _, asked := doorA.asked.Load("/v1/packages/proof/alpha/releases/1.0.0/locked-requirements"); !asked {
-		t.Fatalf("the machine did not read hub a's release: %d %s", code, out)
+	if !carried(&apiA, "/v1/packages/proof/alpha/releases/1.0.0/locked-requirements") {
+		t.Fatalf("the run did not carry hub a's release: %d %s", code, out)
 	}
 	first := launched()
 	if first.PID == 0 {
 		t.Fatalf("the launched Host's record names no process or protocol range: %+v", first)
 	}
 	code, out = runCozy(t, root, "run", "proof/beta/generate", "--tensorhub", "b", "--json")
-	if _, asked := doorB.asked.Load("/v1/packages/proof/beta/releases/1.0.0/locked-requirements"); !asked {
-		t.Fatalf("the machine did not read the release at the run's hub: %d %s", code, out)
+	if !carried(&apiB, "/v1/packages/proof/beta/releases/1.0.0/locked-requirements") {
+		t.Fatalf("the run did not carry the release of its hub: %d %s", code, out)
+	}
+	for _, read := range []*sync.Map{&doorA.asked, &doorB.asked} {
+		read.Range(func(path, _ any) bool {
+			if strings.HasPrefix(path.(string), "/v1/packages/") {
+				t.Fatalf("a machine read %s at a Hub", path)
+			}
+			return true
+		})
 	}
 	for _, other := range []*sync.Map{&apiA, &doorA.asked} {
 		other.Range(func(path, _ any) bool {
@@ -803,12 +828,9 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	if third := launched(); third.PID != second.PID {
 		t.Fatalf("the machine moved for a model of the hub it served (Host %d, then %d)", second.PID, third.PID)
 	}
-	if _, seen := doorB.workers.Load(accessB); !seen {
-		t.Fatalf("hub b's doors were not read as the machine's registration there: %d %s", code, out)
-	}
 	doorB.workers.Range(func(worker, _ any) bool {
 		if worker != accessB {
-			t.Fatalf("hub b's doors were read as %s, not as the machine's registration there", worker)
+			t.Fatalf("hub b's doors were read as %s, not with the run's token", worker)
 		}
 		return true
 	})

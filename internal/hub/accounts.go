@@ -13,7 +13,7 @@ import (
 )
 
 // Account is the one public Tensorhub namespace owned by the authenticated user, and that
-// user's AuthKit id (a run capability's subject).
+// user's AuthKit id (a run capability's subject; absent from a Hub that states none).
 type Account struct {
 	Name   string `json:"name"`
 	UserID string `json:"user_id"`
@@ -32,7 +32,7 @@ func (c *Client) CurrentAccount(ctx context.Context) (Account, *exit.Error) {
 		method: http.MethodGet, path: "/v1/accounts/current", auth: true,
 	}, &out)
 	out.Name = CanonicalName(out.Name)
-	if problem == nil && (!resourceSlug.MatchString(out.Name) || out.UserID == "") {
+	if problem == nil && !resourceSlug.MatchString(out.Name) {
 		problem = exit.Named(exit.Internal, "account.current_invalid",
 			"Tensorhub returned an invalid current account name")
 	}
