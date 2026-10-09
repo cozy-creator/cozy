@@ -8,11 +8,13 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"net"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
@@ -41,19 +43,83 @@ type Client struct {
 // machine's worker id, which every cap names.
 func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Client, error) {
 	c := &Client{worker: worker, signer: signer}
-	conn, err := grpc.NewClient(addr,
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+	conn, err := grpc.NewClient(addr, append(dialing(tlsConfig),
 		grpc.WithPerRPCCredentials(caps{c}),
 		grpc.WithInitialWindowSize(16<<20), grpc.WithInitialConnWindowSize(32<<20),
 		// A ping every 20 s keeps NAT mappings on the path alive through a quiet run, and an
 		// unanswered one ends a dead connection so the run is attached again at once.
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 20 * time.Second, PermitWithoutStream: true}),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))...)
 	if err != nil {
 		return nil, err
 	}
 	c.conn, c.Machine = conn, pb.NewMachineClient(conn)
 	return c, nil
+}
+
+// synWait is how long a connection attempt waits for the machine's SYN-ACK before it also
+// sends one on a new socket: the kernel's first SYN retransmission comes after as long.
+const synWait = time.Second
+
+// dialing is how every connection to a machine is made. A fresh pod's public port can stop
+// answering SYNs for a moment (seen for 2 s about 23 s after readiness, as its provider
+// published the ports), and a socket whose SYN went unanswered then may stay unanswered. So
+// an attempt that hears no SYN-ACK within synWait races a new socket, and another each
+// synWait after, taking whichever the machine answers first. It gives up only as gRPC's
+// connect did, after 20 s with no SYN-ACK on any socket; a refusal ends it at once, and the
+// next attempt follows within a second. An answered connection keeps gRPC's 20 s for TLS
+// and HTTP/2, and an established one its keepalive.
+func dialing(tlsConfig *tls.Config) []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+		grpc.WithContextDialer(raceDial),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff:           backoff.Config{BaseDelay: 200 * time.Millisecond, Multiplier: 1.6, Jitter: 0.2, MaxDelay: time.Second},
+			MinConnectTimeout: 20 * time.Second,
+		}),
+	}
+}
+
+// raceDial connects on the first socket the machine answers; see dialing.
+func raceDial(ctx context.Context, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type dialed struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan dialed)
+	race := func() {
+		go func() {
+			conn, err := dialSocket(ctx, addr)
+			select {
+			case results <- dialed{conn, err}:
+			case <-ctx.Done():
+				if conn != nil {
+					conn.Close()
+				}
+			}
+		}()
+	}
+	race()
+	another := time.NewTicker(synWait)
+	defer another.Stop()
+	for {
+		select {
+		case r := <-results:
+			// A socket ends before ctx only when the machine is reached or something answered
+			// for it (a refusal, an unreachable route): that answer ends the attempt.
+			return r.conn, r.err
+		case <-another.C:
+			race()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+var dialSocket = func(ctx context.Context, addr string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 }
 
 // Close ends the connection.
