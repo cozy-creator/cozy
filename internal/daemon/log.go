@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
 
 // LogBytes bounds the daemon log on disk. A write that would carry the file past it
@@ -12,12 +14,15 @@ import (
 // observed bytes, never on elapsed time.
 const LogBytes = 32 << 20
 
-// Log is the daemon's append-only log writer, opened once per daemon life.
+// Log is the daemon's append-only log writer, opened once per daemon life. Every line
+// starts with its UTC write time, so the log lines up with run events.
 type Log struct {
-	mu   sync.Mutex
-	path string
-	file *os.File
-	size int64
+	mu      sync.Mutex
+	path    string
+	file    *os.File
+	size    int64
+	midLine bool
+	timeNow func() time.Time
 }
 
 // OpenLog appends to the log at path, creating it. It carries on from the size it finds
@@ -47,7 +52,8 @@ func (l *Log) open() error {
 func (l *Log) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.size > 0 && l.size+int64(len(p)) > LogBytes {
+	line := l.stamp(p)
+	if l.size > 0 && l.size+int64(len(line)) > LogBytes {
 		l.file.Close()
 		if err := os.Rename(l.path, l.path+".1"); err != nil && !os.IsNotExist(err) {
 			return 0, fmt.Errorf("cannot rotate the daemon log %s: %w", l.path, err)
@@ -56,9 +62,30 @@ func (l *Log) Write(p []byte) (int, error) {
 			return 0, err
 		}
 	}
-	n, err := l.file.Write(p)
+	n, err := l.file.Write(line)
 	l.size += int64(n)
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// stamp prefixes every line that begins in p with the current UTC time.
+func (l *Log) stamp(p []byte) []byte {
+	at := time.Now().UTC().Format("2006-01-02T15:04:05.000Z ")
+	out := make([]byte, 0, len(p)+len(at))
+	for len(p) > 0 {
+		if !l.midLine {
+			out = append(out, at...)
+		}
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			out, l.midLine = append(out, p...), true
+			break
+		}
+		out, p, l.midLine = append(out, p[:i+1]...), p[i+1:], false
+	}
+	return out
 }
 
 func (l *Log) Close() error {
