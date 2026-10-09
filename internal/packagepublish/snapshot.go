@@ -1,6 +1,7 @@
 package packagepublish
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,7 +13,7 @@ import (
 
 // SnapshotSource copies a bounded project and its local dependencies, relocating uv paths.
 // The destination belongs to one invocation; no source fingerprint is calculated.
-func SnapshotSource(tree, root string) (*Package, *exit.Error) {
+func SnapshotSource(ctx context.Context, tree, root string) (*Package, *exit.Error) {
 	pack, problem := PrepareLocalFrom(tree)
 	if problem != nil {
 		return nil, problem
@@ -81,6 +82,9 @@ func SnapshotSource(tree, root string) (*Package, *exit.Error) {
 				return nil, problem
 			}
 		}
+	}
+	if problem := retainLockedGitWheels(ctx, root, nil, nil); problem != nil {
+		return nil, problem
 	}
 	frozen, problem := PrepareLocalFrom(root)
 	if problem != nil {

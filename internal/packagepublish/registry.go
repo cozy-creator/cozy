@@ -68,10 +68,21 @@ type exactDependency struct {
 // collectRegistryRows exports the locked registry closure of a project whose account index,
 // if any, is already bound to the publishing account.
 func collectRegistryRows(ctx context.Context, project, stage, account string, existing []DependencyWheel, selected hostruntime.PythonInterpreter) ([]RegistryRow, *exit.Error) {
+	raw, problem := exportLockedRegistry(ctx, project, stage, selected, nil)
+	if problem != nil {
+		return nil, problem
+	}
+	return RegistryRowsFromLock(raw, existing, account, selected.Version)
+}
+
+func exportLockedRegistry(ctx context.Context, project, stage string, selected hostruntime.PythonInterpreter, extras []string) ([]byte, *exit.Error) {
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-default-groups", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project,
 		"--python", selected.Executable, "--no-python-downloads"}
+	for _, extra := range extras {
+		args = append(args, "--extra", extra)
+	}
 	command := exec.CommandContext(ctx, "uv", args...)
 	command.Env = config.Frozen().Tool("UV_PYTHON_DOWNLOADS=never")
 	output, err := command.CombinedOutput()
@@ -93,7 +104,7 @@ func collectRegistryRows(ctx context.Context, project, stage, account string, ex
 		return nil, exit.Named(exit.Structural, "registry_dependency_export_invalid",
 			"uv export did not produce a non-empty pylock.toml at or below %d B", maxLockBytes)
 	}
-	return RegistryRowsFromLock(raw, existing, account, selected.Version)
+	return raw, nil
 }
 
 // orgIndexNamespace answers the org namespace when raw is one hub org index —

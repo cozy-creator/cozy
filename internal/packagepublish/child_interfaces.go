@@ -255,6 +255,9 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 		}
 		return fail(exit.Named(exit.Structural, "child.interface_lock_refused", "cannot lock the captured interface dependencies: %s", detail))
 	}
+	if problem := retainLockedGitWheels(ctx, root, &python, extras); problem != nil {
+		return fail(problem)
+	}
 	prepared, problem := PrepareLocalFrom(root)
 	if problem != nil {
 		return fail(problem)
