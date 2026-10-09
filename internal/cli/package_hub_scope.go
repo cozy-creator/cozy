@@ -86,9 +86,9 @@ func installHubPriority(ctx *Context, inst records.PackageInstall) int {
 	switch installHubScope(ctx, inst) {
 	case "selected hub":
 		return 0
-	case "local":
-		return 1
 	case "other hub":
+		return 1
+	case "local":
 		return 2
 	default:
 		return 3

@@ -143,6 +143,11 @@ func TestPackageListPlacesSelectedHubBeforeLocalDiagnostics(t *testing.T) {
 	row.Dir = layout.InstallDir(row.ID)
 	_, problem = store.Activate(row)
 	fatal(t, problem)
+	other := row
+	other.ID, other.Package, other.Hub = "eeeeeeeeeeeeeeee", "fidika/minimax-h3", "http://127.0.0.1:2"
+	other.Dir = layout.InstallDir(other.ID)
+	_, problem = store.Activate(other)
+	fatal(t, problem)
 	store.Close()
 	code, out := runCozy(t, root, "package", "list", "--json")
 	var doc struct {
@@ -154,5 +159,9 @@ func TestPackageListPlacesSelectedHubBeforeLocalDiagnostics(t *testing.T) {
 	}
 	if len(doc.Packages) != 20 || doc.Omitted != 5 || doc.Packages[0].Package != "paul/minimax-h3" || doc.Packages[0].Scope != "selected hub" || doc.Packages[1].Package != "local/diagnostic-00" {
 		t.Fatalf("selected package hidden behind diagnostics: %s", out)
+	}
+	code, out = runCozy(t, root, "package", "list", "--all-hubs", "--json")
+	if code != 0 || json.Unmarshal([]byte(out), &doc) != nil || len(doc.Packages) != 20 || doc.Omitted != 6 || doc.Packages[0].Package != row.Package || doc.Packages[1].Package != other.Package || doc.Packages[2].Package != "local/diagnostic-00" {
+		t.Fatalf("explicit all-Hub inventory hid published packages: %d %s", code, out)
 	}
 }
