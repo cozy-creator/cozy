@@ -59,7 +59,8 @@ func TestAMachineStoppedMidJobRunsAJobOnItsNextBoot(t *testing.T) {
 	}
 }
 
-// restartProject is local/restart-proof: a job that runs until canceled, and a quick one.
+// restartProject is local/restart-proof: a job that runs until canceled, one that stops when
+// paused or canceled, and a quick one.
 func restartProject(t *testing.T) string {
 	t.Helper()
 	project := filepath.Join(t.TempDir(), "restart-proof")
@@ -85,7 +86,7 @@ only-include=["restart_proof.py"]
 	must(t, os.WriteFile(filepath.Join(project, "restart_proof.py"), []byte(`import time
 
 import msgspec
-from cozy_runtime.author import App
+from cozy_runtime.author import App, Context
 
 
 class SlowRequest(msgspec.Struct, forbid_unknown_fields=True):
@@ -106,6 +107,14 @@ app = App()
 @app.job
 def slow(payload: SlowRequest) -> AddResult:
     time.sleep(payload.seconds)
+    return AddResult(value=payload.seconds)
+
+
+@app.job
+def paced(ctx: Context, payload: SlowRequest) -> AddResult:
+    for _ in range(payload.seconds * 20):
+        time.sleep(0.05)
+        ctx.raise_if_cancelled()
     return AddResult(value=payload.seconds)
 
 
