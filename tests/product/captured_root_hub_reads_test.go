@@ -13,9 +13,9 @@ import (
 )
 
 // A captured root naming its Model's repository without a lane has the CLI read that Model once
-// (th-241: the machine reads no model at a Hub): the warm run reads nothing at any Hub, nor
-// does a new machine lifetime. The model's owner changing it from this computer moves the
-// catalog revision, so the next run reads it again, even when the machine was stopped then.
+// and the machine resolve its release lane by name once (th-245): the warm run reads nothing at
+// any Hub, nor does a new machine lifetime. The model's owner changing it from this computer
+// moves the catalog revision, so the next run reads it again, even when the machine was stopped then.
 func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine runs the call")
