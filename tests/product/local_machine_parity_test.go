@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -49,6 +50,10 @@ type machineHub struct {
 	grants                                        map[string]string // more of the grant, as a Hub adds a port for an image that serves it
 	authorityWorker, authorityToken, authorityKey string            // current provider attempt only
 	polledBindings                                int64             // the bindings revision the last authority poll carried
+	// lease is the authority lease the Hub names (30 s when 0); unreachable drops its polls,
+	// as a Hub the pod cannot reach; leased counts the polls answered.
+	lease, leased int
+	unreachable   bool
 }
 
 func newMachineHub(t *testing.T) *machineHub {
@@ -58,8 +63,11 @@ func newMachineHub(t *testing.T) *machineHub {
 		switch r.URL.Path {
 		case "/v1/worker/rental/authorized-keys":
 			h.mu.Lock()
-			worker, token, key := h.authorityWorker, h.authorityToken, h.authorityKey
+			worker, token, key, lease, unreachable := h.authorityWorker, h.authorityToken, h.authorityKey, cmp.Or(h.lease, 30), h.unreachable
 			h.mu.Unlock()
+			if unreachable {
+				panic(http.ErrAbortHandler) // the connection drops unanswered
+			}
 			if r.Method != http.MethodGet || worker == "" || token == "" || key == "" ||
 				r.Header.Get("X-Cozy-Worker-ID") != worker || r.Header.Get("X-Cozy-Worker-Token") != token {
 				http.Error(w, "worker authority refused", http.StatusForbidden)
@@ -70,8 +78,9 @@ func newMachineHub(t *testing.T) *machineHub {
 			h.fakeRentalHub.mu.Unlock()
 			h.mu.Lock()
 			h.polledBindings = bindings
+			h.leased++
 			h.mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"worker_id": worker, "authorized_keys": []string{key}, "lease_seconds": 30, "bindings_revision": bindings})
+			_ = json.NewEncoder(w).Encode(map[string]any{"worker_id": worker, "authorized_keys": []string{key}, "lease_seconds": lease, "bindings_revision": bindings})
 		case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -312,8 +321,9 @@ func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.St
 	return parityMachinesOn(t, machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel})
 }
 
-// parityMachinesOn is parityMachines with both machines running source's Host and Runtime.
-func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string, home.Layout, *records.Store) {
+// parityMachinesOn is parityMachines with both machines running source's Host and Runtime;
+// front, when given, names the address this computer reaches the rental's machine at.
+func parityMachinesOn(t *testing.T, source machines.Source, front ...func(string) string) (*machineHub, string, home.Layout, *records.Store) {
 	t.Helper()
 	if source.Host == "" {
 		t.Skip("requires -machine-host: the standalone agent both machines run")
@@ -352,6 +362,9 @@ func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string
 	t.Cleanup(func() { store.Close() })
 	launch, identity, token, provider := providerHost(t, h, layout, source, uv)
 	h.provider = provider
+	for _, through := range front {
+		launch.Addr = through(launch.Addr)
+	}
 	// The rental's paid hardware is what its worker's ClaimAck reads back: the inventory the
 	// Runtime schedules on, the same four virtual devices its workspace reports.
 	const model, count = "Virtual Accelerator", 4

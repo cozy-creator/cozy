@@ -49,7 +49,6 @@ var errNoDescribe = exit.Named(exit.Unavailable, "machine.describe_unsupported",
 func (m *machineRuns) loopV1(request records.Request) {
 	defer m.enforceDeadlineV1(request)()
 	lastError, delay, followed := "", time.Second, false
-	authorityDelay := time.Second
 	for m.ctx.Err() == nil {
 		current, problem := m.store.RequestRow(request.ID)
 		if problem != nil || current == nil {
@@ -90,11 +89,18 @@ func (m *machineRuns) loopV1(request records.Request) {
 		if done {
 			return
 		}
-		// stepV1 may have crossed the durable dispatch boundary before losing its reply.
-		if marked, readProblem := m.store.RunV1Marked(request.ID, records.RunV1Sent); readProblem != nil {
+		// stepV1 may have crossed the durable dispatch boundary, or seen acceptance, before
+		// losing its stream.
+		var readProblem *exit.Error
+		if sent, readProblem = m.store.RunV1Marked(request.ID, records.RunV1Sent); readProblem != nil {
 			return
-		} else {
-			sent = marked
+		}
+		if accepted, readProblem = m.store.RunV1(request.ID); readProblem != nil {
+			return
+		}
+		moved := progressed(m.store, link)
+		if moved {
+			lastError = "" // a new loss is news again
 		}
 		if problem != nil && problem.Message != lastError && m.ctx.Err() == nil {
 			fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, problem.Message)
@@ -114,7 +120,7 @@ func (m *machineRuns) loopV1(request records.Request) {
 					problem = exit.Named(problem.Code, problem.ErrName(), "%s; %s", problem.Message, next)
 				}
 			}
-			if again, _ := m.store.RunV1(request.ID); !again && (!sent || upgrade) && !link.CancelRequested && permanentRefusal(problem) {
+			if !accepted && (!sent || upgrade) && !link.CancelRequested && permanentRefusal(problem) {
 				failed, failure := m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
 				if failed {
 					return
@@ -132,32 +138,32 @@ func (m *machineRuns) loopV1(request records.Request) {
 				_ = m.store.AppendEvent(request.ID, "request.parked", 0, parked)
 			}
 		}
-		// The stream's authority can expire before the machine refreshes its owner lease.
-		// Recover only observation of a durably accepted run, after a fresh authenticated
-		// Status succeeds. A refusal never authorizes another submission or control.
-		if problem != nil && problem.ErrName() == "machine_execution.observation_unauthorized" {
-			if latest, _ := m.store.MachineExecution(request.ID); latest != nil && latest.RemoteCursor > link.RemoteCursor {
-				authorityDelay = time.Second // the prior stream made actual progress
+		// A run its machine may hold is attached again while that machine lives, however long
+		// it cannot be reached: this computer's machine, or a rental its Hub has not ended. The
+		// connection's keepalive measures a silent machine; this paces the attempts after. Any
+		// other is asked again on new evidence (a reader, its rental attaching, a restart): a
+		// timer would dial a gone pod forever.
+		if problem != nil && (accepted || sent) {
+			if accepted {
+				_ = m.store.LoseObservation(request.ID, problem.Message)
 			}
-			if held, readProblem := m.store.RunV1(request.ID); readProblem == nil && held && m.renewObservationV1(*current, link.MachineID, &authorityDelay) {
-				lastError, delay = "", time.Second
-				continue
+			if !machines.IsLocal(link.MachineID) {
+				rental, _ := m.store.RentalRow(link.MachineID)
+				if rental != nil && records.RentalTerminalState(rental.State) {
+					fmt.Fprintf(m.context.Out, "machine execution %s: rental %s is %s; observation stopped\n", request.ID, link.MachineID, rental.State)
+				}
+				if rental == nil || records.RentalTerminalState(rental.State) {
+					return
+				}
 			}
-			return
-		}
-		// A remote machine holding this run that cannot be reached is asked again only on new
-		// evidence: a reader, the rental attaching again, or the daemon's restart. A timer
-		// would dial a gone pod forever.
-		if problem != nil && (accepted || sent) && !machines.IsLocal(link.MachineID) {
-			return
 		}
 		switch {
 		case problem == nil:
 			delay = 0 // the stream ended without an outcome: attach again at once
-		case problem.Message == lastError:
-			delay = min(2*max(delay, time.Second), 5*time.Second)
-		default:
+		case moved:
 			delay = time.Second
+		default:
+			delay = min(2*max(delay, time.Second), 10*time.Second)
 		}
 		select {
 		case <-m.ctx.Done():
@@ -167,70 +173,10 @@ func (m *machineRuns) loopV1(request records.Request) {
 	}
 }
 
-// renewObservationV1 asks whether the same owner is authorized again. Status is read-only;
-// a permanently revoked key remains refused, with capped backoff rather than a busy loop.
-// Rental resolution uses the fleet's refreshed identity and refuses ended rentals. A
-// temporary resolution or transport failure cannot finish this authority recovery either.
-func (m *machineRuns) renewObservationV1(request records.Request, machineID string, delay *time.Duration) bool {
-	lastFailure := ""
-	note := func(reason string) {
-		if reason != lastFailure && m.ctx.Err() == nil {
-			fmt.Fprintf(m.context.Out, "machine execution %s: observation recovery: %s\n", request.ID, reason)
-			lastFailure = reason
-		}
-	}
-	for m.ctx.Err() == nil {
-		select {
-		case <-m.ctx.Done():
-			return false
-		case <-time.After(*delay):
-		}
-		*delay = min(*delay+*delay, 30*time.Second)
-		link, problem := m.store.MachineExecution(request.ID)
-		if problem != nil || link == nil || link.Collected || link.Abandoned || link.Lost || link.MachineID != machineID {
-			return false
-		}
-		// Rental resolution reports not-ready for terminal states too. Do not keep probing
-		// a machine the owner has given back merely because that error is Unavailable.
-		rental, problem := m.store.RentalRow(machineID)
-		if problem != nil {
-			note(problem.Message)
-			return false
-		}
-		if rental != nil && records.RentalTerminalState(rental.State) {
-			note("rental is terminal; observation recovery stopped")
-			return false
-		}
-		ctx, cancel := context.WithTimeout(machines.AttachOnly(m.ctx), 10*time.Second)
-		machine, problem := m.machines.DialV1(ctx, machineID, m.runHolder(request, "observing"))
-		if problem != nil {
-			cancel()
-			note(problem.Message)
-			if problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
-				continue
-			}
-			return false
-		}
-		frame, err := machine.Status(ctx)
-		machine.Close()
-		cancel()
-		if err == nil {
-			if frame.GetWorkerId() != machine.WorkerID {
-				note("Status answered with a different machine identity")
-			}
-			return frame.GetWorkerId() == machine.WorkerID
-		}
-		note(status.Convert(err).Message())
-		switch status.Code(err) {
-		case codes.PermissionDenied, codes.Unauthenticated, codes.Unavailable, codes.DeadlineExceeded,
-			codes.ResourceExhausted, codes.Aborted, codes.Canceled:
-			// Only a successful fresh Status authorizes nil-spec observation again.
-			// Parent cancellation exits the loop; it never controls the remote run.
-		default:
-			return false
-		}
-	}
-	return false
+// progressed answers whether the run's log moved past link's cursor since link was read.
+func progressed(store *records.Store, link *records.MachineExecution) bool {
+	latest, _ := store.MachineExecution(link.RequestID)
+	return latest != nil && latest.RemoteCursor > link.RemoteCursor
 }
 
 // permanentRefusal is a refusal resubmitting the same spec cannot change.
@@ -397,6 +343,9 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		if state := event.GetState(); state != nil && !opened {
 			head, opened = state.Sequence, true // the stream's first frame names the log's head
 			terminal = records.Settled(state.State)
+			if restored, _ := m.store.RestoreObservation(request.ID); restored {
+				fmt.Fprintf(m.context.Out, "machine execution %s: observed on %s again\n", request.ID, link.MachineID)
+			}
 		}
 		if state := event.GetState(); state != nil && !accepted {
 			if problem := m.store.AcceptRunV1(request.ID, link.MachineID, state); problem != nil {
@@ -444,22 +393,20 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 }
 
 // An explicit first-submission rejection can end a request without acceptance. Other
-// failures, including a retry after a lost reply, leave the possible remote run unresolved.
+// failures, including a retry after a lost reply or a key the machine does not admit now,
+// leave the possible remote run unresolved.
 func (m *machineRuns) runRefusalV1(id string, err error, first bool) (bool, *exit.Error) {
 	problem := machines.Transport(err)
 	if first {
 		switch status.Code(err) {
 		// UNIMPLEMENTED is a machine older than this cozy: the run loop updates it first.
-		case codes.InvalidArgument, codes.FailedPrecondition, codes.AlreadyExists, codes.PermissionDenied, codes.Unauthenticated:
+		case codes.InvalidArgument, codes.FailedPrecondition, codes.AlreadyExists, codes.PermissionDenied:
 			failed, recordProblem := m.store.FailQueuedRequest(id, records.QueuedFailure(problem))
 			if recordProblem != nil {
 				return false, recordProblem
 			}
 			return failed, problem
 		}
-	}
-	if !first && (status.Code(err) == codes.PermissionDenied || status.Code(err) == codes.Unauthenticated) {
-		problem = exit.Named(exit.Credential, "machine_execution.observation_unauthorized", "machine execution observation is not authorized: %s", status.Convert(err).Message())
 	}
 	return false, problem
 }

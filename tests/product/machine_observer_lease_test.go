@@ -35,14 +35,13 @@ import (
 // not inference. Its one accepted run survives an owner-lease lapse exactly as a rental's does.
 type observerLeasePeer struct {
 	v1.UnimplementedMachineServer
-	expiring, expireRelease        chan struct{}
-	public                         ed25519.PublicKey
-	denyStatus, denyRun, denyFirst bool
-	transientStatus                codes.Code
-	mu                             sync.Mutex
-	id                             string
-	statusTimes, runTimes          []time.Time
-	specs, attaches, controls      atomic.Int32
+	expiring, expireRelease   chan struct{}
+	public                    ed25519.PublicKey
+	denyRun, denyFirst        bool
+	mu                        sync.Mutex
+	id                        string
+	statusTimes, runTimes     []time.Time
+	specs, attaches, controls atomic.Int32
 }
 
 func (p *observerLeasePeer) authorize(ctx context.Context) error {
@@ -64,15 +63,7 @@ func (p *observerLeasePeer) Status(_ *v1.StatusRequest, stream grpc.ServerStream
 	}
 	p.mu.Lock()
 	p.statusTimes = append(p.statusTimes, time.Now())
-	denied := p.denyStatus || (!p.denyRun && len(p.statusTimes) == 1)
-	transient := p.transientStatus != codes.OK && len(p.statusTimes) == 1
 	p.mu.Unlock()
-	if transient {
-		return status.Error(p.transientStatus, "temporary failure reading renewed owner authority")
-	}
-	if denied {
-		return status.Error(codes.PermissionDenied, "owner lease unavailable")
-	}
 	return stream.Send(&v1.StatusFrame{WorkerId: "lease-worker", BootId: "lease-boot", Phase: "ready"})
 }
 
@@ -203,9 +194,11 @@ func observerEventually(t *testing.T, until func() bool) {
 	}
 }
 
-func TestAcceptedRunObserverRecoversItsLeaseWithoutResubmission(t *testing.T) {
+// A stream its rental's machine ends for lack of authority is attached again, never
+// resubmitted, and without a Status probe first: the attach is itself read-only.
+func TestAcceptedRunObserverAttachesAgainWithoutResubmission(t *testing.T) {
 	peer := new(observerLeasePeer)
-	root, store, request, _ := observerLeaseFixture(t, peer)
+	root, store, request, _ := observerLeaseFixture(t, peer, true)
 	observerEventually(t, func() bool { row, _ := store.MachineExecution(request.ID); return row != nil && row.Collected })
 	row, problem := store.RequestRow(request.ID)
 	if problem != nil || row.State != "succeeded" {
@@ -219,33 +212,8 @@ func TestAcceptedRunObserverRecoversItsLeaseWithoutResubmission(t *testing.T) {
 	}
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
-	if len(peer.statusTimes) != 2 || peer.statusTimes[1].Sub(peer.statusTimes[0]) < 1800*time.Millisecond {
-		t.Fatalf("missing denial backoff: %v", peer.statusTimes)
-	}
-}
-
-func TestAcceptedRunObserverRetriesTransientAuthorityProbeWithoutResubmission(t *testing.T) {
-	for _, code := range []codes.Code{codes.Unavailable, codes.DeadlineExceeded} {
-		t.Run(code.String(), func(t *testing.T) {
-			peer := &observerLeasePeer{transientStatus: code}
-			_, store, request, _ := observerLeaseFixture(t, peer)
-			observerEventually(t, func() bool {
-				row, _ := store.MachineExecution(request.ID)
-				return row != nil && row.Collected
-			})
-			row, problem := store.RequestRow(request.ID)
-			if problem != nil || row.State != "succeeded" {
-				t.Fatalf("terminal collection: %+v %v", row, problem)
-			}
-			if peer.specs.Load() != 1 || peer.attaches.Load() != 1 || peer.controls.Load() != 0 {
-				t.Fatalf("specs=%d attaches=%d controls=%d", peer.specs.Load(), peer.attaches.Load(), peer.controls.Load())
-			}
-			peer.mu.Lock()
-			defer peer.mu.Unlock()
-			if len(peer.statusTimes) != 2 || peer.statusTimes[1].Sub(peer.statusTimes[0]) < 1800*time.Millisecond {
-				t.Fatalf("transient authority probe did not back off: %v", peer.statusTimes)
-			}
-		})
+	if len(peer.statusTimes) != 0 || len(peer.runTimes) != 2 {
+		t.Fatalf("status probes %v, streams %v", peer.statusTimes, peer.runTimes)
 	}
 }
 
@@ -267,7 +235,7 @@ func TestAcceptedRunObserverRetriesTemporaryRentalResolutionRefusal(t *testing.T
 	close(peer.expireRelease)
 	observerEventually(t, func() bool {
 		log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
-		return strings.Contains(string(log), "observation recovery: this rental is updating its software")
+		return strings.Contains(string(log), "this rental is updating its software")
 	})
 	update.State = "succeeded"
 	fatal(t, store.SaveRuntimeUpdate(*update))
@@ -300,7 +268,7 @@ func TestEndingRentalStopsAuthorityRecoveryWithoutControllingWork(t *testing.T) 
 	close(peer.expireRelease)
 	observerEventually(t, func() bool {
 		log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
-		return strings.Contains(string(log), "rental is terminal; observation recovery stopped")
+		return strings.Contains(string(log), "observation stopped")
 	})
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
@@ -309,29 +277,29 @@ func TestEndingRentalStopsAuthorityRecoveryWithoutControllingWork(t *testing.T) 
 	}
 }
 
+// A key its machine keeps refusing is asked again with growing pauses, never in a busy loop,
+// and a daemon that detaches meanwhile leaves the accepted work alone.
 func TestRevokedRunObserverBacksOffAndDetachDoesNotControlWork(t *testing.T) {
-	for _, denyRun := range []bool{false, true} {
-		t.Run(map[bool]string{false: "Status-denied", true: "Status-allowed-Run-denied"}[denyRun], func(t *testing.T) {
-			peer := &observerLeasePeer{denyStatus: !denyRun, denyRun: denyRun}
-			_, store, request, owner := observerLeaseFixture(t, peer)
-			observerEventually(t, func() bool { peer.mu.Lock(); defer peer.mu.Unlock(); return len(peer.statusTimes) >= 2 })
-			time.Sleep(300 * time.Millisecond)
-			must(t, owner.cmd.Process.Signal(os.Interrupt))
-			select {
-			case <-owner.exited:
-			case <-time.After(5 * time.Second):
-				t.Fatal("observer daemon did not detach")
-			}
-			peer.mu.Lock()
-			defer peer.mu.Unlock()
-			if len(peer.statusTimes) != 2 || peer.statusTimes[1].Sub(peer.statusTimes[0]) < 1800*time.Millisecond {
-				t.Fatalf("refusal busy loop: %v", peer.statusTimes)
-			}
-			row, _ := store.RequestRow(request.ID)
-			if records.Settled(row.State) || peer.specs.Load() != 1 || peer.controls.Load() != 0 {
-				t.Fatalf("revocation/detach changed accepted work: state=%s specs=%d controls=%d", row.State, peer.specs.Load(), peer.controls.Load())
-			}
-		})
+	peer := &observerLeasePeer{denyRun: true}
+	_, store, request, owner := observerLeaseFixture(t, peer, true)
+	observerEventually(t, func() bool { peer.mu.Lock(); defer peer.mu.Unlock(); return len(peer.runTimes) >= 3 })
+	must(t, owner.cmd.Process.Signal(os.Interrupt))
+	select {
+	case <-owner.exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("observer daemon did not detach")
+	}
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if gap := peer.runTimes[2].Sub(peer.runTimes[1]); gap < 1800*time.Millisecond {
+		t.Fatalf("refusal busy loop: %v", peer.runTimes)
+	}
+	row, _ := store.RequestRow(request.ID)
+	if records.Settled(row.State) || peer.specs.Load() != 1 || peer.controls.Load() != 0 || len(peer.statusTimes) != 0 {
+		t.Fatalf("revocation/detach changed accepted work: state=%s specs=%d controls=%d", row.State, peer.specs.Load(), peer.controls.Load())
+	}
+	if loss, _ := store.ObservationLost(request.ID); loss == nil {
+		t.Fatal("the refused run does not say its observation is lost")
 	}
 }
 

@@ -152,9 +152,13 @@ func Transport(err error) *exit.Error {
 	if problem := machinev1.Skew(err); problem != nil {
 		return problem
 	}
-	code := status.Code(err)
-	if code == codes.Unavailable || code == codes.DeadlineExceeded || code == codes.Canceled || code == codes.ResourceExhausted || code == codes.Aborted {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled, codes.ResourceExhausted, codes.Aborted:
 		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "machine execution observation is unavailable: %s", status.Convert(err).Message())
+	case codes.Unauthenticated:
+		// Not a verdict on the work: a machine older than TensorD 0.3.2 lets this computer's
+		// key lapse while its Hub is out of reach, and admits it again once the Hub answers.
+		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "the machine does not admit this computer's key now: %s", status.Convert(err).Message())
 	}
 	return exit.Named(exit.Conflict, "machine_execution.refused", "Runtime refused machine execution: %s", status.Convert(err).Message())
 }
