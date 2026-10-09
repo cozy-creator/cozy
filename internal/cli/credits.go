@@ -23,23 +23,28 @@ const creditHistoryLimit = 50
 
 func handleCredits(ctx *Context) *exit.Error {
 	c := client(ctx)
+	// A Hub that cannot say now leaves the balance shown and no warning.
 	hctx, cancel := hub.Context()
+	credit, creditProblem := c.Credit(hctx)
+	cancel()
+	if creditProblem == nil {
+		rememberCredit(ctx, credit)
+		if credit == nil {
+			record := compactRecord([]output.Field{{K: "billing", V: "unmetered"}, {K: "hub", V: c.Base()}}, "billing", "hub")
+			record.Notes = []string{"This Hub does not meter your account: rentals hold no credit and are never stopped for balance."}
+			return emit(ctx, record)
+		}
+	}
+	hctx, cancel = hub.Context()
 	balance, problem := c.Balance(hctx)
 	cancel()
 	if problem != nil {
 		return problem
 	}
 	record := balanceRecord(balance)
-	// A Hub that cannot say now leaves the balance shown and no warning.
-	hctx, cancel = hub.Context()
-	credit, creditProblem := c.Credit(hctx)
-	cancel()
-	if creditProblem == nil {
-		rememberCredit(ctx, credit)
-		if credit.Low() {
-			record.Notes = append(record.Notes, lowCreditMessage(credit))
-			record.Next = []string{"cozy credits buy <usd>"}
-		}
+	if credit.Low() {
+		record.Notes = append(record.Notes, lowCreditMessage(credit))
+		record.Next = []string{"cozy credits buy <usd>"}
 	}
 	return emit(ctx, record)
 }
