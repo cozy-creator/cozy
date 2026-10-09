@@ -1058,12 +1058,12 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"position", "total", "queued", "execution", "attempt_wall", "attempts", "created", "reason", "hub"},
 		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
-			"remaining_ms", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining", "retry_available"},
+			"stage_remaining_ms", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining", "retry_available"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "rental_boot", "wait_reason", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
-			"position", "total", "progress_unit", "progress_rate", "remaining_ms", "queued_ms", "execution_ms", "execution_known", "attempt_wall_ms", "attempts",
+			"position", "total", "progress_unit", "progress_rate", "stage_remaining_ms", "queued_ms", "execution_ms", "execution_known", "attempt_wall_ms", "attempts",
 			"created_at", "error_type", "error_code", "error", "triage", "retaining", "retry_available", "hub"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
@@ -1203,8 +1203,8 @@ func runListRows(rows []api.Lifecycle) output.List {
 			if life.ProgressRate != nil {
 				typed["progress_rate"] = *life.ProgressRate
 			}
-			if life.RemainingMS != nil {
-				typed["remaining_ms"] = *life.RemainingMS
+			if life.StageRemainingMS != nil {
+				typed["stage_remaining_ms"] = *life.StageRemainingMS
 			}
 		}
 		if life.OverallFraction != nil && (life.Status == "in_progress" || life.Status == "completed" || life.Status == "failed" || life.Status == "canceled") {
@@ -1818,17 +1818,11 @@ type RunProgress struct {
 	placementLine   string
 	closed          bool
 	began           time.Time
-	stepStage       string
-	stepSeconds     float64
-	stepSamples     int
-	stepPosition    float64
+	progressSample  orchestrator.ProgressSnapshot
 	progressAttempt uint64
 	view            liveView
 	overallSeen     bool
 	overallFraction float64
-	overallDelta    float64
-	overallSeconds  float64
-	overallScoped   bool
 
 	// The sparse lane's memory: which tenth of which stage was last appended, and when.
 	sparseStage   string
@@ -1963,9 +1957,8 @@ func (p *RunProgress) On(e localapi.Event) bool {
 			p.view.retireAll(eventTime(e), true)
 		}
 		p.progressAttempt = e.Attempt
-		p.stepStage, p.stepSeconds, p.stepSamples = "", 0, 0
-		p.overallSeen, p.overallFraction, p.overallDelta, p.overallSeconds = false, 0, 0, 0
-		p.overallScoped = false
+		p.progressSample = orchestrator.ProgressSnapshot{}
+		p.overallSeen, p.overallFraction = false, 0
 	}
 	// A redirected human command has no status line to rewrite: it gets the sparse
 	// append lane. --full deliberately restores the complete diagnostic stream.
@@ -2088,13 +2081,12 @@ type stepFacts struct {
 	bytes            bool
 	rate             float64
 	hasRate          bool
-	perStep          float64
-	overallRemaining time.Duration
-	hasOverallETA    bool
+	stageEstimate    orchestrator.StageEstimate
+	hasStageETA      bool
 	scoped           bool
 }
 
-// observe folds one progress payload into the per-stage step-time accumulator and
+// observe reads one progress payload and its measured current-stage rate, then
 // returns the frame's facts; ok is false when the frame carries no usable fraction.
 func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	name, _ := fields["stage"].(string)
@@ -2103,25 +2095,16 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	overallFraction, overallOK := number(fields["overall_fraction"])
 	position, positionOK := number(fields["position"])
 	total, totalOK := number(fields["total"])
-	stepMS, stepOK := number(fields["step_ms"])
-	previousPosition := p.stepPosition
-	if name != "" && name != p.stepStage {
-		p.stepStage, p.stepSeconds, p.stepSamples, p.stepPosition = name, 0, 0, -1
-		previousPosition = -1
-	}
-	if stepOK && stepMS >= 0 {
-		if stepMS > 0 && (!positionOK || position > p.stepPosition) {
-			p.stepSeconds += stepMS / 1000
-			p.stepSamples++
-			p.stepPosition = position
-		}
-	}
 	label := stageLabel(name)
 	if label == "" {
 		label = "running"
 	}
 	facts := stepFacts{label: label, scoped: strings.Contains(name, " / ")}
-	p.overallScoped = p.overallScoped || facts.scoped
+	sample, sampled := orchestrator.DecodeProgressSnapshot(fields)
+	if sampled {
+		facts.stageEstimate, facts.hasStageETA = sample.EstimateStage(p.progressSample)
+	}
+	p.progressSample = sample
 	if positionOK != totalOK || positionOK &&
 		(position < 0 || total <= 0 || position > total || math.Trunc(position) != position || math.Trunc(total) != total) {
 		return facts, false
@@ -2144,31 +2127,10 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 		if p.overallSeen && overallFraction < p.overallFraction {
 			return facts, false
 		}
-		if p.overallSeen && overallFraction > p.overallFraction && stepOK && stepMS > 0 {
-			elapsed := stepMS / 1000
-			if positionOK {
-				// A coalesced frame carries the last step's interval, not the
-				// elapsed time for every step since the previous coordinate.
-				advanced := position - math.Max(0, previousPosition)
-				elapsed *= math.Max(0, advanced)
-			}
-			p.overallDelta += overallFraction - p.overallFraction
-			p.overallSeconds += elapsed
-		}
 		p.overallSeen, p.overallFraction = true, overallFraction
 	}
 	if p.overallSeen {
 		facts.overallFraction, facts.hasOverall = p.overallFraction, true
-		// A child range is work allocation, not a prediction that later children
-		// take the same time. Keep its measured step ETA scoped to that child.
-		if !p.overallScoped && p.overallDelta > 0 && p.overallSeconds > 0 {
-			facts.overallRemaining = time.Duration(
-				(1 - p.overallFraction) * p.overallSeconds / p.overallDelta * float64(time.Second))
-			facts.hasOverallETA = true
-		}
-	}
-	if p.stepSamples > 0 {
-		facts.perStep = p.stepSeconds / float64(p.stepSamples)
 	}
 	return facts, facts.hasStageFraction || facts.hasOverall
 }

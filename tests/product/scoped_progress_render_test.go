@@ -22,13 +22,13 @@ func TestScopedProgressKeepsChildTimingSeparateFromOverallWork(t *testing.T) {
 		p.On(liveEvent("progress", map[string]any{
 			"stage": "Shot 2 of 7 / denoise", "position": position, "total": 8,
 			"stage_fraction": float64(position) / 8, "overall_fraction": .1 + float64(position)/30,
-			"step_ms": 1000,
+			"step_ms": 1000, "sample_unix_ms": 1000 * position,
 		}))
 	}
 	child := liveFrame(p, time.Now())
 	p.On(liveEvent("progress", map[string]any{"stage": "Assembling video", "overall_fraction": .95}))
 	got := child + "\n" + liveFrame(p, time.Now())
-	for _, want := range []string{"Shot 2 of 7 · Generating video", "step 3/8", "1.00s/step avg", " 20%", " 95%"} {
+	for _, want := range []string{"Shot 2 of 7 · Generating video", "3/8", " 20%", " 95%"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("scoped progress lacks %q: %q", want, got)
 		}
@@ -88,7 +88,7 @@ func TestRunWatchRendersScopedChildProgress(t *testing.T) {
 		t.Fatalf("CLI watch failed [%d]: %s\n%s", code, stdout, stderr)
 	}
 	for _, want := range []string{"Preparing model files", "downloading", "Waiting for a progress update",
-		"Checking model compatibility", "Checking model inputs", "Shot 2 of 7 · Generating video · step 3/8", "20% overall"} {
+		"Checking model compatibility", "Checking model inputs", "Shot 2 of 7 · Generating video · 3/8", "20% overall"} {
 		if !strings.Contains(stderr, want) {
 			t.Fatalf("CLI progress lacks %q: %s", want, stderr)
 		}

@@ -58,18 +58,19 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 			Payload: map[string]any{"value": map[string]any{
 				"stage": "tile_steps", "stage_fraction": stageFraction,
 				"overall_fraction": overallFraction, "position": float64(position),
-				"total": float64(100), "step_ms": float64(20),
+				"total": float64(100), "step_ms": float64(20), "sample_unix_ms": float64(position * 20),
 			}}}
 	}
 	p.On(frame(0.50, 0.10, 50))
 	if got := liveFrame(p, time.Now()); !strings.Contains(got, "▸ tile_steps") ||
-		!regexp.MustCompile(`█+░+  50%  step 50/100`).MatchString(got) ||
+		!regexp.MustCompile(`█+░+  50%  50/100`).MatchString(got) ||
 		!regexp.MustCompile(`overall █+░+  10%$`).MatchString(got) {
 		t.Fatalf("first progress sample conflated stage and overall facts: %q", got)
 	}
 	p.On(frame(0.60, 0.20, 60))
-	if got := liveFrame(p, time.Now()); !regexp.MustCompile(`overall █+░+  20% · ETA ~`).MatchString(got) {
-		t.Fatalf("forward overall progress did not produce a whole-job ETA: %q", got)
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "ETA ~0.8s") ||
+		!regexp.MustCompile(`overall █+░+  20%$`).MatchString(got) {
+		t.Fatalf("measured timing did not stay on the current stage: %q", got)
 	}
 	p.Done()
 
@@ -77,12 +78,12 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 	// terminal control bytes or a separate estimate from the human formatter.
 	p, buf = progressSink(output.Mode{Human: true}, false)
 	p.On(frame(0.50, 0.10, 50))
-	if got := buf.String(); !strings.Contains(got, "tile_steps 50/100 · 50% stage · 0.02s/step avg · ETA ~1s · 10% overall") ||
+	if got := buf.String(); !strings.Contains(got, "tile_steps 50/100 · 50% stage · 10% overall") ||
 		strings.ContainsAny(got, "\r\033") {
-		t.Fatalf("redirected progress dropped measured timing: %q", got)
+		t.Fatalf("redirected progress did not retain the first untimed count: %q", got)
 	}
 	p.On(frame(0.60, 0.20, 60))
-	if got := buf.String(); !strings.Contains(got, "tile_steps 60/100 · 60% stage · 0.02s/step avg · ETA ~0.8s · 20% overall") {
+	if got := buf.String(); !strings.Contains(got, "tile_steps 60/100 · 60% stage · ETA ~0.8s · 20% overall") {
 		t.Fatalf("redirected progress did not advance its stage ETA: %q", got)
 	}
 	p.Done()
@@ -99,7 +100,7 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 	p.Done()
 }
 
-func TestProgressOverallETAAccountsForCoalescedSteps(t *testing.T) {
+func TestProgressStageETAAccountsForCoalescedSamples(t *testing.T) {
 	p, _ := progressSink(output.Mode{Human: true, Live: true}, false)
 	t.Cleanup(p.Done)
 	for _, position := range []float64{3, 6} {
@@ -107,11 +108,12 @@ func TestProgressOverallETAAccountsForCoalescedSteps(t *testing.T) {
 			Payload: map[string]any{"value": map[string]any{
 				"stage": "denoise", "position": position, "total": float64(30),
 				"stage_fraction": position / 30, "overall_fraction": position / 30,
-				"step_ms": float64(42000),
+				"step_ms": float64(42000), "sample_unix_ms": position * 42000,
 			}}})
 	}
-	if got := liveFrame(p, time.Now()); !strings.Contains(got, "20% · ETA ~16m48s") {
-		t.Fatalf("whole-job ETA charged one interval to three completed steps: %q", got)
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "ETA ~16m48s") ||
+		!regexp.MustCompile(`overall █+░+  20%$`).MatchString(got) {
+		t.Fatalf("stage ETA did not use the elapsed source interval for three counted units: %q", got)
 	}
 }
 

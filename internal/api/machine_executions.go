@@ -305,9 +305,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	}
 	if view.Accepted && state.Status == "in_progress" {
 		// No live fanout carries Runtime-owned progress; the imported sample does.
-		if value, problem := s.store.LatestMachineProgress(row.ID, row.Ordinal); problem == nil && value != nil {
-			state.Progress = value
-			state.Stage, _ = value["stage"].(string)
+		if samples, problem := s.store.MachineProgressSamples(row.ID, row.Ordinal); problem == nil && len(samples) > 0 {
+			state.Progress = samples[0]
+			state.Stage, _ = samples[0]["stage"].(string)
 		}
 	}
 	var terminal *archive.Terminal

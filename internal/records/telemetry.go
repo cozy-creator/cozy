@@ -228,6 +228,11 @@ func telemetryRowV1(event *v1.RunEvent, current string) (string, map[string]any)
 		return "request.preparing", preparing
 	}
 	sample := map[string]any{"stage": p.Stage}
+	if event.AtMs > 0 {
+		// Keep source time distinguishable from the event row's receipt-time fallback.
+		// Replayed/coalesced progress may arrive together and cannot be timed by arrival.
+		sample["sample_unix_ms"] = event.AtMs
+	}
 	if p.Fraction >= 0 {
 		sample["overall_fraction"] = p.Fraction
 	}

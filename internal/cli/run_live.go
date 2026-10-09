@@ -35,8 +35,6 @@ type liveView struct {
 	done                         []liveDone
 	overall                      float64
 	hasOverall                   bool
-	eta                          time.Duration
-	hasETA                       bool
 	held                         map[string][]any // this run's GPU grants: call key -> ordinals
 	waits                        []gpuWait
 	stalls                       map[string]*stall // steps held for their callee's weights
@@ -65,9 +63,9 @@ type liveStage struct {
 	current, total int64
 	rate           float64
 	hasRate        bool
-	stepSeconds    float64
-	steps          int
-	position       float64
+	progressSample orchestrator.ProgressSnapshot
+	estimate       orchestrator.StageEstimate
+	hasETA         bool
 }
 
 // gpuWait is one of this run's calls waiting for GPUs; ownRun says only this run holds them.
@@ -238,7 +236,6 @@ func (p *RunProgress) liveProgress(fields map[string]any, at time.Time) {
 	facts, _ := p.observe(fields)
 	if facts.hasOverall {
 		v.overall, v.hasOverall = facts.overallFraction, true
-		v.eta, v.hasETA = facts.overallRemaining, facts.hasOverallETA
 	}
 	v.executing, v.status = true, "running"
 	if v.phase != nil {
@@ -282,7 +279,7 @@ func (p *RunProgress) liveProgress(fields map[string]any, at time.Time) {
 		if !nested {
 			v.supersede(at)
 		}
-		s = &liveStage{key: key, label: stageLabel(scope), scope: true, started: at, position: -1}
+		s = &liveStage{key: key, label: stageLabel(scope), scope: true, started: at}
 		v.scopes = append(v.scopes, s)
 	} else if s.announced && !nested {
 		v.sequenced(s)
@@ -305,7 +302,7 @@ func (p *RunProgress) liveProgress(fields map[string]any, at time.Time) {
 	s.announced = s.announced || !nested
 	if leaf != s.leaf {
 		*s = liveStage{key: s.key, label: s.label, leaf: leaf, scope: true, announced: s.announced,
-			started: s.started, position: -1, call: s.call}
+			started: s.started, call: s.call}
 	}
 	s.measure(fields)
 	s.last = at
@@ -542,26 +539,27 @@ func (v *liveView) enter(key string, e localapi.Event, at time.Time, status stri
 
 // measure reads one progress sample of the current leaf.
 func (s *liveStage) measure(fields map[string]any) {
-	fraction, hasFraction := number(fields["stage_fraction"])
-	position, hasPosition := number(fields["position"])
-	total, hasTotal := number(fields["total"])
-	if hasPosition && hasTotal && position >= 0 && total > 0 && position <= total &&
-		position == float64(int64(position)) && total == float64(int64(total)) {
-		s.counted, s.current, s.total = true, int64(position), int64(total)
-		s.bytes = fields["unit"] == "bytes"
-		s.rate, s.hasRate = number(fields["rate"])
-		s.hasRate = s.hasRate && s.rate >= 0
-		if !hasFraction {
-			fraction, hasFraction = position/total, true
-		}
-		if stepMS, ok := number(fields["step_ms"]); ok && stepMS > 0 && position > s.position {
-			s.stepSeconds += stepMS / 1000
-			s.steps++
-			s.position = position
-		}
+	sample, ok := orchestrator.DecodeProgressSnapshot(fields)
+	s.hasETA = false
+	if ok {
+		s.estimate, s.hasETA = sample.EstimateStage(s.progressSample)
 	}
-	if hasFraction && fraction >= 0 && fraction <= 1 {
-		s.fraction, s.hasFraction = fraction, true
+	s.progressSample = sample
+	if !ok {
+		return
+	}
+	s.counted = sample.Position != nil && sample.Total != nil
+	if s.counted {
+		s.current, s.total = *sample.Position, *sample.Total
+	}
+	s.bytes = sample.Unit == "bytes"
+	s.hasRate = sample.Rate != nil
+	if s.hasRate {
+		s.rate = *sample.Rate
+	}
+	s.hasFraction = sample.StageFraction != nil
+	if s.hasFraction {
+		s.fraction = *sample.StageFraction
 	}
 }
 
@@ -601,9 +599,6 @@ func (p *RunProgress) frame(at time.Time, width, height int) []string {
 	}
 	if v.hasOverall && v.ended.IsZero() {
 		row := "  overall " + meter(v.overall, width)
-		if v.hasETA {
-			row += " · ETA ~" + shortDuration(v.eta)
-		}
 		active = append(active, row)
 	}
 	done := v.done
@@ -703,11 +698,9 @@ func (s *liveStage) rows(ran time.Duration, held *stall, width int, at time.Time
 	case s.counted && s.bytes:
 		row += "  " + bytesMoved(float64(s.current), float64(s.total), s.rate, s.hasRate, 0)
 	case s.counted:
-		row += fmt.Sprintf("  step %d/%d", s.current, s.total)
-		if s.steps > 0 {
-			perStep := s.stepSeconds / float64(s.steps)
-			remaining := time.Duration(float64(s.total-s.current) * perStep * float64(time.Second))
-			row += fmt.Sprintf(" · %.2fs/step avg · ETA ~%s", perStep, shortDuration(remaining))
+		row += fmt.Sprintf("  %d/%d", s.current, s.total)
+		if s.hasETA {
+			row += " · ETA ~" + shortDuration(time.Duration(s.estimate.RemainingMS)*time.Millisecond)
 		}
 	}
 	return append(rows, row)
@@ -962,7 +955,7 @@ func (p *RunProgress) applyCallPhase(phase callPhaseEvent, final bool) {
 			}
 		}
 		if s == nil {
-			s = &liveStage{key: "call:" + phase.Request, label: stageLabel(phase.Label), scope: true, announced: true, position: -1}
+			s = &liveStage{key: "call:" + phase.Request, label: stageLabel(phase.Label), scope: true, announced: true}
 			v.scopes = append(v.scopes, s)
 		}
 		v.calls[phase.Request] = s

@@ -175,7 +175,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	if strings.ContainsAny(stderr, "\r\033") {
 		t.Fatalf("piped progress carries terminal control bytes\n%q", stderr)
 	}
-	stepLine := regexp.MustCompile(`^  tile_steps (\d+)/100 · (\d+)% stage · [0-9.]+s/step avg · ETA ~[0-9hms.]+ · (\d+)% overall · elapsed [0-9ms.]+$`)
+	stepLine := regexp.MustCompile(`^  tile_steps (\d+)/100 · (\d+)% stage · ETA ~[0-9hms.]+ · (\d+)% overall · elapsed [0-9ms.]+$`)
 	previous, matched := -1, 0
 	for _, line := range strings.Split(stderr, "\n") {
 		if !strings.Contains(line, "tile_steps") {
@@ -211,7 +211,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	}
 	// The 80-column pty clamps the tail (that IS the resize safety); the bar, steps
 	// and percentage must always survive the clamp.
-	barred := regexp.MustCompile(`[█░]{20} +\d+%  step \d+/100`)
+	barred := regexp.MustCompile(`[█░]{20} +\d+%  \d+/100`)
 	seen := 0
 	for _, chunk := range rewrites[1:] {
 		line := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(chunk, "")
@@ -229,8 +229,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("terminal rewrites never showed the step bar\n%q", tty)
 	}
 	if plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(tty, ""); !strings.Contains(plain, "▸ tile_steps · ") ||
-		!strings.Contains(plain, "s/step avg") || !strings.Contains(plain, "ETA ~") {
-		t.Fatalf("terminal run never showed elapsed, measured speed and stage ETA\n%q", tty)
+		!strings.Contains(plain, "ETA ~") {
+		t.Fatalf("terminal run never showed elapsed and measured stage ETA\n%q", tty)
 	}
 
 	// --await --json: stdout remains one final result; stderr carries typed JSONL events.
@@ -261,8 +261,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatal("awaited JSON omitted available progress")
 	}
 
-	// The list reuses the same lossy Runtime progress lane. Whole-job percentage and ETA
-	// come only from overall_fraction; the current stage remains explicitly stage-local.
+	// The list reuses the same lossy Runtime progress lane. Whole-job percentage
+	// comes from overall_fraction; ETA remains explicitly stage-local.
 	// Completed rows preserve the successful 100% coordinate after live telemetry is gone.
 	code, output := runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=6", "delay_ms=5000")
@@ -270,16 +270,17 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("detached progress run failed [exit %d]\n%s", code, output)
 	}
 	type progressRow struct {
-		Number          int64    `json:"number"`
-		Status          string   `json:"status"`
-		ProgressStage   string   `json:"progress_stage"`
-		StageFraction   *float64 `json:"stage_fraction"`
-		OverallFraction *float64 `json:"overall_fraction"`
-		Position        *int64   `json:"position"`
-		Total           *int64   `json:"total"`
-		RemainingMS     *int64   `json:"remaining_ms"`
-		ExecutionMS     *int64   `json:"execution_ms"`
-		ExecutionKnown  bool     `json:"execution_known"`
+		Number           int64    `json:"number"`
+		Status           string   `json:"status"`
+		ProgressStage    string   `json:"progress_stage"`
+		StageFraction    *float64 `json:"stage_fraction"`
+		OverallFraction  *float64 `json:"overall_fraction"`
+		Position         *int64   `json:"position"`
+		Total            *int64   `json:"total"`
+		RemainingMS      *int64   `json:"remaining_ms"`
+		StageRemainingMS *int64   `json:"stage_remaining_ms"`
+		ExecutionMS      *int64   `json:"execution_ms"`
+		ExecutionKnown   bool     `json:"execution_known"`
 	}
 	list := func(full bool) progressRow {
 		t.Helper()
@@ -335,7 +336,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 		live.OverallFraction == nil || *live.OverallFraction <= 0 ||
 		live.Position == nil || live.Total == nil || *live.Position <= 0 ||
 		*live.Total <= 0 || *live.Position > *live.Total ||
-		live.RemainingMS == nil || *live.RemainingMS <= 0 {
+		live.RemainingMS != nil || live.StageRemainingMS == nil || *live.StageRemainingMS <= 0 {
 		t.Fatalf("live run does not distinguish overall and stage progress: %+v", live)
 	}
 	// Default JSON is the same typed machine projection with fewer diagnostic
@@ -349,7 +350,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	}
 	if terminal := list(true); terminal.Status != "completed" || terminal.ProgressStage != "" ||
 		terminal.StageFraction != nil || terminal.OverallFraction == nil || *terminal.OverallFraction != 1 ||
-		terminal.Position != nil || terminal.Total != nil || terminal.RemainingMS != nil {
+		terminal.Position != nil || terminal.Total != nil || terminal.RemainingMS != nil || terminal.StageRemainingMS != nil {
 		t.Fatalf("terminal run did not preserve completed progress: %+v", terminal)
 	}
 
