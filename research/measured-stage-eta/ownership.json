@@ -1,0 +1,6 @@
+{
+  "owner": "/root/fusion_resume",
+  "purpose": "Replace weighted-fraction run ETA with measured, explicitly stage-local remaining estimate",
+  "branch": "fix/measured-stage-eta-20261009",
+  "base_sha": "cdbd61fe4359236dcb0db38bd87b277b5d6f2b92"
+}
