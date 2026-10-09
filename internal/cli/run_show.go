@@ -360,6 +360,8 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		report.Waiting = describeBoot(bootMachine(life), life.RentalBoot, time.Now()).line(bootMachine(life))
 	case life.Status == "queued" && life.WaitReason != "":
 		report.Waiting = "waiting: " + life.WaitReason
+	case life.Status == "in_progress" && life.ObservationLost != nil:
+		report.Waiting = reconnecting(life) + ": " + life.ObservationLost.Reason
 	}
 	report.Result = life.Result
 	report.Output = life.Output

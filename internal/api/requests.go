@@ -837,6 +837,10 @@ type Lifecycle struct {
 	RentalProgress *orchestrator.RentalProgress         `json:"rental_progress,omitempty"`
 	// RentalBoot is the boot of the rental a queued request waits on, as its Hub last said.
 	RentalBoot *hub.RentalBoot `json:"rental_boot,omitempty"`
+	// ObservationLost is a running run whose machine this computer cannot hear now: its
+	// progress is the last it heard, and the run is being attached again.
+	ObservationLost *records.ObservationLoss `json:"observation_lost,omitempty"`
+
 	// WaitReason is why a queued request last said it waits (its newest park), verbatim.
 	WaitReason       string         `json:"wait_reason,omitempty"`
 	PhaseElapsedMS   *int64         `json:"phase_elapsed_ms,omitempty"`
@@ -995,6 +999,9 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 			s.fillWait(&life)
 		}
 		s.fillLifecycleProgress(&life, row)
+		if life.Status == "in_progress" {
+			life.ObservationLost, _ = s.store.ObservationLost(row.ID)
+		}
 		s.fillGPUWait(&life, row)
 		life.OutputExport = s.outputExportOf(row.ID)
 		if life.Status == "canceled" {

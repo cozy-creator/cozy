@@ -1058,12 +1058,12 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"position", "total", "queued", "execution", "attempt_wall", "attempts", "created", "reason", "hub"},
 		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
-			"stage_remaining_ms", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining", "retry_available"},
+			"stage_remaining_ms", "observation_lost", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining", "retry_available"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "rental_boot", "wait_reason", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
-			"position", "total", "progress_unit", "progress_rate", "stage_remaining_ms", "queued_ms", "execution_ms", "execution_known", "attempt_wall_ms", "attempts",
+			"position", "total", "progress_unit", "progress_rate", "stage_remaining_ms", "observation_lost", "queued_ms", "execution_ms", "execution_known", "attempt_wall_ms", "attempts",
 			"created_at", "error_type", "error_code", "error", "triage", "retaining", "retry_available", "hub"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
@@ -1205,6 +1205,9 @@ func runListRows(rows []api.Lifecycle) output.List {
 			}
 			if life.StageRemainingMS != nil {
 				typed["stage_remaining_ms"] = *life.StageRemainingMS
+			}
+			if life.ObservationLost != nil {
+				typed["observation_lost"] = life.ObservationLost
 			}
 		}
 		if life.OverallFraction != nil && (life.Status == "in_progress" || life.Status == "completed" || life.Status == "failed" || life.Status == "canceled") {
@@ -1375,6 +1378,14 @@ func progressValue(life api.Lifecycle) string {
 		}
 		return "-"
 	}
+	if life.ObservationLost != nil {
+		heard := life
+		heard.ObservationLost = nil
+		if last := progressValue(heard); last != "-" {
+			return reconnecting(life) + " · last " + last
+		}
+		return reconnecting(life)
+	}
 	// ONE NUMBER AND THE STAGE. This cell carried four facts at once -- an overall
 	// percent, a remaining estimate, the stage, and a SECOND percent scoped to that
 	// stage -- so `35% overall (~2s) · denoise 90% stage` asked a reader to hold two
@@ -1405,6 +1416,16 @@ func progressValue(life api.Lifecycle) string {
 		return overall
 	}
 	return stage + " " + overall
+}
+
+// reconnecting is a running run whose machine this computer lost: what it last heard is not
+// live, so the cell says what the daemon is doing first.
+func reconnecting(life api.Lifecycle) string {
+	cell := "reconnecting to " + cmp.Or(life.Machine, "its machine")
+	if since, err := time.Parse(time.RFC3339Nano, life.ObservationLost.Since); err == nil {
+		cell += " · lost " + shortDuration(time.Since(since)) + " ago"
+	}
+	return cell
 }
 
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
