@@ -120,11 +120,11 @@ machine, `--host` can retain the running agent; a different agent must be bundle
 the selected Runtime wheel. The stable bootstrap itself changes with the image or
 service bootstrap, and its identity is reported separately from the running agent.
 
-Cached execution access belongs to the current device key or operator credential. Signing
-out or switching credentials cannot reuse another account's cached grant. The agent retains
-one delegated account per Hub: that account can renew access, while a different account
-receives an explicit conflict so retained jobs keep their original authority.
-Delegated access and updates require their advertised capabilities. Retired Hosts and
+Execution access is an OAuth grant of the Hub for the machine's own TLS key: the CLI approves
+it with the current device key, and the machine holds and refreshes it in memory. Revoking
+that device key or signing out ends it; another account's runs get their own grant. A
+publication grant is fresh per run and outlives sign-out. Updates require their advertised
+capabilities. Retired Hosts and
 agents lacking transactional replacement are refused before new work or updates;
 they require a current image or service bootstrap. Existing accepted work and its
 authority are preserved. There is no legacy submission or credential fallback.
