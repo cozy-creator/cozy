@@ -134,32 +134,11 @@ func handleRentalSSHInfo(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer store.Close()
-	row, problem := store.RentalByMachine(strings.TrimSpace(ctx.Inv.Args[0]))
+	address, problem := readDevelopmentRentalSSH(ctx, store, ctx.Inv.Args[0])
 	if problem != nil {
 		return problem
 	}
-	if row == nil {
-		return exit.New(exit.Conflict, "development rental is not attached on this Creator home")
-	}
-	c := client(ctx)
-	if row.Hub != c.Base() {
-		return exit.New(exit.Conflict, "rental belongs to another configured Hub")
-	}
-	call, cancel := hub.Context()
-	defer cancel()
-	remote, problem := c.Rental(call, row.ID)
-	if problem != nil {
-		return problem
-	}
-	if !remote.Development || !remote.Ready() || remote.WorkerID != row.ExpectedWorkerID || remote.WorkerBootID != row.ExpectedWorkerBootID {
-		return exit.New(exit.Conflict, "development rental is not ready on its pinned worker boot")
-	}
-	host, port, err := net.SplitHostPort(remote.SSHAddress)
-	number, parseErr := strconv.Atoi(port)
-	if err != nil || net.ParseIP(host) == nil || parseErr != nil || number < 1 || number > 65535 {
-		return exit.New(exit.Unavailable, "Hub has not supplied a valid mapped SSH endpoint")
-	}
-	return emit(ctx, compactRecord([]output.Field{{K: "rental", V: row.ID}, {K: "machine", V: row.MachineName}, {K: "ssh_address", V: remote.SSHAddress}, {K: "host", V: host}, {K: "port", V: number}, {K: "user", V: "root"}, {K: "worker_boot_id", V: remote.WorkerBootID}}, "machine", "ssh_address"))
+	return emit(ctx, compactRecord([]output.Field{{K: "rental", V: address.Row.ID}, {K: "machine", V: address.Row.MachineName}, {K: "ssh_address", V: address.Address}, {K: "host", V: address.Host}, {K: "port", V: address.Port}, {K: "user", V: "root"}, {K: "worker_boot_id", V: address.Row.ExpectedWorkerBootID}}, "machine", "ssh_address"))
 }
 
 // rentalProviderFlag is the hidden `--provider` development override, lowercased; empty lets
@@ -220,4 +199,40 @@ func rentalMachineExclusions(ctx *Context, existing *records.RentalOperation, pr
 		return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict", "rental operation already names different excluded provider machines").WithRemedy("resume without --exclude-provider-machine or use a new operation key")
 	}
 	return req.ExcludedProviderMachines, nil
+}
+
+// readDevelopmentRentalSSH shares the existing owned-rental and pinned-boot checks.
+type developmentRentalSSH struct {
+	Row           *records.Rental
+	Host, Address string
+	Port          int
+}
+
+func readDevelopmentRentalSSH(ctx *Context, store *records.Store, name string) (developmentRentalSSH, *exit.Error) {
+	row, problem := store.RentalByMachine(strings.TrimSpace(name))
+	if problem != nil {
+		return developmentRentalSSH{}, problem
+	}
+	if row == nil {
+		return developmentRentalSSH{}, exit.New(exit.Conflict, "development rental is not attached on this Creator home")
+	}
+	c := client(ctx)
+	if row.Hub != c.Base() {
+		return developmentRentalSSH{}, exit.New(exit.Conflict, "rental belongs to another configured Hub")
+	}
+	call, cancel := hub.Context()
+	defer cancel()
+	remote, problem := c.Rental(call, row.ID)
+	if problem != nil {
+		return developmentRentalSSH{}, problem
+	}
+	if !remote.Development || !remote.Ready() || remote.WorkerID != row.ExpectedWorkerID || remote.WorkerBootID != row.ExpectedWorkerBootID {
+		return developmentRentalSSH{}, exit.New(exit.Conflict, "development rental is not ready on its pinned worker boot")
+	}
+	host, port, err := net.SplitHostPort(remote.SSHAddress)
+	number, parseErr := strconv.Atoi(port)
+	if err != nil || net.ParseIP(host) == nil || parseErr != nil || number < 1 || number > 65535 {
+		return developmentRentalSSH{}, exit.New(exit.Unavailable, "Hub has not supplied a valid mapped SSH endpoint")
+	}
+	return developmentRentalSSH{Row: row, Host: host, Port: number, Address: remote.SSHAddress}, nil
 }
