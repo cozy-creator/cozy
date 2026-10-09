@@ -39,6 +39,10 @@ func handleWarm(ctx *Context, target Target, ep *launch.Entrypoint, level string
 		if problem != nil {
 			return problem
 		}
+		// The member's every slot is resolved here (th-241): the machine reads no binding.
+		if models, problem = exactRunModels(ctx, target, ep, overrides.Models, models, resolveInvocationModels); problem != nil {
+			return problem
+		}
 		if selection.Models, problem = applyModelAdapters(ctx, target, ep, models, overrides.Overlays); problem != nil {
 			return problem
 		}

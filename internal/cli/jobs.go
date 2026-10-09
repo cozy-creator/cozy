@@ -107,17 +107,13 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if deadline%time.Millisecond != 0 {
 		sub.TimeoutMS++
 	}
-	// On a known machine, a published job's explicit choices are the machine's to resolve.
 	models, chosen, e := jobModelChoices(ctx, target, job, overrides.Models, selectedRental)
 	if e != nil {
 		return e
 	}
-	if !chosen {
-		children := capturedModelChoices(models)
-		if models, e = resolveJobModelInputs(ctx, target, job, overrides.Models); e != nil {
-			return e
-		}
-		models = append(models, children...)
+	// Every model input is resolved here (th-241): the machine reads no binding at a Hub.
+	if models, e = exactRunModels(ctx, target, job, overrides.Models, models, resolveJobModelInputs); e != nil {
+		return e
 	}
 	if models, e = applyModelAdapters(ctx, target, job, models, overrides.Overlays); e != nil {
 		return e

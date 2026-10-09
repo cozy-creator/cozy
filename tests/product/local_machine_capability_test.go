@@ -37,7 +37,7 @@ func TestALocalUploadCarriesACapabilityForThisComputersMachine(t *testing.T) {
 		}
 	})
 	provisionMachine(t, root)
-	code, out := runCozy(t, root, "model", "upload", strayTensor(t, root), "proof/output", "--json")
+	code, out := runCozy(t, root, "model", "upload", strayTensor(t, root), "proof/output", "--await", "--json")
 	skipWithoutMachine(t, code, out)
 	trades := h.hubAccess.trades()
 	if code == 0 || !strings.Contains(out, "capability_refused") || len(trades) != 1 {

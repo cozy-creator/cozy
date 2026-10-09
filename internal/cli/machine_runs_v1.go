@@ -459,11 +459,6 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 		// Only unpublished code names its owner: its org-relative defaults are the owner's.
 		spec.Owner = m.runAccount(request)
 	}
-	revision, problem := m.store.BindingRevision(m.context.forHub(request.Hub).Cfg.HubURL)
-	if problem != nil {
-		return nil, problem
-	}
-	spec.BindingRevision = revision
 	if problem := m.writeTreesV1(ctx, request, machine, spec); problem != nil {
 		return nil, problem
 	}
@@ -523,7 +518,11 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	if len(request.Assets) > 0 {
 		m.submissionStage(request.ID, "inputs", fmt.Sprintf("%d input(s)", len(request.Assets)), began)
 	}
-	if spec.Models, problem = modelChoicesV1(request, request.Models); problem != nil {
+	models, problem := m.runModels(request)
+	if problem != nil {
+		return nil, problem
+	}
+	if spec.Models, problem = modelChoicesV1(request, models); problem != nil {
 		return nil, problem
 	}
 	// The selected Hub supplies package/model access independently of rental ownership.
@@ -547,6 +546,50 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 }
 
 // modelChoicesV1 are a run's model choices as a v1 spec names them.
+// runModels are every model choice a run's machine needs (th-241: it resolves nothing at a
+// Hub): the run's own and, for a run that composes children, its callees' bindings, every rung
+// resolved here.
+//
+// The callees' bindings are kept under the catalog revision, as the run's own are
+// (exactRunModels): a warm run reads nothing at any Hub.
+func (m *machineRuns) runModels(request records.Request) ([]records.ModelRef, *exit.Error) {
+	if !request.ComposesChildren() {
+		return request.Models, nil
+	}
+	children, problem := m.childModels(request)
+	if problem != nil {
+		return nil, problem
+	}
+	return records.OneSelectionPerSlot(request.Models, children), nil
+}
+
+func (m *machineRuns) childModels(request records.Request) ([]records.ModelRef, *exit.Error) {
+	kept := ""
+	if revision, problem := m.store.BindingRevision(m.context.forHub(request.Hub).Cfg.HubURL); problem == nil {
+		identity, err := json.Marshal([]any{"child-models/1", request.Hub, request.Package, request.Release, request.InstallID,
+			request.Entrypoint, client(m.context.forHub(request.Hub)).CredentialIdentity(), revision})
+		if err == nil {
+			name := sha256.Sum256(identity)
+			kept = filepath.Join(m.layout.Root, "releases", "children", hex.EncodeToString(name[:16])+".json")
+		}
+	}
+	var children []records.ModelRef
+	if raw, err := os.ReadFile(kept); kept != "" && err == nil && json.Unmarshal(raw, &children) == nil {
+		return children, nil
+	}
+	var problem *exit.Error
+	if request.InstallID == "" {
+		children, problem = m.resolver.PublishedChildModels(m.context.forHub(request.Hub), request)
+	} else {
+		children, problem = m.resolver.UnpublishedChildModels(request)
+	}
+	if raw, err := json.Marshal(children); problem == nil && kept != "" && err == nil &&
+		os.MkdirAll(filepath.Dir(kept), 0o700) == nil && os.WriteFile(kept+".tmp", raw, 0o600) == nil {
+		_ = os.Rename(kept+".tmp", kept)
+	}
+	return children, problem
+}
+
 func modelChoicesV1(request records.Request, models []records.ModelRef) ([]*v1.ModelChoice, *exit.Error) {
 	return orchestrator.ModelChoices(request, models)
 }
@@ -623,11 +666,6 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
 			spec.Owner = caller.Account
 		}
-	}
-	// Resolved under the same key as this computer's calls (owner, binding revision), so a
-	// call after a warm run reuses its preparation instead of resolving again.
-	if spec.BindingRevision, problem = m.store.BindingRevision(m.context.forHub(origin).Cfg.HubURL); problem != nil {
-		return nil, problem
 	}
 	if selection.Warm != "" {
 		// A warm set member: the machine's whole set goes back with this one changed.

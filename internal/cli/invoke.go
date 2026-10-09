@@ -312,14 +312,10 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return exit.Usagef("a provider-source model runs on a named machine").
 			WithRemedy("add --rental=<name>; the machine resolves, narrows and converts the source itself")
 	}
-	if !chosen || managedRental && selectedRental == "" {
-		// Choosing a machine to rent reads the ladders; so do editable code and provider
-		// sources.
-		children := capturedModelChoices(models)
-		if models, e = resolveInvocationModels(ctx, target, ep, overrides.Models); e != nil {
-			return e
-		}
-		models = append(models, children...)
+	// Every slot is resolved here, whatever machine runs the call (th-241): it reads no
+	// binding, model card or resolution at a Hub.
+	if models, e = exactRunModels(ctx, target, ep, overrides.Models, models, resolveInvocationModels); e != nil {
+		return e
 	}
 	if models, e = applyModelAdapters(ctx, target, ep, models, overrides.Overlays); e != nil {
 		return e
@@ -466,9 +462,9 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 	for parameter := range profiles {
 		return nil, false, exit.Usagef("--source-profile %s names no model parameter of %s", parameter, target.Function)
 	}
-	// Unpublished code is a root naming its installation, whose open slots the machine
-	// resolves under the owner the root names. Code that calls other unpublished code goes by
-	// capture instead, and resolves its own slots, unless every slot names one provider source.
+	// Unpublished code is a root naming its installation; its open slots resolve here under the
+	// owner the root names (exactRunModels). Code that calls other unpublished code goes by
+	// capture instead, unless every slot names one provider source.
 	if (strings.HasPrefix(target.Package, "local/") || target.Snapshot) && !oneSource(ep, out) {
 		calls, problem := callsUnpublished(ctx, target.InstallID)
 		if problem != nil || calls {
@@ -537,6 +533,110 @@ func pinnedProviderSource(ctx *Context, raw string) (string, *exit.Error) {
 		return "", problem
 	}
 	return source.Canonical, nil
+}
+
+// exactRunModels are a run's model choices as its machine takes them (th-241: it resolves
+// nothing at a Hub): every Hub slot of ep resolved here, an explicit choice to its exact
+// checkpoint and an unchosen slot to its binding's ladder with every rung's checkpoint, beside
+// the provider sources the caller named and its captured children's choices, each pinned.
+//
+// Kept under the catalog revision this client knows, as a machine once kept its own: a warm
+// run reads nothing at any Hub, and a publish, yank or bind (here or stated by the Hub) moves
+// the revision and so resolves again.
+func exactRunModels(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string,
+	chosen []orchestrator.ModelRef,
+	resolve func(*Context, Target, *launch.Entrypoint, map[string]string) ([]orchestrator.ModelRef, *exit.Error),
+) ([]orchestrator.ModelRef, *exit.Error) {
+	kept := keptRunModelsPath(ctx, target, ep, overrides, chosen)
+	if raw, err := os.ReadFile(kept); kept != "" && err == nil {
+		var models []orchestrator.ModelRef
+		if json.Unmarshal(raw, &models) == nil {
+			return models, nil
+		}
+	}
+	models, problem := resolveRunModels(ctx, target, ep, overrides, chosen, resolve)
+	if raw, err := json.Marshal(models); problem == nil && kept != "" && err == nil &&
+		os.MkdirAll(filepath.Dir(kept), 0o700) == nil && os.WriteFile(kept+".tmp", raw, 0o600) == nil {
+		_ = os.Rename(kept+".tmp", kept)
+	}
+	return models, problem
+}
+
+// keptRunModelsPath names one run's resolved models: its Hub, code, callable and declared
+// slots, choices, the signed-in credential (org-relative names are its account's) and the
+// catalog revision. "" when the revision cannot be read.
+func keptRunModelsPath(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string, chosen []orchestrator.ModelRef) string {
+	_, store, _, problem := open(ctx.Cfg, false)
+	if problem != nil {
+		return ""
+	}
+	revision, problem := store.BindingRevision(ctx.Cfg.HubURL)
+	store.Close()
+	if problem != nil {
+		return ""
+	}
+	identity, err := json.Marshal([]any{"run-models/1", ctx.Cfg.HubURL, target.Package, target.Release, target.InstallID,
+		ep.Name, ep.Models, overrides, chosen, client(ctx).CredentialIdentity(), revision})
+	if err != nil {
+		return ""
+	}
+	name := sha256.Sum256(identity)
+	return filepath.Join(home.Paths(ctx.Cfg.Home).Root, "releases", "models", hex.EncodeToString(name[:16])+".json")
+}
+
+func resolveRunModels(ctx *Context, target Target, ep *launch.Entrypoint, overrides map[string]string,
+	chosen []orchestrator.ModelRef,
+	resolve func(*Context, Target, *launch.Entrypoint, map[string]string) ([]orchestrator.ModelRef, *exit.Error),
+) ([]orchestrator.ModelRef, *exit.Error) {
+	var out []orchestrator.ModelRef
+	sourced := map[string]bool{}
+	for _, model := range chosen {
+		if model.Source != "" && model.Callable == "" {
+			sourced[model.BindingSlot()] = true
+			out = append(out, model)
+		}
+	}
+	hubSlots := *ep
+	hubSlots.Models = slices.DeleteFunc(slices.Clone(ep.Models), func(slot launch.Slot) bool { return sourced[slot.Path] })
+	if len(hubSlots.Models) > 0 {
+		resolved, problem := resolve(ctx, target, &hubSlots, overrides)
+		if problem != nil {
+			return nil, problem
+		}
+		out = append(out, resolved...)
+	}
+	for _, child := range capturedModelChoices(chosen) {
+		pinned, problem := pinModelChoice(ctx, child)
+		if problem != nil {
+			return nil, problem
+		}
+		out = append(out, pinned)
+	}
+	return out, nil
+}
+
+// pinModelChoice is a named model choice at its exact checkpoint: a provider source or a pinned
+// manifest as it is, else the release and lane it names resolved at the Hub.
+func pinModelChoice(ctx *Context, model orchestrator.ModelRef) (orchestrator.ModelRef, *exit.Error) {
+	if model.Source != "" || model.Manifest != "" {
+		return model, nil
+	}
+	spec := model.Model
+	if model.Release != "" {
+		spec += "@" + model.Release
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	resolved, problem := client(ctx).ResolveModel(hctx, spec, model.Lane)
+	if problem != nil {
+		return model, problem
+	}
+	if resolved.Model != model.Model || resolved.ManifestID == "" {
+		return model, exit.Named(exit.Conflict, "rental.model_resolution_changed",
+			"Tensorhub returned no exact checkpoint for %s", spec)
+	}
+	model.Release, model.Lane, model.Manifest, model.ManifestLength = resolved.Release, resolved.Lane, resolved.ManifestID, resolved.ManifestLength
+	return model, nil
 }
 
 // invocationModelSpec is one slot's selection before the card is read: an explicit
