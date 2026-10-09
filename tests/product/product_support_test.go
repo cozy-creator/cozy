@@ -542,7 +542,8 @@ func listedRentalQuote(listing http.Handler) http.HandlerFunc {
 					w.Header().Set("Content-Type", "application/json")
 					_ = json.NewEncoder(w).Encode(map[string]any{"name": row.Name, "accelerator_count": width.Count,
 						"price_usd_micros_per_hour": width.Price, "storage_usd_micros_per_hour": width.Storage,
-						"container_disk_gb": request.Disk})
+						"maximum_total_hourly_rate_usd_micros": width.Price + width.Storage,
+						"container_disk_gb":                    request.Disk})
 					return
 				}
 			}

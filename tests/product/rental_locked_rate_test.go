@@ -115,7 +115,7 @@ func TestRentalConsentsToTheQuoteForItsDisk(t *testing.T) {
 		if request["container_disk_gb"] == float64(500) {
 			return http.StatusUnprocessableEntity, `{"error":{"code":"rental.disk_unavailable","message":"a 500 GB container disk: cpu offers allow at most 160 GB"}}`
 		}
-		return http.StatusOK, `{"name":"cpu","accelerator_count":1,"price_usd_micros_per_hour":480000,"storage_usd_micros_per_hour":22240,"container_disk_gb":160,"vcpu_count":16,"memory_gb":32}`
+		return http.StatusOK, `{"name":"cpu","accelerator_count":1,"price_usd_micros_per_hour":480000,"storage_usd_micros_per_hour":22240,"maximum_total_hourly_rate_usd_micros":502240,"container_disk_gb":160,"vcpu_count":16,"memory_gb":32}`
 	}
 	stand.rent = func(request map[string]any) map[string]any {
 		return map[string]any{"rental_id": "pr-quote", "name": request["name"], "state": "pending_acquisition",
