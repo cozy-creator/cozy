@@ -754,6 +754,77 @@ pub fn resolve_closure(request: &PullRequest<'_>) -> Result<hub::Closure> {
     )
 }
 
+/// The part of `closure` the named components reach: the manifest, its header, the header's
+/// assets and those components' parts. The manifest and then the header land first, two small
+/// pulls, since only they say which object is whose. A component the header does not name
+/// refuses.
+pub fn narrow(
+    request: &PullRequest<'_>,
+    closure: &hub::Closure,
+    components: &[String],
+) -> Result<hub::Closure> {
+    let stage = |objects: Vec<ObjectRef>| -> Result<()> {
+        let mut part = closure.clone();
+        part.objects = objects;
+        part.components = components.to_vec();
+        let pull_part = PullRequest {
+            cancellation: request.cancellation.clone(),
+            store: request.store,
+            base: request.base,
+            refspec: request.refspec,
+            lane: request.lane,
+            credential: request.credential,
+            policy: request.policy,
+            deadline: request.deadline,
+            streams: request.streams,
+            session: request.session,
+            sample_seconds: request.sample_seconds,
+            on_plan: None,
+            on_object: None,
+            closure: Some(&part),
+        };
+        pull(&pull_part).map(drop)
+    };
+    stage(vec![closure.manifest.clone()])?;
+    let manifest = request.store.read_manifest(&closure.manifest)?;
+    let Some(header_ref) = manifest.header().cloned() else {
+        return refuse(
+            Code::ATTACHMENT_CARDINALITY,
+            "not a checkpoint manifest: no cozytensors header attachment",
+        );
+    };
+    stage(vec![header_ref.clone()])?;
+    let header = crate::checkpoint::load_header(request.store, &header_ref)?;
+    if let Some(absent) = components.iter().find(|name| {
+        !header
+            .components
+            .iter()
+            .any(|(component, _)| component == *name)
+    }) {
+        return refuse(
+            Code::NOT_CONTAINED,
+            format!("component {absent:?} is not in this checkpoint"),
+        );
+    }
+    let mut objects = vec![header_ref];
+    for (_, asset) in &header.assets {
+        objects.extend(asset.segments.iter().cloned());
+    }
+    for (component, _, tensor) in header.tensors() {
+        if components.contains(component) {
+            for (_, part) in &tensor.parts {
+                objects.extend(part.segments().iter().cloned());
+            }
+        }
+    }
+    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    objects.dedup_by(|a, b| a.sha256 == b.sha256);
+    let mut narrowed = closure.clone();
+    narrowed.objects = objects;
+    narrowed.components = components.to_vec();
+    Ok(narrowed)
+}
+
 /// What a pull actually did — counted, never estimated.
 #[derive(Debug, Clone, Default)]
 pub struct PullReport {
@@ -912,6 +983,12 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     if plan.wanted.is_empty() && records_checkpoint(request.store, &closure) {
         return Ok(report);
     }
+    if !closure.components.is_empty() {
+        // Part of a checkpoint: each object it names is proved resident, and nothing records
+        // the checkpoint, whose closure is not all here.
+        plan.complete_objects(request.store)?;
+        return Ok(report);
+    }
     // The proof and the index row both write the catalog; a contended catalog waits for its
     // live holder (`catalog::lock`), so a busy moment never throws a landed walk away.
     match closure.scope.as_str() {
@@ -1008,6 +1085,7 @@ fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
         complete: true,
         // Served only when nothing is wanted, so it authorizes no presign.
         presign_max_digests: 0,
+        components: Vec::new(),
     })
 }
 

@@ -15,8 +15,8 @@ use tensorfs_core::header::{Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::jcs::{self, Json};
 use tensorfs_core::manifest::{Draft, Entry};
-use tensorfs_core::store::Store;
 use tensorfs_core::registry;
+use tensorfs_core::store::Store;
 
 const TFS: &str = env!("CARGO_BIN_EXE_tfs");
 
@@ -520,14 +520,10 @@ fn concurrent_ensures_of_one_manifest_share_one_fetch() {
         Duration::from_millis(150),
         serve_all(),
     );
-    let mut leader = ensure(
-        &root,
-        &hub.base,
-        &["--streams", "1"],
-    )
-    .stdout(Stdio::piped())
-    .spawn()
-    .unwrap();
+    let mut leader = ensure(&root, &hub.base, &["--streams", "1"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut lines = BufReader::new(leader.stdout.take().unwrap()).lines();
     let mut seen = Vec::new();
     for line in lines.by_ref() {
@@ -726,4 +722,145 @@ fn a_pressure_pass_reports_the_disk_and_keeps_what_it_is_told() {
         assert_eq!(relief.collected_bytes, 0);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- components first
+
+/// A checkpoint whose `first` and `second` components each reach their own two blobs.
+fn two_components(size: usize) -> (Checkpoint, Vec<ObjectRef>, Vec<ObjectRef>) {
+    let spec = registry::seeds()
+        .into_iter()
+        .find(|seed| seed.alias == "plain/1")
+        .unwrap()
+        .spec;
+    let mut bodies = HashMap::new();
+    let mut components = Vec::new();
+    let mut reached = Vec::new();
+    for (salt, name) in ["first", "second"].into_iter().enumerate() {
+        let mut tensors = Vec::new();
+        let mut refs = Vec::new();
+        for index in 0..2 {
+            let body: Vec<u8> = (0..size)
+                .map(|at| ((at * 31 + index * 7 + salt * 13) % 251) as u8)
+                .collect();
+            let object = ObjectRef::of(&body);
+            tensors.push((
+                format!("blocks.{index}.weight"),
+                Tensor {
+                    dtype: Dtype::F32,
+                    shape: vec![(size / 4) as u64],
+                    encoding: spec.object_id(),
+                    parts: vec![(
+                        "value".into(),
+                        Part {
+                            dtype: Dtype::F32,
+                            shape: vec![(size / 4) as u64],
+                            body: Body::Segments(vec![object.clone()]),
+                        },
+                    )],
+                },
+            ));
+            refs.push(object.clone());
+            bodies.insert(object.sha256.clone(), body);
+        }
+        components.push((name.to_string(), tensors));
+        reached.push(refs);
+    }
+    let header = Header {
+        configs: Vec::new(),
+        assets: Vec::new(),
+        encodings: vec![spec],
+        components,
+    };
+    header.validate(&Closure::default()).unwrap();
+    let header_bytes = header.canonical_bytes().unwrap();
+    let header_ref = ObjectRef::of(&header_bytes);
+    bodies.insert(header_ref.sha256.clone(), header_bytes);
+    let manifest = Draft {
+        entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header_ref))],
+    }
+    .seal()
+    .unwrap()
+    .canonical_bytes();
+    let manifest_ref = ObjectRef::of(&manifest);
+    bodies.insert(manifest_ref.sha256.clone(), manifest);
+    let mut objects: Vec<ObjectRef> = bodies
+        .iter()
+        .filter(|(hex, _)| **hex != manifest_ref.sha256)
+        .map(|(hex, body)| ObjectRef {
+            sha256: hex.clone(),
+            length: body.len() as u64,
+        })
+        .collect();
+    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    let second = reached.pop().unwrap();
+    let first = reached.pop().unwrap();
+    let blobs = first.iter().chain(&second).cloned().collect();
+    let checkpoint = Checkpoint {
+        bodies,
+        manifest: manifest_ref,
+        objects,
+        blobs,
+    };
+    (checkpoint, first, second)
+}
+
+#[test]
+fn a_component_first_ensure_lands_only_that_component_and_the_whole_one_lands_the_rest() {
+    let dir = temporary("components-first");
+    let root = store(&dir);
+    let (checkpoint, first, second) = two_components(64 << 10);
+    let checkpoint = Arc::new(checkpoint);
+    let hub = hub(Arc::clone(&checkpoint), None, Duration::ZERO, serve_all());
+    let total: u64 = checkpoint.bodies.values().map(|b| b.len() as u64).sum();
+    let second_bytes: u64 = second.iter().map(|o| o.length).sum();
+
+    let part = run(&root, &hub.base, &["--component", "first"]);
+    assert!(part.ok, "{}", part.stdout);
+    let result = part.last().clone();
+    assert_eq!(text(&result, "event"), "ensure.result", "{}", part.stdout);
+    assert_eq!(num(&result, "bytes_total"), total - second_bytes);
+    assert!(first.iter().all(|o| hub.gets(&o.sha256) == 1));
+    assert!(second.iter().all(|o| hub.gets(&o.sha256) == 0));
+
+    // The rest of the checkpoint: only the second component's blobs move, and it records.
+    let whole = run(&root, &hub.base, &[]);
+    let result = assert_result(&whole, &checkpoint);
+    assert_eq!(num(&result, "bytes_fetched"), second_bytes);
+    assert!(checkpoint.blobs.iter().all(|o| hub.gets(&o.sha256) == 1));
+    let warm = run(&root, &hub.base, &[]);
+    assert_eq!(num(&assert_result(&warm, &checkpoint), "bytes_fetched"), 0);
+
+    let absent = run(&root, &hub.base, &["--component", "third"]);
+    assert_eq!(refused(&absent).0, "NOT_CONTAINED");
+}
+
+#[test]
+fn a_part_is_held_from_collection_until_its_hold_drops() {
+    let dir = temporary("part-hold");
+    let root = store(&dir);
+    let (checkpoint, first, _) = two_components(16 << 10);
+    let hub = hub(Arc::new(checkpoint), None, Duration::ZERO, serve_all());
+    let store = Store::open(&root).unwrap();
+    let host = tensorfs_core::transport::base_host(&hub.base).unwrap();
+    let credential = tensorfs_core::transport::credential_from_spec("", vec![host]).unwrap();
+    let policy = tensorfs_core::transport::SourcePolicy::default();
+    let components = vec!["first".to_string()];
+    let mut request = tensorfs_core::ensure::Request::new(
+        &store,
+        &hub.base,
+        "acme/model@r1",
+        &credential,
+        &policy,
+    );
+    request.lane = "public";
+    request.components = &components;
+    let (_, hold) = tensorfs_core::ensure::ensure_part(&request).unwrap();
+    assert!(first.iter().all(|o| store.contains(&o.sha256)));
+    // Nothing records part of a checkpoint: the hold alone keeps it from collection.
+    assert!(tensorfs_core::gc::collect(&root, false).is_err());
+    assert!(first.iter().all(|o| store.contains(&o.sha256)));
+    drop(hold);
+    tensorfs_core::gc::collect(&root, false).unwrap();
+    assert!(first.iter().all(|o| !store.contains(&o.sha256)));
 }

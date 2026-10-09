@@ -48,6 +48,9 @@ pub struct Request<'a> {
     pub step: &'a str,
     /// Manifests the GC policy must not evict: the caller's serving set.
     pub keep: &'a [String],
+    /// Make only these components resident (with the manifest, header and assets): the ones a
+    /// caller runs first. Empty: the whole checkpoint, recorded once it is all here.
+    pub components: &'a [String],
     pub cancellation: Option<PullCancellation>,
     pub streams: usize,
     /// The transport ledger's resolution; configuration, never a verdict.
@@ -72,6 +75,7 @@ impl<'a> Request<'a> {
             policy,
             step: "",
             keep: &[],
+            components: &[],
             cancellation: None,
             streams: transport::PULL_STREAMS,
             sample_seconds: transport::SAMPLE_SECONDS,
@@ -209,6 +213,36 @@ struct Counters {
 }
 
 pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
+    run(request, false).map(|(ensured, _)| ensured)
+}
+
+/// What an ensure of some components landed, held from GC until dropped. Nothing records part
+/// of a checkpoint, so its objects are unreferenced until the whole one is; the caller keeps
+/// this while it still means to complete it.
+pub struct PartHold {
+    hold: Option<crate::meta::Hold>,
+    meta: crate::meta::Meta,
+}
+
+impl Drop for PartHold {
+    fn drop(&mut self) {
+        if let Some(hold) = self.hold.take() {
+            let _ = hold.release(&self.meta);
+        }
+    }
+}
+
+/// [`ensure`] of `request.components` alone, its objects held until the hold drops. The hold
+/// is taken while this ensure still leads its flight, so no collection runs between the two.
+pub fn ensure_part(request: &Request<'_>) -> Result<(Ensured, PartHold)> {
+    if request.components.is_empty() {
+        return crate::err::refuse(Code::MISSING_FIELD, "a part names its components");
+    }
+    let (ensured, hold) = run(request, true)?;
+    Ok((ensured, hold.expect("a part ensure holds what it landed")))
+}
+
+fn run(request: &Request<'_>, hold: bool) -> Result<(Ensured, Option<PartHold>)> {
     let started = Instant::now();
     let model = request.refspec.split('@').next().unwrap_or_default();
     let say = |phase: Phase, bytes_done: u64, bytes_total: u64, rate: f64, attempt: u32| {
@@ -229,9 +263,14 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
     // caller's display, never silence, and the caller's cancellation still ends it.
     let resolving = || say(Phase::Resolving, 0, 0, 0.0, 0);
     resolving();
-    let closure = ticking(tick, &resolving, || {
+    let mut closure = ticking(tick, &resolving, || {
         transport::resolve_closure(&request.pull(request.store))
     })?;
+    if !request.components.is_empty() {
+        closure = ticking(tick, &resolving, || {
+            transport::narrow(&request.pull(request.store), &closure, request.components)
+        })?;
+    }
     let declared = closure.manifest.length + closure.objects.iter().map(|o| o.length).sum::<u64>();
     let flight = Flight::lead(
         request.store,
@@ -333,7 +372,19 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
         counters.origin_bytes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64(),
         counters.attempt.load(Ordering::Relaxed),
     );
-    Ok(Ensured {
+    let part = if hold {
+        let meta = crate::meta::Meta::open(request.store)?;
+        let owner = crate::meta::owner(request.store.root());
+        let _admitting = owner.as_ref().map(|owner| owner.gate.read().unwrap());
+        let held = meta.read_hold(owner.as_ref(), &closure_objects)?;
+        Some(PartHold {
+            hold: Some(held),
+            meta,
+        })
+    } else {
+        None
+    };
+    let ensured = Ensured {
         model: report.model,
         release: report.release,
         lane: report.lane,
@@ -348,7 +399,8 @@ pub fn ensure(request: &Request<'_>) -> Result<Ensured> {
         attempts: counters.attempt.load(Ordering::Relaxed),
         joined: flight.joined,
         seconds: started.elapsed().as_secs_f64(),
-    })
+    };
+    Ok((ensured, part))
 }
 
 /// Run `work`, calling `tick` once per `every` until it returns.

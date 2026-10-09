@@ -65,6 +65,8 @@ pub struct Closure {
     pub complete: bool,
     /// The largest presign ask the HUB will read, as the hub itself stated it.
     pub presign_max_digests: usize,
+    /// The components `objects` is narrowed to ([`super::narrow`]); empty: the whole checkpoint.
+    pub components: Vec<String>,
 }
 
 /// ONE PAGE of a closure. `after` is the last digest of the page before it, exclusive;
@@ -154,6 +156,7 @@ pub fn closure(
         objects,
         complete,
         presign_max_digests,
+        components: Vec::new(),
     })
 }
 

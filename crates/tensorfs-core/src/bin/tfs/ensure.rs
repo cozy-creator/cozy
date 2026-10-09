@@ -118,11 +118,16 @@ pub fn cmd_ensure(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
         .into_iter()
         .map(str::to_string)
         .collect();
+    let components: Vec<String> = flag_all(flags, "component")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let on_event = |event: &Event| say(&out, progress(event));
     let mut request = Request::new(&store, hub, refspec, &credential, &policy);
     request.lane = flag(flags, "lane").unwrap_or("");
     request.step = step;
     request.keep = &keep;
+    request.components = &components;
     request.streams = flag_num(flags, "streams", transport::PULL_STREAMS);
     request.sample_seconds = flag_num(flags, "sample-seconds", transport::SAMPLE_SECONDS);
     request.on_event = Some(&on_event);
