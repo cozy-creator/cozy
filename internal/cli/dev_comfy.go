@@ -126,7 +126,10 @@ func handleDevComfy(ctx *Context) *exit.Error {
 			}
 			return problem
 		}
-		return store.RecordRentalKeepalive(address.Row.ID, receipt, time.Now())
+		if problem := store.RecordRentalKeepalive(address.Row.ID, receipt, time.Now()); problem != nil {
+			return problem
+		}
+		return nil
 	}
 	// Refuse identity/auth failures before sending a Comfy graph to the SSH host.
 	call, cancel := context.WithTimeout(observed, 15*time.Second)
@@ -161,7 +164,9 @@ func handleDevComfy(ctx *Context) *exit.Error {
 		ctx.exitCode = 1
 	}
 	var seconds any
-	if result.ServerExecutionSeconds!=nil {seconds=*result.ServerExecutionSeconds}
+	if result.ServerExecutionSeconds != nil {
+		seconds = *result.ServerExecutionSeconds
+	}
 	return emit(ctx, compactRecord([]output.Field{{K: "operation", V: result.Operation}, {K: "status", V: result.Status},
 		{K: "prompt_id", V: result.PromptID}, {K: "server_execution_seconds", V: seconds},
 		{K: "detail", V: result.Detail}, {K: "output_directory", V: out}, {K: "files", V: result.Files}},
