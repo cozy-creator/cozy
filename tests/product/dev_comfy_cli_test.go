@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -53,7 +54,7 @@ func TestDevComfyCLIAcknowledgedKeepaliveReachesTransportAndReportsOutcome(t *te
 	certServer := httptest.NewTLSServer(http.NotFoundHandler())
 	cert := certServer.TLS.Certificates[0]
 	certServer.Close()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow pinned loopback machine fixture for the real CLI keepalive
 	must(t, err)
 	peer := &comfyKeepalivePeer{}
 	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}})))
@@ -82,7 +83,12 @@ func TestDevComfyCLIAcknowledgedKeepaliveReachesTransportAndReportsOutcome(t *te
 	for _, status := range []string{"success", "failed"} {
 		must(t, os.WriteFile(outcome, []byte(status), 0600))
 		command := exec.Command(cozyBin, "dev", "comfy", "--rental=fixture", "--input="+input, "--idempotency-key="+status, "--ssh-key="+key, "--ssh-known-hosts="+hosts, "--out="+filepath.Join(root, "out-"+status), "--json", "--full")
-		command.Env = childEnv(t, root, "PATH="+bin+":"+os.Getenv("PATH"))
+		command.Env = childEnv(t, root)
+		for i, entry := range command.Env {
+			if strings.HasPrefix(entry, "PATH=") {
+				command.Env[i] = "PATH=" + bin + string(os.PathListSeparator) + strings.TrimPrefix(entry, "PATH=")
+			}
+		}
 		var stdout, stderr bytes.Buffer
 		command.Stdout = &stdout
 		command.Stderr = &stderr
