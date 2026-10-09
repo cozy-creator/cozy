@@ -3,10 +3,12 @@ package producttest
 import (
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 )
@@ -20,7 +22,7 @@ func TestALocalUploadCarriesACapabilityForThisComputersMachine(t *testing.T) {
 		t.Skip("requires -machine-host: the pod-supervisor this computer's machine runs")
 	}
 	h := newMachineHub(t)
-	h.hubAccess.refuse = true
+	h.hubAccess.refuseTrades()
 	root, err := os.MkdirTemp("", "czg")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
@@ -54,5 +56,24 @@ func TestALocalUploadCarriesACapabilityForThisComputersMachine(t *testing.T) {
 	}
 	if ops, _ := json.Marshal(claims["authorization_details"]); string(ops) != `[{"model":"proof/output","type":"tensorhub_model_publish"}]` {
 		t.Fatalf("the capability is not exactly the destination: %s", ops)
+	}
+
+	// A fresh daemon reaches the machine the last one left running and delivers the next upload.
+	if code, out := runCozy(t, root, "down"); code != 0 {
+		t.Fatalf("down [exit %d]\n%s", code, out)
+	}
+	done := make(chan string, 1)
+	go func() {
+		code, out := runCozy(t, root, "model", "upload", strayTensor(t, root), "proof/output", "--await", "--json")
+		done <- fmt.Sprintf("[exit %d]\n%s", code, out)
+	}()
+	select {
+	case out := <-done:
+		if trades := h.hubAccess.trades(); len(trades) != 2 || !strings.Contains(out, "capability_refused") {
+			t.Fatalf("the upload after a daemon restart did not reach the machine: %d trades %s", len(trades), out)
+		}
+	case <-time.After(2 * time.Minute):
+		daemonLog, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
+		t.Fatalf("the upload after a daemon restart never reached the machine; daemon log:\n%s", daemonLog)
 	}
 }

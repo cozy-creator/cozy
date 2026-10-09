@@ -245,13 +245,14 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	}
 
 	// The owner's change to the package moves the catalog revision: the CLI reads the binding
-	// once more, then nothing again; no machine reads it.
+	// once more for whichever machine runs next, then nothing again; no machine reads it.
 	h.mux.HandleFunc("DELETE /v1/packages/"+parityPublished+"/releases/"+parityVersion, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"release":"` + parityVersion + `","state":"yanked","changed":true}`))
 	})
 	if code, out := runCozy(t, root, "package", "yank", parityPublished, "--version", parityVersion); code != 0 || strings.Contains(out, "keeps what it read") || strings.Contains(out, "no machine was told") {
 		t.Fatalf("yank did not reach every machine [exit %d]\n%s", code, out)
 	}
+	changed := true
 	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {
 		for _, key := range []string{"changed", "warm again"} {
 			mu.Lock()
@@ -264,9 +265,10 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			calls := strings.Join(seen, "\n")
 			mu.Unlock()
 			read := strings.Contains(calls, "account GET /v1/packages/"+parityPublished+"/bindings")
-			if (key == "changed") != read || catalog(calls) || key == "warm again" && calls != "" {
+			if changed != read || catalog(calls) || !changed && calls != "" {
 				t.Fatalf("the %s run on %s read: %q", key, venue, calls)
 			}
+			changed = false
 		}
 	}
 

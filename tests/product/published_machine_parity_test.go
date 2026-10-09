@@ -25,14 +25,25 @@ const (
 	parityVersion   = "0.0.1"
 )
 
-// A published release on a known machine is one message to that machine: `cozy run` makes no
-// Hub request, on this computer's machine or on a rental, with the real Host and Runtime on
-// both. Each machine reads the release, its lock and its interface at its own Hub.
+// A published release on a known machine is one message to that machine, with the real Host
+// and Runtime on this computer's machine and on a rental. The CLI reads the release's card,
+// its lock and its published closure once per catalog revision and hands them to whichever
+// machine runs it (th-241); after that no run reads a Hub, and no machine ever reads a package.
 func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 	h, root, _, store := parityMachines(t)
 	publishParityRelease(t, h, root, parityProject(t))
 	var mu sync.Mutex
 	var seen []string
+	var machineReads []string
+	doors := h.worker.Config.Handler
+	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
+			mu.Lock()
+			machineReads = append(machineReads, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+		}
+		doors.ServeHTTP(w, r)
+	})
 	served := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/rentals") { // the fleet's own reconciliation
@@ -42,6 +53,7 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 		}
 		served.ServeHTTP(w, r)
 	})
+	carded := false
 	run := func(venue, key string, args ...string) {
 		t.Helper()
 		mu.Lock()
@@ -62,11 +74,23 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 		}
 		mu.Lock()
 		calls := append([]string(nil), seen...)
+		if len(machineReads) != 0 {
+			t.Fatalf("a machine read a package at its Hub: %v", machineReads)
+		}
 		mu.Unlock()
-		// Its first published call grants the machine content access; identity and
-		// lifecycle remain local, and subsequent calls rely on the grant the machine holds.
+		// The first run reads the release's card; the first on each machine names the Hub's
+		// account and token endpoint for its capability. Nothing else, and nothing after.
 		if key == "cold" {
 			calls = slices.DeleteFunc(calls, hubAccessCall)
+		}
+		if !carded {
+			card := len(calls) > 0 && !slices.ContainsFunc(calls, func(call string) bool {
+				return !strings.Contains(call, " /v1/packages/"+parityPublished)
+			})
+			if !card || !slices.Contains(calls, "GET /v1/packages/"+parityPublished+"/releases/"+parityVersion+"/locked-requirements") {
+				t.Fatalf("the first run on %s did not read only the release's card: %v", venue, calls)
+			}
+			carded, calls = true, nil
 		}
 		if len(calls) != 0 {
 			t.Fatalf("the %s run on %s made %d Hub requests; want none: %v", key, venue, len(calls), calls)
@@ -80,8 +104,8 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 			run(venue.name, key, venue.args...)
 		}
 	}
-	// A stopped machine boots for the next run and describes the release itself: its startup
-	// check finds no update pending, so the run reads no Hub either.
+	// A stopped machine boots for the next run, which carries the card the CLI keeps: its
+	// startup check finds no update pending, so the run reads no Hub either.
 	for i := range 3 {
 		if code, out := runCozy(t, root, "machine", "stop"); code != 0 {
 			t.Fatalf("machine stop [exit %d]\n%s", code, out)
@@ -152,14 +176,14 @@ func publishParityReleaseAt(t *testing.T, h *machineHub, root, project, release 
 	must(t, err)
 	account := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if body, ok := releases[r.URL.Path]; ok {
+		if body, ok := releases[r.URL.Path]; ok && r.Method == http.MethodGet {
 			_, _ = w.Write(body)
 			return
 		}
-		switch r.URL.Path {
-		case path + "/download":
+		switch {
+		case r.URL.Path == path+"/download" && (r.URL.Query().Get("release") == release || r.URL.Query().Get("release") == ""):
 			_, _ = w.Write(plan)
-		case "/v1/index/proof/simple/machine-parity/":
+		case r.URL.Path == "/v1/index/proof/simple/machine-parity/":
 			_, _ = fmt.Fprintf(w, `<a href="%s/%s#sha256=%x">%s</a>`, files.URL, name, sum, name)
 		default:
 			account.ServeHTTP(w, r)

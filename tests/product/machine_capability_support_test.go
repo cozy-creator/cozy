@@ -108,9 +108,10 @@ func (a *fakeHubAccess) serveMachine(w http.ResponseWriter, r *http.Request) boo
 		}
 		a.mu.Lock()
 		a.traded = append(a.traded, claims.Capability)
+		refuse := a.refuse
 		a.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		if a.refuse || r.Header.Get("DPoP") == "" || r.PostForm.Get("client_id") != "tensord" {
+		if refuse || r.Header.Get("DPoP") == "" || r.PostForm.Get("client_id") != "tensord" {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"error":"invalid_grant","reason":"refused","error_description":"the stand-in hub grants nothing"}`))
 			return true
@@ -120,6 +121,13 @@ func (a *fakeHubAccess) serveMachine(w http.ResponseWriter, r *http.Request) boo
 		return false
 	}
 	return true
+}
+
+// refuseTrades answers every later trade invalid_grant.
+func (a *fakeHubAccess) refuseTrades() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.refuse = true
 }
 
 // trades are the capabilities machines presented at the token endpoint, oldest first.

@@ -44,7 +44,7 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 		}
 	})
 	// The stand-in hub refuses every capability trade.
-	h.hubAccess.refuse = true
+	h.hubAccess.refuseTrades()
 	serveOtherBytes(h, manifest)
 	root, err := os.MkdirTemp("", "czf")
 	must(t, err)

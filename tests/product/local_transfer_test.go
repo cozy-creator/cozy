@@ -36,8 +36,6 @@ func TestLocalTransfersAreWarmRunsOnThisComputersMachine(t *testing.T) {
 		served.ServeHTTP(w, r)
 	})
 	serveOtherBytes(h, manifest)
-	// The machine trades its run capability at the Hub, which grants nothing.
-	h.hubAccess.refuse = true
 	root, err := os.MkdirTemp("", "czt")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
@@ -67,13 +65,16 @@ func TestLocalTransfersAreWarmRunsOnThisComputersMachine(t *testing.T) {
 			t.Fatalf("%s did not end with the machine's own answer %q [exit %d]\n%s", what, want, code, out)
 		}
 	}
+	// The owner's checkpoint named by digest is a private read: the machine trades its
+	// capability, then refuses the bytes that arrive by its own name.
 	refused(t, "a checkpoint into a local alias", "model_download_failed", "model", "download", "proof/model#"+manifest, "local/tiny")
 	refused(t, "an absent alias's upload", "this machine holds no local/absent", "model", "upload", "local/absent", "proof/model")
 
 	// One F16 tensor: written, made as it is, then published under the run's capability,
-	// which the Hub refuses. An upload that ends before publishing trades nothing.
+	// which the Hub now refuses. An upload that ends before publishing trades nothing.
+	h.hubAccess.refuseTrades()
 	refused(t, "a local file's upload", "capability_refused", "model", "upload", strayTensor(t, root), "proof/model")
-	if trades := h.hubAccess.trades(); len(trades) != 1 {
-		t.Fatalf("want one trade, the file's upload, got %d", len(trades))
+	if trades := h.hubAccess.trades(); len(trades) != 2 {
+		t.Fatalf("want two trades, the download's read and the file's upload, got %d", len(trades))
 	}
 }

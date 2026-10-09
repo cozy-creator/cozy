@@ -103,7 +103,7 @@ def main(payload: Request) -> Result:
 	// The CLI reads each release's card and hands it to the machine (th-241).
 	account := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if body, found := releases[r.URL.Path]; found {
+		if body, found := releases[r.URL.Path]; found && r.Method == http.MethodGet {
 			_, _ = w.Write(body)
 			return
 		}
