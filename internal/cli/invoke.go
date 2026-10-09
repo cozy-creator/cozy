@@ -2980,22 +2980,18 @@ func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInt
 		return Target{}, nil, problem
 	}
 	// A release this client has not installed: the one kept under the current catalog revision,
-	// else the newest the machine names at the selected Hub, else the Hub's own answer. Every
-	// machine is sent that exact release, so a warm run reads no Hub; a publish, yank or bind
-	// moves the revision.
+	// else the selected Hub's newest. Every machine is sent that exact release with its card,
+	// so a machine reads no Hub to install it; a publish, yank or bind moves the revision.
 	root, revision := home.Paths(ctx.Cfg.Home).Root, catalogRevision(ctx)
 	if release, surface := keptNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision); release != "" {
 		target.Release = release
 		return target, surface, nil
 	}
-	release, surface, problem := describeOnMachine(ctx, target.Package)
-	if problem == nil && release == "" {
-		target, surface, problem = catalogInvocationTarget(ctx, target)
-		release = target.Release
-	}
+	target, surface, problem = catalogInvocationTarget(ctx, target)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
+	release := target.Release
 	keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision, release)
 	target.Release = release
 	return target, surface, nil
@@ -3012,8 +3008,7 @@ func catalogRevision(ctx *Context) string {
 	return revision
 }
 
-// catalogInvocationTarget is the selected Hub's newest release of target and its interface,
-// read when no machine can describe it.
+// catalogInvocationTarget is the selected Hub's newest release of target and its interface.
 func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
 	root := home.Paths(ctx.Cfg.Home).Root
 	ref, problem := hub.ParseRef(target.Package)
@@ -3053,56 +3048,6 @@ func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.Packa
 	// no further Hub call.
 	keepReleaseInterface(root, ctx.Cfg.HubURL, target.Package, release, detail.PackageInterface, requirements)
 	return target, packageInterface, nil
-}
-
-// describeOnMachine is pkg's newest release and its interface as the machine the run goes to
-// installs it at the selected Hub (describe/1), so the client reads no Hub. "" when the run has no
-// machine yet, or the machine or daemon cannot describe.
-func describeOnMachine(ctx *Context, pkg string) (string, *launch.PackageInterface, *exit.Error) {
-	machine, known, problem := knownMachine(ctx)
-	if problem != nil || !known {
-		return "", nil, problem
-	}
-	var described api.ReleaseDescription
-	if ctx.endpoint != nil {
-		install, problem := foregroundPrewarm(ctx, ctx.endpoint, machine, records.RentalInstallSelection{Package: pkg})
-		if problem != nil || json.Unmarshal(install.Result, &described) != nil {
-			return "", nil, describeFallback(problem)
-		}
-	} else {
-		c, problem := dial(ctx)
-		if problem != nil {
-			return "", nil, problem
-		}
-		if described, problem = c.DescribeRelease(machine, pkg); problem != nil {
-			return "", nil, describeFallback(problem)
-		}
-	}
-	if described.Release == "" || len(described.Interface) == 0 {
-		return "", nil, nil
-	}
-	raw, err := canonical.NormalizeJCS(described.Interface)
-	if err != nil {
-		return "", nil, exit.Named(exit.Conflict, "machine.package_interface_invalid", "the machine described an invalid package interface")
-	}
-	surface, problem := launch.DecodePackageInterface(raw)
-	if problem != nil {
-		return "", nil, exit.Named(exit.Conflict, "machine.package_interface_invalid",
-			"the machine described an invalid package interface: %s", problem.Message)
-	}
-	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, ctx.Cfg.HubURL, pkg, described.Release, raw, nil)
-	return described.Release, surface, nil
-}
-
-// describeFallback keeps a describe refusal that ends the run, and drops one that only says
-// the machine or daemon cannot describe now (an older one, no route, or an unreachable
-// machine, whose run is still recorded and waits for it): the Hub names it.
-func describeFallback(problem *exit.Error) *exit.Error {
-	if problem == nil || problem.Code == exit.Unavailable || problem.Code == exit.NotFound ||
-		problem.ErrName() == "untyped_answer" || problem.ErrName() == "hub.untyped_refusal" {
-		return nil
-	}
-	return problem
 }
 
 // knownMachine is the machine a run names without renting one: this computer's, or a named

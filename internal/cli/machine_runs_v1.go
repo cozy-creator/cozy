@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
-	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/inputasset"
@@ -42,10 +41,6 @@ import (
 // under the request's id, and the same call streams its log to the outcome. Resubmitting is
 // attaching: the id is the idempotency, so nothing is frozen, closed or acknowledged. Outputs
 // are read with Read into the run's outputs folder as their revisions land.
-
-// errNoDescribe is a machine that cannot name a package's newest release and its interface
-// (describe/1): the client reads them at the Hub instead.
-var errNoDescribe = exit.Named(exit.Unavailable, "machine.describe_unsupported", "the machine cannot describe a release")
 
 // loopV1 follows one run on its machine until it is settled.
 func (m *machineRuns) loopV1(request records.Request) {
@@ -495,7 +490,11 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 			m.submissionStage(request.ID, "package", revision.Package, began)
 		}
 	} else {
-		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: request.Package, Release: request.Release}}
+		release, problem := m.releaseV1(ctx, request.Hub, request.Package, request.Release, machine)
+		if problem != nil {
+			return nil, problem
+		}
+		spec.Source = &v1.RunSpec_Release{Release: release}
 	}
 	began = time.Now()
 	for _, asset := range request.Assets {
@@ -554,7 +553,7 @@ func modelChoicesV1(request records.Request, models []records.ModelRef) ([]*v1.M
 
 // warmSetV1 is the machine's warm set with the selection's member added, changed or (`off`)
 // removed; the other members are sent back as the machine reported them.
-func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection) (*v1.WarmSet, *exit.Error) {
+func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection, release *v1.Release) (*v1.WarmSet, *exit.Error) {
 	set := &v1.WarmSet{}
 	for _, item := range current {
 		if item.GetRelease().GetPackage() == selection.Package && item.GetEntrypoint() == selection.Entrypoint {
@@ -574,7 +573,10 @@ func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection)
 	if problem != nil {
 		return nil, problem
 	}
-	set.Items = append(set.Items, &v1.WarmItem{Source: &v1.WarmItem_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}},
+	if release == nil {
+		release = &v1.Release{Package: selection.Package, Release: selection.Release}
+	}
+	set.Items = append(set.Items, &v1.WarmItem{Source: &v1.WarmItem_Release{Release: release},
 		Entrypoint: selection.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1)})
 	return set, nil
 }
@@ -601,9 +603,6 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		return nil, exit.Named(exit.Structural, "machine.warm_unsupported",
 			"this machine takes no warm runs or model uploads; %s", machines.RuntimeUpdate(row.RentalID))
 	}
-	if selection.Package != "" && selection.Release == "" && !slices.Contains(capabilities, "describe/1") {
-		return nil, errNoDescribe
-	}
 	if selection.HoldsLocally() && !slices.Contains(capabilities, "local-models/1") {
 		return nil, exit.Named(exit.Structural, "machine.local_models_unsupported",
 			"this machine holds no local files or local/ models; %s", machines.RuntimeUpdate(row.RentalID))
@@ -613,6 +612,12 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		origin = machine.Account.Base()
 	}
 	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_WARM, WeightsDestination: selection.Destination}
+	var release *v1.Release
+	if selection.Package != "" && !strings.HasPrefix(selection.Package, "local/") {
+		if release, problem = m.releaseV1(ctx, origin, selection.Package, selection.Release, machine); problem != nil {
+			return nil, problem
+		}
+	}
 	if strings.HasPrefix(selection.Package, "local/") {
 		// Only unpublished code names its owner, as a call of it does: the same preparation key.
 		if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
@@ -630,12 +635,12 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			return nil, exit.Named(exit.Structural, "machine.warm_set_unsupported",
 				"this machine keeps no warm set; %s", machines.RuntimeUpdate(row.RentalID))
 		}
-		if spec.Set, problem = warmSetV1(frame.GetWarm(), selection); problem != nil {
+		if spec.Set, problem = warmSetV1(frame.GetWarm(), selection, release); problem != nil {
 			return nil, problem
 		}
 		selection.Models = nil
-	} else if selection.Package != "" {
-		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}}
+	} else if release != nil {
+		spec.Source = &v1.RunSpec_Release{Release: release}
 	}
 	for _, model := range selection.Models {
 		spec.Models = append(spec.Models, &v1.ModelChoice{Parameter: either(model.Slot, model.Model), Repository: model.Model,
@@ -690,20 +695,41 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	}
 }
 
-// Describe installs pkg's newest release on a machine at the request's selected Hub and answers
-// it with its interface: an install-only warm run with no release named (describe/1).
-func (m *machineRuns) Describe(ctx context.Context, machine, pkg, hub string) (api.ReleaseDescription, *exit.Error) {
-	row := records.RentalInstall{ID: records.NewID("describe"), RentalID: machine,
-		Selection: records.RentalInstallSelection{Package: pkg, Hub: hub}}
-	result, problem := m.prewarmV1(ctx, row, func(machines.InstallProgress) {})
-	if problem != nil && problem.ErrName() == "machine.warm_unsupported" {
-		problem = errNoDescribe
+// releaseV1 is a published release as a machine installs it reading no Hub (th-241): its card
+// (package interface and Python version) and its locked requirements, written to the machine
+// as an object. No release named is the Hub's newest.
+func (m *machineRuns) releaseV1(ctx context.Context, origin, pkg, release string, machine *machines.V1) (*v1.Release, *exit.Error) {
+	account := client(m.context.forHub(origin))
+	ref, problem := hub.ParseRef(pkg)
+	if problem != nil {
+		return nil, problem
 	}
-	var described api.ReleaseDescription
-	if problem == nil && (json.Unmarshal(result, &described) != nil || described.Release == "" || len(described.Interface) == 0) {
-		problem = errNoDescribe
+	if release == "" {
+		card, problem := account.PackageCard(ctx, ref)
+		if problem != nil {
+			return nil, problem
+		}
+		if release, problem = newestPackageRelease(card.Releases); problem != nil {
+			return nil, problem
+		}
 	}
-	return described, problem
+	detail, problem := account.PackageRelease(ctx, ref, release)
+	if problem != nil {
+		return nil, problem
+	}
+	if detail.Release.Release != release || len(detail.PackageInterface) == 0 {
+		return nil, exit.Named(exit.Conflict, "rental.package_release_invalid", "Tensorhub returned no card for %s@%s", pkg, release)
+	}
+	lock, problem := account.PackageLockedRequirements(ctx, ref, release)
+	if problem != nil {
+		return nil, problem
+	}
+	object, err := machinev1.WriteBytes(ctx, machine.Machine, lock)
+	if err != nil {
+		return nil, machines.Transport(err)
+	}
+	return &v1.Release{Package: pkg, Release: release, PackageInterface: detail.PackageInterface,
+		PythonVersion: detail.PythonVersion, LockedRequirements: object.Digest}, nil
 }
 
 // writeTreesV1 writes each `--input-tree ref=dir` to the machine as writeTreeV1 does; the

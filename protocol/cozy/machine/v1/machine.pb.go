@@ -670,11 +670,18 @@ func (x *ProviderAccess) GetCivitai() string {
 }
 
 type Release struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Package       string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // org/name
-	Release       string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Package string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"` // org/name
+	Release string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
+	// The release as its Hub publishes it, so the machine installs it reading no Hub (th-241):
+	// its package interface (canonical JSON), its Python version, and its locked requirements
+	// as an object the caller wrote with Write (sha256:<hex>). Needed only when the signer
+	// holds no installation of the release yet.
+	PackageInterface   []byte `protobuf:"bytes,3,opt,name=package_interface,json=packageInterface,proto3" json:"package_interface,omitempty"`
+	PythonVersion      string `protobuf:"bytes,4,opt,name=python_version,json=pythonVersion,proto3" json:"python_version,omitempty"`
+	LockedRequirements string `protobuf:"bytes,5,opt,name=locked_requirements,json=lockedRequirements,proto3" json:"locked_requirements,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *Release) Reset() {
@@ -717,6 +724,27 @@ func (x *Release) GetPackage() string {
 func (x *Release) GetRelease() string {
 	if x != nil {
 		return x.Release
+	}
+	return ""
+}
+
+func (x *Release) GetPackageInterface() []byte {
+	if x != nil {
+		return x.PackageInterface
+	}
+	return nil
+}
+
+func (x *Release) GetPythonVersion() string {
+	if x != nil {
+		return x.PythonVersion
+	}
+	return ""
+}
+
+func (x *Release) GetLockedRequirements() string {
+	if x != nil {
+		return x.LockedRequirements
 	}
 	return ""
 }
@@ -3142,10 +3170,13 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x06sourceJ\x04\b\v\x10\fJ\x04\b\x11\x10\x12J\x04\b\x13\x10\x14\"L\n" +
 	"\x0eProviderAccess\x12 \n" +
 	"\vhuggingface\x18\x01 \x01(\tR\vhuggingface\x12\x18\n" +
-	"\acivitai\x18\x02 \x01(\tR\acivitai\"=\n" +
+	"\acivitai\x18\x02 \x01(\tR\acivitai\"\xc2\x01\n" +
 	"\aRelease\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
-	"\arelease\x18\x02 \x01(\tR\arelease\")\n" +
+	"\arelease\x18\x02 \x01(\tR\arelease\x12+\n" +
+	"\x11package_interface\x18\x03 \x01(\fR\x10packageInterface\x12%\n" +
+	"\x0epython_version\x18\x04 \x01(\tR\rpythonVersion\x12/\n" +
+	"\x13locked_requirements\x18\x05 \x01(\tR\x12lockedRequirements\")\n" +
 	"\vLocalSource\x12\x1a\n" +
 	"\bmanifest\x18\x01 \x01(\tR\bmanifest\"\x86\x01\n" +
 	"\tInputFile\x12\x14\n" +

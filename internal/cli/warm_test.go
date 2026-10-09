@@ -19,7 +19,7 @@ func TestAWarmSetChangesOneMemberAndKeepsTheRest(t *testing.T) {
 		member("paul/anima", "generate", v1.WarmLevel_WARM_LEVEL_HOST)}
 	selection := records.RentalInstallSelection{Package: "paul/sdxl", Release: "2.6.0", Entrypoint: "generate", Warm: "host",
 		Models: []records.ModelRef{{Choice: true, Package: "paul/sdxl", Slot: "model", BindingPath: "model", Model: "paul/sdxl", Release: "1.0.0"}}}
-	set, problem := warmSetV1(current, selection)
+	set, problem := warmSetV1(current, selection, nil)
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -35,11 +35,11 @@ func TestAWarmSetChangesOneMemberAndKeepsTheRest(t *testing.T) {
 		t.Fatalf("the member was not replaced with its new level and models: %v", changed)
 	}
 	selection.Warm = "off"
-	if set, _ = warmSetV1(current, selection); len(set.Items) != 1 || set.Items[0].GetRelease().GetPackage() != "paul/anima" {
+	if set, _ = warmSetV1(current, selection, nil); len(set.Items) != 1 || set.Items[0].GetRelease().GetPackage() != "paul/anima" {
 		t.Fatalf("off did not remove the member: %v", set.Items)
 	}
 	selection.Warm = "hot"
-	if _, problem := warmSetV1(current, selection); problem == nil {
+	if _, problem := warmSetV1(current, selection, nil); problem == nil {
 		t.Fatal("an unknown level was accepted")
 	}
 }
