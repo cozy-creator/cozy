@@ -225,6 +225,9 @@ func handleLs(ctx *Context) *exit.Error {
 			return !installedInScope(ctx, inst)
 		})
 	}
+	slices.SortStableFunc(rows, func(a, b records.PackageInstall) int {
+		return installHubPriority(ctx, a) - installHubPriority(ctx, b)
+	})
 	for _, inst := range rows {
 		pythonStatus := "supported"
 		if pythonProblem != nil {

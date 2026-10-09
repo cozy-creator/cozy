@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -119,5 +120,39 @@ func TestPackageRemovePreservesOtherHubInstallations(t *testing.T) {
 	fatal(t, problem)
 	if retained == nil {
 		t.Fatal("another Hub's superseded record was removed")
+	}
+}
+
+// A selected Hub's installed package must survive the default20-row presentation
+// cap even when the home retains many earlier-alphabetic local diagnostics.
+func TestPackageListPlacesSelectedHubBeforeLocalDiagnostics(t *testing.T) {
+	root := t.TempDir()
+	const current = "http://127.0.0.1:1"
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+current+"\n"), 0o600))
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	for i := range 24 {
+		row := records.PackageInstall{ID: fmt.Sprintf("%016x", i+1), Package: fmt.Sprintf("local/diagnostic-%02d", i), Major: 1, Version: "1.0.0", SourceKind: "local", Verified: true}
+		row.Dir = layout.InstallDir(row.ID)
+		_, problem = store.Activate(row)
+		fatal(t, problem)
+	}
+	row := records.PackageInstall{ID: "ffffffffffffffff", Package: "paul/minimax-h3", Major: 1, Version: "1.26.3", SourceKind: "tensorhub", Hub: current, Verified: true}
+	row.Dir = layout.InstallDir(row.ID)
+	_, problem = store.Activate(row)
+	fatal(t, problem)
+	store.Close()
+	code, out := runCozy(t, root, "package", "list", "--json")
+	var doc struct {
+		Packages []struct{ Package, Scope string }
+		Omitted  int
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &doc) != nil {
+		t.Fatalf("list: %d %s", code, out)
+	}
+	if len(doc.Packages) != 20 || doc.Omitted != 5 || doc.Packages[0].Package != "paul/minimax-h3" || doc.Packages[0].Scope != "selected hub" || doc.Packages[1].Package != "local/diagnostic-00" {
+		t.Fatalf("selected package hidden behind diagnostics: %s", out)
 	}
 }
