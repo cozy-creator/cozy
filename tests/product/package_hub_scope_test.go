@@ -85,9 +85,8 @@ func TestPackageListShowsEveryHubPublishedFirst(t *testing.T) {
 	}
 }
 
-// Removal is work on an installation, so it uses the installation's own hub: the name the
-// list shows removes it with no flag. An explicit --tensorhub naming another hub keeps it, and
-// keeps another hub's superseded install of the same name.
+// Each hub's installation of one org/name is its own. --tensorhub=a removes only a's; a hub
+// with none refuses, naming the hub that has one; no flag removes every hub's.
 func TestPackageRemoveUsesTheInstallationsHub(t *testing.T) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
@@ -97,33 +96,26 @@ func TestPackageRemoveUsesTheInstallationsHub(t *testing.T) {
 	defer store.Close()
 	const a, b = "http://127.0.0.1:1", "http://127.0.0.1:2"
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: a\nhubs:\n  a: "+a+"\n  b: "+b+"\n"), 0o600))
-	prior := updateAllInstall(t, layout, store, 1, "proof/shared", "1.0.0", "tensorhub", a)
-	active := updateAllInstall(t, layout, store, 2, "proof/shared", "1.0.1", "tensorhub", b)
+	fromA := updateAllInstall(t, layout, store, 1, "proof/shared", "1.0.0", "tensorhub", a)
+	fromB := updateAllInstall(t, layout, store, 2, "proof/shared", "1.0.1", "tensorhub", b)
+	if code, out := runCozy(t, root, "package", "remove", "proof/shared", "--tensorhub=a", "--json"); code != 0 || !strings.Contains(out, `"changed":true`) {
+		t.Fatalf("removing hub a's installation failed: %d %s", code, out)
+	}
+	if _, err := os.Stat(fromA.Dir); !os.IsNotExist(err) {
+		t.Fatalf("hub a's files survived its removal: %v", err)
+	}
+	if _, got, problem := store.ActivePackage(b, "proof/shared"); problem != nil || got == nil || got.ID != fromB.ID {
+		t.Fatalf("removing hub a's installation touched hub b's: %+v %v", got, problem)
+	}
 	code, out := runCozy(t, root, "package", "remove", "proof/shared", "--tensorhub=a", "--json")
 	if code == 0 || !strings.Contains(out, "package.other_hub") || !strings.Contains(out, "installed from hub b ("+b+")") {
-		t.Fatalf("removal through another hub did not refuse naming the installation's hub: %d %s", code, out)
+		t.Fatalf("removal at a hub without the package did not name the hub that has it: %d %s", code, out)
 	}
-	_, got, problem := store.ActivePackage("proof/shared")
-	fatal(t, problem)
-	if got == nil || got.ID != active.ID {
-		t.Fatal("an install from another hub than --tensorhub was unpinned")
-	}
-	code, out = runCozy(t, root, "package", "remove", "proof/shared", "--tensorhub=b", "--json")
-	if code != 0 || !strings.Contains(out, `"changed":true`) {
-		t.Fatalf("explicit hub removal failed: %d %s", code, out)
-	}
-	if _, err := os.Stat(active.Dir); !os.IsNotExist(err) {
-		t.Fatalf("selected hub files survived removal: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(prior.Dir, "prior.py")); err != nil {
-		t.Fatalf("--tensorhub=b reclaimed hub a's superseded files: %v", err)
-	}
-	code, out = runCozy(t, root, "package", "remove", "proof/shared", "--json")
-	if code != 0 || !strings.Contains(out, `"changed":true`) {
+	if code, out := runCozy(t, root, "package", "remove", "proof/shared", "--json"); code != 0 || !strings.Contains(out, `"changed":true`) {
 		t.Fatalf("removal by name without a flag failed: %d %s", code, out)
 	}
-	if _, err := os.Stat(prior.Dir); !os.IsNotExist(err) {
-		t.Fatalf("hub a's superseded files survived removal by name: %v", err)
+	if _, err := os.Stat(fromB.Dir); !os.IsNotExist(err) {
+		t.Fatalf("hub b's files survived removal by name: %v", err)
 	}
 }
 

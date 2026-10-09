@@ -632,7 +632,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 			}
 		}
 	} else {
-		jobs, e = s.packages.Jobs(sub.Package)
+		jobs, e = s.packages.Jobs(hub, sub.Package)
 	}
 	if e != nil {
 		return out, nil, e

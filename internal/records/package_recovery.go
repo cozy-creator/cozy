@@ -67,7 +67,7 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 		return 0, exit.Named(exit.Validation, "package_inventory_source_pin_count_invalid",
 			"package inventory source contains %d pins for %d installs", pinCount, installCount)
 	}
-	rows, err := source.Query(`SELECT ` + installCols("") + ` FROM installs ORDER BY id`)
+	rows, err := source.Query(`SELECT ` + installHubCols("") + ` FROM installs ORDER BY id`)
 	if err != nil {
 		return 0, exit.Named(exit.Validation, "package_inventory_source_unreadable",
 			"cannot read source package installs: %s", err)
@@ -75,7 +75,7 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 	var installs []PackageInstall
 	seen := make(map[string]PackageInstall, installCount)
 	for rows.Next() {
-		inst, scanErr := scanInstall(rows)
+		inst, scanErr := scanInstallHub(rows)
 		if scanErr != nil {
 			rows.Close()
 			return 0, exit.Named(exit.Validation, "package_inventory_source_unreadable",
@@ -93,7 +93,7 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 		return 0, exit.Named(exit.Conflict, "package_inventory_source_changed",
 			"package inventory source changed while it was being read")
 	}
-	pinRows, err := source.Query(`SELECT package,major,install_id,activated_at FROM pins ORDER BY package`)
+	pinRows, err := source.Query(`SELECT hub,package,major,install_id,activated_at FROM pins ORDER BY package, hub`)
 	if err != nil {
 		return 0, exit.Named(exit.Validation, "package_inventory_source_unreadable",
 			"cannot read source package pins: %s", err)
@@ -104,17 +104,17 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 		var pin Pin
 		var inst PackageInstall
 		exists := false
-		scanErr := pinRows.Scan(&pin.Package, &pin.Major, &pin.InstallID, &pin.ActivatedAt)
+		scanErr := pinRows.Scan(&pin.Hub, &pin.Package, &pin.Major, &pin.InstallID, &pin.ActivatedAt)
 		if scanErr == nil {
 			inst, exists = seen[pin.InstallID]
 		}
-		if scanErr != nil || pin.Package == "" || packages[pin.Package] || !exists ||
-			inst.Package != pin.Package || inst.Major != pin.Major {
+		if scanErr != nil || pin.Package == "" || packages[pin.Hub+"\x00"+pin.Package] || !exists ||
+			inst.Package != pin.Package || inst.Major != pin.Major || inst.PinHub() != pin.Hub {
 			pinRows.Close()
 			return 0, exit.Named(exit.Validation, "package_inventory_source_pin_invalid",
 				"source package pin is duplicate, malformed, or names an absent install")
 		}
-		packages[pin.Package] = true
+		packages[pin.Hub+"\x00"+pin.Package] = true
 		pins = append(pins, pin)
 	}
 	pinRows.Close()
@@ -130,8 +130,8 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 	defer tx.Rollback()
 	missingInstalls := make([]PackageInstall, 0, len(installs))
 	for _, inst := range installs {
-		current, scanErr := scanInstall(tx.QueryRow(
-			`SELECT `+installCols("")+` FROM installs WHERE id=?`, inst.ID))
+		current, scanErr := scanInstallHub(tx.QueryRow(
+			`SELECT `+installHubCols("")+` FROM installs WHERE id=?`, inst.ID))
 		switch {
 		case errors.Is(scanErr, sql.ErrNoRows):
 			missingInstalls = append(missingInstalls, inst)
@@ -147,8 +147,8 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 	missingPins := make([]Pin, 0, len(pins))
 	for _, pin := range pins {
 		var current Pin
-		scanErr := tx.QueryRow(`SELECT package,major,install_id,activated_at FROM pins WHERE package=?`,
-			pin.Package).Scan(&current.Package, &current.Major, &current.InstallID, &current.ActivatedAt)
+		scanErr := tx.QueryRow(`SELECT hub,package,major,install_id,activated_at FROM pins WHERE hub=? AND package=?`,
+			pin.Hub, pin.Package).Scan(&current.Hub, &current.Package, &current.Major, &current.InstallID, &current.ActivatedAt)
 		switch {
 		case errors.Is(scanErr, sql.ErrNoRows):
 			missingPins = append(missingPins, pin)
@@ -165,20 +165,20 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 		if inst.Verified {
 			verified = 1
 		}
-		if _, err := tx.Exec(`INSERT INTO installs(`+installCols("")+`) VALUES(`+placeholders()+`)`,
+		if _, err := tx.Exec(`INSERT INTO installs(`+installHubCols("")+`) VALUES(`+placeholders()+`,?)`,
 			inst.ID, inst.Package, inst.Major, inst.Version,
 			inst.SourceKind, inst.SourceRef, verified,
 			inst.Dir, inst.Python, inst.Runtime, inst.ProjectDir,
 			inst.UV, inst.Platform, inst.Extra,
 			inst.Packages, inst.Closure,
 			inst.PlacementSetDigest, inst.BytesExcl, inst.BytesShared,
-			inst.CreatedAt); err != nil {
+			inst.CreatedAt, inst.Hub); err != nil {
 			return 0, exit.Internalf("cannot recover package install %s: %s", inst.ID, err)
 		}
 	}
 	for _, pin := range missingPins {
-		if _, err := tx.Exec(`INSERT INTO pins(package,major,install_id,activated_at) VALUES(?,?,?,?)`,
-			pin.Package, pin.Major, pin.InstallID, pin.ActivatedAt); err != nil {
+		if _, err := tx.Exec(`INSERT INTO pins(hub,package,major,install_id,activated_at) VALUES(?,?,?,?,?)`,
+			pin.Hub, pin.Package, pin.Major, pin.InstallID, pin.ActivatedAt); err != nil {
 			return 0, exit.Internalf("cannot recover package pin %s: %s", pin.Package, err)
 		}
 	}

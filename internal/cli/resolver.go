@@ -35,13 +35,9 @@ import (
 
 // Resolver is the Cozy daemon's package resolver.
 type Resolver struct {
-	mu        sync.Mutex
 	refreshMu sync.Mutex
 	store     *records.Store
 	cfg       config.Config
-	// placements contain only control-plane facts. Keeping this cache distinct is the
-	// seam cl-020's verified control manifest will populate without a local venv.
-	placements map[string]orchestrator.DesiredPlacement
 	// catalogs is one public catalog client per Tensorhub origin; each request reads
 	// its own hub's catalog.
 	catalogMu sync.Mutex
@@ -113,8 +109,12 @@ func (s *EditableSnapshot) Close() {
 // RefreshEditable is the daemon-owned pre-invocation fence for live source trees.
 // It snapshots the current tree, builds a complete replacement install when it
 // moved, and swaps the active pin only after Runtime accepted the replacement.
-// A failure returns a typed refusal and leaves the last good install active.
+// A failure returns a typed refusal and leaves the last good install active. Only a local/
+// capture has a source tree; a published package passes untouched.
 func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error) {
+	if !strings.HasPrefix(strings.TrimSpace(pkg), "local/") {
+		return "", false, false, nil
+	}
 	snapshot, problem := r.SnapshotEditable(pkg)
 	if snapshot == nil {
 		return "", false, false, problem
@@ -133,7 +133,7 @@ func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, chan
 // refusal beside the snapshot that names the install still active.
 func (r *Resolver) SnapshotEditable(pkg string) (*EditableSnapshot, *exit.Error) {
 	pkg = strings.TrimSpace(pkg)
-	current, problem := r.activeInstall(pkg)
+	current, problem := r.activeInstall("", pkg)
 	if problem != nil {
 		return nil, problem
 	}
@@ -192,7 +192,7 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
 	defer writer.Unlock()
-	latest, problem := r.activeInstall(pkg)
+	latest, problem := r.activeInstall("", pkg)
 	if problem != nil {
 		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
@@ -216,9 +216,6 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 	if problem != nil {
 		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
-	r.mu.Lock()
-	delete(r.placements, pkg)
-	r.mu.Unlock()
 	if result.Install.ID == "" {
 		return current.ID, false, refreshFailure(pkg, current, exit.Internalf("editable refresh returned no active install"))
 	}
@@ -262,8 +259,7 @@ func (r *Resolver) namespaceAt(origin string) (packagepublish.Namespace, *exit.E
 func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	return &Resolver{
 		store: store, cfg: cfg,
-		placements: map[string]orchestrator.DesiredPlacement{},
-		catalogs:   map[string]*hub.Client{},
+		catalogs: map[string]*hub.Client{},
 	}
 }
 
@@ -282,35 +278,6 @@ func (r *Resolver) catalog(origin string) *hub.Client {
 	c := hub.New(cfg, "cozy-daemon")
 	r.catalogs[cfg.HubURL] = c
 	return c
-}
-
-// ResolvePlacement answers only WHAT a package target should host. The current local
-// install derives that fact from its proven environment; a future control-manifest
-// install can supply it directly without changing the API or orchestrator boundary.
-func (r *Resolver) ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error) {
-	pkg = strings.TrimSpace(pkg)
-	r.mu.Lock()
-	placement, ok := r.placements[pkg]
-	r.mu.Unlock()
-	if ok {
-		return placement, nil
-	}
-	inst, e := r.activeInstall(pkg)
-	if e != nil {
-		return orchestrator.DesiredPlacement{}, e
-	}
-	facts, e := launch.Read(*inst, r.cfg.Home, r.cfg.Tool())
-	if e != nil {
-		return orchestrator.DesiredPlacement{}, e
-	}
-	placement, e = facts.Placement()
-	if e != nil {
-		return orchestrator.DesiredPlacement{}, e
-	}
-	r.mu.Lock()
-	r.placements[pkg] = placement
-	r.mu.Unlock()
-	return placement, nil
 }
 
 // ResolveInstall answers from the exact immutable row a durable request retained.
@@ -557,8 +524,8 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 // verified install of it when there is one, else the interface its machine described here (a
 // run on a known machine reads no Hub), else Tensorhub's release card (choosing a machine).
 func (r *Resolver) releaseInterface(origin string, ref hub.Ref, release string) ([]string, *launch.PackageInterface, *exit.Error) {
-	if _, installed, problem := r.store.ActivePackage(ref.String()); problem == nil && installed != nil &&
-		installed.PublishedAt(r.cfg.ForHub(origin).HubURL) && installed.Version == release {
+	if _, installed, problem := r.store.ActivePackage(r.cfg.ForHub(origin).HubURL, ref.String()); problem == nil && installed != nil &&
+		installed.Version == release {
 		if held, packageInterface, problem := r.installPackageInterface(installed.ID); problem == nil {
 			return strings.Split(held.Closure, "\n"), packageInterface, nil
 		}
@@ -651,8 +618,8 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 
 // Jobs names the `@job` functions one installed package registers, with the PackageInterface
 // id each resolves to. `cozy run list` and the API's job listing read it.
-func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
-	inst, e := r.activeInstall(strings.TrimSpace(pkg))
+func (r *Resolver) Jobs(hub, pkg string) ([]launch.JobFacts, *exit.Error) {
+	inst, e := r.activeInstall(hub, strings.TrimSpace(pkg))
 	if e != nil {
 		return nil, e
 	}
@@ -684,43 +651,31 @@ func jobsOf(facts *launch.Facts) ([]launch.JobFacts, *exit.Error) {
 	return out, nil
 }
 
-// activeInstall resolves an active package pin. Internal callers may name a major as
-// `org/name@v2`; otherwise the newest installed major wins.
-func (r *Resolver) activeInstall(ref string) (*records.PackageInstall, *exit.Error) {
-	pkg, major, hasMajor := splitMajor(ref)
+func (r *Resolver) activeInstall(hub, ref string) (*records.PackageInstall, *exit.Error) {
 	if r.store == nil {
 		return nil, exit.Unavailablef("this Cozy daemon has no install records")
 	}
-	pins, e := r.store.Pins(pkg)
-	if e != nil {
+	return activeInstall(r.store, hub, ref)
+}
+
+// activeInstall is the install a package reference resolves to at hub (local/ at none).
+// Internal callers may name a major as `org/name@v2`.
+func activeInstall(store *records.Store, hub, ref string) (*records.PackageInstall, *exit.Error) {
+	pkg, major, hasMajor := splitMajor(ref)
+	pin, inst, e := store.ActivePackage(hub, pkg)
+	switch {
+	case e != nil:
 		return nil, e
-	}
-	if len(pins) == 0 {
-		return nil, exit.New(exit.NotFound, "%s is not installed on this host", pkg).
+	case pin == nil || hasMajor && pin.Major != major:
+		where := "on this host"
+		if hub := records.ReferenceHub(hub, pkg); hub != "" {
+			where = "from " + hub
+		}
+		return nil, exit.New(exit.NotFound, "%s is not installed %s", ref, where).
 			WithRemedy("`cozy package list` shows installed packages").
-			WithNext("cozy package search " + pkg)
-	}
-	chosen := pins[len(pins)-1]
-	if hasMajor {
-		found := false
-		for _, p := range pins {
-			if p.Major == major {
-				chosen, found = p, true
-			}
-		}
-		if !found {
-			return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", pkg, major).
-				WithRemedy("installed majors: %s", majorsOf(pins)).
-				WithNext("cozy package list")
-		}
-	}
-	inst, e := r.store.Install(chosen.InstallID)
-	if e != nil {
-		return nil, e
-	}
-	if inst == nil {
-		return nil, exit.Internalf("%s is pinned to install %s and that row is gone",
-			pkg, chosen.InstallID)
+			WithNext("cozy package list")
+	case inst == nil:
+		return nil, exit.Internalf("%s is pinned to install %s and that row is gone", pkg, pin.InstallID)
 	}
 	return inst, nil
 }
@@ -739,29 +694,6 @@ func splitMajor(ref string) (pkg string, major int, ok bool) {
 		n = n*10 + int(c-'0')
 	}
 	return name, n, true
-}
-
-func majorsOf(pins []records.Pin) string {
-	out := make([]string, 0, len(pins))
-	for _, p := range pins {
-		out = append(out, "v"+itoa(p.Major))
-	}
-	sort.Strings(out)
-	return strings.Join(out, ", ")
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
 }
 
 // List names every package this host can resolve.

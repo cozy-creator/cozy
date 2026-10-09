@@ -3264,12 +3264,9 @@ func leasedInstallFacts(ctx *Context, pkg string) (*launch.Facts, *install.Lease
 	}
 	defer store.Close()
 	for {
-		active, problem := installedPackage(store, pkg)
+		active, problem := activeInstall(store, ctx.Cfg.HubURL, pkg)
 		if problem != nil {
 			return nil, nil, problem
-		}
-		if active.SourceKind == "tensorhub" && !active.PublishedAt(ctx.Cfg.HubURL) {
-			return nil, nil, exit.New(exit.NotFound, "%s is not installed from %s", pkg, ctx.Cfg.HubURL)
 		}
 		lease, problem := install.LeaseInstall(layout, store, active.ID)
 		if problem != nil && problem.Code == exit.NotFound {
@@ -3285,44 +3282,6 @@ func leasedInstallFacts(ctx *Context, pkg string) (*launch.Facts, *install.Lease
 		}
 		return facts, lease, nil
 	}
-}
-
-func installedPackage(store *records.Store, pkg string) (*records.PackageInstall, *exit.Error) {
-	bare, major, hasMajor := splitMajor(pkg)
-	pins, e := store.Pins(bare)
-	if e != nil {
-		return nil, e
-	}
-	if len(pins) == 0 {
-		return nil, exit.New(exit.NotFound, "%s is not installed on this host", pkg).
-			WithRemedy("`cozy package list` lists what is").
-			WithNext("cozy package search "+pkg, "cozy package list")
-	}
-	eligible := pins[:0]
-	for _, pin := range pins {
-		if !hasMajor || pin.Major == major {
-			eligible = append(eligible, pin)
-		}
-	}
-	if len(eligible) == 0 {
-		return nil, exit.New(exit.NotFound, "%s is not installed on this host", pkg).
-			WithRemedy("`cozy package list` lists installed majors").
-			WithNext("cozy package list")
-	}
-	chosen := eligible[0]
-	for _, pin := range eligible[1:] {
-		if pin.ActivatedAt > chosen.ActivatedAt {
-			chosen = pin
-		}
-	}
-	install, e := store.Install(chosen.InstallID)
-	if e != nil {
-		return nil, e
-	}
-	if install == nil {
-		return nil, exit.Internalf("%s is pinned to install %s and that row is gone", pkg, chosen.InstallID)
-	}
-	return install, nil
 }
 
 // eventText reads one string field out of an event's payload. It is how a pre-attempt

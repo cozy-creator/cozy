@@ -302,13 +302,12 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	mark("verify")
 
 	// The pin decision is made before the expensive step, never after it.
-	prior, priorInstall, e := st.ActivePackage(inst.Package)
+	prior, priorInstall, e := st.ActivePackage(inst.PinHub(), inst.Package)
 	if e != nil {
 		return fail(e)
 	}
 	if !req.Snapshot && prior != nil && priorInstall != nil && priorInstall.SourceKind == inst.SourceKind &&
-		priorInstall.Package == inst.Package && priorInstall.Version == inst.Version &&
-		inst.SourceKind == "tensorhub" && priorInstall.PublishedAt(inst.Hub) {
+		priorInstall.Package == inst.Package && priorInstall.Version == inst.Version && inst.SourceKind == "tensorhub" {
 		res.Idempotent = true
 		res.Install = *priorInstall
 		_ = os.RemoveAll(installDir)
@@ -552,14 +551,14 @@ func checkCapacity(dir string, staged int64) *exit.Error {
 		WithNext("cozy package list")
 }
 
-// Remove drops one install: its pin, install row, and exclusive directory.
+// Remove drops one hub's install of pkg: its pin, install row, and exclusive directory.
 // Shared TensorFS bytes are never touched here.
-func Remove(l home.Layout, st *records.Store, pkg string, major int) (int64, *exit.Error) {
-	pin, inst, e := st.ActivePin(pkg, major)
+func Remove(l home.Layout, st *records.Store, hub, pkg string, major int) (int64, *exit.Error) {
+	pin, inst, e := st.ActivePin(hub, pkg, major)
 	if e != nil || pin == nil {
 		return 0, e
 	}
-	if e := st.Unpin(pkg, major); e != nil {
+	if e := st.Unpin(hub, pkg, major); e != nil {
 		return 0, e
 	}
 	if inst == nil {

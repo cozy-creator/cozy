@@ -56,13 +56,10 @@ type ModelTransferOwner interface {
 type ModelTransferMover func(context.Context, records.ModelTransferWeights,
 	WeightsGrantMinter) *exit.Error
 
-// Launcher resolves a package ref along the two boundaries #484 split: the
-// platform-neutral desired placement and the local target-environment launch. A connected
-// worker asks only for ResolvePlacement; it must never force this host to materialize or
-// execute the target environment merely to author a remote plan.
+// Launcher validates captures and reads local installations. A connected worker must never
+// force this host to materialize or execute the target environment to author a remote plan.
 type Launcher interface {
 	ValidateExecutionCapture(records.Request) *exit.Error
-	ResolvePlacement(pkg string) (DesiredPlacement, *exit.Error)
 	LocalInstallation(installID, digest string) (localpackage.Installation, *exit.Error)
 }
 

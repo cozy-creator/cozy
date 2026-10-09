@@ -38,10 +38,10 @@ func TestInstallSweep(t *testing.T) {
 	}
 	// The retired install loses its pin the way `cozy package remove` drops it; the
 	// serving one keeps a submitted request, which is the reference the claim must honour.
-	if problem := store.Unpin(retired.Package, retired.Major); problem != nil {
+	if problem := store.Unpin(retired.PinHub(), retired.Package, retired.Major); problem != nil {
 		t.Fatal(problem)
 	}
-	if problem := store.Unpin(serving.Package, serving.Major); problem != nil {
+	if problem := store.Unpin(serving.PinHub(), serving.Package, serving.Major); problem != nil {
 		t.Fatal(problem)
 	}
 	if _, _, problem := store.Submit(records.Request{

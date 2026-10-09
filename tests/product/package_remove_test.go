@@ -31,7 +31,7 @@ func TestPackageRemoveReportsSweptInstall(t *testing.T) {
 	unpinned.Hub = testDefaultHub
 	_, problem = store.Activate(unpinned)
 	fatal(t, problem)
-	fatal(t, store.Unpin(unpinned.Package, unpinned.Major))
+	fatal(t, store.Unpin(unpinned.PinHub(), unpinned.Package, unpinned.Major))
 	store.Close()
 	must(t, os.MkdirAll(filepath.Join(unpinned.Dir, "venv"), 0o700))
 

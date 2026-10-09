@@ -70,9 +70,14 @@ func packageHubProblem(ctx *Context, pkg string, problem *exit.Error) *exit.Erro
 			next = append(next, command)
 		}
 	}
-	if _, inst, _ := store.ActivePackage(pkg); inst != nil && inst.SourceKind == "tensorhub" && inst.Hub != "" && !inst.PublishedAt(here) {
-		sighted(fmt.Sprintf("%s@%s is installed from hub %s", pkg, inst.Version, ctx.Cfg.HubText(inst.Hub)),
-			retyped(ctx, "", "", ctx.Cfg.HubLabel(inst.Hub)))
+	pins, _ := store.Pins(pkg)
+	if i := slices.IndexFunc(pins, func(p records.Pin) bool { return p.Hub != "" && p.Hub != here }); i >= 0 {
+		version := ""
+		if inst, _ := store.Install(pins[i].InstallID); inst != nil {
+			version = "@" + inst.Version
+		}
+		sighted(fmt.Sprintf("%s%s is installed from hub %s", pkg, version, ctx.Cfg.HubText(pins[i].Hub)),
+			retyped(ctx, "", "", ctx.Cfg.HubLabel(pins[i].Hub)))
 	} else if runs, _ := store.Requests("", pkg, 20); len(runs) > 0 {
 		if i := slices.IndexFunc(runs, func(r records.Request) bool { return r.Hub != "" && strings.TrimRight(r.Hub, "/") != here }); i >= 0 {
 			sighted(fmt.Sprintf("%s ran from hub %s", pkg, ctx.Cfg.HubText(runs[i].Hub)), retyped(ctx, "", "", ctx.Cfg.HubLabel(runs[i].Hub)))
@@ -126,12 +131,12 @@ func retyped(ctx *Context, from, to, hub string) string {
 	return strings.Join(words, " ")
 }
 
-func foreignPackageRemoval(ctx *Context, inst records.PackageInstall) *exit.Error {
-	origin := "an unrecorded hub"
-	if inst.Hub != "" {
-		origin = "hub " + ctx.Cfg.HubText(inst.Hub)
+func foreignPackageRemoval(ctx *Context, origin, pkg string) *exit.Error {
+	from := "an unrecorded hub"
+	if origin != "" {
+		from = "hub " + ctx.Cfg.HubText(origin)
 	}
-	return exit.Named(exit.Conflict, "package.other_hub", "%s was installed from %s, not hub %s; it was kept",
-		inst.Package, origin, ctx.Cfg.HubText(ctx.Cfg.HubURL)).
-		WithRemedy("omit --tensorhub to remove the installation whatever its hub")
+	return exit.Named(exit.Conflict, "package.other_hub", "%s is installed from %s, not hub %s; it was kept",
+		pkg, from, ctx.Cfg.HubText(ctx.Cfg.HubURL)).
+		WithRemedy("omit --tensorhub to remove every hub's installation of %s", pkg)
 }
