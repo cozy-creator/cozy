@@ -33,7 +33,7 @@ const (
 
 // nativeModelUpload runs a provider ingest as an ordinary script on a machine, rented or
 // this computer's: the machine downloads the source, converts it to CozyTensors with
-// reviewed TensorFS profiles and uploads the checkpoint under its own publication grant. A Runtime recipe, where one exists, adds its
+// reviewed TensorFS profiles and uploads the checkpoint under the run's capability. A Runtime recipe, where one exists, adds its
 // model-owned metadata; without one the profiles the source headers match are used.
 func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	cwd, err := os.Getwd()
@@ -117,9 +117,8 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 		return true, exit.Internalf("cannot prepare model ingestion: %s", err)
 	}
 	// Run capture owns the exact script and SDK. The same native receipts survive
-	// edited callers, cancellation and retry; the destination is the sole grant.
+	// edited callers, cancellation and retry.
 	ctx.Inv.Args = []string{path}
-	ctx.Inv.Values["--allow-upload"] = []string{destination.String()}
 	// The script already names its profiles; the run must not reread them as job
 	// model-slot bindings (slot=profile), which refused every profiled ingest. The
 	// ingest consumed --lane too; the run has nothing left to read from either.

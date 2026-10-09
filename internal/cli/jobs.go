@@ -14,7 +14,6 @@ import (
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -40,13 +39,6 @@ import (
 // ---------------------------------------------------------------------- job submit
 
 func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.Error {
-	if names := ctx.Inv.Values["--allow-upload"]; len(names) > 0 {
-		normalized, problem := hub.NormalizePublicationRepositories(names)
-		if problem != nil {
-			return problem
-		}
-		ctx.Inv.Values["--allow-upload"] = normalized
-	}
 	deadline, problem := runDeadline(ctx)
 	if problem != nil {
 		return problem
@@ -105,9 +97,8 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
-		AllowPublish: ctx.Inv.Values["--allow-upload"],
-		TimeoutMS:    int64(deadline / time.Millisecond),
-		RetainWork:   strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
+		TimeoutMS:  int64(deadline / time.Millisecond),
+		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory,

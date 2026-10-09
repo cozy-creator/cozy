@@ -20,12 +20,11 @@ import (
 type V1 struct {
 	*machinev1.Client
 	Name, WorkerID, BootID string
-	// Leaf is the machine's pinned TLS leaf (DER): a Hub binds the execution access it grants
-	// to it. Local is this computer's machine, which reads a loopback Hub there.
+	// Leaf is the machine's pinned TLS leaf (DER): a run's capability binds to its key.
+	// Local is this computer's machine, which reads a loopback Hub there.
 	Leaf  []byte
 	Local bool
-	// Rented is a rental's machine: it can read its own Hub with the pod's capability.
-	// A run that selects another Hub carries separate account-authorized access.
+	// Rented is a rental's machine: a run that names no Hub reads its own Hub's public content.
 	Rented bool
 	// HubID is a rental's identity, Owned an owned machine (this computer's), and Account the
 	// owner's client at the machine's Hub.

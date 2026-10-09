@@ -19,8 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/machinev1"
@@ -33,7 +35,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 )
 
 // A run on a machine that serves cozy.machine.v1 is one Run call: its spec (code, payload,
@@ -321,7 +322,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			return m.runRefusalV1(request.ID, err, spec != nil && !sent)
 		}
 	}
-	head, opened, terminal, regranted := uint64(0), false, false, false
+	head, opened, terminal := uint64(0), false, false
 	// Output files are read apart from the stream: progress and the outcome never wait on bytes.
 	var fetch *fetcherV1
 	if !catchUp {
@@ -337,12 +338,6 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		}
 		if errors.Is(err, io.EOF) {
 			return false, nil
-		}
-		if err != nil && !opened && !regranted && m.regrantV1(ctx, request.Hub, machine, spec, err) {
-			regranted = true
-			if stream, err = machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), spec); err == nil {
-				continue
-			}
 		}
 		if err != nil {
 			return m.runRefusalV1(request.ID, err, spec != nil && !sent && !opened)
@@ -484,20 +479,6 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 			spec.WeightsDestination = request.ModelTransfer.Destination
 		}
 	}
-	// One grant covers every repository the run may publish into: its weights destination and
-	// those the owner consented to (--allow-upload).
-	repositories, problem := m.store.RequestPublicationRepositories(request.ID)
-	if problem != nil {
-		return nil, problem
-	}
-	if spec.WeightsDestination != "" {
-		repositories = append(repositories, spec.WeightsDestination)
-	}
-	if len(repositories) > 0 {
-		if spec.Publication, problem = authorizeV1Publication(ctx, machine, request.Hub, repositories); problem != nil {
-			return nil, problem
-		}
-	}
 	began := time.Now()
 	if request.LocalInstallationID != "" {
 		revision, problem := m.capturedRevision(request)
@@ -548,7 +529,12 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	}
 	// The selected Hub supplies package/model access independently of rental ownership.
 	if request.Hub != "" {
-		if access, problem := m.hubAccessV1(ctx, request.Hub, machine, request.LocalInstallationID == "" && request.InstallID == "" || len(request.Models) > 0); problem != nil {
+		expires := time.Now().Add(capabilityLife)
+		if deadline := time.UnixMilli(int64(request.DeadlineUnixMS)); request.DeadlineUnixMS > 0 && deadline.Before(expires) {
+			expires = deadline
+		}
+		operations := m.privateOperations(request.Hub, m.runAccount(request), spec)
+		if access, problem := m.hubAccessV1(ctx, request.Hub, machine, request.ID, operations, expires); problem != nil {
 			return nil, problem
 		} else {
 			spec.Hub = access
@@ -656,13 +642,13 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, ManifestLength: uint64(max(model.ManifestLength, 0)),
 			Source: model.Source, Profiles: model.Profiles})
 	}
-	if spec.Hub, problem = m.hubAccessV1(ctx, origin, machine, true); problem != nil {
-		return nil, problem
+	owner := ""
+	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
+		owner = caller.Account
 	}
-	if selection.Destination != "" && !strings.HasPrefix(selection.Destination, "local/") {
-		if spec.Publication, problem = authorizeV1Publication(ctx, machine, origin, []string{selection.Destination}); problem != nil {
-			return nil, problem
-		}
+	operations := m.privateOperations(origin, owner, spec)
+	if spec.Hub, problem = m.hubAccessV1(ctx, origin, machine, row.ID, operations, time.Now().Add(capabilityLife)); problem != nil {
+		return nil, problem
 	}
 	if selection.Write != "" {
 		report(machines.InstallProgress{Stage: "writing " + filepath.Base(selection.Write)})
@@ -683,17 +669,10 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	if err != nil {
 		return nil, machines.Transport(err)
 	}
-	regranted := false
 	for {
 		event, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			return nil, exit.Unavailablef("the machine ended the installation's stream before its outcome")
-		}
-		if err != nil && !regranted && m.regrantV1(ctx, origin, machine, spec, err) {
-			regranted = true
-			if stream, err = machine.Run(ctx, row.ID, 0, spec); err == nil {
-				continue
-			}
 		}
 		if err != nil {
 			return nil, machines.Transport(err)
@@ -775,35 +754,61 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 	return nil
 }
 
-// hubAccessV1 is the signed-in account's execution access at origin for the machine's leaf
-// key: a fresh code the machine redeems at submission and then refreshes itself. For the first
-// half of the grant's life the machine is trusted to hold it and a warm run asks the Hub
-// nothing; a machine that lost it refuses with hub_access_required (regrantV1). A run whose
-// owner is not signed in carries none; the machine then refuses only what needs a Hub.
-func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *machines.V1, required bool) (*v1.HubAccess, *exit.Error) {
-	account := client(m.context.forHub(origin))
-	// Every published request names its selected source explicitly, including when that
-	// source also rented the machine. The pod's default Hub cannot select a run's source.
+// capabilityLife caps a run capability: a run past it reads only public content.
+const capabilityLife = 24 * time.Hour
+
+// privateOperations are what a run does at origin that is not public (th-241): reading one of
+// the owner's checkpoints by its exact manifest, and publishing into its weights destination.
+// Everything else the machine reads anonymously.
+func (m *machineRuns) privateOperations(origin, owner string, spec *v1.RunSpec) []any {
+	var operations []any
+	seen := map[string]bool{}
+	read := func(model, manifest string) {
+		ref, problem := hub.ParseRef(model)
+		if problem != nil || owner == "" || ref.Org != owner || manifest == "" || seen[model+"@"+manifest] {
+			return
+		}
+		seen[model+"@"+manifest] = true
+		operations = append(operations, map[string]string{"type": "tensorhub_model_read", "model": model, "manifest": manifest})
+	}
+	for _, choice := range spec.GetModels() {
+		read(choice.GetRepository(), choice.GetManifest())
+		for _, adapter := range choice.GetAdapters() {
+			read(adapter.GetModel(), adapter.GetManifest())
+		}
+	}
+	if destination := strings.TrimPrefix(spec.GetWeightsDestination(), "model://"); destination != "" && !strings.HasPrefix(destination, "local/") {
+		operations = append(operations, map[string]string{"type": "tensorhub_model_publish", "model": destination})
+	}
+	return operations
+}
+
+// hubAccessV1 is where the machine reads origin, and, for a run with private operations, the
+// owner's capability for them: signed offline with this computer's device key for the
+// machine's leaf, which the machine trades once at its first private operation. Public reads
+// need nothing, and nothing here asks the Hub to authorize anything. A run whose owner is not
+// signed in carries no Hub access; the machine then refuses only what needs one.
+func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *machines.V1, run string, operations []any, expires time.Time) (*v1.HubAccess, *exit.Error) {
+	hubContext := m.context.forHub(origin)
+	account := client(hubContext)
 	if account.CredentialIdentity() == "" {
-		if machine.Rented && required {
-			return nil, exit.Named(exit.Credential, "hub.execution_access_required",
-				"reading %s on this rental requires execution access", account.Base()).
+		if len(operations) > 0 {
+			return nil, exit.Named(exit.Credential, "hub.capability_requires_sign_in",
+				"this run publishes to or reads private models at %s, which needs your sign-in there", account.Base()).
 				WithRemedy("sign in with `cozy auth login <email> --tensorhub=%s`", account.Base())
 		}
 		return nil, nil
 	}
-	key := hubGrantKey(origin, account.CredentialIdentity(), machine.Leaf)
-	if held, ok := m.hubGrants.Load(key); ok && time.Now().Before(held.(heldGrant).renew) {
-		return proto.Clone(held.(heldGrant).access).(*v1.HubAccess), nil
+	key := origin + "\x00" + account.CredentialIdentity()
+	held, ok := m.hubEnvironments.Load(key)
+	if !ok {
+		environment, problem := account.ExecutionEnvironment(ctx)
+		if problem != nil {
+			return nil, problem
+		}
+		held, _ = m.hubEnvironments.LoadOrStore(key, environment)
 	}
-	environment, problem := account.ExecutionEnvironment(ctx)
-	if problem != nil {
-		return nil, problem
-	}
-	grant, problem := account.GrantExecution(ctx, machine.Leaf, environment.Environment["TENSORHUB_PUBLIC_ORIGIN"])
-	if problem != nil {
-		return nil, problem
-	}
+	environment := held.(hub.ExecutionEnvironment)
 	reads := environment.Environment["TENSORHUB_ORIGIN"]
 	if local := loopbackHub(origin); machine.Local && local != "" && loopbackHub(reads) == "" {
 		reads = local // this computer's machine reads a Hub on this computer there
@@ -814,40 +819,28 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 			access.ObjectHosts = append(access.ObjectHosts, host)
 		}
 	}
-	m.hubGrants.Store(key, heldGrant{access: proto.Clone(access).(*v1.HubAccess), renew: time.Now().Add(executionGrantLife / 2)})
-	access.Authorization = hubAuthorizationV1(grant)
+	if len(operations) == 0 {
+		return access, nil
+	}
+	user, problem := account.CurrentAccount(ctx)
+	if problem != nil {
+		return nil, problem
+	}
+	workload, problem := hub.LeafThumbprint(machine.Leaf)
+	if problem != nil {
+		return nil, problem
+	}
+	auth := hubContext.AccountAuth
+	if auth == nil {
+		auth = accountauth.New(hubContext.Cfg)
+	}
+	access.Capability, problem = auth.SignRunCapability(accountauth.RunCapability{UserID: user.UserID,
+		Audience: environment.Environment["TENSORHUB_PUBLIC_ORIGIN"], Workload: workload, Run: run,
+		Operations: operations, Expires: expires})
+	if problem != nil {
+		return nil, problem
+	}
 	return access, nil
-}
-
-// executionGrantLife is how long the Hub lets an execution grant last.
-const executionGrantLife = 7 * 24 * time.Hour
-
-// heldGrant is a machine's execution access without its code, and when to grant again.
-type heldGrant struct {
-	access *v1.HubAccess
-	renew  time.Time
-}
-
-func hubGrantKey(origin, identity string, leaf []byte) string {
-	return origin + "\x00" + identity + "\x00" + string(leaf)
-}
-
-// regrantV1 answers a machine's refusal of spec's Hub access: it holds no grant (it restarted),
-// or the code did not redeem (it expired before submission). spec then carries a fresh code and
-// the submission is sent again, once.
-func (m *machineRuns) regrantV1(ctx context.Context, origin string, machine *machines.V1, spec *v1.RunSpec, err error) bool {
-	refusal := status.Convert(err).Message()
-	if spec == nil || spec.Hub == nil || !strings.Contains(refusal, "hub_access_required") && !strings.Contains(refusal, "hub_authorization_refused") {
-		return false
-	}
-	account := client(m.context.forHub(origin))
-	m.hubGrants.Delete(hubGrantKey(origin, account.CredentialIdentity(), machine.Leaf))
-	access, problem := m.hubAccessV1(ctx, origin, machine, true)
-	if problem != nil || access == nil {
-		return false
-	}
-	spec.Hub = access
-	return true
 }
 
 // loopbackHub is origin as scheme://host[:port] when it names this computer, else "".

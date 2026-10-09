@@ -535,31 +535,29 @@ func TestPackageUpdateAllUpdatesEachInstallFromItsOwnHub(t *testing.T) {
 
 // A local run of a published install reads its model bindings from the hub it was
 // installed from, not from whichever hub is current.
-// fixtureExecutionAccess grants only catalog/storage reads to a machine's leaf key and
-// returns the Authorization its reads carry. The fixture deliberately exposes no
-// owned-machine registration or lifecycle API.
+// fixtureExecutionAccess signs root in at server with a device key and routes its machine's
+// reads to worker: anonymous ones (public content), and those that carry the token a run's
+// capability trades for (Tensorhub th-241), which it returns as its Authorization. The
+// fixture deliberately exposes no owned-machine registration or lifecycle API.
 func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, worker http.Handler) string {
 	t.Helper()
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	const deviceID = "fixture-device"
-	plantMachineKey(t, root, server.URL, deviceID, private)
-	accountToken := "account-" + randomToken(t)
-	grants := newFakeGrants(server.URL, server.URL, accountToken)
+	access := newFakeHubAccess(server.URL, server.URL, "account-"+randomToken(t))
+	access.signIn(t, root)
+	token := "DPoP " + fixtureCapabilityToken(server.URL+"/v1/auth", server.URL)
 	account := server.Config.Handler
-	server.Config.Handler = machineKeyLogin(deviceID, public, accountToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/machines":
 			t.Error("owned machine attempted registration")
 			http.Error(w, "no machine registry", http.StatusGone)
-		case grants.serve(w, r):
-		case r.Header.Get("Authorization") == "DPoP "+grants.token:
+		case access.serve(w, r), access.serveMachine(w, r):
+		case r.Header.Get("Authorization") == "" || r.Header.Get("Authorization") == token:
 			worker.ServeHTTP(w, r)
 		default:
 			account.ServeHTTP(w, r)
 		}
-	}))
-	return "DPoP " + grants.token
+	})
+	return token
 }
 
 func TestLocalRunKeepsConfiguredHubDespiteCachedInstall(t *testing.T) {
@@ -794,7 +792,7 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 		}
 	}
 	if _, as := doorB.fetchedAs.Load(accessB); !as {
-		t.Fatal("the machine did not fetch hub b's model at b's doors with its delegated execution credential")
+		t.Fatal("the machine did not fetch the owner's model at hub b's doors under the run's capability")
 	}
 	if _, asked := doorA.asked.Load("/v1/tensorfs/closure"); asked {
 		t.Fatal("hub a's doors were asked for hub b's model")

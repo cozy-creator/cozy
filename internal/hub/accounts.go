@@ -12,9 +12,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-// Account is the one public Tensorhub namespace owned by the authenticated user.
+// Account is the one public Tensorhub namespace owned by the authenticated user, and that
+// user's AuthKit id (a run capability's subject).
 type Account struct {
-	Name string `json:"name"`
+	Name   string `json:"name"`
+	UserID string `json:"user_id"`
 }
 
 // CurrentAccount is the authenticated user's immutable Tensorhub account name, in its one
@@ -23,14 +25,14 @@ type Account struct {
 func (c *Client) CurrentAccount(ctx context.Context) (Account, *exit.Error) {
 	var out Account
 	kept := c.accountPath()
-	if loadRelease(kept, &out) && resourceSlug.MatchString(out.Name) {
+	if loadRelease(kept, &out) && resourceSlug.MatchString(out.Name) && out.UserID != "" {
 		return out, nil
 	}
 	problem := c.do(ctx, call{
 		method: http.MethodGet, path: "/v1/accounts/current", auth: true,
 	}, &out)
 	out.Name = CanonicalName(out.Name)
-	if problem == nil && !resourceSlug.MatchString(out.Name) {
+	if problem == nil && (!resourceSlug.MatchString(out.Name) || out.UserID == "") {
 		problem = exit.Named(exit.Internal, "account.current_invalid",
 			"Tensorhub returned an invalid current account name")
 	}

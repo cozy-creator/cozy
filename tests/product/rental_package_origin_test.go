@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"encoding/json"
-	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -108,9 +107,10 @@ func TestAMissingPackageNamesItsHubAndWhereItExists(t *testing.T) {
 }
 
 // The same contract with real CLI, daemon, machine and Runtime. The package exists only on
-// the selected source Hub. Its execution grant advertises a separate remotely reachable
-// catalog address (the role a local Hub's public/ngrok URL has), and the rental's Hub never
-// receives package requests or the source Hub's account credential.
+// the selected source Hub. Its execution environment advertises a separate remotely
+// reachable catalog address (the role a local Hub's public/ngrok URL has), the machine reads
+// the public package there with no credential (th-241), and the rental's Hub never receives
+// package requests.
 func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	rentalHub, root, layout, store := parityMachines(t)
 	source := newMachineHub(t)
@@ -123,35 +123,25 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	}
 	configure("source")
 	var mu sync.Mutex
-	var catalogReads, grantLeaves []string
+	var catalogReads []string
 	wrongReads := []string{}
-	grantToken := fixtureGrantToken(source.server.URL+"/v1/auth", source.server.URL)
 	catalog := source.access.Config.Handler
 	source.access.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
 			mu.Lock()
 			catalogReads = append(catalogReads, r.URL.Path)
 			mu.Unlock()
-			if r.Header.Get("Authorization") != "DPoP "+grantToken || r.Header.Get("DPoP") == "" || r.Header.Get("X-Cozy-Worker-Token") != "" {
-				t.Error("source catalog was not read with its delegated execution access")
-				http.Error(w, "execution access required", http.StatusForbidden)
+			if r.Header.Get("Authorization") != "" || r.Header.Get("DPoP") != "" || r.Header.Get("X-Cozy-Worker-Token") != "" {
+				t.Error("a public package was read with a credential")
+				http.Error(w, "public reads are anonymous", http.StatusForbidden)
 				return
 			}
 		}
 		catalog.ServeHTTP(w, r)
 	})
-	account := source.server.Config.Handler
-	source.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/auth/oauth2/authorize" {
-			mu.Lock()
-			grantLeaves = append(grantLeaves, r.URL.Query().Get("dpop_jkt"))
-			mu.Unlock()
-		}
-		account.ServeHTTP(w, r)
-	})
 	ownerCatalog := rentalHub.worker.Config.Handler
 	rentalHub.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/v1/packages/") || r.Header.Get("Authorization") == "DPoP "+grantToken {
+		if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
 			mu.Lock()
 			wrongReads = append(wrongReads, r.URL.Path)
 			mu.Unlock()
@@ -320,16 +310,10 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
 
 	row, problem := store.RentalRow(parityRental)
 	fatal(t, problem)
-	certificate, err := os.ReadFile(row.CertPath)
-	must(t, err)
-	leaf, _ := pem.Decode(certificate)
-	if leaf == nil {
-		t.Fatal("rental has no pinned certificate")
-	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(catalogReads) == 0 || len(grantLeaves) == 0 || grantLeaves[0] != leafJKT(t, leaf.Bytes) || len(wrongReads) != 0 {
-		t.Fatalf("catalog/grant routing: catalog=%v grants=%d wrong=%v", catalogReads, len(grantLeaves), wrongReads)
+	if len(catalogReads) == 0 || len(wrongReads) != 0 {
+		t.Fatalf("catalog routing: catalog=%v wrong=%v", catalogReads, wrongReads)
 	}
 	if row.Hub != rentalHub.server.URL {
 		t.Fatal("running another source changed the rental's lifecycle authority")

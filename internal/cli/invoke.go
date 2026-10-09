@@ -168,9 +168,6 @@ func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInte
 		}
 	}
 	if callable.Kind != "job" {
-		if len(ctx.Inv.Values["--allow-upload"]) > 0 {
-			return exit.Usagef("--allow-upload applies only to Runtime-owned job transactions")
-		}
 		if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
 			return exit.Usagef("--timeout requires --await for serving callables").
 				WithRemedy("a detached serving call has no client waiting to enforce a caller deadline")

@@ -69,13 +69,13 @@ its configured `tensorhub_url` for catalog and authorization requests. The selec
 `GET /v1/execution-environment` supplies the remote `TENSORHUB_ORIGIN` from the Hub's
 `server.public_origin` configuration. For a Hub running at `http://127.0.0.1:8819`, that
 public origin can be its exposed HTTPS ngrok address. The remote machine reads package
-releases, locked dependencies, model metadata and storage URLs there with an execution
-grant bound to its pinned leaf key. It never treats the controller's loopback URL as its
-own localhost.
+releases, locked dependencies, model metadata and storage URLs there with no credential,
+and the run's private operations under a capability bound to its pinned leaf key. It never
+treats the controller's loopback URL as its own localhost.
 
 A named rental remains controlled through its recorded machine identity and original
 rental Hub. New runs, package installs and model downloads still use the CLI's selected
-Hub. Every published request carries that source's own execution grant, even when the
+Hub. A request with private operations carries a capability for that source, even when the
 same Hub rented the machine. A local unpublished run with no Hub model inputs can
 still execute offline. A remote published source requires login to the selected Hub.
 

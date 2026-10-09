@@ -29,8 +29,7 @@ type JobPlan struct {
 	DescriptorID string
 	// InstallationID names a retained installed resource, never package bytes.
 	InstallationID string
-	// Outputs are the job's declared asset result field paths — the output ids the
-	// publication grant names, one destination each. Grants mint off the DECLARATION.
+	// Outputs are the job's declared asset result field paths, one destination each.
 	Outputs []string
 	// WeightsOutputs is the explicit WeightsSink subset. Empty keeps an ordinary asset
 	// job on the existing publication path; non-empty is the M0 weights-only contract.

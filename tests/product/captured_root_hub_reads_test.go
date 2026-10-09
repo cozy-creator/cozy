@@ -40,7 +40,7 @@ func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 	var seen []string
 	count := func(hub string, handler http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			authority := r.URL.Path == "/v1/worker/rental/authorized-keys" || grantCall(r.Method+" "+r.URL.Path)
+			authority := r.URL.Path == "/v1/worker/rental/authorized-keys" || hubAccessCall(r.Method+" "+r.URL.Path)
 			if !strings.HasPrefix(r.URL.Path, "/v1/rentals") && !authority {
 				mu.Lock()
 				seen = append(seen, hub+" "+r.Method+" "+r.URL.Path)

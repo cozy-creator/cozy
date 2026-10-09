@@ -54,8 +54,9 @@ type machineHub struct {
 	// as a Hub the pod cannot reach; leased counts the polls answered.
 	lease, leased int
 	unreachable   bool
-	// oauth answers the machine-grant routes on the account API.
-	oauth *fakeGrants
+	// hubAccess answers the account routes a run's Hub access takes, and a machine's trade of
+	// its run capability where it reads the Hub.
+	hubAccess *fakeHubAccess
 }
 
 func newMachineHub(t *testing.T) *machineHub {
@@ -91,14 +92,17 @@ func newMachineHub(t *testing.T) *machineHub {
 	}))
 	t.Cleanup(h.worker.Close)
 	h.access = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.hubAccess.serveMachine(w, r) {
+			return
+		}
 		h.worker.Config.Handler.ServeHTTP(w, r)
 	}))
 	t.Cleanup(h.access.Close)
 	served := h.server.Config.Handler
-	h.oauth = newFakeGrants(h.server.URL, h.server.URL, "rental-idle-test")
-	h.oauth.origin = h.access.URL
+	h.hubAccess = newFakeHubAccess(h.server.URL, h.server.URL, "rental-idle-test")
+	h.hubAccess.origin = h.access.URL
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.oauth.serve(w, r) {
+		if h.hubAccess.serve(w, r) {
 			return
 		}
 		switch {

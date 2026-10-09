@@ -20,7 +20,6 @@ type Submission struct {
 	// Hub is the Tensorhub origin the request belongs to; empty is the daemon's default.
 	Hub                      string
 	RequestID                string // server-reserved identity for request-owned input capture
-	AllowPublish             []string
 	MachineExecutionObserver bool
 	MachineEndpoint          *machineendpoint.Endpoint
 	TimeoutMS                int64
@@ -305,9 +304,6 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	if s.TimeoutMS > 0 {
 		event["timeout_ms"] = s.TimeoutMS
 		event["deadline_unix_ms"] = s.DeadlineUnixMS
-	}
-	if len(s.AllowPublish) > 0 {
-		event["allow_publish"] = s.AllowPublish
 	}
 	if s.AttentionKernel != "" {
 		event["attention_kernel"] = s.AttentionKernel

@@ -66,7 +66,7 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 		// Its first published call grants the machine content access; identity and
 		// lifecycle remain local, and subsequent calls rely on the grant the machine holds.
 		if key == "cold" {
-			calls = slices.DeleteFunc(calls, grantCall)
+			calls = slices.DeleteFunc(calls, hubAccessCall)
 		}
 		if len(calls) != 0 {
 			t.Fatalf("the %s run on %s made %d Hub requests; want none: %v", key, venue, len(calls), calls)

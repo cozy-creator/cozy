@@ -5,12 +5,10 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -23,8 +21,8 @@ import (
 
 // Under a running daemon that predates cozy.machine.v1, an installation on a rental is this
 // command's own warm run on the rental's machine: a model download reaches the machine and ends
-// with the machine's own answer, and an upload grants publication to the rental by its Hub
-// identity. Nothing is queued for the older daemon, and this computer's machine never starts.
+// with the machine's own answer, and an upload carries a capability for the rental's own leaf.
+// Nothing is queued for the older daemon, and this computer's machine never starts.
 func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 	if *machineHostBinary == "" || *olderCozy == "" {
 		t.Skip("requires -machine-host (the rental's machine) and -older-cozy (a daemon that predates cozy.machine.v1)")
@@ -35,32 +33,24 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 	}
 	h := newMachineHub(t)
 	manifest := "sha256:" + strings.Repeat("a", 64)
-	var mu sync.Mutex
-	var grants []map[string]any
 	served := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/models/resolve":
 			_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/model", "manifest_id": manifest,
 				"manifest_length": 128, "bytes": 4096, "components": []string{"transformer"}})
-		case r.URL.Path == "/v1/auth/oauth2/authorize" && publicationRequest(r.URL.Query()) &&
-			!strings.Contains(r.URL.Query().Get("authorization_details"), "quantized"):
-			var detail []map[string]any
-			_ = json.Unmarshal([]byte(r.URL.Query().Get("authorization_details")), &detail)
-			mu.Lock()
-			grants = append(grants, detail...)
-			mu.Unlock()
-			back := url.Values{"error": {"access_denied"}, "error_description": {"the stand-in hub grants nothing"}, "state": {r.URL.Query().Get("state")}}
-			http.Redirect(w, r, r.URL.Query().Get("redirect_uri")+"?"+back.Encode(), http.StatusSeeOther)
 		default:
 			served.ServeHTTP(w, r)
 		}
 	})
+	// The stand-in hub refuses every capability trade.
+	h.hubAccess.refuse = true
 	serveOtherBytes(h, manifest)
 	root, err := os.MkdirTemp("", "czf")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	h.hubAccess.signIn(t, root)
 	witness := filepath.Join(root, "local-machine-launched")
 	stubMachine(t, root, "#!/bin/sh\necho \"$@\" >> "+witness+"\nexit 3\n")
 	t.Cleanup(func() {
@@ -113,18 +103,20 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 		t.Fatalf("the quantize job did not reach the rental's machine [exit %d]\n%s", code, out)
 	}
 
-	// The upload is granted to the rental itself (its Hub id and pinned leaf); the stand-in hub
-	// refuses the grant, so nothing is made.
-	code, out = runCozy(t, root, "model", "upload", "civitai://1", "proof/model", "--rental=tessa", "--json")
+	// The upload's capability names the rental's own leaf and its destination; the rental's
+	// machine trades it at the Hub, which refuses, so nothing is published.
+	code, out = runCozy(t, root, "model", "upload", strayTensor(t, root), "proof/model", "--rental=tessa", "--json")
 	t.Logf("model upload under the older daemon [exit %d]:\n%s", code, out)
-	mu.Lock()
-	asked := append([]map[string]any(nil), grants...)
-	mu.Unlock()
-	if code == 0 || !strings.Contains(out, "hub.grant_refused") || len(asked) != 1 {
-		t.Fatalf("the upload did not ask the Hub to grant the rental [exit %d, %d grants]\n%s", code, len(asked), out)
+	trades := h.hubAccess.trades()
+	if code == 0 || !strings.Contains(out, "capability_refused") || len(trades) != 1 {
+		t.Fatalf("the upload did not trade its capability on the rental [exit %d, %d trades]\n%s", code, len(trades), out)
 	}
-	if asked[0]["machine_id"] != parityRental {
-		t.Fatalf("the grant does not name the rental: %v", asked[0])
+	_, claims := h.hubAccess.capabilityOf(t, trades[0])
+	if cnf, _ := claims["cnf"].(map[string]any); cnf["jkt"] != leafJKT(t, launch.Leaf) {
+		t.Fatalf("the capability does not name the rental's leaf: %v", claims)
+	}
+	if ops, _ := json.Marshal(claims["authorization_details"]); string(ops) != `[{"model":"proof/model","type":"tensorhub_model_publish"}]` {
+		t.Fatalf("the capability is not exactly the upload: %s", ops)
 	}
 
 	store, problem = records.Open(layout.DB)

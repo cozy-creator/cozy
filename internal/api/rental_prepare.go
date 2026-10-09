@@ -70,7 +70,7 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 				s.refuseTyped(w, r, problem)
 				return
 			}
-		} else if _, problem := hub.NormalizePublicationRepositories([]string{body.Destination}); problem != nil {
+		} else if problem := hub.ValidPublicationDestination(body.Destination); problem != nil {
 			s.refuseTyped(w, r, problem)
 			return
 		}

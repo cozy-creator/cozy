@@ -37,21 +37,19 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 	}
 	var mu sync.Mutex
 	var lanes []string
-	var grants *fakeGrants
+	var access *fakeHubAccess
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := "http://" + r.Host
 		encode := func(value any) { _ = json.NewEncoder(w).Encode(value) }
-		if grants.serve(w, r) {
+		if access.serve(w, r) {
 			return
 		}
 		switch {
-		case r.URL.Path == "/v1/accounts/current":
-			encode(map[string]any{"name": "proof"})
 		case r.URL.Path == "/v1/models/resolve":
 			lane := r.URL.Query().Get("lane")
-			if !strings.HasPrefix(r.Header.Get("Authorization"), "DPoP ") || r.Header.Get("DPoP") == "" {
-				t.Error("model resolution did not use machine execution access")
-				http.Error(w, "wrong authority", 403)
+			if r.Header.Get("Authorization") != "" || r.Header.Get("DPoP") != "" {
+				t.Error("a public model's resolution carried a credential")
+				http.Error(w, "public reads are anonymous", 403)
 				return
 			}
 			if r.URL.Query().Get("ref") != "proof/probe@1.0.0" || lane != "bf16" && lane != "fp32" {
@@ -81,7 +79,7 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 		}
 	}))
 	defer server.Close()
-	grants = newFakeGrants(server.URL, server.URL, "fixture-account")
+	access = newFakeHubAccess(server.URL, server.URL, "fixture-account")
 	root, err := os.MkdirTemp("", "czlad-")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: fixture-account\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))

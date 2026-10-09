@@ -33,8 +33,7 @@ type JobFacts struct {
 	// DERIVED, never stored (cr-009's seam) — every environment of one release computes
 	// the same one, and the worker resolves its local record by exactly this string.
 	DescriptorID string
-	// Outputs are the job's declared asset result field paths. They ARE the output ids
-	// the publication grant names, one destination each.
+	// Outputs are the job's declared asset result field paths, one destination each.
 	Outputs        []string
 	WeightsOutputs []orchestrator.WeightsOutput
 	ModelParams    []string

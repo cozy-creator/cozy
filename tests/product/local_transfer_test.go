@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -37,12 +36,13 @@ func TestLocalTransfersAreWarmRunsOnThisComputersMachine(t *testing.T) {
 		served.ServeHTTP(w, r)
 	})
 	serveOtherBytes(h, manifest)
-	// The machine redeems its publication grant at the Hub, which grants nothing.
-	h.oauth.refuse = publicationRequest
+	// The machine trades its run capability at the Hub, which grants nothing.
+	h.hubAccess.refuse = true
 	root, err := os.MkdirTemp("", "czt")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	h.hubAccess.signIn(t, root)
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "machine", "stop")
 		_, _ = runCozy(t, root, "down")
@@ -70,19 +70,10 @@ func TestLocalTransfersAreWarmRunsOnThisComputersMachine(t *testing.T) {
 	refused(t, "a checkpoint into a local alias", "model_download_failed", "model", "download", "proof/model#"+manifest, "local/tiny")
 	refused(t, "an absent alias's upload", "this machine holds no local/absent", "model", "upload", "local/absent", "proof/model")
 
-	// One F16 tensor: written, made as it is, then published under the machine's own grant.
-	header := []byte(`{"stray.weight":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}`)
-	file := filepath.Join(root, "stray.safetensors")
-	body := binary.LittleEndian.AppendUint64(nil, uint64(len(header)))
-	must(t, os.WriteFile(file, append(append(body, header...), 0, 0, 0, 0), 0o600))
-	refused(t, "a local file's upload", "publication_unauthorized", "model", "upload", file, "proof/model")
-	publications := 0
-	for _, asked := range h.oauth.requests() {
-		if publicationRequest(asked) {
-			publications++
-		}
-	}
-	if publications != 2 {
-		t.Fatalf("want a publication grant for each upload, got %d", publications)
+	// One F16 tensor: written, made as it is, then published under the run's capability,
+	// which the Hub refuses. An upload that ends before publishing trades nothing.
+	refused(t, "a local file's upload", "capability_refused", "model", "upload", strayTensor(t, root), "proof/model")
+	if trades := h.hubAccess.trades(); len(trades) != 1 {
+		t.Fatalf("want one trade, the file's upload, got %d", len(trades))
 	}
 }
