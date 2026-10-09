@@ -1,45 +1,23 @@
 package producttest
 
 import (
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
-	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 )
 
 // A run on this computer's machine that may publish (`cozy model upload` without a rental,
-// or any job with --allow-upload) asks Tensorhub for the same machine authorization a rental
-// gets: the owned machine's id and its Host's own certificate, never a rental id.
+// or any job with --allow-upload) asks Tensorhub for the same publication grant a rental
+// gets, bound to its Host's own key, never a rental id.
 func TestLocalMachinePublicationGrantBindsCertificateWithoutRegistration(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: the pod-supervisor this computer's machine runs")
 	}
 	h := newMachineHub(t)
-	var mu sync.Mutex
-	var grants []map[string]any
-	served := h.server.Config.Handler
-	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == "/v1/machine-authorizations" {
-			var body map[string]any
-			if json.NewDecoder(r.Body).Decode(&body) != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			mu.Lock()
-			grants = append(grants, body)
-			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"token": "machine-grant", "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
-			return
-		}
-		served.ServeHTTP(w, r)
-	})
 	root, err := os.MkdirTemp("", "czg")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
@@ -65,24 +43,24 @@ def main() -> dict[str, str]:
 `), 0o600))
 	code, out := runCozy(t, root, "run", script, "--allow-upload", "proof/output", "--await", "--json")
 	skipWithoutMachine(t, code, out)
-	mu.Lock()
-	defer mu.Unlock()
+	var grants []url.Values
+	for _, asked := range h.oauth.requests() {
+		if publicationRequest(asked) {
+			grants = append(grants, asked)
+		}
+	}
 	if len(grants) != 1 {
-		t.Fatalf("want one machine authorization, got %d [exit %d]\n%s", len(grants), code, out)
+		t.Fatalf("want one machine publication grant, got %d [exit %d]\n%s", len(grants), code, out)
 	}
-	grant, _ := grants[0]["requested_grant"].(map[string]any)
-	machineID, _ := grant["machine_id"].(string)
-	if machineID != "" || grant["rental_id"] != nil {
-		t.Fatal("local publication grant acquired a registry/rental identity")
+	var detail []map[string]any
+	must(t, json.Unmarshal([]byte(grants[0].Get("authorization_details")), &detail))
+	if len(detail) != 1 || detail[0]["machine_id"] != "" || grants[0].Get("scope") != "offline_access" {
+		t.Fatalf("local publication grant acquired a registry/rental identity: %v", grants[0])
 	}
-	leaf, err := base64.RawURLEncoding.DecodeString(grants[0]["delegate_certificate_der_b64url"].(string))
-	if err != nil {
-		t.Fatalf("the grant carries no Host certificate: %v", err)
+	if grants[0].Get("dpop_jkt") == "" || grants[0].Get("client_id") != "cozy-machine" {
+		t.Fatalf("the grant is not bound to the machine's key: %v", grants[0])
 	}
-	if _, err := x509.ParseCertificate(leaf); err != nil {
-		t.Fatalf("the grant's Host certificate is not a certificate: %v", err)
-	}
-	if repositories, _ := json.Marshal(grant["repositories"]); string(repositories) != `[{"name":"output","org":"proof"}]` {
+	if repositories, _ := json.Marshal(detail[0]["repositories"]); string(repositories) != `[{"name":"output","org":"proof"}]` {
 		t.Fatalf("the grant is not exactly the consented repository: %s", repositories)
 	}
 	if code != 0 {

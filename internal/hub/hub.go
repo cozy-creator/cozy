@@ -248,6 +248,8 @@ type call struct {
 	status *int
 	// trustRoot receives the root of an already verified TLS chain for delegation to an agent.
 	trustRoot *[]byte
+	// location takes a redirect's Location instead of following it.
+	location *string
 }
 
 // WithToken returns a copy of the client carrying a credential supplied for this
@@ -436,6 +438,11 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 			req, progress = guardResponse(req)
 		}
 	}
+	if cl.location != nil {
+		stay := *client
+		stay.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &stay
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		if progress != nil {
@@ -444,6 +451,9 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 		return 0, TransportFailure(c.base, err)
 	}
 	defer resp.Body.Close()
+	if cl.location != nil {
+		*cl.location = resp.Header.Get("Location")
+	}
 	if cl.trustRoot != nil && resp.TLS != nil && len(resp.TLS.VerifiedChains) > 0 {
 		chain := resp.TLS.VerifiedChains[0]
 		if len(chain) > 0 {

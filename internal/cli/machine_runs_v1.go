@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // A run on a machine that serves cozy.machine.v1 is one Run call: its spec (code, payload,
@@ -320,7 +321,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			return m.runRefusalV1(request.ID, err, spec != nil && !sent)
 		}
 	}
-	head, opened, terminal := uint64(0), false, false
+	head, opened, terminal, regranted := uint64(0), false, false, false
 	// Output files are read apart from the stream: progress and the outcome never wait on bytes.
 	var fetch *fetcherV1
 	if !catchUp {
@@ -336,6 +337,12 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 		}
 		if errors.Is(err, io.EOF) {
 			return false, nil
+		}
+		if err != nil && !opened && !regranted && m.regrantV1(ctx, request.Hub, machine, spec, err) {
+			regranted = true
+			if stream, err = machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), spec); err == nil {
+				continue
+			}
 		}
 		if err != nil {
 			return m.runRefusalV1(request.ID, err, spec != nil && !sent && !opened)
@@ -676,10 +683,17 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	if err != nil {
 		return nil, machines.Transport(err)
 	}
+	regranted := false
 	for {
 		event, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			return nil, exit.Unavailablef("the machine ended the installation's stream before its outcome")
+		}
+		if err != nil && !regranted && m.regrantV1(ctx, origin, machine, spec, err) {
+			regranted = true
+			if stream, err = machine.Run(ctx, row.ID, 0, spec); err == nil {
+				continue
+			}
 		}
 		if err != nil {
 			return nil, machines.Transport(err)
@@ -761,9 +775,11 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 	return nil
 }
 
-// hubAccessV1 is the signed-in account's execution access at origin, bound to the machine's
-// leaf: the machine reads its Hub with it during the run's preparation and forgets it. A run
-// whose owner is not signed in carries none; the machine then refuses only what needs a Hub.
+// hubAccessV1 is the signed-in account's execution access at origin for the machine's leaf
+// key: a fresh code the machine redeems at submission and then refreshes itself. For the first
+// half of the grant's life the machine is trusted to hold it and a warm run asks the Hub
+// nothing; a machine that lost it refuses with hub_access_required (regrantV1). A run whose
+// owner is not signed in carries none; the machine then refuses only what needs a Hub.
 func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *machines.V1, required bool) (*v1.HubAccess, *exit.Error) {
 	account := client(m.context.forHub(origin))
 	// Every published request names its selected source explicitly, including when that
@@ -776,36 +792,60 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 		}
 		return nil, nil
 	}
-	// One grant serves this machine's runs for the first half of its life: a warm run asks the
-	// Hub nothing.
-	key := origin + "\x00" + account.CredentialIdentity() + "\x00" + string(machine.Leaf)
-	if held, ok := m.hubAccess.Load(key); ok && time.Now().Before(held.(heldAccess).renew) {
-		return held.(heldAccess).grant, nil
+	key := hubGrantKey(origin, account.CredentialIdentity(), machine.Leaf)
+	if held, ok := m.hubGrants.Load(key); ok && time.Now().Before(held.(heldGrant).renew) {
+		return proto.Clone(held.(heldGrant).access).(*v1.HubAccess), nil
 	}
-	access, problem := account.AuthorizeExecutionAccess(ctx, machine.Leaf)
+	environment, problem := account.ExecutionEnvironment(ctx)
 	if problem != nil {
 		return nil, problem
 	}
-	reads := access.Environment["TENSORHUB_ORIGIN"]
+	grant, problem := account.GrantExecution(ctx, machine.Leaf, environment.Environment["TENSORHUB_PUBLIC_ORIGIN"])
+	if problem != nil {
+		return nil, problem
+	}
+	reads := environment.Environment["TENSORHUB_ORIGIN"]
 	if local := loopbackHub(origin); machine.Local && local != "" && loopbackHub(reads) == "" {
 		reads = local // this computer's machine reads a Hub on this computer there
 	}
-	grant := &v1.HubAccess{Origin: reads, Token: access.Token, ExpiresAt: access.ExpiresAt.Unix(), CaDer: access.TrustRoot}
-	for _, host := range strings.Split(access.Environment["TENSORHUB_OBJECT_STORAGE_HOSTS"], ",") {
+	access := &v1.HubAccess{Origin: reads, CaDer: environment.TrustRoot}
+	for _, host := range strings.Split(environment.Environment["TENSORHUB_OBJECT_STORAGE_HOSTS"], ",") {
 		if host = strings.TrimSpace(host); host != "" {
-			grant.ObjectHosts = append(grant.ObjectHosts, host)
+			access.ObjectHosts = append(access.ObjectHosts, host)
 		}
 	}
-	if life := time.Until(access.ExpiresAt); life > 0 {
-		m.hubAccess.Store(key, heldAccess{grant: grant, renew: time.Now().Add(life / 2)})
-	}
-	return grant, nil
+	m.hubGrants.Store(key, heldGrant{access: proto.Clone(access).(*v1.HubAccess), renew: time.Now().Add(executionGrantLife / 2)})
+	access.Authorization = hubAuthorizationV1(grant)
+	return access, nil
 }
 
-// heldAccess is a machine's execution access and when to ask for a fresh one.
-type heldAccess struct {
-	grant *v1.HubAccess
-	renew time.Time
+// executionGrantLife is how long the Hub lets an execution grant last.
+const executionGrantLife = 7 * 24 * time.Hour
+
+// heldGrant is a machine's execution access without its code, and when to grant again.
+type heldGrant struct {
+	access *v1.HubAccess
+	renew  time.Time
+}
+
+func hubGrantKey(origin, identity string, leaf []byte) string {
+	return origin + "\x00" + identity + "\x00" + string(leaf)
+}
+
+// regrantV1 answers a machine's refusal of spec: when it holds no grant for spec's Hub access
+// (it restarted), spec carries a fresh code and the submission is sent again, once.
+func (m *machineRuns) regrantV1(ctx context.Context, origin string, machine *machines.V1, spec *v1.RunSpec, err error) bool {
+	if spec == nil || spec.Hub == nil || spec.Hub.Authorization != nil || !strings.Contains(status.Convert(err).Message(), "hub_access_required") {
+		return false
+	}
+	account := client(m.context.forHub(origin))
+	m.hubGrants.Delete(hubGrantKey(origin, account.CredentialIdentity(), machine.Leaf))
+	access, problem := m.hubAccessV1(ctx, origin, machine, true)
+	if problem != nil || access == nil {
+		return false
+	}
+	spec.Hub = access
+	return true
 }
 
 // loopbackHub is origin as scheme://host[:port] when it names this computer, else "".

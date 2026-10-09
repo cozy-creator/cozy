@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"net/http"
@@ -126,14 +125,14 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	var mu sync.Mutex
 	var catalogReads, grantLeaves []string
 	wrongReads := []string{}
-	grantToken := executionGrantToken(source.server.URL, "fixture-account", 1)
+	grantToken := fixtureGrantToken(source.server.URL+"/v1/auth", source.server.URL)
 	catalog := source.access.Config.Handler
 	source.access.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/packages/") {
 			mu.Lock()
 			catalogReads = append(catalogReads, r.URL.Path)
 			mu.Unlock()
-			if r.Header.Get("Authorization") != "Bearer "+grantToken || r.Header.Get("X-Cozy-Worker-Token") != "" {
+			if r.Header.Get("Authorization") != "DPoP "+grantToken || r.Header.Get("DPoP") == "" || r.Header.Get("X-Cozy-Worker-Token") != "" {
 				t.Error("source catalog was not read with its delegated execution access")
 				http.Error(w, "execution access required", http.StatusForbidden)
 				return
@@ -143,22 +142,16 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	})
 	account := source.server.Config.Handler
 	source.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/execution-access" {
-			var body struct {
-				Leaf string `json:"delegate_certificate_der_b64url"`
-			}
-			if json.NewDecoder(r.Body).Decode(&body) != nil {
-				t.Error("invalid execution access request")
-			}
+		if r.URL.Path == "/v1/auth/oauth2/authorize" {
 			mu.Lock()
-			grantLeaves = append(grantLeaves, body.Leaf)
+			grantLeaves = append(grantLeaves, r.URL.Query().Get("dpop_jkt"))
 			mu.Unlock()
 		}
 		account.ServeHTTP(w, r)
 	})
 	ownerCatalog := rentalHub.worker.Config.Handler
 	rentalHub.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/v1/packages/") || r.Header.Get("Authorization") == "Bearer "+grantToken {
+		if strings.HasPrefix(r.URL.Path, "/v1/packages/") || r.Header.Get("Authorization") == "DPoP "+grantToken {
 			mu.Lock()
 			wrongReads = append(wrongReads, r.URL.Path)
 			mu.Unlock()
@@ -323,7 +316,7 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(catalogReads) == 0 || len(grantLeaves) == 0 || grantLeaves[0] != base64.RawURLEncoding.EncodeToString(leaf.Bytes) || len(wrongReads) != 0 {
+	if len(catalogReads) == 0 || len(grantLeaves) == 0 || grantLeaves[0] != leafJKT(t, leaf.Bytes) || len(wrongReads) != 0 {
 		t.Fatalf("catalog/grant routing: catalog=%v grants=%d wrong=%v", catalogReads, len(grantLeaves), wrongReads)
 	}
 	if row.Hub != rentalHub.server.URL {

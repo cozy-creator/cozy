@@ -27,8 +27,8 @@ type machineRuns struct {
 	// A foreground controller closes with its CLI command. Explicit controls must
 	// reach the machine before that command returns; observation remains detachable.
 	foreground bool
-	// hubAccess holds each machine's execution access, by hub, credential and leaf.
-	hubAccess sync.Map
+	// hubGrants are machines holding this client's execution grant, by hub, credential and leaf.
+	hubGrants sync.Map
 	placed    map[string]string // the last placement decision recorded per waiting run
 	machines  *machines.Resolver
 	updates   *rentalRuntimeUpdates
