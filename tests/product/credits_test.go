@@ -23,6 +23,8 @@ type creditHub struct {
 	paidWith string
 	reads    int
 	paid     bool
+	// credit is GET /v1/credit's answer (th-242); nil for an unmetered account.
+	credit map[string]int64
 }
 
 func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux) {
@@ -52,6 +54,14 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			amount := strconv.FormatInt(h.balance, 10)
 			reply(w, 200, map[string]string{"currency": "USD", "balance_amount": amount, "held_amount": "0",
 				"available_amount": amount, "owed_amount": "0", "billing_mode": "prepaid"})
+		})
+		mux.HandleFunc("GET /v1/credit", func(w http.ResponseWriter, r *http.Request) {
+			if !signedIn(w, r) {
+				return
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			reply(w, 200, map[string]any{"credit": h.credit})
 		})
 		mux.HandleFunc("GET /billing/v1/me/transactions", func(w http.ResponseWriter, r *http.Request) {
 			if !signedIn(w, r) {
@@ -193,5 +203,51 @@ func TestCreditsReadAndBuy(t *testing.T) {
 	if code, out := run("", "credits", "history"); code != 0 || !strings.Contains(out, "deposit") ||
 		!strings.Contains(out, "$25.50") {
 		t.Fatalf("history after the purchase: exit %d\n%s", code, out)
+	}
+}
+
+// TestLowCreditWarns is th-242's CLI half: `cozy credits` says when the account's credit
+// is under the Hub's warning and how far it may run before rentals are shut off; a later
+// rental command repeats the warning from that statement without asking the Hub; an
+// account the Hub meters nothing for is never warned.
+func TestLowCreditWarns(t *testing.T) {
+	credits := &creditHub{balance: 500_000,
+		credit: map[string]int64{"available_usd_micros": 500_000, "warning_usd_micros": 1_000_000, "floor_usd_micros": -2_000_000}}
+	var hubURL string
+	hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
+	hubURL = hub.URL
+	root := t.TempDir()
+	run := func(stdin string, args ...string) (int, string) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, append(args, "--tensorhub="+hub.URL)...)...)
+		cmd.Env = childEnv(t, root)
+		cmd.Stdin = strings.NewReader(stdin) //cozy:stdin-value test login code and account name
+		var out bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &out
+		_ = cmd.Run()
+		return cmd.ProcessState.ExitCode(), out.String()
+	}
+	if code, out := run("123456\nlow\n", "auth", "login", "low@example.test"); code != 0 {
+		t.Fatalf("login: exit %d\n%s", code, out)
+	}
+	const warning = "Tensorhub credit is low: $0.50 available. Running rentals continue until your balance passes -$2.00"
+	if code, out := run("", "credits"); code != 0 || !strings.Contains(out, warning) || !strings.Contains(out, "cozy credits buy <usd>") {
+		t.Fatalf("credits under the warning: exit %d\n%s", code, out)
+	}
+	if _, out := run("", "rental", "list", "--no-watch"); !strings.Contains(out, "warning: "+warning) {
+		t.Fatalf("a rental command after a low statement:\n%s", out)
+	}
+	if _, out := run("", "credits", "history"); strings.Contains(out, "credit is low") {
+		t.Fatalf("a command that spends nothing warned:\n%s", out)
+	}
+
+	credits.mu.Lock()
+	credits.credit = nil
+	credits.mu.Unlock()
+	if code, out := run("", "credits"); code != 0 || strings.Contains(out, "credit is low") {
+		t.Fatalf("an unmetered account was warned: exit %d\n%s", code, out)
+	}
+	if _, out := run("", "rental", "list", "--no-watch"); strings.Contains(out, "credit is low") {
+		t.Fatalf("a rental command after the Hub stopped metering warned:\n%s", out)
 	}
 }

@@ -1077,12 +1077,14 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 	var listingProblem *exit.Error
 	if asked == nil && only == nil {
 		hctx, cancel := hub.Context()
-		var bindings int64
-		listing, bindings, listingProblem = owner.RentalListing(hctx)
+		var stated hub.RentalListing
+		stated, listingProblem = owner.RentalListing(hctx)
 		listed = listingProblem == nil
 		cancel()
 		if listed {
-			_ = m.store.StateHubBindingsRevision(origin, bindings)
+			listing = stated.Rentals
+			_ = m.store.StateHubBindingsRevision(origin, stated.BindingsRevision)
+			_ = stateCredit(m.store, m.origin(origin), stated.Credit)
 		}
 	}
 	m.mu.Lock()

@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // cl-077: the user's prepaid Tensorhub credit, read and bought through the hub's
@@ -20,13 +22,94 @@ import (
 const creditHistoryLimit = 50
 
 func handleCredits(ctx *Context) *exit.Error {
+	c := client(ctx)
 	hctx, cancel := hub.Context()
-	balance, problem := client(ctx).Balance(hctx)
+	balance, problem := c.Balance(hctx)
 	cancel()
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, balanceRecord(balance))
+	record := balanceRecord(balance)
+	// A Hub that cannot say now leaves the balance shown and no warning.
+	hctx, cancel = hub.Context()
+	credit, creditProblem := c.Credit(hctx)
+	cancel()
+	if creditProblem == nil {
+		rememberCredit(ctx, credit)
+		if credit.Low() {
+			record.Notes = append(record.Notes, lowCreditMessage(credit))
+			record.Next = []string{"cozy credits buy <usd>"}
+		}
+	}
+	return emit(ctx, record)
+}
+
+// creditWarningAge is how long a Hub's stated credit warns run and rental commands.
+const creditWarningAge = 15 * time.Minute
+
+// lowCreditMessage tells the owner their credit is under the Hub's warning (th-242).
+func lowCreditMessage(credit *hub.Credit) string {
+	return fmt.Sprintf("Tensorhub credit is low: %s available. Running rentals continue until your balance passes %s, "+
+		"then they are shut off, even mid-run. Buy credit: cozy credits buy <usd>", usd(credit.Available), usd(credit.Floor))
+}
+
+// stateCredit records what one Hub stated about the account's credit.
+func stateCredit(st *records.Store, origin string, credit *hub.Credit) *exit.Error {
+	if credit == nil {
+		return st.StateHubCredit(origin, nil)
+	}
+	return st.StateHubCredit(origin, &records.HubCredit{Available: credit.Available, Warning: credit.Warning,
+		Floor: credit.Floor, Observed: time.Now()})
+}
+
+func rememberCredit(ctx *Context, credit *hub.Credit) {
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return
+	}
+	st, problem := records.Open(layout.DB)
+	if problem != nil {
+		return
+	}
+	defer st.Close()
+	_ = stateCredit(st, ctx.Cfg.HubURL, credit)
+}
+
+// warnLowCredit warns a run or rental command whose Hub last stated the account's credit
+// under its warning, recently. It asks the Hub nothing: the daemon's rental listing and
+// `cozy credits` keep the statement current.
+func warnLowCredit(ctx *Context) {
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return
+	}
+	st, problem := records.Open(layout.DB)
+	if problem != nil {
+		return
+	}
+	defer st.Close()
+	stated, problem := st.HubCredit(ctx.Cfg.HubURL)
+	if problem != nil || stated == nil || time.Since(stated.Observed) > creditWarningAge {
+		return
+	}
+	credit := &hub.Credit{Available: stated.Available, Warning: stated.Warning, Floor: stated.Floor}
+	if credit.Low() {
+		ctx.warn(records.Warning{Code: "credit.low", Message: lowCreditMessage(credit)})
+	}
+}
+
+// creditCommand is whether argv runs or rents: the commands that spend credit.
+func creditCommand(argv []string) bool {
+	for i := 0; i < len(argv); i++ {
+		switch arg := argv[i]; {
+		case arg == "--tensorhub" || arg == "--fields":
+			i++
+		case strings.HasPrefix(arg, "-"):
+		default:
+			return arg == "run" || arg == "rental" || arg == "rent"
+		}
+	}
+	return false
 }
 
 func balanceRecord(b hub.Balance) output.Record {

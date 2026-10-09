@@ -141,6 +141,9 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 		}
 		ctx.Daemon = state
 	}
+	if creditCommand(r.argv) {
+		warnLowCredit(ctx)
+	}
 	problem := h(ctx)
 	r.exitCode = ctx.exitCode
 	if said := ctx.said(); problem != nil && len(said) > 0 {

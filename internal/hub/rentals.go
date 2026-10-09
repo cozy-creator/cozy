@@ -760,30 +760,41 @@ func (w wireRental) named(what string) *exit.Error {
 // serves one malformed row must not thereby hide the ten good ones (cl-193). An odd name
 // is folded or replaced by the id, since a billing pod must stay nameable.
 func (c *Client) Rentals(ctx context.Context) ([]Rental, *exit.Error) {
-	rentals, _, problem := c.RentalListing(ctx)
-	return rentals, problem
+	listing, problem := c.RentalListing(ctx)
+	return listing.Rentals, problem
 }
 
-// RentalListing is Rentals with the account's bindings revision the listing carries (0 from a
-// Hub that states none): a rebind from another computer or the Hub moves it.
-func (c *Client) RentalListing(ctx context.Context) ([]Rental, int64, *exit.Error) {
+// RentalListing is the account's rentals and the account facts the listing carries.
+type RentalListing struct {
+	Rentals []Rental
+	// BindingsRevision is 0 from a Hub that states none: a rebind from another computer or
+	// the Hub moves it.
+	BindingsRevision int64
+	// Credit is nil for an account that never touches credit, or when the Hub could not
+	// read it now.
+	Credit *Credit
+}
+
+// RentalListing is Rentals with the account facts the listing carries.
+func (c *Client) RentalListing(ctx context.Context) (RentalListing, *exit.Error) {
 	var out struct {
 		Rentals          []wireRental `json:"rentals"`
 		BindingsRevision int64        `json:"bindings_revision"`
+		Credit           *Credit      `json:"credit"`
 	}
 	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals", auth: true,
 		responseBytes: maxRentalListingBytes}, &out)
 	if e != nil {
-		return nil, 0, e
+		return RentalListing{}, e
 	}
-	rentals := make([]Rental, 0, len(out.Rentals))
+	listing := RentalListing{Rentals: make([]Rental, 0, len(out.Rentals)), BindingsRevision: out.BindingsRevision, Credit: out.Credit}
 	for _, wire := range out.Rentals {
 		if !rentalid.Valid(wire.ID) {
 			continue
 		}
-		rentals = append(rentals, wire.rental())
+		listing.Rentals = append(listing.Rentals, wire.rental())
 	}
-	return rentals, out.BindingsRevision, nil
+	return listing, nil
 }
 
 // RentalHistory is every rental of this account that bore `name` (any name when blank), ended
