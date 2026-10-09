@@ -361,8 +361,9 @@ type RentalDevelopment struct {
 }
 
 type RentalRequest struct {
-	Development *RentalDevelopment `json:"development,omitempty"`
-	Name        string             `json:"name"`
+	MaximumTotalHourlyRateUSDMicros int64              `json:"maximum_total_hourly_rate_usd_micros,omitempty"`
+	Development                     *RentalDevelopment `json:"development,omitempty"`
+	Name                            string             `json:"name"`
 	// Provider names the marketplace (`--provider`); omitted buys from the hub's default.
 	Provider                 string   `json:"provider,omitempty"`
 	ExcludedProviderMachines []string `json:"excluded_provider_machines,omitempty"`
@@ -529,9 +530,10 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 // Provider offer names and prices are deliberately absent: the caller rents from
 // Tensorhub, not its adapter.
 type RentalSKU struct {
-	Name             string `json:"name"`
-	Provider         string `json:"provider,omitempty"`
-	AcceleratorModel string `json:"accelerator_model"`
+	IncludedStorageUSDMicrosPerHour int64  `json:"included_storage_usd_micros_per_hour,omitempty"`
+	Name                            string `json:"name"`
+	Provider                        string `json:"provider,omitempty"`
+	AcceleratorModel                string `json:"accelerator_model"`
 	// AcceleratorCount is the machine's GPU count. VRAMGB stays the ONE-CARD figure at
 	// every count, and that is the right fit test: under a sequence-parallel group every
 	// GPU holds the FULL weights, so width buys latency, never capacity.
@@ -574,18 +576,25 @@ type RentalProduct struct {
 
 // RentalWidth is one buyable GPU count and its per-machine prices.
 type RentalWidth struct {
-	AcceleratorCount        int   `json:"accelerator_count"`
-	PriceUSDMicrosPerHour   int64 `json:"price_usd_micros_per_hour"`
-	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
-	VCPUCount               int   `json:"vcpu_count,omitempty"`
-	MemoryGB                int   `json:"memory_gb,omitempty"`
+	Provider                        string `json:"provider,omitempty"`
+	IncludedStorageUSDMicrosPerHour int64  `json:"included_storage_usd_micros_per_hour,omitempty"`
+	AcceleratorCount                int    `json:"accelerator_count"`
+	PriceUSDMicrosPerHour           int64  `json:"price_usd_micros_per_hour"`
+	StorageUSDMicrosPerHour         int64  `json:"storage_usd_micros_per_hour"`
+	VCPUCount                       int    `json:"vcpu_count,omitempty"`
+	MemoryGB                        int    `json:"memory_gb,omitempty"`
 }
 
 // Machines flattens the product into one RentalSKU per width.
 func (p RentalProduct) Machines() []RentalSKU {
 	out := make([]RentalSKU, 0, len(p.Widths))
 	for _, width := range p.Widths {
-		out = append(out, RentalSKU{Name: p.Name, Provider: p.Provider, AcceleratorModel: p.AcceleratorModel,
+		provider := width.Provider
+		if provider == "" {
+			provider = p.Provider
+		}
+		out = append(out, RentalSKU{Name: p.Name, Provider: provider,
+			IncludedStorageUSDMicrosPerHour: width.IncludedStorageUSDMicrosPerHour, AcceleratorModel: p.AcceleratorModel,
 			AcceleratorCount: width.AcceleratorCount, PythonProvisionableMinors: p.PythonProvisionableMinors,
 			BaseWorkerProfile: p.BaseWorkerProfile,
 			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB,
@@ -610,7 +619,7 @@ func RentalProducts(skus []RentalSKU) []RentalProduct {
 				BaseWorkerProfile:         sku.BaseWorkerProfile, ComputeCapability: sku.ComputeCapability,
 				VRAMGB: sku.VRAMGB})
 		}
-		out[i].Widths = append(out[i].Widths, RentalWidth{AcceleratorCount: sku.AcceleratorCount,
+		out[i].Widths = append(out[i].Widths, RentalWidth{Provider: sku.Provider, IncludedStorageUSDMicrosPerHour: sku.IncludedStorageUSDMicrosPerHour, AcceleratorCount: sku.AcceleratorCount,
 			PriceUSDMicrosPerHour: sku.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: sku.StorageUSDMicrosPerHour,
 			VCPUCount: sku.VCPUCount, MemoryGB: sku.MemoryGB})
 	}
@@ -919,12 +928,15 @@ type RentalSKUStatus struct {
 // RentalQuote is what one exact rental request will lock: its disk and declared
 // workload choose the machine, so it can differ from the default-disk listing.
 type RentalQuote struct {
-	ExcludedProviderMachines []string `json:"excluded_provider_machines,omitempty"`
-	PriceUSDMicrosPerHour    int64    `json:"price_usd_micros_per_hour"`
-	StorageUSDMicrosPerHour  int64    `json:"storage_usd_micros_per_hour"`
-	ContainerDiskGB          int      `json:"container_disk_gb"`
-	VCPUCount                int      `json:"vcpu_count,omitempty"`
-	MemoryGB                 int      `json:"memory_gb,omitempty"`
+	Provider                        string   `json:"provider,omitempty"`
+	IncludedStorageUSDMicrosPerHour int64    `json:"included_storage_usd_micros_per_hour,omitempty"`
+	MaximumTotalHourlyRateUSDMicros int64    `json:"maximum_total_hourly_rate_usd_micros,omitempty"`
+	ExcludedProviderMachines        []string `json:"excluded_provider_machines,omitempty"`
+	PriceUSDMicrosPerHour           int64    `json:"price_usd_micros_per_hour"`
+	StorageUSDMicrosPerHour         int64    `json:"storage_usd_micros_per_hour"`
+	ContainerDiskGB                 int      `json:"container_disk_gb"`
+	VCPUCount                       int      `json:"vcpu_count,omitempty"`
+	MemoryGB                        int      `json:"memory_gb,omitempty"`
 }
 
 // QuoteRental prices the exact body a rental POST would send.

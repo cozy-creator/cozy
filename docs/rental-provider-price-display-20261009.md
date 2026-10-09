@@ -2,8 +2,10 @@
 
 Owner: Paul Fidika; implementation agent: linear_resume.
 Branch: fix/rental-provider-price-display-20261009.
-Base: origin/master8abcceee894fdb79c6d824c08430807586141e6e.
+Base: origin/master 8abcceee894fdb79c6d824c08430807586141e6e.
 
-Scope: retain and show each GPU count's selected provider, correctly distinguish compute from bundled storage, and carry the accepted total price ceiling into the existing quote/create path. Normal CLI checks must expose changing provider offers without silently accepting a more expensive fallback. No running rental is changed; no machines are rented for validation.
+The catalog now keeps the provider attached to each GPU count and shows it beside the price. A two-card RunPod offer and a four-card Vast offer can no longer appear to be the same provider's price ladder. Vast's disk component is separated when the Hub supplies it; otherwise the CLI says storage is included and compute is not itemized, rather than falsely showing zero storage.
 
-Current CLI discards the Hub's per-width provider and labels Vast's storage-inclusive total as GPU-only. Thus the RunPod two-H100 quote and the more expensive Vast four-H100 quote appear to be one provider's price ladder.
+Before creating a rental, the CLI reads the refreshed exact-request quote and saves its confirmed total hourly limit in the durable paid request. Replays retain that original body and ceiling. A Hub that cannot confirm that limit is refused before any paid request; no generic approval prompt is added. Explicit provider choices remain unchanged. Existing rentals and requests are preserved.
+
+Validation uses ordinary CLI subprocesses over real HTTP fixtures: mixed-width providers, itemized and unknown bundled storage, no paid request to an unaware Hub, durable ceiling propagation, existing locked-rate/disk-quote behavior, and machine-exclusion replay. A one-second exclusion test timed out during the initial shared test run and passed its isolated rerun unchanged. Builds and vet pass. No rented machine was ended or changed.

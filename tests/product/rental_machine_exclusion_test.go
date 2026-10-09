@@ -46,7 +46,7 @@ func TestRentalMachineExclusionsReachQuoteAndPaidIntentAndSurviveReplay(t *testi
 		mu.Lock()
 		_ = json.Unmarshal(raw, &quote)
 		mu.Unlock()
-		body, _ := json.Marshal(map[string]any{"price_usd_micros_per_hour": 260000, "container_disk_gb": 321, "excluded_provider_machines": req["excluded_provider_machines"]})
+		body, _ := json.Marshal(map[string]any{"price_usd_micros_per_hour": 260000, "maximum_total_hourly_rate_usd_micros": 260000, "container_disk_gb": 321, "excluded_provider_machines": req["excluded_provider_machines"]})
 		return http.StatusOK, string(body)
 	}
 	stand.rent = func(req map[string]any) map[string]any {
@@ -104,7 +104,7 @@ func TestRentalMachineExclusionsReconfirmUnsentResumeAgainstOlderHub(t *testing.
 		mu.Lock()
 		confirmed := aware
 		mu.Unlock()
-		body := map[string]any{"price_usd_micros_per_hour": 260000, "container_disk_gb": 321}
+		body := map[string]any{"price_usd_micros_per_hour": 260000, "maximum_total_hourly_rate_usd_micros": 260000, "container_disk_gb": 321}
 		if confirmed {
 			body["excluded_provider_machines"] = req["excluded_provider_machines"]
 		}

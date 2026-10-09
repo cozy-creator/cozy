@@ -336,6 +336,7 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	operationKey, reason string, hourlyRateUSDMicros int64, deadline time.Time, managedRequestID string,
 ) (*rentalAcquisition, *exit.Error) {
 	c := client(ctx)
+	var acceptedTotalCeiling int64
 	existing, e := st.RentalOperation(operationKey)
 	if e != nil {
 		return nil, e
@@ -442,6 +443,11 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	}
 	if existing != nil {
 		hourlyRateUSDMicros = existing.HourlyRateUSDMicros
+		prior, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
+		if problem != nil {
+			return nil, problem
+		}
+		acceptedTotalCeiling = prior.MaximumTotalHourlyRateUSDMicros
 		// An unsent or unconfirmed paid intent may resume against a rolled-back
 		// Hub. Reconfirm only this requested feature; keep its retained rate.
 		if existing.RentalID == "" && len(excluded) > 0 {
@@ -455,7 +461,7 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 				return nil, problem
 			}
 		}
-	} else if hourlyRateUSDMicros, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), creator.PublicKey(),
+	} else if hourlyRateUSDMicros, acceptedTotalCeiling, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), creator.PublicKey(),
 		workload, development, image, provider, excluded, hourlyRateUSDMicros); e != nil {
 		return nil, e
 	}
@@ -465,6 +471,15 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 			creator.PublicKey(), workload, development, image, provider, excluded...)
 		if e != nil {
 			return nil, "", e
+		}
+		request, problem := hub.ParseRentalRequestBytes(body)
+		if problem != nil {
+			return nil, "", problem
+		}
+		request.MaximumTotalHourlyRateUSDMicros = acceptedTotalCeiling
+		body, err := json.Marshal(request)
+		if err != nil {
+			return nil, "", exit.Internalf("cannot encode quoted rental request: %v", err)
 		}
 		return body, rentalRequestDigest(c.Base(), body), nil
 	}
@@ -495,32 +510,40 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 // renter consents to.
 func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHash, creatorKey string,
 	workload hub.DeclaredWorkload, development *hub.RentalDevelopment, image, provider string, excluded []string, listed int64,
-) (int64, *exit.Error) {
+) (int64, int64, *exit.Error) {
 	body, e := hub.RentalRequestBytes("quote", skuName, gpus, tokenHash, creatorKey, workload, development, image, provider, excluded...)
 	if e != nil {
-		return 0, e
+		return 0, 0, e
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
 	quote, e := c.QuoteRental(hctx, body)
 	if e != nil {
-		return 0, e
+		return 0, 0, e
 	}
 	if e = confirmedMachineExclusions(quote, excluded); e != nil {
-		return 0, e
+		return 0, 0, e
 	}
 
+	total := quote.PriceUSDMicrosPerHour + quote.StorageUSDMicrosPerHour
+	if quote.MaximumTotalHourlyRateUSDMicros <= 0 || quote.MaximumTotalHourlyRateUSDMicros != total {
+		return 0, 0, exit.Named(exit.Conflict, "rental.price_ceiling_unsupported", "the Hub did not confirm the quoted total price limit").WithRemedy("update this Hub before renting; no rental request was submitted")
+	}
 	if ctx.Err != nil && !ctx.Mode().JSON {
 		// The machine it names is the one bought: a product can be priced at another tier.
-		line := fmt.Sprintf("%s%s with a %d GB disk: %s", orchestrator.MachineLabel(skuName, gpus),
-			machineShape(quote.VCPUCount, quote.MemoryGB), quote.ContainerDiskGB,
-			rateBreakdown(quote.PriceUSDMicrosPerHour, quote.StorageUSDMicrosPerHour))
+		providerLabel := ""
+		if quote.Provider != "" {
+			providerLabel = " on " + quote.Provider
+		}
+		line := fmt.Sprintf("%s%s%s with a %d GB disk: %s", orchestrator.MachineLabel(skuName, gpus),
+			machineShape(quote.VCPUCount, quote.MemoryGB), providerLabel, quote.ContainerDiskGB,
+			rentalQuoteBreakdown(quote))
 		if quote.PriceUSDMicrosPerHour != listed {
 			line += " (the default-disk listing is " + rentalPrice(listed) + ")"
 		}
 		fmt.Fprintln(ctx.Err, line)
 	}
-	return quote.PriceUSDMicrosPerHour, nil
+	return quote.PriceUSDMicrosPerHour, total, nil
 }
 
 // complete asks the Hub for the pod, then waits on the Hub's word alone until it is
@@ -748,20 +771,28 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 		prices := make([]string, 0, len(product.Widths))
 		gpuPrices := make([]string, 0, len(product.Widths))
 		storage := make([]string, 0, len(product.Widths))
+		providers := make([]string, 0, len(product.Widths))
 		for _, width := range product.Widths {
 			label := ""
 			if len(product.Widths) > 1 || width.AcceleratorCount != 1 {
 				label = fmt.Sprintf("%dx ", width.AcceleratorCount)
 			}
 			prices = append(prices, label+rentalPrice(total(width)))
-			gpuPrices = append(gpuPrices, label+rentalPrice(width.PriceUSDMicrosPerHour))
-			storage = append(storage, label+rentalPrice(width.StorageUSDMicrosPerHour))
+			providers = append(providers, label+width.Provider)
+			if width.Provider == "vast" && width.IncludedStorageUSDMicrosPerHour == 0 {
+				gpuPrices = append(gpuPrices, label+"not itemized")
+				storage = append(storage, label+"included")
+			} else {
+				gpuPrices = append(gpuPrices, label+rentalPrice(width.PriceUSDMicrosPerHour-width.IncludedStorageUSDMicrosPerHour))
+				storage = append(storage, label+rentalPrice(width.StorageUSDMicrosPerHour+width.IncludedStorageUSDMicrosPerHour))
+			}
 		}
 		rows = append(rows, map[string]string{
 			"name": product.Name, acceleratorColumn: acceleratorName(product.AcceleratorModel) +
 				machineShape(product.Widths[0].VCPUCount, product.Widths[0].MemoryGB),
 			"accelerator model": product.AcceleratorModel,
 			"gpus":              joinInts(product.Counts()),
+			"providers":         strings.Join(providers, ", "),
 			"compute":           computeCapabilityText(product.ComputeCapability),
 			"vram":              fmt.Sprintf("%d GB", product.VRAMGB),
 			"gpu price":         strings.Join(gpuPrices, ", "),
@@ -771,9 +802,9 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 	}
 	doc := output.List{
 		Name:   "gpus",
-		Fields: []string{"name", acceleratorColumn, "gpus", "compute", "vram", "price"},
+		Fields: []string{"name", acceleratorColumn, "gpus", "compute", "vram", "providers", "price"},
 		AllFields: []string{"name", "gpu", "accelerator model", "gpus", "compute",
-			"vram", "gpu price", "storage price", "price"},
+			"vram", "providers", "gpu price", "storage price", "price"},
 		Rows: rows, Total: len(rows),
 		Next: []string{"cozy rental new <machine-slug> [--gpus N]"},
 	}
@@ -2230,4 +2261,11 @@ func confirmedMachineExclusions(quote hub.RentalQuote, excluded []string) *exit.
 		return exit.Named(exit.Structural, "rental.machine_exclusion_unsupported", "Tensorhub did not confirm the excluded provider machines; no new rental POST was sent").WithRemedy("update this Hub to support provider-machine exclusions")
 	}
 	return nil
+}
+
+func rentalQuoteBreakdown(quote hub.RentalQuote) string {
+	if quote.Provider == "vast" && quote.IncludedStorageUSDMicrosPerHour == 0 {
+		return rentalPrice(quote.PriceUSDMicrosPerHour+quote.StorageUSDMicrosPerHour) + " (storage included)"
+	}
+	return rateBreakdown(quote.PriceUSDMicrosPerHour-quote.IncludedStorageUSDMicrosPerHour, quote.StorageUSDMicrosPerHour+quote.IncludedStorageUSDMicrosPerHour)
 }
