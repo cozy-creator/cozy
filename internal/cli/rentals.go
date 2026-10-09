@@ -450,7 +450,7 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 		acceptedTotalCeiling = prior.MaximumTotalHourlyRateUSDMicros
 		// An unsent or unconfirmed paid intent may resume against a rolled-back
 		// Hub. Reconfirm only this requested feature; keep its retained rate.
-		if existing.RentalID == "" && len(excluded) > 0 {
+		if existing.RentalID == "" && (len(excluded) > 0 || acceptedTotalCeiling > 0) {
 			hctx, cancel := hub.Context()
 			confirmed, problem := c.QuoteRental(hctx, existing.RequestBody)
 			cancel()
@@ -459,6 +459,11 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 			}
 			if problem = confirmedMachineExclusions(confirmed, excluded); problem != nil {
 				return nil, problem
+			}
+			if acceptedTotalCeiling > 0 {
+				if problem := confirmedRentalPriceLimit(confirmed, acceptedTotalCeiling); problem != nil {
+					return nil, problem
+				}
 			}
 		}
 	} else if hourlyRateUSDMicros, acceptedTotalCeiling, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), creator.PublicKey(),
@@ -526,8 +531,8 @@ func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHas
 	}
 
 	total := quote.PriceUSDMicrosPerHour + quote.StorageUSDMicrosPerHour
-	if quote.MaximumTotalHourlyRateUSDMicros <= 0 || quote.MaximumTotalHourlyRateUSDMicros != total {
-		return 0, 0, exit.Named(exit.Conflict, "rental.price_ceiling_unsupported", "the Hub did not confirm the quoted total price limit").WithRemedy("update this Hub before renting; no rental request was submitted")
+	if problem := confirmedRentalPriceLimit(quote, 0); problem != nil {
+		return 0, 0, problem
 	}
 	if ctx.Err != nil && !ctx.Mode().JSON {
 		// The machine it names is the one bought: a product can be priced at another tier.
@@ -628,14 +633,21 @@ func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitio
 	// A fresh acceptance may not lock more than the catalog quote the renter agreed
 	// to; a rate at or below it is adopted, as is a replayed ask's reconciled
 	// BILLED rate (th-120). Neither is a reason to destroy a working pod.
-	if remote.State == "pending_acquisition" && remote.HourlyRateUSDMicros > hourlyRateUSDMicros {
+	lockedRate, acceptedRate := remote.HourlyRateUSDMicros, hourlyRateUSDMicros
+	if intent, problem := hub.ParseRentalRequestBytes(a.op.RequestBody); problem == nil && intent.MaximumTotalHourlyRateUSDMicros > 0 {
+		acceptedRate = intent.MaximumTotalHourlyRateUSDMicros
+		if remote.ComputeUSDMicrosPerHour > 0 {
+			lockedRate = remote.ComputeUSDMicrosPerHour + remote.StorageUSDMicrosPerHour
+		}
+	}
+	if remote.State == "pending_acquisition" && lockedRate > acceptedRate {
 		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)
 		hctx, cancel := hub.Context()
 		_ = c.Release(hctx, remote.ID, "locked Cozy retail rate changed")
 		cancel()
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.hourly_rate_changed",
 			"rental %s locked %d USD micros/hour, above catalog rate %d",
-			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros).
+			remote.ID, lockedRate, acceptedRate).
 			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
 	}
 	row := records.Rental{
@@ -2271,4 +2283,16 @@ func rentalQuoteBreakdown(quote hub.RentalQuote) string {
 		return rentalPrice(quote.PriceUSDMicrosPerHour+quote.StorageUSDMicrosPerHour) + " (storage included)"
 	}
 	return rateBreakdown(quote.PriceUSDMicrosPerHour-quote.IncludedStorageUSDMicrosPerHour, quote.StorageUSDMicrosPerHour+quote.IncludedStorageUSDMicrosPerHour)
+}
+
+// A resumed unsent intent must not lose its price limit if the Hub rolled back.
+func confirmedRentalPriceLimit(quote hub.RentalQuote, accepted int64) *exit.Error {
+	total := quote.PriceUSDMicrosPerHour + quote.StorageUSDMicrosPerHour
+	if quote.MaximumTotalHourlyRateUSDMicros <= 0 || quote.MaximumTotalHourlyRateUSDMicros != total {
+		return exit.Named(exit.Conflict, "rental.price_ceiling_unsupported", "the Hub did not confirm the quoted total price limit").WithRemedy("update this Hub before renting; no rental request was submitted")
+	}
+	if accepted > 0 && total > accepted {
+		return exit.Named(exit.Conflict, "rental.hourly_rate_changed", "current quote totals %d USD micros/hour, above the retained limit %d", total, accepted).WithRemedy("the original request was retained and no new paid request was sent")
+	}
+	return nil
 }

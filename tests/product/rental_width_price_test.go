@@ -80,3 +80,51 @@ func TestRentalPaidRequestKeepsFreshTotalCeiling(t *testing.T) {
 		t.Fatalf("paid request changed price ceiling to%d: %s", got.Load(), out)
 	}
 }
+
+func TestRentalPricedResumeReconfirmsLimitAfterHubRollback(t *testing.T) {
+	root, _, stand := rentalEndRoot(t, "price-resume-rollback")
+	defer runCozy(t, root, "down")
+	stand.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1, "price_usd_micros_per_hour": 100000})
+	var aware atomic.Bool
+	aware.Store(true)
+	var posts atomic.Int64
+	stand.quote = func(map[string]any) (int, string) {
+		if aware.Load() {
+			return 200, `{"price_usd_micros_per_hour":100000,"maximum_total_hourly_rate_usd_micros":100000}`
+		}
+		return 200, `{"price_usd_micros_per_hour":100000}`
+	}
+	original := stand.server.Config.Handler
+	stand.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/v1/rentals" {
+			posts.Add(1)
+			w.WriteHeader(503)
+			_, _ = w.Write([]byte(`{"error":{"code":"proof.no_create","message":"no paid request accepted"}}`))
+			return
+		}
+		original.ServeHTTP(w, r)
+	})
+	args := []string{"rental", "new", "cpu", "--idempotency-key=price-unsent", "--development=false", "--json"}
+	_, out := runCozy(t, root, args...)
+	if !strings.Contains(out, "proof.no_create") || posts.Load() != 1 {
+		t.Fatalf("initial intent not retained: %s posts%d", out, posts.Load())
+	}
+	aware.Store(false)
+	code, out := runCozy(t, root, args...)
+	if code == 0 || !strings.Contains(out, "rental.price_ceiling_unsupported") || posts.Load() != 1 {
+		t.Fatalf("rollback received resumed paid POST: %d %s posts%d", code, out, posts.Load())
+	}
+}
+
+func TestRentalBundledTotalWithinAcceptedLimitIsKept(t *testing.T) {
+	root, _, stand := rentalEndRoot(t, "bundled-within-limit")
+	defer runCozy(t, root, "down")
+	stand.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1, "price_usd_micros_per_hour": 100000, "storage_usd_micros_per_hour": 41700})
+	stand.rent = func(request map[string]any) map[string]any {
+		return map[string]any{"rental_id": "pr-bundled-within", "name": request["name"], "state": "pending_acquisition", "requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 130000, "compute_usd_micros_per_hour": 120000, "storage_usd_micros_per_hour": 10000}
+	}
+	_, out := rentUntilRecorded(t, root, "pr-bundled-within", "cpu", "--development=false", "--idempotency-key=bundled-within", "--json")
+	if stand.releases("pr-bundled-within") != 0 || strings.Contains(out, "rental.hourly_rate_changed") {
+		t.Fatalf("within-budget total compared with old compute-only rate: %s", out)
+	}
+}
