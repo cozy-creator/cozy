@@ -832,10 +832,12 @@ func hubGrantKey(origin, identity string, leaf []byte) string {
 	return origin + "\x00" + identity + "\x00" + string(leaf)
 }
 
-// regrantV1 answers a machine's refusal of spec: when it holds no grant for spec's Hub access
-// (it restarted), spec carries a fresh code and the submission is sent again, once.
+// regrantV1 answers a machine's refusal of spec's Hub access: it holds no grant (it restarted),
+// or the code did not redeem (it expired before submission). spec then carries a fresh code and
+// the submission is sent again, once.
 func (m *machineRuns) regrantV1(ctx context.Context, origin string, machine *machines.V1, spec *v1.RunSpec, err error) bool {
-	if spec == nil || spec.Hub == nil || spec.Hub.Authorization != nil || !strings.Contains(status.Convert(err).Message(), "hub_access_required") {
+	refusal := status.Convert(err).Message()
+	if spec == nil || spec.Hub == nil || !strings.Contains(refusal, "hub_access_required") && !strings.Contains(refusal, "hub_authorization_refused") {
 		return false
 	}
 	account := client(m.context.forHub(origin))
