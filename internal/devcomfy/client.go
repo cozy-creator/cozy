@@ -121,7 +121,7 @@ func (s SSH) command(ctx context.Context, request map[string]any) *exec.Cmd {
 		"root@"+s.Host, "CUDA_VISIBLE_DEVICES='' "+quote(s.Python)+" -c "+quote(bootstrap))
 	command.Env = s.Environment
 	raw, _ := json.Marshal(request)
-	command.Stdin = io.MultiReader(bytes.NewReader(append(raw, '\n')), strings.NewReader(driverSource))
+	command.Stdin = io.MultiReader(bytes.NewReader(append(raw, '\n')), strings.NewReader(driverSource)) //cozy:stdin-value framed request and captured script bytes, never terminal input
 	return command
 }
 
@@ -233,7 +233,7 @@ func Run(parent context.Context, o Options) (result Result, returned error) {
 	}
 	identity := struct {
 		Rental, Worker, Boot, StateRoot string
-		Input                Input
+		Input                           Input
 	}{o.Rental, o.Worker, o.Boot, o.StateRoot, o.Input}
 	raw, _ := json.Marshal(identity)
 	receipt := filepath.Join(o.ReceiptDir, "request.json")
@@ -351,7 +351,8 @@ func Run(parent context.Context, o Options) (result Result, returned error) {
 	for {
 		result.Operation = op
 		result.OutputDirectory = o.OutputDir
-		_ = save(filepath.Join(o.ReceiptDir, "status.json"), result)
+		// This snapshot is observation evidence only; recovery reads the remote receipt.
+		_ = save(filepath.Join(o.ReceiptDir, "observation.json"), result)
 		if o.Progress != nil {
 			o.Progress(result)
 		}

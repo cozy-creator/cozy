@@ -1,12 +1,15 @@
-package devcomfy
+package producttest
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +22,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/devcomfy"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -33,6 +38,16 @@ func TestOwnedSSHComfyRoundTripAndReplay(t *testing.T) {
 		}
 	}
 	root := t.TempDir()
+	env := childEnv(t, root, "CUDA_VISIBLE_DEVICES=")
+	marker := "$(touch /must-not-run) `echo unsafe`"
+	graph, err := json.Marshal(map[string]any{"1": map[string]any{"class_type": "Fixture", "inputs": map[string]any{"text": marker}}})
+	must(t, err)
+	python, err := exec.LookPath("python3")
+	must(t, err)
+	pythonPath := filepath.Join(root, "python with 'quote")
+	must(t, os.Symlink(python, pythonPath))
+	var collisionArmed, payloadLeaked atomic.Bool
+	racingTarget := filepath.Join(root, "local-output", "outputs", "sample.mp4")
 	key := filepath.Join(root, "key")
 	if raw, err := exec.Command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key).CombinedOutput(); err != nil {
 		t.Fatal(err, string(raw))
@@ -57,7 +72,7 @@ func TestOwnedSSHComfyRoundTripAndReplay(t *testing.T) {
 		return &ssh.Permissions{}, nil
 	}}
 	config.AddHostKey(signer)
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow loopback SSH fixture authenticates the development transport
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,10 +113,32 @@ func TestOwnedSSHComfyRoundTripAndReplay(t *testing.T) {
 							request.Reply(false, nil)
 							break
 						}
+						if strings.Contains(spec.Command, marker) {
+							payloadLeaked.Store(true)
+							request.Reply(false, nil)
+							channel.Close()
+							break
+						}
 						request.Reply(true, nil)
+						framed := bufio.NewReader(channel)
+						firstLine, err := framed.ReadString('\n')
+						if err != nil {
+							channel.Close()
+							break
+						}
+						var envelope map[string]any
+						if json.Unmarshal([]byte(firstLine), &envelope) != nil {
+							channel.Close()
+							break
+						}
+						if envelope["action"] == "fetch" && envelope["name"] == "outputs/sample.mp4" && collisionArmed.Swap(false) {
+							if err := os.WriteFile(racingTarget, []byte("another operation's video"), 0600); err != nil {
+								t.Error(err)
+							}
+						}
 						command := exec.Command("sh", "-c", spec.Command)
-						command.Env = append(os.Environ(), "CUDA_VISIBLE_DEVICES=")
-						command.Stdin = channel
+						command.Env = env
+						command.Stdin = io.MultiReader(strings.NewReader(firstLine), framed) //cozy:stdin-value forward the framed SSH request into the fixture process
 						command.Stdout = channel
 						command.Stderr = channel.Stderr()
 						code := 0
@@ -139,6 +176,10 @@ func TestOwnedSSHComfyRoundTripAndReplay(t *testing.T) {
 		case r.URL.Path == "/prompt":
 			var body map[string]any
 			json.NewDecoder(r.Body).Decode(&body)
+			received := body["prompt"].(map[string]any)["1"].(map[string]any)["inputs"].(map[string]any)["text"]
+			if received != marker {
+				t.Errorf("graph value changed: %v", received)
+			}
 			posts.Add(1)
 			prompt = body["prompt_id"].(string)
 			json.NewEncoder(w).Encode(map[string]any{"prompt_id": prompt})
@@ -152,10 +193,10 @@ func TestOwnedSSHComfyRoundTripAndReplay(t *testing.T) {
 	_, httpPort, _ := net.SplitHostPort(strings.TrimPrefix(comfy.URL, "http://"))
 	servicePort, _ := strconv.Atoi(httpPort)
 	var renewals atomic.Int32
-	o := Options{SSH: SSH{Host: host, Port: port, Key: key, KnownHosts: hosts, Python: "python3", Environment: os.Environ()}, Input: Input{GraphJSON: `{"1":{"class_type":"Fixture","inputs":{"text":"$(touch no)"}}}`, OutputRoot: outputs, Port: servicePort, TimeoutS: 30, ExpectedSteps: 8}, Rental: "rental", Worker: "worker", Boot: "boot", Key: "stable", StateRoot: filepath.Join(root, "remote-state"), ReceiptDir: filepath.Join(root, "receipts"), OutputDir: filepath.Join(root, "local-output"), Keepalive: func(context.Context) error { renewals.Add(1); return nil }}
+	o := devcomfy.Options{SSH: devcomfy.SSH{Host: host, Port: port, Key: key, KnownHosts: hosts, Python: pythonPath, Environment: env}, Input: devcomfy.Input{GraphJSON: string(graph), OutputRoot: outputs, Port: servicePort, TimeoutS: 30, ExpectedSteps: 8}, Rental: "rental", Worker: "worker", Boot: "boot", Key: "stable", StateRoot: filepath.Join(root, "remote-state"), ReceiptDir: filepath.Join(root, "receipts"), OutputDir: filepath.Join(root, "local-output"), Keepalive: func(context.Context) error { renewals.Add(1); return nil }}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	first, err := Run(ctx, o)
+	first, err := devcomfy.Run(ctx, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +207,7 @@ func TestOwnedSSHComfyRoundTripAndReplay(t *testing.T) {
 	if err != nil || !bytes.Equal(got, original) {
 		t.Fatal("original artifact changed", err)
 	}
-	second, err := Run(ctx, o)
+	second, err := devcomfy.Run(ctx, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,19 +219,35 @@ func TestOwnedSSHComfyRoundTripAndReplay(t *testing.T) {
 	if err = os.Remove(target); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(target+".partial-"+Operation(o.Rental, o.Key)[:12], original[:101], 0600); err != nil {
+	if err = os.WriteFile(target+".partial-"+devcomfy.Operation(o.Rental, o.Key)[:12], original[:101], 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = Run(ctx, o); err != nil {
+	if _, err = devcomfy.Run(ctx, o); err != nil {
 		t.Fatal(err)
 	}
 	got, err = os.ReadFile(target)
 	if err != nil || !bytes.Equal(got, original) || posts.Load() != 1 {
 		t.Fatal("partial transfer did not resume the same original", err)
 	}
+	// Create a foreign destination only after fetch checked absence and opened its partial.
+	must(t, os.Remove(target))
+	collisionArmed.Store(true)
+	if _, err = devcomfy.Run(ctx, o); !errors.Is(err, os.ErrExist) {
+		t.Fatal("racing output was replaced or collision was hidden", err)
+	}
+	got, err = os.ReadFile(target)
+	must(t, err)
+	held, err := os.ReadFile(target + ".partial-" + devcomfy.Operation(o.Rental, o.Key)[:12])
+	must(t, err)
+	if string(got) != "another operation's video" || !bytes.Equal(held, original) {
+		t.Fatal("publication collision destroyed either original")
+	}
+	if payloadLeaked.Load() {
+		t.Fatal("graph value entered the SSH command")
+	}
 	changed := o
 	changed.Boot = "different"
-	if _, err = Run(ctx, changed); err == nil {
+	if _, err = devcomfy.Run(ctx, changed); err == nil {
 		t.Fatal("changed boot accepted")
 	}
 	bad := o
@@ -199,7 +256,7 @@ func TestOwnedSSHComfyRoundTripAndReplay(t *testing.T) {
 	bad.SSH.KnownHosts = filepath.Join(root, "empty-hosts")
 	os.WriteFile(bad.SSH.KnownHosts, nil, 0600)
 	started := time.Now()
-	if _, err = Run(ctx, bad); err == nil || time.Since(started) > 5*time.Second {
+	if _, err = devcomfy.Run(ctx, bad); err == nil || time.Since(started) > 5*time.Second {
 		t.Fatal("host-key refusal was retried or accepted", err)
 	}
 	if posts.Load() != 1 {
