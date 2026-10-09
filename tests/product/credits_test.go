@@ -23,8 +23,9 @@ type creditHub struct {
 	paidWith string
 	reads    int
 	paid     bool
-	// credit is GET /v1/credit's answer (th-242); nil for an unmetered account.
-	credit map[string]int64
+	// GET /v1/credit (th-242) states the balance against these; null for an unmetered account.
+	warning, floor int64
+	unmetered      bool
 }
 
 func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux) {
@@ -61,7 +62,11 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			}
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			reply(w, 200, map[string]any{"credit": h.credit})
+			var credit map[string]int64
+			if !h.unmetered {
+				credit = map[string]int64{"available_usd_micros": h.balance, "warning_usd_micros": h.warning, "floor_usd_micros": h.floor}
+			}
+			reply(w, 200, map[string]any{"credit": credit})
 		})
 		mux.HandleFunc("GET /billing/v1/me/transactions", func(w http.ResponseWriter, r *http.Request) {
 			if !signedIn(w, r) {
@@ -211,8 +216,7 @@ func TestCreditsReadAndBuy(t *testing.T) {
 // rental command repeats the warning from that statement without asking the Hub; an
 // account the Hub meters nothing for is never warned.
 func TestLowCreditWarns(t *testing.T) {
-	credits := &creditHub{balance: 500_000,
-		credit: map[string]int64{"available_usd_micros": 500_000, "warning_usd_micros": 1_000_000, "floor_usd_micros": -2_000_000}}
+	credits := &creditHub{balance: 500_000, warning: 1_000_000, floor: -2_000_000}
 	var hubURL string
 	hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
 	hubURL = hub.URL
@@ -242,10 +246,16 @@ func TestLowCreditWarns(t *testing.T) {
 	}
 
 	credits.mu.Lock()
-	credits.credit = nil
+	credits.unmetered = true
 	credits.mu.Unlock()
-	if code, out := run("", "credits"); code != 0 || strings.Contains(out, "credit is low") {
-		t.Fatalf("an unmetered account was warned: exit %d\n%s", code, out)
+	if code, out := run("", "credits"); code != 0 || strings.Contains(out, "credit is low") ||
+		!strings.Contains(out, "billing: unmetered") || !strings.Contains(out, "never stopped for balance") ||
+		strings.Contains(out, "available") || strings.Contains(out, "cozy credits buy") {
+		t.Fatalf("an unmetered account was shown a balance or warned: exit %d\n%s", code, out)
+	}
+	if code, out := run("", "credits", "--json"); code != 0 || !strings.Contains(out, `"billing":"unmetered"`) ||
+		strings.Contains(out, `"available"`) {
+		t.Fatalf("an unmetered account as JSON: exit %d\n%s", code, out)
 	}
 	if _, out := run("", "rental", "list", "--no-watch"); strings.Contains(out, "credit is low") {
 		t.Fatalf("a rental command after the Hub stopped metering warned:\n%s", out)
