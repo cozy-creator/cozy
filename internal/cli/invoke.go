@@ -312,8 +312,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return exit.Usagef("a provider-source model runs on a named machine").
 			WithRemedy("add --rental=<name>; the machine resolves, narrows and converts the source itself")
 	}
-	// Every slot is resolved here, whatever machine runs the call (th-241): it reads no
-	// binding, model card or resolution at a Hub.
+	// Every slot is chosen here, whatever machine runs the call: it reads no binding or model
+	// card at a Hub, only each named release lane's closure (th-245).
 	if models, e = exactRunModels(ctx, target, ep, overrides.Models, models, resolveInvocationModels); e != nil {
 		return e
 	}
@@ -535,10 +535,10 @@ func pinnedProviderSource(ctx *Context, raw string) (string, *exit.Error) {
 	return source.Canonical, nil
 }
 
-// exactRunModels are a run's model choices as its machine takes them (th-241: it resolves
-// nothing at a Hub): every Hub slot of ep resolved here, an explicit choice to its exact
-// checkpoint and an unchosen slot to its binding's ladder with every rung's checkpoint, beside
-// the provider sources the caller named and its captured children's choices, each pinned.
+// exactRunModels are a run's model choices: every Hub slot of ep resolved here, an explicit
+// choice to its release lane and an unchosen slot to its binding's ladder, beside the provider
+// sources the caller named and its captured children's choices. The machine is sent their
+// names and resolves each release lane at the Hub (th-245).
 //
 // Kept under the catalog revision this client knows, as a machine once kept its own: a warm
 // run reads nothing at any Hub, and a publish, yank or bind (here or stated by the Hub) moves

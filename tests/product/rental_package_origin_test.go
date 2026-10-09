@@ -107,9 +107,9 @@ func TestAMissingPackageNamesItsHubAndWhereItExists(t *testing.T) {
 }
 
 // The same contract with real CLI, daemon, machine and Runtime. The package exists only on
-// the selected source Hub. The CLI reads its release there and hands the machine the card
-// with the run (th-241): no machine reads a package at any Hub, and the rental's Hub never
-// receives package requests.
+// the selected source Hub. The run names its release (th-245): the CLI reads it there and the
+// machine installs it by name at that Hub's own origin, and the rental's Hub never receives
+// package requests.
 func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	rentalHub, root, layout, store := parityMachines(t)
 	source := newMachineHub(t)
@@ -122,7 +122,7 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 	}
 	configure("source")
 	var mu sync.Mutex
-	var catalogReads []string
+	var catalogReads, machineReads []string
 	wrongReads := []string{}
 	record := func(reads *[]string, next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -135,7 +135,10 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 		})
 	}
 	source.server.Config.Handler = record(&catalogReads, source.server.Config.Handler)
-	for _, wrong := range []*httptest.Server{source.access, source.worker, rentalHub.server, rentalHub.access, rentalHub.worker} {
+	for _, door := range []*httptest.Server{source.access, source.worker} {
+		door.Config.Handler = record(&machineReads, door.Config.Handler)
+	}
+	for _, wrong := range []*httptest.Server{rentalHub.server, rentalHub.access, rentalHub.worker} {
 		wrong.Config.Handler = record(&wrongReads, wrong.Config.Handler)
 	}
 	run := func(key string, extra ...string) {
@@ -153,7 +156,7 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 			t.Fatalf("source or machine changed: request=%+v link=%+v", request, link)
 		}
 	}
-	run("source-cold") // The rental describes the selected Hub's newest release itself.
+	run("source-cold") // The rental installs the selected Hub's release by name there.
 
 	// Reproduce cached install provenance from a different Hub without changing its release.
 	response, err := http.Get(source.server.URL + "/v1/packages/" + parityPublished + "/releases/" + parityVersion)
@@ -302,8 +305,8 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
 	fatal(t, problem)
 	mu.Lock()
 	defer mu.Unlock()
-	if len(catalogReads) == 0 || len(wrongReads) != 0 {
-		t.Fatalf("catalog routing: catalog=%v wrong=%v", catalogReads, wrongReads)
+	if len(catalogReads) == 0 || len(machineReads) == 0 || len(wrongReads) != 0 {
+		t.Fatalf("catalog routing: catalog=%v machine=%v wrong=%v", catalogReads, machineReads, wrongReads)
 	}
 	if row.Hub != rentalHub.server.URL {
 		t.Fatal("running another source changed the rental's lifecycle authority")

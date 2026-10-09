@@ -82,8 +82,12 @@ still execute offline. A remote published source requires login to the selected 
 A bare `org/package/function` invocation takes one path on every machine, this computer's
 or a rental: the installed release, else the newest this client kept under its current
 catalog revision, else the newest the machine names at the selected Hub (the Hub's own
-answer only when no machine can say yet). The run carries that exact release, so a warm
-run reads nothing at any Hub. A publish, yank or bind moves the revision, and the next run
-asks again. A package missing from the selected Hub fails even when this computer or the
+answer only when no machine can say yet). The run names that release and each model as
+`org/name@release` with a lane or the binding's GPU rungs, never a hash (th-245): a machine
+that does not hold them reads the release's card and lock, and resolves each release lane
+with the Hub's closure, by name and anonymously. Only the owner's own checkpoint travels by
+hash, read under the run's capability. The run also carries the catalog revision, so a
+warm run reads nothing at any Hub, and a publish, yank or bind moves the revision: the
+next run asks again. A package missing from the selected Hub fails even when this computer or the
 worker holds it from another Hub.
 Only an explicit local source path takes the local-code upload path.

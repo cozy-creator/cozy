@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -12,8 +13,9 @@ import (
 
 // A rebind made from another computer or the Hub reaches every machine without a request of
 // its own: the account's bindings revision rides the rental listing this computer polls. The
-// CLI reads the package's binding and its Model once more and hands every machine the exact
-// choice (th-241), then nothing is read again; no machine reads a binding or Model at a Hub.
+// CLI reads the package's binding and its Model once more and hands every machine the named
+// choice under the new catalog revision (th-245); each machine resolves it once more with the
+// Hub's closure, then nothing is read again. No machine reads a binding or Model card.
 func TestARebindMadeElsewhereReachesEveryMachine(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root, machines.Local, "tessa")
@@ -55,10 +57,16 @@ func TestARebindMadeElsewhereReachesEveryMachine(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls := strings.Join(seen, "\n")
-		if strings.Contains(calls, "machine GET /v1/packages/") || strings.Contains(calls, "machine GET /v1/models/") {
+		if strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/bindings") || strings.Contains(calls, "machine GET /v1/models/") {
 			t.Fatalf("a machine read the catalog at its Hub on %s: %q", venue, calls)
 		}
 		return calls
+	}
+	// resolves drops a machine's resolution of its model by name, which a new catalog revision asks for.
+	resolves := func(calls string) string {
+		return strings.Join(slices.DeleteFunc(strings.Split(calls, "\n"), func(call string) bool {
+			return call == "machine POST /v1/tensorfs/closure"
+		}), "\n")
 	}
 	read := func(calls string) bool {
 		return strings.Contains(calls, "account GET /v1/packages/"+parityPublished+"/bindings") && strings.Contains(calls, "account GET /v1/models/proof/probe")
@@ -91,7 +99,9 @@ func TestARebindMadeElsewhereReachesEveryMachine(t *testing.T) {
 	for venue, args := range venues {
 		if calls := run(venue, args...); first && !read(calls) {
 			t.Fatalf("the run on %s after a rebind elsewhere did not read the binding again: %q", venue, calls)
-		} else if !first && calls != "" {
+		} else if !strings.Contains(calls, "machine POST /v1/tensorfs/closure") {
+			t.Fatalf("the machine %s did not resolve its model again under the new revision: %q", venue, calls)
+		} else if !first && resolves(calls) != "" {
 			t.Fatalf("the run on %s read again what the CLI resolved for another machine: %q", venue, calls)
 		}
 		first = false

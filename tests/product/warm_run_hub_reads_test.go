@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -45,7 +46,8 @@ func probeCheckpoint(t *testing.T) ([]byte, map[string][]byte) {
 
 // seedProbe lands proof/probe@1.0.0/bf16 in each named machine's store (this computer's, or a
 // rental's name) as a user does, with `cozy model download` from the stand-in Hub, and
-// answers the Hub's resolution of it.
+// answers the Hub's resolution of it. The machines' Hub keeps answering the probe's closure,
+// for any spelling of it, and records each ref and lane asked (h.closures).
 func seedProbe(t *testing.T, h *machineHub, root string, venues ...string) map[string]any {
 	t.Helper()
 	// A checkpoint of the caller's own named by digest is a private read: the run carries a
@@ -70,6 +72,11 @@ func seedProbe(t *testing.T, h *machineHub, root string, venues ...string) map[s
 	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/tensorfs/closure":
+			var asked struct{ Ref, Lane string }
+			_ = json.NewDecoder(r.Body).Decode(&asked)
+			h.mu.Lock()
+			h.closures = append(h.closures, strings.TrimSpace(asked.Ref+" "+asked.Lane))
+			h.mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"complete": true, "lane": "bf16", "model": "proof/probe", "release": "1.0.0",
 				"manifest": ref(manifest), "objects": closure, "presign_max_digests": 64, "scope": "runtime"})
 		case r.URL.Path == "/v1/tensorfs/presign":
@@ -105,7 +112,7 @@ func seedProbe(t *testing.T, h *machineHub, root string, venues ...string) map[s
 			t.Fatalf("seeding proof/probe on %s [exit %d]\n%s", venue, code, out)
 		}
 	}
-	h.server.Config.Handler, h.worker.Config.Handler = account, doors
+	h.server.Config.Handler = account
 	return resolved
 }
 
@@ -174,10 +181,11 @@ def touch(payload: TouchRequest, source: Probe) -> TouchResult:
 	return project
 }
 
-// A warm run of a published release makes no Hub content request, from the CLI or machine
-// (th-241): the CLI read the owner's binding and the model card on the cold run and kept the
-// ladder under its catalog revision; the machine reads no binding or model at a Hub at all.
-// Rental authority still refreshes independently of content reuse.
+// A warm run of a published release makes no Hub request, from the CLI or machine. The cold
+// run names the release and the model (th-245): the CLI reads the owner's binding once per
+// catalog revision, and each machine installs the release by name and resolves the model's
+// release lane with the Hub's closure, never by hash and never reading a binding or model
+// card. Rental authority still refreshes independently of content reuse.
 func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
 	resolved := seedProbe(t, h, root, machines.Local, "tessa")
@@ -216,8 +224,26 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 		}
 	}))
 	catalog := func(calls string) bool {
-		return strings.Contains(calls, "machine GET /v1/packages/") || strings.Contains(calls, "machine GET /v1/models/")
+		return strings.Contains(calls, "machine GET /v1/models/") || strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/bindings")
 	}
+	installs := func(calls string) bool {
+		return strings.Contains(calls, "machine GET /v1/packages/"+parityPublished+"/releases/")
+	}
+	byName := func(venue string) {
+		t.Helper()
+		h.mu.Lock()
+		asked := slices.Clone(h.closures)
+		h.closures = nil
+		h.mu.Unlock()
+		if !slices.Contains(asked, "proof/probe@1.0.0 bf16") || slices.ContainsFunc(asked, func(ref string) bool {
+			return strings.HasPrefix(ref, "proof/probe@sha256:")
+		}) {
+			t.Fatalf("the cold run on %s did not resolve proof/probe@1.0.0 bf16 by name: %q", venue, asked)
+		}
+	}
+	h.mu.Lock()
+	h.closures = nil
+	h.mu.Unlock()
 
 	for _, venue := range []struct {
 		name string
@@ -238,6 +264,12 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			if catalog(strings.Join(calls, "\n")) {
 				t.Fatalf("the %s run on %s read the catalog from its machine: %v", key, venue.name, calls)
 			}
+			if key == "cold" {
+				if !installs(strings.Join(calls, "\n")) {
+					t.Fatalf("the cold run on %s did not install the release by name: %v", venue.name, calls)
+				}
+				byName(venue.name)
+			}
 			if key == "warm" && len(calls) != 0 {
 				t.Fatalf("the warm run on %s made %d Hub requests; want none: %v", venue.name, len(calls), calls)
 			}
@@ -245,7 +277,8 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	}
 
 	// The owner's change to the package moves the catalog revision: the CLI reads the binding
-	// once more for whichever machine runs next, then nothing again; no machine reads it.
+	// once more for whichever machine runs next, then nothing again; no machine reads it, and
+	// each resolves its model once more by name.
 	h.mux.HandleFunc("DELETE /v1/packages/"+parityPublished+"/releases/"+parityVersion, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"release":"` + parityVersion + `","state":"yanked","changed":true}`))
 	})
@@ -265,7 +298,7 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			calls := strings.Join(seen, "\n")
 			mu.Unlock()
 			read := strings.Contains(calls, "account GET /v1/packages/"+parityPublished+"/bindings")
-			if changed != read || catalog(calls) || !changed && calls != "" {
+			if changed != read || catalog(calls) || installs(calls) || !strings.Contains(calls, "machine POST /v1/tensorfs/closure") && key == "changed" || key == "warm again" && calls != "" {
 				t.Fatalf("the %s run on %s read: %q", key, venue, calls)
 			}
 			changed = false

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,7 +101,17 @@ def main(payload: Request) -> Result:
 		releases[prefix], releases[prefix+"/locked-requirements"] = detail, []byte(locked)
 		plans[version] = hub.PackageDownloadPlan{Release: version, Downloads: []hub.PackageInstallDownload{{Kind: "project_wheel", Path: filepath.Base(path)}}}
 	}
-	// The CLI reads each release's card and hands it to the machine (th-241).
+	// The machine installs each release by name, reading its card and lock at its Hub (th-245).
+	var machineReads sync.Map
+	doors := h.worker.Config.Handler
+	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, found := releases[r.URL.Path]; found && r.Method == http.MethodGet {
+			machineReads.Store(r.URL.Path, true)
+			_, _ = w.Write(body)
+			return
+		}
+		doors.ServeHTTP(w, r)
+	})
 	account := h.server.Config.Handler
 	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if body, found := releases[r.URL.Path]; found && r.Method == http.MethodGet {
@@ -134,6 +145,9 @@ def main(payload: Request) -> Result:
 			return row != nil && row.State == "succeeded"
 		})
 		t.Logf("ordinary published install %s: %s", version, time.Since(started))
+		if _, read := machineReads.Load("/v1/packages/proof/install-interface-probe/releases/" + version + "/locked-requirements"); !read {
+			t.Fatalf("the machine did not install %s by name at its Hub", version)
+		}
 		if body, err := os.ReadFile(imports); !os.IsNotExist(err) {
 			t.Fatalf("installing %s imported the package: %q %v", version, body, err)
 		}
