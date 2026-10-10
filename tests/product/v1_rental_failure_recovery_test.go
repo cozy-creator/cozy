@@ -56,7 +56,8 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 		hub.add(id, name)
 		hub.setState(id, "degraded", "")
 		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: id, MachineName: name, SKU: "cpu",
-			AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1"}))
+			AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1",
+			ReadyAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)}))
 	}
 	type arm struct {
 		kind, selected, rental        string
@@ -210,7 +211,8 @@ func TestARunReleasedBeforeARestartIsPlacedAgain(t *testing.T) {
 	hub.add("rental-lost", "nitian")
 	hub.setState("rental-lost", "failed", "readiness.receipt_conflict")
 	rental := records.Rental{AcceleratorCount: 1, ID: "rental-lost", MachineName: "nitian", SKU: "cpu",
-		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1"}
+		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1",
+		ReadyAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)}
 	fatal(t, store.RecordRental(rental))
 	const id = "req-released-before-restart"
 	body, _ := canonical.Spell(canonical.Digest([]byte(id)))
@@ -234,7 +236,8 @@ func TestARunReleasedBeforeARestartIsPlacedAgain(t *testing.T) {
 		events, problem := store.EventsAfter(id, 0, 1000)
 		fatal(t, problem)
 		for _, event := range events {
-			if event.Type == "request.parked" {
+			// Placed again: it waits for a machine, or the market's answer settles it.
+			if event.Type == "request.parked" || event.Type == "request.placement" {
 				return
 			}
 		}

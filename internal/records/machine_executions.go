@@ -352,6 +352,40 @@ func (s *Store) RequestMachineCancellation(id, actor string) (bool, *exit.Error)
 	return len(link.Receipt) > 0, nil
 }
 
+// CancelUnacceptedRun ends a canceled run its machine answered it never took: the submission
+// is closed, the run canceled, and nothing of it is exported or published.
+func (s *Store) CancelUnacceptedRun(id string) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin the unaccepted cancellation: %s", err)
+	}
+	defer tx.Rollback()
+	var unaccepted bool
+	if err := tx.QueryRow(`SELECT e.cancel_requested=1 AND length(e.receipt)=0 AND NOT EXISTS(SELECT 1 FROM request_events a
+ WHERE a.request_id=e.request_id AND a.type=?) FROM machine_executions e WHERE e.request_id=?`, RunV1Accepted, id).Scan(&unaccepted); err != nil {
+		return exit.Internalf("cannot read the unaccepted cancellation: %s", err)
+	}
+	if !unaccepted {
+		return nil
+	}
+	if err := appendEventTx(tx, id, "machine.submission_closed", 0, map[string]any{"reason": "the machine never took the run"}); err != nil {
+		return exit.Internalf("cannot close the unaccepted submission: %s", err)
+	}
+	if err := projectCancellationTx(tx, id, "canceled", "machine_never_accepted"); err != nil {
+		return exit.Internalf("cannot cancel the unaccepted run: %s", err)
+	}
+	if problem := skipOutputExport(tx, id, "the run was canceled before its machine took it"); problem != nil {
+		return problem
+	}
+	if problem := endModelTransferTx(tx, id, "canceled", "its machine never took it"); problem != nil {
+		return problem
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit the unaccepted cancellation: %s", err)
+	}
+	return nil
+}
+
 // projectCancellationTx moves an unfinished run to `state` with its event. A finished run
 // keeps its terminal: what settles after it is a note, never a second status.
 func projectCancellationTx(tx *sql.Tx, id, state, scope string) error {

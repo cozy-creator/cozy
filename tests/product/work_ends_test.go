@@ -1,17 +1,34 @@
 package producttest
 
 import (
+	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
+	"encoding/pem"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/machineendpoint"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
+	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 // idleRoot is a daemon root whose idle exit follows one second with nothing to manage.
@@ -157,5 +174,138 @@ func TestAnExportToAnInvalidDestinationFailsOnce(t *testing.T) {
 	}
 	if raw, _ := os.ReadFile(logPath); strings.Contains(string(raw), "idle exit held") {
 		t.Fatalf("a failed export held the daemon\n%s", tail(logPath))
+	}
+}
+
+// A run no machine on the market can take fails with the reason instead of queuing on stock.
+func TestARunTheMarketCannotServeFails(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	for _, sku := range h.market {
+		h.soldOut[sku.Name] = true
+	}
+	root := ladderRoot(t, h)
+	startDaemonProcess(t, root)
+	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json", "--idempotency-key", "sold-out")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	waitFor(t, root, "the sold-out run failing", func() bool {
+		row, problem := store.RequestByIdempotencyKey("sold-out")
+		return problem == nil && row != nil && row.State == "failed"
+	})
+	row, problem := store.RequestByIdempotencyKey("sold-out")
+	fatal(t, problem)
+	if errType, _, _, problem := store.SettledFailure(row.ID); problem != nil || errType != "rental.no_inventory" {
+		t.Fatalf("the sold-out run failed as %q, not for want of stock: %v\n%s", errType, problem, out)
+	}
+}
+
+// A run waiting on a rental that fails before it is ever ready fails with that rental's
+// cause: it is not placed again on a market that could not boot it. One that had served is.
+func TestARunWhoseMachineNeverBootedFailsInsteadOfPlacingAgain(t *testing.T) {
+	root := filepath.Join(scratchBase, "never-booted")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down") })
+	hub := newFakeRentalHub(t, 0)
+	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubURL+"\n"+
+		"tensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	hub.packageReleases = map[string]any{"fake/lost@1": rentalReleaseFacts()}
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	hub.add("rental-unbooted", "sumireko")
+	hub.setState("rental-unbooted", "acquiring", "")
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "rental-unbooted", MachineName: "sumireko", SKU: "cpu",
+		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "acquiring", Hub: hubURL}))
+	const id = "req-on-unbooted"
+	body, _ := canonical.Spell(canonical.Digest([]byte(id)))
+	_, _, problem = store.Submit(records.Request{ID: id, IdemKey: "idem-" + id, BodyDigest: body, Package: "fake/lost",
+		Release: "1", Entrypoint: "generate", Payload: []byte("{}"), Rental: true, Worker: "rental-unbooted", MachineExecutionObserver: true})
+	fatal(t, problem)
+	fatal(t, store.LinkMachineExecution(id, "rental-unbooted"))
+	startDaemonProcess(t, root)
+	hub.setState("rental-unbooted", "failed", "supervisor_never_started")
+	waitFor(t, root, "the run failing with its unbooted rental", func() bool {
+		row, problem := store.RequestRow(id)
+		return problem == nil && row != nil && row.State == "failed"
+	})
+	_, _, errText, problem := store.SettledFailure(id)
+	fatal(t, problem)
+	if !strings.Contains(errText, "supervisor_never_started") {
+		t.Fatalf("the run did not fail with its rental's cause: %q", errText)
+	}
+	events, problem := store.EventsAfter(id, 0, 1000)
+	fatal(t, problem)
+	for _, event := range events {
+		if event.Type == "request.queued" {
+			t.Fatalf("a run whose rental never booted was placed again: %+v", event)
+		}
+	}
+}
+
+// A canceled run its machine answers it never took ends canceled; it does not wait forever
+// on a cancellation the machine cannot apply.
+type neverTookMachine struct {
+	v1.UnimplementedMachineServer
+	controls atomic.Int32
+}
+
+func (m *neverTookMachine) Control(context.Context, *v1.ControlRequest) (*v1.RunState, error) {
+	m.controls.Add(1)
+	return nil, status.Error(codes.NotFound, "no such run")
+}
+
+func (m *neverTookMachine) Run(*v1.RunRequest, grpc.ServerStreamingServer[v1.RunEvent]) error {
+	return status.Error(codes.NotFound, "no such run")
+}
+
+func TestACancelTheMachineNeverTookEndsCanceled(t *testing.T) {
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	must(t, os.MkdirAll(layout.Machine, 0700))
+	_, problem = machines.NewHost(layout.Machine, "", nil).Owner()
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	certSource := httptest.NewTLSServer(http.NotFoundHandler())
+	cert := certSource.TLS.Certificates[0]
+	certSource.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow test machine transport
+	must(t, err)
+	machine := &neverTookMachine{}
+	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}})))
+	v1.RegisterMachineServer(server, machine)
+	go server.Serve(listener)
+	defer server.Stop()
+	ep := &machineendpoint.Endpoint{Format: machineendpoint.Format, Address: listener.Addr().String(), WorkerID: "fixture-worker",
+		WorkerBootID: "fixture-boot", WorkspaceID: "fixture",
+		CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}))}
+	startDaemonProcess(t, root)
+	row, _, problem := store.SubmitWithEvent(records.Request{ID: "req-never-taken", IdemKey: "never-taken", Package: "proof/never",
+		Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
+		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Destination: "proof/never", Outputs: []records.ModelTransferOutput{{Name: "model"}}}},
+		map[string]any{"machine_endpoint": ep})
+	fatal(t, problem)
+	fatal(t, store.LinkMachineExecution(row.ID, ep.Name()))
+	fatal(t, store.AppendEvent(row.ID, records.RunV1Sent, 0, map[string]any{"machine": ep.Name()}))
+	if code, out := runCozy(t, root, "run", "cancel", row.ID, "--json"); code != 0 {
+		t.Fatalf("cancel [%d]: %s", code, out)
+	}
+	waitFor(t, root, "the never-taken run ending canceled", func() bool {
+		current, problem := store.RequestRow(row.ID)
+		return problem == nil && current != nil && current.State == "canceled"
+	})
+	if machine.controls.Load() == 0 {
+		t.Fatal("the cancellation never asked the machine")
+	}
+	transfer, problem := store.ModelTransferOf(row.ID)
+	fatal(t, problem)
+	if transfer == nil || transfer.State != "canceled" {
+		t.Fatalf("the canceled run's weights destination still waits: %+v", transfer)
 	}
 }

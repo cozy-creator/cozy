@@ -100,6 +100,13 @@ func (m *machineRuns) loopV1(request records.Request) {
 		if moved {
 			lastError = "" // a new loss is news again
 		}
+		// The market giving the same refusal on the next ask made no progress: unsent work fails
+		// with it rather than waiting on stock or a catalog that may never come.
+		if problem != nil && problem.Message == lastError && marketRefusal(problem) && !accepted && !sent && !link.CancelRequested {
+			if failed, _ := m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem)); failed {
+				return
+			}
+		}
 		if problem != nil && problem.Message != lastError && m.ctx.Err() == nil {
 			fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, problem.Message)
 			lastError = problem.Message
@@ -177,9 +184,16 @@ func progressed(store *records.Store, link *records.MachineExecution) bool {
 	return latest != nil && latest.RemoteCursor > link.RemoteCursor
 }
 
-// permanentRefusal is a refusal resubmitting the same spec cannot change.
+// permanentRefusal is a refusal resubmitting the same spec cannot change, among them a market
+// with no base image that runs the release.
 func permanentRefusal(problem *exit.Error) bool {
-	return problem.Code != exit.Unavailable && problem.Code != exit.Deadline && problem.Code != exit.Canceled
+	return problem.ErrName() == "rental.package_base_incompatible" ||
+		problem.Code != exit.Unavailable && problem.Code != exit.Deadline && problem.Code != exit.Canceled
+}
+
+// marketRefusal is a placement the Hub's market cannot serve now: no stock, or nothing offered.
+func marketRefusal(problem *exit.Error) bool {
+	return problem.ErrName() == "rental.no_inventory" || problem.ErrName() == "rental.catalog_empty"
 }
 
 // followTargetV1 updates a machine to the Hub's target software and answers "" once it runs
@@ -302,6 +316,10 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 	}
 	if link.CancelRequested {
 		if _, err := machine.Control(ctx, request.ID, v1.Action_ACTION_CANCEL); err != nil {
+			if !accepted && status.Code(err) == codes.NotFound {
+				// The machine never took the run: its cancellation ends here.
+				return true, m.store.CancelUnacceptedRun(request.ID)
+			}
 			return false, machines.Transport(err)
 		}
 	}
@@ -1493,6 +1511,10 @@ func (m *machineRuns) controlV1(ctx context.Context, request records.Request, ac
 	defer machine.Close()
 	state, err := machine.Control(ctx, request.ID, value)
 	if err != nil {
+		if action == "cancel" && status.Code(err) == codes.NotFound {
+			// A machine that never took the run ends its cancellation here.
+			return m.store.CancelUnacceptedRun(request.ID)
+		}
 		return machines.Transport(err)
 	}
 	// A running job stops before it rests paused: until then it is pausing.
