@@ -1619,7 +1619,3 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 	}
 	return out, nil
 }
-
-func (m *managedRentals) observeIdle(row records.Rental) (rental.Idleness, *exit.Error) {
-	return rental.ObserveIdle(m.store, row)
-}

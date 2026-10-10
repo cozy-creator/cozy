@@ -12,7 +12,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
@@ -74,10 +73,10 @@ func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
 	check(second, later, false)
 }
 
-// Preparation can spend minutes on a paid pod before an attempt exists. The
-// terminal request event ends that work even when the controller was restarted
-// between observations, and the listing never invents the machine's deadline.
-func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
+// Preparation can spend minutes on a paid pod before an attempt exists. The terminal
+// request event ends that work even across a controller restart; the listing never
+// invents the machine's deadline, and the daemon never releases the rental itself.
+func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 	for _, outcome := range []string{"failed", "canceled"} {
 		t.Run(outcome, func(t *testing.T) {
 			root := t.TempDir()
@@ -163,17 +162,13 @@ func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 			if settled.IsZero() {
 				t.Fatal("missing durable settlement event")
 			}
-			idle := listedRental(t, root, rentalID)
-			if want := settled.UTC().Format(time.RFC3339); idle.IdleSince != want || idle.ReleaseDue != "" {
-				t.Fatalf("idle since=%q due=%q, want the terminal event %q (ready was an hour ago) and no deadline from a machine that cannot answer", idle.IdleSince, idle.ReleaseDue, want)
+			listed := listedRental(t, root, rentalID)
+			if listed.Queued == nil || *listed.Queued != 0 || listed.Running == nil || *listed.Running != 0 || listed.ReleaseDue != "" {
+				t.Fatalf("settled preparation still listed as work, or a deadline from a machine that cannot answer: %+v", listed)
 			}
 			startDaemonProcess(t, root)
-			row, problem := store.RentalRow(rentalID)
-			fatal(t, problem)
-			observed, problem := rental.ObserveIdle(store, *row)
-			fatal(t, problem)
-			if !observed.Since.Equal(settled) {
-				t.Fatalf("restarted idle start=%s, want %s", observed.Since, settled)
+			if queued, running, problem := store.RentalWorkCounts(rentalID, ""); problem != nil || queued+running != 0 {
+				t.Fatalf("restart revived settled preparation: queued=%d running=%d %v", queued, running, problem)
 			}
 			if peer.releases(rentalID) != 0 {
 				t.Fatal("the daemon released a rental; its machine ends itself")

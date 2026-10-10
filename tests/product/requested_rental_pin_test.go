@@ -11,7 +11,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 func requestedRentalRequest(id, rentalID string) records.Request {
@@ -74,12 +73,12 @@ func TestRequestedRentalQueueKeepsRentalAlive(t *testing.T) {
 	request := requestedRentalRequest("requested-queued", row.ID)
 	_, _, problem = store.Submit(request)
 	fatal(t, problem)
-	idle, problem := rental.ObserveIdle(store, row)
+	queued, running, problem := store.RentalWorkCounts(row.ID, "")
 	fatal(t, problem)
-	if idle.Queued != 1 || idle.Running != 0 {
-		t.Fatalf("requested-rental work is invisible to idle: %+v", idle)
+	if queued != 1 || running != 0 {
+		t.Fatalf("requested-rental work is invisible to the rental's work: queued=%d running=%d", queued, running)
 	}
-	queued, running, problem := store.RentalRunCounts(row.ID)
+	queued, running, problem = store.RentalRunCounts(row.ID)
 	fatal(t, problem)
 	if queued != 1 || running != 0 {
 		t.Fatalf("rental run counts miss requested-rental work: queued=%d running=%d", queued, running)

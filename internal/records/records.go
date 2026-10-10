@@ -131,7 +131,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 func init() {
 	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
-	schema = append(schema, rentalInstallsDDL, rentalInstallsIndex, runtimeUpdatesDDL, rentalIdleDDL, bindingRevisionDDL, hubBindingsRevisionDDL,
+	schema = append(schema, rentalInstallsDDL, rentalInstallsIndex, runtimeUpdatesDDL, bindingRevisionDDL, hubBindingsRevisionDDL,
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex, hubCreditDDL)
 	schema = append(schema, obligationIndexes...)
 	schema = append(schema, requestsByInstall)

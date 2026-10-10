@@ -30,7 +30,7 @@ func TestRecordsOpenAcceptsADriftedShapeAndKeepsRentals(t *testing.T) {
 		`ALTER TABLE rentals ADD COLUMN future_note TEXT NOT NULL DEFAULT 'kept'`,
 		`CREATE INDEX future_rentals_state ON rentals(state)`,
 		`CREATE TABLE future_ledger(id TEXT)`,
-		`DROP TABLE rental_idle`,
+		`DROP TABLE rental_installs`,
 		`ALTER TABLE rentals DROP COLUMN failure_container_state`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
@@ -57,8 +57,8 @@ func TestRecordsOpenAcceptsADriftedShapeAndKeepsRentals(t *testing.T) {
 	if row == nil || row.MachineName != "drifted" || row.State != "ready" || row.HourlyRateUSDMicros != 2_490_000 {
 		t.Fatalf("the rental row did not survive: %+v", row)
 	}
-	if _, problem := store.RentalIdleObservation(*row); problem != nil {
-		t.Fatalf("the missing rental_idle table was not restored: %s", problem.Message)
+	if _, _, problem := store.RentalWorkCounts(row.ID, ""); problem != nil {
+		t.Fatalf("the missing rental_installs table was not restored: %s", problem.Message)
 	}
 	store.Close()
 

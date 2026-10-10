@@ -12,11 +12,18 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// Acknowledgment is the machine's answer to one keepalive: the boot that reset its idle clock
+// and the deadline it now holds (0: none named), received at AcknowledgedAtMS here.
+type Acknowledgment struct {
+	WorkerID, WorkerBootID           string
+	AcknowledgedAtMS, IdleDeadlineMS int64
+}
+
 // KeepAlive resets a ready rental's idle deadline once, with Status's keepalive. It uses only
 // the rental's recorded address, pin and Creator key: it
 // never starts this computer's machine, reads a Hub, retries or releases the rental.
-func KeepAlive(ctx context.Context, l home.Layout, row *records.Rental) (records.RentalKeepalive, *exit.Error) {
-	var out records.RentalKeepalive
+func KeepAlive(ctx context.Context, l home.Layout, row *records.Rental) (Acknowledgment, *exit.Error) {
+	var out Acknowledgment
 	if row == nil || row.State != "ready" {
 		return out, exit.New(exit.Conflict, "keepalive requires a current ready rental")
 	}
@@ -45,13 +52,13 @@ func KeepAlive(ctx context.Context, l home.Layout, row *records.Rental) (records
 
 // acknowledged accepts the pinned worker's future deadline, or zero from a machine that
 // names none (TensorD 0.5.2–0.5.5 after a job).
-func acknowledged(row *records.Rental, worker, boot string, deadline int64) (records.RentalKeepalive, *exit.Error) {
+func acknowledged(row *records.Rental, worker, boot string, deadline int64) (Acknowledgment, *exit.Error) {
 	if worker != row.ExpectedWorkerID || boot != row.ExpectedWorkerBootID {
-		return records.RentalKeepalive{}, exit.New(exit.Conflict, "rental keepalive was answered by another worker or boot than the rental's")
+		return Acknowledgment{}, exit.New(exit.Conflict, "rental keepalive was answered by another worker or boot than the rental's")
 	}
 	now := time.Now().UnixMilli()
 	if deadline != 0 && deadline <= now {
-		return records.RentalKeepalive{}, exit.New(exit.Conflict, "the machine returned no future rental idle deadline")
+		return Acknowledgment{}, exit.New(exit.Conflict, "the machine returned no future rental idle deadline")
 	}
-	return records.RentalKeepalive{WorkerID: worker, WorkerBootID: boot, AcknowledgedAtMS: now, IdleDeadlineMS: deadline}, nil
+	return Acknowledgment{WorkerID: worker, WorkerBootID: boot, AcknowledgedAtMS: now, IdleDeadlineMS: deadline}, nil
 }

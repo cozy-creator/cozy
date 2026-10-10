@@ -457,7 +457,7 @@ type Rental struct {
 	ExpectedWorkerBootID string
 	// ReadyAt is when this host first recorded the hub saying `ready` — the pod's first
 	// observed billing moment as a usable machine, as opposed to RentedAt, which is only
-	// when it was asked for. It is the idle clock of a rental that has never run anything.
+	// when it was asked for.
 	ReadyAt string
 	Failure RentalFailure
 }
@@ -907,7 +907,7 @@ func (s *Store) HeldRentalIDs() (map[string]bool, *exit.Error) {
 // pinnedToRental is THE spelling of "this request is pinned to rental X": the scheduler
 // assigned it there (worker), or the caller selected X (`cozy run --rental`) and it is not
 // assigned yet (requested_rental; worker is empty until dispatch). Every "work on this
-// rental" question uses it, so counts, idle expiry, release and mode claims cannot drift.
+// rental" question uses it, so counts, release and mode claims cannot drift.
 // Assignment only ever writes worker=requested_rental, so each row matches at most once.
 func pinnedToRental(alias, rentalID string) (string, []any) {
 	return "(" + alias + "worker=? OR " + alias + "requested_rental=?)", []any{rentalID, rentalID}
@@ -916,7 +916,7 @@ func pinnedToRental(alias, rentalID string) (string, []any) {
 // RentalRunCounts is the work still pinned to one machine, in the ONE spelling of "still
 // owes work or a terminal": queued is every request waiting for the pod, running is every
 // request the pod is executing or finalizing plus every attempt whose terminal is still
-// owed. The idle release fences on both being zero.
+// owed. A managed release fences on both being zero.
 func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.Error) {
 	return s.rentalRunCounts(id, "")
 }
@@ -1010,7 +1010,7 @@ func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *ex
 	return rentalLastSettlement(s.db, id)
 }
 
-func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlement, bool, *exit.Error) {
+func rentalLastSettlement(reader rentalReader, id string) (RentalLastSettlement, bool, *exit.Error) {
 	// Machine work completion is recorded with its inactive state projection.
 	// Its later run.completed event describes outcome collection, not more
 	// compute; prefer the work timestamp so collection/reconnect cannot renew idle.

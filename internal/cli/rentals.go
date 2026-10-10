@@ -1293,20 +1293,20 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	spend, spendFacts := accruedSpend(inventory)
 	list := output.List{
 		Name:   "rentals",
-		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "uptime", "running", "queued", "idle", "ends"},
-		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "compute", "storage", "spent", "failure", "uptime", "running", "queued", "idle", "ends",
+		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "uptime", "running", "queued", "ends"},
+		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "compute", "storage", "spent", "failure", "uptime", "running", "queued", "ends",
 			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
-			"idle_since", "image", "provider", "provider machine", "provider resource",
+			"image", "provider", "provider machine", "provider resource",
 			"provider host", "provider state", "container state"},
 		// The machine document carries the underlying facts, never the table's
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
 		TypedFields: []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
-			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
+			"running", "queued", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
 			"spend_usd_micros", "spend_basis", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour",
 			"vcpu_count", "memory_gb", "unreachable_since"},
 		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
-			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
+			"running", "queued", "release_due_at",
 			"hourly_rate_usd_micros", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour", "vcpu_count", "memory_gb",
 			"spend_usd_micros", "spend_basis", "failure_code",
 			"base_worker_image_digest", "base_worker_image_tag",
@@ -1343,13 +1343,6 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if r.Activity != nil {
 			activity = *r.Activity
 		}
-		idleSince := activity.IdleSince
-		since, sinceErr := time.Parse(time.RFC3339, idleSince)
-		eligible := sinceErr == nil
-		idleText := ""
-		if eligible {
-			idleText = idleClock(time.Since(since))
-		}
 		state := rentalStateCell(r.State, r.Boot, now)
 		if r.RuntimeUpdate != "" {
 			state, haveUpdate = state+" (updating its software)", true
@@ -1361,20 +1354,19 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			state += " (unverified)"
 		}
 		if since, err := time.Parse(time.RFC3339Nano, r.UnreachableSince); err == nil && r.State == hub.RentalReady {
-			state += " (unreachable " + idleClock(now.Sub(since)) + ")"
+			state += " (unreachable " + durationClock(now.Sub(since)) + ")"
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU), "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
 			"state": state, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(activity.Running), "queued": strconv.Itoa(activity.Queued),
-			"idle": idleText, "ends": endsCell(r.ReleaseDue),
+			"ends":   endsCell(r.ReleaseDue),
 			"rental": r.ID, "bought for": orNone(r.BoughtFor),
 			"accelerator": acceleratorLabel(r.AcceleratorModel, r.AcceleratorCount) + machineShape(r.VCPUCount, r.MemoryGB),
 			"address":     r.Address,
 			"media":       r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
-			"idle_since": idleSince,
-			"image":      either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": either(r.Provider, r.Failure.Provider),
+			"image": either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": either(r.Provider, r.Failure.Provider),
 			"provider machine": r.ProviderMachineID, "provider resource": either(r.ProviderResourceID, r.Failure.ProviderResourceID), "provider host": r.Failure.ProviderHostID,
 			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
 			"$/hour":  rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour)),
@@ -1401,15 +1393,12 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"provider": either(r.Provider, r.Failure.Provider), "provider_machine_id": r.ProviderMachineID, "provider_resource_id": either(r.ProviderResourceID, r.Failure.ProviderResourceID),
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub, "runtime_update": r.RuntimeUpdate,
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
-			"idle_since_at": idleSince, "release_due_at": r.ReleaseDue,
+			"release_due_at":           r.ReleaseDue,
 			"base_worker_image_digest": either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest),
 			"base_worker_image_tag":    r.BaseWorkerImageTag, "unreachable_since": r.UnreachableSince} {
 			if value != "" {
 				typed[key] = value
 			}
-		}
-		if eligible {
-			typed["idle_s"] = int64(time.Since(since).Seconds())
 		}
 		if r.HubUnknown {
 			haveHubUnknown = true
@@ -1430,7 +1419,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		list.TypedRows = append(list.TypedRows, typed)
 	}
 	if haveFailure {
-		list.Fields = []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "failure", "uptime", "running", "queued", "idle", "ends"}
+		list.Fields = []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "failure", "uptime", "running", "queued", "ends"}
 		list.TypedFields = append(list.TypedFields, "failure_code")
 	}
 	if haveHubUnknown {
@@ -1464,11 +1453,11 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			// observable here, which the RUNNING/QUEUED dashes also say.
 			"state":   state,
 			"failure": "—", "uptime": rentalUptime(seen.RentedAt),
-			"running": "—", "queued": "—", "idle": "—", "ends": "—",
+			"running": "—", "queued": "—", "ends": "—",
 			"rental": seen.ID, "bought for": "—",
 			"accelerator": acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount) + machineShape(seen.VCPUCount, seen.MemoryGB),
 			"address":     seen.Address, "media": seen.MediaAddress, "hub": seen.Hub,
-			"rented": orNone(seen.RentedAt), "ready": "—", "idle_since": "",
+			"rented": orNone(seen.RentedAt), "ready": "—",
 			"image": either(seen.BaseWorkerImageTag, seen.BaseWorkerImageDigest), "provider": seen.Provider, "provider machine": seen.ProviderMachineID, "provider resource": seen.ProviderResourceID, "provider host": "",
 			"provider state": "", "container state": "",
 			"$/hour":  rentalHourlyRate(costPerHour(seen.HourlyRateUSDMicros, seen.ComputeUSDMicrosPerHour, seen.StorageUSDMicrosPerHour)),
@@ -1528,9 +1517,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"machine": machine, "sku": orNone(op.SKU), "gpus": gpuCell(op.AcceleratorModel, op.AcceleratorCount),
 			"state":   state,
 			"failure": "—", "uptime": rentalUptime(op.RentedAt), "running": "0", "queued": "0",
-			"idle": "—", "ends": "—", "rental": orNone(op.ID), "bought for": orNone(op.BoughtFor),
+			"ends": "—", "rental": orNone(op.ID), "bought for": orNone(op.BoughtFor),
 			"accelerator": "—", "address": "", "media": "", "hub": op.Hub,
-			"rented": stamp(op.RentedAt), "ready": "—", "idle_since": "",
+			"rented": stamp(op.RentedAt), "ready": "—",
 			"image": "", "provider": "", "provider resource": "", "provider host": "",
 			"provider state": "", "container state": "",
 			"$/hour": rentalHourlyRate(op.HourlyRateUSDMicros), "spent": rentalSpend(op),
@@ -1708,9 +1697,9 @@ type jsonFact struct{ V any }
 func (jsonFact) Human() string                  { return "" }
 func (f jsonFact) MarshalJSON() ([]byte, error) { return json.Marshal(f.V) }
 
-// idleClock spells a countdown duration the way a person reads a clock: `0s`, `41s`,
+// durationClock spells a duration the way a person reads a clock: `0s`, `41s`,
 // `1m30s`, `30m` — whole seconds, no zero units.
-func idleClock(d time.Duration) string {
+func durationClock(d time.Duration) string {
 	if d < 0 {
 		d = 0
 	}
@@ -1780,7 +1769,7 @@ func endsCell(due string) string {
 		return ""
 	}
 	if left := time.Until(at); left > 0 {
-		return "in " + idleClock(left)
+		return "in " + durationClock(left)
 	}
 	return "now"
 }

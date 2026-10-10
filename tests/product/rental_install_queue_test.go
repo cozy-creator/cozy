@@ -106,10 +106,10 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	if calls.Load() != 0 {
 		t.Fatal("booting rental was dispatched")
 	}
-	idle, problem := store.RentalIdleObservation(machine)
+	queued, _, problem := store.RentalWorkCounts(machine.ID, "")
 	rentalInstallCheck(t, problem)
-	if idle.Queued != 1 {
-		t.Fatalf("queued installation missing from idle census: %+v", idle)
+	if queued != 1 {
+		t.Fatalf("queued installation missing from the rental's work: %d", queued)
 	}
 	obligations, problem := store.Obligations()
 	rentalInstallCheck(t, problem)
@@ -152,10 +152,10 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	if calls.Load() != 2 {
 		t.Fatalf("prepare calls=%d", calls.Load())
 	}
-	idle, problem = resumed.RentalIdleObservation(machine)
+	queued, running, problem := resumed.RentalWorkCounts(machine.ID, "")
 	rentalInstallCheck(t, problem)
-	if idle.Queued+idle.Running != 0 || time.Since(idle.Since) > time.Minute {
-		t.Fatalf("completion did not release activity/reset idle: %+v", idle)
+	if queued+running != 0 {
+		t.Fatalf("completion did not end the rental's work: queued=%d running=%d", queued, running)
 	}
 }
 

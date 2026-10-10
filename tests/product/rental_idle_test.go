@@ -399,15 +399,13 @@ func (h *fakeRentalHub) close() {
 // Listing assertions use the public JSON fields; adding a display column must not
 // make lifecycle proofs depend on its position or the machine's elapsed uptime.
 type rentalListingRow struct {
-	ID          string `json:"rental_id"`
-	Machine     string `json:"machine"`
-	State       string `json:"state"`
-	Failure     string `json:"failure_code"`
-	Running     *int   `json:"running"`
-	Queued      *int   `json:"queued"`
-	IdleSeconds *int   `json:"idle_s"`
-	IdleSince   string `json:"idle_since_at"`
-	ReleaseDue  string `json:"release_due_at"`
+	ID         string `json:"rental_id"`
+	Machine    string `json:"machine"`
+	State      string `json:"state"`
+	Failure    string `json:"failure_code"`
+	Running    *int   `json:"running"`
+	Queued     *int   `json:"queued"`
+	ReleaseDue string `json:"release_due_at"`
 }
 
 func listedRental(t *testing.T, root, id string) rentalListingRow {

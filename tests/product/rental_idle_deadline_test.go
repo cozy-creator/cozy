@@ -110,7 +110,7 @@ func TestRentalListAndKeepaliveShowTheMachinesIdleDeadline(t *testing.T) {
 		t.Fatalf("listing lost the machine's deadline %s: %v", stamp(machine.deadline.Load()), row)
 	}
 	code, out := runCozy(t, root, "rental", "list")
-	if code != 0 || !regexp.MustCompile(`IDLE\s+ENDS`).MatchString(out) || !regexp.MustCompile(`kirin\s.*\sin [67]m(\d+s)?\s`).MatchString(out) ||
+	if code != 0 || !regexp.MustCompile(`QUEUED\s+ENDS`).MatchString(out) || strings.Contains(out, "IDLE") || !regexp.MustCompile(`kirin\s.*\sin [67]m(\d+s)?\s`).MatchString(out) ||
 		!strings.Contains(out, "Rentals end themselves after 15 minutes idle (no queued or running job).") || strings.Contains(out, "nused") {
 		t.Fatalf("the board does not show the machine's deadline or the owner's rule [exit %d]:\n%s", code, out)
 	}

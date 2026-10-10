@@ -24,11 +24,11 @@ func (h *fakeRentalHub) set(id, key string, value any) {
 }
 
 // TestRentalListLiveBoard is cl-114 as behaviour: `cozy rental list` on a terminal is
-// the fleet as a live board — MACHINE SKU STATE $/HOUR SPENT UPTIME RUNNING QUEUED IDLE, redrawn in
+// the fleet as a live board — MACHINE SKU STATE $/HOUR SPENT UPTIME RUNNING QUEUED ENDS, redrawn in
 // place every second — and the same verb piped or --json is one plain snapshot. The
 // board is watched through a real pseudo-terminal across planted transitions: the pod
-// acquiring, then ready with observed idle time, then held by queued work, then counting
-// elapsed idle time again once the work settles.
+// acquiring, then ready, then holding queued work, then with none once the work settles.
+// ENDS is only ever the machine's own deadline; this pod's machine cannot answer.
 func TestRentalListLiveBoard(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-list-tui")
 	must(t, os.RemoveAll(root))
@@ -36,7 +36,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	hub := newFakeRentalHub(t, 0)
 	port := hub.port()
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	// The board reports observed inactivity without inventing a worker deadline.
+	// The board never invents a machine's deadline.
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"), 0o600))
@@ -53,9 +53,9 @@ func TestRentalListLiveBoard(t *testing.T) {
 	}))
 
 	// Each transition is planted once the board has drawn the one before it: the hub moves
-	// the pod to ready, queued work holds it, the work settles, and the idle clock moves on.
-	countdown := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+0\s+(\d+)s`)
-	firstIdle := ""
+	// the pod to ready, queued work holds it, and the work settles.
+	idle := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+0\s+-`)
+	busy := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+1\s+-`)
 	code, tty := ptyDrive(t, root, 24, 4, func(step int, drawn string) []byte {
 		switch step {
 		case 0:
@@ -64,11 +64,9 @@ func TestRentalListLiveBoard(t *testing.T) {
 			}
 			hub.set("rental-tui", "state", "ready")
 		case 1:
-			idle := countdown.FindStringSubmatch(drawn)
-			if idle == nil || !regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready`).MatchString(drawn) {
+			if !idle.MatchString(drawn) {
 				return nil
 			}
-			firstIdle = idle[1]
 			_, _, problem := store.Submit(records.Request{
 				ID: "req-rental-tui", IdemKey: "idem-rental-tui",
 				BodyDigest: "sha256:" + strings.Repeat("ef", 32),
@@ -77,13 +75,12 @@ func TestRentalListLiveBoard(t *testing.T) {
 			})
 			fatal(t, problem)
 		case 2:
-			if !regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+1\s+-`).MatchString(drawn) {
+			if !busy.MatchString(drawn) {
 				return nil
 			}
 			fatal(t, store.SettleRequest("req-rental-tui", "canceled"))
 		case 3:
-			idle := countdown.FindAllStringSubmatch(drawn, -1)
-			if len(idle) == 0 || idle[len(idle)-1][1] == firstIdle {
+			if !idle.MatchString(drawn) {
 				return nil
 			}
 			return []byte("q")
@@ -101,7 +98,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 			t.Fatalf("live board did not emit terminal restoration %q\n%q", control, tty)
 		}
 	}
-	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+SPENT\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(tty) {
+	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+SPENT\s+UPTIME\s+RUNNING\s+QUEUED\s+ENDS`).MatchString(tty) || strings.Contains(tty, "IDLE") {
 		t.Fatalf("the board does not carry the ruled columns\n%q", tty)
 	}
 	if strings.Count(tty, "\x1b[H\x1b[J") < 5 {
@@ -116,31 +113,19 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if acquiring == nil || ready == nil || acquiring[0] >= ready[0] {
 		t.Fatalf("the board did not redraw acquiring→ready in order\n%q", tty)
 	}
-	busy := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+1\s+-`).FindStringIndex(tty)
-	if busy == nil {
-		t.Fatalf("queued work did not blank the idle countdown\n%q", tty)
-	}
-	elapsed := countdown.FindAllStringSubmatchIndex(tty, -1)
-	if len(elapsed) < 2 {
-		t.Fatalf("the IDLE cell did not count observed elapsed time\n%q", tty)
-	}
-	first := tty[elapsed[0][2]:elapsed[0][3]]
-	last := tty[elapsed[len(elapsed)-1][2]:elapsed[len(elapsed)-1][3]]
-	if first == last {
-		t.Fatalf("the IDLE elapsed clock never moved: always %ss\n%q", first, tty)
-	}
-	if elapsed[len(elapsed)-1][0] < busy[0] {
-		t.Fatalf("the idle countdown did not resume after the work settled\n%q", tty)
+	held := busy.FindStringIndex(tty)
+	settled := idle.FindAllStringIndex(tty, -1)
+	if held == nil || len(settled) == 0 || settled[len(settled)-1][0] < held[0] {
+		t.Fatalf("the board did not show the queued work and then none once it settled\n%q", tty)
 	}
 
 	// PIPED: one plain snapshot — no terminal control bytes, the same columns, the spend
-	// header — and bare `cozy rental` is byte-for-byte the same verb (the elapsed idle
-	// second is the one moving part).
+	// header — and bare `cozy rental` is byte-for-byte the same verb.
 	code, listed := runCozy(t, root, "rental", "list")
 	if code != 0 || strings.ContainsAny(listed, "\r\x1b") {
 		t.Fatalf("piped snapshot carries terminal control bytes [exit %d]\n%q", code, listed)
 	}
-	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+SPENT\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(listed) ||
+	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+SPENT\s+UPTIME\s+RUNNING\s+QUEUED\s+ENDS`).MatchString(listed) ||
 		!strings.Contains(listed, "Remote machines running: 1") ||
 		!strings.Contains(listed, "Rentals end themselves after 15 minutes idle (no queued or running job).") {
 		t.Fatalf("piped snapshot lost the ruled surface\n%s", listed)
@@ -197,7 +182,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	row := document.Rentals[0]
 	for _, field := range []string{"machine", "sku", "state", "rental_id", "accelerator",
 		"accelerator_count", "address", "hub", "rented_at", "ready_at", "running", "queued",
-		"idle_s", "idle_since_at", "hourly_rate_usd_micros"} {
+		"hourly_rate_usd_micros"} {
 		if _, ok := row[field]; !ok {
 			t.Fatalf("JSON row lost field %q: %s", field, out)
 		}
@@ -205,10 +190,10 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if row["machine"] != "sparrow" || row["state"] != "ready" || row["rental_id"] != "rental-tui" ||
 		row["running"] != float64(0) || row["queued"] != float64(0) || row["hourly_rate_usd_micros"] != float64(100_000) ||
 		row["accelerator_count"] != float64(1) ||
-		row["idle_s"] == nil || row["release_due_at"] != nil {
-		t.Fatalf("JSON row is not the live idle truth: %s", out)
+		row["release_due_at"] != nil {
+		t.Fatalf("JSON row is not the live truth: %s", out)
 	}
-	for _, spelling := range []string{`"idle":`, `"uptime":`, `"rented":`} {
+	for _, spelling := range []string{`"idle`, `"uptime":`, `"rented":`} {
 		if strings.Contains(out, spelling) {
 			t.Fatalf("JSON carries the table spelling %s: %s", spelling, out)
 		}

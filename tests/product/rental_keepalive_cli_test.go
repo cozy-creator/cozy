@@ -75,8 +75,8 @@ func statusRentalHub(t *testing.T) (string, *records.Store, *machines.Launch, re
 }
 
 // Ordinary CLI -> actual daemon/records -> the rental's machine over cozy.machine.v1. Only an
-// explicit keepalive moves the machine's deadline and the local clock: listing and a daemon
-// restart never do, and an ending rental is not kept alive.
+// explicit keepalive moves the machine's deadline: listing and a daemon restart never do, and
+// an ending rental is not kept alive.
 func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	root, store, launch, identity, daemon := statusRental(t)
 	cert := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf}))
@@ -113,31 +113,20 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 		}
 		return due
 	}
-	baseline := func() time.Time {
-		t.Helper()
-		current, p := store.RentalRow(parityRental)
-		fatal(t, p)
-		idle, p := rental.ObserveIdle(store, *current)
-		fatal(t, p)
-		return idle.Since
-	}
-
 	first := keepalive()
 	if first.UnixMilli() != held() {
 		t.Fatalf("the CLI reported %s, the machine holds %d", first, held())
 	}
-	initial := baseline()
 	time.Sleep(20 * time.Millisecond)
 	second := keepalive()
-	renewed := baseline()
-	if !second.After(first) || !renewed.After(initial) || second.UnixMilli() != held() {
-		t.Fatal("an explicit keepalive did not reset the machine and the local clock again")
+	if !second.After(first) || second.UnixMilli() != held() {
+		t.Fatal("an explicit keepalive did not reset the machine again")
 	}
 	if code, out := runCozy(t, root, "rental", "list", "--json", "--no-watch"); code != 0 {
 		t.Fatalf("list: %s", out)
 	}
 	daemon = crashAndRestartTransactionDaemon(t, daemon)
-	if !baseline().Equal(renewed) || held() != second.UnixMilli() {
+	if held() != second.UnixMilli() {
 		t.Fatal("listing or a daemon restart renewed the rental")
 	}
 	_ = daemon
@@ -156,8 +145,8 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 			t.Fatalf("the older cozy did not start its daemon: %v\n%s", err, raw)
 		}
 		time.Sleep(20 * time.Millisecond)
-		if third := keepalive(); !third.After(second) || third.UnixMilli() != held() || !baseline().After(renewed) {
-			t.Fatal("keepalive under the older daemon did not reset the machine and the local clock")
+		if third := keepalive(); !third.After(second) || third.UnixMilli() != held() {
+			t.Fatal("keepalive under the older daemon did not reset the machine")
 		}
 	}
 
