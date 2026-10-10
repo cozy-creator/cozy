@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -59,7 +60,45 @@ func (m *machineRuns) Status(ctx context.Context, machine string) (api.MachineSt
 	if err != nil {
 		return api.MachineStatus{}, machines.Transport(err)
 	}
-	return statusOf(frame), nil
+	status := statusOf(frame)
+	// Each installation's hub as this computer names it: a named hub at that origin, else the
+	// rental's own hub, which a rental reads at the address the Hub gives it, not this
+	// computer's URL of it.
+	hubs := map[string]string{originKey(m.context.Cfg.HubURL): m.context.Cfg.HubURL}
+	for _, url := range m.context.Cfg.Hubs {
+		hubs[originKey(url)] = url
+	}
+	if row, _ := m.store.RentalRow(machine); row != nil && row.Hub != "" {
+		for _, own := range frame.GetHubs() {
+			hubs[originKey(own.GetOrigin())] = row.Hub
+		}
+	}
+	for i, env := range status.Environments {
+		if url := hubs[originKey(env.Hub)]; url != "" {
+			status.Environments[i].Hub = url
+		}
+	}
+	return status, nil
+}
+
+// originKey is scheme://host:port, lowercase with the default port spelled, as a machine keys
+// a Hub origin; "" for anything else.
+func originKey(origin string) string {
+	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(origin), "/"))
+	if err != nil || parsed.Host == "" || parsed.Path != "" {
+		return ""
+	}
+	port := parsed.Port()
+	switch {
+	case port != "":
+	case parsed.Scheme == "https":
+		port = "443"
+	case parsed.Scheme == "http":
+		port = "80"
+	default:
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Hostname()) + ":" + port
 }
 
 // releaseDue asks each ready rental's machine, at most eight at once, when it ends itself.
@@ -124,7 +163,7 @@ func statusOf(frame *machinepb.StatusFrame) api.MachineStatus {
 	}
 	for _, env := range frame.GetEnvironments() {
 		out.Environments = append(out.Environments, api.MachineEnvironment{Installation: env.GetInstallation(), Package: env.GetPackage(),
-			Release: env.GetRelease(), Level: env.GetLevel()})
+			Release: env.GetRelease(), Level: env.GetLevel(), Hub: env.GetHub()})
 	}
 	for _, item := range frame.GetWarm() {
 		level := strings.ToLower(strings.TrimPrefix(item.GetLevel().String(), "WARM_LEVEL_"))

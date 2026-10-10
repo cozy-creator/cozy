@@ -56,6 +56,14 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation requires a package release or explicitly selected models"))
 		return
 	}
+	if body.Local != "" || body.Remove != "" {
+		// Local code from this computer, or one installation taken away: nothing else.
+		if body.Local != "" && body.Remove != "" || len(body.Models) > 0 || body.Destination != "" || body.Write != "" || body.Warm != "" ||
+			body.Local != "" && !strings.HasPrefix(body.Package, "local/") || strings.ContainsAny(body.Local+body.Remove, "\r\n\x00/") {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "a local installation or a removal names one package and nothing else"))
+			return
+		}
+	}
 	downloads := body.Models
 	if body.Destination != "" {
 		// One model put in the destination: a provider source or a written file made on the

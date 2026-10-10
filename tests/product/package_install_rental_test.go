@@ -111,14 +111,10 @@ func TestPackageInstallRental(t *testing.T) {
 	}
 }
 
-func TestPackageInstallRentalRejectsEditableSource(t *testing.T) {
-	for _, source := range []string{".", "./project", "paul/minimax-h3"} {
-		t.Run(source, func(t *testing.T) {
-			var out bytes.Buffer
-			err := (&cli.PackageInstallCmd{Ref: source, Editable: true, Rental: "kirukiru"}).Run(&cli.Runtime{Out: &out, Err: &out})
-			if err == nil || !strings.Contains(err.Error(), "requires a published org/name") {
-				t.Fatalf("editable source was not refused before contacting a service: %v", err)
-			}
-		})
+func TestPackageInstallRentalRejectsEditablePublishedPackage(t *testing.T) {
+	var out bytes.Buffer
+	err := (&cli.PackageInstallCmd{Ref: "paul/minimax-h3", Editable: true, Rental: "kirukiru"}).Run(&cli.Runtime{Out: &out, Err: &out})
+	if err == nil || !strings.Contains(err.Error(), "--editable requires an explicit package directory") {
+		t.Fatalf("an editable published package was not refused before contacting a service: %v", err)
 	}
 }

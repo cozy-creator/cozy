@@ -41,6 +41,12 @@ type RentalInstallSelection struct {
 	// this level (WarmLevels); "off" takes it out. Models are then its `model.<param>=` choices.
 	Entrypoint string `json:"entrypoint,omitempty"`
 	Warm       string `json:"warm,omitempty"`
+	// Local is this computer's installation of local/<name> code, written to the machine
+	// and installed there (`cozy package install ./dir --rental`).
+	Local string `json:"local,omitempty"`
+	// Remove takes the machine's installation of that name away (`cozy package remove
+	// --rental`); Package and Release say what it was.
+	Remove string `json:"remove,omitempty"`
 }
 
 // WarmLevels are how far a machine keeps a warm set member ready, each including the ones
@@ -75,6 +81,9 @@ func (s RentalInstallSelection) HoldsLocally() bool {
 func (s RentalInstallSelection) Target() string {
 	if s.Warm != "" {
 		return s.Package + "/" + s.Entrypoint + " warm=" + s.Warm
+	}
+	if s.Remove != "" {
+		return "remove " + s.Package + "@" + s.Release
 	}
 	if s.Package != "" && s.Release == "" {
 		return s.Package // the hub's newest, until the machine names it

@@ -140,29 +140,39 @@ cozy package info org/name        # releases, newest first, with publication tim
 cozy package install org/name
 cozy package install org/name --version 1.2.3
 cozy package install org/name --rental=kirukiru
-cozy package install . --editable
+cozy package install ./project
+cozy package install . --editable --rental=kirukiru
 cozy package list
 cozy package list --rental=kirukiru
+cozy package update                      # every package; or name some
+cozy package update org/name --rental=kirukiru
+cozy package remove org/name --rental=kirukiru
 ```
 
 Package names resolve at the current hub, or at `--tensorhub=<hub>` for one command;
 the same org/name at two hubs is two packages, installed side by side. `cozy package list`
 shows every hub's installations with a HUB column, published ones before local captures;
-`--tensorhub` narrows it. `remove` and `update-all` act on each hub's installation
+`--tensorhub` narrows it. `remove` and `update` act on each hub's installation
 through that hub unless `--tensorhub` narrows them. A name the hub lacks is answered with that hub and,
 from this computer's records alone, the other hub it was installed or run from and the
 same name under another org at this hub, each with the command that works.
 
 `--rental` installs published code and Python dependencies on that existing rental,
-without downloading model weights or changing the local package installation.
-Omit `--version` to select the newest published release. Rental installs are queued
+without downloading model weights or changing the local package installation; the rental
+reads the release at its hub itself, so an installation it holds asks no hub anything.
+Omit `--version` to select the newest published release. A directory with `--rental` is
+installed here (as below) and its captured code written to the rental, only the objects the
+rental lacks. `update --rental` moves each published package the rental holds to its hub's
+newest release and removes its older ones; `remove --rental` deletes installations and their
+environments from the rental. Rental installs are queued
 durably while the worker boots and delivered automatically once it is ready; the command
 waits for the outcome (Ctrl-C detaches, `--no-wait` returns once queued), and
 `cozy package list --rental=NAME` lists what that machine holds. See
 [package and model preparation](docs/worker-preparation.md) for explicit model prewarming.
 
-An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) creates a
-local-only editable install after a bounded source scan. While the daemon runs it watches that
+An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) is installed
+after a bounded source scan, as it is now; installing it again unchanged does nothing.
+With `--editable` the install follows the directory: while the daemon runs it watches that
 tree: an edit atomically prepares a new install and re-prepares every worker holding the
 package — the local one and each attached rental — so the next run is warm; every invocation
 still checks the tree itself. A failed rebuild (a syntax error mid-edit) keeps the last good
@@ -318,8 +328,9 @@ checked from headers before any transfer or allocation. Re-running the same inge
 its completed checkpoint from any rental without downloading again, reattaches to a live run,
 or retries a stopped one on the same rental so the pod resumes from its journals. The checkpoint has no release label; publish one with `cozy model publish`.
 
-`cozy package update-all` upgrades packages installed from the selected Tensorhub to newer
-published releases, without downloading model weights. Its list includes the selected
+`cozy package update [org/name …]` upgrades the named packages, or every one, to newer
+published releases, without downloading model weights; naming one that is not installed is
+refused. Its list includes the selected
 Hub's packages and local sources; known installations from other Hubs are excluded.
 Legacy installs without a recorded source are resolved again at the
 selected Tensorhub. It keeps local/editable packages, development versions, and known-source

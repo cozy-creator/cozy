@@ -39,21 +39,7 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 			}
 		}
 	}
-	_, store, problem := rentalStores(ctx)
-	if problem != nil {
-		return problem
-	}
-	rentalID, problem := machines.InstallTarget(store, rentalName)
-	store.Close()
-	if problem != nil {
-		return problem
-	}
-	state, _, problem := ensureDaemon(ctx)
-	if problem != nil {
-		return problem
-	}
-	ctx.Daemon = state
-	client, problem := localapi.Open(ctx.Cfg, state)
+	client, rentalID, problem := rentalInstallClient(ctx, rentalName)
 	if problem != nil {
 		return problem
 	}
@@ -82,6 +68,48 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 		record.Notes = append(record.Notes, "no model weights were requested")
 	}
 	return emit(ctx, record)
+}
+
+// rentalInstallClient is the daemon that queues installations, and the rental's id there.
+func rentalInstallClient(ctx *Context, rentalName string) (*localapi.Client, string, *exit.Error) {
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return nil, "", problem
+	}
+	rentalID, problem := machines.InstallTarget(store, rentalName)
+	store.Close()
+	if problem != nil {
+		return nil, "", problem
+	}
+	client, problem := dial(ctx)
+	return client, rentalID, problem
+}
+
+// settleRentalInstall queues one selection on the rental and follows it to its outcome: what
+// `package update` and `package remove` do once per package.
+func settleRentalInstall(ctx *Context, rentalName string, selection records.RentalInstallSelection) (records.RentalInstall, *exit.Error) {
+	if rentalName != machines.Local {
+		ep, problem := foregroundRental(ctx, rentalName)
+		if problem != nil {
+			return records.RentalInstall{}, problem
+		}
+		if ep != nil {
+			return foregroundPrewarm(ctx, ep, rentalName, selection)
+		}
+	}
+	client, rentalID, problem := rentalInstallClient(ctx, rentalName)
+	if problem != nil {
+		return records.RentalInstall{}, problem
+	}
+	queued, problem := client.PrepareRentalPackage(rentalID, selection)
+	if problem != nil {
+		return records.RentalInstall{}, problem
+	}
+	settled, detached, problem := watchRentalInstall(ctx, client, rentalName, queued)
+	if problem == nil && detached {
+		problem = exit.New(exit.Canceled, "detached from %s; it continues on %s", queued.Selection.Target(), rentalName)
+	}
+	return settled, problem
 }
 
 // foregroundInstall makes one installation on a machine this command reaches as an explicit
