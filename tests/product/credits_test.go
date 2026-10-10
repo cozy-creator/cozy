@@ -42,19 +42,21 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 		return true
 	}
 	return func(mux *http.ServeMux) {
-		mux.HandleFunc("GET /billing/v1/me/balance", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("GET /billing/v1/me", func(w http.ResponseWriter, r *http.Request) {
 			if !signedIn(w, r) {
-				return
-			}
-			if r.URL.Query().Get("currency") != "USD" {
-				reply(w, 400, map[string]any{"error": map[string]string{"code": "invalid_param", "message": "currency required"}})
 				return
 			}
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			amount := strconv.FormatInt(h.balance, 10)
-			reply(w, 200, map[string]string{"currency": "USD", "balance_amount": amount, "held_amount": "0",
-				"available_amount": amount, "owed_amount": "0", "billing_mode": "prepaid"})
+			// A customer never billed holds no balance yet.
+			balances := []any{}
+			if h.balance != 0 {
+				amount := strconv.FormatInt(h.balance, 10)
+				balances = append(balances, map[string]string{"customer_id": "0192f1d4-0000-7000-8000-000000000001", "currency": "USD",
+					"balance_amount": amount, "held_amount": "0", "available_amount": amount, "owed_amount": "0", "billing_mode": "prepaid"})
+			}
+			reply(w, 200, map[string]any{"id": "0192f1d4-0000-7000-8000-000000000001", "balances": balances,
+				"collection_payment_methods": []any{}, "unread_notifications": 0})
 		})
 		mux.HandleFunc("GET /v1/credit", func(w http.ResponseWriter, r *http.Request) {
 			if !signedIn(w, r) {
@@ -68,7 +70,7 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			}
 			reply(w, 200, map[string]any{"credit": credit})
 		})
-		mux.HandleFunc("GET /billing/v1/me/transactions", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("GET /billing/v1/me/balance/transactions", func(w http.ResponseWriter, r *http.Request) {
 			if !signedIn(w, r) {
 				return
 			}
@@ -81,7 +83,7 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			}
 			reply(w, 200, map[string]any{"data": data, "next_cursor": nil})
 		})
-		mux.HandleFunc("GET /billing/v1/products", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("GET /billing/v1/catalog/products", func(w http.ResponseWriter, r *http.Request) {
 			reply(w, 200, map[string]any{"next_cursor": nil, "data": []any{map[string]any{
 				"key": "api-credit", "prices": []any{map[string]any{"key": "deposit", "archived": false, "currency": "USD",
 					"unit_amount": "0", "customer_amount": map[string]string{"min_amount": "10000000", "max_amount": "500000000"}}},

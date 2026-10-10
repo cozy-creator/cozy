@@ -30,11 +30,21 @@ type Balance struct {
 	Owed      int64  `json:"owed_amount,string"`
 }
 
-// Balance reads the user's credit.
+// Balance reads the user's credit from their billing account, which lists a balance
+// per currency held: none before the first.
 func (c *Client) Balance(ctx context.Context) (Balance, *exit.Error) {
-	var out Balance
-	problem := c.do(ctx, call{method: http.MethodGet, path: "/billing/v1/me/balance?currency=" + CreditCurrency, auth: true}, &out)
-	return out, problem
+	var out struct {
+		Balances []Balance `json:"balances"`
+	}
+	if problem := c.do(ctx, call{method: http.MethodGet, path: "/billing/v1/me", auth: true}, &out); problem != nil {
+		return Balance{}, problem
+	}
+	for _, b := range out.Balances {
+		if b.Currency == CreditCurrency {
+			return b, nil
+		}
+	}
+	return Balance{Currency: CreditCurrency}, nil
 }
 
 // Credit is the caller's net balance (balance less every hold and anything owed) against
@@ -80,7 +90,7 @@ func (c *Client) CreditHistory(ctx context.Context, limit int, cursor string) ([
 		Data       []CreditTransaction `json:"data"`
 		NextCursor *string             `json:"next_cursor"`
 	}
-	problem := c.do(ctx, call{method: http.MethodGet, path: "/billing/v1/me/transactions?" + query.Encode(), auth: true}, &out)
+	problem := c.do(ctx, call{method: http.MethodGet, path: "/billing/v1/me/balance/transactions?" + query.Encode(), auth: true}, &out)
 	next := ""
 	if out.NextCursor != nil {
 		next = *out.NextCursor
@@ -107,7 +117,7 @@ func (c *Client) CreditDepositBounds(ctx context.Context) (DepositBounds, *exit.
 			} `json:"prices"`
 		} `json:"data"`
 	}
-	if problem := c.do(ctx, call{method: http.MethodGet, path: "/billing/v1/products", optionalAuth: true}, &out); problem != nil {
+	if problem := c.do(ctx, call{method: http.MethodGet, path: "/billing/v1/catalog/products", optionalAuth: true}, &out); problem != nil {
 		return DepositBounds{}, problem
 	}
 	for _, product := range out.Data {
