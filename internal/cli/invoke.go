@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -2098,11 +2099,22 @@ func (p *RunProgress) On(e localapi.Event) bool {
 }
 
 // machineProgressEvent reads a Runtime-owned execution's imported progress sample in the
-// live lane's shape, so a machine run's stages render exactly as a local run's do.
+// live lane's shape, so a machine run's stages render exactly as a local run's do. A sample
+// that counts bytes and no steps (a job's child call downloading) is a byte-counted stage.
 func machineProgressEvent(e localapi.Event) localapi.Event {
 	value, ok := e.Payload["payload"].(map[string]any)
 	if e.Type != "machine.progress" || e.Payload["type"] != "progress" || !ok {
 		return e
+	}
+	done, doneOK := number(value["bytes_done"])
+	total, totalOK := number(value["bytes_total"])
+	if _, counted := value["total"]; doneOK && totalOK && total > 0 && !counted {
+		value = maps.Clone(value)
+		done = min(max(done, 0), total)
+		value["position"], value["total"], value["unit"] = done, total, "bytes"
+		if _, ok := value["stage_fraction"]; !ok {
+			value["stage_fraction"] = done / total
+		}
 	}
 	e.Type, e.Payload = "request.progress", map[string]any{"value": value}
 	return e
