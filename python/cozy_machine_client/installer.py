@@ -35,13 +35,16 @@ def main():
     captured.add_argument("--callees", default="{}")
     # A live project installed editable in this environment, kept while its lock stands.
     captured.add_argument("--editable-environment", type=Path)
+    # An index the project's sources name without declaring it (name=url).
+    captured.add_argument("--index", action="append", default=[])
     args = parser.parse_args()
     try:
         shared = dict(distribution=args.distribution, release=args.release, python_requires=args.python_requires,
             python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel,
             python=args.python, sdk=args.sdk_wheel, callees=msgspec.json.decode(args.callees, type=dict[str, str]))
         if args.editable_environment:
-            result = install_editable(project=args.project, environment=args.editable_environment, wheels=args.wheel, **shared)
+            result = install_editable(project=args.project, environment=args.editable_environment, wheels=args.wheel,
+                                      indexes=args.index, **shared)
         else:
             result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements, **shared)
     except PackageError as exc:
