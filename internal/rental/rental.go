@@ -16,6 +16,7 @@ import (
 	"runtime"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -174,6 +175,36 @@ func RetainedAcquisitionCredentials(l home.Layout, operation records.RentalOpera
 		}
 	}
 	return secret.Value{}, CreatorIdentity{}, problem
+}
+
+// HoldAsk marks a paid ask as being made by this process. The kernel drops the mark when the
+// process ends: that, never elapsed time, proves an unanswered ask has nobody left to answer it.
+func HoldAsk(l home.Layout, operationKey string) (func(), *exit.Error) {
+	f, err := os.Open(l.PendingRentalMediaToken(operationKey))
+	if err == nil {
+		err = flock.BlockShared(f)
+	}
+	if err != nil {
+		if f != nil {
+			_ = f.Close()
+		}
+		return nil, exit.Internalf("cannot mark rental operation %s as in flight: %s", operationKey, err)
+	}
+	return func() { _ = flock.Release(f); _ = f.Close() }, nil
+}
+
+// AskHeld is whether a live process is making the ask.
+func AskHeld(l home.Layout, operationKey string) bool {
+	f, err := os.Open(l.PendingRentalMediaToken(operationKey))
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	defer f.Close()
+	if flock.Exclusive(f) != nil {
+		return true
+	}
+	_ = flock.Release(f)
+	return false
 }
 
 // ForgetPending removes the pre-id token only after the operation is attached or proved

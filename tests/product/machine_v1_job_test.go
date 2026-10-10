@@ -308,7 +308,7 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 }
 
 // A run its machine already accepted never starts a stopped machine: observing attaches while
-// the machine runs and waits while it is stopped, on cozy.machine.v1 as on the path before it.
+// the machine runs, and a machine whose process is gone ends the run as machine_stopped.
 func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
 		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")

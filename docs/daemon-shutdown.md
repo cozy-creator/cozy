@@ -21,4 +21,9 @@ because the client restarted. Work an older daemon left `blocked` fails at start
 reason it stopped for.
 
 `cozy down --all` keeps its destructive meaning: cancel work and end rentals. The idle
-exit still waits until nothing is left to manage.
+exit waits until nothing is left to manage. Work at rest is not managed: a paused run and a
+finished one keeping its results wait for the next command, whose daemon resumes or serves
+them. An accepted run whose machine on this computer is gone (its process, not a slow
+answer) fails as `machine_stopped`. A paid rental ask that was never answered fails once
+the command making it is gone, and stays replayable under its `--idempotency-key`; one whose
+rental the Hub answers 404 for is closed.
