@@ -82,7 +82,8 @@ func TestUnreachableHubIsNotReportedAsAuthentication(t *testing.T) {
 	}
 }
 
-// A hub that answers and refuses the machine key is still an auth failure.
+// A hub that answers and refuses the machine key is still an auth failure, named as
+// this computer's key (not the Hub's password wording) with the login that repairs it.
 func TestHubRefusalStillReportsAuthentication(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -93,11 +94,13 @@ func TestHubRefusalStillReportsAuthentication(t *testing.T) {
 	root := hubHome(t, "hub-refuses-auth", server.URL)
 
 	code, out := runCozy(t, root, "--json", "auth")
-	if code == 0 {
-		t.Fatalf("a refused machine key exited 0\n%s", out)
+	if code != 1 {
+		t.Fatalf("a refused machine key exited %d, want 1 (operational)\n%s", code, out)
 	}
-	if name, _ := errorOf(t, out); name != "auth.device_key_revoked" {
-		t.Fatalf("a genuine auth refusal was not reported as one\n%s", out)
+	name, message := errorOf(t, out)
+	want := server.URL + " no longer accepts this computer's sign-in key (revoked or unknown there)"
+	if name != "auth.device_key_refused" || message != want || !strings.Contains(out, `"next":["cozy auth login <email>"]`) {
+		t.Fatalf("got %s %q, want auth.device_key_refused %q naming the login\n%s", name, message, want, out)
 	}
 }
 
