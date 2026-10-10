@@ -1608,10 +1608,9 @@ fn a_slow_origin_is_given_longer_each_ask_and_then_left_alone() {
     request.sample_seconds = 0.1;
     let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 3);
-    // Its first byte takes 400 ms where its peers' took none. It is asked again with twice
-    // the wait each time until one ask is given long enough; its body, with no peer to be
-    // slower than, is then left to finish at the origin's pace.
-    assert!(origin.hits(&format!("/obj/{slow}")) <= 6);
+    // Its first byte takes 400 ms where its peers' took none, so it may be dropped once. Its
+    // next ask has no peer still running to be slower than, and is left to the origin's pace.
+    assert!(origin.hits(&format!("/obj/{slow}")) <= 2);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3911,6 +3910,116 @@ fn a_source_request_far_slower_than_its_peers_is_restarted() {
     assert!(took < crawl / 4, "the fetch waited out the crawl: {took:?}");
     let log = std::fs::read_to_string(source.root.join("logs/transport.log")).unwrap();
     assert!(log.contains(" restart "), "{log}");
+}
+
+/// An origin behind one link that every answer shares: its first `burst` bytes unpaced, then
+/// `rate` B/s, answering at most `answering` requests at once while the rest wait their turn
+/// before any header, as on a pod whose link or origin turned slow for every request alike.
+/// The range at `crawl` is sent at 16 KiB/s on its first ask, beside the link.
+fn shared_link(
+    name: &str,
+    body: &[u8],
+    (rate, burst): (f64, usize),
+    answering: usize,
+    crawl: Option<usize>,
+) -> Source {
+    let link = Arc::new(Mutex::new((std::time::Instant::now(), 0)));
+    let turns = Arc::new((Mutex::new(answering), std::sync::Condvar::new()));
+    let (served, crawled) = (body.to_vec(), Arc::new(AtomicUsize::new(0)));
+    Source::new(name, body, move |request| {
+        let Some((first, last)) = range_of(request) else {
+            return partial(&served, request);
+        };
+        let crawling = crawl == Some(first) && crawled.fetch_add(1, Ordering::Relaxed) == 0;
+        let head = format!(
+            "HTTP/1.1 206 X\r\ncontent-length: {}\r\ncontent-range: bytes {first}-{last}/{}\r\n\
+             connection: close\r\n\r\n",
+            last + 1 - first,
+            served.len()
+        );
+        let range = served[first..=last].to_vec();
+        let (link, turns) = (Arc::clone(&link), Arc::clone(&turns));
+        Serve::Script(Box::new(move |socket| {
+            let (free, freed) = &*turns;
+            let mut left = freed
+                .wait_while(free.lock().unwrap(), |left| *left == 0)
+                .unwrap();
+            *left -= 1;
+            drop(left);
+            let mut sent = socket.write_all(head.as_bytes());
+            for block in range.chunks(16 << 10) {
+                let time = |rate: f64| Duration::from_secs_f64(block.len() as f64 / rate);
+                if crawling {
+                    sent = sent.and_then(|()| socket.write_all(block));
+                    std::thread::sleep(time((16 << 10) as f64));
+                } else {
+                    let due = {
+                        let (next, carried) = &mut *link.lock().unwrap();
+                        *carried += block.len();
+                        if *carried > burst {
+                            *next = (*next).max(std::time::Instant::now()) + time(rate);
+                        }
+                        *next
+                    };
+                    std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+                    sent = sent.and_then(|()| socket.write_all(block));
+                }
+                if sent.is_err() {
+                    break;
+                }
+            }
+            *free.lock().unwrap() += 1;
+            freed.notify_one();
+        }))
+    })
+}
+
+fn transport_log(source: &Source) -> String {
+    std::fs::read_to_string(source.root.join("logs/transport.log")).unwrap_or_default()
+}
+
+/// The first range comes home at once, then the link turns slow for every range alike:
+/// twelve share it and nineteen wait for a turn. None is slower than the requests beside
+/// it, so none is restarted (vast 5090s, 2026-10-10: 885 restarts in 42 s, every range
+/// judged against the few early asks that came home).
+#[test]
+fn a_pod_whose_every_range_is_slow_restarts_none() {
+    let body = ranged_body(32 << 20);
+    let link = ((12 << 20) as f64, 1 << 20);
+    let source = shared_link("uniform-slow", &body, link, 12, None);
+    let fetched = source.fetch(32, &local_policy()).unwrap();
+
+    assert!(source.held());
+    assert_eq!(fetched.transferred, source.object.length);
+    let log = transport_log(&source);
+    assert!(!log.contains(" restart "), "{log}");
+    assert_eq!(source.asked().len(), 32, "{log}");
+}
+
+/// One range crawls while its peers move at the link's shared pace: that range, and only
+/// it, is restarted, and the object lands long before the crawl would have.
+#[test]
+fn the_one_range_far_slower_than_the_ranges_beside_it_is_restarted() {
+    let body = ranged_body(16 << 20);
+    let link = ((8 << 20) as f64, 0);
+    let source = shared_link("one-crawls", &body, link, 16, Some(8 << 20));
+    let started = std::time::Instant::now();
+    source.fetch(16, &local_policy()).unwrap();
+    let took = started.elapsed();
+
+    assert!(source.held());
+    let log = transport_log(&source);
+    let restarts: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(" restart "))
+        .collect();
+    assert_eq!(restarts.len(), 1, "{log}");
+    assert!(restarts[0].contains(" bytes=8388608-9437183 "), "{log}");
+    // Alone, the crawling megabyte takes 64 s.
+    assert!(
+        took < Duration::from_secs(16),
+        "the fetch waited out the crawl: {took:?}"
+    );
 }
 
 /// A name the resolver does not answer is weather like any failed request: it is asked
