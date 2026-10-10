@@ -97,7 +97,7 @@ func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, 
 	// even ensure the empty store or query the accelerator.
 	tensorfs := filepath.Join(path, "tfs")
 	must(t, os.WriteFile(tensorfs, []byte("#!/bin/sh\nprintf 'tfs\\n' >> "+quote(activity)+"\n"+
-		"case \"$1 $2\" in\n'store ensure') exit 0;;\n'repo list') : > \"$5\"; exit 0;;\nesac\nexit 97\n"), 0700))
+		"case \"$1 $2\" in\n'store init') exit 0;;\n'repo list') : > \"$5\"; exit 0;;\nesac\nexit 97\n"), 0700))
 	must(t, os.WriteFile(filepath.Join(path, "nvidia-smi"), []byte("#!/bin/sh\nprintf 'gpu\\n' >> "+quote(activity)+"\n"+
 		"if [ \"$#\" -eq 0 ]; then printf 'CUDA Version: 13.0\\n'; else printf '%s\\n' "+
 		quote("0, "+gpu+", 8192, 8192, 580.82.09, 8.9")+"; fi\n"), 0700))
@@ -111,7 +111,7 @@ func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, 
 	defer store.Close()
 	_, problem = store.Activate(records.PackageInstall{ID: "inst-admission", Package: ladderPackage,
 		Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: installDir,
-		Platform: "linux-x86"})
+		Platform: "linux-x86", Hub: server.URL})
 	fatal(t, problem)
 	return root, path, activity, probe
 }

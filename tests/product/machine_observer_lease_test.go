@@ -169,7 +169,7 @@ func observerLeaseFixture(t *testing.T, peer *observerLeasePeer, rented ...bool)
 			Address: ep.Address, CertPath: layout.RentalCert(machineID), ExpectedWorkerID: ep.WorkerID,
 			ExpectedWorkerBootID: ep.WorkerBootID}))
 	}
-	request, _, problem := store.SubmitWithEvent(records.Request{ID: "lease-run", IdemKey: "lease-run", Package: "proof/lease", Release: "1", Entrypoint: "main", Kind: "serving", Payload: []byte(`{}`), BodyDigest: "sha256:" + strings.Repeat("1", 64), MachineExecutionObserver: true}, event)
+	request, _, problem := store.SubmitWithEvent(records.Request{ID: "lease-run", IdemKey: "lease-run", Package: "proof/lease", Entrypoint: "main", Kind: "serving", Payload: []byte(`{}`), BodyDigest: "sha256:" + strings.Repeat("1", 64), MachineExecutionObserver: true}, event)
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -177,6 +177,11 @@ func observerLeaseFixture(t *testing.T, peer *observerLeasePeer, rented ...bool)
 		t.Fatal(problem)
 	}
 	t.Cleanup(func() { server.Stop(); store.Close() })
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("daemon log:\n%s", tail(filepath.Join(layout.Root, "daemon.log")))
+		}
+	})
 	controller := startDaemonProcess(t, layout.Root)
 	return layout.Root, store, request, controller
 }
