@@ -76,6 +76,9 @@ func (s RentalInstallSelection) Target() string {
 	if s.Warm != "" {
 		return s.Package + "/" + s.Entrypoint + " warm=" + s.Warm
 	}
+	if s.Package != "" && s.Release == "" {
+		return s.Package // the hub's newest, until the machine names it
+	}
 	if s.Package != "" {
 		return s.Package + "@" + s.Release
 	}

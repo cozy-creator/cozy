@@ -47,8 +47,9 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, problem)
 			return
 		}
-		if body.Release == "" || strings.ContainsAny(body.Release, "\r\n\x00") {
-			s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation requires one exact package release"))
+		// An empty release is the hub's newest, which the machine reads there.
+		if strings.ContainsAny(body.Release, "\r\n\x00/@") {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation names at most one exact package release"))
 			return
 		}
 	} else if body.Release != "" || len(body.Models) == 0 {

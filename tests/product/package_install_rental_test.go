@@ -16,22 +16,19 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Exercise the public grammar, real release resolver and authenticated daemon
-// client against isolated peers. No worker, Python environment or weights exist.
+// Exercise the public grammar and authenticated daemon client against isolated peers. The
+// command asks the Hub nothing: the machine reads the release at its hub (the newest when
+// none is named) and answers which it installed. No worker, Python environment or weights.
 func TestPackageInstallRental(t *testing.T) {
 	for _, test := range []struct {
-		name, version, selected, rental string
-		refused                         bool
+		name, version, installed, rental string
 	}{
-		{"latest-by-name", "", "2.0.0", "kirukiru", false},
-		{"pinned-by-id", "1.2.3", "1.2.3", "rental-proof", false},
-		{"changed-pin", "1.2.3", "2.0.0", "kirukiru", true},
-		{"missing-release", "", "", "kirukiru", true},
+		{"latest-by-name", "", "2.0.0", "kirukiru"},
+		{"pinned-by-id", "1.2.3", "1.2.3", "rental-proof"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			check := func(problem *exit.Error) {
@@ -40,16 +37,10 @@ func TestPackageInstallRental(t *testing.T) {
 					t.Fatal(problem)
 				}
 			}
-			var resolutions, preparations atomic.Int32
+			var preparations atomic.Int32
 			hubPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != "POST" || r.URL.Path != "/v1/packages/paul/minimax-h3/download" || r.URL.Query().Get("release") != test.version {
-					t.Errorf("unexpected Hub request (including model or byte download): %s %s", r.Method, r.URL)
-					http.Error(w, "unexpected request", 500)
-					return
-				}
-				resolutions.Add(1)
-				_ = json.NewEncoder(w).Encode(hub.PackageDownloadPlan{Release: test.selected,
-					Downloads: []hub.PackageInstallDownload{{Kind: "project_wheel", Path: "unused.whl"}}})
+				t.Errorf("a rental installation asked the Hub: %s %s", r.Method, r.URL)
+				http.Error(w, "unexpected request", 500)
 			}))
 			defer hubPeer.Close()
 			localPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +53,8 @@ func TestPackageInstallRental(t *testing.T) {
 				}
 				if r.Method == "GET" && r.URL.Path == "/v1/local/rentals/rental-proof/installs/install-proof" { // the command follows it
 					_ = json.NewEncoder(w).Encode(api.RentalInstallStatus{RentalInstall: records.RentalInstall{ID: "install-proof", RentalID: "rental-proof",
-						State: "succeeded", Selection: records.RentalInstallSelection{Package: "paul/minimax-h3", Release: test.selected}}})
+						State: "succeeded", Selection: records.RentalInstallSelection{Package: "paul/minimax-h3", Release: test.version},
+						Result: json.RawMessage(`{"package":"paul/minimax-h3","release":"` + test.installed + `"}`)}})
 					return
 				}
 				if r.Method != "POST" || r.URL.Path != "/v1/local/rentals/rental-proof/prepare" || r.Header.Get("Authorization") == "" {
@@ -74,7 +66,7 @@ func TestPackageInstallRental(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 					t.Error(err)
 				}
-				if request.Package != "paul/minimax-h3" || request.Release != test.selected || len(request.Models) != 0 {
+				if request.Package != "paul/minimax-h3" || request.Release != test.version || request.Hub != hubPeer.URL || len(request.Models) != 0 {
 					t.Errorf("wrong preparation or implicit model selection: %+v", request)
 				}
 				preparations.Add(1)
@@ -107,15 +99,8 @@ func TestPackageInstallRental(t *testing.T) {
 				t.Fatal(err)
 			}
 			err = parsed.Run(&cli.Runtime{Cfg: config.Config{Home: layout.Root, HubURL: hubPeer.URL}, Out: &out, Err: &diagnostic, Mode: output.Mode{JSON: true, Full: true}})
-			if test.refused {
-				if err == nil || preparations.Load() != 0 {
-					t.Fatalf("bad release reached preparation: %v, %d", err, preparations.Load())
-				}
-			} else if err != nil || preparations.Load() != 1 || !strings.Contains(out.String(), `"status":"succeeded","target":"paul/minimax-h3@`+test.selected+`"`) {
+			if err != nil || preparations.Load() != 1 || !strings.Contains(out.String(), `"status":"succeeded","target":"paul/minimax-h3@`+test.installed+`"`) {
 				t.Fatalf("rental install: %v; preparations=%d; output=%s", err, preparations.Load(), &out)
-			}
-			if resolutions.Load() != 1 {
-				t.Fatalf("resolutions=%d", resolutions.Load())
 			}
 			_, installed, problem := store.ActivePackage(hubPeer.URL, "paul/minimax-h3")
 			check(problem)

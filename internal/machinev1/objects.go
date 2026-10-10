@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
@@ -101,19 +102,12 @@ func WriteFile(ctx context.Context, client pb.MachineClient, path string) (Objec
 }
 
 func writeFile(ctx context.Context, client pb.MachineClient, path string) (Object, bool, error) {
-	file, err := os.Open(path)
+	object, err := fileObject(path)
 	if err != nil {
 		return Object{}, false, err
 	}
-	hash := sha256.New()
-	length, err := io.Copy(hash, file)
-	file.Close()
-	if err != nil {
-		return Object{}, false, err
-	}
-	object := Object{Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil)), Length: length}
 	open := func() (io.ReadSeekCloser, error) { return os.Open(path) }
-	sent, err := writeObject(ctx, client, object.Digest, length, open)
+	sent, err := writeObject(ctx, client, object.Digest, object.Length, open)
 	return object, sent, err
 }
 
@@ -148,40 +142,87 @@ type localManifest struct {
 }
 
 // LocalSource writes an unpublished package (its source archive, vendored wheels and locked
-// requirements) and then its manifest. A run names the manifest's digest; unchanged code
-// writes nothing new and reopens the machine's installation, and `sent` is then false.
+// requirements) and its manifest. A run names the manifest's digest; unchanged code
+// writes nothing new and reopens the machine's installation, and `sent` is then false. The
+// manifest names its members by digest, so every object goes up side by side: one round
+// trip for those the machine holds, two for the rest.
 func LocalSource(ctx context.Context, client pb.MachineClient, installation localpackage.Installation) (manifestDigest string, sent bool, err error) {
 	manifest := localManifest{Package: installation.Package, Release: installation.Release,
 		PythonRequires: installation.PythonRequires, PythonVersion: installation.PythonVersion, Callees: installation.Callees}
-	sourced := false
+	type upload struct {
+		object Object
+		open   func() (io.ReadSeekCloser, error)
+	}
+	var uploads []upload
 	for _, file := range installation.Files {
-		object, wrote, err := writeFile(ctx, client, file.Path)
+		object, err := fileObject(file.Path)
 		if err != nil {
 			return "", false, fmt.Errorf("writing %s: %w", file.Filename, err)
 		}
-		sent = sent || wrote
+		path := file.Path
+		uploads = append(uploads, upload{object, func() (io.ReadSeekCloser, error) { return os.Open(path) }})
 		if file.Kind == "source" {
-			manifest.Source, sourced = &object, true
+			manifest.Source = &object
 			continue
 		}
 		object.Name = file.Filename
 		manifest.Wheels = append(manifest.Wheels, object)
 	}
-	if !sourced && len(manifest.Wheels) == 0 {
+	if manifest.Source == nil && len(manifest.Wheels) == 0 {
 		return "", false, fmt.Errorf("%s has no source archive or retained wheels to write", installation.Package)
 	}
+	bytesUpload := func(data []byte) upload {
+		sum := sha256.Sum256(data)
+		object := Object{Digest: "sha256:" + hex.EncodeToString(sum[:]), Length: int64(len(data))}
+		return upload{object, func() (io.ReadSeekCloser, error) { return nopCloser{bytes.NewReader(data)}, nil }}
+	}
 	if len(installation.DependencyRequirements) > 0 {
-		requirements, wrote, err := writeBytes(ctx, client, installation.DependencyRequirements)
-		if err != nil {
-			return "", false, fmt.Errorf("writing the locked requirements: %w", err)
-		}
-		sent = sent || wrote
-		manifest.Requirements = &requirements
+		requirements := bytesUpload(installation.DependencyRequirements)
+		uploads = append(uploads, requirements)
+		manifest.Requirements = &requirements.object
 	}
 	document, err := json.Marshal(manifest)
 	if err != nil {
 		return "", false, err
 	}
-	written, wrote, err := writeBytes(ctx, client, document)
-	return written.Digest, sent || wrote, err
+	written := bytesUpload(document)
+	uploads = append(uploads, written)
+	var (
+		wait  sync.WaitGroup
+		mu    sync.Mutex
+		first error
+		slots = make(chan struct{}, 8)
+	)
+	for _, u := range uploads {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			wrote, err := writeObject(ctx, client, u.object.Digest, u.object.Length, u.open)
+			mu.Lock()
+			defer mu.Unlock()
+			sent = sent || wrote
+			if err != nil && first == nil {
+				first = fmt.Errorf("writing %s: %w", u.object.Digest, err)
+			}
+		}()
+	}
+	wait.Wait()
+	return written.object.Digest, sent, first
+}
+
+// fileObject names the file at path by its sha256 and length.
+func fileObject(path string) (Object, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Object{}, err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	length, err := io.Copy(hash, file)
+	if err != nil {
+		return Object{}, err
+	}
+	return Object{Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil)), Length: length}, nil
 }
