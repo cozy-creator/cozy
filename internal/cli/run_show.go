@@ -48,7 +48,9 @@ type runReport struct {
 	Steps    []reportSteps     `json:"steps,omitempty"`
 	Degree   int               `json:"degree,omitempty"`
 	GPUs     []reportGPU       `json:"gpus,omitempty"`
-	Calls    []reportCall      `json:"calls,omitempty"`
+	// Transport is how a group's GPUs exchanged data: Runtime's record, kept whole.
+	Transport json.RawMessage `json:"transport,omitempty"`
+	Calls     []reportCall    `json:"calls,omitempty"`
 	// Resolved is what the machine installed and which checkpoint each Model slot ran: the
 	// run's reproducible identity, recorded by the machine that chose it.
 	Resolved json.RawMessage     `json:"resolved,omitempty"`
@@ -106,11 +108,13 @@ type reportCall struct {
 	Error       string        `json:"error,omitempty"`
 	ErrorCode   string        `json:"error_code,omitempty"`
 	Runtime     string        `json:"runtime,omitempty"` // the SDK its executor loaded
-	GPUs        []reportGPU   `json:"gpus,omitempty"`    // its grants' cards, then its release's records
+	GPUs        []reportGPU   `json:"gpus,omitempty"`    // its grants' cards, then its execution's records
 	StartUnixMS int64         `json:"start_unix_ms,omitempty"`
 	MS          float64       `json:"ms"`
 	Stages      []reportStage `json:"stages"`
 	Steps       []reportSteps `json:"steps,omitempty"`
+	// Transport is how its GPUs exchanged data: Runtime's record, kept whole.
+	Transport json.RawMessage `json:"transport,omitempty"`
 
 	timed []reportStage // its latest record's attribution stages, beside Stages until sorted
 }
@@ -153,8 +157,8 @@ type solCalls struct {
 	DensePrefix int `json:"dense_prefix"`
 }
 
-// legacyRank is a Runtime's `ranks` row, all a Runtime before `gpus` sends: its `ordinal`
-// is the GPU's number. Drop once no deployed Runtime lacks `gpus`.
+// legacyRank is a Runtime's `ranks` row, all the Rust machine's Runtime sends: its `ordinal`
+// is the GPU's number.
 type legacyRank struct {
 	reportGPU
 	Ordinal int `json:"ordinal"`
@@ -212,22 +216,113 @@ type triageEvidence struct {
 			Stages map[string]triageTrack `json:"stages"`
 			Steps  map[string]triageTrack `json:"steps"`
 		} `json:"attribution"`
-		Execution struct {
-			Degree       int          `json:"degree"`
-			GPUs         []reportGPU  `json:"gpus"`
-			Ranks        []legacyRank `json:"ranks"`
-			Executor     triageSetup  `json:"executor"`
-			Construction triageSetup  `json:"construction"`
-		} `json:"execution"`
-		// The executor's attention observations: Sol's calls per GPU among them.
-		Observations []struct {
-			Name   string `json:"name"`
-			Fields struct {
-				Rank int `json:"rank"`
-				solCalls
-			} `json:"fields"`
-		} `json:"observations"`
+		Execution    executionRecord `json:"execution"`
+		Observations []observation   `json:"observations"`
 	} `json:"measurements"`
+}
+
+// executionRecord is Runtime's record of one attempt's execution: a run's, or a call's.
+type executionRecord struct {
+	Degree       int             `json:"degree"`
+	GPUs         []reportGPU     `json:"gpus"`
+	Ranks        []legacyRank    `json:"ranks"`
+	Transport    json.RawMessage `json:"transport"`
+	Executor     triageSetup     `json:"executor"`
+	Construction triageSetup     `json:"construction"`
+}
+
+// observation is one of the executor's attention observations: Sol's calls per GPU among them.
+type observation struct {
+	Name   string `json:"name"`
+	Fields struct {
+		Rank int `json:"rank"`
+		solCalls
+	} `json:"fields"`
+}
+
+// gpus are the execution's GPU records, each with its Sol calls.
+func (x executionRecord) gpus(observations []observation) []reportGPU {
+	gpus := gpuRecords(x.GPUs, x.Ranks)
+	for _, row := range observations {
+		for i := range gpus {
+			if row.Name == "attention.sol.calls" && gpus[i].Rank == row.Fields.Rank {
+				calls := row.Fields.solCalls
+				gpus[i].Attention.Sol = &calls
+			}
+		}
+	}
+	return gpus
+}
+
+// transportRecord is how a group's GPUs exchanged data (Runtime's `execution.transport`).
+type transportRecord struct {
+	Degree int             `json:"degree"`
+	GPUs   []int           `json:"gpus"`
+	Route  string          `json:"route"`
+	NCCL   map[string]any  `json:"nccl"`
+	Pairs  []transportPair `json:"pairs"`
+	Reason string          `json:"reason"`
+}
+
+type transportPair struct {
+	A          int     `json:"a"`
+	B          int     `json:"b"`
+	Peer       bool    `json:"peer"`
+	DirectGBps float64 `json:"direct_gbps"`
+	StagedGBps float64 `json:"staged_gbps"`
+}
+
+func (p transportPair) String() string {
+	text := fmt.Sprintf("GPU %d↔%d %.1f GB/s direct vs %.1f staged", p.A, p.B, p.DirectGBps, p.StagedGBps)
+	if !p.Peer {
+		text += " (no peer access)"
+	}
+	return text
+}
+
+// transportText is a transport in one line: its GPUs, route and NCCL settings, the slowest
+// pair's bandwidths (every pair's when full) and why that route; "" for none or unreadable.
+func transportText(raw json.RawMessage, full bool) string {
+	var t transportRecord
+	if len(raw) == 0 || json.Unmarshal(raw, &t) != nil || max(t.Degree, len(t.GPUs)) < 2 {
+		return ""
+	}
+	parts := []string{fmt.Sprintf("%d GPUs", t.Degree)}
+	if len(t.GPUs) > 0 {
+		cards := make([]reportGPU, len(t.GPUs))
+		for i, gpu := range t.GPUs {
+			cards[i].GPU = gpu
+		}
+		parts[0] = gpuNames(cards)
+	}
+	if t.Route != "" {
+		route := "route " + t.Route
+		if len(t.NCCL) > 0 {
+			settings := make([]string, 0, len(t.NCCL))
+			for name, value := range t.NCCL {
+				settings = append(settings, fmt.Sprintf("%s=%v", strings.TrimPrefix(name, "NCCL_"), value))
+			}
+			slices.Sort(settings)
+			route += " (NCCL " + strings.Join(settings, ", ") + ")"
+		}
+		parts = append(parts, route)
+	}
+	pairs := slices.Clone(t.Pairs)
+	slices.SortStableFunc(pairs, func(a, b transportPair) int { return cmp.Compare(a.DirectGBps, b.DirectGBps) })
+	shown := pairs
+	if !full {
+		shown = pairs[:min(1, len(pairs))]
+	}
+	for _, pair := range shown {
+		parts = append(parts, pair.String())
+	}
+	if len(shown) < len(pairs) {
+		parts[len(parts)-1] += fmt.Sprintf(", slowest of %d", len(pairs))
+	}
+	if t.Reason != "" {
+		parts = append(parts, t.Reason)
+	}
+	return strings.Join(parts, " · ")
 }
 
 // The evidence events run show reads, each decoded once into its own type. A payload
@@ -323,6 +418,10 @@ type callEvent struct {
 	Steps        map[string]triageTrack `json:"steps"`
 	Memoized     bool                   `json:"memoized"`           // answered from a result its machine held
 	Computation  string                 `json:"computation_digest"` // a memoized call's computation
+	// Its executor's record and attention observations, read apart: a Runtime's new or odd
+	// field there never hides the call.
+	Execution    json.RawMessage `json:"execution"`
+	Observations json.RawMessage `json:"observations"`
 }
 
 func handleRunShow(ctx *Context) *exit.Error {
@@ -492,6 +591,12 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				c.timed = append(c.timed, stage)
 			}
 			c.Steps = stepSummaries(record.Steps)
+			var execution executionRecord
+			var observations []observation
+			if json.Unmarshal(record.Execution, &execution) == nil {
+				_ = json.Unmarshal(record.Observations, &observations)
+				c.GPUs, c.Transport = seat(c.GPUs, execution.gpus(observations), true), execution.Transport
+			}
 		case "machine.resolved":
 			report.Resolved = event.Payload
 		case "machine.executor":
@@ -588,15 +693,8 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	var triage triageEvidence
 	if len(evidence.Triage) > 0 && json.Unmarshal(evidence.Triage, &triage) == nil {
 		execution := triage.Measurements.Execution
-		report.Degree, report.GPUs = execution.Degree, gpuRecords(execution.GPUs, execution.Ranks)
-		for _, row := range triage.Measurements.Observations {
-			for i := range report.GPUs {
-				if row.Name == "attention.sol.calls" && report.GPUs[i].Rank == row.Fields.Rank {
-					calls := row.Fields.solCalls
-					report.GPUs[i].Attention.Sol = &calls
-				}
-			}
-		}
+		report.Degree, report.GPUs = execution.Degree, execution.gpus(triage.Measurements.Observations)
+		report.Transport = execution.Transport
 		if boot := execution.Executor; boot.StartedUnixMS > 0 {
 			report.Stages = append(report.Stages, setupStage("executor boot", boot.StartedUnixMS,
 				boot.MS, created, topLegs(boot.Legs)))
@@ -641,7 +739,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			status = "succeeded" // a call's status is Runtime's word, as its calls' rows say it
 		}
 		root := reportCall{Request: life.RequestID, Module: life.Package, Function: life.Function, Label: "this run",
-			Status: status, GPUs: report.GPUs, StartUnixMS: started.UnixMilli(), MS: float64(life.ExecutionMS),
+			Status: status, GPUs: report.GPUs, Transport: report.Transport, StartUnixMS: started.UnixMilli(), MS: float64(life.ExecutionMS),
 			Steps: report.Steps, Stages: []reportStage{}}
 		for _, stage := range report.Stages {
 			if stage.Kind == "inference" || stage.Kind == "wait" {
@@ -956,7 +1054,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		_ = table.Flush()
 	}
 	emitTimeline(w, table, r.Stages, r.Steps, offset, mode.Full)
-	emitGPUs(w, table, r.GPUs, r.Steps, offset, mode.Full)
+	emitGPUs(w, table, r.GPUs, r.Transport, r.Steps, offset, mode.Full)
 	if len(r.Calls) == 0 {
 		return nil
 	}
@@ -971,6 +1069,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	for _, c := range r.Calls {
 		if c.callTiming.present() {
 			fmt.Fprintf(w, "  call %d: %s\n", c.Number, callTimingText(callPhaseEvent{Phase: "terminal", callTiming: c.callTiming}, time.Time{}, true))
+		}
+		if line := transportText(c.Transport, false); line != "" && c.Number > 0 {
+			fmt.Fprintf(w, "  call %d transport: %s\n", c.Number, line)
 		}
 	}
 	if !mode.Full {
@@ -1041,7 +1142,7 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 		}
 	}
 	emitTimeline(w, table, c.Stages, c.Steps, offset, full)
-	emitGPUs(w, table, c.GPUs, c.Steps, offset, full)
+	emitGPUs(w, table, c.GPUs, c.Transport, c.Steps, offset, full)
 }
 
 func (c reportCall) state() string {
@@ -1092,9 +1193,10 @@ func emitTimeline(w io.Writer, table *tabwriter.Writer, stages []reportStage, st
 	}
 }
 
-// emitGPUs prints the GPUs an execution ran on, by the number nvidia-smi shows. A card held
-// with no process on it (a one-process call on a wider grant) and a CPU process are not.
-func emitGPUs(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, steps []reportSteps, offset func(int64) string, full bool) {
+// emitGPUs prints the GPUs an execution ran on, by the number nvidia-smi shows, and how they
+// exchanged data. A card held with no process on it (a one-process call on a wider grant) and
+// a CPU process are not.
+func emitGPUs(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, transport json.RawMessage, steps []reportSteps, offset func(int64) string, full bool) {
 	gpus = slices.DeleteFunc(slices.Clone(gpus), func(g reportGPU) bool {
 		return g.PID <= 0 || g.GPU < 0 && g.UUID == ""
 	})
@@ -1116,6 +1218,9 @@ func emitGPUs(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, steps []re
 		if len(gpu.Attention.Segments) > 1 {
 			fmt.Fprintf(w, "GPU %s attention by step: %s\n", gpu.number(), segmentsText(gpu.Attention.Segments, steps))
 		}
+	}
+	if line := transportText(transport, full); line != "" {
+		fmt.Fprintf(w, "transport: %s\n", line)
 	}
 	emitKernels(w, table, gpus, full)
 }

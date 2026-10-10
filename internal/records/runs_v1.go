@@ -248,18 +248,22 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 }
 
 // insertCallV1 records one settled call of the run as `machine.call`, the record `run show`
-// lists: the callee, the author's label, how it ended, when, and its stage and step tracks.
+// lists: the callee, the author's label, how it ended, when, its stage and step tracks, and
+// its execution record (GPUs, attention, transport) with its attention observations.
 func insertCallV1(tx *sql.Tx, id string, attempt int64, call *v1.Call) error {
 	var measured struct {
 		Attribution struct {
 			Stages json.RawMessage `json:"stages"`
 			Steps  json.RawMessage `json:"steps"`
 		} `json:"attribution"`
+		Execution    json.RawMessage `json:"execution"`
+		Observations json.RawMessage `json:"observations"`
 	}
 	_ = json.Unmarshal(call.Measurements, &measured)
 	record := map[string]any{"request": call.Run, "parent": id, "index": call.Index, "attempt": attempt,
 		"export": call.Function, "label": call.Label, "status": call.Status, "error": call.GetReason().GetMessage(),
 		"called_unix_ms": call.CalledAtMs, "stages": measured.Attribution.Stages, "steps": measured.Attribution.Steps,
+		"execution": measured.Execution, "observations": measured.Observations,
 		"memoized": call.Memoized, "computation_digest": call.ComputationDigest}
 	if code := call.GetReason().GetCode(); code != "" {
 		record["error_code"] = code
