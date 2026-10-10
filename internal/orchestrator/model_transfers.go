@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -36,7 +37,9 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 		c.forgetTransferProgress(req.ID)
 		return
 	}
+	moved := false
 	if problem == nil && transfer != nil {
+		before := transferMark(transfer)
 		ctx, leave := c.joinTransfer(req.ID)
 		problem = c.opt.ModelTransfers.PassThrough(ctx, req.ID, transfer.ModelTransferIntent)
 		canceled := ctx.Err() != nil
@@ -46,16 +49,20 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 			c.forgetTransferProgress(req.ID)
 			return
 		}
+		after, _ := c.opt.Store.ModelTransferOf(req.ID)
+		moved = after != nil && transferMark(after) != before
 	}
 	if problem != nil {
-		if permanentTransferFailure(problem) {
-			_ = c.opt.Store.FailModelTransfer(req.ID, problem.ErrName(), problem.Message)
-			_, _ = c.opt.Store.SettleModelTransferRequest(req.ID, 0)
-			c.forgetTransferProgress(req.ID)
-			c.signalClosed(requestWaitKey(req.ID), problem)
-		} else {
+		// An unavailable source or destination is tried again only after an attempt that
+		// moved the transfer to its next durable step; one that moved nothing fails it.
+		if !permanentTransferFailure(problem) && moved {
 			time.AfterFunc(2*time.Second, func() { c.runModelPassThrough(req) })
+			return
 		}
+		_ = c.opt.Store.FailModelTransfer(req.ID, problem.ErrName(), problem.Message)
+		_, _ = c.opt.Store.SettleModelTransferRequest(req.ID, 0)
+		c.forgetTransferProgress(req.ID)
+		c.signalClosed(requestWaitKey(req.ID), problem)
 		return
 	}
 	current, readProblem := c.opt.Store.RequestRow(req.ID)
@@ -98,4 +105,10 @@ func permanentTransferFailure(problem *exit.Error) bool {
 	default:
 		return true
 	}
+}
+
+// transferMark is what a transfer has durably done: its step and the models and checkpoints
+// it holds.
+func transferMark(t *records.ModelTransfer) string {
+	return fmt.Sprint(t.State, t.Models, t.Checkpoints)
 }

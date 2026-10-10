@@ -80,7 +80,7 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT ` + machineRetentionReleased + ` AND (
  (length(e.receipt)=0 AND (e.cancel_requested=1 OR ` + machineExecutionAbandoned + `) AND length(e.submission)>0 AND NOT EXISTS
  (SELECT 1 FROM request_events closed WHERE closed.request_id=r.id AND closed.type='machine.submission_closed')) OR
- (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked','canceled')) OR
+ (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','canceled')) OR
  (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))`
 
 // Recipient custody (staged inputs, collected models) outlives the execution. It is owed to

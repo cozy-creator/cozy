@@ -206,7 +206,7 @@ func TestRequestedRentalFlowsToChildAndRetainedRetry(t *testing.T) {
 	if child.Worker != "wanted" || child.RequestedRental != "wanted" {
 		t.Fatalf("child escaped affinity: %+v", child)
 	}
-	_, problem = st.BlockRetainedWork(child.ID, "proof", "pause child")
+	_, problem = st.FailQueuedRequest(child.ID, retainedFailure("proof", "pause child"))
 	fatal(t, problem)
 	retried, _, problem := st.Submit(records.Request{ID: "retry", IdemKey: "retry", BodyDigest: childDigest("e"), Package: "local/op", Entrypoint: "run", Kind: "job", Payload: []byte("{}"), RetainWork: true, RetryOf: child.ID})
 	fatal(t, problem)

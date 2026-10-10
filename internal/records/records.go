@@ -151,19 +151,6 @@ func Open(path string) (*Store, *exit.Error) {
 	return open(path)
 }
 
-// OpenForDaemon is Open plus the daemon's startup correction of retained-work projections.
-func OpenForDaemon(path string) (*Store, *exit.Error) {
-	store, problem := open(path)
-	if problem != nil {
-		return nil, problem
-	}
-	if problem := store.ReconcileLostRetainedWork(); problem != nil {
-		store.Close()
-		return nil, problem
-	}
-	return store, nil
-}
-
 // open accepts an empty database, the current schema, schema 49 (migrated), or a newer one.
 // The current schema evolves additively: verifySchema adds any table, column or index the
 // authored DDL has and the database lacks. Any other older schema is refused.

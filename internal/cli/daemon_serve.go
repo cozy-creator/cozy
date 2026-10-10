@@ -103,7 +103,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		go func() { _ = httpServer.Serve(v6) }()
 	}
 
-	st, e := records.OpenForDaemon(l.DB)
+	st, e := records.Open(l.DB)
 	if e != nil {
 		closeListeners()
 		return e

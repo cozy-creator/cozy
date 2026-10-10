@@ -32,7 +32,7 @@ func TestSuccessfulReleaseRequiresNewVerifiedRootAndExactSuccess(t *testing.T) {
 			if mode != "active" {
 				status, state := "SUCCEEDED", "succeeded"
 				if mode == "failed" {
-					status, state = "FAILED", "blocked"
+					status, state = "FAILED", "failed"
 				}
 				if mode == "paused" {
 					status, state = "CANCELED", "paused"

@@ -195,12 +195,29 @@ func (q *Installs) Run(ctx context.Context) {
 				go func(row records.RentalInstall) {
 					defer workers.Done()
 					defer cancel()
-					result, problem := q.prepare(work, row, func(progress InstallProgress) { q.progress.Store(row.ID, progress) })
+					var reported sync.Mutex
+					var first *InstallProgress
+					moved := false
+					result, problem := q.prepare(work, row, func(progress InstallProgress) {
+						reported.Lock()
+						if first == nil {
+							first = &progress
+						} else if progress.Stage != first.Stage || progress.TransferredBytes > first.TransferredBytes {
+							moved = true
+						}
+						reported.Unlock()
+						q.progress.Store(row.ID, progress)
+					})
+					reported.Lock()
+					progressed := moved
+					reported.Unlock()
 					q.progress.Delete(row.ID)
 					state := "succeeded"
 					if problem != nil {
+						// A stopping daemon leaves the installation to the next one. Otherwise it
+						// runs again only after an unavailable machine let it make progress.
 						state, result = "failed", nil
-						if work.Err() != nil || problem.Code == exit.Unavailable || problem.Code == exit.Canceled {
+						if ctx.Err() != nil || progressed && problem.Code == exit.Unavailable {
 							state = "queued"
 						}
 					}

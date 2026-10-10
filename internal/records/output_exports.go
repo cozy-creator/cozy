@@ -96,12 +96,13 @@ func (s *Store) OutputExportOf(requestID string) (*OutputExport, *exit.Error) {
 	return &row, nil
 }
 
-// OutputExportsOwed is every non-settled export of a request that has ended.
+// OutputExportsOwed is every unsettled export of a request that has ended. A failed export
+// is settled: it is never tried again.
 func (s *Store) OutputExportsOwed() ([]OutputExport, *exit.Error) {
 	rows, err := s.db.Query(`SELECT e.request_id,e.directory,e.outputs,
 		e.state,e.attempts,e.error_code,e.safe_error,e.published_paths,e.updated_at
 		FROM request_output_exports e JOIN requests r ON r.id=e.request_id
-		WHERE e.state IN ('pending','exporting','failed')
+		WHERE e.state IN ('pending','exporting')
 		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')
 		ORDER BY r.created_at,r.id`)
 	if err != nil {

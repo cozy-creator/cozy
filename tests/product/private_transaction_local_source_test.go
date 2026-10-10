@@ -124,7 +124,7 @@ func localSourceRetryRecords(t *testing.T, arm string) (*records.Store, records.
 	old := records.ModelCheckpoint{Slot: "shared", HeadID: "sha256:" + strings.Repeat("3", 64),
 		HeadLength: 500, PlanDigest: "sha256:" + strings.Repeat("4", 64), Index: 7, Bytes: 4096}
 	fatal(t, store.ObserveModelSourceCheckpoints(prior.ID, intent.SourceSelection, "retained-boot", []records.ModelCheckpoint{old}))
-	_, problem = store.BlockRetainedWork(prior.ID, "author_exception", "step B failed")
+	_, problem = store.FailQueuedRequest(prior.ID, retainedFailure("author_exception", "step B failed"))
 	fatal(t, problem)
 	newIntent := *intent
 	newIntent.Destination = "proof/fixed"

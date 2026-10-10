@@ -226,10 +226,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		MachineExecution: view,
 	}
 	state.OutputExport = s.outputExportOf(row.ID)
-	if row.State == "blocked" && state.Status == "failed" {
-		state.StoppedEventID = s.store.StoppedEventID(row)
-	}
-	if row.State == "failed" || row.State == "blocked" || row.State == "abandoned" {
+	if row.State == "failed" || row.State == "abandoned" {
 		state.ErrorType, state.ErrorCode, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
 	// The run's output log as this client holds it; its result is the fold once collected.
@@ -256,7 +253,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		}
 		if events, problem := s.store.EventsAfter(row.ID, 0, 256); problem == nil {
 			for _, event := range events {
-				if event.Type == "request.blocked" || event.Type == "run.failed" {
+				if event.Type == "run.failed" {
 					state.ErrorType, _ = event.Payload["error_type"].(string)
 					state.ErrorCode, _ = event.Payload["error_code"].(string)
 					state.Error, _ = event.Payload["error"].(string)
@@ -308,20 +305,6 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	if intervals, problem := s.store.MachineExecutionIntervals(row.ID); problem != nil {
 		view.ObservationError = problem.Message
 	} else {
-		if state.StoppedEventID != 0 {
-			current, present := max(row.Ordinal, 1), false
-			for i := range intervals {
-				if intervals[i].Attempt == current {
-					present = true
-					if intervals[i].FinishedAt == "" {
-						intervals[i].FinishedAt = s.store.StoppedEventAt(row)
-					}
-				}
-			}
-			if !present {
-				intervals = append(intervals, records.MachineExecutionInterval{Attempt: current, FinishedAt: s.store.StoppedEventAt(row)})
-			}
-		}
 		if !v1run {
 			state.AttemptWallMS = machineAttemptWallMS(row, link, intervals, terminal, time.Now().UnixMilli())
 		}

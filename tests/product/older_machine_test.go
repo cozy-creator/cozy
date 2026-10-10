@@ -224,6 +224,6 @@ func reachesState(t *testing.T, root string, store *records.Store, id, state str
 	eventually(t, root, id+" "+state, func() bool {
 		current, problem := store.RequestRow(id)
 		fatal(t, problem)
-		return current != nil && records.PublicRunStatus(current.State, false) == state
+		return current != nil && records.PublicRunStatus(current.State) == state
 	})
 }

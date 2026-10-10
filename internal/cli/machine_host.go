@@ -238,7 +238,7 @@ func runsPhrase(rows []records.Request) string {
 			break
 		}
 		refs = append(refs, fmt.Sprintf("%s (%s)", runReference(row.Number, row.ID),
-			records.PublicRunStatus(row.State, false)))
+			records.PublicRunStatus(row.State)))
 	}
 	phrase := "run " + strings.Join(refs, ", ")
 	if len(rows) > 1 {

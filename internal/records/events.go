@@ -229,11 +229,10 @@ func (s *Store) failQueuedRequest(requestID string, expected *Request, payload m
 	var state, worker string
 	var ordinal int64
 	var revision uint64
-	var retain bool
 	var openAttempts int
-	if err := tx.QueryRow(`SELECT state,retain_work,worker,ordinal,control_revision,(SELECT COUNT(*) FROM attempts WHERE request_id=r.id
+	if err := tx.QueryRow(`SELECT state,worker,ordinal,control_revision,(SELECT COUNT(*) FROM attempts WHERE request_id=r.id
 		AND state IN ('preparing','offered','accepted','recovered_open','terminal'))
-		FROM requests r WHERE id=?`, requestID).Scan(&state, &retain, &worker, &ordinal, &revision, &openAttempts); err != nil {
+		FROM requests r WHERE id=?`, requestID).Scan(&state, &worker, &ordinal, &revision, &openAttempts); err != nil {
 		if err == sql.ErrNoRows {
 			return false, nil
 		}
@@ -249,23 +248,6 @@ func (s *Store) failQueuedRequest(requestID string, expected *Request, payload m
 		return false, exit.New(exit.Conflict,
 			"request %s has an attempt and is not a queued failure", requestID)
 	}
-	if retain {
-		if _, err := tx.Exec(`UPDATE requests SET state='blocked' WHERE id=?`, requestID); err != nil {
-			return false, exit.Internalf("cannot retain queued failure: %s", err)
-		}
-		blocked := make(map[string]any, len(payload))
-		for key, value := range payload {
-			blocked[key] = value
-		}
-		blocked["status"] = "blocked"
-		if err := appendEventTx(tx, requestID, "request.blocked", 0, blocked); err != nil {
-			return false, exit.Internalf("cannot journal retained queued failure: %s", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return false, exit.Internalf("cannot commit retained queued failure: %s", err)
-		}
-		return true, nil
-	}
 	if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=?`, requestID); err != nil {
 		return false, exit.Internalf("cannot settle queued request %s: %s", requestID, err)
 	}
@@ -275,6 +257,9 @@ func (s *Store) failQueuedRequest(requestID string, expected *Request, payload m
 		safe_error=?,updated_at=? WHERE request_id=? AND state NOT IN ('completed','canceling','canceled')`,
 		code, detail, now(), requestID); err != nil {
 		return false, exit.Internalf("cannot fail queued model transfer %s: %s", requestID, err)
+	}
+	if problem := skipOutputExport(tx, requestID, "the run failed before it started: "+detail); problem != nil {
+		return false, problem
 	}
 	if err := appendEventTx(tx, requestID, "run.failed", 0, payload); err != nil {
 		return false, exit.Internalf("cannot append queued failure for %s: %s", requestID, err)
@@ -390,7 +375,7 @@ func (s *Store) TerminalOverallFraction(requestID string, attempt int64) (*float
 	err := s.db.QueryRow(`SELECT payload FROM request_events
 		WHERE request_id=? AND attempt=? AND type IN (
 		'run.completed','run.failed','run.canceled','request.attempt_failed',
-		'request.pausing','request.blocked','request.canceling','request.finalizing')
+		'request.pausing','request.canceling','request.finalizing')
 		AND json_extract(payload,'$.overall_fraction') IS NOT NULL
 		ORDER BY seq DESC LIMIT 1`, requestID, attempt).Scan(&body)
 	if err == sql.ErrNoRows {
@@ -444,14 +429,13 @@ func (s *Store) CancelAttribution(requestID string) (actor, errType, errText str
 	return actor, errType, errText, nil
 }
 
-// SettledFailure is the typed cause journaled with a request's failed or blocked settlement.
+// SettledFailure is the typed cause journaled with a request's failed settlement.
 // A failure before any attempt (a refused desired state, an unplaceable pin) has no attempt
 // row to carry it; this event is its only durable record.
 func (s *Store) SettledFailure(requestID string) (errType, errCode, errText string, problem *exit.Error) {
 	var body string
 	err := s.db.QueryRow(`SELECT payload FROM request_events
-		WHERE request_id=? AND type IN ('run.failed','request.blocked')
-		ORDER BY seq DESC LIMIT 1`, requestID).Scan(&body)
+		WHERE request_id=? AND type='run.failed' ORDER BY seq DESC LIMIT 1`, requestID).Scan(&body)
 	if err == sql.ErrNoRows {
 		return "", "", "", nil
 	}

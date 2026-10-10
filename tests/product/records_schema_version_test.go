@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	_ "modernc.org/sqlite"
 )
@@ -14,7 +13,7 @@ import (
 // An older numbered schema other than 49 is refused by name and left exactly as it was.
 func TestRecordsRefuseAnOlderSchemaUnchanged(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	store, problem := records.OpenForDaemon(path)
+	store, problem := records.Open(path)
 	fatal(t, problem)
 	store.Close()
 	db, err := sql.Open("sqlite", path)
@@ -22,15 +21,13 @@ func TestRecordsRefuseAnOlderSchemaUnchanged(t *testing.T) {
 	defer db.Close()
 	_, err = db.Exec(`PRAGMA user_version=48`)
 	must(t, err)
-	for _, open := range []func(string) (*records.Store, *exit.Error){records.Open, records.OpenForDaemon} {
-		store, problem := open(path)
-		if problem == nil {
-			store.Close()
-			t.Fatal("a schema-48 database was opened")
-		}
-		if problem.ErrName() != "records_schema_unsupported" || !strings.Contains(problem.Message, "schema 48") {
-			t.Fatalf("refusal = %s: %s", problem.ErrName(), problem.Message)
-		}
+	store, problem = records.Open(path)
+	if problem == nil {
+		store.Close()
+		t.Fatal("a schema-48 database was opened")
+	}
+	if problem.ErrName() != "records_schema_unsupported" || !strings.Contains(problem.Message, "schema 48") {
+		t.Fatalf("refusal = %s: %s", problem.ErrName(), problem.Message)
 	}
 	var version int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
@@ -43,7 +40,7 @@ func TestRecordsRefuseAnOlderSchemaUnchanged(t *testing.T) {
 // recorded hub (a local capture under none) in place, keeping every row.
 func TestRecordsMigrateSchema49PinsUnderTheirHub(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	store, problem := records.OpenForDaemon(path)
+	store, problem := records.Open(path)
 	fatal(t, problem)
 	const origin = "http://127.0.0.1:1"
 	for _, inst := range []records.PackageInstall{
@@ -87,7 +84,7 @@ func TestRecordsMigrateSchema49PinsUnderTheirHub(t *testing.T) {
 func TestRecordsWrittenByANewerCreatorOpenInCompatibilityMode(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "records.db")
-	store, problem := records.OpenForDaemon(path)
+	store, problem := records.Open(path)
 	if problem != nil {
 		t.Fatalf("initialize records: %v", problem)
 	}
@@ -114,26 +111,23 @@ func TestRecordsWrittenByANewerCreatorOpenInCompatibilityMode(t *testing.T) {
 	}
 	db.Close()
 
-	for _, open := range []func(string) (*records.Store, *exit.Error){records.Open,
-		records.OpenForDaemon} {
-		store, problem = open(path)
-		if problem != nil {
-			t.Fatalf("a newer database with every required table was refused: %s", problem.Message)
-		}
-		row, problem := store.RentalRow("pr-newer")
-		fatal(t, problem)
-		row.State = "attached"
-		fatal(t, store.RecordRental(*row))
-		fresh := seed
-		fresh.ID, fresh.MachineName = "pr-older-write", "older-write"
-		fatal(t, store.RecordRental(fresh))
-		row, problem = store.RentalRow("pr-newer")
-		fatal(t, problem)
-		if row == nil || row.State != "attached" || row.HourlyRateUSDMicros != 2_490_000 {
-			t.Fatalf("the rental did not round-trip: %+v", row)
-		}
-		store.Close()
+	store, problem = records.Open(path)
+	if problem != nil {
+		t.Fatalf("a newer database with every required table was refused: %s", problem.Message)
 	}
+	row, problem := store.RentalRow("pr-newer")
+	fatal(t, problem)
+	row.State = "attached"
+	fatal(t, store.RecordRental(*row))
+	fresh := seed
+	fresh.ID, fresh.MachineName = "pr-older-write", "older-write"
+	fatal(t, store.RecordRental(fresh))
+	row, problem = store.RentalRow("pr-newer")
+	fatal(t, problem)
+	if row == nil || row.State != "attached" || row.HourlyRateUSDMicros != 2_490_000 {
+		t.Fatalf("the rental did not round-trip: %+v", row)
+	}
+	store.Close()
 
 	db, err = sql.Open("sqlite", path)
 	if err != nil {

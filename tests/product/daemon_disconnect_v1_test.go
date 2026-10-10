@@ -34,7 +34,7 @@ func v1RetainedRun(t *testing.T, store *records.Store, label, rental string) rec
 	return request
 }
 
-// `cozy down` disconnects; it never ends work kept for its owner. A paused run, a blocked one
+// `cozy down` disconnects; it never ends work kept for its owner. A paused run, a failed one
 // and a finished one whose result is still on its machine stay exactly as they were across
 // two disconnects, and so does their rental.
 func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
@@ -50,8 +50,8 @@ func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.AcceptRunV1(paused.ID, rental, &v1.RunState{Id: paused.ID, Number: 1, State: "running", Attempt: 1}))
 	fatal(t, store.ObserveRunV1(paused.ID, &v1.RunEvent{Sequence: 1, Event: &v1.RunEvent_State{State: &v1.RunState{Id: paused.ID, Number: 1, State: "paused", Sequence: 1, Attempt: 1}}}, nil))
-	blocked := v1RetainedRun(t, store, "blocked", rental)
-	_, problem = store.BlockRetainedWork(blocked.ID, "fixture.blocked", "retained inputs")
+	failed := v1RetainedRun(t, store, "failed", rental)
+	_, problem = store.FailQueuedRequest(failed.ID, retainedFailure("fixture.failed", "retained inputs"))
 	fatal(t, problem)
 	finished := v1RetainedRun(t, store, "finished", rental)
 	_, problem = store.MarkRunV1Sent(finished.ID)
@@ -63,14 +63,14 @@ func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
 	must(t, os.WriteFile(kept, []byte("retained result"), 0o600))
 	before := map[string]*records.Request{}
 	links := map[string]*records.MachineExecution{}
-	for _, id := range []string{paused.ID, blocked.ID, finished.ID} {
+	for _, id := range []string{paused.ID, failed.ID, finished.ID} {
 		before[id], problem = store.RequestRow(id)
 		fatal(t, problem)
 		links[id], problem = store.MachineExecution(id)
 		fatal(t, problem)
 	}
-	if !before[paused.ID].RetainWork || !before[blocked.ID].RetainWork || before[paused.ID].State != "paused" || before[blocked.ID].State != "blocked" {
-		t.Fatal("the fixture's paused and blocked runs are not kept for their owner")
+	if !before[paused.ID].RetainWork || before[paused.ID].State != "paused" || before[failed.ID].State != "failed" {
+		t.Fatal("the fixture's paused and failed runs are not as recorded")
 	}
 	for cycle := range 2 {
 		code, out := runCozy(t, root, "down", "--json")

@@ -1,17 +1,14 @@
 package producttest
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/daemon"
@@ -19,26 +16,27 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestPublicRunStatusProjectsStoppedFailuresAndPendingAcceptanceConsistently(t *testing.T) {
+// A retained job that fails before it starts is failed: listed, filtered and watched as a
+// failure, owing nothing, with --retry offered while its machine can still take one.
+func TestPublicRunStatusShowsFailedRetainedWork(t *testing.T) {
 	o := hostOwner(t, "public-run-status")
 	manual := recordPrivateTransaction(t, o.store, "manual", "")
-	_, problem := o.store.BlockRetainedWork(manual.ID, "dependency.missing", "fix the dependency before retrying")
+	_, problem := o.store.FailQueuedRequest(manual.ID, retainedFailure("dependency.missing", "fix the dependency before retrying"))
 	fatal(t, problem)
 	unavailable := recordPrivateTransaction(t, o.store, "no-custody", "unavailable-rental")
-	_, problem = o.store.BlockRetainedWork(unavailable.ID, "dependency.missing", "the selected machine is unavailable")
+	_, problem = o.store.FailQueuedRequest(unavailable.ID, retainedFailure("dependency.missing", "the selected machine is unavailable"))
 	fatal(t, problem)
 	paused := recordPrivateTransaction(t, o.store, "paused", "")
 	_, problem = o.store.RequestPause(paused.ID, "test user")
 	fatal(t, problem)
 	_, problem = o.store.CompleteRequestPause(paused.ID)
 	fatal(t, problem)
-	pending, _, problem := o.store.Submit(records.Request{ID: "pending-acceptance", IdemKey: "pending-acceptance", Kind: "job", Package: "local/private-proof", Entrypoint: "prepare", Payload: []byte(`{}`), BodyDigest: childDigest("1"), RetainWork: true, MachineExecutionObserver: true})
+	refused, _, problem := o.store.Submit(records.Request{ID: "refused-at-the-door", IdemKey: "refused-at-the-door", Kind: "job", Package: "local/private-proof", Entrypoint: "prepare", Payload: []byte(`{}`), BodyDigest: childDigest("1"), RetainWork: true, MachineExecutionObserver: true})
 	fatal(t, problem)
-	fatal(t, o.store.LinkMachineExecution(pending.ID, "local"))
-	_, problem = o.store.MarkRunV1Sent(pending.ID)
+	fatal(t, o.store.LinkMachineExecution(refused.ID, "local"))
+	_, problem = o.store.MarkRunV1Sent(refused.ID)
 	fatal(t, problem)
-
-	_, problem = o.store.BlockRetainedWork(pending.ID, "connection.lost", "acceptance receipt has not arrived")
+	_, problem = o.store.FailQueuedRequest(refused.ID, retainedFailure("machine.upgrade_required", "the machine refused the run"))
 	fatal(t, problem)
 	defer publicationControlAPI(t, o)()
 
@@ -60,26 +58,21 @@ func TestPublicRunStatusProjectsStoppedFailuresAndPendingAcceptanceConsistently(
 		return document, result
 	}
 	document, all := read("")
-	if _, exists := document["blocked"]; exists {
-		t.Fatalf("public blocked category: %+v", document)
-	}
-	if len(all) != 4 || document["failed"] != float64(2) || document["queued"] != float64(1) || document["paused"] != float64(1) {
+	if len(all) != 4 || document["failed"] != float64(3) || document["queued"] != nil || document["paused"] != float64(1) {
 		t.Fatalf("inconsistent public census: %+v", document)
 	}
 	_, failed := read("failed")
 	_, queued := read("queued")
 	_, stopped := read("paused")
-	if len(failed) != 2 || len(queued) != 1 || queued[0]["status"] != "queued" || len(stopped) != 1 || stopped[0]["status"] != "paused" {
+	if len(failed) != 3 || len(queued) != 0 || len(stopped) != 1 || stopped[0]["status"] != "paused" {
 		t.Fatal("public filters disagree with projected rows")
 	}
-
 	for _, entry := range failed {
 		wantRetry := entry["number"] == float64(manual.Number)
-		if entry["status"] != "failed" || (entry["retry_available"] == true) != wantRetry || entry["retaining"] != true {
+		if entry["status"] != "failed" || (entry["retry_available"] == true) != wantRetry || entry["retaining"] == true {
 			t.Fatalf("failed list lost recovery facts: %+v", entry)
 		}
 	}
-
 	for _, item := range []struct {
 		row   records.Request
 		retry bool
@@ -91,48 +84,22 @@ func TestPublicRunStatusProjectsStoppedFailuresAndPendingAcceptanceConsistently(
 				Next          []string
 			}
 		}
-		if code == 0 || json.Unmarshal([]byte(out), &result) != nil || result.Error.Code != "failed" || strings.Contains(result.Error.Message, "ended blocked") {
-			t.Fatalf("manual stop was not a failure [%d]: %s", code, out)
+		if code == 0 || json.Unmarshal([]byte(out), &result) != nil || result.Error.Code != "failed" {
+			t.Fatalf("a failed retained job was not a failure [%d]: %s", code, out)
 		}
 		if strings.Contains(out, "--retry") != item.retry {
 			t.Fatalf("incorrect retained retry hint: %s", out)
 		}
 		row, problem := o.store.RequestRow(item.row.ID)
 		fatal(t, problem)
-		if row.State != "blocked" || !row.RetainWork {
-			t.Fatal("presentation changed scheduling/custody")
+		if row.State != "failed" {
+			t.Fatalf("watching changed the run: %+v", row)
 		}
 	}
-	before, problem := o.store.MachineExecution(pending.ID)
-	fatal(t, problem)
-	if len(before.Submission) != 0 || len(before.Receipt) != 0 || len(before.PendingControl) != 0 {
-		t.Fatal("public observation invented acceptance or a control operation")
-	}
-	if sent, problem := o.store.RunV1Marked(pending.ID, records.RunV1Sent); problem != nil || !sent {
-		t.Fatal("public observation lost native dispatch evidence")
-	}
-	row, problem := o.store.RequestRow(pending.ID)
+	row, problem := o.store.RequestRow(refused.ID)
 	fatal(t, problem)
 	if o.store.RetainedRetryAvailable(*row) {
-		t.Fatal("ambiguous acceptance advertised retry")
-	}
-}
-
-func TestPublicRunStatusFreezesStoppedExecutionAtOriginalEvent(t *testing.T) {
-	o := hostOwner(t, "public-stopped-duration")
-	request, original := archivedLostObserver(t, o.store, o.l.DB)
-	ended, err := time.Parse(time.RFC3339Nano, original.At)
-	must(t, err)
-	defer publicationControlAPI(t, o)()
-	for range 2 {
-		if got, want := listedMachineTiming(t, o.root, request.ID).AttemptWallMS, ended.UnixMilli()-1000; got != want {
-			t.Fatalf("manual stop execution_ms=%d, want original event duration %d", got, want)
-		}
-	}
-	link, problem := o.store.MachineExecution(request.ID)
-	fatal(t, problem)
-	if len(link.Outcome) != 0 {
-		t.Fatal("public failure invented a Runtime terminal outcome")
+		t.Fatal("a sent run advertised retry")
 	}
 }
 
@@ -168,28 +135,4 @@ func TestPublicRunStatusWatchAcceptsOlderDaemonWithoutStopIdentity(t *testing.T)
 			}
 		})
 	}
-}
-
-func archivedLostObserver(t *testing.T, store *records.Store, path string) (records.Request, records.Event) {
-	t.Helper()
-	request, _, problem := store.Submit(records.Request{ID: "archive-run", IdemKey: "archived-history", Package: "local/private-proof", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), Worker: "lost-rental", Rental: true, RetainWork: true, MachineExecutionObserver: true})
-	fatal(t, problem)
-	fatal(t, store.LinkMachineExecution(request.ID, request.Worker))
-	raw, err := os.ReadFile("testdata/record-archive/receipt.bin")
-	must(t, err)
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	defer db.Close()
-	_, err = db.Exec(`UPDATE machine_executions SET receipt=? WHERE request_id=?`, raw, request.ID)
-	must(t, err)
-	_, err = db.Exec(`UPDATE requests SET ordinal=1,state='dispatching' WHERE id=?`, request.ID)
-	must(t, err)
-	changed, problem := store.BlockRetainedWork(request.ID, "request.state_lost", "the retained rental is unavailable")
-	fatal(t, problem)
-	if !changed {
-		t.Fatal("archived fixture did not block")
-	}
-	events, problem := store.EventsAfter(request.ID, 0, 100)
-	fatal(t, problem)
-	return request, events[len(events)-1]
 }

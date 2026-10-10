@@ -4,31 +4,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
-
-func (s *Store) RetainedFailure(id string) (string, string, *exit.Error) {
-	var raw string
-	err := s.db.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='request.blocked' ORDER BY seq DESC LIMIT 1`, id).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", nil
-	}
-	if err != nil {
-		return "", "", exit.Internalf("cannot read retained failure: %s", err)
-	}
-	var detail struct {
-		ErrorType string `json:"error_type"`
-		Error     string `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(raw), &detail); err != nil {
-		return "", "", exit.Internalf("cannot decode retained failure: %s", err)
-	}
-	return detail.ErrorType, detail.Error, nil
-}
 
 // retainRetryTx acquires lineage and the same retained machine in the admission
 // transaction. A concurrent cancellation wins before or after this commit, never
@@ -51,7 +31,7 @@ func retainRetryFrom(tx retryReader, request *Request, prior Request) *exit.Erro
 			return exit.Internalf("cannot inspect predecessor child custody: %s", err)
 		}
 	}
-	retained, stopped := prior.RetainWork, prior.State == "paused" || prior.State == "blocked" || prior.State == "succeeded" && retainedResult
+	retained, stopped := prior.RetainWork, prior.State == "paused" || prior.State == "failed" || prior.State == "succeeded" && retainedResult
 	var v1run bool
 	if request.MachineExecutionObserver {
 		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, prior.ID, RunV1Accepted).Scan(&v1run); err != nil {
@@ -71,17 +51,17 @@ func retainRetryFrom(tx retryReader, request *Request, prior Request) *exit.Erro
 			return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s has unconfirmed native acceptance; observe or explicitly abandon it", prior.ID)
 		}
 		var machineRetained bool
-		// Preparation can block before any submission exists. Its retained client
+		// Preparation can fail before any submission exists. Its retained client
 		// intent is retryable without inventing Runtime custody; a sent submission
 		// with a missing receipt must still reconcile possible acceptance first.
 		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id
 			WHERE r.id=? AND length(e.pending_control)=0 AND e.cancel_requested=0 AND (
 			(length(e.receipt)>0 AND `+machineExecutionOwed+`) OR
-			(r.state='blocked' AND r.retain_work=1 AND length(e.submission)=0 AND length(e.receipt)=0 AND NOT `+machineExecutionLost+`)))`, prior.ID).Scan(&machineRetained); err != nil {
+			(r.state='failed' AND r.retain_work=1 AND length(e.submission)=0 AND length(e.receipt)=0 AND NOT `+machineExecutionLost+`)))`, prior.ID).Scan(&machineRetained); err != nil {
 			return exit.Internalf("cannot inspect predecessor machine custody: %s", err)
 		}
 		retained = machineRetained
-		stopped = machineRetained && (prior.State == "failed" || prior.State == "paused" || prior.State == "blocked" || prior.State == "succeeded")
+		stopped = machineRetained && (prior.State == "failed" || prior.State == "paused" || prior.State == "succeeded")
 	}
 	if !request.RetainWork || request.Kind != "job" || !retained || !prior.IsJob() || !stopped {
 		return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s must retain stopped work; current state %s", prior.ID, prior.State)
@@ -125,47 +105,12 @@ func retainRetryFrom(tx retryReader, request *Request, prior Request) *exit.Erro
 // RetainedState is an execution stop that still owns the request's exact inputs,
 // intermediate outputs and machine. It is never a terminal attempt outcome.
 func RetainedState(state string) bool {
-	switch state {
-	case "pausing", "paused", "blocked":
-		return true
-	}
-	return false
+	return state == "pausing" || state == "paused"
 }
 
 func (r Request) RetainsLocalOutputs() bool {
 	return r.RetainWork && (r.ChildArtifacts || (r.WeightsOutputs != "" && r.WeightsOutputs != "[]")) &&
 		(r.ModelTransfer == nil || r.ModelTransfer.Destination == "")
-}
-
-func (s *Store) BlockRetainedWork(id, code, detail string) (bool, *exit.Error) {
-	return s.blockRetainedWork(id, code, detail)
-}
-
-func (s *Store) blockRetainedWork(id, code, detail string) (bool, *exit.Error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return false, exit.Internalf("cannot begin retained failure: %s", err)
-	}
-	defer tx.Rollback()
-	states := `'submitted','queued','dispatching','requeue_pending','finalizing'`
-	result, err := tx.Exec(`UPDATE requests SET state='blocked' WHERE id=? AND retain_work=1
-		AND state IN (`+states+`)`, id)
-	if err != nil {
-		return false, exit.Internalf("cannot retain failed work: %s", err)
-	}
-	changed, _ := result.RowsAffected()
-	if changed == 0 {
-		return false, nil
-	}
-	if err := appendEventTx(tx, id, "request.blocked", 0, map[string]any{
-		"status": "blocked", "error_type": code, "error": detail, "requeuing": false,
-	}); err != nil {
-		return false, exit.Internalf("cannot journal retained failure: %s", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, exit.Internalf("cannot commit retained failure: %s", err)
-	}
-	return true, nil
 }
 
 // RequestPause commits intent before any stop frame, fencing concurrent dispatch.
@@ -191,7 +136,7 @@ func (s *Store) RequestPause(id, actor string) (string, *exit.Error) {
 	if state == "paused" || state == "pausing" {
 		return state, nil
 	}
-	if settledRequestState(state) || state == "canceling" || state == "releasing" || state == "blocked" || state == "finalizing" {
+	if settledRequestState(state) || state == "canceling" || state == "releasing" || state == "finalizing" {
 		return "", exit.Named(exit.Conflict, "request.pause_refused", "request %s cannot pause from %s", id, state)
 	}
 	next := "pausing"
@@ -218,7 +163,7 @@ func (s *Store) CompleteRequestPause(id string) (bool, *exit.Error) {
 		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
 		AND NOT EXISTS(SELECT 1 FROM request_model_transfers WHERE request_id=? AND state='materializing')
 		AND NOT EXISTS(WITH RECURSIVE family(id) AS (SELECT id FROM requests WHERE parent_request_id=? UNION ALL SELECT r.id FROM requests r JOIN family f ON r.parent_request_id=f.id)
-		SELECT 1 FROM requests r JOIN family f ON r.id=f.id WHERE r.state NOT IN ('paused','blocked',`+settledRequestStates+`)
+		SELECT 1 FROM requests r JOIN family f ON r.id=f.id WHERE r.state NOT IN ('paused',`+settledRequestStates+`)
 		OR EXISTS(SELECT 1 FROM attempts a WHERE a.request_id=r.id AND a.state IN (`+openAttemptStates+`)))`, id, id, id, id)
 	if err != nil {
 		return false, exit.Internalf("cannot finish pause: %s", err)

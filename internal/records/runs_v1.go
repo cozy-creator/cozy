@@ -47,7 +47,7 @@ func (s *Store) MarkRunV1Sent(id string) (bool, *exit.Error) {
 	if err != nil {
 		return false, exit.Internalf("cannot read machine dispatch: %s", err)
 	}
-	if machine == "" || canceled || abandoned || Settled(state) || state == "pausing" || state == "paused" || state == "blocked" {
+	if machine == "" || canceled || abandoned || Settled(state) || state == "pausing" || state == "paused" {
 		return false, nil
 	}
 	if !sent {
@@ -432,7 +432,8 @@ func recordRunEndV1(tx *sql.Tx, id string, attempt uint64, raw []byte, end RunEn
 	if outcome.Status == "succeeded" {
 		return recordPublishedWeightsV1(tx, id, outcome.Outputs)
 	}
-	return nil
+	reason, _ := facts["error"].(string)
+	return endModelTransferTx(tx, id, state, reason)
 }
 
 // recordPublishedWeightsV1 records the checkpoints the machine published to the run's weights
@@ -458,7 +459,17 @@ func recordPublishedWeightsV1(tx *sql.Tx, id string, products []*v1.Product) *ex
 			}
 		}
 	}
-	if len(checkpoints) == 0 {
+	var missing []string
+	for _, output := range intent.Outputs {
+		if checkpoints[output.Name] == "" {
+			missing = append(missing, output.Name)
+		}
+	}
+	if len(missing) > 0 {
+		if _, err := tx.Exec(`UPDATE request_model_transfers SET state='failed',error_code='model_transfer.outputs_missing',safe_error=?,updated_at=? WHERE request_id=?`,
+			"the run succeeded but published no checkpoint for "+strings.Join(missing, ", ")+" to "+intent.Destination, now(), id); err != nil {
+			return exit.Internalf("cannot record the run's missing checkpoints: %s", err)
+		}
 		return nil
 	}
 	encoded, _ := json.Marshal(checkpoints)

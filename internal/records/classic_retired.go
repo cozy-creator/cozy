@@ -17,8 +17,8 @@ const ClassicRetiredOutcome = "CLASSIC_RETIRED"
 
 // RetireClassicWork ends, once at daemon start, every unfinished request that has no
 // machine execution and is not the daemon's own model pass-through: it ran or would run
-// on a classic worker session. Open attempts close
-// as ABANDONED and nothing is revived. A request being canceled ends canceled; every other
+// on a classic worker session. Every open attempt closes, as ABANDONED unless it recorded a
+// terminal, and nothing is revived. A request being canceled ends canceled; every other
 // one fails with ClassicRetiredCode. Custody held for any classic run is forgotten.
 func (s *Store) RetireClassicWork() ([]string, *exit.Error) {
 	tx, err := s.db.Begin()
@@ -52,15 +52,18 @@ func (s *Store) RetireClassicWork() ([]string, *exit.Error) {
 		return nil, exit.Internalf("cannot finish classic census: %s", err)
 	}
 	const message = "this work was accepted for the retired classic worker; machines now run work as machine executions"
+	// Every attempt row is a classic worker session's, and none is acknowledged again: each
+	// still open closes here, settled request or not, and a recorded terminal keeps its outcome.
+	if _, err := tx.Exec(`UPDATE attempts SET state='closed',
+		closed_at=CASE WHEN closed_at='' THEN ? ELSE closed_at END,
+		terminal_status=CASE WHEN terminal_status='' THEN 'ABANDONED' ELSE terminal_status END,
+		terminal_cause=CASE WHEN terminal_cause='' THEN 'EXECUTION_CONTEXT_LOST' ELSE terminal_cause END,
+		safe_message=CASE WHEN safe_message='' THEN ? ELSE safe_message END
+		WHERE state IN (`+openAttemptStates+`)`, now(), message); err != nil {
+		return nil, exit.Internalf("cannot close classic attempts: %s", err)
+	}
 	var ids []string
 	for _, r := range found {
-		if _, err := tx.Exec(`UPDATE attempts SET state='closed',closed_at=?,
-			terminal_status=CASE WHEN terminal_status='' THEN 'ABANDONED' ELSE terminal_status END,
-			terminal_cause=CASE WHEN terminal_cause='' THEN 'EXECUTION_CONTEXT_LOST' ELSE terminal_cause END,
-			safe_message=CASE WHEN safe_message='' THEN ? ELSE safe_message END
-			WHERE request_id=? AND state IN (`+openAttemptStates+`)`, now(), message, r.id); err != nil {
-			return nil, exit.Internalf("cannot close classic attempts of %s: %s", r.id, err)
-		}
 		state, event := "failed", "run.failed"
 		if r.state == "canceling" {
 			state, event = "canceled", "run.canceled"

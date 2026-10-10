@@ -33,7 +33,7 @@ func TestUnpublishedChildReopenPreservesPriorOwnership(t *testing.T) {
 	before, problem := store.RequestRow(prior.ID)
 	fatal(t, problem)
 	store.Close()
-	store, problem = records.OpenForDaemon(path)
+	store, problem = records.Open(path)
 	fatal(t, problem)
 	defer store.Close()
 	after, problem := store.RequestRow(prior.ID)
@@ -103,7 +103,7 @@ func TestUnpublishedChildrenDoNotReuseEffectsByDefault(t *testing.T) {
 	child, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	closeChild(t, store, child, "SUCCEEDED", "succeeded")
-	closeChild(t, store, parent, "FAILED", "blocked")
+	closeChild(t, store, parent, "FAILED", "failed")
 	parent.ID, parent.IdemKey, parent.RetryOf = "req-effects-edited", "effects-edited", parent.ID
 	parent, _, problem = store.Submit(parent)
 	fatal(t, problem)
@@ -164,7 +164,7 @@ func TestUnpublishedChildHistoryDoesNotActAsOperationCache(t *testing.T) {
 		t.Fatalf("child lost owner scope: %+v", child)
 	}
 	closeChild(t, store, child, "SUCCEEDED", "succeeded")
-	closeChild(t, store, parent, "FAILED", "blocked")
+	closeChild(t, store, parent, "FAILED", "failed")
 	next := parent
 	next.ID, next.IdemKey = "req-parent-edited", "parent-edited"
 	next.RetryOf = parent.ID

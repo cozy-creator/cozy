@@ -252,7 +252,7 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 	entered := make(chan string, 4)
 	release := make(chan struct{})
 	var calls, active atomic.Int32
-	q := machines.NewInstalls(store, prepared(func(ctx context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
+	q := machines.NewInstalls(store, prepared(func(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) *exit.Error {
 		if active.Add(1) != 1 {
 			t.Error("one rental received concurrent installations")
 		}
@@ -260,6 +260,9 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 		call := calls.Add(1)
 		entered <- row.Selection.Release
 		if call == 1 {
+			// Bytes moved before the machine became unavailable: it is tried again.
+			report(machines.InstallProgress{Stage: "download", TotalBytes: 100})
+			report(machines.InstallProgress{Stage: "download", TotalBytes: 100, TransferredBytes: 40})
 			return exit.Unavailablef("control stream unavailable")
 		}
 		if call == 2 {
@@ -313,6 +316,41 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 	waitRentalInstall(t, store, second.ID, "succeeded")
 	if calls.Load() != 3 {
 		t.Fatalf("prepare calls=%d", calls.Load())
+	}
+}
+
+// An unavailable machine that let an installation make no progress fails it with the reason:
+// it is not queued again, however often the queue wakes.
+func TestRentalInstallWithNoProgressFailsInsteadOfQueuingAgain(t *testing.T) {
+	_, store := rentalInstallStore(t)
+	machine := rentalInstallMachine("ready")
+	rentalInstallCheck(t, store.RecordRental(machine))
+	var calls atomic.Int32
+	q := machines.NewInstalls(store, prepared(func(_ context.Context, _ records.RentalInstall, report func(machines.InstallProgress)) *exit.Error {
+		calls.Add(1)
+		report(machines.InstallProgress{Stage: "connect"})
+		return exit.Named(exit.Unavailable, "machine.stopped", "this computer's machine is stopped")
+	}), io.Discard)
+	row, problem := q.Accept(machine.ID, records.RentalInstallSelection{Package: "proof/stalled", Release: "1.0.0"})
+	rentalInstallCheck(t, problem)
+	runRentalInstallQueue(t, q)
+	done := waitRentalInstall(t, store, row.ID, "failed")
+	if done.ErrorCode != "machine.stopped" {
+		t.Fatalf("the installation failed without its reason: %+v", done)
+	}
+	for range 5 {
+		q.Wake()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("a failed installation was tried %d times", calls.Load())
+	}
+	obligations, problem := store.Obligations()
+	rentalInstallCheck(t, problem)
+	for _, o := range obligations {
+		if o.Kind == "rental_install" {
+			t.Fatalf("a failed installation holds the daemon: %+v", o)
+		}
 	}
 }
 

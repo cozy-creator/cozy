@@ -60,11 +60,11 @@ func TestRentalIdleObservationScopesWorkAndRetainedState(t *testing.T) {
 	}
 	paused := observe()
 	idleSince(paused, paused.Since)
-	blocked := recordPrivateTransaction(t, store, "blocked", row.ID)
-	changed, p := store.BlockRetainedWork(blocked.ID, "fixture", "failed work remains retained")
+	failed := recordPrivateTransaction(t, store, "failed", row.ID)
+	changed, p := store.FailQueuedRequest(failed.ID, retainedFailure("fixture", "failed before it started"))
 	fatal(t, p)
 	if !changed {
-		t.Fatal("blocked fixture did not settle")
+		t.Fatal("failed fixture did not settle")
 	}
 	idle := observe()
 	idleSince(idle, idle.Since)
