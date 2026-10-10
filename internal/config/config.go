@@ -112,6 +112,11 @@ type Config struct {
 	// keeps the daemon up until `cozy down`.
 	DaemonIdleShutdown time.Duration
 
+	// HubLiveness is the longest a connection to Tensorhub may show no sign of life (no
+	// frame, no ACK to a probe) before it is dead. It never bounds how long a Hub that is
+	// alive takes to answer.
+	HubLiveness time.Duration
+
 	// PlacementPrefer is the tier a rented run is placed under (placement-economics.md):
 	// fast | balanced | cheap. Config only, never a flag.
 	PlacementPrefer string
@@ -140,6 +145,7 @@ type values struct {
 	RentalsDevelopment       bool   `name:"rentals_development" default:"true"`
 	RentalsSSHPublicKey      string `name:"rentals_ssh_public_key"`
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
+	HubLivenessS             int64  `name:"tensorhub_liveness_s" default:"40"`
 	PlacementPrefer          string `name:"placement_prefer" default:"balanced"`
 	PlayerURL                string `name:"player_url" default:"https://cozy-creator.github.io/cozy/play/"`
 	Port                     int    `name:"port" default:"8818"`
@@ -168,6 +174,7 @@ var behaviour = map[string]struct {
 	"local_rate_micro_usd_per_hour": {"local_rate_micro_usd_per_hour", nonNegative},
 	"rentals_development":           {"rentals.development", boolean},
 	"daemon_idle_shutdown_s":        {"daemon.idle_shutdown_s", nonNegative},
+	"tensorhub_liveness_s":          {"tensorhub_liveness_s", positive},
 	"placement_prefer":              {"placement.prefer", oneOf("fast", "balanced", "cheap")},
 	"port":                          {"port", tcpPort},
 	"yield":                         {"yield", oneOf("smart", "always", "never")},
@@ -177,6 +184,14 @@ func nonNegative(raw string) error {
 	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil || value < 0 {
 		return fmt.Errorf("is not a non-negative integer")
+	}
+	return nil
+}
+
+func positive(raw string) error {
+	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || value < 1 {
+		return fmt.Errorf("is not a positive integer")
 	}
 	return nil
 }
@@ -238,6 +253,7 @@ func admitBehaviour(file *resolver) []unusableSetting {
 var fileKeys = map[string]bool{
 	"tensorhub_url":                 true,
 	"tensorhub_token":               true,
+	"tensorhub_liveness_s":          true,
 	"huggingface_token":             true,
 	"civitai_token":                 true,
 	"tfs":                           true,
@@ -466,6 +482,7 @@ func load() (Config, *exit.Error) {
 		RentalsDevelopment:       input.RentalsDevelopment,
 		RentalsSSHPublicKey:      strings.TrimSpace(input.RentalsSSHPublicKey),
 		DaemonIdleShutdown:       time.Duration(input.DaemonIdleShutdownS) * time.Second,
+		HubLiveness:              time.Duration(input.HubLivenessS) * time.Second,
 		PlacementPrefer:          input.PlacementPrefer,
 		PlayerURL:                strings.TrimSpace(input.PlayerURL),
 		Digest:                   digest,

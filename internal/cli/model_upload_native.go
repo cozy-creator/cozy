@@ -225,7 +225,7 @@ func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profi
 		}
 		source, named.source = narrowed, narrowed
 	}
-	runCtx, cancel := hub.LongContext()
+	runCtx, cancel := hub.Context()
 	defer cancel()
 	conversion, problem := preflightConversionPlan(runCtx, ctx, source, profileSlots(profiles))
 	if hostUnaware(problem) {

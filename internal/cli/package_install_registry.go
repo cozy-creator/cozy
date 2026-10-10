@@ -120,7 +120,7 @@ func resolveRegistryPackage(ctx *Context, value, version string) (hub.Ref, hub.P
 	if problem != nil {
 		return ref, hub.PackageDownloadPlan{}, problem
 	}
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	packagePublishStatus(ctx, "Resolving %s...", ref.String())
 	plan, problem := client(ctx).PackageDownloads(hctx, ref, release)

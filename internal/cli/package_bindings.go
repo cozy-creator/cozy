@@ -142,7 +142,7 @@ func handlePackageBind(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	if problem := verifyPackageSlot(hctx, c, ref, slot); problem != nil {
 		return problem

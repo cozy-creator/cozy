@@ -64,7 +64,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	reason := "cozy package publish " + ref.String() + "@" + release
 	packagePublishStatus(ctx, "Checking %s@%s...", ref.String(), release)
 
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	lookupStarted := time.Now()
 	detail, lookupProblem := c.PackageRelease(hctx, ref, release)
@@ -187,7 +187,7 @@ func handlePackageYank(ctx *Context) *exit.Error {
 			WithRemedy("use a release such as 1.2.3")
 	}
 	reason := "cozy package yank " + ref.String() + "@" + release
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	yanked, problem := client(ctx).YankPackageRelease(hctx, ref, release, reason)
 	if problem != nil {

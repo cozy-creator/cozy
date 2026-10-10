@@ -161,12 +161,9 @@ func packagePublishPath(ref Ref, release string) string {
 func (c *Client) DeclarePackageRelease(ctx context.Context, ref Ref, release string,
 	files []PackageDeclaredFile, reason string) (PackageReleaseDraft, *exit.Error) {
 	var out PackageReleaseDraft
-	// patient: the grant answers one store HEAD per declared subject — work
-	// bounded by the declaration itself, not by a wall clock. A 174-file
-	// declaration against remote object custody exceeded the 10s header clock.
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packagePublishPath(ref, release), auth: true, reason: reason,
-		body: map[string]any{"files": files}, patient: true,
+		body:          map[string]any{"files": files},
 		responseBytes: 16 << 20}, &out)
 	return out, e
 }
@@ -184,8 +181,7 @@ func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release stri
 	var out PackageReleaseCommit
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packagePublishPath(ref, release) + "/finalize", auth: true, reason: reason,
-		body:    body,
-		patient: true}, &out)
+		body: body}, &out)
 	return out, e
 }
 
@@ -202,8 +198,7 @@ func (c *Client) PackageReleaseStatus(ctx context.Context, ref Ref, release stri
 const packageFinalizePollInterval = 2 * time.Second
 
 // WaitPackageRelease follows a 202 finalization until the durable commit or
-// typed failure is visible. Each status call has a short header/body deadline;
-// the caller context, rather than a fixed wall clock, controls the whole wait.
+// typed failure is visible. The caller context controls the whole wait.
 func (c *Client) WaitPackageRelease(ctx context.Context, ref Ref, release string,
 	initial PackageReleaseCommit, progress func(PackageReleaseCommit),
 ) (PackageReleaseCommit, *exit.Error) {
@@ -228,9 +223,7 @@ func (c *Client) WaitPackageRelease(ctx context.Context, ref Ref, release string
 			return state, exit.New(exit.Canceled, "package finalization was canceled")
 		case <-timer.C:
 		}
-		callCtx, cancel := context.WithTimeout(ctx, Timeout)
-		next, problem := c.PackageReleaseStatus(callCtx, ref, release)
-		cancel()
+		next, problem := c.PackageReleaseStatus(ctx, ref, release)
 		if transientPoll(ctx, problem) {
 			continue
 		}

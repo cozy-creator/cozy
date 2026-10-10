@@ -171,7 +171,7 @@ func New(cfg config.Config) *Manager {
 	if managers.byPath == nil {
 		managers.byPath = map[string]*Manager{}
 	}
-	manager := &Manager{hub: origin, path: path, http: &http.Client{Timeout: hub.Timeout}, now: time.Now}
+	manager := &Manager{hub: origin, path: path, http: hub.HTTP(cfg.HubLiveness), now: time.Now}
 	managers.byPath[path] = manager
 	return manager
 }

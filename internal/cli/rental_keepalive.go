@@ -10,7 +10,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
@@ -68,8 +67,6 @@ func (m *managedRentals) keepalive(ctx context.Context, id string) (api.RentalKe
 	if problem != nil {
 		return out, problem
 	}
-	ctx, cancel := context.WithTimeout(ctx, hub.Timeout)
-	defer cancel()
 	receipt, problem := rental.KeepAlive(ctx, m.layout, row)
 	if problem == nil {
 		problem = m.store.RecordRentalKeepalive(id, receipt, time.Now())
