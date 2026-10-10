@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -79,6 +80,41 @@ func TestRunShowPrintsEachGPUsAttentionKernels(t *testing.T) {
 				t.Fatalf("run show --json lost a GPU's kernel evidence from %s: %+v", fixture, gpu)
 			}
 		}
+	}
+}
+
+// A kernel that finishes compiling mid-run serves the run's later steps, and run show names
+// which steps served which kernels, for the run and its call, while --json keeps the record.
+// Run 5168's recorded measurements: a fresh RTX 5090 took Sage3 FP4 from denoise step 3.
+func TestRunShowNamesWhichStepsServedWhichKernels(t *testing.T) {
+	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "h3-run-5168-segments.json"))
+	must(t, err)
+	o := hostOwner(t, "run-show-segments")
+	id := succeededWithTriage(t, o, bundle)
+	fatal(t, o.store.AppendEvent(id, "run.in_progress", 1, map[string]any{"started_unix_ms": 1791588625585}))
+	defer publicationControlAPI(t, o)()
+	want := "\nGPU 0 attention by step: denoise steps 0–2 fl2va_dit=sol-attn, dense sageattention · 3–7 " +
+		"fl2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv, dense sageattention3-fp4-global-lowmem; sparse-prefix=kitchen-int8\n\nattention kernels\n"
+	for _, args := range [][]string{{"run", "show", id}, {"run", "show", id, "--call", "0"}} {
+		code, human := runCozy(t, o.root, args...)
+		if code != 0 || !strings.Contains(human, want) {
+			t.Fatalf("%v [%d] does not say which steps served which kernels:\n%s", args, code, human)
+		}
+	}
+	code, out := runCozy(t, o.root, "run", "show", id, "--json")
+	var report struct {
+		GPUs []struct {
+			Attention struct {
+				Segments []struct {
+					Stage string `json:"stage"`
+					Step  int    `json:"step"`
+				} `json:"segments"`
+			} `json:"attention"`
+		} `json:"gpus"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &report) != nil || len(report.GPUs) != 1 ||
+		fmt.Sprint(report.GPUs[0].Attention.Segments) != "[{ 0} {denoise 3}]" {
+		t.Fatalf("run show --json [%d] lost the attention segments: %+v\n%s", code, report, out)
 	}
 }
 

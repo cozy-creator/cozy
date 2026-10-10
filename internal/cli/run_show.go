@@ -129,7 +129,18 @@ type reportGPU struct {
 		Impl      string         `json:"impl"`
 		Kernels   []reportKernel `json:"kernels,omitempty"` // every kernel of its chains
 		Sol       *solCalls      `json:"sol,omitempty"`
+		Segments  []segment      `json:"segments,omitempty"`
 	} `json:"attention"`
+}
+
+// segment is one attention selection a run served from `step` of `stage` on ("" is the
+// run's start), when a kernel that finished compiling mid-run took over. `dense` is Sol's.
+type segment struct {
+	Stage    string `json:"stage"`
+	Step     int    `json:"step"`
+	AtUS     int64  `json:"at_us"`
+	Observed string `json:"observed"`
+	Dense    string `json:"dense"`
 }
 
 // solCalls are Sol's attention calls on one GPU: sparse ones (approximate) and dense ones.
@@ -934,7 +945,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		_ = table.Flush()
 	}
 	emitTimeline(w, table, r.Stages, r.Steps, offset, mode.Full)
-	emitGPUs(w, table, r.GPUs, offset, mode.Full)
+	emitGPUs(w, table, r.GPUs, r.Steps, offset, mode.Full)
 	if len(r.Calls) == 0 {
 		return nil
 	}
@@ -1015,7 +1026,7 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 		fmt.Fprintf(w, "error: %s\n", c.Error)
 	}
 	emitTimeline(w, table, c.Stages, c.Steps, offset, full)
-	emitGPUs(w, table, c.GPUs, offset, full)
+	emitGPUs(w, table, c.GPUs, c.Steps, offset, full)
 }
 
 func (c reportCall) state() string {
@@ -1068,7 +1079,7 @@ func emitTimeline(w io.Writer, table *tabwriter.Writer, stages []reportStage, st
 
 // emitGPUs prints the GPUs an execution ran on, by the number nvidia-smi shows. A card held
 // with no process on it (a one-process call on a wider grant) and a CPU process are not.
-func emitGPUs(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, offset func(int64) string, full bool) {
+func emitGPUs(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, steps []reportSteps, offset func(int64) string, full bool) {
 	gpus = slices.DeleteFunc(slices.Clone(gpus), func(g reportGPU) bool {
 		return g.PID <= 0 || g.GPU < 0 && g.UUID == ""
 	})
@@ -1086,7 +1097,63 @@ func emitGPUs(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, offset fun
 			output.Elide(dash(gpu.UUID), 17, full), gpu.PID, start, took, gpuAttention(gpu))
 	}
 	table.Flush()
+	for _, gpu := range gpus {
+		if len(gpu.Attention.Segments) > 1 {
+			fmt.Fprintf(w, "GPU %s attention by step: %s\n", gpu.number(), segmentsText(gpu.Attention.Segments, steps))
+		}
+	}
 	emitKernels(w, table, gpus, full)
+}
+
+// segmentsText spells which steps served which selection, naming only what differs between
+// them: "denoise steps 0–2 fl2va_dit=sol-attn, dense sageattention · 3–7 …". The run's start
+// reads as the next selection's stage when it served steps of it, else as before that stage;
+// a stage whose step count is unknown is left open ("3–").
+func segmentsText(segments []segment, steps []reportSteps) string {
+	held := make([][]string, len(segments))
+	for i, s := range segments {
+		held[i] = strings.Split(s.Observed, ",")
+		if s.Dense != "" {
+			held[i] = append(held[i], "dense "+s.Dense)
+		}
+	}
+	text, stage := make([]string, len(segments)), ""
+	for i, s := range segments {
+		var next segment
+		if i+1 < len(segments) {
+			next = segments[i+1]
+		}
+		served := "before " + next.Stage
+		if s.Stage != "" || next.Step > 0 {
+			s.Stage = cmp.Or(s.Stage, next.Stage)
+			last := next.Step - 1
+			if next.Stage != s.Stage {
+				last = -1
+				for _, track := range steps {
+					if track.Name == s.Stage {
+						last = track.Count - 1
+					}
+				}
+			}
+			served = strconv.Itoa(s.Step)
+			if last != s.Step {
+				served += "–"
+			}
+			if last > s.Step {
+				served += strconv.Itoa(last)
+			}
+			if s.Stage != stage {
+				served = s.Stage + " steps " + served
+			}
+			stage = s.Stage
+		}
+		// What every selection held says nothing about this one.
+		differs := slices.DeleteFunc(slices.Clone(held[i]), func(part string) bool {
+			return !slices.ContainsFunc(held, func(other []string) bool { return !slices.Contains(other, part) })
+		})
+		text[i] = served + " " + strings.Join(differs, ", ")
+	}
+	return strings.Join(text, " · ")
 }
 
 // number is the GPU's number as nvidia-smi shows it, "-" when unknown.
