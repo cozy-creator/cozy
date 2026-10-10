@@ -87,7 +87,7 @@ func holdCheckpoint(ctx *Context, source string) *exit.Error {
 	if problem != nil || !known {
 		return problem
 	}
-	model, problem := resolveRemoteModel(ctx, "", launch.Slot{}, source, "", nil)
+	model, problem := resolveRemoteModel(ctx, client(ctx), "", launch.Slot{}, source, "", nil)
 	if problem != nil {
 		return problem
 	}

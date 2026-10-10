@@ -67,7 +67,7 @@ func Open(root string) (Layout, *exit.Error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return Layout{}, exit.Internalf("cannot create the private local root %s: %s", root, err)
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
+	if err := Protect(root, 0o700); err != nil {
 		return Layout{}, exit.Internalf("cannot protect the private local root %s: %s", root, err)
 	}
 	l := Paths(root)
@@ -79,6 +79,16 @@ func Open(root string) (Layout, *exit.Error) {
 		}
 	}
 	return l, nil
+}
+
+// Protect gives path the private mode, writing only when it has another: every command opens
+// the root and its records, and a mode rewritten each time is a journal write that waits on a
+// busy disk for seconds where reading the mode never does.
+func Protect(path string, mode os.FileMode) error {
+	if info, err := os.Stat(path); err == nil && info.Mode().Perm() == mode {
+		return nil
+	}
+	return os.Chmod(path, mode)
 }
 
 // Paths derives the layout from root without touching the filesystem. Only readers that

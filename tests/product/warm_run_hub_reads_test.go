@@ -201,8 +201,10 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 	var seen []string
 	count := func(hub string, handler http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			authority := r.Method == http.MethodGet && r.URL.Path == "/v1/worker/rental/authorized-keys"
-			if !strings.HasPrefix(r.URL.Path, "/v1/rentals") && !authority {
+			// Run or no run, the daemon re-reads its rentals and a rental's machine its own
+			// authority, each on its own clock.
+			background := r.Method == http.MethodGet && (strings.HasPrefix(r.URL.Path, "/v1/rentals") || r.URL.Path == "/v1/worker/rental/authorized-keys")
+			if !background {
 				mu.Lock()
 				seen = append(seen, hub+" "+r.Method+" "+r.URL.Path)
 				mu.Unlock()
@@ -273,6 +275,26 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 			if key == "warm" && len(calls) != 0 {
 				t.Fatalf("the warm run on %s made %d Hub requests; want none: %v", venue.name, len(calls), calls)
 			}
+		}
+	}
+
+	// A new daemon is no colder: what the last one read (the Hub's execution environment,
+	// this computer's short bearer) is kept on disk, not in a process.
+	if code, out := runCozy(t, root, "down"); code != 0 {
+		t.Fatalf("down [exit %d]\n%s", code, out)
+	}
+	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {
+		mu.Lock()
+		seen = nil
+		mu.Unlock()
+		if code, out := runCozy(t, root, append([]string{"run", parityPublished + "/touch", "value=1", "--await", "--json"}, args...)...); code != 0 || !strings.Contains(out, `"value":2`) {
+			t.Fatalf("touch on %s under a new daemon [exit %d]\n%s", venue, code, out)
+		}
+		mu.Lock()
+		calls := append([]string(nil), seen...)
+		mu.Unlock()
+		if len(calls) != 0 {
+			t.Fatalf("the warm run on %s under a new daemon made %d Hub requests; want none: %v", venue, len(calls), calls)
 		}
 	}
 

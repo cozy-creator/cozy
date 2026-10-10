@@ -270,6 +270,9 @@ func (s *Store) MachineExecutions() ([]MachineExecution, *exit.Error) {
 	return result, nil
 }
 
+// LocalMachine names this computer's machine as a run's destination.
+const LocalMachine = "local"
+
 // LinkMachineExecution pins the selected machine before preparation or submission.
 // Reconnect cannot silently move an accepted or ambiguous execution to another pod.
 func (s *Store) LinkMachineExecution(id, machine string) *exit.Error {

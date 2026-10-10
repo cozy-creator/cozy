@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 
@@ -23,16 +24,69 @@ import (
 // so a binding naming a release or lane the card does not carry is refused with the real
 // list rather than a bare "not found" hours later on a paid pod.
 
+// cardReader reads a model card: a Hub, or the cards one command already read.
+type cardReader interface {
+	ModelCard(context.Context, hub.Ref) (hub.ModelCard, *exit.Error)
+}
+
+// readCards reads each distinct model card refs name at once, so a run with several cold slots
+// waits on one round trip rather than one per slot. A card it could not read is read again,
+// and refused, where it is used.
+func readCards(ctx *Context, refs []string) cardReader {
+	cards := &readCardSet{hub: client(ctx), cards: map[string]hub.ModelCard{}}
+	var wait sync.WaitGroup
+	var mu sync.Mutex
+	for _, raw := range refs {
+		model, _, _, _, problem := hub.ParseModelRef(raw)
+		ref, refProblem := hub.ParseRef(model)
+		if problem != nil || refProblem != nil || ref.Org == "local" {
+			continue
+		}
+		if _, seen := cards.cards[ref.String()]; seen {
+			continue
+		}
+		cards.cards[ref.String()] = hub.ModelCard{}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			hctx, cancel := hub.Context()
+			defer cancel()
+			card, problem := cards.hub.ModelCard(hctx, ref)
+			mu.Lock()
+			defer mu.Unlock()
+			if problem != nil {
+				delete(cards.cards, ref.String())
+			} else {
+				cards.cards[ref.String()] = card
+			}
+		}()
+	}
+	wait.Wait()
+	return cards
+}
+
+type readCardSet struct {
+	hub   *hub.Client
+	cards map[string]hub.ModelCard
+}
+
+func (s *readCardSet) ModelCard(ctx context.Context, ref hub.Ref) (hub.ModelCard, *exit.Error) {
+	if card, read := s.cards[ref.String()]; read {
+		return card, nil
+	}
+	return s.hub.ModelCard(ctx, ref)
+}
+
 // modelReleaseCard reads the card and selects `release` (the newest unyanked one when
 // empty). A release named explicitly is honoured even when yanked. A miss names the
 // releases the card offers.
-func modelReleaseCard(ctx context.Context, c *hub.Client, ref hub.Ref, release string) (
+func modelReleaseCard(ctx context.Context, c cardReader, ref hub.Ref, release string) (
 	hub.ModelCard, *hub.ModelReleaseSummary, *exit.Error,
 ) {
 	return modelReleaseCardForLane(ctx, c, ref, release, "")
 }
 
-func modelReleaseCardForLane(ctx context.Context, c *hub.Client, ref hub.Ref, release, lane string) (hub.ModelCard, *hub.ModelReleaseSummary, *exit.Error) {
+func modelReleaseCardForLane(ctx context.Context, c cardReader, ref hub.Ref, release, lane string) (hub.ModelCard, *hub.ModelReleaseSummary, *exit.Error) {
 	card, problem := c.ModelCard(ctx, ref)
 	if problem != nil {
 		return card, nil, problem
@@ -140,7 +194,7 @@ func bindRemedy(packageName, slot string) string {
 // resolveRemoteLadder resolves a configured ladder for a rented run WITHOUT choosing a lane: every
 // rung is bound to the exact manifest the card publishes for its lane, and the machine
 // decision pins one of them once the machine exists.
-func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
+func resolveRemoteLadder(ctx *Context, cards cardReader, packageName string, slot launch.Slot,
 	spec invocationModelSpec) (orchestrator.ModelRef, *exit.Error) {
 	var empty orchestrator.ModelRef
 	modelName, release, _, _, problem := hub.ParseModelRef(spec.Ref)
@@ -156,7 +210,7 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	_, selected, problem := modelReleaseCard(hctx, client(ctx), ref, release)
+	_, selected, problem := modelReleaseCard(hctx, cards, ref, release)
 	if problem != nil {
 		return empty, rebind(problem, packageName, slot.Path)
 	}

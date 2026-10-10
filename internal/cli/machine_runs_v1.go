@@ -893,16 +893,10 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 		}
 		return &v1.HubAccess{Origin: origin}, nil
 	}
-	key := origin + "\x00" + account.CredentialIdentity()
-	held, ok := m.hubEnvironments.Load(key)
-	if !ok {
-		environment, problem := account.ExecutionEnvironment(ctx)
-		if problem != nil {
-			return nil, problem
-		}
-		held, _ = m.hubEnvironments.LoadOrStore(key, environment)
+	environment, problem := account.ExecutionEnvironment(ctx)
+	if problem != nil {
+		return nil, problem
 	}
-	environment := held.(hub.ExecutionEnvironment)
 	reads := environment.Environment["TENSORHUB_ORIGIN"]
 	if local := loopbackHub(origin); machine.Local && local != "" && loopbackHub(reads) == "" {
 		reads = local // this computer's machine reads a Hub on this computer there
@@ -916,15 +910,9 @@ func (m *machineRuns) hubAccessV1(ctx context.Context, origin string, machine *m
 	if len(operations) == 0 {
 		return access, nil
 	}
-	tokens, ok := m.hubTokenEndpoints.Load(origin)
-	if !ok {
-		endpoint, problem := account.TokenEndpoint(ctx)
-		if problem != nil {
-			return nil, problem
-		}
-		tokens, _ = m.hubTokenEndpoints.LoadOrStore(origin, endpoint)
+	if access.TokenEndpoint, problem = account.TokenEndpoint(ctx); problem != nil {
+		return nil, problem
 	}
-	access.TokenEndpoint = tokens.(string)
 	user, problem := account.CurrentAccount(ctx)
 	if problem != nil {
 		return nil, problem

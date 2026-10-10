@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 )
 
 // PackageInstall is one immutable install: a materialized environment plus the exact files
@@ -211,7 +212,7 @@ func open(path string) (*Store, *exit.Error) {
 	// the same boundary the daemon record carries, and the WAL/SHM siblings SQLite
 	// creates next inherit these bits (cl-116). Windows mode bits are a fiction; the
 	// user-profile ACL scopes the root there.
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := home.Protect(path, 0o600); err != nil {
 		db.Close()
 		return nil, exit.Internalf("cannot protect the records database %s: %s", path, err)
 	}

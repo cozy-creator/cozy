@@ -136,11 +136,12 @@ func (m *Manager) Forget() *exit.Error {
 	if err := os.Remove(m.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return exit.Internalf("cannot erase the machine credential: %s", err)
 	}
+	_ = os.Remove(m.sessionPath())
 	m.session = Session{}
 	return nil
 }
 
-// Manager owns one Tensorhub origin's machine key and memory-only access token.
+// Manager owns one Tensorhub origin's machine key and its short access token, kept beside it.
 // Obtaining one performs no I/O or network work.
 type Manager struct {
 	hub     string
@@ -269,7 +270,15 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 	}
 	// Another CLI process may have signed out or installed a different device key.
 	// Cached bearers belong only to the key still present on disk.
-	if m.session.DeviceKeyID == stored.DeviceKeyID && m.session.AccessToken.Present() && m.session.ExpiresAt.After(m.now().Add(30*time.Second)) {
+	live := func(s Session) bool {
+		return s.DeviceKeyID == stored.DeviceKeyID && s.AccessToken.Present() && s.ExpiresAt.After(m.now().Add(30*time.Second))
+	}
+	if live(m.session) {
+		return m.session, nil
+	}
+	// A bearer another command minted serves this one: each command is a short process.
+	if kept := m.loadSession(); live(kept) {
+		m.session = kept
 		return m.session, nil
 	}
 	m.session = Session{}
@@ -298,7 +307,48 @@ func (m *Manager) Authenticate(ctx context.Context) (Session, *exit.Error) {
 		return Session{}, m.keyRefused(problem)
 	}
 	m.session, problem = answer.session(stored.Email, started)
+	if problem == nil {
+		m.saveSession(m.session)
+	}
 	return m.session, problem
+}
+
+// keptSession is a bearer kept beside its machine key, mode 0600, for the next command.
+type keptSession struct {
+	AccessToken string    `json:"access_token"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	DeviceKeyID string    `json:"device_key_id"`
+	Email       string    `json:"email"`
+}
+
+func (m *Manager) sessionPath() string { return strings.TrimSuffix(m.path, ".json") + ".session.json" }
+
+func (m *Manager) loadSession() Session {
+	raw, err := os.ReadFile(m.sessionPath())
+	var kept keptSession
+	if err != nil || json.Unmarshal(raw, &kept) != nil {
+		return Session{}
+	}
+	return Session{AccessToken: secret.New(kept.AccessToken), ExpiresAt: kept.ExpiresAt, DeviceKeyID: kept.DeviceKeyID, Email: kept.Email}
+}
+
+// saveSession is best effort: a bearer that cannot be kept is minted again next time.
+func (m *Manager) saveSession(s Session) {
+	raw, err := json.Marshal(keptSession{AccessToken: s.AccessToken.Reveal(), ExpiresAt: s.ExpiresAt, DeviceKeyID: s.DeviceKeyID, Email: s.Email})
+	if err != nil {
+		return
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(m.path), ".session-*.tmp")
+	if err != nil {
+		return
+	}
+	defer os.Remove(temporary.Name())
+	if err = temporary.Chmod(0o600); err == nil {
+		_, err = temporary.Write(raw)
+	}
+	if closeErr := temporary.Close(); err == nil && closeErr == nil {
+		_ = os.Rename(temporary.Name(), m.sessionPath())
+	}
 }
 
 // BeginEnrollment sends the email code and retains a fresh key only in memory.
@@ -366,6 +416,7 @@ func (m *Manager) FinishEnrollment(ctx context.Context, enrollment *Enrollment, 
 	}
 	m.mu.Lock()
 	m.session = session
+	m.saveSession(session)
 	m.mu.Unlock()
 	return session, nil
 }
@@ -598,6 +649,7 @@ func (m *Manager) loginCommand() string {
 // without expiring our copy of it.
 func (m *Manager) Invalidate() {
 	m.mu.Lock()
+	_ = os.Remove(m.sessionPath())
 	m.session = Session{}
 	m.mu.Unlock()
 }

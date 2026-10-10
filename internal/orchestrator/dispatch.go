@@ -172,6 +172,15 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 	if req.Hub == "" {
 		req.Hub = c.opt.Cfg.HubURL
 	}
+	// A run that names its machine is placed in the commit its submission waits on: this
+	// computer's, or a named rental (refused there when released). Only a rental the fleet has
+	// yet to choose is placed later.
+	if req.Worker == "" {
+		req.Worker = req.RequestedRental
+	}
+	if req.Placement = req.Worker; !req.Rental && !machineendpoint.IsName(req.Worker) {
+		req.Placement = records.LocalMachine
+	}
 	req, fresh, e := c.opt.Store.SubmitWithEvent(req, event)
 	if e != nil {
 		return records.Request{}, false, e
