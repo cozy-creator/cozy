@@ -3206,7 +3206,7 @@ func newestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
 		best = bestPre
 	}
 	if best == "" {
-		return "", exit.New(exit.NotFound, "package has no non-yanked release")
+		return "", exit.Named(exit.NotFound, "package.all_yanked", "package has no non-yanked release")
 	}
 	return best, nil
 }

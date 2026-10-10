@@ -632,6 +632,11 @@ func boundedSourceTree(tree string, requiredFiles []string) (string, map[string]
 		return "", nil, exit.Named(exit.Structural, "package_tree_unreadable", "%s: %v", root, err)
 	}
 	for _, required := range requiredFiles {
+		if files[required] == "" && required == "uv.lock" {
+			return "", nil, exit.Named(exit.Validation, "package_source_required_file_missing",
+				"package source has no uv.lock").
+				WithRemedy("lock it once with `cozy package lock` in %s; `cozy run` takes a directory without one", root)
+		}
 		if files[required] == "" {
 			return "", nil, exit.Named(exit.Validation, "package_source_required_file_missing",
 				"package source has no %s", required)
