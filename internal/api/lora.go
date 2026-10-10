@@ -21,13 +21,16 @@ type Capabilities struct {
 	MachineV1 bool `json:"machine_v1"`
 	// WarmSet is a controller whose rental installations carry a warm set member.
 	WarmSet bool `json:"warm_set"`
+	// PackageVerbs is a controller whose rental installations take a hub's newest release,
+	// this computer's local code and removals.
+	PackageVerbs bool `json:"package_verbs"`
 }
 
 func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
 	_, endpoint := s.machineExecutions.(interface {
 		ValidateEndpoint(context.Context, *machineendpoint.Endpoint) *exit.Error
 	})
-	s.ok(w, r, http.StatusOK, Capabilities{ModelOverrides: true, MachineEndpoints: endpoint, MachineV1: s.machineExecutions != nil, WarmSet: true})
+	s.ok(w, r, http.StatusOK, Capabilities{ModelOverrides: true, MachineEndpoints: endpoint, MachineV1: s.machineExecutions != nil, WarmSet: true, PackageVerbs: true})
 }
 
 // validateModelAdapters validates selection syntax; the executing Runtime owns

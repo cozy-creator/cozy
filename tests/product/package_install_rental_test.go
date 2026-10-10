@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,9 +27,13 @@ import (
 func TestPackageInstallRental(t *testing.T) {
 	for _, test := range []struct {
 		name, version, installed, rental string
+		// older: a daemon from before package_verbs takes exact releases only, so the
+		// command reads the newest at the hub itself.
+		older bool
 	}{
-		{"latest-by-name", "", "2.0.0", "kirukiru"},
-		{"pinned-by-id", "1.2.3", "1.2.3", "rental-proof"},
+		{"latest-by-name", "", "2.0.0", "kirukiru", false},
+		{"pinned-by-id", "1.2.3", "1.2.3", "rental-proof", false},
+		{"older-daemon", "", "2.0.0", "kirukiru", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			check := func(problem *exit.Error) {
@@ -39,6 +44,10 @@ func TestPackageInstallRental(t *testing.T) {
 			}
 			var preparations atomic.Int32
 			hubPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if test.older && r.Method == "GET" && r.URL.Path == "/v1/packages/paul/minimax-h3" {
+					_, _ = w.Write([]byte(`{"package":{"name":"minimax-h3"},"releases":[{"release":"1.2.3"},{"release":"2.0.0"}]}`))
+					return
+				}
 				t.Errorf("a rental installation asked the Hub: %s %s", r.Method, r.URL)
 				http.Error(w, "unexpected request", 500)
 			}))
@@ -47,8 +56,8 @@ func TestPackageInstallRental(t *testing.T) {
 				if r.Method == "GET" && r.URL.Path == "/" {
 					return
 				}
-				if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // a current daemon: it carries v1 installs
-					_, _ = w.Write([]byte(`{"machine_v1":true}`))
+				if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // it carries v1 installs
+					_, _ = fmt.Fprintf(w, `{"machine_v1":true,"package_verbs":%t}`, !test.older)
 					return
 				}
 				if r.Method == "GET" && r.URL.Path == "/v1/local/rentals/rental-proof/installs/install-proof" { // the command follows it
@@ -66,7 +75,11 @@ func TestPackageInstallRental(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 					t.Error(err)
 				}
-				if request.Package != "paul/minimax-h3" || request.Release != test.version || request.Hub != hubPeer.URL || len(request.Models) != 0 {
+				sent := test.version
+				if test.older {
+					sent = test.installed
+				}
+				if request.Package != "paul/minimax-h3" || request.Release != sent || request.Hub != hubPeer.URL || len(request.Models) != 0 {
 					t.Errorf("wrong preparation or implicit model selection: %+v", request)
 				}
 				preparations.Add(1)
