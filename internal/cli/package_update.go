@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -9,7 +10,12 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func handlePackageUpdateAll(ctx *Context) *exit.Error {
+// handlePackageUpdate is `cozy package update [<package>…]`: the named installations, else every
+// one, each from its own hub, here or on a rental.
+func handlePackageUpdate(ctx *Context) *exit.Error {
+	if ctx.Inv.Value("--rental") != "" {
+		return rentalPackageUpdate(ctx)
+	}
 	_, store, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return problem
@@ -19,6 +25,10 @@ func handlePackageUpdateAll(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	installed = slices.DeleteFunc(installed, func(prior records.PackageInstall) bool { return !inHubScope(ctx, prior) })
+	if installed, problem = namedInstalls(ctx.Inv.Args, installed, func(i records.PackageInstall) string { return i.Package }, "on this computer"); problem != nil {
+		return problem
+	}
 	list := output.List{Name: "packages",
 		Fields:    []string{"package", "from", "to", "status", "detail"},
 		AllFields: []string{"package", "from", "to", "status", "detail", "error_code"},
@@ -26,9 +36,6 @@ func handlePackageUpdateAll(ctx *Context) *exit.Error {
 	}
 	counts := map[string]int{"updated": 0, "current": 0, "failed": 0, "skipped": 0}
 	for _, prior := range installed {
-		if !inHubScope(ctx, prior) {
-			continue
-		}
 		// Each installation updates from the hub it came from, with that hub's credential.
 		row := updateInstalledPackage(ctx.forHub(prior.Hub), prior)
 		if prior.SourceKind == "tensorhub" {
@@ -115,4 +122,19 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 	}
 	row["detail"] = strings.Join(result.Warnings, "; ")
 	return row
+}
+
+// namedInstalls keeps the installations names names, refusing a name none of them is; no names
+// keeps every one.
+func namedInstalls[T any](names []string, installs []T, name func(T) string, where string) ([]T, *exit.Error) {
+	if len(names) == 0 {
+		return installs, nil
+	}
+	for _, wanted := range names {
+		if !slices.ContainsFunc(installs, func(i T) bool { return name(i) == wanted }) {
+			return nil, exit.Named(exit.NotFound, "package.not_installed", "%s is not installed %s", wanted, where).
+				WithNext("cozy package list")
+		}
+	}
+	return slices.DeleteFunc(installs, func(i T) bool { return !slices.Contains(names, name(i)) }), nil
 }

@@ -47,13 +47,22 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, problem)
 			return
 		}
-		if body.Release == "" || strings.ContainsAny(body.Release, "\r\n\x00") {
-			s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation requires one exact package release"))
+		// An empty release is the hub's newest, which the machine reads there.
+		if strings.ContainsAny(body.Release, "\r\n\x00/@") {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation names at most one exact package release"))
 			return
 		}
 	} else if body.Release != "" || len(body.Models) == 0 {
 		s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation requires a package release or explicitly selected models"))
 		return
+	}
+	if body.Local != "" || body.Remove != "" {
+		// Local code from this computer, or one installation taken away: nothing else.
+		if body.Local != "" && body.Remove != "" || len(body.Models) > 0 || body.Destination != "" || body.Write != "" || body.Warm != "" ||
+			body.Local != "" && !strings.HasPrefix(body.Package, "local/") || strings.ContainsAny(body.Local+body.Remove, "\r\n\x00/") {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "a local installation or a removal names one package and nothing else"))
+			return
+		}
 	}
 	downloads := body.Models
 	if body.Destination != "" {

@@ -470,7 +470,7 @@ func packageCardHub(t *testing.T, asked *sync.Map) *httptest.Server {
 
 // A bulk update updates each installation from the hub it came from and asks no hub for
 // another's package; --tensorhub narrows it to one hub's installations.
-func TestPackageUpdateAllUpdatesEachInstallFromItsOwnHub(t *testing.T) {
+func TestPackageUpdateUpdatesEachInstallFromItsOwnHub(t *testing.T) {
 	root := t.TempDir()
 	var askedA, askedB sync.Map
 	hubA, hubB := packageCardHub(t, &askedA), packageCardHub(t, &askedB)
@@ -495,9 +495,9 @@ func TestPackageUpdateAllUpdatesEachInstallFromItsOwnHub(t *testing.T) {
 	}
 	update := func(want int, args ...string) map[string]map[string]any {
 		t.Helper()
-		code, out := runCozy(t, root, append([]string{"package", "update-all", "--json", "--full"}, args...)...)
+		code, out := runCozy(t, root, append([]string{"package", "update", "--json", "--full"}, args...)...)
 		if code != want {
-			t.Fatalf("package update-all exited %d: %s", code, out)
+			t.Fatalf("package update exited %d: %s", code, out)
 		}
 		var doc updated
 		must(t, json.Unmarshal([]byte(out), &doc))

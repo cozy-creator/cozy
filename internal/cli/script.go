@@ -73,20 +73,19 @@ func directoryTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Erro
 				WithRemedy("use ./project or ./project/function for an authored package")
 		}
 	}
-	var pack *packagepublish.Package
-	var problem *exit.Error
-	if _, err := os.Stat(filepath.Join(directory, "uv.lock")); err == nil {
-		pack, problem = packagepublish.PrepareLocalFrom(directory)
-	} else {
-		// A one-off local run needs no publication lock and does not write one
-		// into the author's working tree. Resolve in the existing owned copy.
-		pack, problem = packagepublish.PrepareUnpublishedFrom(context.Background(), directory, commandNamespace(ctx))
-	}
+	author, problem := packagepublish.AuthorTree(directory)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	defer pack.Close()
-	target, surface, problem := snapshotTarget(ctx, pack)
+	// An unchanged tree runs the snapshot it already has, before any lock or build.
+	target, surface, problem := capturedTarget(ctx, author, func() (*packagepublish.Package, *exit.Error) {
+		if _, locked := author.Files["uv.lock"]; locked {
+			return packagepublish.PrepareLocalFrom(directory)
+		}
+		// A one-off local run needs no publication lock and does not write one
+		// into the author's working tree. Resolve in the existing owned copy.
+		return packagepublish.PrepareUnpublishedFrom(context.Background(), directory, commandNamespace(ctx))
+	})
 	if problem != nil {
 		return Target{}, nil, problem
 	}
@@ -102,6 +101,12 @@ func directoryTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Erro
 // snapshotTarget uses the ordinary installer while keeping the user's editable
 // pin unchanged. Both the program and its environment are owned by the run.
 func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*records.PackageInstall) (Target, *launch.PackageInterface, *exit.Error) {
+	return capturedTarget(ctx, pack, func() (*packagepublish.Package, *exit.Error) { return pack, nil }, remote...)
+}
+
+// capturedTarget is the run's snapshot of the authored tree: the one already captured from
+// exactly these files, else prepare's package captured now and recorded against them.
+func capturedTarget(ctx *Context, author *packagepublish.Package, prepare func() (*packagepublish.Package, *exit.Error), remote ...*records.PackageInstall) (Target, *launch.PackageInterface, *exit.Error) {
 	layout, store, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return Target{}, nil, problem
@@ -121,11 +126,11 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*recor
 	}()
 	// An unchanged tree (its files and its local dependencies) runs the snapshot it already
 	// has: the same installation, which its machine already holds.
-	live, _, problem := pack.SourceStats()
+	live, _, problem := author.SourceStats()
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	if held, surface := heldSnapshot(store, "local/"+pack.Name, pack.Release, live); held != nil {
+	if held, surface := heldSnapshot(store, "local/"+author.Name, author.Release, live); held != nil {
 		handedOff = true
 		return Target{Package: held.Package, InstallID: held.ID, Release: held.Version, Snapshot: true,
 			releaseCapture: writer.Unlock}, surface, nil
@@ -135,6 +140,13 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*recor
 		return Target{}, nil, problem
 	}
 	defer stage.Release()
+	pack, problem := prepare()
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	if pack != author {
+		defer pack.Close()
+	}
 	frozen, problem := packagepublish.SnapshotSource(context.Background(), pack.Tree, filepath.Join(stage.Path, "source"))
 	if problem != nil {
 		return Target{}, nil, problem

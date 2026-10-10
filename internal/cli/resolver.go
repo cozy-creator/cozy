@@ -138,7 +138,7 @@ func (r *Resolver) SnapshotEditable(pkg string) (*EditableSnapshot, *exit.Error)
 		return nil, problem
 	}
 	snapshot := &EditableSnapshot{Package: pkg, Current: current}
-	if current.SourceKind != "local" {
+	if current.SourceKind != "local" || current.Captured() {
 		return snapshot, nil
 	}
 	snapshot.Editable = true

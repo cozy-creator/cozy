@@ -56,6 +56,9 @@ type LocalSource struct {
 	// Namespace is the caller on the command's Tensorhub. The owned source copy binds its
 	// account index there; it is asked only when the source names that index.
 	Namespace packagepublish.NamespaceSource
+	// Frozen installs the directory as it is now: the install follows its own copy, never
+	// the authored tree, so later edits there change nothing (no --editable).
+	Frozen bool
 }
 
 type PublishedSource struct {
@@ -287,7 +290,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(e)
 		}
 		inst.ProjectDir = sourceDir
-		if req.Snapshot {
+		if req.Snapshot || local.Frozen {
 			inst.SourceRef = sourceDir
 		}
 	}

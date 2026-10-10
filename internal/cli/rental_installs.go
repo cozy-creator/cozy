@@ -15,13 +15,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
+// handleRentalPackageInstall asks the Hub nothing: the machine reads the release at the hub the
+// selection names, and one it already holds is the answer with no read anywhere. No model
+// bindings are resolved or forwarded by package installation.
 func handleRentalPackageInstall(ctx *Context) *exit.Error {
-	ref, plan, problem := resolveRegistryPackage(ctx, ctx.Inv.Args[0], ctx.Inv.Value("--version"))
+	ref, release, problem := registryPackageRef(ctx.Inv.Args[0], ctx.Inv.Value("--version"))
 	if problem != nil {
 		return problem
 	}
-	// No model bindings are resolved or forwarded by package installation.
-	return enqueueRentalInstall(ctx, ctx.Inv.Value("--rental"), records.RentalInstallSelection{Package: ref.String(), Release: plan.Release}, !ctx.Inv.Bool("--no-wait"))
+	selection := records.RentalInstallSelection{Package: ref.String(), Release: release, Hub: ctx.Cfg.HubURL}
+	return enqueueRentalInstall(ctx, ctx.Inv.Value("--rental"), selection, !ctx.Inv.Bool("--no-wait"))
 }
 
 func enqueueRentalInstall(ctx *Context, rentalName string, selection records.RentalInstallSelection, await bool) *exit.Error {
@@ -36,21 +39,7 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 			}
 		}
 	}
-	_, store, problem := rentalStores(ctx)
-	if problem != nil {
-		return problem
-	}
-	rentalID, problem := machines.InstallTarget(store, rentalName)
-	store.Close()
-	if problem != nil {
-		return problem
-	}
-	state, _, problem := ensureDaemon(ctx)
-	if problem != nil {
-		return problem
-	}
-	ctx.Daemon = state
-	client, problem := localapi.Open(ctx.Cfg, state)
+	client, rentalID, problem := rentalInstallClient(ctx, rentalName)
 	if problem != nil {
 		return problem
 	}
@@ -79,6 +68,48 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 		record.Notes = append(record.Notes, "no model weights were requested")
 	}
 	return emit(ctx, record)
+}
+
+// rentalInstallClient is the daemon that queues installations, and the rental's id there.
+func rentalInstallClient(ctx *Context, rentalName string) (*localapi.Client, string, *exit.Error) {
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return nil, "", problem
+	}
+	rentalID, problem := machines.InstallTarget(store, rentalName)
+	store.Close()
+	if problem != nil {
+		return nil, "", problem
+	}
+	client, problem := dial(ctx)
+	return client, rentalID, problem
+}
+
+// settleRentalInstall queues one selection on the rental and follows it to its outcome: what
+// `package update` and `package remove` do once per package.
+func settleRentalInstall(ctx *Context, rentalName string, selection records.RentalInstallSelection) (records.RentalInstall, *exit.Error) {
+	if rentalName != machines.Local {
+		ep, problem := foregroundRental(ctx, rentalName)
+		if problem != nil {
+			return records.RentalInstall{}, problem
+		}
+		if ep != nil {
+			return foregroundPrewarm(ctx, ep, rentalName, selection)
+		}
+	}
+	client, rentalID, problem := rentalInstallClient(ctx, rentalName)
+	if problem != nil {
+		return records.RentalInstall{}, problem
+	}
+	queued, problem := client.PrepareRentalPackage(rentalID, selection)
+	if problem != nil {
+		return records.RentalInstall{}, problem
+	}
+	settled, detached, problem := watchRentalInstall(ctx, client, rentalName, queued)
+	if problem == nil && detached {
+		problem = exit.New(exit.Canceled, "detached from %s; it continues on %s", queued.Selection.Target(), rentalName)
+	}
+	return settled, problem
 }
 
 // foregroundInstall makes one installation on a machine this command reaches as an explicit
@@ -123,11 +154,10 @@ func foregroundPrewarm(ctx *Context, ep *machineendpoint.Endpoint, machine strin
 // emitInstalled is a succeeded installation; an upload names the checkpoint it put in its
 // destination.
 func emitInstalled(ctx *Context, install records.RentalInstall, began time.Time) *exit.Error {
-	fields := []output.Field{{K: "id", V: install.ID}, {K: "rental", V: install.RentalID}, {K: "status", V: "succeeded"},
-		{K: "target", V: install.Selection.Target()}, {K: "elapsed", V: time.Since(began).Round(time.Second).String()}}
-	shown := []string{"id", "rental", "status", "target", "elapsed"}
 	var result struct {
-		Models []struct {
+		// A package installation: the release the machine installed.
+		Package, Release string
+		Models           []struct {
 			Published *struct{ Destination, Checkpoint string } `json:"published"`
 		} `json:"models"`
 		// A warm set: each member with the level it holds and why that is short of its ask.
@@ -137,6 +167,13 @@ func emitInstalled(ctx *Context, install records.RentalInstall, began time.Time)
 		} `json:"set"`
 	}
 	_ = json.Unmarshal(install.Result, &result)
+	target := install.Selection.Target()
+	if result.Package != "" && result.Release != "" {
+		target = result.Package + "@" + result.Release
+	}
+	fields := []output.Field{{K: "id", V: install.ID}, {K: "rental", V: install.RentalID}, {K: "status", V: "succeeded"},
+		{K: "target", V: target}, {K: "elapsed", V: time.Since(began).Round(time.Second).String()}}
+	shown := []string{"id", "rental", "status", "target", "elapsed"}
 	for _, member := range result.Set {
 		if selection := install.Selection; member.Package == selection.Package && member.Entrypoint == selection.Entrypoint {
 			fields, shown = append(fields, output.Field{K: "level", V: member.Level}), append(shown, "level")
@@ -185,7 +222,7 @@ func watchRentalInstall(ctx *Context, client *localapi.Client, machine string, i
 				fmt.Fprintf(ctx.Err, "\ndetached from installation %s; it continues on %s\n", install.ID, machine)
 			}
 			return status.RentalInstall, true, nil
-		case <-time.After(time.Second):
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }

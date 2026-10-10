@@ -63,6 +63,9 @@ type MachineEnvironment struct {
 	Package      string `json:"package"`
 	Release      string `json:"release"`
 	Level        string `json:"level,omitempty"` // what it holds now: installed … gpu
+	// Hub is the hub a published installation came from, as this computer names it (its URL
+	// here); empty for local code.
+	Hub string `json:"hub,omitempty"`
 }
 
 // MachineWarmMember is one function of the caller's warm set: the level asked, the level it

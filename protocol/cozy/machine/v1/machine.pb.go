@@ -33,6 +33,11 @@ const (
 	RunKind_RUN_KIND_JOB    RunKind = 1
 	RunKind_RUN_KIND_WARM   RunKind = 2 // prepare only: install and download, then succeed
 	RunKind_RUN_KIND_UPDATE RunKind = 3 // stage, verify and activate a software cohort at idle
+	// `remove/1`: the caller's installations of the source leave the machine: an installation
+	// by its name, or a release's package (its release, or every release when empty) from the
+	// run's Hub (local/ packages from none). Their environments are deleted once no process and
+	// no other installation holds them.
+	RunKind_RUN_KIND_REMOVE RunKind = 4
 )
 
 // Enum value maps for RunKind.
@@ -42,12 +47,14 @@ var (
 		1: "RUN_KIND_JOB",
 		2: "RUN_KIND_WARM",
 		3: "RUN_KIND_UPDATE",
+		4: "RUN_KIND_REMOVE",
 	}
 	RunKind_value = map[string]int32{
 		"RUN_KIND_CALL":   0,
 		"RUN_KIND_JOB":    1,
 		"RUN_KIND_WARM":   2,
 		"RUN_KIND_UPDATE": 3,
+		"RUN_KIND_REMOVE": 4,
 	}
 )
 
@@ -2382,7 +2389,7 @@ type StatusFrame struct {
 	Version            string                 `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"` // this machine's release
 	Capabilities       []string               `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
 	Receipt            []byte                 `protobuf:"bytes,5,opt,name=receipt,proto3" json:"receipt,omitempty"`                                                      // the sealed readiness envelope; empty until sealed
-	IdleDeadlineUnixMs int64                  `protobuf:"varint,6,opt,name=idle_deadline_unix_ms,json=idleDeadlineUnixMs,proto3" json:"idle_deadline_unix_ms,omitempty"` // 0: no idle release
+	IdleDeadlineUnixMs int64                  `protobuf:"varint,6,opt,name=idle_deadline_unix_ms,json=idleDeadlineUnixMs,proto3" json:"idle_deadline_unix_ms,omitempty"` // a rental's release, 15 min after its last job; 0: never
 	Runs               []*RunState            `protobuf:"bytes,7,rep,name=runs,proto3" json:"runs,omitempty"`                                                            // the caller's live runs
 	Phase              string                 `protobuf:"bytes,8,opt,name=phase,proto3" json:"phase,omitempty"`                                                          // booting, ready, releasing
 	Platform           string                 `protobuf:"bytes,9,opt,name=platform,proto3" json:"platform,omitempty"`                                                    // os/arch
@@ -2920,6 +2927,7 @@ type Environment struct {
 	Runtime       string                 `protobuf:"bytes,5,opt,name=runtime,proto3" json:"runtime,omitempty"` // the cozy-runtime installed in it
 	Level         string                 `protobuf:"bytes,6,opt,name=level,proto3" json:"level,omitempty"`     // what it holds now (as WarmItem.holds), in a warm set or not
 	Warning       string                 `protobuf:"bytes,7,opt,name=warning,proto3" json:"warning,omitempty"` // why it does not run the machine's own Runtime; empty when it does
+	Hub           string                 `protobuf:"bytes,8,opt,name=hub,proto3" json:"hub,omitempty"`         // the Hub origin a published installation came from; empty for local code
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2999,6 +3007,13 @@ func (x *Environment) GetLevel() string {
 func (x *Environment) GetWarning() string {
 	if x != nil {
 		return x.Warning
+	}
+	return ""
+}
+
+func (x *Environment) GetHub() string {
+	if x != nil {
+		return x.Hub
 	}
 	return ""
 }
@@ -3418,7 +3433,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x03Hub\x12\x16\n" +
 	"\x06origin\x18\x01 \x01(\tR\x06origin\x12\x1d\n" +
 	"\n" +
-	"machine_id\x18\x02 \x01(\tR\tmachineId\"\xd1\x01\n" +
+	"machine_id\x18\x02 \x01(\tR\tmachineId\"\xe3\x01\n" +
 	"\vEnvironment\x12\"\n" +
 	"\finstallation\x18\x01 \x01(\tR\finstallation\x12\x18\n" +
 	"\apackage\x18\x02 \x01(\tR\apackage\x12\x18\n" +
@@ -3426,7 +3441,8 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\ventrypoints\x18\x04 \x03(\tR\ventrypoints\x12\x18\n" +
 	"\aruntime\x18\x05 \x01(\tR\aruntime\x12\x14\n" +
 	"\x05level\x18\x06 \x01(\tR\x05level\x12\x18\n" +
-	"\awarning\x18\a \x01(\tR\awarning\"F\n" +
+	"\awarning\x18\a \x01(\tR\awarning\x12\x10\n" +
+	"\x03hub\x18\b \x01(\tR\x03hub\"F\n" +
 	"\x04Disk\x12\x1f\n" +
 	"\vtotal_bytes\x18\x01 \x01(\x04R\n" +
 	"totalBytes\x12\x1d\n" +
@@ -3440,12 +3456,13 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x04data\x18\x04 \x01(\fR\x04data\"9\n" +
 	"\vWriteResult\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\tR\x06digest\x12\x12\n" +
-	"\x04held\x18\x02 \x01(\x04R\x04held*V\n" +
+	"\x04held\x18\x02 \x01(\x04R\x04held*k\n" +
 	"\aRunKind\x12\x11\n" +
 	"\rRUN_KIND_CALL\x10\x00\x12\x10\n" +
 	"\fRUN_KIND_JOB\x10\x01\x12\x11\n" +
 	"\rRUN_KIND_WARM\x10\x02\x12\x13\n" +
-	"\x0fRUN_KIND_UPDATE\x10\x03*\x9e\x01\n" +
+	"\x0fRUN_KIND_UPDATE\x10\x03\x12\x13\n" +
+	"\x0fRUN_KIND_REMOVE\x10\x04*\x9e\x01\n" +
 	"\tWarmLevel\x12\x1a\n" +
 	"\x16WARM_LEVEL_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14WARM_LEVEL_INSTALLED\x10\x01\x12\x19\n" +

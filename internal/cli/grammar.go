@@ -206,16 +206,16 @@ func (c *HubRemoveCmd) Run(r *Runtime) error {
 }
 
 type PackageCmd struct {
-	UpdateAll PackageUpdateAllCmd `cmd:"" help:"Update installed published packages, each from its own hub, to newer releases without downloading model weights; local and development installs are skipped."`
-	Search    PackageSearchCmd    `cmd:"" help:"Search for AI magic."`
-	Install   PackageInstallCmd   `cmd:"" help:"Install a published package or explicit local directory."`
-	Recover   PackageRecoverCmd   `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
-	Remove    PackageRemoveCmd    `cmd:"" help:"Delete source-code."`
-	List      PackageListCmd      `cmd:"" help:"List installed packages from every hub, with each one's hub."`
-	Info      PackageInfoCmd      `cmd:"" help:"Show a published package's releases."`
-	Lock      PackageLockCmd      `cmd:"" help:"Lock this package's dependencies for the current Tensorhub and account."`
-	Publish   PackagePublishCmd   `cmd:"" help:"Publish a package release."`
-	Yank      PackageYankCmd      `cmd:"" help:"Permanently yank a package release."`
+	Search  PackageSearchCmd  `cmd:"" help:"Search for AI magic."`
+	Install PackageInstallCmd `cmd:"" help:"Install a published package or a local directory, here or on a rental."`
+	Update  PackageUpdateCmd  `cmd:"" help:"Update installed published packages, each from its own hub, to its newest release without downloading model weights: the named ones, else every one. Local code is skipped."`
+	Remove  PackageRemoveCmd  `cmd:"" help:"Remove installed packages, here or on a rental."`
+	Recover PackageRecoverCmd `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
+	List    PackageListCmd    `cmd:"" help:"List installed packages from every hub, with each one's hub."`
+	Info    PackageInfoCmd    `cmd:"" help:"Show a published package's releases."`
+	Lock    PackageLockCmd    `cmd:"" help:"Lock this package's dependencies for the current Tensorhub and account."`
+	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
+	Yank    PackageYankCmd    `cmd:"" help:"Permanently yank a package release."`
 
 	Bind     PackageBindCmd     `cmd:"" help:"Set an owner model override for one package slot."`
 	Unbind   PackageUnbindCmd   `cmd:"" help:"Remove an owner override and use the package default."`
@@ -264,15 +264,18 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 type PackageInstallCmd struct {
 	Ref      string `arg:"" name:"package-or-directory" predictor:"dir-or-ref" help:"Published org/name or explicit directory such as . or ./project."`
 	Version  string `help:"Install this release instead of the newest, e.g. 1.2.3."`
-	Editable bool   `help:"Keep an explicit local directory live for development."`
-	Rental   string `predictor:"rental" help:"Install published code and dependencies on this existing rental name or id, without model weights; waits for the outcome."`
+	Editable bool   `help:"Keep an explicit local directory live: later runs use its current files."`
+	Rental   string `predictor:"rental" help:"Install on this existing rental name or id as well, without model weights; a published package installs there only. Waits for the outcome."`
 	NoWait   bool   `name:"no-wait" help:"With --rental, answer once the installation is queued instead of waiting for its outcome."`
 }
 
-type PackageUpdateAllCmd struct{}
+type PackageUpdateCmd struct {
+	Refs   []string `arg:"" optional:"" name:"package" predictor:"package" help:"Installed packages to update; none updates every one."`
+	Rental string   `predictor:"rental" help:"Update the packages this rental holds instead of this computer's; waits for the outcome."`
+}
 
-func (c *PackageUpdateAllCmd) Run(r *Runtime) error {
-	return r.call(handlePackageUpdateAll, nil, nil, nil, false)
+func (c *PackageUpdateCmd) Run(r *Runtime) error {
+	return r.call(handlePackageUpdate, c.Refs, nil, values("--rental", c.Rental), false)
 }
 
 type PackageRecoverCmd struct {
@@ -306,14 +309,15 @@ func (c *PackageRecoverCmd) Run(r *Runtime) error {
 }
 
 type PackageRemoveCmd struct {
-	Refs []string `arg:"" name:"package" predictor:"package" help:"Installed package ref."`
+	Refs   []string `arg:"" name:"package" predictor:"package" help:"Installed package ref."`
+	Rental string   `predictor:"rental" help:"Remove from this rental instead of this computer; waits for the outcome."`
 }
 
 func (c *PackageRemoveCmd) Run(r *Runtime) error {
 	// The daemon is ensured inside the verb, after the removal: a daemon started here
 	// sweeps unreferenced installs on boot, and the verb would then find nothing to
 	// report for a package whose pin was already gone.
-	return r.call(handleRm, c.Refs, nil, nil, false)
+	return r.call(handleRm, c.Refs, nil, values("--rental", c.Rental), false)
 }
 
 type PackageListCmd struct {

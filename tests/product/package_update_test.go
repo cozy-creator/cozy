@@ -30,7 +30,7 @@ func updateAllInstall(t *testing.T, layout home.Layout, store *records.Store, n 
 	return prior
 }
 
-func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
+func TestPackageUpdateContinuesFailuresAndPreservesSelections(t *testing.T) {
 	plan, wheel := reportingRelease(t)
 	root := t.TempDir()
 	layout, problem := home.Open(root)
@@ -85,7 +85,7 @@ func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
-	code, out := runCozy(t, root, "package", "update-all", "--json")
+	code, out := runCozy(t, root, "package", "update", "--json")
 	var result struct {
 		Packages                          []map[string]string
 		Updated, Current, Failed, Skipped int
@@ -119,15 +119,15 @@ func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
 		}
 	}
 	fatal(t, store.Unpin(server.URL, "a-failed/install-reporting", 1))
-	code, out = runCozy(t, root, "package", "update-all", "--json")
+	code, out = runCozy(t, root, "package", "update", "--json")
 	if code != 0 || json.Unmarshal([]byte(out), &result) != nil || result.Updated != 0 || result.Current != 2 || result.Failed != 0 || downloads.Load() != 2 {
 		t.Fatalf("already current packages were installed again: %d %s", code, out)
 	}
 }
 
-func TestPackageUpdateAllEmptyAndSkippedOutput(t *testing.T) {
+func TestPackageUpdateEmptyAndSkippedOutput(t *testing.T) {
 	root := t.TempDir()
-	code, out := runCozy(t, root, "package", "update-all", "--json")
+	code, out := runCozy(t, root, "package", "update", "--json")
 	if code != 0 || !strings.Contains(out, `"packages":[]`) || !strings.Contains(out, `"updated":0`) {
 		t.Fatalf("empty update: %d %s", code, out)
 	}
@@ -139,18 +139,18 @@ func TestPackageUpdateAllEmptyAndSkippedOutput(t *testing.T) {
 		updateAllInstall(t, layout, store, i+1, fmt.Sprintf("local/project-%02d", i), "1.0.0", "local", "")
 	}
 	store.Close()
-	code, out = runCozy(t, root, "package", "update-all", "--json")
+	code, out = runCozy(t, root, "package", "update", "--json")
 	var result struct{ Packages []map[string]string }
 	if code != 0 || json.Unmarshal([]byte(out), &result) != nil || len(result.Packages) != 22 || strings.Contains(out, `"omitted"`) {
 		t.Fatalf("bulk update omitted package results: %d %s", code, out)
 	}
-	code, out = runCozy(t, root, "package", "update-all")
+	code, out = runCozy(t, root, "package", "update")
 	if code != 0 || !strings.Contains(out, "STATUS") || !strings.Contains(out, "skipped") || !strings.Contains(out, "local/project-21") {
 		t.Fatalf("human bulk table: %d %s", code, out)
 	}
 }
 
-func TestPackageUpdateAllPreservesConcurrentLocalSelection(t *testing.T) {
+func TestPackageUpdatePreservesConcurrentLocalSelection(t *testing.T) {
 	plan, _ := reportingRelease(t)
 	root := t.TempDir()
 	layout, problem := home.Open(root)
@@ -183,7 +183,7 @@ func TestPackageUpdateAllPreservesConcurrentLocalSelection(t *testing.T) {
 		w.WriteHeader(500)
 	})
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
-	code, out := runCozy(t, root, "package", "update-all", "--json")
+	code, out := runCozy(t, root, "package", "update", "--json")
 	if code != 1 || !strings.Contains(out, `"error_code":"package.update_changed"`) {
 		t.Fatalf("concurrent selection was not refused: %d %s", code, out)
 	}

@@ -44,21 +44,14 @@ func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.
 }
 
 func handleInstall(ctx *Context) *exit.Error {
-	if ctx.Inv.Value("--rental") != "" {
-		if explicitPackageDirectory(ctx.Inv.Args[0]) || ctx.Inv.Bool("--editable") {
-			return exit.Usagef("package install --rental requires a published org/name; editable directories use private execution").
-				WithRemedy("use `cozy run ./project/<function> --rental=<rental>` to upload local code privately")
-		}
-		return handleRentalPackageInstall(ctx)
-	}
 	if explicitPackageDirectory(ctx.Inv.Args[0]) {
-		if !ctx.Inv.Bool("--editable") {
-			return exit.Usagef("an explicit package directory requires --editable")
-		}
 		return handleDirectoryInstall(ctx)
 	}
 	if ctx.Inv.Bool("--editable") {
 		return exit.Usagef("--editable requires an explicit package directory")
+	}
+	if ctx.Inv.Value("--rental") != "" {
+		return handleRentalPackageInstall(ctx)
 	}
 	return handleRegistryInstall(ctx)
 }
@@ -70,18 +63,26 @@ func explicitPackageDirectory(value string) bool {
 		strings.HasPrefix(value, `.\`) || strings.HasPrefix(value, `..\`)
 }
 
+// handleDirectoryInstall installs local/<name> from a directory on this computer: as it is now,
+// or --editable, following its files. Unchanged since its install, it is already installed.
+// With --rental the same code is installed there too, only the objects it lacks written.
 func handleDirectoryInstall(ctx *Context) *exit.Error {
 	path := strings.TrimSpace(ctx.Inv.Args[0])
 	if ctx.Inv.Value("--version") != "" {
 		return exit.Usagef("an explicit package directory does not take --version").
 			WithRemedy("use `cozy package install %s` by itself", path)
 	}
+	editable := ctx.Inv.Bool("--editable")
 	pack, problem := packagepublish.PrepareLocalFrom(path)
 	if problem != nil {
 		return problem
 	}
 	defer pack.Close()
 	files, bytes, problem := pack.SourceInventory()
+	if problem != nil {
+		return problem
+	}
+	stats, _, problem := pack.SourceStats()
 	if problem != nil {
 		return problem
 	}
@@ -95,18 +96,27 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 	defer writer.Unlock()
-	var result *install.Result
-	problem = packagePublishStage(ctx, "Creating local package environment", func() *exit.Error {
+	result := &install.Result{Idempotent: true}
+	if prior, _ := activeInstall(st, "", ref.Package); prior != nil && prior.SourceKind == "local" && prior.Version == pack.Release &&
+		editable == !prior.Captured() && (!editable || prior.SourceRef == pack.Tree) && packagepublish.SourceStatsUnchanged(prior.Dir, stats) {
+		result.Install = *prior
+	} else if problem = packagePublishStage(ctx, "Creating local package environment", func() *exit.Error {
 		var installProblem *exit.Error
 		result, installProblem = install.Run(l, st, install.Request{Ref: ref, Force: true,
-			Local: &install.LocalSource{Bytes: bytes, Files: files,
+			Local: &install.LocalSource{Bytes: bytes, Files: files, Frozen: !editable,
 				Package: ref.Package, Release: pack.Release, Tree: pack.Tree, Namespace: commandNamespace(ctx)}})
 		return installProblem
-	})
-	if problem != nil {
+	}); problem != nil {
 		return problem
 	}
-	return emitInstallResult(ctx, result, reclaimInstallResult(l, st, result)...)
+	cleanup := reclaimInstallResult(l, st, result)
+	rental := ctx.Inv.Value("--rental")
+	if rental == "" {
+		return emitInstallResult(ctx, result, cleanup...)
+	}
+	writer.Unlock()
+	selection := records.RentalInstallSelection{Package: ref.Package, Release: pack.Release, Hub: ctx.Cfg.HubURL, Local: result.Install.ID}
+	return enqueueRentalInstall(ctx, rental, selection, !ctx.Inv.Bool("--no-wait"))
 }
 
 func handlePackageRecover(ctx *Context) *exit.Error {
@@ -206,23 +216,19 @@ func emitInstallResult(ctx *Context, res *install.Result, cleanup ...output.Fiel
 }
 
 // rentalPackages is `cozy package list --rental=<name>`: the packages that rental's machine holds,
-// each with the level it holds it at.
+// each with the level it holds it at and the hub it came from.
 func rentalPackages(ctx *Context) *exit.Error {
-	rentalID, problem := requestedRental(ctx)
+	_, envs, problem := rentalEnvironments(ctx)
 	if problem != nil {
 		return problem
 	}
-	client, problem := dial(ctx)
-	if problem != nil {
-		return problem
-	}
-	status, problem := client.MachineStatus(rentalID)
-	if problem != nil {
-		return problem
-	}
-	l := output.List{Name: "packages", Fields: []string{"package", "release", "level"}, AllFields: []string{"package", "release", "level", "installation"}}
-	for _, env := range status.Environments {
-		l.Rows = append(l.Rows, map[string]string{"package": env.Package, "release": env.Release, "level": env.Level, "installation": env.Installation})
+	l := output.List{Name: "packages", Fields: []string{"package", "release", "level", "hub"}, AllFields: []string{"package", "release", "level", "hub", "installation"}}
+	for _, env := range envs {
+		hub := ""
+		if env.Hub != "" {
+			hub = ctx.Cfg.HubLabel(env.Hub)
+		}
+		l.Rows = append(l.Rows, map[string]string{"package": env.Package, "release": env.Release, "level": env.Level, "hub": hub, "installation": env.Installation})
 	}
 	return emit(ctx, l)
 }
@@ -335,6 +341,9 @@ func syncedText(st *records.Store, inst records.PackageInstall) (string, *exit.E
 }
 
 func handleRm(ctx *Context) *exit.Error {
+	if ctx.Inv.Value("--rental") != "" {
+		return rentalPackageRemove(ctx)
+	}
 	l, st, w, e := open(ctx.Cfg, true)
 	if e != nil {
 		return e
@@ -348,6 +357,20 @@ func handleRm(ctx *Context) *exit.Error {
 		AllFields: []string{"package", "major", "reclaimed", "install_id"},
 	}
 	var freed int64
+	unreferenced, e := st.Unreferenced()
+	if e != nil {
+		return e
+	}
+	for _, arg := range ctx.Inv.Args {
+		pins, e := st.Pins(strings.TrimSpace(arg))
+		if e != nil {
+			return e
+		}
+		if len(pins) == 0 && !slices.ContainsFunc(unreferenced, func(u records.PackageInstall) bool { return u.Package == strings.TrimSpace(arg) }) {
+			return exit.Named(exit.NotFound, "package.not_installed", "%s is not installed on this computer", arg).
+				WithNext("cozy package list")
+		}
+	}
 	for _, arg := range ctx.Inv.Args {
 		ref, e := install.ParseRef(arg)
 		if e != nil {
@@ -390,8 +413,7 @@ func handleRm(ctx *Context) *exit.Error {
 	}
 	// Removing a package also clears superseded installs for the same selected
 	// major. Active requests/workers were fenced above and the database claim rechecks.
-	unreferenced, e := st.Unreferenced()
-	if e != nil {
+	if unreferenced, e = st.Unreferenced(); e != nil {
 		return e
 	}
 	for _, superseded := range unreferenced {

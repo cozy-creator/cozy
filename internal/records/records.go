@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -410,6 +411,12 @@ func (inst PackageInstall) PublishedAt(origin string) bool {
 
 // PinHub is the hub this install's pin is keyed under: the hub it came from.
 func (inst PackageInstall) PinHub() string { return ReferenceHub(inst.Hub, inst.Package) }
+
+// Captured is local code installed as it was (a run's snapshot, or a directory installed
+// without --editable): it follows its own copy, never the authored tree.
+func (inst PackageInstall) Captured() bool {
+	return inst.SourceKind == "local" && filepath.Clean(inst.SourceRef) == filepath.Join(inst.Dir, "source")
+}
 
 // ReferenceHub is the pin hub a package reference resolves under at hub: local/ captures
 // belong to no hub.

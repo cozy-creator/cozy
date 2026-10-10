@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -664,6 +665,26 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			spec.Owner = caller.Account
 		}
 	}
+	switch {
+	case selection.Remove != "":
+		if !slices.Contains(capabilities, "remove/1") {
+			return nil, exit.Named(exit.Structural, "machine.remove_unsupported",
+				"this machine cannot remove packages; %s", machines.RuntimeUpdate(row.RentalID))
+		}
+		spec.Kind, spec.Source = v1.RunKind_RUN_KIND_REMOVE, &v1.RunSpec_Installation{Installation: selection.Remove}
+	case selection.Local != "":
+		// This computer's capture of local code: only the objects the machine lacks go.
+		root, problem := m.localInstallation(ctx, selection)
+		if problem != nil {
+			return nil, problem
+		}
+		report(machines.InstallProgress{Stage: "writing " + selection.Package})
+		manifest, _, err := machinev1.LocalSource(ctx, machine.Machine, root)
+		if err != nil {
+			return nil, machines.Transport(err)
+		}
+		spec.Source = &v1.RunSpec_Local{Local: &v1.LocalSource{Manifest: manifest}}
+	}
 	if selection.Warm != "" {
 		// A warm set member: the machine's whole set goes back with this one changed.
 		if !slices.Contains(capabilities, "warm/2") {
@@ -674,7 +695,7 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			return nil, problem
 		}
 		selection.Models = nil
-	} else if selection.Package != "" && !strings.HasPrefix(selection.Package, "local/") {
+	} else if selection.Package != "" && !strings.HasPrefix(selection.Package, "local/") && spec.Source == nil {
 		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}}
 	}
 	for _, model := range selection.Models {
@@ -732,6 +753,17 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			return json.RawMessage(outcome.Result), nil
 		}
 	}
+}
+
+// localInstallation is the captured code of this computer's local installation the selection
+// names, as a run of it would send it.
+func (m *machineRuns) localInstallation(ctx context.Context, selection records.RentalInstallSelection) (localpackage.Installation, *exit.Error) {
+	revision, problem := m.resolver.PrepareLocal(ctx, selection.Local)
+	if problem != nil {
+		return localpackage.Installation{}, problem
+	}
+	return m.capturedRevision(records.Request{InstallID: selection.Local, LocalInstallationID: revision.ID,
+		Package: revision.Package, Release: revision.Release})
 }
 
 // writeTreesV1 writes each `--input-tree ref=dir` to the machine as writeTreeV1 does; the
