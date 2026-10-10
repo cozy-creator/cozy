@@ -103,7 +103,7 @@ func TestRentalListNamesMachinesThisHostNeverRecorded(t *testing.T) {
 		row["hourly_rate_usd_micros"] != float64(3_190_000) {
 		t.Fatalf("the unrecorded row is not the hub's truth: %s", out)
 	}
-	for _, field := range []string{"running", "queued", "idle_s", "idle_since_at", "release_due_at"} {
+	for _, field := range []string{"running", "queued", "release_due_at"} {
 		if _, present := row[field]; present {
 			t.Fatalf("unobserved %s was reported as a fact: %s", field, out)
 		}

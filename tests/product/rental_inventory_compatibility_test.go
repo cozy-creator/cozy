@@ -25,7 +25,7 @@ func TestRentalShowUsesOnlyTheWorkerDeadline(t *testing.T) {
 				switch r.URL.Path {
 				case "/":
 				case "/v1/local/rentals":
-					_, _ = w.Write([]byte(`{"rentals":[{"rental_id":"rental-proof","machine":"touji","state":"ready","release_due_at":"2026-10-10T04:10:00Z","activity":{"idle_since_at":"2026-10-10T03:55:00Z"}}]}`))
+					_, _ = w.Write([]byte(`{"rentals":[{"rental_id":"rental-proof","machine":"touji","state":"ready","release_due_at":"2026-10-10T04:10:00Z","activity":{"running":0,"queued":0}}]}`))
 				case "/v1/local/machines/rental-proof/status":
 					if state == "unreachable" {
 						w.WriteHeader(http.StatusServiceUnavailable)

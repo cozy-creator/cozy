@@ -108,9 +108,8 @@ type RentalSummary struct {
 // Activity is absent for machines known only to the Hub: this daemon cannot
 // observe their queued/running work and must not report zero for them.
 type RentalActivity struct {
-	Running   int    `json:"running"`
-	Queued    int    `json:"queued"`
-	IdleSince string `json:"idle_since_at,omitempty"`
+	Running int `json:"running"`
+	Queued  int `json:"queued"`
 }
 
 func (s *Server) listRentals(w http.ResponseWriter, r *http.Request) {

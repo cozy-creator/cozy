@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/api"
@@ -189,7 +188,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		if fleet.origin(row.Hub) != origin {
 			continue
 		}
-		idle, problem := fleet.observeIdle(row)
+		queued, running, problem := st.RentalWorkCounts(row.ID, row.ManagedRequestID)
 		if problem != nil {
 			return result, problem
 		}
@@ -201,7 +200,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			SpendUSDMicros:      live[row.ID].SpendUSDMicros, SpendBasis: live[row.ID].SpendBasis,
 			Address: row.Address, MediaAddress: row.MediaAddress, Hub: row.Hub,
 			RentedAt: row.RentedAt, ReadyAt: row.ReadyAt, BoughtFor: boughtFor[row.ID],
-			Activity: &api.RentalActivity{Running: idle.Running, Queued: idle.Queued},
+			Activity: &api.RentalActivity{Running: running, Queued: queued},
 			Failure: hub.RentalFailure{
 				Code: row.Failure.Code, BaseWorkerImageDigest: row.Failure.BaseWorkerImageDigest,
 				Provider: row.Failure.Provider, ProviderResourceID: row.Failure.ProviderResourceID,
@@ -219,11 +218,6 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			return result, problem
 		} else if update != nil && update.Active() {
 			summary.RuntimeUpdate = update.State
-		}
-		// This host's own observation of the machine's work; when it ends itself is the
-		// machine's to say (ReleaseDue, from its live Status).
-		if idle.Queued == 0 && idle.Running == 0 && !idle.Since.IsZero() {
-			summary.Activity.IdleSince = idle.Since.UTC().Format(time.RFC3339)
 		}
 		result.Rentals = append(result.Rentals, summary)
 	}

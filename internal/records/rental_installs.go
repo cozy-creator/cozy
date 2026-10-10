@@ -224,24 +224,9 @@ func (s *Store) SettleRentalInstall(id, state string, result json.RawMessage, pr
 	if problem != nil {
 		code, message = problem.ErrName(), problem.Message
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot settle rental installation: %s", err)
-	}
-	defer tx.Rollback()
-	stamp := now()
-	settled, err := tx.Exec(`UPDATE rental_installs SET state=?,error_code=?,error=?,result=?,updated_at=? WHERE id=? AND state IN ('queued','installing')`, state, code, message, string(result), stamp, id)
+	_, err := s.db.Exec(`UPDATE rental_installs SET state=?,error_code=?,error=?,result=?,updated_at=? WHERE id=? AND state IN ('queued','installing')`, state, code, message, string(result), now(), id)
 	if err != nil {
 		return exit.Internalf("cannot save rental installation result: %s", err)
-	}
-	if n, _ := settled.RowsAffected(); n == 1 && state != "queued" {
-		_, err = tx.Exec(`INSERT INTO rental_idle(rental_id,work_finished_at) SELECT r.id,? FROM rentals r JOIN rental_installs i ON i.rental_id=r.id WHERE i.id=? AND r.state='ready' ON CONFLICT(rental_id) DO UPDATE SET work_finished_at=excluded.work_finished_at`, stamp, id)
-		if err != nil {
-			return exit.Internalf("cannot record rental installation completion: %s", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit rental installation result: %s", err)
 	}
 	return nil
 }

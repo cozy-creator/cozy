@@ -675,17 +675,17 @@ and models are prepared when requests run. Retrying the same idempotency key reu
 set, including when `--model` is omitted on the retry.
 
 Rentals end themselves after 15 minutes idle: no job queued for or running on the
-machine. The machine enforces this, with or without Creator. Package preparation, warm
-runs, paused jobs, uploads, updates, an open connection and status polling are idle
-time. `cozy rental end <name>` ends one now.
+machine. The machine enforces this, with or without Creator. Every run is a job
+(warm-ups, uploads and conversions too); updates, paused jobs, an open connection and
+status polling are idle time. `cozy rental end <name>` ends one now.
 
 `cozy rental keepalive <name>` resets that 15-minute clock once and prints the
 deadline the machine answered. It authenticates directly to the pinned rental Host,
 so it also works while Runtime is unavailable, and admits no execution.
 
-`cozy rental list` shows each known machine's observed idle time, when it ends itself
-(ENDS, from the machine's live Status; blank if it cannot answer or names no deadline)
-and accrued spend (`est.` until the provider's charges settle, about an hour late; `-`
+`cozy rental list` shows each known machine's queued and running work, when it ends
+itself (ENDS, from the machine's live Status, the only rental clock; blank if it cannot
+answer or names no deadline) and accrued spend (`est.` until the provider's charges settle, about an hour late; `-`
 from a Hub that does not say). A release Tensorhub does not confirm is retried.
 Activity is unknown for machines absent from this controller's history.
 

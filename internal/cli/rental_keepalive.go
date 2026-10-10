@@ -35,9 +35,6 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if problem := store.RecordRentalKeepalive(subject.Row.ID, receipt, time.Now()); problem != nil {
-		return problem
-	}
 	// The deadline the machine answered: its clock restarted now, or none named.
 	fields := append([]output.Field{{K: "rental", V: subject.Row.ID},
 		{K: "acknowledged_at", V: time.UnixMilli(receipt.AcknowledgedAtMS).UTC().Format(time.RFC3339Nano)}},
@@ -46,7 +43,7 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 }
 
 // keepalive is the daemon's route for the same reset (a cozy before the command did it
-// itself still asks here), and records what the machine answered.
+// itself still asks here).
 func (m *managedRentals) keepalive(ctx context.Context, id string) (api.RentalKeepaliveResult, *exit.Error) {
 	var out api.RentalKeepaliveResult
 	m.mu.Lock()
@@ -63,9 +60,6 @@ func (m *managedRentals) keepalive(ctx context.Context, id string) (api.RentalKe
 		return out, problem
 	}
 	receipt, problem := rental.KeepAlive(ctx, m.layout, row)
-	if problem == nil {
-		problem = m.store.RecordRentalKeepalive(id, receipt, time.Now())
-	}
 	if problem != nil {
 		return out, problem
 	}

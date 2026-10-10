@@ -119,14 +119,11 @@ func handleDevComfy(ctx *Context) *exit.Error {
 	observed, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	keepalive := func(call context.Context) error {
-		receipt, problem := rental.KeepAlive(call, layout, address.Row)
+		_, problem := rental.KeepAlive(call, layout, address.Row)
 		if problem != nil {
 			if problem.Code != exit.Unavailable {
 				return &devcomfy.IdentityError{Err: problem}
 			}
-			return problem
-		}
-		if problem := store.RecordRentalKeepalive(address.Row.ID, receipt, time.Now()); problem != nil {
 			return problem
 		}
 		return nil
