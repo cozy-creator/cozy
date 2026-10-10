@@ -29,7 +29,7 @@ func TestCapturedHubWheelRetainsBytesWithoutRemoteLoopbackRequirement(t *testing
 	}))
 	defer server.Close()
 	index := server.URL + "/v1/index/paul/simple/"
-	object := server.URL + "/v1/index/paul/files/" + digest + "/" + filepath.Base(source)
+	object := server.URL + "/v1/index/paul/hub-fixture/1.0.0/" + filepath.Base(source)
 	lock := fmt.Sprintf("version=1\n[[package]]\nname='capture-root'\nversion='1.0.0'\nsource={editable='.'}\n[[package]]\nname='hub-fixture'\nversion='1.0.0'\nsource={registry=%q}\nwheels=[{url=%q,hash=%q}]\n", index, object, "sha256:"+digest)
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte("[project]\nname='capture-root'\nversion='1.0.0'\n"), 0600))
@@ -49,14 +49,23 @@ func TestCapturedHubWheelRetainsBytesWithoutRemoteLoopbackRequirement(t *testing
 	}
 	for _, candidate := range []string{
 		strings.Replace(lock, object, strings.Replace(object, server.URL, "https://other.invalid", 1), 1),
-		strings.Replace(lock, object, strings.Replace(object, "/paul/files/", "/other/files/", 1), 1),
+		strings.Replace(lock, object, strings.Replace(object, "/paul/hub-fixture/", "/other/hub-fixture/", 1), 1),
 		strings.Replace(lock, object, object+"?redirect=1", 1),
-		strings.Replace(lock, object, strings.Replace(object, digest, strings.Repeat("1", 64), 1), 1),
+		strings.Replace(lock, object, strings.Replace(object, "http://", "http://user:secret@", 1), 1),
+		strings.Replace(lock, object, object+"#fragment", 1),
 	} {
 		if _, _, problem := packagepublish.CapturedRegistryRows([]byte(candidate), closure, "capture-root", "1.0.0", nil); problem == nil {
-			t.Fatal("changed Hub object origin/namespace/hash admitted")
+			t.Fatal("changed Hub object origin/namespace/credentials admitted")
 		}
 	}
+	// Release URLs need not contain the digest: the lock's SHA256 still binds
+	// their bytes, and a changed hash must fail even with valid wheel metadata.
+	wrongHash := strings.Replace(lock, "sha256:"+digest, "sha256:"+strings.Repeat("1", 64), 1)
+	must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(wrongHash), 0600))
+	if _, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}}); problem == nil || problem.Name != "private_dependency_download_changed" {
+		t.Fatalf("changed locked hash admitted: %v", problem)
+	}
+	must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600))
 	changed.Store(true)
 	if _, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}}); problem == nil {
 		t.Fatal("changed Hub bytes admitted")

@@ -46,7 +46,7 @@ func intakeProject(t *testing.T, origin, runtimeVersion string, wheels []intakeW
 	closure := "capture-root==1.0.0"
 	selected := map[string]string{}
 	for _, w := range wheels {
-		object := origin + "/v1/index/paul/files/" + w.digest + "/" + w.filename
+		object := origin + "/v1/index/paul/" + w.name + "/1.0.0/" + w.filename
 		lock += fmt.Sprintf("[[package]]\nname=%q\nversion='1.0.0'\nsource={registry=%q}\nwheels=[{url=%q,hash=%q,size=%d}]\n", w.name, origin+"/v1/index/paul/simple/", object, "sha256:"+w.digest, len(w.data))
 		closure += "\n" + w.name + "==1.0.0"
 		selected[w.name] = "1.0.0"
@@ -106,6 +106,19 @@ func TestWheelIntakeCacheReusesUnchangedClosureAcrossRuntimeRevision(t *testing.
 			must(t, os.WriteFile(first[wheels[0].name].Path, []byte("scratch changed"), 0600))
 		}
 	}
+	root, closure, selected := intakeProject(t, server.URL, "0.23.2", wheels)
+	lockPath := filepath.Join(root, "uv.lock")
+	raw, err := os.ReadFile(lockPath)
+	must(t, err)
+	// A warm content cache does not authorize a newly changed source origin.
+	must(t, os.WriteFile(lockPath, bytes.ReplaceAll(raw, []byte(server.URL+"/v1/index/paul/intake-library-"), []byte("https://other.invalid/v1/index/paul/intake-library-")), 0600))
+	if _, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), cache, selected); problem == nil || problem.Name != "registry_dependency_origin_refused" {
+		t.Fatalf("cached bytes bypassed current source-origin validation: %v", problem)
+	}
+	if requests.Load() != 46 {
+		t.Fatal("refused source origin made another HTTP request")
+	}
+
 }
 
 func TestWheelIntakeCacheRepairsCorruptionAndRejectsChangedBytes(t *testing.T) {
@@ -202,5 +215,36 @@ func TestWheelIntakeCacheConcurrentCapturesIgnoreIncompleteDownloads(t *testing.
 	}
 	if requests.Load() != 2 {
 		t.Fatalf("parallel captures downloaded the same wheel repeatedly: %d", requests.Load())
+	}
+}
+
+func TestWheelIntakeCacheStillChecksLockedSize(t *testing.T) {
+	wheels := intakeWheels(t, 1)
+	item := wheels[0]
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Write(item.data)
+	}))
+	defer server.Close()
+	cache := home.Paths(t.TempDir()).DependencyCache()
+	root, closure, selected := intakeProject(t, server.URL, "", wheels)
+	capture := func() *exit.Error {
+		_, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), cache, selected)
+		return problem
+	}
+	fatal(t, capture())
+	lockPath := filepath.Join(root, "uv.lock")
+	raw, err := os.ReadFile(lockPath)
+	must(t, err)
+	wrongSize := bytes.ReplaceAll(raw, []byte(fmt.Sprintf("size=%d", len(item.data))), []byte(fmt.Sprintf("size=%d", len(item.data)+1)))
+	must(t, os.WriteFile(lockPath, wrongSize, 0600))
+	if problem := capture(); problem == nil || problem.Name != "private_dependency_download_changed" {
+		t.Fatalf("cache ignored the new lock's declared size: %v", problem)
+	}
+	must(t, os.WriteFile(lockPath, raw, 0600))
+	fatal(t, capture())
+	if requests.Load() != 2 {
+		t.Fatal("invalid size poisoned the previously verified cache entry")
 	}
 }
