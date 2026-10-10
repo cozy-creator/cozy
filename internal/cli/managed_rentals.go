@@ -1024,6 +1024,9 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 	rows, problem := m.reconcilableLocked(origin)
 	var asks []records.RentalOperation
 	if problem == nil && only == nil {
+		problem = m.failUnansweredAsksLocked(origin)
+	}
+	if problem == nil && only == nil {
 		asks, problem = m.rowlessAsksLocked(origin)
 	}
 	m.mu.Unlock()
@@ -1054,8 +1057,9 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 		views = append(views, rentalView{id: row.ID, remote: remote, unknown: observed != nil,
 			released: observed == nil && remote.State == hub.RentalReleased})
 	}
-	// An ask whose answer was refused has no row to reconcile; the Hub still settles it.
-	var gone []records.RentalOperation
+	// An ask whose answer was refused has no row to reconcile; the Hub still settles it. One
+	// the Hub answers 404 for is over: nothing is rented under that id.
+	var gone, unknown []records.RentalOperation
 	for _, op := range asks {
 		if asked != nil {
 			break
@@ -1066,7 +1070,9 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 		switch {
 		case observed == nil && hub.RentalAbsent(remote.State):
 			gone = append(gone, op)
-		case observed != nil && observed.Code != exit.NotFound:
+		case observed != nil && observed.Code == exit.NotFound:
+			unknown = append(unknown, op)
+		case observed != nil:
 			asked = observed
 		}
 	}
@@ -1089,6 +1095,11 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 	released, failed, rebooted, problem := m.applyRowsLocked(origin, views)
 	if problem == nil {
 		problem = m.settleAsksLocked(origin, gone)
+	}
+	for _, op := range unknown {
+		if problem == nil {
+			problem = m.failAskLocked(op, fmt.Sprintf("%s answered 404 for rental %s", origin, op.RentalID))
+		}
 	}
 	census := m.censusLocked(origin)
 	switch {
@@ -1200,6 +1211,46 @@ func (m *managedRentals) rowlessAsksLocked(origin string) ([]records.RentalOpera
 		}
 	}
 	return out, nil
+}
+
+// failUnansweredAsksLocked ends origin's paid asks that never got an answer naming a rental
+// and that no process is making any more: nothing can finish them.
+func (m *managedRentals) failUnansweredAsksLocked(origin string) *exit.Error {
+	operations, problem := m.store.ActiveRentalOperations()
+	if problem != nil {
+		return problem
+	}
+	for _, op := range operations {
+		if _, buying := m.buying[op.Key]; buying || op.RentalID != "" || m.origin(op.Hub) != origin {
+			continue
+		}
+		if problem := m.failAskLocked(op, origin+" never answered this ask, and the command that made it is gone"); problem != nil {
+			return problem
+		}
+	}
+	return nil
+}
+
+// failAskLocked closes one rowless ask with its reason, unless a live process still makes it
+// or a row took it meanwhile.
+func (m *managedRentals) failAskLocked(op records.RentalOperation, reason string) *exit.Error {
+	if rental.AskHeld(m.layout, op.Key) {
+		return nil
+	}
+	failed, problem := m.store.FailRentalOperation(op.Key, reason)
+	if problem != nil || !failed {
+		return problem
+	}
+	if op.RentalID != "" {
+		rental.ForgetPending(m.layout, op.Key)
+	}
+	// The daemon says so in its log; a command says so beside its own output.
+	said := m.ctx.Err
+	if m.owner != nil {
+		said = m.ctx.Out
+	}
+	fmt.Fprintf(said, "rental operation %s (%s) failed: %s; `cozy rental list` shows what the account holds\n", op.Key, op.Reason, reason)
+	return nil
 }
 
 // settleAsksLocked closes the rowless asks the Hub reported gone, unless a row or an

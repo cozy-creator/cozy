@@ -100,6 +100,16 @@ func (m *machineRuns) loopV1(request records.Request) {
 		if moved {
 			lastError = "" // a new loss is news again
 		}
+		// This computer's machine is proven gone (its process, not a slow answer), so a run it
+		// accepted is over: it fails, or ends canceled when that was asked, and is never run
+		// again. A paused run rests in the machine's own records until it starts.
+		if problem != nil && problem.ErrName() == "machine.stopped" && accepted &&
+			!records.Settled(current.State) && current.State != "paused" {
+			if lost := m.store.StopMachineExecution(request.ID, link.MachineID); lost == nil {
+				fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, records.MachineStoppedMessage)
+				return
+			}
+		}
 		// The market giving the same refusal on the next ask made no progress: unsent work fails
 		// with it rather than waiting on stock or a catalog that may never come.
 		if problem != nil && problem.Message == lastError && marketRefusal(problem) && !accepted && !sent && !link.CancelRequested {

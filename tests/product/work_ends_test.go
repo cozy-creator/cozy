@@ -20,10 +20,12 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -307,5 +309,130 @@ func TestACancelTheMachineNeverTookEndsCanceled(t *testing.T) {
 	fatal(t, problem)
 	if transfer == nil || transfer.State != "canceled" {
 		t.Fatalf("the canceled run's weights destination still waits: %+v", transfer)
+	}
+}
+
+// A paid ask nothing can finish fails with the reason: one its Hub never answered and no
+// command is making any more, and one whose rental the Hub answers 404 for. An ask a live
+// command still makes is left alone until that command is gone.
+func TestARentalAskNobodyCanFinishFails(t *testing.T) {
+	root, store := idleRoot(t, "ask-fails")
+	hub := newFakeRentalHub(t, 0)
+	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubURL+"\n"+
+		"tensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 1\n"), 0o600))
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	author := func(string) ([]byte, string, *exit.Error) { return []byte(`{}`), "proof", nil }
+	for _, key := range []string{"ask-unanswered", "ask-unknown", "ask-in-flight"} {
+		_, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: key, Hub: hubURL, Reason: "cozy rental new cpu",
+			HourlyRateUSDMicros: 1}, author)
+		fatal(t, problem)
+		_, problem = rental.PendingMediaToken(layout, key)
+		fatal(t, problem)
+	}
+	fatal(t, store.AdvanceRentalOperation("ask-unknown", "pr-unknown-to-the-hub", "acquiring"))
+	release, problem := rental.HoldAsk(layout, "ask-in-flight")
+	fatal(t, problem)
+
+	logPath := filepath.Join(root, "daemon.log")
+	d := startDaemonProcess(t, root)
+	ended := func(key, state, reason string) bool {
+		op, problem := store.RentalOperation(key)
+		fatal(t, problem)
+		return op != nil && op.State == state && strings.Contains(op.Failure, reason)
+	}
+	waitFor(t, root, "the unfinishable asks failing", func() bool {
+		return ended("ask-unanswered", "rejected", "never answered this ask") && ended("ask-unknown", "released", "answered 404 for rental pr-unknown-to-the-hub")
+	})
+	awaitIdleHold(t, d, logPath, "rental_operation ask-in-flight (pending_acquisition)")
+	release()
+	if code := awaitDaemonExit(t, d, 60*time.Second); code != 0 {
+		t.Fatalf("the daemon exited %d\n%s", code, tail(logPath))
+	}
+	if !ended("ask-in-flight", "rejected", "the command that made it is gone") {
+		op, _ := store.RentalOperation("ask-in-flight")
+		t.Fatalf("an ask whose command ended still waits: %+v\n%s", op, tail(logPath))
+	}
+}
+
+// acceptedLocalRun records a run this computer's machine accepted and was running.
+func acceptedLocalRun(t *testing.T, store *records.Store, id string, request records.Request) records.Request {
+	t.Helper()
+	request.ID, request.IdemKey, request.Kind, request.Payload = id, "idem-"+id, "job", []byte(`{}`)
+	request.Package, request.Entrypoint, request.BodyDigest, request.MachineExecutionObserver = "proof/example", "generate", childDigest("7"), true
+	row, _, problem := store.Submit(request)
+	fatal(t, problem)
+	fatal(t, store.LinkMachineExecution(id, machines.Local))
+	if send, problem := store.MarkRunV1Sent(id); problem != nil || !send {
+		t.Fatalf("%s was not sent: %v %v", id, send, problem)
+	}
+	fatal(t, store.AcceptRunV1(id, machines.Local, &v1.RunState{Id: id, Number: 1, State: "running", Attempt: 1}))
+	return row
+}
+
+// A run this computer's machine accepted fails once that machine's process is gone: it says
+// the machine stopped, it is not run again, and it holds nothing. One being canceled ends
+// canceled.
+func TestARunWhoseLocalMachineIsGoneFails(t *testing.T) {
+	root, store := idleRoot(t, "machine-gone")
+	acceptedLocalRun(t, store, "req-machine-gone", records.Request{})
+	acceptedLocalRun(t, store, "req-machine-gone-canceling", records.Request{})
+	_, problem := store.RequestMachineCancellation("req-machine-gone-canceling", "cozy run cancel")
+	fatal(t, problem)
+
+	logPath := filepath.Join(root, "daemon.log")
+	if code := awaitDaemonExit(t, startDaemonProcess(t, root), 60*time.Second); code != 0 {
+		t.Fatalf("the daemon exited %d\n%s", code, tail(logPath))
+	}
+	row, problem := store.RequestRow("req-machine-gone")
+	fatal(t, problem)
+	errType, _, errText, problem := store.SettledFailure("req-machine-gone")
+	fatal(t, problem)
+	if row.State != "failed" || errType != records.MachineStopped || errText != records.MachineStoppedMessage {
+		t.Fatalf("the run did not fail saying its machine stopped: %+v %s %q\n%s", row, errType, errText, tail(logPath))
+	}
+	if row, problem = store.RequestRow("req-machine-gone-canceling"); problem != nil || row.State != "canceled" {
+		t.Fatalf("the run being canceled did not end canceled: %+v %v", row, problem)
+	}
+}
+
+// Work at rest holds no daemon up: a paused run and a finished one keeping its results wait
+// for their owner's next command, exactly as they were.
+func TestWorkAtRestDoesNotHoldTheDaemon(t *testing.T) {
+	root, store := idleRoot(t, "at-rest")
+	acceptedLocalRun(t, store, "job-paused", records.Request{RetainWork: true})
+	fatal(t, store.ObserveRunV1("job-paused", &v1.RunEvent{Sequence: 1, Event: &v1.RunEvent_State{
+		State: &v1.RunState{Id: "job-paused", Number: 1, State: "paused", Sequence: 1, Attempt: 1}}}, nil))
+	_, _, problem := store.Submit(records.Request{ID: "job-kept", IdemKey: "idem-job-kept", Kind: "job", Package: "proof/example",
+		Entrypoint: "generate", Payload: []byte(`{}`), BodyDigest: childDigest("8"), RetainWork: true, ChildArtifacts: true,
+		MachineExecutionObserver: true})
+	fatal(t, problem)
+	fatal(t, store.LinkMachineExecution("job-kept", machines.Local))
+	db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))
+	must(t, err)
+	_, err = db.Exec(`UPDATE requests SET state='succeeded' WHERE id='job-kept'`)
+	must(t, err)
+	must(t, db.Close())
+	if row, _ := store.RequestRow("job-paused"); row == nil || row.State != "paused" {
+		t.Fatalf("the fixture's run is not paused: %+v", row)
+	}
+
+	logPath := filepath.Join(root, "daemon.log")
+	if code := awaitDaemonExit(t, startDaemonProcess(t, root), 60*time.Second); code != 0 {
+		t.Fatalf("the daemon exited %d\n%s", code, tail(logPath))
+	}
+	if log, _ := os.ReadFile(logPath); strings.Contains(string(log), "idle exit held") {
+		t.Fatalf("work at rest held the daemon\n%s", tail(logPath))
+	}
+	for id, state := range map[string]string{"job-paused": "paused", "job-kept": "succeeded"} {
+		if row, problem := store.RequestRow(id); problem != nil || row == nil || row.State != state || !row.RetainWork {
+			t.Fatalf("%s did not rest as it was: %+v %v", id, row, problem)
+		}
+	}
+	obligations, problem := store.Obligations()
+	fatal(t, problem)
+	if len(obligations) != 2 || !obligations[0].AtRest() || !obligations[1].AtRest() {
+		t.Fatalf("work at rest left the records: %+v", obligations)
 	}
 }

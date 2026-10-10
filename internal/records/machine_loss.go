@@ -107,12 +107,22 @@ func endedRentals(q interface {
 // holds (the worker restarted without its execution workspace). The machine and its
 // other work continue.
 func (s *Store) LoseMachineExecution(id, machine, message string) *exit.Error {
+	return s.loseMachineExecution(id, machine, message, "")
+}
+
+// StopMachineExecution settles one accepted execution whose machine's process is proven gone:
+// it fails as its machine would report it, and is never run again.
+func (s *Store) StopMachineExecution(id, machine string) *exit.Error {
+	return s.loseMachineExecution(id, machine, MachineStoppedMessage, MachineStopped)
+}
+
+func (s *Store) loseMachineExecution(id, machine, message, code string) *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin lost execution: %s", err)
 	}
 	defer tx.Rollback()
-	if problem := settleLost(tx, machine, id, message); problem != nil {
+	if problem := settleLost(tx, machine, id, message, code); problem != nil {
 		return problem
 	}
 	if err := tx.Commit(); err != nil {
@@ -129,7 +139,7 @@ func (s *Store) LoseMachine(machine, message string) *exit.Error {
 		return exit.Internalf("cannot begin the replaced machine's settlement: %s", err)
 	}
 	defer tx.Rollback()
-	if problem := settleLost(tx, machine, "", message); problem != nil {
+	if problem := settleLost(tx, machine, "", message, ""); problem != nil {
 		return problem
 	}
 	if err := tx.Commit(); err != nil {
@@ -145,10 +155,13 @@ func (s *Store) LoseMachine(machine, message string) *exit.Error {
 // confirmed run may have executed: it ends FAILED with its machine's loss, and its owner
 // resubmits.
 func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
-	return settleLost(tx, machine, "", "")
+	return settleLost(tx, machine, "", "", "")
 }
 
-func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
+func settleLost(tx *sql.Tx, machine, request, lost, code string) *exit.Error {
+	if code == "" {
+		code = "machine_execution.state_lost"
+	}
 	var cause string
 	var served bool
 	if err := tx.QueryRow(`SELECT failure_code,ready_at<>'' FROM rentals WHERE id=?`, machine).Scan(&cause, &served); err != nil && err != sql.ErrNoRows {
@@ -212,7 +225,7 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 			message += " (" + cause + ")"
 		}
 		detail := map[string]any{
-			"machine_id": value.machine, "error_type": "machine_execution.state_lost", "error": message,
+			"machine_id": value.machine, "error_type": code, "error": message,
 			"had_acceptance_receipt": value.accepted, "had_recorded_outcome": value.hasResult,
 		}
 		if cause != "" {

@@ -17,7 +17,8 @@ import (
 // The daemon's own reason to leave. The owner's ruling: it may stop only once there is
 // nothing left for it to manage — no rental it owns, no request or attempt it owes, no
 // transfer, export, launch or teardown in flight, no client stream attached — and only
-// once that has stayed true for a while. User interaction is not the signal; the absence
+// once that has stayed true for a while. Work at rest (a paused run, a finished one keeping
+// its results) is not managed: the next command's daemon resumes or serves it. User interaction is not the signal; the absence
 // of a CLI is not the signal. The next command brings the daemon back (ensureDaemon).
 //
 // The duration is a DEBOUNCE over an observed fact, never the decision. `managed` decides;
@@ -47,7 +48,9 @@ func (w idleWatch) managed() ([]string, *exit.Error) {
 		return nil, problem
 	}
 	for _, o := range obligations {
-		held = append(held, o.String())
+		if !o.AtRest() {
+			held = append(held, o.String())
+		}
 	}
 	held = append(held, w.startup.holding()...)
 	sort.Strings(held)

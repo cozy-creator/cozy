@@ -374,7 +374,7 @@ func RentalSecrets(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 	if problem != nil {
 		return Swept{}, problem
 	}
-	operations, problem := st.ActiveRentalOperations()
+	operations, problem := st.RentalOperationsWithSecrets()
 	if problem != nil {
 		return Swept{}, problem
 	}

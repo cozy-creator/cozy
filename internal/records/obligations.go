@@ -63,3 +63,7 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 }
 
 func (o Obligation) String() string { return o.Kind + " " + o.ID + " (" + o.State + ")" }
+
+// AtRest is work that waits on its owner alone: a paused run, or a finished one keeping its
+// results. Nothing happens to it until a command asks, so it holds no daemon up.
+func (o Obligation) AtRest() bool { return o.State == "paused" || o.State == "succeeded" }

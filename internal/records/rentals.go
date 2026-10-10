@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS rental_operations (
   rental_id        TEXT NOT NULL DEFAULT '',
   state            TEXT NOT NULL,
   created_at       TEXT NOT NULL,
-  updated_at       TEXT NOT NULL
+  updated_at       TEXT NOT NULL,
+  failure          TEXT NOT NULL DEFAULT ''
 )`
 
 const rentalsDDL = `
@@ -103,15 +104,17 @@ type RentalOperation struct {
 	State               string
 	CreatedAt           string
 	UpdatedAt           string
+	// Failure is why an ask that never became a rental here was closed.
+	Failure string
 }
 
-const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,hourly_rate_usd_micros,managed_request_id,rental_id,state,created_at,updated_at`
+const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,hourly_rate_usd_micros,managed_request_id,rental_id,state,created_at,updated_at,failure`
 
 func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, error) {
 	var op RentalOperation
 	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.Hub, &op.Reason,
 		&op.HourlyRateUSDMicros, &op.ManagedRequestID,
-		&op.RentalID, &op.State, &op.CreatedAt, &op.UpdatedAt)
+		&op.RentalID, &op.State, &op.CreatedAt, &op.UpdatedAt, &op.Failure)
 	return op, err
 }
 
@@ -214,7 +217,7 @@ func (s *Store) BeginRentalOperation(op RentalOperation,
 		}
 	}
 	if _, err := tx.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,'')`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
 		op.HourlyRateUSDMicros, op.ManagedRequestID, op.RentalID, "pending_acquisition", stamp, stamp); err != nil {
 		return RentalOperation{}, false, exit.Internalf("cannot record rental operation: %s", err)
 	}
@@ -266,7 +269,7 @@ func machineNamesInUse(q querier) (map[string]bool, *exit.Error) {
 	}
 	// An unsettled operation holds its word inside the closed request document it replays.
 	if e := collect(`SELECT request_body FROM rental_operations WHERE state NOT IN (`+
-		finalRentalOperationStates+`)`, func(v []byte) string {
+		finalRentalOperationStates+`) OR `+replayableRentalOperation, func(v []byte) string {
 		var request struct {
 			Name string `json:"name"`
 		}
@@ -293,12 +296,41 @@ func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
 // finalRentalOperationStates is the one spelling of "this paid operation is over".
 const finalRentalOperationStates = `'released','rejected'`
 
+// replayableRentalOperation is an ask that failed unanswered: it is over and holds nothing,
+// yet its key may make the same ask again byte for byte (the Hub answers a replay with what
+// the first ask created), so its machine word and its credentials are kept.
+const replayableRentalOperation = `(state='rejected' AND rental_id='' AND failure<>'')`
+
+// Replayable is replayableRentalOperation for one row.
+func (op RentalOperation) Replayable() bool {
+	return op.State == "rejected" && op.RentalID == "" && op.Failure != ""
+}
+
+// RentalOperationsWithSecrets is every operation whose pending credentials are still owed: the
+// open ones and the replayable ones.
+func (s *Store) RentalOperationsWithSecrets() ([]RentalOperation, *exit.Error) {
+	return s.rentalOperationsWhere(`state NOT IN (` + finalRentalOperationStates + `) OR ` + replayableRentalOperation)
+}
+
+// ReopenRentalOperation makes a replayable ask open again for the command replaying it.
+func (s *Store) ReopenRentalOperation(key string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE rental_operations SET state='pending_acquisition',failure='',updated_at=?
+		WHERE operation_key=? AND `+replayableRentalOperation, now(), key); err != nil {
+		return exit.Internalf("cannot reopen rental operation %s: %s", key, err)
+	}
+	return nil
+}
+
 // ActiveRentalOperations is every paid acquisition/release operation whose absence has
 // not been proved. A row may precede its provider rental id, so a safe daemon exit
 // must fence on the operation key as well as on attached rental rows.
 func (s *Store) ActiveRentalOperations() ([]RentalOperation, *exit.Error) {
+	return s.rentalOperationsWhere(`state NOT IN (` + finalRentalOperationStates + `)`)
+}
+
+func (s *Store) rentalOperationsWhere(where string) ([]RentalOperation, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + rentalOperationCols + ` FROM rental_operations
-		WHERE state NOT IN (` + finalRentalOperationStates + `) ORDER BY created_at,operation_key`)
+		WHERE ` + where + ` ORDER BY created_at,operation_key`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list active rental operations: %s", err)
 	}
@@ -388,6 +420,21 @@ func (s *Store) AdvanceRentalOperation(key, rentalID, state string) *exit.Error 
 		// Another writer won after the read. Re-evaluate against its fact instead of
 		// overwriting it with the stale state this caller observed.
 	}
+}
+
+// FailRentalOperation closes a paid ask no rental row stands for and nothing can finish: one
+// that was never answered and that no process is making any more, or one whose rental the Hub
+// answers 404 for. It ends with the reason kept; an ask that named no rental ends `rejected`
+// and stays replayable under its key.
+func (s *Store) FailRentalOperation(key, reason string) (bool, *exit.Error) {
+	result, err := s.db.Exec(`UPDATE rental_operations SET state=CASE WHEN rental_id='' THEN 'rejected' ELSE 'released' END,
+		failure=?,updated_at=? WHERE operation_key=? AND state NOT IN (`+finalRentalOperationStates+`)
+		AND rental_id NOT IN (SELECT id FROM rentals)`, reason, now(), key)
+	if err != nil {
+		return false, exit.Internalf("cannot fail rental operation %s: %s", key, err)
+	}
+	changed, _ := result.RowsAffected()
+	return changed == 1, nil
 }
 
 func rentalOperationFinal(state string) bool {

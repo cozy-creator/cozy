@@ -326,6 +326,8 @@ type rentalAcquisition struct {
 	rate     int64
 	deadline time.Time
 	managed  string
+	// held releases the mark that this process is making the ask.
+	held func()
 }
 
 // openRentalAcquisition records the paid operation and mints its machine word; every Hub
@@ -339,6 +341,11 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	existing, e := st.RentalOperation(operationKey)
 	if e != nil {
 		return nil, e
+	}
+	// An ask that failed unanswered is made again under its key, byte for byte.
+	reopen := existing != nil && existing.Replayable()
+	if reopen {
+		existing.State = "pending_acquisition"
 	}
 	if existing != nil && (existing.State == "rejected" || existing.State == "released") {
 		if managedRequestID != "" && existing.State == "released" {
@@ -405,6 +412,21 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	if e != nil {
 		return nil, e
 	}
+	// The ask is marked in flight before its row exists and until complete returns: a row
+	// with no answer and no mark is an ask nobody is making any more. An attached rental's
+	// ask was answered long ago.
+	held := func() {}
+	if existing == nil || existing.RentalID == "" || existing.State != "attached" {
+		if held, e = rental.HoldAsk(l, operationKey); e != nil {
+			return nil, e
+		}
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			held()
+		}
+	}()
 	// A rental bought FOR a request declares that request's workload, so the hub
 	// can size the pod's container disk to the job (th-152). An ingest holds its
 	// source objects and the canonical CAS output built from them in one Store
@@ -468,6 +490,11 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 		}
 		return body, rentalRequestDigest(c.Base(), body), nil
 	}
+	if reopen {
+		if e := st.ReopenRentalOperation(operationKey); e != nil {
+			return nil, e
+		}
+	}
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
 		Key: operationKey, Hub: c.Base(), Reason: reason, HourlyRateUSDMicros: hourlyRateUSDMicros,
 		ManagedRequestID: managedRequestID,
@@ -485,9 +512,10 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	if e != nil {
 		return nil, e
 	}
+	opened = true
 	return &rentalAcquisition{ctx: ctx, layout: l, store: st, client: c, op: op, machine: request.Name,
 		existing: existing, token: token, creator: creator, replay: replay, sku: skuName,
-		rate: hourlyRateUSDMicros, deadline: deadline, managed: managedRequestID}, nil
+		rate: hourlyRateUSDMicros, deadline: deadline, managed: managedRequestID, held: held}, nil
 }
 
 // quoteRental asks the Hub what this exact request will lock. Its disk and declared
@@ -527,6 +555,7 @@ func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHas
 // attachable or the Hub says it will not be.
 func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitionPhase,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
+	defer a.held()
 	ctx, l, st, c, op := a.ctx, a.layout, a.store, a.client, a.op
 	operationKey, machineName, deadline, skuName := op.Key, a.machine, a.deadline, a.sku
 	hourlyRateUSDMicros, managedRequestID := a.rate, a.managed
