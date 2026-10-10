@@ -627,14 +627,19 @@ impl Journal {
     }
     /// Every generation an installation or an unfinished run names: never evicted meanwhile.
     pub fn bound_generations(&self) -> io::Result<std::collections::HashSet<String>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT json_extract(record,'$.generation') FROM installations
-                 UNION SELECT json_extract(invocation,'$.generation') FROM executions
-                 WHERE state NOT IN ('completed','failed','canceled')",
-            )
-            .map_err(db_error)?;
+        let mut bound = self.running_generations()?;
+        bound.extend(self.generations("SELECT json_extract(record,'$.generation') FROM installations")?);
+        Ok(bound)
+    }
+    /// Every generation an unfinished run names.
+    pub fn running_generations(&self) -> io::Result<std::collections::HashSet<String>> {
+        self.generations(
+            "SELECT json_extract(invocation,'$.generation') FROM executions
+             WHERE state NOT IN ('completed','failed','canceled')",
+        )
+    }
+    fn generations(&self, query: &str) -> io::Result<std::collections::HashSet<String>> {
+        let mut statement = self.connection.prepare(query).map_err(db_error)?;
         let rows = statement
             .query_map([], |row| row.get::<_, Option<String>>(0))
             .map_err(db_error)?;

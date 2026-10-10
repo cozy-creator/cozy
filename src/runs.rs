@@ -332,7 +332,10 @@ impl Runs {
         // A local source is refused here, not accepted to fail: the run takes custody of its
         // objects now, and a refused id is free for the client to write them and send again.
         if let Source::Local(digest) = &spec.source {
-            references.extend(crate::local_source::written(&self.objects, actor, digest)?);
+            let local = self.local.as_ref().ok_or_else(|| {
+                refused("capability_unavailable", "this machine installs no local packages")
+            })?;
+            references.extend(local.written(actor, digest)?);
         }
         // A written file a warm run makes into a model (`object://sha256:<hex>/<file>`).
         for choice in &spec.models {
@@ -600,7 +603,10 @@ impl Runs {
                 let local = self.local.as_ref().ok_or_else(|| {
                     refused("capability_unavailable", "this machine installs no local packages")
                 })?;
-                Some(local.install(&self.service, actor, digest)?)
+                let installed = local.install(&self.service, actor, digest)?;
+                self.supersede(actor, &installed)?;
+                local.collect(actor, &installed.package);
+                Some(installed)
             }
         };
         let held = match held {
@@ -687,7 +693,7 @@ impl Runs {
             return warm_result(installed, models);
         }
         if spec.job {
-            let inputs = self.job_inputs(&spec, &interface, hub.as_ref(), &*observe)?;
+            let inputs = self.job_inputs(&spec, &installation.package, &interface, hub.as_ref(), &*observe)?;
             let context = JobContext {
                 installation: installation.alias.clone(),
                 application: spec.application.clone(),
@@ -821,6 +827,31 @@ impl Runs {
             }
             Source::Local(_) | Source::Models => false,
         };
+        let (removed, reclaimed, retained) = self.uninstall(actor, named)?;
+        if let Some(local) = &self.local {
+            for gone in removed.iter().filter(|i| i.package.starts_with("local/")) {
+                local.collect(actor, &gone.package);
+            }
+        }
+        let rows: Vec<Value> = removed
+            .iter()
+            .map(|i| json!({"package": i.package, "release": i.release, "installation": i.alias, "hub": i.hub}))
+            .collect();
+        Ok(ResultRecord {
+            value: json!({"removed": rows, "reclaimed_bytes": reclaimed, "retained": retained}),
+            artifacts: vec![],
+            asset_bindings: vec![],
+        })
+    }
+
+    /// `actor`'s installations `named` leave the journal, their warm set members and the GPU
+    /// pool. Each environment no installation or unfinished run names any more is deleted,
+    /// its idle executors ended first; one a process still holds is `retained` for reclaim.
+    fn uninstall(
+        &self,
+        actor: &str,
+        named: impl Fn(&Installation) -> bool,
+    ) -> Result<(Vec<Installation>, u64, Vec<String>), Refused> {
         let engine = &self.service.engine;
         let mut removed = vec![];
         for installed in engine.installations(actor)?.into_iter().filter(|i| named(i)) {
@@ -843,15 +874,21 @@ impl Runs {
                 None => retained.push(generation.clone()),
             }
         }
-        let rows: Vec<Value> = removed
-            .iter()
-            .map(|i| json!({"package": i.package, "release": i.release, "installation": i.alias, "hub": i.hub}))
-            .collect();
-        Ok(ResultRecord {
-            value: json!({"removed": rows, "reclaimed_bytes": reclaimed, "retained": retained}),
-            artifacts: vec![],
-            asset_bindings: vec![],
-        })
+        Ok((removed, reclaimed, retained))
+    }
+
+    /// A local package is one installation: the state just installed replaces its earlier
+    /// ones, whose executors end and environments' records leave. One an unfinished run names
+    /// stays until a later install finds it idle.
+    fn supersede(&self, actor: &str, current: &Installation) -> Result<(), Refused> {
+        let running = self.service.engine.with_journal(|j| j.running_generations())?;
+        self.uninstall(actor, |prior| {
+            prior.package == current.package
+                && prior.alias != current.alias
+                && prior.alias.starts_with("local-")
+                && !running.contains(&prior.generation)
+        })?;
+        Ok(())
     }
 
     /// The run's installation and model plan: through the Hub when it needs one (a release,
@@ -1116,6 +1153,7 @@ impl Runs {
     fn job_inputs(
         &self,
         spec: &Spec,
+        package: &str,
         interface: &Value,
         hub: Option<&hub::Source>,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
@@ -1157,9 +1195,12 @@ impl Runs {
                     .make_source(&choice.source, &choice.profiles, &spec.providers, observe)?
                     .manifest
             } else {
-                // A Hub checkpoint by name, or the owner's by hash (th-245).
-                let choice = choice.ok_or_else(|| {
-                    refused("model_choice_absent", format!("the run names no model for {path}"))
+                // A Hub checkpoint by name, or the owner's by hash (th-245); unnamed, the
+                // job's declared default.
+                let declared = crate::published::default_choice(&row, path, package, &spec.owner);
+                let choice = choice.or(declared.as_ref()).ok_or_else(|| {
+                    let (code, message) = crate::published::choice_absent(path, package);
+                    refused(code, message)
                 })?;
                 let (gpu, width) = crate::published::machine_gpu(&self.service);
                 let (named, _) = crate::published::choose(choice, path, (&gpu, width))
@@ -1566,10 +1607,10 @@ mod tests {
         let mut spec = spec(Source::Models, false, "d");
         (spec.job, spec.entrypoint) = (true, "compute".into());
         spec.input = json!({"source": artifact(&held), "factor": 2});
-        let inputs = runs.job_inputs(&spec, &interface, None, &|_, _, _| ()).unwrap();
+        let inputs = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| ()).unwrap();
         assert_eq!(inputs["source"], ("Source".to_string(), ObjectRef { sha256: held, length: 8 }));
         spec.input = json!({"source": artifact(&"cd".repeat(32)), "factor": 2});
-        let absent = runs.job_inputs(&spec, &interface, None, &|_, _, _| ()).unwrap_err();
+        let absent = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| ()).unwrap_err();
         assert_eq!(absent.code, "checkpoint_absent", "{}", absent.message);
         fs::remove_dir_all(root).unwrap();
     }

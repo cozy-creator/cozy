@@ -12,7 +12,7 @@ from pathlib import Path
 
 import msgspec
 
-from .captured_packages import install_captured
+from .captured_packages import install_captured, install_editable
 from .package_records import InstallFailed
 from .packages import PackageError
 
@@ -33,12 +33,17 @@ def main():
     captured.add_argument("--sdk-wheel", action="append", type=Path, default=[])
     captured.add_argument("--python", default=sys.executable)
     captured.add_argument("--callees", default="{}")
+    # A live project installed editable in this environment, kept while its lock stands.
+    captured.add_argument("--editable-environment", type=Path)
     args = parser.parse_args()
     try:
-        result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements,
-            distribution=args.distribution, release=args.release, python_requires=args.python_requires,
+        shared = dict(distribution=args.distribution, release=args.release, python_requires=args.python_requires,
             python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel,
             python=args.python, sdk=args.sdk_wheel, callees=msgspec.json.decode(args.callees, type=dict[str, str]))
+        if args.editable_environment:
+            result = install_editable(project=args.project, environment=args.editable_environment, wheels=args.wheel, **shared)
+        else:
+            result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements, **shared)
     except PackageError as exc:
         print(msgspec.json.encode(InstallFailed(exc.code, str(exc))).decode())
         raise SystemExit(1)

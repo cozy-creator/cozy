@@ -1,9 +1,13 @@
-//! A run's local source: unpublished code the CLI uploaded with Write, named by the digest of
-//! its manifest object. It installs once per manifest, signer and selected SDK; a later run
-//! reopens that installation only while its environment inputs remain the same.
+//! A run's local source: unpublished code, named by the digest of its manifest object.
+//!
+//! A live project is installed editable. The machine holds one copy of it per signer and
+//! package: a rental's is the tree the CLI syncs file by file (only the files that changed are
+//! written), this computer's is the project directory itself. Its environment is built from
+//! the project's lock and kept while the lock stands, so an edit costs a description and a
+//! fresh executor of that package, never an install.
 use crate::{
     api::{
-        install::{prepare_uploaded, InstallerConfig},
+        install::{prepare_editable, prepare_uploaded, InstallerConfig},
         workspaces::{RootSet, UploadedFile, UploadedPackage},
     },
     journal::Installation,
@@ -11,8 +15,14 @@ use crate::{
     service::Service,
 };
 use serde::Deserialize;
-use std::{fs, sync::Arc, sync::Mutex};
-use tensorfs_core::{ids::ObjectRef, store::Store};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+use tensorfs_core::{ids::ObjectRef, sha256, store::Store};
 
 /// The manifest object (JSON). Members are objects the same signer wrote.
 #[derive(Deserialize)]
@@ -36,6 +46,15 @@ pub struct Manifest {
     /// Installed dependency distribution -> the package whose invocables it owns.
     #[serde(default)]
     pub callees: std::collections::BTreeMap<String, String>,
+    /// A live project and the local path dependencies its lock names, file by file under
+    /// their common directory; `project` is the project's own directory there.
+    #[serde(default)]
+    pub files: Vec<Member>,
+    #[serde(default)]
+    pub project: String,
+    /// This computer's machine: that common directory itself, read in place and never copied.
+    #[serde(default)]
+    pub path: String,
 }
 #[derive(Deserialize)]
 pub struct Member {
@@ -43,13 +62,37 @@ pub struct Member {
     pub name: String,
     pub digest: String,
     pub length: u64,
+    #[serde(default)]
+    pub executable: bool,
+}
+impl Member {
+    /// What a tree holds for this file: its bytes and whether it is executable.
+    fn held(&self) -> String {
+        format!("{}{}", self.digest, if self.executable { "+x" } else { "" })
+    }
 }
 
 pub struct LocalSources {
     pub objects: Arc<Objects>,
     pub installer: InstallerConfig,
     pub store: Arc<Store>,
+    /// Each signer's live packages, beside the generations: `<signer>/<package>/{tree,env-*}`.
+    editable: PathBuf,
     installing: Mutex<()>,
+}
+
+/// `name` as a path inside a tree: relative, with no step out of it.
+fn inside(name: &str) -> Result<&Path, Refused> {
+    let path = Path::new(name);
+    if path.components().all(|c| matches!(c, Component::Normal(_))) {
+        return Ok(path);
+    }
+    Err(refused("local_source_invalid", format!("{name:?} is not a path inside the package's tree")))
+}
+
+/// The files the tree under `home` holds, by name; none while it is absent or half written.
+fn held_tree(home: &Path) -> BTreeMap<String, String> {
+    fs::read(home.join("tree.json")).ok().and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
 }
 
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
@@ -101,29 +144,212 @@ fn open_manifest(
     Ok((manifest, ObjectRef { sha256, length }))
 }
 
-/// A local source's objects, its manifest and every member: what a run takes custody of when
-/// it is accepted. One the signer did not write is `local_source_incomplete`, naming it.
-pub fn written(objects: &Objects, actor: &str, digest: &str) -> Result<Vec<ObjectRef>, Refused> {
-    let (manifest, own) = open_manifest(objects, actor, digest)?;
-    let members = manifest
-        .source
-        .iter()
-        .chain(&manifest.wheels)
-        .chain(&manifest.requirements);
-    let mut written = vec![own];
-    for m in members {
-        written.push(written_member(objects, actor, m)?);
-    }
-    Ok(written)
-}
-
 impl LocalSources {
     pub fn new(objects: Arc<Objects>, installer: InstallerConfig, store: Arc<Store>) -> Self {
         Self {
+            editable: installer.generations.with_file_name("editable"),
             objects,
             installer,
             store,
             installing: Mutex::new(()),
+        }
+    }
+
+    /// Where `actor`'s live `package` is kept.
+    fn home(&self, actor: &str, package: &str) -> Result<PathBuf, Refused> {
+        let name = crate::catalog::normalized(package.strip_prefix("local/").unwrap_or_default());
+        if name.is_empty() || name.contains('/') {
+            return Err(refused("local_source_invalid", "a local package manifest names local/<name>"));
+        }
+        Ok(self.editable.join(&sha256::hex_digest(actor.as_bytes())[..16]).join(name))
+    }
+
+    /// A local source's objects, its manifest and every member this machine needs written:
+    /// what a run takes custody of when it is accepted. A live tree needs only the files it
+    /// does not hold already, and a directory read in place none. One the signer did not write
+    /// is `local_source_incomplete`, naming it.
+    pub fn written(&self, actor: &str, digest: &str) -> Result<Vec<ObjectRef>, Refused> {
+        let (manifest, own) = open_manifest(&self.objects, actor, digest)?;
+        let mut written = vec![own];
+        let live = !manifest.files.is_empty();
+        let home = match live {
+            true => self.home(actor, &manifest.package)?,
+            false => PathBuf::new(),
+        };
+        // A directory read in place needs none of its files; a tree, those it does not hold;
+        // an environment already built, none of the wheels it was built from.
+        let held = match live && manifest.path.is_empty() {
+            true => held_tree(&home),
+            false => BTreeMap::new(),
+        };
+        let files = manifest.files.iter().filter(|f| manifest.path.is_empty() && held.get(&f.name) != Some(&f.held()));
+        let built = live && self.environment(&home, &manifest).join(".ready").is_file();
+        let wheels = manifest.wheels.iter().filter(|_| !built);
+        let members = manifest.source.iter().chain(wheels).chain(&manifest.requirements).chain(files);
+        for m in members {
+            written.push(written_member(&self.objects, actor, m)?);
+        }
+        Ok(written)
+    }
+
+    /// The environment a live manifest runs in: one per lock, project metadata, path
+    /// dependencies beside the project, carried wheels and this machine's interpreter, SDK
+    /// pair and runner. Everything else of the project may change under it.
+    fn environment(&self, home: &Path, manifest: &Manifest) -> PathBuf {
+        let own = match manifest.project.is_empty() {
+            true => String::new(),
+            false => format!("{}/", manifest.project),
+        };
+        let held = |name: &str| {
+            let path = format!("{own}{name}");
+            manifest.files.iter().find(|f| f.name == path).map(|f| f.digest.as_str()).unwrap_or_default()
+        };
+        let beside: Vec<_> = manifest.files.iter().filter(|f| !f.name.starts_with(&own)).map(|f| (&f.name, f.held())).collect();
+        let carried: Vec<_> = manifest.wheels.iter().map(|w| (&w.name, &w.digest)).collect();
+        let key = serde_json::json!({
+            "lock": held("uv.lock"), "project": held("pyproject.toml"), "beside": beside, "wheels": carried,
+            "sdk": self.installer.sdk, "client": self.installer.client_wheel,
+            "python": self.installer.python, "python_version": manifest.python_version,
+        });
+        home.join(format!("env-{}", &sha256::hex_digest(key.to_string().as_bytes())[..16]))
+    }
+
+    /// Make the tree under `home` the manifest's files: changed ones are replaced from the
+    /// objects the signer wrote, and ones it no longer names leave.
+    fn sync(&self, actor: &str, home: &Path, files: &[Member]) -> Result<PathBuf, Refused> {
+        let tree = home.join("tree");
+        let held = held_tree(home);
+        let next: BTreeMap<String, String> = files.iter().map(|f| (f.name.clone(), f.held())).collect();
+        if next != held {
+            // Half synced, the tree holds what neither manifest names: forget it until done.
+            let _ = fs::remove_file(home.join("tree.json"));
+        }
+        for file in files {
+            let target = tree.join(inside(&file.name)?);
+            if held.get(&file.name) == Some(&file.held()) && target.is_file() {
+                continue;
+            }
+            let object = written_member(&self.objects, actor, file)?;
+            fs::create_dir_all(target.parent().expect("a file inside the tree"))?;
+            let incoming = home.join(".incoming");
+            fs::copy(self.store.object_path(&object.sha256), &incoming)?;
+            fs::set_permissions(&incoming, fs::Permissions::from_mode(if file.executable { 0o755 } else { 0o644 }))?;
+            fs::rename(&incoming, &target)?;
+        }
+        for gone in held.keys().filter(|name| !next.contains_key(*name)) {
+            let path = tree.join(gone);
+            let _ = fs::remove_file(&path);
+            // Directories it emptied leave with it.
+            let mut parent = path.parent();
+            while let Some(directory) = parent.filter(|d| *d != tree && fs::remove_dir(d).is_ok()) {
+                parent = directory.parent();
+            }
+        }
+        if next != held {
+            fs::create_dir_all(&tree)?;
+            fs::write(home.join(".tree.json"), serde_json::to_vec(&next).map_err(std::io::Error::other)?)?;
+            fs::rename(home.join(".tree.json"), home.join("tree.json"))?;
+        }
+        Ok(tree)
+    }
+
+    /// A live project, installed editable: its tree synced (or read in place), its environment
+    /// built only when the project's lock or a path dependency changed.
+    fn install_live(
+        &self,
+        service: &Service,
+        actor: &str,
+        alias: String,
+        manifest: Manifest,
+    ) -> Result<Installation, Refused> {
+        let home = self.home(actor, &manifest.package)?;
+        fs::create_dir_all(&home)?;
+        let root = match manifest.path.is_empty() {
+            true => self.sync(actor, &home, &manifest.files)?,
+            false => PathBuf::from(&manifest.path),
+        };
+        let project = match manifest.project.is_empty() {
+            true => root.clone(),
+            false => root.join(inside(&manifest.project)?),
+        };
+        if !root.is_absolute() || !project.join("pyproject.toml").is_file() {
+            return Err(refused(
+                "local_source_absent",
+                format!("{} is not a project directory on this machine", project.display()),
+            ));
+        }
+        let environment = self.environment(&home, &manifest);
+        // Wheels the CLI carries for locked dependencies this machine cannot fetch itself (a
+        // Hub's on the caller's computer, a private git source): beside the environment they
+        // install into, and needed only while it is built.
+        let mut wheels = vec![];
+        if !environment.join(".ready").is_file() {
+            let carried = environment.with_extension("wheels");
+            let _ = fs::remove_dir_all(&carried);
+            fs::create_dir_all(&carried)?;
+            for wheel in &manifest.wheels {
+                if !wheel.name.ends_with(".whl") || wheel.name.contains('/') {
+                    return Err(refused("local_source_invalid", format!("{:?} is not a wheel file name", wheel.name)));
+                }
+                let object = written_member(&self.objects, actor, wheel)?;
+                fs::copy(self.store.object_path(&object.sha256), carried.join(&wheel.name))?;
+                wheels.push(carried.join(&wheel.name));
+            }
+        }
+        let root = RootSet {
+            operation_id: String::new(),
+            package: manifest.package.clone(),
+            release: manifest.release.clone(),
+            installation_id: alias.clone(),
+            python_requires: manifest.python_requires,
+            python_version: manifest.python_version,
+            source_archive: String::new(),
+            dependency_requirements: Vec::new(),
+            callees: manifest.callees,
+            files: Vec::new(),
+        };
+        let prepared = prepare_editable(&self.installer, &root, &project, &environment, &wheels)
+            .map_err(|status| refused("package_installation_failed", status.message()))?;
+        let _ = fs::remove_dir_all(environment.with_extension("wheels"));
+        let installed = service.engine.bind_installation(Installation {
+            actor: actor.to_string(),
+            alias,
+            generation: prepared.record.identity,
+            package: manifest.package,
+            release: manifest.release,
+            interface: prepared.interface_bytes,
+            hub: String::new(),
+        })?;
+        service.changed_environment()?;
+        Ok(installed)
+    }
+
+    /// Drop what `actor`'s live `package` no longer runs in: every environment of it no
+    /// generation names, and its whole home once none is left (the package was removed).
+    pub fn collect(&self, actor: &str, package: &str) {
+        let Ok(home) = self.home(actor, package) else {
+            return;
+        };
+        let _installing = self.installing.lock().unwrap();
+        let named: HashSet<PathBuf> = fs::read_dir(&self.installer.generations)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|generation| fs::read_link(generation.path().join("env")).ok())
+            .collect();
+        let mut kept = 0;
+        for entry in fs::read_dir(&home).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let environment = entry.file_name().to_string_lossy().starts_with("env-") && path.is_dir();
+            if environment && named.contains(&fs::canonicalize(&path).unwrap_or_else(|_| path.clone())) {
+                kept += 1;
+            } else if environment {
+                let _ = fs::remove_dir_all(&path);
+                let _ = fs::remove_file(path.with_extension("constraints.txt"));
+            }
+        }
+        if kept == 0 {
+            let _ = fs::remove_dir_all(&home);
         }
     }
 
@@ -151,6 +377,9 @@ impl LocalSources {
         }
         let member = |m: &Member| written_member(&self.objects, actor, m);
         let (manifest, _) = open_manifest(&self.objects, actor, digest)?;
+        if !manifest.files.is_empty() || !manifest.path.is_empty() {
+            return self.install_live(service, actor, alias, manifest);
+        }
         if !manifest.package.starts_with("local/") || (manifest.source.is_none() && manifest.wheels.is_empty()) {
             return Err(refused(
                 "local_source_invalid",
@@ -234,7 +463,19 @@ mod tests {
             name: String::new(),
             digest,
             length: bytes.len() as u64,
+            executable: false,
         }
+    }
+
+    /// The files `names` of `dir` as a live tree's members, each written as its own object.
+    fn live_files(objects: &Objects, actor: &str, dir: &Path, names: &[&str]) -> Vec<serde_json::Value> {
+        names
+            .iter()
+            .map(|name| {
+                let written = write(objects, actor, &fs::read(dir.join(name)).unwrap());
+                serde_json::json!({"name": name, "digest": written.digest, "length": written.length})
+            })
+            .collect()
     }
 
     /// A machine with the real installer helper and the client wheel built from this tree.
@@ -374,6 +615,127 @@ mod tests {
         assert_eq!(installed_sdk(&held.record.python), "0.18.101 0.3.92");
         assert_eq!(held.record.sdk_fallback, "");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A live tree installs editable. An edit writes only the file that changed, replaces it
+    /// in the one tree the machine keeps and describes the project again in the environment
+    /// it already has; a file the project dropped leaves the tree.
+    #[test]
+    fn a_live_tree_is_one_copy_and_an_edit_keeps_its_environment() {
+        let m = machine("cm-live");
+        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let project = m.root.join("project");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_input");
+        fs::create_dir_all(project.join("cpu_input")).unwrap();
+        for name in ["pyproject.toml", "package.toml", "cpu_input/__init__.py"] {
+            fs::copy(fixture.join(name), project.join(name)).unwrap();
+        }
+        fs::write(project.join("notes.txt"), "dropped by the edit").unwrap();
+        let manifest = |files: Vec<serde_json::Value>, extra: serde_json::Value| {
+            let mut manifest = serde_json::json!({"package": "local/cozy-machine-cpu-input", "release": "0.1.0",
+                "python_version": "3.12", "files": files});
+            manifest.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            write(&m.objects, "alice", manifest.to_string().as_bytes()).digest
+        };
+        let none = serde_json::json!({});
+        let first = manifest(live_files(&m.objects, "alice", &project, &["pyproject.toml", "package.toml", "cpu_input/__init__.py", "notes.txt"]), none.clone());
+        let installed = sources.install(&m.service, "alice", &first).unwrap();
+        let home = sources.home("alice", "local/cozy-machine-cpu-input").unwrap();
+        assert_eq!(fs::read_to_string(home.join("tree/notes.txt")).unwrap(), "dropped by the edit");
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        let environment = fs::read_link(m.installer.generations.join(&installed.generation).join("env")).unwrap();
+        assert!(environment.starts_with(fs::canonicalize(&home).unwrap()), "{environment:?}");
+        // The environment imports the tree itself: nothing of the project was copied into it.
+        let imported = run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
+        assert_eq!(Path::new(&imported), fs::canonicalize(home.join("tree/cpu_input/__init__.py")).unwrap());
+
+        // The edit: one file changed, one dropped. Only the changed file is asked for.
+        let source = fs::read_to_string(project.join("cpu_input/__init__.py")).unwrap();
+        fs::write(project.join("cpu_input/__init__.py"), source + "\nEDITED = True\n").unwrap();
+        let unchanged = |name: &str| {
+            let bytes = fs::read(project.join(name)).unwrap();
+            serde_json::json!({"name": name, "digest": format!("sha256:{}", sha256::hex_digest(&bytes)), "length": bytes.len()})
+        };
+        let mut files = vec![unchanged("pyproject.toml"), unchanged("package.toml")];
+        files.extend(live_files(&m.objects, "alice", &project, &["cpu_input/__init__.py"]));
+        let second = manifest(files, none.clone());
+        assert_eq!(sources.written("alice", &second).unwrap().len(), 2, "the manifest and the one edited file");
+        // Another signer holds no tree: every file is asked of it.
+        let theirs = sources.written("bob", &second).err().unwrap();
+        assert_eq!(theirs.code, "local_source_incomplete");
+        let edited = sources.install(&m.service, "alice", &second).unwrap();
+        assert_ne!(edited.generation, installed.generation);
+        assert_eq!(fs::read_link(m.installer.generations.join(&edited.generation).join("env")).unwrap(), environment);
+        assert!(!home.join("tree/notes.txt").exists());
+        let python = m.service.catalog.resolve(&edited.generation).unwrap().record.python;
+        assert_eq!(run(Command::new(&python).args(["-I", "-c", "import cpu_input; print(cpu_input.EDITED)"])), "True");
+        assert_eq!(fs::read_dir(&home).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("env-") && e.path().is_dir()).count(), 1);
+
+        // This computer's machine reads the live directory in place: nothing is written for it
+        // but the manifest, and its environment imports the project where it is.
+        let live = manifest(vec![unchanged("pyproject.toml"), unchanged("package.toml"), unchanged("cpu_input/__init__.py")],
+            serde_json::json!({"path": project.to_string_lossy()}));
+        assert_eq!(sources.written("carol", &live).err().unwrap().code, "local_source_incomplete", "the manifest is hers to write");
+        let live = {
+            let files = vec![unchanged("pyproject.toml"), unchanged("package.toml"), unchanged("cpu_input/__init__.py")];
+            let document = serde_json::json!({"package": "local/cozy-machine-cpu-input", "release": "0.1.0", "python_version": "3.12",
+                "files": files, "path": project.to_string_lossy()});
+            write(&m.objects, "carol", document.to_string().as_bytes()).digest
+        };
+        assert_eq!(sources.written("carol", &live).unwrap().len(), 1);
+        let placed = sources.install(&m.service, "carol", &live).unwrap();
+        let python = m.service.catalog.resolve(&placed.generation).unwrap().record.python;
+        let imported = run(Command::new(&python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
+        assert_eq!(Path::new(&imported), fs::canonicalize(project.join("cpu_input/__init__.py")).unwrap());
+        assert!(!sources.home("carol", "local/cozy-machine-cpu-input").unwrap().join("tree").exists());
+
+        // An environment no generation names leaves; a package with none left leaves whole.
+        fs::remove_dir_all(m.installer.generations.join(&placed.generation)).unwrap();
+        sources.collect("carol", "local/cozy-machine-cpu-input");
+        assert!(!sources.home("carol", "local/cozy-machine-cpu-input").unwrap().exists());
+        sources.collect("alice", "local/cozy-machine-cpu-input");
+        assert!(environment.is_dir());
+        let _ = fs::remove_dir_all(m.root);
+    }
+
+    /// A locked dependency this machine cannot fetch (a Hub's on the caller's computer) rides
+    /// as its wheel: the lock installs everything else, and the carried one installs from its
+    /// own file at the locked version, a callee App under the package the caller names for it.
+    #[test]
+    fn a_live_tree_carries_the_locked_wheels_its_machine_cannot_fetch() {
+        let m = machine("cm-carried");
+        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let (project, index) = (m.root.join("project"), m.root.join("index"));
+        fs::create_dir_all(project.join("cpu_caller")).unwrap();
+        let files = ["pyproject.toml", "package.toml", "cpu_caller/__init__.py"];
+        for name in files {
+            fs::copy(fixtures.join("cpu_caller").join(name), project.join(name)).unwrap();
+        }
+        run(Command::new("uv").current_dir(fixtures.join("cpu_memo")).args(["build", "--wheel", "--out-dir"]).arg(&index));
+        run(Command::new("uv").args(["lock", "--python", "3.12", "--find-links"]).arg(&index).arg("--project").arg(&project));
+        let memo = fs::read_dir(&index).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
+        let carried = write(&m.objects, "alice", &fs::read(&memo).unwrap());
+        // The index the lock names is gone: only the carried wheel has the dependency.
+        fs::remove_dir_all(&index).unwrap();
+        let manifest = |wheels: serde_json::Value| {
+            let document = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+                "files": live_files(&m.objects, "alice", &project, &[&files[..], &["uv.lock"]].concat()),
+                "wheels": wheels, "callees": {"cozy-machine-cpu-memo": "proof/cozy-machine-cpu-memo"}});
+            write(&m.objects, "alice", document.to_string().as_bytes()).digest
+        };
+        let name = memo.file_name().unwrap().to_string_lossy();
+        let with = manifest(serde_json::json!([{"name": name, "digest": carried.digest, "length": carried.length}]));
+        let installed = sources.install(&m.service, "alice", &with).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        let callee = held.record.callees.iter().find(|c| c.distribution == "cozy-machine-cpu-memo").expect("the carried callee App");
+        assert_eq!((callee.package.as_str(), callee.version.as_str()), ("proof/cozy-machine-cpu-memo", "0.1.0"));
+        // Its environment built, the wheels it was built from are no longer asked for.
+        assert_eq!(sources.written("alice", &with).unwrap().len(), 1);
+        // Without the wheel the lock's own source is all there is, and uv says so.
+        let why = sources.install(&m.service, "alice", &manifest(serde_json::json!([]))).err().unwrap().message;
+        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("cozy-machine-cpu-memo"), "{why}");
+        let _ = fs::remove_dir_all(m.root);
     }
 
     /// With an image's seeded cache, a local package's dependencies are links into it, as a
@@ -529,7 +891,9 @@ mod tests {
             ],
             "requirements": member("requirements.txt", requirements.as_bytes()),
         }));
-        for digest in [source, carried] {
+        // The live tree, file by file: the project as it is, its lock and vendor/ wheel.
+        let live = manifest(serde_json::json!({"files": live_files(&m.objects, "alice", &project, &[&files[..], &[vendored.as_str()]].concat())}));
+        for digest in [source, carried, live] {
             let installed = sources.install(&m.service, "alice", &digest).unwrap();
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
             let versions = installed_sdk(&held.record.python);
