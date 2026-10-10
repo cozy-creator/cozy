@@ -646,7 +646,9 @@ pub(super) fn fetch_wanted_bounded(
         backfill: backfill.as_ref(),
         keep: None,
     }
-    .run(streams, None)?;
+    // A quarter of the ceiling first, never under the 16 that fill a 141 MB/s pod (`STREAMS`):
+    // two doublings, while they pay, reach it.
+    .run((streams / 4).max(super::STREAMS), streams, None)?;
     if let Some(backfill) = backfill {
         backfill.finish_offers();
     }
