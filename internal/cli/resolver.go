@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"slices"
 	"sort"
 	"strings"
@@ -44,11 +43,9 @@ type Resolver struct {
 	catalogs  map[string]*hub.Client
 }
 
-// PrepareLocal freezes one editable install into exact wheels before rental attachment.
-// Tensorhub selects the base; the worker validates the package against that exact base.
-func (r *Resolver) PrepareLocal(ctx context.Context, installID string) (
-	localpackage.Installation, *exit.Error,
-) {
+// LocalInstallation is the code of the unpublished install a request names, as its machine
+// takes it: read from the install's own source root, never staged.
+func (r *Resolver) LocalInstallation(installID string) (localpackage.Installation, *exit.Error) {
 	install, problem := r.store.Install(installID)
 	if problem != nil {
 		return localpackage.Installation{}, problem
@@ -56,35 +53,7 @@ func (r *Resolver) PrepareLocal(ctx context.Context, installID string) (
 	if install == nil {
 		return localpackage.Installation{}, exit.New(exit.NotFound, "install %s does not exist", installID)
 	}
-	layout, problem := home.Open(r.cfg.Home)
-	if problem != nil {
-		return localpackage.Installation{}, problem
-	}
-	revision, problem := localpackage.Stage(ctx, layout, *install)
-	if problem != nil {
-		return localpackage.Installation{}, problem
-	}
-	return revision, nil
-}
-
-// LocalRevision reopens the exact staged wheel set a durable request already names.
-func (r *Resolver) LocalInstallation(installID, digest string) (localpackage.Installation, *exit.Error) {
-	install, problem := r.store.Install(installID)
-	if problem != nil {
-		return localpackage.Installation{}, problem
-	}
-	if install == nil {
-		return localpackage.Installation{}, exit.New(exit.NotFound, "install %s does not exist", installID)
-	}
-	layout, problem := home.Open(r.cfg.Home)
-	if problem != nil {
-		return localpackage.Installation{}, problem
-	}
-	revision, problem := localpackage.Open(layout, *install, digest)
-	if problem != nil {
-		return localpackage.Installation{}, problem
-	}
-	return revision, nil
+	return localpackage.Open(*install)
 }
 
 // EditableSnapshot is one reading of an editable install's live source tree against the
@@ -802,11 +771,4 @@ func ladderOffers(ladder []hub.BindingRung, model orchestrator.ModelRef) bool {
 		}
 	}
 	return true
-}
-
-// ValidateExecutionCapture checks that the accepted installation is available.
-// Runtime dependency constraints are resolved by uv during package installation.
-func (r *Resolver) ValidateExecutionCapture(request records.Request) *exit.Error {
-	_, problem := r.LocalInstallation(request.InstallID, request.LocalInstallationID)
-	return problem
 }

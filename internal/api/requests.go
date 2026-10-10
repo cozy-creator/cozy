@@ -20,7 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -199,8 +198,6 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		unlock := localpackage.Guard()
-		defer unlock()
 		var lease *install.Lease
 		defer func() { lease.Release() }()
 		spec, e = s.resolvePlan(r.Context(), selectedHub, sub, &lease)
@@ -629,7 +626,7 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 		return out, problem
 	}
 	out.NeedsAccelerator = needsAccelerator
-	revision, problem := s.packages.PrepareLocal(ctx, installID)
+	revision, problem := s.packages.LocalInstallation(installID)
 	if problem != nil {
 		return out, problem
 	}
@@ -683,7 +680,7 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 	out.InstallID, out.Release = placement.InstallID, placement.Release
 	out.NeedsAccelerator = needsAccelerator
 	if !spec.Preparation.Published {
-		revision, problem := s.packages.PrepareLocal(ctx, placement.InstallID)
+		revision, problem := s.packages.LocalInstallation(placement.InstallID)
 		if problem != nil {
 			return out, problem
 		}

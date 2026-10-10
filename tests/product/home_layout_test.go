@@ -40,7 +40,7 @@ func rootEntries(t *testing.T, root string) []string {
 // TestFreshHomeIsMinimal proves cl-116's allowlist as a property of a REAL fresh home:
 // opening the layout, the records authority and the daemon record creates exactly the
 // target entries and nothing else — no triage/uploads/publications/workers/tmp/
-// local-packages/companions root exists until real work does.
+// companions root exists until real work does.
 func TestFreshHomeIsMinimal(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "home")
 	l, problem := home.Open(root)

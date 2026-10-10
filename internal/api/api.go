@@ -109,8 +109,7 @@ type Server struct {
 // Only an explicit local start may require the target environment.
 type Resolver interface {
 	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
-	PrepareLocal(context.Context, string) (localpackage.Installation, *exit.Error)
-	LocalInstallation(string, string) (localpackage.Installation, *exit.Error)
+	LocalInstallation(installID string) (localpackage.Installation, *exit.Error)
 	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	ResolveRemoteRelease(hub, pkg, release, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)

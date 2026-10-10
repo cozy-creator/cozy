@@ -2,8 +2,6 @@ package orchestrator
 
 import (
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -26,21 +24,6 @@ func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
 		if problem := c.opt.ReclaimInstall(req.InstallID); problem != nil {
 			c.logf("request %s snapshot cleanup deferred: %s", req.ID, problem.Message)
 		}
-	}
-	if req.LocalInstallationID == "" {
-		return
-	}
-	writer, problem := home.LockWriter(c.opt.Layout)
-	if problem != nil {
-		c.logf("request %s local package cleanup deferred: %s", req.ID, problem.Message)
-		return
-	}
-	defer writer.Unlock()
-	unlockLocal := localpackage.Guard()
-	defer unlockLocal()
-	if e := localpackage.DropUnowned(c.opt.Layout, c.opt.Store,
-		req.LocalInstallationID); e != nil {
-		c.logf("request %s local package cleanup deferred: %s", req.ID, e.Message)
 	}
 }
 

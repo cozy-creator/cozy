@@ -147,7 +147,7 @@ func capturedTarget(ctx *Context, author *packagepublish.Package, prepare func()
 	if pack != author {
 		defer pack.Close()
 	}
-	frozen, problem := packagepublish.SnapshotSource(context.Background(), pack.Tree, filepath.Join(stage.Path, "source"))
+	frozen, problem := packagepublish.SnapshotSource(context.Background(), pack.Tree, filepath.Join(stage.Path, "source"), commandNamespace(ctx))
 	if problem != nil {
 		return Target{}, nil, problem
 	}

@@ -11,8 +11,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -421,20 +419,6 @@ const StopGrace = 30 * time.Second
 // Reconcile rebuilds the daemon's work from its records. It runs as startup work, after the
 // API serves: nothing a client asks waits on it.
 func (c *Orchestrator) Reconcile() *exit.Error {
-	writer, problem := home.LockWriter(c.opt.Layout)
-	if problem != nil {
-		// A CLI may be starting this daemon while handing off a captured run.
-		// That writer owns its not-yet-submitted revision; defer optional GC.
-		c.logf("local package sweep deferred: %s", problem.Message)
-	} else {
-		unlockLocal := localpackage.Guard()
-		e := localpackage.Sweep(c.opt.Layout, c.opt.Store)
-		unlockLocal()
-		writer.Unlock()
-		if e != nil {
-			return e
-		}
-	}
 	// Work an older daemon left waiting ends here, failed with its reason.
 	ended, e := c.opt.Store.EndUnfinishedWork()
 	if e != nil {

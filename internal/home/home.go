@@ -44,9 +44,6 @@ type Layout struct {
 	// certificate this client pins when it dials (cl-015). Secrets whose rental is
 	// proven absent are erased by the boot sweep.
 	Rentals string
-	// LocalPackages holds exact ephemeral wheel revisions for rented local-package
-	// commands. It is staging the daemon alone writes, never a catalog.
-	LocalPackages string
 	// Machine is this computer as a machine (proto-062): `root/` is laid out exactly as a
 	// pod's `/` for the same pod-supervisor Host, beside the controller's own grant for it
 	// (registration, owner key, launch record).
@@ -107,16 +104,28 @@ func Paths(root string) Layout {
 	l.Lock = filepath.Join(l.Installs, ".lock")
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
-	l.LocalPackages = filepath.Join(root, "local-packages")
 	l.Machine = filepath.Join(root, "machine")
 	l.Log = filepath.Join(root, "daemon.log")
 	return l
 }
 
-// DependencyCache is disposable immutable payload storage. Captured generations
-// retain independent hardlinks, so deleting cache entries never invalidates them.
+// DependencyCache is disposable immutable payload storage under tmp/: a capture holds its
+// scratch claim shared while it reads, and a daemon that starts with no capture reading it
+// reclaims it with the rest of tmp/.
 func (l Layout) DependencyCache() string {
-	return filepath.Join(l.LocalPackages, "dependency-objects")
+	return filepath.Join(l.Tmp, "dependency-objects")
+}
+
+// HubWheels holds each wheel an unpublished package's lock selects from a Tensorhub index, once
+// per hash: every install of such a package links it beside its source.
+func (l Layout) HubWheels() string {
+	return filepath.Join(l.Root, "hub-wheels")
+}
+
+// RetiredLocalPackages is where cozy before 0.6.13 staged a copy of unpublished code for each
+// run. Nothing reads it: a machine is sent an install's own files.
+func (l Layout) RetiredLocalPackages() string {
+	return filepath.Join(l.Root, "local-packages")
 }
 
 // RentalMediaToken is one rental's provisioned media bearer, mode 0600. It is deliberately

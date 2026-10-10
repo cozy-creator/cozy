@@ -8,10 +8,10 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
@@ -57,7 +57,17 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	if err != nil {
 		return exit.Internalf("cannot capture selected callable wheels")
 	}
-	captured, problem := packagepublish.CaptureWheelDependencies(ctx, parent.Install.SourceRef, i.Package.Name, parent.Install.Closure, stage, i.layout.DependencyCache(), graph, parent.Install.Python)
+	// The cache is tmp/ scratch every capture shares: held, a starting daemon leaves it.
+	cache := i.layout.DependencyCache()
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		return exit.Internalf("cannot create the captured dependency cache")
+	}
+	claim, err := os.OpenFile(filepath.Join(cache, ".claim"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil || flock.BlockShared(claim) != nil {
+		return exit.Internalf("cannot claim the captured dependency cache")
+	}
+	defer claim.Close()
+	captured, problem := packagepublish.CaptureWheelDependencies(ctx, parent.Install.SourceRef, i.Package.Name, parent.Install.Closure, stage, cache, graph, parent.Install.Python)
 	if problem != nil {
 		return problem
 	}
@@ -159,33 +169,6 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			childBindings[n].ParentInstallID = result.Install.ID
 		}
 		if problem := i.store.RecordChildBindings(childBindings); problem != nil {
-			return problem
-		}
-		paths := []string{result.CapturedProjectWheel}
-		var requirements []string
-		for _, dependency := range dependencyNames {
-			if dependency == name {
-				continue
-			}
-			captured := closure[dependency]
-			if captured.RegistryRequirement != "" {
-				requirements = append(requirements, captured.RegistryRequirement)
-			} else {
-				paths = append(paths, captured.Path)
-			}
-		}
-		var dependencyRequirements []byte
-		if len(requirements) > 0 {
-			dependencyRequirements = []byte(strings.Join(requirements, "\n") + "\n")
-		}
-		callees := map[string]string{}
-		for dependency, captured := range closure {
-			if captured.Package != "" {
-				callees[dependency] = captured.Package
-			}
-		}
-		_, problem = localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths, dependencyRequirements, callees)
-		if problem != nil {
 			return problem
 		}
 		overlays[name] = captured[name]

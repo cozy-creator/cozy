@@ -178,17 +178,22 @@ func orgRelativeWheelName(version string) string {
 }
 
 // orgRelativeWheel is a pure dependency wheel; body differs per Hub so its hash names the Hub.
-func orgRelativeWheel(t *testing.T, version, body string) []byte {
+// With entryPoints (an entry_points.txt) it can declare its module's App.
+func orgRelativeWheel(t *testing.T, version, body string, entryPoints ...string) []byte {
 	t.Helper()
 	var out bytes.Buffer
 	archive := zip.NewWriter(&out)
 	info := strings.ReplaceAll(orgRelativeDependency, "-", "_") + "-" + version + ".dist-info/"
 	record := ""
-	for _, member := range [][2]string{
+	members := [][2]string{
 		{"org_relative_dep.py", body},
 		{info + "METADATA", fmt.Sprintf("Metadata-Version: 2.3\nName: %s\nVersion: %s\n", orgRelativeDependency, version)},
 		{info + "WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"},
-	} {
+	}
+	for _, text := range entryPoints {
+		members = append(members, [2]string{info + "entry_points.txt", text})
+	}
+	for _, member := range members {
 		writer, err := archive.Create(member[0])
 		must(t, err)
 		_, err = writer.Write([]byte(member[1]))

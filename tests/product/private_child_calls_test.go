@@ -76,11 +76,6 @@ func TestUnpublishedChildBindingsAreImmutableAndOwnTheirImplementation(t *testin
 	if completedRow.InstallID != child.ID {
 		t.Fatal("rejected GC severed a completed child's exact result schema")
 	}
-	held, problem := store.LocalInstallationInUse(child.ID)
-	fatal(t, problem)
-	if !held {
-		t.Fatal("GC discarded the frozen implementation wheel revision")
-	}
 	forgotten, problem = store.ForgetIfUnreferenced(parent.ID)
 	fatal(t, problem)
 	if !forgotten {

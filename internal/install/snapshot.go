@@ -10,7 +10,7 @@ import (
 
 func snapshotSource(installDir string, local *LocalSource) (string, *exit.Error) {
 	root := filepath.Join(installDir, "source")
-	frozen, problem := packagepublish.SnapshotSource(context.Background(), local.Tree, root)
+	frozen, problem := packagepublish.SnapshotSource(context.Background(), local.Tree, root, local.Namespace)
 	if problem != nil {
 		return "", problem
 	}

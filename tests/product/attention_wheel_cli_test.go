@@ -1,19 +1,16 @@
 package producttest
 
 import (
-	"archive/tar"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -173,22 +170,18 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 			t.Fatal("scalar success silently lost the whole-run unused-pin warning")
 		}
 		install := activeInstall(t, root, localWeightlessRef)
-		revision, problem := localpackage.Stage(t.Context(), home.Layout{LocalPackages: filepath.Join(root, "local-packages")}, install)
+		source, problem := localpackage.Open(install)
 		fatal(t, problem)
-		// The captured source travels to a rented worker as one archive, with the vendored
-		// candidate wheel inside it.
-		archive := ""
-		for _, file := range revision.Files {
-			if file.Kind == "source" {
-				archive = file.Path
+		// The code travels to a rented machine file by file, the vendored candidate wheel
+		// among them.
+		var captured []byte
+		for _, file := range source.Files {
+			if file.Name == "vendor/"+wheelName {
+				captured, _ = os.ReadFile(file.Path)
 			}
 		}
-		if archive == "" {
-			t.Fatalf("rented-worker capture carries no source archive: %+v", revision.Files)
-		}
-		captured := capturedSourceMember(t, archive, "vendor/"+wheelName)
 		if !bytes.Equal(captured, wheelBytes) {
-			t.Fatal("rented-worker capture changed the executing candidate wheel")
+			t.Fatal("the code sent to a rented machine changed the executing candidate wheel")
 		}
 		digest := sha256.Sum256(captured)
 		captures = append(captures, hex.EncodeToString(digest[:]))
@@ -197,29 +190,4 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 	if captures[0] == captures[1] || captures[0] != captures[2] {
 		t.Fatalf("same-version A/B/A bytes lost their capture identity: %v", captures)
 	}
-}
-
-// capturedSourceMember reads one member of a captured source archive, failing if it is absent.
-func capturedSourceMember(t *testing.T, archivePath, member string) []byte {
-	t.Helper()
-	file, err := os.Open(archivePath)
-	must(t, err)
-	defer file.Close()
-	archive := tar.NewReader(file)
-	names := []string{}
-	for {
-		header, err := archive.Next()
-		if err == io.EOF {
-			break
-		}
-		must(t, err)
-		if header.Name == member {
-			body, err := io.ReadAll(archive)
-			must(t, err)
-			return body
-		}
-		names = append(names, header.Name)
-	}
-	t.Fatalf("rented-worker capture omitted %s: %v", member, names)
-	return nil
 }

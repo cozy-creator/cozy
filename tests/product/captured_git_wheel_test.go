@@ -39,7 +39,7 @@ func TestCapturedGitSourceInstallsWithoutGitOrRepositoryAccess(t *testing.T) {
 	originalLock, err := os.ReadFile(filepath.Join(project, "uv.lock"))
 	must(t, err)
 	capture := filepath.Join(t.TempDir(), "captured")
-	pack, problem := packagepublish.SnapshotSource(t.Context(), project, capture)
+	pack, problem := packagepublish.SnapshotSource(t.Context(), project, capture, nil)
 	fatal(t, problem)
 	defer pack.Close()
 	metadata, err := os.ReadFile(filepath.Join(capture, "pyproject.toml"))
@@ -80,7 +80,7 @@ func TestCapturedGitSourceInstallsWithoutGitOrRepositoryAccess(t *testing.T) {
 		t.Fatalf("captured dependency did not execute: %v %s", err, output)
 	}
 	// Capturing the already portable tree does not rebuild or require Git either.
-	repeated, problem := packagepublish.SnapshotSource(t.Context(), capture, filepath.Join(t.TempDir(), "repeated"))
+	repeated, problem := packagepublish.SnapshotSource(t.Context(), capture, filepath.Join(t.TempDir(), "repeated"), nil)
 	fatal(t, problem)
 	defer repeated.Close()
 }
@@ -97,7 +97,7 @@ func TestCapturedGitRejectsChangedLockedCommit(t *testing.T) {
 	changed := append([]byte(nil), raw...)
 	copy(changed[at+1:at+41], strings.Repeat("0", 40))
 	must(t, os.WriteFile(p, changed, 0600))
-	pack, problem := packagepublish.SnapshotSource(t.Context(), project, filepath.Join(t.TempDir(), "capture"))
+	pack, problem := packagepublish.SnapshotSource(t.Context(), project, filepath.Join(t.TempDir(), "capture"), nil)
 	if pack != nil {
 		pack.Close()
 	}
@@ -114,7 +114,7 @@ func TestCapturedGitSkipsInactiveExtra(t *testing.T) {
 		t.Fatalf("lock optional Git fixture: %v\n%s", err, output)
 	}
 	capture := filepath.Join(t.TempDir(), "captured")
-	pack, problem := packagepublish.SnapshotSource(t.Context(), project, capture)
+	pack, problem := packagepublish.SnapshotSource(t.Context(), project, capture, nil)
 	fatal(t, problem)
 	defer pack.Close()
 	if _, err := os.Stat(filepath.Join(capture, ".cozy-dependencies", "git")); !os.IsNotExist(err) {
@@ -137,7 +137,7 @@ func TestCapturedGitDeclaredByLocalChildKeepsItsClosure(t *testing.T) {
 		t.Fatalf("lock child Git fixture: %v\n%s", err, output)
 	}
 	capture := filepath.Join(t.TempDir(), "captured")
-	pack, problem := packagepublish.SnapshotSource(t.Context(), project, capture)
+	pack, problem := packagepublish.SnapshotSource(t.Context(), project, capture, nil)
 	fatal(t, problem)
 	defer pack.Close()
 	wheels, err := filepath.Glob(filepath.Join(capture, ".cozy-dependencies", "git", "cozy-fixture-pinned", "*.whl"))

@@ -58,6 +58,7 @@ type RegistryRow struct {
 	Size           int64  `json:"size"`
 	URL            string `json:"url"`
 	Version        string `json:"version"`
+	Filename       string `json:"-"` // a Hub wheel's file name, as its lock's URL spells it
 }
 
 type exactDependency struct {

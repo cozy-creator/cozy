@@ -155,7 +155,6 @@ async def main(ctx):
 	t.Logf("%d installations share uv's %d-byte NumPy inode; editable source remains separate", len(libraries), first.Size())
 	compositionDown(t, root, path)
 	must(t, removeAllForce(control))
-	must(t, removeAllForce(filepath.Join(root, "local-packages")))
 	for _, library := range libraries {
 		generation := library
 		for range 6 {

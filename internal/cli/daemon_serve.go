@@ -280,9 +280,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 		}},
 		{"tmp sweep", func() string {
 			tmp, note := reclaimNote(reclaim.Tmp(l, st))
+			retired, retiredNote := reclaimNote(reclaim.RetiredLocalPackages(l))
 			reclaim.EmptyRoots(l)
-			return fmt.Sprintf("reclaimed %d of %d entr(y|ies), freed %s%s",
-				tmp.Removed, tmp.Scanned, output.Bytes(tmp.Bytes), note)
+			return fmt.Sprintf("reclaimed %d of %d entr(y|ies), freed %s%s · retired local-packages freed %s%s",
+				tmp.Removed, tmp.Scanned, output.Bytes(tmp.Bytes), note, output.Bytes(retired.Bytes), retiredNote)
 		}},
 	})
 	go fleet.watch(quit)

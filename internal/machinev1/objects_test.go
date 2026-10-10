@@ -118,22 +118,27 @@ func TestWriteResumesFromHeldBytesOnTheRealMachine(t *testing.T) {
 	}
 }
 
-// Unpublished code written with LocalSource installs on the real machine inside a warm run,
-// and the same code written again reuses every held object.
+// Unpublished code written with LocalSource installs on the real machine inside a warm run.
+// Written again unchanged, nothing is offered; after an edit, only the edited file.
 func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 	if *installerPython == "" || *clientWheel == "" || *cpuFixture == "" {
 		t.Skip("requires -installer-python, -client-wheel and -cpu-fixture")
 	}
 	client := serve(t, "--installer-python", *installerPython, "--client-wheel", *clientWheel)
 	ctx := context.Background()
-	archive := filepath.Join(t.TempDir(), "source.tar")
-	tar := exec.Command("tar", "-cf", archive, "-C", *cpuFixture, "pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py")
-	if output, err := tar.CombinedOutput(); err != nil {
-		t.Fatalf("%v: %s", err, output)
+	project := t.TempDir()
+	installation := localpackage.Installation{Package: "local/cozy-machine-cpu-lifecycle", Release: "0.1.0"}
+	for _, name := range []string{"pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"} {
+		raw, err := os.ReadFile(filepath.Join(*cpuFixture, name))
+		must(t, err)
+		path := filepath.Join(project, name)
+		must(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		must(t, os.WriteFile(path, raw, 0o600))
+		object, err := fileObject(path)
+		must(t, err)
+		installation.Files = append(installation.Files, localpackage.File{Name: name, Digest: object.Digest, Length: object.Length, Path: path})
 	}
-	installation := localpackage.Installation{Package: "local/cozy-machine-cpu-lifecycle", Release: "0.1.0", PythonVersion: "3.12",
-		Files: []localpackage.File{{Kind: "source", Filename: "source.tar", Path: archive}}}
-	manifest, sent, err := LocalSource(ctx, client, installation)
+	manifest, sent, held, err := LocalSource(ctx, client, installation, nil)
 	must(t, err)
 	if !sent {
 		t.Fatal("new code was not written")
@@ -144,9 +149,24 @@ func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 	if len(stages) == 0 {
 		t.Fatal("the warm run reported no progress")
 	}
-	again, sent, err := LocalSource(ctx, client, installation)
+	again, sent, _, err := LocalSource(ctx, client, installation, held)
 	must(t, err)
 	if again != manifest || sent {
 		t.Fatalf("the same code named another manifest (%s, then %s) or was written again (%t)", manifest, again, sent)
 	}
+	// The edit: one file's bytes move, and the machine installs it in the tree it holds.
+	edited := &installation.Files[len(installation.Files)-1]
+	raw, err := os.ReadFile(edited.Path)
+	must(t, err)
+	must(t, os.WriteFile(edited.Path, append(raw, []byte("\nEDITED = True\n")...), 0o600))
+	object, err := fileObject(edited.Path)
+	must(t, err)
+	edited.Digest, edited.Length = object.Digest, object.Length
+	next, sent, _, err := LocalSource(ctx, client, installation, held)
+	must(t, err)
+	if next == manifest || !sent {
+		t.Fatalf("the edit named the same manifest or moved no byte (%s, %t)", next, sent)
+	}
+	spec.Source = &pb.RunSpec_Local{Local: &pb.LocalSource{Manifest: next}}
+	must(t, Prepare(ctx, client, "warm-2", spec, nil))
 }

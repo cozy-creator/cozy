@@ -11,9 +11,10 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// SnapshotSource copies a bounded project and its local dependencies, relocating uv paths.
-// The destination belongs to one invocation; no source fingerprint is calculated.
-func SnapshotSource(ctx context.Context, tree, root string) (*Package, *exit.Error) {
+// SnapshotSource copies a bounded project and its local dependencies, relocating uv paths, and
+// writes namespace's account index into the copy before uv reads it: authored source names
+// that index without declaring it. The destination belongs to one invocation.
+func SnapshotSource(ctx context.Context, tree, root string, namespace NamespaceSource) (*Package, *exit.Error) {
 	pack, problem := PrepareLocalFrom(tree)
 	if problem != nil {
 		return nil, problem
@@ -82,6 +83,9 @@ func SnapshotSource(ctx context.Context, tree, root string) (*Package, *exit.Err
 				return nil, problem
 			}
 		}
+	}
+	if problem := BindAccountIndex(ctx, root, namespace); problem != nil {
+		return nil, problem
 	}
 	if problem := retainLockedGitWheels(ctx, root, nil, nil); problem != nil {
 		return nil, problem
