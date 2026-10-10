@@ -35,10 +35,10 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	// The deadline the machine answered: its clock restarted now, or none named.
+	// The deadline the machine answered: its clock restarted now, or none while it has a job.
 	fields := append([]output.Field{{K: "rental", V: subject.Row.ID},
 		{K: "acknowledged_at", V: time.UnixMilli(receipt.AcknowledgedAtMS).UTC().Format(time.RFC3339Nano)}},
-		releaseDue(receipt.IdleDeadlineMS, !ctx.Mode().Human || ctx.Mode().JSON)...)
+		rentalEnds(receipt.IdleDeadlineMS, !ctx.Mode().Human || ctx.Mode().JSON)...)
 	return emit(ctx, output.Record{Fields: fields, AllFields: fields})
 }
 

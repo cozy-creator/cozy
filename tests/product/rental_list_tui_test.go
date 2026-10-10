@@ -28,7 +28,7 @@ func (h *fakeRentalHub) set(id, key string, value any) {
 // place every second — and the same verb piped or --json is one plain snapshot. The
 // board is watched through a real pseudo-terminal across planted transitions: the pod
 // acquiring, then ready, then holding queued work, then with none once the work settles.
-// ENDS is only ever the machine's own deadline; this pod's machine cannot answer.
+// ENDS is only ever the machine's own deadline; this pod's machine cannot answer, so it is "—".
 func TestRentalListLiveBoard(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-list-tui")
 	must(t, os.RemoveAll(root))
@@ -54,8 +54,8 @@ func TestRentalListLiveBoard(t *testing.T) {
 
 	// Each transition is planted once the board has drawn the one before it: the hub moves
 	// the pod to ready, queued work holds it, and the work settles.
-	idle := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+0\s+-`)
-	busy := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+1\s+-`)
+	idle := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+0\s+—`)
+	busy := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+1\s+—`)
 	code, tty := ptyDrive(t, root, 24, 4, func(step int, drawn string) []byte {
 		switch step {
 		case 0:
