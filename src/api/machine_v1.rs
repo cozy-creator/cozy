@@ -320,6 +320,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
             .collect(),
         models,
         attention_kernel: spec.attention_kernel,
+        gpus: spec.gpus,
         hub: None,
         providers: providers
             .map(|p| crate::published::Providers {

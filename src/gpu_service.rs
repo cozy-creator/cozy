@@ -1490,7 +1490,7 @@ impl GpuPool {
         }
         memory.fits(plan, || if device == 0 { self.holdings() } else { vec![] })
     }
-    /// Where `plan` runs now, with its GPUs' call slots: a group on the first `degree` GPUs;
+    /// Where `plan` runs now, with its GPUs' call slots: a group on a free contiguous lane;
     /// one GPU, in order: a free one with its idle executor, a free one where its learned call
     /// fits beside the tenants there (a replica when it runs elsewhere too), or, when it runs
     /// nowhere or its family holds a GPU (whose job may wait on it), the first free or borrowed
@@ -1508,7 +1508,8 @@ impl GpuPool {
             self.permit(engine, family, true, lane, waiting).map(|permit| (start, permit))
         };
         if plan.degree > 1 {
-            let placed = take(0, waiting);
+            let placed = (0..=width.saturating_sub(plan.degree as usize))
+                .find_map(|start| take(start, waiting));
             if placed.is_none() {
                 waiting.iter_mut().take(plan.degree as usize).for_each(|w| *w = true);
             }

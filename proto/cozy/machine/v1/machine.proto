@@ -89,6 +89,9 @@ message RunSpec {
   // clears it. The run installs and downloads every member, and its result lists each one's
   // `level` and `held_back`. Absent: the set is left as it is.
   WarmSet set = 18;
+  // 0: widest group every model slot supports on this machine. Positive: exactly this
+  // many GPUs, or gpu_count_unavailable. Model/weight choices never change this request.
+  uint32 gpus = 20;
 }
 
 // The caller's provider tokens, for models a run makes from a provider source.

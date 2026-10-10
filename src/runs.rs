@@ -63,6 +63,7 @@ pub struct Spec {
     pub inputs: Vec<InputFile>,
     pub models: Vec<domain::ModelChoice>,
     pub attention_kernel: String,
+    pub gpus: u32,
     /// The Hub the run reads and publishes to, under this machine's authority there.
     pub hub: Option<hub::Source>,
     /// Provider tokens for source models, held in memory only.
@@ -105,6 +106,7 @@ pub struct JobContext {
     owner: String,
     catalog_revision: String,
     attention_kernel: String,
+    gpus: u32,
     models: Vec<domain::ModelChoice>,
     /// The job's own model inputs, made present: parameter -> (class, manifest).
     inputs: BTreeMap<String, (String, ObjectRef)>,
@@ -131,6 +133,8 @@ struct Durable {
     #[serde(default)]
     catalog_revision: String,
     attention_kernel: String,
+    #[serde(default)]
+    gpus: u32,
     models: Vec<Vec<u8>>,
     #[serde(default)]
     inputs: BTreeMap<String, (String, String, u64)>,
@@ -158,6 +162,7 @@ impl Durable {
             owner: context.owner.clone(),
             catalog_revision: context.catalog_revision.clone(),
             attention_kernel: context.attention_kernel.clone(),
+            gpus: context.gpus,
             models: context.models.iter().map(crate::archive::encode_model_choice).collect(),
             inputs: context
                 .inputs
@@ -181,6 +186,7 @@ impl Durable {
             owner: self.owner,
             catalog_revision: self.catalog_revision,
             attention_kernel: self.attention_kernel,
+            gpus: self.gpus,
             models: self
                 .models
                 .iter()
@@ -482,7 +488,7 @@ impl Runs {
             } else {
                 // A Hub checkpoint by name, or the owner's by hash.
                 let (gpu, width) = crate::published::machine_gpu(&self.service);
-                let (named, _) = crate::published::choose(choice, &choice.parameter, (&gpu, width))
+                let named = crate::published::choose(choice, &choice.parameter, (&gpu, width))
                     .map_err(|(code, message)| refused(code, message))?;
                 let stage = format!("downloading {}", choice.repository);
                 let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, &|done, total| {
@@ -702,6 +708,7 @@ impl Runs {
                 owner: spec.owner.clone(),
                 catalog_revision: spec.catalog_revision.clone(),
                 attention_kernel: spec.attention_kernel.clone(),
+                gpus: spec.gpus,
                 models: spec.models.clone(),
                 inputs,
                 weights_destination: spec.weights_destination.clone(),
@@ -922,6 +929,7 @@ impl Runs {
                     providers: spec.providers.clone(),
                     entrypoint: entrypoint.into(),
                     choices: choices.to_vec(),
+                    gpus: spec.gpus,
                 };
                 let prepared = publisher
                     .prepare_now(&self.service, actor, &request, observe)
@@ -935,7 +943,7 @@ impl Runs {
                         "a release runs with the run's Hub access, and this run carries none",
                     )
                 })?;
-                let plan = self.configured(actor, &installed, entrypoint, choices)?;
+                let plan = self.configured(actor, &installed, entrypoint, choices, spec.gpus)?;
                 Ok((installed, plan))
             }
         }
@@ -1048,6 +1056,7 @@ impl Runs {
                 })
                 .collect(),
             attention_kernel: context.attention_kernel,
+            gpus: context.gpus,
             hub: context.hub,
             providers: context.providers,
             weights_destination: String::new(),
@@ -1203,7 +1212,7 @@ impl Runs {
                     refused(code, message)
                 })?;
                 let (gpu, width) = crate::published::machine_gpu(&self.service);
-                let (named, _) = crate::published::choose(choice, path, (&gpu, width))
+                let named = crate::published::choose(choice, path, (&gpu, width))
                     .map_err(|(code, message)| refused(code, message))?;
                 let hub = hub.ok_or_else(|| {
                     refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
@@ -1239,6 +1248,7 @@ impl Runs {
         installed: &Installation,
         entrypoint: &str,
         choices: &[domain::ModelChoice],
+        gpus: u32,
     ) -> Result<Option<crate::gpu_service::GpuPlan>, Refused> {
         if !declares_models(installed, entrypoint) {
             if !choices.is_empty() {
@@ -1256,7 +1266,7 @@ impl Runs {
             )
         })?;
         let plan = gpu
-            .prepare_root(installed, entrypoint, choices, &[], 0)
+            .prepare_root(installed, entrypoint, choices, &[], gpus)
             .map_err(|e| refused("model_preparation_failed", e.to_string()))?;
         self.service.engine.bind_preparation(Preparation {
             actor: actor.into(),
@@ -1289,6 +1299,7 @@ mod tests {
             owner: "alice".into(),
             catalog_revision: String::new(),
             attention_kernel: String::new(),
+            gpus: 0,
             models: vec![],
             inputs: BTreeMap::from([("model".into(), ("Model".into(), model.repeat(64), 1))]),
             weights_destination: String::new(),
@@ -1358,6 +1369,7 @@ mod tests {
             inputs: vec![],
             models: vec![],
             attention_kernel: String::new(),
+            gpus: 0,
             hub: None,
             providers: Default::default(),
             weights_destination: String::new(),
@@ -1678,7 +1690,7 @@ mod tests {
         let source = hub::Source::new("https://hub.example", None, vec![], None).unwrap();
         runs.jobs.lock().unwrap().insert("7".into(), JobContext {
             installation:"caller".into(),application:String::new(),hub:Some(source),providers:Default::default(),
-            owner:"alice".into(),catalog_revision:String::new(),attention_kernel:String::new(),
+            owner:"alice".into(),catalog_revision:String::new(),attention_kernel:String::new(),gpus:2,
             models:vec![
                 domain::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
                 domain::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
@@ -1729,7 +1741,7 @@ mod tests {
         runs.jobs.lock().unwrap().insert("7".into(), JobContext {
             installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),
             catalog_revision: String::new(), application: String::new(),
-            attention_kernel: String::new(), models: vec![],
+            attention_kernel: String::new(), gpus: 0, models: vec![],
             inputs: Default::default(), weights_destination: String::new(),
         });
         let child = |name: &str| runs.child_spec("alice", "7", "", name, json!({}), vec![], "d", &[]);

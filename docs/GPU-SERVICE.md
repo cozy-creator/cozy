@@ -27,8 +27,10 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   base and LoRA). Several slots load as one many-model construction (`Load.models`).
 - Choices with `source`, `profiles` or `adapters` are unsupported.
 - Exactly one `ModelGrant` must match each slot. Declared `component_use` must be within its components.
-- Degree: the widest fitting ladder rung's `gpus` (published), else the widest group every slot
-  declares (`sequence_parallel.degrees`, one always) within the envelope (Runtime `machine_lanes.widths`).
+- Degree: the widest group every slot declares (`sequence_parallel.degrees`, one always)
+  within the machine envelope. `RunSpec.gpus > 0` requests that exact degree and refuses an
+  unsupported count. Model lanes/checkpoint overrides never change it; weight ladders fit
+  within the selected group. Busy GPUs cause queuing, not a smaller group.
 - The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
   `Preparation`, and `submit` records `preparation_id`.
 - An empty `installation_id` binds a `published-<hash>` installation from `packages`.
@@ -37,7 +39,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 
 - One call slot per GPU: a call takes every slot of its lane. GPU dispatch is fenced only by a
   startup fence or an active GPU record this machine run does not supervise. CPU dispatch continues.
-- Placement (`GpuPool::place`): a group takes the first K GPUs. A one-GPU call takes, in order, a
+- Placement (`GpuPool::place`): a group takes a free contiguous lane of K GPUs. A one-GPU call takes, in order, a
   free GPU with its plan's idle executor; a free GPU where its learned want fits beside the tenants
   there without evicting any (a replica when the plan runs elsewhere too; a plan with nothing
   learned fits only a GPU that holds nothing); or, when the plan runs nowhere or its family holds a GPU, the first free or

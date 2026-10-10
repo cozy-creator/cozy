@@ -76,6 +76,8 @@ pub struct Request {
     pub providers: Providers,
     pub entrypoint: String,
     pub choices: Vec<domain::ModelChoice>,
+    /// 0 selects the widest supported machine group; otherwise exactly this many GPUs.
+    pub gpus: u32,
 }
 
 /// A Hub checkpoint as a run names it (th-245): `repository` at `release` (empty: the newest) in
@@ -711,7 +713,7 @@ impl Publisher {
         let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
         let package = request.installed.as_ref().map(|i| i.package.as_str()).unwrap_or(&request.package);
         let release = request.installed.as_ref().map(|i| i.release.as_str()).unwrap_or(&request.release);
-        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"catalog":request.catalog_revision,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
+        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"catalog":request.catalog_revision,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu,"gpus":request.gpus});
         format!("hub-{}", sha256::hex_digest(key.to_string().as_bytes()))
     }
 
@@ -1231,8 +1233,8 @@ impl Publisher {
 
     /// The run's model grants, every Hub slot exact as its choice names it (th-241): a
     /// pinned checkpoint, or the widest rung of its binding this machine's GPUs fit. The
-    /// widest fitting rung's GPU count is the group's width; 0 lets each slot's declared
-    /// degrees decide. A slot with no choice is refused: the machine resolves nothing.
+    /// request's GPU count chooses the group independently of the weight lane; 0 uses the
+    /// widest group every slot supports on the machine. A slot with no choice is refused.
     fn model(
         &self,
         service: &Service,
@@ -1256,8 +1258,9 @@ impl Publisher {
             ))?;
         let gpu_model = gpu_name(&gpu.config().envelope()[0]);
         let width = gpu.width();
+        let degree = crate::gpu_service::group_degree(&slots, request.gpus, width)
+            .map_err(|e| ("gpu_count_unavailable", e.to_string()))?;
         let mut grants = vec![];
-        let mut degree = 0u32;
         for slot in &slots {
             let path = slot
                 .get("path")
@@ -1285,9 +1288,8 @@ impl Publisher {
                 grants.push(self.held_grant(installation, &path, reference)?);
                 continue;
             }
-            let (named, gpus) = choose(choice, &path, (&gpu_model, width))?;
+            let named = choose(choice, &path, (&gpu_model, degree as usize))?;
             let named = self.resolve(service, &request.source, named, &request.catalog_revision)?;
-            degree = degree.max(gpus);
             grants.push(ModelGrant {
                 package: installation.package.clone(),
                 slot: path,
@@ -1378,7 +1380,7 @@ impl Publisher {
                 &request.entrypoint,
                 &request.choices,
                 &grants,
-                degree,
+                request.gpus,
             )
             .map_err(|e| ("model_preparation_failed", e.to_string()))?;
         service
@@ -1412,24 +1414,24 @@ pub(crate) fn machine_gpu(service: &Service) -> (String, usize) {
 
 /// A Hub model slot's checkpoint as its choice names it (th-245): the owner's by hash, else
 /// `repository` at `release` in the choice's lane, else the widest rung of its binding this
-/// machine's GPUs fit, else the release's only lane; with the rung's GPU count (0 unstated).
-pub(crate) fn choose(choice: &domain::ModelChoice, path: &str, (gpu, width): (&str, usize)) -> Result<(Named, u32), Failure> {
+/// machine's GPUs fit, else the release's only lane. A weight rung never sets execution width.
+pub(crate) fn choose(choice: &domain::ModelChoice, path: &str, (gpu, width): (&str, usize)) -> Result<Named, Failure> {
     if choice.repository.is_empty() {
         return Err(("model_choice_absent", format!("{path}'s choice names no model repository")));
     }
     let manifest = choice.manifest.as_ref().map(|m| format!("sha256:{}", sha256::hex(&m.digest))).unwrap_or_default();
-    let (lane, gpus) = match choice.lane.is_empty() && manifest.is_empty() && !choice.rungs.is_empty() {
+    let lane = match choice.lane.is_empty() && manifest.is_empty() && !choice.rungs.is_empty() {
         true => {
             let rung = rung(&choice.rungs, gpu, width).ok_or((
                 "model_binding_absent",
                 format!("no rung of {path}'s binding fits {width}x {gpu:?}"),
             ))?;
-            (rung.lane.clone(), rung.gpus)
+            rung.lane.clone()
         }
-        false => (choice.lane.clone(), 0),
+        false => choice.lane.clone(),
     };
     let named = Named { repository: choice.repository.clone(), release: choice.release.clone(), lane, manifest };
-    Ok((named, gpus))
+    Ok(named)
 }
 
 fn make_source(
@@ -2396,21 +2398,21 @@ mod tests {
             manifest: Some(domain::Ref { digest: vec![7; 32], length: 9 }),
             ..Default::default()
         };
-        let (got, gpus) = choose(&pinned, ("", 0)).unwrap();
-        assert_eq!((got.manifest, got.release, gpus), (format!("sha256:{}", "07".repeat(32)), String::new(), 0));
+        let got = choose(&pinned, ("", 0)).unwrap();
+        assert_eq!((got.manifest, got.release), (format!("sha256:{}", "07".repeat(32)), String::new()));
         let laddered = domain::ModelChoice {
             repository: "proof/probe".into(),
             release: "1.0.0".into(),
             rungs: rungs(&[("h100", 2, "fp8"), ("*", 0, "bf16")]),
             ..Default::default()
         };
-        let (got, gpus) = choose(&laddered, ("NVIDIA H100 80GB HBM3", 2)).unwrap();
-        assert_eq!((got.lane.as_str(), gpus, got.release.as_str(), got.manifest.as_str()), ("fp8", 2, "1.0.0", ""));
-        assert_eq!(choose(&laddered, ("NVIDIA A40", 1)).unwrap().0.lane, "bf16");
+        let got = choose(&laddered, ("NVIDIA H100 80GB HBM3", 2)).unwrap();
+        assert_eq!((got.lane.as_str(), got.release.as_str(), got.manifest.as_str()), ("fp8", "1.0.0", ""));
+        assert_eq!(choose(&laddered, ("NVIDIA A40", 1)).unwrap().lane, "bf16");
         let only = domain::ModelChoice { repository: "proof/probe".into(), rungs: rungs(&[("h100", 0, "fp8")]), ..Default::default() };
         assert_eq!(choose(&only, ("NVIDIA A40", 1)).err().unwrap().0, "model_binding_absent");
         let named = domain::ModelChoice { repository: "proof/probe".into(), ..Default::default() };
-        let (got, _) = choose(&named, ("", 0)).unwrap();
+        let got = choose(&named, ("", 0)).unwrap();
         assert_eq!((got.release.as_str(), got.lane.as_str(), got.manifest.as_str()), ("", "", ""));
         let unnamed = domain::ModelChoice { manifest: pinned.manifest.clone(), ..Default::default() };
         assert_eq!(choose(&unnamed, ("", 0)).err().unwrap().0, "model_choice_absent");
@@ -2427,7 +2429,7 @@ mod tests {
         let published = default_choice(&slot, path, "paul/qwen-image-2", "").unwrap();
         assert_eq!((published.parameter.as_str(), published.repository.as_str(), published.release.as_str()), (path, "paul/qwen-image-2", "1.0.0"));
         assert_eq!(published.rungs, rungs(&[("H100", 2, "fp8"), ("*", 0, "bf16")]));
-        assert_eq!(choose(&published, path, ("NVIDIA RTX A4000", 1)).unwrap().0.lane, "bf16");
+        assert_eq!(choose(&published, path, ("NVIDIA RTX A4000", 1)).unwrap().lane, "bf16");
         assert_eq!(default_choice(&slot, path, "local/qwen-copy", "fidika").unwrap().repository, "fidika/qwen-image-2");
         assert!(default_choice(&slot, path, "local/qwen-copy", "").is_none(), "an org-relative default needs its account");
         let explicit = json!({"default_ladder": [{"gpu": "*", "lane": "proof/probe@2.1/bf16"}]});

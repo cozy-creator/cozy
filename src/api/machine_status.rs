@@ -23,6 +23,7 @@ pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Statu
 pub const CAPABILITIES: &[&str] = &[
     "status/1",
     "run/1",
+    "run-gpus/1",
     "control/1",
     "read/1",
     "warm/1",
