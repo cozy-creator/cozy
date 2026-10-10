@@ -2447,6 +2447,41 @@ fn the_policy_fails_closed() {
 }
 
 #[test]
+fn a_fake_ip_answer_is_admitted_only_for_a_named_https_origin() {
+    let policy = SourcePolicy {
+        allowed_hosts: vec![".ngrok.app".into(), "198.18.0.5".into()],
+        allow_local: false,
+        max_redirects: 0,
+        ..Default::default()
+    };
+    let answer = |ips: &[&str], port: u16| -> Vec<std::net::SocketAddr> {
+        ips.iter().map(|ip| std::net::SocketAddr::new(ip.parse().unwrap(), port)).collect()
+    };
+    // Fake-IP DNS answers every name in 198.18/15; TLS then verifies the certificate for the name.
+    policy.resolved.seed("hub.ngrok.app", 443, answer(&["198.18.0.148"], 443));
+    let checked = policy.check("https://hub.ngrok.app/healthz").unwrap();
+    assert_eq!(checked.addrs, answer(&["198.18.0.148"], 443));
+    policy.resolved.seed("top.ngrok.app", 443, answer(&["198.19.255.254"], 443));
+    assert!(policy.check("https://top.ngrok.app/x").is_ok());
+    // Every other blocked answer still refuses, whatever rides beside the fake one.
+    for (name, ips, why) in [
+        ("meta.ngrok.app", ["198.18.0.9", "169.254.169.254"], "link-local"),
+        ("lan.ngrok.app", ["198.18.0.9", "10.0.0.7"], "private"),
+        ("loop.ngrok.app", ["198.18.0.9", "127.0.0.1"], "loopback"),
+    ] {
+        policy.resolved.seed(name, 443, answer(&ips, 443));
+        let refused = policy.check(&format!("https://{name}/x")).unwrap_err();
+        assert_eq!(refused.code, Code::SOURCE_NOT_ALLOWED, "{name}");
+        assert!(refused.detail.contains(why), "{name}: {}", refused.detail);
+    }
+    // Plaintext stays strict, and so does a literal 198.18 address (no name to verify).
+    policy.resolved.seed("hub.ngrok.app", 80, answer(&["198.18.0.148"], 80));
+    assert_eq!(policy.check("http://hub.ngrok.app/x").unwrap_err().code, Code::SOURCE_NOT_ALLOWED);
+    let refused = policy.check("https://198.18.0.5/x").unwrap_err();
+    assert!(refused.detail.contains("private"), "{}", refused.detail);
+}
+
+#[test]
 fn redirects_are_refused_or_revalidated_never_followed_blind() {
     let root = temporary("redirect");
     let store = Store::init(&root).unwrap();
