@@ -186,9 +186,15 @@ pub fn prepare_editable(
     project: &Path,
     environment: &Path,
     wheels: &[PathBuf],
+    indexes: &std::collections::BTreeMap<String, String>,
 ) -> Result<PreparedGeneration, Status> {
     let mut command = installer(config, root)?;
     command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
+    if !indexes.is_empty() {
+        // uv's own setting: every uv the helper runs knows the indexes the sources name.
+        let named: Vec<_> = indexes.iter().map(|(name, url)| format!("{name}={url}")).collect();
+        command.env("UV_INDEX", named.join(" "));
+    }
     for wheel in wheels {
         command.arg("--wheel").arg(wheel);
     }

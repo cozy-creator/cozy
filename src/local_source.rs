@@ -55,6 +55,10 @@ pub struct Manifest {
     /// This computer's machine: that common directory itself, read in place and never copied.
     #[serde(default)]
     pub path: String,
+    /// uv indexes the project's sources name without declaring, by name: an authored tree
+    /// names its account's index (`tensorhub`), whose URL depends on who runs it.
+    #[serde(default)]
+    pub indexes: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 pub struct Member {
@@ -208,6 +212,7 @@ impl LocalSources {
         let carried: Vec<_> = manifest.wheels.iter().map(|w| (&w.name, &w.digest)).collect();
         let key = serde_json::json!({
             "lock": held("uv.lock"), "project": held("pyproject.toml"), "beside": beside, "wheels": carried,
+            "indexes": manifest.indexes,
             "sdk": self.installer.sdk, "client": self.installer.client_wheel,
             "python": self.installer.python, "python_version": manifest.python_version,
         });
@@ -308,7 +313,13 @@ impl LocalSources {
             callees: manifest.callees,
             files: Vec::new(),
         };
-        let prepared = prepare_editable(&self.installer, &root, &project, &environment, &wheels)
+        for (name, url) in &manifest.indexes {
+            let named = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+            if !named || !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(char::is_whitespace) {
+                return Err(refused("local_source_invalid", format!("index {name:?} = {url:?} is not a named HTTP(S) index")));
+            }
+        }
+        let prepared = prepare_editable(&self.installer, &root, &project, &environment, &wheels, &manifest.indexes)
             .map_err(|status| refused("package_installation_failed", status.message()))?;
         let _ = fs::remove_dir_all(environment.with_extension("wheels"));
         let installed = service.engine.bind_installation(Installation {
@@ -735,6 +746,59 @@ mod tests {
         // Without the wheel the lock's own source is all there is, and uv says so.
         let why = sources.install(&m.service, "alice", &manifest(serde_json::json!([]))).err().unwrap().message;
         assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("cozy-machine-cpu-memo"), "{why}");
+        let _ = fs::remove_dir_all(m.root);
+    }
+
+    /// An authored tree names its account's index without declaring it (the URL depends on who
+    /// runs it). Read in place, it installs with the index its manifest names, and without one
+    /// uv says the index is undeclared.
+    #[test]
+    fn an_authored_tree_installs_with_the_index_its_manifest_names() {
+        struct Served(std::process::Child);
+        impl Drop for Served {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let m = machine("cm-indexes");
+        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let (project, served) = (m.root.join("project"), m.root.join("served"));
+        fs::create_dir_all(project.join("cpu_caller")).unwrap();
+        let files = ["pyproject.toml", "package.toml", "cpu_caller/__init__.py"];
+        for name in files {
+            fs::copy(fixtures.join("cpu_caller").join(name), project.join(name)).unwrap();
+        }
+        let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv.sources]\ncozy-machine-cpu-memo = { index = \"tensorhub\" }\n").unwrap();
+        let simple = served.join("simple/cozy-machine-cpu-memo");
+        run(Command::new("uv").current_dir(fixtures.join("cpu_memo")).args(["build", "--wheel", "--out-dir"]).arg(&simple));
+        let memo = fs::read_dir(&simple).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
+        let name = memo.file_name().unwrap().to_string_lossy().to_string();
+        let digest = sha256::hex_digest(&fs::read(&memo).unwrap());
+        fs::write(simple.join("index.html"), format!("<a href=\"{name}#sha256={digest}\">{name}</a>")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let _server = Served(Command::new("python3").args(["-m", "http.server", &port.to_string(), "--bind", "127.0.0.1", "--directory"])
+            .arg(&served).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let url = format!("http://127.0.0.1:{port}/simple/");
+        run(Command::new("uv").args(["lock", "--python", "3.12", "--index", &format!("tensorhub={url}"), "--project"]).arg(&project));
+        let manifest = |indexes: serde_json::Value| {
+            let document = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+                "files": live_files(&m.objects, "alice", &project, &[&files[..], &["uv.lock"]].concat()), "path": project.to_string_lossy(),
+                "indexes": indexes, "callees": {"cozy-machine-cpu-memo": "proof/cozy-machine-cpu-memo"}});
+            write(&m.objects, "alice", document.to_string().as_bytes()).digest
+        };
+        let why = sources.install(&m.service, "alice", &manifest(serde_json::json!({}))).err().unwrap().message;
+        assert!(why.contains("undeclared index"), "{why}");
+        let installed = sources.install(&m.service, "alice", &manifest(serde_json::json!({"tensorhub": url}))).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
+        let bad = sources.install(&m.service, "alice", &manifest(serde_json::json!({"tensorhub": "file:///etc"}))).err().unwrap();
+        assert_eq!(bad.code, "local_source_invalid");
         let _ = fs::remove_dir_all(m.root);
     }
 

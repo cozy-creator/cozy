@@ -16,7 +16,8 @@ pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Statu
 /// deletes their environments once nothing holds them; Status names each one's Hub.
 /// `live-source/1`: a local source's manifest may name a live project file by file (or its
 /// directory on this computer), installed editable in one tree and environment per package;
-/// and a slot a run names no model for takes its declared default.
+/// and a slot a run names no model for takes its declared default. `live-source/2`: that
+/// manifest may also name the uv indexes its project's sources use without declaring them.
 pub const CAPABILITIES: &[&str] = &[
     "status/1",
     "run/1",
@@ -28,6 +29,7 @@ pub const CAPABILITIES: &[&str] = &[
     "local-models/1",
     "remove/1",
     "live-source/1",
+    "live-source/2",
 ];
 
 const LIVE: [&str; 4] = ["queued", "starting", "running", "paused"];
