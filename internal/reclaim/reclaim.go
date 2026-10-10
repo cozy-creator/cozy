@@ -430,13 +430,22 @@ func secretOwner(name string) (string, bool) {
 	return "", false
 }
 
+// RetiredLocalPackages removes the staged copies of unpublished code an older cozy left.
+func RetiredLocalPackages(l home.Layout) (Swept, *exit.Error) {
+	path := l.RetiredLocalPackages()
+	if _, err := os.Lstat(path); err != nil {
+		return Swept{}, nil
+	}
+	freed, problem := removeTree(path)
+	return Swept{Scanned: 1, Removed: 1, Bytes: freed}, problem
+}
+
 // EmptyRoots prunes on-demand directories whose work is gone. Every one of these is
 // recreated by its writer at the moment work exists, so an empty one is debris, not
 // structure. Each remove refuses unless the directory is empty, which is the point.
 func EmptyRoots(l home.Layout) {
 	for _, dir := range []string{
 		l.Workers, filepath.Join(l.Tmp, "locks"), l.Tmp,
-		l.LocalPackages,
 	} {
 		_ = os.Remove(dir)
 	}

@@ -17,7 +17,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -55,13 +54,6 @@ type ModelTransferOwner interface {
 
 type ModelTransferMover func(context.Context, records.ModelTransferWeights,
 	WeightsGrantMinter) *exit.Error
-
-// Launcher validates captures and reads local installations. A connected worker must never
-// force this host to materialize or execute the target environment to author a remote plan.
-type Launcher interface {
-	ValidateExecutionCapture(records.Request) *exit.Error
-	LocalInstallation(installID, digest string) (localpackage.Installation, *exit.Error)
-}
 
 type LogicalPackage struct {
 	Package          string

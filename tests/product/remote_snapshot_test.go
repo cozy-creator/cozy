@@ -160,12 +160,12 @@ def original(payload: Input) -> Result:
 	if problem != nil || selected.RequiresPython == "" {
 		t.Fatalf("lost retained requirements: %+v %v", selected, problem)
 	}
-	staged, problem := localpackage.Stage(context.Background(), layout, snapshot.Install)
+	sent, problem := localpackage.Open(snapshot.Install)
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if staged.PythonVersion != "" || staged.PythonRequires != ">=3.12,<3.13" {
-		t.Fatalf("source imposed client Python %q instead of authored requirements %q", staged.PythonVersion, staged.PythonRequires)
+	if sent.PythonRequires != ">=3.12,<3.13" {
+		t.Fatalf("source lost its authored Python requirement: %q", sent.PythonRequires)
 	}
 	write("proof.py", "raise RuntimeError('later author edit')\n")
 	frozen, err := os.ReadFile(filepath.Join(snapshot.Install.ProjectDir, "proof.py"))

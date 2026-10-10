@@ -23,7 +23,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/inputasset"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -342,6 +341,9 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 	if stream == nil {
 		var err error
 		stream, err = machine.Run(ctx, request.ID, uint64(max(link.RemoteCursor, 0)), spec)
+		if err != nil && m.resend(machine, request, spec, err) {
+			return false, nil
+		}
 		if err != nil {
 			return m.runRefusalV1(request.ID, err, spec != nil && !sent)
 		}
@@ -361,6 +363,9 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			event, err = stream.Recv()
 		}
 		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil && !opened && m.resend(machine, request, spec, err) {
 			return false, nil
 		}
 		if err != nil {
@@ -416,6 +421,14 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 			return false, nil
 		}
 	}
+}
+
+// resend answers whether a refused run is worth sending again with its whole package: the
+// machine's tree lacks a file this daemon did not offer, because what it remembers sending
+// there is no longer what the machine holds. Forgotten, every file is offered next time.
+func (m *machineRuns) resend(machine *machines.V1, request records.Request, spec *v1.RunSpec, err error) bool {
+	return spec.GetLocal() != nil && strings.Contains(status.Convert(err).Message(), "local_source_incomplete") &&
+		m.forgetSent(machine, request)
 }
 
 // An explicit first-submission rejection can end a request without acceptance. Other
@@ -505,18 +518,14 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	}
 	began := time.Now()
 	if request.LocalInstallationID != "" {
-		revision, problem := m.capturedRevision(request)
+		manifest, sent, problem := m.localSourceV1(ctx, machine, request.InstallID)
 		if problem != nil {
 			return nil, problem
 		}
-		manifest, sent, err := machinev1.LocalSource(ctx, machine.Machine, revision)
-		if err != nil {
-			return nil, machines.Transport(err)
-		}
 		spec.Source = &v1.RunSpec_Local{Local: &v1.LocalSource{Manifest: manifest}}
 		if sent {
-			// Code the machine did not hold yet; held code reopens its installation as it is.
-			m.submissionStage(request.ID, "package", revision.Package, began)
+			// Files the machine's tree did not hold yet; an unchanged tree sends none.
+			m.submissionStage(request.ID, "package", request.Package, began)
 		}
 	} else {
 		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: request.Package, Release: request.Release}}
@@ -575,13 +584,16 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 	return spec, nil
 }
 
-// runModels are every model choice a run's machine needs: the run's own and, for a run that
-// composes children, its callees' bindings, each sent by name (th-245).
+// runModels are every model choice a run's machine needs: the run's own and, for a published
+// release that composes children, its callees' Hub bindings, each sent by name (th-245).
+// Unpublished code has no Hub binding: its machine gives each callee slot the default ladder
+// the callee declares (run 5327 named one under another package and failed
+// `model_choice_absent`).
 //
 // The callees' bindings are kept under the catalog revision, as the run's own are
 // (exactRunModels): a warm run reads nothing at any Hub.
 func (m *machineRuns) runModels(request records.Request) ([]records.ModelRef, *exit.Error) {
-	if !request.ComposesChildren() {
+	if !request.ComposesChildren() || request.InstallID != "" {
 		return request.Models, nil
 	}
 	children, problem := m.childModels(request)
@@ -605,12 +617,7 @@ func (m *machineRuns) childModels(request records.Request) ([]records.ModelRef, 
 	if raw, err := os.ReadFile(kept); kept != "" && err == nil && json.Unmarshal(raw, &children) == nil {
 		return children, nil
 	}
-	var problem *exit.Error
-	if request.InstallID == "" {
-		children, problem = m.resolver.PublishedChildModels(m.context.forHub(request.Hub), request)
-	} else {
-		children, problem = m.resolver.UnpublishedChildModels(request)
-	}
+	children, problem := m.resolver.PublishedChildModels(m.context.forHub(request.Hub), request)
 	if raw, err := json.Marshal(children); problem == nil && kept != "" && err == nil &&
 		os.MkdirAll(filepath.Dir(kept), 0o700) == nil && os.WriteFile(kept+".tmp", raw, 0o600) == nil {
 		_ = os.Rename(kept+".tmp", kept)
@@ -701,15 +708,11 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		}
 		spec.Kind, spec.Source = v1.RunKind_RUN_KIND_REMOVE, &v1.RunSpec_Installation{Installation: selection.Remove}
 	case selection.Local != "":
-		// This computer's capture of local code: only the objects the machine lacks go.
-		root, problem := m.localInstallation(ctx, selection)
+		// This computer's local code: only the files the machine's tree lacks go.
+		report(machines.InstallProgress{Stage: "writing " + selection.Package})
+		manifest, _, problem := m.localSourceV1(ctx, machine, selection.Local)
 		if problem != nil {
 			return nil, problem
-		}
-		report(machines.InstallProgress{Stage: "writing " + selection.Package})
-		manifest, _, err := machinev1.LocalSource(ctx, machine.Machine, root)
-		if err != nil {
-			return nil, machines.Transport(err)
 		}
 		spec.Source = &v1.RunSpec_Local{Local: &v1.LocalSource{Manifest: manifest}}
 	}
@@ -781,17 +784,6 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 			return json.RawMessage(outcome.Result), nil
 		}
 	}
-}
-
-// localInstallation is the captured code of this computer's local installation the selection
-// names, as a run of it would send it.
-func (m *machineRuns) localInstallation(ctx context.Context, selection records.RentalInstallSelection) (localpackage.Installation, *exit.Error) {
-	revision, problem := m.resolver.PrepareLocal(ctx, selection.Local)
-	if problem != nil {
-		return localpackage.Installation{}, problem
-	}
-	return m.capturedRevision(records.Request{InstallID: selection.Local, LocalInstallationID: revision.ID,
-		Package: revision.Package, Release: revision.Release})
 }
 
 // writeTreesV1 writes each `--input-tree ref=dir` to the machine as writeTreeV1 does; the

@@ -87,7 +87,7 @@ private-lock-library = {path = "../library", editable = true}
 	first, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil)
 	fatal(t, problem)
 	defer first.Close()
-	frozen, problem := packagepublish.SnapshotSource(t.Context(), first.Tree, filepath.Join(t.TempDir(), "accepted"))
+	frozen, problem := packagepublish.SnapshotSource(t.Context(), first.Tree, filepath.Join(t.TempDir(), "accepted"), nil)
 	fatal(t, problem)
 	defer frozen.Close()
 	second, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil)
@@ -118,7 +118,7 @@ private-lock-library = {path = "../library", editable = true}
 	edited, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil)
 	fatal(t, problem)
 	defer edited.Close()
-	newCapture, problem := packagepublish.SnapshotSource(t.Context(), edited.Tree, filepath.Join(t.TempDir(), "accepted"))
+	newCapture, problem := packagepublish.SnapshotSource(t.Context(), edited.Tree, filepath.Join(t.TempDir(), "accepted"), nil)
 	fatal(t, problem)
 	defer newCapture.Close()
 	for _, row := range []struct {

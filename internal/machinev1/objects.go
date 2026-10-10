@@ -129,64 +129,63 @@ type nopCloser struct{ io.ReadSeeker }
 
 func (nopCloser) Close() error { return nil }
 
-// localManifest is the LocalSource manifest the machine installs from (machine.proto).
+// localManifest is the LocalSource manifest the machine installs from (machine.proto): a live
+// project, file by file, and the wheels its lock selects from a Tensorhub index.
 type localManifest struct {
 	Package        string            `json:"package"`
 	Release        string            `json:"release"`
 	PythonRequires string            `json:"python_requires,omitempty"`
-	PythonVersion  string            `json:"python_version,omitempty"`
-	Source         *Object           `json:"source,omitempty"`
-	Wheels         []Object          `json:"wheels,omitempty"`
-	Requirements   *Object           `json:"requirements,omitempty"`
+	Files          []member          `json:"files"`
+	Wheels         []member          `json:"wheels,omitempty"`
 	Callees        map[string]string `json:"callees,omitempty"`
 }
 
-// LocalSource writes an unpublished package (its source archive, vendored wheels and locked
-// requirements) and its manifest. A run names the manifest's digest; unchanged code
-// writes nothing new and reopens the machine's installation, and `sent` is then false. The
-// manifest names its members by digest, so every object goes up side by side: one round
-// trip for those the machine holds, two for the rest.
-func LocalSource(ctx context.Context, client pb.MachineClient, installation localpackage.Installation) (manifestDigest string, sent bool, err error) {
+type member struct {
+	Name       string `json:"name"`
+	Digest     string `json:"digest"`
+	Length     int64  `json:"length"`
+	Executable bool   `json:"executable,omitempty"`
+}
+
+// Held is what one machine was last sent of one package, by name: its tree's files and the
+// wheels its environment was built from. Nothing it names at the same digest is offered again.
+type Held map[string]string
+
+// LocalSource writes an unpublished package (its source tree and its lock's Tensorhub wheels)
+// and its manifest, and answers the manifest's digest, which a run names. The machine keeps
+// one tree per package: only a file `held` does not name at its digest is offered, one round
+// trip when the machine has the object already and two when it does not, eight at a time.
+// `sent` is false when no byte moved.
+func LocalSource(ctx context.Context, client pb.MachineClient, installation localpackage.Installation, held Held) (manifestDigest string, sent bool, now Held, err error) {
 	manifest := localManifest{Package: installation.Package, Release: installation.Release,
-		PythonRequires: installation.PythonRequires, PythonVersion: installation.PythonVersion, Callees: installation.Callees}
+		PythonRequires: installation.PythonRequires, Callees: installation.Callees,
+		Files: []member{}}
 	type upload struct {
 		object Object
 		open   func() (io.ReadSeekCloser, error)
 	}
 	var uploads []upload
+	now = Held{}
 	for _, file := range installation.Files {
-		object, err := fileObject(file.Path)
-		if err != nil {
-			return "", false, fmt.Errorf("writing %s: %w", file.Filename, err)
+		manifest.Files = append(manifest.Files, member{file.Name, file.Digest, file.Length, file.Executable})
+		if now[file.Name] = file.Digest; held[file.Name] != file.Digest {
+			uploads = append(uploads, upload{Object{Digest: file.Digest, Length: file.Length}, func() (io.ReadSeekCloser, error) { return os.Open(file.Path) }})
 		}
-		path := file.Path
-		uploads = append(uploads, upload{object, func() (io.ReadSeekCloser, error) { return os.Open(path) }})
-		if file.Kind == "source" {
-			manifest.Source = &object
-			continue
+	}
+	for _, wheel := range installation.Wheels {
+		manifest.Wheels = append(manifest.Wheels, member{Name: wheel.Name, Digest: wheel.Digest, Length: wheel.Length})
+		name := "wheel:" + wheel.Name
+		if now[name] = wheel.Digest; held[name] != wheel.Digest {
+			uploads = append(uploads, upload{Object{Digest: wheel.Digest, Length: wheel.Length}, func() (io.ReadSeekCloser, error) { return os.Open(wheel.Path) }})
 		}
-		object.Name = file.Filename
-		manifest.Wheels = append(manifest.Wheels, object)
-	}
-	if manifest.Source == nil && len(manifest.Wheels) == 0 {
-		return "", false, fmt.Errorf("%s has no source archive or retained wheels to write", installation.Package)
-	}
-	bytesUpload := func(data []byte) upload {
-		sum := sha256.Sum256(data)
-		object := Object{Digest: "sha256:" + hex.EncodeToString(sum[:]), Length: int64(len(data))}
-		return upload{object, func() (io.ReadSeekCloser, error) { return nopCloser{bytes.NewReader(data)}, nil }}
-	}
-	if len(installation.DependencyRequirements) > 0 {
-		requirements := bytesUpload(installation.DependencyRequirements)
-		uploads = append(uploads, requirements)
-		manifest.Requirements = &requirements.object
 	}
 	document, err := json.Marshal(manifest)
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
-	written := bytesUpload(document)
-	uploads = append(uploads, written)
+	sum := sha256.Sum256(document)
+	written := Object{Digest: "sha256:" + hex.EncodeToString(sum[:]), Length: int64(len(document))}
+	uploads = append(uploads, upload{written, func() (io.ReadSeekCloser, error) { return nopCloser{bytes.NewReader(document)}, nil }})
 	var (
 		wait  sync.WaitGroup
 		mu    sync.Mutex
@@ -209,7 +208,7 @@ func LocalSource(ctx context.Context, client pb.MachineClient, installation loca
 		}()
 	}
 	wait.Wait()
-	return written.object.Digest, sent, first
+	return written.Digest, sent, now, first
 }
 
 // fileObject names the file at path by its sha256 and length.

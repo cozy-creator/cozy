@@ -14,7 +14,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -453,12 +452,6 @@ func handleRm(ctx *Context) *exit.Error {
 			"install_id": superseded.ID,
 			"reclaimed":  output.Bytes(n),
 		})
-	}
-	unlockLocal := localpackage.Guard()
-	localProblem := localpackage.Sweep(l, st)
-	unlockLocal()
-	if localProblem != nil {
-		return localProblem
 	}
 	if len(removed.Rows) == 0 {
 		removed.Aggregates = []output.Field{{K: "changed", V: false}}

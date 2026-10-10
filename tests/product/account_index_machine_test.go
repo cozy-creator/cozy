@@ -9,9 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/machines"
 )
 
 const indexAccount = "author"
@@ -39,11 +42,16 @@ func accountIndex(wheel []byte, open *atomic.Bool, served *atomic.Int64) http.Ha
 }
 
 // indexProject is an editable package whose one Hub dependency comes from its author's account
-// index, locked as `cozy package lock` locks it: against the author's own Hub.
-func indexProject(t *testing.T, laptopHub string) string {
+// index, locked as `cozy package lock` locks it: against the author's own Hub. module, when set,
+// is its code; dependencies are added to its own.
+func indexProject(t *testing.T, laptopHub, module string, dependencies ...string) string {
 	t.Helper()
 	project := filepath.Join(t.TempDir(), "index-probe")
 	must(t, os.MkdirAll(project, 0o700))
+	extra := ""
+	for _, dependency := range dependencies {
+		extra += fmt.Sprintf(", %q", dependency)
+	}
 	sources := "[tool.uv.sources]\norg-relative-dep={index=\"tensorhub\"}\n"
 	if *machineRuntimeWheel != "" {
 		sources += fmt.Sprintf("cozy-runtime={path=%q}\ntensorfs={path=%q}\n", *machineRuntimeWheel, *machineTensorFSWheel)
@@ -52,7 +60,7 @@ func indexProject(t *testing.T, laptopHub string) string {
 name="index-probe"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime>=` + runtimeFloor + `", "msgspec>=0.19", "org-relative-dep>=1.0,<2"]
+dependencies=["cozy-runtime>=` + runtimeFloor + `", "msgspec>=0.19", "org-relative-dep>=1.0,<2"` + extra + `]
 [project.entry-points."cozy.application"]
 default="index_probe:app"
 ` + sources + `[build-system]
@@ -61,7 +69,7 @@ build-backend="hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include=["index_probe.py"]
 `
-	for name, body := range map[string]string{
+	files := map[string]string{
 		"pyproject.toml": authored,
 		"package.toml":   "[application]\nobject=\"index_probe:app\"\n",
 		"index_probe.py": `import msgspec
@@ -84,7 +92,11 @@ app = App()
 def add(payload: AddRequest) -> AddResult:
     return AddResult(value=payload.value + org_relative_dep.VALUE)
 `,
-	} {
+	}
+	if module != "" {
+		files["index_probe.py"] = module
+	}
+	for name, body := range files {
 		must(t, os.WriteFile(filepath.Join(project, name), []byte(body), 0o600))
 	}
 	// The owned copy Creator locks: the authored project plus the account index it writes.
@@ -156,7 +168,7 @@ func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 		doors.ServeHTTP(w, r)
 	})
 
-	project := indexProject(t, h.server.URL)
+	project := indexProject(t, h.server.URL, "")
 	if lock, err := os.ReadFile(filepath.Join(project, "uv.lock")); err != nil ||
 		!bytes.Contains(lock, []byte(h.server.URL+"/v1/index/"+indexAccount+"/"+orgRelativeDependency+"/1.0.0/")) {
 		t.Fatalf("the lock does not name the author's Hub: %v", err)
@@ -179,5 +191,133 @@ func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 	}
 	if served := machineServed.Load(); served != 0 {
 		t.Fatalf("a machine fetched the captured dependency from a Hub %d times", served)
+	}
+}
+
+// A local package calls a job of another package it takes from its author's account index. That
+// job's Model slot declares a default ladder and nobody bound or chose a model for it. Each
+// machine gives the slot its declared default: no binding is read at any Hub and the caller
+// names nothing (run 5327 failed `model_choice_absent` on exactly this).
+func TestAnIndexCalleesUnchosenSlotTakesItsDeclaredDefault(t *testing.T) {
+	h, root, _, _ := parityMachines(t)
+	h.hubAccess.account = indexAccount
+	seedProbe(t, h, root, machines.Local, "tessa")
+	wheel := orgRelativeWheel(t, "1.0.0", `import msgspec
+from cozy_runtime.author import App, Context, Loader, Model, invocable
+
+
+class Nothing:
+    pass
+
+
+class Probe(Model[Nothing]):
+    def load(self, loader: Loader) -> None:
+        raise RuntimeError("a job never loads its Model")
+
+
+class Touched(msgspec.Struct, frozen=True):
+    value: int
+
+
+@invocable(defaults={"source": [{"gpu": "*", "lane": "proof/probe@1.0.0/bf16"}]})
+async def touch(ctx: Context, *, value: int, source: Probe) -> Touched:
+    return Touched(value + 7)
+
+
+app = App()
+app.job(touch)
+`, "[cozy.application]\ndefault = org_relative_dep:app\n")
+	var open atomic.Bool
+	open.Store(true)
+	var served atomic.Int64
+	h.mux.Handle("GET /v1/index/", accountIndex(wheel, &open, &served))
+	var bindings atomic.Int64
+	account := h.server.Config.Handler
+	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/bindings") {
+			bindings.Add(1)
+		}
+		account.ServeHTTP(w, r)
+	})
+	project := indexProject(t, h.server.URL, `import msgspec
+from cozy_runtime.author import App
+from org_relative_dep import touch
+
+
+class AddRequest(msgspec.Struct, forbid_unknown_fields=True):
+    value: int
+
+
+class AddResult(msgspec.Struct):
+    value: int
+
+
+app = App()
+
+
+@app.job
+async def add(payload: AddRequest) -> AddResult:
+    return AddResult(value=(await touch(value=payload.value)).value)
+`)
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		t.Fatalf("editable install [exit %d]\n%s", code, out)
+	}
+	h.mu.Lock()
+	h.closures = nil
+	h.mu.Unlock()
+	for _, venue := range []struct {
+		name string
+		args []string
+	}{{"local", nil}, {"rental", []string{"--rental=tessa"}}} {
+		args := append([]string{"run", "local/index-probe/add", "value=1", "--await", "--json"}, venue.args...)
+		if code, out := runCozy(t, root, args...); code != 0 || !strings.Contains(out, `"value":8`) {
+			t.Fatalf("add on the %s machine [exit %d]\n%s", venue.name, code, out)
+		}
+		h.mu.Lock()
+		asked := slices.Clone(h.closures)
+		h.closures = nil
+		h.mu.Unlock()
+		if !slices.Contains(asked, "proof/probe@1.0.0 bf16") {
+			t.Fatalf("the %s machine did not resolve the callee's declared default by name: %q", venue.name, asked)
+		}
+	}
+	if read := bindings.Load(); read != 0 {
+		t.Fatalf("an unpublished package read %d Hub bindings; it has none", read)
+	}
+}
+
+// `cozy run ./project` of a package that names `index = "tensorhub"` and declares no index: the
+// CLI writes the caller's account index into what it locks and installs, locked or not and with
+// a Git dependency it carries as a wheel (minimax-h3's shape), so the author never spells a Hub
+// URL, and both machines run it.
+func TestARunOfAnAuthoredDirectorySuppliesItsAccountIndex(t *testing.T) {
+	h, root, _, _ := parityMachines(t)
+	h.hubAccess.account = indexAccount
+	wheel := orgRelativeWheel(t, "1.0.0", "VALUE = 7\n")
+	var open atomic.Bool
+	open.Store(true)
+	var served atomic.Int64
+	h.mux.Handle("GET /v1/index/", accountIndex(wheel, &open, &served))
+	repository, commit := serveGitProject(t)
+	locked := indexProject(t, h.server.URL, "")
+	unlocked := indexProject(t, h.server.URL, "")
+	must(t, os.Remove(filepath.Join(unlocked, "uv.lock")))
+	withGit := indexProject(t, h.server.URL, "", "cozy-fixture-pinned @ git+"+repository+"@"+commit)
+	for _, project := range []string{withGit, locked, unlocked} {
+		for _, venue := range []struct {
+			name string
+			args []string
+		}{{"local", nil}, {"rental", []string{"--rental=tessa"}}} {
+			args := append([]string{"run", project + "/add", "value=1", "--await", "--json"}, venue.args...)
+			if code, out := runCozy(t, root, args...); code != 0 || !strings.Contains(out, `"value":8`) {
+				t.Fatalf("%s on the %s machine [exit %d]\n%s", project, venue.name, code, out)
+			}
+		}
+		if raw, _ := os.ReadFile(filepath.Join(project, "pyproject.toml")); bytes.Contains(raw, []byte("[[tool.uv.index]]")) {
+			t.Fatalf("the run wrote an index into the authored pyproject:\n%s", raw)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(unlocked, "uv.lock")); err == nil {
+		t.Fatal("a one-off run wrote a lock into the authored tree")
 	}
 }

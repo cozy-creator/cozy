@@ -14,7 +14,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
@@ -96,9 +95,6 @@ func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
 		t.Fatalf("wheel constructed a local venv: %v", err)
 	}
 	if _, problem := install.InstalledRequirements(context.Background(), result.Install); problem != nil {
-		t.Fatal(problem)
-	}
-	if _, problem := localpackage.StageWheels(layout, result.Install, surface.Raw, []string{result.CapturedProjectWheel}, []byte("cozy-runtime=="+hostruntime.PackageFloor+"\n")); problem != nil {
 		t.Fatal(problem)
 	}
 }

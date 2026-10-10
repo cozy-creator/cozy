@@ -20,7 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -252,10 +251,6 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if sub.Rental || sub.RentalRequired || sub.RentNew {
-			unlock := localpackage.Guard()
-			defer unlock()
-		}
 		var inputDeclaration *launch.Entrypoint
 		var lease *install.Lease
 		defer func() { lease.Release() }()
@@ -696,7 +691,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		return out, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function)
 	}
-	revision, problem := s.packages.PrepareLocal(ctx, installID)
+	revision, problem := s.packages.LocalInstallation(installID)
 	if problem != nil {
 		return out, problem
 	}

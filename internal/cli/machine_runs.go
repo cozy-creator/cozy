@@ -27,9 +27,11 @@ type machineRuns struct {
 	// A foreground controller closes with its CLI command. Explicit controls must
 	// reach the machine before that command returns; observation remains detachable.
 	foreground bool
-	placed     map[string]string // the last placement decision recorded per waiting run
-	machines   *machines.Resolver
-	updates    *rentalRuntimeUpdates
+	// sent is what each machine boot was last sent of each unpublished package (machinev1.Held).
+	sent     sync.Map
+	placed   map[string]string // the last placement decision recorded per waiting run
+	machines *machines.Resolver
+	updates  *rentalRuntimeUpdates
 	// submitting stops each request's submission work in flight (upload, preparation,
 	// staging) once its cancel is durable; guarded by mu.
 	submitting map[string]context.CancelFunc

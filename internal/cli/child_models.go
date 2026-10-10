@@ -5,7 +5,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -25,36 +24,6 @@ import (
 // declaring a slot of its own would make it device-holding and cost it the CPU
 // orchestration role (decision #601), and the runtime cannot inject one because the child
 // payload is converted from the caller's own arguments.
-
-// childManifest completes one captured child slot pinned to the machine the child will run
-// on — for a rental composition the parent's own pod, so the rung is decided here rather
-// than left for a placement decision the child never enters.
-func (r *Resolver) childManifest(origin string, out orchestrator.ModelRef) (orchestrator.ModelRef, *exit.Error) {
-	// A JOB's model is an invocation INPUT, so it carries exact manifest bytes the way
-	// `jobManifestInputs` grants them for a top-level job — not a bare model identity.
-	ref, problem := hub.ParseRef(out.Model)
-	if problem != nil {
-		return orchestrator.ModelRef{}, problem
-	}
-	hctx, cancel := hub.Context()
-	defer cancel()
-	raw, problem := r.catalog(origin).ReleaseManifest(hctx, ref, out.Release, out.Lane)
-	if problem != nil {
-		return orchestrator.ModelRef{}, problem
-	}
-	if !manifestBytes(raw, out.Manifest) {
-		// The lane moved since selection; read the selected checkpoint itself.
-		if checkpoint, fallback := r.catalog(origin).CheckpointManifest(hctx, ref, out.Manifest); fallback == nil {
-			raw = checkpoint
-		}
-	}
-	if !manifestBytes(raw, out.Manifest) {
-		return orchestrator.ModelRef{}, exit.Named(exit.Conflict, "child.model_manifest_changed",
-			"Tensorhub serves no bytes for the selected checkpoint %s", out.Manifest)
-	}
-	out.ManifestLength = int64(len(raw))
-	return out, nil
-}
 
 // childModelLadder is the selection with its rung still open: the owner's binding or the
 // callee's authored default, every rung resolved against the model card the way a rented
@@ -141,31 +110,6 @@ func (r *Resolver) childSlotBinding(origin, pkg, entrypoint string, slot launch.
 			WithRemedy("declare a default lane: %s", bindRemedy(pkg, slot.Path))
 	}
 	return binding, nil
-}
-
-// childAccelerator is the machine a captured child of this parent will run on. A rental
-// composition keeps parent and child on one pod, so the parent's own paid accelerator is
-// the child's; a local parent's child runs on this host's device.
-func (r *Resolver) childAccelerator(parent records.Request) (string, int, *exit.Error) {
-	if parent.Worker == "" {
-		inventory := hostgpu.Probe(r.cfg)
-		if len(inventory.GPUs) == 0 {
-			return "", 0, nil
-		}
-		return inventory.GPUs[0].Model, len(inventory.GPUs), nil
-	}
-	row, problem := r.store.RentalRow(parent.Worker)
-	if problem != nil {
-		return "", 0, problem
-	}
-	if row == nil {
-		return "", 0, exit.Named(exit.Conflict, "child.parent_machine_absent",
-			"the parent's machine is no longer recorded")
-	}
-	if records.CPUAccelerator(row.AcceleratorModel) {
-		return "", 0, nil
-	}
-	return row.AcceleratorModel, row.AcceleratorCount, nil
 }
 
 // UnpublishedChildModels supplies captured defaults for a CPU request's rental choice.

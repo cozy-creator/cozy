@@ -286,7 +286,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		if e != nil {
 			return fail(e)
 		}
-		if e := packagepublish.BindAccountIndex(context.Background(), sourceDir, local.Namespace); e != nil {
+		if e := packagepublish.RetainHubWheels(context.Background(), sourceDir, l.HubWheels()); e != nil {
 			return fail(e)
 		}
 		inst.ProjectDir = sourceDir
@@ -655,7 +655,32 @@ func Sweep(l home.Layout, st *records.Store, own sync.Locker) (Swept, *exit.Erro
 			swept.Bytes += freed
 		}
 	}
+	_ = underWriter(l, own, func() *exit.Error { swept.Bytes += sweepHubWheels(l); return nil })
 	return swept, first
+}
+
+// sweepHubWheels removes each kept Tensorhub wheel no install links any more, and each fetch a
+// stopped install left. A filesystem that counts no links keeps them all.
+func sweepHubWheels(l home.Layout) (freed int64) {
+	hashes, _ := os.ReadDir(l.HubWheels())
+	for _, hash := range hashes {
+		dir := filepath.Join(l.HubWheels(), hash.Name())
+		entries, _ := os.ReadDir(dir)
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			info, err := os.Lstat(path)
+			if err != nil {
+				continue
+			}
+			if info.IsDir() {
+				_ = os.RemoveAll(path)
+			} else if _, links, size, ok := inode(info); ok && links == 1 && os.Remove(path) == nil {
+				freed += size
+			}
+		}
+		_ = os.Remove(dir)
+	}
+	return freed
 }
 
 func underWriter(l home.Layout, own sync.Locker, do func() *exit.Error) *exit.Error {

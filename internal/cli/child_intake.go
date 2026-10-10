@@ -10,7 +10,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
@@ -40,11 +39,6 @@ func (i *childIntake) Finish(parentInstall string) *exit.Error {
 	}
 	if problem := i.store.RecordChildBindings(bindings); problem != nil {
 		return problem
-	}
-	if len(bindings) > 0 && i.prepared != nil && i.prepared.Install.ID == parentInstall {
-		if _, problem := localpackage.StagePrepared(context.Background(), i.layout, i.prepared.Install, i.Package); problem != nil {
-			return problem
-		}
 	}
 	if i.prepared != nil && i.prepared.Install.ID == parentInstall {
 		i.prepared = nil
@@ -156,12 +150,6 @@ func prepareChildIntakeGraph(ctx *Context, pack *packagepublish.Package, layout 
 			nested.Close()
 			dependency.Close()
 			continue
-		}
-		_, problem = localpackage.StagePrepared(context.Background(), layout, result.Install, dependency)
-		if problem != nil {
-			nested.Close()
-			dependency.Close()
-			return fail(problem)
 		}
 		replacements[name] = path
 		for _, job := range exports {

@@ -1530,42 +1530,6 @@ func (s *Store) Unsettled() ([]Request, *exit.Error) {
 	return out, nil
 }
 
-// LocalInstallationInUse preserves inputs owned by accepted requests, bindings or pins.
-func (s *Store) LocalInstallationInUse(id string) (bool, *exit.Error) {
-	var used bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=?)
-		OR EXISTS(SELECT 1 FROM requests WHERE local_installation_id=? AND state IN (`+activeRequestStates+`))
-		OR EXISTS(SELECT 1 FROM pins WHERE install_id=?)`, id, id, id).Scan(&used)
-	if err != nil {
-		return false, exit.Internalf("cannot read installation ownership: %s", err)
-	}
-	return used, nil
-}
-
-// CanceledLocalPackages are durable transfer tombstones owed to one attached worker. Replaying
-// them on every claimed session is idempotent and finishes cleanup after a daemon/stream crash.
-func (s *Store) CanceledLocalPackages(workerID string) ([]Request, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+requestCols+` FROM requests
-		WHERE state='canceled' AND worker=? AND local_installation_id<>''
-		ORDER BY created_at,id`, workerID)
-	if err != nil {
-		return nil, exit.Internalf("cannot read canceled local package transfers: %s", err)
-	}
-	defer rows.Close()
-	var out []Request
-	for rows.Next() {
-		row, err := scanRequest(rows)
-		if err != nil {
-			return nil, exit.Internalf("cannot scan canceled local package transfer: %s", err)
-		}
-		out = append(out, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, exit.Internalf("cannot finish canceled local package transfers: %s", err)
-	}
-	return out, nil
-}
-
 // Settled answers whether a request state is final: nothing will run for it again.
 func Settled(state string) bool {
 	switch state {

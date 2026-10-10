@@ -11,11 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/localpackage"
-	"github.com/cozy-creator/cozy/internal/records"
-	capturedwheel "github.com/cozy-creator/cozy/internal/wheel"
 )
 
 // Component-boundary proof: real CLI/daemon and machine on an isolated fixture root,
@@ -77,38 +72,14 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 	if code, out := runCozy(t, root, "run", "local/callee-caller-proof/main", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":214`) {
 		t.Fatalf("ordinary nested package job did not return 214 [%d]: %s", code, out)
 	}
-	// Recreate the older source-only retention format from this run's immutable
-	// installed snapshot, keeping its existing captured graph and install ID.
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	request, problem := store.RequestByReference("1")
-	fatal(t, problem)
-	installed, problem := store.Install(request.InstallID)
-	fatal(t, problem)
-	legacyLayout, problem := home.Open(t.TempDir())
-	fatal(t, problem)
-	legacyInstall := *installed
-	legacyInstall.ProjectDir = legacyInstall.SourceRef
-	legacy, problem := localpackage.Stage(t.Context(), legacyLayout, legacyInstall)
-	fatal(t, problem)
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	retained := filepath.Join(layout.LocalPackages, installed.ID)
-	archive, err := os.ReadFile(legacy.Files[0].Path)
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(retained, "source.tar"), archive, 0o600))
-	document, err := json.Marshal(legacy)
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(retained, "installation.json"), document, 0o600))
-	if code, out := runCozy(t, root, "run", "local/callee-caller-proof/main", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":214`) {
-		t.Fatalf("old source-only multi-package capture did not replay [%d]: %s", code, out)
+	// Nothing was staged on this computer for it: the machine was sent the install's own files.
+	if _, err := os.Stat(filepath.Join(root, "local-packages")); !os.IsNotExist(err) {
+		t.Fatalf("the run staged a capture under local-packages: %v", err)
 	}
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine/root/var/lib/cozy/rust-machine/execution/executions.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer db.Close()
-	// Inspect the first run's three executed jobs. The legacy replay may reuse its
-	// previously completed child through a memo, which has no live generation/executor.
+	// The run's three executed jobs.
 	rows, err := db.Query("SELECT invocation FROM executions WHERE id <= 3 ORDER BY id")
 	must(t, err)
 	defer rows.Close()
@@ -139,79 +110,10 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 	}
 }
 
-// Real retained wheel files establish root selection and published callee provenance.
-func TestV1CaptureSelectsItsRootByIDAndPreservesCalleeOrganization(t *testing.T) {
-	layout, problem := home.Open(t.TempDir())
-	fatal(t, problem)
-	stage := func(id, name string, callees map[string]string) localpackage.Installation {
-		inst := records.PackageInstall{ID: id, Package: "local/" + name, Version: "1.0.0", Python: "3.12"}
-		wheel := installWheel(t, name, "1.0.0", "")
-		revision, problem := localpackage.StageWheels(layout, inst, fixturePackageInterface, []string{wheel}, nil, callees)
-		fatal(t, problem)
-		return revision
-	}
-	root := stage("root-id", "caller", nil)
-	child := stage("callee-id", "worker", map[string]string{"worker": "other-org/worker"})
-	revision, problem := localpackage.CapturedRoot(localpackage.ExecutionCapture{Installations: []localpackage.Installation{child, root}}, root.ID)
-	fatal(t, problem)
-	if revision.ID != root.ID || len(revision.Files) != 2 || revision.SourceArchive != "" || revision.Callees["worker"] != "other-org/worker" {
-		t.Fatalf("root or original callee identity was lost: %+v", revision)
-	}
-	for _, file := range revision.Files {
-		if filepath.Ext(file.Filename) != ".whl" {
-			t.Fatalf("multi-package source was mixed with the retained wheels: %+v", file)
-		}
-	}
-}
-
-func TestV1CaptureRefusesConflictingVersionsBeforeSubmission(t *testing.T) {
-	layout, problem := home.Open(t.TempDir())
-	fatal(t, problem)
-	root, problem := localpackage.StageWheels(layout, records.PackageInstall{ID: "root", Package: "local/caller", Version: "1.0.0"},
-		fixturePackageInterface, []string{installWheel(t, "caller", "1.0.0", ""), installWheel(t, "worker", "2.0.0", "")}, nil)
-	fatal(t, problem)
-	child, problem := localpackage.StageWheels(layout, records.PackageInstall{ID: "child", Package: "local/worker", Version: "1.0.0"},
-		fixturePackageInterface, []string{installWheel(t, "worker", "1.0.0", "")}, nil)
-	fatal(t, problem)
-	if _, problem := localpackage.CapturedRoot(localpackage.ExecutionCapture{Installations: []localpackage.Installation{root, child}}, root.ID); problem == nil {
-		t.Fatal("two versions of the same distribution were admitted in one environment")
-	}
-}
-
-func TestV1CaptureKeepsTheCallersSelectedWheelAndRemovesItsRegistryDuplicate(t *testing.T) {
-	layout, problem := home.Open(t.TempDir())
-	fatal(t, problem)
-	worker := installWheel(t, "worker", "1.0.0", "worker:app")
-	selected, independent := filepath.Join(t.TempDir(), filepath.Base(worker)), filepath.Join(t.TempDir(), filepath.Base(worker))
-	fatal(t, capturedwheel.PinDependencies(worker, selected, []string{"library>=1"}))
-	fatal(t, capturedwheel.PinDependencies(worker, independent, []string{"library==2"}))
-	root, problem := localpackage.StageWheels(layout, records.PackageInstall{ID: "root", Package: "local/caller", Version: "1.0.0"},
-		fixturePackageInterface, []string{installWheel(t, "caller", "1.0.0", ""), selected},
-		[]byte("worker @ https://example.invalid/worker.whl --hash=sha256:retained\nlibrary @ https://example.invalid/library.whl --hash=sha256:retained\n"))
-	fatal(t, problem)
-	child, problem := localpackage.StageWheels(layout, records.PackageInstall{ID: "child", Package: "local/worker", Version: "1.0.0"},
-		fixturePackageInterface, []string{independent}, nil)
-	fatal(t, problem)
-	merged, problem := localpackage.CapturedRoot(localpackage.ExecutionCapture{Installations: []localpackage.Installation{root, child}}, root.ID)
-	fatal(t, problem)
-	if strings.Contains(string(merged.DependencyRequirements), "worker @") || !strings.Contains(string(merged.DependencyRequirements), "library @") {
-		t.Fatal("supplied wheel competed with a registry source, or an unrelated requirement disappeared")
-	}
-	for _, file := range merged.Files {
-		if strings.HasPrefix(file.Filename, "worker-") {
-			for _, selected := range root.Files {
-				if selected.Filename == file.Filename && selected.Digest != file.Digest {
-					t.Fatal("child's independent dependency metadata overrode the caller's selected wheel")
-				}
-			}
-		}
-	}
-}
-
-// Cut condition 21: a machine runs its own Runtime/TensorFS pair. A package whose local
-// dependency is captured with its closure installs there although its lock chose another
-// Runtime: the sealed wheel pins every other dependency exactly and the pair to its author's
-// bounds. Pinned exactly, the machine's own pair failed `uv pip check` (run 4811).
+// Cut condition 21: a machine runs its own Runtime/TensorFS pair. A package with a local
+// dependency installs there from its own lock although the lock chose another Runtime: the
+// machine's pair replaces the locked one wherever the package's declared bounds admit it
+// (run 4811 pinned the pair exactly, and the machine's own failed `uv pip check`).
 func TestACapturedPackageInstallsOnAMachineWhoseRuntimeDiffers(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host")
@@ -271,15 +173,7 @@ func TestACapturedPackageInstallsOnAMachineWhoseRuntimeDiffers(t *testing.T) {
 	if code, out := runCozy(t, root, "run", "local/skew-caller/survey", "values:=[3,4]", "--await", "--json"); code != 0 || !strings.Contains(out, `"squares":[9,16]`) {
 		t.Fatalf("the captured pair locked to Runtime %s did not run on a machine with %s [%d]: %s", locked[1], machine, code, out)
 	}
-	sealed, _ := filepath.Glob(filepath.Join(root, "local-packages", "*", "skew_caller-1.0.0-py3-none-any.whl"))
-	if len(sealed) != 1 {
-		t.Fatalf("no single sealed caller wheel: %v", sealed)
-	}
-	metadata, problem := capturedwheel.Metadata(sealed[0])
-	fatal(t, problem)
-	text := string(metadata)
-	if strings.Contains(text, "cozy-runtime==") || strings.Contains(text, "tensorfs==") ||
-		!strings.Contains(text, "Requires-Dist: cozy-runtime>=0.18.89") || !strings.Contains(text, "Requires-Dist: msgspec==") {
-		t.Fatalf("the sealed wheel must leave the SDK pair at its bounds and pin the rest:\n%s", text)
+	if _, err := os.Stat(filepath.Join(root, "local-packages")); !os.IsNotExist(err) {
+		t.Fatalf("the run staged a capture under local-packages: %v", err)
 	}
 }

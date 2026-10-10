@@ -1,10 +1,8 @@
 package producttest
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,59 +14,8 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
-
-func TestCapturePublicationExcludesTerminalCleanupAcrossProcesses(t *testing.T) {
-	o := hostOwner(t, fmt.Sprintf("capture-publication-%d", time.Now().UnixNano()))
-	revision := "restored-install"
-	raw, err := json.Marshal(localpackage.Installation{ID: revision, Package: "local/restored", Release: "1.0.0"})
-	must(t, err)
-	root := filepath.Join(o.l.LocalPackages, revision)
-	must(t, os.MkdirAll(root, 0700))
-	must(t, os.WriteFile(filepath.Join(root, "installation.json"), raw, 0600))
-	_, _, problem := o.store.Submit(records.Request{ID: "finishing-old", IdemKey: "finishing-old", BodyDigest: childDigest("a"),
-		Package: "local/restored", Entrypoint: "main", Payload: []byte(`{}`), LocalInstallationID: revision})
-	fatal(t, problem)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	// A different process holds the same kernel writer lock as CLI publication.
-	child := exec.CommandContext(ctx, "flock", "--nonblock", o.l.Lock, "cat")
-	input, err := child.StdinPipe()
-	must(t, err)
-	output, err := child.StdoutPipe()
-	must(t, err)
-	must(t, child.Start())
-	t.Cleanup(func() { input.Close(); cancel(); _ = child.Wait() })
-	_, err = input.Write([]byte("writer held\n"))
-	must(t, err)
-	line, err := bufio.NewReader(output).ReadString('\n')
-	must(t, err)
-	if line != "writer held\n" {
-		t.Fatal("publication process did not acquire the writer")
-	}
-	fatal(t, o.c.CancelQueued("finishing-old", "publication race control"))
-	if _, err := os.Stat(root); err != nil {
-		t.Fatal("terminal cleanup deleted a revision held by another publication process", err)
-	}
-	problem = o.c.Reconcile()
-	fatal(t, problem)
-	if _, err := os.Stat(root); err != nil {
-		t.Fatal("boot sweep deleted an in-progress publication", err)
-	}
-	inst := records.PackageInstall{ID: "restored-install", Package: "local/restored", Dir: o.l.InstallDir("restored-install"), Version: "1.0.0"}
-	fatal(t, o.store.RecordInstall(inst))
-	_, _, problem = o.store.Submit(records.Request{ID: "accepted-new", IdemKey: "accepted-new", BodyDigest: childDigest("a"),
-		Package: "local/restored", InstallID: inst.ID, Entrypoint: "main", Payload: []byte(`{}`), LocalInstallationID: revision})
-	fatal(t, problem)
-	must(t, input.Close())
-	must(t, child.Wait())
-	fatal(t, localpackage.DropUnowned(o.l, o.store, revision))
-	if _, err := os.Stat(root); err != nil {
-		t.Fatal("accepted request failed to take custody after writer release", err)
-	}
-}
 
 func TestCaptureReaderHandoffReleasesWriterBeforeAwait(t *testing.T) {
 	integration(t)
