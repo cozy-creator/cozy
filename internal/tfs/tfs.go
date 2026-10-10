@@ -56,8 +56,12 @@ func Open(cfg config.Config) (*Tool, *exit.Error) {
 	if err := os.MkdirAll(t.Root, 0o755); err != nil {
 		return nil, exit.Internalf("cannot create the local store at %s: %s", t.Root, err)
 	}
-	if _, e := t.run("store", "ensure", t.Root); e != nil {
-		return nil, e
+	// A Store is created only where none is: an existing one is opened by each verb as it is
+	// (TensorFS 0.4 removed `store ensure`, which did both).
+	if entries, err := os.ReadDir(t.Root); err == nil && len(entries) == 0 {
+		if _, e := t.run("store", "init", t.Root); e != nil {
+			return nil, e
+		}
 	}
 	return t, nil
 }

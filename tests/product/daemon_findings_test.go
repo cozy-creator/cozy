@@ -3,7 +3,6 @@ package producttest
 import (
 	"database/sql"
 	"encoding/json"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,17 +40,6 @@ func TestRentalNewWaitsOutARecordsWriter(t *testing.T) {
 	stand.setSKUs(cpuSKU)
 	var asks atomic.Int32
 	stand.rent = refusedAnswer("pr-busywriterproof0001", "pending_acquisition", &asks)
-	catalog := make(chan struct{}, 1)
-	served := stand.server.Config.Handler
-	stand.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		served.ServeHTTP(w, r)
-		if r.URL.Path == "/v1/rental-skus" {
-			select {
-			case catalog <- struct{}{}:
-			default:
-			}
-		}
-	})
 	startDaemonProcess(t, root)
 
 	writer, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite")+"?_txlock=immediate")
@@ -67,18 +55,15 @@ func TestRentalNewWaitsOutARecordsWriter(t *testing.T) {
 	must(t, cmd.Start())
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	select {
-	case <-catalog:
-	case <-done:
-		t.Fatalf("rental new ended before it read the catalog:\n%s", out.String())
-	case <-time.After(60 * time.Second):
-		t.Fatal("rental new never read the catalog")
-	}
 	// Hold the writer well past the five-second SQLite busy timeout the ask used to fail at.
+	// The command's first record write (its fleet reconcile) waits; nothing is asked yet.
 	select {
 	case <-done:
 		t.Fatalf("rental new ended while another writer held the records:\n%s", out.String())
 	case <-time.After(8 * time.Second):
+	}
+	if asks.Load() != 0 {
+		t.Fatalf("rental new asked for a pod before it could record the ask:\n%s", out.String())
 	}
 	must(t, tx.Commit())
 	select {

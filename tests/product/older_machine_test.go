@@ -203,6 +203,8 @@ func olderMachineHome(t *testing.T, machine *olderMachine) (string, *records.Sto
 	hub.publishListing()
 	hub.add(olderRental, "elder")
 	hub.software = map[string]string{"runtime": "0.18.102", "tensorfs": "0.3.93"}
+	// A call names its release's callees' models, read once from the release at its Hub.
+	hub.packageReleases = map[string]any{"proof/example@1.0.0": rentalReleaseFacts()}
 	row := records.Rental{ID: olderRental, MachineName: "elder", State: "ready", SKU: "cpu", AcceleratorModel: "CPU",
 		AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: hub.server.URL, Address: listener.Addr().String(),
 		MediaAddress: "127.0.0.1:1", ExpectedWorkerID: olderWorkerID, ExpectedWorkerBootID: olderBootID}

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -20,17 +21,20 @@ func quantizerJob(lane string) string {
 		`"result":{"input":"model"},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"` + lane + `"}]}`
 }
 
-// installQuantizer records pkg as an installed published package with this interface.
+// installQuantizer records pkg as a package installed from the root's hub, with this interface.
 func installQuantizer(t *testing.T, root, pkg string, iface []byte) {
 	t.Helper()
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
+	raw, err := os.ReadFile(filepath.Join(root, config.FileName))
+	must(t, err)
+	_, origin, _ := strings.Cut(strings.SplitN(string(raw), "\n", 2)[0], "tensorhub_url: ")
 	dir := filepath.Join(root, "installs", strings.ReplaceAll(pkg, "/", "-"))
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(dir)), 0700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0600))
 	_, problem = store.Activate(records.PackageInstall{ID: filepath.Base(dir), Package: pkg, Major: 1,
-		Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, Platform: "linux-x86"})
+		Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, Platform: "linux-x86", Hub: origin})
 	fatal(t, problem)
 }
 
