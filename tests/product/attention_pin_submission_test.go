@@ -34,13 +34,6 @@ func TestAttentionPinSurvivesSubmissionAndConflictingReplayRefuses(t *testing.T)
 	if strings.Contains(replay, "different body") {
 		t.Fatalf("same pin conflicts: %s", replay)
 	}
-	// The same pin given by flag and by payload term is one pin, not a conflict.
-	twice := append(append([]string(nil), args...), "kernel.attention=flash-attn3-fp8")
-	// The run itself may fail on a machine with no device for the kernel; only admission
-	// is under test.
-	if _, out := runCozy(t, root, twice...); strings.Contains(out, "pinned as both") || strings.Contains(out, "different body") {
-		t.Fatalf("an identical repeated pin was refused: %s", out)
-	}
 	args[4] = "--attention-kernel=flash-attn3"
 	if code, out := runCozy(t, root, args...); code == 0 || !strings.Contains(out, "different body") {
 		t.Fatalf("changed pin replayed: %s", out)
@@ -52,7 +45,9 @@ func TestAttentionPinSurvivesSubmissionAndConflictingReplayRefuses(t *testing.T)
 	}
 }
 
-func TestScopedAttentionPinSurvivesCLIAndLegacySubmission(t *testing.T) {
+// --attention-kernel is the one spelling: a `kernel.attention=` term is an ordinary
+// undeclared payload field, never a pin, and a malformed flag refuses before admission.
+func TestScopedAttentionPinSurvivesSubmission(t *testing.T) {
 	root := t.TempDir()
 	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
 		t.Fatalf("install %d: %s", code, out)
@@ -69,14 +64,23 @@ func TestScopedAttentionPinSurvivesCLIAndLegacySubmission(t *testing.T) {
 		if request == nil || request.AttentionKernel != pin {
 			t.Fatalf("durable scoped pin lost: %+v; CLI %s", request, first)
 		}
-		args[4] = "kernel.attention=" + pin
-		if _, out := runCozy(t, root, args...); strings.Contains(out, "different body") {
-			t.Fatalf("equivalent legacy spelling changed identity: %s", out)
-		}
 		args[4] = "--attention-kernel=other_component=kitchen-int8"
 		if code, out := runCozy(t, root, args...); code == 0 || !strings.Contains(out, "different body") {
 			t.Fatalf("changing only scope replayed the request: %s", out)
 		}
+	}
+	_, out := runCozy(t, root, "--json", "run", localWeightlessRef+"/echo", "why=term", "kernel.attention=sdpa", "--idempotency-key=term")
+	request, problem := store.RequestByIdempotencyKey("term")
+	fatal(t, problem)
+	if request == nil || request.AttentionKernel != "" {
+		t.Fatalf("kernel.attention= still pins: %+v; CLI %s", request, out)
+	}
+	code, out := runCozy(t, root, "--json", "run", localWeightlessRef+"/echo", "why=bad", "--attention-kernel=dit=a=b", "--idempotency-key=bad")
+	if code == 0 || !strings.Contains(out, "attention_override_invalid") {
+		t.Fatalf("malformed --attention-kernel was admitted (%d): %s", code, out)
+	}
+	if request, problem := store.RequestByIdempotencyKey("bad"); problem != nil || request != nil {
+		t.Fatalf("malformed --attention-kernel was durably admitted: %+v %v", request, problem)
 	}
 }
 

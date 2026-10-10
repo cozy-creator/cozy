@@ -509,14 +509,14 @@ type RunCmd struct {
 type RunExecuteCmd struct {
 	MachineEndpointFile string   `name:"machine-endpoint-file" predictor:"file" help:"Run on this explicitly pinned owned machine using the controller's existing signing identity; never register or rent a machine."`
 	Target              string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], explicit ./project[/function], or a Python script."`
-	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
+	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
 	Out                 string   `help:"Output directory." predictor:"dir"`
 	Timeout             string   `help:"Request deadline."`
 	PayloadFile         string   `name:"input" predictor:"file" help:"Read the whole payload from a JSON or YAML file, e.g. --input=~/request.yaml; inline fields override file values."`
 	Assets              []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	AssetFidelity       []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
 	LoRAs               []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
-	AttentionKernel     string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend. Example: model/fl2va_dit=kitchen-int8. No fallback; Runtime validates hardware, compiled mode and parallelism."`
+	AttentionKernel     string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend, e.g. model/fl2va_dit=kitchen-int8. It serves every step, waits for its own compile, and is refused rather than replaced when it cannot serve."`
 	Rental              *string  `predictor:"rental" help:"Run only on this existing rental name or id; never buy a replacement."`
 	RentNew             bool     `help:"Buy a fresh managed rental for this run; do not reuse existing machines."`
 	RentalOnly          bool     `help:"Require a remote rental even when local capacity is ready."`
