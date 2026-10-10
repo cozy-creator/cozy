@@ -1325,6 +1325,10 @@ func machineStatusFields(status api.MachineStatus, typed bool) []output.Field {
 		return human
 	}
 	fields := []output.Field{{K: name("agent", "agent_version"), V: status.Agent}, {K: "phase", V: status.Phase}}
+	if status.IdleDeadlineUnixMS > 0 {
+		fields = append(fields, output.Field{K: name("release_due", "release_due_at"),
+			V: time.UnixMilli(status.IdleDeadlineUnixMS).UTC().Format(time.RFC3339Nano)})
+	}
 	for _, software := range [][3]string{{"runtime", "runtime_version", status.Runtime}, {"tensorfs", "tensorfs_version", status.TensorFS}} {
 		if software[2] != "" {
 			fields = append(fields, output.Field{K: name(software[0], software[1]), V: software[2]})
@@ -1367,17 +1371,17 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "uptime", "running", "queued", "idle"},
 		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "compute", "storage", "spent", "failure", "uptime", "running", "queued", "idle",
 			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
-			"idle_since", "release_due", "image", "provider", "provider machine", "provider resource",
+			"idle_since", "image", "provider", "provider machine", "provider resource",
 			"provider host", "provider state", "container state"},
 		// The machine document carries the underlying facts, never the table's
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
 		TypedFields: []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
-			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
+			"running", "queued", "idle_s", "base_worker_image_tag", "base_worker_image_digest",
 			"spend_usd_micros", "spend_basis", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour",
 			"vcpu_count", "memory_gb", "unreachable_since"},
 		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
-			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
+			"running", "queued", "idle_s", "idle_since_at",
 			"hourly_rate_usd_micros", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour", "vcpu_count", "memory_gb",
 			"spend_usd_micros", "spend_basis", "failure_code",
 			"base_worker_image_digest", "base_worker_image_tag",
@@ -1414,13 +1418,14 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if r.Activity != nil {
 			activity = *r.Activity
 		}
-		idleSince, releaseDue := activity.IdleSince, activity.ReleaseDue
+		// An older daemon can still supply a locally estimated ReleaseDue. Do not
+		// present it as the worker's deadline; `rental show` asks its live Status.
+		idleSince := activity.IdleSince
 		since, sinceErr := time.Parse(time.RFC3339, idleSince)
-		due, dueErr := time.Parse(time.RFC3339, releaseDue)
-		eligible := sinceErr == nil && dueErr == nil
+		eligible := sinceErr == nil
 		idleText := ""
 		if eligible {
-			idleText = idleClock(time.Since(since)) + " / " + idleClock(due.Sub(since))
+			idleText = idleClock(time.Since(since))
 		}
 		state := rentalStateCell(r.State, r.Boot, now)
 		if r.RuntimeUpdate != "" {
@@ -1445,8 +1450,8 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"address":     r.Address,
 			"media":       r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
-			"idle_since": idleSince, "release_due": releaseDue,
-			"image": either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": either(r.Provider, r.Failure.Provider),
+			"idle_since": idleSince,
+			"image":      either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": either(r.Provider, r.Failure.Provider),
 			"provider machine": r.ProviderMachineID, "provider resource": either(r.ProviderResourceID, r.Failure.ProviderResourceID), "provider host": r.Failure.ProviderHostID,
 			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
 			"$/hour":  rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour)),
@@ -1473,7 +1478,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"provider": either(r.Provider, r.Failure.Provider), "provider_machine_id": r.ProviderMachineID, "provider_resource_id": either(r.ProviderResourceID, r.Failure.ProviderResourceID),
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub, "runtime_update": r.RuntimeUpdate,
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
-			"idle_since_at": idleSince, "release_due_at": releaseDue,
+			"idle_since_at":            idleSince,
 			"base_worker_image_digest": either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest),
 			"base_worker_image_tag":    r.BaseWorkerImageTag, "unreachable_since": r.UnreachableSince} {
 			if value != "" {
@@ -1823,13 +1828,13 @@ func roughDuration(d time.Duration) string {
 	return d.Round(time.Minute).String()
 }
 
-// idleShutdownNote is the one sentence the rental list owes: what ends an idle machine.
+// idleShutdownNote states the unused-rental timeout, not a new timer after each run.
 func idleShutdownNote() string {
-	return "Idle machines shut down after 15 minutes. Use cozy rental keepalive <name> for one explicit reset."
+	return "Unused rentals time out after 15 minutes. End used rentals with cozy rental end <name>."
 }
 
 func idleReleaseNote() string {
-	return "rentals end after 15 minutes without active work; cozy rental keepalive <name> explicitly resets that deadline"
+	return "unused rentals time out after 15 minutes; cozy rental keepalive <name> explicitly resets that deadline"
 }
 
 // handleRentRelease is idempotent and ends only on provider ABSENCE: the hub reporting the

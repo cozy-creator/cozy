@@ -498,7 +498,7 @@ type RunCmd struct {
 	Upload  RunUploadCmd  `cmd:"" help:"Upload a run's retained output, from the rental holding it, as a private checkpoint in org/model without running it again."`
 	Execute RunExecuteCmd `cmd:"" default:"withargs" hidden:""`
 	Cancel  RunCancelCmd  `cmd:"" help:"Cancel a queued or running run."`
-	Pause   RunPauseCmd   `cmd:"" help:"Pause a private transaction and retain its work. Rentals still shut down after 15 idle minutes; cozy rental keepalive <name> resets the deadline once."`
+	Pause   RunPauseCmd   `cmd:"" help:"Pause a private transaction and retain its work. End a used rental explicitly with cozy rental end <name>."`
 	Resume  RunResumeCmd  `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List    RunListCmd    `cmd:"" help:"List current and past runs."`
 	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
@@ -633,7 +633,7 @@ func (c *RunShowCmd) Run(r *Runtime) error {
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
-	Keepalive   RentalKeepaliveCmd   `cmd:"" help:"Explicitly reset this rental's fixed 15-minute idle deadline once."`
+	Keepalive   RentalKeepaliveCmd   `cmd:"" help:"Explicitly reset an unused rental's 15-minute timeout once; used rentals do not expire automatically."`
 	Update      RentalUpdateCmd      `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
 	SSHInfo     RentalSSHInfoCmd     `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List        RentalListCmd        `cmd:"" help:"List rented machines, live on a terminal."`

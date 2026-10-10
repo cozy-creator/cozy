@@ -27,8 +27,8 @@ func (h *fakeRentalHub) set(id, key string, value any) {
 // the fleet as a live board — MACHINE SKU STATE $/HOUR SPENT UPTIME RUNNING QUEUED IDLE, redrawn in
 // place every second — and the same verb piped or --json is one plain snapshot. The
 // board is watched through a real pseudo-terminal across planted transitions: the pod
-// acquiring, then ready with an idle countdown from the fixed fifteen-minute policy
-// policy, then held by queued work, then counting down again once the work settles.
+// acquiring, then ready with observed idle time, then held by queued work, then counting
+// elapsed idle time again once the work settles.
 func TestRentalListLiveBoard(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-list-tui")
 	must(t, os.RemoveAll(root))
@@ -36,8 +36,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	hub := newFakeRentalHub(t, 0)
 	port := hub.port()
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	// The grace is deliberately NOT the 300s default: the IDLE deadline must come from
-	// the policy the config actually states, never from a spelled-out five minutes.
+	// The board reports observed inactivity without inventing a worker deadline.
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"), 0o600))
@@ -55,7 +54,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 
 	// Each transition is planted once the board has drawn the one before it: the hub moves
 	// the pod to ready, queued work holds it, the work settles, and the idle clock moves on.
-	countdown := regexp.MustCompile(`(\d+)s / 15m`)
+	countdown := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+-\s+\S+\s+0\s+0\s+(\d+)s`)
 	firstIdle := ""
 	code, tty := ptyDrive(t, root, 24, 4, func(step int, drawn string) []byte {
 		switch step {
@@ -123,12 +122,12 @@ func TestRentalListLiveBoard(t *testing.T) {
 	}
 	elapsed := countdown.FindAllStringSubmatchIndex(tty, -1)
 	if len(elapsed) < 2 {
-		t.Fatalf("the IDLE cell did not count elapsed over the 15m policy deadline\n%q", tty)
+		t.Fatalf("the IDLE cell did not count observed elapsed time\n%q", tty)
 	}
 	first := tty[elapsed[0][2]:elapsed[0][3]]
 	last := tty[elapsed[len(elapsed)-1][2]:elapsed[len(elapsed)-1][3]]
 	if first == last {
-		t.Fatalf("the IDLE elapsed clock never moved: always %ss / 15m\n%q", first, tty)
+		t.Fatalf("the IDLE elapsed clock never moved: always %ss\n%q", first, tty)
 	}
 	if elapsed[len(elapsed)-1][0] < busy[0] {
 		t.Fatalf("the idle countdown did not resume after the work settled\n%q", tty)
@@ -143,7 +142,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	}
 	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+SPENT\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(listed) ||
 		!strings.Contains(listed, "Remote machines running: 1") ||
-		!strings.Contains(listed, "Idle machines shut down after 15 minutes.") {
+		!strings.Contains(listed, "Unused rentals time out after 15 minutes.") {
 		t.Fatalf("piped snapshot lost the ruled surface\n%s", listed)
 	}
 	// Bare `cozy rental` names the group's VERBS; it is not one of them. The live table
@@ -198,7 +197,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	row := document.Rentals[0]
 	for _, field := range []string{"machine", "sku", "state", "rental_id", "accelerator",
 		"accelerator_count", "address", "hub", "rented_at", "ready_at", "running", "queued",
-		"idle_s", "idle_since_at", "release_due_at", "hourly_rate_usd_micros"} {
+		"idle_s", "idle_since_at", "hourly_rate_usd_micros"} {
 		if _, ok := row[field]; !ok {
 			t.Fatalf("JSON row lost field %q: %s", field, out)
 		}
@@ -206,7 +205,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if row["machine"] != "sparrow" || row["state"] != "ready" || row["rental_id"] != "rental-tui" ||
 		row["running"] != float64(0) || row["queued"] != float64(0) || row["hourly_rate_usd_micros"] != float64(100_000) ||
 		row["accelerator_count"] != float64(1) ||
-		row["idle_s"] == nil || row["release_due_at"] == "" {
+		row["idle_s"] == nil || row["release_due_at"] != nil {
 		t.Fatalf("JSON row is not the live idle truth: %s", out)
 	}
 	for _, spelling := range []string{`"idle":`, `"uptime":`, `"rented":`} {

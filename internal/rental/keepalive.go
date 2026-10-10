@@ -43,14 +43,14 @@ func KeepAlive(ctx context.Context, l home.Layout, row *records.Rental) (records
 	return acknowledged(row, frame.GetWorkerId(), frame.GetBootId(), frame.GetIdleDeadlineUnixMs())
 }
 
-// acknowledged accepts an answer from the rental's own worker and boot that names a deadline
-// still ahead; Creator schedules from its own clock, so the reset is stamped here.
+// acknowledged accepts the pinned worker's future deadline, or zero when the
+// rental has been used and no longer expires automatically.
 func acknowledged(row *records.Rental, worker, boot string, deadline int64) (records.RentalKeepalive, *exit.Error) {
 	if worker != row.ExpectedWorkerID || boot != row.ExpectedWorkerBootID {
 		return records.RentalKeepalive{}, exit.New(exit.Conflict, "rental keepalive was answered by another worker or boot than the rental's")
 	}
 	now := time.Now().UnixMilli()
-	if deadline <= now {
+	if deadline != 0 && deadline <= now {
 		return records.RentalKeepalive{}, exit.New(exit.Conflict, "the machine returned no future rental idle deadline")
 	}
 	return records.RentalKeepalive{WorkerID: worker, WorkerBootID: boot, AcknowledgedAtMS: now, IdleDeadlineMS: deadline}, nil

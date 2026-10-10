@@ -57,10 +57,10 @@ type RentalKeepalive struct {
 }
 
 // RecordRentalKeepalive accepts only an acknowledgment from the rental's recorded boot.
-// Creator schedules from its own observation, so the machine's idle window is recorded as
-// reported; an older acknowledgment never moves the clock backward.
+// The worker owns expiry; zero means there is no automatic deadline. An older
+// acknowledgment never replaces a newer observation.
 func (s *Store) RecordRentalKeepalive(id string, result RentalKeepalive, observedAt time.Time) *exit.Error {
-	if observedAt.IsZero() || result.WorkerID == "" || result.WorkerBootID == "" || result.AcknowledgedAtMS <= 0 || result.IdleDeadlineMS <= result.AcknowledgedAtMS {
+	if observedAt.IsZero() || result.WorkerID == "" || result.WorkerBootID == "" || result.AcknowledgedAtMS <= 0 || (result.IdleDeadlineMS != 0 && result.IdleDeadlineMS <= result.AcknowledgedAtMS) {
 		return exit.New(exit.Conflict, "the machine returned an invalid rental keepalive acknowledgment")
 	}
 	updated, err := s.db.Exec(`INSERT INTO rental_idle(rental_id,worker_id,worker_boot_id,acknowledged_at_ms,idle_deadline_ms,receipt_observed_at)
