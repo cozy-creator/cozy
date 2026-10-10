@@ -24,7 +24,7 @@ func lockedGitFixture(t *testing.T) string {
 func TestSelectedGitWheelCaptureDoesNotMisclassifyItAsRegistry(t *testing.T) {
 	project := lockedGitFixture(t)
 	selected := map[string]map[string]string{"caller": {"cozy-fixture-package": "1.0.0", "cozy-fixture-pinned": "0.3.0.dev0"}}
-	got, problem := packagepublish.CaptureWheelDependencies(t.Context(), project, "cozy-fixture-package", "cozy-fixture-package==1.0.0\ncozy-fixture-pinned==0.3.0.dev0", t.TempDir(), selected)
+	got, problem := packagepublish.CaptureWheelDependencies(t.Context(), project, "cozy-fixture-package", "cozy-fixture-package==1.0.0\ncozy-fixture-pinned==0.3.0.dev0", t.TempDir(), t.TempDir(), selected)
 	fatal(t, problem)
 	dependency := got["cozy-fixture-pinned"]
 	if dependency.Path == "" || dependency.Version != "0.3.0.dev0" || dependency.RegistryRequirement != "" || !strings.HasPrefix(dependency.Digest, "sha256:") {

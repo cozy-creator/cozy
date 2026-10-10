@@ -27,7 +27,7 @@ func TestCapturedPyTorchRequirementPreservesOfficialObjectInPrivateEnvironment(t
 		if packagepublish.ImageOwnedDistribution(name) && problem == nil && len(rows) != 1 {
 			t.Fatal("framework direct reference was omitted")
 		}
-		captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), map[string]map[string]string{"library": {name: version}})
+		captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), t.TempDir(), map[string]map[string]string{"library": {name: version}})
 		return captured[name], problem == nil
 	}
 	good, ok := capture(t, "torch", index, object, hash)

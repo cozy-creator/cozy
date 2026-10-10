@@ -35,7 +35,7 @@ func TestCapturedHubWheelRetainsBytesWithoutRemoteLoopbackRequirement(t *testing
 	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte("[project]\nname='capture-root'\nversion='1.0.0'\n"), 0600))
 	must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600))
 	closure := "capture-root==1.0.0\nhub-fixture==1.0.0"
-	captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}})
+	captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}})
 	fatal(t, problem)
 	got := captured["hub-fixture"]
 	if got.Path == "" || got.Digest != "sha256:"+digest || got.RegistryRequirement != "" || !got.Application || got.Package != "paul/hub-fixture" {
@@ -58,7 +58,7 @@ func TestCapturedHubWheelRetainsBytesWithoutRemoteLoopbackRequirement(t *testing
 		}
 	}
 	changed.Store(true)
-	if _, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}}); problem == nil {
+	if _, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}}); problem == nil {
 		t.Fatal("changed Hub bytes admitted")
 	}
 }

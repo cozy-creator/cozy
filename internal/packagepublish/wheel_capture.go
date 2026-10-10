@@ -24,7 +24,8 @@ type CapturedDependency struct {
 
 // CaptureWheelDependencies retains the selected dependency bytes without
 // rebuilding the caller or inventing a source project for any wheel library.
-func CaptureWheelDependencies(ctx context.Context, tree, project, installed, stage string, selected map[string]map[string]string, targetPython ...string) (map[string]CapturedDependency, *exit.Error) {
+// cache is the caller's disposable dependency-object store, shared across captures.
+func CaptureWheelDependencies(ctx context.Context, tree, project, installed, stage, cache string, selected map[string]map[string]string, targetPython ...string) (map[string]CapturedDependency, *exit.Error) {
 	metadata, problem := readProjectDocument(filepath.Join(tree, "pyproject.toml"))
 	if problem != nil {
 		return nil, problem
@@ -88,7 +89,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 			if row.Size > MaxDependencyWheelBytes {
 				return nil, exit.New(exit.Validation, "callable wheel exceeds the unpublished wheel bound")
 			}
-			if problem := fetchCapturedWheel(ctx, client, row, path); problem != nil {
+			if problem := fetchCachedWheel(ctx, client, row, path, cache); problem != nil {
 				return nil, problem
 			}
 			var problem *exit.Error

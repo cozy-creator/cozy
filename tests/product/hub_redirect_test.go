@@ -55,7 +55,7 @@ func TestCapturedHubStorageRedirectRetainsExactWheel(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600); err != nil {
 				t.Fatal(err)
 			}
-			captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "root", "root==1.0\nfixture==1.0", t.TempDir(), map[string]map[string]string{"fixture": {"fixture": "1.0"}}, "3.12.12")
+			captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "root", "root==1.0\nfixture==1.0", t.TempDir(), t.TempDir(), map[string]map[string]string{"fixture": {"fixture": "1.0"}}, "3.12.12")
 			if arm.code == "" {
 				if problem != nil {
 					t.Fatal(problem)

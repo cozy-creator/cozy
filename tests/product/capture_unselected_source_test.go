@@ -22,7 +22,7 @@ func TestWheelCaptureSkipsUnselectedSourceBuild(t *testing.T) {
 	write(filepath.Join(source, "pyproject.toml"), "[project]\nname='source-bound'\nversion='1.0.0'\n")
 	write(filepath.Join(root, "uv.lock"), "version=1\n[[package]]\nname='capture-root'\nversion='1.0.0'\nsource={editable='.'}\n[[package]]\nname='source-bound'\nversion='1.0.0'\nsource={directory='source-bound'}\n")
 	stage := t.TempDir()
-	captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", "capture-root==1.0.0\nsource-bound==1.0.0", stage,
+	captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", "capture-root==1.0.0\nsource-bound==1.0.0", stage, t.TempDir(),
 		map[string]map[string]string{"app": {"capture-root": "1.0.0"}}, "3.12.12")
 	fatal(t, problem)
 	if _, ok := captured["source-bound"]; ok {
