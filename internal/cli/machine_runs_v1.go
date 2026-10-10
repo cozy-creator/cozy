@@ -127,12 +127,14 @@ func (m *machineRuns) loopV1(request records.Request) {
 			upgrade := problem.ErrName() == "machine.upgrade_required"
 			if upgrade && !followed {
 				followed = true
-				if next := m.followTargetV1(link.MachineID, current.Hub); next == "" {
+				began := time.Now()
+				next := m.followTargetV1(link.MachineID, current.Hub)
+				m.submissionStage(request.ID, "update", cmp.Or(next, "the Hub's target software"), began)
+				if next == "" {
 					lastError = ""
 					continue
-				} else {
-					problem = exit.Named(problem.Code, problem.ErrName(), "%s; %s", problem.Message, next)
 				}
+				problem = exit.Named(problem.Code, problem.ErrName(), "%s; %s", problem.Message, next)
 			}
 			if !accepted && (!sent || upgrade) && !link.CancelRequested && permanentRefusal(problem) {
 				failed, failure := m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
@@ -213,7 +215,7 @@ func (m *machineRuns) followTargetV1(machine, origin string) string {
 		if changed {
 			return ""
 		}
-		return cmp.Or(kept, "this machine runs the files it was installed from") +
+		return cmp.Or(kept, "this computer's machine has no installed software to update") +
 			"; `cozy machine install` takes the Hub's target software, or name newer wheels with --runtime-wheel/--tensorfs-wheel"
 	}
 	name := machine
