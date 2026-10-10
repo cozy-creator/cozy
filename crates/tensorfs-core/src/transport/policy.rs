@@ -113,6 +113,11 @@ fn v4_private(v4: Ipv4Addr) -> bool {
         || v4.is_documentation()
 }
 
+/// 198.18/15, the benchmarking range fake-IP resolvers answer from.
+fn fake_ip(address: IpAddr) -> bool {
+    matches!(canonical(address), IpAddr::V4(v4) if v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18)
+}
+
 fn v4_reserved(v4: Ipv4Addr) -> bool {
     v4.octets()[0] >= 240 // 240/4, includes 255.255.255.255
 }
@@ -196,6 +201,15 @@ impl std::fmt::Debug for Resolved {
 }
 
 impl Resolved {
+    /// Answers a test hands the policy for a name, as a resolver would.
+    #[cfg(test)]
+    pub(crate) fn seed(&self, host: &str, port: u16, addrs: Vec<SocketAddr>) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert((host.to_string(), port), Arc::new(Mutex::new(Some(addrs))));
+    }
+
     fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
         let slot = Arc::clone(
             self.0
@@ -278,7 +292,15 @@ impl SourcePolicy {
             return refuse(Code::HUB_UNREACHABLE, format!("{host} resolved to nothing"));
         }
         if !self.allow_local {
+            let named = host.parse::<IpAddr>().is_err();
             for addr in &addrs {
+                // Fake-IP DNS (some datacenters' transparent proxies) answers every name in
+                // 198.18/15 and forwards to the real host. Over https the certificate must
+                // verify for `host`, which authenticates the peer, and 198.18/15 is no
+                // internal-service range; plaintext and IP literals stay strict.
+                if https && named && fake_ip(addr.ip()) {
+                    continue;
+                }
                 let why = blocked(addr.ip());
                 if !why.is_empty() {
                     return refuse(
