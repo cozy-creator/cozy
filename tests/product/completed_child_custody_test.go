@@ -13,7 +13,7 @@ func TestCancelledAncestorWaitsForNestedCompletedCustody(t *testing.T) {
 	leaf := operationHistory(t, store, "nested-leaf", middle, true)
 	closeChild(t, store, leaf, "SUCCEEDED", "succeeded")
 	closeChild(t, store, middle, "SUCCEEDED", "succeeded")
-	closeChild(t, store, root, "FAILED", "blocked")
+	closeChild(t, store, root, "FAILED", "paused")
 	fatal(t, store.RequestRetainedCancellation(root.ID, "test"))
 	ready, problem := store.ReleaseCompletedChildWork(root.ID, middle.ID)
 	fatal(t, problem)
@@ -50,7 +50,7 @@ func TestCancelledAncestorAuthorizesOnlyItsSuccessfulChildFinalization(t *testin
 	otherRoot := offerChildParent(t, store, recordPrivateTransaction(t, store, "other-root", ""))
 	other := operationHistory(t, store, "other-child", otherRoot, true)
 	closeChild(t, store, other, "SUCCEEDED", "succeeded")
-	closeChild(t, store, root, "FAILED", "blocked")
+	closeChild(t, store, root, "FAILED", "paused")
 	intent := func(id string) records.WeightsFinalization {
 		return records.WeightsFinalization{RequestID: id, Attempt: 1, InstanceID: "private-worker",
 			OwnerScope: "owner", InvocationDigest: childDigest("1"), OutputSlot: "weights"}

@@ -396,8 +396,9 @@ submitted at once queue against one worker and drain in submission order.
 `retain_work:true` makes an ordinary unpublished package job retain its exact inputs, implementation
 and native intermediate work across failed or paused attempts. `pause` durably fences
 admission and reaches `paused` only after its writers and child writers stop. `resume`
-continues the same captured request. A deterministic `blocked` failure requires a
-corrected new request with `retry_of`, which accepts the prior public run number or ID.
+continues the same captured request. Work ends completed or failed; a failure before its
+machine took the run can be retried by a corrected new request with `retry_of`, which
+accepts the prior public run number or ID.
 The new request selects the same physical store; run lineage scopes artifact grants and
 history, while completed computation is cached by the Host independently of run IDs.
 Fresh unrelated runs on that workspace can reuse compatible completed operations. The old

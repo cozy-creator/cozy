@@ -1020,10 +1020,10 @@ func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlem
 		  AND a.state IN ('terminal','closed') AND a.closed_at<>''
 		  ORDER BY a.attempt DESC LIMIT 1),''),
 		COALESCE((SELECT e.at FROM request_events e WHERE e.request_id=r.id
-		  AND e.type IN ('client.machine_work_finished','run.completed','run.failed','run.canceled','request.paused','request.blocked')
+		  AND e.type IN ('client.machine_work_finished','run.completed','run.failed','run.canceled','request.paused')
 		  ORDER BY (e.type='client.machine_work_finished') DESC,e.seq DESC LIMIT 1),'')
 		FROM requests r WHERE `+pinned+` AND r.rental=1
-		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned','paused','blocked')`, args...)
+		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned','paused')`, args...)
 	if err != nil {
 		return RentalLastSettlement{}, false, exit.Internalf(
 			"cannot read settlements for rental %s: %s", id, err)

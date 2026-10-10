@@ -820,7 +820,7 @@ type JobState struct {
 	RetainWork       bool                  `json:"retain_work,omitempty"`
 	Retaining        bool                  `json:"retaining,omitempty"`
 	RetryAvailable   bool                  `json:"retry_available,omitempty"`
-	StoppedEventID   int64                 `json:"stopped_event_id,omitempty"`
+	StoppedEventID   int64                 `json:"stopped_event_id,omitempty"` // an older daemon's blocked stop
 	RetryOf          string                `json:"retry_of,omitempty"`
 	ReuseScope       string                `json:"reuse_scope,omitempty"`
 	Number           int64                 `json:"number"`
@@ -1001,10 +1001,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		EventsURL:    "/v1/requests/" + row.ID + "/events",
 		OutputExport: s.outputExportOf(row.ID),
 	}
-	if row.State == "blocked" && state.Status == "failed" {
-		state.StoppedEventID = s.store.StoppedEventID(row)
-	}
-	if row.State == "blocked" || row.State == "failed" {
+	if row.State == "failed" {
 		state.ErrorType, state.ErrorCode, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
 	if row.ParentRequestID != "" {
@@ -1146,9 +1143,6 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		}
 	}
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
-	if terminalAt == "" && state.StoppedEventID != 0 {
-		terminalAt = s.store.StoppedEventAt(row)
-	}
 	state.QueuedMS = queuedMS(row, attempts, terminalAt)
 	state.ExecutionMS = executionMS(row, attempts, terminalAt)
 	// THE BILL. Absent unless a rate was configured — see JobBill. `$0.00` for a job

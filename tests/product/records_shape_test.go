@@ -16,7 +16,7 @@ import (
 // table or column is added. Nothing is moved aside and no rental row is lost.
 func TestRecordsOpenAcceptsADriftedShapeAndKeepsRentals(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
-	store, problem := records.OpenForDaemon(path)
+	store, problem := records.Open(path)
 	fatal(t, problem)
 	seed := records.Rental{ID: "pr-drifted", MachineName: "drifted", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
 		AcceleratorCount: 1, HourlyRateUSDMicros: 2_490_000, State: "ready", Address: "127.0.0.1:1",

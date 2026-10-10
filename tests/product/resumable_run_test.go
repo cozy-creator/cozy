@@ -36,7 +36,7 @@ func TestResumableRunWalksToTheRunToResume(t *testing.T) {
 	walk(base, "", scoped, "")
 	submit("job-first", scoped, "")
 	walk(base, "", scoped, "")
-	if changed, problem := store.BlockRetainedWork("job-first", "source_failed", "pod lost the network"); problem != nil || !changed {
+	if changed, problem := store.FailQueuedRequest("job-first", retainedFailure("source_failed", "pod lost the network")); problem != nil || !changed {
 		t.Fatalf("the first run did not stop with retained work: %v", problem)
 	}
 	walk(base, "", scoped+"/retry-of/job-first", "job-first")
@@ -77,7 +77,7 @@ func TestAutomaticResumeStaysOnItsSelectedHub(t *testing.T) {
 				Package: "proof/example", Entrypoint: "main", Payload: []byte(`{}`), Worker: "pr-shared",
 				BodyDigest: "sha256:" + strings.Repeat("1", 64), RetainWork: true})
 			fatal(t, problem)
-			if changed, problem := store.BlockRetainedWork("job-a", "source_failed", "retryable source failure"); problem != nil || !changed {
+			if changed, problem := store.FailQueuedRequest("job-a", retainedFailure("source_failed", "retryable source failure")); problem != nil || !changed {
 				t.Fatalf("could not retain the prior operation: %v", problem)
 			}
 			key, retry, problem := store.ResumableRun(base, "https://hub-a.example/", "pr-shared", true)

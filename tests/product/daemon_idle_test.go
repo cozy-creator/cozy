@@ -62,7 +62,16 @@ func TestDaemonIdleShutdown(t *testing.T) {
 
 	// (c) A request still owed work holds the daemon up; settling it through the daemon's
 	// own cancel route is what lets it go.
+	recovered := func() int {
+		log, _ := os.ReadFile(logPath)
+		return strings.Count(string(log), "startup recovery:")
+	}
+	before := recovered()
 	queued := startDaemonProcess(t, root)
+	// Startup ends work a previous daemon left unfinished; this request arrives after it.
+	for recovered() == before {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if _, _, problem := store.Submit(records.Request{
 		ID: "req-idle-arm", IdemKey: "idem-idle-arm", BodyDigest: "sha256:" + strings.Repeat("ab", 32),
 		Package: "fake/idle", Entrypoint: "generate", Payload: []byte("{}"),

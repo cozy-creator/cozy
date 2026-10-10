@@ -430,16 +430,11 @@ func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 // The two are deliberately not the same word list: the store records what happened to a
 // row, the contract says what a client should do next.
 func contractStatus(state string) string {
-	return records.PublicRunStatus(state, false)
+	return records.PublicRunStatus(state)
 }
 
 func (s *Server) publicStatusOf(row records.Request) string {
-	status, problem := s.store.PublicRunState(row)
-	if problem != nil {
-		// A failed observation does not prove that an ambiguous submission stopped.
-		return "queued"
-	}
-	return status
+	return records.PublicRunStatus(row.State)
 }
 
 // resolvePlan turns the client's package/function into the orchestrator's Submission.
@@ -845,7 +840,7 @@ type Lifecycle struct {
 	Error          string `json:"error,omitempty"`
 	Retaining      bool   `json:"retaining,omitempty"`
 	RetryAvailable bool   `json:"retry_available,omitempty"`
-	StoppedEventID int64  `json:"stopped_event_id,omitempty"`
+	StoppedEventID int64  `json:"stopped_event_id,omitempty"` // an older daemon's blocked stop
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this daemon canceled on request.
@@ -1015,9 +1010,6 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 	}
 	life.Retaining, _ = s.store.RequestRetaining(row)
 	life.RetryAvailable = s.store.RetainedRetryAvailable(row)
-	if row.State == "blocked" && life.Status == "failed" {
-		life.StoppedEventID = s.store.StoppedEventID(row)
-	}
 	if row.RequestedRental != "" {
 		life.RequestedRental, life.RequestedMachine = row.RequestedRental, row.Machine
 	}
@@ -1047,9 +1039,6 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		}
 	}
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
-	if terminalAt == "" && life.StoppedEventID != 0 {
-		terminalAt = s.store.StoppedEventAt(row)
-	}
 	life.QueuedMS = queuedMS(row, attempts, terminalAt)
 	life.ExecutionMS = executionMS(row, attempts, terminalAt)
 	outs, _ := s.store.VisibleOutputs(row.ID)

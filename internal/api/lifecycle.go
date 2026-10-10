@@ -180,7 +180,7 @@ func (s *Server) inFlight() []LifecycleIdentity {
 	listed := map[string]bool{}
 	for _, o := range obligations {
 		if o.Kind == "attempt" || o.Kind == "rental" || listed[o.ID] ||
-			o.State == "paused" || o.State == "blocked" || o.State == "succeeded" {
+			o.State == "paused" || o.State == "succeeded" {
 			continue
 		}
 		listed[o.ID] = true

@@ -77,7 +77,7 @@ func (m *machineRuns) loopV1(request records.Request) {
 		}
 		// Unsent work never starts after cancellation. Sent work still needs its machine's
 		// outcome, even when acceptance was lost or a stopped local machine settled it here.
-		if !accepted && (link.CancelRequested || records.Settled(current.State) || slices.Contains([]string{"pausing", "paused", "blocked"}, current.State)) {
+		if !accepted && (link.CancelRequested || records.Settled(current.State) || records.RetainedState(current.State)) {
 			if !link.CancelRequested || !sent {
 				return
 			}

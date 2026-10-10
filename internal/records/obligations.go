@@ -19,10 +19,9 @@ type Obligation struct {
 }
 
 // Obligations is the full automatic-management census, read in ONE statement so
-// no fence can see half of the picture. A rental counts until the hub proves it
-// gone or explicitly confirms that creation never happened. Failed provisioning
-// alone is not that proof. A rental operation counts until it is final, and only when no
-// rental row already stands for it.
+// no fence can see half of the picture. A rental counts until the hub reports it failed
+// or released: the hub records either only once the provider holds nothing. A rental
+// operation counts until it is final, and only when no rental row already stands for it.
 func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 	rows, err := s.db.Query(`
 		SELECT CASE WHEN kind='job' THEN 'job' ELSE 'invocation' END,id,state FROM requests
@@ -34,8 +33,7 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 		SELECT 'attempt',request_id||'#'||attempt,state FROM attempts
 		 WHERE state IN (` + openAttemptStates + `)
 		UNION ALL
-		SELECT 'rental',id,state FROM rentals
-		 WHERE NOT (state='failed' AND failure_code='provider_create_did_not_happen')
+		SELECT 'rental',id,state FROM rentals WHERE state NOT IN (` + absentRentalStates + `)
 		UNION ALL
 		SELECT 'rental_operation',operation_key,state FROM rental_operations
 		 WHERE state NOT IN (` + finalRentalOperationStates + `)

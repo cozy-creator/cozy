@@ -16,8 +16,9 @@ next command's daemon picks each piece up where it was:
 - output exports and uploads, model transfers, rental acquisitions, installations and
   Runtime updates resume from their rows.
 
-Startup does not submit a failed, paused, blocked, canceled, refused, or completed
-execution merely because the client restarted.
+Startup does not submit a failed, paused, canceled, refused, or completed execution merely
+because the client restarted. Work an older daemon left `blocked` fails at startup with the
+reason it stopped for.
 
 `cozy down --all` keeps its destructive meaning: cancel work and end rentals. The idle
 exit still waits until nothing is left to manage.

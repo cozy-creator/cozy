@@ -55,6 +55,11 @@ func (s *Store) AbandonMachineExecution(id, actor, why string) (bool, *exit.Erro
 	if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, next, id); err != nil {
 		return false, exit.Internalf("cannot close abandoned local intent: %s", err)
 	}
+	if next != "succeeded" {
+		if problem := endModelTransferTx(tx, id, next, facts["error"].(string)); problem != nil {
+			return false, problem
+		}
+	}
 	if next != state {
 		// This is the local run's terminal, never a fabricated Runtime outcome.
 		facts["status"] = "ABANDONED"

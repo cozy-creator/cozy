@@ -298,7 +298,7 @@ func (s *Store) RequestNativeEffectCancel(parentID string, index, parentAttempt 
 		return nil, exit.Named(exit.Conflict, "child.intent_changed", "effect cancellation names another accepted intent")
 	}
 	// Parent suspension interrupts Python awaits but retains logical effects.
-	if parent.State == "pausing" || parent.State == "paused" || parent.State == "blocked" {
+	if parent.State == "pausing" || parent.State == "paused" {
 		return &row, nil
 	}
 	if row.State == "succeeded" || row.State == "failed" || row.State == "canceled" {

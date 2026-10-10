@@ -435,6 +435,14 @@ func (c *Orchestrator) Reconcile() *exit.Error {
 			return e
 		}
 	}
+	// Work an older daemon left waiting ends here, failed with its reason.
+	ended, e := c.opt.Store.EndUnfinishedWork()
+	if e != nil {
+		return e
+	}
+	for _, line := range ended {
+		c.logf("%s; it waited for a retry and has failed", line)
+	}
 	// Work accepted for the retired classic worker session ends here, named, and custody no
 	// store can release any more (classic work, ended rentals) is forgotten.
 	retired, e := c.opt.Store.RetireClassicWork()

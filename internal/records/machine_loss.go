@@ -231,6 +231,11 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, next, value.id); err != nil {
 			return exit.Internalf("cannot project destroyed execution: %s", err)
 		}
+		if next != "succeeded" {
+			if problem := endModelTransferTx(tx, value.id, next, message); problem != nil {
+				return problem
+			}
+		}
 		if next != value.state {
 			if err := appendEventTx(tx, value.id, StateEvent(next), 0, detail); err != nil {
 				return exit.Internalf("cannot record destroyed execution projection: %s", err)

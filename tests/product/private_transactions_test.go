@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -41,6 +42,12 @@ func TestUnpublishedTransactionCommandsResolveExistingRequest(t *testing.T) {
 	if requests := listInvocations(t, root); len(requests) != 0 {
 		t.Fatalf("lifecycle commands created requests: %+v", requests)
 	}
+}
+
+// retainedFailure is a retained job's failure before it started, as a refused preparation
+// records it.
+func retainedFailure(code, detail string) map[string]any {
+	return records.QueuedFailure(exit.Named(exit.Failed, code, "%s", detail))
 }
 
 func recordPrivateTransaction(t *testing.T, store *records.Store, label, rentalID string) records.Request {

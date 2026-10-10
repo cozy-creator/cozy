@@ -19,7 +19,7 @@ func TestUnpublishedTransactionEditedRetryPreservesHistoryAndCustody(t *testing.
 	const rental = "pr-edited-retry"
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: rental, MachineName: "otter", State: "ready", HourlyRateUSDMicros: 100_000}))
 	prior := recordPrivateTransaction(t, store, "broken-program", rental)
-	changed, problem := store.BlockRetainedWork(prior.ID, "author_exception", "step B failed")
+	changed, problem := store.FailQueuedRequest(prior.ID, retainedFailure("author_exception", "step B failed"))
 	fatal(t, problem)
 	if !changed {
 		t.Fatal("failed request did not retain its work")
@@ -42,7 +42,7 @@ func TestUnpublishedTransactionEditedRetryPreservesHistoryAndCustody(t *testing.
 		admitted.BodyDigest != retry.BodyDigest || !bytes.Equal(admitted.Payload, retry.Payload) || admitted.Ordinal != 0 {
 		t.Fatalf("edited retry lost immutable program or retained custody: %+v", admitted)
 	}
-	assertPrivateTransactionIdentity(t, store, *before, "blocked")
+	assertPrivateTransactionIdentity(t, store, *before, "failed")
 	after, problem := store.RequestByReference(prior.ID)
 	fatal(t, problem)
 	if after.RetryOf != before.RetryOf || after.ReuseScope != before.ReuseScope {
@@ -84,8 +84,8 @@ func TestUnpublishedTransactionRetryRefusesUnavailableCustody(t *testing.T) {
 				fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: rental, MachineName: "otter", State: "ready", HourlyRateUSDMicros: 100_000}))
 			}
 			prior := recordPrivateTransaction(t, store, arm, rental)
-			if arm != "active" {
-				_, problem := store.BlockRetainedWork(prior.ID, "author_exception", "step B failed")
+			if arm != "active" && arm != "canceled" {
+				_, problem := store.FailQueuedRequest(prior.ID, retainedFailure("author_exception", "step B failed"))
 				fatal(t, problem)
 			}
 			if arm == "canceled" {

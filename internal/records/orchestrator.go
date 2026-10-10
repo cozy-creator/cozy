@@ -208,7 +208,7 @@ CREATE TABLE IF NOT EXISTS weights_finalizations (
 // refusal, the idle exit — reads these; a request in any other
 // state is settled and an attempt in any other state is closed.
 const (
-	activeRequestStates = `'submitted','queued','dispatching','requeue_pending','finalizing','pausing','paused','blocked','canceling','releasing'`
+	activeRequestStates = `'submitted','queued','dispatching','requeue_pending','finalizing','pausing','paused','canceling','releasing'`
 	openAttemptStates   = `'preparing','offered','accepted','recovered_open','terminal'`
 	// settledRequestStates is the SQL spelling of settledRequestState: a row here owes
 	// nothing and no later observation may contradict it.
