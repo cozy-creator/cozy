@@ -473,7 +473,7 @@ func Refusal(req records.Request, d orchestrator.PlacementDecision, needsAcceler
 		return exit.Named(exit.Unavailable, "rental.no_inventory",
 			"every rental SKU fitting %s is out of stock right now (%s) — NOTHING was rented",
 			req.Package, strings.Join(noStock, ", ")).
-			WithRemedy("this is a stock-out, not a bad ladder: the request waits and the fleet re-asks")
+			WithRemedy("this is a stock-out, not a bad ladder: a run that meets it twice fails; run it again once stock returns")
 	case capped != nil:
 		// The one refusal that names an OPERATOR action rather than weather. Parking on
 		// it would hide a misconfigured cap behind a queue that never drains.
@@ -491,7 +491,7 @@ func Refusal(req records.Request, d orchestrator.PlacementDecision, needsAcceler
 		return exit.Named(exit.Unavailable, "rental.catalog_empty",
 			"Tensorhub offered no %s product when %s was placed; %s",
 			class, req.Package, heldOrNothing(verdicts)).
-			WithRemedy("this is an empty catalog, not a bad ladder: the request waits and the fleet re-asks")
+			WithRemedy("this is an empty catalog, not a bad ladder: a run that meets it twice fails; run it again once Tensorhub offers one")
 	}
 	return exit.Named(exit.Capacity, "rental.no_fitting_sku",
 		"no rental SKU on offer fits %s: %s", req.Package, strings.Join(verdicts, "; ")).

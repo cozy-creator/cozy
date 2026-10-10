@@ -83,7 +83,8 @@ func TestARunOnARentalItsHubCouldNotReachFailsWithTheCause(t *testing.T) {
 	hub.add("rental-unreached", "adashino")
 	hub.setState("rental-unreached", "degraded", "")
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "rental-unreached", MachineName: "adashino", SKU: "cpu",
-		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1"}))
+		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1",
+		ReadyAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)}))
 	for id, accepted := range map[string]bool{"req-confirmed": true, "req-sent": false} {
 		body, _ := canonical.Spell(canonical.Digest([]byte(id)))
 		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: "idem-" + id, BodyDigest: body, Package: "fake/lost",

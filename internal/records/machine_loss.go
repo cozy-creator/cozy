@@ -139,17 +139,19 @@ func (s *Store) LoseMachine(machine, message string) *exit.Error {
 }
 
 // settleLostMachine ends every obligation on a rental proven gone, its runs and those that
-// reached it as an explicit endpoint. A run its machine never confirmed stays in the outbox:
-// released to be placed again under the same identity, charging nothing; the gone machine
-// cannot run it, and a late acceptance from it is refused (AcceptRunV1). A confirmed run may
-// have executed: it ends FAILED with its machine's loss, and its owner resubmits.
+// reached it as an explicit endpoint. A run a machine that had served never confirmed stays
+// in the outbox: released to be placed again under the same identity, charging nothing; the
+// gone machine cannot run it, and a late acceptance from it is refused (AcceptRunV1). A
+// confirmed run may have executed: it ends FAILED with its machine's loss, and its owner
+// resubmits.
 func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
 	return settleLost(tx, machine, "", "")
 }
 
 func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 	var cause string
-	if err := tx.QueryRow(`SELECT failure_code FROM rentals WHERE id=?`, machine).Scan(&cause); err != nil && err != sql.ErrNoRows {
+	var served bool
+	if err := tx.QueryRow(`SELECT failure_code,ready_at<>'' FROM rentals WHERE id=?`, machine).Scan(&cause, &served); err != nil && err != sql.ErrNoRows {
 		return exit.Internalf("cannot read lost machine cause: %s", err)
 	}
 	rows, err := tx.Query(`SELECT e.machine_id,r.id,r.state,r.retain_work,r.rental=1 AND r.requested_rental='',
@@ -179,7 +181,9 @@ func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 		return exit.Internalf("cannot finish destroyed machine observers: %s", err)
 	}
 	for _, value := range observations {
-		if !value.accepted && value.placeable && !value.retained && (value.state == "submitted" || value.state == "queued") {
+		// Placed again only off a machine that had served: one lost before it was ever ready
+		// fails its runs, or a market that cannot boot them would be bought from forever.
+		if !value.accepted && value.placeable && !value.retained && served && (value.state == "submitted" || value.state == "queued") {
 			if problem := releaseUnconfirmedTx(tx, value.id, value.machine, cause); problem != nil {
 				return problem
 			}
