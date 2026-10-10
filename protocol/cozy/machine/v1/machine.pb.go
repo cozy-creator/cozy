@@ -2078,6 +2078,7 @@ type ReadRequest struct {
 	Offset        uint64               `protobuf:"varint,4,opt,name=offset,proto3" json:"offset,omitempty"`
 	IfRev         uint64               `protobuf:"varint,5,opt,name=if_rev,json=ifRev,proto3" json:"if_rev,omitempty"` // nonzero: refuse (FAILED_PRECONDITION) unless the output is at this rev
 	Tail          uint64               `protobuf:"varint,6,opt,name=tail,proto3" json:"tail,omitempty"`                // a log's newest bytes, from a line start
+	Length        uint64               `protobuf:"varint,7,opt,name=length,proto3" json:"length,omitempty"`            // nonzero: at most this many bytes from offset (one range of a parallel read)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2163,6 +2164,13 @@ func (x *ReadRequest) GetIfRev() uint64 {
 func (x *ReadRequest) GetTail() uint64 {
 	if x != nil {
 		return x.Tail
+	}
+	return 0
+}
+
+func (x *ReadRequest) GetLength() uint64 {
+	if x != nil {
+		return x.Length
 	}
 	return 0
 }
@@ -2265,6 +2273,7 @@ type ReadFrame struct {
 	Digest        string                 `protobuf:"bytes,3,opt,name=digest,proto3" json:"digest,omitempty"` // sha256:<hex>, once the output is final
 	MediaType     string                 `protobuf:"bytes,4,opt,name=media_type,json=mediaType,proto3" json:"media_type,omitempty"`
 	Data          []byte                 `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"`
+	End           uint64                 `protobuf:"varint,6,opt,name=end,proto3" json:"end,omitempty"` // the first frame: where this read's bytes end; zero from a machine without ranges
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2334,6 +2343,13 @@ func (x *ReadFrame) GetData() []byte {
 	return nil
 }
 
+func (x *ReadFrame) GetEnd() uint64 {
+	if x != nil {
+		return x.End
+	}
+	return 0
+}
+
 // Without a machine-scope cap Status answers one frame (identity and the sealed receipt) and
 // ends. With one it streams: each frame is the whole picture, sent again when it changes. An
 // open Status stream is not activity; `keepalive` resets the idle deadline once and the first
@@ -2389,7 +2405,7 @@ type StatusFrame struct {
 	Version            string                 `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"` // this machine's release
 	Capabilities       []string               `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
 	Receipt            []byte                 `protobuf:"bytes,5,opt,name=receipt,proto3" json:"receipt,omitempty"`                                                      // the sealed readiness envelope; empty until sealed
-	IdleDeadlineUnixMs int64                  `protobuf:"varint,6,opt,name=idle_deadline_unix_ms,json=idleDeadlineUnixMs,proto3" json:"idle_deadline_unix_ms,omitempty"` // a rental's release, 15 min after its last job; 0: never
+	IdleDeadlineUnixMs int64                  `protobuf:"varint,6,opt,name=idle_deadline_unix_ms,json=idleDeadlineUnixMs,proto3" json:"idle_deadline_unix_ms,omitempty"` // an idle rental's release, 15 min after its last job; 0: none (a job is queued or running, or it never releases)
 	Runs               []*RunState            `protobuf:"bytes,7,rep,name=runs,proto3" json:"runs,omitempty"`                                                            // the caller's live runs
 	Phase              string                 `protobuf:"bytes,8,opt,name=phase,proto3" json:"phase,omitempty"`                                                          // booting, ready, releasing
 	Platform           string                 `protobuf:"bytes,9,opt,name=platform,proto3" json:"platform,omitempty"`                                                    // os/arch
@@ -3358,27 +3374,29 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x12computation_digest\x18\v \x01(\tR\x11computationDigest\"Q\n" +
 	"\x0eControlRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12/\n" +
-	"\x06action\x18\x02 \x01(\x0e2\x17.cozy.machine.v1.ActionR\x06action\"\xc1\x01\n" +
+	"\x06action\x18\x02 \x01(\x0e2\x17.cozy.machine.v1.ActionR\x06action\"\xd9\x01\n" +
 	"\vReadRequest\x127\n" +
 	"\x06output\x18\x01 \x01(\v2\x1d.cozy.machine.v1.OutputTargetH\x00R\x06output\x12\x18\n" +
 	"\x06triage\x18\x02 \x01(\tH\x00R\x06triage\x12\x12\n" +
 	"\x03log\x18\x03 \x01(\tH\x00R\x03log\x12\x16\n" +
 	"\x06offset\x18\x04 \x01(\x04R\x06offset\x12\x15\n" +
 	"\x06if_rev\x18\x05 \x01(\x04R\x05ifRev\x12\x12\n" +
-	"\x04tail\x18\x06 \x01(\x04R\x04tailB\b\n" +
+	"\x04tail\x18\x06 \x01(\x04R\x04tail\x12\x16\n" +
+	"\x06length\x18\a \x01(\x04R\x06lengthB\b\n" +
 	"\x06target\"f\n" +
 	"\fOutputTarget\x12\x10\n" +
 	"\x03run\x18\x01 \x01(\tR\x03run\x12\x16\n" +
 	"\x06output\x18\x02 \x01(\tR\x06output\x12\x14\n" +
 	"\x05index\x18\x03 \x01(\rR\x05index\x12\x16\n" +
-	"\x06member\x18\x04 \x01(\tR\x06member\"\x80\x01\n" +
+	"\x06member\x18\x04 \x01(\tR\x06member\"\x92\x01\n" +
 	"\tReadFrame\x12\x10\n" +
 	"\x03rev\x18\x01 \x01(\x04R\x03rev\x12\x16\n" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x16\n" +
 	"\x06digest\x18\x03 \x01(\tR\x06digest\x12\x1d\n" +
 	"\n" +
 	"media_type\x18\x04 \x01(\tR\tmediaType\x12\x12\n" +
-	"\x04data\x18\x05 \x01(\fR\x04data\"-\n" +
+	"\x04data\x18\x05 \x01(\fR\x04data\x12\x10\n" +
+	"\x03end\x18\x06 \x01(\x04R\x03end\"-\n" +
 	"\rStatusRequest\x12\x1c\n" +
 	"\tkeepalive\x18\x01 \x01(\bR\tkeepalive\"\x86\x06\n" +
 	"\vStatusFrame\x12\x1b\n" +
