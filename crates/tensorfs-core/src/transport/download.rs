@@ -2,10 +2,12 @@
 //! fixed ranged chunks on one queue, `streams` workers each GET one chunk into its
 //! object's temp file, and a finished file is hashed and committed to the Store.
 //!
-//! One rule per request: one that fails, or moves bytes far slower than the first asks that
-//! came home (or none), is dropped, and the rest of its chunk is asked again on fresh
-//! connections, in 1 MiB pieces. Nothing counts asks. The pull ends on an answer asking
-//! again cannot change, or when nothing new has landed for twice its measured patience.
+//! One rule per request: one that fails, or waits or moves far slower than the requests
+//! running beside it over the same time, is dropped, and the rest of its chunk is asked
+//! again on fresh connections, in 1 MiB pieces. A pod whose every request is slow restarts
+//! none (vast 5090s, 2026-10-10: 885 restarts in 42 s against a median of the few early
+//! asks that came home). The pull ends on an answer asking again cannot change, or when
+//! nothing new has landed for twice its measured patience.
 //!
 //! Why chunks: a cold R2 object answers each MiB after its own delay, usually under a
 //! second and sometimes a minute. One GET for the object pays every delay in a row (runs
@@ -91,13 +93,9 @@ pub const PART_BYTES: u64 = 64 << 20;
 
 /// A dropped request's unfinished range is cut into pieces, an eighth of a chunk each and
 /// never under this: a slow object answers small asks side by side, and a chunk asked again
-/// whole would pay its slow MiBs in a row. Also the least a request must carry for its body
-/// rate to be compared with its peers'.
+/// whole would pay its slow MiBs in a row. Also what a body is given time to move, at its
+/// peers' pace, before it is judged.
 const PIECE_BYTES: u64 = 1 << 20;
-
-/// Completed first asks a running request is compared with: how long each waited for its
-/// first byte, and how fast its body then came.
-const PEERS: usize = 64;
 
 /// An object being downloaded: its file, and what is still out.
 struct Object {
@@ -140,11 +138,9 @@ struct Chunk {
     stated: bool,
     /// The origin refused the URL the last ask held, with this status.
     stale: Option<u16>,
-    /// Asks in a row dropped with no byte moved. Each doubles the time the next ask gets
-    /// before it is judged, so an origin that is honestly slow to answer still does.
-    silent: u32,
-    /// Never dropped or failed: a first ask, whose rate is what peers are compared with.
-    fresh: bool,
+    /// Times this range was dropped. Each doubles what the next ask is given before it is
+    /// judged, so an origin that is honestly slow still answers.
+    drops: u32,
     /// The object's only chunk so far: its origin has not yet shown that it answers ranges.
     lead: bool,
     /// The chunk this is (a piece of): the range a source download records when it is home.
@@ -167,11 +163,22 @@ struct Flight {
     subject: String,
     range: (u64, u64),
     began: Instant,
-    /// How many times its peers' wait this request gets for its first byte.
+    /// How many fair windows this request gets before it is judged.
     patience: u32,
     /// When its body was last judged, and with how many bytes.
     judged: Option<Instant>,
     seen: u64,
+}
+
+/// A request as the others see it: ended, or still running (`open`) as of the watch's tick.
+struct Peer {
+    began: Instant,
+    first: Option<Instant>,
+    ended: Instant,
+    open: bool,
+    bytes: u64,
+    /// It asked for less than a piece: judged by its time in all, not by a rate.
+    small: bool,
 }
 
 enum Outcome {
@@ -210,11 +217,8 @@ struct State {
     again: VecDeque<usize>,
     /// Workers holding a chunk or opening an object.
     busy: usize,
-    /// The last first asks that came home. Those that carried a piece's worth of bytes:
-    /// seconds to their first byte, and their body's rate. The smaller ones: seconds in all.
-    waits: VecDeque<f64>,
-    rates: VecDeque<f64>,
-    small: VecDeque<f64>,
+    /// The last requests that ended, as many as there are streams, oldest first.
+    shown: VecDeque<Peer>,
     /// The last refusal a retry answered, quoted if the pull stops moving.
     last: Option<Refusal>,
     failure: Option<Refusal>,
@@ -524,8 +528,7 @@ impl Run<'_> {
             due: Instant::now(),
             stated: false,
             stale: None,
-            silent: 0,
-            fresh: true,
+            drops: 0,
             lead: !job.ranged,
             unit: (first, end),
         };
@@ -579,8 +582,7 @@ impl Run<'_> {
                 due: Instant::now(),
                 stated: false,
                 stale: None,
-                silent: 0,
-                fresh: true,
+                drops: 0,
                 lead: false,
                 unit: (first, end),
             });
@@ -658,28 +660,18 @@ impl Run<'_> {
             subject: decisions::object(wanted),
             range: asked,
             began,
-            patience: 1 << chunk.silent.min(6),
+            patience: 1 << chunk.drops.min(6),
             judged: None,
             seen: 0,
         });
         self.requests.fetch_add(1, Ordering::Relaxed);
         let ended = self.stream(&mut chunk, &url, delivery.is_some(), &ledger, buffer);
         *self.flights[slot].lock().unwrap() = None;
+        self.show(&attempt, began, asked);
         // What this ask added: a whole answer to a resumed range starts the object over.
         let moved = chunk.first.saturating_sub(asked.0);
         let (refusal, stated) = match ended {
             Ok(()) => {
-                if let (true, Some(first)) = (chunk.fresh, attempt.first.get()) {
-                    let wait = first.duration_since(began).as_secs_f64();
-                    let body = first.elapsed().as_secs_f64().max(1e-6);
-                    let mut state = self.state.lock().unwrap();
-                    if moved >= PIECE_BYTES {
-                        remember(&mut state.waits, wait);
-                        remember(&mut state.rates, moved as f64 / body);
-                    } else {
-                        remember(&mut state.small, wait + body);
-                    }
-                }
                 if let Err(refusal) = self.unit_home(&chunk) {
                     return Outcome::Fatal(named(refusal, &wanted.id()));
                 }
@@ -707,11 +699,7 @@ impl Run<'_> {
             return Outcome::Fatal(stopped);
         }
         let dropped = attempt.stopped.load(Ordering::Acquire);
-        chunk.fresh = false;
-        chunk.silent = match (dropped, moved) {
-            (true, 0) => chunk.silent + 1,
-            _ => 0,
-        };
+        chunk.drops += dropped as u32;
         // An ask that moved nothing waits one sample, or as long as the origin stated.
         let wait = match (stated, moved) {
             (Some(stated), _) => stated,
@@ -739,6 +727,25 @@ impl Run<'_> {
         }
         again.push(chunk);
         Outcome::Again(again)
+    }
+
+    /// An ended request that had a first byte, for the ones still running to be judged by.
+    fn show(&self, attempt: &Attempt, began: Instant, asked: (u64, u64)) {
+        let Some(first) = attempt.first.get().copied() else {
+            return;
+        };
+        let mut state = self.state.lock().unwrap();
+        if state.shown.len() >= self.flights.len() {
+            state.shown.pop_front();
+        }
+        state.shown.push_back(Peer {
+            began,
+            first: Some(first),
+            ended: Instant::now(),
+            open: false,
+            bytes: attempt.bytes.load(Ordering::Relaxed),
+            small: asked.1 - asked.0 < PIECE_BYTES,
+        });
     }
 
     /// The watch's cadence, and a request's own: a fifth of the pull's sample.
@@ -972,8 +979,10 @@ impl Run<'_> {
     }
 
     /// The one rule, five times a sample: a request that has waited far longer for its first
-    /// byte than its peers did, or whose body runs far slower than theirs, is dropped. And
-    /// the pull's own end: nothing new has landed for twice its measured patience.
+    /// byte than the requests beside it, or whose body runs far slower than theirs over the
+    /// same time, is dropped. Peers are the requests still running and those that ended
+    /// since its window began, never history, so a pod whose every request is slow drops
+    /// none. And the pull's own end: nothing new has landed for twice its measured patience.
     fn watch(&self, observer: &mut Option<&mut dyn FetchObserver>) {
         let job = self.job;
         let sample = self.tick();
@@ -1003,45 +1012,99 @@ impl Run<'_> {
                 self.wake.notify_all();
                 return;
             }
-            let (wait, typical) = (median(&state.waits), median(&state.rates));
-            let small = median(&state.small);
             let floor = sample.as_secs_f64() * 2.0;
+            let now = Instant::now();
+            let live: Vec<(usize, Peer)> = (self.flights.iter().enumerate())
+                .filter_map(|(slot, flight)| {
+                    let flight = flight.lock().unwrap();
+                    let flight = flight.as_ref()?;
+                    let peer = Peer {
+                        began: flight.began,
+                        first: flight.attempt.first.get().copied(),
+                        ended: now,
+                        open: true,
+                        bytes: flight.attempt.bytes.load(Ordering::Relaxed),
+                        small: flight.range.1 - flight.range.0 < PIECE_BYTES,
+                    };
+                    Some((slot, peer))
+                })
+                .collect();
+            // A peer's figure, and whether it is only a floor because the peer still runs.
+            let secs =
+                |from: Instant, to: Instant| to.saturating_duration_since(from).as_secs_f64();
+            let wait = |peer: &Peer| {
+                Some(
+                    peer.first
+                        .map_or((secs(peer.began, peer.ended), peer.open), |first| {
+                            (secs(peer.began, first), false)
+                        }),
+                )
+            };
+            let took = |peer: &Peer| {
+                peer.small
+                    .then(|| (secs(peer.began, peer.ended), peer.open))
+            };
+            let rate = |peer: &Peer| {
+                let first = peer.first.filter(|_| !peer.small)?;
+                let body = secs(first, peer.ended);
+                (peer.bytes >= PIECE_BYTES || body >= sample.as_secs_f64())
+                    .then(|| (peer.bytes as f64 / body.max(1e-6), false))
+            };
+            // The middle of the others running now and those ended since `since`. A floor
+            // under `least` says nothing yet, and is left out.
+            let shown = &state.shown;
+            let peers = |slot: usize, since: Instant, least: f64, figure: &Figure| {
+                let ended = shown.range(shown.partition_point(|peer| peer.ended < since)..);
+                let values = (live.iter())
+                    .filter(|(other, _)| *other != slot)
+                    .map(|(_, peer)| peer)
+                    .chain(ended)
+                    .filter_map(figure)
+                    .filter_map(|(value, floor)| (!floor || value >= least).then_some(value))
+                    .collect();
+                median(values).filter(|value| *value > 0.0)
+            };
             let mut flying = false;
-            for flight in &self.flights {
+            for (slot, flight) in self.flights.iter().enumerate() {
                 let mut flight = flight.lock().unwrap();
                 let Some(flight) = flight.as_mut() else {
                     continue;
                 };
                 flying = true;
                 let bytes = flight.attempt.bytes.load(Ordering::Relaxed);
-                let waited = flight.began.elapsed().as_secs_f64();
+                let (began, waited) = (flight.began, flight.began.elapsed().as_secs_f64());
                 let patience = flight.patience as f64;
+                // Far longer at it than its peers took: for its first byte, or in all.
+                let longer = |figure: &Figure| {
+                    let least = waited / (STALL_FACTOR * patience);
+                    (waited > floor * patience)
+                        .then(|| peers(slot, began, least, figure))
+                        .flatten()
+                        .filter(|typical| waited > (typical * STALL_FACTOR).max(floor) * patience)
+                };
                 let slow = match flight.attempt.first.get() {
-                    // Less than a piece to fetch, and far longer at it than its small peers
-                    // took in all. Never sooner than the two ticks a body is judged over.
-                    _ if flight.range.1 - flight.range.0 < PIECE_BYTES && small > 0.0 => {
-                        let allowed = (small * STALL_FACTOR).max(floor) * patience;
-                        (waited > allowed).then_some(bytes as f64 / waited)
-                    }
-                    // No byte yet, after far longer than its peers waited for theirs.
-                    None => {
-                        let allowed = (wait * STALL_FACTOR).max(floor) * patience;
-                        (wait > 0.0 && waited > allowed).then_some(0.0)
-                    }
-                    // A body judged over two ticks, from its first byte.
+                    // Less than a piece to fetch, against its small peers' time in all.
+                    _ if flight.range.1 - flight.range.0 < PIECE_BYTES => longer(&took)
+                        .map(|took| (bytes as f64 / waited, format!("peers_small_s={took:.2}"))),
+                    None => longer(&wait).map(|wait| (0.0, format!("peers_wait_s={wait:.2}"))),
+                    // A body is judged once its peers' pace would have brought a piece of it
+                    // home, and over no less than two ticks: then far slower than theirs.
                     Some(first) => {
-                        let since = *flight.judged.get_or_insert(*first);
-                        let window = since.elapsed();
-                        (window >= sample * 2)
-                            .then(|| {
-                                let rate = (bytes - flight.seen) as f64 / window.as_secs_f64();
+                        let since = flight.judged.unwrap_or(began);
+                        let window = flight.judged.unwrap_or(*first).elapsed().as_secs_f64();
+                        (window >= floor * patience)
+                            .then(|| peers(slot, since, 0.0, &rate))
+                            .flatten()
+                            .filter(|typical| window >= (PIECE_BYTES as f64 / typical) * patience)
+                            .and_then(|typical| {
+                                let rate = (bytes - flight.seen) as f64 / window;
                                 (flight.judged, flight.seen) = (Some(Instant::now()), bytes);
-                                rate
+                                (rate * STALL_FACTOR < typical)
+                                    .then(|| (rate, format!("peers_bps={typical:.0}")))
                             })
-                            .filter(|rate| rate * STALL_FACTOR < typical)
                     }
                 };
-                let Some(rate) = slow else {
+                let Some((rate, peers)) = slow else {
                     continue;
                 };
                 flight.attempt.stopped.store(true, Ordering::Release);
@@ -1051,10 +1114,11 @@ impl Run<'_> {
                     "restart",
                     &flight.subject,
                     &format!(
-                        "bytes={}-{} got={bytes} rate_bps={rate:.0} peers_bps={typical:.0} \
-                         peers_wait_s={wait:.2} peers_small_s={small:.2} after_s={waited:.1}",
+                        "bytes={}-{} got={bytes} rate_bps={rate:.0} {peers} after_s={waited:.1} \
+                         patience={}",
                         flight.range.0,
                         flight.range.1 - 1,
+                        flight.patience,
                     ),
                 );
             }
@@ -1144,18 +1208,13 @@ impl Read for Verifying<'_> {
     }
 }
 
-fn remember(peers: &mut VecDeque<f64>, value: f64) {
-    if peers.len() == PEERS {
-        peers.pop_front();
-    }
-    peers.push_back(value);
-}
+/// One figure of a peer, and whether it is only a floor.
+type Figure<'a> = dyn Fn(&Peer) -> Option<(f64, bool)> + 'a;
 
-/// The middle of what the last peers showed; zero with none to compare with.
-fn median(peers: &VecDeque<f64>) -> f64 {
-    let mut sorted: Vec<f64> = peers.iter().copied().collect();
-    sorted.sort_by(f64::total_cmp);
-    sorted.get(sorted.len() / 2).copied().unwrap_or(0.0)
+/// The middle of what peers showed; none with no peer to compare with.
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    let middle = values.len() / 2;
+    (!values.is_empty()).then(|| *values.select_nth_unstable_by(middle, f64::total_cmp).1)
 }
 
 fn named(refusal: Refusal, id: &str) -> Refusal {
