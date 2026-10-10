@@ -100,7 +100,7 @@ func awaitIdleHold(t *testing.T, d *daemonProcess, logPath, holder string) {
 	for {
 		log, _ := os.ReadFile(logPath)
 		for _, line := range strings.Split(string(log), "\n") {
-			if strings.HasPrefix(line, "idle exit held for 1s by: ") && strings.Contains(line, holder) {
+			if strings.Contains(line, "Z idle exit held for 1s by: ") && strings.Contains(line, holder) {
 				return
 			}
 		}
