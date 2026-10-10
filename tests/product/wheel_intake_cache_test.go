@@ -57,7 +57,7 @@ func intakeProject(t *testing.T, origin, runtimeVersion string, wheels []intakeW
 		lock += fmt.Sprintf("[[package]]\nname='cozy-runtime'\nversion=%q\nsource={registry='https://pypi.org/simple'}\nwheels=[{url=%q,hash=%q,size=100}]\n", runtimeVersion,
 			"https://files.pythonhosted.org/packages/aa/bb/"+strings.Repeat("1", 60)+"/cozy_runtime-"+runtimeVersion+"-py3-none-any.whl", "sha256:"+strings.Repeat("2", 64))
 		closure += "\ncozy-runtime==" + runtimeVersion
-		selected["cozy-runtime"] = runtimeVersion
+		selected["cozy-runtime"] = runtimeVersion //cozy:allow distribution metadata, not a Runtime command
 	}
 	must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600))
 	return root, closure, map[string]map[string]string{"callable": selected}
@@ -86,7 +86,7 @@ func TestWheelIntakeCacheReusesUnchangedClosureAcrossRuntimeRevision(t *testing.
 		if requests.Load() != 46 {
 			t.Fatalf("capture %d fetched unchanged wheel bytes: %d HTTP requests", i, requests.Load())
 		}
-		if captured["cozy-runtime"].Version != version {
+		if captured["cozy-runtime"].Version != version { //cozy:allow distribution metadata, not a Runtime command
 			t.Fatal("Runtime-only change was hidden by cache reuse")
 		}
 		for _, item := range wheels {
