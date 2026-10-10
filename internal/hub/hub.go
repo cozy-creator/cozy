@@ -545,9 +545,6 @@ func (c *Client) refusal(status int, raw []byte) *exit.Error {
 		// The one next step the hub cannot write for us: it does not know where this
 		// Creator stores its machine credential, or which hub this command addressed.
 		e.WithNext("cozy auth login <email> --tensorhub=" + c.label)
-		if c.source == "unset" && c.tokens == nil {
-			e.WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token (%s)", e.Remedy)
-		}
 	}
 	return e
 }
