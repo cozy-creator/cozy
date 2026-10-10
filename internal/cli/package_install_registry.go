@@ -127,6 +127,10 @@ func resolveRegistryPackage(ctx *Context, value, version string) (hub.Ref, hub.P
 	if problem == nil && (plan.Release == "" || release != "" && !sameRelease(plan.Release, release)) {
 		problem = exit.Internalf("Tensorhub answered release %q for requested %q", plan.Release, release)
 	}
+	if problem != nil && problem.ErrName() == "package_release.absent" && release != "" {
+		problem = exit.Named(exit.NotFound, "package_release.absent", "%s has no release %s on hub %s", ref, release, ctx.Cfg.HubText(ctx.Cfg.HubURL)).
+			WithNext("cozy package info " + ref.String())
+	}
 	return ref, plan, packageHubProblem(ctx, ref.String(), problem)
 }
 

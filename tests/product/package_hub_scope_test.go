@@ -145,3 +145,18 @@ func TestAMissingPackageNamesTheHubItRanFrom(t *testing.T) {
 		t.Fatalf("a package this computer ran elsewhere was not traced to its hub [exit %d]\n%s", code, out)
 	}
 }
+
+// A release the hub does not have is named as that, with where to see the ones it has.
+func TestAMissingReleaseIsNamed(t *testing.T) {
+	root := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"package_release.absent","message":"release operation is absent","remedy":"call begin first"}}`))
+	}))
+	defer server.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0o600))
+	code, out := runCozy(t, root, "package", "install", "proof/sdxl", "--version", "9.9.9")
+	if code == 0 || !strings.Contains(out, "proof/sdxl has no release 9.9.9") || !strings.Contains(out, "cozy package info proof/sdxl") || strings.Contains(out, "call begin") {
+		t.Fatalf("a missing release: %d %s", code, out)
+	}
+}

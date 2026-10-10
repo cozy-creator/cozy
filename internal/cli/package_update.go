@@ -93,6 +93,10 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 		return fail(problem)
 	}
 	latest, problem := newestPackageRelease(card.Releases)
+	if problem != nil && problem.ErrName() == "package.all_yanked" {
+		row["detail"] = "every release is yanked; the installed one stays"
+		return row
+	}
 	if problem != nil {
 		return fail(problem)
 	}

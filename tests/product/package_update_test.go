@@ -49,6 +49,7 @@ func TestPackageUpdateContinuesFailuresAndPreservesSelections(t *testing.T) {
 		{"local/editable", "1.0.0", "local"},
 		{"newer/install-reporting", "2.0.0", "tensorhub"},
 		{"private/dependency", "1.0.0", "wheel"},
+		{"yanked/install-reporting", "1.0.0", "tensorhub"},
 		{"z-updated/install-reporting", "1.0.0", "tensorhub"},
 	} {
 		priors[entry.pkg] = updateAllInstall(t, layout, store, i+1, entry.pkg, entry.version, entry.source, server.URL)
@@ -58,8 +59,12 @@ func TestPackageUpdateContinuesFailuresAndPreservesSelections(t *testing.T) {
 		if r.PathValue("org") == "development" {
 			t.Error("development pin attempted a registry update")
 		}
+		releases := []hub.ReleaseSummary{{Release: "1.0.1"}, {Release: "9.0.0", Yanked: true}}
+		if r.PathValue("org") == "yanked" { // every release yanked: the installed one stays, not a failure
+			releases = []hub.ReleaseSummary{{Release: "1.0.0", Yanked: true}}
+		}
 		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: r.PathValue("org"), Name: "install-reporting"},
-			Releases: []hub.ReleaseSummary{{Release: "1.0.1"}, {Release: "9.0.0", Yanked: true}}})
+			Releases: releases})
 	})
 	mux.HandleFunc("POST /v1/packages/{org}/install-reporting/download", func(w http.ResponseWriter, r *http.Request) {
 		downloads.Add(1)
@@ -93,7 +98,7 @@ func TestPackageUpdateContinuesFailuresAndPreservesSelections(t *testing.T) {
 	if code != 1 || json.Unmarshal([]byte(out), &result) != nil {
 		t.Fatalf("bulk result must be one JSON document with exit 1: %d %s", code, out)
 	}
-	if result.Updated != 1 || result.Current != 1 || result.Failed != 1 || result.Skipped != 4 || len(result.Packages) != 7 || downloads.Load() != 2 {
+	if result.Updated != 1 || result.Current != 1 || result.Failed != 1 || result.Skipped != 5 || len(result.Packages) != 8 || downloads.Load() != 2 {
 		t.Fatalf("bulk update summary: %s; downloads=%d", out, downloads.Load())
 	}
 	for _, row := range result.Packages {
@@ -117,6 +122,14 @@ func TestPackageUpdateContinuesFailuresAndPreservesSelections(t *testing.T) {
 				t.Fatal("failed update damaged prior bytes")
 			}
 		}
+	}
+	// Naming one updates only it; a name not installed is refused.
+	code, out = runCozy(t, root, "package", "update", "current/install-reporting", "--json")
+	if code != 0 || json.Unmarshal([]byte(out), &result) != nil || len(result.Packages) != 1 || result.Current != 1 {
+		t.Fatalf("named update: %d %s", code, out)
+	}
+	if code, out = runCozy(t, root, "package", "update", "absent/install-reporting", "--json"); code == 0 || !strings.Contains(out, "package.not_installed") {
+		t.Fatalf("an update of a package not installed: %d %s", code, out)
 	}
 	fatal(t, store.Unpin(server.URL, "a-failed/install-reporting", 1))
 	code, out = runCozy(t, root, "package", "update", "--json")
