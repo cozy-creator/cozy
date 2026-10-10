@@ -40,6 +40,7 @@ type runReport struct {
 	WallMS         int64  `json:"wall_ms,omitempty"`
 	Waiting        string `json:"waiting,omitempty"`
 	ErrorType      string `json:"error_type,omitempty"`
+	ErrorCode      string `json:"error_code,omitempty"`
 	Error          string `json:"error,omitempty"`
 	// Warnings are what the run reported without failing: its admission's and its machine's.
 	Warnings []records.Warning `json:"warnings,omitempty"`
@@ -103,6 +104,7 @@ type reportCall struct {
 	Memoized    bool          `json:"memoized,omitempty"`    // answered from a result its machine held; nothing ran
 	Computation string        `json:"computation,omitempty"` // a memoized call's computation, ran or answered
 	Error       string        `json:"error,omitempty"`
+	ErrorCode   string        `json:"error_code,omitempty"`
 	Runtime     string        `json:"runtime,omitempty"` // the SDK its executor loaded
 	GPUs        []reportGPU   `json:"gpus,omitempty"`    // its grants' cards, then its release's records
 	StartUnixMS int64         `json:"start_unix_ms,omitempty"`
@@ -315,6 +317,7 @@ type callEvent struct {
 	Label        string                 `json:"label"`
 	Status       string                 `json:"status"`
 	Error        string                 `json:"error"`
+	ErrorCode    string                 `json:"error_code"`
 	CalledUnixMS int64                  `json:"called_unix_ms"`
 	Stages       map[string]triageTrack `json:"stages"`
 	Steps        map[string]triageTrack `json:"steps"`
@@ -356,7 +359,7 @@ func handleRunShow(ctx *Context) *exit.Error {
 func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	report := runReport{Number: life.Number, RequestID: life.RequestID, Status: life.Status,
 		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Machine: life.Machine,
-		ErrorType: life.ErrorType, Error: life.Error,
+		ErrorType: life.ErrorType, ErrorCode: life.ErrorCode, Error: life.Error,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS,
 		ExecutionKnown: life.ExecutionKnown || life.MachineExecution == nil, AttemptWallMS: life.AttemptWallMS,
 		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
@@ -466,7 +469,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				continue
 			}
 			c.Parent, c.Index, c.Attempt, c.Module, c.Function = record.Parent, record.Index, record.Attempt, record.Module, record.Export
-			c.Label, c.Status, c.Error = record.Label, record.Status, record.Error
+			c.Label, c.Status, c.Error, c.ErrorCode = record.Label, record.Status, record.Error, record.ErrorCode
 			c.Memoized, c.Computation = record.Memoized, record.Computation
 			c.StartUnixMS = record.CalledUnixMS
 			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
@@ -913,7 +916,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		fmt.Fprintf(w, "\n%s", r.Waiting)
 	}
 	if r.Error != "" {
-		fmt.Fprintf(w, "\nerror %s: %s", r.ErrorType, r.Error)
+		fmt.Fprintf(w, "\nerror %s: %s", cmp.Or(r.ErrorCode, r.ErrorType), r.Error)
 	}
 	for _, warning := range r.Warnings {
 		if warning.Code != "" {
@@ -1031,7 +1034,11 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 	}
 	fmt.Fprintln(w)
 	if c.Error != "" {
-		fmt.Fprintf(w, "error: %s\n", c.Error)
+		if c.ErrorCode != "" {
+			fmt.Fprintf(w, "error %s: %s\n", c.ErrorCode, c.Error)
+		} else {
+			fmt.Fprintf(w, "error: %s\n", c.Error)
+		}
 	}
 	emitTimeline(w, table, c.Stages, c.Steps, offset, full)
 	emitGPUs(w, table, c.GPUs, c.Steps, offset, full)
