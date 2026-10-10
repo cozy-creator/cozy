@@ -662,27 +662,25 @@ their shared object closure and required disk headroom. This declares capacity n
 and models are prepared when requests run. Retrying the same idempotency key reuses the pinned
 set, including when `--model` is omitted on the retry.
 
-Every rental has a fixed 15-minute idle shutdown. Active model preparation and work
-assigned to that machine keep it busy. The idle clock begins at readiness and starts
-again when real work settles. Paused or failed retained files, an open connection,
-status polling, and unassigned work elsewhere in the fleet do not keep it alive.
-Creator performs idle cleanup while connected; the pod independently enforces the
-same fixed policy and asks Tensorhub to release it even if Creator is offline.
+An unused rental times out after 15 minutes. Once the worker accepts work, that
+fact is durable across restarts and automatic shutdown is disabled for that rental.
+End used rentals explicitly with `cozy rental end <name>`. An open connection and
+status polling alone do not make a rental used.
 
-`cozy rental keepalive <name>` explicitly resets that rental's deadline once, to
-15 minutes after the worker acknowledges it. The command reports the acknowledged
-deadline. There is no duration option, automatic renewal, or setting to disable
-shutdown. A failed or unanswered keepalive does not extend Creator's deadline.
-Keepalive authenticates directly to the pinned rental Host, so it also works while
-Runtime is unavailable or incompatible during repair. It does not admit execution
-or open a new control claim.
+`cozy rental keepalive <name>` explicitly resets an unused rental's deadline once,
+to 15 minutes after the worker acknowledges it. For a used rental, the worker
+acknowledges that there is no automatic deadline. A failed or unanswered keepalive
+does not extend the worker's deadline. Keepalive authenticates directly to the
+pinned rental Host, so it also works while Runtime is unavailable or incompatible
+during repair. It does not admit execution or open a new control claim.
 
-`cozy rental list` shows each known machine's idle time, release deadline and accrued spend
-(`est.` until the provider's charges settle, about an hour late; `-` from a Hub that does not say);
-`cozy rental end <name>` ends one now. A release Tensorhub does not confirm is retried.
-Activity is unknown for machines absent from this controller's history and for an
-explicit preparation interrupted by controller restart; their pod guard still applies.
-A managed rental whose job is completed and collected may be released immediately.
+`cozy rental list` shows each known machine's observed idle time and accrued spend
+(`est.` until the provider's charges settle, about an hour late; `-` from a Hub that does not say).
+`cozy rental show <name>` reads the worker's actual automatic release deadline, if
+one exists; the CLI does not calculate a deadline from local completion times.
+A release Tensorhub does not confirm is retried. Activity is unknown for machines
+absent from this controller's history and for an explicit preparation interrupted
+by controller restart.
 
 Rental creation sends only that private machine name, the SKU, and introduction credential material—never a package, model,
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity

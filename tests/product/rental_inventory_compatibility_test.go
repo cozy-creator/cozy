@@ -9,9 +9,56 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 )
+
+func TestRentalShowUsesOnlyTheWorkerDeadline(t *testing.T) {
+	for _, state := range []string{"unused", "used", "unreachable"} {
+		t.Run(state, func(t *testing.T) {
+			layout, lock, pid, _ := compatibilityOwner(t)
+			deadline := time.Date(2026, 10, 10, 4, 6, 31, 571000000, time.UTC)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/":
+				case "/v1/local/rentals":
+					_, _ = w.Write([]byte(`{"rentals":[{"rental_id":"rental-proof","machine":"touji","state":"ready","activity":{"idle_since_at":"2026-10-10T03:55:00Z","release_due_at":"2026-10-10T04:10:00Z"}}]}`))
+				case "/v1/local/machines/rental-proof/status":
+					if state == "unreachable" {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_, _ = w.Write([]byte(`{"error":{"class":"operational","code":"unavailable","message":"worker unavailable"}}`))
+						return
+					}
+					ms := int64(0)
+					if state == "unused" {
+						ms = deadline.UnixMilli()
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"phase": "ready", "idle_deadline_unix_ms": ms})
+				default:
+					t.Errorf("unexpected route %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
+			out, err := compatibilityCLI(t, layout.Root, "rental", "show", "touji", "--json", "--full")
+			if err != nil {
+				t.Fatalf("show: %v %s", err, out)
+			}
+			var document map[string]any
+			must(t, json.Unmarshal([]byte(out), &document))
+			got, present := document["release_due_at"]
+			if state == "unused" {
+				if !present || got != deadline.Format(time.RFC3339Nano) {
+					t.Fatalf("lost worker's actual deadline: %s", out)
+				}
+			} else if present {
+				t.Fatalf("invented an expiry for %s worker: %s", state, out)
+			}
+		})
+	}
+}
 
 func TestRentalListUsesDaemonAPIWithoutOpeningSQLite(t *testing.T) {
 	layout, lock, pid, done := compatibilityOwner(t)
@@ -59,7 +106,7 @@ func TestRentalInventoryHumanDrainingKeepsRawStates(t *testing.T) {
 	defer server.Close()
 	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
 	output, err := compatibilityCLI(t, layout.Root, "rental", "list", "--no-watch")
-	if err != nil || strings.Count(output, "draining") != 2 || strings.Contains(output, "release_requested") || !strings.Contains(output, "Idle machines shut down after 15 minutes") {
+	if err != nil || strings.Count(output, "draining") != 2 || strings.Contains(output, "release_requested") || !strings.Contains(output, "Unused rentals time out after 15 minutes") {
 		t.Fatalf("inventory lost human state or daemon-owned idle policy: %v %s", err, output)
 	}
 	output, err = compatibilityCLI(t, layout.Root, "rental", "list", "--json")

@@ -242,7 +242,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s\n", l.DB, yield)
 	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Daemon)
-	fmt.Fprintln(ctx.Out, "  rentals: released after 15 minutes without active work; manual cozy rental keepalive resets once")
+	fmt.Fprintln(ctx.Out, "  rentals: unused rentals time out after 15 minutes; end used rentals explicitly")
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down · exits on its own after %s with nothing to manage\n",
 			ctx.Cfg.DaemonIdleShutdown)

@@ -41,11 +41,14 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 	}
 	result := api.RentalKeepaliveResult{Rental: subject.Row.ID, WorkerID: receipt.WorkerID, WorkerBootID: receipt.WorkerBootID,
 		AcknowledgedAtUnixMS: receipt.AcknowledgedAtMS, IdleDeadlineUnixMS: receipt.IdleDeadlineMS}
-	return emit(ctx, compactRecord([]output.Field{
+	fields := []output.Field{
 		{K: "rental", V: result.Rental},
 		{K: "acknowledged_at", V: time.UnixMilli(result.AcknowledgedAtUnixMS).UTC().Format(time.RFC3339Nano)},
-		{K: "release_due", V: time.UnixMilli(result.IdleDeadlineUnixMS).UTC().Format(time.RFC3339Nano)},
-	}, "rental", "acknowledged_at", "release_due"))
+	}
+	if result.IdleDeadlineUnixMS > 0 {
+		fields = append(fields, output.Field{K: "release_due", V: time.UnixMilli(result.IdleDeadlineUnixMS).UTC().Format(time.RFC3339Nano)})
+	}
+	return emit(ctx, compactRecord(fields, "rental", "acknowledged_at", "release_due"))
 }
 
 // keepalive is the daemon's route for the same reset (a cozy before the command did it

@@ -226,9 +226,10 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		if idle.PendingPreparation > 0 {
 			summary.Activity = nil
 		}
-		if due, eligible := idle.ReleaseAt(); eligible {
+		// Local observations describe inactivity, not the worker's release policy.
+		// Only its live Status can supply an authoritative expiry (zero means none).
+		if summary.Activity != nil && idle.Queued == 0 && idle.Running == 0 && !idle.Since.IsZero() {
 			summary.Activity.IdleSince = idle.Since.UTC().Format(time.RFC3339)
-			summary.Activity.ReleaseDue = due.UTC().Format(time.RFC3339)
 		}
 		result.Rentals = append(result.Rentals, summary)
 	}
