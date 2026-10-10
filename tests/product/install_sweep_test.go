@@ -3,6 +3,7 @@ package producttest
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/home"
@@ -80,7 +81,7 @@ func TestInstallSweep(t *testing.T) {
 		t.Logf("symlink safety fixture unavailable: %v", err)
 	}
 
-	swept, problem := install.Sweep(l, store)
+	swept, problem := install.Sweep(l, store, new(sync.Mutex))
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -113,7 +114,7 @@ func TestInstallSweep(t *testing.T) {
 	}
 
 	// The sweep is idempotent: a second pass over the survivors removes nothing.
-	again, problem := install.Sweep(l, store)
+	again, problem := install.Sweep(l, store, new(sync.Mutex))
 	if problem != nil {
 		t.Fatal(problem)
 	}

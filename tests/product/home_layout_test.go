@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -79,14 +80,14 @@ func TestFreshHomeIsMinimal(t *testing.T) {
 	// The single-writer lock lives INSIDE installs and never becomes a sweep victim.
 	writer, problem := install.Lock(l)
 	fatal(t, problem)
-	defer writer.Unlock()
+	writer.Unlock()
 	if filepath.Dir(l.Lock) != l.Installs {
 		t.Fatalf("writer lock at %s, want under %s", l.Lock, l.Installs)
 	}
-	swept, problem := install.Sweep(l, store)
+	swept, problem := install.Sweep(l, store, new(sync.Mutex))
 	fatal(t, problem)
-	if swept.Removed != 0 {
-		t.Fatalf("install sweep removed %d entries from a home holding only the writer lock", swept.Removed)
+	if _, err := os.Stat(l.Lock); swept.Removed != 0 || err != nil {
+		t.Fatalf("install sweep removed %d entries from a home holding only the writer lock (lock: %v)", swept.Removed, err)
 	}
 }
 

@@ -31,6 +31,7 @@ type idleWatch struct {
 	store    *records.Store
 	owner    *orchestrator.Orchestrator
 	server   *api.Server
+	startup  *daemonStartup
 	log      io.Writer
 }
 
@@ -48,6 +49,7 @@ func (w idleWatch) managed() ([]string, *exit.Error) {
 	for _, o := range obligations {
 		held = append(held, o.String())
 	}
+	held = append(held, w.startup.holding()...)
 	sort.Strings(held)
 	return held, nil
 }

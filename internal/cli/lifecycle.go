@@ -11,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -284,16 +283,28 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 	return blockers, nil
 }
 
+// finishDaemonDown waits for the daemon it stopped — that pid — to let go of the root. Any
+// other command may already have started the next daemon, which is not the one stopping.
+// The daemon bounds its own drain; a slow one is reported as it goes, never cut off.
 func finishDaemonDown(ctx *Context, extra []output.Field, notes ...string) *exit.Error {
-	deadline := time.Now().Add(2 * orchestrator.StopGrace)
-	for time.Now().Before(deadline) {
-		if !daemon.Probe(ctx.Cfg).Up {
+	stopping, began := ctx.Daemon.PID, time.Now()
+	reported := began
+	for {
+		state := daemon.Probe(ctx.Cfg)
+		// A held record with no pid is an owner releasing or claiming it, not a successor.
+		if !state.Up || stopping != 0 && state.PID != 0 && state.PID != stopping {
+			if state.Up {
+				notes = append(notes, fmt.Sprintf("another command has already started the next daemon (pid %d)", state.PID))
+			}
 			fields := []output.Field{{K: "daemon", V: "stopped"}, {K: "changed", V: true}}
 			fields = append(fields, extra...)
 			return emit(ctx, output.Record{Fields: fields, Notes: notes})
 		}
+		if time.Since(reported) >= 5*time.Second {
+			reported = time.Now()
+			fmt.Fprintf(ctx.Err, "waiting for the daemon (pid %d) to finish stopping: %s so far\n",
+				stopping, time.Since(began).Round(time.Second))
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return exit.New(exit.Conflict, "the daemon accepted down but did not finish stopping").
-		WithRemedy("the daemon remains responsible for its workers; no forced kill was performed")
 }

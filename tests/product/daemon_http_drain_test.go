@@ -19,7 +19,8 @@ func TestDaemonHTTPDrainFlushesReplyAndEndsStream(t *testing.T) {
 	buffered, canceled, finish := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	streamStarted, streamStopped := make(chan struct{}), make(chan struct{})
 	const reply = `{"shutting_down":true}`
-	server := daemon.NewHTTPServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := daemon.NewHTTPServer()
+	server.Open(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/events" {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "data: ready\n\n")
@@ -100,7 +101,8 @@ func TestRepeatedCLIUpDownReceivesTheFinalResponse(t *testing.T) {
 
 func TestDaemonHTTPDrainHonorsItsCancellationBound(t *testing.T) {
 	started, canceled, finish := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	server := daemon.NewHTTPServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := daemon.NewHTTPServer()
+	server.Open(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		<-r.Context().Done()
 		close(canceled)

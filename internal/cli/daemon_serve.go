@@ -94,6 +94,15 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	defer held.Release()
 
+	// SERVED FROM THE CLAIM ON. A bound port the kernel accepts connections for while nothing
+	// answers them is a hung client; until the API opens below, every request is told the
+	// daemon is starting, and everything the restart owes runs after it opens (startup).
+	httpServer := daemon.NewHTTPServer()
+	go func() { _ = httpServer.Serve(v4) }()
+	if v6 != nil {
+		go func() { _ = httpServer.Serve(v6) }()
+	}
+
 	st, e := records.OpenForDaemon(l.DB)
 	if e != nil {
 		closeListeners()
@@ -173,28 +182,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 	installsStopped := make(chan struct{})
 	defer cancelInstalls()
 
-	e = c.Reconcile()
-	if e != nil {
-		closeListeners()
-		return e
-	}
-	go fleet.releaseOrphaned()
-
-	// cl-076: an install directory is reachable only through its record, so a records.db
-	// that was lost or rebuilt strands every one of them on disk with no verb able to
-	// touch it. The sweep runs here — after reconcile has closed the worker rows that
-	// would otherwise still reference an install, and before the API is served — and it
-	// is never fatal: what it removes is a venv `cozy package install` rebuilds.
-	swept, sweepNote := sweepInstalls(l, st)
-	// The two roots that used to grow without bound. The writer removes its own bytes
-	// when they die; these sweeps are the backstop for a crashed one, and each lets the
-	// records authority — or a live process's kernel lock — decide what still has a claim.
-	workers, workersNote := reclaimNote(reclaim.Workers(l, st))
-	tmp, tmpNote := reclaimNote(reclaim.Tmp(l, st))
-	publications, publicationsNote := reclaimNote(reclaim.Publications(l, st))
-	rentalSecrets, rentalSecretsNote := reclaimNote(reclaim.RentalSecrets(l, st))
-	reclaim.EmptyRoots(l)
-
 	// One per-launch CLI credential rides the daemon's own held 0600 record. It is never
 	// printed, logged, or placed on argv, and rotates with every launch. The public web
 	// stub exposes no state; full browser authorization is a later, separately reviewed
@@ -223,23 +210,13 @@ func serveDaemon(ctx *Context) *exit.Error {
 		closeListeners()
 		return e
 	}
-	updates.Resume()
-	machines.Resume()
 	go func() { defer close(installsStopped); installs.Run(installContext) }()
 	defer func() { cancelInstalls(); <-installsStopped }()
+	httpServer.Open(handler)
+	go func() { _ = c.Serve() }()
 
 	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
 		addr, strings.Join(bound, "+"), socket)
-	fmt.Fprintf(ctx.Out, "  install sweep: reclaimed %d of %d director(ies), freed %s exclusive%s\n",
-		swept.Removed, swept.Scanned, output.Bytes(swept.Bytes), sweepNote)
-	fmt.Fprintf(ctx.Out, "  worker sweep: reclaimed %d of %d director(ies), freed %s%s\n",
-		workers.Removed, workers.Scanned, output.Bytes(workers.Bytes), workersNote)
-	fmt.Fprintf(ctx.Out, "  tmp sweep: reclaimed %d of %d entr(y|ies), freed %s%s\n",
-		tmp.Removed, tmp.Scanned, output.Bytes(tmp.Bytes), tmpNote)
-	if publications.Scanned+rentalSecrets.Scanned > 0 {
-		fmt.Fprintf(ctx.Out, "  lifecycle sweep: %d publication root(s) settled%s · %d stale rental secret(s) erased%s\n",
-			publications.Removed, publicationsNote, rentalSecrets.Removed, rentalSecretsNote)
-	}
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s\n", l.DB, yield)
 	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Daemon)
 	fmt.Fprintln(ctx.Out, "  rentals: unused rentals time out after 15 minutes; end used rentals explicitly")
@@ -251,16 +228,59 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	fmt.Fprintf(ctx.Out, "  claim: %s; this daemon stops if that record stops naming it\n", l.Daemon)
 
-	httpServer := daemon.NewHTTPServer(handler)
-	go func() { _ = httpServer.Serve(v4) }()
-	if v6 != nil {
-		go func() { _ = httpServer.Serve(v6) }()
-	}
-	go func() { _ = c.Serve() }()
-
 	// The idle exit takes exactly the path a SIGTERM takes: the server's shutdown hook
 	// feeds the same channel, and everything after `<-stop` is shared.
 	quit := make(chan struct{})
+	startup := &daemonStartup{log: ctx.Out}
+	go startup.run(quit, []startupStep{
+		// The lifecycle sweep is a few reads: it goes first, before anything owed can buy.
+		{"lifecycle sweep", func() string {
+			publications, publicationsNote := reclaimNote(reclaim.Publications(l, st))
+			rentalSecrets, rentalSecretsNote := reclaimNote(reclaim.RentalSecrets(l, st))
+			return fmt.Sprintf("%d publication root(s) settled%s · %d stale rental secret(s) erased%s",
+				publications.Removed, publicationsNote, rentalSecrets.Removed, rentalSecretsNote)
+		}},
+		{"recovery", func() string {
+			if problem := c.Reconcile(); problem != nil {
+				return "incomplete: " + problem.Message
+			}
+			return "owed work, output exports and model transfers resumed"
+		}},
+		{"run recovery", func() string {
+			go fleet.releaseOrphaned()
+			updates.Resume()
+			machines.Resume()
+			return "rental reconciliation started; Runtime updates and run observers resumed"
+		}},
+		// cl-076: an install directory is reachable only through its record, so a records.db
+		// that was lost or rebuilt strands every one of them on disk with no verb able to
+		// touch it. The sweep runs after recovery has closed the rows that would otherwise
+		// still reference an install, and it is never fatal: what it removes is a venv
+		// `cozy package install` rebuilds.
+		{"install sweep", func() string {
+			swept, problem := install.Sweep(l, st, &resolver.refreshMu)
+			note := ""
+			if problem != nil {
+				note = " · incomplete: " + problem.Message
+			}
+			return fmt.Sprintf("reclaimed %d of %d director(ies), freed %s exclusive%s",
+				swept.Removed, swept.Scanned, output.Bytes(swept.Bytes), note)
+		}},
+		// The two roots that used to grow without bound. The writer removes its own bytes
+		// when they die; these sweeps are the backstop for a crashed one, and each lets the
+		// records authority — or a live process's kernel lock — decide what still has a claim.
+		{"worker sweep", func() string {
+			workers, note := reclaimNote(reclaim.Workers(l, st))
+			return fmt.Sprintf("reclaimed %d of %d director(ies), freed %s%s",
+				workers.Removed, workers.Scanned, output.Bytes(workers.Bytes), note)
+		}},
+		{"tmp sweep", func() string {
+			tmp, note := reclaimNote(reclaim.Tmp(l, st))
+			reclaim.EmptyRoots(l)
+			return fmt.Sprintf("reclaimed %d of %d entr(y|ies), freed %s%s",
+				tmp.Removed, tmp.Scanned, output.Bytes(tmp.Bytes), note)
+		}},
+	})
 	go fleet.watch(quit)
 	// Every editable install's source tree is watched for as long as this daemon runs
 	// (cl-097): an edit is rebuilt and every worker holding the package re-prepared before
@@ -270,7 +290,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		fmt.Fprintf(ctx.Out, "editable watch unavailable: %s\n", e.Message)
 	}
 	idle := idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,
-		server: server, log: ctx.Out}
+		server: server, startup: startup, log: ctx.Out}
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		go idle.run(quit)
 	}
@@ -300,24 +320,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 // reclaimNote turns a reclaim sweep's first refusal into a banner note; like the install
 // sweep, nothing here may keep the daemon down.
 func reclaimNote(swept reclaim.Swept, problem *exit.Error) (reclaim.Swept, string) {
-	if problem != nil {
-		return swept, " · incomplete: " + problem.Message
-	}
-	return swept, ""
-}
-
-// sweepInstalls takes the single-writer lock the install transaction takes, sweeps, and
-// answers a note for the startup banner instead of an error. Every outcome here is
-// recoverable by reinstalling one package, so none of them may keep the daemon down: a
-// concurrent writer defers the sweep to the next start, and a directory that refuses to
-// go is reported and left where it is.
-func sweepInstalls(l home.Layout, st *records.Store) (install.Swept, string) {
-	writer, problem := install.Lock(l)
-	if problem != nil {
-		return install.Swept{}, " · deferred: " + problem.Message
-	}
-	defer writer.Unlock()
-	swept, problem := install.Sweep(l, st)
 	if problem != nil {
 		return swept, " · incomplete: " + problem.Message
 	}

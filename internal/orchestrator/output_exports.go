@@ -167,8 +167,7 @@ func (c *Orchestrator) failOutputExport(requestID string, problem *exit.Error) {
 	c.logf("output export %s failed (%s): %s", requestID, problem.ErrName(), problem.Message)
 }
 
-// ResumeOutputExports settles every terminal obligation before the restarted daemon
-// starts serving clients.
+// ResumeOutputExports settles every terminal obligation a previous daemon left.
 func (c *Orchestrator) ResumeOutputExports() *exit.Error {
 	owed, problem := c.opt.Store.OutputExportsOwed()
 	if problem != nil {

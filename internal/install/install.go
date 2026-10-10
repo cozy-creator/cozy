@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -610,9 +611,11 @@ type Swept struct {
 // disk: unreferenced, and unreachable by any verb (cl-076). The sweep walks the
 // DIRECTORY instead and lets the refcounted database claim decide, so an install that
 // is still pinned, still serving a request, or still held by a live worker survives.
-// Callers hold the single-writer lock: an install stages its directory before it commits
-// the row that names it.
-func Sweep(l home.Layout, st *records.Store) (Swept, *exit.Error) {
+// Each entry is decided under the single-writer lock (an install stages its directory
+// before it commits the row that names it) and the caller's own install mutex, one entry
+// at a time, so a sweep never holds back a submission for more than one entry. An entry
+// whose lock another writer holds waits for the next sweep.
+func Sweep(l home.Layout, st *records.Store, own sync.Locker) (Swept, *exit.Error) {
 	entries, err := os.ReadDir(l.Installs)
 	if err != nil {
 		return Swept{}, exit.Internalf("cannot scan the install root %s: %s", l.Installs, err)
@@ -623,11 +626,18 @@ func Sweep(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 		// A DirEntry's type is its own lstat, so a symlink is skipped as a symlink: the
 		// sweep removes trees this root owns and nothing it merely names.
 		if !entry.IsDir() {
-			sweepLease(l, st, entry.Name())
+			if strings.HasSuffix(entry.Name(), ".lease") {
+				_ = underWriter(l, own, func() *exit.Error { sweepLease(l, st, entry.Name()); return nil })
+			}
 			continue
 		}
 		swept.Scanned++
-		freed, removed, problem := sweepInstall(l, st, entry.Name())
+		var freed int64
+		var removed bool
+		problem := underWriter(l, own, func() (problem *exit.Error) {
+			freed, removed, problem = sweepInstall(l, st, entry.Name())
+			return problem
+		})
 		if problem != nil {
 			// Each entry is independent, so one directory that will not go is not worth
 			// abandoning the rest of the sweep for. The first refusal is returned once
@@ -645,6 +655,17 @@ func Sweep(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 	return swept, first
 }
 
+func underWriter(l home.Layout, own sync.Locker, do func() *exit.Error) *exit.Error {
+	own.Lock()
+	defer own.Unlock()
+	writer, problem := Lock(l)
+	if problem != nil {
+		return problem
+	}
+	defer writer.Unlock()
+	return do()
+}
+
 // sweepInstall reclaims one directory under the install root. A recorded install goes
 // through Reclaim so the claim still decides; a directory with NO record has no claim
 // left to win and nothing that can reference it, and its bytes are measured here because
@@ -653,6 +674,9 @@ func sweepInstall(l home.Layout, st *records.Store, id string) (int64, bool, *ex
 	target, problem := installRemovalTarget(l, id)
 	if problem != nil {
 		return 0, false, problem
+	}
+	if _, err := os.Lstat(target); err != nil {
+		return 0, false, nil // reclaimed since the sweep listed it
 	}
 	inst, problem := st.Install(id)
 	if problem != nil {
