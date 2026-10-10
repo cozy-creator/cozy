@@ -120,16 +120,16 @@ func TestRunShowNamesWhichStepsServedWhichKernels(t *testing.T) {
 
 // A request whose --attention-kernel was still compiling waits for it before its first step, and
 // Runtime 0.23.4 records the wait as a stage, which run show, its call and --json all carry.
-// Run 5211's recorded bundle (a fresh RTX 5090 waited for Sage3 FP4's boot compile), its wait
-// spanning the measured gap from the run's start to its first step.
+// Run 5230's recorded bundle (Runtime 0.23.4 on a fresh RTX 5090: the override waited 1m42.8s
+// for Sage3 FP4's boot compile, after an earlier override was canceled mid-wait).
 func TestRunShowListsTheCompileWaitAsAStage(t *testing.T) {
 	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "compile-wait.json"))
 	must(t, err)
 	o := hostOwner(t, "run-show-compile-wait")
 	id := succeededWithTriage(t, o, bundle)
-	fatal(t, o.store.AppendEvent(id, "run.in_progress", 1, map[string]any{"started_unix_ms": 1791603811459}))
+	fatal(t, o.store.AppendEvent(id, "run.in_progress", 1, map[string]any{"started_unix_ms": 1791612171439}))
 	defer publicationControlAPI(t, o)()
-	row := regexp.MustCompile(`(?m)^waiting for sageattention3-fp4-global-lowmem compile +wait +\S+ +1m27\.7s *\n(.*\n)*tokenize +inference `)
+	row := regexp.MustCompile(`(?m)^waiting for sageattention3-fp4-global-lowmem compile +wait +\S+ +1m42\.8s *\n(.*\n)*tokenize +inference `)
 	for _, args := range [][]string{{"run", "show", id}, {"run", "show", id, "--call", "0"}} {
 		code, human := runCozy(t, o.root, args...)
 		t.Logf("cozy %v:\n%s", args, human)
@@ -147,7 +147,7 @@ func TestRunShowListsTheCompileWaitAsAStage(t *testing.T) {
 	}
 	must(t, json.Unmarshal([]byte(out), &report))
 	for _, stage := range report.Stages {
-		if stage.Name == "waiting for sageattention3-fp4-global-lowmem compile" && stage.Kind == "wait" && stage.MS == 87680 {
+		if stage.Name == "waiting for sageattention3-fp4-global-lowmem compile" && stage.Kind == "wait" && stage.MS == 102751.082 {
 			return
 		}
 	}
