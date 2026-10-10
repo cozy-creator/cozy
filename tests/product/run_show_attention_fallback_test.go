@@ -21,7 +21,7 @@ func TestRunShowRetainsSelectionTimeAttentionFallback(t *testing.T) {
 	o := hostOwner(t, "run-show-attention-fallback")
 	id := succeededWithTriage(t, o, bundle)
 	defer publicationControlAPI(t, o)()
-	want := "GPU 0 attention fallback (base/fl2va_dit): used sol-attn instead of sol-attn-sage2-fixed-kmean: kernel build still compiling (42%)"
+	want := "GPU 0 attention fallback (base/fl2va_dit): selected sol-attn instead of sol-attn-sage2-fixed-kmean: kernel build still compiling (42%)"
 	for _, args := range [][]string{{"run", "show", id}, {"run", "show", id, "--full"}} {
 		code, human := runCozy(t, o.root, args...)
 		if code != 0 || !strings.Contains(human, want) {

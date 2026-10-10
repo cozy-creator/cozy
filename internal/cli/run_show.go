@@ -140,7 +140,7 @@ type reportGPU struct {
 	} `json:"attention"`
 }
 
-// attentionFallback preserves why a different kernel served when it was selected.
+// attentionFallback preserves why a different kernel was selected.
 // The preferred kernel may already be ready by the end of the run.
 type attentionFallback struct {
 	Component string `json:"component"`
@@ -1300,7 +1300,7 @@ func (g reportGPU) number() string {
 func emitKernels(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, full bool) {
 	for _, gpu := range gpus {
 		for _, fallback := range gpu.Attention.Fallbacks {
-			fmt.Fprintf(w, "\nGPU %s attention fallback (%s): used %s instead of %s: %s\n",
+			fmt.Fprintf(w, "\nGPU %s attention fallback (%s): selected %s instead of %s: %s\n",
 				gpu.number(), fallback.Component, fallback.Selected, fallback.Preferred,
 				output.Elide(fallback.Reason, 240, full))
 		}
