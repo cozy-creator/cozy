@@ -1178,8 +1178,9 @@ func (f *fetcherV1) stop() {
 // they match the digest, never editing it in place. `from` > 0 says the revision extends the
 // file's bytes from there, so only the tail is read; -1 says nothing is known, and a shorter
 // file is tried as a prefix first. `held` is told how many bytes are in hand as they arrive.
-// The bytes read stay beside the file until they are whole, so a read the connection cut
-// continues from where it stopped, at the same revision.
+// A big file is read in ranges side by side (machinev1.ReadRanges). The bytes read stay beside
+// the file until they are whole, so a read the connection cut continues from where they stop
+// being whole, at the same revision.
 func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product, from int64, progress func(int64, int64)) *exit.Error {
 	if progress == nil {
 		progress = func(int64, int64) {}
@@ -1199,7 +1200,8 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 	unwritable := func(err error) *exit.Error {
 		return exit.Named(exit.Unavailable, "output_unwritable", "cannot write into %s: %s", directory, err)
 	}
-	read := func(prefix int64) *exit.Error {
+	var read func(prefix int64) *exit.Error
+	read = func(prefix int64) *exit.Error {
 		file, problem := lockPartial(partial)
 		if problem != nil {
 			return unwritable(problem)
@@ -1225,8 +1227,11 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 			file.Close()
 			return unwritable(err)
 		}
-		_, _, err = machine.ReadOutput(ctx, run, product.Output, outputIndexV1(product), uint64(offset), uint64(product.Rev),
-			&counted{w: file, n: offset, held: held})
+		target := &v1.OutputTarget{Run: run, Output: product.Output, Index: outputIndexV1(product)}
+		whole, err := machine.ReadRanges(ctx, target, uint64(product.Rev), offset, product.Length, file, held)
+		if err != nil {
+			_ = file.Truncate(offset + whole) // what a cut read keeps: its bytes in order
+		}
 		if closeErr := file.Close(); err == nil {
 			err = closeErr
 		}
@@ -1239,6 +1244,9 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 		}
 		if digestOf(partial) != product.Digest {
 			_ = os.Remove(partial)
+			if offset > 0 && prefix == 0 {
+				return read(0) // the kept bytes were not whole (a process ended mid-read)
+			}
 			return exit.Named(exit.Conflict, "output_revision_changed", "%s moved past revision %d while it was read", product.Output, product.Rev)
 		}
 		if err := os.Rename(partial, product.Path); err != nil {
@@ -1304,20 +1312,6 @@ func globEscape(name string) string {
 	return quoted.String()
 }
 
-// counted reports how many bytes a read holds as they arrive.
-type counted struct {
-	w    io.Writer
-	n    int64
-	held func(int64)
-}
-
-func (c *counted) Write(p []byte) (int, error) {
-	n, err := c.w.Write(p)
-	c.n += int64(n)
-	c.held(c.n)
-	return n, err
-}
-
 // readTreeV1 makes the directory at product.Path this revision's tree: its manifest, then each
 // member file it names, read and verified beside the folder, then placed whole.
 func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string, product records.Product, progress func(int64, int64)) *exit.Error {
@@ -1330,34 +1324,43 @@ func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string
 	}
 	defer os.RemoveAll(staging)
 	var received, transferBytes int64
-	read := func(member, target, digest string) *exit.Error {
+	read := func(member resultfiles.TreeMember, target string) *exit.Error {
 		file, err := os.Create(target)
 		if err != nil {
 			return exit.Named(exit.Unavailable, "output_unwritable", "cannot stage a tree in %s: %s", directory, err)
 		}
-		hash := sha256.New()
-		var writer io.Writer = io.MultiWriter(file, hash)
-		if member != "" {
-			writer = &counted{w: writer, n: received, held: func(n int64) {
-				received = n
+		before := received
+		_, err = machine.ReadRanges(ctx, &v1.OutputTarget{Run: run, Output: product.Output, Index: outputIndexV1(product), Member: member.Path},
+			uint64(product.Rev), 0, member.Length, file, func(n int64) {
+				received = before + n
 				progress(received, transferBytes)
-			}}
-		}
-		_, _, err = machine.ReadMember(ctx, run, product.Output, outputIndexV1(product), member, uint64(product.Rev), writer)
+			})
 		if closeErr := file.Close(); err == nil {
 			err = closeErr
 		}
 		if err != nil {
 			return machines.Transport(err)
 		}
-		if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
+		if digestOf(target) != member.Digest {
 			return exit.Named(exit.Conflict, "output_revision_changed", "%s moved past revision %d while it was read", product.Output, product.Rev)
 		}
 		return nil
 	}
 	manifest := filepath.Join(staging, "manifest")
-	if problem := read("", manifest, product.Digest); problem != nil {
-		return problem
+	if file, err := os.Create(manifest); err != nil {
+		return exit.Named(exit.Unavailable, "output_unwritable", "cannot stage a tree in %s: %s", directory, err)
+	} else {
+		hash := sha256.New()
+		_, _, err = machine.ReadMember(ctx, run, product.Output, outputIndexV1(product), "", uint64(product.Rev), io.MultiWriter(file, hash))
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return machines.Transport(err)
+		}
+		if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != product.Digest {
+			return exit.Named(exit.Conflict, "output_revision_changed", "%s moved past revision %d while it was read", product.Output, product.Rev)
+		}
 	}
 	raw, err := os.ReadFile(manifest)
 	if err != nil {
@@ -1399,7 +1402,7 @@ func readTreeV1(ctx context.Context, machine *machines.V1, run, directory string
 		if _, err := os.Stat(held); err == nil {
 			continue // a duplicate file is read once
 		}
-		if problem := read(member.Path, held, member.Digest); problem != nil {
+		if problem := read(member, held); problem != nil {
 			return problem
 		}
 	}

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/capability"
@@ -37,23 +39,30 @@ type Client struct {
 	Machine pb.MachineClient
 	worker  string
 	signer  Signer
+	// dial opens another connection to the machine: a lane of ReadRanges.
+	dial    func() (*grpc.ClientConn, error)
+	lanesMu sync.Mutex
+	lanes   []*grpc.ClientConn
+	ranges  atomic.Int32
 }
 
 // Dial connects to the machine at addr whose pinned leaf tlsConfig trusts; worker is the
 // machine's worker id, which every cap names.
 func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Client, error) {
 	c := &Client{worker: worker, signer: signer}
-	conn, err := grpc.NewClient(addr, append(dialing(tlsConfig),
+	options := append(dialing(tlsConfig),
 		grpc.WithPerRPCCredentials(caps{c}),
 		grpc.WithInitialWindowSize(16<<20), grpc.WithInitialConnWindowSize(32<<20),
 		// A ping every 20 s keeps NAT mappings on the path alive through a quiet run, and an
 		// unanswered one ends a dead connection so the run is attached again at once.
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 20 * time.Second, PermitWithoutStream: true}),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))...)
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
+	conn, err := grpc.NewClient(addr, options...)
 	if err != nil {
 		return nil, err
 	}
 	c.conn, c.Machine = conn, pb.NewMachineClient(conn)
+	c.dial = func() (*grpc.ClientConn, error) { return grpc.NewClient(addr, options...) }
 	return c, nil
 }
 
@@ -122,8 +131,18 @@ var dialSocket = func(ctx context.Context, addr string) (net.Conn, error) {
 	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 }
 
-// Close ends the connection.
-func (c *Client) Close() error { return c.conn.Close() }
+// Close ends the connection and its lanes.
+func (c *Client) Close() error {
+	c.lanesMu.Lock()
+	for i, lane := range c.lanes {
+		if lane != nil {
+			_ = lane.Close()
+			c.lanes[i] = nil
+		}
+	}
+	c.lanesMu.Unlock()
+	return c.conn.Close()
+}
 
 // Broken is a connection gRPC has given up on for now, or one closed: a caller dials anew
 // rather than wait out its reconnect backoff.
