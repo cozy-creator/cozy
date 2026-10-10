@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"slices"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machines"
@@ -25,6 +26,18 @@ func (m *machineRuns) localSourceV1(ctx context.Context, machine *machines.V1, i
 	key := machine.Name + "\x00" + machine.BootID + "\x00" + source.Package
 	held, _ := m.sent.Load(key)
 	sent, _ := held.(machinev1.Held)
+	if sent == nil {
+		// A machine before live packages would accept the manifest and fail installing it: it
+		// is asked first, and one without them is updated before the run is sent (dispatch).
+		frame, err := machine.Status(ctx)
+		if err != nil {
+			return "", false, machines.Transport(err)
+		}
+		if !slices.Contains(frame.GetCapabilities(), "live-source/1") {
+			return "", false, exit.Named(exit.Structural, "machine.upgrade_required",
+				"%s runs TensorD %s, which installs no live package", machine.Name, frame.GetVersion())
+		}
+	}
 	manifest, moved, now, err := machinev1.LocalSource(ctx, machine.Machine, source, sent)
 	if err != nil {
 		return "", false, machines.Transport(err)

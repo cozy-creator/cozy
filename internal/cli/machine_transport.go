@@ -46,7 +46,16 @@ func (m *machineRuns) ValidateEndpoint(ctx context.Context, ep *machineendpoint.
 
 // Prewarm makes one installation on its machine without running anything: `cozy package
 // install`, `cozy model download` and `cozy model upload`, as a warm run.
+// A machine older than this cozy takes the Hub's target software first, once.
 func (m *machineRuns) Prewarm(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) (json.RawMessage, *exit.Error) {
+	result, problem := m.prewarmV1(ctx, row, report)
+	if problem == nil || problem.ErrName() != "machine.upgrade_required" {
+		return result, problem
+	}
+	report(machines.InstallProgress{Stage: "updating the machine's software"})
+	if next := m.followTargetV1(row.RentalID, row.Selection.Hub); next != "" {
+		return nil, exit.Named(problem.Code, problem.ErrName(), "%s; %s", problem.Message, next)
+	}
 	return m.prewarmV1(ctx, row, report)
 }
 

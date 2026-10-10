@@ -46,6 +46,9 @@ type olderMachine struct {
 	serves            string
 	updates, refusals int
 	runs              map[string]bool
+	// live: the machine names live-source/1 once it runs `serves` (and takes local code only then).
+	live   bool
+	writes int
 	// held is the run that stays running until release closes.
 	held    string
 	release chan struct{}
@@ -55,8 +58,31 @@ func (m *olderMachine) Status(_ *v1.StatusRequest, stream grpc.ServerStreamingSe
 	m.mu.Lock()
 	frame := &v1.StatusFrame{WorkerId: olderWorkerID, BootId: olderBootID, Version: "0.1.0", Phase: "ready",
 		Runtime: m.runtime, Tensorfs: m.tensorfs, Capabilities: []string{"status/1", "run/1", "update/1"}}
+	if m.live && m.runtime == m.serves {
+		frame.Capabilities = append(frame.Capabilities, "live-source/1")
+	}
 	m.mu.Unlock()
 	return stream.Send(frame)
+}
+
+// Write holds every object it is sent.
+func (m *olderMachine) Write(stream grpc.ClientStreamingServer[v1.WriteFrame, v1.WriteResult]) error {
+	header, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	held := header.GetOffset()
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		held += uint64(len(frame.GetData()))
+	}
+	m.mu.Lock()
+	m.writes++
+	m.mu.Unlock()
+	return stream.SendAndClose(&v1.WriteResult{Digest: header.GetDigest(), Held: held})
 }
 
 func (m *olderMachine) Run(request *v1.RunRequest, stream grpc.ServerStreamingServer[v1.RunEvent]) error {
@@ -135,6 +161,35 @@ func TestAnOlderMachineTakesTheTargetBeforeNewWork(t *testing.T) {
 		}
 		if code, out := runCozy(t, root, "run", "watch", fresh, "--json"); code != 0 || !strings.Contains(out, `"status":"completed"`) {
 			t.Fatalf("watch did not follow the call sent again [exit %d]: %s", code, out)
+		}
+	})
+	t.Run("updates before local code", func(t *testing.T) {
+		// A machine before live packages would take a local package's manifest and fail it while
+		// installing: it is updated first, shown as a stage, and the run then goes.
+		machine := &olderMachine{runtime: "0.18.101", tensorfs: "0.3.93", serves: "0.18.102", runs: map[string]bool{}, live: true}
+		root, store, _ := olderMachineHome(t, machine)
+		project := filepath.Join(t.TempDir(), "live-probe")
+		must(t, os.MkdirAll(project, 0o700))
+		must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte("[project]\nname=\"live-probe\"\nversion=\"0.1.0\"\nrequires-python=\">=3.12\"\n"), 0o600))
+		must(t, os.WriteFile(filepath.Join(project, "live_probe.py"), []byte("VALUE = 1\n"), 0o600))
+		const id = "run-local-on-an-older-machine"
+		fatal(t, store.RecordInstall(records.PackageInstall{ID: "install-live-probe", Package: "local/live-probe", Version: "0.1.0",
+			SourceKind: "local", SourceRef: project, ProjectDir: project, Dir: t.TempDir()}))
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "local/live-probe", Release: "0.1.0",
+			Entrypoint: "main", Kind: "call", Payload: []byte(`{}`), BodyDigest: childDigest(id), MachineExecutionObserver: true,
+			InstallID: "install-live-probe", LocalInstallationID: "install-live-probe"})
+		fatal(t, problem)
+		fatal(t, store.LinkMachineExecution(id, olderRental))
+		startDaemonProcess(t, root)
+		reachesState(t, root, store, id, "completed")
+		machine.mu.Lock()
+		updates, refusals, writes := machine.updates, machine.refusals, machine.writes
+		machine.mu.Unlock()
+		if updates != 1 || refusals != 0 || writes == 0 {
+			t.Fatalf("the machine took %d update(s), refused %d run(s) and was written %d object(s); want 1, 0 and its source", updates, refusals, writes)
+		}
+		if _, out := runCozy(t, root, "run", "show", id); !strings.Contains(out, "machine software update") {
+			t.Fatalf("the update is not shown as a stage:\n%s", out)
 		}
 	})
 	t.Run("names the next step", func(t *testing.T) {

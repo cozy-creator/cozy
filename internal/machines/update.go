@@ -135,14 +135,15 @@ func (h *Host) retainActivatedHost() (*installedArtifact, *exit.Error) {
 }
 
 // follow brings a machine boot to the Hub's target software unless its owner pinned the files
-// it runs. It answers whether the software changed, else why not, and whether that was a
-// failure: a machine that cannot follow keeps serving what it runs.
-func (h *Host) follow(ctx context.Context, account *hub.Client) (changed bool, why string, failed bool) {
+// it runs and nothing needs more (`needed`: a run they cannot serve). It answers whether the
+// software changed, else why not, and whether that was a failure: a machine that cannot
+// follow keeps serving what it runs.
+func (h *Host) follow(ctx context.Context, account *hub.Client, needed bool) (changed bool, why string, failed bool) {
 	before, problem := h.Installed()
 	switch {
 	case account == nil || problem != nil || before == nil:
 		return false, "", false
-	case before.Pinned:
+	case before.Pinned && !needed:
 		return false, "it runs the files it was installed from", false
 	}
 	target, problem := account.Software(ctx)
@@ -162,8 +163,8 @@ func (h *Host) follow(ctx context.Context, account *hub.Client) (changed bool, w
 	return true, "", false
 }
 
-// FollowTarget brings the running machine to the Hub's target software, as a boot does: it
-// answers whether the software changed, else why not.
+// FollowTarget brings the running machine to the Hub's target software for a run its software
+// cannot serve, pinned or not: it answers whether the software changed, else why not.
 func (h *Host) FollowTarget(ctx context.Context, account *hub.Client) (bool, string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -172,7 +173,7 @@ func (h *Host) FollowTarget(ctx context.Context, account *hub.Client) (bool, str
 		return false, problem.Message
 	}
 	defer unlock()
-	changed, why, _ := h.follow(ctx, account)
+	changed, why, _ := h.follow(ctx, account, true)
 	return changed, why
 }
 

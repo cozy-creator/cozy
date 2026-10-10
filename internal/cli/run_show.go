@@ -853,7 +853,7 @@ func preparingStage(event preparingEvent) reportStage {
 	name := map[string]string{"resolved": "resolve", "downloading": "download",
 		"preparing": "package environment", "connect": "machine connection",
 		"package_preparation": "package preparation", "machine": "machine preparation", "model_defaults": "model defaults",
-		"inputs": "input staging", "submit": "submission"}[event.Stage]
+		"inputs": "input staging", "submit": "submission", "update": "machine software update"}[event.Stage]
 	if name == "" {
 		name = event.Stage
 	}
