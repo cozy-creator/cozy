@@ -78,7 +78,7 @@ var Routes = []Route{
 		"reconciled rental inventory, account spend, pending acquisitions, and activity",
 		"`cozy rental list`"},
 	{"POST", "/v1/local/rentals/{rental_id}/keepalive", Local, true, true, false, "",
-		"explicitly reset fixed fifteen-minute idle deadline after authenticated Host acknowledgment",
+		"reset the rental's fifteen-minute idle clock once, after its machine acknowledges",
 		"`cozy rental keepalive`"},
 	{"GET", "/v1/local/machines/{machine}/status", Local, true, false, false, "",
 		"one machine's picture as it reports it: software, GPUs, live runs, environments, disk, idle deadline",

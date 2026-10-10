@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
+	"time"
 
 	machinepb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -57,6 +60,28 @@ func (m *machineRuns) Status(ctx context.Context, machine string) (api.MachineSt
 		return api.MachineStatus{}, machines.Transport(err)
 	}
 	return statusOf(frame), nil
+}
+
+// releaseDue asks each ready rental's machine, at most eight at once, when it ends itself.
+// One its Hub cannot reach is not asked; one that cannot answer, or names none, shows none.
+func (m *machineRuns) releaseDue(ctx context.Context, rows []api.RentalSummary) {
+	var wait sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for i := range rows {
+		if rows[i].State != hub.RentalReady || rows[i].UnreachableSince != "" {
+			continue
+		}
+		wait.Add(1)
+		go func(row *api.RentalSummary) {
+			defer wait.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			if status, problem := m.Status(ctx, row.ID); problem == nil && status.IdleDeadlineUnixMS > 0 {
+				row.ReleaseDue = time.UnixMilli(status.IdleDeadlineUnixMS).UTC().Format(time.RFC3339Nano)
+			}
+		}(&rows[i])
+	}
+	wait.Wait()
 }
 
 // machineLogs maps the log names clients use to the logs machines keep: the name

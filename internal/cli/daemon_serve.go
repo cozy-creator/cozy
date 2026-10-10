@@ -200,8 +200,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 		MachineExecutions:   machines,
 		Orchestrator:        c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
-		RentalInventory: func(hub string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
-			return readRentalInventory(st, fleet, hub, allHubs, reconcile)
+		RentalInventory: func(call context.Context, hub string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
+			inventory, problem := readRentalInventory(st, fleet, hub, allHubs, reconcile)
+			if problem == nil {
+				machines.releaseDue(call, inventory.Rentals)
+			}
+			return inventory, problem
 		},
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
@@ -219,7 +223,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		addr, strings.Join(bound, "+"), socket)
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s\n", l.DB, yield)
 	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Daemon)
-	fmt.Fprintln(ctx.Out, "  rentals: unused rentals time out after 15 minutes; end used rentals explicitly")
+	fmt.Fprintln(ctx.Out, "  rentals: "+idleReleaseNote())
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down · exits on its own after %s with nothing to manage\n",
 			ctx.Cfg.DaemonIdleShutdown)

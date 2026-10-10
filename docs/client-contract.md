@@ -75,12 +75,10 @@ the new one's GPU quote and storage estimate fit `rental.max_owner_hourly_spend_
 checked atomically, and refuses otherwise with `rental.fleet_spend_cap`. Creator reuses the
 cheapest idle rental first, otherwise buys the cheapest offered SKU; a product the cap
 refuses is excluded and the next one tried. Every rental, manual or
-Creator-managed, has an immutable 900-second idle deadline. Only actual work on that
-machine and an acknowledged explicit `cozy rental keepalive <name>` reset it. Retained
-failed/paused files, connection traffic and unpinned fleet work do not. The pod independently
-enforces expiry while Creator is offline, using the existing Hub release route. Creator
-schedules its fallback from first local receipt observation, so clock skew cannot make
-it release before the acknowledged allowance; duplicate/older receipts do not renew it. A managed rental whose assigned requests are terminal, their output
+Creator-managed, ends itself after 900 seconds with no job queued for or running on it; the
+machine enforces this, with or without Creator, and an acknowledged
+`cozy rental keepalive <name>` resets that clock once. Creator only reports the deadline the
+machine's Status names. A managed rental whose assigned requests are terminal, their output
 bytes mirrored, and their outcome acknowledgements sent is released at once when its work was
 a job. `cozy rental end` releases one now.
 
@@ -328,8 +326,8 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | one attempt's kept triage bundle from its own row; 404 when none was kept |
 | `POST /v1/local/requests/{id}/abandon` | local | yes | explicit actor abandons local Runtime-run tracking; preserves remote evidence and does not confirm remote stop or release a rental |
 | `GET /v1/local/requests/{id}/evidence` | local | yes | one run's lifecycle events, the latest sample of each progress stream, and its last attempt's kept triage bundle; the `cozy run show` source |
-| `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, and activity; `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
-| `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | one explicit reset of an unused machine's fifteen-minute deadline (Status keepalive); used machines acknowledge deadline zero; no body |
+| `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, activity, and each ready machine's own idle deadline (`release_due_at`); `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
+| `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | one reset of the machine's fifteen-minute idle clock (Status keepalive); answers the new deadline; no body |
 | `GET /v1/local/machines/{machine}/status` | local | yes | one machine's picture as it reports it (cozy.machine.v1 Status): software, GPUs, live runs, environments, disk, idle deadline |
 | `GET /v1/local/machines/{machine}/logs/{log}` | local | yes | one log a machine keeps (`tensorfs`: TensorFS's transport decisions), oldest line first, `?tail_bytes=` the newest; an older machine answers a note in `unavailable` |
 | `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |

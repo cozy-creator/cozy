@@ -14,7 +14,6 @@ import (
 type RentalInventory struct {
 	MachinesRunning      int             `json:"machines_running"`
 	HourlySpendUSDMicros int64           `json:"hourly_spend_usd_micros"`
-	IdleReleaseSeconds   int64           `json:"idle_release_s"`
 	Rentals              []RentalSummary `json:"rentals"`
 	Unrecorded           []RentalSummary `json:"unrecorded"`
 	Pending              []RentalSummary `json:"pending"`
@@ -74,7 +73,10 @@ type RentalSummary struct {
 	ReadyAt             string          `json:"ready_at,omitempty"`
 	BoughtFor           string          `json:"bought_for,omitempty"`
 	Activity            *RentalActivity `json:"activity,omitempty"`
-	Operation           string          `json:"operation,omitempty"`
+	// ReleaseDue is when the rental's machine says it ends itself unless a job is queued
+	// or running by then (RFC 3339); blank when it names none or cannot answer.
+	ReleaseDue string `json:"release_due_at,omitempty"`
+	Operation  string `json:"operation,omitempty"`
 	// Boot is the pod's boot while the Hub still acquires it.
 	Boot *hub.RentalBoot `json:"boot,omitempty"`
 	// RuntimeUpdate is the state of a Runtime update holding this rental's work.
@@ -106,10 +108,9 @@ type RentalSummary struct {
 // Activity is absent for machines known only to the Hub: this daemon cannot
 // observe their queued/running work and must not report zero for them.
 type RentalActivity struct {
-	Running    int    `json:"running"`
-	Queued     int    `json:"queued"`
-	IdleSince  string `json:"idle_since_at,omitempty"`
-	ReleaseDue string `json:"release_due_at,omitempty"`
+	Running   int    `json:"running"`
+	Queued    int    `json:"queued"`
+	IdleSince string `json:"idle_since_at,omitempty"`
 }
 
 func (s *Server) listRentals(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +124,7 @@ func (s *Server) listRentals(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	inventory, problem := s.rentalInventory(hub, r.URL.Query().Get("hubs") == "all",
+	inventory, problem := s.rentalInventory(r.Context(), hub, r.URL.Query().Get("hubs") == "all",
 		r.URL.Query().Get("reconcile") != "false")
 	if problem != nil {
 		s.refuseTyped(w, r, problem)

@@ -11,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 // readRentalInventory is one hub's reconciled fleet, or with allHubs every known
@@ -75,7 +74,6 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 		}
 		merged.MachinesRunning += result.MachinesRunning
 		merged.HourlySpendUSDMicros += result.HourlySpendUSDMicros
-		merged.IdleReleaseSeconds = result.IdleReleaseSeconds
 		merged.Rentals = append(merged.Rentals, result.Rentals...)
 		merged.Unrecorded = append(merged.Unrecorded, result.Unrecorded...)
 		merged.Pending = append(merged.Pending, result.Pending...)
@@ -173,7 +171,6 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		result.MachinesRunning, result.HourlySpendUSDMicros = count, burn
 	}
 	census := fleet.censusLocked(origin)
-	result.IdleReleaseSeconds = int64(rental.IdleTimeout / time.Second)
 	rows, problem := st.Rentals()
 	if problem != nil {
 		return result, problem
@@ -223,12 +220,9 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		} else if update != nil && update.Active() {
 			summary.RuntimeUpdate = update.State
 		}
-		if idle.PendingPreparation > 0 {
-			summary.Activity = nil
-		}
-		// Local observations describe inactivity, not the worker's release policy.
-		// Only its live Status can supply an authoritative expiry (zero means none).
-		if summary.Activity != nil && idle.Queued == 0 && idle.Running == 0 && !idle.Since.IsZero() {
+		// This host's own observation of the machine's work; when it ends itself is the
+		// machine's to say (ReleaseDue, from its live Status).
+		if idle.Queued == 0 && idle.Running == 0 && !idle.Since.IsZero() {
 			summary.Activity.IdleSince = idle.Since.UTC().Format(time.RFC3339)
 		}
 		result.Rentals = append(result.Rentals, summary)

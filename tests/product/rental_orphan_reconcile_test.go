@@ -160,7 +160,7 @@ func TestEndingAnUnrecordedMachineByItsHubNameReleasesIt(t *testing.T) {
 
 // TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt is the idle ruling as behaviour.
 //
-// The daemon HAS an automatic shutdown — a fixed fifteen minutes — and it applies to the machines this host owns. It must not apply here. A
+// Rentals end themselves after fifteen idle minutes; this daemon ends none on its own. A
 // rental the hub bills this account for that this host has no record of may be
 // another host's live machine: this daemon holds none of its credentials, cannot see
 // its work, and cannot tell an abandoned pod from one somebody is using. Ending it on

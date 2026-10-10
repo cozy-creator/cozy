@@ -8,12 +8,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestUsedRentalKeepaliveAcknowledgesNoDeadline(t *testing.T) {
-	row := records.Rental{ID: "used", MachineName: "used", State: "ready", AcceleratorModel: "CPU", AcceleratorCount: 1,
+// A machine that names no deadline (TensorD 0.5.2–0.5.5 after a job) is still an acknowledgment.
+func TestKeepaliveAcceptsAMachineNamingNoDeadline(t *testing.T) {
+	row := records.Rental{ID: "older", MachineName: "older", State: "ready", AcceleratorModel: "CPU", AcceleratorCount: 1,
 		HourlyRateUSDMicros: 1, ExpectedWorkerID: "worker", ExpectedWorkerBootID: "boot"}
 	receipt, problem := acknowledged(&row, "worker", "boot", 0)
 	if problem != nil || receipt.IdleDeadlineMS != 0 {
-		t.Fatalf("used-rental acknowledgment: %+v %v", receipt, problem)
+		t.Fatalf("no-deadline acknowledgment: %+v %v", receipt, problem)
 	}
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.sqlite"))
 	if problem != nil {

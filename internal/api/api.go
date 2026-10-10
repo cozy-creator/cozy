@@ -83,7 +83,7 @@ type Server struct {
 	// rentals resolves only the non-secret, attempt-bound desired placement. The
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
 	rentals             func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
-	rentalInventory     func(string, bool, bool) (RentalInventory, *exit.Error)
+	rentalInventory     func(context.Context, string, bool, bool) (RentalInventory, *exit.Error)
 	rentalKeepalive     func(context.Context, string) (RentalKeepaliveResult, *exit.Error)
 	rentalInstall       func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	rentalInstallStatus func(string, string) (*RentalInstallStatus, *exit.Error)
@@ -139,7 +139,7 @@ type Options struct {
 	// sent separately over WorkerControl.
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	// RentalInventory answers one hub's fleet, or with allHubs every hub's.
-	RentalInventory func(hub string, allHubs, reconcile bool) (RentalInventory, *exit.Error)
+	RentalInventory func(ctx context.Context, hub string, allHubs, reconcile bool) (RentalInventory, *exit.Error)
 	RentalKeepalive func(context.Context, string) (RentalKeepaliveResult, *exit.Error)
 	RentalInstall   func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	// RentalInstallStatus reads one queued installation on one machine, with its progress.

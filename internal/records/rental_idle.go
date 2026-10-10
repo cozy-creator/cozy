@@ -7,8 +7,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-const RentalIdleTimeoutSeconds int64 = 900
-
 const rentalIdleDDL = `CREATE TABLE IF NOT EXISTS rental_idle (
  rental_id TEXT PRIMARY KEY REFERENCES rentals(id) ON DELETE CASCADE,
  worker_id TEXT NOT NULL DEFAULT '',
@@ -16,8 +14,7 @@ const rentalIdleDDL = `CREATE TABLE IF NOT EXISTS rental_idle (
  acknowledged_at_ms INTEGER NOT NULL DEFAULT 0,
  idle_deadline_ms INTEGER NOT NULL DEFAULT 0,
  receipt_observed_at TEXT NOT NULL DEFAULT '',
- work_finished_at TEXT NOT NULL DEFAULT '',
- preparation_pending INTEGER NOT NULL DEFAULT 0
+ work_finished_at TEXT NOT NULL DEFAULT ''
 )`
 
 // RentalIdleRunCounts excludes retained terminal attempts and counts only work
@@ -57,8 +54,8 @@ type RentalKeepalive struct {
 }
 
 // RecordRentalKeepalive accepts only an acknowledgment from the rental's recorded boot.
-// The worker owns expiry; zero means there is no automatic deadline. An older
-// acknowledgment never replaces a newer observation.
+// The machine owns expiry; a zero deadline names none. An older acknowledgment never
+// replaces a newer observation.
 func (s *Store) RecordRentalKeepalive(id string, result RentalKeepalive, observedAt time.Time) *exit.Error {
 	if observedAt.IsZero() || result.WorkerID == "" || result.WorkerBootID == "" || result.AcknowledgedAtMS <= 0 || (result.IdleDeadlineMS != 0 && result.IdleDeadlineMS <= result.AcknowledgedAtMS) {
 		return exit.New(exit.Conflict, "the machine returned an invalid rental keepalive acknowledgment")
@@ -90,61 +87,34 @@ func (s *Store) RecordRentalKeepalive(id string, result RentalKeepalive, observe
 	return nil
 }
 
-func (s *Store) RecordRentalPreparationStarted(id string) *exit.Error {
-	result, err := s.db.Exec(`INSERT INTO rental_idle(rental_id,preparation_pending) SELECT id,1 FROM rentals WHERE id=? AND state='ready' ON CONFLICT(rental_id) DO UPDATE SET preparation_pending=preparation_pending+1`, id)
-	if err != nil {
-		return exit.Internalf("cannot record rental preparation: %s", err)
-	}
-	count, err := result.RowsAffected()
-	if err != nil || count != 1 {
-		return exit.New(exit.Conflict, "rental is no longer ready for preparation")
-	}
-	return nil
-}
-
-func (s *Store) RecordRentalWorkFinished(id string, at time.Time) *exit.Error {
-	_, err := s.db.Exec(`INSERT INTO rental_idle(rental_id,work_finished_at) SELECT id,? FROM rentals WHERE id=?
- ON CONFLICT(rental_id) DO UPDATE SET work_finished_at=excluded.work_finished_at,preparation_pending=MAX(0,preparation_pending-1)`, at.UTC().Format(time.RFC3339Nano), id)
-	if err != nil {
-		return exit.Internalf("cannot record rental work completion: %s", err)
-	}
-	return nil
-}
-
-func (s *Store) RentalIdleResetAt(row Rental) (time.Time, int, *exit.Error) {
-	return rentalIdleResetAt(s.db, row)
-}
-
-func rentalIdleResetAt(reader rentalIdleReader, row Rental) (time.Time, int, *exit.Error) {
+func rentalIdleResetAt(reader rentalIdleReader, row Rental) (time.Time, *exit.Error) {
 	var ack int64
-	var pending int
 	var worker, boot, finished, observed string
-	err := reader.QueryRow(`SELECT worker_id,worker_boot_id,acknowledged_at_ms,work_finished_at,preparation_pending,receipt_observed_at FROM rental_idle WHERE rental_id=?`, row.ID).Scan(&worker, &boot, &ack, &finished, &pending, &observed)
+	err := reader.QueryRow(`SELECT worker_id,worker_boot_id,acknowledged_at_ms,work_finished_at,receipt_observed_at FROM rental_idle WHERE rental_id=?`, row.ID).Scan(&worker, &boot, &ack, &finished, &observed)
 	if err == sql.ErrNoRows {
-		return time.Time{}, 0, nil
+		return time.Time{}, nil
 	}
 	if err != nil {
-		return time.Time{}, 0, exit.Internalf("cannot read rental idle receipt: %s", err)
+		return time.Time{}, exit.Internalf("cannot read rental idle receipt: %s", err)
 	}
 	var at time.Time
 	if ack > 0 && worker == row.ExpectedWorkerID && boot == row.ExpectedWorkerBootID {
-		// Host timestamps are identity/order facts, never a laptop clock baseline.
-		// Scheduling from first receipt avoids early DELETE when clocks differ.
+		// Host timestamps are identity/order facts; idle starts at this computer's receipt.
 		at, err = time.Parse(time.RFC3339Nano, observed)
 		if err != nil {
-			return time.Time{}, 0, exit.Internalf("invalid rental keepalive observation time: %s", err)
+			return time.Time{}, exit.Internalf("invalid rental keepalive observation time: %s", err)
 		}
 	}
 	if finished != "" {
 		work, err := time.Parse(time.RFC3339Nano, finished)
 		if err != nil {
-			return time.Time{}, 0, exit.Internalf("invalid rental work completion time: %s", err)
+			return time.Time{}, exit.Internalf("invalid rental work completion time: %s", err)
 		}
 		if work.After(at) {
 			at = work
 		}
 	}
-	return at, pending, nil
+	return at, nil
 }
 
 type rentalIdleReader interface {
@@ -152,22 +122,11 @@ type rentalIdleReader interface {
 	QueryRow(string, ...any) *sql.Row
 }
 
-// RentalIdleState is one machine's work and clock facts. Unresolved preparation
-// is uncertainty after controller loss, not activity or a clock renewal.
+// RentalIdleState is this host's observation of one machine's work: what it has queued and
+// running, and since when it has had none. When the machine ends itself is its own to say.
 type RentalIdleState struct {
-	Queued, Running, PendingPreparation int
-	Since                               time.Time
-}
-
-func (i RentalIdleState) ReleaseAt() (time.Time, bool) {
-	if i.Queued > 0 || i.Running > 0 || i.PendingPreparation > 0 || i.Since.IsZero() {
-		return time.Time{}, false
-	}
-	return i.Since.Add(time.Duration(RentalIdleTimeoutSeconds) * time.Second), true
-}
-func (i RentalIdleState) Due(at time.Time) bool {
-	deadline, ok := i.ReleaseAt()
-	return ok && !at.Before(deadline)
+	Queued, Running int
+	Since           time.Time
 }
 
 func (s *Store) RentalIdleObservation(row Rental) (RentalIdleState, *exit.Error) {
@@ -193,11 +152,10 @@ func rentalIdleObservation(reader rentalIdleReader, row Rental) (RentalIdleState
 	if found && last.SettledAt.After(idle.Since) {
 		idle.Since = last.SettledAt
 	}
-	at, pending, problem := rentalIdleResetAt(reader, row)
+	at, problem := rentalIdleResetAt(reader, row)
 	if problem != nil {
 		return idle, problem
 	}
-	idle.PendingPreparation = pending
 	if at.After(idle.Since) {
 		idle.Since = at
 	}

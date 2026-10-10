@@ -406,6 +406,7 @@ type rentalListingRow struct {
 	Running     *int   `json:"running"`
 	Queued      *int   `json:"queued"`
 	IdleSeconds *int   `json:"idle_s"`
+	IdleSince   string `json:"idle_since_at"`
 	ReleaseDue  string `json:"release_due_at"`
 }
 

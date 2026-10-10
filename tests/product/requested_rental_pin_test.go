@@ -76,7 +76,7 @@ func TestRequestedRentalQueueKeepsRentalAlive(t *testing.T) {
 	fatal(t, problem)
 	idle, problem := rental.ObserveIdle(store, row)
 	fatal(t, problem)
-	if idle.Queued != 1 || idle.Running != 0 || idle.Due(now) {
+	if idle.Queued != 1 || idle.Running != 0 {
 		t.Fatalf("requested-rental work is invisible to idle: %+v", idle)
 	}
 	queued, running, problem := store.RentalRunCounts(row.ID)

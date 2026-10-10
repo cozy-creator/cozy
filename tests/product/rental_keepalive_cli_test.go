@@ -104,7 +104,7 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 			t.Fatalf("keepalive CLI: %d %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
 		}
 		var result struct {
-			ReleaseDue string `json:"release_due"`
+			ReleaseDue string `json:"release_due_at"`
 		}
 		must(t, json.Unmarshal([]byte(out), &result))
 		due, err := time.Parse(time.RFC3339Nano, result.ReleaseDue)
