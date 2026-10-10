@@ -130,13 +130,23 @@ type reportGPU struct {
 	StartUS   int64  `json:"start_us"`
 	EndUS     int64  `json:"end_us"`
 	Attention struct {
-		Requested string         `json:"requested"`
-		Observed  string         `json:"observed"`
-		Impl      string         `json:"impl"`
-		Kernels   []reportKernel `json:"kernels,omitempty"` // every kernel of its chains
-		Sol       *solCalls      `json:"sol,omitempty"`
-		Segments  []segment      `json:"segments,omitempty"`
+		Requested string              `json:"requested"`
+		Observed  string              `json:"observed"`
+		Impl      string              `json:"impl"`
+		Kernels   []reportKernel      `json:"kernels,omitempty"` // every kernel of its chains
+		Sol       *solCalls           `json:"sol,omitempty"`
+		Segments  []segment           `json:"segments,omitempty"`
+		Fallbacks []attentionFallback `json:"fallbacks,omitempty"`
 	} `json:"attention"`
+}
+
+// attentionFallback preserves why a different kernel served when it was selected.
+// The preferred kernel may already be ready by the end of the run.
+type attentionFallback struct {
+	Component string `json:"component"`
+	Preferred string `json:"preferred"`
+	Selected  string `json:"selected"`
+	Reason    string `json:"reason"`
 }
 
 // segment is one attention selection a run served from `step` of `stage` on ("" is the
@@ -1288,6 +1298,13 @@ func (g reportGPU) number() string {
 // kernel of its chains why it did not (still compiling, failed, absent, unsupported), with
 // its compile time on this machine.
 func emitKernels(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, full bool) {
+	for _, gpu := range gpus {
+		for _, fallback := range gpu.Attention.Fallbacks {
+			fmt.Fprintf(w, "\nGPU %s attention fallback (%s): used %s instead of %s: %s\n",
+				gpu.number(), fallback.Component, fallback.Selected, fallback.Preferred,
+				output.Elide(fallback.Reason, 240, full))
+		}
+	}
 	header := false
 	for _, gpu := range gpus {
 		for _, kernel := range gpu.Attention.Kernels {
