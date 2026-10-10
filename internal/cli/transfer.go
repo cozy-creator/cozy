@@ -122,7 +122,7 @@ func handleMachineModelDownload(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--idempotency-key") != "" {
 		return exit.Usagef("machine model download does not accept --rental-only or --idempotency-key")
 	}
-	model, problem := resolveRemoteModel(ctx, "", launch.Slot{}, ctx.Inv.Args[0], ctx.Inv.Value("--lane"), nil)
+	model, problem := resolveRemoteModel(ctx, client(ctx), "", launch.Slot{}, ctx.Inv.Args[0], ctx.Inv.Value("--lane"), nil)
 	if problem != nil {
 		return problem
 	}

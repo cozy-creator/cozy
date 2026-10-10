@@ -669,6 +669,11 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 	for _, slot := range ep.Models {
 		slots[slot.Path] = slot
 	}
+	refs := make([]string, 0, len(selected))
+	for _, spec := range selected {
+		refs = append(refs, spec.Ref)
+	}
+	cards := readCards(ctx, refs)
 	out := make([]orchestrator.ModelRef, 0, len(selected))
 	for _, spec := range selected {
 		slot, ok := slots[spec.Slot]
@@ -678,9 +683,9 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 		var row orchestrator.ModelRef
 		var problem *exit.Error
 		if spec.Explicit {
-			row, problem = resolveRemoteModel(ctx, target.Package, slot, spec.Ref, spec.Lane, spec.Binding)
+			row, problem = resolveRemoteModel(ctx, cards, target.Package, slot, spec.Ref, spec.Lane, spec.Binding)
 		} else {
-			row, problem = resolveRemoteLadder(ctx, target.Package, slot, spec)
+			row, problem = resolveRemoteLadder(ctx, cards, target.Package, slot, spec)
 		}
 		if problem != nil {
 			return nil, problem
@@ -837,7 +842,7 @@ func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstal
 	return row, nil
 }
 
-func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw, wantedLane string,
+func resolveRemoteModel(ctx *Context, cards cardReader, packageName string, slot launch.Slot, raw, wantedLane string,
 	binding *hub.PackageBindingRow) (orchestrator.ModelRef, *exit.Error) {
 	// Exact checkpoint inputs use Hub-owned facts; named selections use the release
 	// card. Both freeze a verified repository/manifest identity before preparation.
@@ -883,7 +888,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 			ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
 			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}, nil
 	}
-	_, selected, problem := modelReleaseCardForLane(hctx, client(ctx), ref, release, wantedLane)
+	_, selected, problem := modelReleaseCardForLane(hctx, cards, ref, release, wantedLane)
 	if problem != nil {
 		return empty, problem
 	}

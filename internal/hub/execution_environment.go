@@ -22,7 +22,26 @@ type ExecutionEnvironment struct {
 	TrustRoot   []byte            `json:"-"`
 }
 
+// ExecutionEnvironment is read once per credential and kept beside it, as the account is: a
+// later run, in this process or the next, reads no Hub.
 func (c *Client) ExecutionEnvironment(ctx context.Context) (ExecutionEnvironment, *exit.Error) {
+	type kept struct {
+		Environment map[string]string `json:"environment"`
+		TrustRoot   []byte            `json:"trust_root,omitempty"`
+	}
+	path := c.keptPath("environments")
+	var held kept
+	if loadRelease(path, &held) && held.Environment["TENSORHUB_ORIGIN"] != "" && held.Environment["TENSORHUB_PUBLIC_ORIGIN"] != "" {
+		return ExecutionEnvironment{Environment: held.Environment, TrustRoot: held.TrustRoot}, nil
+	}
+	out, problem := c.readExecutionEnvironment(ctx)
+	if problem == nil {
+		storeRelease(path, kept{Environment: out.Environment, TrustRoot: out.TrustRoot})
+	}
+	return out, problem
+}
+
+func (c *Client) readExecutionEnvironment(ctx context.Context) (ExecutionEnvironment, *exit.Error) {
 	var out ExecutionEnvironment
 	if problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/execution-environment", auth: true, trustRoot: &out.TrustRoot}, &out); problem != nil {
 		return ExecutionEnvironment{}, problem
@@ -44,6 +63,19 @@ func (c *Client) ExecutionEnvironment(ctx context.Context) (ExecutionEnvironment
 // server's token endpoint, from its protected-resource metadata (RFC 9728) and the issuer's
 // OpenID metadata. The issuer is this Hub's AuthKit, read at its path on this client's origin.
 func (c *Client) TokenEndpoint(ctx context.Context) (string, *exit.Error) {
+	path := c.keptPath("token-endpoints")
+	var endpoint string
+	if loadRelease(path, &endpoint) && endpoint != "" {
+		return endpoint, nil
+	}
+	endpoint, problem := c.readTokenEndpoint(ctx)
+	if problem == nil {
+		storeRelease(path, endpoint)
+	}
+	return endpoint, problem
+}
+
+func (c *Client) readTokenEndpoint(ctx context.Context) (string, *exit.Error) {
 	var described struct {
 		Servers []string `json:"authorization_servers"`
 	}

@@ -498,7 +498,10 @@ type Request struct {
 	// this request, before any scheduler can create a local attempt.
 	MachineExecutionObserver bool                      `json:"-"`
 	MachineEndpoint          *machineendpoint.Endpoint `json:"-"` // admission-only public target in request events
-	DeadlineUnixMS           uint64                    `json:"-"` // frozen submission event is its durable source
+	// Placement is the machine a run names at submission, recorded in the one commit the
+	// submission waits on; empty: its observer places it.
+	Placement      string `json:"-"`
+	DeadlineUnixMS uint64 `json:"-"` // frozen submission event is its durable source
 	// Warnings are admission-only: each becomes one request.warning event with the row.
 	Warnings []Warning `json:"-"`
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
@@ -1736,7 +1739,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		if r.ParentRequestID != "" {
 			return Request{}, false, exit.New(exit.Validation, "a machine execution observer must be a root request")
 		}
-		machine := ""
+		machine := r.Placement
 		if r.MachineEndpoint != nil {
 			machine = r.MachineEndpoint.Name()
 		}

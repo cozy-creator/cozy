@@ -44,13 +44,16 @@ func (c *Client) CurrentAccount(ctx context.Context) (Account, *exit.Error) {
 
 // accountPath keeps the account of this client's credential: its machine key, else its
 // operator token. With neither there is no account to keep.
-func (c *Client) accountPath() string {
+func (c *Client) accountPath() string { return c.keptPath("accounts") }
+
+// keptPath names a document of kind kept for this client's Hub and credential; "" keeps none.
+func (c *Client) keptPath(kind string) string {
 	identity := c.CredentialIdentity()
 	if c.releases == "" || identity == "" {
 		return ""
 	}
 	name := sha256.Sum256([]byte(c.base + "\x00" + identity))
-	return filepath.Join(filepath.Dir(c.releases), "auth", "accounts", hex.EncodeToString(name[:16])+".json")
+	return filepath.Join(filepath.Dir(c.releases), "auth", kind, hex.EncodeToString(name[:16])+".json")
 }
 
 // CredentialIdentity binds cached authority to the current long-lived device key or

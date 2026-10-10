@@ -27,15 +27,19 @@ type HubCredit struct {
 
 // StateHubCredit records what hub stated; nil forgets it.
 func (s *Store) StateHubCredit(hub string, credit *HubCredit) *exit.Error {
-	var err error
-	if credit == nil {
-		_, err = s.db.Exec(`DELETE FROM hub_credit WHERE hub=?`, hub)
-	} else {
-		_, err = s.db.Exec(`INSERT INTO hub_credit(hub,available_usd_micros,warning_usd_micros,floor_usd_micros,observed_ms)
+	// An observation the Hub states again at every listing: it never waits on the disk, which
+	// the daemon would otherwise sync every few seconds for as long as it holds a rental.
+	err := s.unsynced(func(tx *sql.Tx) error {
+		if credit == nil {
+			_, err := tx.Exec(`DELETE FROM hub_credit WHERE hub=?`, hub)
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO hub_credit(hub,available_usd_micros,warning_usd_micros,floor_usd_micros,observed_ms)
  VALUES(?,?,?,?,?) ON CONFLICT(hub) DO UPDATE SET available_usd_micros=excluded.available_usd_micros,
  warning_usd_micros=excluded.warning_usd_micros,floor_usd_micros=excluded.floor_usd_micros,observed_ms=excluded.observed_ms`,
 			hub, credit.Available, credit.Warning, credit.Floor, credit.Observed.UnixMilli())
-	}
+		return err
+	})
 	if err != nil {
 		return exit.Internalf("cannot record the Hub's credit: %s", err)
 	}

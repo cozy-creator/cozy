@@ -164,7 +164,7 @@ func transferSource(ctx *Context, raw string, upload bool) (records.ModelRef, st
 		source, problem := pinnedProviderSource(ctx, parsed.Canonical)
 		return records.ModelRef{Slot: "model", Source: source}, "", problem
 	}
-	model, problem := resolveRemoteModel(ctx, "", launch.Slot{}, raw, lane, nil)
+	model, problem := resolveRemoteModel(ctx, client(ctx), "", launch.Slot{}, raw, lane, nil)
 	model.Slot = "model"
 	return model, "", problem
 }
@@ -311,7 +311,7 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 			lane = selectedLane
 		}
 		if manifest == "" {
-			resolvedModel, problem := resolveRemoteModel(ctx, "", launch.Slot{}, raw, lane, nil)
+			resolvedModel, problem := resolveRemoteModel(ctx, client(ctx), "", launch.Slot{}, raw, lane, nil)
 			if problem != nil {
 				return publishSource{}, problem
 			}
