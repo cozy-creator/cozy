@@ -5,7 +5,7 @@
 
 use super::credential::{credential_from_spec, Anonymous, HostToken};
 use super::download::{fetch_ranged, Ranged};
-use super::ledger::{Deadline, Ledger, PULL_STREAMS};
+use super::ledger::{Deadline, Ledger};
 use super::policy::{self, blocked, CheckedUrl, SourcePolicy};
 use super::pull::{absolute_location, pull, Fetched, ObjectSource, PullRequest};
 use super::push::{push_object, UploadGrant};
@@ -2132,32 +2132,85 @@ fn a_wide_walk_writes_through_a_bounded_number_of_writers() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A default pull of more objects than `PULL_STREAMS` puts exactly that many requests on
-/// the wire: the origin holds each one until that many are open together, or ten seconds.
-#[test]
-fn a_default_pull_keeps_pull_streams_requests_open_at_the_origin() {
-    let root = temporary("default-streams");
-    let store = Store::init(&root).unwrap();
-    let checkpoint = Arc::new(checkpoint(PULL_STREAMS + 32, 4 * 1024));
+/// An origin whose object answers move 4 KiB at a time: each answer one piece per `gap` at
+/// most, all of them together one piece per `shared`, catching up at most a second left
+/// idle between answers. It counts the most answers it had open at once.
+fn paced_origin(
+    checkpoint: Arc<Checkpoint>,
+    gap: Duration,
+    shared: Duration,
+) -> (Origin, Arc<AtomicUsize>) {
+    let bodies = Arc::clone(&checkpoint);
     let (open, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let (held, most) = (Arc::clone(&open), Arc::clone(&peak));
-    let origin = hub_origin(Arc::clone(&checkpoint), move |_, _| {
-        most.fetch_max(held.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
-        let until = std::time::Instant::now() + Duration::from_secs(10);
-        while most.load(Ordering::SeqCst) < PULL_STREAMS && std::time::Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        held.fetch_sub(1, Ordering::SeqCst);
-        None
+    let next = Arc::new(Mutex::new(std::time::Instant::now()));
+    let most = Arc::clone(&peak);
+    let origin = hub_origin(checkpoint, move |hex, _| {
+        let body = bodies.bodies.get(hex)?.clone();
+        let (open, most, next) = (Arc::clone(&open), Arc::clone(&most), Arc::clone(&next));
+        Some(Serve::Script(Box::new(move |socket: &mut TcpStream| {
+            most.fetch_max(open.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes());
+            let mut due = std::time::Instant::now();
+            for piece in body.chunks(4096) {
+                due += gap;
+                let slot = {
+                    let mut next = next.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    let idle = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+                    *next = (*next).max(idle) + shared;
+                    *next
+                };
+                let at = due.max(slot);
+                std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+                if socket.write_all(piece).is_err() {
+                    break;
+                }
+            }
+            open.fetch_sub(1, Ordering::SeqCst);
+        })))
     });
+    (origin, peak)
+}
+
+/// Each answer moves 100 KB/s however many run, so every doubling lands twice the bytes a
+/// second: a pull asked for 64 starts at 16 and grows to 64.
+#[test]
+fn a_pull_widens_while_wider_lands_more() {
+    let root = temporary("widens");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(170, 64 * 1024));
+    let gap = Duration::from_millis(40);
+    let (origin, peak) = paced_origin(Arc::clone(&checkpoint), gap, Duration::ZERO);
     let policy = SourcePolicy::default();
     let mut request = request_for(&store, &origin.base, &policy);
-    // Judged at the runtime's cadence, so a held request is never restarted.
-    request.sample_seconds = crate::transport::SAMPLE_SECONDS;
+    (request.streams, request.sample_seconds) = (64, 0.05);
     let report = pull(&request).unwrap();
-    assert_eq!(report.fetched, PULL_STREAMS as u64 + 34);
-    assert_eq!(report.streams, PULL_STREAMS, "{report:?}");
-    assert_eq!(peak.load(Ordering::SeqCst), PULL_STREAMS, "{report:?}");
+    assert_eq!(report.fetched, 172);
+    assert_eq!(report.streams, 64, "{report:?}");
+    assert!(peak.load(Ordering::SeqCst) > 32, "{report:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Every answer shares 655 KB/s, which 16 already move with each object taking 1.6 s, ten
+/// times a request's own cost here: the pull tries 32 and holds there.
+#[test]
+fn a_pull_holds_its_width_when_wider_lands_no_more() {
+    let root = temporary("holds");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(130, 64 * 1024));
+    let shared = Duration::from_micros(6_250);
+    let (origin, peak) = paced_origin(Arc::clone(&checkpoint), Duration::ZERO, shared);
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &origin.base, &policy);
+    (request.streams, request.sample_seconds) = (64, 0.05);
+    let report = pull(&request).unwrap();
+    assert_eq!(report.fetched, 132);
+    assert_eq!(report.streams, 32, "{report:?}");
+    assert!(peak.load(Ordering::SeqCst) <= 32, "{report:?}");
     let _ = std::fs::remove_dir_all(root);
 }
 

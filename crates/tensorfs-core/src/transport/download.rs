@@ -97,6 +97,36 @@ pub const PART_BYTES: u64 = 64 << 20;
 /// peers' pace, before it is judged.
 const PIECE_BYTES: u64 = 1 << 20;
 
+/// What a doubling of the requests in flight must pay to stay: equal widths measured within
+/// 4% of each other on a link they saturate, and 26-60% apart on one that rewards width.
+const GROWTH: f64 = 1.1;
+
+/// The download's width, judged on each width's second round of requests (one ended per
+/// stream, so its new streams are under way): bytes home a second against the width before.
+struct Width {
+    now: usize,
+    most: usize,
+    /// Requests ended and bytes home when the round began, and when; `measuring` once the
+    /// first round is done.
+    round: (u64, u64, Instant),
+    measuring: bool,
+    before: Option<f64>,
+}
+
+impl Width {
+    /// The rate of a width whose second round just ended, if one did.
+    fn measured(&mut self, ended: u64, landed: u64) -> Option<f64> {
+        if self.now >= self.most || ended - self.round.0 < self.now as u64 {
+            return None;
+        }
+        let round = std::mem::replace(&mut self.round, (ended, landed, Instant::now()));
+        self.measuring = !self.measuring;
+        (!self.measuring).then(|| {
+            landed.saturating_sub(round.1) as f64 / round.2.elapsed().as_secs_f64().max(1e-6)
+        })
+    }
+}
+
 /// An object being downloaded: its file, and what is still out.
 struct Object {
     /// Its place in `wanted`, which is how the URL supply names it.
@@ -267,13 +297,18 @@ struct Run<'a> {
     /// its object's bytes back out, so asking the same bytes forever is not progress.
     landed: AtomicU64,
     writers: Writers,
+    /// Requests in flight now, and how many have ended, home or not.
+    width: AtomicUsize,
+    ended: AtomicU64,
 }
 
 impl Download<'_> {
-    /// Download `wanted` with `streams` requests in flight. `observer` hears the bytes home
-    /// so far, on this thread.
+    /// Download `wanted` with `first` requests in flight, doubled up to `streams` while each
+    /// doubling lands `GROWTH` times the bytes a second. `observer` hears the bytes home so
+    /// far, on this thread.
     pub fn run(
         &self,
+        first: usize,
         streams: usize,
         mut observer: Option<&mut dyn FetchObserver>,
     ) -> Result<WalkOutcome> {
@@ -301,14 +336,18 @@ impl Download<'_> {
             minted: AtomicU64::new(0),
             landed: AtomicU64::new(0),
             writers: Writers::new(),
+            width: AtomicUsize::new(first.clamp(1, streams)),
+            ended: AtomicU64::new(0),
         };
         std::thread::scope(|scope| {
-            for slot in 0..streams {
+            let spawn = |slot: usize| {
                 let run = &run;
                 scope.spawn(move || run.work(slot));
-            }
-            run.watch(&mut observer);
+            };
+            (0..run.width.load(Ordering::Relaxed)).for_each(spawn);
+            run.watch(&mut observer, &spawn);
         });
+        let streams = run.width.load(Ordering::Relaxed);
         if let Some(observer) = observer.as_mut() {
             observer.moved(run.landed.load(Ordering::Relaxed));
         }
@@ -357,7 +396,11 @@ impl Run<'_> {
         while let Some(chunk) = self.take() {
             let outcome = match chunk.first == chunk.end {
                 true => self.commit(&chunk.object),
-                false => self.request(slot, chunk, &mut buffer),
+                false => {
+                    let outcome = self.request(slot, chunk, &mut buffer);
+                    self.ended.fetch_add(1, Ordering::Relaxed);
+                    outcome
+                }
             };
             let mut state = self.state.lock().unwrap();
             state.busy -= 1;
@@ -983,9 +1026,16 @@ impl Run<'_> {
     /// same time, is dropped. Peers are the requests still running and those that ended
     /// since its window began, never history, so a pod whose every request is slow drops
     /// none. And the pull's own end: nothing new has landed for twice its measured patience.
-    fn watch(&self, observer: &mut Option<&mut dyn FetchObserver>) {
+    fn watch(&self, observer: &mut Option<&mut dyn FetchObserver>, spawn: &dyn Fn(usize)) {
         let job = self.job;
         let sample = self.tick();
+        let mut width = Width {
+            now: self.width.load(Ordering::Relaxed),
+            most: self.flights.len(),
+            round: (0, 0, Instant::now()),
+            measuring: false,
+            before: None,
+        };
         // The most bytes ever home, and when that last grew while requests were being asked.
         let (mut most, mut grew) = (0, Instant::now());
         let mut state = self.state.lock().unwrap();
@@ -1011,6 +1061,29 @@ impl Run<'_> {
                 self.fail(&mut state, refusal);
                 self.wake.notify_all();
                 return;
+            }
+            let landed = self.landed.load(Ordering::Relaxed);
+            if let Some(rate) = width.measured(self.ended.load(Ordering::Relaxed), landed) {
+                let pays = width.before.is_none_or(|before| rate >= before * GROWTH);
+                decisions::record(
+                    job.store,
+                    "width",
+                    &width.now.to_string(),
+                    &format!(
+                        "rate_bps={rate:.0} before_bps={:.0} {}",
+                        width.before.unwrap_or(0.0),
+                        if pays { "widen" } else { "hold" },
+                    ),
+                );
+                match pays {
+                    true => {
+                        let from = width.now;
+                        (width.now, width.before) = ((from * 2).min(width.most), Some(rate));
+                        self.width.store(width.now, Ordering::Relaxed);
+                        (from..width.now).for_each(spawn);
+                    }
+                    false => width.most = width.now,
+                }
             }
             let floor = sample.as_secs_f64() * 2.0;
             let now = Instant::now();
@@ -1285,7 +1358,7 @@ pub fn fetch_ranged(
         backfill: None,
         keep: None,
     }
-    .run(ranged.streams.clamp(1, 64), observer)?;
+    .run(usize::MAX, ranged.streams.clamp(1, 64), observer)?;
     Ok(Fetched {
         object: grant.object.clone(),
         transferred: outcome.bytes_moved,
