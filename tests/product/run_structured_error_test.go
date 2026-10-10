@@ -17,6 +17,7 @@ func TestRunFailureKeepsCodeSeparateFromMessage(t *testing.T) {
 	for _, message := range []string{
 		"the run names no model for generate_image.models.model",
 		"other_code: detail mentions model_choice_absent: literally",
+		"model_choice_absent: literal body in the current typed format",
 	} {
 		t.Run(message, func(t *testing.T) {
 			o := hostOwner(t, strings.ReplaceAll(message, " ", "_"))
