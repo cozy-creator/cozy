@@ -190,10 +190,8 @@ pub fn prepare_editable(
 ) -> Result<PreparedGeneration, Status> {
     let mut command = installer(config, root)?;
     command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
-    if !indexes.is_empty() {
-        // uv's own setting: every uv the helper runs knows the indexes the sources name.
-        let named: Vec<_> = indexes.iter().map(|(name, url)| format!("{name}={url}")).collect();
-        command.env("UV_INDEX", named.join(" "));
+    for (name, url) in indexes {
+        command.arg("--index").arg(format!("{name}={url}"));
     }
     for wheel in wheels {
         command.arg("--wheel").arg(wheel);

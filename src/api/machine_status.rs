@@ -17,7 +17,9 @@ pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Statu
 /// `live-source/1`: a local source's manifest may name a live project file by file (or its
 /// directory on this computer), installed editable in one tree and environment per package;
 /// and a slot a run names no model for takes its declared default. `live-source/2`: that
-/// manifest may also name the uv indexes its project's sources use without declaring them.
+/// manifest may also name the uv indexes its project's sources use without declaring them and the
+/// local path dependencies its lock installs, and a locked project installs whatever indexes
+/// they name.
 pub const CAPABILITIES: &[&str] = &[
     "status/1",
     "run/1",

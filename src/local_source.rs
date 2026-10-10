@@ -59,6 +59,10 @@ pub struct Manifest {
     /// names its account's index (`tensorhub`), whose URL depends on who runs it.
     #[serde(default)]
     pub indexes: BTreeMap<String, String>,
+    /// The local path dependencies its lock installs, as directories or files under the tree:
+    /// their code is the environment's, not the project's own.
+    #[serde(default)]
+    pub locals: Vec<String>,
 }
 #[derive(Deserialize)]
 pub struct Member {
@@ -196,9 +200,9 @@ impl LocalSources {
         Ok(written)
     }
 
-    /// The environment a live manifest runs in: one per lock, project metadata, path
-    /// dependencies beside the project, carried wheels and this machine's interpreter, SDK
-    /// pair and runner. Everything else of the project may change under it.
+    /// The environment a live manifest runs in: one per lock, project metadata, local path
+    /// dependencies, carried wheels and this machine's interpreter, SDK pair and runner.
+    /// Everything else of the project may change under it.
     fn environment(&self, home: &Path, manifest: &Manifest) -> PathBuf {
         let own = match manifest.project.is_empty() {
             true => String::new(),
@@ -208,7 +212,8 @@ impl LocalSources {
             let path = format!("{own}{name}");
             manifest.files.iter().find(|f| f.name == path).map(|f| f.digest.as_str()).unwrap_or_default()
         };
-        let beside: Vec<_> = manifest.files.iter().filter(|f| !f.name.starts_with(&own)).map(|f| (&f.name, f.held())).collect();
+        let local = |name: &str| manifest.locals.iter().any(|dir| name == dir || name.starts_with(&format!("{dir}/")));
+        let beside: Vec<_> = manifest.files.iter().filter(|f| !f.name.starts_with(&own) || local(&f.name)).map(|f| (&f.name, f.held())).collect();
         let carried: Vec<_> = manifest.wheels.iter().map(|w| (&w.name, &w.digest)).collect();
         let key = serde_json::json!({
             "lock": held("uv.lock"), "project": held("pyproject.toml"), "beside": beside, "wheels": carried,
@@ -750,8 +755,9 @@ mod tests {
     }
 
     /// An authored tree names its account's index without declaring it (the URL depends on who
-    /// runs it). Read in place, it installs with the index its manifest names, and without one
-    /// uv says the index is undeclared.
+    /// runs it). Locked, it installs read in place with no index at all: its lock says where each
+    /// dependency comes from. Unlocked, it resolves against the index its manifest names, and
+    /// without one uv says the index is undeclared.
     #[test]
     fn an_authored_tree_installs_with_the_index_its_manifest_names() {
         struct Served(std::process::Child);
@@ -786,19 +792,65 @@ mod tests {
         }
         let url = format!("http://127.0.0.1:{port}/simple/");
         run(Command::new("uv").args(["lock", "--python", "3.12", "--index", &format!("tensorhub={url}"), "--project"]).arg(&project));
-        let manifest = |indexes: serde_json::Value| {
+        let unlocked = m.root.join("unlocked");
+        fs::create_dir_all(unlocked.join("cpu_caller")).unwrap();
+        for name in files {
+            fs::copy(project.join(name), unlocked.join(name)).unwrap();
+        }
+        let manifest = |dir: &Path, names: &[&str], indexes: serde_json::Value| {
             let document = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
-                "files": live_files(&m.objects, "alice", &project, &[&files[..], &["uv.lock"]].concat()), "path": project.to_string_lossy(),
+                "files": live_files(&m.objects, "alice", dir, names), "path": dir.to_string_lossy(),
                 "indexes": indexes, "callees": {"cozy-machine-cpu-memo": "proof/cozy-machine-cpu-memo"}});
             write(&m.objects, "alice", document.to_string().as_bytes()).digest
         };
-        let why = sources.install(&m.service, "alice", &manifest(serde_json::json!({}))).err().unwrap().message;
+        let callee = |installed: Installation| {
+            let held = m.service.catalog.resolve(&installed.generation).unwrap();
+            assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
+        };
+        let locked = [&files[..], &["uv.lock"]].concat();
+        callee(sources.install(&m.service, "alice", &manifest(&project, &locked, serde_json::json!({}))).unwrap());
+        let why = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({}))).err().unwrap().message;
         assert!(why.contains("undeclared index"), "{why}");
-        let installed = sources.install(&m.service, "alice", &manifest(serde_json::json!({"tensorhub": url}))).unwrap();
-        let held = m.service.catalog.resolve(&installed.generation).unwrap();
-        assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
-        let bad = sources.install(&m.service, "alice", &manifest(serde_json::json!({"tensorhub": "file:///etc"}))).err().unwrap();
+        callee(sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": url}))).unwrap());
+        let bad = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": "file:///etc"}))).err().unwrap();
         assert_eq!(bad.code, "local_source_invalid");
+        let _ = fs::remove_dir_all(m.root);
+    }
+
+    /// A path dependency's code is the package's too: an edit of it builds the environment again
+    /// with that dependency built from its new code, though its metadata did not change.
+    #[test]
+    fn an_edited_path_dependency_is_built_again() {
+        let m = machine("cm-beside");
+        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let project = m.root.join("live");
+        for (fixture, to) in [("cpu_caller", ""), ("cpu_memo", "deps/cpu_memo")] {
+            let from = repo.join("tests/fixtures").join(fixture);
+            fs::create_dir_all(project.join(to).join(fixture)).unwrap();
+            for name in ["pyproject.toml", "package.toml", &format!("{fixture}/__init__.py")] {
+                fs::copy(from.join(name), project.join(to).join(name)).unwrap();
+            }
+        }
+        let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
+        // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime<0.19\"]\n[tool.uv.sources]\ncozy-machine-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
+        let names = ["pyproject.toml", "package.toml", "uv.lock", "cpu_caller/__init__.py",
+            "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"];
+        let install = || {
+            let document = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+                "files": live_files(&m.objects, "alice", &project, &names), "path": project.to_string_lossy(), "locals": ["deps/cpu_memo"]});
+            let installed = sources.install(&m.service, "alice", &write(&m.objects, "alice", document.to_string().as_bytes()).digest).unwrap();
+            m.service.catalog.resolve(&installed.generation).unwrap().record.python
+        };
+        let python = install();
+        assert_eq!(run(Command::new(&python).args(["-I", "-c", "import cpu_memo; print(hasattr(cpu_memo, 'EDITED'))"])), "False");
+        let memo = project.join("deps/cpu_memo/cpu_memo/__init__.py");
+        let source = fs::read_to_string(&memo).unwrap();
+        fs::write(&memo, source + "\nEDITED = True\n").unwrap();
+        let python = install();
+        assert_eq!(run(Command::new(&python).args(["-I", "-c", "import cpu_memo; print(cpu_memo.EDITED)"])), "True");
         let _ = fs::remove_dir_all(m.root);
     }
 

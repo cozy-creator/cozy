@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 import uuid
 import zipfile
 from pathlib import Path
@@ -45,6 +46,14 @@ def installed_description(distribution: str, interpreter: Path) -> msgspec.Raw:
 #: SDK, the runner client) is copied into the environment: its static reader refuses metadata
 #: and sources linked from elsewhere. Only the locked dependencies are linked.
 COPY = ("--link-mode", "copy") if os.environ.get("UV_LINK_MODE") == "symlink" else ()
+
+
+def local_builds(project: Path) -> list[str]:
+    """The lock's packages built from a directory on this machine. uv keys a built directory by
+    its metadata alone, so an environment built because their code changed builds them again."""
+    lock = tomllib.loads((project / "uv.lock").read_text())
+    return [row["name"] for row in lock.get("package", ())
+            if {"directory", "editable", "path"} & set(row.get("source", {})) and row["source"].get("editable") != "."]
 
 
 def linked_applications(interpreter: Path) -> list[str]:
@@ -130,12 +139,15 @@ def live_paths(environment: Path) -> None:
 
 def install_editable(*, project: Path, environment: Path, wheels: list[Path], distribution: str, release: str,
                      python_requires: str, python_version: str, generations: Path, client_wheel: Path,
-                     python: str, sdk: list[Path] = (), callees: dict[str, str] | None = None):
+                     python: str, sdk: list[Path] = (), callees: dict[str, str] | None = None,
+                     indexes: list[str] = ()):
     """A live project, installed editable: `environment` is built once from the project's lock
     and kept while the lock stands, and every call publishes a generation that describes the
     project as it is now and runs in that environment. An edit costs a description, never an
     install. `wheels` are locked dependencies the caller carries because this machine cannot
-    fetch them: each installs from its file, at the version the lock selected."""
+    fetch them: each installs from its file, at the version the lock selected. `indexes` (name=url)
+    are those the project's sources name without declaring: a lock already pins where each
+    dependency comes from, so only an unlocked project resolves against them."""
     python = interpreter_for(python, python_requires, python_version)
     project = project.resolve(strict=True)
     metadata = read_metadata(project)
@@ -154,7 +166,8 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                 # every dependency as an ordinary install: only the project itself is live.
                 carried = sorted({tuple(wheel.name.split("-")[:2]) for wheel in wheels})
                 sync = ["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-install-project", "--no-python-downloads",
-                        "--project", str(project), "--python", python, *(f"--no-install-package={name}" for name, _ in carried)]
+                        "--project", str(project), "--python", python, *(f"--no-install-package={name}" for name, _ in carried),
+                        *(f"--refresh-package={name}" for name in local_builds(project))]
                 placed = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(environment)}
                 subprocess.run(sync, env=placed, check=True)
                 linked = linked_applications(interpreter) if COPY else []
@@ -163,11 +176,14 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                 if carried:
                     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "--no-deps", "--no-index",
                                     "--find-links", str(wheels[0].parent), *(f"{name}=={version}" for name, version in carried)], check=True)
-                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "--no-deps", "--editable", str(project)], check=True)
+                # Its dependencies are in place: the project alone, whatever indexes its sources name.
+                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "--no-deps", "--no-sources",
+                                "--editable", str(project)], check=True)
             else:
                 subprocess.run(["uv", "venv", "--allow-existing", "--python", python, str(environment)], check=True)
                 found = ["--find-links", str(wheels[0].parent)] if wheels else []
-                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *found, "--editable", str(project)], check=True)
+                named = [f"--index={index}" for index in indexes]
+                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)], check=True)
             live_paths(environment)
 
         capture()
