@@ -9,6 +9,7 @@ import (
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -41,6 +42,9 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 	}
 	client, rentalID, problem := rentalInstallClient(ctx, rentalName)
 	if problem != nil {
+		return problem
+	}
+	if selection, problem = olderDaemonSelection(ctx, client, selection); problem != nil {
 		return problem
 	}
 	result, problem := client.PrepareRentalPackage(rentalID, selection)
@@ -85,6 +89,34 @@ func rentalInstallClient(ctx *Context, rentalName string) (*localapi.Client, str
 	return client, rentalID, problem
 }
 
+// olderDaemonSelection is the selection a daemon from before package_verbs takes: an exact
+// release, which this command then reads at the hub; local code and removals it cannot queue.
+func olderDaemonSelection(ctx *Context, daemon *localapi.Client, selection records.RentalInstallSelection) (records.RentalInstallSelection, *exit.Error) {
+	if selection.Package == "" || selection.Release != "" && selection.Local == "" && selection.Remove == "" {
+		return selection, nil
+	}
+	if caps, problem := daemon.Capabilities(); problem != nil || caps.PackageVerbs {
+		return selection, problem
+	}
+	if selection.Local != "" || selection.Remove != "" {
+		return selection, exit.Named(exit.Unavailable, "daemon.package_verbs_unavailable",
+			"this computer's daemon predates installing local code on, and removing packages from, a rental").
+			WithRemedy("restart it with `cozy down`; running work and rentals continue")
+	}
+	ref, problem := hub.ParseRef(selection.Package)
+	if problem != nil {
+		return selection, problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	card, problem := client(ctx.forHub(selection.Hub)).PackageCard(hctx, ref)
+	if problem != nil {
+		return selection, packageHubProblem(ctx, selection.Package, problem)
+	}
+	selection.Release, problem = newestPackageRelease(card.Releases)
+	return selection, problem
+}
+
 // settleRentalInstall queues one selection on the rental and follows it to its outcome: what
 // `package update` and `package remove` do once per package.
 func settleRentalInstall(ctx *Context, rentalName string, selection records.RentalInstallSelection) (records.RentalInstall, *exit.Error) {
@@ -99,6 +131,9 @@ func settleRentalInstall(ctx *Context, rentalName string, selection records.Rent
 	}
 	client, rentalID, problem := rentalInstallClient(ctx, rentalName)
 	if problem != nil {
+		return records.RentalInstall{}, problem
+	}
+	if selection, problem = olderDaemonSelection(ctx, client, selection); problem != nil {
 		return records.RentalInstall{}, problem
 	}
 	queued, problem := client.PrepareRentalPackage(rentalID, selection)
