@@ -474,8 +474,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			c.Phase, c.timingAt = "terminal", at.UnixMilli()
 			c.timed = nil
 			for name, track := range record.Stages {
-				stage := reportStage{Name: name, Kind: "inference",
-					StartUnixMS: track.StartedUnixMS, MS: track.TotalMS, Count: track.Count}
+				stage := attributed(name, track)
 				if record.Module == publicationModule {
 					stage.Kind = "phase" // an effect runs no model
 				}
@@ -605,8 +604,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				fmt.Sprintf("fill %s, warm %s", span(load.FillMS), span(load.WarmMS))))
 		}
 		for name, track := range triage.Measurements.Attribution.Stages {
-			report.Stages = append(report.Stages, reportStage{Name: name, Kind: "inference",
-				StartUnixMS: track.StartedUnixMS, MS: track.TotalMS, Count: track.Count})
+			report.Stages = append(report.Stages, attributed(name, track))
 		}
 		report.Steps = stepSummaries(triage.Measurements.Attribution.Steps)
 	}
@@ -643,7 +641,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			Status: status, GPUs: report.GPUs, StartUnixMS: started.UnixMilli(), MS: float64(life.ExecutionMS),
 			Steps: report.Steps, Stages: []reportStage{}}
 		for _, stage := range report.Stages {
-			if stage.Kind == "inference" {
+			if stage.Kind == "inference" || stage.Kind == "wait" {
 				root.Stages = append(root.Stages, stage)
 			}
 		}
@@ -659,10 +657,20 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	return report
 }
 
-// sortStages orders setup, GPU wait, then execution phases and inference, then transfer;
-// within an order, by start (unknown last).
+// attributed is one span Runtime recorded for an execution: inference, or a wait it named
+// "waiting for …" (a request's attention kernel compiling).
+func attributed(name string, track triageTrack) reportStage {
+	kind := "inference"
+	if strings.HasPrefix(name, "waiting for ") {
+		kind = "wait"
+	}
+	return reportStage{Name: name, Kind: kind, StartUnixMS: track.StartedUnixMS, MS: track.TotalMS, Count: track.Count}
+}
+
+// sortStages orders setup, GPU and other waits, then execution phases and inference, then
+// transfer; within an order, by start (unknown last).
 func sortStages(stages []reportStage) {
-	order := map[string]int{"setup": 0, "download": 1, "gpu": 1, "phase": 2, "inference": 2, "transfer": 3}
+	order := map[string]int{"setup": 0, "download": 1, "gpu": 1, "wait": 1, "phase": 2, "inference": 2, "transfer": 3}
 	sort.SliceStable(stages, func(i, j int) bool {
 		a, b := stages[i], stages[j]
 		if order[a.Kind] != order[b.Kind] {
