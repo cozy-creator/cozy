@@ -8,7 +8,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,17 +35,9 @@ import (
 // An undeclared key is carried only to be dropped by ValidatePayload, which names it in the
 // run's one warning (owner, 2026-09-28): an unknown field never refuses a run.
 
-// KernelAxes is the execution-path override's vocabulary of AXES (cr-125), and it is one:
-// attention. A GEMM or fusion pin is not here because no measurement has asked for one. The
-// KERNEL names are the runtime's own (`attention.BY_NAME`) and are deliberately NOT restated
-// here — a second copy of that vocabulary would drift from the image that ships the kernels,
-// so an unknown NAME refuses at the worker, which knows what it can actually run.
-var KernelAxes = []string{"attention"}
-
-// RunKeys are the RESERVED dotted namespaces a run term may claim before the payload grammar
-// sees it. `model.<param>=<ref>` picks the WEIGHTS off the owner's ladder (cl-109);
-// `kernel.<axis>=<name>` picks the EXECUTION PATH off the runtime's own selection (cr-125).
-// Neither can reach a payload field, because a wire name carries no dot.
+// RunKeys are the RESERVED dotted namespace a run term may claim before the payload grammar
+// sees it: `model.<param>=<ref>` picks the WEIGHTS off the owner's ladder (cl-109). It cannot
+// reach a payload field, because a wire name carries no dot.
 type RunKeys struct {
 	// Models is the declared slot path -> ref the caller pinned.
 	Models map[string]string
@@ -54,15 +45,12 @@ type RunKeys struct {
 	// Runtime/package compatibility declaration resolves components and bounds later;
 	// the CLI only canonicalizes syntax and decimal weights here.
 	Overlays map[string][]ModelOverlay
-	// AttentionKernel rides the InvocationSpec to the worker; empty leaves the runtime's own
-	// selection alone, which is what every ordinary run does.
-	AttentionKernel string
 }
 
 // ParsePayload builds one request document from the argv terms, and collects the reserved
-// run keys beside it. The exact-case dotted prefixes are matched BEFORE field case-folding
-// and can never reach a payload field — wire names carry no dot — so they route to the
-// returned RunKeys. A bare `model=` or `kernel=` term stays an ordinary payload field.
+// run keys beside it. The exact-case dotted prefix is matched BEFORE field case-folding
+// and can never reach a payload field — wire names carry no dot — so it routes to the
+// returned RunKeys. A bare `model=` term stays an ordinary payload field.
 func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 	json.RawMessage, RunKeys, *exit.Error,
 ) {
@@ -148,25 +136,6 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		if strings.Contains(term, ".lora=") {
 			if problem := parseModelOverlayTerm(ep, term, &keys); problem != nil {
 				return nil, RunKeys{}, problem
-			}
-			continue
-		}
-		if strings.HasPrefix(term, "kernel.") {
-			axis, name, e := kernelOverrideTerm(term)
-			if e != nil {
-				return nil, RunKeys{}, e
-			}
-			switch axis {
-			case "attention":
-				if keys.AttentionKernel != "" {
-					return nil, RunKeys{}, exit.Usagef("kernel.attention was pinned more than once")
-				}
-				keys.AttentionKernel = name
-			default:
-				// A NAMED AXIS WITH NOWHERE TO PUT IT. Reachable only by adding a name to
-				// KernelAxes without a field beside it, and silently dropping the pin there
-				// would be the exact failure the whole namespace exists to prevent.
-				return nil, RunKeys{}, exit.Internalf("kernel.%s is declared but carries nowhere", axis)
 			}
 			continue
 		}
@@ -399,36 +368,6 @@ func appendModelOverlay(ep *Entrypoint, slotPath string, overlay ModelOverlay, k
 	overlay.Ref, overlay.Weight = strings.TrimSpace(overlay.Ref), canonical
 	keys.Overlays[slotPath] = append(keys.Overlays[slotPath], overlay)
 	return nil
-}
-
-// kernelOverrideTerm claims one `kernel.`-prefixed argv term for the execution-path override
-// (cr-125). The namespace is claimed WHOLE: a term that is not a legal override refuses here
-// rather than falling through to become a payload field named `kernel.gemm`, which is exactly
-// the mistyped-pin failure the reservation exists to prevent. The `:=` form is refused with
-// the rest — a kernel name is one word, so a structured spelling would be a second grammar
-// for the same fact.
-func kernelOverrideTerm(term string) (axis, name string, problem *exit.Error) {
-	refuse := func() *exit.Error {
-		spellings := make([]string, 0, len(KernelAxes))
-		for _, a := range KernelAxes {
-			spellings = append(spellings, "kernel."+a+"=<name>")
-		}
-		return exit.Named(exit.Usage, "kernel_override_unknown",
-			"%s is not an execution-path override", term).
-			WithRemedy("the reserved namespace is %s", strings.Join(spellings, ", "))
-	}
-	key, raw, ok := strings.Cut(term, "=")
-	if !ok || raw == "" || strings.HasSuffix(key, ":") {
-		return "", "", refuse()
-	}
-	asked := strings.TrimPrefix(key, "kernel.")
-	if !slices.Contains(KernelAxes, asked) {
-		return "", "", refuse()
-	}
-	if problem := ValidateAttentionOverride(raw); problem != nil {
-		return "", "", problem
-	}
-	return asked, raw, nil
 }
 
 // ValidateAttentionOverride checks transport syntax only. Runtime owns backend names,

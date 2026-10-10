@@ -16,12 +16,11 @@ component selects that component name across model parameters; including the
 model parameter makes the scope exact. For a turbo entrypoint the parameter is
 `base_model`, for example `base_model/fl2va_dit=kitchen-int8`.
 
-The existing positional spelling is equivalent:
-
-```sh
-cozy run paul/minimax-h3/fl2va prompt="A scene" \
-  kernel.attention=model/fl2va_dit=kitchen-int8
-```
+The override holds for every step of the run. When its kernel is still compiling
+the request waits for that compile (run progress shows it) and then runs on it; a
+failed compile refuses the request with the compile's reason. Requests without an
+override never wait: they start on the best ready kernel and switch at a step
+once a better one is built.
 
 Supply one override, without whitespace. Creator validates its syntax, transports
 the exact string separately from the package payload, records it with the request
@@ -59,7 +58,7 @@ source. For example, after copying the wheel into `vendor/`:
 uv add --no-sync ./vendor/cozy_kernel_flash_attn3-*.whl
 cozy package install . --editable
 cozy run local/my-package/generate --rental=my-rental --input=request.json \
-  kernel.attention=model/dit=flash-attn3 --await --json
+  --attention-kernel=model/dit=flash-attn3 --await --json
 ```
 
 Replace the package, callable, model/component scope, and wheel filename with the

@@ -44,7 +44,7 @@ cozy package install . --editable
 cozy run local/attention-kernel-benchmark/generate \
   model.model=YOUR_ORG/attention-kernel-benchmark@1/bf16 \
   seed=91 tokens=512 iterations=10 --rental=YOUR_RENTAL \
-  kernel.attention=model/dit=sdpa --await --json
+  --attention-kernel=model/dit=sdpa --await --json
 # Repeat with model/dit=flash-attn3, then model/dit=sdpa.
 ```
 

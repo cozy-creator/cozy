@@ -262,14 +262,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if pin := ctx.Inv.Value("--attention-kernel"); pin != "" {
-		if overrides.AttentionKernel != "" && overrides.AttentionKernel != pin {
-			return exit.Usagef("attention kernel was pinned as both %s and %s", overrides.AttentionKernel, pin)
-		}
-		if problem := launch.ValidateAttentionOverride(pin); problem != nil {
-			return problem
-		}
-		overrides.AttentionKernel = pin
+	attentionKernel := ctx.Inv.Value("--attention-kernel")
+	if problem := launch.ValidateAttentionOverride(attentionKernel); problem != nil {
+		return problem
 	}
 	prepareImage := imagePreparer(ctx)
 	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"], prepareImage)
@@ -347,7 +342,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		RequestedRental: selectedRental,
 		Models:          models,
 		OutputDirectory: outputDirectory,
-		AttentionKernel: overrides.AttentionKernel,
+		AttentionKernel: attentionKernel,
 		Ignored:         ignored,
 	}, key)
 	releaseSnapshotReader(target)

@@ -148,7 +148,7 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 		// A pin belongs to the whole run. A scalar may succeed without a site,
 		// but its machine warns in the run's log that no call applied the pin.
 		code, out = runCozy(t, root, "run", localWeightlessRef+"/echo", "why=wheel-proof",
-			"kernel.attention=sdpa", "--idempotency-key="+key+"-pin", "--await", "--json")
+			"--attention-kernel=sdpa", "--idempotency-key="+key+"-pin", "--await", "--json")
 		if code != 0 || !strings.Contains(out, "wheel-proof|"+candidate+"|0.1.0") {
 			t.Fatalf("unmatched run pin prevented the scalar result [%d]: %s", code, out)
 		}
