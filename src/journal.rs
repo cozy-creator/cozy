@@ -21,6 +21,9 @@ pub struct Invocation {
     /// The caller's attention-kernel pin, passed to the executor verbatim.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub attention_kernel: String,
+    /// An explicit run GPU group; zero selects the package's widest supported group.
+    #[serde(default)]
+    pub gpus: u32,
     /// File inputs the caller imported, verified at acceptance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputFile>,

@@ -368,6 +368,7 @@ impl Runs {
             entrypoint: spec.entrypoint.clone(),
             input: spec.input.clone(),
             attention_kernel: spec.attention_kernel.clone(),
+            gpus: spec.gpus,
             inputs: spec.inputs.clone(),
             job: spec.job,
             accelerator: false, // known only after the actual installation is prepared
@@ -726,6 +727,7 @@ impl Runs {
                 entrypoint: spec.entrypoint,
                 input: spec.input,
                 attention_kernel: spec.attention_kernel,
+                gpus: spec.gpus,
                 inputs: spec.inputs,
                 job: spec.job,
                 parent: spec.parent,
@@ -1094,6 +1096,7 @@ impl Runs {
             return Ok(());
         };
         let family = crate::gpu_reservation::family(parent, |id| self.service.engine.get(id))?;
+        let owner = parent.id.clone();
         let (runs, entrypoint) = (self.clone(), entrypoint.to_string());
         let application = application.to_string();
         let started = std::thread::Builder::new().name("child-prefetch".into()).spawn(move || {
@@ -1110,7 +1113,7 @@ impl Runs {
                 Ok((installation, Some(plan))) => {
                     match runs.service.catalog.resolve(&installation.generation)
                         .and_then(|held| held.application(&application)) {
-                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, family.clone()),
+                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, family.clone(), owner.clone()),
                         Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
                     }
                 }
@@ -1698,6 +1701,11 @@ mod tests {
             inputs:Default::default(),weights_destination:String::new(),
         });
         let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child",&[]).unwrap();
+        assert_eq!(child.gpus, 2);
+        let durable = serde_json::to_vec(&Durable::of(&runs.jobs.lock().unwrap()["7"])).unwrap();
+        let restored = serde_json::from_slice::<Durable>(&durable).unwrap().context().unwrap();
+        assert_eq!(restored.gpus, 2, "a resumed job keeps its exact GPU request");
+        runs.jobs.lock().unwrap().insert("7".into(), restored);
         let chosen: Vec<_> = child.models.iter().map(|c| (c.parameter.as_str(), c.repository.as_str())).collect();
         assert_eq!(chosen, [("render.models.network", "second/chosen")],
             "a choice addressed to the callee's package reaches its declared slot, by that slot's path");
@@ -1710,6 +1718,7 @@ mod tests {
         };
         let hinted = runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", std::slice::from_ref(&chosen)).unwrap();
         let demanded = runs.child_spec("alice", "7", "callee:app", "render", json!({"prompt":"later"}), vec![], "call", std::slice::from_ref(&chosen)).unwrap();
+        assert_eq!((hinted.gpus, demanded.gpus), (2, 2));
         assert_eq!(hinted.models, vec![chosen]);
         assert_eq!(hinted.models, demanded.models);
         assert!(hinted.models[0].repository.is_empty(), "B must not remain constrained to A's repository");

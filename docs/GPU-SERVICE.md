@@ -31,6 +31,9 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   within the machine envelope. `RunSpec.gpus > 0` requests that exact degree and refuses an
   unsupported count. Model lanes/checkpoint overrides never change it; weight ladders fit
   within the selected group. Busy GPUs cause queuing, not a smaller group.
+- A job with an explicit GPU count reserves that subset for its lifetime. CPU job code stays
+  deviceless; nested GPU calls borrow the exact group and cannot spread concurrent siblings
+  onto the remaining GPUs. Unsupported child operations fail rather than reduce the count.
 - The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
   `Preparation`, and `submit` records `preparation_id`.
 - An empty `installation_id` binds a `published-<hash>` installation from `packages`.

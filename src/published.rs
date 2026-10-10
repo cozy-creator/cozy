@@ -1259,7 +1259,7 @@ impl Publisher {
         let gpu_model = gpu_name(&gpu.config().envelope()[0]);
         let width = gpu.width();
         let degree = crate::gpu_service::group_degree(&slots, request.gpus, width)
-            .map_err(|e| ("gpu_count_unavailable", e.to_string()))?;
+            .map_err(|e| ("gpu_count_unavailable", e.to_string().trim_start_matches("gpu_count_unavailable: ").into()))?;
         let mut grants = vec![];
         for slot in &slots {
             let path = slot
@@ -2416,6 +2416,47 @@ mod tests {
         assert_eq!((got.release.as_str(), got.lane.as_str(), got.manifest.as_str()), ("", "", ""));
         let unnamed = domain::ModelChoice { manifest: pinned.manifest.clone(), ..Default::default() };
         assert_eq!(choose(&unnamed, ("", 0)).err().unwrap().0, "model_choice_absent");
+    }
+
+    #[test]
+    fn model_identity_and_ladder_do_not_choose_the_execution_width() {
+        let path = "render.models.base";
+        let slot = json!({"path": path, "sequence_parallel": {"degrees": [2, 4, 7, 8]},
+            "default_ladder": [{"gpu": "*", "gpus": 1, "lane": "base@1.0/fp8"}]});
+        let default = default_choice(&slot, path, "org/package", "").unwrap();
+        let mut lane = default.clone();
+        lane.lane = "bf16".into();
+        let mut pinned = default.clone();
+        pinned.manifest = Some(domain::Ref { digest: vec![7; 32], length: 9 });
+        for (requested, expected) in [(0, 4), (1, 1), (2, 2), (4, 4)] {
+            let degree = crate::gpu_service::group_degree(std::slice::from_ref(&slot), requested, 4).unwrap();
+            assert_eq!(degree, expected);
+            for choice in [&default, &lane, &pinned] {
+                let named = choose(choice, path, ("NVIDIA H100", degree as usize)).unwrap();
+                assert_eq!(named.repository, "org/base");
+            }
+        }
+        assert_eq!(choose(&lane, path, ("NVIDIA H100", 2)).unwrap().lane, "bf16");
+        assert_eq!(choose(&pinned, path, ("NVIDIA H100", 2)).unwrap().manifest, format!("sha256:{}", "07".repeat(32)));
+        assert!(crate::gpu_service::group_degree(&[slot], 3, 4).is_err());
+    }
+
+    #[test]
+    fn an_explicit_gpu_count_has_its_own_preparation_cache_key() {
+        let mut request = Request {
+            source: hub::Source::new("https://hub.example", None, vec![], None).unwrap(),
+            package: "org/package".into(), release: "1".into(), installed: None,
+            owner: "org".into(), catalog_revision: String::new(), providers: Providers::default(),
+            entrypoint: "render".into(), choices: vec![], gpus: 0,
+        };
+        let default = Publisher::resolution_key("installed", &request, "4xH100");
+        request.gpus = 2;
+        let two = Publisher::resolution_key("installed", &request, "4xH100");
+        request.gpus = 1;
+        let one = Publisher::resolution_key("installed", &request, "4xH100");
+        assert_ne!(default, two);
+        assert_ne!(two, one);
+        assert_ne!(one, default);
     }
 
     /// A slot the run names no model for takes its declared default ladder, with no binding

@@ -1146,11 +1146,12 @@ mod tests {
         });
         resent.providers = None;
         assert_eq!(spec_of(resent).unwrap().0.digest, digest);
-        let changes: [fn(&mut v1::RunSpec); 6] = [
+        let changes: [fn(&mut v1::RunSpec); 7] = [
             |s| s.payload = br#"{"seed":9007199254740992,"nested":{"a":1,"b":2}}"#.to_vec(),
             |s| s.payload = br#"{"seed":9007199254740993.0,"nested":{"a":1,"b":2}}"#.to_vec(),
             |s| s.inputs.reverse(),
             |s| s.models.reverse(),
+            |s| s.gpus = 2,
             |s| s.entrypoint = "other".into(),
             |s| s.hub.as_mut().unwrap().origin = "https://other.example.test".into(),
         ];
@@ -1159,6 +1160,18 @@ mod tests {
             change(&mut changed);
             assert_ne!(spec_of(changed).unwrap().0.digest, digest);
         }
+    }
+
+    #[test]
+    fn exact_gpu_count_survives_the_wire_and_is_advertised() {
+        let mut sent = authored();
+        sent.gpus = 2;
+        let encoded = prost::Message::encode_to_vec(&sent);
+        let decoded = <v1::RunSpec as prost::Message>::decode(encoded.as_slice()).unwrap();
+        let (spec, _) = spec_of(decoded).unwrap();
+        assert_eq!(spec.gpus, 2);
+        assert_eq!(spec_of(authored()).unwrap().0.gpus, 0);
+        assert!(crate::api::machine_status::CAPABILITIES.contains(&"run-gpus/1"));
     }
 
     /// A capability a machine cannot trade (it holds no key) refuses a new run, never the

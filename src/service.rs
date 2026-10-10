@@ -20,6 +20,7 @@ pub struct Call {
     pub entrypoint: String,
     pub input: Value,
     pub attention_kernel: String,
+    pub gpus: u32,
     pub inputs: Vec<crate::journal::InputFile>,
     pub job: bool,
     /// A child run's parent execution id.
@@ -262,6 +263,7 @@ impl Service {
         let held = self.catalog.resolve(generation)?;
         let mut invocation = held.invocation(&call.entrypoint, call.input)?;
         invocation.attention_kernel = call.attention_kernel;
+        invocation.gpus = call.gpus;
         invocation.inputs = call.inputs;
         let record = self
             .engine
@@ -280,9 +282,17 @@ impl Service {
         let held = self.catalog.resolve(generation)?;
         let mut invocation = held.invocation_of(&call.application, &call.entrypoint, call.input)?;
         invocation.attention_kernel = call.attention_kernel;
+        invocation.gpus = call.gpus;
         invocation.inputs = call.inputs;
         invocation.job = call.job;
         invocation.accelerator = call.job && held.accelerator_job(&invocation.module, &invocation.entrypoint)?;
+        if invocation.job && invocation.gpus > 0 {
+            let available = self.gpu().map_or(0, |gpu| gpu.width());
+            if invocation.gpus as usize > available || (invocation.accelerator && invocation.gpus != 1) {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
+                    "gpu_count_unavailable: requested {} GPUs; this machine has {available}, and accelerator job bodies support one", invocation.gpus)));
+            }
+        }
         if invocation.accelerator && self.gpu().is_none() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "accelerator_job_unavailable: this job requires a configured GPU"));
         }
@@ -419,7 +429,7 @@ impl Service {
         // pretend they are free merely because it has no local supervisor.
         let active = self.engine.active(usize::MAX)?;
         let is_gpu = |record: &Execution| {
-            record.invocation.accelerator || record
+            record.invocation.accelerator || (record.invocation.job && record.invocation.gpus > 0) || record
                 .submission
                 .as_ref()
                 .is_some_and(|s| !s.preparation_id.is_empty())
@@ -473,12 +483,12 @@ impl Service {
                         continue;
                     };
                     if record.invocation.job {
-                        let accelerator = record.invocation.accelerator;
+                        let accelerator = record.invocation.accelerator || record.invocation.gpus > 0;
                         if accelerator && gpu_fenced {
                             continue;
                         }
                         if !jobs.dispatch(&self.engine, &record, held, &waiting)? && accelerator {
-                            waiting.iter_mut().take(1).for_each(|w| *w = true);
+                            waiting.iter_mut().take(record.invocation.gpus.max(1) as usize).for_each(|w| *w = true);
                         }
                     } else if room > 0 && jobs.dispatch(&self.engine, &record, held, &waiting)? {
                         room -= 1;

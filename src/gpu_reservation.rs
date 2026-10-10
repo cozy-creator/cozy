@@ -15,6 +15,7 @@ struct State {
     family: Option<String>,
     holders: usize,
     calling: bool,
+    bounded: bool,
 }
 pub(crate) struct Permit {
     slots: Arc<Slots>,
@@ -34,11 +35,20 @@ impl Slots {
         self: &Arc<Self>,
         family: Option<&str>,
         call: bool,
+        bounded: bool,
         devices: Range<usize>,
         waiting: &[bool],
     ) -> Option<Permit> {
         let mut slots = self.slots.lock().unwrap();
         let held = family.is_some_and(|family| Self::held(&slots, family));
+        // An explicitly bounded job lends only its existing subset. Even after its parent
+        // exits, a live child keeps the bound with the reservation it still holds.
+        let limited = family.is_some_and(|family| slots.iter().flatten()
+            .any(|state| state.family.as_deref() == Some(family) && state.bounded));
+        if limited && devices.clone().any(|device| slots.get(device).and_then(Option::as_ref)
+            .is_none_or(|state| state.family.as_deref() != family)) {
+            return None;
+        }
         let usable = devices.clone().all(|device| match slots.get(device) {
             Some(None) => held || !waiting.get(device).copied().unwrap_or(false),
             Some(Some(state)) => {
@@ -54,12 +64,14 @@ impl Slots {
                 Some(state) => {
                     state.holders += 1;
                     state.calling |= call;
+                    state.bounded |= bounded;
                 }
                 None => {
                     *slot = Some(State {
                         family: family.map(str::to_owned),
                         holders: 1,
                         calling: call,
+                        bounded,
                     })
                 }
             }
@@ -105,7 +117,7 @@ impl Drop for Permit {
     }
 }
 
-/// Outermost accelerator ancestor, never an unconditional CPU root: sibling GPU
+/// Outermost GPU-owning ancestor (accelerator or explicit group), never an unconditional CPU root: sibling GPU
 /// jobs of a CPU orchestrator must compete, while a CPU intermediary may borrow.
 pub(crate) fn family(
     record: &crate::journal::Execution,
@@ -118,7 +130,7 @@ pub(crate) fn family(
         if !seen.insert(current.id.clone()) {
             return Err(std::io::Error::other("cyclic managed parent chain"));
         }
-        if current.invocation.accelerator {
+        if current.invocation.accelerator || (current.invocation.job && current.invocation.gpus > 0) {
             family = Some(current.id.clone());
         }
         if current.invocation.parent.is_empty() {
@@ -134,22 +146,41 @@ mod tests {
     #[test]
     fn family_keeps_the_slot_until_every_started_member_exits() {
         let slot = Slots::new(1);
-        let parent = slot.take(Some("job-1"), false, 0..1, &[]).unwrap();
-        let child = slot.take(Some("job-1"), true, 0..1, &[]).unwrap();
-        assert!(slot.take(Some("job-1"), true, 0..1, &[]).is_none());
-        assert!(slot.take(Some("job-2"), false, 0..1, &[]).is_none());
-        assert!(slot.take(None, true, 0..1, &[]).is_none()); // unrelated call / warm / prefetch
+        let parent = slot.take(Some("job-1"), false, false, 0..1, &[]).unwrap();
+        let child = slot.take(Some("job-1"), true, false, 0..1, &[]).unwrap();
+        assert!(slot.take(Some("job-1"), true, false, 0..1, &[]).is_none());
+        assert!(slot.take(Some("job-2"), false, false, 0..1, &[]).is_none());
+        assert!(slot.take(None, true, false, 0..1, &[]).is_none()); // unrelated call / warm / prefetch
         drop(parent); // pause/cancel ends root, started child keeps its reservation
-        assert!(slot.take(None, true, 0..1, &[]).is_none());
-        let resumed = slot.take(Some("job-1"), false, 0..1, &[]).unwrap();
+        assert!(slot.take(None, true, false, 0..1, &[]).is_none());
+        let resumed = slot.take(Some("job-1"), false, false, 0..1, &[]).unwrap();
         drop(child);
-        assert!(slot.take(None, true, 0..1, &[]).is_none()); // live parent still owns the family
-        let next = slot.take(Some("job-1"), true, 0..1, &[]).unwrap();
+        assert!(slot.take(None, true, false, 0..1, &[]).is_none()); // live parent still owns the family
+        let next = slot.take(Some("job-1"), true, false, 0..1, &[]).unwrap();
         drop(resumed);
-        assert!(slot.take(None, true, 0..1, &[]).is_none());
+        assert!(slot.take(None, true, false, 0..1, &[]).is_none());
         drop(next);
-        assert!(slot.take(None, true, 0..1, &[]).is_some());
+        assert!(slot.take(None, true, false, 0..1, &[]).is_some());
     }
+    #[test]
+    fn a_bounded_family_never_expands_and_live_children_keep_its_bound() {
+        let slots = Slots::new(4);
+        let parent = slots.take(Some("root"), false, true, 0..2, &[]).unwrap();
+        let nested = slots.take(Some("root"), false, true, 0..2, &[]).unwrap();
+        let child = slots.take(Some("root"), true, false, 0..2, &[]).unwrap();
+        assert!(slots.take(Some("root"), true, false, 2..4, &[]).is_none());
+        let unrelated = slots.take(None, true, false, 2..4, &[]).unwrap();
+        drop((parent, nested));
+        assert!(slots.take(None, true, false, 0..2, &[]).is_none());
+        drop(unrelated);
+        assert!(slots.take(Some("root"), true, false, 2..4, &[]).is_none());
+        let resumed = slots.take(Some("root"), false, true, 0..2, &[]).unwrap();
+        drop(child);
+        assert!(slots.take(None, true, false, 0..2, &[]).is_none());
+        drop(resumed);
+        assert!(slots.take(None, true, false, 0..4, &[]).is_some());
+    }
+
     #[test]
     fn family_comes_from_durable_accelerator_ancestry_not_cpu_siblings() {
         use crate::{execution::Engine, journal::Invocation};
@@ -200,55 +231,78 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn an_explicit_cpu_root_owns_the_nested_gpu_family_after_restart() {
+        use crate::{execution::Engine, journal::Invocation};
+        let root = std::env::temp_dir().join(format!("job-budget-family-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let parent = engine.submit("parent", Invocation {
+            job: true, gpus: 2, ..Default::default()
+        }).unwrap();
+        let middle = engine.submit("middle", Invocation {
+            job: true, gpus: 2, parent: parent.id.clone(), ..Default::default()
+        }).unwrap();
+        let child = engine.submit("child", Invocation {
+            parent: middle.id.clone(), gpus: 2, ..Default::default()
+        }).unwrap();
+        assert_eq!(family(&child, |id| engine.get(id)).unwrap(), Some(parent.id.clone()));
+        drop(engine);
+        let reopened = Engine::open(&root).unwrap();
+        assert_eq!(reopened.get(&parent.id).unwrap().invocation.gpus, 2);
+        assert_eq!(family(&reopened.get(&child.id).unwrap(), |id| reopened.get(id)).unwrap(), Some(parent.id));
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn managed_prefetch_borrows_its_parent_family_but_serializes_with_calls() {
         let slot = Slots::new(1);
         let parent = slot
-            .take(Some("accelerator-parent"), false, 0..1, &[])
+            .take(Some("accelerator-parent"), false, false, 0..1, &[])
             .unwrap();
         let prefetch = slot
-            .take(Some("accelerator-parent"), true, 0..1, &[])
+            .take(Some("accelerator-parent"), true, false, 0..1, &[])
             .unwrap();
-        assert!(slot.take(None, true, 0..1, &[]).is_none());
-        assert!(slot.take(Some("another-parent"), true, 0..1, &[]).is_none());
+        assert!(slot.take(None, true, false, 0..1, &[]).is_none());
+        assert!(slot.take(Some("another-parent"), true, false, 0..1, &[]).is_none());
         assert!(slot
-            .take(Some("accelerator-parent"), true, 0..1, &[])
+            .take(Some("accelerator-parent"), true, false, 0..1, &[])
             .is_none());
         drop(prefetch);
         assert!(slot
-            .take(Some("accelerator-parent"), true, 0..1, &[])
+            .take(Some("accelerator-parent"), true, false, 0..1, &[])
             .is_some());
-        assert!(slot.take(None, true, 0..1, &[]).is_none());
+        assert!(slot.take(None, true, false, 0..1, &[]).is_none());
         drop(parent);
-        assert!(slot.take(None, true, 0..1, &[]).is_some());
+        assert!(slot.take(None, true, false, 0..1, &[]).is_some());
     }
     #[test]
     fn each_gpu_serves_its_own_call_and_a_waited_for_gpu_is_only_borrowed() {
         let slots = Slots::new(4);
-        let first = slots.take(None, true, 0..1, &[]).unwrap();
-        let second = slots.take(None, true, 1..2, &[]).unwrap();
-        assert!(slots.take(None, true, 0..2, &[]).is_none()); // a group needs every GPU of it
-        assert!(slots.take(None, true, 3..5, &[]).is_none()); // beyond the envelope
+        let first = slots.take(None, true, false, 0..1, &[]).unwrap();
+        let second = slots.take(None, true, false, 1..2, &[]).unwrap();
+        assert!(slots.take(None, true, false, 0..2, &[]).is_none()); // a group needs every GPU of it
+        assert!(slots.take(None, true, false, 3..5, &[]).is_none()); // beyond the envelope
         let waiting = [false, false, true, false];
-        assert!(slots.take(None, true, 2..3, &waiting).is_none());
-        let job = slots.take(Some("job"), false, 2..3, &[]).unwrap();
-        assert!(slots.take(Some("job"), true, 2..3, &waiting).is_some()); // its family borrows
+        assert!(slots.take(None, true, false, 2..3, &waiting).is_none());
+        let job = slots.take(Some("job"), false, false, 2..3, &[]).unwrap();
+        assert!(slots.take(Some("job"), true, false, 2..3, &waiting).is_some()); // its family borrows
         // A family holding a slot takes a free GPU an earlier request waits for: that request
         // may be waiting on the family's job.
         let marked = [false, false, false, true];
-        assert!(slots.take(None, true, 3..4, &marked).is_none());
-        assert!(slots.take(Some("job"), true, 3..4, &marked).is_some());
-        assert!(slots.take(Some("other"), true, 3..4, &marked).is_none());
+        assert!(slots.take(None, true, false, 3..4, &marked).is_none());
+        assert!(slots.take(Some("job"), true, false, 3..4, &marked).is_some());
+        assert!(slots.take(Some("other"), true, false, 3..4, &marked).is_none());
         drop((first, second));
-        assert!(slots.take(None, true, 0..2, &[]).is_some());
+        assert!(slots.take(None, true, false, 0..2, &[]).is_some());
         drop(job);
-        assert!(slots.take(None, true, 0..4, &[]).is_some());
+        assert!(slots.take(None, true, false, 0..4, &[]).is_some());
     }
 
     #[test]
     fn a_job_waits_for_its_familys_call_on_its_gpu_to_end() {
         let slots = Slots::new(1);
-        let child = slots.take(Some("job"), true, 0..1, &[]).unwrap();
-        let job = slots.take(Some("job"), false, 0..1, &[]).unwrap();
+        let child = slots.take(Some("job"), true, false, 0..1, &[]).unwrap();
+        let job = slots.take(Some("job"), false, false, 0..1, &[]).unwrap();
         let (done, seen) = std::sync::mpsc::channel();
         let waiter = slots.clone();
         let thread = std::thread::spawn(move || {
@@ -265,15 +319,15 @@ mod tests {
     #[test]
     fn ordinary_calls_and_warm_work_remain_exclusive() {
         let slot = Slots::new(1);
-        let call = slot.take(None, true, 0..1, &[]).unwrap();
-        assert!(slot.take(None, true, 0..1, &[]).is_none());
-        assert!(slot.take(Some("job"), false, 0..1, &[]).is_none());
+        let call = slot.take(None, true, false, 0..1, &[]).unwrap();
+        assert!(slot.take(None, true, false, 0..1, &[]).is_none());
+        assert!(slot.take(Some("job"), false, false, 0..1, &[]).is_none());
         drop(call);
-        let root = slot.take(Some("job"), false, 0..1, &[]).unwrap();
-        let nested = slot.take(Some("job"), false, 0..1, &[]).unwrap();
+        let root = slot.take(Some("job"), false, false, 0..1, &[]).unwrap();
+        let nested = slot.take(Some("job"), false, false, 0..1, &[]).unwrap();
         drop(root);
-        assert!(slot.take(None, true, 0..1, &[]).is_none());
+        assert!(slot.take(None, true, false, 0..1, &[]).is_none());
         drop(nested);
-        assert!(slot.take(None, true, 0..1, &[]).is_some());
+        assert!(slot.take(None, true, false, 0..1, &[]).is_some());
     }
 }

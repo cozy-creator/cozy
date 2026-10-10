@@ -234,7 +234,7 @@ impl Jobs {
         held: HeldGeneration,
         waiting: &[bool],
     ) -> io::Result<bool> {
-        let allocation = if record.invocation.accelerator {
+        let allocation = if record.invocation.accelerator || (record.invocation.job && record.invocation.gpus > 0) {
             let pool = self.service.upgrade().and_then(|s| s.gpu())
                 .ok_or_else(|| io::Error::other("accelerator_job_unavailable: no configured GPU"))?;
             let Some(allocation) = pool.job_allocation(engine, record, waiting)? else { return Ok(false); };

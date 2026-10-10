@@ -27,6 +27,15 @@ the same reasons a run's outcome carries. Unknown fields are ignored with a warn
 serves a run's output log and bytes, live or finished. Browsers have no other way to reach a pod
 with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` link and the web player.
 
+
+`RunSpec.gpus` is optional (`run-gpus/1`). Zero uses the widest GPU group supported by
+all package-code model slots on the machine. A positive value requests exactly that many
+GPUs; unsupported operations fail instead of reducing the count. This includes GPU child
+calls of a job. A job with an explicit count reserves one subset until its executor and all
+borrowing children exit; CPU orchestration remains deviceless. Checkpoint identity and weight
+ladder GPU hints never select parallelism. Busy GPUs cause queuing, not a smaller group.
+
+
 ## What disappears
 
 - **Describe, keepalive and the receipt route** fold into Status.
