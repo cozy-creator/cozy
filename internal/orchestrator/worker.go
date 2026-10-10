@@ -418,7 +418,8 @@ func ClassicRetired() *exit.Error {
 // SIGTERM deserved three budgets.
 const StopGrace = 30 * time.Second
 
-// Reconcile rebuilds the daemon's work from its records before anything is served.
+// Reconcile rebuilds the daemon's work from its records. It runs as startup work, after the
+// API serves: nothing a client asks waits on it.
 func (c *Orchestrator) Reconcile() *exit.Error {
 	writer, problem := home.LockWriter(c.opt.Layout)
 	if problem != nil {
@@ -447,8 +448,8 @@ func (c *Orchestrator) Reconcile() *exit.Error {
 		return e
 	}
 	// THE QUEUE IS MEMORY, AND THE AUTHORITY IS NOT. A request recorded as owed work before
-	// the crash has no queue entry after it; rebuilding the queue from the authority, in
-	// its own created_at order, happens before anything is served.
+	// the crash has no queue entry after it; the queue is rebuilt from the authority, in
+	// its own created_at order.
 	owed, e := c.opt.Store.Owed()
 	if e != nil {
 		return e

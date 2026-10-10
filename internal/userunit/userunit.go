@@ -34,11 +34,10 @@ func Name(prefix, path string, isDefault bool) string {
 }
 
 // Spec is one process to run as a unit. Output names a file each stream appends to ("" is
-// nothing); Fresh truncates Stderr at start instead.
+// nothing).
 type Spec struct {
 	Unit, Dir, Stdout, Stderr string
 	Argv, Env                 []string
-	Fresh                     bool
 }
 
 // Start runs spec as its unit and answers whether a unit of that name was already running,
@@ -48,8 +47,8 @@ func Start(spec Spec) (bool, error) {
 		return true, nil
 	}
 	_ = exec.Command("systemctl", "--user", "reset-failed", spec.Unit).Run()
-	args := []string{"--user", "--unit=" + spec.Unit, "--collect", "--quiet", "-p", "StandardOutput=" + sink(spec.Stdout, false),
-		"-p", "StandardError=" + sink(spec.Stderr, spec.Fresh)}
+	args := []string{"--user", "--unit=" + spec.Unit, "--collect", "--quiet", "-p", "StandardOutput=" + sink(spec.Stdout),
+		"-p", "StandardError=" + sink(spec.Stderr)}
 	if spec.Dir != "" {
 		args = append(args, "--working-directory="+spec.Dir)
 	}
@@ -72,12 +71,9 @@ func Running(unit string) bool {
 	return state == "active" || state == "activating" || state == "reloading"
 }
 
-func sink(path string, fresh bool) string {
-	switch {
-	case path == "":
+func sink(path string) string {
+	if path == "" {
 		return "null"
-	case fresh:
-		return "truncate:" + path
 	}
 	return "append:" + path
 }

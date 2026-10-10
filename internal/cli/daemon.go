@@ -29,6 +29,8 @@ const daemonProcessName = "cozy-daemon"
 
 const maxDaemonStartupDiagnostic = 16 << 10
 
+const maxDaemonStartupLog = 1 << 20
+
 type daemonExit struct {
 	err        error
 	code       exit.Code
@@ -258,8 +260,9 @@ func DaemonUnit(home string) string {
 
 // startDaemonUnit runs the daemon as its own user unit, outside the caller's scope and
 // cgroup: ending the session that started it never ends it, and `cozy down` ends the unit.
-// A unit already running is the daemon, starting. Its startup refusal is its stderr, kept in
-// daemon-startup.log.
+// A unit already running is the daemon, starting. Its stderr — a startup refusal, a panic, a
+// SIGQUIT goroutine dump — appends to daemon-startup.log after a start marker, so the next
+// start never erases the last daemon's words.
 func startDaemonUnit(ctx *Context, self string, env []string) (*daemonChild, *exit.Error) {
 	// The daemon entry is named by argv0; a unit runs its command's own name.
 	entry := filepath.Join(ctx.Cfg.Home, daemonProcessName)
@@ -274,7 +277,8 @@ func startDaemonUnit(ctx *Context, self string, env []string) (*daemonChild, *ex
 		}
 	}
 	unit, startup := DaemonUnit(ctx.Cfg.Home), filepath.Join(ctx.Cfg.Home, "daemon-startup.log")
-	if _, err := userunit.Start(userunit.Spec{Unit: unit, Argv: []string{entry}, Env: env, Stderr: startup, Fresh: true}); err != nil {
+	offset := markDaemonStart(unit, startup)
+	if _, err := userunit.Start(userunit.Spec{Unit: unit, Argv: []string{entry}, Env: env, Stderr: startup}); err != nil {
 		return nil, exit.Internalf("cannot start the Cozy daemon unit: %s", err)
 	}
 	done, stop := make(chan daemonExit, 1), make(chan struct{})
@@ -288,8 +292,7 @@ func startDaemonUnit(ctx *Context, self string, env []string) (*daemonChild, *ex
 			if state := userunit.Property(unit, "ActiveState"); state == "active" || state == "activating" {
 				continue
 			}
-			raw, _ := os.ReadFile(startup)
-			result := daemonExit{code: exit.Internal, diagnostic: strings.TrimSpace(string(raw[:min(len(raw), maxDaemonStartupDiagnostic)]))}
+			result := daemonExit{code: exit.Internal, diagnostic: startupDiagnostic(startup, offset)}
 			// A unit that ended in a word refused; one that ended silently found another owner.
 			if result.diagnostic != "" {
 				result.err = errors.New("the Cozy daemon unit ended")
@@ -301,6 +304,52 @@ func startDaemonUnit(ctx *Context, self string, env []string) (*daemonChild, *ex
 	var closeOnce sync.Once
 	return &daemonChild{pid: userunit.MainPID(unit), done: done,
 		closeDiagnostics: func() { closeOnce.Do(func() { close(stop) }) }}, nil
+}
+
+// startMarker opens each start's part of daemon-startup.log.
+const startMarker = "--- cozy-daemon start "
+
+// markDaemonStart appends this start's marker and answers where its diagnostic begins. A file
+// past maxDaemonStartupLog moves to .1 first, keeping the previous daemon's words; a running
+// unit's file is never moved.
+func markDaemonStart(unit, path string) int64 {
+	if userunit.Running(unit) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0
+		}
+		return info.Size()
+	}
+	if info, err := os.Stat(path); err == nil && info.Size() > maxDaemonStartupLog {
+		_ = os.Rename(path, path+".1")
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	fmt.Fprintf(file, "%s%s · cozy %s · started by pid %d\n", startMarker,
+		time.Now().UTC().Format(time.RFC3339), version(), os.Getpid())
+	offset, _ := file.Seek(0, io.SeekEnd)
+	return offset
+}
+
+// startupDiagnostic is what the daemon wrote after this start's marker, without the markers of
+// starts that raced it.
+func startupDiagnostic(path string, offset int64) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	raw, _ := io.ReadAll(io.NewSectionReader(file, offset, maxDaemonStartupDiagnostic))
+	var kept []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, startMarker) {
+			kept = append(kept, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
 }
 
 func readBoundedDiagnostic(reader io.Reader) string {

@@ -118,6 +118,11 @@ var pinsByHub = []string{
 	`ALTER TABLE pins_by_hub RENAME TO pins`,
 }
 
+// requestsByInstall makes an install's references a lookup rather than a scan of every
+// request's payload: each install reclaim (one per settled run, one per directory in the
+// startup sweep) reads them, and so does its delete's foreign-key check.
+const requestsByInstall = `CREATE INDEX IF NOT EXISTS requests_install ON requests(install_id)`
+
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orchestratorSchema,
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
@@ -128,6 +133,7 @@ func init() {
 	schema = append(schema, rentalInstallsDDL, rentalInstallsIndex, runtimeUpdatesDDL, rentalIdleDDL, bindingRevisionDDL, hubBindingsRevisionDDL,
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex, hubCreditDDL)
 	schema = append(schema, obligationIndexes...)
+	schema = append(schema, requestsByInstall)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -168,9 +174,9 @@ func open(path string) (*Store, *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot open the local records database %s: %s", path, err)
 	}
-	// ONE writer: the lifecycle authority is a single-writer store, so serializing every
-	// statement on one connection is the honest shape rather than a tuning choice.
-	db.SetMaxOpenConns(1)
+	// ONE writer at a time (the driver's write gate), and readers on connections of their
+	// own: a read never queues behind a write that is slow or waiting on another process.
+	db.SetMaxIdleConns(4)
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, exit.Internalf("cannot open the local records database %s: %s", path, err)
