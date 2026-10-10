@@ -716,14 +716,15 @@ func (c *RentalEndCmd) Run(r *Runtime) error {
 
 type RentalListCmd struct {
 	AllHubs bool `help:"Retained for scripts; rental listings always include every known Hub."`
-	Ended   bool `help:"Ended rentals instead: why and when each ended, and what it cost."`
+	All     bool `help:"Every rental, live and ended: when it ran, how long, the runs this computer sent it, and what it cost."`
+	Ended   bool `help:"Only the ended rentals of --all."`
 	Watch   bool `help:"Refresh continuously (requires a terminal)."`
 	NoWatch bool `help:"Print one snapshot even in a terminal."`
 }
 
 func (c *RentalListCmd) Run(r *Runtime) error {
 	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch, "--all-hubs", c.AllHubs,
-		"--ended", c.Ended), nil, false)
+		"--all", c.All, "--ended", c.Ended), nil, false)
 }
 
 type RentalShowCmd struct {

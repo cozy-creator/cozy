@@ -1044,37 +1044,57 @@ func missingOf(r hub.Rental) string {
 
 // handleRentalList is `cozy rental list` (cl-114). On a terminal it is the live board:
 // the fleet redrawn in place every second, the way `cozy run list` watches runs. Piped
-// or --json it is one plain snapshot. Bare `cozy rental` prints the verbs, not this.
+// or --json it is one plain snapshot. --all lists every rental, live and ended, and
+// --ended the ended ones. Bare `cozy rental` prints the verbs, not this.
 func handleRentalList(ctx *Context) *exit.Error {
 	explicit, disabled := ctx.Inv.Bool("--watch"), ctx.Inv.Bool("--no-watch")
 	if explicit && disabled {
 		return exit.Usagef("--watch and --no-watch cannot be used together")
-	}
-	if ctx.Inv.Bool("--ended") {
-		if explicit {
-			return exit.Usagef("--ended lists history once; it cannot --watch")
-		}
-		list, problem := endedRentals(ctx)
-		if problem != nil {
-			return problem
-		}
-		return emit(ctx, list)
 	}
 	watching := explicit || ctx.Mode().TTY && !disabled
 	if watching && (ctx.Mode().JSON || !ctx.Mode().TTY) {
 		return exit.Usagef("--watch requires interactive terminal output").
 			WithRemedy("omit --watch for one snapshot, or use --json for automation")
 	}
+	var fetch func(context.Context) (output.List, *exit.Error)
+	var problem *exit.Error
+	done, anchor := func() {}, "machine"
+	if ended := ctx.Inv.Bool("--ended"); ended || ctx.Inv.Bool("--all") {
+		fetch, done, problem = rentalHistory(ctx, ended)
+		anchor = "rental"
+	} else {
+		fetch, problem = rentalBoard(ctx, watching)
+	}
+	if problem != nil {
+		return problem
+	}
+	defer done()
+	if watching {
+		return watchList(ctx, anchor, func(call context.Context) (output.List, *exit.Error) {
+			list, problem := fetch(call)
+			list.Next = nil
+			return list, problem
+		})
+	}
+	list, problem := fetch(context.Background())
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, list)
+}
+
+// rentalBoard reads the live fleet from the daemon, reconciling with the hubs every pollCadence.
+func rentalBoard(ctx *Context, watching bool) (func(context.Context) (output.List, *exit.Error), *exit.Error) {
 	const allHubs = true
 	client, problem := dial(ctx)
 	if problem != nil {
-		return problem
+		return nil, problem
 	}
 	if watching {
 		client = following(ctx, client)
 	}
 	var last time.Time
-	fetch := func(call context.Context) (output.List, *exit.Error) {
+	return func(call context.Context) (output.List, *exit.Error) {
 		reconcile := last.IsZero() || time.Since(last) >= pollCadence
 		inventory, problem := client.RentalInventory(call, reconcile, allHubs)
 		if problem != nil {
@@ -1087,20 +1107,8 @@ func handleRentalList(ctx *Context) *exit.Error {
 		if inventory.HubUnanswered != nil || len(inventory.UnreadableHubs) > 0 {
 			ctx.exitCode = 1
 		}
-		list := renderRentalList(ctx.Cfg, inventory, allHubs)
-		if watching {
-			list.Next = nil
-		}
-		return list, nil
-	}
-	if watching {
-		return watchList(ctx, "machine", fetch)
-	}
-	list, problem := fetch(context.Background())
-	if problem != nil {
-		return problem
-	}
-	return emit(ctx, list)
+		return renderRentalList(ctx.Cfg, inventory, allHubs), nil
+	}, nil
 }
 
 // handleRentalShow is `cozy rental show <rental>`: one rental's row of the every-hub
@@ -1181,90 +1189,6 @@ func showEndedRental(ctx *Context, subject string) *exit.Error {
 	}
 	return exit.Named(exit.NotFound, "rental.unknown", "no rental is named %q on any hub this host is signed in to", subject).
 		WithNext("cozy rental list")
-}
-
-// endedRentals is `cozy rental list --ended`: every ended rental of the hubs the listing
-// spans that this host is signed in to, the latest ended first, each with why and when it
-// ended and what it cost. A hub that cannot answer is named, never silently left out.
-func endedRentals(ctx *Context) (output.List, *exit.Error) {
-	store, _ := existingRecords(ctx)
-	if store != nil {
-		defer store.Close()
-	}
-	origins, problem := rentalInventoryOrigins(ctx, store)
-	if problem != nil {
-		return output.List{}, problem
-	}
-	fields := []string{"machine", "gpus", "ended by", "ended", "spent"}
-	if len(origins) > 1 {
-		fields = append(fields, "hub")
-	}
-	list := output.List{Name: "ended_rentals", Fields: fields,
-		AllFields: []string{"machine", "rental", "gpus", "state", "ended by", "rented", "ended", "$/hour", "spent", "hub", "provider", "provider machine", "provider resource"},
-		TypedFields: []string{"machine", "rental_id", "hub", "state", "release_cause", "ended_at",
-			"spend_usd_micros", "spend_basis"},
-		TypedAllFields: []string{"machine", "rental_id", "hub", "state", "release_cause", "rented_at", "ended_at",
-			"accelerator", "accelerator_count", "hourly_rate_usd_micros", "spend_usd_micros", "spend_basis", "provider", "provider_machine_id", "provider_resource_id"},
-		Next: []string{"cozy rental show <machine>"}}
-	type ended struct {
-		hub    string
-		rental hub.Rental
-	}
-	var rows []ended
-	var spend []api.RentalSummary
-	for _, origin := range origins {
-		scoped := ctx.forHub(origin)
-		if len(origins) > 1 && !scoped.Cfg.HubToken.Present() && !accountauth.New(scoped.Cfg).CredentialPresent() {
-			continue
-		}
-		call, cancel := hub.Context()
-		history, problem := client(scoped).RentalHistory(call, "")
-		cancel()
-		if problem != nil && len(origins) == 1 {
-			return output.List{}, problem
-		}
-		if problem != nil {
-			ctx.exitCode = 1
-			list.Lead = append(list.Lead, fmt.Sprintf("hub %s did not answer: %s; its ended rentals are not shown",
-				ctx.Cfg.HubLabel(origin), problem.Message))
-			continue
-		}
-		for _, r := range history {
-			if hub.RentalAbsent(r.State) {
-				rows = append(rows, ended{ctx.Cfg.HubLabel(origin), r})
-				spend = append(spend, api.RentalSummary{SpendUSDMicros: r.SpendUSDMicros, SpendBasis: r.SpendBasis})
-			}
-		}
-	}
-	at := func(r hub.Rental) time.Time {
-		t, _ := time.Parse(time.RFC3339Nano, either(r.EndedAt, r.CreatedAt))
-		return t
-	}
-	slices.SortStableFunc(rows, func(a, b ended) int { return at(b.rental).Compare(at(a.rental)) })
-	total, _ := accruedSpend(api.RentalInventory{Rentals: spend})
-	list.Lead = append([]string{fmt.Sprintf("Ended rentals: %d%s", len(rows), total)}, list.Lead...)
-	for _, row := range rows {
-		r := row.rental
-		list.Rows = append(list.Rows, map[string]string{"machine": r.Name, "rental": r.ID,
-			"provider": r.Provider, "provider machine": r.ProviderMachineID, "provider resource": r.ProviderResourceID,
-			"gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount), "state": humanRentalState(r.State),
-			"ended by": orNone(r.EndCause()), "rented": stamp(r.CreatedAt), "ended": orNone(stamp(r.EndedAt)),
-			"$/hour": rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour)),
-			"spent":  rentalSpend(api.RentalSummary{SpendUSDMicros: r.SpendUSDMicros, SpendBasis: r.SpendBasis}),
-			"hub":    row.hub})
-		typed := map[string]any{"machine": r.Name, "rental_id": r.ID, "hub": row.hub, "state": r.State,
-			"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros}
-		for key, value := range map[string]string{"release_cause": r.EndCause(), "rented_at": r.CreatedAt,
-			"provider": r.Provider, "provider_machine_id": r.ProviderMachineID, "provider_resource_id": r.ProviderResourceID,
-			"ended_at": r.EndedAt, "accelerator": r.AcceleratorModel} {
-			if value != "" {
-				typed[key] = value
-			}
-		}
-		spendFields(typed, api.RentalSummary{SpendUSDMicros: r.SpendUSDMicros, SpendBasis: r.SpendBasis})
-		list.TypedRows = append(list.TypedRows, typed)
-	}
-	return list, nil
 }
 
 func endedRentalRecord(ctx *Context, hubName string, r hub.Rental) output.Record {
@@ -1393,7 +1317,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		Aggregates: append([]output.Field{{K: "machines_running", V: jsonFact{count}},
 			{K: "hourly_spend_usd_micros", V: jsonFact{burn}}}, spendFacts...),
 		Trail: []string{idleShutdownNote()},
-		Next:  []string{"cozy rental list --ended", "cozy help rental"},
+		Next:  []string{"cozy rental list --all", "cozy help rental"},
 	}
 	if problem := inventory.HubUnanswered; problem != nil {
 		list.Lead = []string{problem.Message,

@@ -942,6 +942,43 @@ func (s *Store) rentalRunCounts(id, except string) (queued, running int, problem
 	return queued, running, nil
 }
 
+// RentalWork is what this computer's records hold of one rental: the SKU it bought and the
+// runs it sent there, by outcome.
+type RentalWork struct {
+	SKU                         string
+	Succeeded, Failed, Canceled int
+}
+
+// RentalWorkByID reads every rental this computer recorded, in one grouped pass: its SKU from
+// the purchase (or the live row) and its settled runs, pinned as pinnedToRental spells it.
+func (s *Store) RentalWorkByID() (map[string]RentalWork, *exit.Error) {
+	rows, err := s.db.Query(`SELECT id, MAX(sku), SUM(succeeded), SUM(failed), SUM(canceled) FROM (
+		SELECT CASE WHEN worker<>'' THEN worker ELSE requested_rental END AS id, '' AS sku, state='succeeded' AS succeeded,
+		  state IN ('failed','refused','abandoned') AS failed, state='canceled' AS canceled
+		  FROM requests WHERE rental=1 AND (worker<>'' OR requested_rental<>'')
+		UNION ALL SELECT rental_id, CASE WHEN json_valid(CAST(request_body AS TEXT))
+		  THEN COALESCE(json_extract(CAST(request_body AS TEXT),'$.sku'),'') ELSE '' END, 0, 0, 0
+		  FROM rental_operations WHERE rental_id<>''
+		UNION ALL SELECT id, sku, 0, 0, 0 FROM rentals) GROUP BY id`)
+	if err != nil {
+		return nil, exit.Internalf("cannot read the work of rented machines: %s", err)
+	}
+	defer rows.Close()
+	work := map[string]RentalWork{}
+	for rows.Next() {
+		var id string
+		var w RentalWork
+		if err := rows.Scan(&id, &w.SKU, &w.Succeeded, &w.Failed, &w.Canceled); err != nil {
+			return nil, exit.Internalf("cannot read a rented machine's work: %s", err)
+		}
+		work[id] = w
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot read the work of rented machines: %s", err)
+	}
+	return work, nil
+}
+
 // RentalHasRetainedJob keeps unacknowledged job outcomes and unfinished successful
 // publications out of new capacity, even after a connection or request has failed.
 // This does not retire or release a manually rented machine.

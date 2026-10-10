@@ -632,7 +632,8 @@ cozy rental new h100-sxm5-80gb \
 cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candidate image
 
 cozy rental list                   # current rented machines, live on a terminal
-cozy rental list --ended           # ended rentals: why and when each ended, and what it cost
+cozy rental list --all             # every rental, live and ended: lifetime, runs from this computer, cost, end cause
+cozy rental list --ended           # the ended ones only
 cozy rental show otter             # one rental's facts, including accrued spend, ended or not
 cozy rental logs otter -f          # the provider's boot log, followed while it boots
 cozy rental logs otter --tensorfs  # TensorFS's transport decisions: hedges, lane grants, wins, pull walks

@@ -441,6 +441,19 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 		}
 	}
 	t.Logf("journals: %v", journals["local"])
+	// The rental's history counts the runs this computer sent it, under the SKU it holds.
+	code, out := runCozy(t, root, "--json", "rental", "list", "--all")
+	var history struct {
+		Rentals []struct {
+			Machine string `json:"machine"`
+			SKU     string `json:"sku"`
+			Runs    int    `json:"runs_succeeded"`
+		} `json:"rental_history"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &history) != nil || len(history.Rentals) != 1 ||
+		history.Rentals[0].Machine != "tessa" || history.Rentals[0].SKU != "virtual-4" || history.Rentals[0].Runs != 2 {
+		t.Fatalf("rental list --all does not count tessa's two runs [exit %d]\n%s", code, out)
+	}
 
 	// A stopped agent launches again on its next call, keeping its machine root and boot.
 	// The single supervisor needs no durable Runtime ownership history on either launch.
