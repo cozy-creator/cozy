@@ -17,7 +17,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -25,18 +25,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
-
-// Timeout bounds one hub call end to end. A hub that accepts a connection and then
-// says nothing is exit 10 (deadline), not exit 9 — the two failures have different
-// remedies and the matrix keeps them apart.
-const Timeout = 10 * time.Second
 
 // maxBody caps a response read. The catalog answers are small documents; a hub that
 // streams something enormous at us is a fault, not a listing.
@@ -66,13 +61,10 @@ type Client struct {
 	token  secret.Value
 	source string // where the token came from, for the remedy text
 	http   *http.Client
-	// slow answers calls whose work or response is bounded by bytes rather than total
-	// wall time. Connection setup and headers are still bounded, and response bodies are
-	// guarded below by observed byte progress.
-	slow    *http.Client
-	patient *http.Client // paid/proof operations: caller envelope bounds work, not a header clock
-	agent   string
-	tokens  TokenSource
+	agent  string
+	tokens TokenSource
+	// waiting hears "waiting on Tensorhub" while a call has no answer; nil hears nothing.
+	waiting io.Writer
 	// releases keeps committed release documents (release_cache.go); empty keeps none.
 	releases string
 }
@@ -86,15 +78,13 @@ type TokenSource interface {
 // New builds the client from the frozen config value. It reads no environment.
 func New(cfg config.Config, agent string) *Client {
 	return &Client{
-		base:    strings.TrimRight(cfg.HubURL, "/"),
-		named:   cfg.HubText(cfg.HubURL),
-		label:   cfg.HubLabel(cfg.HubURL),
-		token:   cfg.HubToken,
-		source:  cfg.HubTokenSource,
-		http:    &http.Client{Timeout: Timeout},
-		slow:    &http.Client{Transport: slowTransport()},
-		patient: &http.Client{Transport: patientTransport()},
-		agent:   agent,
+		base:   strings.TrimRight(cfg.HubURL, "/"),
+		named:  cfg.HubText(cfg.HubURL),
+		label:  cfg.HubLabel(cfg.HubURL),
+		token:  cfg.HubToken,
+		source: cfg.HubTokenSource,
+		http:   HTTP(cfg.HubLiveness),
+		agent:  agent,
 		releases: func() string {
 			if cfg.Home == "" {
 				return ""
@@ -104,70 +94,64 @@ func New(cfg config.Config, agent string) *Client {
 	}
 }
 
-func slowTransport() *http.Transport {
+// WithWaiting returns a copy that says on w, every waitReport, how long a call has been
+// waiting for its answer.
+func (c *Client) WithWaiting(w io.Writer) *Client {
+	d := *c
+	d.waiting = w
+	return &d
+}
+
+// waitReport is how often a call still waiting for its answer says so. It only reports.
+const waitReport = 5 * time.Second
+
+// awaiting reports the wait until the returned func is called, which returns once no
+// report is being written.
+func (c *Client) awaiting() func() {
+	if c.waiting == nil {
+		return func() {}
+	}
+	began, ticker, done, gone := time.Now(), time.NewTicker(waitReport), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(gone)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				fmt.Fprintf(c.waiting, "waiting on Tensorhub at %s (%s)\n", c.named, time.Since(began).Round(time.Second))
+			}
+		}
+	}()
+	return func() {
+		ticker.Stop()
+		close(done)
+		<-gone
+	}
+}
+
+// transports holds one pooled transport per liveness window: the process's config is
+// frozen, so in practice one.
+var transports sync.Map
+
+// HTTP is the one client every Hub request uses. No clock bounds a Hub that is alive,
+// however slowly it answers. A connection is dead once it shows no sign of life for the
+// liveness window: half of it without a frame sends a probe (an HTTP/2 PING, and a TCP
+// keepalive under any protocol), and the other half without its ACK closes the connection.
+// A dial gets the same half for its SYN-ACK and a TLS handshake the whole window; a
+// refusal, an unreachable route or a TLS failure ends a call at once.
+func HTTP(liveness time.Duration) *http.Client {
+	if t, ok := transports.Load(liveness); ok {
+		return &http.Client{Transport: t.(*http.Transport)}
+	}
+	probe := liveness / 2
 	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.DialContext = (&net.Dialer{Timeout: Timeout, KeepAlive: 30 * time.Second}).DialContext
-	t.ResponseHeaderTimeout = Timeout
-	return t
-}
-
-func patientTransport() *http.Transport {
-	t := slowTransport()
-	t.ResponseHeaderTimeout = 0
-	return t
-}
-
-var errResponseStalled = errors.New("hub response body stalled")
-
-type responseProgress struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	timer  *time.Timer
-	done   atomic.Bool
-}
-
-func guardResponse(req *http.Request) (*http.Request, *responseProgress) {
-	ctx, cancel := context.WithCancelCause(req.Context())
-	return req.WithContext(ctx), &responseProgress{ctx: ctx, cancel: cancel}
-}
-
-func (g *responseProgress) start() {
-	g.timer = time.AfterFunc(Timeout, func() { g.cancel(errResponseStalled) })
-}
-
-func (g *responseProgress) stop() {
-	g.done.Store(true)
-	if g.timer != nil {
-		g.timer.Stop()
-	}
-	g.cancel(nil)
-}
-
-func (g *responseProgress) touch() {
-	if !g.done.Load() && g.timer != nil {
-		g.timer.Reset(Timeout)
-	}
-}
-
-func (g *responseProgress) reader(r io.Reader) io.Reader {
-	return &progressReader{reader: r, touch: g.touch}
-}
-
-func (g *responseProgress) stalled() bool {
-	return errors.Is(context.Cause(g.ctx), errResponseStalled)
-}
-
-type progressReader struct {
-	reader io.Reader
-	touch  func()
-}
-
-func (r *progressReader) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
-	if n > 0 {
-		r.touch()
-	}
-	return n, err
+	t.DialContext = (&net.Dialer{Timeout: probe, KeepAliveConfig: net.KeepAliveConfig{
+		Enable: true, Idle: probe, Interval: probe / 5, Count: 5}}).DialContext
+	t.TLSHandshakeTimeout = liveness
+	t.HTTP2 = &http.HTTP2Config{SendPingTimeout: probe, PingTimeout: probe, WriteByteTimeout: liveness}
+	pooled, _ := transports.LoadOrStore(liveness, t)
+	return &http.Client{Transport: pooled.(*http.Transport)}
 }
 
 func (c *Client) Base() string { return c.base }
@@ -231,16 +215,8 @@ type call struct {
 	// idempotency is the caller-owned operation identity for a paid mutation. It is
 	// distinct from Tensorhub's provider operation id and survives a lost HTTP answer.
 	idempotency string
-	// byBytes drops the total wall clock for work bounded by bytes. Connection setup and
-	// headers remain bounded, and an answer body must keep making byte progress.
-	byBytes bool
-	// patient removes the response-header clock for a server-side operation already
-	// bounded by its own explicit resource/cost/duration envelope. Once headers arrive,
-	// the ordinary response-body progress guard applies.
-	patient bool
 	// responseBytes widens the ordinary small-JSON cap for one explicitly bounded
-	// response shape and moves the call onto the slow client: a large snapshot body
-	// is bounded by these bytes, not by Timeout.
+	// response shape.
 	responseBytes int64
 	// raw takes the answer's exact bytes instead of decoding it. The snapshot
 	// manifest route answers a canonical document verbatim, and this client must
@@ -426,23 +402,9 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 		req.Header.Set("Authorization", "Bearer "+token.Reveal())
 	}
 
-	client := c.http
-	var progress *responseProgress
-	if cl.byBytes || cl.responseBytes > 0 {
-		client = c.slow
-		req, progress = guardResponse(req)
-	}
-	if cl.patient {
-		client = c.patient
-		if progress == nil {
-			req, progress = guardResponse(req)
-		}
-	}
-	resp, err := client.Do(req)
+	defer c.awaiting()()
+	resp, err := c.http.Do(req)
 	if err != nil {
-		if progress != nil {
-			progress.stop()
-		}
 		return 0, TransportFailure(c.base, err)
 	}
 	defer resp.Body.Close()
@@ -452,10 +414,6 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 			*cl.trustRoot = append([]byte(nil), chain[len(chain)-1].Raw...)
 		}
 	}
-	if progress != nil {
-		progress.start()
-		defer progress.stop()
-	}
 
 	cap := int64(maxBody)
 	if cl.raw != nil {
@@ -464,20 +422,9 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 	if cl.responseBytes > cap {
 		cap = cl.responseBytes
 	}
-	responseBody := io.Reader(resp.Body)
-	if progress != nil {
-		responseBody = progress.reader(responseBody)
-	}
-	raw, err := io.ReadAll(io.LimitReader(responseBody, cap))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, cap))
 	if err != nil {
-		if progress != nil && progress.stalled() {
-			return resp.StatusCode, exit.Named(exit.Deadline, "hub.response_stalled",
-				"the hub at %s stopped sending its response body for %s", c.base, Timeout).
-				WithRemedy("retry; if it persists the hub is up but its response stream is stalled")
-		}
-		return resp.StatusCode, exit.Named(exit.Unavailable, "hub.response_interrupted",
-			"Tensorhub at %s broke off its response: %s", c.base, innermost(err)).
-			WithRemedy("retry; if it persists the hub or a proxy in front of it is dropping connections")
+		return resp.StatusCode, TransportFailure(c.base, err)
 	}
 	if cl.status != nil {
 		*cl.status = resp.StatusCode
@@ -596,17 +543,8 @@ func ParseRef(s string) (Ref, *exit.Error) {
 	return Ref{Org: org, Name: name}, nil
 }
 
-// Context bounds one hub call. Handlers never build their own.
+// Context is one Hub call's context: its caller may cancel it, and no clock does. A Hub
+// that is alive may take as long as it needs; a dead connection ends the call (HTTP).
 func Context() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), Timeout)
-}
-
-// LongContext carries a whole transfer — many calls, some of them proportional to the
-// bytes moved. A catalog read that takes minutes is broken; a publish that does is
-// working, and one deadline cannot mean both — so this one carries NO deadline. Each
-// object at the storage edge is bounded by its own byte counter, and a transfer is a
-// finite list of those; the only thing left for this context to carry is the caller's
-// cancel.
-func LongContext() (context.Context, context.CancelFunc) {
 	return context.WithCancel(context.Background())
 }

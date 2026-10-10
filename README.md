@@ -778,6 +778,7 @@ tensorhub_url: local        # the current hub: a name from `hubs` or a URL
 hubs:
   local: http://127.0.0.1:8819
 tensorhub_token: replace-with-your-token
+tensorhub_liveness_s: 40    # a Hub connection silent this long, probes unanswered, is dead
 huggingface_token: hf_replace-with-your-token
 civitai_token: replace-with-your-token
 tfs: /usr/local/bin/tfs
@@ -791,6 +792,10 @@ daemon:
 Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an available
 loopback port when another process owns 8818. A configured nonzero port is strict; `port: 0`
 explicitly asks the OS to select any available port.
+
+No clock bounds a Hub call: a slow Hub is waited on and says so (`waiting on Tensorhub at …
+(10s)`). Only a refused or unreachable dial, a TLS failure, a reset, or a connection silent for
+`tensorhub_liveness_s` with its probes (HTTP/2 PING, TCP keepalive) unanswered fails it.
 
 Hubs work like kubectl contexts. Without `tensorhub_url`, Cozy uses `tensorhub`
 (`https://tensorhub.com`). Local development names its own hub and switches to it:

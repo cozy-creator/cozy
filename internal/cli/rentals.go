@@ -871,7 +871,7 @@ func transient(e *exit.Error) bool {
 // only after the body finished.
 func rentalCallContext(deadline time.Time) (context.Context, context.CancelFunc) {
 	if deadline.IsZero() {
-		return hub.LongContext()
+		return hub.Context()
 	}
 	return context.WithDeadline(context.Background(), deadline)
 }
@@ -1955,7 +1955,7 @@ func learnRentalIdentity(ctx *Context, l home.Layout, st *records.Store,
 	op *records.RentalOperation,
 ) (string, *exit.Error) {
 	// The replay goes to the hub the ask was sent to, with that hub's credential.
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	seen, answered, problem := client(ctx.forHub(op.Hub)).Rent(hctx, op.RequestBody, op.Reason, op.Key)
 	cancel()
 	// A REFUSAL created nothing, so the ask may be settled as having bought nothing. An

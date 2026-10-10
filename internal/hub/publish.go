@@ -54,8 +54,7 @@ func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID strin
 	e := c.do(ctx, call{
 		method: http.MethodPut,
 		path:   publications(ref) + "/" + url.PathEscape(operationID), auth: true, reason: reason,
-		body:    map[string]any{"objects": objects},
-		byBytes: true, patient: true,
+		body: map[string]any{"objects": objects},
 	}, &out)
 	return out, e
 }
@@ -108,7 +107,7 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/grants",
-		auth:   true, reason: reason, byBytes: true, patient: true,
+		auth:   true, reason: reason,
 		body: map[string]any{"object_ids": objectIDs},
 	}, &out)
 	if e != nil {
@@ -278,8 +277,8 @@ func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation str
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/finalize",
-		auth:   true, reason: reason, byBytes: true,
-		body: request, patient: true, raw: &raw,
+		auth:   true, reason: reason,
+		body: request, raw: &raw,
 	}, nil)
 	if e != nil {
 		return CheckpointPublication{}, e
@@ -305,9 +304,7 @@ func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation str
 			return CheckpointPublication{}, exit.New(exit.Canceled, "model finalization was canceled")
 		case <-timer.C:
 		}
-		callCtx, cancel := context.WithTimeout(ctx, Timeout)
-		raw, problem = c.readModelFinalization(callCtx, ref, operation)
-		cancel()
+		raw, problem = c.readModelFinalization(ctx, ref, operation)
 		if transientPoll(ctx, problem) {
 			continue
 		}
@@ -383,7 +380,7 @@ func (c *Client) UpdateModelRelease(ctx context.Context, ref Ref, release string
 	}
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodPost, path: modelReleasePath(ref, release),
-		auth: true, reason: reason, patient: true,
+		auth: true, reason: reason,
 		body: map[string]any{"expected_revision": expectedRevision,
 			"set_lanes": setLanes, "remove_lanes": removeLanes, "default_lane": defaultLane}}, &out)
 	return out, e
@@ -398,7 +395,7 @@ func (c *Client) RetargetModelLane(ctx context.Context, ref Ref, release, lane,
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodPut,
 		path: modelReleasePath(ref, release) + "/lanes/" + url.PathEscape(lane),
-		auth: true, reason: reason, patient: true,
+		auth: true, reason: reason,
 		body: map[string]any{"checkpoint_id": checkpointID}}, &out)
 	return out, e
 }
@@ -416,7 +413,7 @@ type ModelDeletion struct {
 func (c *Client) DeleteModel(ctx context.Context, ref Ref, reason string) (ModelDeletion, *exit.Error) {
 	var out ModelDeletion
 	if e := c.do(ctx, call{method: http.MethodDelete, path: "/v1/models/" + ref.Org + "/" + ref.Name,
-		auth: true, reason: reason, patient: true}, &out); e != nil {
+		auth: true, reason: reason}, &out); e != nil {
 		return out, e
 	}
 	if out.Model != ref.String() {
@@ -428,7 +425,7 @@ func (c *Client) DeleteModel(ctx context.Context, ref Ref, reason string) (Model
 func (c *Client) YankModelRelease(ctx context.Context, ref Ref, release, reason string) (ModelRelease, *exit.Error) {
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodDelete, path: modelReleasePath(ref, release),
-		auth: true, reason: reason, patient: true}, &out)
+		auth: true, reason: reason}, &out)
 	return out, e
 }
 
@@ -491,7 +488,7 @@ func (c *Client) ReleaseManifest(ctx context.Context, ref Ref, release, lane str
 		method: http.MethodGet,
 		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/releases/" +
 			url.PathEscape(release) + "/lanes/" + url.PathEscape(lane) + "/manifest",
-		raw: &raw, byBytes: true,
+		raw: &raw,
 	}, nil)
 	return raw, e
 }
@@ -501,7 +498,7 @@ func (c *Client) CheckpointManifest(ctx context.Context, ref Ref, checkpointID s
 	e := c.do(ctx, call{
 		method: http.MethodGet, optionalAuth: true,
 		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + checkpointID,
-		raw:  &raw, byBytes: true,
+		raw:  &raw,
 	}, nil)
 	return raw, e
 }
@@ -524,7 +521,7 @@ func (c *Client) ReleaseReads(ctx context.Context, ref Ref, release, lane string
 		Reads []Read `json:"reads"`
 	}
 	e := c.do(ctx, call{
-		method: http.MethodPost, byBytes: true,
+		method: http.MethodPost,
 		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/releases/" + url.PathEscape(release) +
 			"/lanes/" + url.PathEscape(lane) + "/reads",
 		body: map[string]any{"object_ids": ids},
@@ -537,7 +534,7 @@ func (c *Client) CheckpointReads(ctx context.Context, ref Ref, checkpointID stri
 		Reads []Read `json:"reads"`
 	}
 	e := c.do(ctx, call{
-		method: http.MethodPost, byBytes: true, optionalAuth: true,
+		method: http.MethodPost, optionalAuth: true,
 		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + checkpointID + "/reads",
 		body: map[string]any{"object_ids": ids},
 	}, &out)

@@ -246,7 +246,7 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 		if problem != nil {
 			return publishSource{}, problem
 		}
-		hctx, cancel := hub.LongContext()
+		hctx, cancel := hub.Context()
 		defer cancel()
 		resolved, problem := resolver.Resolve(hctx, parsed)
 		if problem != nil {
@@ -296,7 +296,7 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 	if !catalogModelSpelling(raw) {
 		return publishSource{}, parseProblem
 	}
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	refspec := raw
 	if strings.Contains(raw, "#") {

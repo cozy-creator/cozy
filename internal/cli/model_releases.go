@@ -103,7 +103,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	current, lookup := c.ModelRelease(hctx, ref, release)
 	if lookup != nil && lookup.Code != exit.NotFound {
@@ -190,7 +190,7 @@ func handleModelRetarget(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	updated, problem := c.RetargetModelLane(hctx, ref, release, lane, checkpoint,
 		"cozy model retarget "+ref.String()+"@"+release+"/"+lane)
@@ -228,7 +228,7 @@ func handleModelYank(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	yanked, problem := c.YankModelRelease(hctx, ref, release,
 		"cozy model yank "+ref.String()+"@"+release)
@@ -277,7 +277,7 @@ func handleModelDelete(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := hub.Context()
 	defer cancel()
 	reason := "cozy model delete " + target
 	gc := "Tensorhub's next GC reclaims objects no other model references"
