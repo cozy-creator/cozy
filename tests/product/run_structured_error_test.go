@@ -41,13 +41,22 @@ func TestRunFailureKeepsCodeSeparateFromMessage(t *testing.T) {
 				ErrorCode string `json:"error_code"`
 				Error     string `json:"error"`
 				Calls     []struct {
+					Request   string `json:"request"`
 					ErrorCode string `json:"error_code"`
 					Error     string `json:"error"`
 				} `json:"calls"`
 			}
-			if code != 0 || json.Unmarshal([]byte(shown), &report) != nil || report.ErrorCode != errorCode || report.Error != message ||
-				len(report.Calls) != 1 || report.Calls[0].ErrorCode != errorCode || report.Calls[0].Error != message {
+			if code != 0 || json.Unmarshal([]byte(shown), &report) != nil || report.ErrorCode != errorCode || report.Error != message {
 				t.Fatalf("show lost the typed parent or child failure [%d]: %s", code, shown)
+			}
+			childFound := false
+			for _, call := range report.Calls {
+				if call.Request == id+"/0" {
+					childFound = call.ErrorCode == errorCode && call.Error == message
+				}
+			}
+			if !childFound {
+				t.Fatalf("show lost the typed child failure: %s", shown)
 			}
 			for _, args := range [][]string{{"run", "show", id}, {"run", "show", id, "--call", "1"}, {"run", "watch", id}} {
 				code, text := runCozy(t, o.root, args...)

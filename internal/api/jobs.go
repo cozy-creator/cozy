@@ -1005,7 +1005,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		state.StoppedEventID = s.store.StoppedEventID(row)
 	}
 	if row.State == "blocked" || row.State == "failed" {
-		state.ErrorType, _, state.Error, _ = s.store.SettledFailure(row.ID)
+		state.ErrorType, state.ErrorCode, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
 	if row.ParentRequestID != "" {
 		state.ParentRequestID = row.ParentRequestID

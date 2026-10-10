@@ -535,6 +535,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	// case cl-004's publication-escape arm produces, and the reason it exists.
 	if state.ErrorType == "" && terminal != nil {
 		state.ErrorType, _ = terminal.Payload["error_type"].(string)
+		state.ErrorCode, _ = terminal.Payload["error_code"].(string)
 		state.Error, _ = terminal.Payload["error"].(string)
 	}
 	fields := jobFields(ctx.Mode(), state, true)
@@ -646,6 +647,13 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		}
 		err.Message += "; kept " + strings.Join(kept, ", ")
 	}
+	life := api.Lifecycle{Number: state.Number, RequestID: state.JobID, Status: state.Status,
+		CanceledBy: state.CanceledBy, Triage: state.Triage}
+	if state.MachineExecution != nil {
+		life.Machine = state.MachineExecution.Machine
+	}
+	err.Cause = state.ErrorCode
+	err.Details = failureDetails(ctx, life, state.ErrorType, state.ErrorCode, state.Error, terminal)
 	return err
 }
 
