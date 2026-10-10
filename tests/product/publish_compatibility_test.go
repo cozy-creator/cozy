@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -38,7 +39,10 @@ func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 		t.Fatal("fixture lost its Runtime dependency")
 	}
 	compatibleRuntime := "cozy-runtime[media]>=" + matched[1] + ",<1"
-	narrow := "tensorfs>=0.3.35,<0.5"
+	// A minor-wide TensorFS pin at the vendored Runtime's own floor, so it stays satisfiable
+	// as the Runtime moves TensorFS minors.
+	floor, ceiling := runtimeTensorFSMinor(t, project)
+	narrow := "tensorfs>=" + floor + ",<" + ceiling
 	authored := strings.Replace(string(raw), matched[0], fmt.Sprintf("%q, %q", compatibleRuntime, narrow), 1)
 	must(t, os.WriteFile(path, []byte(authored), 0644))
 	lock := exec.Command("uv", "lock")
@@ -159,9 +163,41 @@ func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 		}
 	}
 	compact := strings.ReplaceAll(metadata, " ", "")
-	if !strings.Contains(compact, "Requires-Dist:cozy-runtime[media]<1,>="+matched[1]) || !strings.Contains(compact, "Requires-Dist:tensorfs<0.5,>=0.3.35") {
+	if !strings.Contains(compact, "Requires-Dist:cozy-runtime[media]<1,>="+matched[1]) || !strings.Contains(compact, "Requires-Dist:tensorfs<"+ceiling+",>="+floor) {
 		t.Fatalf("published wheel changed the declared compatibility bounds:\n%s", metadata)
 	}
+}
+
+// runtimeTensorFSMinor reads the TensorFS floor the fixture's vendored Runtime wheel requires
+// and the next minor above it.
+func runtimeTensorFSMinor(t *testing.T, project string) (floor, ceiling string) {
+	t.Helper()
+	wheels, err := filepath.Glob(filepath.Join(project, "vendor", "cozy_runtime-*.whl"))
+	must(t, err)
+	if len(wheels) != 1 {
+		t.Fatalf("fixture vendors %d Runtime wheels", len(wheels))
+	}
+	archive, err := zip.OpenReader(wheels[0])
+	must(t, err)
+	defer archive.Close()
+	requirement := regexp.MustCompile(`(?m)^Requires-Dist: tensorfs\b[^;\n]*>=([0-9]+)\.([0-9]+)(\.[0-9]+)?`)
+	for _, file := range archive.File {
+		if !strings.HasSuffix(file.Name, ".dist-info/METADATA") {
+			continue
+		}
+		stream, err := file.Open()
+		must(t, err)
+		raw, err := io.ReadAll(stream)
+		stream.Close()
+		must(t, err)
+		if found := requirement.FindStringSubmatch(string(raw)); found != nil {
+			minor, err := strconv.Atoi(found[2])
+			must(t, err)
+			return found[1] + "." + found[2] + found[3], found[1] + "." + strconv.Itoa(minor+1)
+		}
+	}
+	t.Fatalf("%s declares no TensorFS floor", filepath.Base(wheels[0]))
+	return "", ""
 }
 
 func assertStandardSdist(t *testing.T, raw []byte) {
