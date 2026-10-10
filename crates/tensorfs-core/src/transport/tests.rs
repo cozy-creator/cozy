@@ -5,7 +5,7 @@
 
 use super::credential::{credential_from_spec, Anonymous, HostToken};
 use super::download::{fetch_ranged, Ranged};
-use super::ledger::{Deadline, Ledger};
+use super::ledger::{Deadline, Ledger, PULL_STREAMS};
 use super::policy::{self, blocked, CheckedUrl, SourcePolicy};
 use super::pull::{absolute_location, pull, Fetched, ObjectSource, PullRequest};
 use super::push::{push_object, UploadGrant};
@@ -2129,6 +2129,35 @@ fn a_wide_walk_writes_through_a_bounded_number_of_writers() {
         "{report:?}"
     );
     assert_eq!(pull(&request).unwrap().fetched, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A default pull of more objects than `PULL_STREAMS` puts exactly that many requests on
+/// the wire: the origin holds each one until that many are open together, or ten seconds.
+#[test]
+fn a_default_pull_keeps_pull_streams_requests_open_at_the_origin() {
+    let root = temporary("default-streams");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(PULL_STREAMS + 32, 4 * 1024));
+    let (open, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (held, most) = (Arc::clone(&open), Arc::clone(&peak));
+    let origin = hub_origin(Arc::clone(&checkpoint), move |_, _| {
+        most.fetch_max(held.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while most.load(Ordering::SeqCst) < PULL_STREAMS && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        held.fetch_sub(1, Ordering::SeqCst);
+        None
+    });
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, &origin.base, &policy);
+    // Judged at the runtime's cadence, so a held request is never restarted.
+    request.sample_seconds = crate::transport::SAMPLE_SECONDS;
+    let report = pull(&request).unwrap();
+    assert_eq!(report.fetched, PULL_STREAMS as u64 + 34);
+    assert_eq!(report.streams, PULL_STREAMS, "{report:?}");
+    assert_eq!(peak.load(Ordering::SeqCst), PULL_STREAMS, "{report:?}");
     let _ = std::fs::remove_dir_all(root);
 }
 
