@@ -18,6 +18,19 @@ func (c *Client) Status(ctx context.Context) (*pb.StatusFrame, error) {
 	return first(ctx, c.Machine, false)
 }
 
+// IdleDeadline is when an idle machine says it releases itself (Unix ms). 0: none, because a
+// job is queued or running there (TensorD before 0.5.11 named now + 15 minutes instead) or
+// because it never does.
+func IdleDeadline(frame *pb.StatusFrame) int64 {
+	for _, run := range frame.GetRuns() {
+		switch run.GetState() {
+		case "queued", "starting", "running":
+			return 0
+		}
+	}
+	return frame.GetIdleDeadlineUnixMs()
+}
+
 // Keepalive resets the machine's idle deadline once; the frame carries the new deadline.
 func (c *Client) Keepalive(ctx context.Context) (*pb.StatusFrame, error) {
 	return first(ctx, c.Machine, true)

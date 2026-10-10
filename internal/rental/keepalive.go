@@ -47,11 +47,11 @@ func KeepAlive(ctx context.Context, l home.Layout, row *records.Rental) (Acknowl
 	if err != nil {
 		return out, exit.Unavailablef("rental keepalive was not acknowledged: %s", status.Convert(err).Message())
 	}
-	return acknowledged(row, frame.GetWorkerId(), frame.GetBootId(), frame.GetIdleDeadlineUnixMs())
+	return acknowledged(row, frame.GetWorkerId(), frame.GetBootId(), machinev1.IdleDeadline(frame))
 }
 
 // acknowledged accepts the pinned worker's future deadline, or zero from a machine that
-// names none (TensorD 0.5.2–0.5.5 after a job).
+// has a job queued or running and so names none.
 func acknowledged(row *records.Rental, worker, boot string, deadline int64) (Acknowledgment, *exit.Error) {
 	if worker != row.ExpectedWorkerID || boot != row.ExpectedWorkerBootID {
 		return Acknowledgment{}, exit.New(exit.Conflict, "rental keepalive was answered by another worker or boot than the rental's")

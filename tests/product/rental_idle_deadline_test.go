@@ -25,18 +25,27 @@ import (
 )
 
 // idleClockMachine is a rental's machine as far as its idle clock goes: Status names the
-// deadline it holds (0: none, as TensorD 0.5.2–0.5.5 after a job), and a keepalive restarts
-// a held clock.
+// deadline it holds (0: none, while it has a job), and a keepalive restarts a held clock.
+// `working` gives it a running job; `slides` names the deadline TensorD 0.5.7–0.5.9 named
+// then, now + 15 minutes.
 type idleClockMachine struct {
 	v1.UnimplementedMachineServer
-	deadline atomic.Int64
+	deadline        atomic.Int64
+	working, slides atomic.Bool
 }
 
 func (m *idleClockMachine) Status(request *v1.StatusRequest, stream grpc.ServerStreamingServer[v1.StatusFrame]) error {
 	if request.Keepalive && m.deadline.Load() != 0 {
 		m.deadline.Store(time.Now().Add(15 * time.Minute).UnixMilli())
 	}
-	return stream.Send(&v1.StatusFrame{WorkerId: "idle-worker", BootId: "idle-boot", Phase: "ready", IdleDeadlineUnixMs: m.deadline.Load()})
+	frame := &v1.StatusFrame{WorkerId: "idle-worker", BootId: "idle-boot", Phase: "ready", IdleDeadlineUnixMs: m.deadline.Load()}
+	if m.working.Load() {
+		frame.Runs, frame.IdleDeadlineUnixMs = []*v1.RunState{{Id: "job-1", State: "running"}}, 0
+		if m.slides.Load() {
+			frame.IdleDeadlineUnixMs = time.Now().Add(15 * time.Minute).UnixMilli()
+		}
+	}
+	return stream.Send(frame)
 }
 
 // The real CLI and daemon say the owner's rule, and `rental list`, `rental show` and
@@ -132,15 +141,29 @@ func TestRentalListAndKeepaliveShowTheMachinesIdleDeadline(t *testing.T) {
 		t.Fatalf("keepalive does not say when the rental ends [exit %d]:\n%s", code, out)
 	}
 
-	// A machine that names no deadline gets none, from either command.
-	machine.deadline.Store(0)
-	if row := listed(); row["release_due_at"] != nil {
-		t.Fatalf("invented a deadline: %v", row)
+	// While a job is queued or running there is no deadline, whether the machine names none
+	// or (TensorD 0.5.7–0.5.9) one that slides at now + 15 minutes: no countdown anywhere.
+	machine.working.Store(true)
+	for _, slides := range []bool{false, true} {
+		machine.slides.Store(slides)
+		if row := listed(); row["release_due_at"] != nil {
+			t.Fatalf("a working rental (slides %v) was given a deadline: %v", slides, row)
+		}
+		if acknowledged := keepalive(); acknowledged["release_due_at"] != nil || acknowledged["rental"] != "pr-idle" {
+			t.Fatalf("keepalive (slides %v) gave a working rental a deadline: %v", slides, acknowledged)
+		}
+		if code, out := runCozy(t, root, "rental", "list"); code != 0 || !regexp.MustCompile(`kirin\s.*\s0\s+0\s+—\s`).MatchString(out) || regexp.MustCompile(`kirin\s.*\sin \d+m`).MatchString(out) {
+			t.Fatalf("the board counts a working rental (slides %v) down [exit %d]:\n%s", slides, code, out)
+		}
+		for _, command := range [][]string{{"rental", "show", "kirin"}, {"rental", "keepalive", "kirin"}} {
+			if code, out := runCozy(t, root, command...); code != 0 || !regexp.MustCompile(`ends:?\s+after its jobs`).MatchString(out) || regexp.MustCompile(`in \d+m`).MatchString(out) {
+				t.Fatalf("%v (slides %v) counts a working rental down [exit %d]:\n%s", command, slides, code, out)
+			}
+		}
 	}
-	if acknowledged := keepalive(); acknowledged["release_due_at"] != nil || acknowledged["rental"] != "pr-idle" {
-		t.Fatalf("keepalive invented a deadline: %v", acknowledged)
-	}
-	if code, out := runCozy(t, root, "rental", "keepalive", "kirin"); code != 0 || strings.Contains(out, "ends") {
-		t.Fatalf("human keepalive without a deadline [exit %d]:\n%s", code, out)
+	// Idle again, the countdown is back.
+	machine.working.Store(false)
+	if row := listed(); row["release_due_at"] != stamp(machine.deadline.Load()) {
+		t.Fatalf("an idle rental lost its deadline: %v", row)
 	}
 }

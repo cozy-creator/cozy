@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/records"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -102,7 +103,8 @@ func originKey(origin string) string {
 }
 
 // releaseDue asks each ready rental's machine, at most eight at once, when it ends itself.
-// One its Hub cannot reach is not asked; one that cannot answer, or names none, shows none.
+// One its Hub cannot reach is not asked; one that cannot answer, or names none (a job is
+// queued or running there), shows none.
 func (m *machineRuns) releaseDue(ctx context.Context, rows []api.RentalSummary) {
 	var wait sync.WaitGroup
 	slots := make(chan struct{}, 8)
@@ -152,7 +154,7 @@ func (m *machineRuns) MachineLog(ctx context.Context, machine, log string, tailB
 func statusOf(frame *machinepb.StatusFrame) api.MachineStatus {
 	out := api.MachineStatus{WorkerID: frame.GetWorkerId(), BootID: frame.GetBootId(), Agent: frame.GetVersion(),
 		Phase: frame.GetPhase(), Runtime: frame.GetRuntime(), TensorFS: frame.GetTensorfs(),
-		Capabilities: frame.GetCapabilities(), IdleDeadlineUnixMS: frame.GetIdleDeadlineUnixMs(),
+		Capabilities: frame.GetCapabilities(), IdleDeadlineUnixMS: machinev1.IdleDeadline(frame),
 		GPUs: []api.MachineGPU{}, Runs: []api.MachineRun{}, Environments: []api.MachineEnvironment{},
 		DiskTotalBytes: frame.GetDisk().GetTotalBytes(), DiskFreeBytes: frame.GetDisk().GetFreeBytes()}
 	for _, gpu := range frame.GetGpus() {

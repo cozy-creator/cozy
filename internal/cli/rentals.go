@@ -1241,7 +1241,11 @@ func rentalStatus(client *localapi.Client, rentalID string, typed bool) ([]outpu
 	if problem != nil {
 		return nil, []string{"machine status unavailable: " + problem.Message}
 	}
-	return machineStatusFields(status, typed), nil
+	fields := machineStatusFields(status, typed)
+	if status.IdleDeadlineUnixMS == 0 {
+		fields = slices.Insert(fields, 2, rentalEnds(0, typed)...)
+	}
+	return fields, nil
 }
 
 // machineStatusFields names a machine's software, phase, GPUs, live runs and free disk.
@@ -1762,11 +1766,20 @@ func releaseDue(ms int64, typed bool) []output.Field {
 	return []output.Field{{K: "ends", V: endsCell(due.Format(time.RFC3339Nano)) + " (" + due.Local().Format("15:04:05") + ")"}}
 }
 
-// endsCell is how long until a machine's reported deadline; blank when it named none.
+// rentalEnds is releaseDue for a rental: one that names no deadline has a job queued or
+// running, and ends only after it.
+func rentalEnds(ms int64, typed bool) []output.Field {
+	if ms <= 0 && !typed {
+		return []output.Field{{K: "ends", V: "after its jobs"}}
+	}
+	return releaseDue(ms, typed)
+}
+
+// endsCell is how long until an idle machine's reported deadline; "—" when it named none.
 func endsCell(due string) string {
 	at, err := time.Parse(time.RFC3339Nano, due)
 	if err != nil {
-		return ""
+		return "—"
 	}
 	if left := time.Until(at); left > 0 {
 		return "in " + durationClock(left)
