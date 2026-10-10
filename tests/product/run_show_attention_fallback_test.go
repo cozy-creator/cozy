@@ -12,7 +12,7 @@ func TestRunShowRetainsSelectionTimeAttentionFallback(t *testing.T) {
 	fallback := map[string]any{"component": "base/fl2va_dit", "preferred": "sol-attn-sage2-fixed-kmean",
 		"selected": "sol-attn", "reason": "kernel build still compiling (42%)"}
 	bundle, err := json.Marshal(map[string]any{"measurements": map[string]any{"execution": map[string]any{
-		"degree": 1, "gpus": []any{map[string]any{"gpu": 0, "arch": "sm_90", "attention": map[string]any{
+		"degree": 1, "gpus": []any{map[string]any{"gpu": 0, "pid": 1234, "arch": "sm_90", "attention": map[string]any{
 			"observed": "sol-attn", "fallbacks": []any{fallback}, "kernels": []any{
 				map[string]any{"kernel": "sol-attn", "state": "ready", "served": true},
 				map[string]any{"kernel": "sol-attn-sage2-fixed-kmean", "state": "ready", "served": false},
