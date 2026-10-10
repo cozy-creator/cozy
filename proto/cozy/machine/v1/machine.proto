@@ -105,9 +105,17 @@ message Release {
   reserved 3, 4, 5;    // the card and lock the caller once carried
 }
 // The manifest is a JSON object written with Write: {package: "local/<dist>", release,
-// python_requires, python_version, source: {digest, length} (a tar of the project),
-// wheels: [{name, digest, length}], requirements: {digest, length}}. Its members are objects
-// the same signer wrote.
+// python_requires, python_version, callees: {distribution: package} and its code. A live
+// project is installed editable from `files: [{name, digest, length, executable}]`: the
+// project and the path dependencies its lock names, each file under their common directory,
+// with `project` the project's directory there. The machine keeps one such tree and one
+// environment per signer and package: a Write is needed only for a file the tree does not
+// hold, and the environment is rebuilt only when the lock, the project's metadata or a path
+// dependency changes. `path` names that common directory on this computer's machine, which
+// reads it in place. `wheels: [{name, digest, length}]` are locked dependencies the caller
+// carries because the machine cannot fetch them. Members are objects the same signer wrote.
+// (Before live projects: `source: {digest, length}`, a tar of the project, or `wheels` with
+// `requirements: {digest, length}`.)
 message LocalSource {
   string manifest = 1;  // sha256:<hex> of the manifest object
 }

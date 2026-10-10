@@ -165,7 +165,40 @@ pub fn prepare_uploaded(
     uploaded: &UploadedPackage,
 ) -> Result<PreparedGeneration, Status> {
     let materialized = materialize_uploaded(uploaded, &config.staging_root)?;
-    let captured_python = &materialized.root_set.python_version;
+    let mut command = installer(config, &materialized.root_set)?;
+    if let Some(project) = &materialized.project {
+        command.arg("--project").arg(project);
+    }
+    for wheel in &materialized.wheels {
+        command.arg("--wheel").arg(wheel);
+    }
+    if let Some(requirements) = &materialized.requirements {
+        command.arg("--requirements").arg(requirements);
+    }
+    publish(config, command)
+}
+
+/// A live project installed editable in `environment`, which is built when it is not there
+/// yet: the generation it publishes describes the project now and runs in that environment.
+pub fn prepare_editable(
+    config: &InstallerConfig,
+    root: &RootSet,
+    project: &Path,
+    environment: &Path,
+    wheels: &[PathBuf],
+) -> Result<PreparedGeneration, Status> {
+    let mut command = installer(config, root)?;
+    command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
+    for wheel in wheels {
+        command.arg("--wheel").arg(wheel);
+    }
+    publish(config, command)
+}
+
+/// The trusted helper's command for one package: this machine's interpreter, SDK pair, runner
+/// client and generations, and what the package declares of itself.
+fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status> {
+    let captured_python = &root.python_version;
     let python = if !captured_python.is_empty() {
         let parts: Vec<_> = captured_python.split('.').collect();
         if !(2..=3).contains(&parts.len())
@@ -208,36 +241,18 @@ pub fn prepare_uploaded(
         .arg("--python")
         .arg(python)
         .arg("--distribution")
-        .arg(
-            materialized
-                .root_set
-                .package
-                .rsplit('/')
-                .next()
-                .expect("declared package"),
-        )
+        .arg(root.package.rsplit('/').next().expect("declared package"))
         .arg("--release")
-        .arg(&materialized.root_set.release)
+        .arg(&root.release)
         .arg("--callees")
-        .arg(serde_json::to_string(&materialized.root_set.callees)
-            .map_err(|error| Status::internal(error.to_string()))?)
-        .arg(format!(
-            "--python-requires={}",
-            materialized.root_set.python_requires
-        ))
-        .arg(format!(
-            "--python-version={}",
-            materialized.root_set.python_version
-        ));
-    if let Some(project) = &materialized.project {
-        command.arg("--project").arg(project);
-    }
-    for wheel in &materialized.wheels {
-        command.arg("--wheel").arg(wheel);
-    }
-    if let Some(requirements) = &materialized.requirements {
-        command.arg("--requirements").arg(requirements);
-    }
+        .arg(serde_json::to_string(&root.callees).map_err(|error| Status::internal(error.to_string()))?)
+        .arg(format!("--python-requires={}", root.python_requires))
+        .arg(format!("--python-version={}", root.python_version));
+    Ok(command)
+}
+
+/// Run the helper to its exit and hold the generation it published.
+fn publish(config: &InstallerConfig, mut command: Command) -> Result<PreparedGeneration, Status> {
     // Bounds on output memory do not kill a progressing installer. Always drain
     // its stdout and wait for its actual exit; no wall-clock kill is inserted.
     let mut child = command

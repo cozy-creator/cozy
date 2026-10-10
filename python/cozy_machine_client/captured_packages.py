@@ -16,7 +16,7 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from .package_records import Dependency, DescribeInstalled, DESCRIPTION_DECODER, PackageMetadata
+from .package_records import Dependency, Describe, DescribeInstalled, DESCRIPTION_DECODER, PackageMetadata
 from .packages import PackageError, in_environment, publish_generation, read_metadata
 
 
@@ -89,16 +89,110 @@ def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     return fallback
 
 
-def install_captured(*, project: Path | None, wheels: list[Path], requirements: Path | None,
-                     distribution: str, release: str, python_requires: str, python_version: str,
-                     generations: Path, client_wheel: Path, python: str, sdk: list[Path] = (),
-                     callees: dict[str, str] | None = None):
+def interpreter_for(python: str, python_requires: str, python_version: str) -> str:
+    """The machine's interpreter for a package, refused when its declared Python excludes it."""
     python = subprocess.check_output(["uv", "python", "find", "--no-project", "--no-python-downloads", python]).decode().strip()
     version = Version(subprocess.check_output([python, "-I", "-S", "-c", "import platform;print(platform.python_version())"]).decode().strip())
     if python_requires and version not in SpecifierSet(python_requires):
         raise PackageError("package_python_unavailable", "configured interpreter does not satisfy captured Python requirements")
     if python_version and str(version) != python_version and ".".join(str(version).split(".")[:2]) != python_version:
         raise PackageError("package_python_unavailable", "configured interpreter does not match captured Python selection")
+    return python
+
+
+def add_runner(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
+    """The runner client beside a selected closure: it may add its own dependencies only
+    without changing one already selected package or SDK version (uv reports any conflict)."""
+    locked = inventory(interpreter)
+    constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
+    subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
+    after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
+    if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
+        raise PackageError("package_lock_changed", "runner installation changed the captured dependency closure")
+    check = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
+    if check.returncode != 0:
+        conflicts = [line.strip() for line in (check.stdout + check.stderr).splitlines() if "requires" in line or "not installed" in line]
+        raise PackageError("package_dependency_conflict", "; ".join(conflicts)[:2000] or f"uv pip check exited {check.returncode}")
+
+
+def live_paths(environment: Path) -> None:
+    """Spell an editable install's source paths as `import` lines. Python adds them at startup
+    all the same, and the Runtime's static reader, which never interprets such a line, reads the
+    environment's installed packages without following the project out of it: the project is
+    described from its own directory."""
+    for path in environment.glob("lib/python*/site-packages/*.pth"):
+        lines = path.read_text().splitlines()
+        live = [line for line in lines if line and not line.startswith(("#", "import ", "import\t"))
+                and not (path.parent / line.rstrip()).resolve().is_relative_to(environment.resolve())]
+        if live:
+            path.write_text("".join(f"import sys; sys.path.append({line.rstrip()!r})\n" if line in live else line + "\n" for line in lines))
+
+
+def install_editable(*, project: Path, environment: Path, wheels: list[Path], distribution: str, release: str,
+                     python_requires: str, python_version: str, generations: Path, client_wheel: Path,
+                     python: str, sdk: list[Path] = (), callees: dict[str, str] | None = None):
+    """A live project, installed editable: `environment` is built once from the project's lock
+    and kept while the lock stands, and every call publishes a generation that describes the
+    project as it is now and runs in that environment. An edit costs a description, never an
+    install. `wheels` are locked dependencies the caller carries because this machine cannot
+    fetch them: each installs from its file, at the version the lock selected."""
+    python = interpreter_for(python, python_requires, python_version)
+    project = project.resolve(strict=True)
+    metadata = read_metadata(project)
+    if canonicalize_name(metadata.name) != canonicalize_name(distribution) or Version(metadata.version) != Version(release):
+        raise PackageError("package_metadata_changed", "the live project declares another package release")
+    interpreter, ready = environment / "bin" / "python", environment / ".ready"
+    if not ready.is_file():
+        shutil.rmtree(environment, ignore_errors=True)  # a build that never finished
+        environment.parent.mkdir(parents=True, exist_ok=True)
+
+        def capture():
+            """The project's own selection. Run again, it restores what the machine's pair replaced."""
+            if (project / "uv.lock").is_file():
+                # Each carried distribution at the version the lock selected, from its own
+                # files (uv picks the one this platform takes); the lock installs the rest,
+                # every dependency as an ordinary install: only the project itself is live.
+                carried = sorted({tuple(wheel.name.split("-")[:2]) for wheel in wheels})
+                sync = ["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-install-project", "--no-python-downloads",
+                        "--project", str(project), "--python", python, *(f"--no-install-package={name}" for name, _ in carried)]
+                placed = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(environment)}
+                subprocess.run(sync, env=placed, check=True)
+                linked = linked_applications(interpreter) if COPY else []
+                if linked:
+                    subprocess.run([*sync, *COPY, *(f"--reinstall-package={name}" for name in linked)], env=placed, check=True)
+                if carried:
+                    subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "--no-deps", "--no-index",
+                                    "--find-links", str(wheels[0].parent), *(f"{name}=={version}" for name, version in carried)], check=True)
+                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "--no-deps", "--editable", str(project)], check=True)
+            else:
+                subprocess.run(["uv", "venv", "--allow-existing", "--python", python, str(environment)], check=True)
+                found = ["--find-links", str(wheels[0].parent)] if wheels else []
+                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *found, "--editable", str(project)], check=True)
+            live_paths(environment)
+
+        capture()
+        fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
+        add_runner(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
+        ready.write_text(fallback)
+    generations.mkdir(parents=True, exist_ok=True)
+    root = generations.resolve() / uuid.uuid4().hex
+    root.mkdir(); (root / ".hold").touch()
+    try:
+        (root / "env").symlink_to(environment.resolve(), target_is_directory=True)
+        # Described by the environment's own Runtime, from the project's directory.
+        live = root / "env" / "bin" / "python"
+        interface = in_environment(live, Describe(str(project), str(live)), DESCRIPTION_DECODER).interface
+        return publish_generation(root, metadata, interface, callees, ready.read_text())
+    except BaseException:
+        shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched
+        raise
+
+
+def install_captured(*, project: Path | None, wheels: list[Path], requirements: Path | None,
+                     distribution: str, release: str, python_requires: str, python_version: str,
+                     generations: Path, client_wheel: Path, python: str, sdk: list[Path] = (),
+                     callees: dict[str, str] | None = None):
+    python = interpreter_for(python, python_requires, python_version)
     project = project.resolve() if project else None
     wheels = [wheel.resolve(strict=True) for wheel in wheels]
     client_wheel = client_wheel.resolve(strict=True)
@@ -169,19 +263,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
 
         capture()
         fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
-        locked = inventory(interpreter)
-        constraints = root / "captured-constraints.txt"
-        constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
-        # Runner dependencies may be added only without changing a single already
-        # selected package/SDK version. uv reports any conflict with declared bounds.
-        subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
-        after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
-        if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
-            raise PackageError("package_lock_changed", "runner installation changed the captured dependency closure")
-        check = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-        if check.returncode != 0:
-            conflicts = [line.strip() for line in (check.stdout + check.stderr).splitlines() if "requires" in line or "not installed" in line]
-            raise PackageError("package_dependency_conflict", "; ".join(conflicts)[:2000] or f"uv pip check exited {check.returncode}")
+        add_runner(interpreter, root / "captured-constraints.txt", client_wheel)
         return publish_generation(root, metadata, None, callees, fallback)
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched

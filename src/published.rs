@@ -1266,11 +1266,13 @@ impl Publisher {
                 .to_string();
             let parameter = path.rsplit('.').next().unwrap_or_default().to_string();
             job.stage(format!("choosing the model for {path}"));
+            let declared = default_choice(slot, &path, &installation.package, &request.owner);
             let choice = request
                 .choices
                 .iter()
                 .find(|c| c.parameter == path || c.parameter == parameter)
-                .ok_or(("model_choice_absent", format!("the run names no model for {path}")))?;
+                .or(declared.as_ref())
+                .ok_or_else(|| choice_absent(&path, &installation.package))?;
             if !choice.source.is_empty() {
                 grants.push(self.source_grant(installation, &path, choice, &request.providers, job)?);
                 continue;
@@ -1786,6 +1788,39 @@ fn probe(url: &str, policy: &SourcePolicy, ledger: &Ledger) -> Result<u64, Refus
 
 fn io_failure(error: io::Error) -> Failure {
     ("release_root_preparation_failed", error.to_string())
+}
+
+/// A slot's declared default as a choice (its `default_ladder`: rungs of
+/// `[org/]model@release/lane`, one model and release): what a run that names no model for the
+/// slot gets, with no binding read anywhere. An org-relative model is the package's account's:
+/// the package's org, or for unpublished code the run's `owner`.
+pub(crate) fn default_choice(slot: &Value, path: &str, package: &str, owner: &str) -> Option<domain::ModelChoice> {
+    let account = match package.split_once('/') {
+        Some((org, _)) if org != "local" => org,
+        _ => owner,
+    };
+    let mut choice = domain::ModelChoice { parameter: path.into(), ..Default::default() };
+    for rung in slot.get("default_ladder")?.as_array()? {
+        let (reference, lane) = rung.get("lane")?.as_str()?.rsplit_once('/')?;
+        let (model, release) = reference.split_once('@')?;
+        choice.repository = match model.contains('/') {
+            true => model.into(),
+            false if account.is_empty() => return None,
+            false => format!("{account}/{model}"),
+        };
+        choice.release = release.into();
+        choice.rungs.push(domain::ModelRung {
+            gpu: rung.get("gpu").and_then(Value::as_str).unwrap_or("*").into(),
+            gpus: rung.get("gpus").and_then(Value::as_u64).unwrap_or(0) as u32,
+            lane: lane.into(),
+        });
+    }
+    (!choice.rungs.is_empty()).then_some(choice)
+}
+
+/// A slot with neither a choice nor a declared default.
+pub(crate) fn choice_absent(path: &str, package: &str) -> Failure {
+    ("model_choice_absent", format!("the run names no model for {path}, and {package} declares no default for it"))
 }
 
 fn model_slots(interface: &Value, entrypoint: &str) -> Option<Vec<Value>> {
@@ -2379,6 +2414,26 @@ mod tests {
         assert_eq!((got.release.as_str(), got.lane.as_str(), got.manifest.as_str()), ("", "", ""));
         let unnamed = domain::ModelChoice { manifest: pinned.manifest.clone(), ..Default::default() };
         assert_eq!(choose(&unnamed, ("", 0)).err().unwrap().0, "model_choice_absent");
+    }
+
+    /// A slot the run names no model for takes its declared default ladder, with no binding
+    /// read anywhere (run 5327's `generate_image.models.model` failed `model_choice_absent`).
+    /// An org-relative model is the package's account's: its org, or unpublished code's owner.
+    #[test]
+    fn an_unchosen_slot_takes_its_declared_default() {
+        let path = "generate_image.models.model";
+        let slot = json!({"path": path, "default_ladder": [
+            {"gpu": "H100", "gpus": 2, "lane": "qwen-image-2@1.0.0/fp8"}, {"gpu": "*", "lane": "qwen-image-2@1.0.0/bf16"}]});
+        let published = default_choice(&slot, path, "paul/qwen-image-2", "").unwrap();
+        assert_eq!((published.parameter.as_str(), published.repository.as_str(), published.release.as_str()), (path, "paul/qwen-image-2", "1.0.0"));
+        assert_eq!(published.rungs, rungs(&[("H100", 2, "fp8"), ("*", 0, "bf16")]));
+        assert_eq!(choose(&published, path, ("NVIDIA RTX A4000", 1)).unwrap().0.lane, "bf16");
+        assert_eq!(default_choice(&slot, path, "local/qwen-copy", "fidika").unwrap().repository, "fidika/qwen-image-2");
+        assert!(default_choice(&slot, path, "local/qwen-copy", "").is_none(), "an org-relative default needs its account");
+        let explicit = json!({"default_ladder": [{"gpu": "*", "lane": "proof/probe@2.1/bf16"}]});
+        assert_eq!(default_choice(&explicit, path, "local/qwen-copy", "").unwrap().repository, "proof/probe");
+        assert!(default_choice(&json!({"path": path}), path, "paul/qwen-image-2", "").is_none());
+        assert_eq!(choice_absent(path, "paul/qwen-image-2").0, "model_choice_absent");
     }
 
     #[test]

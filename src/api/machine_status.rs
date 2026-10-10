@@ -14,6 +14,9 @@ pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Statu
 /// set and each environment's level. `upload/1`: a warm run of one provider source puts it in
 /// its weights destination. `remove/1`: a remove run drops the caller's installations and
 /// deletes their environments once nothing holds them; Status names each one's Hub.
+/// `live-source/1`: a local source's manifest may name a live project file by file (or its
+/// directory on this computer), installed editable in one tree and environment per package;
+/// and a slot a run names no model for takes its declared default.
 pub const CAPABILITIES: &[&str] = &[
     "status/1",
     "run/1",
@@ -24,6 +27,7 @@ pub const CAPABILITIES: &[&str] = &[
     "upload/1",
     "local-models/1",
     "remove/1",
+    "live-source/1",
 ];
 
 const LIVE: [&str; 4] = ["queued", "starting", "running", "paused"];
