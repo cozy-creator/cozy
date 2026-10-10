@@ -38,16 +38,11 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 	if problem := store.RecordRentalKeepalive(subject.Row.ID, receipt, time.Now()); problem != nil {
 		return problem
 	}
-	result := api.RentalKeepaliveResult{Rental: subject.Row.ID, WorkerID: receipt.WorkerID, WorkerBootID: receipt.WorkerBootID,
-		AcknowledgedAtUnixMS: receipt.AcknowledgedAtMS, IdleDeadlineUnixMS: receipt.IdleDeadlineMS}
-	fields := []output.Field{
-		{K: "rental", V: result.Rental},
-		{K: "acknowledged_at", V: time.UnixMilli(result.AcknowledgedAtUnixMS).UTC().Format(time.RFC3339Nano)},
-	}
-	if result.IdleDeadlineUnixMS > 0 {
-		fields = append(fields, output.Field{K: "release_due", V: time.UnixMilli(result.IdleDeadlineUnixMS).UTC().Format(time.RFC3339Nano)})
-	}
-	return emit(ctx, compactRecord(fields, "rental", "acknowledged_at", "release_due"))
+	// The deadline the machine answered: its clock restarted now, or none named.
+	fields := append([]output.Field{{K: "rental", V: subject.Row.ID},
+		{K: "acknowledged_at", V: time.UnixMilli(receipt.AcknowledgedAtMS).UTC().Format(time.RFC3339Nano)}},
+		releaseDue(receipt.IdleDeadlineMS, !ctx.Mode().Human || ctx.Mode().JSON)...)
+	return emit(ctx, output.Record{Fields: fields, AllFields: fields})
 }
 
 // keepalive is the daemon's route for the same reset (a cozy before the command did it

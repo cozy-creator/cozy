@@ -19,32 +19,35 @@ func idleRecord(t *testing.T, store *records.Store, id string, at time.Time) rec
 	return row
 }
 
-func TestFixedRentalIdleClockScopesWorkAndRetainedState(t *testing.T) {
+// The IDLE column is this host's observation of each machine's own work; when the machine
+// ends itself is its own to say.
+func TestRentalIdleObservationScopesWorkAndRetainedState(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	at := time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC)
 	row := idleRecord(t, store, "idle", at)
 	observe := func() rental.Idleness { t.Helper(); i, p := rental.ObserveIdle(store, row); fatal(t, p); return i }
-	checkBoundary := func(i rental.Idleness, baseline time.Time) {
+	idleSince := func(i rental.Idleness, baseline time.Time) {
 		t.Helper()
-		if i.Due(baseline.Add(900*time.Second-time.Nanosecond)) || !i.Due(baseline.Add(900*time.Second)) {
-			t.Fatalf("not an exact fifteen-minute deadline: %+v", i)
+		if i.Queued+i.Running != 0 || !i.Since.Equal(baseline) {
+			t.Fatalf("not idle since %s: %+v", baseline, i)
 		}
 	}
-	checkBoundary(observe(), at)
+	busy := func() bool { i := observe(); return i.Queued+i.Running > 0 }
+	idleSince(observe(), at)
 	// Unpinned fleet work is not this rental's activity.
 	unpinned := recordPrivateTransaction(t, store, "unpinned", "")
-	checkBoundary(observe(), at)
-	// Its own explicitly purchased queued request does protect this one machine.
+	idleSince(observe(), at)
+	// Its own explicitly purchased queued request is this one machine's work.
 	row.ManagedRequestID = unpinned.ID
-	if observe().Due(at.Add(time.Hour)) {
-		t.Fatal("acquisition buyer did not protect its machine")
+	if !busy() {
+		t.Fatal("acquisition buyer's request is not its machine's work")
 	}
 	row.ManagedRequestID = ""
 	request := recordPrivateTransaction(t, store, "pinned", row.ID)
-	if observe().Due(at.Add(time.Hour)) {
-		t.Fatal("pinned preparation was treated as idle")
+	if !busy() {
+		t.Fatal("pinned work was treated as idle")
 	}
 	state, p := store.RequestPause(request.ID, "clock proof")
 	fatal(t, p)
@@ -56,10 +59,7 @@ func TestFixedRentalIdleClockScopesWorkAndRetainedState(t *testing.T) {
 		}
 	}
 	paused := observe()
-	if paused.Running != 0 || paused.Queued != 0 {
-		t.Fatalf("retained paused work is activity: %+v", paused)
-	}
-	checkBoundary(paused, paused.Since)
+	idleSince(paused, paused.Since)
 	blocked := recordPrivateTransaction(t, store, "blocked", row.ID)
 	changed, p := store.BlockRetainedWork(blocked.ID, "fixture", "failed work remains retained")
 	fatal(t, p)
@@ -67,7 +67,7 @@ func TestFixedRentalIdleClockScopesWorkAndRetainedState(t *testing.T) {
 		t.Fatal("blocked fixture did not settle")
 	}
 	idle := observe()
-	checkBoundary(idle, idle.Since)
+	idleSince(idle, idle.Since)
 	if retained, p := store.RentalRetainsWork(row.ID); p != nil || !retained {
 		t.Fatal("idle policy destroyed or ignored retained custody", p)
 	}
@@ -95,65 +95,36 @@ func TestRentalKeepaliveReceiptSurvivesReconnectAndRejectsInvalidAcknowledgment(
 		t.Helper()
 		i, p := rental.ObserveIdle(store, row)
 		fatal(t, p)
-		due, ok := i.ReleaseAt()
-		if !ok || !due.Equal(want) {
-			t.Fatalf("deadline=%s eligible=%v want=%s", due, ok, want)
+		if !i.Since.Equal(want) {
+			t.Fatalf("idle since=%s want=%s", i.Since, want)
 		}
 	}
-	check(at.Add(900 * time.Second))
+	check(at)
 	fatal(t, store.RecordRentalKeepalive(row.ID, receipt, at))
-	check(at.Add(900 * time.Second))
+	check(at)
 	for _, mutate := range []func(*records.RentalKeepalive){func(r *records.RentalKeepalive) { r.WorkerID = "other" }, func(r *records.RentalKeepalive) { r.WorkerBootID = "other" }, func(r *records.RentalKeepalive) { r.AcknowledgedAtMS = 0 }, func(r *records.RentalKeepalive) { r.IdleDeadlineMS = r.AcknowledgedAtMS }} {
 		invalid := receipt
 		mutate(&invalid)
 		if store.RecordRentalKeepalive(row.ID, invalid, at.Add(time.Minute)) == nil {
 			t.Fatal("invalid worker acknowledgment renewed rental")
 		}
-		check(at.Add(900 * time.Second))
+		check(at)
 	}
 	later := receipt
 	later.AcknowledgedAtMS += 120000
 	later.IdleDeadlineMS += 120000
 	fatal(t, store.RecordRentalKeepalive(row.ID, later, at.Add(120*time.Second)))
-	check(at.Add(1020 * time.Second))
-	// A Host whose own idle window differs is still an acknowledgment: Creator's
-	// schedule comes from its own observation, not the Host's window.
-	longer := later
-	longer.AcknowledgedAtMS += 60000
-	longer.IdleDeadlineMS = longer.AcknowledgedAtMS + 1800000
-	fatal(t, store.RecordRentalKeepalive(row.ID, longer, at.Add(180*time.Second)))
-	check(at.Add(1080 * time.Second))
+	check(at.Add(120 * time.Second))
+	// A machine that names no deadline (an older TensorD) still restarted its clock.
+	none := later
+	none.AcknowledgedAtMS += 60000
+	none.IdleDeadlineMS = 0
+	fatal(t, store.RecordRentalKeepalive(row.ID, none, at.Add(180*time.Second)))
+	check(at.Add(180 * time.Second))
 	row.State = "release_requested"
 	fatal(t, store.RecordRental(row))
 	if store.RecordRentalKeepalive(row.ID, later, at.Add(120*time.Second)) == nil {
 		t.Fatal("ending rental renewed")
-	}
-}
-
-func TestInterruptedExplicitPreparationDefersOnlyCreatorExpiryWithoutRenewal(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.sqlite")
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	at := time.Now().Add(-time.Hour).UTC()
-	row := idleRecord(t, store, "preparing", at)
-	fatal(t, store.RecordRentalPreparationStarted(row.ID))
-	store.Close()
-	store, problem = records.Open(path)
-	fatal(t, problem)
-	defer store.Close()
-	idle, problem := rental.ObserveIdle(store, row)
-	fatal(t, problem)
-	if idle.PendingPreparation != 1 || idle.Running != 0 || !idle.Since.Equal(at) || idle.Due(time.Now()) {
-		t.Fatalf("unknown preparation was renewed or falsely reported active: %+v", idle)
-	}
-	// Only an actual finished preparation advances the local baseline. The stale
-	// intent issues no worker RPC and cannot renew the independent pod deadline.
-	done := time.Now().UTC()
-	fatal(t, store.RecordRentalWorkFinished(row.ID, done))
-	idle, problem = rental.ObserveIdle(store, row)
-	fatal(t, problem)
-	if idle.PendingPreparation != 0 || !idle.Due(done.Add(900*time.Second)) || idle.Due(done.Add(899*time.Second)) {
-		t.Fatalf("finished preparation did not start fixed grace: %+v", idle)
 	}
 }
 
@@ -176,41 +147,5 @@ func TestRentalIdleConfigurationHasNoDurationOrDisableEscape(t *testing.T) {
 	t.Setenv("RENTALS_IDLE_RELEASE_S", "1")
 	if code, out := runCozy(t, root, "help", "rental", "keepalive"); code != 0 {
 		t.Fatalf("fixed policy rejected ordinary environment: %d %s", code, out)
-	}
-	if rental.IdleTimeout != 900*time.Second {
-		t.Fatal("environment changed fixed deadline")
-	}
-}
-
-func TestRentalKeepaliveLocalDeadlineIgnoresHostClockSkew(t *testing.T) {
-	for _, skew := range []time.Duration{-8 * time.Hour, 8 * time.Hour} {
-		t.Run(skew.String(), func(t *testing.T) {
-			store, problem := records.Open(filepath.Join(t.TempDir(), "records.sqlite"))
-			fatal(t, problem)
-			defer store.Close()
-			received := time.Date(2026, 9, 24, 12, 0, 0, 123456789, time.UTC)
-			row := idleRecord(t, store, "skew", received.Add(-time.Hour))
-			ack := received.Add(skew).UnixMilli()
-			receipt := records.RentalKeepalive{WorkerID: row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID, AcknowledgedAtMS: ack, IdleDeadlineMS: ack + 900000}
-			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received))
-			check := func(want time.Time) {
-				t.Helper()
-				idle, p := rental.ObserveIdle(store, row)
-				fatal(t, p)
-				due, ok := idle.ReleaseAt()
-				if !ok || !due.Equal(want) {
-					t.Fatalf("local due=%s want=%s Host skew=%s", due, want, skew)
-				}
-			}
-			check(received.Add(900 * time.Second))
-			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received.Add(10*time.Minute)))
-			check(received.Add(900 * time.Second))
-			newer := receipt
-			newer.AcknowledgedAtMS += 1000
-			newer.IdleDeadlineMS += 1000
-			fatal(t, store.RecordRentalKeepalive(row.ID, newer, received.Add(time.Second)))
-			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received.Add(20*time.Minute)))
-			check(received.Add(901 * time.Second))
-		})
 	}
 }

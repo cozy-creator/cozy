@@ -76,8 +76,7 @@ func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
 
 // Preparation can spend minutes on a paid pod before an attempt exists. The
 // terminal request event ends that work even when the controller was restarted
-// between observations. Run467/468 lost 105 GB because only attempt closure
-// advanced the idle clock, making the ready timestamp the deadline again.
+// between observations, and the listing never invents the machine's deadline.
 func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 	for _, outcome := range []string{"failed", "canceled"} {
 		t.Run(outcome, func(t *testing.T) {
@@ -90,7 +89,6 @@ func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 			peer := newFakeRentalHub(t, 0)
 			port := peer.port()
 			origin := fmt.Sprintf("http://127.0.0.1:%d", port)
-			const grace = rental.IdleTimeout
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\n"+
 					""+
@@ -166,19 +164,19 @@ func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 				t.Fatal("missing durable settlement event")
 			}
 			idle := listedRental(t, root, rentalID)
-			if want := settled.Add(grace).UTC().Format(time.RFC3339); idle.ReleaseDue != want {
-				t.Fatalf("idle deadline=%q, want terminal event + grace %q (ready was an hour ago)", idle.ReleaseDue, want)
+			if want := settled.UTC().Format(time.RFC3339); idle.IdleSince != want || idle.ReleaseDue != "" {
+				t.Fatalf("idle since=%q due=%q, want the terminal event %q (ready was an hour ago) and no deadline from a machine that cannot answer", idle.IdleSince, idle.ReleaseDue, want)
 			}
 			startDaemonProcess(t, root)
 			row, problem := store.RentalRow(rentalID)
 			fatal(t, problem)
 			observed, problem := rental.ObserveIdle(store, *row)
 			fatal(t, problem)
-			if observed.Due(settled.Add(grace-time.Nanosecond)) || !observed.Due(settled.Add(grace)) {
-				t.Fatal("restarted fixed deadline boundary is wrong")
+			if !observed.Since.Equal(settled) {
+				t.Fatalf("restarted idle start=%s, want %s", observed.Since, settled)
 			}
 			if peer.releases(rentalID) != 0 {
-				t.Fatal("restarted daemon released before fixed deadline")
+				t.Fatal("the daemon released a rental; its machine ends itself")
 			}
 			attempts, problem := store.Attempts(requestID)
 			fatal(t, problem)

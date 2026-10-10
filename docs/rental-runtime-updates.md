@@ -80,7 +80,7 @@ commands do not depend on SSH's interactive PATH. The current wheel-pair symlink
 is a rollback cache, not a virtual environment. Worker dependency validation,
 native imports and post-update health remain authoritative. An incompatible
 heavy platform is an actionable preflight refusal, not permission to replace it.
-The immutable 900-second rental idle deadline is neither extended nor disabled.
+An update is idle time: it neither resets nor disables the rental's 900-second idle clock.
 
 The CUDA image installs `uv` at `/usr/local/bin/uv`. Its existing updater invokes
 Python and supervisorctl with absolute paths, so older images with the original

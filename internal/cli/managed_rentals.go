@@ -21,9 +21,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
-// managedRentals serializes fleet admission, acknowledged keepalive and release.
-// Fixed idle expiry counts real work on each machine, never retained bytes or
-// an open controller connection. Durable records survive daemon restarts.
+// managedRentals serializes fleet admission, acknowledged keepalive and release. Each
+// rental's machine ends itself when idle; durable records survive daemon restarts.
 //
 // mu guards this struct and each decision's read-then-write of the records. It is never
 // held across Hub or provider I/O: an operation snapshots under it, asks with it
@@ -767,10 +766,9 @@ func acquiringState(state string) bool {
 	return false
 }
 
-// watch is the idle release's own loop. It re-reads the records at pollCadence — the
-// resolution every rental verb already samples a rental at — and acts only on what they
-// say; the grace is the debounce, and a sample that finds nothing to do costs a few local
-// reads. It returns when quit closes.
+// watch is the fleet's own loop. It re-reads the records at pollCadence — the resolution
+// every rental verb already samples a rental at — and acts only on what they say; a sample
+// that finds nothing to do costs a few local reads. It returns when quit closes.
 
 func (m *managedRentals) watch(quit <-chan struct{}) {
 	tick := time.NewTicker(pollCadence)

@@ -43,8 +43,8 @@ func KeepAlive(ctx context.Context, l home.Layout, row *records.Rental) (records
 	return acknowledged(row, frame.GetWorkerId(), frame.GetBootId(), frame.GetIdleDeadlineUnixMs())
 }
 
-// acknowledged accepts the pinned worker's future deadline, or zero when the
-// rental has been used and no longer expires automatically.
+// acknowledged accepts the pinned worker's future deadline, or zero from a machine that
+// names none (TensorD 0.5.2–0.5.5 after a job).
 func acknowledged(row *records.Rental, worker, boot string, deadline int64) (records.RentalKeepalive, *exit.Error) {
 	if worker != row.ExpectedWorkerID || boot != row.ExpectedWorkerBootID {
 		return records.RentalKeepalive{}, exit.New(exit.Conflict, "rental keepalive was answered by another worker or boot than the rental's")

@@ -14,8 +14,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 )
 
+// rental show says the deadline the machine's Status names now, never the listing's or a
+// guessed one: none when it names none or cannot answer.
 func TestRentalShowUsesOnlyTheWorkerDeadline(t *testing.T) {
-	for _, state := range []string{"unused", "used", "unreachable"} {
+	for _, state := range []string{"named", "none", "unreachable"} {
 		t.Run(state, func(t *testing.T) {
 			layout, lock, pid, _ := compatibilityOwner(t)
 			deadline := time.Date(2026, 10, 10, 4, 6, 31, 571000000, time.UTC)
@@ -23,7 +25,7 @@ func TestRentalShowUsesOnlyTheWorkerDeadline(t *testing.T) {
 				switch r.URL.Path {
 				case "/":
 				case "/v1/local/rentals":
-					_, _ = w.Write([]byte(`{"rentals":[{"rental_id":"rental-proof","machine":"touji","state":"ready","activity":{"idle_since_at":"2026-10-10T03:55:00Z","release_due_at":"2026-10-10T04:10:00Z"}}]}`))
+					_, _ = w.Write([]byte(`{"rentals":[{"rental_id":"rental-proof","machine":"touji","state":"ready","release_due_at":"2026-10-10T04:10:00Z","activity":{"idle_since_at":"2026-10-10T03:55:00Z"}}]}`))
 				case "/v1/local/machines/rental-proof/status":
 					if state == "unreachable" {
 						w.WriteHeader(http.StatusServiceUnavailable)
@@ -31,7 +33,7 @@ func TestRentalShowUsesOnlyTheWorkerDeadline(t *testing.T) {
 						return
 					}
 					ms := int64(0)
-					if state == "unused" {
+					if state == "named" {
 						ms = deadline.UnixMilli()
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"phase": "ready", "idle_deadline_unix_ms": ms})
@@ -49,7 +51,7 @@ func TestRentalShowUsesOnlyTheWorkerDeadline(t *testing.T) {
 			var document map[string]any
 			must(t, json.Unmarshal([]byte(out), &document))
 			got, present := document["release_due_at"]
-			if state == "unused" {
+			if state == "named" {
 				if !present || got != deadline.Format(time.RFC3339Nano) {
 					t.Fatalf("lost worker's actual deadline: %s", out)
 				}
@@ -68,7 +70,7 @@ func TestRentalListUsesDaemonAPIWithoutOpeningSQLite(t *testing.T) {
 		case "/":
 		case "/v1/local/rentals":
 			reads.Add(1)
-			_, _ = w.Write([]byte(`{"machines_running":1,"hourly_spend_usd_micros":100000,"idle_release_s":900,"rentals":[{"rental_id":"retained","machine":"shelly","state":"ready","hourly_rate_usd_micros":100000,"accelerator_count":1,"activity":{"running":1,"queued":2}}],"unrecorded":[],"pending":[],"future_fact":"ignored"}`))
+			_, _ = w.Write([]byte(`{"machines_running":1,"hourly_spend_usd_micros":100000,"rentals":[{"rental_id":"retained","machine":"shelly","state":"ready","hourly_rate_usd_micros":100000,"accelerator_count":1,"activity":{"running":1,"queued":2}}],"unrecorded":[],"pending":[],"future_fact":"ignored"}`))
 		default:
 			t.Errorf("unexpected client route: %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -100,13 +102,13 @@ func TestRentalInventoryHumanDrainingKeepsRawStates(t *testing.T) {
 	layout, lock, pid, _ := compatibilityOwner(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/local/rentals" {
-			_, _ = w.Write([]byte(`{"machines_running":2,"hourly_spend_usd_micros":200000,"idle_release_s":900,"rentals":[],"unrecorded":[{"rental_id":"remote-id","machine":"remote-machine","state":"release_requested","hourly_rate_usd_micros":100000}],"pending":[{"machine":"pending-machine","state":"release_requested","operation":"pending-id","hourly_rate_usd_micros":100000}]}`))
+			_, _ = w.Write([]byte(`{"machines_running":2,"hourly_spend_usd_micros":200000,"rentals":[],"unrecorded":[{"rental_id":"remote-id","machine":"remote-machine","state":"release_requested","hourly_rate_usd_micros":100000}],"pending":[{"machine":"pending-machine","state":"release_requested","operation":"pending-id","hourly_rate_usd_micros":100000}]}`))
 		}
 	}))
 	defer server.Close()
 	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
 	output, err := compatibilityCLI(t, layout.Root, "rental", "list", "--no-watch")
-	if err != nil || strings.Count(output, "draining") != 2 || strings.Contains(output, "release_requested") || !strings.Contains(output, "Unused rentals time out after 15 minutes") {
+	if err != nil || strings.Count(output, "draining") != 2 || strings.Contains(output, "release_requested") || !strings.Contains(output, "Rentals end themselves after 15 minutes idle") {
 		t.Fatalf("inventory lost human state or daemon-owned idle policy: %v %s", err, output)
 	}
 	output, err = compatibilityCLI(t, layout.Root, "rental", "list", "--json")
