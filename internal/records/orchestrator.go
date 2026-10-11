@@ -606,13 +606,15 @@ type ModelRef struct {
 	Choice bool `json:"choice,omitempty"`
 	// Source is a Choice naming a provider checkpoint (hf://org/repo@commit, civitai://id)
 	// that the machine resolves, narrows to Profiles (or the one it selects) and converts.
-	Source   string            `json:"source,omitempty"`
-	Profiles []string          `json:"profiles,omitempty"`
-	Callable string            `json:"callable,omitempty"` // independently scheduled captured callable, qualified by package
-	GPUs     int               `json:"gpus,omitempty"`     // exact selected execution group, zero is unspecified
-	Adapters []ModelAdapterRef `json:"adapters,omitempty"`
-	Package  string            `json:"package"`
-	Slot     string            `json:"slot"`
+	Source   string   `json:"source,omitempty"`
+	Profiles []string `json:"profiles,omitempty"`
+	Callable string   `json:"callable,omitempty"` // independently scheduled captured callable, qualified by package
+	GPUs     int      `json:"gpus,omitempty"`     // advisory weight-ladder selector; never execution width
+	// SupportedGPUs comes only from this slot's package-code interface, never a model card.
+	SupportedGPUs []int             `json:"supported_gpus,omitempty"`
+	Adapters      []ModelAdapterRef `json:"adapters,omitempty"`
+	Package       string            `json:"package"`
+	Slot          string            `json:"slot"`
 	// BindingPath is the exact interface Model path used for package preparation.
 	// Jobs keep Slot as the bare invocation parameter; serving already uses a path.
 	BindingPath string `json:"binding_path,omitempty"`
@@ -782,24 +784,25 @@ func Width(models []ModelRef, machine int) int {
 	return width
 }
 
-// PurchaseRung only buys a wider machine when that exact group is authored.
+// PurchaseRung chooses weight data for the available group. The rung count is a
+// selector, not a requirement to rent or execute with that count.
 func (m ModelRef) PurchaseRung(accelerator string, count int) (ModelRung, int, bool) {
 	if m.Source != "" {
 		return m.sourceRung()
 	}
 	if m.Pinned() {
 		rung, index, ok := m.RungAt(accelerator, m.GPUs)
-		return rung, index, ok && m.GPUs <= count
+		return rung, index, ok
 	}
+	chosen := -1
 	for i, rung := range m.Ladder {
-		if rung.GPUs == count && RungMatches(rung.GPU, accelerator) {
-			return rung, i, true
+		if rung.GPUs <= count && RungMatches(rung.GPU, accelerator) &&
+			(chosen < 0 || rung.GPUs > m.Ladder[chosen].GPUs) {
+			chosen = i
 		}
 	}
-	for i, rung := range m.Ladder {
-		if rung.GPUs <= 1 && RungMatches(rung.GPU, accelerator) {
-			return rung, i, true
-		}
+	if chosen >= 0 {
+		return m.Ladder[chosen], chosen, true
 	}
 	return ModelRung{}, -1, false
 }

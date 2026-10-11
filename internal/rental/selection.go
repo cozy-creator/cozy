@@ -18,6 +18,9 @@ import (
 // base profile the release already contradicts, or whose WIDTH the package cannot shard
 // across, is not worth an hour's rent, because the pod would refuse it typed on arrival.
 type Constraints struct {
+	// GPUs requests an exact execution group independently of the selected weights.
+	// Wider machines may lend a subset; this is not the rental's physical size.
+	GPUs                  uint32
 	Requirements          []string
 	RequiresPython        string
 	PythonVersion         string
@@ -47,19 +50,16 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		}
 		c := orchestrator.PlacementCandidate{SKU: sku.Name, GPUs: sku.AcceleratorCount,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
-		size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job, constraints.Working, true)
+		c.Verdict = GPUCountUnusable(sku.AcceleratorCount, constraints.GPUs)
+		count := sku.AcceleratorCount
+		if constraints.GPUs > 0 {
+			count = int(constraints.GPUs)
+		}
 		if c.Verdict == "" {
-			requested := 0
-			for _, model := range c.Models {
-				requested = max(requested, model.GPUs)
-			}
-			if requested > 0 {
-				if requested != sku.AcceleratorCount {
-					c.Verdict = orchestrator.VerdictNoRung
-				}
-			} else {
-				c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
-			}
+			size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job, constraints.Working, count)
+		}
+		if c.Verdict == "" {
+			c.Verdict = PurchaseWidthUnusable(count, models, job, constraints)
 		}
 		if c.Verdict == "" {
 			c.Verdict = baseMismatch(sku, constraints)
@@ -67,6 +67,56 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		out = append(out, c)
 	}
 	return out
+}
+
+// PurchaseWidthUnusable uses package-code capability only. A CPU composition may
+// reserve an explicit subset; each actual GPU child validates that exact count on the
+// worker. Without an explicit count, a wide rental needs a child that can use it.
+func PurchaseWidthUnusable(width int, models []records.ModelRef, job bool, constraints Constraints) string {
+	if job && constraints.GPUs > 0 {
+		return ""
+	}
+	if job {
+		groups := map[string][]int{}
+		for _, model := range models {
+			if model.Callable == "" {
+				continue
+			}
+			degrees := model.SupportedGPUs
+			if len(degrees) == 0 {
+				degrees = []int{1}
+			}
+			if common, seen := groups[model.Callable]; seen {
+				var overlap []int
+				for _, degree := range common {
+					for _, candidate := range degrees {
+						if degree == candidate {
+							overlap = append(overlap, degree)
+						}
+					}
+				}
+				degrees = overlap
+			}
+			groups[model.Callable] = degrees
+		}
+		for _, degrees := range groups {
+			for _, degree := range degrees {
+				if degree == width {
+					return ""
+				}
+			}
+		}
+	}
+	return WidthUnusable(width, job, constraints)
+}
+
+// GPUCountUnusable rejects a machine that cannot supply the exact requested subset.
+func GPUCountUnusable(available int, requested uint32) string {
+	if requested > 0 && (available < 0 || uint64(available) < uint64(requested)) {
+		return orchestrator.VerdictExcluded + "gpu_count_unavailable: " +
+			fmt.Sprintf("requested %d GPUs; this machine has %d", requested, available)
+	}
+	return ""
 }
 
 // Size pins the selection onto one machine and holds its device to what the pinned lanes
@@ -82,13 +132,14 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 // Other selections retain the legacy weights-plus-working estimate.
 func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
 	vramGB int64, device, job bool, working records.WorkingPeaks) {
-	size(c, models, accelerator, vramGB, device, job, working, false)
+	size(c, models, accelerator, vramGB, device, job, working, c.GPUs)
 }
 
 func size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
-	vramGB int64, device, job bool, working records.WorkingPeaks, purchase bool) {
+	vramGB int64, device, job bool, working records.WorkingPeaks, count int) {
+	c.RunGPUs = count
 	var ok bool
-	if c.Models, c.Rung, ok = pin(models, accelerator, c.GPUs, purchase); !ok {
+	if c.Models, c.Rung, ok = pin(models, accelerator, count); !ok {
 		c.Verdict = orchestrator.VerdictNoRung
 		return
 	}
@@ -97,7 +148,7 @@ func size(c *orchestrator.PlacementCandidate, models []records.ModelRef, acceler
 		return
 	}
 	need := WithWorking(records.Resident(c.Models, accelerator, job),
-		working.For(c.Models, c.SKU, records.Width(c.Models, c.GPUs)))
+		working.For(c.Models, c.SKU, count))
 	c.Fit, c.Verdict = FitNote(need, vramGB), Fit(need, vramGB, c.SKU)
 }
 
@@ -131,38 +182,17 @@ func WithWorking(need records.Residency, peak records.WorkingPeak) records.Resid
 	return need
 }
 
-// Pin selects exact execution groups that fit an existing machine: a rental already paid
-// for, or this host. The refs of one callable are one execution group and share one width,
-// the widest authored count up to the machine's that every one of them has a rung for
-// (ModelRef.RungAt), so H3's base and LoRA on 4×H100 take 4 although both ladders list ×2
-// first. Order among widths is a purchase preference (PurchaseRung); among rungs of one
-// width it still ranks lanes. Rung is the worst selected authored preference, so a
-// singleton child cannot hide another child's fallback. Pinned refs keep their exact
-// group and contribute no ladder rank.
+// Pin chooses weight lanes for a machine or requested GPU subset. Rung counts select
+// compatible weight data; only package-code declarations select execution parallelism.
 func Pin(models []records.ModelRef, accelerator string, count int) ([]records.ModelRef, int, bool) {
-	return pin(models, accelerator, count, false)
+	return pin(models, accelerator, count)
 }
 
-func pin(models []records.ModelRef, accelerator string, count int, purchase bool) ([]records.ModelRef, int, bool) {
-	width := map[string]int{}
-	widen := func(model records.ModelRef, candidate int) {
-		if candidate > width[model.Callable] && candidate <= count && takes(models, model.Callable, accelerator, candidate) {
-			width[model.Callable] = candidate
-		}
-	}
-	for _, model := range models {
-		widen(model, model.GPUs)
-		for _, rung := range model.Ladder {
-			widen(model, rung.GPUs)
-		}
-	}
+func pin(models []records.ModelRef, accelerator string, count int) ([]records.ModelRef, int, bool) {
 	rung := 0
 	pinned := make([]records.ModelRef, 0, len(models))
 	for _, model := range models {
-		fitted, index, ok := model.RungAt(accelerator, width[model.Callable])
-		if purchase {
-			fitted, index, ok = model.PurchaseRung(accelerator, count)
-		}
+		fitted, index, ok := model.PurchaseRung(accelerator, count)
 		if !ok {
 			return nil, 0, false
 		}
@@ -172,15 +202,6 @@ func pin(models []records.ModelRef, accelerator string, count int, purchase bool
 		pinned = append(pinned, model.Pin(fitted))
 	}
 	return pinned, rung, true
-}
-
-func takes(models []records.ModelRef, callable, accelerator string, width int) bool {
-	for _, model := range models {
-		if _, _, ok := model.RungAt(accelerator, width); model.Callable == callable && !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // Fit is the one VRAM sanity floor a buy, a reuse and an explicit override are held to
@@ -368,7 +389,7 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 // the request settled FAILED on a fleet that was simply still booting.
 func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	row records.Rental, vramGB int64, needsAccelerator, offered, job bool,
-	working records.WorkingPeaks, disk Disk,
+	constraints Constraints, disk Disk,
 ) bool {
 	if needsAccelerator && row.AcceleratorModel == "CPU" {
 		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
@@ -392,7 +413,21 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	// minute decides nothing). Its GPU count is not held to the package's degrees: the
 	// pod is already paid for, and the selection takes the widest authored group that
 	// fits it (Pin). Cards beyond that group idle; nothing refuses.
-	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job, working)
+	count := c.GPUs
+	if constraints.GPUs > 0 {
+		if c.Verdict = GPUCountUnusable(count, constraints.GPUs); c.Verdict != "" {
+			return false
+		}
+		count = int(constraints.GPUs)
+		if c.Verdict = PurchaseWidthUnusable(count, models, job, constraints); c.Verdict != "" {
+			return false
+		}
+	} else {
+		for count > 1 && PurchaseWidthUnusable(count, models, job, constraints) != "" {
+			count--
+		}
+	}
+	size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job, constraints.Working, count)
 	switch {
 	case c.Verdict != "":
 		return false
@@ -567,7 +602,7 @@ func Measure(candidates []orchestrator.PlacementCandidate, rows []hub.ModelThrou
 		}
 		for _, row := range rows {
 			if row.Release != models[0].Release || row.Lane != c.Models[0].Lane || row.SKU != c.SKU ||
-				max(row.AcceleratorCount, 1) != max(records.Width(c.Models, c.GPUs), 1) {
+				c.RunGPUs == 0 || max(row.AcceleratorCount, 1) != c.RunGPUs {
 				continue
 			}
 			seconds, billed := row.MedianS+row.PrepareS, row.MedianS+row.PrepareS

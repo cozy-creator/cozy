@@ -77,8 +77,11 @@ func TestUnpublishedRentalPreservesSelectedFunctionDegrees(t *testing.T) {
 			must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), body, 0444))
 			fatal(t, store.RecordInstall(installed))
 			constraints, problem := cli.RentalConstraints(&cli.Context{Cfg: config.Config{Home: layout.Root}},
-				records.Request{InstallID: installed.ID, Package: installed.Package, Release: installed.Version, Entrypoint: arm.function})
+				records.Request{InstallID: installed.ID, Package: installed.Package, Release: installed.Version, Entrypoint: arm.function, GPUs: 2})
 			fatal(t, problem)
+			if constraints.GPUs != 2 {
+				t.Fatal("explicit GPU request was lost while reading package capability")
+			}
 			if !slices.Equal(constraints.Degrees, arm.want) {
 				t.Fatalf("installed %s declares %v; rental constraints retained %v", arm.function, arm.want, constraints.Degrees)
 			}

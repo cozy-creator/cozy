@@ -10,7 +10,7 @@ import (
 )
 
 func TestCountedPurchasePreferencePrecedesMeasuredFallback(t *testing.T) {
-	models := []records.ModelRef{{Model: "proof/h3", Ladder: []records.ModelRung{
+	models := []records.ModelRef{{Callable: "proof/h3/run", SupportedGPUs: []int{1, 2, 4}, Model: "proof/h3", Ladder: []records.ModelRung{
 		{GPU: "H100", GPUs: 2, Lane: "fp8-pruned", Manifest: "two"},
 		{GPU: "H100", GPUs: 4, Lane: "fp8-pruned", Manifest: "four"},
 	}}}

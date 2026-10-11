@@ -57,9 +57,6 @@ func (r *Resolver) childModelLadder(origin, pkg, entrypoint string, slot launch.
 	}
 	rungs := make([]records.ModelRung, 0, len(binding.Ladder))
 	for _, rung := range binding.Ladder {
-		if !slot.AllowsGPUCount(rung.GPUs) {
-			return empty, exit.Named(exit.Validation, "package_model_default_invalid", "%s does not support %d GPUs", slot.Path, rung.GPUs)
-		}
 		lane, problem := laneOf(ref, selected, rung.Lane)
 		if problem != nil {
 			return empty, problem
@@ -75,7 +72,8 @@ func (r *Resolver) childModelLadder(origin, pkg, entrypoint string, slot launch.
 			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
 	return orchestrator.ModelRef{Package: pkg, Slot: slot.Param, BindingPath: slot.Path,
-		Model: ref.String(), CatalogRepository: ref.String(), Release: selected.Release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
+		Model: ref.String(), CatalogRepository: ref.String(), Release: selected.Release, ComponentUse: slot.ComponentUse,
+		SupportedGPUs: slot.SupportedGPUCounts(), Ladder: rungs}, nil
 }
 
 // childSlotBinding is the selection order minus the run key: a run key belongs to the

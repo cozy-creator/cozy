@@ -220,7 +220,7 @@ func resolveRemoteLadder(ctx *Context, cards cardReader, packageName string, slo
 		return empty, rebind(problem, packageName, slot.Path)
 	}
 	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(), CatalogRepository: ref.String(),
-		Release: selected.Release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
+		Release: selected.Release, ComponentUse: slot.ComponentUse, SupportedGPUs: slot.SupportedGPUCounts(), Ladder: rungs}, nil
 }
 
 // ladderRungs binds each rung to the release's manifest for its lane. A rung the release
@@ -231,9 +231,6 @@ func ladderRungs(ctx *Context, ref hub.Ref, selected *hub.ModelReleaseSummary, s
 	var first *exit.Error
 	for _, rung := range ladder {
 		lane, problem := laneOf(ref, selected, rung.Lane)
-		if problem == nil && !slot.AllowsGPUCount(rung.GPUs) {
-			problem = exit.Named(exit.Validation, "package_model_default_invalid", "%s does not support %d GPUs", slot.Path, rung.GPUs)
-		}
 		if problem == nil {
 			problem = requireCheckpointComponents(spec+"/"+rung.Lane, slot, lane.Components)
 		}
