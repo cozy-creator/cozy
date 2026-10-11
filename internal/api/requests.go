@@ -867,6 +867,7 @@ type Lifecycle struct {
 	QueuePosition *int             `json:"queue_position,omitempty"`
 	QueueDepth    *int             `json:"queue_depth,omitempty"`
 	OutputExport  *OutputExportRef `json:"output_export,omitempty"`
+	Memo
 }
 
 // DisplayMachine also reads the selection facts older daemons expose before an
@@ -968,7 +969,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		}
 		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
-			ExecutionMS: state.ExecutionMS, ExecutionKnown: state.ExecutionKnown,
+			ExecutionMS: state.ExecutionMS, ExecutionKnown: state.ExecutionKnown, Memo: state.Memo,
 			AttemptWallMS: state.AttemptWallMS, QueuedMS: state.QueuedMS,
 			Result: state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Output: state.Output,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,

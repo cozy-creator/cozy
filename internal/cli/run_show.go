@@ -42,6 +42,11 @@ type runReport struct {
 	ErrorType      string `json:"error_type,omitempty"`
 	ErrorCode      string `json:"error_code,omitempty"`
 	Error          string `json:"error,omitempty"`
+	// How its machine's memo answered it: from a result it held (nothing ran), the
+	// computation it ran or answered, or why it was neither looked up nor held.
+	Memoized    bool   `json:"memoized"`
+	Computation string `json:"computation,omitempty"`
+	Unmemoized  string `json:"unmemoized,omitempty"`
 	// Warnings are what the run reported without failing: its admission's and its machine's.
 	Warnings []records.Warning `json:"warnings,omitempty"`
 	Stages   []reportStage     `json:"stages"`
@@ -105,6 +110,7 @@ type reportCall struct {
 	Status      string        `json:"status,omitempty"`      // empty until Runtime records it settled
 	Memoized    bool          `json:"memoized,omitempty"`    // answered from a result its machine held; nothing ran
 	Computation string        `json:"computation,omitempty"` // a memoized call's computation, ran or answered
+	Unmemoized  string        `json:"unmemoized,omitempty"`  // why a memoizable call was neither looked up nor held
 	Error       string        `json:"error,omitempty"`
 	ErrorCode   string        `json:"error_code,omitempty"`
 	Runtime     string        `json:"runtime,omitempty"` // the SDK its executor loaded
@@ -428,6 +434,7 @@ type callEvent struct {
 	Steps        map[string]triageTrack `json:"steps"`
 	Memoized     bool                   `json:"memoized"`           // answered from a result its machine held
 	Computation  string                 `json:"computation_digest"` // a memoized call's computation
+	Unmemoized   string                 `json:"unmemoized"`         // why a memoizable call was not memoized
 	// Its executor's record and attention observations, read apart: a Runtime's new or odd
 	// field there never hides the call.
 	Execution    json.RawMessage `json:"execution"`
@@ -469,6 +476,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	report := runReport{Number: life.Number, RequestID: life.RequestID, Status: life.Status,
 		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Machine: life.Machine,
 		ErrorType: life.ErrorType, ErrorCode: life.ErrorCode, Error: life.Error,
+		Memoized: life.Memoized, Computation: life.Computation, Unmemoized: life.Unmemoized,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS,
 		ExecutionKnown: life.ExecutionKnown || life.MachineExecution == nil, AttemptWallMS: life.AttemptWallMS,
 		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
@@ -579,7 +587,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			}
 			c.Parent, c.Index, c.Attempt, c.Module, c.Function = record.Parent, record.Index, record.Attempt, record.Module, record.Export
 			c.Label, c.Status, c.Error, c.ErrorCode = record.Label, record.Status, record.Error, record.ErrorCode
-			c.Memoized, c.Computation = record.Memoized, record.Computation
+			c.Memoized, c.Computation, c.Unmemoized = record.Memoized, record.Computation, record.Unmemoized
 			c.StartUnixMS = record.CalledUnixMS
 			c.MS = float64(at.UnixMilli() - record.CalledUnixMS)
 			c.callTiming = record.callTiming
@@ -750,7 +758,8 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		}
 		root := reportCall{Request: life.RequestID, Module: life.Package, Function: life.Function, Label: "this run",
 			Status: status, GPUs: report.GPUs, Transport: report.Transport, StartUnixMS: started.UnixMilli(), MS: float64(life.ExecutionMS),
-			Steps: report.Steps, Stages: []reportStage{}}
+			Steps: report.Steps, Stages: []reportStage{},
+			Memoized: report.Memoized, Computation: report.Computation, Unmemoized: report.Unmemoized}
 		for _, stage := range report.Stages {
 			if stage.Kind == "inference" || stage.Kind == "wait" {
 				root.Stages = append(root.Stages, stage)
@@ -1042,6 +1051,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		fmt.Fprintf(w, " · wall %s", span(float64(r.WallMS)))
 	}
 	fmt.Fprintln(w)
+	if memo := memoText(r.Memoized, r.Computation, r.Unmemoized, r.Status == "completed"); memo != "" {
+		fmt.Fprintf(w, "memo: %s\n", memo)
+	}
 	if r.Result != nil {
 		if raw, err := json.Marshal(r.Result); err == nil {
 			fmt.Fprintf(w, "result %s\n", output.Elide(string(raw), 2000, mode.Full))
@@ -1082,6 +1094,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		}
 		if line := transportText(c.Transport, false); line != "" && c.Number > 0 {
 			fmt.Fprintf(w, "  call %d transport: %s\n", c.Number, line)
+		}
+		if c.Unmemoized != "" && c.Number > 0 {
+			fmt.Fprintf(w, "  call %d not memoized: %s\n", c.Number, c.Unmemoized)
 		}
 	}
 	if !mode.Full {
@@ -1144,6 +1159,9 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 		fmt.Fprintf(w, " · %s", c.Runtime)
 	}
 	fmt.Fprintln(w)
+	if memo := memoText(c.Memoized, c.Computation, c.Unmemoized, c.Status == "succeeded"); memo != "" {
+		fmt.Fprintf(w, "memo: %s\n", memo)
+	}
 	if c.Error != "" {
 		if c.ErrorCode != "" {
 			fmt.Fprintf(w, "error %s: %s\n", c.ErrorCode, c.Error)
@@ -1163,6 +1181,19 @@ func (c reportCall) state() string {
 		return c.Status
 	}
 	return c.Phase
+}
+
+// memoText is how its machine's memo answered a run or call, "" when it said nothing.
+func memoText(memoized bool, computation, unmemoized string, succeeded bool) string {
+	switch {
+	case memoized:
+		return strings.TrimSuffix("served from this machine's memo (nothing ran) · "+computation, " · ")
+	case unmemoized != "":
+		return "not memoized: " + unmemoized
+	case computation != "" && succeeded:
+		return "computed · " + computation
+	}
+	return ""
 }
 
 // name is the call's label, else its request id's first eight digits.

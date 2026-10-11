@@ -264,7 +264,7 @@ func insertCallV1(tx *sql.Tx, id string, attempt int64, call *v1.Call) error {
 		"export": call.Function, "label": call.Label, "status": call.Status, "error": call.GetReason().GetMessage(),
 		"called_unix_ms": call.CalledAtMs, "stages": measured.Attribution.Stages, "steps": measured.Attribution.Steps,
 		"execution": measured.Execution, "observations": measured.Observations,
-		"memoized": call.Memoized, "computation_digest": call.ComputationDigest}
+		"memoized": call.Memoized, "computation_digest": call.ComputationDigest, "unmemoized": call.Unmemoized}
 	if code := call.GetReason().GetCode(); code != "" {
 		record["error_code"] = code
 	}

@@ -273,7 +273,8 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	}
 	var terminal *archive.Terminal
 	if outcome := records.RunV1Outcome(link); v1run && outcome != nil {
-		// A cozy.machine.v1 run's outcome carries its result and typed reason.
+		// A cozy.machine.v1 run's outcome carries its result, typed reason and memo.
+		state.Memo = Memo{Memoized: outcome.Memoized, Computation: outcome.ComputationDigest, Unmemoized: outcome.Unmemoized}
 		if state.ErrorType == "" && outcome.Status != "succeeded" && outcome.Reason != nil {
 			state.ErrorType, state.Error = outcome.Reason.Code, outcome.Reason.Message
 		}
@@ -321,8 +322,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			state.ExecutionMS, state.ExecutionKnown = running, true
 		}
 	}
-	if outcome := records.RunV1Outcome(link); v1run && outcome != nil && outcome.ExecutionMs > 0 && outcome.ExecutionMs <= math.MaxInt64 {
-		// A cozy.machine.v1 machine measures the run's own running time, every attempt summed.
+	if outcome := records.RunV1Outcome(link); v1run && outcome != nil && (outcome.ExecutionMs > 0 || outcome.Memoized) && outcome.ExecutionMs <= math.MaxInt64 {
+		// A cozy.machine.v1 machine measures the run's own running time, every attempt summed;
+		// a run answered from its memo ran for none.
 		state.ExecutionMS, state.ExecutionKnown = int64(outcome.ExecutionMs), true
 	}
 	if state.Status == "canceled" {
