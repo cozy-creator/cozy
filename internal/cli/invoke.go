@@ -139,7 +139,7 @@ func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInte
 	if problem != nil {
 		return problem
 	}
-	target.Function = name
+	target.Function, target.surface = name, packageInterface
 	callable, problem := packageInterface.Function(target.Function)
 	if problem != nil {
 		return unknownFunction(target, packageInterface)
@@ -585,6 +585,12 @@ func resolveRunModels(ctx *Context, target Target, ep *launch.Entrypoint, overri
 		out = append(out, resolved...)
 	}
 	for _, child := range capturedModelChoices(chosen) {
+		// A choice for a slot this package does not declare is the machine's to ignore, with a
+		// warning in the run's log: nothing is read at a Hub for it.
+		if target.surface != nil && child.Package == target.Package && !target.surface.DeclaresSlot(child.BindingSlot()) {
+			out = append(out, child)
+			continue
+		}
 		pinned, problem := pinModelChoice(ctx, child)
 		if problem != nil {
 			return nil, problem
@@ -2996,6 +3002,8 @@ type Target struct {
 	releaseCapture func()
 	// lease holds the resolved install until the daemon has recorded the submission.
 	lease *install.Lease
+	// surface is the package's interface: the model slots its callables declare.
+	surface *launch.PackageInterface
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path

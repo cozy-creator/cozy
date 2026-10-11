@@ -79,8 +79,9 @@ app.job(convert, weights=(WeightsOutput("model", max_new_bytes=65536),))
 // for the publication it makes during the run.
 func TestAConversionShowsItsCheckpointUploadAsACall(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
-	// The machine's grant to publish into the destination the owner consented to comes from
-	// the stand-in Hub's grant routes; its publication doors refuse the checkpoint.
+	// The run's capability to publish into its destination is signed by this computer's device
+	// key; the machine trades it at the stand-in Hub, whose publication doors refuse the checkpoint.
+	h.hubAccess.signIn(t, root)
 	worker := h.worker.Config.Handler
 	h.worker.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/models/") {

@@ -26,7 +26,7 @@ if [ "$2" = version ]; then
 fi
 if [ "$2" != python-interpreters ]; then exit 91; fi
 printf '%%s\n' '%s'
-`, hostruntime.ToolFloor, body)
+`, hostruntime.ToolRelease, body)
 			must(t, os.WriteFile(filepath.Join(toolDir, "cozy-runtime"), []byte(script), 0700)) //cozy:allow read-only Runtime inventory boundary fixture
 			t.Setenv("PATH", toolDir)
 			inventory, problem := hostruntime.PythonExecutors(context.Background())
@@ -59,7 +59,7 @@ if [ "$2" = version ]; then
  exit 0
 fi
 printf '%%s\n' '%s'
-`, hostruntime.ToolFloor, body)
+`, hostruntime.ToolRelease, body)
 	must(t, os.WriteFile(filepath.Join(toolDir, "cozy-runtime"), []byte(script), 0700)) //cozy:allow read-only Runtime inventory boundary fixture
 	t.Setenv("PATH", toolDir)
 	inventory, problem := hostruntime.PythonExecutors(context.Background())

@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // restartProof is a package whose one call appends a line to a file (its effect), reports a
@@ -112,8 +114,10 @@ module-root = ""
 		return shown
 	}
 	type run struct {
-		Status string `json:"status"`
-		Output []struct {
+		Status    string `json:"status"`
+		ErrorCode string `json:"error_code"`
+		Error     string `json:"error"`
+		Output    []struct {
 			Name, Status, Path string
 		} `json:"output"`
 	}
@@ -164,14 +168,14 @@ module-root = ""
 		t.Fatalf("up [exit %d]\n%s", code, out)
 	}
 
-	// The call that was running: FAILED with the reason, never run again.
+	// The call that was running: FAILED as machine_stopped in the owner's words, never run again.
 	landed(t, "the interrupted run to settle", func() bool {
 		state, _ := shown("2")
 		return state.Status != "in_progress" && state.Status != "queued" && state.Status != ""
 	})
 	interrupted, out := shown("2")
-	if interrupted.Status != "failed" || !strings.Contains(out, "will not be replayed") {
-		t.Fatalf("the interrupted run did not fail with the no-replay reason:\n%s", out)
+	if interrupted.Status != "failed" || interrupted.ErrorCode != records.MachineStopped || interrupted.Error != records.MachineStoppedMessage {
+		t.Fatalf("the interrupted run did not fail as machine_stopped, not retried:\n%s", out)
 	}
 	// The call that had finished: its result and output, collected from the restarted machine.
 	landed(t, "the finished run to be collected", func() bool {

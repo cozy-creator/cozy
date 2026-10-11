@@ -459,6 +459,15 @@ func (d *PackageInterface) Function(name string) (*Entrypoint, *exit.Error) {
 		WithRemedy("it registers: %s", strings.Join(d.PublicNames(), ", "))
 }
 
+// DeclaresSlot answers whether any callable declares the model slot at path
+// (`<callable>.models.<parameter>`).
+func (d *PackageInterface) DeclaresSlot(path string) bool {
+	declares := func(callable Entrypoint) bool {
+		return slices.ContainsFunc(callable.Models, func(slot Slot) bool { return slot.Path == path })
+	}
+	return slices.ContainsFunc(d.Entrypoints, declares) || slices.ContainsFunc(d.Jobs, declares)
+}
+
 // RequirePublic guards user-facing discovery and root submission. Managed child
 // resolution reads the complete interface and checks its admitted parent instead.
 func (e *Entrypoint) RequirePublic() *exit.Error {
