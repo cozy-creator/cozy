@@ -256,23 +256,24 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 		return exit.Internalf("cannot read request %s for its measurement: %s", t.RequestID, err)
 	}
 	sku := "local"
-	var width int
 	if req.Worker != "" {
-		err := tx.QueryRow(`SELECT sku,accelerator_count FROM rentals WHERE id=?`, req.Worker).Scan(&sku, &width)
+		err := tx.QueryRow(`SELECT sku FROM rentals WHERE id=?`, req.Worker).Scan(&sku)
 		if errors.Is(err, sql.ErrNoRows) {
 			sku = ""
 		} else if err != nil {
 			return exit.Internalf("cannot read rental %s for its measurement: %s", req.Worker, err)
 		}
-		width = Width(req.Models, width)
 	}
+	// This archived outcome has no attested execution degree. Neither a weight-fit
+	// rung nor the rental's physical count proves how many GPUs served it. Keep
+	// working-memory evidence, but leave its width unknown for exact-total matching.
 	pkg, release, entrypoint := measurementSubject(req)
 	if _, err := tx.Exec(`INSERT INTO device_memory_measurements(request_id,attempt,package,release,
  entrypoint,models_digest,shape_cell,sku,working_peak_bytes,measured_at,
  total_peak_bytes,request_digest,exact_models_digest,gpu_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(request_id,attempt) DO NOTHING`, t.RequestID, t.Attempt, pkg, release, entrypoint,
 		ModelsDigest(req.Models), body.Sub("metrics").Str("shape_cell"), sku, int64(peak), now(),
-		int64(total), exactMemoryRequest(req), exactModelsDigest(req.Models), width); err != nil {
+		int64(total), exactMemoryRequest(req), exactModelsDigest(req.Models), 0); err != nil {
 		return exit.Internalf("cannot record the working memory of %s#%d: %s", t.RequestID, t.Attempt, err)
 	}
 	return nil

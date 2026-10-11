@@ -443,6 +443,7 @@ func replayJobSubmission(sub JobSubmission,
 		sort.Strings(params)
 	}
 	return orchestrator.Submission{Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: packageName,
+		GPUs: sub.GPUs, AttentionKernel: sub.AttentionKernel,
 		ChildArtifacts: recorded.ChildArtifacts, OutputDirectory: sub.OutputDirectory,
 		Entrypoint: function, Payload: payload, Org: org, Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
 		InstallID: recorded.InstallID, Release: recorded.Release,

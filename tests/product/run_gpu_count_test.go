@@ -37,6 +37,50 @@ func TestRunGPUCountSurvivesCLIAdmissionAndConflictingReplay(t *testing.T) {
 	}
 }
 
+func TestJobGPUCountAndKernelSurviveIdenticalReplay(t *testing.T) {
+	root := t.TempDir()
+	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
+		t.Fatalf("install %d: %s", code, out)
+	}
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	for _, explicit := range []bool{false, true} {
+		key := "job-auto"
+		if explicit {
+			key = "job-two"
+		}
+		args := []string{"--json", "run", localWeightlessRef + "/tile_job", "size=16", "--attention-kernel=sdpa", "--idempotency-key=" + key}
+		if explicit {
+			args = append(args, "--gpus=2")
+		}
+		_, first := runCozy(t, root, args...)
+		row, problem := store.RequestByIdempotencyKey(key)
+		fatal(t, problem)
+		if row == nil || row.AttentionKernel != "sdpa" || (row.GPUs == 2) != explicit {
+			t.Fatalf("job lost intent: %+v; %s", row, first)
+		}
+		_, replay := runCozy(t, root, args...)
+		if strings.Contains(replay, "different body") {
+			t.Fatalf("identical job conflicted: %s", replay)
+		}
+		changed := append([]string(nil), args...)
+		if explicit {
+			changed[len(changed)-1] = "--gpus=1"
+		} else {
+			changed = append(changed, "--gpus=2")
+		}
+		if code, out := runCozy(t, root, changed...); code == 0 || !strings.Contains(out, "different body") {
+			t.Fatalf("job changed count replayed: %d %s", code, out)
+		}
+		changed = append([]string(nil), args...)
+		changed[4] = "--attention-kernel=flash-attn3"
+		if code, out := runCozy(t, root, changed...); code == 0 || !strings.Contains(out, "different body") {
+			t.Fatalf("job changed kernel replayed: %d %s", code, out)
+		}
+	}
+}
+
 func TestRunGPUCountRejectsInvalidFlagsBeforeAdmission(t *testing.T) {
 	root := t.TempDir()
 	for _, invalid := range []string{"0", "-1", "1.5", "4294967296"} {
