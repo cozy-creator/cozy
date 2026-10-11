@@ -508,7 +508,12 @@ fn serve(
             .name("machine-admin".into())
             .spawn(move || {
                 for stream in admin.incoming() {
-                    let Ok(mut stream) = stream else { continue };
+                    let Ok(mut stream) = stream else {
+                        // Out of descriptors, say: the listener still stands, so pause and
+                        // accept again rather than spin.
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    };
                     if stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -543,7 +548,11 @@ fn serve(
             })?;
     }
     for stream in listener.incoming() {
-        let stream = stream?;
+        // A failed accept (out of descriptors, say) is not the end of the weight socket.
+        let Ok(stream) = stream else {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
         if stopped.load(Ordering::Acquire) {
             break;
         }
