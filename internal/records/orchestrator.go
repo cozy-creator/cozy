@@ -771,19 +771,6 @@ func (m ModelRef) RungAt(accelerator string, width int) (ModelRung, int, bool) {
 	return m.Ladder[uncounted], uncounted, true
 }
 
-// Width is the device group a pinned selection takes on a machine of `machine` cards: its
-// widest exact group, or the whole machine when no ref is counted.
-func Width(models []ModelRef, machine int) int {
-	width := 0
-	for _, model := range models {
-		width = max(width, model.GPUs)
-	}
-	if width == 0 {
-		return machine
-	}
-	return width
-}
-
 // PurchaseRung chooses weight data for the available group. The rung count is a
 // selector, not a requirement to rent or execute with that count.
 func (m ModelRef) PurchaseRung(accelerator string, count int) (ModelRung, int, bool) {
