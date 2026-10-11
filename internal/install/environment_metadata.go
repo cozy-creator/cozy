@@ -1,7 +1,6 @@
 package install
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -104,21 +102,6 @@ func closure(venv string) (int, string) {
 	}
 	sort.Strings(lines)
 	return len(lines), strings.Join(lines, "\n")
-}
-
-// ExecutionRequirements reads the declarations of the code a rental will run.
-// Every package owns its complete dependency subtree, including Torch and CUDA.
-// The selected installed roster remains exact for local and remote capture.
-func ExecutionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, *exit.Error) {
-	installed := installedMetadata(venv)
-	if len(installed) == 0 {
-		return packagepublish.RequirementSelection{}, exit.New(exit.Structural, "captured environment metadata is unavailable")
-	}
-	metadata := map[string]string{}
-	for name, distribution := range installed {
-		metadata[name] = string(distribution.metadata)
-	}
-	return packagepublish.ActiveRequirements(ctx, project, extras, metadata, pythonVersion(venv))
 }
 
 type installedDistribution struct {

@@ -5,16 +5,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
-// Exercise real source admission, dependency discovery, snapshot copying and
-// identity checks, stopping at the final metadata fence before any Python build.
+// A local path dependency wheel larger than the ordinary source-file bound is admitted with its
+// project; an ordinary source file of that size is not.
 func TestEditableSnapshotLargeWheelKeepsSourceIdentityFence(t *testing.T) {
 	for _, location := range []string{"external", "inside"} {
 		t.Run(location, func(t *testing.T) {
@@ -56,15 +53,8 @@ func TestEditableSnapshotLargeWheelKeepsSourceIdentityFence(t *testing.T) {
 			pack, problem := packagepublish.PrepareLocalFrom(project)
 			fatal(t, problem)
 			defer pack.Close()
-			count, size, problem := pack.SourceInventory()
+			_, _, problem = pack.SourceInventory()
 			fatal(t, problem)
-			// The deliberately stale release reaches the snapshot's final identity
-			// fence only after every large dependency has copied and rehashed.
-			local := &install.LocalSource{Package: "local/snapshot-root", Release: "2.0", Tree: project, Files: count, Bytes: size}
-			_, problem = install.Run(home.Layout{Installs: filepath.Join(root, "installs")}, nil, install.Request{Snapshot: true, Local: local})
-			if problem == nil || problem.Name != "local_package_source_changed" || !strings.Contains(problem.Error(), "copied project declares a different package name or version") {
-				t.Fatalf("large admitted wheel did not reach the unchanged metadata identity fence: %v", problem)
-			}
 			// An ordinary member of the same size must still fail source admission.
 			ordinary := filepath.Join(project, "ordinary.py")
 			file, err = os.Create(ordinary)

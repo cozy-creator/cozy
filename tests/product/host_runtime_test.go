@@ -222,7 +222,7 @@ func TestAnOldHostToolIsBroughtForward(t *testing.T) {
 	if data, err := lock.CombinedOutput(); err != nil {
 		t.Fatalf("lock fixture: %v\n%s", err, data)
 	}
-	code, out = run(t, root, true, "package", "install", project, "--editable", "--json")
+	code, out = run(t, root, true, "package", "install", project, "--json")
 	if code != 0 {
 		t.Fatalf("the caller was not described with this Cozy's own tool [exit %d]\n%s", code, out)
 	}

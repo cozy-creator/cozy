@@ -104,7 +104,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		command.Env = childEnv(t, root, "PATH="+path)
 		return command
 	}
-	if out, err := cozy("package", "install", project, "--editable", "--json").CombinedOutput(); err != nil {
+	if out, err := cozy("package", "install", project, "--json").CombinedOutput(); err != nil {
 		t.Fatalf("package install: %v %s", err, out)
 	}
 	directory := filepath.Join(root, "outputs", "local-output-log-proof")

@@ -105,7 +105,7 @@ func newMediaMachine(t *testing.T) *mediaMachine {
 	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)
 	root, port := cozy1Root(t)
-	if code, out := runCozy(t, root, "package", "install", mediaScriptPackage(t, wheel), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", mediaScriptPackage(t, wheel)); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "machine", "start"); code != 0 {

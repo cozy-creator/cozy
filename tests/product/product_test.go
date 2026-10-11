@@ -45,7 +45,7 @@ func TestProductPath(t *testing.T) {
 	})
 
 	project := weightlessProject(t)
-	code, out := runCozy(t, root, "package", "install", project, "--editable")
+	code, out := runCozy(t, root, "package", "install", project)
 	if code != 0 {
 		t.Fatalf("local directory package install [exit %d]\n%s", code, out)
 	}
@@ -57,7 +57,8 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
 	}
 	// Disk is two byte columns: the package's own bytes and its shared dependencies —
-	// integers for a program, binary units for a person.
+	// integers for a program, binary units for a person. A local package's dependencies are
+	// its machine's: none are here.
 	code, out = runCozy(t, root, "package", "list", "--json")
 	var listed struct {
 		Packages []struct {
@@ -68,7 +69,7 @@ func TestProductPath(t *testing.T) {
 	}
 	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || len(listed.Packages) != 1 ||
 		listed.Packages[0].Package != localWeightlessRef || listed.Packages[0].Size <= 0 ||
-		listed.Packages[0].Dependencies <= 0 {
+		listed.Packages[0].Dependencies != 0 {
 		t.Fatalf("package list --json lacks integer size and dependencies [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "package", "list")

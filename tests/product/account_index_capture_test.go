@@ -14,10 +14,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
-// A capture writes the account index into its owned copy with explicit scope: only the
+// A lock writes the account index into its owned copy with explicit scope: only the
 // dependencies the source names from `tensorhub` are looked up there, and none falls through
 // to the public index. The authored project never changes.
-func TestAccountIndexCaptureKeepsExplicitScope(t *testing.T) {
+func TestAccountIndexLockKeepsExplicitScope(t *testing.T) {
 	for _, missing := range []bool{false, true} {
 		t.Run(fmt.Sprint("missing-owned=", missing), func(t *testing.T) {
 			var mu sync.Mutex
@@ -45,9 +45,9 @@ default = true
 			namespace := func() (packagepublish.Namespace, *exit.Error) {
 				return packagepublish.Namespace{Hub: server.URL, Account: "paul"}, nil
 			}
-			_, problem := packagepublish.PrepareUnpublishedFrom(t.Context(), tree, namespace)
-			if problem == nil || problem.Name != "child.interface_lock_refused" {
-				t.Fatalf("capture answered %v", problem)
+			_, problem := packagepublish.Lock(t.Context(), tree, namespace, nil)
+			if problem == nil || problem.Name != "package_lock_refused" {
+				t.Fatalf("lock answered %v", problem)
 			}
 			mu.Lock()
 			defer mu.Unlock()
@@ -69,7 +69,7 @@ default = true
 			authored, err := os.ReadFile(filepath.Join(tree, "pyproject.toml"))
 			must(t, err)
 			if string(authored) != metadata {
-				t.Fatal("capture changed the authored project")
+				t.Fatal("the lock changed the authored project")
 			}
 		})
 	}
@@ -97,7 +97,7 @@ explicit = true
 	if !uses {
 		t.Fatal("a named account index was not detected")
 	}
-	if _, problem := packagepublish.PrepareUnpublishedFrom(t.Context(), named, nil); problem == nil ||
+	if _, problem := packagepublish.AccountIndexes(named, nil); problem == nil ||
 		problem.Name != "account_index_namespace_missing" {
 		t.Fatalf("an unresolved account index answered %v", problem)
 	}

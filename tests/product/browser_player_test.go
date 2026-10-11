@@ -604,7 +604,7 @@ func TestRunPlayPlaysALocalMachinesGrowingFilm(t *testing.T) {
 	pages := httptest.NewServer(http.FileServer(http.Dir(filepath.Join("..", "..", "web", "player"))))
 	defer pages.Close()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: http://127.0.0.1:1\nplayer_url: "+pages.URL+"/index.html\n"), 0o600))
-	if code, out := runCozy(t, root, "package", "install", outputLogProof(t, wheel), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", outputLogProof(t, wheel)); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	gate, out := t.TempDir(), filepath.Join(root, "film")

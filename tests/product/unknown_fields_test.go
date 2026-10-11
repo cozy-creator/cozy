@@ -29,7 +29,7 @@ func TestUnknownFieldsWarnAndRun(t *testing.T) {
 		}
 	})
 	provisionMachine(t, root)
-	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", weightlessProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	target := localWeightlessRef + "/labels"

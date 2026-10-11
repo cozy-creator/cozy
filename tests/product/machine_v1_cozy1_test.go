@@ -222,7 +222,7 @@ func TestCozy1FollowsAJobsFilmOnAV1Machine(t *testing.T) {
 	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	var encoded bytes.Buffer
@@ -301,7 +301,7 @@ func TestCozy1FollowsAGrowingVideoOnAV1Machine(t *testing.T) {
 	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)
 	root, port := cozy1Root(t)
-	if code, out := runCozy(t, root, "package", "install", outputLogProof(t, wheel), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", outputLogProof(t, wheel)); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	gate, out := t.TempDir(), filepath.Join(root, "film")

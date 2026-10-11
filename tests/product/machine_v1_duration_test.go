@@ -14,7 +14,7 @@ import (
 // for the machine to prepare the package.
 func TestAV1RunsExecutionTicksHoldsPausedAndExcludesItsWait(t *testing.T) {
 	_, root, _, store := parityMachines(t)
-	if code, out := runCozy(t, root, "package", "install", restartProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", restartProject(t)); code != 0 {
 		t.Fatalf("installing the restart package [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "local/restart-proof/paced", "seconds=8", "--json", "--idempotency-key", "timed"); code != 0 {

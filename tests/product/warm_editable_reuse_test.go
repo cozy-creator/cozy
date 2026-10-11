@@ -10,7 +10,7 @@ import (
 // computer's machine and on a rental, with the real Host and Runtime.
 func TestAnUnchangedEditablePackageIsNotCapturedOrUploadedAgain(t *testing.T) {
 	_, root, _, store := parityMachines(t)
-	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", parityProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	for venue, args := range map[string][]string{"local": nil, "rental": {"--rental=tessa"}} {

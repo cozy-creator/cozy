@@ -149,7 +149,7 @@ async def main(payload: Input) -> Result:
 			t.Fatalf("locking %s: %v\n%s", dir, err, out)
 		}
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {

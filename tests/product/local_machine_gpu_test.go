@@ -85,7 +85,7 @@ def gpu_sum(payload: SumRequest) -> SumResult:
 	if out, err := lock.CombinedOutput(); err != nil {
 		t.Fatalf("locking the GPU package: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	code, out := runCozy(t, root, "run", "local/gpu-proof/gpu_sum", "value=3", "--await", "--json", "--idempotency-key", "gpu-proof")

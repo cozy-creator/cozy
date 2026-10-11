@@ -95,7 +95,7 @@ module-root = ""
 	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 

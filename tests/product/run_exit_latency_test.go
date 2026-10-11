@@ -33,7 +33,7 @@ func TestRunExitsPromptlyAfterItsOutcome(t *testing.T) {
 			_ = removeAllForce(root)
 		}
 	})
-	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", weightlessProject(t)); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	// One run's tail: its machine's outcome (the journal's finish) to its command's exit.

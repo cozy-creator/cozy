@@ -17,7 +17,7 @@ import (
 // new Runtime waits for the old one's worker root instead of failing its boot.
 func TestAMachineStoppedMidJobRunsAJobOnItsNextBoot(t *testing.T) {
 	_, root, _, store := parityMachines(t)
-	if code, out := runCozy(t, root, "package", "install", restartProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", restartProject(t)); code != 0 {
 		t.Fatalf("installing the restart package [exit %d]\n%s", code, out)
 	}
 	go runCozy(t, root, "run", "local/restart-proof/slow", "seconds=120", "--json", "--idempotency-key", "slow")

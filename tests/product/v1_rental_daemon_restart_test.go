@@ -16,7 +16,7 @@ import (
 // meanwhile reaches the machine; and no restart ends the rental, which takes new work after.
 func TestV1RentalRunSurvivesDaemonRestart(t *testing.T) {
 	h, root, layout, store := parityMachines(t)
-	if code, out := runCozy(t, root, "package", "install", nativeLifecycleProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", nativeLifecycleProject(t)); code != 0 {
 		t.Fatalf("installing authored lifecycle fixture [%d]: %s", code, out)
 	}
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,

@@ -53,7 +53,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	picture := image.NewRGBA(image.Rect(0, 0, 2, 2))
@@ -146,7 +146,7 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "machine", "start"); code != 0 {
@@ -330,7 +330,7 @@ func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	picture := image.NewRGBA(image.Rect(0, 0, 2, 2))
@@ -396,7 +396,7 @@ func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	var encoded bytes.Buffer
@@ -456,7 +456,7 @@ func TestMachineV1InputTreeReachesTheCallable(t *testing.T) {
 	if out, err := exec.Command("uv", "lock", "--directory", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v\n%s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
 	data := filepath.Join(root, "data")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -359,23 +360,6 @@ func condensed(text string) string {
 	return text
 }
 
-// BindAccountIndex binds an owned source copy, such as an editable install's snapshot, to
-// the namespace's account index without changing any locked version.
-func BindAccountIndex(ctx context.Context, project string, namespace NamespaceSource) *exit.Error {
-	document, problem := readProjectDocument(filepath.Join(project, "pyproject.toml"))
-	if problem != nil {
-		return problem
-	}
-	if uses, _ := accountIndexUse(document); !uses {
-		return nil
-	}
-	python, problem := hostruntime.ProjectPython(ctx, project)
-	if problem != nil {
-		return problem
-	}
-	return bindAccountIndex(ctx, project, namespace, python.Executable, true)
-}
-
 // Locked is one written project lock.
 type Locked struct {
 	Path    string
@@ -463,4 +447,67 @@ func Lock(ctx context.Context, projectDir string, namespace NamespaceSource, upg
 		return Locked{}, exit.Internalf("cannot replace uv.lock: %s", err)
 	}
 	return locked, nil
+}
+
+// AccountIndexes are the uv indexes an authored project's sources name without declaring: its
+// account index, at the URL its lock resolved against, else the caller's. A machine installing
+// the project where its author keeps it is told them; nil when it names none.
+func AccountIndexes(project string, namespace NamespaceSource) (map[string]string, *exit.Error) {
+	document, problem := readProjectDocument(filepath.Join(project, "pyproject.toml"))
+	if problem != nil {
+		return nil, problem
+	}
+	if uses, declared := accountIndexUse(document); !uses || declared != "" {
+		return nil, nil
+	}
+	var lock capturedLock
+	if raw, err := os.ReadFile(filepath.Join(project, "uv.lock")); err == nil && toml.Unmarshal(raw, &lock) == nil {
+		for _, entry := range lock.Packages {
+			if orgIndexNamespace(entry.Source.Registry) != "" {
+				return map[string]string{AccountIndexName: entry.Source.Registry}, nil
+			}
+		}
+	}
+	if namespace == nil {
+		return nil, exit.Named(exit.Validation, "account_index_namespace_missing",
+			"this project resolves %s dependencies but no Tensorhub account was selected", AccountIndexName)
+	}
+	selected, problem := namespace()
+	if problem != nil {
+		return nil, problem
+	}
+	url, problem := selected.IndexURL()
+	if problem != nil {
+		return nil, problem
+	}
+	return map[string]string{AccountIndexName: url}, nil
+}
+
+// ProjectRequiresPython is the Requires-Python an authored project declares.
+func ProjectRequiresPython(project string) (string, *exit.Error) {
+	document, problem := readProjectDocument(filepath.Join(project, "pyproject.toml"))
+	if problem != nil {
+		return "", problem
+	}
+	return document.Project.RequiresPython, nil
+}
+
+func copySnapshotFile(from, to string, limit int64) *exit.Error {
+	in, err := os.Open(from)
+	if err != nil {
+		return exit.Internalf("cannot read invocation source: %s", err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return exit.Internalf("cannot create invocation source: %s", err)
+	}
+	n, copyErr := io.Copy(out, io.LimitReader(in, limit+1))
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	if copyErr != nil || syncErr != nil || closeErr != nil || n > limit {
+		return exit.Named(exit.Conflict, "local_package_source_changed",
+			"cannot capture a bounded complete invocation source file")
+	}
+	return nil
 }

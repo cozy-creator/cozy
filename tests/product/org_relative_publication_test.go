@@ -382,17 +382,11 @@ func TestOneSourcePublishesToEachHubAsItsAccount(t *testing.T) {
 		t.Fatal("publication changed the authored pyproject or lock")
 	}
 
-	// An editable install binds its owned snapshot to the current caller's index, and an
-	// editable run resolves the org-relative default to that caller's model.
+	// A directory install runs as each caller: its run resolves the org-relative default to
+	// that caller's model.
 	for i, h := range hubs {
-		if code, out := runCozyIn(t, t.TempDir(), roots[i], path, "package", "install", source, "--editable", "--json"); code != 0 {
+		if code, out := runCozyIn(t, t.TempDir(), roots[i], path, "package", "install", source, "--json"); code != 0 {
 			t.Fatalf("editable install as %s: %d\n%s", h.account, code, out)
-		}
-		installed := activeInstall(t, roots[i], "local/h3")
-		python := filepath.Join(installed.Dir, "venv", "bin", "python")
-		hubName, err := exec.Command(python, "-c", "import org_relative_dep; print(org_relative_dep.HUB)").Output()
-		if err != nil || strings.TrimSpace(string(hubName)) != h.account {
-			t.Fatalf("%s's editable environment installed the dependency from %q: %v", h.account, hubName, err)
 		}
 		key := "org-relative-editable-" + h.account
 		code, out := runCozyIn(t, t.TempDir(), roots[i], path, "run", "local/h3/generate", "steps=1", "--rental-only", "--json", "--idempotency-key", key)

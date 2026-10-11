@@ -71,7 +71,7 @@ func TestRunShowListsEachChildCallOfALocalRun(t *testing.T) {
 		}
 	})
 	provisionMachine(t, root)
-	if code, out := runCozy(t, root, "package", "install", callsProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", callsProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	const key = "child-calls"

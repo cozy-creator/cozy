@@ -97,7 +97,7 @@ app.job(run)
 			t.Fatalf("lock fixture: %v %s", err, out)
 		}
 	}
-	if code, out, stderr := runCozyStreams(t, root, "--json", "package", "install", project, "--editable"); code != 0 {
+	if code, out, stderr := runCozyStreams(t, root, "--json", "package", "install", project); code != 0 {
 		t.Fatalf("install parent: %d %s %s", code, out, stderr)
 	}
 	photo := filepath.Join(t.TempDir(), "photo.png")

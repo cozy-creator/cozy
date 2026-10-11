@@ -65,7 +65,7 @@ func TestARentalRunNeverStartsThisComputersMachine(t *testing.T) {
 		}
 	}
 	// Packaging a local directory happens in this command: a static read, no machine.
-	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", parityProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	untouched(t, "installing a local directory")

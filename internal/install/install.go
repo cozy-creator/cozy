@@ -1,8 +1,8 @@
 // Package install is the staged install transaction (cozy-creator.md function 2):
 // stage → verify source → build venv → verify package interface → activate the pin in ONE
-// database transaction. An install is an IMMUTABLE TREE plus a pin. The active install is
-// never extracted over, rebuilt in place, or mutated; a kill at any pre-activation stage
-// leaves the previous pin runnable.
+// database transaction. A published install is an IMMUTABLE TREE plus a pin, never extracted
+// over, rebuilt in place, or mutated; a local install is its author's directory plus the
+// interface read from it. A kill at any pre-activation stage leaves the previous pin runnable.
 package install
 
 import (
@@ -33,32 +33,23 @@ import (
 type Request struct {
 	Ref   Ref
 	Force bool
-	// Snapshot freezes local source into the install and leaves its active pin alone.
-	// It is the same installation path, owned by one or more durable invocations.
+	// Snapshot records a local install without moving its package's active pin: one a run of
+	// an explicit directory owns.
 	Snapshot  bool
 	Local     *LocalSource
 	Published *PublishedSource
-	// RemoteEnvironment is read only while capturing a remote-only invocation.
-	// Source/interface/requirements custody is independent when Run returns.
-	RemoteEnvironment *records.PackageInstall
-	RemoteCapture     bool
 }
 
-// LocalSource is one author-controlled directory after Creator's bounded source
-// scan. It is deliberately neither a wheel nor a Hub release/qualification: the
-// source is installed through normal uv editable semantics.
+// LocalSource is one author-controlled directory after Creator's bounded source scan. The
+// install is that directory, as an editable Python install is: nothing is copied and no
+// environment is built here. Its interface is read from its source, and each machine
+// installs it in its own environment.
 type LocalSource struct {
 	Bytes   int64
 	Files   int
 	Package string
 	Release string
 	Tree    string
-	// Namespace is the caller on the command's Tensorhub. The owned source copy binds its
-	// account index there; it is asked only when the source names that index.
-	Namespace packagepublish.NamespaceSource
-	// Frozen installs the directory as it is now: the install follows its own copy, never
-	// the authored tree, so later edits there change nothing (no --editable).
-	Frozen bool
 }
 
 type PublishedSource struct {
@@ -189,20 +180,13 @@ type Timing struct {
 }
 
 type Result struct {
-	RemoteSnapshot bool
-	Install        records.PackageInstall
-	// Borrowed only while capture holds the install writer. The accepted source,
-	// interface and requirements retain no dependency on this local environment.
-	MetadataEnvironment *records.PackageInstall
-	// CapturedProjectWheel is the metadata-sealed executable of a captured App
-	// wheel. Its original archive remains under this install's original/ directory.
-	CapturedProjectWheel string
-	Superseded           string
-	Idempotent           bool
-	Timings              []Timing
-	Warnings             []string
-	Files                int
-	Bytes                int64
+	Install    records.PackageInstall
+	Superseded string
+	Idempotent bool
+	Timings    []Timing
+	Warnings   []string
+	Files      int
+	Bytes      int64
 }
 
 // Run executes the whole transaction. Every refusal before Activate leaves the
@@ -210,9 +194,6 @@ type Result struct {
 func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if req.Snapshot && req.Local == nil {
 		return nil, exit.Internalf("an invocation snapshot requires local package source")
-	}
-	if (req.RemoteEnvironment != nil || req.RemoteCapture) && !req.Snapshot {
-		return nil, exit.Internalf("environment reuse requires a remote invocation snapshot")
 	}
 	if (req.Published == nil) == (req.Local == nil) {
 		return nil, exit.Usagef("`cozy package install` needs exactly one package source").
@@ -277,21 +258,15 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		if problem != nil {
 			return fail(problem)
 		}
-		inst.SourceKind, inst.SourceRef = "local", abs
+		inst.SourceKind, inst.SourceRef, inst.ProjectDir = "local", abs, abs
 		inst.Package, inst.Version = local.Package, local.Release
 		res.Files, res.Bytes = local.Files, local.Bytes
-		// Keep the authored tree as the watch target, while the installation and
-		// its sibling dependencies share one owned root for imports and describe.
-		sourceDir, e = snapshotSource(installDir, local)
-		if e != nil {
-			return fail(e)
+		if err := os.MkdirAll(installDir, 0o700); err != nil {
+			return fail(exit.Internalf("cannot create the package install directory: %s", err))
 		}
-		if e := packagepublish.RetainHubWheels(context.Background(), sourceDir, l.HubWheels()); e != nil {
+		// A machine may not reach the Hub a wheel of its lock comes from: this home keeps it.
+		if e := packagepublish.KeepHubWheels(context.Background(), abs, l.HubWheels()); e != nil {
 			return fail(e)
-		}
-		inst.ProjectDir = sourceDir
-		if req.Snapshot || local.Frozen {
-			inst.SourceRef = sourceDir
 		}
 	}
 	mark("stage")
@@ -346,34 +321,19 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			WithNext("cozy package list")
 	}
 
-	if e := checkCapacity(l.Installs, res.Bytes); e != nil {
-		return guard(e)
-	}
-
-	// ---- environment: the first code-executing step, on verified source only ----
-	venvDir := filepath.Join(installDir, "venv")
-	metadataVenv := venvDir
+	// ---- environment: a published release's, built from its exact lock. A local package
+	// builds none here: its interface is read from source, and its machine installs it.
 	var env *EnvironmentReceipt
 	var packageInterface *launch.PackageInterface
 	var placement ExactDocument
 	var err *exit.Error
-	var reusable *records.PackageInstall
-	if req.RemoteEnvironment != nil || req.RemoteCapture {
-		reusable, err = snapshotEnvironment(st, req.RemoteEnvironment, inst, sourceDir)
-		if err != nil {
-			return guard(err)
-		}
-	}
 	if req.Published != nil {
+		if e := checkCapacity(l.Installs, res.Bytes); e != nil {
+			return guard(e)
+		}
 		packageInterface, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
-	} else if prior := reusable; prior != nil {
-		metadataVenv = filepath.Join(prior.Dir, "venv")
-		env = &EnvironmentReceipt{Python: prior.Python, UV: prior.UV, Platform: prior.Platform,
-			Extra: prior.Extra, Packages: prior.Packages, Closure: prior.Closure}
-		res.RemoteSnapshot = true
-		res.MetadataEnvironment = prior
 	} else {
-		env, err = materializeEnvironment(sourceDir, venvDir, !req.Snapshot)
+		env = &EnvironmentReceipt{Closure: packagepublish.LockedClosure(sourceDir)}
 	}
 	if err != nil {
 		return guard(err)
@@ -387,20 +347,9 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	// ---- package interface: retain the published document or statically read the
 	// editable source. Model placement is prepared only when a worker is requested.
 	if req.Local != nil {
-		packageInterface, e = readDevelopmentInterface(metadataVenv, sourceDir)
+		packageInterface, e = readDevelopmentInterface(sourceDir)
 		if e != nil {
 			return guard(e)
-		}
-		metadataInstall := inst
-		if res.RemoteSnapshot {
-			metadataInstall = *res.MetadataEnvironment
-		}
-		selected, problem := InstalledRequirements(context.Background(), metadataInstall)
-		if problem != nil {
-			return guard(problem)
-		}
-		if problem := retainExecutionRequirements(installDir, selected); problem != nil {
-			return guard(problem)
 		}
 	}
 	packageInterfacePath := launch.PackageInterfacePath(installDir)
@@ -409,17 +358,6 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	if err := os.WriteFile(packageInterfacePath, packageInterface.Raw, 0o600); err != nil {
 		return guard(exit.Internalf("cannot store unpublished package interface: %s", err))
-	}
-	if req.Local != nil {
-		cache := filepath.Join(installDir, "artifact-cache")
-		if err := os.MkdirAll(cache, 0o700); err != nil {
-			return guard(exit.Internalf("cannot create editable placement cache: %s", err))
-		}
-		if placement.Digest != "" {
-			if err := os.WriteFile(filepath.Join(cache, strings.TrimPrefix(placement.Digest, "sha256:")), placement.Bytes, 0o600); err != nil {
-				return guard(exit.Internalf("cannot store editable PlacementSet: %s", err))
-			}
-		}
 	}
 	inst.PlacementSetDigest = placement.Digest
 	mark("package_interface")
@@ -464,16 +402,16 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	return res, nil
 }
 
-// readDevelopmentInterface reads only the source interface. Model construction
-// belongs to an admitted worker; a source install retains no serving PlacementSet.
-func readDevelopmentInterface(venvDir, sourceDir string) (*launch.PackageInterface, *exit.Error) {
+// readDevelopmentInterface reads a local package's interface from its source alone, with this
+// computer's Runtime: nothing of the package runs and no environment of it is needed (a callee
+// is read from the directory or the exact wheel its lock names).
+func readDevelopmentInterface(sourceDir string) (*launch.PackageInterface, *exit.Error) {
 	env := config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
 	runtimeBin, problem := hostruntime.Path(env)
 	if problem != nil {
 		return nil, problem
 	}
-	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "describe",
-		"--environment-python", home.VenvPython(venvDir))
+	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "describe")
 	cmd.Env = env
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -655,13 +593,30 @@ func Sweep(l home.Layout, st *records.Store, own sync.Locker) (Swept, *exit.Erro
 			swept.Bytes += freed
 		}
 	}
-	_ = underWriter(l, own, func() *exit.Error { swept.Bytes += sweepHubWheels(l); return nil })
+	_ = underWriter(l, own, func() *exit.Error {
+		swept.Bytes += sweepKept(l, st)
+		return nil
+	})
 	return swept, first
 }
 
-// sweepHubWheels removes each kept Tensorhub wheel no install links any more, and each fetch a
-// stopped install left. A filesystem that counts no links keeps them all.
-func sweepHubWheels(l home.Layout) (freed int64) {
+// hubWheelLife is how long a kept Tensorhub wheel no install used again stays.
+const hubWheelLife = 30 * 24 * time.Hour
+
+// sweepKept removes each run script's project no install reads any more, each kept Tensorhub
+// wheel no install used for hubWheelLife, and each fetch a stopped install left.
+func sweepKept(l home.Layout, st *records.Store) (freed int64) {
+	if read, problem := st.LocalSources(); problem == nil {
+		scripts, _ := os.ReadDir(l.Scripts())
+		for _, script := range scripts {
+			if path := filepath.Join(l.Scripts(), script.Name()); !read[path] {
+				gone, _ := Disk(path)
+				if os.RemoveAll(path) == nil {
+					freed += gone
+				}
+			}
+		}
+	}
 	hashes, _ := os.ReadDir(l.HubWheels())
 	for _, hash := range hashes {
 		dir := filepath.Join(l.HubWheels(), hash.Name())
@@ -669,13 +624,12 @@ func sweepHubWheels(l home.Layout) (freed int64) {
 		for _, entry := range entries {
 			path := filepath.Join(dir, entry.Name())
 			info, err := os.Lstat(path)
-			if err != nil {
-				continue
-			}
-			if info.IsDir() {
+			switch {
+			case err != nil:
+			case info.IsDir():
 				_ = os.RemoveAll(path)
-			} else if _, links, size, ok := inode(info); ok && links == 1 && os.Remove(path) == nil {
-				freed += size
+			case time.Since(info.ModTime()) > hubWheelLife && os.Remove(path) == nil:
+				freed += info.Size()
 			}
 		}
 		_ = os.Remove(dir)

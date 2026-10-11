@@ -141,7 +141,7 @@ cozy package install org/name
 cozy package install org/name --version 1.2.3
 cozy package install org/name --rental=kirukiru
 cozy package install ./project
-cozy package install . --editable --rental=kirukiru
+cozy package install . --rental=kirukiru
 cozy package list
 cozy package list --rental=kirukiru
 cozy package update                      # every package; or name some
@@ -151,7 +151,7 @@ cozy package remove org/name --rental=kirukiru
 
 Package names resolve at the current hub, or at `--tensorhub=<hub>` for one command;
 the same org/name at two hubs is two packages, installed side by side. `cozy package list`
-shows every hub's installations with a HUB column, published ones before local captures;
+shows every hub's installations with a HUB column, published ones before local ones;
 `--tensorhub` narrows it. `remove` and `update` act on each hub's installation
 through that hub unless `--tensorhub` narrows them. A name the hub lacks is answered with that hub and,
 from this computer's records alone, the other hub it was installed or run from and the
@@ -161,8 +161,7 @@ same name under another org at this hub, each with the command that works.
 without downloading model weights or changing the local package installation; the rental
 reads the release at its hub itself, so an installation it holds asks no hub anything.
 Omit `--version` to select the newest published release. A directory with `--rental` is
-installed here (as below) and its captured code written to the rental, only the objects the
-rental lacks. `update --rental` moves each published package the rental holds to its hub's
+installed here (as below) and its files written to the rental, only those the rental lacks. `update --rental` moves each published package the rental holds to its hub's
 newest release and removes its older ones; `remove --rental` deletes installations and their
 environments from the rental. Rental installs are queued
 durably while the worker boots and delivered automatically once it is ready; the command
@@ -171,11 +170,11 @@ waits for the outcome (Ctrl-C detaches, `--no-wait` returns once queued), and
 [package and model preparation](docs/worker-preparation.md) for explicit model prewarming.
 
 An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) is installed
-after a bounded source scan, as it is now; installing it again unchanged does nothing.
-With `--editable` the install follows the directory: while the daemon runs it watches that
-tree: an edit atomically prepares a new install and re-prepares every worker holding the
-package — the local one and each attached rental — so the next run is warm; every invocation
-still checks the tree itself. A failed rebuild (a syntax error mid-edit) keeps the last good
+as an editable Python install is: the directory is the package. Nothing is copied and no
+environment is built here; only its interface is read from source. This computer's machine
+installs it in place, building its environment only when `uv.lock` changes, and a rental keeps
+one copy updated with the files that changed. While the daemon runs it watches the tree, and
+every invocation checks it too; installing it again unchanged does nothing. A failed rebuild (a syntax error mid-edit) keeps the last good
 install pinned, is logged typed in `cozy daemon log`, and refuses an invocation only if the tree
 is still broken. `cozy package list --full` shows `synced` or `stale <error>` for the tree.
 Editable installs are not published releases. Model bindings resolve the exact release and lane
@@ -445,21 +444,17 @@ relationship, use the optional retry handle:
 cozy run ./experiment.py --retry <prior-run-id> --rental-only --await
 ```
 
-Each execution captures its source and dependency closure. A corrected retry creates a new
-record linked to the previous run; it never rewrites the old attempt's code or result.
-Unchanged callers reuse their completed local installation after source, local dependency,
-lock, Python, and capture-tool identities are checked. Each invocation still creates a new
-run. One completed capture is retained per caller; a failed preparation keeps the previous
-one. Script dependency locking still runs through uv on each command. Build backends remain
-the versions selected by the completed installation until source, dependencies, the lock,
-or capture tools change. Explicit `cozy package install ./project` also refreshes that
-package's capture on its next run.
-Retained source preparation can be adopted when its exact source/profile still matches.
-Code and unpublished wheels go directly to the authenticated private worker, without a
-Tensorhub package publication or intermediate upload. Published dependencies can still come
-from their package repositories. Ordinary Python edits do not rebuild the worker image.
+A local package runs from its directory, as an editable Python install does: nothing is
+copied on this computer, and only its interface is read here, from source. This computer's
+machine installs it in place; a rental keeps one copy, sent only the files that changed. Each
+machine builds the package's environment once and again only when its lock, its project
+metadata or a local path dependency changes; an ordinary edit costs no install. A corrected
+retry creates a new record linked to the previous run; it never rewrites the old attempt's
+result. Code goes directly to the authenticated machine, without a Tensorhub package
+publication or intermediate upload; published dependencies still come from their package
+indexes.
 
-An **unpublished package** runs from captured source without a Tensorhub package release.
+An **unpublished package** runs from its directory without a Tensorhub package release.
 A **local script** is its single-file form; **editable** describes a dependency's installation
 mode. These terms say where code comes from, not whether its model inputs must be downloaded
 or whether it is allowed to perform managed child calls.
@@ -487,9 +482,8 @@ without reopening it. `--abandon` cannot be combined with `--await`.
 An unchanged deterministic failure is not automatically retried. `--await` returns when a
 transaction blocks or pauses, and the ordinary run view explains the stopped state.
 
-An invocable dependency exposes an ordinary typed Python call. Its implementation is
-captured separately; the parent keeps its ordinary helpers and resources, with generated
-callable interfaces for managed exports. Calling one creates an ordinary managed child job. A reusable computation
+An invocable dependency exposes an ordinary typed Python call. Its implementation is its own
+package in the caller's environment. Calling one creates an ordinary managed child job. A reusable computation
 opts in with `@invocable(memoize=True)` and registers through `app.job(function)`.
 Arbitrary helper functions and external effects do not become cached operations.
 An editable source library declares its App in `package.toml` (`[application] object =
@@ -500,11 +494,8 @@ metadata; no `package.toml` is required inside the wheel. Declare it in the scri
 ordinary Python dependencies, using `[tool.uv.sources]` for a local wheel path.
 The calling single-file script needs neither App declaration.
 
-Installed callable wheels require Runtime 0.12 or newer and a qualified uv dependency
-graph version (0.12.7 or 0.12.11). Creator retains the downloaded original and creates
-an executable with the exact selected dependencies pinned in its metadata; implementation
-and resource bytes stay unchanged. An incompatible private worker base refuses before
-execution. This uses the same `cozy run` command and private transfer path as source libraries.
+Installed callable wheels require Runtime 0.12 or newer. The machine installs them from the
+caller's lock like any other dependency.
 
 On either a local or rented worker, a memoized child can acquire an earlier successful result when its
 exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,
@@ -551,8 +542,8 @@ For editable libraries, declare paths explicitly in the same script metadata:
 # ///
 ```
 
-Each run captures current declared source bytes, including library edits made without a
-version bump. Source changes never mutate an already active or captured attempt. An ordinary
+A run uses the library as it is on disk, including edits made without a version bump: an
+edit of a path dependency rebuilds the machine's environment for the next run. An ordinary
 library call runs inside its caller; only operations participating in the managed memoization
 contract reuse completed computation.
 

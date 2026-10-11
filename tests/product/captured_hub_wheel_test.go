@@ -35,11 +35,10 @@ func TestCapturedHubWheelRetainsBytesWithoutRemoteLoopbackRequirement(t *testing
 	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte("[project]\nname='capture-root'\nversion='1.0.0'\n"), 0600))
 	must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600))
 	closure := "capture-root==1.0.0\nhub-fixture==1.0.0"
-	captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}})
-	fatal(t, problem)
-	got := captured["hub-fixture"]
-	if got.Path == "" || got.Digest != "sha256:"+digest || got.RegistryRequirement != "" || !got.Application || got.Package != "paul/hub-fixture" {
-		t.Fatalf("Hub wheel was not retained privately: %+v", got)
+	store := t.TempDir()
+	fatal(t, packagepublish.KeepHubWheels(t.Context(), root, store))
+	if kept, err := os.ReadFile(filepath.Join(store, digest, filepath.Base(source))); err != nil || string(kept) != string(data) {
+		t.Fatalf("the Hub wheel was not kept by its hash: %v", err)
 	}
 	packRoot := t.TempDir()
 	pack := packagepublish.Package{Name: "capture-root", Release: "1.0.0", Root: packRoot, Wheel: prebuiltProjectWheel(t, packRoot, "capture-root", "py3-none-any", "weightless:app"), Files: map[string]string{"uv.lock": filepath.Join(root, "uv.lock")}}
@@ -62,12 +61,12 @@ func TestCapturedHubWheelRetainsBytesWithoutRemoteLoopbackRequirement(t *testing
 	// their bytes, and a changed hash must fail even with valid wheel metadata.
 	wrongHash := strings.Replace(lock, "sha256:"+digest, "sha256:"+strings.Repeat("1", 64), 1)
 	must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(wrongHash), 0600))
-	if _, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}}); problem == nil || problem.Name != "private_dependency_download_changed" {
+	if problem := packagepublish.KeepHubWheels(t.Context(), root, t.TempDir()); problem == nil || problem.Name != "private_dependency_download_changed" {
 		t.Fatalf("changed locked hash admitted: %v", problem)
 	}
 	must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600))
 	changed.Store(true)
-	if _, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), t.TempDir(), map[string]map[string]string{"library": {"hub-fixture": "1.0.0"}}); problem == nil {
+	if problem := packagepublish.KeepHubWheels(t.Context(), root, t.TempDir()); problem == nil {
 		t.Fatal("changed Hub bytes admitted")
 	}
 }

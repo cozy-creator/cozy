@@ -1,7 +1,6 @@
 package install
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io/fs"
@@ -12,7 +11,6 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -33,54 +31,6 @@ type EnvironmentReceipt struct {
 	Packages int
 	Closure  string
 	Warnings []string
-}
-
-// MaterializeEnvironment is the ONE code-executing step, and it runs only after the source has
-// been verified. Local source is the author's project, so `uv sync` relocks a lock its
-// pyproject has moved past (a version bump) and uv's resolution alone refuses real conflicts.
-// Published releases keep their frozen lock (MaterializePublishedEnvironment).
-func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *exit.Error) {
-	return materializeEnvironment(sourceDir, venvDir, true)
-}
-
-func materializeEnvironment(sourceDir, venvDir string, editable bool) (*EnvironmentReceipt, *exit.Error) {
-	python, problem := hostruntime.ProjectPython(context.Background(), sourceDir)
-	if problem != nil {
-		return nil, problem
-	}
-	env := &EnvironmentReceipt{
-		Platform: runtime.GOOS + "/" + runtime.GOARCH,
-		UV:       toolVersion("uv", "--version"),
-	}
-	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
-
-	args := []string{"sync", "--no-dev", "--no-default-groups", "--no-progress", "--python", python.Executable}
-	if !editable {
-		args = append(args, "--no-editable")
-	}
-	if env.Extra != "" {
-		args = append(args, "--extra", env.Extra)
-	}
-	cmd := exec.Command("uv", args...)
-	cmd.Dir = sourceDir
-	cmd.Env = config.Frozen().Tool(
-		"UV_PROJECT_ENVIRONMENT=" + venvDir,
-	)
-	var out strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
-		return nil, exit.Named(exit.Structural, "package_sync_refused",
-			"`uv %s` could not resolve or install this project for this host", strings.Join(args, " ")).
-			WithRemedy("uv said: %s", condense(out.String())).
-			WithNext("cozy help package install")
-	}
-
-	env.Python = pythonVersion(venvDir)
-	env.Packages, env.Closure = closure(venvDir)
-	if env.Python == "" || env.Packages == 0 {
-		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
-	}
-	return env, nil
 }
 
 // MaterializePublishedEnvironment recreates the frozen environment from the exact
@@ -437,86 +387,6 @@ func Disk(dir string) (exclusive, shared int64) {
 		shared += row.allocated
 	}
 	return
-}
-
-var extraName = regexp.MustCompile(`^\s*(cu\d{2,4})\s*=`)
-
-// pickCUDAExtra chooses the declared CUDA extra this host's driver can actually
-// run: the highest declared cuXYZ at or below the driver's CUDA version. No
-// accelerator, or nothing declared, selects no extra — never a guess.
-func pickCUDAExtra(sourceDir string, warn *[]string) string {
-	declared := declaredExtras(filepath.Join(sourceDir, "pyproject.toml"))
-	if len(declared) == 0 {
-		return ""
-	}
-	host := hostCUDA()
-	if host == 0 {
-		*warn = append(*warn, fmt.Sprintf(
-			"no CUDA driver reported; installing without a CUDA extra (declared: %s)", strings.Join(declared, ", ")))
-		return ""
-	}
-	best, bestN := "", 0
-	for _, name := range declared {
-		n, err := strconv.Atoi(strings.TrimPrefix(name, "cu"))
-		if err != nil {
-			continue
-		}
-		if n <= host && n > bestN {
-			best, bestN = name, n
-		}
-	}
-	if best == "" {
-		*warn = append(*warn, fmt.Sprintf(
-			"this host's CUDA %d.%d is below every declared extra (%s); installing without one",
-			host/10, host%10, strings.Join(declared, ", ")))
-	}
-	return best
-}
-
-func declaredExtras(pyproject string) []string {
-	f, err := os.Open(pyproject)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var out []string
-	in := false
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if t := strings.TrimSpace(line); strings.HasPrefix(t, "[") {
-			in = t == "[project.optional-dependencies]"
-			continue
-		}
-		if in {
-			if m := extraName.FindStringSubmatch(line); m != nil {
-				out = append(out, m[1])
-			}
-		}
-	}
-	return out
-}
-
-var cudaVersion = regexp.MustCompile(`CUDA Version:\s*(\d+)\.(\d+)`)
-
-// hostCUDA is the driver's maximum CUDA version as cuXYZ digits (13.0 -> 130).
-func hostCUDA() int {
-	cmd := exec.Command("nvidia-smi")
-	// The allowlisted tool environment, like every other spawn: a probe that inherited
-	// the full parent environment (TENSORHUB_TOKEN included) was the one production
-	// spawn invisible to the env fence (cl-026).
-	cmd.Env = config.Frozen().Tool()
-	out, err := cmd.Output()
-	if err != nil {
-		return 0
-	}
-	m := cudaVersion.FindSubmatch(out)
-	if m == nil {
-		return 0
-	}
-	major, _ := strconv.Atoi(string(m[1]))
-	minor, _ := strconv.Atoi(string(m[2]))
-	return major*10 + minor
 }
 
 func toolVersion(name string, args ...string) string {

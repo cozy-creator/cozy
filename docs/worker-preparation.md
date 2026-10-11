@@ -13,9 +13,7 @@ cozy package install paul/minimax-h3 --rental=kirukiru --version 1.15.7
 ```
 
 Rental installation leaves the local package inventory unchanged and sends no
-model selections. It accepts published `org/name` packages only; `--editable`
-and local directories are not supported by this published-release path. Installing
-an editable package locally does not publish it. Use
+model selections. Installing a local directory does not publish it. Use
 `cozy run ./project/<function> --rental=kirukiru` for private local code execution
 and its on-demand preparation.
 

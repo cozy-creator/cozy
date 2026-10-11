@@ -395,7 +395,7 @@ func parityMachinesOn(t *testing.T, source machines.Source, front ...func(string
 // and attached. Only the machine name and address may differ.
 func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 	_, root, _, store := parityMachines(t)
-	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", parityProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	journals := map[string][][]string{}

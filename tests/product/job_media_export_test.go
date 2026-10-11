@@ -93,7 +93,7 @@ def picture(payload:Request,out:Outputs)->Picture:
 		}
 		return result
 	}
-	run("package", "install", project, "--editable", "--json")
+	run("package", "install", project, "--json")
 	run("run", "local/job-media-export-proof/text", "--await", "--json")
 	defaultDir := filepath.Join(root, "outputs", "local-job-media-export-proof")
 	if _, err := os.Stat(defaultDir); !os.IsNotExist(err) {

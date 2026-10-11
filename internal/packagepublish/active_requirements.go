@@ -22,17 +22,6 @@ type RequirementSelection struct {
 	Extras         map[string][]string `json:"extras"`
 }
 
-// ActiveRequirements binds selected extras using the standard PEP 508 parser,
-// preserving target-specific markers. Captured metadata arrives on stdin; no
-// captured module, .pth, interpreter or resolver runs. Every selected dependency contributes its own subtree.
-func ActiveRequirements(ctx context.Context, project string, extras []string, metadata map[string]string, python string) (RequirementSelection, *exit.Error) {
-	if extras == nil {
-		extras = []string{}
-	}
-	return readActiveRequirements(ctx, map[string]any{"project": project, "extras": extras,
-		"metadata": metadata, "python": python})
-}
-
 func readActiveRequirements(ctx context.Context, input map[string]any) (RequirementSelection, *exit.Error) {
 	var result RequirementSelection
 	raw, err := json.Marshal(input)

@@ -75,7 +75,7 @@ func TestRuntimeObligationsPreventPrematureRentalRelease(t *testing.T) {
 // collected frees it.
 func TestARentalRunningAV1JobIsOwedUntilItsResultIsHeld(t *testing.T) {
 	_, root, _, store := parityMachines(t)
-	if code, out := runCozy(t, root, "package", "install", restartProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", restartProject(t)); code != 0 {
 		t.Fatalf("installing the restart package [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "local/restart-proof/slow", "seconds=4", "--rental=tessa", "--json", "--idempotency-key", "owed"); code != 0 {

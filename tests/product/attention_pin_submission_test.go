@@ -14,7 +14,7 @@ import (
 // copies dropping the kernel pin before a paid H3 request reached its worker.
 func TestAttentionPinSurvivesSubmissionAndConflictingReplayRefuses(t *testing.T) {
 	root := t.TempDir()
-	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", weightlessProject(t)); code != 0 {
 		t.Fatalf("install %d: %s", code, out)
 	}
 	args := []string{"--json", "run", localWeightlessRef + "/echo", "why=attention-pin", "--attention-kernel=flash-attn3-fp8", "--idempotency-key=attention-pin"}
@@ -49,7 +49,7 @@ func TestAttentionPinSurvivesSubmissionAndConflictingReplayRefuses(t *testing.T)
 // undeclared payload field, never a pin, and a malformed flag refuses before admission.
 func TestScopedAttentionPinSurvivesSubmission(t *testing.T) {
 	root := t.TempDir()
-	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", weightlessProject(t)); code != 0 {
 		t.Fatalf("install %d: %s", code, out)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -108,7 +108,7 @@ func TestAttentionOverrideMalformedHTTPRefusesBeforeAdmission(t *testing.T) {
 func TestEditableVersionBumpRefreshesTheInstall(t *testing.T) {
 	root := t.TempDir()
 	project := weightlessProject(t)
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("install %d: %s", code, out)
 	}
 	pyproject := filepath.Join(project, "pyproject.toml")

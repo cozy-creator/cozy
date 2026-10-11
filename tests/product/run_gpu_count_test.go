@@ -13,7 +13,7 @@ import (
 // This is admission/custody coverage, not GPU inference qualification.
 func TestRunGPUCountSurvivesCLIAdmissionAndConflictingReplay(t *testing.T) {
 	root := t.TempDir()
-	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", weightlessProject(t)); code != 0 {
 		t.Fatalf("install %d: %s", code, out)
 	}
 	args := []string{"--json", "run", localWeightlessRef + "/echo", "why=gpu-count", "--gpus=2", "--idempotency-key=two-gpus"}
@@ -39,7 +39,7 @@ func TestRunGPUCountSurvivesCLIAdmissionAndConflictingReplay(t *testing.T) {
 
 func TestJobGPUCountAndKernelSurviveIdenticalReplay(t *testing.T) {
 	root := t.TempDir()
-	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", weightlessProject(t)); code != 0 {
 		t.Fatalf("install %d: %s", code, out)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

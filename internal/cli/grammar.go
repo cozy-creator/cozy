@@ -265,11 +265,10 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref      string `arg:"" name:"package-or-directory" predictor:"dir-or-ref" help:"Published org/name or explicit directory such as . or ./project."`
-	Version  string `help:"Install this release instead of the newest, e.g. 1.2.3."`
-	Editable bool   `help:"Keep an explicit local directory live: later runs use its current files."`
-	Rental   string `predictor:"rental" help:"Install on this existing rental name or id as well, without model weights; a published package installs there only. Waits for the outcome."`
-	NoWait   bool   `name:"no-wait" help:"With --rental, answer once the installation is queued instead of waiting for its outcome."`
+	Ref     string `arg:"" name:"package-or-directory" predictor:"dir-or-ref" help:"Published org/name or explicit directory such as . or ./project."`
+	Version string `help:"Install this release instead of the newest, e.g. 1.2.3."`
+	Rental  string `predictor:"rental" help:"Install on this existing rental name or id as well, without model weights; a published package installs there only. Waits for the outcome."`
+	NoWait  bool   `name:"no-wait" help:"With --rental, answer once the installation is queued instead of waiting for its outcome."`
 }
 
 type PackageUpdateCmd struct {
@@ -303,7 +302,7 @@ func (c *PackageYankCmd) Run(r *Runtime) error {
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
-	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable, "--no-wait", c.NoWait),
+	return r.call(handleInstall, []string{c.Ref}, bools("--no-wait", c.NoWait),
 		values("--version", c.Version, "--rental", c.Rental), false)
 }
 
