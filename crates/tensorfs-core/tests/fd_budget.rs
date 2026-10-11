@@ -38,7 +38,12 @@ fn origin(bodies: Arc<HashMap<String, Vec<u8>>>) -> Origin {
     let (accepted, asked) = (Arc::clone(&connections), Arc::clone(&requests));
     std::thread::spawn(move || {
         for socket in listener.incoming() {
-            let Ok(socket) = socket else { break };
+            // The squeeze fills the origin's table too: wait and accept again. Ending the loop
+            // closed the listener and the walk stopped on refused connections.
+            let Ok(socket) = socket else {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            };
             accepted.fetch_add(1, Ordering::Relaxed);
             let (bodies, asked) = (Arc::clone(&bodies), Arc::clone(&asked));
             std::thread::spawn(move || serve(socket, &bodies, &asked));

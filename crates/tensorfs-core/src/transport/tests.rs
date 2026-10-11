@@ -4677,6 +4677,8 @@ fn complete_content_length_body_does_not_wait_for_connection_close() {
         // time is unrelated to HTTP framing and may exceed a test socket timer.
         let _ = hold_open.recv();
     });
+    // No wall deadline: admission's fsync takes what a loaded disk takes. A fetch that waited
+    // for the close would get no byte, and the ledger's own stall rule would refuse it.
     let ledger = Ledger::with_resolution(Duration::from_millis(20));
     let result = fetch_ranged(
         &store,
@@ -4684,7 +4686,7 @@ fn complete_content_length_body_does_not_wait_for_connection_close() {
         &format!("http://{address}/body"),
         &local_policy(),
         &Anonymous,
-        Deadline::after_seconds(Some(1.0)),
+        Deadline::none(),
         &ledger,
         Ranged::default(),
         None,
