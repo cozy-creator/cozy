@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -45,11 +46,12 @@ func TestRunGPUCountReachesNativeSpecOrRefusesBeforePreparation(t *testing.T) {
 				t.Fatal(err)
 			}
 			machine := &machines.V1{Name: "fixture", Client: &machinev1.Client{Machine: v1.NewMachineClient(conn)}}
-			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+			root := t.TempDir()
+			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 			if problem != nil {
 				t.Fatal(problem)
 			}
-			m := &machineRuns{store: store, context: &Context{}, resolver: &Resolver{}}
+			m := &machineRuns{store: store, layout: home.Layout{Root: root}, context: &Context{}, resolver: &Resolver{}}
 			for _, kind := range []string{"serving", "job"} {
 				spec, problem := m.specV1(context.Background(), records.Request{Package: "proof/package", Entrypoint: "call", Kind: kind, GPUs: count, Payload: []byte(`{}`)}, machine)
 				if count > 0 && !supported {
