@@ -55,6 +55,10 @@ pub trait MachineBackend: Send + Sync + 'static {
     fn execution_ms(&self, _: VerifiedActor, _: domain::MachineExecutionQuery) -> Result<u64, Status> {
         Ok(0)
     }
+    /// How the machine memo met a run (`call_memo`).
+    fn memo(&self, _: VerifiedActor, _: domain::MachineExecutionQuery) -> Result<crate::journal::CallMemo, Status> {
+        Ok(Default::default())
+    }
     fn control(
         &self,
         _: VerifiedActor,

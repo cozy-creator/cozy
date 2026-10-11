@@ -763,6 +763,13 @@ impl MachineBackend for NativeBackend {
     ) -> Result<u64, Status> {
         Ok(self.query(actor, query)?.executed_ms)
     }
+    fn memo(
+        &self,
+        actor: VerifiedActor,
+        query: domain::MachineExecutionQuery,
+    ) -> Result<crate::journal::CallMemo, Status> {
+        Ok(self.query(actor, query)?.memo)
+    }
     fn measurements(
         &self,
         actor: VerifiedActor,

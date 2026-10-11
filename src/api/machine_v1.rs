@@ -331,7 +331,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         weights_destination: spec.weights_destination,
         owner: spec.owner,
         catalog_revision: spec.catalog_revision,
-        held: None,
         application: String::new(),
         digest: identity_digest,
     }, hub))
@@ -457,6 +456,7 @@ impl Log {
                 },
                 memoized: body["memoized"].as_bool().unwrap_or_default(),
                 computation_digest: body["computation_digest"].as_str().unwrap_or_default().into(),
+                unmemoized: body["unmemoized"].as_str().unwrap_or_default().into(),
                 reason: (!body["error_code"].as_str().unwrap_or_default().is_empty()
                     || matches!(
                         body["status"].as_str(),
@@ -535,8 +535,8 @@ impl Log {
                     result,
                     outputs: self.products.clone(),
                     triage: body.get("triage_bundle").is_some(),
-                    measurements: vec![], // `stream_run` adds them, and the execution time
-                    execution_ms: 0,
+                    measurements: vec![], // `stream_run` adds them, the execution time and memo
+                    ..Default::default()
                 })
             }
             _ => return None,
@@ -941,15 +941,18 @@ pub(super) async fn stream_run<B: MachineBackend>(
             }
             if let (Some(v1::run_event::Event::Outcome(outcome)), None) = (&mut converted.event, &limit) {
                 let (kept_backend, kept_id) = (backend.clone(), id.clone());
-                let (measurements, execution_ms) = tokio::task::spawn_blocking(move || {
+                let (measurements, execution_ms, memo) = tokio::task::spawn_blocking(move || {
                     let run = query(&*kept_backend, actor, &kept_id)?;
                     let measured = kept_backend.measurements(actor, run.clone())?;
-                    Ok::<_, Status>((measured, kept_backend.execution_ms(actor, run)?))
+                    let executed = kept_backend.execution_ms(actor, run.clone())?;
+                    Ok::<_, Status>((measured, executed, kept_backend.memo(actor, run)?))
                 })
                 .await
                 .map_err(|_| Status::internal("machine operation stopped"))??;
                 outcome.measurements = measurements.unwrap_or_default();
                 outcome.execution_ms = execution_ms;
+                (outcome.computation_digest, outcome.memoized, outcome.unmemoized) =
+                    (memo.computation, memo.memoized, memo.unmemoized);
             }
             if sender.send(Ok(converted)).await.is_err() {
                 return Ok(());

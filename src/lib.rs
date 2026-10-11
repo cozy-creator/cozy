@@ -2,6 +2,7 @@ pub mod adapter_views;
 mod archive;
 pub mod api;
 mod boundary_json;
+mod call_memo;
 pub mod catalog;
 pub mod child_launcher;
 pub mod device_executor;

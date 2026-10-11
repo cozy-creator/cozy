@@ -739,7 +739,7 @@ fn a_pause_holds_unstarted_work_and_a_resume_starts_a_fresh_attempt() {
     };
     let (preparing, _) = journal.accept_run("alice", "job/0", "d", child.clone()).unwrap();
     assert_eq!(journal.pause(&preparing.id, "alice", true).unwrap().state, State::Queued);
-    let ready = journal.bind_prepared(&preparing.id, child, "").unwrap();
+    let ready = journal.bind_prepared(&preparing.id, child, "", Default::default(), None).unwrap();
     assert_eq!(ready.state, State::Paused);
     assert_eq!(journal.children(&queued).unwrap().len(), 1);
 

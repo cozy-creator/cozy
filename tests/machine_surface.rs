@@ -780,12 +780,47 @@ mod v1_api {
             .output()
             .unwrap();
         let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
-        vec![
-            "--installer-python".into(),
-            helper.into(),
-            "--client-wheel".into(),
-            wheel.into(),
-        ]
+        let mut args: Vec<std::ffi::OsString> =
+            vec!["--installer-python".into(), helper.into(), "--client-wheel".into(), wheel.into()];
+        // A Runtime wheel not yet published, installed as this machine's own (a dev build).
+        if let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") {
+            args.extend(["--package-sdk".into(), runtime]);
+        }
+        args
+    }
+
+    /// A live project's files written with Write, as `cozy run ./dir` sends them: its manifest.
+    async fn write_live(
+        client: &mut v1::machine_client::MachineClient<Channel>,
+        cap: &str,
+        project: &Path,
+        package: &str,
+        names: &[&str],
+    ) -> String {
+        let mut files = vec![];
+        for name in names {
+            let bytes = fs::read(project.join(name)).unwrap();
+            let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+            write(client, cap, &digest, bytes.len() as u64, 0, &bytes).await.unwrap();
+            files.push(serde_json::json!({"name": name, "digest": digest, "length": bytes.len()}));
+        }
+        let manifest = serde_json::to_vec(&serde_json::json!({"package": package, "release": "0.1.0",
+            "python_version": "3.12", "files": files}))
+        .unwrap();
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        write(client, cap, &digest, manifest.len() as u64, 0, &manifest).await.unwrap();
+        digest
+    }
+
+    /// A fixture copied where a test may edit it.
+    fn project(fixture: &str, names: &[&str]) -> PathBuf {
+        let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(fixture);
+        let to = std::env::temp_dir().join(format!("cm-project-{}", uuid::Uuid::new_v4()));
+        for name in names {
+            fs::create_dir_all(to.join(name).parent().unwrap()).unwrap();
+            fs::copy(from.join(name), to.join(name)).unwrap();
+        }
+        to
     }
 
     /// A fixture package written with Write: its manifest's digest.
@@ -1713,6 +1748,177 @@ mod v1_api {
         assert!(first.iter().all(|(memoized, digest)| !memoized && digest.starts_with("sha256:")), "{first:?}");
         assert_eq!(second[0], (true, first[0].1.clone()), "{second:?}");
         assert!(!second[1].0 && second[1].1.starts_with("sha256:") && second[1].1 != first[1].1, "{second:?}");
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// A memoized function run directly is answered from this machine's memo as a job's calls
+    /// are: the same request again starts nothing and returns the same result and files; another
+    /// request, or an edit of the package, runs. A function not declared memoized always runs,
+    /// and a failed run is never held.
+    #[tokio::test]
+    async fn a_memoized_function_run_directly_is_answered_from_this_machines_memo() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let names = ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"];
+        let project = project("cpu_memo", &names);
+        let package = "local/cozy-machine-cpu-memo";
+        let mut manifest = write_live(&mut client, &all, &project, package, &names).await;
+        let (counter, noted) = (machine.root.join("measured"), machine.root.join("noted"));
+        let mut runner = client.clone();
+        let mut run = async |id: &str, manifest: &str, kind: v1::RunKind, entrypoint: &str, payload: serde_json::Value| {
+            let spec = v1::RunSpec {
+                kind: kind as i32,
+                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.into() })),
+                entrypoint: entrypoint.into(),
+                payload: serde_json::to_vec(&payload).unwrap(),
+                owner: "alice".into(),
+                ..Default::default()
+            };
+            let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
+            collect(runner.run(request).await.unwrap().into_inner()).await.unwrap()
+        };
+        let probe = |value: i64, counter: &Path| serde_json::json!({"payload": {"value": value, "counter": counter}});
+        let count = |path: &Path| fs::read_to_string(path).unwrap();
+        let ran = |events: &[v1::RunEvent]| {
+            events.iter().any(|e| matches!(&e.event, Some(v1::run_event::Event::State(s)) if s.state == "running"))
+        };
+        let entrypoint = v1::RunKind::Call;
+        let first = run("direct-1", &manifest, entrypoint, "measure", probe(3, &counter)).await;
+        let computed = outcome(&first);
+        assert_eq!(computed.status, "succeeded", "{computed:?}");
+        assert!(!computed.memoized && computed.computation_digest.starts_with("sha256:"), "{computed:?}");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&computed.result).unwrap(), serde_json::json!({"square": 9}));
+        assert_eq!(count(&counter), "1");
+        // The same request: answered from the memo, nothing started.
+        let second = run("direct-2", &manifest, entrypoint, "measure", probe(3, &counter)).await;
+        let answered = outcome(&second);
+        assert_eq!(answered.status, "succeeded", "{answered:?}");
+        assert!(answered.memoized && answered.computation_digest == computed.computation_digest, "{answered:?}");
+        assert_eq!(answered.result, computed.result);
+        assert!(!ran(&second) && answered.execution_ms == 0, "{second:?}");
+        assert_eq!(count(&counter), "1", "the answered request ran");
+        // Another request runs.
+        let other = outcome(&run("direct-3", &manifest, entrypoint, "measure", probe(4, &counter)).await);
+        assert!(!other.memoized && other.computation_digest != computed.computation_digest, "{other:?}");
+        assert_eq!(count(&counter), "2");
+        // A memoized job whose result is a file: answered with the same file.
+        let job = v1::RunKind::Job;
+        let mut notes = vec![];
+        for id in ["note-1", "note-2"] {
+            let events = run(id, &manifest, job, "note", probe(5, &noted)).await;
+            let done = outcome(&events);
+            assert_eq!(done.status, "succeeded", "{done:?}");
+            let target = v1::OutputTarget { run: id.into(), output: "file".into(), ..Default::default() };
+            let request = v1::ReadRequest { target: Some(v1::read_request::Target::Output(target)), ..Default::default() };
+            notes.push((done.memoized, read(&mut client, &all, request).await.unwrap().1));
+        }
+        assert_eq!(notes, [(false, b"note 5".to_vec()), (true, b"note 5".to_vec())]);
+        assert_eq!(count(&noted), "1", "the answered job ran");
+        // A function not declared memoized always runs.
+        for id in ["greet-1", "greet-2"] {
+            let events = run(id, &manifest, entrypoint, "greet", serde_json::json!({"text": "hi"})).await;
+            let done = outcome(&events);
+            assert_eq!(done.status, "succeeded", "{done:?}");
+            assert!(ran(&events) && !done.memoized && done.computation_digest.is_empty(), "{done:?}");
+        }
+        // A failed run is never held: the same request fails again by running again.
+        let unwritable = machine.root.join("absent/measured");
+        for id in ["failing-1", "failing-2"] {
+            let events = run(id, &manifest, entrypoint, "measure", probe(3, &unwritable)).await;
+            let done = outcome(&events);
+            assert!(done.status == "failed" && ran(&events) && !done.memoized, "{done:?}");
+        }
+        // An edit of the package is another computation: it runs, then its own memo answers.
+        let source = project.join("cpu_memo/__init__.py");
+        fs::write(&source, fs::read_to_string(&source).unwrap() + "\nEDITED = True\n").unwrap();
+        manifest = write_live(&mut client, &all, &project, package, &names).await;
+        let edited = outcome(&run("edited-1", &manifest, entrypoint, "measure", probe(3, &counter)).await);
+        assert!(!edited.memoized && edited.computation_digest != computed.computation_digest, "{edited:?}");
+        assert_eq!(count(&counter), "3");
+        let again = outcome(&run("edited-2", &manifest, entrypoint, "measure", probe(3, &counter)).await);
+        assert!(again.memoized && again.computation_digest == edited.computation_digest, "{again:?}");
+        assert_eq!(count(&counter), "3");
+        let _ = fs::remove_dir_all(project);
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// An author's condition (`Memoize(requires=("seed",))`): a call that gives its seed is
+    /// memoized, top-level and as a job's call alike; one that omits it runs every time,
+    /// nothing is held, and the run says why.
+    #[tokio::test]
+    async fn a_call_is_memoized_only_when_it_gives_the_seed_its_author_requires() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let names = ["pyproject.toml", "package.toml", "cpu_seeded/__init__.py"];
+        let project = project("cpu_seeded", &names);
+        let manifest = write_live(&mut client, &all, &project, "local/cozy-machine-cpu-seeded", &names).await;
+        let counter = machine.root.join("painted");
+        let mut runner = client.clone();
+        let mut run = async |id: &str, kind: v1::RunKind, entrypoint: &str, payload: serde_json::Value| {
+            let spec = v1::RunSpec {
+                kind: kind as i32,
+                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+                entrypoint: entrypoint.into(),
+                payload: serde_json::to_vec(&payload).unwrap(),
+                owner: "alice".into(),
+                ..Default::default()
+            };
+            let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
+            collect(runner.run(request).await.unwrap().into_inner()).await.unwrap()
+        };
+        let count = || fs::read_to_string(&counter).unwrap();
+        let paint = |prompt: &str, seed: Option<u64>| {
+            let mut request = serde_json::json!({"prompt": prompt, "counter": counter});
+            if let Some(seed) = seed {
+                request["seed"] = seed.into();
+            }
+            request
+        };
+        let entrypoint = v1::RunKind::Call;
+        // Seeded twice: the second is answered from the memo.
+        let first = outcome(&run("seeded-1", entrypoint, "paint", paint("fox", Some(7))).await);
+        let second = outcome(&run("seeded-2", entrypoint, "paint", paint("fox", Some(7))).await);
+        assert!(first.status == "succeeded" && !first.memoized && first.computation_digest.starts_with("sha256:"), "{first:?}");
+        assert!(second.memoized && second.computation_digest == first.computation_digest, "{second:?}");
+        assert_eq!(second.result, first.result);
+        assert_eq!(count(), "1");
+        // The same seed, another prompt: another computation.
+        let owl = outcome(&run("seeded-3", entrypoint, "paint", paint("owl", Some(7))).await);
+        assert!(!owl.memoized && owl.computation_digest != first.computation_digest, "{owl:?}");
+        assert_eq!(count(), "2");
+        // Unseeded twice: two runs, each its own seed, nothing held, and each says why.
+        let mut seeds = vec![];
+        for id in ["unseeded-1", "unseeded-2"] {
+            let done = outcome(&run(id, entrypoint, "paint", paint("fox", None)).await);
+            assert_eq!(done.status, "succeeded", "{done:?}");
+            assert!(!done.memoized && done.computation_digest.is_empty() && done.unmemoized == "seed not given", "{done:?}");
+            seeds.push(serde_json::from_slice::<serde_json::Value>(&done.result).unwrap()["seed"].clone());
+        }
+        assert_ne!(seeds[0], seeds[1], "each unseeded run drew its own seed");
+        assert_eq!(count(), "4");
+        // A job's calls alike: seeded, its second call is answered; unseeded, both run.
+        let calls = |events: &[v1::RunEvent]| -> Vec<(bool, String)> {
+            events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    Some(v1::run_event::Event::Call(call)) => Some((call.memoized, call.unmemoized.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let job = v1::RunKind::Job;
+        let seeded = run("gallery-1", job, "gallery", paint("heron", Some(9))).await;
+        assert_eq!(outcome(&seeded).status, "succeeded", "{seeded:?}");
+        assert_eq!(calls(&seeded), [(false, String::new()), (true, String::new())]);
+        assert_eq!(count(), "5");
+        let unseeded = run("gallery-2", job, "gallery", paint("heron", None)).await;
+        assert_eq!(outcome(&unseeded).status, "succeeded", "{unseeded:?}");
+        let why = "seed not given".to_string();
+        assert_eq!(calls(&unseeded), [(false, why.clone()), (false, why)]);
+        assert_eq!(count(), "7");
+        let _ = fs::remove_dir_all(project);
         let _ = fs::remove_dir_all(tools);
     }
 
