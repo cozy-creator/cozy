@@ -2,8 +2,10 @@ package hub
 
 import (
 	"context"
+	"crypto/rand"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -98,27 +100,34 @@ func (c *Client) CreditHistory(ctx context.Context, limit int, cursor string) ([
 	return out.Data, next, problem
 }
 
-// DepositBounds is the inclusive range one credit purchase may be, in micros.
-type DepositBounds struct {
-	Min int64 `json:"min_amount,string"`
-	Max int64 `json:"max_amount,string"`
+// CreditDeposit is the credit deposit as the hub's catalog sells it: its price, and the
+// inclusive range one purchase may be, in micros.
+type CreditDeposit struct {
+	PriceID string
+	Min     int64
+	Max     int64
 }
 
-// CreditDepositBounds reads what one purchase may be from the hub's catalog.
-func (c *Client) CreditDepositBounds(ctx context.Context) (DepositBounds, *exit.Error) {
+// CreditDeposit reads the credit deposit from the hub's catalog, a lookup by product key.
+func (c *Client) CreditDeposit(ctx context.Context) (CreditDeposit, *exit.Error) {
 	var out struct {
 		Data []struct {
 			Key    string `json:"key"`
 			Prices []struct {
-				Key            string         `json:"key"`
-				Archived       bool           `json:"archived"`
-				Currency       string         `json:"currency"`
-				CustomerAmount *DepositBounds `json:"customer_amount"`
+				ID             string `json:"id"`
+				Key            string `json:"key"`
+				Archived       bool   `json:"archived"`
+				Currency       string `json:"currency"`
+				CustomerAmount *struct {
+					Min int64 `json:"min_amount,string"`
+					Max int64 `json:"max_amount,string"`
+				} `json:"customer_amount"`
 			} `json:"prices"`
 		} `json:"data"`
 	}
-	if problem := c.do(ctx, call{method: http.MethodGet, path: "/billing/v1/catalog/products", optionalAuth: true}, &out); problem != nil {
-		return DepositBounds{}, problem
+	path := "/billing/v1/catalog/products?" + url.Values{"keys": {creditProduct}}.Encode()
+	if problem := c.do(ctx, call{method: http.MethodGet, path: path, optionalAuth: true}, &out); problem != nil {
+		return CreditDeposit{}, problem
 	}
 	for _, product := range out.Data {
 		if product.Key != creditProduct {
@@ -126,84 +135,106 @@ func (c *Client) CreditDepositBounds(ctx context.Context) (DepositBounds, *exit.
 		}
 		for _, price := range product.Prices {
 			if price.Key == creditPrice && !price.Archived && price.Currency == CreditCurrency && price.CustomerAmount != nil {
-				return *price.CustomerAmount, nil
+				return CreditDeposit{PriceID: price.ID, Min: price.CustomerAmount.Min, Max: price.CustomerAmount.Max}, nil
 			}
 		}
 	}
-	return DepositBounds{}, exit.Named(exit.NotFound, "credits.not_sold",
+	return CreditDeposit{}, exit.Named(exit.NotFound, "credits.not_sold",
 		"this hub sells no credit (%s/%s)", creditProduct, creditPrice)
 }
 
-// CreditCheckout is a credit purchase awaiting the buyer at Stripe Checkout.
+// CreditCheckout is a credit purchase awaiting the buyer on Stripe's hosted page. ID
+// names the purchase's order.
 type CreditCheckout struct {
-	SessionID string    `json:"session_id"`
-	URL       string    `json:"url"`
-	ExpiresAt time.Time `json:"expires_at"`
+	ID        string
+	URL       string
+	ExpiresAt time.Time
+	// status reads where the purchase stands.
+	status func(context.Context) (CreditPurchase, *exit.Error)
 }
 
-// BuyCredit opens a checkout session for amount micros of credit and pays it
-// through the hub's redirect option, answering where the buyer pays.
-func (c *Client) BuyCredit(ctx context.Context, amount int64) (CreditCheckout, *exit.Error) {
-	var minted struct {
-		ID        string    `json:"id"`
-		ExpiresAt time.Time `json:"expires_at"`
-	}
-	if problem := c.do(ctx, call{method: http.MethodPost, path: "/billing/v1/me/checkout-sessions", auth: true, body: map[string]string{
-		"product_key": creditProduct, "price_key": creditPrice,
-		"amount": strconv.FormatInt(amount, 10), "success_url": c.base + CreditReturnPath,
-	}}, &minted); problem != nil {
-		return CreditCheckout{}, problem
-	}
-	session, problem := c.creditSession(ctx, minted.ID)
+// CreditPurchase is where a credit purchase stands: Paid once its credit landed, or
+// Ended, naming how it closed unpaid (canceled, expired, ...).
+type CreditPurchase struct {
+	Paid    bool
+	Ended   string
+	Message string
+}
+
+// Status reads where the purchase stands.
+func (c CreditCheckout) Status(ctx context.Context) (CreditPurchase, *exit.Error) {
+	return c.status(ctx)
+}
+
+// creditOrder is the hub's order as a credit purchase reads it.
+type creditOrder struct {
+	ID        string     `json:"id"`
+	Status    string     `json:"status"`
+	Total     int64      `json:"total,string"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	Payment   struct {
+		NextAction *struct {
+			Type string  `json:"type"`
+			URL  *string `json:"url"`
+		} `json:"next_action"`
+		LastPaymentError *struct {
+			Message string `json:"message"`
+		} `json:"last_payment_error"`
+	} `json:"payment"`
+	PaymentOptions []struct {
+		Accepts []string `json:"accepts"`
+	} `json:"payment_options"`
+}
+
+// BuyCredit buys amount micros of credit: an order of the deposit's price at that
+// amount, paid on the hub's hosted Stripe page. It answers where the buyer pays.
+func (c *Client) BuyCredit(ctx context.Context, deposit CreditDeposit, amount int64) (CreditCheckout, *exit.Error) {
+	var order creditOrder
+	problem := c.do(ctx, call{method: http.MethodPost, path: "/billing/v1/me/orders", auth: true, idempotency: rand.Text(),
+		body: map[string]any{"lines": []map[string]string{{"price_id": deposit.PriceID, "amount": strconv.FormatInt(amount, 10)}}}}, &order)
 	if problem != nil {
 		return CreditCheckout{}, problem
 	}
-	option := ""
-	for _, o := range session.Options {
-		if o.Driver == "redirect" {
-			option = o.ID
-			break
-		}
+	hosted := false
+	for _, option := range order.PaymentOptions {
+		hosted = hosted || slices.Contains(option.Accepts, "redirect")
 	}
-	if option == "" {
+	if !hosted {
 		return CreditCheckout{}, exit.Named(exit.Unavailable, "credits.no_hosted_checkout",
 			"this hub offers no hosted checkout for credit")
 	}
-	var paid struct {
-		Status     string `json:"status"`
-		NextAction *struct {
-			URL *string `json:"url"`
-		} `json:"next_action"`
-	}
-	if problem := c.do(ctx, call{method: http.MethodPost, path: "/billing/v1/checkout-sessions/" + url.PathEscape(minted.ID) + "/pay",
-		body: map[string]string{"option_id": option}}, &paid); problem != nil {
+	path := "/billing/v1/me/orders/" + url.PathEscape(order.ID)
+	var paid creditOrder
+	if problem := c.do(ctx, call{method: http.MethodPost, path: path + "/pay", auth: true, idempotency: rand.Text(), body: map[string]any{
+		"payment":        map[string]string{"return_url": c.base + CreditReturnPath},
+		"expected_total": strconv.FormatInt(order.Total, 10),
+	}}, &paid); problem != nil {
 		return CreditCheckout{}, problem
 	}
-	if paid.NextAction == nil || paid.NextAction.URL == nil || *paid.NextAction.URL == "" {
+	next := paid.Payment.NextAction
+	if next == nil || next.Type != "redirect_to_url" || next.URL == nil || *next.URL == "" {
 		return CreditCheckout{}, exit.Named(exit.Internal, "credits.checkout_without_url",
-			"the hub answered checkout %s with no payment page (status %s)", minted.ID, paid.Status)
+			"the hub answered order %s with no payment page (status %s)", order.ID, paid.Status)
 	}
-	return CreditCheckout{SessionID: minted.ID, URL: *paid.NextAction.URL, ExpiresAt: minted.ExpiresAt}, nil
-}
-
-// CreditSession is where a credit purchase stands: created, requires_action,
-// processing, succeeded, failed, blocked, expired or canceled.
-type CreditSession struct {
-	Status         string  `json:"status"`
-	FailureMessage *string `json:"failure_message"`
-	Options        []struct {
-		ID     string `json:"id"`
-		Driver string `json:"driver"`
-	} `json:"options"`
-}
-
-// CreditSessionStatus reads a purchase's checkout session.
-func (c *Client) CreditSessionStatus(ctx context.Context, id string) (CreditSession, *exit.Error) {
-	return c.creditSession(ctx, id)
-}
-
-func (c *Client) creditSession(ctx context.Context, id string) (CreditSession, *exit.Error) {
-	var out CreditSession
-	problem := c.do(ctx, call{method: http.MethodGet, path: "/billing/v1/checkout-sessions/" + url.PathEscape(id)}, &out)
-	return out, problem
+	expires := time.Now().Add(24 * time.Hour)
+	if order.ExpiresAt != nil {
+		expires = *order.ExpiresAt
+	}
+	return CreditCheckout{ID: order.ID, URL: *next.URL, ExpiresAt: expires, status: func(ctx context.Context) (CreditPurchase, *exit.Error) {
+		var now creditOrder
+		if problem := c.do(ctx, call{method: http.MethodGet, path: path, auth: true}, &now); problem != nil {
+			return CreditPurchase{}, problem
+		}
+		switch now.Status {
+		case "complete":
+			return CreditPurchase{Paid: true}, nil
+		case "open", "processing":
+			return CreditPurchase{}, nil
+		}
+		purchase := CreditPurchase{Ended: now.Status}
+		if failure := now.Payment.LastPaymentError; failure != nil {
+			purchase.Message = failure.Message
+		}
+		return purchase, nil
+	}}, nil
 }
