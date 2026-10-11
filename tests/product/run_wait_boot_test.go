@@ -144,10 +144,15 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 	master, watch := startPTY(t, root, 24, ptyColumns, "run", "watch", run)
 	var screenMu sync.Mutex
 	var raw strings.Builder
+	closed := make(chan struct{})
 	go func() {
+		defer close(closed)
 		chunk := make([]byte, 4096)
 		for {
 			n, err := master.Read(chunk)
+			if n > 0 {
+				touchPTY(watch)
+			}
 			screenMu.Lock()
 			raw.Write(chunk[:n])
 			screenMu.Unlock()
@@ -220,6 +225,7 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 	// Ctrl-C detaches the watcher; the run keeps waiting.
 	_, _ = master.Write([]byte{3})
 	_ = watch.Wait()
+	<-closed // the detach is the watch's last write: read to EOF before reading the screen
 	screenMu.Lock()
 	final := screen(raw.String())
 	screenMu.Unlock()
