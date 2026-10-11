@@ -629,3 +629,15 @@ func (e *Entrypoint) RequestFields() []string {
 func (s Slot) AllowsGPUCount(count int) bool {
 	return count >= 0 && (count <= 1 || s.sequenceParallelDegrees()[count])
 }
+
+// SupportedGPUCounts is package-code capability, including the unpartitioned path.
+func (s Slot) SupportedGPUCounts() []int {
+	counts := []int{1}
+	for degree := range s.sequenceParallelDegrees() {
+		if degree > 1 {
+			counts = append(counts, degree)
+		}
+	}
+	sort.Ints(counts)
+	return counts
+}

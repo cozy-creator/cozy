@@ -107,6 +107,9 @@ type PlacementDecision struct {
 // PlacementCandidate is one machine the run could be placed on, as the choice saw it: an
 // attached ready rental (Rental set) or a purchasable product.
 type PlacementCandidate struct {
+	// RunGPUs estimates execution width from package capability and the request.
+	// GPUs remains physical machine capacity; neither replaces worker admission.
+	RunGPUs int    `json:"run_gpus,omitempty"`
 	Rental  string `json:"rental,omitempty"`
 	Machine string `json:"machine,omitempty"`
 	SKU     string `json:"sku"`

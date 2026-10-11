@@ -352,7 +352,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		return none, "", problem
 	}
 	req.Models = records.OneSelectionPerSlot(req.Models, childModels)
-	needsAccelerator = needsAccelerator || req.SizedByOwnModels() || len(childModels) > 0
+	needsAccelerator = needsAccelerator || req.GPUs > 0 || req.SizedByOwnModels() || len(childModels) > 0
 	link, problem := m.store.MachineExecution(req.ID)
 	if problem != nil {
 		return none, "", problem
@@ -520,6 +520,10 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 		}
 		c := orchestrator.PlacementCandidate{Rental: row.ID, Machine: row.MachineName, SKU: row.SKU,
 			GPUs: row.AcceleratorCount, RateUSDMicrosPerHour: row.HourlyRateUSDMicros}
+		if c.Verdict = rental.GPUCountUnusable(row.AcceleratorCount, req.GPUs); c.Verdict != "" {
+			out = append(out, c)
+			continue
+		}
 		if req.RentNew && row.ManagedRequestID != req.ID {
 			c.Verdict = orchestrator.VerdictExcluded + "fresh_rental_requested"
 			out = append(out, c)
@@ -537,7 +541,7 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 			return nil, problem
 		}
 		disk := rental.Disk{HaveGB: m.disks[row.ID], RetainedBytes: retained, SourceBytes: sourceBytes}
-		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints.Working, disk) {
+		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints, disk) {
 			if busy[row.ID] {
 				c.Verdict = orchestrator.VerdictAttaching
 				out = append(out, c)
@@ -1609,7 +1613,7 @@ func rentalMetadata(ctx *Context, req records.Request) (records.Request, *exit.E
 // RentalConstraints reads the selected local install or published release's immutable
 // requirements and interface. Missing facts refuse selection before spending.
 func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
-	var out rental.Constraints
+	out := rental.Constraints{GPUs: req.GPUs}
 	var problem *exit.Error
 	if req, problem = rentalMetadata(ctx, req); problem != nil {
 		return out, problem
