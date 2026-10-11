@@ -309,7 +309,7 @@ impl Member {
 
 struct Session {
     plan: String,
-    /// Its lane's first GPU (envelope index): a group's is 0, a replica's its own GPU.
+    /// Its lane's first GPU (envelope index), for groups as well as one-GPU replicas.
     start: usize,
     generation: String,
     /// The App it serves: its environment's root, or a callee's App in it.
@@ -2975,7 +2975,8 @@ impl GpuPool {
             })
             .filter(|bytes| *bytes > 0);
         session.evictions = evictions.unwrap_or(session.evictions);
-        self.learn(plan, start, &shape, &reply, session.executor.birth.pid, mapped);
+        self.learn(&plan.id, self.lane(start, plan.degree).unwrap_or_default(),
+            &shape, &reply, session.executor.birth.pid, mapped);
         self.record_invoke(&plan.id, &lane, first, invoked.elapsed(), &reply);
         record_measurements(engine, id, &reply);
         if reply.attention_applied {
@@ -3152,14 +3153,13 @@ impl GpuPool {
     /// (the call's peak and each stage method's), its context, its private host bytes.
     fn learn(
         &self,
-        plan: &GpuPlan,
-        start: usize,
+        plan: &str,
+        lane: &[Device],
         shape: &str,
         reply: &Frame,
         pid: u32,
         mapped: Option<u64>,
     ) {
-        let (plan, degree) = (plan.id.as_str(), plan.degree);
         let metrics = reply.metrics.clone().unwrap_or_default();
         let plane = reply.plane.clone().unwrap_or_default();
         let peak = known(plane.activation_peak_bytes)
@@ -3173,7 +3173,6 @@ impl GpuPool {
         let shape = metrics.shape_cell.as_deref().unwrap_or(shape);
         // Every rank of a group runs the same shape on its own GPU, and learns only the context
         // its own process measured there.
-        let lane = self.lane(start, degree).unwrap_or_default();
         for (rank, device) in lane.iter().enumerate() {
             device
                 .memory
