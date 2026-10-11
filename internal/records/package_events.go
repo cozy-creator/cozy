@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 )
@@ -11,6 +12,7 @@ import (
 // The durable trace of an editable package's life outside any request: one row per refresh
 // the daemon's source watcher performed (cl-097), the same shape request_events has, keyed by
 // package because no request asked for it. `cozy package list --full` reads the latest row.
+// A lock tip shown for an unlocked package directory is keyed by that directory.
 var packageEventSchema = []string{`
 CREATE TABLE IF NOT EXISTS package_events (
   seq     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,4 +62,18 @@ func (s *Store) LastPackageEvent(pkg string) (*PackageEvent, *exit.Error) {
 		return nil, exit.Internalf("package event %d for %s has an unreadable payload: %s", event.Seq, pkg, err)
 	}
 	return &event, nil
+}
+
+// PackageEventSince answers whether pkg has an eventType event recorded at or after since.
+func (s *Store) PackageEventSince(pkg, eventType string, since time.Time) (bool, *exit.Error) {
+	var found int
+	err := s.db.QueryRow(`SELECT 1 FROM package_events WHERE package=? AND type=? AND at>=? LIMIT 1`,
+		pkg, eventType, since.UTC().Format(time.RFC3339Nano)).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, exit.Internalf("cannot read package events for %s: %s", pkg, err)
+	}
+	return true, nil
 }

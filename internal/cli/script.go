@@ -99,6 +99,7 @@ func localTarget(ctx *Context, author *packagepublish.Package) (Target, *launch.
 		return Target{}, nil, problem
 	}
 	defer store.Close()
+	lockTip(ctx, store, author.Tree)
 	// Runs share the claim; it keeps a sweep off the install until the run that owns it is
 	// submitted.
 	writer, problem := home.WaitWriter(layout, true, ctx.Err)
