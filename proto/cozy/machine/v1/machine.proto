@@ -243,6 +243,12 @@ message Outcome {
   // calls among them). Empty for a run that ran on no device.
   bytes measurements = 6;
   uint64 execution_ms = 7;  // its own time running its callable, every attempt summed; 0: unknown
+  // A memoizable callable's memo: its computation (sha256:<hex>), whether it ran or was answered;
+  // answered from a result this machine held (nothing ran); or why it was neither looked up nor
+  // held (its author's condition unmet, e.g. "seed not given").
+  string computation_digest = 8;
+  bool memoized = 9;
+  string unmemoized = 10;
 }
 message Reason {
   string code = 1;
@@ -262,6 +268,7 @@ message Call {
   Reason reason = 9;        // why it did not succeed
   bool memoized = 10;       // answered from a result this machine held; nothing ran
   string computation_digest = 11;  // a memoized call's computation (sha256:<hex>), ran or answered
+  string unmemoized = 12;   // why a memoizable call was neither looked up nor held ("seed not given")
 }
 
 // ---- Control -----------------------------------------------------------------------------
