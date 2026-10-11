@@ -246,7 +246,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		bodyDigest = spelled
 	}
 	if s.GPUs > 0 {
-		identity, err := canonical.Write(map[string]canonical.Value{"body_digest": bodyDigest, "gpus": uint64(s.GPUs)})
+		identity, err := canonical.Write(map[string]canonical.Value{"body_digest": bodyDigest, "gpus": int64(s.GPUs)})
 		if err != nil {
 			return records.Request{}, nil, exit.Internalf("cannot encode GPU count identity: %s", err)
 		}

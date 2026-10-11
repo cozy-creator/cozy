@@ -760,7 +760,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		doc["timeout_ms"] = spec.TimeoutMS
 	}
 	if spec.GPUs > 0 {
-		doc["gpus"] = uint64(spec.GPUs)
+		doc["gpus"] = int64(spec.GPUs)
 	}
 	if spec.AttentionKernel != "" {
 		doc["attention_kernel"] = spec.AttentionKernel
