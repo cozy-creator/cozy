@@ -140,7 +140,7 @@ def live_paths(environment: Path) -> None:
 def install_editable(*, project: Path, environment: Path, wheels: list[Path], distribution: str, release: str,
                      python_requires: str, python_version: str, generations: Path, client_wheel: Path,
                      python: str, sdk: list[Path] = (), callees: dict[str, str] | None = None,
-                     indexes: list[str] = ()):
+                     indexes: list[str] = (), source_digest: str = ""):
     """A live project, installed editable: `environment` is built once from the project's lock
     and kept while the lock stands, and every call publishes a generation that describes the
     project as it is now and runs in that environment. An edit costs a description, never an
@@ -198,7 +198,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
         # Described by the environment's own Runtime, from the project's directory.
         live = root / "env" / "bin" / "python"
         interface = in_environment(live, Describe(str(project), str(live)), DESCRIPTION_DECODER).interface
-        return publish_generation(root, metadata, interface, callees, ready.read_text())
+        return publish_generation(root, metadata, interface, callees, ready.read_text(), source_digest)
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched
         raise

@@ -37,6 +37,8 @@ def main():
     captured.add_argument("--editable-environment", type=Path)
     # An index the project's sources name without declaring it (name=url).
     captured.add_argument("--index", action="append", default=[])
+    # A live project's own code, by content (its installed files only point at it).
+    captured.add_argument("--source-digest", default="")
     args = parser.parse_args()
     try:
         shared = dict(distribution=args.distribution, release=args.release, python_requires=args.python_requires,
@@ -44,7 +46,7 @@ def main():
             python=args.python, sdk=args.sdk_wheel, callees=msgspec.json.decode(args.callees, type=dict[str, str]))
         if args.editable_environment:
             result = install_editable(project=args.project, environment=args.editable_environment, wheels=args.wheel,
-                                      indexes=args.index, **shared)
+                                      indexes=args.index, source_digest=args.source_digest, **shared)
         else:
             result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements, **shared)
     except PackageError as exc:
