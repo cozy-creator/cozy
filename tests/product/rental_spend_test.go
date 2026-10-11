@@ -13,8 +13,9 @@ import (
 )
 
 // Tensorhub says what each rental has cost (spend_usd_micros, spend_basis). The listing and
-// `rental show` put it beside the rate, "est." until the provider's charges settle; a
-// rental its Hub does not describe (an older Hub) shows "-" and fails nothing.
+// `rental show` put it beside the rate: what the Hub charged (th-252) or the provider's
+// settled bill as is, anything else marked "est."; a rental its Hub does not describe (an
+// older Hub) shows "-" and fails nothing.
 func TestRentalListingShowsAccruedSpend(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-spend")
 	must(t, os.RemoveAll(root))
@@ -26,7 +27,7 @@ func TestRentalListingShowsAccruedSpend(t *testing.T) {
 		"tensorhub_url: "+hubURL+"\ntensorhub_token: rental-idle-test\n"), 0o600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	for id, machine := range map[string]string{"pr-estimate": "otter", "pr-billed": "heron"} {
+	for id, machine := range map[string]string{"pr-estimate": "otter", "pr-billed": "heron", "pr-charged": "kite"} {
 		hub.add(id, machine)
 		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: id, MachineName: machine,
 			SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL}))
@@ -36,20 +37,23 @@ func TestRentalListingShowsAccruedSpend(t *testing.T) {
 	hub.set("pr-estimate", "spend_basis", "estimate")
 	hub.set("pr-billed", "spend_usd_micros", 3_700_000)
 	hub.set("pr-billed", "spend_basis", "provider_billed")
+	hub.set("pr-charged", "spend_usd_micros", 1_230_000)
+	hub.set("pr-charged", "spend_basis", "charged")
 
 	board := func(want ...string) {
 		t.Helper()
 		code, out := runCozy(t, root, "rental", "list", "--no-watch")
 		lines := map[string]string{}
 		for _, line := range strings.Split(out, "\n") {
-			for _, machine := range []string{"otter", "heron"} {
+			for _, machine := range []string{"otter", "heron", "kite"} {
 				if strings.HasPrefix(line, machine+" ") {
 					lines[machine] = strings.Join(strings.Fields(line), " ")
 				}
 			}
 		}
 		if code != 0 || !strings.Contains(out, "SPENT") || !strings.Contains(out, want[0]) ||
-			!strings.Contains(lines["otter"], want[1]) || !strings.Contains(lines["heron"], want[2]) {
+			!strings.Contains(lines["otter"], want[1]) || !strings.Contains(lines["heron"], want[2]) ||
+			!strings.Contains(lines["kite"], want[3]) || strings.Contains(out, "est.") != strings.Contains(want[0], "est.") {
 			t.Fatalf("board does not show %q [exit %d]:\n%s", want, code, out)
 		}
 	}
@@ -72,9 +76,9 @@ func TestRentalListingShowsAccruedSpend(t *testing.T) {
 		return doc, rows
 	}
 
-	board("Current spend per hour: $0.20 · accrued $4.17 est.", "$0.10 $0.47 est.", "$0.10 $3.70 ")
+	board("Current spend per hour: $0.30 · accrued $5.40 est.", "$0.10 $0.47 est.", "$0.10 $3.70 ", "$0.10 $1.23 ")
 	doc, rows := listed()
-	if doc.Spend == nil || *doc.Spend != 4_170_000 || doc.Basis != "estimate" ||
+	if doc.Spend == nil || *doc.Spend != 5_400_000 || doc.Basis != "estimate" || rows["kite"]["spend_basis"] != "charged" ||
 		rows["otter"]["spend_usd_micros"] != float64(470_000) || rows["otter"]["spend_basis"] != "estimate" ||
 		rows["heron"]["spend_usd_micros"] != float64(3_700_000) || rows["heron"]["spend_basis"] != "provider_billed" {
 		t.Fatalf("JSON lost the spend facts: %+v", doc)
@@ -93,19 +97,32 @@ func TestRentalListingShowsAccruedSpend(t *testing.T) {
 	if code, out := runCozy(t, root, "rental", "show", "nobody", "--json"); code == 0 || !strings.Contains(out, `"rental.unknown"`) {
 		t.Fatalf("rental show of an unknown rental did not refuse [exit %d]:\n%s", code, out)
 	}
+	if code, out := runCozy(t, root, "rental", "show", "kite"); code != 0 || !strings.Contains(out, "$1.23\n") {
+		t.Fatalf("rental show does not show the charged spend as is [exit %d]:\n%s", code, out)
+	}
+
+	// Charged and settled together: the total is exact.
+	hub.set("pr-estimate", "spend_basis", "charged")
+	board("Current spend per hour: $0.30 · accrued $5.40\n", "$0.10 $0.47 ", "$0.10 $3.70 ", "$0.10 $1.23 ")
+	if doc, _ := listed(); doc.Spend == nil || *doc.Spend != 5_400_000 || doc.Basis != "charged" {
+		t.Fatalf("JSON lost the charged total: %+v", doc)
+	}
+	hub.set("pr-estimate", "spend_basis", "estimate")
 
 	// A Hub older than the fields: that rental's spend is unknown, never $0.00.
 	hub.mu.Lock()
 	delete(hub.rentals["pr-billed"], "spend_usd_micros")
 	delete(hub.rentals["pr-billed"], "spend_basis")
 	hub.mu.Unlock()
-	board("accrued at least $0.47 est.", "$0.47 est.", "$0.10 - ")
+	board("accrued at least $1.70 est.", "$0.47 est.", "$0.10 - ", "$0.10 $1.23 ")
 	if doc, rows := listed(); doc.Spend != nil || rows["heron"]["spend_basis"] != nil || rows["otter"]["spend_basis"] != "estimate" {
 		t.Fatalf("JSON invented spend an older Hub never said: %+v", doc)
 	}
 	hub.mu.Lock()
-	delete(hub.rentals["pr-estimate"], "spend_usd_micros")
-	delete(hub.rentals["pr-estimate"], "spend_basis")
+	for _, id := range []string{"pr-estimate", "pr-charged"} {
+		delete(hub.rentals[id], "spend_usd_micros")
+		delete(hub.rentals[id], "spend_basis")
+	}
 	hub.mu.Unlock()
-	board("Current spend per hour: $0.20 · accrued -\n", "$0.10 - ", "$0.10 - ")
+	board("Current spend per hour: $0.30 · accrued -\n", "$0.10 - ", "$0.10 - ", "$0.10 - ")
 }

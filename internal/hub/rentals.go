@@ -107,8 +107,9 @@ type Rental struct {
 	CreatedAt string
 	// ContainerDiskGB is the disk the Hub bought for the pod, or 0 when it does not say.
 	ContainerDiskGB int
-	// SpendUSDMicros is what the rental has cost so far. SpendBasis is "provider_billed" once
-	// every provider charge has settled, else "estimate"; blank from a Hub older than the fact.
+	// SpendUSDMicros is what the rental has cost so far. SpendBasis is "charged" when the Hub
+	// charges it its own price (th-252); otherwise "provider_billed" once every provider charge
+	// has settled, else "estimate"; blank from a Hub older than the fact.
 	SpendUSDMicros int64
 	SpendBasis     string
 	// WebRTC is a ready machine-image rental's browser-media listener: the address a

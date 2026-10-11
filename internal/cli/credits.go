@@ -42,11 +42,61 @@ func handleCredits(ctx *Context) *exit.Error {
 		return problem
 	}
 	record := balanceRecord(balance)
+	burnFacts(ctx, &record, c, credit)
 	if credit.Low() {
 		record.Notes = append(record.Notes, lowCreditMessage(credit))
 		record.Next = []string{"cozy credits buy <usd>"}
 	}
 	return emit(ctx, record)
+}
+
+// burnFacts adds what running rentals charge an hour and when that runs the credit to the
+// floor, as far as the Hub says (th-252); an older Hub says neither.
+func burnFacts(ctx *Context, record *output.Record, c *hub.Client, credit *hub.Credit) {
+	if credit == nil {
+		return
+	}
+	var shown, typed []output.Field
+	if credit.Burn > 0 {
+		typed = append(typed, output.Field{K: "burn_usd_micros_per_hour", V: strconv.FormatInt(credit.Burn, 10)})
+	}
+	if at := credit.DepletesAt; at != nil {
+		typed = append(typed, output.Field{K: "depletes_at", V: at.UTC().Format(time.RFC3339)})
+	}
+	if mode := ctx.Mode(); !mode.Human || mode.JSON {
+		record.Fields, record.AllFields = append(record.Fields, typed...), append(record.AllFields, typed...)
+		return
+	}
+	if credit.Burn > 0 {
+		burn := usdPerHour(credit.Burn)
+		switch n := chargingRentals(c); {
+		case n == 1:
+			burn += " across 1 rental"
+		case n > 1:
+			burn += fmt.Sprintf(" across %d rentals", n)
+		}
+		shown = append(shown, output.Field{K: "burn", V: burn})
+	}
+	if at := credit.DepletesAt; at != nil {
+		shown = append(shown, output.Field{K: "runs out", V: clock(*at)})
+	}
+	record.Fields = append(record.Fields, shown...)
+	record.AllFields = append(append(record.AllFields, shown...), typed...)
+}
+
+// chargingRentals is how many of the account's rentals the Hub is charging now; 0 when the
+// listing cannot say.
+func chargingRentals(c *hub.Client) int {
+	hctx, cancel := hub.Context()
+	defer cancel()
+	rentals, _ := c.Rentals(hctx)
+	n := 0
+	for _, r := range rentals {
+		if r.SpendBasis == "charged" && (r.State == hub.RentalReady || r.State == hub.RentalDegraded) {
+			n++
+		}
+	}
+	return n
 }
 
 // creditWarningAge is how long a Hub's stated credit warns run and rental commands.

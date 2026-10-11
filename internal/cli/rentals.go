@@ -1661,13 +1661,13 @@ func rentalHourlyRate(micros int64) string {
 	return usdPerHourBare(micros)
 }
 
-// rentalSpend is what a rental has cost so far. RunPod posts charges about an hour late, so
-// until they settle the Hub's figure is an estimate and says so; an older Hub says nothing.
+// rentalSpend is what a rental has cost so far: what the Hub charged, or the provider's
+// settled bill, as is; any other figure is an estimate and says so. An older Hub says nothing.
 func rentalSpend(r api.RentalSummary) string {
 	switch r.SpendBasis {
 	case "":
 		return "-"
-	case "provider_billed":
+	case "charged", "provider_billed":
 		return usdPerHourBare(r.SpendUSDMicros)
 	}
 	return usdPerHourBare(r.SpendUSDMicros) + " est."
@@ -1706,6 +1706,10 @@ func accruedSpend(inventory api.RentalInventory) (string, []output.Field) {
 			case "":
 				unknown++
 			case "provider_billed":
+			case "charged":
+				if total.SpendBasis != "estimate" {
+					total.SpendBasis = "charged"
+				}
 			default:
 				total.SpendBasis = "estimate"
 			}
