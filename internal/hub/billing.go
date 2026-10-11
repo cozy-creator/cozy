@@ -112,8 +112,20 @@ type CreditDeposit struct {
 	Max     int64
 }
 
-// CreditDeposit reads the credit deposit from the hub's catalog, a lookup by product key.
+// CreditDeposit reads the credit deposit for the merchant the hub publishes in its config.
 func (c *Client) CreditDeposit(ctx context.Context) (CreditDeposit, *exit.Error) {
+	var config struct {
+		Credit struct {
+			MerchantID string `json:"merchant_id"`
+		} `json:"credit"`
+	}
+	if problem := c.do(ctx, call{method: http.MethodGet, path: "/app/config.json"}, &config); problem != nil {
+		return CreditDeposit{}, problem
+	}
+	if config.Credit.MerchantID == "" {
+		return CreditDeposit{}, exit.Named(exit.Unavailable, "credits.merchant_missing",
+			"this hub does not publish its billing merchant; update Tensorhub before buying credit")
+	}
 	var out struct {
 		Data []struct {
 			Key    string `json:"key"`
@@ -129,7 +141,7 @@ func (c *Client) CreditDeposit(ctx context.Context) (CreditDeposit, *exit.Error)
 			} `json:"prices"`
 		} `json:"data"`
 	}
-	path := "/billing/v1/catalog/products?" + url.Values{"keys": {creditProduct}}.Encode()
+	path := "/billing/v1/catalog/products?" + url.Values{"merchant": {config.Credit.MerchantID}, "keys": {creditProduct}}.Encode()
 	if problem := c.do(ctx, call{method: http.MethodGet, path: path, optionalAuth: true}, &out); problem != nil {
 		return CreditDeposit{}, problem
 	}
