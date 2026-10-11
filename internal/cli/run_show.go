@@ -1191,7 +1191,7 @@ func memoText(memoized bool, computation, unmemoized string, succeeded bool) str
 	case unmemoized != "":
 		return "not memoized: " + unmemoized
 	case computation != "" && succeeded:
-		return "computed and held · " + computation
+		return "computed · " + computation
 	}
 	return ""
 }

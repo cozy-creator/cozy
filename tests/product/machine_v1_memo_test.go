@@ -90,7 +90,7 @@ func TestMemoizedRunIsAnsweredFromTheMachinesMemo(t *testing.T) {
 		in := filepath.Join(t.TempDir(), "req.json")
 		raw, _ := json.Marshal(map[string]any{"payload": map[string]any{"value": value, "counter": counter}})
 		must(t, os.WriteFile(in, raw, 0o600))
-		code, out := runCozy(t, root, "run", "local/cozy-machine-cpu-memo/measure", "--input", in, "--await", "--json")
+		code, out := runCozy(t, root, "run", "local/cozy-machine-cpu-memo/measure", "--input", in, "--await", "--json", "--fields=id,status,result")
 		var run struct {
 			ID     string `json:"id"`
 			Status string `json:"status"`

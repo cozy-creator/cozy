@@ -13,7 +13,7 @@ import (
 )
 
 // A memoizable run says in `cozy run show` how its machine's memo answered it: from a result
-// the machine held (nothing ran), computed and held, or not memoized and why. A job's nested
+// the machine held (nothing ran), computed, or not memoized and why. A job's nested
 // call says the same. A machine that predates the memo says nothing, and neither does show.
 // The real store, daemon API and CLI, from the machine's outcome and call records.
 func TestRunShowSaysHowTheMachineMemoAnsweredARun(t *testing.T) {
@@ -80,7 +80,7 @@ func TestRunShowSaysHowTheMachineMemoAnsweredARun(t *testing.T) {
 		report   shown
 	}{
 		{"run-memo-served", "memo: served from this machine's memo (nothing ran) · " + held, shown{Memoized: true, Computation: held}},
-		{"run-memo-computed", "memo: computed and held · " + computed, shown{Computation: computed}},
+		{"run-memo-computed", "memo: computed · " + computed, shown{Computation: computed}},
 		{"run-memo-unmet", "memo: not memoized: seed not given", shown{Unmemoized: "seed not given"}},
 		{"run-memo-older", "", shown{}},
 	} {
