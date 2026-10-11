@@ -16,8 +16,8 @@ const ClassicRetiredCode = "request.classic_retired"
 const ClassicRetiredOutcome = "CLASSIC_RETIRED"
 
 // RetireClassicWork ends, once at daemon start, every unfinished request that has no
-// machine execution and is not the daemon's own model pass-through: it ran or would run
-// on a classic worker session. Every open attempt closes, as ABANDONED unless it recorded a
+// machine execution: it ran or would run on a classic worker session or as the daemon's
+// own model transfer, which machines now do. Every open attempt closes, as ABANDONED unless it recorded a
 // terminal, and nothing is revived. A request being canceled ends canceled; every other
 // one fails with ClassicRetiredCode. Custody held for any classic run is forgotten.
 func (s *Store) RetireClassicWork() ([]string, *exit.Error) {
@@ -28,7 +28,6 @@ func (s *Store) RetireClassicWork() ([]string, *exit.Error) {
 	defer tx.Rollback()
 	rows, err := tx.Query(`SELECT id,state,ordinal FROM requests r WHERE state IN (` + activeRequestStates + `)
 		AND NOT EXISTS(SELECT 1 FROM machine_executions m WHERE m.request_id=r.id)
-		AND NOT (r.package='cozy/platform' AND r.entrypoint='model-pass-through')
 		ORDER BY created_at,id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read classic work: %s", err)

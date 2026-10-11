@@ -19,9 +19,6 @@ func (c *Orchestrator) Managing() ([]string, *exit.Error) {
 	for slot := range c.starting {
 		held = append(held, "launch "+slot)
 	}
-	for id := range c.transferRunning {
-		held = append(held, "model transfer "+id)
-	}
 	for id := range c.outputExporting {
 		held = append(held, "output export "+id)
 	}

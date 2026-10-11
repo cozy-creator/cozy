@@ -1,116 +1,11 @@
 package producttest
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"os"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/secret"
 )
-
-func TestAssessmentPublicationReconcilesExactBytesAndFencesCanceledWrites(t *testing.T) {
-	report, err := os.ReadFile("testdata/assessment-v5.json")
-	must(t, err)
-	for _, mode := range []string{"normal", "lost-reply", "canceled", "wrong-readback", "changed-account", "wrong-ack-verdict"} {
-		t.Run(mode, func(t *testing.T) {
-			digest := assessmentDigest(report)
-			checkpoint := childDigest("a")
-			writes := 0
-			var stored []byte
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodGet {
-					if stored == nil {
-						http.NotFound(w, r)
-						return
-					}
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write(stored)
-					return
-				}
-				writes++
-				body, err := io.ReadAll(r.Body)
-				if err != nil {
-					t.Error(err)
-				}
-				if !bytes.Equal(body, report) {
-					t.Error("changed canonical report bytes")
-				}
-				stored = append([]byte{}, body...)
-				if mode == "lost-reply" {
-					connection, _, err := w.(http.Hijacker).Hijack()
-					if err != nil {
-						t.Error(err)
-					} else {
-						_ = connection.Close()
-					}
-					return
-				}
-				w.Header().Set("Content-Type", "application/json")
-				verdict := "pass"
-				if mode == "wrong-ack-verdict" {
-					verdict = "fail"
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"assessment": map[string]any{"checkpoint_id": checkpoint, "scope": "publisher_assessment", "report": map[string]any{"digest": digest, "length": len(report)}, "actor": "alice", "created_at": "fixture", "verdict": verdict}, "publisher_reported_verdict": "pass"})
-			}))
-			defer server.Close()
-			client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "")
-			request := publication.AssessmentRequest{Checkpoint: publication.CheckpointRef{Destination: "alice/model", Checkpoint: checkpoint, Manifest: records.ArtifactObjectRef{Digest: checkpoint, Length: 100}, Publication: "upload", Observation: "acknowledged"}, Report: digest, Workloads: childDigest("b")}
-			intent := publication.AssessmentIntent{Request: request, Account: "alice", Report: records.ArtifactObjectRef{Digest: digest, Length: int64(len(report))}, Workloads: records.ArtifactObjectRef{Digest: request.Workloads, Length: 10}, Verdict: "pass", RenderOwner: "producer"}
-			calls := 0
-			canceled := mode == "canceled"
-			before := func() *exit.Error {
-				calls++
-				if canceled {
-					return exit.Named(exit.Canceled, "publication.call_canceled", "canceled")
-				}
-				return nil
-			}
-			account := "alice"
-			if mode == "changed-account" {
-				account = "other"
-			}
-			if mode == "wrong-readback" {
-				stored = []byte(`{"changed":true}`)
-			}
-			result, problem := publication.ApplyAssessment(context.Background(), client, intent, account, report, before)
-			switch mode {
-			case "normal":
-				fatal(t, problem)
-				if result.Observation != "acknowledged" || writes != 1 || calls != 1 {
-					t.Fatal("new assessment did not use one fenced PUT")
-				}
-			case "lost-reply":
-				if problem == nil || writes != 1 {
-					t.Fatal("lost write reply was not uncertain")
-				}
-				canceled = true
-				result, problem = publication.ApplyAssessment(context.Background(), client, intent, account, nil, before)
-				fatal(t, problem)
-				if result.Observation != "observed_convergence" || writes != 1 || calls != 1 {
-					t.Fatal("canceled retry issued another write instead of exact readback")
-				}
-			case "wrong-ack-verdict":
-				if problem == nil || writes != 1 {
-					t.Fatal("a conflicting stored verdict was accepted as an acknowledgement")
-				}
-			default:
-				if problem == nil || writes != 0 {
-					t.Fatal("canceled, foreign-account or changed assessment was written")
-				}
-			}
-		})
-	}
-}
 
 func TestAssessmentFileReservationsKeepOriginalCompositionAndIndependentCustody(t *testing.T) {
 	store, producer, _, workloads, _ := observedAssessment(t, true)

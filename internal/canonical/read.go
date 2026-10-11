@@ -68,19 +68,6 @@ func (d Doc) Sub(key string) Doc {
 	return Doc(m)
 }
 
-// Ints reads one repeated integer field off a parsed document. An entry that is not an
-// integer is skipped rather than guessed at.
-func (d Doc) Ints(key string) []int64 {
-	items, _ := d[key].([]Value)
-	out := make([]int64, 0, len(items))
-	for _, item := range items {
-		if n, ok := item.(int64); ok {
-			out = append(out, n)
-		}
-	}
-	return out
-}
-
 // Strs reads one repeated string field off a parsed document.
 func (d Doc) Strs(key string) []string {
 	items, _ := d[key].([]Value)

@@ -33,8 +33,7 @@ type Options struct {
 	Log            io.Writer
 	// Rentals resolves an attached rental id to its dial spec; nil = this daemon attaches
 	// no rentals.
-	Rentals        func(id string) (*RemoteTarget, *exit.Error)
-	ModelTransfers ModelTransferOwner
+	Rentals func(id string) (*RemoteTarget, *exit.Error)
 }
 
 type RentalObservation struct {
@@ -46,14 +45,6 @@ type RentalObservation struct {
 	WorkerID       string
 	WorkerBootID   string
 }
-
-// ModelTransferOwner moves the daemon's own model transfers.
-type ModelTransferOwner interface {
-	PassThrough(context.Context, string, records.ModelTransferIntent) *exit.Error
-}
-
-type ModelTransferMover func(context.Context, records.ModelTransferWeights,
-	WeightsGrantMinter) *exit.Error
 
 type LogicalPackage struct {
 	Package          string
@@ -339,9 +330,7 @@ type Orchestrator struct {
 	// its first attempt exists. Live-only and observational.
 	phases *phases
 	// transferWake is a lossy nudge over durable request-attached transfer rows.
-	transferWake    map[string]chan struct{}
-	transferRunning map[string]bool
-	transferWork    map[string]*transferWork
+	transferWake map[string]chan struct{}
 }
 
 type wait struct {
@@ -368,8 +357,6 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		parked:          map[string]string{},
 		phases:          newPhases(),
 		transferWake:    make(map[string]chan struct{}),
-		transferRunning: make(map[string]bool),
-		transferWork:    make(map[string]*transferWork),
 	}
 	c.closingCtx, c.cancelClosing = context.WithCancel(context.Background())
 	return c, nil
@@ -609,12 +596,7 @@ func (c *Orchestrator) CancelQueued(requestID, actor string) *exit.Error {
 		}
 		return exit.Internalf("canceled request %s cannot be read back", requestID)
 	}
-	// The canceled terminal is only honest once nothing moves this request's bytes.
-	c.stopTransfer(requestID)
-	if row.ModelTransfer != nil {
-		c.forgetTransferProgress(requestID)
-		c.signalTransfer(requestID)
-	}
+	c.signalTransfer(requestID)
 	c.forget(requestID)
 	c.logf("%s canceled before any attempt", requestID)
 	c.signalClosed(requestWaitKey(requestID),

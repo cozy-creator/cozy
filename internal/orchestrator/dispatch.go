@@ -415,19 +415,8 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 	if current.State != "submitted" && current.State != "queued" {
 		return uint64(current.Ordinal), nil
 	}
-	if passThrough(*current) {
-		// An unchanged verified Manifest has no code to execute and no bytes to
-		// reproduce; the daemon moves it and settles the ordinary request.
-		go c.runModelPassThrough(*current)
-		return 0, nil
-	}
 	c.retireClassic(*current)
 	return 0, ClassicRetired()
-}
-
-// passThrough is the daemon's own model transfer: no machine executes it.
-func passThrough(req records.Request) bool {
-	return req.ModelTransfer != nil && req.Package == "cozy/platform" && req.Entrypoint == "model-pass-through"
 }
 
 // startMachineExecution admits the async observer before releasing the closing
@@ -462,10 +451,6 @@ func (c *Orchestrator) start(req records.Request) {
 		if problem == nil && c.opt.StartMachineExecution != nil {
 			_ = c.startMachineExecution(req)
 		}
-		return
-	}
-	if passThrough(req) {
-		go c.runModelPassThrough(req)
 		return
 	}
 	current, problem := c.opt.Store.RequestRow(req.ID)

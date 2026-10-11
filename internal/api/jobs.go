@@ -127,12 +127,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			"the submission is not one closed JSON object: "+detail, "")
 		return
 	}
-	passThrough := sub.ModelTransfer != nil && sub.Package == "" && sub.Function == ""
 	if problem := validateModelAdapters(sub.Models); problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	if !passThrough && (sub.Package == "" || sub.Function == "") {
+	if sub.Package == "" || sub.Function == "" {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
 			"a job submission names a package and a job function",
 			`{"package":"org/name","function":"census","input":{…}}`)
@@ -464,16 +463,6 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 	if sub.RentNew && sub.Worker != "" {
 		return orchestrator.Submission{}, nil, exit.Usagef("a fresh rental cannot name an existing worker")
 	}
-	if sub.ModelTransfer != nil && sub.Package == "" && sub.Function == "" {
-		if sub.Rental || sub.RentalRequired || sub.RentNew {
-			return orchestrator.Submission{}, nil, exit.Named(exit.Unavailable,
-				"model_transfer.rented_pass_through_unavailable",
-				"rented pass-through has no typed TensorFS source profiles")
-		}
-		return orchestrator.Submission{Kind: "job", Package: "cozy/platform",
-			Entrypoint: "model-pass-through", Payload: []byte("{}"), Org: "local",
-			PlanID: "sha256:" + strings.Repeat("0", 64), ModelTransfer: sub.ModelTransfer}, nil, nil
-	}
 	out := orchestrator.Submission{
 		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org), Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
@@ -511,9 +500,8 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		return out, nil, exit.Named(exit.Validation, "rental.job_worker_without_rental",
 			"a pinned remote worker requires rental authorization")
 	}
-	// Every job runs as a machine execution, on this computer or a rental. A model
-	// transfer has no machine-side staging yet: on this computer its producer still runs
-	// under the local transfer coordinator below.
+	// Every job runs as a machine execution, on this computer or a rental. A job with a
+	// weights destination on this computer resolves its installation below.
 	if out.Rental || sub.ModelTransfer == nil {
 		if strings.HasPrefix(sub.Package, "local/") {
 			if sub.InstallID != "" {

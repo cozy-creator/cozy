@@ -1479,8 +1479,6 @@ func (s *Store) ActiveRequests() ([]Request, *exit.Error) {
 func (s *Store) Owed() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests r
 		WHERE r.state IN ('submitted','queued')
-		  AND NOT (r.package='cozy/platform' AND r.entrypoint='model-pass-through' AND EXISTS
-		      (SELECT 1 FROM request_model_transfers t WHERE t.request_id=r.id))
 		  AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
 		                  AND a.state IN (` + openAttemptStates + `))
 		ORDER BY r.created_at, r.id`)
