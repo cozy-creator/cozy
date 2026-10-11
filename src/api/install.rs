@@ -187,9 +187,11 @@ pub fn prepare_editable(
     environment: &Path,
     wheels: &[PathBuf],
     indexes: &std::collections::BTreeMap<String, String>,
+    source_digest: &str,
 ) -> Result<PreparedGeneration, Status> {
     let mut command = installer(config, root)?;
     command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
+    command.arg("--source-digest").arg(source_digest);
     for (name, url) in indexes {
         command.arg("--index").arg(format!("{name}={url}"));
     }

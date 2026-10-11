@@ -73,6 +73,26 @@ pub struct Member {
     #[serde(default)]
     pub executable: bool,
 }
+impl Manifest {
+    /// The project's directory under the tree, as a prefix of its files' names.
+    fn own(&self) -> String {
+        match self.project.is_empty() {
+            true => String::new(),
+            false => format!("{}/", self.project),
+        }
+    }
+    /// Whether `name` is a local path dependency's file, or outside the project.
+    fn beside(&self, name: &str) -> bool {
+        !name.starts_with(&self.own()) || self.locals.iter().any(|dir| name == dir || name.starts_with(&format!("{dir}/")))
+    }
+    /// The project's own code by content, the same wherever it is installed: what keys its own
+    /// memoized calls (an editable install's files say nothing of the code they point at).
+    fn source_digest(&self) -> String {
+        let own = self.own();
+        let code: Vec<_> = self.files.iter().filter(|f| !self.beside(&f.name)).map(|f| (&f.name[own.len()..], &f.digest)).collect();
+        format!("sha256:{}", sha256::hex_digest(serde_json::json!(code).to_string().as_bytes()))
+    }
+}
 impl Member {
     /// What a tree holds for this file: its bytes and whether it is executable.
     fn held(&self) -> String {
@@ -204,16 +224,12 @@ impl LocalSources {
     /// dependencies, carried wheels and this machine's interpreter, SDK pair and runner.
     /// Everything else of the project may change under it.
     fn environment(&self, home: &Path, manifest: &Manifest) -> PathBuf {
-        let own = match manifest.project.is_empty() {
-            true => String::new(),
-            false => format!("{}/", manifest.project),
-        };
+        let own = manifest.own();
         let held = |name: &str| {
             let path = format!("{own}{name}");
             manifest.files.iter().find(|f| f.name == path).map(|f| f.digest.as_str()).unwrap_or_default()
         };
-        let local = |name: &str| manifest.locals.iter().any(|dir| name == dir || name.starts_with(&format!("{dir}/")));
-        let beside: Vec<_> = manifest.files.iter().filter(|f| !f.name.starts_with(&own) || local(&f.name)).map(|f| (&f.name, f.held())).collect();
+        let beside: Vec<_> = manifest.files.iter().filter(|f| manifest.beside(&f.name)).map(|f| (&f.name, f.held())).collect();
         let carried: Vec<_> = manifest.wheels.iter().map(|w| (&w.name, &w.digest)).collect();
         let key = serde_json::json!({
             "lock": held("uv.lock"), "project": held("pyproject.toml"), "beside": beside, "wheels": carried,
@@ -289,6 +305,7 @@ impl LocalSources {
             ));
         }
         let environment = self.environment(&home, &manifest);
+        let source_digest = manifest.source_digest();
         // Wheels the CLI carries for locked dependencies this machine cannot fetch itself (a
         // Hub's on the caller's computer, a private git source): beside the environment they
         // install into, and needed only while it is built.
@@ -324,7 +341,7 @@ impl LocalSources {
                 return Err(refused("local_source_invalid", format!("index {name:?} = {url:?} is not a named HTTP(S) index")));
             }
         }
-        let prepared = prepare_editable(&self.installer, &root, &project, &environment, &wheels, &manifest.indexes)
+        let prepared = prepare_editable(&self.installer, &root, &project, &environment, &wheels, &manifest.indexes, &source_digest)
             .map_err(|status| refused("package_installation_failed", status.message()))?;
         let _ = fs::remove_dir_all(environment.with_extension("wheels"));
         let installed = service.engine.bind_installation(Installation {
@@ -681,6 +698,10 @@ mod tests {
         assert_eq!(theirs.code, "local_source_incomplete");
         let edited = sources.install(&m.service, "alice", &second).unwrap();
         assert_ne!(edited.generation, installed.generation);
+        // Its own memoized calls are keyed by its code: the edit is another computation.
+        let code = m.service.catalog.resolve(&edited.generation).unwrap().record.source_digest;
+        assert!(held.record.source_digest.starts_with("sha256:") && code.starts_with("sha256:") && code != held.record.source_digest,
+            "{} then {code}", held.record.source_digest);
         assert_eq!(fs::read_link(m.installer.generations.join(&edited.generation).join("env")).unwrap(), environment);
         assert!(!home.join("tree/notes.txt").exists());
         let python = m.service.catalog.resolve(&edited.generation).unwrap().record.python;

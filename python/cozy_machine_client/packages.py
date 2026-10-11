@@ -82,9 +82,11 @@ def in_environment(interpreter: Path, request: msgspec.Struct, decoder: msgspec.
 
 
 def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec.Raw | None,
-                       callees: dict[str, str] | None = None, sdk_fallback: str = "") -> Generation:
+                       callees: dict[str, str] | None = None, sdk_fallback: str = "",
+                       source_digest: str = "") -> Generation:
     """Record and publish the environment. With no `interface` the root's installed one is
-    described in the same process as the environment; the CPU bridge probe runs beside it."""
+    described in the same process as the environment; the CPU bridge probe runs beside it.
+    `source_digest` is a live project's own code, whose installed files only point at it."""
     interpreter = root / "env" / "bin" / "python"
     probe = probe_cpu_bridge(interpreter)
     try:
@@ -99,7 +101,7 @@ def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec
             interpreter, DescribeInstalled(metadata.name, str(interpreter)), DESCRIPTION_DECODER).interface)
     generation = Generation(root.name, metadata.name, metadata.version, metadata.application,
                             str(interpreter), dependencies, interface, bridge,
-                            environment.source_digest, environment.callees, sdk_fallback)
+                            source_digest or environment.source_digest, environment.callees, sdk_fallback)
     with (root / ".generation.json.new").open("wb") as output:
         output.write(msgspec.json.encode(generation))
         output.flush()
