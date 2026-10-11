@@ -226,7 +226,8 @@ func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *t
 		return problem == nil && second != nil && len(placementEvents(t, store, second.ID)) > 0
 	})
 	if verdicts := candidateVerdicts(lastPlacement(t, store, second.ID)); verdicts["guchuko"] != "excluded:attaching: lumachina" {
-		t.Fatalf("the second wait record: %v", verdicts)
+		busy, _ := store.RequestByIdempotencyKey("fleet-wait")
+		t.Fatalf("the second wait record: %v; the busy H100's request: %+v\n%s", verdicts, busy, tail(filepath.Join(root, "daemon.log")))
 	}
 	attached := lumachina
 	attached.Address, attached.CertPath = "127.0.0.1:1", filepath.Join(root, "rentals", "pr-lumachina.pem")

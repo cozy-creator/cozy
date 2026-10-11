@@ -306,6 +306,16 @@ func newOrgLadderHub(t *testing.T, org string, authored ...[]launch.ModelDefault
 		_ = json.NewEncoder(w).Encode(accepted)
 	})
 	mux.HandleFunc("POST /v1/rental-quotes", listedRentalQuote(mux))
+	// A signed-in run on a rental reads where its machine reaches this Hub (#1127), as on Tensorhub.
+	mux.HandleFunc("GET /v1/execution-environment", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer ladder-test" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"auth.required","message":"account required"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"environment": map[string]string{
+			"TENSORHUB_ORIGIN": h.server.URL, "TENSORHUB_PUBLIC_ORIGIN": h.server.URL}})
+	})
 	h.server = httptest.NewServer(mux)
 	t.Cleanup(h.server.Close)
 	return h
