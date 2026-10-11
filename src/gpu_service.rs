@@ -79,7 +79,7 @@ pub struct HostOptions {
 pub struct GpuConfig {
     #[serde(default)]
     pub identity: Option<crate::launch_identity::LaunchIdentity>,
-    /// The GPU envelope, `"0"` or `"0,1,..."`: a degree-K plan runs on the first K.
+    /// The GPU envelope, `"0"` or `"0,1,..."`: a degree-K plan occupies K contiguous devices.
     pub devices: String,
     /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
@@ -503,8 +503,8 @@ pub struct GpuPool {
     stopped: std::sync::atomic::AtomicBool,
     /// Host bytes admitted for executors still starting, by `session_key`, until their load.
     admitted: Mutex<BTreeMap<String, u64>>,
-    /// Each plan's group degree, for host pinned budgets over every GPU.
-    degrees: Mutex<BTreeMap<String, u32>>,
+    /// Live executor lane leaders, including running sessions removed from `sessions`.
+    leaders: Mutex<std::collections::BTreeSet<(String, usize)>>,
     /// Per generation, the import-only executor sessions fork from. Declared after
     /// `sessions`: executors end before the parent they were forked from.
     zygotes: Mutex<BTreeMap<(String, String), Arc<Zygote>>>,
@@ -565,8 +565,10 @@ impl JobAllocation {
         for (lane_start, plan) in plans {
             pool.carry_out(lane_start, &Step::End(plan))?;
         }
-        for holding in pool.holdings() {
-            pool.carry_out(start, &Step::Revoke(holding.id))?;
+        if start == 0 {
+            for holding in pool.holdings() {
+                pool.carry_out(start, &Step::Revoke(holding.id))?;
+            }
         }
         Ok(())
     }
@@ -671,7 +673,7 @@ impl GpuPool {
             sessions: Mutex::new(BTreeMap::new()),
             stopped: Default::default(),
             admitted: Mutex::default(),
-            degrees: Mutex::default(),
+            leaders: Mutex::default(),
             zygotes: Mutex::new(BTreeMap::new()),
             kernel_boots: Mutex::new(BTreeMap::new()),
             members: Mutex::new(BTreeMap::new()),
@@ -835,6 +837,7 @@ impl GpuPool {
         let key = session_key(plan, start);
         self.levels.lock().unwrap().remove(&key);
         self.admitted.lock().unwrap().remove(&key);
+        self.leaders.lock().unwrap().remove(&(plan.to_owned(), start));
         for device in self.lane(start, degree).unwrap_or_default() {
             device.memory.with(|gpu| gpu.ended(plan));
         }
@@ -2461,7 +2464,7 @@ impl GpuPool {
         on_birth: impl Fn(&ProcessBirth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Session> {
         let launched = Instant::now();
-        self.degrees.lock().unwrap().insert(plan.id.clone(), plan.degree);
+        self.leaders.lock().unwrap().insert((plan.id.clone(), start));
         let (root, socket, directory) = self.executor_endpoint()?;
         let config = self.executor_config(held, root, socket, start, plan.degree)?;
         // A forked child takes its lane and seal with its environment, so a group forks from
@@ -2972,15 +2975,7 @@ impl GpuPool {
             })
             .filter(|bytes| *bytes > 0);
         session.evictions = evictions.unwrap_or(session.evictions);
-        self.learn(
-            &plan.id,
-            start,
-            plan.degree,
-            &shape,
-            &reply,
-            session.executor.birth.pid,
-            mapped,
-        );
+        self.learn(session, &shape, &reply, mapped);
         self.record_invoke(&plan.id, &lane, first, invoked.elapsed(), &reply);
         record_measurements(engine, id, &reply);
         if reply.attention_applied {
@@ -3157,14 +3152,13 @@ impl GpuPool {
     /// (the call's peak and each stage method's), its context, its private host bytes.
     fn learn(
         &self,
-        plan: &str,
-        start: usize,
-        degree: u32,
+        session: &Session,
         shape: &str,
         reply: &Frame,
-        pid: u32,
         mapped: Option<u64>,
     ) {
+        let (plan, start, degree) = (session.plan.as_str(), session.start, session.degree);
+        let pid = session.executor.birth.pid;
         let metrics = reply.metrics.clone().unwrap_or_default();
         let plane = reply.plane.clone().unwrap_or_default();
         let peak = known(plane.activation_peak_bytes)
@@ -3238,10 +3232,10 @@ impl GpuPool {
     /// host is unreadable.
     fn pinned_budgets(&self, plan: &str, start: usize) -> Option<BTreeMap<String, u64>> {
         let first = session_key(plan, start);
-        let degrees = self.degrees.lock().unwrap().clone();
+        let leaders = self.leaders.lock().unwrap().clone();
         let mut rows = vec![];
         for (gpu, device) in self.devices.iter().enumerate() {
-            let lane_first = |tenant: &str| gpu == 0 || degrees.get(tenant) == Some(&1);
+            let lane_first = |tenant: &str| leaders.contains(&(tenant.to_owned(), gpu));
             let tenants = device.memory.with(|ledger| ledger.pinned_rows());
             rows.extend(tenants.into_iter().filter(|row| lane_first(&row.0)).map(
                 |(tenant, weights, pinned, used)| (session_key(&tenant, gpu), weights, pinned, used),
@@ -4504,7 +4498,7 @@ mod tests {
         assert_eq!(place(&image, &mut waiting).unwrap().0, 3);
         // Every GPU of its lane free at once: the group runs.
         drop(held);
-        assert_eq!(place(&film, &mut vec![false; 4]).unwrap().0, 0);
+        assert_eq!(place(&film, &mut [false; 4]).unwrap().0, 0);
         pool.stop().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -4635,8 +4629,10 @@ mod tests {
         pool.ended("image", 1, 1);
 
         let gib = 1u64 << 30;
-        for (gpu, tenant, degree) in [(0, "film", 2), (1, "film", 2), (0, "image", 1), (2, "image", 1)] {
-            pool.degrees.lock().unwrap().insert(tenant.into(), degree);
+        for (tenant, start) in [("film", 0), ("film", 2), ("image", 0), ("image", 2)] {
+            pool.leaders.lock().unwrap().insert((tenant.into(), start));
+        }
+        for (gpu, tenant) in [(0, "film"), (1, "film"), (2, "film"), (3, "film"), (0, "image"), (2, "image")] {
             pool.devices[gpu].memory.with(|ledger| {
                 ledger.starting(tenant, 0);
                 let facts = Facts { weights: Some(gib), pinned: Some(0), ..Facts::default() };
@@ -4644,6 +4640,10 @@ mod tests {
             });
         }
         let split = pool.pinned_budgets("image", 2).unwrap();
+        let keys: Vec<_> = split.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["film", "film@2", "image", "image@2"]);
+        pool.ended("film", 2, 2);
+        let split = pool.pinned_budgets("image", 0).unwrap();
         let keys: Vec<_> = split.keys().map(String::as_str).collect();
         assert_eq!(keys, ["film", "image", "image@2"]);
         pool.stop().unwrap();

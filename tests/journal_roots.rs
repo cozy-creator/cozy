@@ -155,6 +155,7 @@ fn film(manifest: &str, reference: &(String, u64), segments: &[&str], hold_at: i
         }],
         models: vec![],
         attention_kernel: String::new(),
+        gpus: 0,
         hub: None,
         providers: Default::default(),
         weights_destination: String::new(),
