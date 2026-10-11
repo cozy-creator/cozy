@@ -16,16 +16,22 @@ import (
 // creditHub is Tensorhub's embedded billing (OpenRails at /billing, th-103) as
 // the CLI meets it: the balance, the credit history, the catalog's deposit, and
 // an order paid on Stripe's hosted page, which this stand-in settles once the
-// buyer has been sent there.
+// buyer has been sent there. beforeOrders makes it a hub before OpenRails
+// v0.237: its orders take no amount (or, with noOrders, it has no order route),
+// and credit is bought through a checkout session.
 type creditHub struct {
-	mu      sync.Mutex
-	balance int64
+	mu           sync.Mutex
+	balance      int64
+	beforeOrders bool
+	noOrders     bool
 	// orders are the order requests' bodies; ordered and payments the idempotency keys of
 	// the orders and their payments.
 	orders   []map[string]any
 	ordered  []string
 	paidWith []map[string]any
 	payments []string
+	minted   []map[string]string
+	option   string
 	amount   int64
 	reads    int
 	paid     bool
@@ -113,8 +119,8 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			reply(w, 200, map[string]any{"data": data, "next_cursor": nil})
 		})
 		mux.HandleFunc("GET /billing/v1/catalog/products", func(w http.ResponseWriter, r *http.Request) {
-			// The catalog is a lookup by product key.
-			if keys := r.URL.Query()["keys"]; len(keys) != 1 || keys[0] != "api-credit" || len(r.URL.Query()) != 1 {
+			// The catalog is a lookup by product key; a hub before orders lists it whole.
+			if keys := r.URL.Query()["keys"]; !h.beforeOrders && (len(keys) != 1 || keys[0] != "api-credit" || len(r.URL.Query()) != 1) {
 				refuse(w, 400, "invalid_query", "keys names 1 to 100 products")
 				return
 			}
@@ -124,6 +130,13 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			}}})
 		})
 		mux.HandleFunc("POST /billing/v1/me/orders", func(w http.ResponseWriter, r *http.Request) {
+			if h.noOrders {
+				h.mu.Lock()
+				h.orders = append(h.orders, nil)
+				h.mu.Unlock()
+				http.NotFound(w, r)
+				return
+			}
 			if !signedIn(w, r) {
 				return
 			}
@@ -132,6 +145,11 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			h.orders, h.ordered = append(h.orders, body), append(h.ordered, r.Header.Get("Idempotency-Key"))
+			if h.beforeOrders {
+				reply(w, 400, map[string]any{"error": map[string]any{"type": "invalid_request_error", "code": "unknown_field",
+					"message": "unknown field amount", "param": "amount", "metadata": nil}})
+				return
+			}
 			if r.Header.Get("Idempotency-Key") == "" {
 				refuse(w, 400, "idempotency_key_required", "The operation needs an Idempotency-Key header.")
 				return
@@ -179,6 +197,49 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 				return
 			}
 			reply(w, 200, order("open", "requires_action", nil))
+		})
+		if !h.beforeOrders {
+			return
+		}
+		mux.HandleFunc("POST /billing/v1/me/checkout-sessions", func(w http.ResponseWriter, r *http.Request) {
+			if !signedIn(w, r) {
+				return
+			}
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			h.mu.Lock()
+			h.minted = append(h.minted, body)
+			h.amount, _ = strconv.ParseInt(body["amount"], 10, 64)
+			h.mu.Unlock()
+			if body["success_url"] != base()+"/credits/return" {
+				refuse(w, 400, "invalid_param", "success_url not allowed")
+				return
+			}
+			reply(w, 201, map[string]any{"id": "ocs_1", "url": nil, "expires_at": time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339)})
+		})
+		mux.HandleFunc("GET /billing/v1/checkout-sessions/ocs_1", func(w http.ResponseWriter, r *http.Request) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			status := "created"
+			if h.option != "" {
+				status = "requires_action"
+				if settled() {
+					status = "succeeded"
+				}
+			}
+			reply(w, 200, map[string]any{"id": "ocs_1", "status": status, "failure_message": nil, "options": []any{
+				map[string]string{"id": "opt_elements", "driver": "stripe_elements", "rail": "stripe"},
+				map[string]string{"id": "opt_hosted", "driver": "redirect", "rail": "stripe"},
+			}})
+		})
+		mux.HandleFunc("POST /billing/v1/checkout-sessions/ocs_1/pay", func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			h.mu.Lock()
+			h.option = body["option_id"]
+			h.mu.Unlock()
+			reply(w, 200, map[string]any{"status": "requires_action", "next_action": map[string]any{
+				"type": "redirect_to_url", "url": "https://checkout.stripe.test/c/pay/ocs_1"}})
 		})
 	}
 }
@@ -243,7 +304,7 @@ func TestCreditsReadAndBuy(t *testing.T) {
 		t.Fatalf("buy $25.50: exit %d\n%s", code, out)
 	}
 	credits.mu.Lock()
-	orders, paidWith := credits.orders, credits.paidWith
+	orders, paidWith, minted := credits.orders, credits.paidWith, len(credits.minted)
 	keys := append(append([]string{}, credits.ordered...), credits.payments...)
 	credits.mu.Unlock()
 	want := map[string]any{"lines": []any{map[string]any{"price_id": "price_1", "amount": "25500000"}}}
@@ -256,6 +317,9 @@ func TestCreditsReadAndBuy(t *testing.T) {
 	}
 	if len(keys) != 2 || keys[0] == "" || keys[1] == "" || keys[0] == keys[1] {
 		t.Fatalf("the order and its payment carried idempotency keys %q", keys)
+	}
+	if minted != 0 {
+		t.Fatalf("a hub that sells credit as an order was asked for a checkout session")
 	}
 
 	code, out = run("", "credits", "--json", "--full")
@@ -270,6 +334,48 @@ func TestCreditsReadAndBuy(t *testing.T) {
 	if code, out := run("", "credits", "buy", "10", "--no-browser", "--no-wait", "--json", "--full"); code != 0 ||
 		!strings.Contains(out, `"order":"ord_1"`) || !strings.Contains(out, `"status":"awaiting payment"`) {
 		t.Fatalf("buy --no-wait: exit %d\n%s", code, out)
+	}
+}
+
+// TestCreditsBuyOnAHubBeforeOrders: a hub before OpenRails v0.237 refuses an order's
+// amount as a field it does not know, or has no order route at all, and `cozy credits
+// buy` then buys the way that hub sells: a checkout session paid through its hosted
+// option. Temporary, with internal/hub/billing_checkout_session.go.
+func TestCreditsBuyOnAHubBeforeOrders(t *testing.T) {
+	for name, credits := range map[string]*creditHub{
+		"its orders take no amount": {beforeOrders: true},
+		"it has no order route":     {beforeOrders: true, noOrders: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var hubURL string
+			hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
+			hubURL = hub.URL
+			run := creditCLI(t, hub.URL)
+			if code, out := run("123456\nbuyer\n", "auth", "login", "buyer@example.test"); code != 0 {
+				t.Fatalf("login: exit %d\n%s", code, out)
+			}
+			if code, out := run("", "credits", "buy", "5", "--no-browser"); code == 0 || !strings.Contains(out, "$10.00 to $500.00") {
+				t.Fatalf("buy 5, outside the bounds: exit %d\n%s", code, out)
+			}
+			code, out := run("", "credits", "buy", "25.50", "--no-browser")
+			if code != 0 || !strings.Contains(out, "https://checkout.stripe.test/c/pay/ocs_1") ||
+				!strings.Contains(out, "paid") || !strings.Contains(out, "available: $25.50") {
+				t.Fatalf("buy $25.50: exit %d\n%s", code, out)
+			}
+			credits.mu.Lock()
+			orders, minted, option := len(credits.orders), credits.minted, credits.option
+			credits.mu.Unlock()
+			if orders != 1 {
+				t.Fatalf("the hub was asked for %d orders before the checkout session, want the one it refused", orders)
+			}
+			if len(minted) != 1 || minted[0]["product_key"] != "api-credit" || minted[0]["price_key"] != "deposit" ||
+				minted[0]["amount"] != "25500000" || minted[0]["success_url"] != hub.URL+"/credits/return" {
+				t.Fatalf("the checkout session asked for %v", minted)
+			}
+			if option != "opt_hosted" {
+				t.Fatalf("paid with option %q, not hosted Checkout", option)
+			}
+		})
 	}
 }
 
