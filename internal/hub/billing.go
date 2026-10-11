@@ -51,11 +51,15 @@ func (c *Client) Balance(ctx context.Context) (Balance, *exit.Error) {
 
 // Credit is the caller's net balance (balance less every hold and anything owed) against
 // the Hub's warning and its overdraft floor: rentals keep running into debt down to the
-// floor and are shut off past it (th-242). nil for an account that never touches credit.
+// floor and are shut off past it (th-242). Burn is what running rentals charge an hour
+// together, and DepletesAt when that reaches the floor (th-252); zero and nil from an older
+// Hub or with nothing charging. nil for an account that never touches credit.
 type Credit struct {
-	Available int64 `json:"available_usd_micros"`
-	Warning   int64 `json:"warning_usd_micros"`
-	Floor     int64 `json:"floor_usd_micros"`
+	Available  int64      `json:"available_usd_micros"`
+	Warning    int64      `json:"warning_usd_micros"`
+	Floor      int64      `json:"floor_usd_micros"`
+	Burn       int64      `json:"burn_usd_micros_per_hour"`
+	DepletesAt *time.Time `json:"depletes_at"`
 }
 
 // Low is whether the owner is to be warned.

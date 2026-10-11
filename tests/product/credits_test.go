@@ -32,6 +32,12 @@ type creditHub struct {
 	// GET /v1/credit (th-242) states the balance against these; null for an unmetered account.
 	warning, floor int64
 	unmetered      bool
+	// A Hub that charges rentals (th-252) also states the burn and when it runs out, and lists
+	// the rentals.
+	charging   bool
+	burn       int64
+	depletesAt *time.Time
+	rentals    []map[string]any
 }
 
 func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux) {
@@ -52,6 +58,17 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 	}
 	// settled is the purchase's state as its buyer reads it: awaiting them at Stripe, then
 	// paid a moment later, when the webhook lands the lot.
+	statement := func() map[string]any {
+		if h.unmetered {
+			return nil
+		}
+		credit := map[string]any{"available_usd_micros": h.balance, "warning_usd_micros": h.warning, "floor_usd_micros": h.floor}
+		if h.charging {
+			credit["burn_usd_micros_per_hour"], credit["depletes_at"] = h.burn, h.depletesAt
+			credit["as_of"] = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		return credit
+	}
 	settled := func() bool {
 		h.reads++
 		if h.reads > 1 && !h.paid {
@@ -93,11 +110,15 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			}
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			var credit map[string]int64
-			if !h.unmetered {
-				credit = map[string]int64{"available_usd_micros": h.balance, "warning_usd_micros": h.warning, "floor_usd_micros": h.floor}
+			reply(w, 200, map[string]any{"credit": statement()})
+		})
+		mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
+			if !signedIn(w, r) {
+				return
 			}
-			reply(w, 200, map[string]any{"credit": credit})
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			reply(w, 200, map[string]any{"rentals": append([]map[string]any{}, h.rentals...), "credit": statement()})
 		})
 		mux.HandleFunc("GET /billing/v1/me/balance/transactions", func(w http.ResponseWriter, r *http.Request) {
 			if !signedIn(w, r) {
@@ -189,7 +210,7 @@ func creditCLI(t *testing.T, hub string) func(stdin string, args ...string) (int
 	return func(stdin string, args ...string) (int, string) {
 		t.Helper()
 		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, append(args, "--tensorhub="+hub)...)...)
-		cmd.Env = childEnv(t, root)
+		cmd.Env = childEnv(t, root, "TZ=Asia/Tokyo")
 		cmd.Stdin = strings.NewReader(stdin) //cozy:stdin-value test login code and account name
 		var out bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &out
@@ -312,4 +333,65 @@ func TestLowCreditWarns(t *testing.T) {
 	if _, out := run("", "rental", "list", "--no-watch"); strings.Contains(out, "credit is low") {
 		t.Fatalf("a rental command after the Hub stopped metering warned:\n%s", out)
 	}
+}
+
+// TestCreditsShowBurn is th-252's CLI half: a Hub that charges rentals its own price states
+// what they burn an hour and when the credit runs out, and `cozy credits` shows both, counting
+// the rentals charging now. An older Hub states neither and nothing is invented; an unmetered
+// account is told so and never given a run-out time.
+func TestCreditsShowBurn(t *testing.T) {
+	depletes := time.Date(2026, 10, 12, 3, 4, 0, 0, time.UTC)
+	credits := &creditHub{balance: 20_000_000, warning: 1_000_000, floor: -2_000_000,
+		charging: true, burn: 1_500_000, depletesAt: &depletes, rentals: []map[string]any{
+			{"rental_id": "pr-ready", "name": "otter", "state": "ready", "spend_basis": "charged", "spend_usd_micros": 900_000},
+			{"rental_id": "pr-degraded", "name": "heron", "state": "degraded", "spend_basis": "charged", "spend_usd_micros": 300_000},
+			{"rental_id": "pr-booting", "name": "kite", "state": "booting", "spend_basis": "charged", "spend_usd_micros": 0},
+			{"rental_id": "pr-released", "name": "wren", "state": "released", "spend_basis": "charged", "spend_usd_micros": 2_000_000},
+		}}
+	var hubURL string
+	hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
+	hubURL = hub.URL
+	run := creditCLI(t, hub.URL)
+	if code, out := run("123456\nspender\n", "auth", "login", "spender@example.test"); code != 0 {
+		t.Fatalf("login: exit %d\n%s", code, out)
+	}
+	show := func(want string, absent ...string) {
+		t.Helper()
+		code, out := run("", "credits")
+		flat := strings.Join(strings.Fields(out), " ")
+		for _, missing := range absent {
+			if strings.Contains(out, missing) {
+				code = -1
+			}
+		}
+		if code != 0 || !strings.Contains(flat, want) {
+			t.Fatalf("credits does not show %q without %q: exit %d\n%s", want, absent, code, out)
+		}
+	}
+
+	show("available: $20.00 burn: $1.50/hour across 2 rentals runs out: 2026-10-12 12:04")
+	code, out := run("", "credits", "--json")
+	var doc map[string]any
+	if code != 0 || json.Unmarshal([]byte(out), &doc) != nil || doc["burn_usd_micros_per_hour"] != "1500000" ||
+		doc["depletes_at"] != "2026-10-12T03:04:00Z" || doc["burn"] != nil {
+		t.Fatalf("credits --json: exit %d\n%s", code, out)
+	}
+
+	credits.mu.Lock()
+	credits.burn, credits.depletesAt = 0, nil
+	credits.mu.Unlock()
+	show("available: $20.00", "burn", "runs out")
+
+	credits.mu.Lock()
+	credits.charging = false
+	credits.mu.Unlock()
+	show("available: $20.00", "burn", "runs out")
+	if code, out := run("", "credits", "--json", "--full"); code != 0 || strings.Contains(out, "burn") || strings.Contains(out, "depletes_at") {
+		t.Fatalf("an older Hub's credit as JSON: exit %d\n%s", code, out)
+	}
+
+	credits.mu.Lock()
+	credits.charging, credits.burn, credits.depletesAt, credits.unmetered = true, 1_500_000, &depletes, true
+	credits.mu.Unlock()
+	show("billing: unmetered", "runs out", "burn")
 }
