@@ -31,8 +31,8 @@ maintenance-capable image; the update command never replaces or buys a rental.
 
 ## End a known external provider resource
 
-A machine created outside Tensorhub has no Hub rental record. For development
-cleanup, `cozy rental end-external --provider vast --resource-id ID
+A machine created outside Tensorhub has no Hub rental record. For operator
+cleanup, the hidden `cozy rental end-external --provider vast --resource-id ID
 --expected-label LABEL --token-stdin` accepts one explicitly supplied provider API
 key on standard input. The command checks that exact instance and label, destroys
 that instance, then waits for the provider to report it absent. Repeat the same
@@ -51,4 +51,5 @@ To skip a known Vast host for a new development rental, use the hidden explicit
 selection `--provider=vast --exclude-provider-machine=150864` (repeat the exclusion
 flag for more machine IDs). This excludes the provider's machine ID at quote and
 acquisition, across retries and replans. It does not name a rental/instance ID or an IP.
-The Hub must confirm the applied exclusions before the CLI submits the paid request.
+Naming a provider or excluding its machines is an operator's choice: Tensorhub refuses
+it from anyone but an admin (`rental.provider_choice_operator_only`).

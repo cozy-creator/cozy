@@ -652,10 +652,10 @@ type RentalCmd struct {
 	SSHInfo     RentalSSHInfoCmd     `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List        RentalListCmd        `cmd:"" help:"List rented machines, live on a terminal."`
 	Show        RentalShowCmd        `cmd:"" help:"Show one rental: state, rate, accrued spend and every other fact."`
-	Logs        RentalLogsCmd        `cmd:"" help:"Print the provider's boot log of a rental's attempt, kept after its pod is gone, or with --tensorfs its machine's TensorFS log."`
+	Logs        RentalLogsCmd        `cmd:"" help:"Print the provider's boot log of a rental's attempt (operators only: Tensorhub admins), or with --tensorfs its machine's TensorFS log."`
 	New         RentalNewCmd         `cmd:"" help:"Start a private rental, or list available machine types."`
 	End         RentalEndCmd         `cmd:"" help:"End a private rental and stop billing."`
-	EndExternal RentalEndExternalCmd `cmd:"" name:"end-external" help:"Development: destroy an explicitly identified Vast instance that has no Hub rental record."`
+	EndExternal RentalEndExternalCmd `cmd:"" name:"end-external" hidden:"" help:"Operator tooling: destroy an explicitly identified Vast instance that has no Hub rental record."`
 }
 
 type RentalEndExternalCmd struct {
@@ -751,8 +751,8 @@ func (c *RentalShowCmd) Run(r *Runtime) error {
 
 type RentalLogsCmd struct {
 	Rental   string `arg:"" name:"rental" predictor:"rental" help:"Rental machine name or id."`
-	Follow   bool   `short:"f" help:"Keep printing while the rental boots, onto any attempt a replan starts."`
-	Attempt  int    `help:"Attempt number, from 1; default the latest."`
+	Follow   bool   `short:"f" help:"Operators: keep printing the boot log while the rental boots, onto any attempt a replan starts."`
+	Attempt  int    `help:"Operators: the boot attempt number, from 1; default the latest."`
 	TensorFS bool   `name:"tensorfs" help:"Print the rental machine's TensorFS transport decisions instead: one line per hedge, lane grant, win and pull walk."`
 }
 

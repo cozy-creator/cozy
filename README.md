@@ -640,7 +640,7 @@ cozy rental list                   # current rented machines, live on a terminal
 cozy rental list --all             # every rental, live and ended: lifetime, runs from this computer, cost, end cause
 cozy rental list --ended           # the ended ones only
 cozy rental show otter             # one rental's facts, including accrued spend, ended or not
-cozy rental logs otter -f          # the provider's boot log, followed while it boots
+cozy rental logs otter -f          # operators (Tensorhub admins): the boot log, followed while it boots
 cozy rental logs otter --tensorfs  # TensorFS's transport decisions: hedges, lane grants, wins, pull walks
 cozy run org/package/generate --rental=otter prompt="moonlit lake"
 cozy rental end otter
@@ -659,8 +659,7 @@ reads RunPod SKU names or provider prices. `cozy run` is local-only by default, 
 purchase or fallback onto another machine. `--rental-only` automatically reuses or acquires
 remote capacity under Tensorhub's owner spend cap. Creator names every private rental
 with one memorable word, unique among this host's live rentals (a released word is drawn again);
-Tensorhub's identity for it is its `pr-…` id, which is what the provider-side pod is named after.
-The name carries no workload facts.
+Tensorhub's identity for it is its `pr-…` id. The name carries no workload facts.
 
 Use `--model org/model@release/lane` to size a manual rental for known checkpoints; repeat
 `--model` for several models. Creator resolves and pins each manifest, and Tensorhub measures
@@ -679,8 +678,8 @@ so it also works while Runtime is unavailable, and admits no execution.
 
 `cozy rental list` shows each known machine's queued and running work, when it ends
 itself (ENDS, from the machine's live Status, the only rental clock; blank if it cannot
-answer or names no deadline) and accrued spend (`est.` until the provider's charges settle, about an hour late; `-`
-from a Hub that does not say). A release Tensorhub does not confirm is retried.
+answer or names no deadline) and accrued spend at Tensorhub's hourly price (`unmetered` on an account
+Tensorhub does not charge, `est.` for a rental from before running charges, `-` from a Hub that does not say). A release Tensorhub does not confirm is retried.
 Activity is unknown for machines absent from this controller's history.
 
 Rental creation sends only that private machine name, the SKU, and introduction credential material—never a package, model,
@@ -699,7 +698,7 @@ and `cozy down --all` request termination; a plain `cozy down` does not.
 
 ## Credits
 
-Tensorhub sells prepaid USD credit: $1 buys $1 of usage at provider cost.
+Tensorhub sells prepaid USD credit: $1 buys $1 of usage at Tensorhub's quoted hourly prices.
 
 ```bash
 cozy credits                       # balance, what running work holds, what is available

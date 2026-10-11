@@ -129,12 +129,12 @@ func renderRentalHistory(rentals []pastRental, unanswered []string, hubs, endedO
 	}
 	list := output.List{Name: "rental_history", Fields: fields,
 		AllFields: []string{"machine", "rental", "sku", "gpus", "accelerator", "hub", "state", "started", "ended", "lifetime",
-			"runs", "failed", "canceled", "$/hour", "spent", "ended by", "provider", "provider machine", "provider resource"},
+			"runs", "failed", "canceled", "$/hour", "spent", "ended by"},
 		TypedFields: []string{"machine", "rental_id", "sku", "gpus", "hub", "state", "rented_at", "ended_at", "lifetime_s",
 			"runs_succeeded", "spend_usd_micros", "spend_basis", "release_cause"},
 		TypedAllFields: []string{"machine", "rental_id", "sku", "gpus", "accelerator", "accelerator_count", "hub", "state",
 			"rented_at", "ended_at", "lifetime_s", "runs_succeeded", "runs_failed", "runs_canceled", "hourly_rate_usd_micros",
-			"spend_usd_micros", "spend_basis", "release_cause", "provider", "provider_machine_id", "provider_resource_id"},
+			"spend_usd_micros", "spend_basis", "release_cause"},
 		Trail: []string{"RUNS counts the runs this computer sent that succeeded; - where it holds no record of the rental."},
 		Next:  []string{"cozy rental show <machine>"}}
 	label := "Rentals"
@@ -152,8 +152,7 @@ func renderRentalHistory(rentals []pastRental, unanswered []string, hubs, endedO
 			"accelerator": acceleratorLabel(r.AcceleratorModel, r.AcceleratorCount), "hub": p.hub,
 			"state": humanRentalState(r.State), "started": clock(p.started), "ended": "live", "ended by": r.EndCause(),
 			"$/hour": rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour)),
-			"spent":  rentalSpend(summary), "provider": r.Provider, "provider machine": r.ProviderMachineID,
-			"provider resource": r.ProviderResourceID}
+			"spent":  rentalSpend(summary)}
 		typed := map[string]any{"machine": r.Name, "rental_id": r.ID, "hub": p.hub, "state": r.State,
 			"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros}
 		if gpus, ok := gpuCount(r.AcceleratorModel, r.AcceleratorCount); ok {
@@ -175,15 +174,18 @@ func renderRentalHistory(rentals []pastRental, unanswered []string, hubs, endedO
 			typed["runs_succeeded"], typed["runs_failed"], typed["runs_canceled"] = w.Succeeded, w.Failed, w.Canceled
 		}
 		for key, value := range map[string]string{"sku": row["sku"], "release_cause": r.EndCause(), "rented_at": r.CreatedAt,
-			"ended_at": r.EndedAt, "accelerator": r.AcceleratorModel, "provider": r.Provider,
-			"provider_machine_id": r.ProviderMachineID, "provider_resource_id": r.ProviderResourceID} {
+			"ended_at": r.EndedAt, "accelerator": r.AcceleratorModel} {
 			if value != "" {
 				typed[key] = value
 			}
 		}
 		spendFields(typed, summary)
+		operatorFacts(row, typed, [3]string{"provider", "provider", r.Provider},
+			[3]string{"provider machine", "provider_machine_id", r.ProviderMachineID},
+			[3]string{"provider resource", "provider_resource_id", r.ProviderResourceID})
 		list.Rows, list.TypedRows = append(list.Rows, row), append(list.TypedRows, typed)
 	}
+	operatorColumns(&list)
 	accrued, spendFacts := accruedSpend(api.RentalInventory{Rentals: spend})
 	count := strconv.Itoa(len(rentals))
 	if !endedOnly {
