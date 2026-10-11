@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
+	"github.com/pelletier/go-toml/v2"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
@@ -245,4 +246,111 @@ func TestAnOldHostToolIsBroughtForward(t *testing.T) {
 		t.Fatalf("the installed interface does not carry the callee's Result: %v\n%s", interfaces, out)
 	}
 	_, _ = run(t, root, true, "down")
+}
+
+// TestAPackageOnANewerSDKIsDescribedAfterAnUpgrade: the host tool on PATH is a real cozy-runtime
+// older than the one a package's uv.lock pins, and that package uses a construct the newer SDK
+// added (`Memoize(requires=...)`, 0.23.22), which the old reader refuses. Without uv the refusal
+// names both releases; with uv this Cozy brings its own reader up to the lock, says so, and the
+// package installs with the construct read.
+func TestAPackageOnANewerSDKIsDescribedAfterAnUpgrade(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the PATH fixture is POSIX")
+	}
+	uv, err := exec.LookPath("uv")
+	if err != nil {
+		t.Skip("uv installs the host tools")
+	}
+	const old = "0.23.20" // the last release whose reader refuses Memoize(requires=...)
+	cache, err := exec.Command(uv, "cache", "dir").Output()
+	must(t, err)
+	uvEnv := append(os.Environ(), "UV_CACHE_DIR="+strings.TrimSpace(string(cache)))
+	host := t.TempDir()
+	install := exec.Command("/usr/bin/nice", "-n", "19", uv, "tool", "install", "--python", "3.12", "cozy-runtime=="+old)
+	install.Env = append(uvEnv, "UV_TOOL_DIR="+filepath.Join(host, "tools"), "UV_TOOL_BIN_DIR="+filepath.Join(host, "bin"))
+	if data, err := install.CombinedOutput(); err != nil {
+		t.Fatalf("install the old host tool: %v\n%s", err, data)
+	}
+	uvBin := t.TempDir()
+	must(t, os.Symlink(uv, filepath.Join(uvBin, "uv")))
+
+	root, _ := hostRuntimeRoot(t, "newer-sdk", "")
+	project := filepath.Join(root, "project")
+	must(t, os.MkdirAll(project, 0o755))
+	write := func(name, body string) { must(t, os.WriteFile(filepath.Join(project, name), []byte(body), 0o600)) }
+	write("pyproject.toml", "[project]\nname=\"memo-seeded\"\nversion=\"0.1.0\"\nrequires-python=\">=3.12,<3.13\"\n"+
+		"dependencies=[\"cozy-runtime>=0.23.22\"]\n[project.entry-points.\"cozy.application\"]\ndefault=\"memo_seeded:app\"\n"+
+		"[build-system]\nrequires=[\"hatchling\"]\nbuild-backend=\"hatchling.build\"\n"+
+		"[tool.hatch.build.targets.wheel]\nonly-include=[\"memo_seeded.py\"]\n")
+	write("package.toml", "[application]\nobject=\"memo_seeded:app\"\n")
+	write("memo_seeded.py", "import msgspec\nfrom cozy_runtime.author import App, Context, Memoize, invocable\n"+
+		"class Drawn(msgspec.Struct):\n    text: str\n"+
+		"@invocable(memoize=Memoize(requires=(\"seed\",)))\n"+
+		"async def draw(ctx: Context, *, prompt: str, seed: int | None = None) -> Drawn:\n    return Drawn(prompt)\n"+
+		"app = App()\napp.job(draw)\n")
+	lock := exec.Command(uv, "lock", "--no-progress", "--project", project)
+	lock.Env = uvEnv
+	if data, err := lock.CombinedOutput(); err != nil {
+		t.Fatalf("lock fixture: %v\n%s", err, data)
+	}
+	var locked struct {
+		Package []struct{ Name, Version string } `toml:"package"`
+	}
+	raw, err := os.ReadFile(filepath.Join(project, "uv.lock"))
+	must(t, err)
+	must(t, toml.Unmarshal(raw, &locked))
+	sdk := ""
+	for _, entry := range locked.Package {
+		if entry.Name == "cozy-runtime" {
+			sdk = entry.Version
+		}
+	}
+	if sdk == "" {
+		t.Fatalf("the lock pins no cozy-runtime\n%s", raw)
+	}
+
+	run := func(path string, args ...string) (int, string) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
+		cmd.Env = childEnv(t, root, "PATH="+path, "XDG_CACHE_HOME="+filepath.Join(root, "cache"),
+			"UV_CACHE_DIR="+strings.TrimSpace(string(cache)))
+		data, _ := cmd.CombinedOutput()
+		return cmd.ProcessState.ExitCode(), string(data)
+	}
+	offline := filepath.Join(host, "bin") + ":/usr/bin:/bin"
+	online := filepath.Join(host, "bin") + ":" + uvBin + ":/usr/bin:/bin"
+
+	// Offline: the old reader refuses, and the refusal names the package's SDK and the reader.
+	code, out := run(offline, "package", "install", project, "--json")
+	for _, want := range []string{"host_runtime_older_than_package", "cozy-runtime " + old + " refused this package",
+		"locked to cozy-runtime " + sdk, "Memoize(requires=", "cozy-runtime[media,model-execution]>=" + sdk} {
+		if code == 0 || !strings.Contains(out, want) {
+			t.Fatalf("the old reader's refusal does not say %q [exit %d]\n%s", want, code, out)
+		}
+	}
+
+	// With uv: the reader is brought up to the lock as its own stage, and the package installs.
+	code, out = run(online, "package", "install", project)
+	if code != 0 || !strings.Contains(out, "Upgrading cozy-runtime "+old+" to "+sdk+" or newer to read packages...") {
+		t.Fatalf("the package was not described after an upgrade [exit %d]\n%s", code, out)
+	}
+	own := filepath.Join(root, "cache", "cozy", "host-runtime", "bin", "cozy-runtime")
+	raw, err = exec.Command(own, "--json", "version").Output()
+	var version struct{ Distribution string }
+	if err != nil || json.Unmarshal(raw, &version) != nil {
+		t.Fatalf("this Cozy's own reader is not installed at %s: %v %s", own, err, raw)
+	}
+	if found, err := pep440.Parse(version.Distribution); err != nil || found.LessThan(pep440.MustParse(sdk)) {
+		t.Fatalf("this Cozy's own reader is release %q, older than the lock's %s", version.Distribution, sdk)
+	}
+	interfaces, _ := filepath.Glob(filepath.Join(root, "installs", "*", "documents", "package-interface.json"))
+	described := ""
+	for _, path := range interfaces {
+		raw, _ := os.ReadFile(path)
+		described += string(raw)
+	}
+	if !strings.Contains(described, `"memo_requires":["seed"]`) {
+		t.Fatalf("the installed interface does not carry the memo condition: %v\n%s", interfaces, out)
+	}
+	_, _ = run(online, "down")
 }
