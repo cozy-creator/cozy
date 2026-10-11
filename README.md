@@ -820,7 +820,9 @@ credential stays at its owning Hub. Each Hub uses its own `cozy auth login --ten
 
 One daemon can retain runs and rentals created under earlier selections without restarting.
 `cozy rental list` shows rentals across every known Hub, including signed-in Hubs
-whose rentals were created by another client. A Hub that cannot answer leaves its
+whose rentals were created by another client. A name alone adds no Hub, so `cozy hub remove`
+takes effect in a running daemon at once; rentals on a removed name are listed under its URL.
+A Hub that cannot answer leaves its
 last observed rentals visible as unverified. `--tensorhub=<hub>` selects the source
 for new work; it does not narrow the rental inventory. `cozy run list` shows every
 Hub by default and can be narrowed with `--tensorhub=<hub>`.

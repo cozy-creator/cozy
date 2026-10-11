@@ -21,16 +21,14 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 	origin = fleet.origin(origin)
 	origins := []string{origin}
 	if allHubs {
-		held, problem := rentalInventoryOrigins(fleet.ctx, st)
+		held, problem := rentalInventoryOrigins(fleet.ctx, st, origin)
 		if problem != nil {
 			return api.RentalInventory{}, problem
 		}
-		if !slices.Contains(held, origin) {
-			held = append(held, origin)
-		}
+		// A hub whose last answer named a live rental stays asked: it may still bill.
 		fleet.mu.Lock()
-		for known := range fleet.census {
-			if !slices.Contains(held, known) {
+		for known, census := range fleet.census {
+			if len(census.live) > 0 && !slices.Contains(held, known) {
 				held = append(held, known)
 			}
 		}
@@ -80,26 +78,18 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 	return merged.Current(), nil
 }
 
-// Inventory covers account-side rentals too: a signed-in Hub need not have a
-// locally attached rental yet. Records remain relevant even after a Hub is unnamed
-// or its credential is removed. This is discovery, never a configuration change.
-func rentalInventoryOrigins(ctx *Context, st *records.Store) ([]string, *exit.Error) {
-	seen := map[string]bool{ctx.Cfg.HubURL: true}
+// rentalInventoryOrigins is every hub an every-hub listing asks, from what holds now: the
+// asking command's hub, every hub this machine is signed in to (another client's rentals
+// need no local record), and every hub this host holds a rental or acquisition on. A hub
+// name never adds a hub, so a daemon's start-up copy of config.yaml cannot keep a removed
+// one listed.
+func rentalInventoryOrigins(ctx *Context, st *records.Store, asked string) ([]string, *exit.Error) {
+	seen := map[string]bool{asked: true}
 	for _, origin := range accountauth.KnownOrigins(ctx.Cfg.Home) {
 		seen[origin] = true
 	}
-	configured := []string{ctx.Cfg.ConfiguredHubURL}
-	for _, origin := range ctx.Cfg.Hubs {
-		configured = append(configured, origin)
-	}
-	for _, origin := range configured {
-		if origin == "" {
-			continue
-		}
-		scoped := ctx.forHub(origin)
-		if scoped.Cfg.HubToken.Present() || accountauth.New(scoped.Cfg).CredentialPresent() {
-			seen[scoped.Cfg.HubURL] = true
-		}
+	if ctx.Cfg.StaticToken() {
+		seen[ctx.Cfg.ConfiguredHubURL] = true
 	}
 	if st != nil {
 		rows, problem := st.Rentals()
