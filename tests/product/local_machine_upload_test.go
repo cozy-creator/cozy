@@ -26,7 +26,7 @@ func weightsProject(t *testing.T) string {
 name="weights-proof"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime>=`+runtimeFloor+`", "tensorfs>=0.3.74,<0.5"]
+dependencies=["cozy-runtime>=`+runtimeFloor+`", "tensorfs>=0.3.74"]
 [project.entry-points."cozy.application"]
 default="weights_proof:app"
 `+sources+`[build-system]
@@ -90,7 +90,7 @@ func TestAConversionShowsItsCheckpointUploadAsACall(t *testing.T) {
 		}
 		worker.ServeHTTP(w, r)
 	})
-	if code, out := runCozy(t, root, "package", "install", weightsProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", weightsProject(t)); code != 0 {
 		t.Fatalf("installing the weights package [exit %d]\n%s", code, out)
 	}
 	code, out := runCozy(t, root, "run", "local/weights-proof/convert", "n=3", "--upload-to", "proof/model", "--await", "--json")

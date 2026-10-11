@@ -56,7 +56,7 @@ func TestFreshRentalRunsConcurrentFirstCalls(t *testing.T) {
 		AcceleratorModel: model, AcceleratorCount: count, HourlyRateUSDMicros: 1, Hub: h.server.URL,
 		Address: launch.Addr, MediaAddress: launch.MediaAddr, ExpectedWorkerID: launch.WorkerID, ExpectedWorkerBootID: launch.BootID},
 		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})), secret.New(token), identity))
-	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", parityProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 

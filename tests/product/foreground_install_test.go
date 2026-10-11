@@ -93,7 +93,7 @@ func TestARentalInstallUnderAnOlderDaemonIsThisCommandsWarmRun(t *testing.T) {
 	// `cozy model quantize --rental` is this command's own job on the rental's machine, which
 	// fetches the checkpoint itself and refuses the stand-in's bytes; nothing is asked of the
 	// older daemon.
-	if code, out := runCozy(t, root, "package", "install", quantizeProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", quantizeProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "model", "quantize", "proof/model#"+manifest, "proof/quantized", "--fp8",

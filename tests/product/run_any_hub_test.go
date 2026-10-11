@@ -21,7 +21,7 @@ func TestARunFindsItsRentalOnAnyHub(t *testing.T) {
 	// The current hub is another one, which does not even answer; the rental's hub is b.
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: a\nhubs:\n  a: "+elsewhere+
 		"\n  b: "+h.server.URL+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	if code, out := runCozy(t, root, "package", "install", parityProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", parityProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	code, out := runCozy(t, root, "run", parityPackage+"/add", "value=41", "--rental=tessa", "--await", "--json", "--idempotency-key", "any-hub")

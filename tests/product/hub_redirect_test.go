@@ -55,14 +55,15 @@ func TestCapturedHubStorageRedirectRetainsExactWheel(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600); err != nil {
 				t.Fatal(err)
 			}
-			captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "root", "root==1.0\nfixture==1.0", t.TempDir(), t.TempDir(), map[string]map[string]string{"fixture": {"fixture": "1.0"}}, "3.12.12")
+			store := t.TempDir()
+			problem := packagepublish.KeepHubWheels(t.Context(), root, store)
 			if arm.code == "" {
 				if problem != nil {
 					t.Fatal(problem)
 				}
-				data, err := os.ReadFile(captured["fixture"].Path)
-				if err != nil || !bytes.Equal(data, payload.Bytes()) || captured["fixture"].RegistryRequirement != "" {
-					t.Fatal("captured redirect lost exact wheel custody", err)
+				data, err := os.ReadFile(filepath.Join(store, arm.hash, "fixture-1.0-py3-none-any.whl"))
+				if err != nil || !bytes.Equal(data, payload.Bytes()) {
+					t.Fatal("the redirect lost exact wheel custody", err)
 				}
 				return
 			}

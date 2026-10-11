@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -222,6 +223,11 @@ func TestGPUFitPatternsAllowMultipleTokens(t *testing.T) {
 		}
 	}
 }
+
+var cozyRuntimeRepo = flag.String("cozy-runtime-repo", "", "a cozy-runtime checkout for the shared corpus comparison")
+
+var requireCozyRuntimePeer = flag.Bool("require-cozy-runtime-peer", false,
+	"fail instead of skipping when no cozy-runtime checkout is named")
 
 func TestAuthoredDefaultsMatchRuntimeCorpus(t *testing.T) {
 	if *cozyRuntimeRepo == "" {

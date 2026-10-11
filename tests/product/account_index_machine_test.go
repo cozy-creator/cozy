@@ -48,9 +48,11 @@ func indexProject(t *testing.T, laptopHub, module string, dependencies ...string
 	t.Helper()
 	project := filepath.Join(t.TempDir(), "index-probe")
 	must(t, os.MkdirAll(project, 0o700))
-	extra := ""
+	extra, metadata := "", ""
 	for _, dependency := range dependencies {
 		extra += fmt.Sprintf(", %q", dependency)
+		// A direct reference builds, as any editable install of it does, once its backend allows it.
+		metadata = "[tool.hatch.metadata]\nallow-direct-references=true\n"
 	}
 	sources := "[tool.uv.sources]\norg-relative-dep={index=\"tensorhub\"}\n"
 	if *machineRuntimeWheel != "" {
@@ -68,7 +70,7 @@ requires=["hatchling"]
 build-backend="hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include=["index_probe.py"]
-`
+` + metadata
 	files := map[string]string{
 		"pyproject.toml": authored,
 		"package.toml":   "[application]\nobject=\"index_probe:app\"\n",
@@ -173,7 +175,7 @@ func TestAccountIndexDependencyTravelsWithItsCapture(t *testing.T) {
 		!bytes.Contains(lock, []byte(h.server.URL+"/v1/index/"+indexAccount+"/"+orgRelativeDependency+"/1.0.0/")) {
 		t.Fatalf("the lock does not name the author's Hub: %v", err)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	if laptopServed.Load() == 0 {
@@ -259,7 +261,7 @@ app = App()
 async def add(payload: AddRequest) -> AddResult:
     return AddResult(value=(await touch(value=payload.value)).value)
 `)
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	h.mu.Lock()

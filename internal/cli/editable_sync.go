@@ -217,7 +217,7 @@ func (s *editableSync) reconcile() {
 	want := map[string]string{}
 	roots := map[string][]string{}
 	for _, row := range rows {
-		if row.SourceKind != "local" || row.SourceRef == "" || row.Captured() {
+		if row.SourceKind != "local" || row.SourceRef == "" {
 			continue
 		}
 		// A deleted source tree is not watched; its install stays usable until removed.

@@ -138,7 +138,7 @@ func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 		must(t, err)
 		installation.Files = append(installation.Files, localpackage.File{Name: name, Digest: object.Digest, Length: object.Length, Path: path})
 	}
-	manifest, sent, held, err := LocalSource(ctx, client, installation, nil)
+	manifest, sent, held, err := LocalSource(ctx, client, installation, nil, false)
 	must(t, err)
 	if !sent {
 		t.Fatal("new code was not written")
@@ -149,7 +149,7 @@ func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 	if len(stages) == 0 {
 		t.Fatal("the warm run reported no progress")
 	}
-	again, sent, _, err := LocalSource(ctx, client, installation, held)
+	again, sent, _, err := LocalSource(ctx, client, installation, held, false)
 	must(t, err)
 	if again != manifest || sent {
 		t.Fatalf("the same code named another manifest (%s, then %s) or was written again (%t)", manifest, again, sent)
@@ -162,11 +162,20 @@ func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 	object, err := fileObject(edited.Path)
 	must(t, err)
 	edited.Digest, edited.Length = object.Digest, object.Length
-	next, sent, _, err := LocalSource(ctx, client, installation, held)
+	next, sent, _, err := LocalSource(ctx, client, installation, held, false)
 	must(t, err)
 	if next == manifest || !sent {
 		t.Fatalf("the edit named the same manifest or moved no byte (%s, %t)", next, sent)
 	}
 	spec.Source = &pb.RunSpec_Local{Local: &pb.LocalSource{Manifest: next}}
 	must(t, Prepare(ctx, client, "warm-2", spec, nil))
+	// This computer's machine reads the project where it is: no file of it is written.
+	installation.Root = project
+	inPlace, _, kept, err := LocalSource(ctx, client, installation, nil, true)
+	must(t, err)
+	if len(kept) != len(installation.Files) {
+		t.Fatalf("in place, the machine holds %d of %d files by name", len(kept), len(installation.Files))
+	}
+	spec.Source = &pb.RunSpec_Local{Local: &pb.LocalSource{Manifest: inPlace}}
+	must(t, Prepare(ctx, client, "warm-3", spec, nil))
 }

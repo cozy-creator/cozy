@@ -31,7 +31,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 	})
 
 	project := weightlessProject(t)
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("editable install failed [exit %d]\n%s", code, out)
 	}
 	// Warm the worker once so delay_ms dominates every later arm's runtime.
@@ -84,7 +84,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 	// ------------------------------------------------ explicit cancel: live and queued
 	// The LIVE path: the authored job has entered a closed gate, so natural success
 	// cannot win before explicit cancellation reaches the real running attempt.
-	if code, out := runCozy(t, root, "package", "install", nativeLifecycleProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", nativeLifecycleProject(t)); code != 0 {
 		t.Fatalf("installing live cancel fixture [%d]: %s", code, out)
 	}
 	gate := filepath.Join(root, "live-cancel-gate")

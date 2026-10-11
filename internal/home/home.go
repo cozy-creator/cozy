@@ -117,9 +117,14 @@ func (l Layout) DependencyCache() string {
 }
 
 // HubWheels holds each wheel an unpublished package's lock selects from a Tensorhub index, once
-// per hash: every install of such a package links it beside its source.
+// per hash, for its machines.
 func (l Layout) HubWheels() string {
 	return filepath.Join(l.Root, "hub-wheels")
+}
+
+// Scripts holds the project each run script is, by its content: a run reads it in place.
+func (l Layout) Scripts() string {
+	return filepath.Join(l.Root, "scripts")
 }
 
 // RetiredLocalPackages is where cozy before 0.6.13 staged a copy of unpublished code for each

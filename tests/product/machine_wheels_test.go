@@ -93,7 +93,7 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 		t.Fatalf("the started machine is not ready on %s: %v", version(first), shown)
 	}
 
-	if code, out := runCozy(t, root, "package", "install", sdkProbe(t, "wheels-probe"), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", sdkProbe(t, "wheels-probe")); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	// A local package installs through the helper the machine makes from its embedded client,

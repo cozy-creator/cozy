@@ -37,9 +37,8 @@ func TestRunExplicitPackageDirectoryCapturesItsTypedInterface(t *testing.T) {
 		if code != 0 || !strings.Contains(out, "local/directory-proof/verify_value") || !strings.Contains(out, "value") {
 			t.Fatalf("directory %s [exit %d]: %s", target, code, out)
 		}
-		// The first reading captures; an unchanged tree then reuses that capture, with no
-		// lock or build.
-		if captured := strings.Contains(out, "Capturing local package"); captured != (i == 0) {
+		// The first run reads the tree; an unchanged tree then reuses that reading.
+		if captured := strings.Contains(out, "Reading local package"); captured != (i == 0) {
 			t.Fatalf("directory %s captured=%t: %s", target, captured, out)
 		}
 	}
@@ -53,8 +52,8 @@ func TestRunExplicitPackageDirectoryCapturesItsTypedInterface(t *testing.T) {
 	}
 	must(t, os.WriteFile(filepath.Join(project, "directory_proof", "__init__.py"), []byte(strings.Replace(source, "@app.job(internal=True)", "@app.job", 1)), 0600))
 	code, out = run("./project")
-	if code != 0 || !strings.Contains(out, "hidden_job") || !strings.Contains(out, "verify_value") || !strings.Contains(out, "Capturing local package") {
-		t.Fatalf("multiple callable directory, captured again after its edit: %d %s", code, out)
+	if code != 0 || !strings.Contains(out, "hidden_job") || !strings.Contains(out, "verify_value") || !strings.Contains(out, "Reading local package") {
+		t.Fatalf("multiple callable directory, read again after its edit: %d %s", code, out)
 	}
 	if _, err := os.Stat(filepath.Join(project, "uv.lock")); !os.IsNotExist(err) {
 		t.Fatalf("description mutated author lock: %v", err)

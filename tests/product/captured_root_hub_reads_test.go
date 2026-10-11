@@ -58,7 +58,7 @@ func TestACapturedRootReadsItsModelOncePerBindingRevision(t *testing.T) {
 		}
 	}))
 
-	if code, out := runCozy(t, root, "package", "install", probeProject(t, "proof/probe@1.0.0/bf16"), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", probeProject(t, "proof/probe@1.0.0/bf16")); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	run := func(key string) string {

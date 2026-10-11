@@ -16,8 +16,9 @@ import (
 // nothing here reads the Hub, a ladder or a package.
 
 // localSourceV1 writes the unpublished code of install to machine and answers its manifest's
-// digest, and whether any byte moved. The machine keeps one tree per package, so only what
-// changed since this daemon last sent it there is offered again.
+// digest, and whether any byte moved. This computer's machine reads the project where it is;
+// another keeps one tree per package, so only what changed since this daemon last sent it
+// there is offered again.
 func (m *machineRuns) localSourceV1(ctx context.Context, machine *machines.V1, install string) (string, bool, *exit.Error) {
 	source, problem := m.resolver.LocalInstallation(install)
 	if problem != nil {
@@ -29,16 +30,20 @@ func (m *machineRuns) localSourceV1(ctx context.Context, machine *machines.V1, i
 	if sent == nil {
 		// A machine before live packages would accept the manifest and fail installing it: it
 		// is asked first, and one without them is updated before the run is sent (dispatch).
+		need := "live-source/1"
+		if len(source.Indexes)+len(source.Locals) > 0 {
+			need = "live-source/2" // the indexes its sources name, and its local dependencies
+		}
 		frame, err := machine.Status(ctx)
 		if err != nil {
 			return "", false, machines.Transport(err)
 		}
-		if !slices.Contains(frame.GetCapabilities(), "live-source/1") {
+		if !slices.Contains(frame.GetCapabilities(), need) {
 			return "", false, exit.Named(exit.Structural, "machine.upgrade_required",
-				"%s runs TensorD %s, which installs no live package", machine.Name, frame.GetVersion())
+				"%s runs TensorD %s, which installs no such live package (%s)", machine.Name, frame.GetVersion(), need)
 		}
 	}
-	manifest, moved, now, err := machinev1.LocalSource(ctx, machine.Machine, source, sent)
+	manifest, moved, now, err := machinev1.LocalSource(ctx, machine.Machine, source, sent, machine.Local)
 	if err != nil {
 		return "", false, machines.Transport(err)
 	}

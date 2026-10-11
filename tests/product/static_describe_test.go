@@ -39,7 +39,7 @@ func TestStaticDescribeNeverImportsPackageCode(t *testing.T) {
 	})
 
 	// (a) Install reads the editable tree's surface without importing weightless.py.
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("a module importing torch at the top did not install on a torch-less host [exit %d]\n%s", code, out)
 	}
 	install := activePackageInstall(t, root)

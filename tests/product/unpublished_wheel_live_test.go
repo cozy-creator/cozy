@@ -12,7 +12,6 @@ import (
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/records"
-	capturedwheel "github.com/cozy-creator/cozy/internal/wheel"
 )
 
 // A callable may omit the worker-owned Runtime from its library dependencies.
@@ -100,8 +99,6 @@ app.job(second)
 	wheels := filepath.Join(project, "wheels")
 	runUV("build", "--wheel", "--out-dir", wheels, library)
 	wheel := filepath.Join(wheels, "unpublished_wheel_proof-0.1.0-py3-none-any.whl")
-	original, err := os.ReadFile(wheel)
-	must(t, err)
 	script := filepath.Join(project, "first.py")
 	code := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
@@ -128,32 +125,6 @@ async def main(ctx):
 	}
 	first, problem := store.RequestByReference("1")
 	fatal(t, problem)
-	// The captured wheel is the child implementation the product bound to this script.
-	bindings, problem := store.ChildBindings(first.InstallID)
-	fatal(t, problem)
-	var inst *records.PackageInstall
-	for _, binding := range bindings {
-		if binding.Module != "wheel_proof" {
-			continue
-		}
-		inst, problem = store.Install(binding.ChildInstallID)
-		fatal(t, problem)
-		break
-	}
-	if inst == nil || inst.SourceKind != "wheel" || inst.Package != "local/unpublished-wheel-proof" {
-		t.Fatalf("captured wheel has no immutable wheel install: %+v", inst)
-	}
-	sealed, problem := capturedwheel.Metadata(filepath.Join(inst.Dir, "wheels", filepath.Base(wheel)))
-	fatal(t, problem)
-	if !strings.Contains(string(sealed), "Requires-Dist: msgspec==") {
-		t.Fatalf("wheel did not seal its selected dependency version: %s", sealed)
-	}
-	retained := filepath.Join(inst.Dir, "original", filepath.Base(wheel))
-	raw, err := os.ReadFile(retained)
-	must(t, err)
-	if !bytes.Equal(raw, original) {
-		t.Fatal("original wheel was not captured byte-exactly")
-	}
 	children := machineChildren(t, root, store, "1")
 	if len(children) != 2 || children[0].Executions != 1 || children[1].Executions != 1 {
 		t.Fatalf("wheel helper did not execute two leaves: %+v", children)

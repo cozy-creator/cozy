@@ -153,21 +153,6 @@ func runTarget(ctx *Context, target Target, packageInterface *launch.PackageInte
 	if level := ctx.Inv.Value("--warm"); level != "" {
 		return handleWarm(ctx, target, callable, level)
 	}
-	if callable.Kind == "job" && strings.HasPrefix(target.Package, "local/") && !target.Snapshot {
-		resolved := target.lease
-		target, packageInterface, problem = snapshotLocalJob(ctx, target)
-		resolved.Release() // the job runs its own snapshot install
-		if problem != nil {
-			return problem
-		}
-		callable, problem = packageInterface.Function(target.Function)
-		if problem != nil {
-			return unknownFunction(target, packageInterface)
-		}
-		if problem := callable.RequirePublic(); problem != nil {
-			return problem
-		}
-	}
 	if callable.Kind != "job" {
 		if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
 			return exit.Usagef("--timeout requires --await for serving callables").
@@ -231,12 +216,6 @@ func validateRunPlacement(ctx *Context) *exit.Error {
 		return exit.Usagef("a named --rental cannot be combined with --rental-only")
 	}
 	return nil
-}
-
-// remoteRun is a run on another computer: a rental, or the endpoint a foreground run took
-// from its --rental. Its preparation never needs this computer's machine.
-func remoteRun(ctx *Context) bool {
-	return ctx.endpoint != nil || rentalRequested(ctx)
 }
 
 func rentalRequested(ctx *Context) bool {
@@ -824,26 +803,6 @@ func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot)
 			WithRemedy("%s", remedy)
 	}
 	return effectiveModelBindings(slots, rows, ref.Org), nil
-}
-
-func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstall, *exit.Error) {
-	layout, problem := home.Open(ctx.Cfg.Home)
-	if problem != nil {
-		return nil, problem
-	}
-	store, problem := records.Open(layout.DB)
-	if problem != nil {
-		return nil, problem
-	}
-	defer store.Close()
-	row, problem := store.Install(target.InstallID)
-	if problem != nil {
-		return nil, problem
-	}
-	if row == nil || row.Package != target.Package || row.SourceKind == "tensorhub" && !row.PublishedAt(ctx.Cfg.HubURL) {
-		return nil, exit.New(exit.NotFound, "installed package %s is no longer available", target.Package)
-	}
-	return row, nil
 }
 
 func resolveRemoteModel(ctx *Context, cards cardReader, packageName string, slot launch.Slot, raw, wantedLane string,
@@ -3089,7 +3048,13 @@ func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInt
 		return Target{}, nil, problem
 	}
 	// An installed package is validated against its installed interface with no hub read;
-	// the machine that runs it prepares that release itself.
+	// the machine that runs it prepares that release itself. A local package's interface is
+	// read again first if its directory changed since.
+	if strings.HasPrefix(target.Package, "local/") {
+		if problem := refreshLocal(ctx, target.Package); problem != nil {
+			return Target{}, nil, problem
+		}
+	}
 	facts, lease, problem := leasedInstallFacts(ctx, target.Package)
 	if problem == nil {
 		target.lease = lease
@@ -3308,6 +3273,21 @@ func unknownFunction(target Target, packageInterface *launch.PackageInterface) *
 	problem.WithRemedy("available functions: %s", strings.Join(names, ", "))
 	for _, name := range names {
 		problem.WithNext("cozy run " + target.Package + "/" + name)
+	}
+	return problem
+}
+
+// refreshLocal reads a local package's directory again when it changed since its install read
+// it: its interface, nothing more. A directory that cannot be read now refuses the run.
+func refreshLocal(ctx *Context, pkg string) *exit.Error {
+	_, store, _, problem := open(ctx.Cfg, false)
+	if problem != nil {
+		return problem
+	}
+	defer store.Close()
+	_, _, _, problem = NewResolver(store, ctx.Cfg).RefreshEditable(pkg)
+	if problem != nil && problem.Code == exit.NotFound {
+		return nil // not installed: the lookup that follows says so
 	}
 	return problem
 }

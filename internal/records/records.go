@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -413,12 +412,6 @@ func (inst PackageInstall) PublishedAt(origin string) bool {
 // PinHub is the hub this install's pin is keyed under: the hub it came from.
 func (inst PackageInstall) PinHub() string { return ReferenceHub(inst.Hub, inst.Package) }
 
-// Captured is local code installed as it was (a run's snapshot, or a directory installed
-// without --editable): it follows its own copy, never the authored tree.
-func (inst PackageInstall) Captured() bool {
-	return inst.SourceKind == "local" && filepath.Clean(inst.SourceRef) == filepath.Join(inst.Dir, "source")
-}
-
 // ReferenceHub is the pin hub a package reference resolves under at hub: local/ captures
 // belong to no hub.
 func ReferenceHub(hub, pkg string) string {
@@ -597,6 +590,27 @@ func (s *Store) EditableInstalls() ([]PackageInstall, *exit.Error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, exit.Internalf("cannot list editable installs: %s", err)
+	}
+	return out, nil
+}
+
+// LocalSources is every directory a local install reads, pinned or not.
+func (s *Store) LocalSources() (map[string]bool, *exit.Error) {
+	rows, err := s.db.Query(`SELECT DISTINCT source_ref FROM installs WHERE source_kind='local'`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list local sources: %s", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var source string
+		if err := rows.Scan(&source); err != nil {
+			return nil, exit.Internalf("cannot read a local source: %s", err)
+		}
+		out[source] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot list local sources: %s", err)
 	}
 	return out, nil
 }

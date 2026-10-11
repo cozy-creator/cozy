@@ -19,7 +19,7 @@ import (
 func TestLeasedInstallSurvivesASupersedingInstall(t *testing.T) {
 	root := t.TempDir()
 	project := weightlessProject(t)
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("install [exit %d]: %s", code, out)
 	}
 	leased := activePackageInstall(t, root)
@@ -35,7 +35,7 @@ func TestLeasedInstallSurvivesASupersedingInstall(t *testing.T) {
 	source, err := os.ReadFile(module)
 	must(t, err)
 	must(t, os.WriteFile(module, append(source, []byte("\n# a superseding edit\n")...), 0o644))
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("superseding install [exit %d]: %s", code, out)
 	}
 	if active := activePackageInstall(t, root); active.ID == leased.ID {

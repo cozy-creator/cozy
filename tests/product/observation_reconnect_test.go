@@ -232,7 +232,7 @@ func TestASilentMachinePathIsNoticedAndTheRunAttachedAgain(t *testing.T) {
 	var front *blackhole
 	_, root, _, store := parityMachinesOn(t, machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel},
 		func(addr string) string { front = newBlackhole(t, addr); return front.addr })
-	if code, out := runCozy(t, root, "package", "install", holdProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", holdProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 
@@ -283,7 +283,7 @@ func TestASilentMachinePathIsNoticedAndTheRunAttachedAgain(t *testing.T) {
 // Hub answers; the daemon attaches again and submits again, never failing either run.
 func TestARentalsHubOutageNeitherLosesNorRefusesItsRuns(t *testing.T) {
 	h, root, _, store := parityMachines(t)
-	if code, out := runCozy(t, root, "package", "install", holdProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", holdProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	// One-second leases from here on, so an outage outlasts many.

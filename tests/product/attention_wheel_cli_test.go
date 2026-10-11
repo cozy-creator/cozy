@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -134,7 +136,7 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 			originalWheel = wheelBytes
 		}
 		runUV("lock", "--project", project, "--refresh-package", "attention-wheel-proof")
-		if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 			t.Fatalf("install %s [%d]: %s", candidate, code, out)
 		}
 		key := fmt.Sprintf("attention-wheel-%d", i)
@@ -170,13 +172,13 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 			t.Fatal("scalar success silently lost the whole-run unused-pin warning")
 		}
 		install := activeInstall(t, root, localWeightlessRef)
-		source, problem := localpackage.Open(install)
+		source, problem := localpackage.Open(install, home.Paths(root).HubWheels(), nil)
 		fatal(t, problem)
 		// The code travels to a rented machine file by file, the vendored candidate wheel
 		// among them.
 		var captured []byte
 		for _, file := range source.Files {
-			if file.Name == "vendor/"+wheelName {
+			if file.Name == path.Join(source.Project, "vendor", wheelName) {
 				captured, _ = os.ReadFile(file.Path)
 			}
 		}

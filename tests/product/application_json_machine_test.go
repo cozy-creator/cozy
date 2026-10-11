@@ -78,7 +78,7 @@ async def echo(ctx: Context, payload: Request) -> Value:
 	if out, err := exec.Command("/usr/bin/nice", "-n", "19", "uv", "lock", "--project", project).CombinedOutput(); err != nil {
 		t.Fatalf("uv lock: %v %s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("package install [%d]\n%s", code, out)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

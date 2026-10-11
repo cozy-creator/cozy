@@ -136,8 +136,12 @@ type localManifest struct {
 	Release        string            `json:"release"`
 	PythonRequires string            `json:"python_requires,omitempty"`
 	Files          []member          `json:"files"`
+	Project        string            `json:"project,omitempty"`
+	Path           string            `json:"path,omitempty"`
 	Wheels         []member          `json:"wheels,omitempty"`
 	Callees        map[string]string `json:"callees,omitempty"`
+	Indexes        map[string]string `json:"indexes,omitempty"`
+	Locals         []string          `json:"locals,omitempty"`
 }
 
 type member struct {
@@ -155,11 +159,15 @@ type Held map[string]string
 // and its manifest, and answers the manifest's digest, which a run names. The machine keeps
 // one tree per package: only a file `held` does not name at its digest is offered, one round
 // trip when the machine has the object already and two when it does not, eight at a time.
+// In place, the machine reads the files where they are (this computer's): only their digests go.
 // `sent` is false when no byte moved.
-func LocalSource(ctx context.Context, client pb.MachineClient, installation localpackage.Installation, held Held) (manifestDigest string, sent bool, now Held, err error) {
+func LocalSource(ctx context.Context, client pb.MachineClient, installation localpackage.Installation, held Held, inPlace bool) (manifestDigest string, sent bool, now Held, err error) {
 	manifest := localManifest{Package: installation.Package, Release: installation.Release,
 		PythonRequires: installation.PythonRequires, Callees: installation.Callees,
-		Files: []member{}}
+		Files: []member{}, Project: installation.Project, Indexes: installation.Indexes, Locals: installation.Locals}
+	if inPlace {
+		manifest.Path = installation.Root
+	}
 	type upload struct {
 		object Object
 		open   func() (io.ReadSeekCloser, error)
@@ -168,7 +176,7 @@ func LocalSource(ctx context.Context, client pb.MachineClient, installation loca
 	now = Held{}
 	for _, file := range installation.Files {
 		manifest.Files = append(manifest.Files, member{file.Name, file.Digest, file.Length, file.Executable})
-		if now[file.Name] = file.Digest; held[file.Name] != file.Digest {
+		if now[file.Name] = file.Digest; held[file.Name] != file.Digest && !inPlace {
 			uploads = append(uploads, upload{Object{Digest: file.Digest, Length: file.Length}, func() (io.ReadSeekCloser, error) { return os.Open(file.Path) }})
 		}
 	}

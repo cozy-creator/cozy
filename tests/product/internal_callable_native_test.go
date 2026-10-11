@@ -91,7 +91,7 @@ async def long_form(ctx: Context, payload: Request) -> Value:
 	if out, err := lock.CombinedOutput(); err != nil {
 		t.Fatalf("fixture lock: %v %s", err, out)
 	}
-	if status, out := runCozyPath(t, root, path, "package", "install", project, "--editable", "--json"); status != 0 ||
+	if status, out := runCozyPath(t, root, path, "package", "install", project, "--json"); status != 0 ||
 		!strings.Contains(out, "cozy run local/internal-proof/long_form") || strings.Contains(out, "cozy run local/internal-proof/segment") || strings.Contains(out, "cozy run local/internal-proof/internal_job") {
 		t.Fatalf("install: %d %s", status, out)
 	}

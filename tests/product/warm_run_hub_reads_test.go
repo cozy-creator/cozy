@@ -329,7 +329,7 @@ func TestAWarmRunReadsNothingAtAnyHub(t *testing.T) {
 
 	// Unpublished code is no different. Its org-relative default names the caller's account,
 	// read once and kept; the CLI binds the default's rungs and the machine reads no model.
-	if code, out := runCozy(t, root, "package", "install", probeProject(t, "probe@1.0.0/bf16"), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", probeProject(t, "probe@1.0.0/bf16")); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	for venue, args := range map[string][]string{"local": nil, "tessa": {"--rental=tessa"}} {

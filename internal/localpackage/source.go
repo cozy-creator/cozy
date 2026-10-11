@@ -1,29 +1,28 @@
-// Package localpackage is unpublished code as its machine takes it: the files of an install's
-// own source root, each named by its content. Nothing is staged or copied for it here. The
-// machine keeps one tree of them per package and is sent only what changed.
+// Package localpackage is unpublished code as its machine takes it: the files of a project where
+// its author keeps it (and of the local path dependencies it names), each named by its
+// content. Nothing is staged or copied here. This computer's machine reads the directory in
+// place; another keeps one tree per package and is sent only what changed.
 package localpackage
 
 import (
-	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/pelletier/go-toml/v2"
 )
 
-// File is one file of the source root, or one wheel its lock selects from a Tensorhub index,
-// which the install keeps beside its source.
+// File is one source file, or one wheel its lock selects from a Tensorhub index that this
+// home keeps.
 type File struct {
-	Name       string // its slash path under the root; a wheel's file name
+	Name       string // its slash path under Root; a wheel's file name
 	Digest     string // sha256:<hex>
 	Length     int64
 	Executable bool
@@ -34,94 +33,144 @@ type File struct {
 type Installation struct {
 	ID, Package, Release string
 	PythonRequires       string
-	Files, Wheels        []File
+	// Root is the directory holding the project and its local path dependencies; Project is
+	// the project's slash path under it ("" when it is Root).
+	Root, Project string
+	Files, Wheels []File
 	// Callees name the package each Tensorhub dependency is.
 	Callees map[string]string
+	// Indexes are the uv indexes the project's sources name without declaring, by name.
+	Indexes map[string]string
+	// Locals are the local path dependencies its lock installs, as slash paths under Root.
+	Locals []string
 }
 
-// An install's source root never changes, so it is read once per process.
-var opened sync.Map
-
-// Open reads install's source root. An install without one (a dependency captured as a wheel)
-// is no root a machine runs.
-func Open(install records.PackageInstall) (Installation, *exit.Error) {
-	if held, ok := opened.Load(install.ID); ok {
-		return held.(Installation), nil
-	}
-	root := install.ProjectDir
-	raw, err := os.ReadFile(filepath.Join(root, "pyproject.toml"))
-	if install.SourceKind != "local" || root == "" || err != nil {
+// Open reads install's project as it is now. hubWheels is where this home keeps the Tensorhub
+// wheels its lock selects; namespace answers the caller's account index for a project that
+// names it before it has a lock.
+func Open(install records.PackageInstall, hubWheels string, namespace packagepublish.NamespaceSource) (Installation, *exit.Error) {
+	project := install.ProjectDir
+	if install.SourceKind != "local" || project == "" {
 		return Installation{}, exit.New(exit.NotFound, "install %s holds no package source to send", install.ID)
 	}
-	var project struct {
-		Project struct {
-			RequiresPython string `toml:"requires-python"`
-		} `toml:"project"`
+	pack, problem := packagepublish.PrepareLocalFrom(project)
+	if problem != nil {
+		return Installation{}, problem
 	}
-	if err := toml.Unmarshal(raw, &project); err != nil {
-		return Installation{}, exit.Named(exit.Validation, "project_metadata_invalid", "pyproject.toml is not valid TOML: %v", err)
-	}
+	defer pack.Close()
 	// Source is portable across compatible interpreters: the Python this computer built with
 	// is not a requirement of the machine, the author's bounds are.
-	out := Installation{ID: install.ID, Package: install.Package, Release: install.Version,
-		PythonRequires: project.Project.RequiresPython}
-	hubWheels := filepath.Join(root, filepath.FromSlash(packagepublish.HubWheelDir))
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.IsDir() && path == hubWheels {
-			return cmp.Or(walkErr, filepath.SkipDir) // its wheels are sent as Wheels
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		info, err := entry.Info()
+	out := Installation{ID: install.ID, Package: install.Package, Release: install.Version, PythonRequires: pack.PythonRequires}
+	members := map[string]string{} // absolute path -> itself, project and dependencies alike
+	for _, path := range pack.Files {
+		members[path] = path
+	}
+	dependencies, problem := packagepublish.LocalDependencyPaths(pack.Tree)
+	if problem != nil {
+		return Installation{}, problem
+	}
+	roots := []string{pack.Tree}
+	for _, dependency := range dependencies {
+		info, err := os.Stat(dependency)
 		if err != nil {
-			return err
+			return Installation{}, exit.New(exit.NotFound, "local dependency %s is unreadable: %s", dependency, err)
 		}
-		if !info.Mode().IsRegular() || len(out.Files) >= packagepublish.MaxSourceFiles {
-			return fs.ErrInvalid
+		if !info.IsDir() {
+			members[dependency], roots = dependency, append(roots, filepath.Dir(dependency))
+			continue
 		}
-		name, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
+		_, files, problem := packagepublish.LibrarySourceTree(dependency)
+		if problem != nil {
+			return Installation{}, problem
 		}
-		digest, err := digestOf(path)
-		out.Files = append(out.Files, File{Name: filepath.ToSlash(name), Digest: digest, Length: info.Size(),
-			Executable: info.Mode()&0o111 != 0, Path: path})
-		return err
-	})
-	if err != nil {
-		return Installation{}, exit.New(exit.Validation, "install %s's source is not a bounded tree of regular files: %s", install.ID, err)
+		for _, path := range files {
+			members[path] = path
+		}
+		roots = append(roots, dependency)
+	}
+	out.Root = common(roots)
+	if rel, _ := filepath.Rel(out.Root, pack.Tree); rel != "." {
+		out.Project = filepath.ToSlash(rel)
+	}
+	for _, dependency := range dependencies {
+		rel, _ := filepath.Rel(out.Root, dependency)
+		out.Locals = append(out.Locals, filepath.ToSlash(rel))
+	}
+	sort.Strings(out.Locals)
+	for path := range members {
+		file, problem := read(out.Root, path)
+		if problem != nil {
+			return Installation{}, problem
+		}
+		out.Files = append(out.Files, file)
 	}
 	sort.Slice(out.Files, func(i, j int) bool { return out.Files[i].Name < out.Files[j].Name })
-	lock, _ := os.ReadFile(filepath.Join(root, "uv.lock"))
+	lock, _ := os.ReadFile(filepath.Join(pack.Tree, "uv.lock"))
 	wheels, callees, problem := packagepublish.HubWheels(lock)
 	if problem != nil {
 		return Installation{}, problem
 	}
 	out.Callees = callees
 	for _, wheel := range wheels {
-		path := filepath.Join(root, filepath.FromSlash(packagepublish.HubWheelPath(wheel)))
+		path := packagepublish.KeptHubWheel(hubWheels, wheel)
 		info, err := os.Stat(path)
 		if err != nil {
 			return Installation{}, exit.Named(exit.NotFound, "local_package_wheel_absent",
-				"install %s does not hold %s, which its lock selects from a Tensorhub index", install.ID, wheel.Filename).
-				WithRemedy("install the package again: `cozy package install <its directory>`")
+				"this computer keeps no %s, which %s's lock selects from a Tensorhub index", wheel.Filename, install.Package).
+				WithRemedy("install the package again: `cozy package install %s`", project)
 		}
 		out.Wheels = append(out.Wheels, File{Name: wheel.Filename, Digest: "sha256:" + wheel.SHA256, Length: info.Size(), Path: path})
 	}
-	opened.Store(install.ID, out)
-	return out, nil
+	out.Indexes, problem = packagepublish.AccountIndexes(pack.Tree, namespace)
+	return out, problem
 }
 
-func digestOf(path string) (string, error) {
-	file, err := os.Open(path)
+// common is the deepest directory holding every one of dirs.
+func common(dirs []string) string {
+	root := filepath.Clean(dirs[0])
+	for _, dir := range dirs[1:] {
+		for dir = filepath.Clean(dir); root != dir && !strings.HasPrefix(dir, root+string(filepath.Separator)); {
+			parent := filepath.Dir(root)
+			if parent == root {
+				break
+			}
+			root = parent
+		}
+	}
+	return root
+}
+
+// A file's digest is read again only once its size or modification time moved.
+var digests sync.Map
+
+type stamp struct {
+	size, modified int64
+	digest         string
+}
+
+func read(root, path string) (File, *exit.Error) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return File{}, exit.New(exit.Validation, "%s is not a readable regular file", path)
+	}
+	name, _ := filepath.Rel(root, path)
+	file := File{Name: filepath.ToSlash(name), Length: info.Size(), Executable: info.Mode()&0o111 != 0, Path: path}
+	if held, ok := digests.Load(path); ok {
+		if held := held.(stamp); held.size == info.Size() && held.modified == info.ModTime().UnixNano() {
+			file.Digest = held.digest
+			return file, nil
+		}
+	}
+	opened, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return File{}, exit.New(exit.Validation, "%s is unreadable: %s", path, err)
 	}
-	defer file.Close()
+	defer opened.Close()
 	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
+	if _, err := io.Copy(hash, opened); err != nil {
+		return File{}, exit.New(exit.Validation, "%s is unreadable: %s", path, err)
 	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+	file.Digest = "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	digests.Store(path, stamp{info.Size(), info.ModTime().UnixNano(), file.Digest})
+	return file, nil
 }

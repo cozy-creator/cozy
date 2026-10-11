@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"io"
 	"slices"
 	"sort"
 	"strings"
@@ -53,7 +54,9 @@ func (r *Resolver) LocalInstallation(installID string) (localpackage.Installatio
 	if install == nil {
 		return localpackage.Installation{}, exit.New(exit.NotFound, "install %s does not exist", installID)
 	}
-	return localpackage.Open(*install)
+	return localpackage.Open(*install, home.Paths(r.cfg.Home).HubWheels(), func() (packagepublish.Namespace, *exit.Error) {
+		return r.namespaceAt(install.Hub)
+	})
 }
 
 // EditableSnapshot is one reading of an editable install's live source tree against the
@@ -107,7 +110,7 @@ func (r *Resolver) SnapshotEditable(pkg string) (*EditableSnapshot, *exit.Error)
 		return nil, problem
 	}
 	snapshot := &EditableSnapshot{Package: pkg, Current: current}
-	if current.SourceKind != "local" || current.Captured() {
+	if current.SourceKind != "local" {
 		return snapshot, nil
 	}
 	snapshot.Editable = true
@@ -156,7 +159,8 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 	if problem != nil {
 		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
-	writer, problem := install.Lock(layout)
+	// Reading a tree takes a moment: another refresh, or an install, is waited for.
+	writer, problem := home.WaitWriter(layout, false, io.Discard)
 	if problem != nil {
 		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
@@ -179,8 +183,7 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 	result, problem := install.Run(layout, r.store, install.Request{
 		Ref: install.Ref{Package: current.Package}, Force: true,
 		Local: &install.LocalSource{Bytes: snapshot.Bytes, Files: snapshot.Files,
-			Package: current.Package, Release: pack.Release, Tree: current.SourceRef,
-			Namespace: r.namespace},
+			Package: current.Package, Release: pack.Release, Tree: current.SourceRef},
 	})
 	if problem != nil {
 		return current.ID, false, refreshFailure(pkg, current, problem)

@@ -25,9 +25,10 @@ type scriptMetadata struct {
 	Tool           map[string]any `toml:"tool"`
 }
 
-// PrepareScript adapts a bounded single file into an ordinary unpublished Python
-// project. Only uv resolves dependencies; Runtime later discovers the explicit App.
-func PrepareScript(ctx context.Context, path string, namespace NamespaceSource) (*Package, *exit.Error) {
+// PrepareScript adapts a bounded single file into an ordinary unpublished Python project, kept
+// under scripts by its content: a script run again unchanged is the same project, untouched.
+// Only uv resolves dependencies; Runtime later discovers the explicit App.
+func PrepareScript(ctx context.Context, path, scripts string, namespace NamespaceSource) (*Package, *exit.Error) {
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, exit.Named(exit.Validation, "script_source_invalid", "script must be a regular file")
@@ -113,8 +114,17 @@ func PrepareScript(ctx context.Context, path string, namespace NamespaceSource) 
 	if err != nil {
 		return nil, exit.Internalf("cannot encode script project metadata: %s", err)
 	}
-	root, err := os.MkdirTemp("", "cozy-script-")
-	if err != nil {
+	root := filepath.Join(scripts, name)
+	if held, err := os.ReadFile(filepath.Join(root, "pyproject.toml")); err == nil && bytes.Equal(held, project) {
+		if _, err := os.Stat(filepath.Join(root, "uv.lock")); err == nil {
+			if pack, problem := PrepareLocalFrom(root); problem == nil {
+				pack.ScriptModels = models
+				return pack, nil
+			}
+		}
+	}
+	_ = os.RemoveAll(root)
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, exit.Internalf("cannot prepare script project: %s", err)
 	}
 	keep := false
@@ -150,7 +160,6 @@ func PrepareScript(ctx context.Context, path string, namespace NamespaceSource) 
 	if problem != nil {
 		return nil, problem
 	}
-	pack.temporarySource = root
 	pack.ScriptModels = models
 	keep = true
 	return pack, nil

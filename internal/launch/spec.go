@@ -47,9 +47,12 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 	if inst.SourceKind == "tensorhub" || inst.SourceKind == "wheel" || capturedSource {
 		packageInterface = PackageInterfacePath(inst.Dir)
 	}
-	environmentPython, e := EnvironmentPython(inst)
-	if e != nil {
-		return nil, e
+	// A local package has no environment here: its source is read alone.
+	environmentPython := ""
+	if inst.SourceKind != "local" {
+		if environmentPython, e = EnvironmentPython(inst); e != nil {
+			return nil, e
+		}
 	}
 	return &Facts{
 		Install:          inst,

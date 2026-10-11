@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -50,12 +49,10 @@ type Package struct {
 	Name                   string
 	Release                string
 	ScriptModels           map[string]string // plain-main default model refs; ordinary CLI overrides win
-	temporarySource        string            // generated single-file project, copied into a retained install
 }
 
 func (p *Package) Close() {
 	_ = os.RemoveAll(p.Root)
-	_ = os.RemoveAll(p.temporarySource)
 }
 
 // Prepare reads publication identity and source paths without executing the
@@ -68,16 +65,17 @@ func Prepare() (*Package, *exit.Error) {
 // PrepareFrom exists so the product suite can drive publication staging from
 // an isolated project directory without changing the process working directory.
 func PrepareFrom(projectDir string) (*Package, *exit.Error) {
-	return prepareFrom(projectDir)
+	return prepareFrom(projectDir, "uv.lock")
 }
 
-// PrepareLocalFrom applies the same bounded source rules to a local install.
+// PrepareLocalFrom applies the same bounded source rules to a local install, which needs no
+// lock: its machine resolves a project without one.
 func PrepareLocalFrom(projectDir string) (*Package, *exit.Error) {
 	return prepareFrom(projectDir)
 }
 
-func prepareFrom(projectDir string) (*Package, *exit.Error) {
-	tree, files, problem := sourceTree(projectDir)
+func prepareFrom(projectDir string, required ...string) (*Package, *exit.Error) {
+	tree, files, problem := boundedSourceTree(projectDir, append([]string{"package.toml", "pyproject.toml"}, required...))
 	if problem != nil {
 		return nil, problem
 	}
@@ -376,16 +374,6 @@ func applicationObject(path string) (string, *exit.Error) {
 	return object, nil
 }
 
-// Paths returns the sorted source-relative paths of one prepared tree.
-func Paths(files map[string]string) []string {
-	out := make([]string, 0, len(files))
-	for path := range files {
-		out = append(out, path)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // SourceInventory counts bounded project and dependency files without hashing their contents.
 func (p *Package) SourceStats(extras ...string) (map[string]SourceStamp, int64, *exit.Error) {
 	var sourceBytes int64
@@ -540,10 +528,6 @@ func IgnoredSourcePath(rel string) bool {
 		}
 	}
 	return ignoredSourceFile(strings.ToLower(parts[len(parts)-1]))
-}
-
-func sourceTree(tree string) (string, map[string]string, *exit.Error) {
-	return boundedSourceTree(tree, []string{"package.toml", "pyproject.toml", "uv.lock"})
 }
 
 // LibrarySourceTree applies package source bounds to a normal Python library.

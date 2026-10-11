@@ -46,9 +46,6 @@ func handleInstall(ctx *Context) *exit.Error {
 	if explicitPackageDirectory(ctx.Inv.Args[0]) {
 		return handleDirectoryInstall(ctx)
 	}
-	if ctx.Inv.Bool("--editable") {
-		return exit.Usagef("--editable requires an explicit package directory")
-	}
 	if ctx.Inv.Value("--rental") != "" {
 		return handleRentalPackageInstall(ctx)
 	}
@@ -62,16 +59,16 @@ func explicitPackageDirectory(value string) bool {
 		strings.HasPrefix(value, `.\`) || strings.HasPrefix(value, `..\`)
 }
 
-// handleDirectoryInstall installs local/<name> from a directory on this computer: as it is now,
-// or --editable, following its files. Unchanged since its install, it is already installed.
-// With --rental the same code is installed there too, only the objects it lacks written.
+// handleDirectoryInstall installs local/<name> as the directory on this computer it is, as an
+// editable Python install is: the install follows its files, and only its interface is read
+// here. Unchanged since its install, it is already installed. With --rental the code is
+// installed there too, only the files that machine lacks written.
 func handleDirectoryInstall(ctx *Context) *exit.Error {
 	path := strings.TrimSpace(ctx.Inv.Args[0])
 	if ctx.Inv.Value("--version") != "" {
 		return exit.Usagef("an explicit package directory does not take --version").
 			WithRemedy("use `cozy package install %s` by itself", path)
 	}
-	editable := ctx.Inv.Bool("--editable")
 	pack, problem := packagepublish.PrepareLocalFrom(path)
 	if problem != nil {
 		return problem
@@ -97,13 +94,12 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	defer writer.Unlock()
 	result := &install.Result{Idempotent: true}
 	if prior, _ := activeInstall(st, "", ref.Package); prior != nil && prior.SourceKind == "local" && prior.Version == pack.Release &&
-		editable == !prior.Captured() && (!editable || prior.SourceRef == pack.Tree) && packagepublish.SourceStatsUnchanged(prior.Dir, stats) {
+		prior.SourceRef == pack.Tree && packagepublish.SourceStatsUnchanged(prior.Dir, stats) {
 		result.Install = *prior
-	} else if problem = packagePublishStage(ctx, "Creating local package environment", func() *exit.Error {
+	} else if problem = packagePublishStage(ctx, "Reading local package", func() *exit.Error {
 		var installProblem *exit.Error
 		result, installProblem = install.Run(l, st, install.Request{Ref: ref, Force: true,
-			Local: &install.LocalSource{Bytes: bytes, Files: files, Frozen: !editable,
-				Package: ref.Package, Release: pack.Release, Tree: pack.Tree, Namespace: commandNamespace(ctx)}})
+			Local: &install.LocalSource{Bytes: bytes, Files: files, Package: ref.Package, Release: pack.Release, Tree: pack.Tree}})
 		return installProblem
 	}); problem != nil {
 		return problem

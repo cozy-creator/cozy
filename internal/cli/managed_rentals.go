@@ -13,10 +13,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
@@ -1629,15 +1629,9 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 		if problem != nil || installed == nil {
 			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
-		selection, problem := install.InstalledRequirements(context.Background(), *installed)
-		if problem != nil {
+		// Local source is installed by its machine within the author's Requires-Python.
+		if out.RequiresPython, problem = packagepublish.ProjectRequiresPython(installed.ProjectDir); problem != nil {
 			return out, problem
-		}
-		out.Requirements, out.RequiresPython = selection.Requirements, selection.RequiresPython
-		// A wheel closure can depend on its selected ABI/markers. Transferred
-		// source instead lets the worker satisfy its authored Requires-Python.
-		if installed.SourceKind != "local" {
-			out.PythonVersion = installed.Python
 		}
 		declared, _ = launch.ReadPackageInterface(launch.PackageInterfacePath(installed.Dir))
 	} else {

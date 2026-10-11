@@ -66,7 +66,7 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 	if out, err := exec.Command("uv", "lock", "--directory", caller, "--python", "3.12").CombinedOutput(); err != nil {
 		t.Fatalf("fixture's authored lock could not select its SDK pair: %v: %s", err, out)
 	}
-	if code, out := runCozy(t, root, "package", "install", caller, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", caller); code != 0 {
 		t.Fatalf("ordinary caller installation failed [%d]: %s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "local/callee-caller-proof/main", "--await", "--json"); code != 0 || !strings.Contains(out, `"value":214`) {
@@ -167,7 +167,7 @@ func TestACapturedPackageInstallsOnAMachineWhoseRuntimeDiffers(t *testing.T) {
 	if locked == nil || string(locked[1]) == machine {
 		t.Fatalf("the lock must choose a Runtime other than the machine's %s: %q", machine, locked)
 	}
-	if code, out := runCozy(t, root, "package", "install", caller, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", caller); code != 0 {
 		t.Fatalf("package install [%d]: %s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "local/skew-caller/survey", "values:=[3,4]", "--await", "--json"); code != 0 || !strings.Contains(out, `"squares":[9,16]`) {

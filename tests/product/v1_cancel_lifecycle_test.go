@@ -43,7 +43,7 @@ func nativeLifecycleHome(t *testing.T) (string, *records.Store, *machines.V1) {
 		}
 	})
 	project := nativeLifecycleProject(t)
-	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
 		t.Fatalf("installing authored lifecycle fixture [%d]: %s", code, out)
 	}
 	warm := filepath.Join(root, "warm-gate")

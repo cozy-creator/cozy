@@ -160,7 +160,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 		_, _ = runCozy(t, root, "down", "--all")
 		_ = os.RemoveAll(root)
 	})
-	if code, out := runCozy(t, root, "package", "install", weightlessProject(t), "--editable"); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", weightlessProject(t)); code != 0 {
 		t.Fatalf("weightless install failed [exit %d]\n%s", code, out)
 	}
 

@@ -123,11 +123,3 @@ func TestPackageInstallRental(t *testing.T) {
 		})
 	}
 }
-
-func TestPackageInstallRentalRejectsEditablePublishedPackage(t *testing.T) {
-	var out bytes.Buffer
-	err := (&cli.PackageInstallCmd{Ref: "paul/minimax-h3", Editable: true, Rental: "kirukiru"}).Run(&cli.Runtime{Out: &out, Err: &out})
-	if err == nil || !strings.Contains(err.Error(), "--editable requires an explicit package directory") {
-		t.Fatalf("an editable published package was not refused before contacting a service: %v", err)
-	}
-}

@@ -172,6 +172,7 @@ func TestAnOlderMachineTakesTheTargetBeforeNewWork(t *testing.T) {
 		must(t, os.MkdirAll(project, 0o700))
 		must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte("[project]\nname=\"live-probe\"\nversion=\"0.1.0\"\nrequires-python=\">=3.12\"\n"), 0o600))
 		must(t, os.WriteFile(filepath.Join(project, "live_probe.py"), []byte("VALUE = 1\n"), 0o600))
+		must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject=\"live_probe:app\"\n"), 0o600))
 		const id = "run-local-on-an-older-machine"
 		fatal(t, store.RecordInstall(records.PackageInstall{ID: "install-live-probe", Package: "local/live-probe", Version: "0.1.0",
 			SourceKind: "local", SourceRef: project, ProjectDir: project, Dir: t.TempDir()}))

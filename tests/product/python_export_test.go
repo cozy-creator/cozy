@@ -78,7 +78,7 @@ exec %q "$@"
 }
 
 func TestPythonExportCaptureAndMetadataUseRuntimeExecutable(t *testing.T) {
-	python, version, log := pythonExportToolchain(t)
+	_, version, log := pythonExportToolchain(t)
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte(`[project]
 name = "python-export-proof"
@@ -96,18 +96,14 @@ only-include = ["operation.py"]
 	must(t, os.WriteFile(filepath.Join(root, "package.toml"), []byte("[application]\nobject = 'operation:app'\n"), 0600))
 	must(t, os.WriteFile(filepath.Join(root, ".python-version"), []byte(version+"\n"), 0600))
 	must(t, os.WriteFile(filepath.Join(root, "operation.py"), []byte("from cozy_runtime.author import App\napp = App()\n"), 0600))
-	pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), root, nil)
+	_, problem := packagepublish.Lock(context.Background(), root, nil, nil)
+	fatal(t, problem)
+	pack, problem := packagepublish.PrepareLocalFrom(root)
 	fatal(t, problem)
 	defer pack.Close()
 	fatal(t, pack.Build(context.Background()))
 	if pack.PythonVersion != version || len(pack.Registry) != 1 || pack.Registry[0].Name != "packaging" {
 		t.Fatalf("wrong captured closure: python=%s registry=%+v", pack.PythonVersion, pack.Registry)
-	}
-	graph, problem := packagepublish.WheelClosures(context.Background(), pack.Tree, python,
-		"python-export-proof==1.0.0\npackaging=="+pack.Registry[0].Version, "python-export-proof", "")
-	fatal(t, problem)
-	if graph["packaging"]["packaging"] != pack.Registry[0].Version {
-		t.Fatalf("wrong native closure graph: %+v", graph)
 	}
 	wheelBytes, err := os.ReadFile(pack.Wheel)
 	must(t, err)
@@ -141,7 +137,7 @@ only-include = ["operation.py"]
 	if strings.Count(string(raw), "export\n") != 2 {
 		t.Fatalf("both registry and published export must run: %s", raw)
 	}
-	for _, operation := range []string{"lock\n", "build\n", "export\n", "tree\n"} {
+	for _, operation := range []string{"lock\n", "build\n", "export\n"} {
 		if !strings.Contains(string(raw), operation) {
 			t.Fatalf("did not exercise %s: %s", operation, raw)
 		}
@@ -152,7 +148,7 @@ func TestPythonScriptLockUsesRuntimeExecutable(t *testing.T) {
 	_, version, log := pythonExportToolchain(t)
 	path := filepath.Join(t.TempDir(), "operation.py")
 	must(t, os.WriteFile(path, []byte("# /// script\n# requires-python = '>=3.12'\n# dependencies = []\n# ///\nprint('not executed during capture')\n"), 0600))
-	pack, problem := packagepublish.PrepareScript(context.Background(), path, nil)
+	pack, problem := packagepublish.PrepareScript(context.Background(), path, t.TempDir(), nil)
 	fatal(t, problem)
 	defer pack.Close()
 	raw, err := os.ReadFile(filepath.Join(pack.Tree, ".python-version"))
