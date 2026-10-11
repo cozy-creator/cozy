@@ -286,6 +286,9 @@ func Refusal(status int, data []byte) *exit.Error {
 // answer, never inferred from equal ids.
 func (c *Client) Submit(sub api.Submission, key string) (api.Handle, *exit.Error) {
 	var h api.Handle
+	if problem := c.requireGPUCount(sub.GPUs); problem != nil {
+		return h, problem
+	}
 	if sub.MachineEndpoint != nil {
 		var caps api.Capabilities
 		if problem := c.call(http.MethodGet, "/v1/capabilities", nil, &caps); problem != nil {
@@ -468,6 +471,9 @@ func (c *Client) Down(all bool) (api.DownResult, *exit.Error) {
 // no capacity is a queued STATE, and the handle says which.
 func (c *Client) SubmitJob(sub api.JobSubmission, key string) (api.JobHandle, *exit.Error) {
 	var h api.JobHandle
+	if problem := c.requireGPUCount(sub.GPUs); problem != nil {
+		return h, problem
+	}
 	if problem := c.requireModelOverrides(sub.Package, sub.Function, sub.Models); problem != nil {
 		return h, problem
 	}

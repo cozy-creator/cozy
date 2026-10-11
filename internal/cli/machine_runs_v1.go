@@ -497,8 +497,19 @@ func (m *machineRuns) place(ctx context.Context, request records.Request, link *
 // to the machine first (each resumes from what the machine holds); the Hub token and provider
 // tokens ride in the spec, which the machine holds in memory for the run's preparation only.
 func (m *machineRuns) specV1(ctx context.Context, request records.Request, machine *machines.V1) (*v1.RunSpec, *exit.Error) {
+	if request.GPUs > 0 {
+		frame, err := machine.Status(ctx)
+		if err != nil {
+			return nil, machines.Transport(err)
+		}
+		if !slices.Contains(frame.GetCapabilities(), "run-gpus/1") {
+			return nil, exit.Named(exit.Structural, "machine.gpu_count_unsupported",
+				"%s cannot honor an explicit GPU count; nothing was submitted", machine.Name).
+				WithRemedy("%s", machines.RuntimeUpdate(machine.Name))
+		}
+	}
 	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_CALL, Entrypoint: request.Entrypoint, Payload: request.Payload,
-		AttentionKernel: request.AttentionKernel}
+		AttentionKernel: request.AttentionKernel, Gpus: request.GPUs}
 	if request.LocalInstallationID != "" || strings.HasPrefix(request.Package, "local/") {
 		// Only unpublished code names its owner: its org-relative defaults are the owner's.
 		spec.Owner = m.runAccount(request)

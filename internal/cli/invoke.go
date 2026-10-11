@@ -244,6 +244,10 @@ func rentalRequested(ctx *Context) bool {
 }
 
 func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
+	gpus, gpuProblem := runGPUCount(ctx)
+	if gpuProblem != nil {
+		return gpuProblem
+	}
 	deadline, e := runDeadline(ctx)
 	if e != nil {
 		return e
@@ -343,8 +347,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		RequestedRental: selectedRental,
 		Models:          models,
 		OutputDirectory: outputDirectory,
-		AttentionKernel: attentionKernel,
-		Ignored:         ignored,
+		AttentionKernel: attentionKernel, GPUs: gpus,
+		Ignored: ignored,
 	}, key)
 	releaseSnapshotReader(target)
 	if e != nil {

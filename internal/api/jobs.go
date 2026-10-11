@@ -74,6 +74,8 @@ type JobSubmission struct {
 	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
 	// AttentionKernel is an optional developer execution-path pin; the job's calls inherit it.
 	AttentionKernel string `json:"attention_kernel,omitempty"`
+	// GPUs is an exact request count; zero lets the machine choose supported parallelism.
+	GPUs uint32 `json:"gpus,omitempty"`
 	// Ignored names the undeclared fields the client dropped from Input.
 	Ignored []string `json:"ignored_fields,omitempty"`
 }
@@ -479,7 +481,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 		ModelTransfer: sub.ModelTransfer, PlannedSourceBytes: sub.PlannedSourceBytes,
-		AttentionKernel: sub.AttentionKernel,
+		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs,
 	}
 	if problem := launch.ValidateAttentionOverride(out.AttentionKernel); problem != nil {
 		return out, nil, problem
@@ -756,6 +758,9 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.TimeoutMS > 0 {
 		doc["timeout_ms"] = spec.TimeoutMS
+	}
+	if spec.GPUs > 0 {
+		doc["gpus"] = uint64(spec.GPUs)
 	}
 	if spec.AttentionKernel != "" {
 		doc["attention_kernel"] = spec.AttentionKernel

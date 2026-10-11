@@ -60,6 +60,8 @@ type Submission struct {
 	OutputDirectory string `json:"output_directory,omitempty"`
 	// AttentionKernel is an optional developer execution-path pin.
 	AttentionKernel string `json:"attention_kernel,omitempty"`
+	// GPUs is an exact request count; zero lets the machine choose supported parallelism.
+	GPUs uint32 `json:"gpus,omitempty"`
 	// Ignored names the undeclared fields the client dropped from Input; the run records
 	// them as its warning.
 	Ignored    []string `json:"ignored_fields,omitempty"`
@@ -325,7 +327,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Models: models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
 		// Replays compare the caller's requested execution path with the original.
-		AttentionKernel: sub.AttentionKernel,
+		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs,
 	}
 }
 
@@ -373,6 +375,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.RentalRequired {
 		doc["rental_required"] = true
+	}
+	if spec.GPUs > 0 {
+		doc["gpus"] = uint64(spec.GPUs)
 	}
 	if spec.AttentionKernel != "" {
 		doc["attention_kernel"] = spec.AttentionKernel
@@ -447,7 +452,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		Rental:  sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
-		AttentionKernel: sub.AttentionKernel,
+		AttentionKernel: sub.AttentionKernel, GPUs: sub.GPUs,
 		OutputDirectory: sub.OutputDirectory,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {

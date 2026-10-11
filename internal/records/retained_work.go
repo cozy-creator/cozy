@@ -94,6 +94,10 @@ func retainRetryFrom(tx retryReader, request *Request, prior Request) *exit.Erro
 	}
 	request.RequestedRental = prior.RequestedRental
 	request.Worker, request.Rental, request.RentalRequired = prior.Worker, prior.Rental, prior.RentalRequired
+	if request.GPUs != 0 && request.GPUs != prior.GPUs {
+		return exit.Named(exit.Conflict, "request.retry_gpu_count_changed", "retry cannot change the predecessor GPU count")
+	}
+	request.GPUs = prior.GPUs
 	request.AttentionKernel = prior.AttentionKernel
 	request.ReuseScope = prior.ReuseScope
 	if request.ReuseScope == "" {

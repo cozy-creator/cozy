@@ -140,10 +140,11 @@ func exactMemoryRequest(req Request) string {
 	}
 	return measurementDigest(struct {
 		Package, Release, Entrypoint, Kind, Plan, Kernel, Trees string
+		GPUs                                                    uint32 `json:",omitempty"`
 		Payload                                                 json.RawMessage
 		Assets                                                  []AssetBinding
 	}{req.Package, req.Release, req.Entrypoint, req.Kind, req.PlanID,
-		req.AttentionKernel, req.Trees, payload, assets})
+		req.AttentionKernel, req.Trees, req.GPUs, payload, assets})
 }
 
 // ModelsDigest names a pinned model selection: every slot's model, release and

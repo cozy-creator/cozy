@@ -52,6 +52,9 @@ func OperationKey(request Request) (string, *exit.Error) {
 		// result — which is the same lie a silent fallback would be, one layer up.
 		identity["attention_kernel"] = request.AttentionKernel
 	}
+	if request.GPUs > 0 {
+		identity["gpus"] = request.GPUs
+	}
 	raw, err := json.Marshal(identity)
 	if err != nil {
 		return "", exit.Internalf("cannot encode operation identity: %s", err)

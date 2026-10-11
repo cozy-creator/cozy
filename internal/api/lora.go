@@ -15,6 +15,7 @@ import (
 // Capabilities describes selection semantics this client endpoint can retain.
 // Execution support is checked separately against the selected machine.
 type Capabilities struct {
+	RunGPUs          bool `json:"run_gpus"`
 	MachineEndpoints bool `json:"machine_endpoints"`
 	ModelOverrides   bool `json:"model_overrides"`
 	// MachineV1 is a controller that runs work on cozy.machine.v1 machines (calls and jobs).
@@ -30,7 +31,7 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
 	_, endpoint := s.machineExecutions.(interface {
 		ValidateEndpoint(context.Context, *machineendpoint.Endpoint) *exit.Error
 	})
-	s.ok(w, r, http.StatusOK, Capabilities{ModelOverrides: true, MachineEndpoints: endpoint, MachineV1: s.machineExecutions != nil, WarmSet: true, PackageVerbs: true})
+	s.ok(w, r, http.StatusOK, Capabilities{RunGPUs: true, ModelOverrides: true, MachineEndpoints: endpoint, MachineV1: s.machineExecutions != nil, WarmSet: true, PackageVerbs: true})
 }
 
 // validateModelAdapters validates selection syntax; the executing Runtime owns

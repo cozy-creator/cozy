@@ -1,6 +1,9 @@
 package cli
 
-import "strconv"
+import (
+	"github.com/cozy-creator/cozy/internal/exit"
+	"strconv"
+)
 
 // CLI is the complete public command grammar. Kong derives parsing and help from
 // this tree; there is no parallel command manifest or string handler registry.
@@ -511,6 +514,7 @@ type RunCmd struct {
 }
 
 type RunExecuteCmd struct {
+	GPUs                *uint32  `name:"gpus" help:"Use exactly this many GPUs for each GPU operation; omit to use the largest package-supported configuration on the machine."`
 	MachineEndpointFile string   `name:"machine-endpoint-file" predictor:"file" help:"Run on this explicitly pinned owned machine using the controller's existing signing identity; never register or rent a machine."`
 	Target              string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], explicit ./project[/function], or a Python script."`
 	Input               []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
@@ -536,6 +540,13 @@ type RunExecuteCmd struct {
 }
 
 func (c *RunExecuteCmd) Run(r *Runtime) error {
+	gpus, problem := gpuCountArgument(c.GPUs)
+	if problem != nil {
+		return problem
+	}
+	if c.GPUs != nil && c.Warm != "" {
+		return exit.Usagef("--gpus applies to a run; it cannot be combined with --warm")
+	}
 	rentalName, problem := rentalArgument(c.Rental)
 	if problem != nil {
 		return problem
@@ -546,7 +557,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--rental-only", c.RentalOnly, "--rent-new", c.RentNew, "--describe", c.Describe), values(
 		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
 		"--machine-endpoint-file", c.MachineEndpointFile,
-		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,
+		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs, "--gpus", gpus,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--upload-to", c.UploadTo, "--source-profile", c.SourceProfiles,

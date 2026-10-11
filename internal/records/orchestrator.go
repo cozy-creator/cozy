@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS requests (
   assets       TEXT    NOT NULL DEFAULT '[]',
   capture      TEXT    NOT NULL DEFAULT '',
   attention_kernel TEXT NOT NULL DEFAULT '',
+  gpus INTEGER NOT NULL DEFAULT 0,
   models       TEXT    NOT NULL DEFAULT '[]',
   weights_outputs TEXT NOT NULL DEFAULT '[]',
   retain_work INTEGER NOT NULL DEFAULT 0 CHECK(retain_work IN (0,1)),
@@ -460,6 +461,8 @@ type Request struct {
 	Capture         string
 	// AttentionKernel is the optional execution-path pin carried into InvocationSpec.
 	AttentionKernel string
+	// GPUs is zero for automatic package-supported parallelism or an exact user count.
+	GPUs uint32
 	// Number is this host's short user-facing request reference. The globally unique ID
 	// remains the durable internal/Hub identity; Number is derived from the retained local
 	// request chronology and is never sent across the worker protocol.
@@ -978,7 +981,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	installation_id,payload,outputs,
 	state,ordinal,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,capture,attention_kernel,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
-	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub`
+	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -987,7 +990,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.State, &r.Ordinal, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, &r.Capture, &r.AttentionKernel, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
-		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub}
+		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub, &r.GPUs}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -1685,9 +1688,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		plan_id,package_release,local_installation_id,
 		local_package_uploaded_boot_id,installation_id,
 		payload,outputs,state,ordinal,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
-		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub)
+		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,?,?,?,?,?,?,
-		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalInstallationID,
 		r.LocalPackageUploadedBootID, r.InstallationID, r.Payload,
@@ -1696,7 +1699,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, r.AttentionKernel, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision,
-		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew, r.Hub); err != nil {
+		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew, r.Hub, r.GPUs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if r.MachineExecutionObserver {

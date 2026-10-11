@@ -451,7 +451,10 @@ type RunSpec struct {
 	// RUN_KIND_WARM (`warm/2`): the caller's whole warm set, replacing its previous one; no items
 	// clears it. The run installs and downloads every member, and its result lists each one's
 	// `level` and `held_back`. Absent: the set is left as it is.
-	Set           *WarmSet `protobuf:"bytes,18,opt,name=set,proto3" json:"set,omitempty"`
+	Set *WarmSet `protobuf:"bytes,18,opt,name=set,proto3" json:"set,omitempty"`
+	// 0: widest group every model slot supports on this machine. Positive: exactly this
+	// many GPUs, or gpu_count_unavailable. Model/weight choices never change this request.
+	Gpus          uint32 `protobuf:"varint,20,opt,name=gpus,proto3" json:"gpus,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -604,6 +607,13 @@ func (x *RunSpec) GetSet() *WarmSet {
 	return nil
 }
 
+func (x *RunSpec) GetGpus() uint32 {
+	if x != nil {
+		return x.Gpus
+	}
+	return 0
+}
+
 type isRunSpec_Source interface {
 	isRunSpec_Source()
 }
@@ -734,9 +744,17 @@ func (x *Release) GetRelease() string {
 }
 
 // The manifest is a JSON object written with Write: {package: "local/<dist>", release,
-// python_requires, python_version, source: {digest, length} (a tar of the project),
-// wheels: [{name, digest, length}], requirements: {digest, length}}. Its members are objects
-// the same signer wrote.
+// python_requires, python_version, callees: {distribution: package} and its code. A live
+// project is installed editable from `files: [{name, digest, length, executable}]`: the
+// project and the path dependencies its lock names, each file under their common directory,
+// with `project` the project's directory there. The machine keeps one such tree and one
+// environment per signer and package: a Write is needed only for a file the tree does not
+// hold, and the environment is rebuilt only when the lock, the project's metadata or a path
+// dependency changes. `path` names that common directory on this computer's machine, which
+// reads it in place. `wheels: [{name, digest, length}]` are locked dependencies the caller
+// carries because the machine cannot fetch them. Members are objects the same signer wrote.
+// (Before live projects: `source: {digest, length}`, a tar of the project, or `wheels` with
+// `requirements: {digest, length}`.)
 type LocalSource struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Manifest      string                 `protobuf:"bytes,1,opt,name=manifest,proto3" json:"manifest,omitempty"` // sha256:<hex> of the manifest object
@@ -3230,7 +3248,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\theld_back\x18\a \x01(\tR\bheldBackB\b\n" +
 	"\x06source\":\n" +
 	"\aWarmSet\x12/\n" +
-	"\x05items\x18\x01 \x03(\v2\x19.cozy.machine.v1.WarmItemR\x05items\"\xbf\x05\n" +
+	"\x05items\x18\x01 \x03(\v2\x19.cozy.machine.v1.WarmItemR\x05items\"\xd3\x05\n" +
 	"\aRunSpec\x12,\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x18.cozy.machine.v1.RunKindR\x04kind\x124\n" +
 	"\arelease\x18\x02 \x01(\v2\x18.cozy.machine.v1.ReleaseH\x00R\arelease\x12$\n" +
@@ -3249,7 +3267,8 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x03hub\x18\x0e \x01(\v2\x1a.cozy.machine.v1.HubAccessR\x03hub\x12\x14\n" +
 	"\x05owner\x18\x0f \x01(\tR\x05owner\x12=\n" +
 	"\tproviders\x18\x10 \x01(\v2\x1f.cozy.machine.v1.ProviderAccessR\tproviders\x12*\n" +
-	"\x03set\x18\x12 \x01(\v2\x18.cozy.machine.v1.WarmSetR\x03setB\b\n" +
+	"\x03set\x18\x12 \x01(\v2\x18.cozy.machine.v1.WarmSetR\x03set\x12\x12\n" +
+	"\x04gpus\x18\x14 \x01(\rR\x04gpusB\b\n" +
 	"\x06sourceJ\x04\b\v\x10\fJ\x04\b\x11\x10\x12J\x04\b\x13\x10\x14\"L\n" +
 	"\x0eProviderAccess\x12 \n" +
 	"\vhuggingface\x18\x01 \x01(\tR\vhuggingface\x12\x18\n" +

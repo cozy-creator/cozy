@@ -102,6 +102,8 @@ type Submission struct {
 	// AttentionKernel is an optional developer execution-path pin. It affects only the
 	// InvocationSpec and is intentionally excluded from placement and model resolution.
 	AttentionKernel string
+	// GPUs is zero for automatic package-supported parallelism or an exact user count.
+	GPUs uint32
 	// OutputExport is the derived publication obligation: the directory (explicit or
 	// default) and the result-file contract. It changes no execution fact and is settled
 	// independently after the terminal mirror.
@@ -243,6 +245,16 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 		bodyDigest = spelled
 	}
+	if s.GPUs > 0 {
+		identity, err := canonical.Write(map[string]canonical.Value{"body_digest": bodyDigest, "gpus": uint64(s.GPUs)})
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf("cannot encode GPU count identity: %s", err)
+		}
+		bodyDigest, err = canonical.Spell(canonical.Digest(identity))
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf("cannot digest GPU count identity: %s", err)
+		}
+	}
 	if s.AttentionKernel != "" {
 		identity, err := canonical.Write(map[string]canonical.Value{
 			"body_digest":      bodyDigest,
@@ -295,8 +307,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Assets:              s.Assets, WeightsOutputs: string(weightsBytes),
 		Kind: s.Kind, RetainWork: s.RetainWork, ReleaseImplicitWork: s.ReleaseImplicitWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		RequestedRental: s.RequestedRental,
-		AttentionKernel: s.AttentionKernel,
-		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
+		AttentionKernel: s.AttentionKernel, GPUs: s.GPUs,
+		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, RentNew: s.RentNew, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer, PlannedSourceBytes: s.PlannedSourceBytes,
 		Warnings: s.Warnings,
@@ -313,6 +325,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	if s.TimeoutMS > 0 {
 		event["timeout_ms"] = s.TimeoutMS
 		event["deadline_unix_ms"] = s.DeadlineUnixMS
+	}
+	if s.GPUs > 0 {
+		event["gpus"] = s.GPUs
 	}
 	if s.AttentionKernel != "" {
 		event["attention_kernel"] = s.AttentionKernel
