@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,14 +14,25 @@ import (
 )
 
 // creditHub is Tensorhub's embedded billing (OpenRails at /billing, th-103) as
-// the CLI meets it: the balance, the credit history, the catalog's deposit
-// bounds, and a checkout session paid through Stripe's hosted page, which this
-// stand-in settles once the buyer has been sent there.
+// the CLI meets it: the balance, the credit history, the catalog's deposit, and
+// an order paid on Stripe's hosted page, which this stand-in settles once the
+// buyer has been sent there. beforeOrders makes it a hub before OpenRails
+// v0.237: its orders take no amount (or, with noOrders, it has no order route),
+// and credit is bought through a checkout session.
 type creditHub struct {
-	mu       sync.Mutex
-	balance  int64
+	mu           sync.Mutex
+	balance      int64
+	beforeOrders bool
+	noOrders     bool
+	// orders are the order requests' bodies; ordered and payments the idempotency keys of
+	// the orders and their payments.
+	orders   []map[string]any
+	ordered  []string
+	paidWith []map[string]any
+	payments []string
 	minted   []map[string]string
-	paidWith string
+	option   string
+	amount   int64
 	reads    int
 	paid     bool
 	// GET /v1/credit (th-242) states the balance against these; null for an unmetered account.
@@ -34,12 +46,35 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(body)
 	}
+	refuse := func(w http.ResponseWriter, status int, code, message string) {
+		reply(w, status, map[string]any{"error": map[string]string{"type": "invalid_request_error", "code": code, "message": message}})
+	}
 	signedIn := func(w http.ResponseWriter, r *http.Request) bool {
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer user-") {
 			reply(w, 401, map[string]any{"error": map[string]string{"code": "authentication_required", "message": "authentication required"}})
 			return false
 		}
 		return true
+	}
+	// settled is the purchase's state as its buyer reads it: awaiting them at Stripe, then
+	// paid a moment later, when the webhook lands the lot.
+	settled := func() bool {
+		h.reads++
+		if h.reads > 1 && !h.paid {
+			h.balance += h.amount
+			h.paid = true
+		}
+		return h.paid
+	}
+	order := func(status, payment string, next any) map[string]any {
+		options := []any{map[string]any{"psp_id": "psp_1", "rail": "stripe", "accepts": []string{"saved_card", "new_card", "redirect"}}}
+		if status == "complete" {
+			options = []any{}
+		}
+		return map[string]any{"id": "ord_1", "origin": "customer", "status": status, "currency": "USD",
+			"total": strconv.FormatInt(h.amount, 10), "payment_options": options,
+			"payment":    map[string]any{"status": payment, "next_action": next, "last_payment_error": nil},
+			"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)}
 	}
 	return func(mux *http.ServeMux) {
 		mux.HandleFunc("GET /billing/v1/me", func(w http.ResponseWriter, r *http.Request) {
@@ -79,16 +114,93 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			data := []any{}
 			if h.paid {
 				data = append(data, map[string]any{"id": "ctx_1", "type": "deposit", "amount": strconv.FormatInt(h.balance, 10),
-					"currency": "USD", "source": "checkout", "source_id": "ocs_1", "created_at": "2026-10-09T05:00:00Z"})
+					"currency": "USD", "source": "grant", "source_id": "ord_1", "created_at": "2026-10-09T05:00:00Z"})
 			}
 			reply(w, 200, map[string]any{"data": data, "next_cursor": nil})
 		})
 		mux.HandleFunc("GET /billing/v1/catalog/products", func(w http.ResponseWriter, r *http.Request) {
+			// The catalog is a lookup by product key; a hub before orders lists it whole.
+			if keys := r.URL.Query()["keys"]; !h.beforeOrders && (len(keys) != 1 || keys[0] != "api-credit" || len(r.URL.Query()) != 1) {
+				refuse(w, 400, "invalid_query", "keys names 1 to 100 products")
+				return
+			}
 			reply(w, 200, map[string]any{"next_cursor": nil, "data": []any{map[string]any{
-				"key": "api-credit", "prices": []any{map[string]any{"key": "deposit", "archived": false, "currency": "USD",
+				"key": "api-credit", "prices": []any{map[string]any{"id": "price_1", "key": "deposit", "archived": false, "currency": "USD",
 					"unit_amount": "0", "customer_amount": map[string]string{"min_amount": "10000000", "max_amount": "500000000"}}},
 			}}})
 		})
+		mux.HandleFunc("POST /billing/v1/me/orders", func(w http.ResponseWriter, r *http.Request) {
+			if h.noOrders {
+				h.mu.Lock()
+				h.orders = append(h.orders, nil)
+				h.mu.Unlock()
+				http.NotFound(w, r)
+				return
+			}
+			if !signedIn(w, r) {
+				return
+			}
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.orders, h.ordered = append(h.orders, body), append(h.ordered, r.Header.Get("Idempotency-Key"))
+			if h.beforeOrders {
+				reply(w, 400, map[string]any{"error": map[string]any{"type": "invalid_request_error", "code": "unknown_field",
+					"message": "unknown field amount", "param": "amount", "metadata": nil}})
+				return
+			}
+			if r.Header.Get("Idempotency-Key") == "" {
+				refuse(w, 400, "idempotency_key_required", "The operation needs an Idempotency-Key header.")
+				return
+			}
+			lines, _ := body["lines"].([]any)
+			line, _ := lines[0].(map[string]any)
+			amount, _ := line["amount"].(string)
+			if len(lines) != 1 || line["price_id"] != "price_1" || len(body) != 1 {
+				refuse(w, 422, "order_line_unavailable", "The price is not for sale.")
+				return
+			}
+			h.amount, _ = strconv.ParseInt(amount, 10, 64)
+			reply(w, 201, order("open", "requires_payment_method", nil))
+		})
+		mux.HandleFunc("POST /billing/v1/me/orders/ord_1/pay", func(w http.ResponseWriter, r *http.Request) {
+			if !signedIn(w, r) {
+				return
+			}
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.paidWith, h.payments = append(h.paidWith, body), append(h.payments, r.Header.Get("Idempotency-Key"))
+			payment, _ := body["payment"].(map[string]any)
+			switch {
+			case r.Header.Get("Idempotency-Key") == "":
+				refuse(w, 400, "idempotency_key_required", "The operation needs an Idempotency-Key header.")
+			case len(payment) != 1 || payment["return_url"] != base()+"/credits/return":
+				refuse(w, 400, "invalid_param", "return_url is not an allowed origin")
+			case body["expected_total"] != strconv.FormatInt(h.amount, 10):
+				refuse(w, 409, "order_total_changed", "The order's total changed.")
+			default:
+				reply(w, 200, order("open", "requires_action", map[string]any{"type": "redirect_to_url",
+					"url": "https://checkout.stripe.test/c/pay/cs_test_1", "transactions": []any{}, "psp_id": "psp_1", "payload": map[string]any{}}))
+			}
+		})
+		mux.HandleFunc("GET /billing/v1/me/orders/ord_1", func(w http.ResponseWriter, r *http.Request) {
+			if !signedIn(w, r) {
+				return
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if len(h.paidWith) > 0 && settled() {
+				reply(w, 200, order("complete", "succeeded", nil))
+				return
+			}
+			reply(w, 200, order("open", "requires_action", nil))
+		})
+		if !h.beforeOrders {
+			return
+		}
 		mux.HandleFunc("POST /billing/v1/me/checkout-sessions", func(w http.ResponseWriter, r *http.Request) {
 			if !signedIn(w, r) {
 				return
@@ -97,9 +209,10 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			h.mu.Lock()
 			h.minted = append(h.minted, body)
+			h.amount, _ = strconv.ParseInt(body["amount"], 10, 64)
 			h.mu.Unlock()
 			if body["success_url"] != base()+"/credits/return" {
-				reply(w, 400, map[string]any{"error": map[string]string{"code": "invalid_param", "message": "success_url not allowed"}})
+				refuse(w, 400, "invalid_param", "success_url not allowed")
 				return
 			}
 			reply(w, 201, map[string]any{"id": "ocs_1", "url": nil, "expires_at": time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339)})
@@ -108,17 +221,10 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			status := "created"
-			if h.paidWith != "" {
-				// The buyer pays at Stripe; the webhook lands the lot a moment later.
-				h.reads++
+			if h.option != "" {
 				status = "requires_action"
-				if h.reads > 1 {
+				if settled() {
 					status = "succeeded"
-					if !h.paid {
-						amount, _ := strconv.ParseInt(h.minted[len(h.minted)-1]["amount"], 10, 64)
-						h.balance += amount
-						h.paid = true
-					}
 				}
 			}
 			reply(w, 200, map[string]any{"id": "ocs_1", "status": status, "failure_message": nil, "options": []any{
@@ -130,7 +236,7 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			h.mu.Lock()
-			h.paidWith = body["option_id"]
+			h.option = body["option_id"]
 			h.mu.Unlock()
 			reply(w, 200, map[string]any{"status": "requires_action", "next_action": map[string]any{
 				"type": "redirect_to_url", "url": "https://checkout.stripe.test/c/pay/ocs_1"}})
@@ -138,20 +244,12 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 	}
 }
 
-// TestCreditsReadAndBuy is cl-077's surface: `cozy credits` and its history read
-// the signed-in user's prepaid credit; `cozy credits buy` refuses an amount
-// outside the hub's deposit bounds before any checkout exists, and otherwise
-// opens a checkout session, pays it through hosted Checkout and waits until the
-// lot lands.
-func TestCreditsReadAndBuy(t *testing.T) {
-	credits := &creditHub{}
-	var hubURL string
-	hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
-	hubURL = hub.URL
+// creditCLI runs cozy against hub in its own home.
+func creditCLI(t *testing.T, hub string) func(stdin string, args ...string) (int, string) {
 	root := t.TempDir()
-	run := func(stdin string, args ...string) (int, string) {
+	return func(stdin string, args ...string) (int, string) {
 		t.Helper()
-		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, append(args, "--tensorhub="+hub.URL)...)...)
+		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, append(args, "--tensorhub="+hub)...)...)
 		cmd.Env = childEnv(t, root)
 		cmd.Stdin = strings.NewReader(stdin) //cozy:stdin-value test login code and account name
 		var out bytes.Buffer
@@ -159,6 +257,19 @@ func TestCreditsReadAndBuy(t *testing.T) {
 		_ = cmd.Run()
 		return cmd.ProcessState.ExitCode(), out.String()
 	}
+}
+
+// TestCreditsReadAndBuy is cl-077's surface: `cozy credits` and its history read
+// the signed-in user's prepaid credit; `cozy credits buy` refuses an amount
+// outside the hub's deposit bounds before any order exists, and otherwise
+// orders the deposit at that amount, pays it on Stripe's hosted page and waits
+// until the lot lands.
+func TestCreditsReadAndBuy(t *testing.T) {
+	credits := &creditHub{}
+	var hubURL string
+	hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
+	hubURL = hub.URL
+	run := creditCLI(t, hub.URL)
 
 	if code, out := run("", "credits"); code == 0 || !strings.Contains(out, "cozy auth login") {
 		t.Fatalf("credits before login: exit %d\n%s", code, out)
@@ -181,25 +292,34 @@ func TestCreditsReadAndBuy(t *testing.T) {
 		t.Fatalf("buy a sub-micro amount: exit %d\n%s", code, out)
 	}
 	credits.mu.Lock()
-	minted := len(credits.minted)
+	ordered := len(credits.orders)
 	credits.mu.Unlock()
-	if minted != 0 {
-		t.Fatalf("a refused amount opened a checkout session")
+	if ordered != 0 {
+		t.Fatalf("a refused amount opened an order")
 	}
 
 	code, out := run("", "credits", "buy", "25.50", "--no-browser")
-	if code != 0 || !strings.Contains(out, "https://checkout.stripe.test/c/pay/ocs_1") ||
+	if code != 0 || !strings.Contains(out, "https://checkout.stripe.test/c/pay/cs_test_1") ||
 		!strings.Contains(out, "paid") || !strings.Contains(out, "available: $25.50") {
 		t.Fatalf("buy $25.50: exit %d\n%s", code, out)
 	}
 	credits.mu.Lock()
-	body, paidWith := credits.minted[0], credits.paidWith
+	orders, paidWith, minted := credits.orders, credits.paidWith, len(credits.minted)
+	keys := append(append([]string{}, credits.ordered...), credits.payments...)
 	credits.mu.Unlock()
-	if body["product_key"] != "api-credit" || body["price_key"] != "deposit" || body["amount"] != "25500000" {
-		t.Fatalf("the checkout session asked for %v", body)
+	want := map[string]any{"lines": []any{map[string]any{"price_id": "price_1", "amount": "25500000"}}}
+	if len(orders) != 1 || !reflect.DeepEqual(orders[0], want) {
+		t.Fatalf("the order asked for %v, want %v", orders, want)
 	}
-	if paidWith != "opt_hosted" {
-		t.Fatalf("paid with option %q, not hosted Checkout", paidWith)
+	pay := map[string]any{"payment": map[string]any{"return_url": hub.URL + "/credits/return"}, "expected_total": "25500000"}
+	if len(paidWith) != 1 || !reflect.DeepEqual(paidWith[0], pay) {
+		t.Fatalf("the order was paid with %v, want %v", paidWith, pay)
+	}
+	if len(keys) != 2 || keys[0] == "" || keys[1] == "" || keys[0] == keys[1] {
+		t.Fatalf("the order and its payment carried idempotency keys %q", keys)
+	}
+	if minted != 0 {
+		t.Fatalf("a hub that sells credit as an order was asked for a checkout session")
 	}
 
 	code, out = run("", "credits", "--json", "--full")
@@ -210,6 +330,52 @@ func TestCreditsReadAndBuy(t *testing.T) {
 	if code, out := run("", "credits", "history"); code != 0 || !strings.Contains(out, "deposit") ||
 		!strings.Contains(out, "$25.50") {
 		t.Fatalf("history after the purchase: exit %d\n%s", code, out)
+	}
+	if code, out := run("", "credits", "buy", "10", "--no-browser", "--no-wait", "--json", "--full"); code != 0 ||
+		!strings.Contains(out, `"order":"ord_1"`) || !strings.Contains(out, `"status":"awaiting payment"`) {
+		t.Fatalf("buy --no-wait: exit %d\n%s", code, out)
+	}
+}
+
+// TestCreditsBuyOnAHubBeforeOrders: a hub before OpenRails v0.237 refuses an order's
+// amount as a field it does not know, or has no order route at all, and `cozy credits
+// buy` then buys the way that hub sells: a checkout session paid through its hosted
+// option. Temporary, with internal/hub/billing_checkout_session.go.
+func TestCreditsBuyOnAHubBeforeOrders(t *testing.T) {
+	for name, credits := range map[string]*creditHub{
+		"its orders take no amount": {beforeOrders: true},
+		"it has no order route":     {beforeOrders: true, noOrders: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var hubURL string
+			hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
+			hubURL = hub.URL
+			run := creditCLI(t, hub.URL)
+			if code, out := run("123456\nbuyer\n", "auth", "login", "buyer@example.test"); code != 0 {
+				t.Fatalf("login: exit %d\n%s", code, out)
+			}
+			if code, out := run("", "credits", "buy", "5", "--no-browser"); code == 0 || !strings.Contains(out, "$10.00 to $500.00") {
+				t.Fatalf("buy 5, outside the bounds: exit %d\n%s", code, out)
+			}
+			code, out := run("", "credits", "buy", "25.50", "--no-browser")
+			if code != 0 || !strings.Contains(out, "https://checkout.stripe.test/c/pay/ocs_1") ||
+				!strings.Contains(out, "paid") || !strings.Contains(out, "available: $25.50") {
+				t.Fatalf("buy $25.50: exit %d\n%s", code, out)
+			}
+			credits.mu.Lock()
+			orders, minted, option := len(credits.orders), credits.minted, credits.option
+			credits.mu.Unlock()
+			if orders != 1 {
+				t.Fatalf("the hub was asked for %d orders before the checkout session, want the one it refused", orders)
+			}
+			if len(minted) != 1 || minted[0]["product_key"] != "api-credit" || minted[0]["price_key"] != "deposit" ||
+				minted[0]["amount"] != "25500000" || minted[0]["success_url"] != hub.URL+"/credits/return" {
+				t.Fatalf("the checkout session asked for %v", minted)
+			}
+			if option != "opt_hosted" {
+				t.Fatalf("paid with option %q, not hosted Checkout", option)
+			}
+		})
 	}
 }
 
@@ -222,17 +388,7 @@ func TestLowCreditWarns(t *testing.T) {
 	var hubURL string
 	hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
 	hubURL = hub.URL
-	root := t.TempDir()
-	run := func(stdin string, args ...string) (int, string) {
-		t.Helper()
-		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, append(args, "--tensorhub="+hub.URL)...)...)
-		cmd.Env = childEnv(t, root)
-		cmd.Stdin = strings.NewReader(stdin) //cozy:stdin-value test login code and account name
-		var out bytes.Buffer
-		cmd.Stdout, cmd.Stderr = &out, &out
-		_ = cmd.Run()
-		return cmd.ProcessState.ExitCode(), out.String()
-	}
+	run := creditCLI(t, hub.URL)
 	if code, out := run("123456\nlow\n", "auth", "login", "low@example.test"); code != 0 {
 		t.Fatalf("login: exit %d\n%s", code, out)
 	}

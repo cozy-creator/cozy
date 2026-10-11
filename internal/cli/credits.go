@@ -172,15 +172,15 @@ func handleCreditsBuy(ctx *Context) *exit.Error {
 	}
 	c := client(ctx)
 	hctx, cancel := hub.Context()
-	bounds, problem := c.CreditDepositBounds(hctx)
+	deposit, problem := c.CreditDeposit(hctx)
 	cancel()
 	if problem != nil {
 		return problem
 	}
-	if amount < bounds.Min || amount > bounds.Max {
+	if amount < deposit.Min || amount > deposit.Max {
 		return exit.Named(exit.Validation, "credits.amount_out_of_range",
-			"%s is outside what one purchase may be: %s to %s", usd(amount), usd(bounds.Min), usd(bounds.Max)).
-			WithRemedy("buy between %s and %s", usd(bounds.Min), usd(bounds.Max))
+			"%s is outside what one purchase may be: %s to %s", usd(amount), usd(deposit.Min), usd(deposit.Max)).
+			WithRemedy("buy between %s and %s", usd(deposit.Min), usd(deposit.Max))
 	}
 	hctx, cancel = hub.Context()
 	before, problem := c.Balance(hctx)
@@ -189,7 +189,7 @@ func handleCreditsBuy(ctx *Context) *exit.Error {
 		return problem
 	}
 	hctx, cancel = hub.Context()
-	checkout, problem := c.BuyCredit(hctx, amount)
+	checkout, problem := c.BuyCredit(hctx, deposit, amount)
 	cancel()
 	if problem != nil {
 		return problem
@@ -200,7 +200,7 @@ func handleCreditsBuy(ctx *Context) *exit.Error {
 			{K: "status", V: "awaiting payment"},
 			{K: "amount", V: usd(amount)},
 			{K: "checkout_url", V: checkout.URL},
-			{K: "session", V: checkout.SessionID},
+			{K: "order", V: checkout.ID},
 			{K: "expires_at", V: checkout.ExpiresAt.UTC().Format(time.RFC3339)},
 		}, "status", "amount", "checkout_url")
 		record.Next = []string{"cozy credits"}
@@ -217,7 +217,7 @@ func handleCreditsBuy(ctx *Context) *exit.Error {
 	return waitForCredit(ctx, c, checkout, amount, before)
 }
 
-// waitForCredit follows the purchase until its lot lands or the session ends.
+// waitForCredit follows the purchase until its lot lands or it ends unpaid.
 func waitForCredit(ctx *Context, c *hub.Client, checkout hub.CreditCheckout, amount int64, before hub.Balance) *exit.Error {
 	wait, cancel := context.WithDeadline(context.Background(), checkout.ExpiresAt)
 	defer cancel()
@@ -227,18 +227,18 @@ func waitForCredit(ctx *Context, c *hub.Client, checkout hub.CreditCheckout, amo
 		select {
 		case <-wait.Done():
 			return exit.Named(exit.Deadline, "credits.checkout_expired",
-				"checkout %s expired before a payment landed", checkout.SessionID).
+				"checkout %s expired before a payment landed", checkout.ID).
 				WithRemedy("nothing was charged; buy again").WithNext("cozy credits buy " + dollars(amount))
 		case <-tick.C:
 		}
 		hctx, done := hub.Context()
-		session, problem := c.CreditSessionStatus(hctx, checkout.SessionID)
+		purchase, problem := checkout.Status(hctx)
 		done()
 		if problem != nil {
-			continue // a transient read; the session's own deadline bounds the wait
+			continue // a transient read; the purchase's own deadline bounds the wait
 		}
-		switch session.Status {
-		case "succeeded":
+		switch {
+		case purchase.Paid:
 			hctx, done := hub.Context()
 			after, problem := c.Balance(hctx)
 			done()
@@ -248,16 +248,16 @@ func waitForCredit(ctx *Context, c *hub.Client, checkout hub.CreditCheckout, amo
 			record := balanceRecord(after)
 			record.Fields = append([]output.Field{{K: "status", V: "paid"}, {K: "bought", V: usd(amount)}}, record.Fields...)
 			record.AllFields = append([]output.Field{{K: "status", V: "paid"}, {K: "bought", V: usd(amount)},
-				{K: "session", V: checkout.SessionID}, {K: "balance_before", V: usd(before.Balance)}}, record.AllFields...)
+				{K: "order", V: checkout.ID}, {K: "balance_before", V: usd(before.Balance)}}, record.AllFields...)
 			record.Next = nil
 			return emit(ctx, record)
-		case "failed", "blocked", "expired", "canceled":
+		case purchase.Ended != "":
 			message := "the payment did not complete"
-			if session.FailureMessage != nil && *session.FailureMessage != "" {
-				message = *session.FailureMessage
+			if purchase.Message != "" {
+				message = purchase.Message
 			}
-			return exit.Named(exit.Failed, "credits.checkout_"+session.Status,
-				"checkout %s %s: %s", checkout.SessionID, session.Status, message).
+			return exit.Named(exit.Failed, "credits.checkout_"+purchase.Ended,
+				"checkout %s %s: %s", checkout.ID, purchase.Ended, message).
 				WithNext("cozy credits buy " + dollars(amount))
 		}
 	}
