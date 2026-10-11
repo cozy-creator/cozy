@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -403,30 +402,16 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 }
 
 // readDevelopmentInterface reads a local package's interface from its source alone, with this
-// computer's Runtime: nothing of the package runs and no environment of it is needed (a callee
-// is read from the directory or the exact wheel its lock names).
+// computer's Runtime brought up to the package's own (hostruntime.Describe): nothing of the
+// package runs and no environment of it is needed (a callee is read from the directory or the
+// exact wheel its lock names).
 func readDevelopmentInterface(sourceDir string) (*launch.PackageInterface, *exit.Error) {
 	env := config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
-	runtimeBin, problem := hostruntime.Path(env)
+	raw, problem := hostruntime.Describe(context.Background(), env, sourceDir)
 	if problem != nil {
 		return nil, problem
 	}
-	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "describe")
-	cmd.Env = env
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if cmd.ProcessState == nil {
-		return nil, exit.Internalf("cannot run %s: %s", runtimeBin, err)
-	}
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, hostruntime.RuntimeExit(code, "describe", "runtime_preparation_failed", stdout.String(), stderr.String())
-	}
-	decoded, problem := launch.DecodePackageInterface([]byte(stdout.String()))
-	if problem != nil {
-		return nil, problem
-	}
-	return decoded, nil
+	return launch.DecodePackageInterface(raw)
 }
 
 // verifySource settles source identity before any build backend or import can run.

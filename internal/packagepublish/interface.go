@@ -38,11 +38,10 @@ type describedInterface struct {
 // contradictions. The staged publication names the account in every org-relative lane.
 func describe(ctx context.Context, tree, root, account string) (describedInterface, *exit.Error) {
 	publish := account != ""
-	env := config.Frozen().Tool()
-	if _, problem := hostruntime.Path(env); problem != nil {
+	raw, problem := hostruntime.Describe(ctx, config.Frozen().Tool(), tree)
+	if problem != nil && strings.HasPrefix(problem.ErrName(), "host_runtime_") {
 		return describedInterface{}, problem
 	}
-	raw, problem := hostruntime.Describe(ctx, env, tree)
 	if problem != nil {
 		return describedInterface{}, exit.Named(exit.Validation, "package_interface_refused",
 			"cozy-runtime could not describe the package").WithRemedy("%s", problem.Message)

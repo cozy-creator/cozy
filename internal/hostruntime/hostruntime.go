@@ -6,7 +6,6 @@ package hostruntime
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -41,42 +40,57 @@ var floor, release = pep440.MustParse(ToolFloor), pep440.MustParse(ToolRelease)
 // InstallCommand installs this host's tool, cozy-runtime, in its own uv environment.
 // install.sh and scripts/install.ps1 run it. TensorFS's `tfs` is not installed: only a
 // machine writes its store.
-var InstallCommand = fmt.Sprintf(
-	"uv tool install --force --refresh-package cozy-runtime --python 3.12 '%s'", toolRequirement)
+var InstallCommand = installCommand(ToolRelease)
 
-const toolRequirement = "cozy-runtime[media,model-execution]>=" + ToolRelease
+func installCommand(minimum string) string {
+	return fmt.Sprintf("uv tool install --force --refresh-package cozy-runtime --python 3.12 '%s'", requirement(minimum))
+}
+
+func requirement(minimum string) string { return "cozy-runtime[media,model-execution]>=" + minimum }
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
 var hostRuntimeInstall = fmt.Sprintf("install cozy-runtime %s or newer: %s — then retry",
 	ToolFloor, InstallCommand)
 
-// hostRuntimeVerdicts memoizes the tool Path chose for this process: a version verb is one
-// interpreter start and an install one uv run, so the host is asked once per daemon. Only an
-// admission is kept, so a reinstall takes effect without a daemon restart.
+// tool is one cozy-runtime executable and the release it says it is.
+type tool struct {
+	path    string
+	release pep440.Version
+}
+
+// hostRuntimeVerdicts memoizes the tool chosen per minimum for this process: a version verb is
+// one interpreter start and an install one uv run, so the host is asked once per daemon. Only
+// an admission is kept, so a reinstall takes effect without a daemon restart.
 var hostRuntimeVerdicts = struct {
 	sync.Mutex
-	chosen map[string]string
-}{chosen: map[string]string{}}
+	chosen map[string]tool
+}{chosen: map[string]tool{}}
 
-// Path is the tool this Cozy reads packages with: a cozy-runtime at ToolRelease or newer. The
-// one on PATH when it is that new; else this Cozy's own copy, installed through uv the first
-// time it is needed; else (offline, uv refused) the older one on PATH with a warning. Only a
-// tool below ToolFloor, or none at all, with no own copy to be had, refuses. The tool answers
-// typed CLI verbs and speaks no machine protocol to this Cozy, so the protocol it names is
-// not read. Its own `version` verb is the fact, asked here.
+// Path is the tool this Cozy asks package-independent questions: a cozy-runtime at ToolRelease
+// or newer (atLeast). The tool answers typed CLI verbs and speaks no machine protocol to this
+// Cozy, so the protocol it names is not read. Its own `version` verb is the fact, asked here.
 func Path(env []string) (string, *exit.Error) {
+	chosen, problem := atLeast(env, release)
+	return chosen.path, problem
+}
+
+// atLeast is a host tool at minimum or newer: the one on PATH when it is that new; else this
+// Cozy's own copy, brought forward through uv when it is older; else (offline, uv refused) the
+// newest one this host has, with a warning. Only a tool below ToolFloor, or none at all, with no
+// own copy to be had, refuses.
+func atLeast(env []string, minimum pep440.Version) (tool, *exit.Error) {
 	onPath, _ := exec.LookPath(Distribution)
 	own := ownTool(env)
-	key := onPath + "\x00" + own
+	key := onPath + "\x00" + own + "\x00" + minimum.String()
 	hostRuntimeVerdicts.Lock()
-	chosen := hostRuntimeVerdicts.chosen[key]
+	chosen, ok := hostRuntimeVerdicts.chosen[key]
 	hostRuntimeVerdicts.Unlock()
-	if chosen != "" {
+	if ok {
 		return chosen, nil
 	}
-	chosen, problem := choose(onPath, own, env)
+	chosen, problem := choose(onPath, own, minimum, env)
 	if problem != nil {
-		return "", problem
+		return tool{}, problem
 	}
 	hostRuntimeVerdicts.Lock()
 	hostRuntimeVerdicts.chosen[key] = chosen
@@ -84,35 +98,43 @@ func Path(env []string) (string, *exit.Error) {
 	return chosen, nil
 }
 
-func choose(onPath, own string, env []string) (string, *exit.Error) {
-	var found pep440.Version
+func choose(onPath, own string, minimum pep440.Version, env []string) (tool, *exit.Error) {
+	var best tool
 	var problem *exit.Error
 	if onPath != "" {
-		if found, problem = toolRelease(onPath, env); problem == nil && !found.LessThan(release) {
-			return onPath, nil
+		var found pep440.Version
+		if found, problem = toolRelease(onPath, env); problem == nil {
+			if !found.LessThan(minimum) {
+				return tool{onPath, found}, nil
+			}
+			best = tool{onPath, found}
 		}
 	}
-	installed, why := ownCopy(own, env)
+	current, why := ownCopy(own, minimum, best, env)
 	if why == "" {
-		return installed, nil
+		return current, nil
+	}
+	if current.path != "" && (best.path == "" || best.release.LessThan(current.release)) {
+		best = current
 	}
 	switch {
-	case onPath == "":
-		return "", exit.Named(exit.Structural, "host_runtime_missing",
+	case best.path == "" && problem != nil:
+		return tool{}, problem
+	case best.path == "":
+		return tool{}, exit.Named(exit.Structural, "host_runtime_missing",
 			"this host has no cozy-runtime command on PATH, and this Cozy could not install its own: %s", why).
 			WithRemedy("%s", hostRuntimeInstall)
-	case problem != nil:
-		return "", problem
-	case found.LessThan(floor):
-		return "", exit.Named(exit.Structural, "host_runtime_below_floor",
+	case best.release.LessThan(floor):
+		return tool{}, exit.Named(exit.Structural, "host_runtime_below_floor",
 			"cozy-runtime %s is release %s; this Cozy needs %s or newer for native model ingestion and managed result collection, and could not install its own: %s",
-			onPath, found.String(), ToolFloor, why).
+			best.path, best.release.String(), ToolFloor, why).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
-	fmt.Fprintf(os.Stderr, "cozy: warning: reading packages with cozy-runtime %s (%s), older than this Cozy's %s, "+
-		"because its own could not be installed (%s): type resolution added since, such as another "+
-		"package's types, may be missing. %s\n", found.String(), onPath, ToolRelease, why, hostRuntimeInstall)
-	return onPath, nil
+	fmt.Fprintf(os.Stderr, "cozy: warning: reading packages with cozy-runtime %s (%s), older than %s, "+
+		"because a newer one could not be installed (%s): what was added since, such as another "+
+		"package's types or a newer SDK's constructs, may be missing. Install it: %s\n",
+		best.release.String(), best.path, minimum.String(), why, installCommand(minimum.String()))
+	return best, nil
 }
 
 // ownTool is where this Cozy keeps its own tool: a uv tool directory in the user's cache
@@ -134,45 +156,67 @@ func ownTool(env []string) string {
 	return filepath.Join(base, "cozy", "host-runtime", "bin", Distribution)
 }
 
-// ownCopy is this Cozy's own tool at ToolRelease or newer, installed through uv when it is
-// absent or older: its path, or why there is none.
-func ownCopy(own string, env []string) (string, string) {
-	if found, problem := toolRelease(own, env); problem == nil && !found.LessThan(release) {
-		return own, ""
+// ownCopy is this Cozy's own tool at minimum or newer, upgraded through uv when it is absent or
+// older: it, or the copy there is (none when absent) and why it is not that new. uv installs the
+// newest release at or above minimum, and nothing older replaces a newer copy, so it never moves
+// below what another package needed. A one-line stage says so, naming what it replaces.
+func ownCopy(own string, minimum pep440.Version, onPath tool, env []string) (tool, string) {
+	current := func() tool {
+		if found, problem := toolRelease(own, env); problem == nil {
+			return tool{own, found}
+		}
+		return tool{}
+	}
+	if have := current(); have.path != "" && !have.release.LessThan(minimum) {
+		return have, ""
 	}
 	root := filepath.Dir(filepath.Dir(own))
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", err.Error()
+		return current(), err.Error()
 	}
 	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return "", err.Error()
+		return current(), err.Error()
 	}
 	defer lock.Close()
 	if err := flock.Block(lock); err != nil {
-		return "", err.Error()
+		return current(), err.Error()
 	}
-	// Another Cozy may have installed it while this one waited.
-	if found, problem := toolRelease(own, env); problem == nil && !found.LessThan(release) {
-		return own, ""
+	// Another Cozy may have brought it forward while this one waited.
+	have := current()
+	if have.path != "" && !have.release.LessThan(minimum) {
+		return have, ""
 	}
-	cmd := exec.Command("uv", "tool", "install", "--force", "--python", "3.12", toolRequirement)
+	uv, err := exec.LookPath("uv")
+	if err != nil {
+		return have, "uv is not on PATH"
+	}
+	if have.path == "" || (onPath.path != "" && have.release.LessThan(onPath.release)) {
+		have = onPath
+	}
+	if have.path == "" {
+		fmt.Fprintf(os.Stderr, "Installing cozy-runtime %s or newer to read packages...\n", minimum.String())
+	} else {
+		fmt.Fprintf(os.Stderr, "Upgrading cozy-runtime %s to %s or newer to read packages...\n",
+			have.release.String(), minimum.String())
+	}
+	want := requirement(minimum.String())
+	cmd := exec.Command(uv, "tool", "install", "--force", "--refresh-package", Distribution, "--python", "3.12", want)
 	cmd.Env = append(append([]string{}, env...), "UV_TOOL_DIR="+filepath.Join(root, "tools"),
 		"UV_TOOL_BIN_DIR="+filepath.Dir(own))
 	var output bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &output, &output
-	fmt.Fprintf(os.Stderr, "cozy: installing cozy-runtime %s or newer for reading packages...\n", ToolRelease)
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Sprintf("`uv tool install %s` failed: %s", toolRequirement, condense(output.String()))
+		return current(), fmt.Sprintf("`uv tool install %s` failed: %s %s", want, err, condense(output.String()))
 	}
-	found, problem := toolRelease(own, env)
-	if problem != nil {
-		return "", problem.Message
+	installed := current()
+	if installed.path == "" {
+		return tool{}, fmt.Sprintf("uv installed no working %s at %s", Distribution, own)
 	}
-	if found.LessThan(release) {
-		return "", fmt.Sprintf("uv installed release %s", found.String())
+	if installed.release.LessThan(minimum) {
+		return installed, fmt.Sprintf("uv installed release %s", installed.release.String())
 	}
-	return own, ""
+	return installed, ""
 }
 
 // toolRelease runs `cozy-runtime --json version` and reads the release the tool prints for
@@ -216,32 +260,6 @@ func unreadableHostRuntime(path, format string, args ...any) *exit.Error {
 	return exit.Named(exit.Structural, "host_runtime_unreadable",
 		"cozy-runtime %s did not identify itself: %s", path, fmt.Sprintf(format, args...)).
 		WithRemedy("%s", hostRuntimeInstall)
-}
-
-// Describe is the one reading of a package surface this host performs — at publish pre-flight,
-// at install, and for a job's descriptor — by the tool at or above ToolFloor:
-// `cozy-runtime describe` parses the source under dir and imports nothing. It returns the
-// canonical PackageInterface bytes. `where` names the source when it is not under dir — an
-// installed release's module lives in its venv, so the venv's interpreter is named for the
-// reading to resolve the file; the interpreter is not run against the package.
-func Describe(ctx context.Context, env []string, dir string, where ...string) ([]byte, *exit.Error) {
-	runtimeBin, problem := Path(env)
-	if problem != nil {
-		return nil, problem
-	}
-	args := append([]string{"--json", "--dir", dir, "describe"}, where...)
-	cmd := exec.CommandContext(ctx, runtimeBin, args...)
-	cmd.Env = env
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if cmd.ProcessState == nil {
-		return nil, exit.Internalf("cannot run %s: %s", runtimeBin, err)
-	}
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, RuntimeExit(code, "describe", "runtime_query_failed", stdout.String(), stderr.String())
-	}
-	return bytes.TrimSuffix([]byte(stdout.String()), []byte("\n")), nil
 }
 
 func condense(s string) string {
