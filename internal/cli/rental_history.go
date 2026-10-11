@@ -37,7 +37,7 @@ func rentalHistory(ctx *Context, endedOnly bool) (func(context.Context) (output.
 			store.Close()
 		}
 	}
-	origins, problem := rentalInventoryOrigins(ctx, store)
+	origins, problem := rentalInventoryOrigins(ctx, store, ctx.Cfg.HubURL)
 	if problem != nil {
 		done()
 		return nil, nil, problem

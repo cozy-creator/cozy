@@ -447,6 +447,77 @@ func TestAllHubsListingIsolatesAnUnreadableHub(t *testing.T) {
 	}
 }
 
+// Removing a hub name takes effect in the running daemon: an every-hub listing stops asking
+// a hub only its name (or the daemon's start-up selection) brought in, and a rental recorded
+// on a hub whose name was removed stays listed, under its URL.
+func TestRemovedHubLeavesTheRunningDaemon(t *testing.T) {
+	root, hubA, standA := rentalEndRoot(t, "hub-remove")
+	standC := newFakeRentalHub(t, 0)
+	hubC := standC.server.URL
+	for device, stand := range map[string]*fakeRentalHub{"machine-a": standA, "machine-c": standC} {
+		public, private, err := ed25519.GenerateKey(rand.Reader)
+		must(t, err)
+		stand.server.Config.Handler = machineKeyLogin(device, public, "rental-idle-test", stand.server.Config.Handler)
+		plantMachineKey(t, root, stand.server.URL, device, private)
+	}
+	// b answers nothing and holds no login; the daemon starts with it current.
+	const hubB = testDefaultHub
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: b\n"+
+		"hubs:\n  a: "+hubA+"\n  b: "+hubB+"\n  c: "+hubC+"\n"+
+		"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	const rentalC = "pr-c5c5c5c5c5c5c5c5c5c5"
+	standC.add(rentalC, "charlie")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	fatal(t, store.RecordRental(records.Rental{ID: rentalC, MachineName: "charlie", State: "ready",
+		Hub: hubC, AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
+	store.Close()
+	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
+		t.Fatalf("up: %d %s", code, out)
+	}
+	started := daemon.Probe(config.Config{Home: root})
+
+	type listing struct {
+		Rentals []struct {
+			ID  string `json:"rental_id"`
+			Hub string `json:"hub"`
+		} `json:"rentals"`
+		Unreadable []struct {
+			Hub string `json:"hub"`
+		} `json:"unreadable_hubs"`
+	}
+	list := func(wantCode int) listing {
+		t.Helper()
+		code, out := runCozy(t, root, "rental", "list", "--all-hubs", "--json")
+		var doc listing
+		if code != wantCode || json.Unmarshal([]byte(out), &doc) != nil {
+			t.Fatalf("rental list --all-hubs exited %d, want %d: %s", code, wantCode, out)
+		}
+		return doc
+	}
+	if doc := list(1); len(doc.Unreadable) != 1 || doc.Unreadable[0].Hub != hubB {
+		t.Fatalf("the current hub b was not named unreadable: %+v", doc)
+	}
+	if code, out := runCozy(t, root, "rental", "list", "--all-hubs", "--no-watch"); !regexp.MustCompile(`(?m)charlie\b.*\sc\s*$`).MatchString(out) {
+		t.Fatalf("charlie is not listed under hub c: %d %s", code, out)
+	}
+	for _, args := range [][]string{{"hub", "use", "a"}, {"hub", "remove", "b"}, {"hub", "remove", "c"}} {
+		if code, out := runCozy(t, root, append(args, "--json")...); code != 0 {
+			t.Fatalf("%v: %d %s", args, code, out)
+		}
+	}
+	if doc := list(0); len(doc.Unreadable) != 0 || len(doc.Rentals) != 1 || doc.Rentals[0].ID != rentalC || doc.Rentals[0].Hub != hubC {
+		t.Fatalf("the running daemon still lists a removed hub, or dropped its rental: %+v", doc)
+	}
+	code, out := runCozy(t, root, "rental", "list", "--all-hubs", "--no-watch")
+	if code != 0 || strings.Contains(out, "unreachable") || !strings.Contains(out, "charlie") || !strings.Contains(out, hubC) {
+		t.Fatalf("human listing warned about a removed hub or lost charlie's URL: %d %s", code, out)
+	}
+	if after := daemon.Probe(config.Config{Home: root}); after.PID != started.PID {
+		t.Fatalf("the daemon was replaced: %d -> %d", started.PID, after.PID)
+	}
+}
+
 // packageCardHub serves one package card per name and counts which packages it was asked for.
 func packageCardHub(t *testing.T, asked *sync.Map) *httptest.Server {
 	t.Helper()
