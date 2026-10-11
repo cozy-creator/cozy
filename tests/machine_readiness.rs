@@ -158,10 +158,10 @@ fn receipt_verifies_and_a_restart_keeps_boot_and_bytes() {
 }
 
 #[test]
-fn a_root_the_go_agent_booted_keeps_its_boot_and_leaf() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-root");
+fn a_retained_root_keeps_its_boot_and_leaf() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retained-root");
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/machine-readiness-go")
+        .join("target/machine-readiness-retained")
         .join(std::process::id().to_string());
     let _ = std::fs::remove_dir_all(&root);
     for file in [
@@ -195,7 +195,7 @@ fn a_root_the_go_agent_booted_keeps_its_boot_and_leaf() {
     );
     assert_eq!(
         facts["worker_listener_bound"], true,
-        "the Go SEC1 key serves TLS"
+        "the retained PKCS#8 key serves TLS"
     );
     assert_eq!(facts["worker_foreign_credential_refused"], true);
     drop(machine);
