@@ -205,10 +205,15 @@ fn no_delay(
     listener: tokio::net::TcpListener,
 ) -> impl Stream<Item = std::io::Result<tokio::net::TcpStream>> {
     use tokio_stream::StreamExt;
-    TcpListenerStream::new(listener).map(|accepted| {
-        accepted.inspect(|stream| {
-            let _ = stream.set_nodelay(true);
-        })
+    TcpListenerStream::new(listener).then(|accepted| async move {
+        match &accepted {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+            }
+            // Out of descriptors, say: tonic accepts again at once, so pause rather than spin.
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+        accepted
     })
 }
 
