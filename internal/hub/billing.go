@@ -190,12 +190,8 @@ type creditOrder struct {
 // amount, paid on the hub's hosted Stripe page. It answers where the buyer pays.
 func (c *Client) BuyCredit(ctx context.Context, deposit CreditDeposit, amount int64) (CreditCheckout, *exit.Error) {
 	var order creditOrder
-	status := 0
-	problem := c.do(ctx, call{method: http.MethodPost, path: "/billing/v1/me/orders", auth: true, idempotency: rand.Text(), status: &status,
+	problem := c.do(ctx, call{method: http.MethodPost, path: "/billing/v1/me/orders", auth: true, idempotency: rand.Text(),
 		body: map[string]any{"lines": []map[string]string{{"price_id": deposit.PriceID, "amount": strconv.FormatInt(amount, 10)}}}}, &order)
-	if hubSellsCreditByCheckoutSession(status, problem) {
-		return c.buyCreditByCheckoutSession(ctx, amount)
-	}
 	if problem != nil {
 		return CreditCheckout{}, problem
 	}
