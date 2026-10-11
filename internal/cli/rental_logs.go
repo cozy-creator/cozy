@@ -17,9 +17,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/rentalid"
 )
 
-// handleRentalLogs is `cozy rental logs <rental>`: every line the provider logged while the
-// rental's latest (or --attempt) attempt booted, kept by its Hub after the pod is gone. -f
-// follows a rental still coming up, onto each attempt a replan starts, until it is up or over.
+// handleRentalLogs is `cozy rental logs <rental>`: for an operator (a Tensorhub admin), every
+// line the provider logged while the rental's latest (or --attempt) attempt booted, kept by its
+// Hub after the pod is gone. -f follows a rental still coming up, onto each attempt a replan
+// starts, until it is up or over. --tensorfs reads the machine's own log, for any renter.
 func handleRentalLogs(ctx *Context) *exit.Error {
 	attempt := 0
 	if text := ctx.Inv.Value("--attempt"); text != "" {

@@ -31,33 +31,25 @@ func TestRentalRequestNamesItsProviderOnlyWhenAsked(t *testing.T) {
 	}
 }
 
-// A named provider lists only that provider's machines. A hub that predates providers
-// ignores the query and answers its default listing, which names none: the ask then
-// finds nothing rather than silently buying from the default marketplace.
-func TestRentalSKUsForANamedProvider(t *testing.T) {
-	product := `{"name":"rtx-3070","accelerator_model":"NVIDIA GeForce RTX 3070","compute_capability":"8.6","vram_gb":8,` +
-		`"widths":[{"accelerator_count":1,"price_usd_micros_per_hour":100000}]`
-	for _, tc := range []struct {
-		hub, provider, query string
-		listed               int
-	}{
-		{`[` + product + `,"provider":"vast"}]`, "vast", "vast", 1},
-		{`[` + product + `}]`, "vast", "vast", 0},
-		{`[` + product + `,"provider":"runpod"}]`, "", "", 1},
-	} {
+// The catalog names no provider (th-254): a named one is the Hub's to filter, and an operator's
+// `?provider=` is asked and its answer listed as is.
+func TestRentalSKUsAskTheHubForANamedProvider(t *testing.T) {
+	product := `[{"name":"rtx-3070","accelerator_model":"NVIDIA GeForce RTX 3070","compute_capability":"8.6","vram_gb":8,` +
+		`"widths":[{"accelerator_count":1,"price_usd_micros_per_hour":100000}]}]`
+	for _, provider := range []string{"vast", ""} {
 		var asked string
 		mux := http.NewServeMux()
 		mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, r *http.Request) {
 			asked = r.URL.Query().Get("provider")
-			_, _ = w.Write([]byte(tc.hub))
+			_, _ = w.Write([]byte(product))
 		})
 		server := httptest.NewServer(mux)
 		client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "rental-provider")
-		skus, problem := client.RentalSKUs(t.Context(), tc.provider)
+		skus, problem := client.RentalSKUs(t.Context(), provider)
 		server.Close()
 		fatal(t, problem)
-		if asked != tc.query || len(skus) != tc.listed || tc.listed == 1 && skus[0].Provider == "" && tc.provider != "" {
-			t.Fatalf("provider %q against %s: asked %q, listed %+v", tc.provider, tc.hub, asked, skus)
+		if asked != provider || len(skus) != 1 || skus[0].Name != "rtx-3070" || skus[0].PriceUSDMicrosPerHour != 100000 {
+			t.Fatalf("provider %q: asked %q, listed %+v", provider, asked, skus)
 		}
 	}
 }

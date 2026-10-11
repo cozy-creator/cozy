@@ -64,7 +64,7 @@ func RentalAbsent(state string) bool {
 }
 
 // Rental is one rented pod as the hub reports it. No plaintext media bearer or private
-// Creator key is part of this view.
+// Creator key is part of this view; the provider identities are in an operator's view only.
 type Rental struct {
 	Provider, ProviderMachineID, ProviderResourceID string
 	Development                                     bool
@@ -107,9 +107,9 @@ type Rental struct {
 	CreatedAt string
 	// ContainerDiskGB is the disk the Hub bought for the pod, or 0 when it does not say.
 	ContainerDiskGB int
-	// SpendUSDMicros is what the rental has cost so far. SpendBasis is "charged" when the Hub
-	// charges it its own price (th-252); otherwise "provider_billed" once every provider charge
-	// has settled, else "estimate"; blank from a Hub older than the fact.
+	// SpendUSDMicros is what the rental has cost so far at the Hub's price. SpendBasis is
+	// "charged" (charged to the account), "unmetered" (an account the Hub does not charge) or
+	// "estimate" (a rental from before running charges); blank from a Hub older than the fact.
 	SpendUSDMicros int64
 	SpendBasis     string
 	// WebRTC is a ready machine-image rental's browser-media listener: the address a
@@ -134,12 +134,13 @@ type RentalWebRTC struct {
 	Fingerprint string `json:"fingerprint"`
 }
 
-// RentalBoot is one boot attempt as the Hub observed it: which attempt, where, how far the
-// provider has brought the container, and when its boot log last moved. State is the
-// attempt's (obligated, ambiguous, booting) or "replanning" between a failed attempt and
-// the next; ReplannedFrom is the failed attempt this one replaces. Phase is the boot phase
-// the Hub times (container: provider running to a started container; host: to the pod's
-// supervisor answering; runtime: to the Runtime's receipt), begun at PhaseStartedAt.
+// RentalBoot is one boot attempt as the Hub observed it: which attempt, where (Datacenter, in
+// an operator's view only), how far the provider has brought the container, and when its boot
+// log last moved. State is the attempt's (obligated, ambiguous, booting) or "replanning"
+// between a failed attempt and the next; ReplannedFrom is the failed attempt this one
+// replaces. Phase is the boot phase the Hub times (container: provider running to a started
+// container; host: to the pod's supervisor answering; runtime: to the Runtime's receipt),
+// begun at PhaseStartedAt.
 // Activity is the Hub's reading of the provider boot log in the container phase
 // (pulling_image, creating_container, starting_container, stopping_container). Times are on
 // this host's clock: the decoder shifts them by the Hub's reading of its own.
@@ -162,7 +163,7 @@ type RentalBoot struct {
 // the boot time the Hub had observed for that product and image when it ended this one.
 type ReplannedBoot struct {
 	Attempt       int       `json:"attempt"`
-	Datacenter    string    `json:"datacenter"`
+	Datacenter    string    `json:"datacenter,omitempty"`
 	StartedAt     time.Time `json:"started_at"`
 	EndedAt       time.Time `json:"ended_at"`
 	FailureCode   string    `json:"failure_code,omitempty"`
@@ -208,8 +209,8 @@ func (w *wireBoot) local(now time.Time) *RentalBoot {
 	return &boot
 }
 
-// RentalFailure is Tensorhub's sanitized terminal boot diagnosis. It contains
-// only frozen image/resource identity and direct provider lifecycle facts.
+// RentalFailure is Tensorhub's sanitized terminal boot diagnosis: frozen image identity and,
+// in an operator's view only, the provider's lifecycle facts.
 type RentalFailure struct {
 	Code                  string `json:"code"`
 	BaseWorkerImageDigest string `json:"base_worker_image_digest"`
@@ -364,7 +365,8 @@ type RentalDevelopment struct {
 type RentalRequest struct {
 	Development *RentalDevelopment `json:"development,omitempty"`
 	Name        string             `json:"name"`
-	// Provider names the marketplace (`--provider`); omitted buys from the hub's default.
+	// Provider and ExcludedProviderMachines are an operator's development choice; the Hub
+	// refuses them from anyone else. Omitted, Tensorhub places the rental.
 	Provider                 string   `json:"provider,omitempty"`
 	ExcludedProviderMachines []string `json:"excluded_provider_machines,omitempty"`
 	SKU                      string   `json:"sku"`
@@ -527,11 +529,9 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 // RentalSKU is one Cozy-priced machine choice: a product at one GPU count. The hub lists
 // each product once with its buyable widths; RentalSKUs flattens that into one RentalSKU
 // per (Name, AcceleratorCount), the unit every placement decision and paid ask uses.
-// Provider offer names and prices are deliberately absent: the caller rents from
-// Tensorhub, not its adapter.
+// Providers, their offers and prices are the operator's: the caller rents from Tensorhub.
 type RentalSKU struct {
 	Name             string `json:"name"`
-	Provider         string `json:"provider,omitempty"`
 	AcceleratorModel string `json:"accelerator_model"`
 	// AcceleratorCount is the machine's GPU count. VRAMGB stays the ONE-CARD figure at
 	// every count, and that is the right fit test: under a sequence-parallel group every
@@ -565,7 +565,6 @@ type RentalSKU struct {
 type RentalProduct struct {
 	PythonProvisionableMinors []string      `json:"python_provisionable_minors"`
 	Name                      string        `json:"name"`
-	Provider                  string        `json:"provider,omitempty"`
 	AcceleratorModel          string        `json:"accelerator_model"`
 	BaseWorkerProfile         string        `json:"base_worker_profile"`
 	ComputeCapability         string        `json:"compute_capability"`
@@ -586,7 +585,7 @@ type RentalWidth struct {
 func (p RentalProduct) Machines() []RentalSKU {
 	out := make([]RentalSKU, 0, len(p.Widths))
 	for _, width := range p.Widths {
-		out = append(out, RentalSKU{Name: p.Name, Provider: p.Provider, AcceleratorModel: p.AcceleratorModel,
+		out = append(out, RentalSKU{Name: p.Name, AcceleratorModel: p.AcceleratorModel,
 			AcceleratorCount: width.AcceleratorCount, PythonProvisionableMinors: p.PythonProvisionableMinors,
 			BaseWorkerProfile: p.BaseWorkerProfile,
 			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB,
@@ -644,17 +643,12 @@ func FindRentalSKU(skus []RentalSKU, name string, gpus int) (RentalSKU, bool) {
 
 // RentalSKUs reads Tensorhub's public product catalog, flattened to one machine per width.
 // A product or width this build cannot price or size is left out; one bad row never
-// hides the rest of the catalog.
-// RentalSKUs lists what one provider sells now; "" is the hub's default. A hub that
-// predates providers answers its default listing, which names no provider, so an
-// ask for a named one finds nothing there rather than a different marketplace.
+// hides the rest of the catalog. A named provider (an operator's development choice) is the
+// Hub's to filter.
 func (c *Client) RentalSKUs(ctx context.Context, provider string) ([]RentalSKU, *exit.Error) {
 	var products []RentalProduct
 	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rental-skus" + providerQuery("?", provider)}, &products); e != nil {
 		return nil, e
-	}
-	if provider != "" {
-		products = slices.DeleteFunc(products, func(p RentalProduct) bool { return p.Provider != provider })
 	}
 	var out []RentalSKU
 	seen := map[string]bool{}
@@ -931,12 +925,11 @@ type RentalSKUStatus struct {
 // RentalQuote is what one exact rental request will lock: its disk and declared
 // workload choose the machine, so it can differ from the default-disk listing.
 type RentalQuote struct {
-	ExcludedProviderMachines []string `json:"excluded_provider_machines,omitempty"`
-	PriceUSDMicrosPerHour    int64    `json:"price_usd_micros_per_hour"`
-	StorageUSDMicrosPerHour  int64    `json:"storage_usd_micros_per_hour"`
-	ContainerDiskGB          int      `json:"container_disk_gb"`
-	VCPUCount                int      `json:"vcpu_count,omitempty"`
-	MemoryGB                 int      `json:"memory_gb,omitempty"`
+	PriceUSDMicrosPerHour   int64 `json:"price_usd_micros_per_hour"`
+	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
+	ContainerDiskGB         int   `json:"container_disk_gb"`
+	VCPUCount               int   `json:"vcpu_count,omitempty"`
+	MemoryGB                int   `json:"memory_gb,omitempty"`
 }
 
 // QuoteRental prices the exact body a rental POST would send.

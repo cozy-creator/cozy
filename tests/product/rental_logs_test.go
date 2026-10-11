@@ -15,9 +15,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// `cozy rental logs` reads a rental's provider boot log from its Hub through the daemon: an
-// older Hub that keeps none says so; a newer one's pages print in order with each line's time
-// and step, --json is one document, -f follows onto a replanned attempt and waits for new
+// `cozy rental logs` reads a rental's provider boot log from its Hub's admin route (th-254): a
+// renter is told it is the operator's; an operator's pages print in order with each line's
+// time and step, --json is one document, -f follows onto a replanned attempt and waits for new
 // lines until the rental is no longer booting, and the log still reads once the rental ended.
 func TestRentalLogsPrintsTheProviderBootLog(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-logs")
@@ -35,9 +35,7 @@ func TestRentalLogsPrintsTheProviderBootLog(t *testing.T) {
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL}))
 	store.Close()
 
-	if code, out := runCozy(t, root, "rental", "logs", "otter"); code == 0 || !strings.Contains(out, "this hub doesn't keep boot logs") {
-		t.Fatalf("an older Hub's missing route was not named [exit %d]:\n%s", code, out)
-	}
+	admin := false
 
 	line := func(second int, step, text string) map[string]any {
 		return map[string]any{"at": fmt.Sprintf("2026-09-25T20:50:%02dZ", second), "step": step, "line": text}
@@ -49,9 +47,15 @@ func TestRentalLogsPrintsTheProviderBootLog(t *testing.T) {
 			line(41, "pulling_image", "9134e987953c Pulling fs layer")},
 	}
 	booting, armed, grown := true, false, false
-	hub.mux.HandleFunc("GET /v1/rentals/{id}/boot-log", func(w http.ResponseWriter, r *http.Request) {
+	hub.mux.HandleFunc("GET /v1/admin/rentals/{id}/boot-log", func(w http.ResponseWriter, r *http.Request) {
 		hub.mu.Lock()
 		defer hub.mu.Unlock()
+		if !admin {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"code":"auth.admin_required","message":"admin required"}}`))
+			return
+		}
 		attempt, _ := strconv.Atoi(r.URL.Query().Get("attempt"))
 		after, _ := strconv.Atoi(r.URL.Query().Get("after"))
 		if attempt == 0 {
@@ -70,6 +74,13 @@ func TestRentalLogsPrintsTheProviderBootLog(t *testing.T) {
 			"booting": booting, "lines": lines, "next": after + len(lines)})
 	})
 
+	if code, out := runCozy(t, root, "rental", "logs", "otter"); code == 0 || !strings.Contains(out, "boot log is the operator's") ||
+		!strings.Contains(out, "--tensorfs") {
+		t.Fatalf("a renter was not told the boot log is the operator's [exit %d]:\n%s", code, out)
+	}
+	hub.mu.Lock()
+	admin = true
+	hub.mu.Unlock()
 	code, out := runCozy(t, root, "rental", "logs", "otter", "--attempt", "1")
 	want := "2026-09-25T20:50:01Z                      create 20GB network volume\n" +
 		"2026-09-25T20:50:01Z  creating_container  create container index.docker.io/tensorhub/worker\n" +
@@ -132,7 +143,7 @@ func TestRentalLogsByAReusedNameReadTheNewestPod(t *testing.T) {
 		fatal(t, store.AdvanceRentalOperation(op.Key, pod, "released"))
 	}
 	store.Close()
-	hub.mux.HandleFunc("GET /v1/rentals/{id}/boot-log", func(w http.ResponseWriter, r *http.Request) {
+	hub.mux.HandleFunc("GET /v1/admin/rentals/{id}/boot-log", func(w http.ResponseWriter, r *http.Request) {
 		lines := []map[string]any{{"at": "2026-10-06T06:00:00Z", "step": "pulling_image", "line": "the log of " + r.PathValue("id")}}
 		if r.URL.Query().Get("after") == "1" {
 			lines = nil // one line, then the end of the log

@@ -22,7 +22,7 @@ func TestRentalShowSaysHowAnEndedRentalEnded(t *testing.T) {
 		"pr-kanna-older": {"rental_id": "pr-kanna-older", "name": "kanna", "state": "released",
 			"requested_accelerator_model": "RTX PRO 6000", "accelerator_count": 4, "hourly_rate_usd_micros": 8_400_000,
 			"created_at": "2026-10-05T09:00:00Z", "ended_at": "2026-10-05T10:00:00Z", "release_cause": "owner_stop",
-			"spend_usd_micros": 8_400_000, "spend_basis": "provider_billed"},
+			"spend_usd_micros": 8_400_000, "spend_basis": "charged"},
 		"pr-kanna-newest": {"rental_id": "pr-kanna-newest", "name": "kanna", "state": "released",
 			"requested_accelerator_model": "RTX PRO 6000", "accelerator_count": 4, "hourly_rate_usd_micros": 8_400_000,
 			"created_at": "2026-10-06T09:21:05Z", "ended_at": "2026-10-06T17:37:50Z", "release_cause": "idle_unreached",
@@ -78,7 +78,7 @@ func TestRentalShowSaysHowAnEndedRentalEnded(t *testing.T) {
 		t.Fatalf("by name, not the newest kanna and how it ended: %v", newest)
 	}
 	if older := show("pr-kanna-older"); older["rental_id"] != "pr-kanna-older" || older["release_cause"] != "owner_stop" ||
-		older["spend_basis"] != "provider_billed" {
+		older["spend_basis"] != "charged" {
 		t.Fatalf("by id: %v", older)
 	}
 	if code, human := runCozy(t, root, "rental", "show", "kanna"); code != 0 ||

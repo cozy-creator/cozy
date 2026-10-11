@@ -49,7 +49,7 @@ func TestRentalHistoryShowsEachRentalsLifetimeRunsAndCost(t *testing.T) {
 		current.rentals[id] = map[string]any{"rental_id": id, "name": name, "state": "released",
 			"requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100_000,
 			"created_at": "2026-10-05T08:00:00Z", "ended_at": endedAt, "release_cause": cause,
-			"spend_usd_micros": spend, "spend_basis": "provider_billed"}
+			"spend_usd_micros": spend, "spend_basis": "charged"}
 	}
 	ended("pr-heron-ended", "heron", "2026-10-06T12:00:00Z", "released_by_pod", 1_250_000)
 	ended("pr-wren-ended", "wren", "2026-10-05T09:00:00Z", "owner_stop", 100_000)
@@ -148,7 +148,7 @@ func TestRentalHistoryShowsEachRentalsLifetimeRunsAndCost(t *testing.T) {
 	}
 	if heron.RentalID != "pr-heron-ended" || heron.SKU != "cpu" || heron.ReleaseCause != "released_by_pod" ||
 		heron.Lifetime == nil || *heron.Lifetime != 28*3600 || heron.Succeeded == nil || *heron.Succeeded != 3 ||
-		*heron.Failed != 2 || *heron.Canceled != 1 || heron.Spend == nil || *heron.Spend != 1_250_000 || heron.SpendBasis != "provider_billed" {
+		*heron.Failed != 2 || *heron.Canceled != 1 || heron.Spend == nil || *heron.Spend != 1_250_000 || heron.SpendBasis != "charged" {
 		t.Fatalf("heron: %+v", heron)
 	}
 	if wren.Succeeded != nil || wren.SKU != "" || wren.Lifetime == nil || *wren.Lifetime != 3600 {

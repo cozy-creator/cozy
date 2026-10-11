@@ -16,9 +16,9 @@ import (
 type bootWords struct {
 	// head names the attempt when it is not the rental's first.
 	head string
-	// replan is the attempt this one replaced: where, for how long, and why it ended.
+	// replan is the attempt this one replaced: where (an operator's view), for how long, and why it ended.
 	replan string
-	// where is this attempt's datacenter.
+	// where is this attempt's datacenter, in an operator's view only.
 	where string
 	// elapsed is how long this attempt has run; empty before it has a start.
 	elapsed string
@@ -38,7 +38,11 @@ func describeBoot(machine string, b *hub.RentalBoot, now time.Time) bootWords {
 		if from.ObservedMaxMS > 0 {
 			why = fmt.Sprintf("no progress past the observed %.1fm max", float64(from.ObservedMaxMS)/float64(time.Minute/time.Millisecond))
 		}
-		w.replan = "replanned from " + from.Datacenter + " after " + brief(from.EndedAt.Sub(from.StartedAt))
+		w.replan = "replanned"
+		if from.Datacenter != "" {
+			w.replan += " from " + from.Datacenter
+		}
+		w.replan += " after " + brief(from.EndedAt.Sub(from.StartedAt))
 		if why != "" {
 			w.replan += " (" + why + ")"
 		}
