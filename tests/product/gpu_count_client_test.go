@@ -1,4 +1,4 @@
-package client
+package producttest
 
 import (
 	"encoding/json"
@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
@@ -31,7 +32,7 @@ func TestExplicitGPUCountRequiresControllerSupportBeforeSubmission(t *testing.T)
 				captured = body.GPUs
 				_, _ = w.Write([]byte(`{"request_id":"recorded","job_id":"recorded"}`))
 			}))
-			c := At(config.Config{}, strings.TrimPrefix(server.URL, "http://"), secret.Mint())
+			c := localapi.At(config.Config{}, strings.TrimPrefix(server.URL, "http://"), secret.Mint())
 			if job {
 				_, problem := c.SubmitJob(api.JobSubmission{Package: "local/fixture", Function: "job", GPUs: 2}, "two")
 				if (problem == nil) != supported {

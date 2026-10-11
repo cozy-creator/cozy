@@ -718,7 +718,7 @@ func OneSelectionPerSlot(groups ...[]ModelRef) []ModelRef {
 	return out
 }
 
-// ModelRung is one GPU class, execution group and lane resolved against the model card.
+// ModelRung is one GPU class, advisory count selector and weight lane resolved against the model card.
 type ModelRung struct {
 	GPUs           int              `json:"gpus,omitempty"`
 	GPU            string           `json:"gpu"`

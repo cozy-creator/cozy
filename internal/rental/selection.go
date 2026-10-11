@@ -154,6 +154,9 @@ func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, acceler
 func size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
 	vramGB int64, device, job bool, working records.WorkingPeaks, count int) {
 	c.RunGPUs = count
+	if accelerator == "CPU" {
+		c.RunGPUs = 0
+	}
 	var ok bool
 	if c.Models, c.Rung, ok = pin(models, accelerator, count); !ok {
 		c.Verdict = orchestrator.VerdictNoRung

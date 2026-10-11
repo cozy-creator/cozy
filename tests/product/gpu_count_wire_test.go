@@ -1,86 +1,32 @@
-package cli
+package producttest
 
-import (
-	"context"
-	"net"
-	"path/filepath"
-	"testing"
+import "testing"
 
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/machines"
-	"github.com/cozy-creator/cozy/internal/machinev1"
-	"github.com/cozy-creator/cozy/internal/records"
-	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/test/bufconn"
-	"google.golang.org/protobuf/proto"
-)
-
-type gpuCountPeer struct {
-	v1.UnimplementedMachineServer
-	supported bool
-	statuses  int
-}
-
-func (p *gpuCountPeer) Status(_ *v1.StatusRequest, stream grpc.ServerStreamingServer[v1.StatusFrame]) error {
-	p.statuses++
-	var capabilities []string
-	if p.supported {
-		capabilities = []string{"run-gpus/1"}
-	}
-	return stream.Send(&v1.StatusFrame{Capabilities: capabilities})
-}
-
+// Drive the real controller and its pinned-TLS machine transport. The peer records
+// request intent only: this does not pretend to qualify GPU inference.
 func TestRunGPUCountReachesNativeSpecOrRefusesBeforePreparation(t *testing.T) {
 	for _, count := range []uint32{0, 1, 2} {
 		for _, supported := range []bool{false, true} {
-			peer := &gpuCountPeer{supported: supported}
-			listener := bufconn.Listen(1 << 20)
-			server := grpc.NewServer()
-			v1.RegisterMachineServer(server, peer)
-			go server.Serve(listener)
-			conn, err := grpc.NewClient("passthrough:///gpu-count", grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }))
-			if err != nil {
-				t.Fatal(err)
+			peer := &observerLeasePeer{requestedGPUs: count, gpuCountCapable: supported, completeFirst: true}
+			_, store, request, _ := observerLeaseFixture(t, peer)
+			if count > 0 && !supported {
+				observerEventually(t, func() bool { row, _ := store.RequestRow(request.ID); return row != nil && row.State == "failed" })
+				if peer.specs.Load() != 0 {
+					t.Fatal("unsupported count reached Run")
+				}
+				continue
 			}
-			machine := &machines.V1{Name: "fixture", Client: &machinev1.Client{Machine: v1.NewMachineClient(conn)}}
-			root := t.TempDir()
-			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-			if problem != nil {
-				t.Fatal(problem)
+			observerEventually(t, func() bool { row, _ := store.MachineExecution(request.ID); return row != nil && row.Collected })
+			peer.mu.Lock()
+			observed := append([]uint32(nil), peer.observedGPUs...)
+			statuses := len(peer.statusTimes)
+			peer.mu.Unlock()
+			if len(observed) != 1 || observed[0] != count {
+				t.Fatalf("GPU count lost: expected%d, observed%v", count, observed)
 			}
-			m := &machineRuns{store: store, layout: home.Layout{Root: root}, context: &Context{}, resolver: &Resolver{}}
-			for _, kind := range []string{"serving", "job"} {
-				spec, problem := m.specV1(context.Background(), records.Request{Package: "proof/package", Entrypoint: "call", Kind: kind, GPUs: count, Payload: []byte(`{}`)}, machine)
-				if count > 0 && !supported {
-					if problem == nil || problem.ErrName() != "machine.gpu_count_unsupported" || spec != nil {
-						t.Fatalf("count silently ignored: count=%d spec=%+v problem=%v", count, spec, problem)
-					}
-					continue
-				}
-				if problem != nil {
-					t.Fatal(problem)
-				}
-				wire, err := proto.Marshal(spec)
-				if err != nil {
-					t.Fatal(err)
-				}
-				decoded := &v1.RunSpec{}
-				if err := proto.Unmarshal(wire, decoded); err != nil {
-					t.Fatal(err)
-				}
-				if decoded.Gpus != count {
-					t.Fatalf("lost count in protobuf: %+v", decoded)
-				}
+			if count == 0 && statuses != 0 {
+				t.Fatalf("automatic request requires new peer capability: %d", statuses)
 			}
-			if count == 0 && peer.statuses != 0 {
-				t.Fatal("automatic run unnecessarily requires new peer capability")
-			}
-			store.Close()
-			conn.Close()
-			server.Stop()
 		}
 	}
 }

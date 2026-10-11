@@ -103,3 +103,10 @@ func TestAutomaticPurchaseUsesSupportedSubsetOfWiderOffer(t *testing.T) {
 		t.Fatalf("six-card purchase did not preserve supported four-GPU execution: %+v", rows[0])
 	}
 }
+
+func TestCPUPurchaseDoesNotInventAOneGPUExecution(t *testing.T) {
+	rows := rental.Purchases([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1}}, nil, false, true, rental.Constraints{})
+	if len(rows) != 1 || rows[0].RunGPUs != 0 {
+		t.Fatalf("CPU offer invented a GPU execution: %+v", rows)
+	}
+}

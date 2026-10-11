@@ -37,6 +37,10 @@ type observerLeasePeer struct {
 	v1.UnimplementedMachineServer
 	expiring, expireRelease   chan struct{}
 	public                    ed25519.PublicKey
+	completeFirst             bool
+	requestedGPUs             uint32
+	gpuCountCapable           bool
+	observedGPUs              []uint32
 	denyRun, denyFirst        bool
 	mu                        sync.Mutex
 	id                        string
@@ -64,7 +68,11 @@ func (p *observerLeasePeer) Status(_ *v1.StatusRequest, stream grpc.ServerStream
 	p.mu.Lock()
 	p.statusTimes = append(p.statusTimes, time.Now())
 	p.mu.Unlock()
-	return stream.Send(&v1.StatusFrame{WorkerId: "lease-worker", BootId: "lease-boot", Phase: "ready"})
+	var capabilities []string
+	if p.gpuCountCapable {
+		capabilities = []string{"run-gpus/1"}
+	}
+	return stream.Send(&v1.StatusFrame{WorkerId: "lease-worker", BootId: "lease-boot", Phase: "ready", Capabilities: capabilities})
 }
 
 func (p *observerLeasePeer) Run(request *v1.RunRequest, stream grpc.ServerStreamingServer[v1.RunEvent]) error {
@@ -73,6 +81,9 @@ func (p *observerLeasePeer) Run(request *v1.RunRequest, stream grpc.ServerStream
 	}
 	p.mu.Lock()
 	p.runTimes = append(p.runTimes, time.Now())
+	if request.Spec != nil {
+		p.observedGPUs = append(p.observedGPUs, request.Spec.Gpus)
+	}
 	first := p.id == ""
 	if first {
 		p.id = request.Id
@@ -105,9 +116,11 @@ func (p *observerLeasePeer) Run(request *v1.RunRequest, stream grpc.ServerStream
 				return stream.Context().Err()
 			}
 		}
-		return status.Error(codes.PermissionDenied, "the key that opened this stream no longer authorizes it")
+		if !p.completeFirst {
+			return status.Error(codes.PermissionDenied, "the key that opened this stream no longer authorizes it")
+		}
 	}
-	if request.Spec != nil || request.After != 1 {
+	if !p.completeFirst && (request.Spec != nil || request.After != 1) {
 		return status.Error(codes.InvalidArgument, "not the same accepted cursor")
 	}
 	if err := stream.Send(&v1.RunEvent{Sequence: 2, Event: &v1.RunEvent_State{State: &v1.RunState{Id: id, Number: 1, State: "succeeded", Sequence: 2, Attempt: 1}}}); err != nil {
@@ -169,7 +182,7 @@ func observerLeaseFixture(t *testing.T, peer *observerLeasePeer, rented ...bool)
 			Address: ep.Address, CertPath: layout.RentalCert(machineID), ExpectedWorkerID: ep.WorkerID,
 			ExpectedWorkerBootID: ep.WorkerBootID}))
 	}
-	request, _, problem := store.SubmitWithEvent(records.Request{ID: "lease-run", IdemKey: "lease-run", Package: "proof/lease", Entrypoint: "main", Kind: "serving", Payload: []byte(`{}`), BodyDigest: "sha256:" + strings.Repeat("1", 64), MachineExecutionObserver: true}, event)
+	request, _, problem := store.SubmitWithEvent(records.Request{GPUs: peer.requestedGPUs, ID: "lease-run", IdemKey: "lease-run", Package: "proof/lease", Entrypoint: "main", Kind: "serving", Payload: []byte(`{}`), BodyDigest: "sha256:" + strings.Repeat("1", 64), MachineExecutionObserver: true}, event)
 	if problem != nil {
 		t.Fatal(problem)
 	}
