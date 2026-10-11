@@ -380,11 +380,7 @@ pub(crate) fn fetch_sources(
         backfill: None,
         keep: Some(&keep),
     }
-    .run(
-        usize::MAX,
-        super::transfer_streams(options.streams.clamp(1, 128)),
-        None,
-    )?;
+    .run(super::transfer_streams(options.streams.clamp(1, 128)), None)?;
     let moved = moved.into_inner().unwrap();
     Ok(jobs
         .iter()

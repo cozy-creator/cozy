@@ -42,10 +42,11 @@ use std::time::{Duration, Instant};
 /// the right number is a property of the LINK, and this module cannot measure the caller's.
 pub const STREAMS: usize = 16;
 
-/// The most requests a pull keeps in flight, before the memory and descriptor bounds. It
-/// starts at a quarter, at least `STREAMS`, and doubles while wider lands more. Measured 2026-10-10, 25-45 GiB
-/// cold: a vast RTX 5060 Ti moved 262, 256 and 251 MB/s at 128, 256 and 512 with 7, 10 and
-/// 37 restarts; a RunPod RTX PRO 6000 moved 845-1,079 MB/s at 128 and 1,359 at 512.
+/// The most requests a pull keeps in flight, before the memory and descriptor bounds.
+/// Measured on a pod: 8 MiB requests move the same 1.1-1.2 GB/s at 64, 128 and 256, so
+/// the link is not what more buys. A cold object answers each MiB in its own time, and
+/// 2 GiB of cold objects asked a MiB at a time was 90% home in 12.0 s at 128, 4.7 s at
+/// 512 and 3.2 s at 1,024.
 pub const PULL_STREAMS: usize = 512;
 
 /// How often a waiting stream SAMPLES — the runtime's one sampling cadence, shared with
