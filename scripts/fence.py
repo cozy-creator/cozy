@@ -882,8 +882,7 @@ def check_typed_resources() -> list[str]:
         bad.append("internal/wheel/build.go: [env] uv build inherits the parent environment; "
                    "the PEP 517 backend executes project code and must receive only Tool() "
                    "and a pinned source's SOURCE_DATE_EPOCH")
-    retired_debug = (pathlib.Path("internal/transfer/fetch.go").read_text() +
-                     pathlib.Path("internal/transfer/upload.go").read_text() +
+    retired_debug = (pathlib.Path("internal/transfer/upload.go").read_text() +
                      pathlib.Path("internal/cli/transfer.go").read_text())
     for retired in ("FailAfter", "--crash-after", "devKill", '"/seal"'):
         if retired in retired_debug:

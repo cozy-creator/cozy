@@ -10,7 +10,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -23,20 +22,6 @@ import (
 // byte or a protocol: the byte plane is TensorFS's (internal/tfs) and the protocol is
 // the hub's (internal/hub). What these own is the argument surface, the progress
 // accounting, and the exit code.
-
-// tooling opens the byte plane and the hub together, with the credential this
-// invocation carries. A verb that could not get either says so before it moves.
-func tooling(ctx *Context) (*tfs.Tool, *hub.Client, home.Layout, *exit.Error) {
-	layout, e := home.Open(ctx.Cfg.Home)
-	if e != nil {
-		return nil, nil, layout, e
-	}
-	tool, e := tfs.Open(ctx.Cfg)
-	if e != nil {
-		return nil, nil, layout, e
-	}
-	return tool, client(ctx), layout, nil
-}
 
 func progress(ctx *Context) func(string) {
 	return func(line string) { _ = output.Progress(ctx.Err, line) }

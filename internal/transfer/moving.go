@@ -73,11 +73,6 @@ func (m *mover) context(parent context.Context) (context.Context, context.Cancel
 	return ctx, cancel
 }
 
-// reader counts every byte that actually arrives. Wrapping the body is what makes the
-// meter fine-grained: a per-object or per-part total only moves when a whole object or
-// part has landed, so a single multi-gigabyte part would read as no progress at all.
-func (m *mover) reader(r io.Reader) io.Reader { return &counted{r: r, m: m} }
-
 func (m *mover) readCloser(r io.ReadCloser) io.ReadCloser {
 	return &countedReadCloser{counted: counted{r: r, m: m}, closer: r}
 }

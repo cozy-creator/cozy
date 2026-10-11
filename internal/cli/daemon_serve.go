@@ -144,12 +144,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	machines.updates = updates
 	fleet.boot = updates.Boot
 	fleet.wakeMachine = machines.WakeMachine
-	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution: machines.Start,
 		Cfg:                   ctx.Cfg, Layout: l, Store: st, Log: ctx.Out,
-		Rentals:        rentals,
-		ModelTransfers: transfers,
+		Rentals: rentals,
 		ReclaimInstall: func(id string) *exit.Error {
 			// Background cleanup and editable refresh are mutations by this same daemon.
 			// Serialize them before the cross-process writer claim so cleanup cannot

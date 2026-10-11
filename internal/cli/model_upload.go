@@ -8,8 +8,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -19,7 +17,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 type publishSource struct {
@@ -44,15 +41,6 @@ type sourceCapability struct {
 	Member, ObjectID, Provider, URL string
 	Length                          int64
 	ExpiresAtUnix                   uint64
-}
-
-func sourceProfileNames(profiles map[string]string) []string {
-	names := make([]string, 0, len(profiles))
-	for _, name := range profiles {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return slices.Compact(names)
 }
 
 func handleModelUpload(ctx *Context) *exit.Error {
@@ -184,167 +172,60 @@ func fileDigest(path string, length int64) (string, *exit.Error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (publishSource, *exit.Error) {
-	raw = strings.TrimSpace(raw)
-	lane := strings.TrimSpace(ctx.Inv.Value("--lane"))
-	if name, local, problem := modelsource.LocalAlias(raw); local {
-		if problem != nil {
-			return publishSource{}, problem
-		}
-		if ctx.Inv.Bool("--rental") {
-			return publishSource{}, exit.Usagef("a local/%s alias cannot be read by a rented worker", name).
-				WithRemedy("use its addressable Tensorhub release or original pinned foreign source")
-		}
-		if lane != "" {
-			return publishSource{}, exit.Usagef("--lane selects only a Tensorhub model release")
-		}
-		tool, _, problem := localTensorFS(ctx)
-		if problem != nil {
-			return publishSource{}, problem
-		}
-		alias, problem := tool.ResolveLocal(name)
-		if problem != nil {
-			return publishSource{}, problem
-		}
-		return publishSource{Canonical: "local/" + name, Selection: alias.ManifestDigest}, nil
-	}
+// resolvePublishSource pins a Hugging Face or Civitai source and inventories its carriers.
+// No weights are downloaded.
+func resolvePublishSource(ctx *Context, raw string) (publishSource, *exit.Error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return publishSource{}, exit.Internalf("cannot resolve the current directory: %s", err)
 	}
-	parsed, parseProblem := modelsource.Parse(raw, cwd)
-	if parseProblem == nil {
-		if lane != "" {
-			return publishSource{}, exit.Usagef("--lane selects only a Tensorhub model release")
-		}
-		if parsed.Kind == modelsource.LocalFile {
-			if ctx.Inv.Bool("--rental") {
-				return publishSource{}, exit.Usagef("a local model file cannot be read by a rented worker").
-					WithRemedy("import it locally or use an addressable pinned foreign source")
-			}
-			file, err := os.Open(parsed.Path)
-			if err != nil {
-				return publishSource{}, exit.New(exit.NotFound, "cannot open local model source: %s", err)
-			}
-			defer file.Close()
-			hash := sha256.New()
-			length, err := io.Copy(hash, file)
-			if err != nil || length != parsed.Bytes {
-				return publishSource{}, exit.Named(exit.Conflict, "model_source.local_changed",
-					"local model source changed while measuring its exact identity")
-			}
-			digest := hex.EncodeToString(hash.Sum(nil))
-			return publishSource{Canonical: parsed.Canonical, Selection: "sha256:" + digest,
-				Files: 1, Bytes: parsed.Bytes, Exact: []modeltransfer.SourceFile{{
-					Member: filepath.Base(parsed.Path), SHA256: digest, Length: parsed.Bytes}}}, nil
-		}
-		var token = ctx.Cfg.HuggingFaceToken
-		if parsed.Kind == modelsource.Civitai {
-			token = ctx.Cfg.CivitaiToken
-		}
-		resolver, problem := modelsource.NewResolver(parsed.Kind, token)
-		if problem != nil {
-			return publishSource{}, problem
-		}
-		hctx, cancel := hub.Context()
-		defer cancel()
-		resolved, problem := resolver.Resolve(hctx, parsed)
-		if problem != nil {
-			return publishSource{}, problem
-		}
-		if parsed.Kind == modelsource.HuggingFace && parsed.Revision == "" {
-			fmt.Fprintf(ctx.Err, "pinned %s\n", resolved.Canonical)
-		}
-		// A single carrier is already exact (for example Civitai's primary
-		// checkpoint). Multi-carrier provider repositories must be narrowed by
-		// TensorFS's reviewed profiles before any body is persisted or granted.
-		// An as-is plan narrows itself from the headers, as an unnamed selection does.
-		// A Civitai primary with its companions is narrowed by its header plan instead.
-		if len(resolved.Files) > 1 && len(sourceProfiles) > 0 && !slices.Contains(sourceProfiles, tfs.AsIsProfile) &&
-			!slices.ContainsFunc(resolved.Files, func(file modelsource.File) bool { return file.Companion }) {
-			tool, _, problem := localTensorFS(ctx)
-			if problem != nil {
-				return publishSource{}, problem
-			}
-			members, problem := tool.SourceProfileMembers(ctx.Cfg.TensorFSRegistry, sourceProfiles)
-			if problem != nil {
-				return publishSource{}, problem
-			}
-			resolved, problem = resolved.Select(members)
-			if problem != nil {
-				return publishSource{}, problem
-			}
-		}
-		exact := make([]modeltransfer.SourceFile, 0, len(resolved.Files))
-		access := make([]sourceCapability, 0, len(resolved.Files))
-		provider := string(parsed.Kind)
-		for _, file := range resolved.Files {
-			exact = append(exact, modeltransfer.SourceFile{
-				Member: file.Member, SHA256: file.SHA256, Length: file.Length,
-			})
-			access = append(access, sourceCapability{
-				Member: file.Member, ObjectID: "sha256:" + file.SHA256,
-				Length: file.Length, Provider: provider, URL: file.URL,
-			})
-		}
-		return publishSource{Canonical: resolved.Canonical,
-			Selection: "sha256:" + resolved.SelectionSHA256,
-			License:   resolved.License, Files: len(resolved.Files), Bytes: resolved.Bytes,
-			Exact: exact, Access: access,
-			Resolver: resolver, Resolution: resolved}, nil
-	}
-	if !catalogModelSpelling(raw) {
-		return publishSource{}, parseProblem
-	}
-	hctx, cancel := hub.Context()
-	defer cancel()
-	refspec := raw
-	if strings.Contains(raw, "#") {
-		model, release, selectedLane, manifest, problem := hub.ParseModelRef(raw)
-		if problem != nil {
-			return publishSource{}, problem
-		}
-		if selectedLane != "" {
-			if lane != "" && lane != selectedLane {
-				return publishSource{}, exit.Usagef("model reference and selected lane disagree")
-			}
-			lane = selectedLane
-		}
-		if manifest == "" {
-			resolvedModel, problem := resolveRemoteModel(ctx, client(ctx), "", launch.Slot{}, raw, lane, nil)
-			if problem != nil {
-				return publishSource{}, problem
-			}
-			refspec = model + "@" + resolvedModel.Release
-			lane = resolvedModel.Lane
-		} else {
-			refspec = model + "@" + manifest
-			if release != "" {
-				refspec = model + "@" + release + "@" + manifest
-			}
-		}
-	}
-	resolved, problem := client(ctx).ResolveModel(hctx, refspec, lane)
+	parsed, problem := modelsource.Parse(strings.TrimSpace(raw), cwd)
 	if problem != nil {
 		return publishSource{}, problem
 	}
-	if (resolved.Release == "") != (resolved.Lane == "") || resolved.ManifestID == "" {
-		return publishSource{}, exit.Named(exit.Structural, "model_source_resolution_incomplete",
-			"Tensorhub did not resolve one exact checkpoint")
+	if parsed.Kind != modelsource.HuggingFace && parsed.Kind != modelsource.Civitai {
+		return publishSource{}, exit.Usagef("%q is not a Hugging Face or Civitai source", raw)
 	}
-	selectedRef := resolved.Model + "@" + resolved.ManifestID
-	if resolved.Release != "" {
-		selectedRef = resolved.Model + "@" + resolved.Release
+	token := ctx.Cfg.HuggingFaceToken
+	if parsed.Kind == modelsource.Civitai {
+		token = ctx.Cfg.CivitaiToken
 	}
-	return publishSource{Canonical: selectedRef,
-		Selection: resolved.ManifestID, Lane: resolved.Lane,
-		Files: resolved.Objects, Bytes: resolved.Bytes}, nil
+	resolver, problem := modelsource.NewResolver(parsed.Kind, token)
+	if problem != nil {
+		return publishSource{}, problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	resolved, problem := resolver.Resolve(hctx, parsed)
+	if problem != nil {
+		return publishSource{}, problem
+	}
+	if parsed.Kind == modelsource.HuggingFace && parsed.Revision == "" {
+		fmt.Fprintf(ctx.Err, "pinned %s\n", resolved.Canonical)
+	}
+	exact := make([]modeltransfer.SourceFile, 0, len(resolved.Files))
+	access := make([]sourceCapability, 0, len(resolved.Files))
+	provider := string(parsed.Kind)
+	for _, file := range resolved.Files {
+		exact = append(exact, modeltransfer.SourceFile{
+			Member: file.Member, SHA256: file.SHA256, Length: file.Length,
+		})
+		access = append(access, sourceCapability{
+			Member: file.Member, ObjectID: "sha256:" + file.SHA256,
+			Length: file.Length, Provider: provider, URL: file.URL,
+		})
+	}
+	return publishSource{Canonical: resolved.Canonical,
+		Selection: "sha256:" + resolved.SelectionSHA256,
+		License:   resolved.License, Files: len(resolved.Files), Bytes: resolved.Bytes,
+		Exact: exact, Access: access,
+		Resolver: resolver, Resolution: resolved}, nil
 }
 
 // narrowPublishSource applies a reviewed TensorFS source profile to a provider
 // resolution already used for header preflight. Keeping this in-memory avoids a
 // second provider resolution between the preflight and durable submission while
-// making the accepted source inventory match RefreshRemoteSource exactly.
+// making the accepted source inventory match the submitted one exactly.
 func narrowPublishSource(ctx *Context, source publishSource, profiles []string) (publishSource, *exit.Error) {
 	if source.Resolver == nil || len(profiles) == 0 {
 		return source, nil

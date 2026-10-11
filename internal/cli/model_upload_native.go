@@ -195,7 +195,7 @@ type nativeIngestPlan struct {
 func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profiles []string) (nativeIngestPlan, *exit.Error) {
 	// The provider resolves moving URL spellings to an immutable identity first. No
 	// weights are downloaded by this inventory.
-	source, problem := resolvePublishSource(ctx, parsed.Canonical, nil)
+	source, problem := resolvePublishSource(ctx, parsed.Canonical)
 	if problem != nil {
 		return nativeIngestPlan{}, problem
 	}

@@ -456,9 +456,6 @@ func (c *Orchestrator) Reconcile() *exit.Error {
 	if problem := c.ResumeOutputExports(); problem != nil {
 		return problem
 	}
-	if problem := c.ResumeModelTransfers(); problem != nil {
-		return problem
-	}
 	return c.ResumeQueuedRequests()
 }
 

@@ -63,9 +63,8 @@ func (s *Store) EndUnfinishedWork() ([]string, *exit.Error) {
 		line, _, _ := strings.Cut(detail, "\n")
 		ids = append(ids, b.id+": "+line)
 	}
-	// A machine run publishes its weights in its outcome, and the daemon's own pass-through
-	// settles its request only after its transfer: an ended run's open destination is never
-	// published to.
+	// A machine run publishes its weights in its outcome: an ended run's open destination is
+	// never published to.
 	if _, err := tx.Exec(`UPDATE request_model_transfers SET
  state=CASE WHEN r.state='canceled' THEN 'canceled' ELSE 'failed' END,
  error_code=CASE WHEN r.state='succeeded' THEN 'model_transfer.outputs_missing' ELSE 'model_transfer.run_'||r.state END,
@@ -75,7 +74,6 @@ func (s *Store) EndUnfinishedWork() ([]string, *exit.Error) {
  FROM requests r WHERE r.id=request_model_transfers.request_id
  AND request_model_transfers.state NOT IN ('completed','failed','canceled')
  AND r.state IN (`+settledRequestStates+`)
- AND NOT (r.package='cozy/platform' AND r.entrypoint='model-pass-through')
  AND (r.state<>'succeeded' OR COALESCE(json_extract(request_model_transfers.intent,'$.destination'),'')<>'')`, now()); err != nil {
 		return nil, exit.Internalf("cannot end the weights destinations of ended runs: %s", err)
 	}
