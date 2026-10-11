@@ -497,10 +497,13 @@ The calling single-file script needs neither App declaration.
 Installed callable wheels require Runtime 0.12 or newer. The machine installs them from the
 caller's lock like any other dependency.
 
-On either a local or rented worker, a memoized child can acquire an earlier successful result when its
+On either a local or rented worker, a memoized function, run directly or called by a job, can acquire
+an earlier successful result when its
 exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,
 and measured numerical environment match. A fresh script can reuse this work without a retry
 ID. Run IDs, the parent's script digest and call position are not computation cache keys.
+`cozy run show` says when a run or call was served from the machine's memo, or why it was not
+memoized (its author's condition unmet, e.g. `seed not given`).
 Native model results travel as `ModelArtifact`
 references; reuse acquires independent native custody before the new result is visible.
 The reference names its original producer and receipt without copying tensor bytes.

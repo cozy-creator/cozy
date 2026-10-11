@@ -811,6 +811,14 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 
 // ------------------------------------------------------------------------- status
 
+// Memo is how its machine's memo answered a memoizable run: from a result it held (nothing
+// ran), the computation it ran or answered, or why it was neither looked up nor held.
+type Memo struct {
+	Memoized    bool   `json:"memoized,omitempty"`
+	Computation string `json:"computation,omitempty"`
+	Unmemoized  string `json:"unmemoized,omitempty"`
+}
+
 // JobState is one job's document: the lifecycle a request has, plus the two facts only a
 // job has — its publication and its running bill.
 type JobState struct {
@@ -871,6 +879,7 @@ type JobState struct {
 	Triage    *TriageRef `json:"triage,omitempty"`
 	CreatedAt string     `json:"created_at"`
 	EventsURL string     `json:"events_url"`
+	Memo
 }
 
 // ModelSourceState is one selected source file's transfer, as a client sees it. `safe_code`

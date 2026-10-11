@@ -1763,10 +1763,16 @@ type Outcome struct {
 	// `execution` (degree, ranks with the GPU and attention each served, executor boot,
 	// construction load and warm) and `observations` (attention rows, Sol's dense and sparse
 	// calls among them). Empty for a run that ran on no device.
-	Measurements  []byte `protobuf:"bytes,6,opt,name=measurements,proto3" json:"measurements,omitempty"`
-	ExecutionMs   uint64 `protobuf:"varint,7,opt,name=execution_ms,json=executionMs,proto3" json:"execution_ms,omitempty"` // its own time running its callable, every attempt summed; 0: unknown
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Measurements []byte `protobuf:"bytes,6,opt,name=measurements,proto3" json:"measurements,omitempty"`
+	ExecutionMs  uint64 `protobuf:"varint,7,opt,name=execution_ms,json=executionMs,proto3" json:"execution_ms,omitempty"` // its own time running its callable, every attempt summed; 0: unknown
+	// A memoizable callable's memo: its computation (sha256:<hex>), whether it ran or was answered;
+	// answered from a result this machine held (nothing ran); or why it was neither looked up nor
+	// held (its author's condition unmet, e.g. "seed not given").
+	ComputationDigest string `protobuf:"bytes,8,opt,name=computation_digest,json=computationDigest,proto3" json:"computation_digest,omitempty"`
+	Memoized          bool   `protobuf:"varint,9,opt,name=memoized,proto3" json:"memoized,omitempty"`
+	Unmemoized        string `protobuf:"bytes,10,opt,name=unmemoized,proto3" json:"unmemoized,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Outcome) Reset() {
@@ -1848,6 +1854,27 @@ func (x *Outcome) GetExecutionMs() uint64 {
 	return 0
 }
 
+func (x *Outcome) GetComputationDigest() string {
+	if x != nil {
+		return x.ComputationDigest
+	}
+	return ""
+}
+
+func (x *Outcome) GetMemoized() bool {
+	if x != nil {
+		return x.Memoized
+	}
+	return false
+}
+
+func (x *Outcome) GetUnmemoized() string {
+	if x != nil {
+		return x.Unmemoized
+	}
+	return ""
+}
+
 type Reason struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Code          string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
@@ -1922,6 +1949,7 @@ type Call struct {
 	Reason            *Reason                `protobuf:"bytes,9,opt,name=reason,proto3" json:"reason,omitempty"`                                                 // why it did not succeed
 	Memoized          bool                   `protobuf:"varint,10,opt,name=memoized,proto3" json:"memoized,omitempty"`                                           // answered from a result this machine held; nothing ran
 	ComputationDigest string                 `protobuf:"bytes,11,opt,name=computation_digest,json=computationDigest,proto3" json:"computation_digest,omitempty"` // a memoized call's computation (sha256:<hex>), ran or answered
+	Unmemoized        string                 `protobuf:"bytes,12,opt,name=unmemoized,proto3" json:"unmemoized,omitempty"`                                        // why a memoizable call was neither looked up nor held ("seed not given")
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -2029,6 +2057,13 @@ func (x *Call) GetMemoized() bool {
 func (x *Call) GetComputationDigest() string {
 	if x != nil {
 		return x.ComputationDigest
+	}
+	return ""
+}
+
+func (x *Call) GetUnmemoized() string {
+	if x != nil {
+		return x.Unmemoized
 	}
 	return ""
 }
@@ -3364,7 +3399,7 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x0e_appended_from\"3\n" +
 	"\aLogLine\x12\x14\n" +
 	"\x05level\x18\x01 \x01(\tR\x05level\x12\x12\n" +
-	"\x04text\x18\x02 \x01(\tR\x04text\"\xfd\x01\n" +
+	"\x04text\x18\x02 \x01(\tR\x04text\"\xe8\x02\n" +
 	"\aOutcome\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12/\n" +
 	"\x06reason\x18\x02 \x01(\v2\x17.cozy.machine.v1.ReasonR\x06reason\x12\x16\n" +
@@ -3372,11 +3407,17 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\aoutputs\x18\x04 \x03(\v2\x18.cozy.machine.v1.ProductR\aoutputs\x12\x16\n" +
 	"\x06triage\x18\x05 \x01(\bR\x06triage\x12\"\n" +
 	"\fmeasurements\x18\x06 \x01(\fR\fmeasurements\x12!\n" +
-	"\fexecution_ms\x18\a \x01(\x04R\vexecutionMs\"N\n" +
+	"\fexecution_ms\x18\a \x01(\x04R\vexecutionMs\x12-\n" +
+	"\x12computation_digest\x18\b \x01(\tR\x11computationDigest\x12\x1a\n" +
+	"\bmemoized\x18\t \x01(\bR\bmemoized\x12\x1e\n" +
+	"\n" +
+	"unmemoized\x18\n" +
+	" \x01(\tR\n" +
+	"unmemoized\"N\n" +
 	"\x06Reason\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x16\n" +
-	"\x06origin\x18\x03 \x01(\tR\x06origin\"\xe0\x02\n" +
+	"\x06origin\x18\x03 \x01(\tR\x06origin\"\x80\x03\n" +
 	"\x04Call\x12\x10\n" +
 	"\x03run\x18\x01 \x01(\tR\x03run\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\rR\x05index\x12\x1a\n" +
@@ -3390,7 +3431,10 @@ const file_cozy_machine_v1_machine_proto_rawDesc = "" +
 	"\x06reason\x18\t \x01(\v2\x17.cozy.machine.v1.ReasonR\x06reason\x12\x1a\n" +
 	"\bmemoized\x18\n" +
 	" \x01(\bR\bmemoized\x12-\n" +
-	"\x12computation_digest\x18\v \x01(\tR\x11computationDigest\"Q\n" +
+	"\x12computation_digest\x18\v \x01(\tR\x11computationDigest\x12\x1e\n" +
+	"\n" +
+	"unmemoized\x18\f \x01(\tR\n" +
+	"unmemoized\"Q\n" +
 	"\x0eControlRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12/\n" +
 	"\x06action\x18\x02 \x01(\x0e2\x17.cozy.machine.v1.ActionR\x06action\"\xd9\x01\n" +
