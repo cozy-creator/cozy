@@ -79,7 +79,6 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
             Some((String::new(), "render".into())),
         )]
         .into(),
-        memoized: Default::default(),
         pure: false,
         pure_callables: Default::default(),
         serving: Default::default(),

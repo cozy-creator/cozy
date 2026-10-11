@@ -65,8 +65,6 @@ struct Parent {
     /// `(module, export)` of each invocable it may call: the App it belongs to (empty: its own
     /// package's; else a callee's in its environment) and the entrypoint registered for it.
     callables: Callables,
-    /// The memoized ones' operation identity.
-    memoized: HashMap<(String, String), String>,
     /// The job itself is memoized: each call it makes must be too, or replaying its result
     /// would skip that call's effects.
     pure: bool,
@@ -137,10 +135,6 @@ struct ChildCall {
     label: String,
     /// Its `call` event is in the parent's log.
     recorded: bool,
-    /// A memoized call's computation digest, whether it ran or a held result answered it.
-    computation: Option<String>,
-    /// A memoized call that ran: its computation digest, under which its result is held.
-    memo: Option<String>,
     request: String,
     /// The answered result and grants, once the child succeeded (materialized once).
     settled: Option<(String, Vec<Value>)>,
@@ -403,7 +397,6 @@ impl Jobs {
                 .unwrap_or_default(),
             spool: spool.clone(),
             callables,
-            memoized: memoized(&held.record),
             pure: declarations(&document).any(|(declared, entry, kind)| {
                 kind == "job"
                     && entry["name"].as_str() == Some(record.invocation.entrypoint.as_str())
@@ -842,29 +835,12 @@ impl Jobs {
         let inputs = child_inputs(&request_input, parent, &calls.received);
         let request = format!("{}/{}", parent.request, frame.call_index);
         let intent = child_intent(&frame.module, &frame.export, &input);
-        // A memoized call's computation: its operation identity and its request. A result this
-        // machine holds for the signer answers it (where its files are, too).
-        let computation = parent
-            .memoized
-            .get(&(frame.module.clone(), frame.export.clone()))
-            .map(|operation| {
-                let computation = crate::boundary_json::exact(&json!([operation, input]));
-                format!("sha256:{}", tensorfs_core::sha256::hex_digest(&computation))
-            });
-        let held = match &computation {
-            Some(digest) => runs
-                .objects
-                .held_memo(&parent.actor, digest)
-                .map_err(|e| ("child_call_refused", e.to_string()))?,
-            None => None,
-        };
-        let memo = computation.clone().filter(|_| held.is_none());
         let job = service
             .engine
             .get(&parent.id)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
         let record = runs
-            .child(&job, &request, &intent, application, entrypoint, request_input, inputs, held, choices)
+            .child(&job, &request, &intent, application, entrypoint, request_input, inputs, choices)
             .map_err(|refusal| match refusal.code {
                 "run_id_conflict" => (
                     "child_call_refused",
@@ -888,8 +864,6 @@ impl Jobs {
             function: frame.export.clone(),
             label: frame.progress_label.clone(),
             recorded: false,
-            computation,
-            memo,
             request: request.clone(),
             settled: None,
             progress: (0, None),
@@ -963,21 +937,6 @@ impl Jobs {
                                 media_type: row["media_type"].as_str().unwrap_or_default().into(),
                             },
                         );
-                    }
-                    // A memoized call's result: this machine reuses it for the signer while it
-                    // holds every file it names (a tree's members are not held as one result).
-                    if let Some(digest) = &call.memo {
-                        let (record, objects) = held_memo(result);
-                        if !settled.1.iter().any(|grant| grant["kind"] == "tree")
-                            && record.len() <= MEMO_RESULT_BYTES
-                        {
-                            let kept = service.engine.with_journal(|j| {
-                                j.hold_memo(&parent.actor, digest, &record, &objects)
-                            });
-                            if let Err(error) = kept {
-                                eprintln!("job {}: memo of call {}: {error}", parent.id, frame.call_index);
-                            }
-                        }
                     }
                     call.settled = Some(settled);
                 }
@@ -1251,47 +1210,6 @@ fn conclude(
     Ok(())
 }
 
-/// The largest memoized result record this machine holds for reuse.
-const MEMO_RESULT_BYTES: usize = 48 << 10;
-
-/// `(module, export)` of each memoized invocable of the environment (the root's and its
-/// callees') and its operation identity, the same on every machine: a callee's own function
-/// (its package and the identity this machine's description of it read from its installed
-/// source), else its package's installed files; with the module and the export. A package with
-/// neither memoizes nothing. The root's own description is its caller's, so it keys by files.
-fn memoized(generation: &crate::catalog::Generation) -> HashMap<(String, String), String> {
-    let mut memoized = HashMap::new();
-    let apps = std::iter::once((&generation.interface, &generation.source_digest, None))
-        .chain(generation.callees.iter().map(|c| (&c.interface, &c.source_digest, Some(c.package.as_str()))));
-    for (interface, digest, callee) in apps {
-        for (declared, _, _) in declarations(interface) {
-            if let (Some(module), Some(export), Some(true)) = (
-                declared["module"].as_str(),
-                declared["export"].as_str(),
-                declared["memoize"].as_bool(),
-            ) {
-                let function = declared["operation_identity"].as_str().filter(|identity| {
-                    identity.strip_prefix("sha256:").is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-                });
-                let base = match (callee, function) {
-                    (Some(package), Some(identity)) => format!("{package}\0{identity}"),
-                    _ if !digest.is_empty() => digest.clone(),
-                    _ => continue,
-                };
-                let identity = format!("{base}\0{module}\0{export}");
-                memoized.insert(
-                    (module.into(), export.into()),
-                    format!(
-                        "sha256:{}",
-                        tensorfs_core::sha256::hex_digest(identity.as_bytes())
-                    ),
-                );
-            }
-        }
-    }
-    memoized
-}
-
 /// `(module, export)` of every invocable of the environment declared `memoize=True`.
 fn pure_callables(generation: &crate::catalog::Generation) -> std::collections::HashSet<(String, String)> {
     std::iter::once(&generation.interface)
@@ -1511,20 +1429,6 @@ fn child_inputs(
             })
         })
         .collect()
-}
-
-/// A child's result record as this machine keeps it for reuse: its value and file bindings,
-/// each file named by its digest only (its path is the store's when reused), and those digests.
-fn held_memo(result: &crate::journal::ResultRecord) -> (Vec<u8>, Vec<String>) {
-    let artifacts: Vec<_> = result
-        .artifacts
-        .iter()
-        .filter(|a| result.asset_bindings.iter().any(|b| b.relative_path == a.name))
-        .map(|a| crate::journal::Artifact { path: String::new(), ..a.clone() })
-        .collect();
-    let objects = artifacts.iter().map(|a| a.sha256.clone()).collect();
-    let record = crate::journal::ResultRecord { value: result.value.clone(), artifacts, asset_bindings: result.asset_bindings.clone() };
-    (serde_json::to_vec(&record).unwrap_or_default(), objects)
 }
 
 /// A completed child's result as its parent receives it: each file leaf named by its bytes
@@ -1755,9 +1659,8 @@ fn record_call(
         "attempt": record.attempt.max(1), "module": call.module, "export": call.function,
         "label": call.label, "status": status, "error_code": error_code, "error": error,
         "called_unix_ms": record.accepted_at_ms, "finished_unix_ms": record.finished_at_ms,
-        "measurements": measurements, "computation_digest": call.computation,
-        // Answered from a held result: a memoized call that did not run (its `memo` is unset).
-        "memoized": call.computation.is_some() && call.memo.is_none(),
+        "measurements": measurements, "computation_digest": record.memo.computation,
+        "memoized": record.memo.memoized, "unmemoized": record.memo.unmemoized,
     });
     match engine.append_call(&parent.id, &record.id, &crate::boundary_json::exact(&body)) {
         Ok(_) => true,
@@ -1831,45 +1734,6 @@ mod exact_tests {
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
     }
-    /// A callee's memoized function is keyed by its package and the identity this machine read
-    /// from its installed source: a new release that leaves it unchanged keeps its memos, one
-    /// that changes it does not. Without an identity, and always for the root's own functions
-    /// (whose description is its caller's), the package's installed files key it.
-    #[test]
-    fn a_callees_unchanged_function_keeps_its_memo_key_across_releases() {
-        let job = |name: &str, identity: Option<&str>| {
-            let mut invocable = json!({"module": "lib", "export": name, "memoize": true});
-            if let Some(identity) = identity {
-                invocable["operation_identity"] = identity.into();
-            }
-            json!({"name": name, "invocable": invocable})
-        };
-        let (same, changed) = (format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "b".repeat(64)));
-        let generation = |files: &str, second: &str| -> crate::catalog::Generation {
-            serde_json::from_value(json!({
-                "identity": "g", "package": "local/root", "version": "1", "application": "root:app",
-                "python": "/p", "source_digest": "sha256:root",
-                "interface": {"jobs": [{"name": "own", "invocable": {"module": "root", "export": "own",
-                    "memoize": true, "operation_identity": same}}]},
-                "callees": [{"distribution": "lib", "version": "1", "application": "lib:app",
-                    "source_digest": files, "package": "local/lib",
-                    "interface": {"jobs": [job("first", Some(&same)), job("second", Some(second)), job("third", None)]}}],
-            }))
-            .unwrap()
-        };
-        let before = memoized(&generation("sha256:one", &same));
-        let after = memoized(&generation("sha256:two", &changed));
-        let key = |m: &HashMap<(String, String), String>, module: &str, export: &str| m[&(module.to_string(), export.to_string())].clone();
-        assert_eq!(key(&before, "lib", "first"), key(&after, "lib", "first"), "an unchanged function keeps its key");
-        assert_ne!(key(&before, "lib", "second"), key(&after, "lib", "second"), "a changed function does not");
-        assert_ne!(key(&before, "lib", "third"), key(&after, "lib", "third"), "without an identity, the files key it");
-        // The root's declared identity is not this machine's reading: its files key it.
-        let root = generation("sha256:one", &same);
-        let mut moved = root.clone();
-        moved.source_digest = "sha256:other".into();
-        assert_ne!(key(&memoized(&root), "root", "own"), key(&memoized(&moved), "root", "own"));
-    }
-
     /// A serving call (the Runtime's typed caller of another package's entrypoint) is its
     /// request plus models: a passed ModelArtifact is the exact checkpoint of the callee's slot,
     /// a null one leaves the slot to the callee's ladder.
@@ -1963,7 +1827,7 @@ mod exact_tests {
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let jobs = Jobs::configure(&service,store,None).unwrap();
         let parent = Parent { id:"parent".into(),request:"parent".into(),actor:"alice".into(),spool:root.clone(),
-            callables:calls,memoized:Default::default(),pure:false,pure_callables:Default::default(),serving:Default::default(),
+            callables:calls,pure:false,pure_callables:Default::default(),serving:Default::default(),
             inputs:vec![],calls:Default::default() };
         let frame = Frame { module:"shared".into(),export:"apply".into(),..Default::default() };
         assert_eq!(jobs.child_call(&parent,&frame).unwrap_err().0,"child_ambiguous");

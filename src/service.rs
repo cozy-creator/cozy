@@ -271,13 +271,16 @@ impl Service {
         self.retain(&record, held.retention());
         Ok(record)
     }
-    /// A run prepared inside itself (`runs`) names its generation, call and model plan.
+    /// A run prepared inside itself (`runs`) names its generation, call and model plan, and how
+    /// the machine memo met it; one the memo answered (`answer`) completes with that result.
     pub fn bind_prepared(
         &self,
         id: &str,
         generation: &str,
         call: Call,
         preparation: &str,
+        memo: crate::journal::CallMemo,
+        answer: Option<crate::journal::ResultRecord>,
     ) -> io::Result<Execution> {
         let held = self.catalog.resolve(generation)?;
         let mut invocation = held.invocation_of(&call.application, &call.entrypoint, call.input)?;
@@ -297,7 +300,7 @@ impl Service {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "accelerator_job_unavailable: this job requires a configured GPU"));
         }
         invocation.parent = call.parent;
-        let record = self.engine.bind_prepared(id, invocation, preparation)?;
+        let record = self.engine.bind_prepared(id, invocation, preparation, memo, answer)?;
         self.retain(&record, held.retention());
         Ok(record)
     }

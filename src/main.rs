@@ -409,6 +409,7 @@ fn start_api(
         store.clone(),
         service.engine.clone(),
     )?);
+    service.engine.hold_memos(&objects);
     // The leaf the CLI pins is the key a run's capability names (th-241).
     let leaf = cozy_machine::hub::Leaf::from_pem(&identity.key_pem).map_err(|e| io::Error::other(e.0))?;
     backend.runs = Some(Arc::new(cozy_machine::runs::Runs {

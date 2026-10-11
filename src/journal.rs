@@ -245,6 +245,28 @@ pub struct Execution {
     pub executor: Option<ExecutorFacts>,
     pub result: Option<ResultRecord>,
     pub failure: Option<String>,
+    #[serde(default, skip_serializing_if = "CallMemo::is_empty")]
+    pub memo: CallMemo,
+}
+
+/// How the machine memo (`call_memo`) met a memoizable call.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CallMemo {
+    /// `sha256:<hex>`: what answered it, or what its success is held under.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub computation: String,
+    /// Answered from a result this machine held: nothing ran.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub memoized: bool,
+    /// Why it was neither looked up nor held: its author's condition unmet ("seed not given").
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub unmemoized: String,
+}
+impl CallMemo {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 impl Execution {
@@ -744,24 +766,9 @@ impl Journal {
             .map_err(db_error)?;
         Ok(())
     }
-    /// A memoized call's result, reusable while this machine holds every file it names: the
-    /// child's result record, keyed by its signer and computation. Each signer keeps its
-    /// `MAX_HELD_MEMOS` most recently used.
-    pub fn hold_memo(&mut self, actor: &str, computation: &str, record: &[u8], objects: &[String]) -> io::Result<()> {
+    pub fn hold_memo(&mut self, held: &HeldMemo) -> io::Result<()> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
-        tx.execute("INSERT OR REPLACE INTO held_memos(actor,computation,record,used_ms) VALUES(?1,?2,?3,?4)",
-            params![actor, computation, record, timestamp()]).map_err(db_error)?;
-        tx.execute("DELETE FROM held_memos WHERE actor=?1 AND computation NOT IN
-            (SELECT computation FROM held_memos WHERE actor=?1 ORDER BY used_ms DESC LIMIT ?2)",
-            params![actor, MAX_HELD_MEMOS]).map_err(db_error)?;
-        tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation NOT IN
-            (SELECT computation FROM held_memos WHERE actor=?1)", params![actor]).map_err(db_error)?;
-        tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation=?2", params![actor, computation])
-            .map_err(db_error)?;
-        for sha256 in objects {
-            tx.execute("INSERT OR IGNORE INTO held_memo_objects(actor,computation,sha256) VALUES(?1,?2,?3)",
-                params![actor, computation, sha256]).map_err(db_error)?;
-        }
+        hold_memo(&tx, held)?;
         tx.commit().map_err(db_error)
     }
     pub fn held_memo(&self, actor: &str, computation: &str) -> io::Result<Option<Vec<u8>>> {
@@ -1310,11 +1317,14 @@ impl Journal {
     }
 
     /// A preparing run's code and models are ready: it names them and becomes dispatchable.
+    /// The prepared run names its call; a memoized one answered (`answer`) completes with it.
     pub fn bind_prepared(
         &mut self,
         id: &str,
         invocation: Invocation,
         preparation: &str,
+        memo: CallMemo,
+        answer: Option<ResultRecord>,
     ) -> io::Result<Execution> {
         let encoded_invocation = encoded(&invocation)?;
         self.update_with(
@@ -1331,7 +1341,11 @@ impl Journal {
                     submission.preparation_id = preparation.into();
                 }
                 record.waiting_reason = None;
-                if record.pause_actor.is_some() {
+                record.memo = memo;
+                if let Some(result) = answer {
+                    record.state = State::Completed;
+                    record.result = Some(result);
+                } else if record.pause_actor.is_some() {
                     record.state = State::Paused;
                 }
                 Ok(true)
@@ -1401,6 +1415,34 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+/// A memoized call's success, reusable while this machine holds every file it names: its
+/// result record, keyed by its signer and computation. Each signer keeps its `MAX_HELD_MEMOS`
+/// most recently used.
+#[derive(Clone, Debug)]
+pub struct HeldMemo {
+    pub actor: String,
+    pub computation: String,
+    pub record: Vec<u8>,
+    pub objects: Vec<String>,
+}
+fn hold_memo(tx: &rusqlite::Transaction<'_>, held: &HeldMemo) -> io::Result<()> {
+    let HeldMemo { actor, computation, record, objects } = held;
+    tx.execute("INSERT OR REPLACE INTO held_memos(actor,computation,record,used_ms) VALUES(?1,?2,?3,?4)",
+        params![actor, computation, record, timestamp()]).map_err(db_error)?;
+    tx.execute("DELETE FROM held_memos WHERE actor=?1 AND computation NOT IN
+        (SELECT computation FROM held_memos WHERE actor=?1 ORDER BY used_ms DESC LIMIT ?2)",
+        params![actor, MAX_HELD_MEMOS]).map_err(db_error)?;
+    tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation NOT IN
+        (SELECT computation FROM held_memos WHERE actor=?1)", params![actor]).map_err(db_error)?;
+    tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation=?2", params![actor, computation])
+        .map_err(db_error)?;
+    for sha256 in objects {
+        tx.execute("INSERT OR IGNORE INTO held_memo_objects(actor,computation,sha256) VALUES(?1,?2,?3)",
+            params![actor, computation, sha256]).map_err(db_error)?;
+    }
+    Ok(())
 }
 
 fn touch_object(
@@ -1480,6 +1522,7 @@ fn insert(
         executor: None,
         result: None,
         failure: None,
+        memo: CallMemo::default(),
     };
     tx.execute(
         "UPDATE executions SET record=?1 WHERE id=?2",
@@ -2373,16 +2416,22 @@ impl Journal {
 
     /// Caller must prove process termination and durable artifact custody first.
     pub fn finish(&mut self, id: &str, outcome: Outcome) -> io::Result<Execution> {
-        self.finish_observed(id, outcome, None)
+        self.finish_observed(id, outcome, None, None)
     }
 
+    /// The run ends; a memoizable success's `held` memo is held in the same transaction.
     pub fn finish_observed(
         &mut self,
         id: &str,
         outcome: Outcome,
         progress: Option<&ProgressSnapshot>,
+        held: Option<HeldMemo>,
     ) -> io::Result<Execution> {
-        self.update_observed(id, progress, |record| {
+        let hold = |tx: &rusqlite::Transaction<'_>, record: &Execution| match held {
+            Some(held) if record.state == State::Completed => hold_memo(tx, &held),
+            _ => Ok(()),
+        };
+        self.update_with(id, progress, |record| {
             // A paused run's attempt has ended: a late outcome of it (its executor's shutdown
             // failing) changes nothing.
             if record.state.terminal() || record.state == State::Paused {
@@ -2418,7 +2467,7 @@ impl Journal {
             }
             record.finished_at_ms = timestamp().max(0) as u64;
             Ok(true)
-        })
+        }, hold)
     }
 }
 

@@ -1,8 +1,8 @@
 //! CPU runner supervision. Scheduling policy remains with the machine owner.
 use crate::{
     journal::{
-        Artifact, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSnapshot,
-        ResultRecord, State, SubmissionContext,
+        Artifact, CallMemo, Execution, Invocation, Journal, Outcome, ProcessBirth,
+        ProgressSnapshot, ResultRecord, State, SubmissionContext,
     },
     launch_identity::Seal,
     process::Liveness,
@@ -25,7 +25,7 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     process::{Child, Stdio},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -167,6 +167,8 @@ pub struct Engine {
     progress: Mutex<HashMap<String, ProgressSnapshot>>,
     activity: Mutex<u64>,
     activity_changed: Condvar,
+    /// What holds a memoizable run's success for its signer (`call_memo`), once configured.
+    memo: OnceLock<Weak<crate::objects::Objects>>,
 }
 
 #[derive(Clone)]
@@ -197,7 +199,13 @@ impl Engine {
             progress: Mutex::new(HashMap::new()),
             activity: Mutex::new(0),
             activity_changed: Condvar::new(),
+            memo: OnceLock::new(),
         }))
+    }
+
+    /// A memoizable run's success is kept by `objects` from now on (`Objects::keep`).
+    pub fn hold_memos(&self, objects: &Arc<crate::objects::Objects>) {
+        let _ = self.memo.set(Arc::downgrade(objects));
     }
 
     pub fn submit(&self, key: &str, invocation: Invocation) -> io::Result<Execution> {
@@ -440,14 +448,17 @@ impl Engine {
         Ok((record, new))
     }
 
-    /// The preparing run names its code and models and becomes dispatchable. Its observation
-    /// ends under the lock a dispatcher claims under: a claim made the moment the run is
-    /// queued keeps its ownership (else `reconcile` takes the attempt for an orphan).
+    /// The preparing run names its code and models and becomes dispatchable, or completes with
+    /// the memoized result that answered it (`answer`). Its observation ends under the lock a
+    /// dispatcher claims under: a claim made the moment the run is queued keeps its ownership
+    /// (else `reconcile` takes the attempt for an orphan).
     pub fn bind_prepared(
         &self,
         id: &str,
         invocation: Invocation,
         preparation: &str,
+        memo: CallMemo,
+        answer: Option<ResultRecord>,
     ) -> io::Result<Execution> {
         let mut owned = self.owned.lock().unwrap();
         let mut progress = self.progress.lock().unwrap();
@@ -455,7 +466,7 @@ impl Engine {
             .journal
             .lock()
             .unwrap()
-            .bind_prepared(id, invocation, preparation);
+            .bind_prepared(id, invocation, preparation, memo, answer);
         progress.remove(id);
         owned.remove(id);
         drop((progress, owned));
@@ -832,6 +843,7 @@ impl Engine {
     }
 
     pub(crate) fn finish(&self, id: &str, outcome: Outcome) -> io::Result<Execution> {
+        let held = self.held_memo(id, &outcome);
         let mut progress = self.progress.lock().unwrap();
         let mut journal = self.journal.lock().unwrap();
         if matches!(outcome, Outcome::Completed(_)) {
@@ -840,7 +852,7 @@ impl Engine {
                 eprintln!("run {id}: attention pin warning not logged: {error}");
             }
         }
-        let record = journal.finish_observed(id, outcome, progress.get(id))?;
+        let record = journal.finish_observed(id, outcome, progress.get(id), held)?;
         drop(journal);
         if record.state.terminal() || record.state == State::Paused {
             progress.remove(id);
@@ -848,6 +860,19 @@ impl Engine {
         drop(progress);
         self.notify_activity();
         Ok(record)
+    }
+
+    /// A memoizable run's success, its files kept for its signer, to hold as it completes: a
+    /// later call of the same computation is answered from it the moment this one is done.
+    fn held_memo(&self, id: &str, outcome: &Outcome) -> Option<crate::journal::HeldMemo> {
+        let (Outcome::Completed(result), Some(objects)) = (outcome, self.memo.get().and_then(Weak::upgrade)) else {
+            return None;
+        };
+        let record = self.get(id).ok().filter(|r| !r.memo.computation.is_empty() && !r.memo.memoized)?;
+        objects.keep(&record, result).unwrap_or_else(|error| {
+            eprintln!("run {id}: its success is not held for the memo: {error}");
+            None
+        })
     }
 
     pub(crate) fn watch_process(

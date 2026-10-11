@@ -5,9 +5,10 @@
 //! completes ends the run FAILED (`journal::PREPARING`).
 use crate::{
     api::domain,
+    call_memo::{self, Memo},
     gpu_service::{without_gpus, KeptMember, Level, Member},
     hub,
-    journal::{Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
+    journal::{CallMemo, Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
     local_source::LocalSources,
     objects::{Objects, Refused},
     published::{declares_models, Providers, Publisher, Request},
@@ -73,8 +74,6 @@ pub struct Spec {
     pub owner: String,
     /// The caller's catalog revision: held resolutions are reused only under it (th-245).
     pub catalog_revision: String,
-    /// A child's memoized result this machine holds: its answer.
-    pub held: Option<ResultRecord>,
     /// A child run of a callee: the other package's App its parent's environment holds.
     pub application: String,
     /// The spec's identity (its access excluded): a resubmitted id must carry the same.
@@ -553,10 +552,6 @@ impl Runs {
     /// The run's code and models made ready: Ok(None) once it is dispatchable, Ok(Some) for a
     /// warm run's result.
     fn prepare(&self, actor: &str, id: &str, spec: Spec) -> Result<Option<ResultRecord>, Refused> {
-        // A memoized call answered from a result this machine holds runs nothing.
-        if let (false, Some(held)) = (spec.parent.is_empty(), &spec.held) {
-            return Ok(Some(held.clone()));
-        }
         let engine = self.service.engine.clone();
         let run = id.to_string();
         // Byte counts arrive per chunk: a new stage shows at once, bytes at most 4 times a second.
@@ -699,7 +694,31 @@ impl Runs {
                 "interface": interface});
             return warm_result(installed, models);
         }
-        if spec.job {
+        // A memoized callable's run is answered from the success this machine holds for its
+        // signer under the same computation, and starts nothing. A run that names a weights
+        // destination has an effect beyond its result: it always runs.
+        let generation = self.service.catalog.resolve(&installation.generation)?;
+        let memo = match declared {
+            Some(entry) if spec.weights_destination.is_empty() => call_memo::of(
+                &generation.record,
+                &spec.application,
+                &entry["invocable"],
+                &spec.input,
+                &spec.inputs,
+                &spec.attention_kernel,
+                call_memo::models(plan.as_ref(), &spec.models),
+            ),
+            _ => Memo::Off,
+        };
+        let (memo, answer) = match memo {
+            Memo::Key(computation) => {
+                let answer = self.objects.recall(actor, &computation, id)?;
+                (CallMemo { memoized: answer.is_some(), computation, ..Default::default() }, answer)
+            }
+            Memo::Unmet(why) => (CallMemo { unmemoized: why, ..Default::default() }, None),
+            Memo::Off => (CallMemo::default(), None),
+        };
+        if spec.job && answer.is_none() {
             let inputs = self.job_inputs(&spec, &installation.package, &interface, hub.as_ref(), &*observe)?;
             let context = JobContext {
                 installation: installation.alias.clone(),
@@ -734,6 +753,8 @@ impl Runs {
                 application: spec.application,
             },
             plan.as_ref().map(|plan| plan.id.as_str()).unwrap_or_default(),
+            memo,
+            answer,
         )?;
         Ok(None)
     }
@@ -953,8 +974,7 @@ impl Runs {
 
     /// A child call of a running job: a run `<request>` under the job's signer, idempotent on
     /// `intent`, preparing inside itself with the job's context and the choices addressed to
-    /// its callable. `held`, a memoized call's result this machine holds, completes it without
-    /// running.
+    /// its callable.
     #[allow(clippy::too_many_arguments)]
     pub fn child(
         self: &Arc<Self>,
@@ -965,7 +985,6 @@ impl Runs {
         entrypoint: &str,
         input: Value,
         inputs: Vec<InputFile>,
-        held: Option<ResultRecord>,
         passed: Vec<domain::ModelChoice>,
     ) -> Result<Execution, Refused> {
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
@@ -973,9 +992,8 @@ impl Runs {
         if let Some(existing) = self.existing(&actor, request, intent)? {
             return Ok(existing);
         }
-        let mut spec =
+        let spec =
             self.child_spec(&actor, &parent.id, application, entrypoint, input, inputs, intent, &passed)?;
-        spec.held = held;
         self.submit(&actor, request, spec)
     }
 
@@ -1064,7 +1082,6 @@ impl Runs {
             weights_destination: String::new(),
             owner: context.owner,
             catalog_revision: context.catalog_revision,
-            held: None,
             application: application.into(),
             digest: digest.into(),
         };
@@ -1378,7 +1395,6 @@ mod tests {
             weights_destination: String::new(),
             owner: "alice".into(),
             catalog_revision: String::new(),
-            held: None,
             application: String::new(),
             digest: digest.into(),
         }

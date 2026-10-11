@@ -2,7 +2,10 @@
 //! resumable from the length already held. Bytes stage per signer and enter the TensorFS
 //! store only once their digest verifies. A run names only objects its own signer wrote, so
 //! another signer's object is neither readable nor reported as held.
-use crate::execution::Engine;
+use crate::{
+    execution::Engine,
+    journal::{Artifact, Execution, HeldMemo, ResultRecord},
+};
 use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
@@ -15,6 +18,9 @@ use std::{
 use tensorfs_core::{
     catalog::WriterGuard, ids::ObjectRef, object_roots, sha256, store::Fault, store::Store,
 };
+
+/// The largest memoized result record this machine holds for reuse.
+const MEMO_RESULT_BYTES: usize = 48 << 10;
 
 pub struct Objects {
     root: PathBuf,
@@ -132,26 +138,72 @@ impl Objects {
         Ok(path.is_file().then_some((path, length)))
     }
 
-    /// A memoized call's held result for this signer, its files at their store paths; None when
-    /// there is none or a file is gone (the memo goes with it).
-    pub fn held_memo(&self, actor: &str, computation: &str) -> io::Result<Option<crate::journal::ResultRecord>> {
+    /// The success a memoized computation left for this signer, its files linked into `run`'s
+    /// custody as that run's own result; None when there is none or a file is gone (the memo
+    /// goes with it).
+    pub fn recall(&self, actor: &str, computation: &str, run: &str) -> io::Result<Option<ResultRecord>> {
         let _custody = self.guard();
         let Some(raw) = self.engine.with_journal(|j| j.held_memo(actor, computation))? else {
             return Ok(None);
         };
-        let Ok(mut record) = serde_json::from_slice::<crate::journal::ResultRecord>(&raw) else {
+        let Ok(mut record) = serde_json::from_slice::<ResultRecord>(&raw) else {
             return Ok(None);
         };
-        for artifact in &mut record.artifacts {
-            match self.path(actor, &format!("sha256:{}", artifact.sha256))? {
-                Some((path, length)) if length == artifact.length => artifact.path = path.display().to_string(),
-                _ => {
-                    self.engine.with_journal(|j| j.drop_held_memos(&artifact.sha256))?;
-                    return Ok(None);
+        let custody = self.engine.root.join("results").join(run);
+        for (index, artifact) in record.artifacts.iter_mut().enumerate() {
+            let Some((held, _)) = self
+                .path(actor, &format!("sha256:{}", artifact.sha256))?
+                .filter(|(_, length)| *length == artifact.length)
+            else {
+                self.engine.with_journal(|j| j.drop_held_memos(&artifact.sha256))?;
+                return Ok(None);
+            };
+            fs::create_dir_all(&custody)?;
+            let name = format!("{index}-{}", artifact.sha256);
+            if let Err(error) = fs::hard_link(&held, custody.join(&name)) {
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    fs::copy(&held, custody.join(&name))?;
                 }
             }
+            artifact.path = format!("results/{run}/{name}");
         }
         Ok(Some(record))
+    }
+
+    /// A memoizable run's success `result`, its files kept for its signer, to hold under its
+    /// computation while this machine holds every file it names. A tree's members are not held
+    /// as one result, nor is a record over `MEMO_RESULT_BYTES`.
+    pub fn keep(&self, record: &Execution, result: &ResultRecord) -> io::Result<Option<HeldMemo>> {
+        let Some(submission) = &record.submission else {
+            return Ok(None);
+        };
+        if result.asset_bindings.iter().any(|b| b.media_type == crate::gpu_service::TREE_MEDIA) {
+            return Ok(None);
+        }
+        let bound: Vec<_> = result
+            .artifacts
+            .iter()
+            .filter(|a| result.asset_bindings.iter().any(|b| b.relative_path == a.name))
+            .collect();
+        let held = ResultRecord {
+            value: result.value.clone(),
+            artifacts: bound.iter().map(|a| Artifact { path: String::new(), ..(*a).clone() }).collect(),
+            asset_bindings: result.asset_bindings.clone(),
+        };
+        let raw = serde_json::to_vec(&held)?;
+        if raw.len() > MEMO_RESULT_BYTES {
+            return Ok(None);
+        }
+        for artifact in &bound {
+            let object = ObjectRef { sha256: artifact.sha256.clone(), length: artifact.length };
+            self.adopt(&submission.actor, &record.id, &self.engine.root.join(&artifact.path), &object)?;
+        }
+        Ok(Some(HeldMemo {
+            actor: submission.actor.clone(),
+            computation: record.memo.computation.clone(),
+            record: raw,
+            objects: bound.iter().map(|a| a.sha256.clone()).collect(),
+        }))
     }
 
     /// A file this machine produced for the signer (a child run's result) as its object, so a
@@ -384,8 +436,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A held memo answers with its file at the store's path while its signer holds the file;
-    /// when reclaim releases the file, the memo goes with it.
+    /// A held memo answers with its file in the answered run's custody while its signer holds
+    /// the file; when reclaim releases the file, the memo goes with it.
     #[test]
     fn a_held_memo_answers_while_its_file_is_held_and_goes_with_it() {
         let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
@@ -407,11 +459,14 @@ mod tests {
             }],
         };
         let engine = service.engine.clone();
-        engine.with_journal(|j| j.hold_memo("alice", "sha256:c", &serde_json::to_vec(&record).unwrap(), std::slice::from_ref(&hex))).unwrap();
-        let held = objects.held_memo("alice", "sha256:c").unwrap().unwrap();
-        assert_eq!(fs::read(&held.artifacts[0].path).unwrap(), bytes);
+        let held = crate::journal::HeldMemo { actor: "alice".into(), computation: "sha256:c".into(),
+            record: serde_json::to_vec(&record).unwrap(), objects: vec![hex.clone()] };
+        engine.with_journal(|j| j.hold_memo(&held)).unwrap();
+        let held = objects.recall("alice", "sha256:c", "7").unwrap().unwrap();
+        assert_eq!(held.artifacts[0].path, format!("results/7/0-{hex}"));
+        assert_eq!(fs::read(engine.root.join(&held.artifacts[0].path)).unwrap(), bytes);
         assert_eq!(held.value, record.value);
-        assert!(objects.held_memo("bob", "sha256:c").unwrap().is_none(), "a memo is its signer's");
+        assert!(objects.recall("bob", "sha256:c", "8").unwrap().is_none(), "a memo is its signer's");
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(objects.release(Duration::ZERO).unwrap(), 1);
         assert!(engine.with_journal(|j| j.held_memo("alice", "sha256:c")).unwrap().is_none(), "reclaim dropped the memo");
