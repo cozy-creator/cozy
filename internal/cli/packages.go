@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -52,6 +55,25 @@ func handleInstall(ctx *Context) *exit.Error {
 	return handleRegistryInstall(ctx)
 }
 
+// lockTip suggests a lock to a human reading a package directory with no uv.lock, at most once
+// a day per directory: an unlocked package asks PyPI for the newest Runtime to be read, and
+// resolves its dependencies at every environment build.
+func lockTip(ctx *Context, st *records.Store, dir string) {
+	const event = "package.lock_tip"
+	if ctx.Mode().JSON {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(dir, "uv.lock")); !errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if shown, problem := st.PackageEventSince(dir, event, time.Now().Add(-24*time.Hour)); problem != nil || shown {
+		return
+	}
+	if st.AppendPackageEvent(dir, event, nil) == nil {
+		fmt.Fprintln(ctx.Err, "tip: `cozy package lock` pins this package's dependencies (faster starts, reproducible runs)")
+	}
+}
+
 func explicitPackageDirectory(value string) bool {
 	value = strings.TrimSpace(value)
 	return value == "." || value == ".." || filepath.IsAbs(value) ||
@@ -92,6 +114,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 	defer writer.Unlock()
+	lockTip(ctx, st, pack.Tree)
 	result := &install.Result{Idempotent: true}
 	if prior, _ := activeInstall(st, "", ref.Package); prior != nil && prior.SourceKind == "local" && prior.Version == pack.Release &&
 		prior.SourceRef == pack.Tree && packagepublish.SourceStatsUnchanged(prior.Dir, stats) {
