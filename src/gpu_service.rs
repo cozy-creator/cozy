@@ -2975,7 +2975,7 @@ impl GpuPool {
             })
             .filter(|bytes| *bytes > 0);
         session.evictions = evictions.unwrap_or(session.evictions);
-        self.learn(session, &shape, &reply, mapped);
+        self.learn(plan, start, &shape, &reply, session.executor.birth.pid, mapped);
         self.record_invoke(&plan.id, &lane, first, invoked.elapsed(), &reply);
         record_measurements(engine, id, &reply);
         if reply.attention_applied {
@@ -3152,13 +3152,14 @@ impl GpuPool {
     /// (the call's peak and each stage method's), its context, its private host bytes.
     fn learn(
         &self,
-        session: &Session,
+        plan: &GpuPlan,
+        start: usize,
         shape: &str,
         reply: &Frame,
+        pid: u32,
         mapped: Option<u64>,
     ) {
-        let (plan, start, degree) = (session.plan.as_str(), session.start, session.degree);
-        let pid = session.executor.birth.pid;
+        let (plan, degree) = (plan.id.as_str(), plan.degree);
         let metrics = reply.metrics.clone().unwrap_or_default();
         let plane = reply.plane.clone().unwrap_or_default();
         let peak = known(plane.activation_peak_bytes)
