@@ -28,8 +28,12 @@ def extract(wheel: Path, target: Path) -> None:
     target.write_bytes(data)
     target.chmod(0o755)
     version = json.loads(subprocess.check_output([str(target.resolve()), 'version'], text=True))
-    required = {'hub-access/1', 'runtime-update/1', 'machine-bootstrap/1'}
-    if version.get('name') != 'cozy-machine' or not required.issubset(version.get('capabilities', [])):
+    # These operations are static API contracts. Update/readiness authority belongs
+    # to a running machine's Status, not its unbooted binary's version response.
+    required = {'status/1', 'run/1', 'control/1', 'read/1', 'execution.cpu/1'}
+    if (version.get('name') != 'cozy-machine'
+            or 'cozy.machine.v1' not in version.get('api', [])
+            or not required.issubset(version.get('capabilities', []))):
         raise ValueError('bundled agent lacks the current machine operation contracts')
     print(json.dumps({'wheel': str(wheel), 'agent_sha256': hashlib.sha256(data).hexdigest(), 'version': version}))
 

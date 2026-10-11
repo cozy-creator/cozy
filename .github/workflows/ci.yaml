@@ -184,9 +184,10 @@ jobs:
           scripts/release.sh "ci-$GITHUB_SHA-next" linux/amd64
           scripts/accept.sh --dist "dist/ci-$GITHUB_SHA" --upgrade "dist/ci-$GITHUB_SHA-next" \
             --prefix "$RUNNER_TEMP/prefix" --home "$RUNNER_TEMP/cozy-home"
-      # Independent of the Go result, so one red check does not hide the other.
+      # Independent of the Go result once its toolchain exists. A skipped setup
+      # must not turn into an unrelated empty-wheel installation error.
       - name: Python types
-        if: ${{ !cancelled() && matrix.shard == 0 }}
+        if: ${{ !cancelled() && matrix.shard == 0 && steps.toolchain.outcome == 'success' }}
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/types"
           uv pip install --python "$RUNNER_TEMP/types/bin/python" packaging "$RUNTIME_WHEEL" "cozy-eval==$COZY_EVAL_VERSION" "$TENSORFS_WHEEL"

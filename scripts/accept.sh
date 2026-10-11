@@ -51,7 +51,7 @@ for command in "package install" "model download" "auth login" "run cancel" "ren
 done
 run help run
 check "contextual Kong help works" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy run' && echo 1 || echo 0)" "$OUT"
-check "run exposes named existing rentals and automatic remote allocation" "$(printf '%s' "$OUT" | grep -q -- '--rental=RENTAL' && printf '%s' "$OUT" | grep -q -- '--rental-only' && ! printf '%s' "$OUT" | grep -Eq -- '--(local|machine|max-cost|cloud)' && echo 1 || echo 0)" "$OUT"
+check "run exposes named existing rentals and automatic remote allocation" "$(printf '%s' "$OUT" | grep -q -- '--rental=RENTAL' && printf '%s' "$OUT" | grep -q -- '--rental-only' && ! printf '%s' "$OUT" | grep -Eq -- '--(local|machine|max-cost|cloud)([=[:space:]]|$)' && echo 1 || echo 0)" "$OUT"
 run package
 check "bare noun group shows focused help" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy package <command>' && echo 1 || echo 0)" "$OUT"
 
