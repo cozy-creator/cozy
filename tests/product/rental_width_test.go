@@ -60,15 +60,12 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 				name, declared[name])
 		}
 	}
-	// A degree the author did not declare stays out however wide the machine is.
+	// A wider offer may run the largest package-supported subset, which is two here.
 	partial := verdicts(rental.Constraints{Degrees: []int{2}}, false)
-	if partial["2x h100"] != "" {
-		t.Fatalf("the declared width was excluded: %q", partial["2x h100"])
-	}
-	if !strings.Contains(partial["4x h100"], "width_undeclared") ||
-		!strings.Contains(partial["4x h100"], "degrees 2") {
-		t.Fatalf("4x h100 verdict = %q, want a refusal naming the declared degrees",
-			partial["4x h100"])
+	for _, name := range []string{"2x h100", "4x h100"} {
+		if partial[name] != "" {
+			t.Fatalf("supported subset was excluded on %s: %q", name, partial[name])
+		}
 	}
 	// A JOB shards nothing: one bounded attempt on a wide pod idles every card but one for
 	// the whole hour, whatever the package declares.

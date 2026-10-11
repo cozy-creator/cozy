@@ -50,16 +50,15 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		}
 		c := orchestrator.PlacementCandidate{SKU: sku.Name, GPUs: sku.AcceleratorCount,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
-		c.Verdict = GPUCountUnusable(sku.AcceleratorCount, constraints.GPUs)
-		count := sku.AcceleratorCount
-		if constraints.GPUs > 0 {
-			count = int(constraints.GPUs)
+		count, verdict := runWidth(sku.AcceleratorCount, models, job, constraints)
+		c.Verdict = verdict
+		// Do not buy several GPUs for code that can use only one. A parallel
+		// package may use a supported subset of a wider offer.
+		if c.Verdict == "" && constraints.GPUs == 0 && count == 1 && sku.AcceleratorCount > 1 {
+			c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
 		}
 		if c.Verdict == "" {
 			size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job, constraints.Working, count)
-		}
-		if c.Verdict == "" {
-			c.Verdict = PurchaseWidthUnusable(count, models, job, constraints)
 		}
 		if c.Verdict == "" {
 			c.Verdict = baseMismatch(sku, constraints)
@@ -108,6 +107,23 @@ func PurchaseWidthUnusable(width int, models []records.ModelRef, job bool, const
 		}
 	}
 	return WidthUnusable(width, job, constraints)
+}
+
+// runWidth is shared by purchases and existing machines; only package code and
+// an explicit request select the degree. Weight selectors do not participate.
+func runWidth(available int, models []records.ModelRef, job bool, constraints Constraints) (int, string) {
+	if reason := GPUCountUnusable(available, constraints.GPUs); reason != "" {
+		return 0, reason
+	}
+	if constraints.GPUs > 0 {
+		count := int(constraints.GPUs)
+		return count, PurchaseWidthUnusable(count, models, job, constraints)
+	}
+	count := available
+	for count > 1 && PurchaseWidthUnusable(count, models, job, constraints) != "" {
+		count--
+	}
+	return count, ""
 }
 
 // GPUCountUnusable rejects a machine that cannot supply the exact requested subset.
@@ -413,19 +429,9 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	// minute decides nothing). Its GPU count is not held to the package's degrees: the
 	// pod is already paid for, and the selection takes the widest authored group that
 	// fits it (Pin). Cards beyond that group idle; nothing refuses.
-	count := c.GPUs
-	if constraints.GPUs > 0 {
-		if c.Verdict = GPUCountUnusable(count, constraints.GPUs); c.Verdict != "" {
-			return false
-		}
-		count = int(constraints.GPUs)
-		if c.Verdict = PurchaseWidthUnusable(count, models, job, constraints); c.Verdict != "" {
-			return false
-		}
-	} else {
-		for count > 1 && PurchaseWidthUnusable(count, models, job, constraints) != "" {
-			count--
-		}
+	count, verdict := runWidth(c.GPUs, models, job, constraints)
+	if c.Verdict = verdict; c.Verdict != "" {
+		return false
 	}
 	size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job, constraints.Working, count)
 	switch {

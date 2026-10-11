@@ -65,7 +65,7 @@ func exampleCandidates(t *testing.T, ahead int) []orchestrator.PlacementCandidat
 		t.Fatalf("the H100 does not fit rung 1: %v %d", pinned, rung)
 	}
 	attached := orchestrator.PlacementCandidate{Rental: "pr-morgiana", Machine: "morgiana", SKU: "h100-sxm5-80gb",
-		Rung: rung, Lane: fp8Lane, Ahead: ahead, RateUSDMicrosPerHour: 3_520_000, Models: pinned}
+		GPUs: 1, RunGPUs: 1, Rung: rung, Lane: fp8Lane, Ahead: ahead, RateUSDMicrosPerHour: 3_520_000, Models: pinned}
 	candidates := append([]orchestrator.PlacementCandidate{attached},
 		rental.Purchases(exampleMarket(), exampleLadder(), true, false, rental.Constraints{})...)
 	if used := rental.Measure(candidates, exampleRows(), exampleLadder()); len(used) != 2 {

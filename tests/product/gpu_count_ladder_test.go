@@ -19,12 +19,12 @@ func TestPackageCapabilityPermitsWideRentalsAndWeightSelectorsRemainIndependent(
 	}
 	candidates := rental.Purchases(skus, models, true, true, rental.Constraints{})
 	for i, c := range candidates {
-		expected := skus[i].AcceleratorCount == 2 || skus[i].AcceleratorCount == 4
+		expected := skus[i].AcceleratorCount >= 2
 		if (c.Verdict == "") != expected {
 			t.Fatalf("width %d verdict %q", c.GPUs, c.Verdict)
 		}
-		if expected && c.Models[1].GPUs != c.GPUs {
-			t.Fatalf("bought count %d with H3 group %d", c.GPUs, c.Models[1].GPUs)
+		if expected && c.Models[1].GPUs != c.RunGPUs {
+			t.Fatalf("run count %d with H3 weight selector %d", c.RunGPUs, c.Models[1].GPUs)
 		}
 	}
 	// Weight selectors choose compatible lanes; the worker independently chooses
