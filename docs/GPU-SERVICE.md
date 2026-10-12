@@ -41,7 +41,9 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   CPU preparation and downloads remain concurrent. Standalone calls keep per-call placement.
 - `Context.release_gpus()` releases a deviceless workflow's reservation before final CPU
   encoding or uploads. In-flight calls retain their own slots; subsequent calls must acquire
-  a reservation again. An inline accelerator job retains its GPU until its executor exits.
+  a reservation again. Only the owning root releases that workflow claim; nested CPU jobs
+  cannot surrender an ancestor's future work. An inline accelerator job retains its GPU
+  until its executor exits.
 - The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
   `Preparation`, and `submit` records `preparation_id`.
 - An empty `installation_id` binds a `published-<hash>` installation from `packages`.

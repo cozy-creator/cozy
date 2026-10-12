@@ -149,7 +149,7 @@ struct Received {
 
 impl Jobs {
     /// Jobs and model-less calls, with the configured executor environment and identity.
-    /// CPU jobs remain deviceless; explicitly declared GPU jobs borrow the native pool.
+    /// CPU jobs remain deviceless; their GPU children borrow a workflow reservation.
     /// `runs` prepares a job's children (none: no children).
     pub fn configure(
         service: &Arc<Service>,
