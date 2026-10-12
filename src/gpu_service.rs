@@ -564,6 +564,7 @@ struct WorkflowClaim {
     /// Queued warming hints stop after the author ends this GPU phase. Only an actual
     /// subsequent GPU call reopens it; prefetch itself never acquires a workflow lease.
     released: bool,
+    phase: u64,
 }
 impl JobAllocation {
     pub fn prepare(&self) -> io::Result<()> {
@@ -1504,7 +1505,7 @@ impl GpuPool {
             // that each begin with one GPU and later need the whole machine.
             degree: if record.invocation.gpus == 0 { self.width() } else { record.invocation.gpus as usize },
             claim: Mutex::new(WorkflowClaim {
-                permit: allocation.map(|allocation| allocation.permit), released: false,
+                permit: allocation.map(|allocation| allocation.permit), released: false, phase: 0,
             }),
         });
         let mut workflows = self.workflows.lock().unwrap();
@@ -1537,12 +1538,19 @@ impl GpuPool {
         if let Some(workflow) = self.workflow_owner(Some(family)) {
             // Each live serving child still owns its independent call permit.
             let mut claim = workflow.claim.lock().unwrap();
+            if !claim.released { claim.phase += 1; }
             claim.released = true;
             claim.permit.take();
         }
     }
-    fn prefetch_allowed(&self, family: Option<&str>) -> bool {
-        self.workflow_owner(family).is_none_or(|workflow| !workflow.claim.lock().unwrap().released)
+    fn prefetch_phase(&self, family: Option<&str>) -> Option<u64> {
+        match self.workflow_owner(family) {
+            Some(workflow) => {
+                let claim = workflow.claim.lock().unwrap();
+                (!claim.released).then_some(claim.phase)
+            }
+            None => Some(0),
+        }
     }
     /// Reserve a job's explicit group, or one GPU for an accelerator job. CPU jobs keep
     /// deviceless executors while their children borrow only the reserved family subset.
@@ -1739,7 +1747,8 @@ impl GpuPool {
             .spawn(move || {
                 let Ok(record) = engine.get(&owner) else { return; };
                 let Ok(workflow) = crate::gpu_reservation::workflow(&record, |id| engine.get(id)) else { return; };
-                let active = || pool.prefetch_allowed(workflow.as_deref()) && engine.get(&owner).is_ok_and(|record| {
+                let Some(phase) = pool.prefetch_phase(workflow.as_deref()) else { return; };
+                let active = || pool.prefetch_phase(workflow.as_deref()) == Some(phase) && engine.get(&owner).is_ok_and(|record| {
                     record.state == State::Running && record.cancel_actor.is_none() && record.pause_actor.is_none()
                 });
                 if !active() { return; }
@@ -4666,10 +4675,11 @@ mod tests {
         assert!(pool.place(&engine, &plan("other-worker", 1), (None, None), &mut [false; 8]).is_none());
         assert!(pool.admit_workflow(&engine, first_family, &mut waiting));
         let (_, segment) = pool.place(&engine, &plan("shared-video-executor", 8), (None, first_family), &mut waiting).unwrap();
+        let prefetch_phase = pool.prefetch_phase(first_family);
         // Explicit release is idempotent; a running child retains its own call slots.
         pool.release_workflow(&first.id);
         pool.release_workflow(&first.id);
-        assert!(!pool.prefetch_allowed(first_family), "warming cannot reopen a released GPU phase");
+        assert_eq!(pool.prefetch_phase(first_family), None, "warming cannot reopen a released GPU phase");
         let mut waiting = [false; 8];
         assert!(!pool.admit_workflow(&engine, second_family, &mut waiting));
         assert!(!pool.admit_workflow(&engine, first_family, &mut waiting),
@@ -4682,7 +4692,8 @@ mod tests {
         drop(next_segment);
         drop(second_owner); // The executor's retained lease ends on its exact exit.
         assert!(pool.admit_workflow(&engine, first_family, &mut [false; 8]));
-        assert!(pool.prefetch_allowed(first_family), "a new admitted call may prepare its next model");
+        assert!(pool.prefetch_phase(first_family).is_some(), "a new admitted call may prepare its next model");
+        assert_ne!(pool.prefetch_phase(first_family), prefetch_phase, "old queued hints remain ended in a later phase");
         drop(first_owner);
         assert!(pool.place(&engine, &plan("other-worker", 8), (None, None), &mut [false; 8]).is_some());
         pool.stop().unwrap();
