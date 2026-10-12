@@ -32,6 +32,7 @@ type creditHub struct {
 	// GET /v1/credit (th-242) states the balance against these; null for an unmetered account.
 	warning, floor int64
 	unmetered      bool
+	omitMerchant   bool
 	// A Hub that charges rentals (th-252) also states the burn and when it runs out, and lists
 	// the rentals.
 	charging   bool
@@ -88,6 +89,14 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)}
 	}
 	return func(mux *http.ServeMux) {
+		const merchantID = "0192f1d4-0000-7000-8000-000000000099"
+		mux.HandleFunc("GET /app/config.json", func(w http.ResponseWriter, _ *http.Request) {
+			credit := map[string]any{"currency": "USD", "future_field": true}
+			if !h.omitMerchant {
+				credit["merchant_id"] = merchantID
+			}
+			reply(w, 200, map[string]any{"credit": credit, "future_field": true})
+		})
 		mux.HandleFunc("GET /billing/v1/me", func(w http.ResponseWriter, r *http.Request) {
 			if !signedIn(w, r) {
 				return
@@ -133,10 +142,11 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			}
 			reply(w, 200, map[string]any{"data": data, "next_cursor": nil})
 		})
-		mux.HandleFunc("GET /billing/v1/catalog/products", func(w http.ResponseWriter, r *http.Request) {
-			// The catalog is a lookup by product key.
-			if keys := r.URL.Query()["keys"]; len(keys) != 1 || keys[0] != "api-credit" || len(r.URL.Query()) != 1 {
-				refuse(w, 400, "invalid_query", "keys names 1 to 100 products")
+		mux.HandleFunc("GET /billing/v1/products", func(w http.ResponseWriter, r *http.Request) {
+			// The catalog requires the actual merchant and the requested product keys.
+			if keys := r.URL.Query()["keys"]; len(keys) != 1 || keys[0] != "api-credit" ||
+				r.URL.Query().Get("merchant") != merchantID || len(r.URL.Query()) != 2 {
+				refuse(w, 400, "invalid_query", "merchant and keys are required")
 				return
 			}
 			reply(w, 200, map[string]any{"next_cursor": nil, "data": []any{map[string]any{
@@ -291,6 +301,26 @@ func TestCreditsReadAndBuy(t *testing.T) {
 	if code, out := run("", "credits", "buy", "10", "--no-browser", "--no-wait", "--json", "--full"); code != 0 ||
 		!strings.Contains(out, `"order":"ord_1"`) || !strings.Contains(out, `"status":"awaiting payment"`) {
 		t.Fatalf("buy --no-wait: exit %d\n%s", code, out)
+	}
+}
+
+func TestCreditsBuyRequiresTheHubMerchant(t *testing.T) {
+	credits := &creditHub{omitMerchant: true}
+	var hubURL string
+	hub := newAccountHubWith(t, credits.routes(t, func() string { return hubURL }))
+	hubURL = hub.URL
+	run := creditCLI(t, hub.URL)
+	if code, out := run("123456\nbuyer\n", "auth", "login", "buyer@example.test"); code != 0 {
+		t.Fatalf("login: exit %d\n%s", code, out)
+	}
+	if code, out := run("", "credits", "buy", "25", "--no-browser"); code == 0 ||
+		!strings.Contains(out, "update Tensorhub before buying credit") {
+		t.Fatalf("buy without a configured merchant: exit %d\n%s", code, out)
+	}
+	credits.mu.Lock()
+	defer credits.mu.Unlock()
+	if len(credits.orders) != 0 {
+		t.Fatal("a missing merchant opened an order")
 	}
 }
 
