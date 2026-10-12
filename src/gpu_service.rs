@@ -557,7 +557,13 @@ pub(crate) struct JobAllocation {
 /// but may release its permit early while it finishes CPU/network work.
 pub(crate) struct Workflow {
     degree: usize,
-    permit: Mutex<Option<Permit>>,
+    claim: Mutex<WorkflowClaim>,
+}
+struct WorkflowClaim {
+    permit: Option<Permit>,
+    /// Queued warming hints stop after the author ends this GPU phase. Only an actual
+    /// subsequent GPU call reopens it; prefetch itself never acquires a workflow lease.
+    released: bool,
 }
 impl JobAllocation {
     pub fn prepare(&self) -> io::Result<()> {
@@ -1497,7 +1503,9 @@ impl GpuPool {
             // Reserving only a first child's width would deadlock independent workflows
             // that each begin with one GPU and later need the whole machine.
             degree: if record.invocation.gpus == 0 { self.width() } else { record.invocation.gpus as usize },
-            permit: Mutex::new(allocation.map(|allocation| allocation.permit)),
+            claim: Mutex::new(WorkflowClaim {
+                permit: allocation.map(|allocation| allocation.permit), released: false,
+            }),
         });
         let mut workflows = self.workflows.lock().unwrap();
         workflows.retain(|_, owner| owner.strong_count() > 0);
@@ -1510,11 +1518,15 @@ impl GpuPool {
     }
     fn admit_workflow(self: &Arc<Self>, engine: &Arc<Engine>, family: Option<&str>, waiting: &mut [bool]) -> bool {
         let Some(workflow) = self.workflow_owner(family) else { return true; };
-        let mut permit = workflow.permit.lock().unwrap();
-        if permit.is_some() { return true; }
+        let mut claim = workflow.claim.lock().unwrap();
+        if claim.permit.is_some() { return true; }
         for start in 0..=self.width() - workflow.degree {
+            // A release relinquishes queue priority too, even if an earlier child still
+            // holds its in-flight call slots or a prefetch borrowed this family briefly.
+            if waiting.iter().skip(start).take(workflow.degree).any(|wait| *wait) { continue; }
             if let Some(token) = self.workflow_slots.take(family, false, true, start..start + workflow.degree, waiting) {
-                *permit = Some(Permit { pool: self.clone(), engine: Arc::downgrade(engine), token: Some(token), workflow_token: None });
+                claim.permit = Some(Permit { pool: self.clone(), engine: Arc::downgrade(engine), token: Some(token), workflow_token: None });
+                claim.released = false;
                 return true;
             }
         }
@@ -1524,8 +1536,13 @@ impl GpuPool {
     pub(crate) fn release_workflow(&self, family: &str) {
         if let Some(workflow) = self.workflow_owner(Some(family)) {
             // Each live serving child still owns its independent call permit.
-            workflow.permit.lock().unwrap().take();
+            let mut claim = workflow.claim.lock().unwrap();
+            claim.released = true;
+            claim.permit.take();
         }
+    }
+    fn prefetch_allowed(&self, family: Option<&str>) -> bool {
+        self.workflow_owner(family).is_none_or(|workflow| !workflow.claim.lock().unwrap().released)
     }
     /// Reserve a job's explicit group, or one GPU for an accelerator job. CPU jobs keep
     /// deviceless executors while their children borrow only the reserved family subset.
@@ -1720,7 +1737,9 @@ impl GpuPool {
         let started = std::thread::Builder::new()
             .name("executor-prefetch".into())
             .spawn(move || {
-                let active = || engine.get(&owner).is_ok_and(|record| {
+                let Ok(record) = engine.get(&owner) else { return; };
+                let Ok(workflow) = crate::gpu_reservation::workflow(&record, |id| engine.get(id)) else { return; };
+                let active = || pool.prefetch_allowed(workflow.as_deref()) && engine.get(&owner).is_ok_and(|record| {
                     record.state == State::Running && record.cancel_actor.is_none() && record.pause_actor.is_none()
                 });
                 if !active() { return; }
@@ -1736,8 +1755,6 @@ impl GpuPool {
                     return pool.note_prewarm(&key, asked.elapsed(), Default::default(), &Ok("already loaded"));
                 }
                 // Requests queued for a GPU go first.
-                let Ok(record) = engine.get(&owner) else { return; };
-                let Ok(workflow) = crate::gpu_reservation::workflow(&record, |id| engine.get(id)) else { return; };
                 let (start, _permit) = loop {
                     if !active() { return; }
                     let mut waiting = vec![gpu_request_queued(&engine); pool.width()];
@@ -4652,7 +4669,11 @@ mod tests {
         // Explicit release is idempotent; a running child retains its own call slots.
         pool.release_workflow(&first.id);
         pool.release_workflow(&first.id);
-        assert!(!pool.admit_workflow(&engine, second_family, &mut [false; 8]));
+        assert!(!pool.prefetch_allowed(first_family), "warming cannot reopen a released GPU phase");
+        let mut waiting = [false; 8];
+        assert!(!pool.admit_workflow(&engine, second_family, &mut waiting));
+        assert!(!pool.admit_workflow(&engine, first_family, &mut waiting),
+            "an in-flight child does not preserve queue priority after explicit release");
         drop(segment);
         assert!(pool.admit_workflow(&engine, second_family, &mut [false; 8]));
         let (_, next_segment) = pool.place(&engine, &plan("shared-video-executor", 8), (None, second_family), &mut [false; 8]).unwrap();
@@ -4661,6 +4682,7 @@ mod tests {
         drop(next_segment);
         drop(second_owner); // The executor's retained lease ends on its exact exit.
         assert!(pool.admit_workflow(&engine, first_family, &mut [false; 8]));
+        assert!(pool.prefetch_allowed(first_family), "a new admitted call may prepare its next model");
         drop(first_owner);
         assert!(pool.place(&engine, &plan("other-worker", 8), (None, None), &mut [false; 8]).is_some());
         pool.stop().unwrap();
