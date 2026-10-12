@@ -75,7 +75,32 @@ func describeBoot(machine string, b *hub.RentalBoot, now time.Time) bootWords {
 	if !b.Started() && !b.BootLogAt.IsZero() {
 		w.activity = "boot log active " + ago(now.Sub(b.BootLogAt))
 	}
+	if !b.Started() && b.Pull != nil {
+		w.activity = joinParts(w.activity, describePull(b.Pull))
+	}
 	return w
+}
+
+func describePull(p *hub.RentalPull) string {
+	if !p.Observable {
+		return "pull rate unavailable; ready ETA unknown"
+	}
+	transfer := func(label string, bytes, total int64, rate *float64) string {
+		if total <= 0 {
+			return ""
+		}
+		text := fmt.Sprintf("%s %.1f/%.1f MB", label, float64(bytes)/1e6, float64(total)/1e6)
+		if rate != nil {
+			text += fmt.Sprintf(" at %.1f MB/s", *rate/1e6)
+		}
+		return text
+	}
+	eta := "ready ETA unknown"
+	if p.RemainingSeconds != nil && *p.RemainingSeconds >= 0 {
+		eta = "at least " + brief(time.Duration(*p.RemainingSeconds*float64(time.Second))) + " left on observed layers; ready ETA unknown"
+	}
+	return joinParts(transfer("download", p.DownloadBytes, p.DownloadTotalBytes, p.DownloadBytesPerSecond),
+		transfer("extract", p.ExtractBytes, p.ExtractTotalBytes, p.ExtractBytesPerSecond), eta)
 }
 
 // line is the whole sentence: "waiting for nonomiya to boot · AP-IN-1 · 6m · container not
