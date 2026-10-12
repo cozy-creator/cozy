@@ -145,6 +145,7 @@ type RentalWebRTC struct {
 // (pulling_image, creating_container, starting_container, stopping_container). Times are on
 // this host's clock: the decoder shifts them by the Hub's reading of its own.
 type RentalBoot struct {
+	Pull            *RentalPull    `json:"pull,omitempty"`
 	Attempt         int            `json:"attempt"`
 	State           string         `json:"state"`
 	Datacenter      string         `json:"datacenter,omitempty"`
@@ -157,6 +158,23 @@ type RentalBoot struct {
 	LastProgressAt  time.Time      `json:"last_progress_at,omitzero"`
 	BootLogAt       time.Time      `json:"boot_log_at,omitzero"`
 	ReplannedFrom   *ReplannedBoot `json:"replanned_from,omitempty"`
+}
+
+// RentalPull is measured provider telemetry for observed layers only. Partial
+// provider logs cannot establish whole-image progress or a machine ready time.
+type RentalPull struct {
+	Observable             bool      `json:"observable"`
+	LayersObserved         int       `json:"layers_observed"`
+	LayersComplete         int       `json:"layers_complete"`
+	DownloadBytes          int64     `json:"download_bytes"`
+	DownloadTotalBytes     int64     `json:"download_total_bytes"`
+	DownloadBytesPerSecond *float64  `json:"download_bytes_per_second,omitempty"`
+	ExtractBytes           int64     `json:"extract_bytes"`
+	ExtractTotalBytes      int64     `json:"extract_total_bytes"`
+	ExtractBytesPerSecond  *float64  `json:"extract_bytes_per_second,omitempty"`
+	RemainingSeconds       *float64  `json:"remaining_seconds,omitempty"`
+	EstimateScope          string    `json:"estimate_scope"`
+	LastMeasuredAt         time.Time `json:"last_measured_at,omitzero"`
 }
 
 // ReplannedBoot is a failed attempt the rental replaced with another host. ObservedMaxMS is
@@ -200,6 +218,11 @@ func (w *wireBoot) local(now time.Time) *RentalBoot {
 	shift(&boot.LastProgressAt)
 	shift(&boot.BootLogAt)
 	shift(&boot.PhaseStartedAt)
+	if boot.Pull != nil {
+		moved := *boot.Pull
+		shift(&moved.LastMeasuredAt)
+		boot.Pull = &moved
+	}
 	if from := boot.ReplannedFrom; from != nil {
 		moved := *from
 		shift(&moved.StartedAt)
