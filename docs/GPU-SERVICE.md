@@ -31,9 +31,17 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   within the machine envelope. `RunSpec.gpus > 0` requests that exact degree and refuses an
   unsupported count. Model lanes/checkpoint overrides never change it; weight ladders fit
   within the selected group. Busy GPUs cause queuing, not a smaller group.
-- A job with an explicit GPU count reserves that subset for its lifetime. CPU job code stays
+- A job with an explicit GPU count reserves that subset until `Context.release_gpus()` or exit. CPU job code stays
   deviceless; nested GPU calls borrow the exact group and cannot spread concurrent siblings
   onto the remaining GPUs. Unsupported child operations fail rather than reduce the count.
+- A CPU workflow without an explicit count reserves the machine envelope lazily, when its
+  first GPU child starts. Its serving calls still use their package-supported widths. Keeping
+  the envelope between calls prevents another workflow from alternating long-form segments
+  and avoids deadlocking workflows that start with one-GPU references before multi-GPU video.
+  CPU preparation and downloads remain concurrent. Standalone calls keep per-call placement.
+- `Context.release_gpus()` releases a deviceless workflow's reservation before final CPU
+  encoding or uploads. In-flight calls retain their own slots; subsequent calls must acquire
+  a reservation again. An inline accelerator job retains its GPU until its executor exits.
 - The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
   `Preparation`, and `submit` records `preparation_id`.
 - An empty `installation_id` binds a `published-<hash>` installation from `packages`.
