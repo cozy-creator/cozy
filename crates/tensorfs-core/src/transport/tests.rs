@@ -5307,8 +5307,8 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
     };
     let dispatch: Dispatch = Arc::new(move |request: &Request| {
         let path = request.path.as_str();
-        if path.starts_with("/upload/") {
-            let id = format!("sha256:{}", &path["/upload/".len()..]);
+        if let Some(digest) = path.strip_prefix("/upload/") {
+            let id = format!("sha256:{digest}");
             let mode = {
                 let mut hub = hub.lock().unwrap();
                 *hub.puts.entry(id.clone()).or_default() += 1;
