@@ -1236,7 +1236,7 @@ func (s *Store) PinRental(id, rentalID string, models []ModelRef) (bool, *exit.E
 		set, args = ", models=?", append(args, string(encoded))
 	}
 	result, err := s.db.Exec(`UPDATE requests SET worker=?,
-		machine=COALESCE((SELECT machine_name FROM rentals WHERE id=?),machine)`+set+`
+		machine=COALESCE((SELECT COALESCE(NULLIF(stable_machine_name,''),machine_name) FROM rentals WHERE id=?),machine)`+set+`
 		WHERE id=? AND rental=1 AND worker='' AND (requested_rental='' OR requested_rental=?) AND
 		state IN ('submitted','queued','requeue_pending') AND NOT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed'))`, append(args, id, rentalID, rentalID)...)
 	if err != nil {
@@ -1678,7 +1678,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		payload,outputs,state,ordinal,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
 		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub,gpus)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,?,?,?,?,?,?,
-		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		COALESCE((SELECT COALESCE(NULLIF(stable_machine_name,''),machine_name) FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalInstallationID,
 		r.LocalPackageUploadedBootID, r.InstallationID, r.Payload,

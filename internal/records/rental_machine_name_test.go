@@ -2,6 +2,7 @@ package records
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -57,5 +58,52 @@ func TestStableMachineNamePersistsWithoutRenamingRental(t *testing.T) {
 	}
 	if got, problem := s.RentalByMachine("pr-first"); problem != nil || got == nil || got.ID != "pr-first" {
 		t.Fatalf("ID stopped resolving on collision: %+v %v", got, problem)
+	}
+}
+
+func TestNewRunCapturesStableMachineNameAndKeepsPriorHistory(t *testing.T) {
+	st, problem := Open(filepath.Join(t.TempDir(), "records.sqlite"))
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	defer st.Close()
+	rental := Rental{ID: "pr-target", MachineName: "julian", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, State: "ready"}
+	if problem := st.RecordRental(rental); problem != nil {
+		t.Fatal(problem)
+	}
+	submit := func(id, worker string) Request {
+		t.Helper()
+		got, _, problem := st.Submit(Request{ID: id, IdemKey: id, BodyDigest: "sha256:" + strings.Repeat("a", 64), Package: "local/test", Entrypoint: "main", Kind: "call", Payload: []byte(`{}`), Rental: true, Worker: worker})
+		if problem != nil {
+			t.Fatal(problem)
+		}
+		return got
+	}
+	old := submit("old", rental.ID)
+	rental.StableMachineName = "mikatan-356e23"
+	if problem := st.RecordRental(rental); problem != nil {
+		t.Fatal(problem)
+	}
+	direct := submit("direct", rental.ID)
+	queued := submit("queued", "")
+	if pinned, problem := st.PinRental(queued.ID, rental.ID, nil); problem != nil || !pinned {
+		t.Fatalf("pin: %t %v", pinned, problem)
+	}
+	for id, want := range map[string]string{old.ID: "julian", direct.ID: rental.StableMachineName, queued.ID: rental.StableMachineName} {
+		got, problem := st.RequestRow(id)
+		if problem != nil || got == nil || got.Machine != want {
+			t.Fatalf("%s machine: %+v %v; want %s", id, got, problem, want)
+		}
+	}
+	// Later observations cannot rewrite already captured run history.
+	rental.StableMachineName = "elpeo-474f11"
+	if problem := st.RecordRental(rental); problem != nil {
+		t.Fatal(problem)
+	}
+	for _, id := range []string{direct.ID, queued.ID} {
+		got, problem := st.RequestRow(id)
+		if problem != nil || got.Machine != "mikatan-356e23" {
+			t.Fatalf("run history changed: %+v %v", got, problem)
+		}
 	}
 }
