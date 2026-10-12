@@ -496,6 +496,9 @@ pub struct GpuPool {
     config: GpuConfig,
     store: Arc<Store>,
     reserved: Arc<crate::gpu_reservation::Slots>,
+    /// Deviceless root executors own these leases; the pool only finds live owners.
+    workflows: Mutex<BTreeMap<String, Weak<Workflow>>>,
+    workflow_slots: Arc<crate::gpu_reservation::Slots>,
     /// Idle executors by `session_key`: a call takes its own out for its run. One per plan and
     /// lane; the memory policy decides which keep weights mapped.
     sessions: Mutex<BTreeMap<String, Session>>,
@@ -543,11 +546,18 @@ pub(crate) struct Permit {
     pool: Arc<GpuPool>,
     engine: Weak<Engine>,
     token: Option<crate::gpu_reservation::Permit>,
+    workflow_token: Option<crate::gpu_reservation::Permit>,
 }
 pub(crate) struct JobAllocation {
     permit: Permit,
     pub devices: String,
     start: usize,
+}
+/// A CPU workflow's scheduling claim. The root executor retains it until exact exit,
+/// but may release its permit early while it finishes CPU/network work.
+pub(crate) struct Workflow {
+    degree: usize,
+    permit: Mutex<Option<Permit>>,
 }
 impl JobAllocation {
     pub fn prepare(&self) -> io::Result<()> {
@@ -576,6 +586,7 @@ impl JobAllocation {
 impl Drop for Permit {
     fn drop(&mut self) {
         drop(self.token.take());
+        drop(self.workflow_token.take());
         if let Some(engine) = self.engine.upgrade() {
             engine.notify_activity();
         }
@@ -670,6 +681,8 @@ impl GpuPool {
             config,
             store,
             reserved: crate::gpu_reservation::Slots::new(envelope.len()),
+            workflows: Mutex::default(),
+            workflow_slots: crate::gpu_reservation::Slots::new(envelope.len()),
             sessions: Mutex::new(BTreeMap::new()),
             stopped: Default::default(),
             admitted: Mutex::default(),
@@ -972,7 +985,7 @@ impl GpuPool {
         if self.level(&plan.id).is_some_and(|holds| holds >= level) {
             return "";
         }
-        let Some(_permit) = self.permit(engine, None, true, false, 0..plan.degree as usize, &[]) else {
+        let Some(_permit) = self.permit(engine, (None, None), true, false, 0..plan.degree as usize, &[]) else {
             return "a request holds the GPU; it loads when that ends";
         };
         // A request queued for the GPU goes first; the member comes back after it.
@@ -1464,25 +1477,70 @@ impl GpuPool {
     fn permit(
         self: &Arc<Self>,
         engine: &Arc<Engine>,
-        family: Option<&str>,
+        families: (Option<&str>, Option<&str>),
         call: bool,
         bounded: bool,
         devices: std::ops::Range<usize>,
         waiting: &[bool],
     ) -> Option<Permit> {
-        let token = self.reserved.take(family, call, bounded, devices, waiting)?;
-        Some(Permit { pool: self.clone(), engine: Arc::downgrade(engine), token: Some(token) })
+        // Workflow ownership and inline accelerator ancestry are independent: a CPU
+        // workflow's sibling accelerator jobs still need separate physical allocations.
+        let workflow_token = self.workflow_slots.take(families.1, call, bounded, devices.clone(), waiting)?;
+        // Once the workflow is admitted, its descendants cannot queue behind a request
+        // waiting for that workflow's reservation to end.
+        let inner_waiting = if families.1.is_some() { &[][..] } else { waiting };
+        let token = self.reserved.take(families.0, call, bounded, devices, inner_waiting)?;
+        Some(Permit { pool: self.clone(), engine: Arc::downgrade(engine), token: Some(token), workflow_token: Some(workflow_token) })
+    }
+    pub(crate) fn workflow(&self, record: &Execution, allocation: Option<JobAllocation>) -> Arc<Workflow> {
+        let workflow = Arc::new(Workflow {
+            // Reserving only a first child's width would deadlock independent workflows
+            // that each begin with one GPU and later need the whole machine.
+            degree: if record.invocation.gpus == 0 { self.width() } else { record.invocation.gpus as usize },
+            permit: Mutex::new(allocation.map(|allocation| allocation.permit)),
+        });
+        let mut workflows = self.workflows.lock().unwrap();
+        workflows.retain(|_, owner| owner.strong_count() > 0);
+        workflows.insert(record.id.clone(), Arc::downgrade(&workflow));
+        workflow
+    }
+    fn workflow_owner(&self, family: Option<&str>) -> Option<Arc<Workflow>> {
+        let owner = self.workflows.lock().unwrap().get(family?).cloned()?;
+        owner.upgrade()
+    }
+    fn admit_workflow(self: &Arc<Self>, engine: &Arc<Engine>, family: Option<&str>, waiting: &mut [bool]) -> bool {
+        let Some(workflow) = self.workflow_owner(family) else { return true; };
+        let mut permit = workflow.permit.lock().unwrap();
+        if permit.is_some() { return true; }
+        for start in 0..=self.width() - workflow.degree {
+            if let Some(token) = self.workflow_slots.take(family, false, true, start..start + workflow.degree, waiting) {
+                *permit = Some(Permit { pool: self.clone(), engine: Arc::downgrade(engine), token: Some(token), workflow_token: None });
+                return true;
+            }
+        }
+        waiting.iter_mut().take(workflow.degree).for_each(|wait| *wait = true);
+        false
+    }
+    pub(crate) fn release_workflow(&self, family: &str) {
+        if let Some(workflow) = self.workflow_owner(Some(family)) {
+            // Each live serving child still owns its independent call permit.
+            workflow.permit.lock().unwrap().take();
+        }
     }
     /// Reserve a job's explicit group, or one GPU for an accelerator job. CPU jobs keep
     /// deviceless executors while their children borrow only the reserved family subset.
     pub(crate) fn job_allocation(self: &Arc<Self>, engine: &Arc<Engine>, record: &Execution, waiting: &[bool]) -> io::Result<Option<JobAllocation>> {
         let family = crate::gpu_reservation::family(record, |id| engine.get(id))?;
+        let workflow = crate::gpu_reservation::workflow(record, |id| engine.get(id))?;
         let degree = record.invocation.gpus.max(1);
         if degree as usize > self.width() || (record.invocation.accelerator && degree != 1) {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "gpu_count_unavailable: the job cannot use its requested GPU group"));
         }
+        if !self.admit_workflow(engine, workflow.as_deref(), &mut waiting.to_vec()) {
+            return Ok(None);
+        }
         for start in 0..=self.width() - degree as usize {
-            if let Some(permit) = self.permit(engine, family.as_deref(), false,
+            if let Some(permit) = self.permit(engine, (family.as_deref(), workflow.as_deref()), false,
                 record.invocation.gpus > 0, start..start + degree as usize, waiting) {
                 let devices = match record.invocation.accelerator {
                     true => self.lane_devices(start, degree)?,
@@ -1521,13 +1579,13 @@ impl GpuPool {
         self: &Arc<Self>,
         engine: &Arc<Engine>,
         plan: &GpuPlan,
-        family: Option<&str>,
+        families: (Option<&str>, Option<&str>),
         waiting: &mut [bool],
     ) -> Option<(usize, Permit)> {
         let width = self.devices.len();
         let take = |start: usize, waiting: &[bool]| {
             let lane = start..start + plan.degree as usize;
-            self.permit(engine, family, true, false, lane, waiting).map(|permit| (start, permit))
+            self.permit(engine, families, true, false, lane, waiting).map(|permit| (start, permit))
         };
         if plan.degree > 1 {
             let placed = (0..=width.saturating_sub(plan.degree as usize))
@@ -1546,7 +1604,8 @@ impl GpuPool {
                 (0..width).filter(fit).find_map(|device| take(device, waiting))
             })
             .or_else(|| {
-                let anywhere = hosts.is_empty() || family.is_some_and(|f| self.reserved.holds(f));
+                let anywhere = hosts.is_empty() || families.0.is_some_and(|f| self.reserved.holds(f))
+                    || families.1.is_some_and(|f| self.workflow_slots.holds(f));
                 anywhere.then(|| (0..width).find_map(|device| take(device, waiting))).flatten()
             });
         match &placed {
@@ -1571,7 +1630,11 @@ impl GpuPool {
         waiting: &mut [bool],
     ) -> io::Result<bool> {
         let family = crate::gpu_reservation::family(record, |id| engine.get(id))?;
-        let Some((start, permit)) = self.place(engine, &plan, family.as_deref(), waiting) else {
+        let workflow = crate::gpu_reservation::workflow(record, |id| engine.get(id))?;
+        if !self.admit_workflow(engine, workflow.as_deref(), waiting) {
+            return Ok(false);
+        }
+        let Some((start, permit)) = self.place(engine, &plan, (family.as_deref(), workflow.as_deref()), waiting) else {
             return Ok(false);
         };
         engine.dispatch_managed(&record.id, move |engine, id| {
@@ -1673,10 +1736,12 @@ impl GpuPool {
                     return pool.note_prewarm(&key, asked.elapsed(), Default::default(), &Ok("already loaded"));
                 }
                 // Requests queued for a GPU go first.
+                let Ok(record) = engine.get(&owner) else { return; };
+                let Ok(workflow) = crate::gpu_reservation::workflow(&record, |id| engine.get(id)) else { return; };
                 let (start, _permit) = loop {
                     if !active() { return; }
                     let mut waiting = vec![gpu_request_queued(&engine); pool.width()];
-                    if let Some(placed) = pool.place(&engine, &plan, family.as_deref(), &mut waiting) {
+                    if let Some(placed) = pool.place(&engine, &plan, (family.as_deref(), workflow.as_deref()), &mut waiting) {
                         break placed;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4472,7 +4537,7 @@ mod tests {
     fn calls_of_one_plan_spread_over_free_gpus_and_a_waiting_group_keeps_its_place() {
         let (root, pool, engine) = pool_of(4);
         let (image, film) = (plan("image", 1), plan("film", 2));
-        let place = |plan: &GpuPlan, waiting: &mut [bool]| pool.place(&engine, plan, None, waiting);
+        let place = |plan: &GpuPlan, waiting: &mut [bool]| pool.place(&engine, plan, (None, None), waiting);
         let serving = |gpu: usize| pool.devices[gpu].memory.with(|ledger| ledger.starting("image", 0));
         let mut waiting = vec![false; 4];
         let (gpu, first) = place(&image, &mut waiting).unwrap();
@@ -4508,12 +4573,12 @@ mod tests {
         let (root, pool, engine) = pool_of(4);
         let group = plan("two", 2);
         let mut waiting = vec![false; 4];
-        let (first_gpu, first) = pool.place(&engine, &group, None, &mut waiting).unwrap();
-        let (second_gpu, second) = pool.place(&engine, &group, None, &mut waiting).unwrap();
+        let (first_gpu, first) = pool.place(&engine, &group, (None, None), &mut waiting).unwrap();
+        let (second_gpu, second) = pool.place(&engine, &group, (None, None), &mut waiting).unwrap();
         assert_eq!((first_gpu, second_gpu), (0, 2));
-        assert!(pool.place(&engine, &group, None, &mut waiting).is_none());
+        assert!(pool.place(&engine, &group, (None, None), &mut waiting).is_none());
         drop(first);
-        assert_eq!(pool.place(&engine, &group, None, &mut [false; 4]).unwrap().0, 0);
+        assert_eq!(pool.place(&engine, &group, (None, None), &mut [false; 4]).unwrap().0, 0);
         drop(second);
         pool.stop().unwrap();
         fs::remove_dir_all(root).unwrap();
@@ -4531,17 +4596,98 @@ mod tests {
         allocation.prepare().unwrap();
         let family = Some(job.id.as_str());
         let group = plan("child", 2);
-        let (gpu, child) = pool.place(&engine, &group, family, &mut [false; 4]).unwrap();
+        let (gpu, child) = pool.place(&engine, &group, (family, family), &mut [false; 4]).unwrap();
         assert_eq!(gpu, 0);
-        assert!(pool.place(&engine, &group, family, &mut [false; 4]).is_none(),
+        assert!(pool.place(&engine, &group, (family, family), &mut [false; 4]).is_none(),
             "a simultaneous sibling cannot escape to the other two GPUs");
-        let (gpu, other) = pool.place(&engine, &group, None, &mut [false; 4]).unwrap();
+        let (gpu, other) = pool.place(&engine, &group, (None, None), &mut [false; 4]).unwrap();
         assert_eq!(gpu, 2, "the unrelated request uses the unreserved half");
         drop(allocation); // canceled/ended parent; its live child still owns the subset.
-        assert!(pool.place(&engine, &group, None, &mut [false; 4]).is_none());
+        assert!(pool.place(&engine, &group, (None, None), &mut [false; 4]).is_none());
         drop(child);
-        assert_eq!(pool.place(&engine, &group, None, &mut [false; 4]).unwrap().0, 0);
+        assert_eq!(pool.place(&engine, &group, (None, None), &mut [false; 4]).unwrap().0, 0);
         drop(other);
+        pool.stop().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cpu_workflows_keep_gpu_ownership_between_small_and_group_children() {
+        let (root, pool, engine) = pool_of(8);
+        let job = |key| engine.submit(key, crate::journal::Invocation {
+            job: true, ..Default::default()
+        }).unwrap();
+        let first = job("first");
+        let second = job("second");
+        let first_owner = pool.workflow(&first, None);
+        let second_owner = pool.workflow(&second, None);
+        let first_family = Some(first.id.as_str());
+        let second_family = Some(second.id.as_str());
+        // CPU-only roots and their downloads do not reserve GPUs in advance.
+        let (_, unrelated) = pool.place(&engine, &plan("image", 1), (None, None), &mut [false; 8]).unwrap();
+        assert!(!pool.admit_workflow(&engine, first_family, &mut [false; 8]));
+        drop(unrelated);
+        assert!(pool.admit_workflow(&engine, first_family, &mut [false; 8]));
+        // Sibling inline GPU jobs share workflow ownership, not an actual CUDA device.
+        let inline = |key| engine.submit(key, crate::journal::Invocation {
+            job: true, accelerator: true, parent: first.id.clone(), ..Default::default()
+        }).unwrap();
+        let left = inline("left");
+        let right = inline("right");
+        let left_gpu = pool.job_allocation(&engine, &left, &[]).unwrap().unwrap();
+        let right_gpu = pool.job_allocation(&engine, &right, &[]).unwrap().unwrap();
+        assert_ne!(left_gpu.devices, right_gpu.devices);
+        let (_, nested) = pool.place(&engine, &plan("nested", 1),
+            (Some(left.id.as_str()), first_family), &mut [false; 8]).unwrap();
+        drop((nested, left_gpu, right_gpu));
+        let (_, reference) = pool.place(&engine, &plan("reference", 1), (None, first_family), &mut [false; 8]).unwrap();
+        assert!(!pool.admit_workflow(&engine, second_family, &mut [false; 8]));
+        drop(reference);
+        // A gap between child submissions must not become a turn for another root.
+        let mut waiting = [false; 8];
+        assert!(!pool.admit_workflow(&engine, second_family, &mut waiting));
+        assert!(pool.place(&engine, &plan("other-worker", 1), (None, None), &mut [false; 8]).is_none());
+        assert!(pool.admit_workflow(&engine, first_family, &mut waiting));
+        let (_, segment) = pool.place(&engine, &plan("shared-video-executor", 8), (None, first_family), &mut waiting).unwrap();
+        // Explicit release is idempotent; a running child retains its own call slots.
+        pool.release_workflow(&first.id);
+        pool.release_workflow(&first.id);
+        assert!(!pool.admit_workflow(&engine, second_family, &mut [false; 8]));
+        drop(segment);
+        assert!(pool.admit_workflow(&engine, second_family, &mut [false; 8]));
+        let (_, next_segment) = pool.place(&engine, &plan("shared-video-executor", 8), (None, second_family), &mut [false; 8]).unwrap();
+        assert!(!pool.admit_workflow(&engine, first_family, &mut [false; 8]),
+            "a later call cannot take back a released lease from its next owner");
+        drop(next_segment);
+        drop(second_owner); // The executor's retained lease ends on its exact exit.
+        assert!(pool.admit_workflow(&engine, first_family, &mut [false; 8]));
+        drop(first_owner);
+        assert!(pool.place(&engine, &plan("other-worker", 8), (None, None), &mut [false; 8]).is_some());
+        pool.stop().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_workflow_subsets_release_before_the_cpu_root_exits() {
+        let (root, pool, engine) = pool_of(4);
+        let job = engine.submit("two-gpu-root", crate::journal::Invocation {
+            job: true, gpus: 2, ..Default::default()
+        }).unwrap();
+        let allocation = pool.job_allocation(&engine, &job, &[]).unwrap().unwrap();
+        let owner = pool.workflow(&job, Some(allocation));
+        let family = Some(job.id.as_str());
+        let (_, other_worker) = pool.place(&engine, &plan("other", 2), (None, None), &mut [false; 4]).unwrap();
+        let (_, child) = pool.place(&engine, &plan("child", 2), (family, family), &mut [false; 4]).unwrap();
+        assert!(pool.place(&engine, &plan("child", 1), (family, family), &mut [false; 4]).is_none());
+        drop(child);
+        pool.release_workflow(&job.id);
+        let (start, next_worker) = pool.place(&engine, &plan("next", 2), (None, None), &mut [false; 4]).unwrap();
+        assert_eq!(start, 0);
+        assert!(!pool.admit_workflow(&engine, family, &mut [false; 4]));
+        drop(next_worker);
+        assert!(pool.admit_workflow(&engine, family, &mut [false; 4]));
+        assert!(pool.place(&engine, &plan("too-wide", 4), (family, family), &mut [false; 4]).is_none());
+        drop((owner, other_worker));
         pool.stop().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -4553,13 +4699,13 @@ mod tests {
         let (root, pool, engine) = pool_of(2);
         let image = plan("image", 1);
         let mut waiting = vec![false; 2];
-        let (gpu, first) = pool.place(&engine, &image, None, &mut waiting).unwrap();
+        let (gpu, first) = pool.place(&engine, &image, (None, None), &mut waiting).unwrap();
         assert_eq!(gpu, 0);
         pool.devices[0].memory.with(|ledger| ledger.starting("image", 0));
-        let (gpu, second) = pool.place(&engine, &image, None, &mut waiting).unwrap();
+        let (gpu, second) = pool.place(&engine, &image, (None, None), &mut waiting).unwrap();
         assert_eq!(gpu, 1);
         pool.devices[1].memory.with(|ledger| ledger.starting("image", 0));
-        assert!(pool.place(&engine, &image, None, &mut waiting).is_none());
+        assert!(pool.place(&engine, &image, (None, None), &mut waiting).is_none());
         assert_eq!(waiting, [true, true]);
         drop((first, second));
         pool.stop().unwrap();
@@ -4587,11 +4733,11 @@ mod tests {
             .unwrap();
         let allocation = pool.job_allocation(&engine, &job, &[]).unwrap().unwrap();
         let mut waiting = vec![false; 4];
-        assert!(pool.place(&engine, &plan("film", 4), None, &mut waiting).is_none());
+        assert!(pool.place(&engine, &plan("film", 4), (None, None), &mut waiting).is_none());
         assert_eq!(waiting, [true, true, true, true]);
         // Its group child takes GPU 1 the foreign group waits for, and borrows GPU 0.
         let family = Some(job.id.as_str());
-        let (gpu, child) = pool.place(&engine, &plan("segment", 2), family, &mut waiting).unwrap();
+        let (gpu, child) = pool.place(&engine, &plan("segment", 2), (family, family), &mut waiting).unwrap();
         assert_eq!(gpu, 0);
         // The job pauses and resumes while its child runs: it prepares only after the call.
         drop(allocation);

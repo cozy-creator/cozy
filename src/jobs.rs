@@ -1,5 +1,5 @@
-//! Jobs and their child runs. Explicit accelerator jobs hold a family GPU reservation;
-//! other jobs run deviceless (`run_job`).
+//! Jobs and their child runs. Accelerator jobs retain their device allocation; deviceless
+//! workflows retain a family scheduling reservation from their first GPU child until release.
 //! Each call it makes to one of its package's invocables arrives on the seam (`child_call`)
 //! and becomes a run of its own, `<parent>/<call_index>`, under the parent's signer: same
 //! records, dispatched like any run, canceled with the parent. A child's result and files
@@ -317,7 +317,14 @@ impl Jobs {
             )
         })?;
         executor.retain_until_exit(directory);
-        if let Some(allocation) = allocation { executor.retain_until_exit(allocation); }
+        let family = crate::gpu_reservation::workflow(&pending, |id| engine.get(id))?;
+        let workflow_pool = (pending.invocation.job && !pending.invocation.accelerator && family.as_deref() == Some(id))
+            .then(|| self.service.upgrade().and_then(|service| service.gpu())).flatten();
+        if let Some(pool) = workflow_pool {
+            executor.retain_until_exit(pool.workflow(&pending, allocation));
+        } else if let Some(allocation) = allocation {
+            executor.retain_until_exit(allocation);
+        }
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
         let facts = ExecutorFacts {
             pid: executor.birth.pid,
@@ -1044,9 +1051,19 @@ impl Jobs {
             // A hint about a future call: TensorD may prepare its weights and ask Runtime
             // to build the construction. This answer does not promise completed loading.
             Kind::ModelPrefetch => self.model_prefetch(parent, frame),
-            // A deviceless parent holds none; an inline GPU handler keeps its
-            // actual device reservation until exit, per Context.release_gpus.
-            Kind::GpuRelease => Ok(Answer::ok(frame.seq)),
+            Kind::GpuRelease => {
+                let service = self.service.upgrade()
+                    .ok_or_else(|| io::Error::other("the machine is stopping"))?;
+                let record = service.engine.get(&parent.id)?;
+                // An inline accelerator handler cannot give up its actual device safely.
+                if !record.invocation.accelerator {
+                    if let (Some(pool), Some(family)) = (service.gpu(),
+                        crate::gpu_reservation::workflow(&record, |id| service.engine.get(id))?) {
+                        pool.release_workflow(&family);
+                    }
+                }
+                Ok(Answer::ok(frame.seq))
+            }
             Kind::Checkpoint => self.checkpoint(parent, frame),
             _ => return Ok((Answer::unavailable(frame.seq), None)),
         };
@@ -1839,6 +1856,38 @@ mod exact_tests {
         let pure = Parent { pure_callables:[("root".into(),"unrelated".into())].into(), ..pure };
         assert_ne!(jobs.child_call(&pure,&unrelated).unwrap_err().0,"child_impure");
         assert!(service.engine.nonterminal(usize::MAX).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_release_frame_releases_a_live_cpu_roots_reservation() {
+        let root = std::env::temp_dir().join(format!("cm-release-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let config = serde_json::from_value(json!({"devices": "GPU-test-release", "prespawn": false})).unwrap();
+        let pool = crate::gpu_service::GpuPool::new(&root.join("gpu"), config, store.clone()).unwrap();
+        service.configure_gpu(pool.clone()).unwrap();
+        let jobs = Jobs::configure(&service, store, None).unwrap();
+        let job = service.engine.submit("root", crate::journal::Invocation {
+            job: true, gpus: 1, ..Default::default()
+        }).unwrap();
+        let next = service.engine.submit("next", crate::journal::Invocation {
+            job: true, gpus: 1, ..Default::default()
+        }).unwrap();
+        let allocation = pool.job_allocation(&service.engine, &job, &[]).unwrap().unwrap();
+        let owner = pool.workflow(&job, Some(allocation));
+        assert!(pool.job_allocation(&service.engine, &next, &[]).unwrap().is_none());
+        let parent = Parent {
+            id: job.id, request: "root".into(), actor: "alice".into(), spool: root.clone(),
+            callables: Default::default(), pure: false, pure_callables: Default::default(),
+            serving: Default::default(), inputs: vec![], calls: Default::default(),
+        };
+        let (answer, file) = jobs.seam(&parent, &Frame { kind: Kind::GpuRelease, seq: 7, ..Default::default() }).unwrap();
+        assert!(answer.ok && file.is_none());
+        assert!(pool.job_allocation(&service.engine, &next, &[]).unwrap().is_some(),
+            "the CPU root is still alive but its release must unblock the next workflow");
+        drop(owner);
+        pool.stop().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

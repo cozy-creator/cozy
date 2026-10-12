@@ -117,11 +117,27 @@ impl Drop for Permit {
     }
 }
 
-/// Outermost GPU-owning ancestor (accelerator or explicit group), never an unconditional CPU root: sibling GPU
-/// jobs of a CPU orchestrator must compete, while a CPU intermediary may borrow.
+/// GPU-owning ancestry serializes sibling inline accelerator jobs, while descendants
+/// can borrow an ancestor's allocation.
 pub(crate) fn family(
     record: &crate::journal::Execution,
+    get: impl FnMut(&str) -> std::io::Result<crate::journal::Execution>,
+) -> std::io::Result<Option<String>> {
+    owner(record, get, false)
+}
+
+/// A workflow's outermost managed job, even when its CPU body has no device allocation.
+pub(crate) fn workflow(
+    record: &crate::journal::Execution,
+    get: impl FnMut(&str) -> std::io::Result<crate::journal::Execution>,
+) -> std::io::Result<Option<String>> {
+    owner(record, get, true)
+}
+
+fn owner(
+    record: &crate::journal::Execution,
     mut get: impl FnMut(&str) -> std::io::Result<crate::journal::Execution>,
+    workflow: bool,
 ) -> std::io::Result<Option<String>> {
     let mut current = record.clone();
     let mut family = None;
@@ -130,7 +146,7 @@ pub(crate) fn family(
         if !seen.insert(current.id.clone()) {
             return Err(std::io::Error::other("cyclic managed parent chain"));
         }
-        if current.invocation.accelerator || (current.invocation.job && current.invocation.gpus > 0) {
+        if current.invocation.accelerator || (current.invocation.job && (workflow || current.invocation.gpus > 0)) {
             family = Some(current.id.clone());
         }
         if current.invocation.parent.is_empty() {
@@ -209,6 +225,9 @@ mod tests {
         let middle = submit("middle", &first.id, false);
         let nested = submit("nested", &middle.id, true);
         assert_eq!(family(&cpu, |id| engine.get(id)).unwrap(), None);
+        for record in [&cpu, &first, &second, &middle, &nested] {
+            assert_eq!(workflow(record, |id| engine.get(id)).unwrap(), Some(cpu.id.clone()));
+        }
         assert_eq!(
             family(&first, |id| engine.get(id)).unwrap(),
             Some(first.id.clone())
