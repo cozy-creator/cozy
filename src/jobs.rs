@@ -1057,9 +1057,9 @@ impl Jobs {
                 let record = service.engine.get(&parent.id)?;
                 // An inline accelerator handler cannot give up its actual device safely.
                 if !record.invocation.accelerator {
-                    if let (Some(pool), Some(family)) = (service.gpu(),
-                        crate::gpu_reservation::workflow(&record, |id| service.engine.get(id))?) {
-                        pool.release_workflow(&family);
+                    if let Some(pool) = service.gpu() {
+                        // A nested CPU job cannot surrender its ancestor's future GPU work.
+                        pool.release_workflow(&record.id);
                     }
                 }
                 Ok(Answer::ok(frame.seq))
@@ -1877,12 +1877,20 @@ mod exact_tests {
         let allocation = pool.job_allocation(&service.engine, &job, &[]).unwrap().unwrap();
         let owner = pool.workflow(&job, Some(allocation));
         assert!(pool.job_allocation(&service.engine, &next, &[]).unwrap().is_none());
-        let parent = Parent {
-            id: job.id, request: "root".into(), actor: "alice".into(), spool: root.clone(),
+        let nested = service.engine.submit("nested", crate::journal::Invocation {
+            job: true, parent: job.id.clone(), ..Default::default()
+        }).unwrap();
+        let mut parent = Parent {
+            id: nested.id, request: "root".into(), actor: "alice".into(), spool: root.clone(),
             callables: Default::default(), pure: false, pure_callables: Default::default(),
             serving: Default::default(), inputs: vec![], calls: Default::default(),
         };
-        let (answer, file) = jobs.seam(&parent, &Frame { kind: Kind::GpuRelease, seq: 7, ..Default::default() }).unwrap();
+        let release = Frame { kind: Kind::GpuRelease, seq: 7, ..Default::default() };
+        assert!(jobs.seam(&parent, &release).unwrap().0.ok);
+        assert!(pool.job_allocation(&service.engine, &next, &[]).unwrap().is_none(),
+            "a nested CPU child must not release its ancestor's reservation");
+        parent.id = job.id;
+        let (answer, file) = jobs.seam(&parent, &release).unwrap();
         assert!(answer.ok && file.is_none());
         assert!(pool.job_allocation(&service.engine, &next, &[]).unwrap().is_some(),
             "the CPU root is still alive but its release must unblock the next workflow");
