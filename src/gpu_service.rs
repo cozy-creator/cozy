@@ -1543,7 +1543,7 @@ impl GpuPool {
             claim.permit.take();
         }
     }
-    fn prefetch_phase(&self, family: Option<&str>) -> Option<u64> {
+    pub(crate) fn prefetch_phase(&self, family: Option<&str>) -> Option<u64> {
         match self.workflow_owner(family) {
             Some(workflow) => {
                 let claim = workflow.claim.lock().unwrap();
@@ -1740,14 +1740,14 @@ impl GpuPool {
     /// `prefetch(motion_segment)`): load it in the background where it fits beside the tenants
     /// already there (it never makes room), without waiting for the parent's own run to end.
     /// It takes the GPU's call slot like any call, so a child call in flight finishes first.
-    pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: GpuPlan, family: Option<String>, owner: String) {
+    pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: GpuPlan, family: Option<String>, owner: String, phase: Option<u64>) {
         let (pool, engine) = (self.clone(), engine.clone());
         let started = std::thread::Builder::new()
             .name("executor-prefetch".into())
             .spawn(move || {
                 let Ok(record) = engine.get(&owner) else { return; };
                 let Ok(workflow) = crate::gpu_reservation::workflow(&record, |id| engine.get(id)) else { return; };
-                let Some(phase) = pool.prefetch_phase(workflow.as_deref()) else { return; };
+                let Some(phase) = phase else { return; };
                 let active = || pool.prefetch_phase(workflow.as_deref()) == Some(phase) && engine.get(&owner).is_ok_and(|record| {
                     record.state == State::Running && record.cancel_actor.is_none() && record.pause_actor.is_none()
                 });

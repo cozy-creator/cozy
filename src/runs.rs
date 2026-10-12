@@ -1113,6 +1113,10 @@ impl Runs {
             return Ok(());
         };
         let family = crate::gpu_reservation::family(parent, |id| self.service.engine.get(id))?;
+        let workflow = crate::gpu_reservation::workflow(parent, |id| self.service.engine.get(id))?;
+        // Downloads can outlast the GPU phase that requested this hint. They may finish,
+        // but the hint must not warm a GPU after that phase has explicitly released it.
+        let phase = gpu.prefetch_phase(workflow.as_deref());
         let owner = parent.id.clone();
         let (runs, entrypoint) = (self.clone(), entrypoint.to_string());
         let application = application.to_string();
@@ -1130,7 +1134,7 @@ impl Runs {
                 Ok((installation, Some(plan))) => {
                     match runs.service.catalog.resolve(&installation.generation)
                         .and_then(|held| held.application(&application)) {
-                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, family.clone(), owner.clone()),
+                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, family.clone(), owner.clone(), phase),
                         Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
                     }
                 }
