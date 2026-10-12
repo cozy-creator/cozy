@@ -1266,11 +1266,13 @@ func writeOutputV1(ctx context.Context, machine *machines.V1, run, directory str
 	}
 	info, err := os.Stat(product.Path)
 	prefix := int64(0)
-	if err == nil && info.Mode().IsRegular() && info.Size() < product.Length && (from < 0 || info.Size() == from) {
+	if err == nil && info.Mode().IsRegular() && info.Size() < product.Length && (from < 0 || from > 0 && info.Size() <= from) {
 		prefix = info.Size()
 	}
 	if prefix > 0 {
-		// Only the tail; bytes that do not match the digest are read whole once.
+		// An earlier append revision can be a prefix too. Only the tail is read;
+		// an intervening replacement or corrupt prefix fails the final digest and
+		// falls back to a whole read before any new revision becomes visible.
 		if problem := read(prefix); problem == nil || ctx.Err() != nil {
 			return problem
 		}
