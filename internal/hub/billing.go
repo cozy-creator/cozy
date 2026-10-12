@@ -141,7 +141,7 @@ func (c *Client) CreditDeposit(ctx context.Context) (CreditDeposit, *exit.Error)
 			} `json:"prices"`
 		} `json:"data"`
 	}
-	path := "/billing/v1/catalog/products?" + url.Values{"merchant": {config.Credit.MerchantID}, "keys": {creditProduct}}.Encode()
+	path := "/billing/v1/products?" + url.Values{"merchant": {config.Credit.MerchantID}, "keys": {creditProduct}}.Encode()
 	if problem := c.do(ctx, call{method: http.MethodGet, path: path, optionalAuth: true}, &out); problem != nil {
 		return CreditDeposit{}, problem
 	}

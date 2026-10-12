@@ -142,7 +142,7 @@ func (h *creditHub) routes(t *testing.T, base func() string) func(*http.ServeMux
 			}
 			reply(w, 200, map[string]any{"data": data, "next_cursor": nil})
 		})
-		mux.HandleFunc("GET /billing/v1/catalog/products", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("GET /billing/v1/products", func(w http.ResponseWriter, r *http.Request) {
 			// The catalog requires the actual merchant and the requested product keys.
 			if keys := r.URL.Query()["keys"]; len(keys) != 1 || keys[0] != "api-credit" ||
 				r.URL.Query().Get("merchant") != merchantID || len(r.URL.Query()) != 2 {
