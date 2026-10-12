@@ -120,9 +120,15 @@ func rentalLogSubject(ctx *Context, typed string) (id, origin string, problem *e
 		return "", "", problem
 	}
 	for _, row := range append(append(inventory.Rentals, inventory.Unrecorded...), inventory.Pending...) {
-		if row.ID != "" && (row.ID == typed || strings.EqualFold(row.MachineName, typed)) {
-			return row.ID, row.Hub, nil
+		if row.ID != "" && (row.ID == typed || strings.EqualFold(row.MachineName, typed) || strings.EqualFold(row.RentalAlias, typed)) {
+			if id != "" && id != row.ID {
+				return "", "", exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple rentals; use a rental ID", typed)
+			}
+			id, origin = row.ID, row.Hub
 		}
+	}
+	if id != "" {
+		return id, origin, nil
 	}
 	if rentalid.Valid(typed) {
 		return typed, "", nil

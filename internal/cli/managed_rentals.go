@@ -974,7 +974,7 @@ func (m *managedRentals) settle(release *pendingRelease) *exit.Error {
 			confirmed = true
 		case observed == nil:
 			row.State = remote.State
-			copyRentalFailure(&row, remote)
+			copyRentalObservation(&row, remote)
 			if update := m.store.RecordRental(row); update != nil {
 				return update
 			}
@@ -1370,6 +1370,7 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			continue
 		}
 		row, remote := *current, view.remote
+		row.StableMachineName = remote.StableMachineName
 		if view.unknown {
 			census.hubUnknown[row.ID] = true
 			continue
@@ -1434,7 +1435,7 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 		}
 		wasAttachable := localRentalAttachable(row)
 		row.State = remote.State
-		copyRentalFailure(&row, remote)
+		copyRentalObservation(&row, remote)
 		// Written only when the Hub said something new: this runs every poll for every rental,
 		// and an ended one's write settles its runs again.
 		if row != *current {

@@ -184,7 +184,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		}
 		summary := api.RentalSummary{
 			Provider: live[row.ID].Provider, ProviderMachineID: live[row.ID].ProviderMachineID, ProviderResourceID: live[row.ID].ProviderResourceID,
-			ID: row.ID, MachineName: row.MachineName, SKU: row.SKU, State: row.State,
+			ID: row.ID, MachineName: row.DisplayName(), RentalAlias: row.MachineName, SKU: row.SKU, State: row.State,
 			AcceleratorModel: row.AcceleratorModel, AcceleratorCount: row.AcceleratorCount,
 			HourlyRateUSDMicros: row.HourlyRateUSDMicros,
 			SpendUSDMicros:      live[row.ID].SpendUSDMicros, SpendBasis: live[row.ID].SpendBasis,
@@ -203,6 +203,9 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			HubUnknown:            census.hubUnknown[row.ID],
 			UnreachableSince:      live[row.ID].UnreachableSince,
 		}
+		if seen, ok := live[row.ID]; ok {
+			summary.MachineName = seen.DisplayName()
+		}
 		costOf(&summary, live[row.ID])
 		if update, problem := st.RuntimeUpdate(row.ID); problem != nil {
 			return result, problem
@@ -216,7 +219,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		hubNamed[seen.ID], hubNamed[seen.Name] = true, true
 		result.Unrecorded = append(result.Unrecorded, api.RentalSummary{
 			Provider: seen.Provider, ProviderMachineID: seen.ProviderMachineID, ProviderResourceID: seen.ProviderResourceID,
-			ID: seen.ID, MachineName: seen.Name, State: seen.State,
+			ID: seen.ID, MachineName: seen.DisplayName(), RentalAlias: seen.Name, State: seen.State,
 			AcceleratorModel: seen.AcceleratorModel, AcceleratorCount: seen.AcceleratorCount,
 			HourlyRateUSDMicros: seen.HourlyRateUSDMicros, Address: seen.Address,
 			SpendUSDMicros: seen.SpendUSDMicros, SpendBasis: seen.SpendBasis,

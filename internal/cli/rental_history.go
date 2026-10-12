@@ -148,12 +148,12 @@ func renderRentalHistory(rentals []pastRental, unanswered []string, hubs, endedO
 		r := p.rental
 		summary := api.RentalSummary{SpendUSDMicros: r.SpendUSDMicros, SpendBasis: r.SpendBasis}
 		spend = append(spend, summary)
-		row := map[string]string{"machine": r.Name, "rental": r.ID, "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
+		row := map[string]string{"machine": r.DisplayName(), "rental": r.ID, "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
 			"accelerator": acceleratorLabel(r.AcceleratorModel, r.AcceleratorCount), "hub": p.hub,
 			"state": humanRentalState(r.State), "started": clock(p.started), "ended": "live", "ended by": r.EndCause(),
 			"$/hour": rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour)),
 			"spent":  rentalSpend(summary)}
-		typed := map[string]any{"machine": r.Name, "rental_id": r.ID, "hub": p.hub, "state": r.State,
+		typed := map[string]any{"machine": r.DisplayName(), "rental_id": r.ID, "hub": p.hub, "state": r.State,
 			"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros}
 		if gpus, ok := gpuCount(r.AcceleratorModel, r.AcceleratorCount); ok {
 			typed["gpus"] = gpus
