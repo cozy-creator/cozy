@@ -5315,14 +5315,22 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                 hub.mode
             };
             if request.header("x-grant-generation") == Some("1")
-                && matches!(mode, "expired403" | "landed" | "heartbeat") {
+                && matches!(mode, "expired403" | "landed" | "heartbeat")
+            {
                 std::thread::sleep(Duration::from_millis(1200));
                 if mode == "landed" {
-                    hub.lock().unwrap().uploaded.insert(id, request.body.clone());
+                    hub.lock()
+                        .unwrap()
+                        .uploaded
+                        .insert(id, request.body.clone());
                 }
-                if mode != "heartbeat" { return status(403, b"expired grant"); }
+                if mode != "heartbeat" {
+                    return status(403, b"expired grant");
+                }
             }
-            if mode == "denied" { return status(403, b"permission denied"); }
+            if mode == "denied" {
+                return status(403, b"permission denied");
+            }
         }
         let mut hub = hub.lock().unwrap();
         let op = path
@@ -5393,7 +5401,10 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                     *generation += 1;
                     let generation = *generation;
                     if hub.uploaded.contains_key(&id) {
-                        held.push(Value::obj(vec![("object_id", Value::str(id)), ("state", Value::str("accepted"))]));
+                        held.push(Value::obj(vec![
+                            ("object_id", Value::str(id)),
+                            ("state", Value::str("accepted")),
+                        ]));
                         continue;
                     }
                     let lifetime = match mode {
@@ -5406,15 +5417,26 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                         ("object_id", Value::str(id.clone())),
                         ("url", Value::str(format!("{url}/upload/{}", &id[7..]))),
                         ("expires_at_unix", Value::uint(1_000_000_000 + lifetime)),
-                        ("required_headers", Value::obj(vec![
-                            ("if-none-match", Value::str("*")),
-                            ("x-grant-generation", Value::str(generation.to_string())),
-                        ])),
+                        (
+                            "required_headers",
+                            Value::obj(vec![
+                                ("if-none-match", Value::str("*")),
+                                ("x-grant-generation", Value::str(generation.to_string())),
+                            ]),
+                        ),
                     ]));
                 }
                 ok_json(&Value::obj(vec![
-                    ("grants", Value::arr(grants)), ("held", Value::arr(held)),
-                    ("server_time_unix", Value::uint(if hub.mode == "legacy" { 0 } else { 1_000_000_000 })),
+                    ("grants", Value::arr(grants)),
+                    ("held", Value::arr(held)),
+                    (
+                        "server_time_unix",
+                        Value::uint(if hub.mode == "legacy" {
+                            0
+                        } else {
+                            1_000_000_000
+                        }),
+                    ),
                 ]))
             }
             "POST" if path.ends_with("/verify") => {
@@ -5536,10 +5558,17 @@ fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-
 #[test]
-fn publication_renews_only_expired_authority_and_keeps_long_puts_live() {
-    for mode in ["stale", "expired403", "landed", "heartbeat", "denied", "always-stale", "legacy"] {
+fn publish_renews_only_expired_authority_and_keeps_long_puts_live() {
+    for mode in [
+        "stale",
+        "expired403",
+        "landed",
+        "heartbeat",
+        "denied",
+        "always-stale",
+        "legacy",
+    ] {
         let root = temporary(&format!("publish-renew-{mode}"));
         let store = Store::init(&root).unwrap();
         let checkpoint = Arc::new(checkpoint(1, 512));
@@ -5550,9 +5579,14 @@ fn publication_renews_only_expired_authority_and_keeps_long_puts_live() {
         state.lock().unwrap().mode = mode;
         let progress = Mutex::new((0, 0));
         let published = super::publish(&super::Publication {
-            store: &store, hub: &hub.base, destination: "acme/model",
-            manifest: &checkpoint.manifest, operation: mode, credential: &Anonymous,
-            policy: &policy, progress: &|done, total| *progress.lock().unwrap() = (done, total),
+            store: &store,
+            hub: &hub.base,
+            destination: "acme/model",
+            manifest: &checkpoint.manifest,
+            operation: mode,
+            credential: &Anonymous,
+            policy: &policy,
+            progress: &|done, total| *progress.lock().unwrap() = (done, total),
             streams: 2,
         });
         let state = state.lock().unwrap();
@@ -5568,10 +5602,15 @@ fn publication_renews_only_expired_authority_and_keeps_long_puts_live() {
             assert!(state.puts.is_empty());
         } else {
             assert_eq!(published.unwrap().checkpoint, checkpoint.manifest.id());
-            if mode == "legacy" { assert!(state.grants.values().all(|n| *n == 1)); }
-            else { assert!(state.grants.values().all(|n| *n >= 2), "{mode}"); }
+            if mode == "legacy" {
+                assert!(state.grants.values().all(|n| *n == 1));
+            } else {
+                assert!(state.grants.values().all(|n| *n >= 2), "{mode}");
+            }
             assert_eq!(state.uploaded.len(), state.declared.len() - 1);
-            if mode != "expired403" { assert!(state.puts.values().all(|n| *n == 1), "{mode}"); }
+            if mode != "expired403" {
+                assert!(state.puts.values().all(|n| *n == 1), "{mode}");
+            }
             let (done, total) = *progress.lock().unwrap();
             assert_eq!(done, total, "held-on-renewal bytes count exactly once");
         }
