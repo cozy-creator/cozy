@@ -633,7 +633,7 @@ func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitio
 		HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
 		ManagedRequestID:    managedRequestID, State: remote.State, Hub: c.Base(),
 	}
-	copyRentalFailure(&row, remote)
+	copyRentalObservation(&row, remote)
 	stored, problem := st.RentalRow(remote.ID)
 	if problem != nil {
 		return records.Rental{}, hub.Rental{}, false, problem
@@ -674,7 +674,7 @@ func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitio
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
 		row.ExpectedWorkerID, row.ExpectedWorkerBootID = seen.WorkerID, seen.WorkerBootID
-		copyRentalFailure(&row, seen)
+		copyRentalObservation(&row, seen)
 		if e := st.RecordRentalContext(observation, row); e != nil {
 			return e
 		}
@@ -1021,10 +1021,8 @@ func rentalProvisionFailure(id string, r hub.Rental) *exit.Error {
 		WithNext("cozy rental end " + id)
 }
 
-func copyRentalFailure(row *records.Rental, remote hub.Rental) {
-	if remote.StableMachineName != "" {
-		row.StableMachineName = remote.StableMachineName
-	}
+func copyRentalObservation(row *records.Rental, remote hub.Rental) {
+	row.StableMachineName = remote.StableMachineName
 	if remote.Failure == nil || remote.Failure.Code == "" {
 		return
 	}
@@ -1331,7 +1329,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"running", "queued", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
 			"spend_usd_micros", "spend_basis", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour",
 			"vcpu_count", "memory_gb", "unreachable_since"},
-		TypedAllFields: []string{"machine", "rental_alias", "rental alias", "sku", "gpus", "state", "rental_id", "bought_for",
+		TypedAllFields: []string{"machine", "rental_alias", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "release_due_at",
 			"hourly_rate_usd_micros", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour", "vcpu_count", "memory_gb",
@@ -1903,7 +1901,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	// ONLY path to a pod whose local record was never written, was lost, or belongs to
 	// another host.
 	listed, listing := false, 0
-	if known.RentalID == "" {
+	if known.RentalID == "" || known.Row != nil && strings.EqualFold(known.Row.StableMachineName, subject) {
 		hctx, cancel := hub.Context()
 		remote, problem := c.Rentals(hctx)
 		cancel()

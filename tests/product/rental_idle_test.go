@@ -121,7 +121,7 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 			if state, _ := row["state"].(string); !history && (state == "released" || state == "failed") {
 				continue
 			}
-			if name != "" && row["name"] != name {
+			if name != "" && row["name"] != name && row["machine_name"] != name {
 				continue
 			}
 			rows = append(rows, row)

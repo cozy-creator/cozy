@@ -203,8 +203,8 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			HubUnknown:            census.hubUnknown[row.ID],
 			UnreachableSince:      live[row.ID].UnreachableSince,
 		}
-		if seen := live[row.ID]; seen.StableMachineName != "" {
-			summary.MachineName = seen.StableMachineName
+		if seen, ok := live[row.ID]; ok {
+			summary.MachineName = seen.DisplayName()
 		}
 		costOf(&summary, live[row.ID])
 		if update, problem := st.RuntimeUpdate(row.ID); problem != nil {

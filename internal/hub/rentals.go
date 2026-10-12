@@ -803,7 +803,9 @@ func (c *Client) RentalHistory(ctx context.Context, name string) ([]Rental, *exi
 		Rentals []wireRental `json:"rentals"`
 	}
 	query := url.Values{"state": {"all"}}
-	// Filter locally: older Hubs only index the original rental alias.
+	if name != "" {
+		query.Set("name", strings.ToLower(name))
+	}
 	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals?" + query.Encode(), auth: true,
 		responseBytes: maxRentalListingBytes}, &out)
 	if e != nil {

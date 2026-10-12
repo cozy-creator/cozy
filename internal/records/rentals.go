@@ -681,7 +681,7 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
-		  stable_machine_name=CASE WHEN excluded.stable_machine_name<>'' THEN excluded.stable_machine_name ELSE rentals.stable_machine_name END,
+		  stable_machine_name=excluded.stable_machine_name,
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
 		  accelerator_count=CASE WHEN rentals.accelerator_count>0

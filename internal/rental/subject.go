@@ -25,7 +25,7 @@ type Subject struct {
 	Typed string
 	// RentalID is the hub's identity for it, when this host ever learned one.
 	RentalID string
-	// Machine is the machine word this host authored the ask under, when known.
+	// Machine is the observed host name, or the original rental alias before allocation.
 	Machine string
 	// Hub is the authority the ask went to; a release must not be judged by another's 404.
 	Hub string
@@ -58,7 +58,7 @@ func Resolve(st *records.Store, typed string) (Subject, *exit.Error) {
 	}
 	if row != nil {
 		found.Row = row
-		found.RentalID, found.Machine, found.Hub = row.ID, row.MachineName, row.Hub
+		found.RentalID, found.Machine, found.Hub = row.ID, row.DisplayName(), row.Hub
 	}
 	operations, problem := st.RentalOperations()
 	if problem != nil {
