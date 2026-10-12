@@ -518,7 +518,7 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 		if m.origin(row.Hub) != origin {
 			continue
 		}
-		c := orchestrator.PlacementCandidate{Rental: row.ID, Machine: row.MachineName, SKU: row.SKU,
+		c := orchestrator.PlacementCandidate{Rental: row.ID, Machine: row.DisplayName(), SKU: row.SKU,
 			GPUs: row.AcceleratorCount, RateUSDMicrosPerHour: row.HourlyRateUSDMicros}
 		if c.Verdict = rental.GPUCountUnusable(row.AcceleratorCount, req.GPUs); c.Verdict != "" {
 			out = append(out, c)
