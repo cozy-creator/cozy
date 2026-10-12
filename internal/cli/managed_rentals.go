@@ -1370,6 +1370,9 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			continue
 		}
 		row, remote := *current, view.remote
+		if remote.StableMachineName != "" {
+			row.StableMachineName = remote.StableMachineName
+		}
 		if view.unknown {
 			census.hubUnknown[row.ID] = true
 			continue

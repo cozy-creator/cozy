@@ -43,6 +43,7 @@ const rentalsDDL = `
 CREATE TABLE IF NOT EXISTS rentals (
   id                TEXT PRIMARY KEY,
   machine_name      TEXT NOT NULL DEFAULT '',
+  stable_machine_name TEXT NOT NULL DEFAULT '',
   sku               TEXT NOT NULL DEFAULT '',
   accelerator_model TEXT NOT NULL,
   accelerator_count INTEGER NOT NULL DEFAULT 0,
@@ -478,10 +479,11 @@ func (s *Store) RequestRentalRelease(id string) (string, *exit.Error) {
 
 // Rental is one provider-neutral pod rental this client may attach a worker to.
 type Rental struct {
-	ID               string
-	MachineName      string
-	SKU              string
-	AcceleratorModel string
+	ID                string
+	MachineName       string
+	StableMachineName string
+	SKU               string
+	AcceleratorModel  string
 	// AcceleratorCount is this pod's WIDTH, as the hub reported it for the product that
 	// was PAID for. It is a first-class rental fact, not a detail of the SKU name: it is
 	// the device envelope this host grants the pod's worker, the degree a group placement
@@ -521,11 +523,11 @@ type RentalFailure struct {
 	ContainerState        string
 }
 
-const rentalCols = `id,machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider,failure_provider_resource_id,failure_provider_host_id,failure_provider_state,failure_container_state`
+const rentalCols = `id,machine_name,stable_machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider,failure_provider_resource_id,failure_provider_host_id,failure_provider_state,failure_container_state`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
-	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.AcceleratorModel, &r.AcceleratorCount,
+	err := row.Scan(&r.ID, &r.MachineName, &r.StableMachineName, &r.SKU, &r.AcceleratorModel, &r.AcceleratorCount,
 		&r.HourlyRateUSDMicros, &r.ManagedRequestID, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
 		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID, &r.ReadyAt,
@@ -677,8 +679,9 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 		r.ReadyAt = now()
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
+		  stable_machine_name=CASE WHEN excluded.stable_machine_name<>'' THEN excluded.stable_machine_name ELSE rentals.stable_machine_name END,
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
 		  accelerator_count=CASE WHEN rentals.accelerator_count>0
@@ -702,7 +705,7 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 		  failure_provider_host_id=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_host_id ELSE excluded.failure_provider_host_id END,
 		  failure_provider_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_state ELSE excluded.failure_provider_state END,
 		  failure_container_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_container_state ELSE excluded.failure_container_state END`,
-		r.ID, r.MachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.ManagedRequestID,
+		r.ID, r.MachineName, r.StableMachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.ManagedRequestID,
 		r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt,
 		r.Failure.Code, r.Failure.BaseWorkerImageDigest, r.Failure.Provider,
@@ -772,15 +775,37 @@ func (s *Store) CompleteRentalAttachment(key string, row Rental, stage func() *e
 // RentalByMachine resolves either a memorable machine name, in any case, or the opaque
 // Tensorhub id.
 func (s *Store) RentalByMachine(name string) (*Rental, *exit.Error) {
-	r, err := scanRental(s.db.QueryRow(
-		`SELECT `+rentalCols+` FROM rentals WHERE machine_name=? OR id=?`, strings.ToLower(name), name))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+	// The rental ID is authoritative even when a provider name collides with an alias.
+	if r, problem := s.RentalRow(name); problem != nil || r != nil {
+		return r, problem
 	}
+	rows, err := s.db.Query(`SELECT `+rentalCols+` FROM rentals WHERE machine_name=? OR stable_machine_name=?`, strings.ToLower(name), strings.ToLower(name))
 	if err != nil {
 		return nil, exit.Internalf("cannot read rented machine %s: %s", name, err)
 	}
-	return &r, nil
+	defer rows.Close()
+	var found *Rental
+	for rows.Next() {
+		r, err := scanRental(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read rented machine %s: %s", name, err)
+		}
+		if found != nil {
+			return nil, exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple rentals; use a rental ID", name)
+		}
+		found = &r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot read rented machine %s: %s", name, err)
+	}
+	return found, nil
+}
+
+func (r Rental) DisplayName() string {
+	if r.StableMachineName != "" {
+		return r.StableMachineName
+	}
+	return r.MachineName
 }
 
 // ObserveRentalWorker validates the direct ClaimAck against Tensorhub's pinned worker

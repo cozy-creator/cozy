@@ -61,6 +61,7 @@ type RentalSummary struct {
 	ProviderResourceID  string          `json:"provider_resource_id,omitempty"`
 	ID                  string          `json:"rental_id"`
 	MachineName         string          `json:"machine"`
+	RentalAlias         string          `json:"rental_alias,omitempty"`
 	SKU                 string          `json:"sku,omitempty"`
 	State               string          `json:"state"`
 	AcceleratorModel    string          `json:"accelerator,omitempty"`

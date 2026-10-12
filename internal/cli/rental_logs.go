@@ -120,7 +120,7 @@ func rentalLogSubject(ctx *Context, typed string) (id, origin string, problem *e
 		return "", "", problem
 	}
 	for _, row := range append(append(inventory.Rentals, inventory.Unrecorded...), inventory.Pending...) {
-		if row.ID != "" && (row.ID == typed || strings.EqualFold(row.MachineName, typed)) {
+		if row.ID != "" && (row.ID == typed || strings.EqualFold(row.MachineName, typed) || strings.EqualFold(row.RentalAlias, typed)) {
 			return row.ID, row.Hub, nil
 		}
 	}

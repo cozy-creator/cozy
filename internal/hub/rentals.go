@@ -67,6 +67,7 @@ func RentalAbsent(state string) bool {
 // Creator key is part of this view; the provider identities are in an operator's view only.
 type Rental struct {
 	Provider, ProviderMachineID, ProviderResourceID string
+	StableMachineName                               string
 	Development                                     bool
 	SSHAddress                                      string
 	ID                                              string
@@ -257,6 +258,7 @@ func (r Rental) EndCause() string {
 type wireRental struct {
 	Provider              string         `json:"provider,omitempty"`
 	ProviderMachineID     string         `json:"provider_machine_id,omitempty"`
+	StableMachineName     string         `json:"machine_name,omitempty"`
 	ProviderResourceID    string         `json:"provider_resource_id,omitempty"`
 	Development           bool           `json:"development,omitempty"`
 	SSHAddress            string         `json:"ssh_address,omitempty"`
@@ -328,7 +330,8 @@ func (w wireRental) machineName() string {
 func (w wireRental) rental() Rental {
 	return Rental{
 		Provider: w.Provider, ProviderMachineID: w.ProviderMachineID, ProviderResourceID: w.ProviderResourceID,
-		Development: w.Development, SSHAddress: w.SSHAddress, ID: w.ID, Name: w.machineName(), State: w.State,
+		StableMachineName: validStableMachineName(w.StableMachineName),
+		Development:       w.Development, SSHAddress: w.SSHAddress, ID: w.ID, Name: w.machineName(), State: w.State,
 		AcceleratorModel: w.AcceleratorModel, AcceleratorCount: w.AcceleratorCount,
 		Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, Failure: w.Failure, MediaAddress: w.MediaAddress,
@@ -800,9 +803,7 @@ func (c *Client) RentalHistory(ctx context.Context, name string) ([]Rental, *exi
 		Rentals []wireRental `json:"rentals"`
 	}
 	query := url.Values{"state": {"all"}}
-	if name != "" {
-		query.Set("name", strings.ToLower(name))
-	}
+	// Filter locally: older Hubs only index the original rental alias.
 	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals?" + query.Encode(), auth: true,
 		responseBytes: maxRentalListingBytes}, &out)
 	if e != nil {
@@ -810,7 +811,7 @@ func (c *Client) RentalHistory(ctx context.Context, name string) ([]Rental, *exi
 	}
 	var named []Rental
 	for _, wire := range out.Rentals {
-		if rental := wire.rental(); rentalid.Valid(wire.ID) && (name == "" || strings.EqualFold(rental.Name, name)) {
+		if rental := wire.rental(); rentalid.Valid(wire.ID) && (name == "" || rental.MatchesName(name)) {
 			named = append(named, rental)
 		}
 	}
@@ -956,4 +957,23 @@ func providerQuery(sep, provider string) string {
 		return ""
 	}
 	return sep + "provider=" + url.QueryEscape(provider)
+}
+
+// DisplayName is the physical host name when known; Name remains the rental alias.
+func (r Rental) DisplayName() string {
+	if r.StableMachineName != "" {
+		return r.StableMachineName
+	}
+	return r.Name
+}
+
+func (r Rental) MatchesName(name string) bool {
+	return strings.EqualFold(r.Name, name) || r.StableMachineName != "" && strings.EqualFold(r.StableMachineName, name)
+}
+
+func validStableMachineName(name string) string {
+	if rentalid.ValidMachineName(name) {
+		return name
+	}
+	return ""
 }

@@ -201,7 +201,7 @@ func handleRent(ctx *Context) *exit.Error {
 		notes = append(notes, note)
 	}
 	fields := []output.Field{
-		{K: "machine", V: row.MachineName},
+		{K: "machine", V: row.DisplayName()},
 		{K: "rental", V: ready.ID},
 		{K: "state", V: ready.State},
 		{K: "address", V: ready.Address},
@@ -224,8 +224,8 @@ func handleRent(ctx *Context) *exit.Error {
 	rec := compactRecord(fields, "machine", "state", "gpu", "changed")
 	rec.Notes = notes
 	rec.Next = []string{
-		"cozy run <org/package/function> --rental=" + row.MachineName,
-		"cozy rental end " + row.MachineName,
+		"cozy run <org/package/function> --rental=" + row.DisplayName(),
+		"cozy rental end " + row.DisplayName(),
 	}
 	return emit(ctx, rec)
 }
@@ -1022,6 +1022,9 @@ func rentalProvisionFailure(id string, r hub.Rental) *exit.Error {
 }
 
 func copyRentalFailure(row *records.Rental, remote hub.Rental) {
+	if remote.StableMachineName != "" {
+		row.StableMachineName = remote.StableMachineName
+	}
 	if remote.Failure == nil || remote.Failure.Code == "" {
 		return
 	}
@@ -1136,8 +1139,17 @@ func handleRentalShow(ctx *Context) *exit.Error {
 	}
 	subject := strings.TrimSpace(ctx.Inv.Args[0])
 	list := renderRentalList(ctx.Cfg, inventory, true)
+	matches := 0
+	for _, row := range list.Rows {
+		if row["rental"] == subject || row["machine"] == subject || row["rental alias"] == subject {
+			matches++
+		}
+	}
+	if matches > 1 {
+		return exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple rentals; use a rental ID", subject)
+	}
 	for i, row := range list.Rows {
-		if row["rental"] != subject && row["machine"] != subject {
+		if row["rental"] != subject && row["machine"] != subject && row["rental alias"] != subject {
 			continue
 		}
 		fields, all, value := append([]string{"rental"}, append(list.Fields, "compute", "storage")...), list.AllFields,
@@ -1210,12 +1222,12 @@ func showEndedRental(ctx *Context, subject string) *exit.Error {
 func endedRentalRecord(ctx *Context, hubName string, r hub.Rental) output.Record {
 	spent := rentalSpend(api.RentalSummary{SpendUSDMicros: r.SpendUSDMicros, SpendBasis: r.SpendBasis})
 	cause := r.EndCause()
-	fields := []output.Field{{K: "rental", V: r.ID}, {K: "machine", V: r.Name}, {K: "hub", V: hubName},
+	fields := []output.Field{{K: "rental", V: r.ID}, {K: "machine", V: r.DisplayName()}, {K: "hub", V: hubName},
 		{K: "state", V: humanRentalState(r.State)}, {K: "ended by", V: orNone(cause)},
 		{K: "rented", V: stamp(r.CreatedAt)}, {K: "ended", V: orNone(stamp(r.EndedAt))}, {K: "spent", V: spent},
 		{K: "gpus", V: gpuCell(r.AcceleratorModel, r.AcceleratorCount)},
 		{K: "$/hour", V: rentalHourlyRate(costPerHour(r.HourlyRateUSDMicros, r.ComputeUSDMicrosPerHour, r.StorageUSDMicrosPerHour))}}
-	typed := []output.Field{{K: "rental_id", V: r.ID}, {K: "machine", V: r.Name}, {K: "hub", V: hubName},
+	typed := []output.Field{{K: "rental_id", V: r.ID}, {K: "machine", V: r.DisplayName()}, {K: "hub", V: hubName},
 		{K: "state", V: r.State}, {K: "rented_at", V: r.CreatedAt},
 		{K: "accelerator", V: r.AcceleratorModel}, {K: "accelerator_count", V: r.AcceleratorCount},
 		{K: "hourly_rate_usd_micros", V: r.HourlyRateUSDMicros}}
@@ -1310,7 +1322,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	list := output.List{
 		Name:   "rentals",
 		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "uptime", "running", "queued", "ends"},
-		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "compute", "storage", "spent", "failure", "uptime", "running", "queued", "ends",
+		AllFields: []string{"machine", "rental alias", "sku", "gpus", "state", "$/hour", "compute", "storage", "spent", "failure", "uptime", "running", "queued", "ends",
 			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
 			"image", "container state"},
 		// The machine document carries the underlying facts, never the table's
@@ -1319,7 +1331,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"running", "queued", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
 			"spend_usd_micros", "spend_basis", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour",
 			"vcpu_count", "memory_gb", "unreachable_since"},
-		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
+		TypedAllFields: []string{"machine", "rental_alias", "rental alias", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "release_due_at",
 			"hourly_rate_usd_micros", "compute_usd_micros_per_hour", "storage_usd_micros_per_hour", "vcpu_count", "memory_gb",
@@ -1371,7 +1383,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			state += " (unreachable " + durationClock(now.Sub(since)) + ")"
 		}
 		row := map[string]string{
-			"machine": r.MachineName, "sku": orNone(r.SKU), "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
+			"machine": r.MachineName, "rental alias": r.RentalAlias, "sku": orNone(r.SKU), "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
 			"state": state, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(activity.Running), "queued": strconv.Itoa(activity.Queued),
 			"ends":   endsCell(r.ReleaseDue),
@@ -1387,7 +1399,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"spent": rentalSpend(r),
 		}
 		typed := map[string]any{
-			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
+			"machine": r.MachineName, "rental_alias": r.RentalAlias, "state": r.State, "rental_id": r.ID,
 			"running": activity.Running, "queued": activity.Queued,
 			"hourly_rate_usd_micros": r.HourlyRateUSDMicros,
 			"accelerator_count":      r.AcceleratorCount,
@@ -1461,9 +1473,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			// bought. The card is what the SKU column exists to tell a reader — the
 			// difference between an H100 and a 4090 is the difference between $3.19 and
 			// $0.74 an hour — so the cell carries the card rather than a dash.
-			"machine": either(seen.MachineName, seen.ID),
-			"sku":     orNone(acceleratorName(seen.AcceleratorModel)),
-			"gpus":    gpuCell(seen.AcceleratorModel, seen.AcceleratorCount),
+			"machine": either(seen.MachineName, seen.ID), "rental alias": seen.RentalAlias,
+			"sku":  orNone(acceleratorName(seen.AcceleratorModel)),
+			"gpus": gpuCell(seen.AcceleratorModel, seen.AcceleratorCount),
 			// Billed to this account, attached to another Creator home: its work is not
 			// observable here, which the RUNNING/QUEUED dashes also say.
 			"state":   state,
@@ -1479,7 +1491,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"spent": rentalSpend(seen),
 		}
 		typed := map[string]any{
-			"machine": seen.MachineName, "state": seen.State, "rental_id": seen.ID,
+			"machine": seen.MachineName, "rental_alias": seen.RentalAlias, "state": seen.State, "rental_id": seen.ID,
 			"hourly_rate_usd_micros": seen.HourlyRateUSDMicros,
 			"accelerator_count":      seen.AcceleratorCount, "recorded": false,
 		}
@@ -1901,14 +1913,16 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		}
 		listed, listing = true, len(remote)
 		for _, seen := range remote {
-			if seen.ID != subject && !strings.EqualFold(seen.Name, subject) {
+			if seen.ID != subject && !seen.MatchesName(subject) {
 				continue
+			}
+			if known.RentalID != "" && known.RentalID != seen.ID {
+				return exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple rentals; use a rental ID", subject)
 			}
 			known.RentalID = seen.ID
 			if known.Machine == "" {
-				known.Machine = seen.Name
+				known.Machine = seen.DisplayName()
 			}
-			break
 		}
 	}
 	id := known.RentalID
