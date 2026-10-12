@@ -131,3 +131,38 @@ func TestAnInterruptedOutputReadResumesFromItsBytes(t *testing.T) {
 		t.Fatalf("the folder holds %d entries, want the output alone", len(entries))
 	}
 }
+
+// The visible file can lag several append revisions while GPU work continues. A newer
+// append can reuse that earlier prefix too; a replaced/corrupt prefix still falls back
+// to a complete read and must never be published under the new revision's digest.
+func TestAnOutputSeveralAppendRevisionsBehindReusesItsVerifiedPrefix(t *testing.T) {
+	for _, corrupt := range []bool{false, true} {
+		t.Run(map[bool]string{false: "earlier append", true: "changed prefix"}[corrupt], func(t *testing.T) {
+			data := bytes.Repeat([]byte("the run's growing output "), 1<<13)
+			machine := &cutMachine{data: data, cut: true}
+			v1 := serveCut(t, machine)
+			directory := t.TempDir()
+			product := cutProduct(data, directory)
+			prefix := append([]byte(nil), data[:len(data)/3]...)
+			if corrupt {
+				prefix[0] ^= 0xff
+			}
+			if err := os.WriteFile(product.Path, prefix, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if problem := writeOutputV1(t.Context(), v1, "run", directory, product, int64(2*len(data)/3), nil); problem != nil {
+				t.Fatalf("the append failed: %v", problem)
+			}
+			want := []uint64{uint64(len(prefix))}
+			if corrupt {
+				want = append(want, 0)
+			}
+			if !slices.Equal(machine.offsets, want) {
+				t.Fatalf("read offsets %v, want %v", machine.offsets, want)
+			}
+			if held, err := os.ReadFile(product.Path); err != nil || !bytes.Equal(held, data) {
+				t.Fatalf("the visible file differs from the complete revision: %v", err)
+			}
+		})
+	}
+}
