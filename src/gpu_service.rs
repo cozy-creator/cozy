@@ -1565,8 +1565,18 @@ impl GpuPool {
             return Ok(None);
         }
         for start in 0..=self.width() - degree as usize {
-            if let Some(permit) = self.permit(engine, (family.as_deref(), workflow.as_deref()), false,
-                record.invocation.gpus > 0, start..start + degree as usize, waiting) {
+            let devices = start..start + degree as usize;
+            let permit = if record.invocation.accelerator {
+                self.permit(engine, (family.as_deref(), workflow.as_deref()), false,
+                    record.invocation.gpus > 0, devices, waiting)
+            } else {
+                // CPU orchestration reserves a workflow subset, never an actual device.
+                // Its inline accelerator children must still acquire separate allocations.
+                self.workflow_slots.take(workflow.as_deref(), false, true, devices, waiting)
+                    .map(|token| Permit { pool: self.clone(), engine: Arc::downgrade(engine),
+                        token: None, workflow_token: Some(token) })
+            };
+            if let Some(permit) = permit {
                 let devices = match record.invocation.accelerator {
                     true => self.lane_devices(start, degree)?,
                     false => String::new(), // CPU orchestration owns slots, never a CUDA device.
@@ -4622,9 +4632,9 @@ mod tests {
         allocation.prepare().unwrap();
         let family = Some(job.id.as_str());
         let group = plan("child", 2);
-        let (gpu, child) = pool.place(&engine, &group, (family, family), &mut [false; 4]).unwrap();
+        let (gpu, child) = pool.place(&engine, &group, (None, family), &mut [false; 4]).unwrap();
         assert_eq!(gpu, 0);
-        assert!(pool.place(&engine, &group, (family, family), &mut [false; 4]).is_none(),
+        assert!(pool.place(&engine, &group, (None, family), &mut [false; 4]).is_none(),
             "a simultaneous sibling cannot escape to the other two GPUs");
         let (gpu, other) = pool.place(&engine, &group, (None, None), &mut [false; 4]).unwrap();
         assert_eq!(gpu, 2, "the unrelated request uses the unreserved half");
@@ -4710,8 +4720,18 @@ mod tests {
         let owner = pool.workflow(&job, Some(allocation));
         let family = Some(job.id.as_str());
         let (_, other_worker) = pool.place(&engine, &plan("other", 2), (None, None), &mut [false; 4]).unwrap();
-        let (_, child) = pool.place(&engine, &plan("child", 2), (family, family), &mut [false; 4]).unwrap();
-        assert!(pool.place(&engine, &plan("child", 1), (family, family), &mut [false; 4]).is_none());
+        let inline = |key| engine.submit(key, crate::journal::Invocation {
+            job: true, accelerator: true, parent: job.id.clone(), ..Default::default()
+        }).unwrap();
+        let left = inline("left");
+        let right = inline("right");
+        let left_gpu = pool.job_allocation(&engine, &left, &[]).unwrap().unwrap();
+        let right_gpu = pool.job_allocation(&engine, &right, &[]).unwrap().unwrap();
+        assert_ne!(left_gpu.devices, right_gpu.devices);
+        assert!(pool.job_allocation(&engine, &inline("third"), &[]).unwrap().is_none());
+        drop((left_gpu, right_gpu));
+        let (_, child) = pool.place(&engine, &plan("child", 2), (None, family), &mut [false; 4]).unwrap();
+        assert!(pool.place(&engine, &plan("child", 1), (None, family), &mut [false; 4]).is_none());
         drop(child);
         pool.release_workflow(&job.id);
         let (start, next_worker) = pool.place(&engine, &plan("next", 2), (None, None), &mut [false; 4]).unwrap();
@@ -4719,7 +4739,7 @@ mod tests {
         assert!(!pool.admit_workflow(&engine, family, &mut [false; 4]));
         drop(next_worker);
         assert!(pool.admit_workflow(&engine, family, &mut [false; 4]));
-        assert!(pool.place(&engine, &plan("too-wide", 4), (family, family), &mut [false; 4]).is_none());
+        assert!(pool.place(&engine, &plan("too-wide", 4), (None, family), &mut [false; 4]).is_none());
         drop((owner, other_worker));
         pool.stop().unwrap();
         fs::remove_dir_all(root).unwrap();

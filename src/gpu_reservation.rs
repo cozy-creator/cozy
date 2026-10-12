@@ -146,7 +146,7 @@ fn owner(
         if !seen.insert(current.id.clone()) {
             return Err(std::io::Error::other("cyclic managed parent chain"));
         }
-        if current.invocation.accelerator || (current.invocation.job && (workflow || current.invocation.gpus > 0)) {
+        if current.invocation.accelerator || (workflow && current.invocation.job) {
             family = Some(current.id.clone());
         }
         if current.invocation.parent.is_empty() {
@@ -250,7 +250,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn an_explicit_cpu_root_owns_the_nested_gpu_family_after_restart() {
+    fn an_explicit_cpu_root_owns_the_workflow_without_allocating_a_cuda_device() {
         use crate::{execution::Engine, journal::Invocation};
         let root = std::env::temp_dir().join(format!("job-budget-family-{}", uuid::Uuid::new_v4()));
         let engine = Engine::open(&root).unwrap();
@@ -263,11 +263,12 @@ mod tests {
         let child = engine.submit("child", Invocation {
             parent: middle.id.clone(), gpus: 2, ..Default::default()
         }).unwrap();
-        assert_eq!(family(&child, |id| engine.get(id)).unwrap(), Some(parent.id.clone()));
+        assert_eq!(family(&child, |id| engine.get(id)).unwrap(), None);
+        assert_eq!(workflow(&child, |id| engine.get(id)).unwrap(), Some(parent.id.clone()));
         drop(engine);
         let reopened = Engine::open(&root).unwrap();
         assert_eq!(reopened.get(&parent.id).unwrap().invocation.gpus, 2);
-        assert_eq!(family(&reopened.get(&child.id).unwrap(), |id| reopened.get(id)).unwrap(), Some(parent.id));
+        assert_eq!(workflow(&reopened.get(&child.id).unwrap(), |id| reopened.get(id)).unwrap(), Some(parent.id));
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
