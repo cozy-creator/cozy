@@ -5,7 +5,8 @@
 //! checkpoint the repository already holds converges with no transfer.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::canon::{self, Value};
 use crate::checkpoint::walk_cozytensors;
@@ -18,9 +19,65 @@ use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::SourcePolicy;
 use crate::transport::push::{push_object, UploadGrant};
 
-/// Objects first asked for in one request. The Hub decides how many it takes: a selection it
-/// refuses as too large is halved and asked again.
-const BATCH: usize = 128;
+/// Renew stale authority at most twice per object; fresh permission refusals are terminal.
+const GRANT_RENEWALS: usize = 2;
+
+struct Grant {
+    upload: UploadGrant,
+    received: Instant,
+    lifetime: Option<Duration>,
+}
+
+impl Grant {
+    fn stale(&self) -> bool {
+        self.lifetime
+            .is_some_and(|life| self.received.elapsed() >= life / 2)
+    }
+
+    fn expired(&self) -> bool {
+        self.lifetime
+            .is_some_and(|life| self.received.elapsed() >= life)
+    }
+}
+
+fn grants(answer: &Value, received: Instant) -> Result<BTreeMap<String, Grant>> {
+    let server_time = number(answer, "server_time_unix");
+    rows(answer, "grants")
+        .iter()
+        .map(|grant| {
+            let headers = match field(grant, "required_headers") {
+                Some(Value::Obj(pairs)) => pairs
+                    .iter()
+                    .map(|(k, v)| match v {
+                        Value::Str(v) => Ok((k.to_lowercase(), v.clone())),
+                        _ => Err(hub_refused("a grant header is not text")),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                _ => vec![],
+            };
+            let expires = number(grant, "expires_at_unix");
+            Ok((
+                text(grant, "object_id").to_string(),
+                Grant {
+                    upload: UploadGrant {
+                        url: text(grant, "url").to_string(),
+                        headers,
+                    },
+                    received,
+                    // Older Hubs may omit clocks. Never compare the signer's time to our wall clock.
+                    lifetime: (server_time > 0 && expires > 0)
+                        .then(|| Duration::from_secs(expires.saturating_sub(server_time))),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn is_held(answer: &Value, id: &str) -> bool {
+    rows(answer, "held").iter().any(|row| {
+        text(row, "object_id") == id && matches!(text(row, "state"), "accepted" | "verifying")
+    })
+}
 
 pub struct Publication<'a> {
     pub store: &'a Store,
@@ -203,9 +260,10 @@ pub fn publish(p: &Publication) -> Result<Published> {
     (p.progress)(*landed.lock().unwrap(), total);
 
     // Push what the Hub lacks under its grants, then have it verify them.
-    let (mut rest, mut size) = (pending.as_slice(), BATCH);
+    let (mut rest, mut size) = (pending.as_slice(), p.streams.clamp(1, 32));
     while !rest.is_empty() {
         let batch = &rest[..size.min(rest.len())];
+        let received = Instant::now();
         let answer = match call("POST", &format!("{path}/grants"), &ids(batch)) {
             Err(refusal)
                 if batch.len() > 1
@@ -220,58 +278,130 @@ pub fn publish(p: &Publication) -> Result<Published> {
             answer => answer?,
         };
         rest = &rest[batch.len()..];
+        let mut minted = grants(&answer, received)?;
+        let heartbeat = minted
+            .values()
+            .filter_map(|grant| grant.lifetime)
+            .min()
+            .filter(|life| !life.is_zero())
+            .map(|life| (life / 2).max(Duration::from_millis(1)));
         let mut uploads = vec![];
-        for grant in rows(&answer, "grants") {
-            let id = text(grant, "object_id").to_string();
-            let object = objects
-                .get(&id)
-                .ok_or_else(|| hub_refused(format!("a grant for {id}")))?;
-            let headers = match field(grant, "required_headers") {
-                Some(Value::Obj(pairs)) => pairs
-                    .iter()
-                    .map(|(k, v)| match v {
-                        Value::Str(v) => Ok((k.to_lowercase(), v.clone())),
-                        _ => Err(hub_refused("a grant header is not text")),
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                _ => vec![],
-            };
-            let url = text(grant, "url").to_string();
-            uploads.push((object.clone(), UploadGrant { url, headers }));
+        for id in batch {
+            if is_held(&answer, id) {
+                let mut landed = landed.lock().unwrap();
+                *landed += objects[id].length;
+                (p.progress)(*landed, total);
+            } else {
+                let grant = minted
+                    .remove(id)
+                    .ok_or_else(|| hub_refused("the Hub omitted a selected object's grant"))?;
+                uploads.push((objects[id].clone(), grant));
+            }
         }
         let failed: Mutex<Option<Refusal>> = Mutex::new(None);
-        let queue = Mutex::new(uploads.into_iter());
+        let (send, receive) = mpsc::channel();
+        let count = uploads.len();
+        let mut next_heartbeat = heartbeat.map(|wait| received + wait);
         std::thread::scope(|scope| {
-            for _ in 0..p.streams.clamp(1, 32) {
-                scope.spawn(|| loop {
-                    let Some((object, grant)) = queue.lock().unwrap().next() else {
-                        return;
-                    };
-                    if failed.lock().unwrap().is_some() {
-                        return;
+            for (object, mut grant) in uploads {
+                let send = send.clone();
+                let failed = &failed;
+                let call = &call;
+                let path = &path;
+                let ledger = &ledger;
+                scope.spawn(move || {
+                    let pushed = (|| {
+                        let mut renewals = 0;
+                        loop {
+                            if failed.lock().unwrap().is_some() {
+                                return Ok(false);
+                            }
+                            if grant.stale() {
+                                if renewals == GRANT_RENEWALS {
+                                    return Err(hub_refused(
+                                        "the Hub repeatedly issued stale upload grants",
+                                    ));
+                                }
+                                renewals += 1;
+                                let received = Instant::now();
+                                let answer =
+                                    call("POST", &format!("{path}/grants"), &ids(&[object.id()]))?;
+                                if is_held(&answer, &object.id()) {
+                                    return Ok(true);
+                                }
+                                grant =
+                                    grants(&answer, received)?.remove(&object.id()).ok_or_else(
+                                        || hub_refused("renewal omitted the selected object"),
+                                    )?;
+                                continue;
+                            }
+                            match push_object(
+                                p.store,
+                                &object.sha256,
+                                object.sha256 == p.manifest.sha256,
+                                &grant.upload,
+                                p.policy,
+                                p.credential,
+                                deadline,
+                                ledger,
+                                "",
+                            ) {
+                                Ok(_) => return Ok(true),
+                                Err(refusal)
+                                    if grant.expired()
+                                        && renewals < GRANT_RENEWALS
+                                        && refusal.code == Code::TRANSFER_FAILED
+                                        && refusal.detail
+                                            == "the object store answered HTTP 403 to the PUT" =>
+                                {
+                                    // Re-mint through the authority; an ordinary fresh 403 is terminal.
+                                    // A lost successful PUT may come back as held on this renewal.
+                                    continue;
+                                }
+                                Err(refusal) => return Err(refusal),
+                            }
+                        }
+                    })();
+                    if let Err(ref refusal) = pushed {
+                        failed
+                            .lock()
+                            .unwrap()
+                            .get_or_insert_with(|| refusal.clone());
                     }
-                    let pushed = push_object(
-                        p.store,
-                        &object.sha256,
-                        object.sha256 == p.manifest.sha256,
-                        &grant,
-                        p.policy,
-                        p.credential,
-                        deadline,
-                        &ledger,
-                        "",
-                    );
-                    match pushed {
-                        Ok(_) => {
+                    let _ = send.send((object, pushed));
+                });
+            }
+            drop(send);
+            for _ in 0..count {
+                loop {
+                    let result = match next_heartbeat {
+                        Some(due) => {
+                            receive.recv_timeout(due.saturating_duration_since(Instant::now()))
+                        }
+                        None => receive
+                            .recv()
+                            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                    };
+                    match result {
+                        Ok((object, Ok(true))) => {
                             let mut landed = landed.lock().unwrap();
                             *landed += object.length;
                             (p.progress)(*landed, total);
+                            break;
                         }
-                        Err(refusal) => {
-                            failed.lock().unwrap().get_or_insert(refusal);
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // A long PUT can outlive a grant. Keep publication holds alive without
+                            // interrupting that request; the next attempt renews its own grant.
+                            if let Err(refusal) =
+                                call("POST", &format!("{path}/grants"), &ids(batch))
+                            {
+                                failed.lock().unwrap().get_or_insert(refusal);
+                            }
+                            next_heartbeat = heartbeat.map(|wait| Instant::now() + wait);
                         }
                     }
-                });
+                }
             }
         });
         if let Some(refusal) = failed.into_inner().unwrap() {

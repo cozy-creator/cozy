@@ -5254,7 +5254,7 @@ mod tail;
 // ---------------------------------------------------------------- publication
 
 /// The most objects this stand-in Hub takes in one grant or verify request.
-const SELECTION: usize = 50;
+const SELECTION: usize = 3;
 
 #[derive(Default)]
 struct PublicationHub {
@@ -5265,6 +5265,10 @@ struct PublicationHub {
     holds: bool,
     /// Grant or verify requests refused for their selection's size.
     refused: usize,
+    mode: &'static str,
+    grants: HashMap<String, usize>,
+    puts: HashMap<String, usize>,
+    max_selection: usize,
 }
 
 fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
@@ -5302,8 +5306,33 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
         ])
     };
     let dispatch: Dispatch = Arc::new(move |request: &Request| {
-        let mut hub = hub.lock().unwrap();
         let path = request.path.as_str();
+        if let Some(digest) = path.strip_prefix("/upload/") {
+            let id = format!("sha256:{digest}");
+            let mode = {
+                let mut hub = hub.lock().unwrap();
+                *hub.puts.entry(id.clone()).or_default() += 1;
+                hub.mode
+            };
+            if request.header("x-grant-generation") == Some("1")
+                && matches!(mode, "expired403" | "landed" | "heartbeat")
+            {
+                std::thread::sleep(Duration::from_millis(1200));
+                if mode == "landed" {
+                    hub.lock()
+                        .unwrap()
+                        .uploaded
+                        .insert(id, request.body.clone());
+                }
+                if mode != "heartbeat" {
+                    return status(403, b"expired grant");
+                }
+            }
+            if mode == "denied" {
+                return status(403, b"permission denied");
+            }
+        }
+        let mut hub = hub.lock().unwrap();
         let op = path
             .strip_prefix(&format!("{REPO}/publications/"))
             .map(|rest| rest.split('/').next().unwrap().to_string())
@@ -5362,20 +5391,53 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
             }
             "POST" if path.ends_with("/grants") => {
                 let url = base.lock().unwrap().clone();
-                let grants = objects(&request.body, "object_ids")
-                    .into_iter()
-                    .map(|id| {
-                        Value::obj(vec![
-                            ("object_id", Value::str(id.clone())),
-                            ("url", Value::str(format!("{url}/upload/{}", &id[7..]))),
-                            (
-                                "required_headers",
-                                Value::obj(vec![("if-none-match", Value::str("*"))]),
-                            ),
-                        ])
-                    })
-                    .collect();
-                ok_json(&Value::obj(vec![("grants", Value::arr(grants))]))
+                let selected = objects(&request.body, "object_ids");
+                hub.max_selection = hub.max_selection.max(selected.len());
+                let mut grants = vec![];
+                let mut held = vec![];
+                for id in selected {
+                    let mode = hub.mode;
+                    let generation = hub.grants.entry(id.clone()).or_default();
+                    *generation += 1;
+                    let generation = *generation;
+                    if hub.uploaded.contains_key(&id) {
+                        held.push(Value::obj(vec![
+                            ("object_id", Value::str(id)),
+                            ("state", Value::str("accepted")),
+                        ]));
+                        continue;
+                    }
+                    let lifetime = match mode {
+                        "always-stale" => 0,
+                        "stale" if generation == 1 => 0,
+                        "expired403" | "landed" | "heartbeat" if generation == 1 => 1,
+                        _ => 600,
+                    };
+                    grants.push(Value::obj(vec![
+                        ("object_id", Value::str(id.clone())),
+                        ("url", Value::str(format!("{url}/upload/{}", &id[7..]))),
+                        ("expires_at_unix", Value::uint(1_000_000_000 + lifetime)),
+                        (
+                            "required_headers",
+                            Value::obj(vec![
+                                ("if-none-match", Value::str("*")),
+                                ("x-grant-generation", Value::str(generation.to_string())),
+                            ]),
+                        ),
+                    ]));
+                }
+                ok_json(&Value::obj(vec![
+                    ("grants", Value::arr(grants)),
+                    ("held", Value::arr(held)),
+                    (
+                        "server_time_unix",
+                        Value::uint(if hub.mode == "legacy" {
+                            0
+                        } else {
+                            1_000_000_000
+                        }),
+                    ),
+                ]))
             }
             "POST" if path.ends_with("/verify") => {
                 let ids = objects(&request.body, "object_ids");
@@ -5490,7 +5552,69 @@ fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
     assert_eq!(held.uploaded.len(), held.declared.len() - 1);
     assert_eq!(held.verified.len(), held.declared.len() - 1);
     assert_eq!(held.finalized, 1);
-    // 128, then 64, were refused once each; every later request fit.
-    assert_eq!(held.refused, 2);
+    // Four dispatch slots exceed this Hub's three-object limit; two then fit.
+    assert_eq!(held.refused, 1);
+    assert!(held.max_selection <= 4);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn publish_renews_only_expired_authority_and_keeps_long_puts_live() {
+    for mode in [
+        "stale",
+        "expired403",
+        "landed",
+        "heartbeat",
+        "denied",
+        "always-stale",
+        "legacy",
+    ] {
+        let root = temporary(&format!("publish-renew-{mode}"));
+        let store = Store::init(&root).unwrap();
+        let checkpoint = Arc::new(checkpoint(1, 512));
+        let source = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+        let policy = local_policy();
+        pull(&request_for(&store, &source.base, &policy)).unwrap();
+        let (hub, state) = publication_hub(checkpoint.bodies[&checkpoint.manifest.sha256].clone());
+        state.lock().unwrap().mode = mode;
+        let progress = Mutex::new((0, 0));
+        let published = super::publish(&super::Publication {
+            store: &store,
+            hub: &hub.base,
+            destination: "acme/model",
+            manifest: &checkpoint.manifest,
+            operation: mode,
+            credential: &Anonymous,
+            policy: &policy,
+            progress: &|done, total| *progress.lock().unwrap() = (done, total),
+            streams: 2,
+        });
+        let state = state.lock().unwrap();
+        assert!(state.max_selection <= 2);
+        if mode == "denied" {
+            assert_eq!(published.unwrap_err().code, Code::TRANSFER_FAILED);
+            assert!(state.grants.values().all(|n| *n == 1));
+            assert!(state.puts.values().all(|n| *n == 1));
+            assert_eq!(state.finalized, 0);
+        } else if mode == "always-stale" {
+            assert_eq!(published.unwrap_err().code, Code::HUB_REFUSED);
+            assert!(state.grants.values().all(|n| *n <= 3));
+            assert!(state.puts.is_empty());
+        } else {
+            assert_eq!(published.unwrap().checkpoint, checkpoint.manifest.id());
+            if mode == "legacy" {
+                assert!(state.grants.values().all(|n| *n == 1));
+            } else {
+                assert!(state.grants.values().all(|n| *n >= 2), "{mode}");
+            }
+            assert_eq!(state.uploaded.len(), state.declared.len() - 1);
+            if mode != "expired403" {
+                assert!(state.puts.values().all(|n| *n == 1), "{mode}");
+            }
+            let (done, total) = *progress.lock().unwrap();
+            assert_eq!(done, total, "held-on-renewal bytes count exactly once");
+        }
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
