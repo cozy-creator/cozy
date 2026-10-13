@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             seed_cache: None,
         },
         &uploaded,
+        None,
     )?;
     fs::write(
         output.join("prepared-generation.json"),

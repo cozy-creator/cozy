@@ -8,6 +8,7 @@ use crate::{
     hub::{self, Catalog},
     journal::{Installation, Preparation},
     objects::Refused,
+    process::Supervised,
     service::Service,
 };
 use fs2::FileExt;
@@ -15,8 +16,9 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    os::unix::process::CommandExt,
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
@@ -143,6 +145,8 @@ struct Job {
     observer: Option<Observer>,
     /// A hint's preparation: no call waits on its downloads (`Lanes`).
     behind: bool,
+    /// Its run's stop: a cancel ends its downloads and installs.
+    stop: Option<PullCancellation>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -187,6 +191,12 @@ impl Job {
 
 type Failure = (&'static str, String);
 
+/// A preparation its run's cancel stopped.
+pub const CANCELED: &str = "preparation_canceled";
+fn canceled() -> Failure {
+    (CANCELED, "the run was canceled while it prepared".into())
+}
+
 /// What one environment generation is built from: the release's locked requirements, its
 /// Python, its package interface and its version.
 #[derive(Clone, Copy)]
@@ -223,10 +233,14 @@ struct Lanes {
 }
 
 impl Lanes {
-    fn run<T>(&self, behind: bool, pull: impl Fn(Option<PullCancellation>) -> Result<T, Failure>) -> Result<T, Failure> {
+    fn run<T>(&self, behind: bool, stop: Option<&PullCancellation>,
+        pull: impl Fn(Option<PullCancellation>) -> Result<T, Failure>) -> Result<T, Failure> {
         if !behind {
             let _waited = Waited::on(self);
-            return pull(None);
+            return match pull(stop.cloned()) {
+                Err(_) if stop.is_some_and(PullCancellation::is_cancelled) => Err(canceled()),
+                result => result,
+            };
         }
         loop {
             let stop = PullCancellation::default();
@@ -385,6 +399,7 @@ impl Publisher {
         actor: &str,
         request: &Request,
         observe: Option<Observer>,
+        stop: Option<&PullCancellation>,
     ) -> Result<Prepared, Failure> {
         if let Ok(Some(prepared)) = self.held(service, actor, request) {
             return Ok(prepared);
@@ -392,6 +407,7 @@ impl Publisher {
         let job = Job {
             behind: observe.is_none(),
             observer: observe,
+            stop: stop.cloned(),
             ..Default::default()
         };
         self.work(service, actor, request, &job)
@@ -413,7 +429,7 @@ impl Publisher {
                 format!("{path} names a source and a catalog checkpoint"),
             ));
         }
-        let made = self.make(&choice.source, &choice.profiles, providers, job.behind, &|stage, moved, total| {
+        let made = self.make(&choice.source, &choice.profiles, providers, job.behind, job.stop.as_ref(), &|stage, moved, total| {
             job.set(Progress::Preparing {
                 stage: format!("{stage} for {path}"),
                 moved,
@@ -493,22 +509,24 @@ impl Publisher {
         source: &str,
         profiles: &[String],
         providers: &Providers,
+        stop: Option<&PullCancellation>,
         progress: &(dyn Fn(&str, u64, u64) + Sync),
     ) -> Result<tensorfs_core::source_model::Made, Refused> {
-        self.make(source, profiles, providers, false, progress)
+        self.make(source, profiles, providers, false, stop, progress)
             .map_err(|(code, message)| Refused { code, message })
     }
 
     /// A provider source made into a local model (`make_source`) in its lane (`Lanes`).
     fn make(&self, source: &str, profiles: &[String], providers: &Providers, behind: bool,
-        progress: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<tensorfs_core::source_model::Made, Failure> {
+        stop: Option<&PullCancellation>, progress: &(dyn Fn(&str, u64, u64) + Sync),
+    ) -> Result<tensorfs_core::source_model::Made, Failure> {
         let mut sorted = profiles.to_vec();
         sorted.sort();
         let key = json!([source, sorted]).to_string();
         let gate = self.making.lock().unwrap().entry(key.clone()).or_default().clone();
         let made = {
             let _one = gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.lanes.run(behind, |stop| make_source(&self.store, source, profiles, providers, stop, progress))
+            self.lanes.run(behind, stop, |stop| make_source(&self.store, source, profiles, providers, stop, progress))
         };
         let mut making = self.making.lock().unwrap();
         if Arc::strong_count(&gate) == 2 {
@@ -521,7 +539,7 @@ impl Publisher {
     /// store GC may evict as each attempt starts (`protected`).
     fn ensure(&self, service: &Service, source: &hub::Source, checkpoint: &Named, pull: &Pull,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
-        self.lanes.run(pull.behind, |stop| {
+        self.lanes.run(pull.behind, pull.stop.as_ref(), |stop| {
             let keep = self.protected(service).map_err(io_failure)?;
             ensure_with(&self.store, source, checkpoint, &keep, pull, stop, bytes)
         })
@@ -554,6 +572,7 @@ impl Publisher {
         source: &hub::Source,
         named: Named,
         revision: &str,
+        stop: Option<&PullCancellation>,
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<Named, Refused> {
         let failed = |(code, message)| Refused { code, message };
@@ -567,7 +586,8 @@ impl Publisher {
             }
         }
         let _fetching = self.fetch(vec![named.manifest.clone()]);
-        self.ensure(service, source, &named, &Pull::default(), bytes).map_err(failed)?;
+        let pull = Pull { stop: stop.cloned(), ..Pull::default() };
+        self.ensure(service, source, &named, &pull, bytes).map_err(failed)?;
         Ok(named)
     }
 
@@ -948,7 +968,7 @@ impl Publisher {
             "--python",
             python,
             &env.to_string_lossy(),
-        ])?;
+        ], job.stop.as_ref())?;
         let requirements = dir.join("requirements.txt").to_string_lossy().to_string();
         // The last install compiles the whole environment's bytecode: executors run `-I` from
         // an environment they may not write, so uncompiled modules compile again in every
@@ -981,12 +1001,13 @@ impl Publisher {
                 "--requirements",
                 &requirements,
             ],
+            job.stop.as_ref(),
             &|read| job.bytes(read, 0),
         )?;
         let mut sdk_fallback = String::new();
         if sdk {
             job.stage("installing the machine's Runtime and TensorFS".into());
-            sdk_fallback = self.install_sdk(&py, &dir, &split.sdk, compile(!client))?;
+            sdk_fallback = self.install_sdk(&py, &dir, &split.sdk, compile(!client), job.stop.as_ref())?;
             if !sdk_fallback.is_empty() {
                 sdk_choice = "locked";
                 eprintln!("package {} {release}: {sdk_fallback}", split.distribution);
@@ -1006,7 +1027,7 @@ impl Publisher {
                 "--constraints",
                 &constraints,
                 &wheel,
-            ])?;
+            ], job.stop.as_ref())?;
         }
         let application = interface
             .get("application")
@@ -1057,7 +1078,7 @@ impl Publisher {
         let fetched: Vec<Result<PathBuf, Failure>> = std::thread::scope(|scope| {
             let handles: Vec<_> = files
                 .iter()
-                .map(|file| scope.spawn(|| self.hub_wheel(file, &policy, &wheels)))
+                .map(|file| scope.spawn(|| self.hub_wheel(file, &policy, &wheels, job.stop.as_ref())))
                 .collect();
             handles
                 .into_iter()
@@ -1078,10 +1099,16 @@ impl Publisher {
             .collect())
     }
 
-    fn hub_wheel(&self, file: &HubFile, policy: &SourcePolicy, wheels: &Path) -> Result<PathBuf, Failure> {
-        let failed = |e: Refusal| ("package_file_download_failed", format!("{}: {e}", file.url));
+    fn hub_wheel(&self, file: &HubFile, policy: &SourcePolicy, wheels: &Path, stop: Option<&PullCancellation>) -> Result<PathBuf, Failure> {
+        let failed = |e: Refusal| match stop.is_some_and(PullCancellation::is_cancelled) {
+            true => canceled(),
+            false => ("package_file_download_failed", format!("{}: {e}", file.url)),
+        };
         if !self.store.contains(&file.sha256) {
-            let ledger = Ledger::new();
+            let ledger = match stop {
+                Some(stop) => Ledger::new().with_cancellation(stop.clone()),
+                None => Ledger::new(),
+            };
             let object = ObjectRef {
                 sha256: file.sha256.clone(),
                 length: probe(&file.url, policy, &ledger).map_err(failed)?,
@@ -1132,7 +1159,7 @@ impl Publisher {
     /// requirements, where the package's bounds admit them (uv's check of every installed
     /// requirement); else the release's locked SDK. A package's bounds are never overridden.
     /// Returns "" for the machine's pair, else why it fell back and to what: never silent.
-    fn install_sdk(&self, py: &str, dir: &Path, locked: &str, compile: &str) -> Result<String, Failure> {
+    fn install_sdk(&self, py: &str, dir: &Path, locked: &str, compile: &str, stop: Option<&PullCancellation>) -> Result<String, Failure> {
         let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
         let mut args = vec!["pip", "install", "--no-config", "--python", py, compile, "--constraints", &constraints];
         let links = self.sdk.find_links.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -1141,7 +1168,10 @@ impl Publisher {
         }
         args.extend(self.sdk.requirements.iter().map(String::as_str));
         // uv's failure names its step (`uv pip install` or `uv pip check`) and its output.
-        let own = self.uv(&args).and_then(|()| self.uv(&["pip", "check", "--no-config", "--python", py]));
+        let own = self.uv(&args, stop).and_then(|()| self.uv(&["pip", "check", "--no-config", "--python", py], stop));
+        if own.as_ref().is_err_and(|(code, _)| *code == CANCELED) {
+            return own.map(|()| String::new());
+        }
         let Err((code, detail)) = own else {
             return Ok(String::new());
         };
@@ -1155,7 +1185,7 @@ impl Publisher {
         }
         fs::write(dir.join("sdk-requirements.txt"), locked).map_err(io_failure)?;
         let sdk = dir.join("sdk-requirements.txt").to_string_lossy().to_string();
-        self.uv(&["pip", "install", "--no-config", "--python", py, compile, "--require-hashes", "--no-deps", "--requirements", &sdk])?;
+        self.uv(&["pip", "install", "--no-config", "--python", py, compile, "--require-hashes", "--no-deps", "--requirements", &sdk], stop)?;
         let detail: Vec<&str> = detail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         let detail = detail[detail.len().saturating_sub(12)..].join(" | ");
         Ok(format!(
@@ -1165,15 +1195,18 @@ impl Publisher {
         ))
     }
 
-    fn uv(&self, args: &[&str]) -> Result<(), Failure> {
-        self.uv_observed(args, &|_| ())
+    fn uv(&self, args: &[&str], stop: Option<&PullCancellation>) -> Result<(), Failure> {
+        self.uv_observed(args, stop, &|_| ())
     }
 
     /// `uv` with `read` told, about once a second, how many bytes the process has read so far
-    /// (its downloads and the cache it copies from), so a long install shows it moves.
-    fn uv_observed(&self, args: &[&str], read: &(dyn Fn(u64) + Sync)) -> Result<(), Failure> {
+    /// (its downloads and the cache it copies from), so a long install shows it moves. Its
+    /// process group is killed when `stop` is canceled, or when its CPU and bytes stop moving
+    /// past its measured patience (`process::supervise`).
+    fn uv_observed(&self, args: &[&str], stop: Option<&PullCancellation>, read: &(dyn Fn(u64) + Sync)) -> Result<(), Failure> {
         let mut command = Command::new(&self.sdk.uv);
-        command.args(args).env_clear().stdin(Stdio::null());
+        command.args(args).env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        command.process_group(0);
         for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
@@ -1190,51 +1223,32 @@ impl Publisher {
                 .env("UV_LINK_MODE", "symlink"),
             None => command.env("UV_CACHE_DIR", self.root.join("uv-cache")),
         };
-        let child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                (
-                    "package_installation_uv_absent",
-                    format!("cannot run uv: {e}"),
-                )
-            })?;
-        let io = format!("/proc/{}/io", child.id());
-        let ended = std::sync::atomic::AtomicBool::new(false);
-        let output = std::thread::scope(|scope| {
-            let sampler = scope.spawn(|| {
-                while !ended.load(std::sync::atomic::Ordering::Acquire) {
-                    std::thread::park_timeout(std::time::Duration::from_secs(1));
-                    let rchar = fs::read_to_string(&io).ok().and_then(|text| {
-                        text.lines()
-                            .find_map(|l| l.strip_prefix("rchar: "))
-                            .and_then(|v| v.trim().parse().ok())
-                    });
-                    if let (Some(rchar), false) =
-                        (rchar, ended.load(std::sync::atomic::Ordering::Acquire))
-                    {
-                        read(rchar);
-                    }
-                }
+        let mut child = command.spawn().map_err(|e| {
+            (
+                "package_installation_uv_absent",
+                format!("cannot run uv: {e}"),
+            )
+        })?;
+        let mut stderr = child.stderr.take().expect("piped uv stderr");
+        let (ended, stderr) = std::thread::scope(|scope| {
+            let drained = scope.spawn(move || {
+                let mut kept = Vec::new();
+                let _ = stderr.read_to_end(&mut kept);
+                kept
             });
-            let output = child.wait_with_output();
-            ended.store(true, std::sync::atomic::Ordering::Release);
-            sampler.thread().unpark();
-            output
-        })
-        .map_err(|e| ("package_installation_uv_failed", format!("uv: {e}")))?;
-        if output.status.success() {
-            return Ok(());
+            let ended = crate::process::supervise(&mut child, stop, "uv", read);
+            (ended, drained.join().unwrap_or_default())
+        });
+        let step = args[..2.min(args.len())].join(" ");
+        match ended.map_err(|e| ("package_installation_uv_failed", format!("uv: {e}")))? {
+            Supervised::Exited(status) if status.success() => Ok(()),
+            Supervised::Exited(_) => Err((
+                "package_installation_uv_failed",
+                format!("uv {step}:\n{}", crate::api::install::stderr_tail(&stderr)),
+            )),
+            Supervised::Canceled => Err(canceled()),
+            Supervised::Wedged(verdict) => Err(("package_installation_stalled", format!("uv {step}: {verdict}"))),
         }
-        Err((
-            "package_installation_uv_failed",
-            format!(
-                "uv {}:\n{}",
-                args[..2.min(args.len())].join(" "),
-                crate::api::install::stderr_tail(&output.stderr)
-            ),
-        ))
     }
 
     /// The run's model grants, every Hub slot exact as its choice names it (th-241): a
@@ -1489,6 +1503,7 @@ struct Pull {
     components: Vec<String>,
     streams: Option<usize>,
     behind: bool,
+    stop: Option<PullCancellation>,
 }
 
 /// Download one resolved checkpoint: a release's lane anonymously, the owner's checkpoint by
@@ -1572,7 +1587,7 @@ fn download_all<'g>(
             .map(|(at, (grant, part))| {
                 let moved = &moved;
                 scope.spawn(move || {
-                    let pull = Pull { components: part.clone(), behind: job.behind, ..Pull::default() };
+                    let pull = Pull { components: part.clone(), behind: job.behind, stop: job.stop.clone(), ..Pull::default() };
                     publisher.ensure(service, source, &Named::of(grant), &pull, &|done, total| {
                         let (done, total) = {
                             let mut moved = moved.lock().unwrap();
@@ -1655,12 +1670,12 @@ fn apply_adapters(
                 lane: adapter.lane.clone(),
                 manifest: adapter.manifest.clone(),
             })?;
-            let pull = Pull { behind: job.behind, ..Pull::default() };
+            let pull = Pull { behind: job.behind, stop: job.stop.clone(), ..Pull::default() };
             publisher.ensure(service, source, &named, &pull, &|d, t| job.bytes(d, t))?;
             named.manifest
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
-            let made = publisher.make(&adapter.source, &adapter.profiles, providers, job.behind, &|stage, moved, total| {
+            let made = publisher.make(&adapter.source, &adapter.profiles, providers, job.behind, job.stop.as_ref(), &|stage, moved, total| {
                 job.set(Progress::Preparing {
                     stage: format!("{stage} for an adapter of {}", grant.slot),
                     moved,
@@ -2311,12 +2326,12 @@ mod tests {
         };
         let (dir, env) = environment("admits", &open);
         let py = env.join("bin/python").to_string_lossy().to_string();
-        assert_eq!(publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode").unwrap(), "");
+        assert_eq!(publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode", None).unwrap(), "");
         assert_eq!(installed_sdk(&env), vec![json!({"name": "cozy-runtime", "version": "9.0"})]);
 
         let (dir, env) = environment("refuses", &bounded);
         let py = env.join("bin/python").to_string_lossy().to_string();
-        let why = publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode").unwrap();
+        let why = publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode", None).unwrap();
         assert!(why.contains("uv pip check") && why.contains("needs-old"), "{why}");
         assert!(why.ends_with("it runs the release's locked cozy-runtime==1.0"), "{why}");
         assert_eq!(installed_sdk(&env), vec![json!({"name": "cozy-runtime", "version": "1.0"})]);
@@ -2541,7 +2556,7 @@ mod tests {
         let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
         let publisher = Publisher::new(&root.join("published"), Default::default(), store).unwrap();
         let source = "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors";
-        let make = || publisher.make_source(source, &[], &Providers::default(), &|_, _, _| {}).unwrap();
+        let make = || publisher.make_source(source, &[], &Providers::default(), None, &|_, _, _| {}).unwrap();
         let (a, b) = std::thread::scope(|scope| {
             let a = scope.spawn(make);
             let b = scope.spawn(make);
@@ -2649,7 +2664,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             let before = objects(&behind_heard);
-            bench.publisher.download(&bench.service, &waited_hub, waited, "", &|_, _| ()).unwrap();
+            bench.publisher.download(&bench.service, &waited_hub, waited, "", None, &|_, _| ()).unwrap();
             let during = objects(&behind_heard) - before;
             // Alongside, it would have asked for ~12 more objects in the 300 ms the call took.
             assert!(during <= 2, "{during} objects moved behind a download a call waited on");
@@ -2683,7 +2698,7 @@ mod tests {
             while objects(&hint_heard) < 3 && !hint.is_finished() {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            bench.publisher.download(&bench.service, &call_hub, named.clone(), "", &|done, total| {
+            bench.publisher.download(&bench.service, &call_hub, named.clone(), "", None, &|done, total| {
                 seen.lock().unwrap().push((done, total))
             })
             .unwrap();

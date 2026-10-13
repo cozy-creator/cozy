@@ -893,6 +893,7 @@ impl MachineBackend for NativeBackend {
             let canceled = self.service.engine.cancel_run(&actor_id(actor), &query.request_id)
                 .map_err(|error| match error.kind() {
                     std::io::ErrorKind::Unsupported => refusal("update_control_unsupported", &error.to_string()),
+                    std::io::ErrorKind::ResourceBusy => refusal("cancel_unavailable", &error.to_string()),
                     _ => problem(error),
                 })?;
             if let Some(jobs) = self.service.jobs() {

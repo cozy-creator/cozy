@@ -22,7 +22,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tensorfs_core::{ids::ObjectRef, sha256, store::Store};
+use tensorfs_core::{ids::ObjectRef, sha256, store::Store, transport::PullCancellation};
 
 /// The manifest object (JSON). Members are objects the same signer wrote.
 #[derive(Deserialize)]
@@ -287,6 +287,7 @@ impl LocalSources {
         actor: &str,
         alias: String,
         manifest: Manifest,
+        stop: Option<&PullCancellation>,
     ) -> Result<Installation, Refused> {
         let home = self.home(actor, &manifest.package)?;
         fs::create_dir_all(&home)?;
@@ -341,8 +342,8 @@ impl LocalSources {
                 return Err(refused("local_source_invalid", format!("index {name:?} = {url:?} is not a named HTTP(S) index")));
             }
         }
-        let prepared = prepare_editable(&self.installer, &root, &project, &environment, &wheels, &manifest.indexes, &source_digest)
-            .map_err(|status| refused("package_installation_failed", status.message()))?;
+        let prepared = prepare_editable(&self.installer, &root, &project, &environment, &wheels, &manifest.indexes, &source_digest, stop)
+            .map_err(installer_refusal)?;
         let _ = fs::remove_dir_all(environment.with_extension("wheels"));
         let installed = service.engine.bind_installation(Installation {
             actor: actor.to_string(),
@@ -392,6 +393,7 @@ impl LocalSources {
         service: &Service,
         actor: &str,
         digest: &str,
+        stop: Option<&PullCancellation>,
     ) -> Result<Installation, Refused> {
         // Like published installations, local aliases include the selected SDK and
         // client. The source digest alone cannot identify the environment after an update.
@@ -411,7 +413,7 @@ impl LocalSources {
         let member = |m: &Member| written_member(&self.objects, actor, m);
         let (manifest, _) = open_manifest(&self.objects, actor, digest)?;
         if !manifest.files.is_empty() || !manifest.path.is_empty() {
-            return self.install_live(service, actor, alias, manifest);
+            return self.install_live(service, actor, alias, manifest, stop);
         }
         if !manifest.package.starts_with("local/") || (manifest.source.is_none() && manifest.wheels.is_empty()) {
             return Err(refused(
@@ -460,8 +462,7 @@ impl LocalSources {
             },
             files,
         };
-        let prepared = prepare_uploaded(&self.installer, &uploaded)
-            .map_err(|status| refused("package_installation_failed", status.message()))?;
+        let prepared = prepare_uploaded(&self.installer, &uploaded, stop).map_err(installer_refusal)?;
         let installed = service.engine.bind_installation(Installation {
             actor: actor.to_string(),
             alias,
@@ -476,6 +477,17 @@ impl LocalSources {
     }
 }
 
+
+/// The trusted installer's end as a run's reason: canceled with its run, wedged (no CPU or
+/// bytes moved past its measured patience), or failed.
+fn installer_refusal(status: tonic::Status) -> Refused {
+    let code = match status.code() {
+        tonic::Code::Cancelled => crate::published::CANCELED,
+        tonic::Code::Aborted => "package_installation_stalled",
+        _ => "package_installation_failed",
+    };
+    refused(code, status.message())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,13 +618,13 @@ mod tests {
 
         // Another signer cannot install what it did not write.
         let refused = sources
-            .install(&service, "bob", &manifest.digest)
+            .install(&service, "bob", &manifest.digest, None)
             .err()
             .unwrap();
         assert_eq!(refused.code, "local_source_incomplete");
 
         let installed = sources
-            .install(&service, "alice", &manifest.digest)
+            .install(&service, "alice", &manifest.digest, None)
             .unwrap();
         assert_eq!(installed.package, "local/tensord-cpu-input");
         let interface: serde_json::Value = serde_json::from_slice(&installed.interface).unwrap();
@@ -620,7 +632,7 @@ mod tests {
             .as_array()
             .is_some_and(|e| !e.is_empty()));
         let again = sources
-            .install(&service, "alice", &manifest.digest)
+            .install(&service, "alice", &manifest.digest, None)
             .unwrap();
         assert_eq!(again.generation, installed.generation);
 
@@ -636,10 +648,10 @@ mod tests {
         );
         // The source and manifest stay byte-identical across this SDK change. Reusing
         // the first alias here would silently keep its original Runtime/TensorFS.
-        let updated = pinned.install(&service, "alice", &manifest.digest).unwrap();
+        let updated = pinned.install(&service, "alice", &manifest.digest, None).unwrap();
         assert_ne!(updated.alias, installed.alias);
         assert_ne!(updated.generation, installed.generation);
-        let same_sdk = pinned.install(&service, "alice", &manifest.digest).unwrap();
+        let same_sdk = pinned.install(&service, "alice", &manifest.digest, None).unwrap();
         assert_eq!(same_sdk.alias, updated.alias);
         assert_eq!(same_sdk.generation, updated.generation);
         // A prior generation remains valid for already accepted work.
@@ -672,7 +684,7 @@ mod tests {
         };
         let none = serde_json::json!({});
         let first = manifest(live_files(&m.objects, "alice", &project, &["pyproject.toml", "package.toml", "cpu_input/__init__.py", "notes.txt"]), none.clone());
-        let installed = sources.install(&m.service, "alice", &first).unwrap();
+        let installed = sources.install(&m.service, "alice", &first, None).unwrap();
         let home = sources.home("alice", "local/tensord-cpu-input").unwrap();
         assert_eq!(fs::read_to_string(home.join("tree/notes.txt")).unwrap(), "dropped by the edit");
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
@@ -696,7 +708,7 @@ mod tests {
         // Another signer holds no tree: every file is asked of it.
         let theirs = sources.written("bob", &second).err().unwrap();
         assert_eq!(theirs.code, "local_source_incomplete");
-        let edited = sources.install(&m.service, "alice", &second).unwrap();
+        let edited = sources.install(&m.service, "alice", &second, None).unwrap();
         assert_ne!(edited.generation, installed.generation);
         // Its own memoized calls are keyed by its code: the edit is another computation.
         let code = m.service.catalog.resolve(&edited.generation).unwrap().record.source_digest;
@@ -720,7 +732,7 @@ mod tests {
             write(&m.objects, "carol", document.to_string().as_bytes()).digest
         };
         assert_eq!(sources.written("carol", &live).unwrap().len(), 1);
-        let placed = sources.install(&m.service, "carol", &live).unwrap();
+        let placed = sources.install(&m.service, "carol", &live, None).unwrap();
         let python = m.service.catalog.resolve(&placed.generation).unwrap().record.python;
         let imported = run(Command::new(&python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
         assert_eq!(Path::new(&imported), fs::canonicalize(project.join("cpu_input/__init__.py")).unwrap());
@@ -763,14 +775,14 @@ mod tests {
         };
         let name = memo.file_name().unwrap().to_string_lossy();
         let with = manifest(serde_json::json!([{"name": name, "digest": carried.digest, "length": carried.length}]));
-        let installed = sources.install(&m.service, "alice", &with).unwrap();
+        let installed = sources.install(&m.service, "alice", &with, None).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         let callee = held.record.callees.iter().find(|c| c.distribution == "tensord-cpu-memo").expect("the carried callee App");
         assert_eq!((callee.package.as_str(), callee.version.as_str()), ("proof/tensord-cpu-memo", "0.1.0"));
         // Its environment built, the wheels it was built from are no longer asked for.
         assert_eq!(sources.written("alice", &with).unwrap().len(), 1);
         // Without the wheel the lock's own source is all there is, and uv says so.
-        let why = sources.install(&m.service, "alice", &manifest(serde_json::json!([]))).err().unwrap().message;
+        let why = sources.install(&m.service, "alice", &manifest(serde_json::json!([])), None).err().unwrap().message;
         assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("tensord-cpu-memo"), "{why}");
         let _ = fs::remove_dir_all(m.root);
     }
@@ -829,11 +841,11 @@ mod tests {
             assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         };
         let locked = [&files[..], &["uv.lock"]].concat();
-        callee(sources.install(&m.service, "alice", &manifest(&project, &locked, serde_json::json!({}))).unwrap());
-        let why = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({}))).err().unwrap().message;
+        callee(sources.install(&m.service, "alice", &manifest(&project, &locked, serde_json::json!({})), None).unwrap());
+        let why = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({})), None).err().unwrap().message;
         assert!(why.contains("undeclared index"), "{why}");
-        callee(sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": url}))).unwrap());
-        let bad = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": "file:///etc"}))).err().unwrap();
+        callee(sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": url})), None).unwrap());
+        let bad = sources.install(&m.service, "alice", &manifest(&unlocked, &files, serde_json::json!({"tensorhub": "file:///etc"})), None).err().unwrap();
         assert_eq!(bad.code, "local_source_invalid");
         let _ = fs::remove_dir_all(m.root);
     }
@@ -862,7 +874,7 @@ mod tests {
         let install = || {
             let document = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
                 "files": live_files(&m.objects, "alice", &project, &names), "path": project.to_string_lossy(), "locals": ["deps/cpu_memo"]});
-            let installed = sources.install(&m.service, "alice", &write(&m.objects, "alice", document.to_string().as_bytes()).digest).unwrap();
+            let installed = sources.install(&m.service, "alice", &write(&m.objects, "alice", document.to_string().as_bytes()).digest, None).unwrap();
             m.service.catalog.resolve(&installed.generation).unwrap().record.python
         };
         let python = install();
@@ -903,7 +915,7 @@ mod tests {
             "wheels": [{"name": name, "digest": wheel.digest, "length": wheel.length}],
             "requirements": {"digest": locked.digest, "length": locked.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
-        let installed = sources.install(&m.service, "alice", &manifest.digest).unwrap();
+        let installed = sources.install(&m.service, "alice", &manifest.digest, None).unwrap();
         let python = m.service.catalog.resolve(&installed.generation).unwrap().record.python;
         let site = python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
         // A locked dependency links into the seed; the App the Runtime describes is copied.
@@ -932,7 +944,7 @@ mod tests {
             "wheels": [{"name": name, "digest": wheel.digest, "length": wheel.length}],
             "requirements": {"digest": locked.digest, "length": locked.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
-        let installed = sources.install(&m.service, "alice", &manifest.digest).unwrap();
+        let installed = sources.install(&m.service, "alice", &manifest.digest, None).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
@@ -958,7 +970,7 @@ mod tests {
         let manifest = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
             "source": {"digest": source.digest, "length": source.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
-        let installed = sources.install(&m.service, "alice", &manifest.digest).unwrap();
+        let installed = sources.install(&m.service, "alice", &manifest.digest, None).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
@@ -1031,7 +1043,7 @@ mod tests {
         // The live tree, file by file: the project as it is, its lock and vendor/ wheel.
         let live = manifest(serde_json::json!({"files": live_files(&m.objects, "alice", &project, &[&files[..], &[vendored.as_str()]].concat())}));
         for digest in [source, carried, live] {
-            let installed = sources.install(&m.service, "alice", &digest).unwrap();
+            let installed = sources.install(&m.service, "alice", &digest, None).unwrap();
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
             let versions = installed_sdk(&held.record.python);
             assert!(versions.starts_with(&format!("{dev} ")), "{versions}");
@@ -1041,7 +1053,7 @@ mod tests {
         }
 
         // A refusal carries its reason: a typed one as itself, a failed operation in uv's words.
-        let refused = |digest: &str| sources.install(&m.service, "alice", digest).err().unwrap().message;
+        let refused = |digest: &str| sources.install(&m.service, "alice", digest, None).err().unwrap().message;
         let absent = manifest(serde_json::json!({"source": member("source.tar", &archive(&project, &files))}));
         let why = refused(&absent);
         assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("vendor/cozy_runtime-0.18.101"), "{why}");
