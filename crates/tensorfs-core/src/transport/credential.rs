@@ -110,25 +110,6 @@ impl CredentialProvider for Anonymous {
     }
 }
 
-/// One bearer token, presented only to the hosts it names (tfs-052's shape).
-pub struct HostToken {
-    pub hosts: Vec<String>,
-    pub token: String,
-}
-
-impl CredentialProvider for HostToken {
-    fn headers(&self, ask: &Ask) -> Vec<(String, String)> {
-        if names(&self.hosts, ask) {
-            vec![(
-                "authorization".to_string(),
-                format!("Bearer {}", self.token),
-            )]
-        } else {
-            Vec::new()
-        }
-    }
-}
-
 /// Arbitrary presentation headers, scoped to named hosts — the generic impl a caller
 /// builds when its credential is not a bearer.
 pub struct ScopedHeaders {
