@@ -61,7 +61,6 @@ type Context struct {
 	Daemon           daemon.State
 	AccountAuth      *accountauth.Manager
 	namespace        packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
-	ingestBytes      int64                          // planned source bytes a native ingest declares for its rental
 	warnings         *[]records.Warning             // this command's, shared by its scoped copies
 	rentalSelections map[string]string              // --rental names this command resolved, to rental IDs
 }

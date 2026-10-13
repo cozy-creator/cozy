@@ -19,22 +19,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
-// A rented ingest (`cozy model upload <source> <repo> --rental-only`) runs as a script, and
-// the rental bought for it declares the ingest's planned source bytes, so the Hub sizes the
-// pod's disk to the ingest rather than to the script-run default. The stand-in Hub captures
-// the paid request and refuses it; nothing is rented.
-func TestRentedIngestDeclaresItsPlannedSourceBytes(t *testing.T) {
-	planned := civitaiPrimaryBytes(t, 128078)
-	root, paid := rentalCapture(t)
-	out, code := rentedUpload(t, root, nil, "civitai://128078", "proof/sdxl", "--source-profile", "civitai/sdxl/single-file/1")
-	if request := paid(t, out, code); request.PlannedSourceBytes != planned {
-		t.Fatalf("the ingest's rental declared %d planned source bytes, want the source's %d", request.PlannedSourceBytes, planned)
-	}
-}
-
 // The host and the rental install TensorFS independently, so the host's may know fewer
 // profiles. What this host does not recognize, a profile named or the source itself, is the
-// rental's to decide: the ingest still asks for its rental, and only the rental may refuse.
+// rental's to decide: a rental sized for the ingest is still asked for, and only it may refuse.
 // A host whose registry is a hint plans an unrecognized source as-is and says so.
 func TestHostTensorFSUnawareOfAProfileDefersToTheRental(t *testing.T) {
 	planned := civitaiPrimaryBytes(t, 128078)
@@ -42,8 +29,7 @@ func TestHostTensorFSUnawareOfAProfileDefersToTheRental(t *testing.T) {
 		root, paid := rentalCapture(t)
 		registry := filepath.Join(root, "host-registry.json")
 		must(t, os.WriteFile(registry, []byte(`{"entries":[],"source_profiles":[]}`), 0o600))
-		out, code := rentedUpload(t, root, []string{"COZY_TFS_REGISTRY=" + registry},
-			append([]string{"civitai://128078", "proof/sdxl"}, named...)...)
+		out, code := rentalForSource(t, root, []string{"COZY_TFS_REGISTRY=" + registry}, "civitai://128078", named...)
 		if request := paid(t, out, code); request.PlannedSourceBytes != planned {
 			t.Fatalf("%v: the deferred ingest declared %d planned source bytes, want %d", named, request.PlannedSourceBytes, planned)
 		}
@@ -141,10 +127,11 @@ func rentalCapture(t *testing.T) (string, func(*testing.T, []byte, int) hub.Rent
 	}
 }
 
-func rentedUpload(t *testing.T, root string, env []string, args ...string) ([]byte, int) {
+// rentalForSource asks for a cpu rental sized for an ingest of source (`cozy rental new --model`).
+func rentalForSource(t *testing.T, root string, env []string, source string, args ...string) ([]byte, int) {
 	t.Helper()
-	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin, "model", "upload"},
-		append(args, "--rental-only", "--json")...)...)
+	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin, "rental", "new", "cpu", "--model", source},
+		append(args, "--json")...)...)
 	cmd.Env = childEnv(t, root, env...)
 	out, _ := cmd.CombinedOutput()
 	return out, cmd.ProcessState.ExitCode()

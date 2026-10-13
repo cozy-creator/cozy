@@ -32,7 +32,7 @@ func TestActiveCallLimitSharesPackageAndNativeWorkButAllowsLongHistory(t *testin
 	if _, _, problem := store.SubmitChild(makeCall(32), 1, childDigest("1"), "private-boot", nil); problem == nil || problem.ErrName() != "child.active_limit" {
 		t.Fatalf("33rd active call: %v", problem)
 	}
-	native := records.NativeCall{ID: "native-active", ParentRequestID: parent.ID, CallIndex: 33, Kind: "source", Operation: "download_huggingface", IntentDigest: childDigest("4"), Request: []byte(`{}`)}
+	native := records.NativeCall{ID: "native-active", ParentRequestID: parent.ID, CallIndex: 33, Kind: "effect", Operation: "upload_checkpoint", IntentDigest: childDigest("4"), Request: []byte(`{}`)}
 	if _, _, problem := store.AcceptNativeCall(native, 1, childDigest("1"), "private-boot"); problem == nil || problem.ErrName() != "child.active_limit" {
 		t.Fatalf("native call bypassed shared limit: %v", problem)
 	}
