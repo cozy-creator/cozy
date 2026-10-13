@@ -39,9 +39,11 @@ type runReport struct {
 	AttemptWallMS  int64  `json:"attempt_wall_ms,omitempty"`
 	WallMS         int64  `json:"wall_ms,omitempty"`
 	Waiting        string `json:"waiting,omitempty"`
-	ErrorType      string `json:"error_type,omitempty"`
-	ErrorCode      string `json:"error_code,omitempty"`
-	Error          string `json:"error,omitempty"`
+	// Allocation is the run's own GPU allocation while it runs: held (on GPUs), waiting, released.
+	Allocation *records.GPUAllocation `json:"allocation,omitempty"`
+	ErrorType  string                 `json:"error_type,omitempty"`
+	ErrorCode  string                 `json:"error_code,omitempty"`
+	Error      string                 `json:"error,omitempty"`
 	// How its machine's memo answered it: from a result it held (nothing ran), the
 	// computation it ran or answered, or why it was neither looked up nor held.
 	Memoized    bool   `json:"memoized"`
@@ -494,6 +496,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	case life.Status == "in_progress" && life.ObservationLost != nil:
 		report.Waiting = reconnecting(life) + ": " + life.ObservationLost.Reason
 	}
+	report.Allocation = life.GPUAllocation
 	report.Result = life.Result
 	report.Output = life.Output
 	if view := life.MachineExecution; view != nil && !view.Collected && view.CollectionRefused != "" {
@@ -542,7 +545,10 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			stage := reportStage{Name: "GPU", Kind: "gpu", StartUnixMS: at.UnixMilli(),
 				Detail: gpuNames(lease.cards())}
 			stages := &report.Stages
-			if request, _, _ := strings.Cut(lease.Key, "#"); request != life.RequestID {
+			if lease.Key == records.GPUAllocationKey {
+				// The run's own allocation: held from its first GPU step until released.
+				stage.Name = "GPUs held"
+			} else if request, _, _ := strings.Cut(lease.Key, "#"); request != life.RequestID {
 				c := call(request)
 				c.GPUs, stages = seat(c.GPUs, lease.cards(), false), &c.Stages
 			} else {
@@ -559,7 +565,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				stage := &(*open.stages)[open.index]
 				stage.MS = float64(at.UnixMilli() - stage.StartUnixMS)
 			}
-			if request, _, _ := strings.Cut(release.Key, "#"); request != life.RequestID {
+			if request, _, _ := strings.Cut(release.Key, "#"); request != life.RequestID && release.Key != records.GPUAllocationKey {
 				c := call(request)
 				c.GPUs = seat(c.GPUs, gpuRecords(release.GPUs, release.Ranks), true)
 			}
@@ -683,6 +689,11 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			}
 			endedAt = at.UnixMilli()
 		}
+	}
+	// An allocation released by the run's end has no release of its own.
+	if open, ok := granted[records.GPUAllocationKey]; ok && endedAt > 0 {
+		stage := &(*open.stages)[open.index]
+		stage.MS = float64(endedAt - stage.StartUnixMS)
 	}
 	// Each machine preparation step lasts until the next begins; the last, until the run runs.
 	for i := range machineSteps {
@@ -1031,6 +1042,11 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	}
 	if r.Waiting != "" {
 		fmt.Fprintf(w, "\n%s", r.Waiting)
+	}
+	if r.Allocation != nil && r.Allocation.State == "held" {
+		fmt.Fprintf(w, "\nholding %s", gpuNames(gpuEvent{Ordinals: r.Allocation.GPUs}.cards()))
+	} else if r.Allocation != nil && r.Allocation.State == "released" {
+		fmt.Fprintf(w, "\nGPUs released")
 	}
 	if r.Error != "" {
 		fmt.Fprintf(w, "\nerror %s: %s", cmp.Or(r.ErrorCode, r.ErrorType), r.Error)

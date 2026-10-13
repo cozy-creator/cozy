@@ -813,9 +813,11 @@ type Lifecycle struct {
 	// whatever advancement that phase actually has. Absent for anything that has left
 	// the queue, and absent field by field for a phase whose producer measured nothing:
 	// a missing rate means "not measured", never zero.
-	Phase          string                               `json:"phase,omitempty"`
-	PhaseMachine   string                               `json:"phase_machine,omitempty"`
-	WaitingFor     *orchestrator.WaitingRun             `json:"waiting_for,omitempty"`
+	Phase        string                   `json:"phase,omitempty"`
+	PhaseMachine string                   `json:"phase_machine,omitempty"`
+	WaitingFor   *orchestrator.WaitingRun `json:"waiting_for,omitempty"`
+	// GPUAllocation is the run's own GPU allocation on its machine: held, waiting or released.
+	GPUAllocation  *records.GPUAllocation               `json:"gpu_allocation,omitempty"`
 	PhaseDetail    string                               `json:"phase_detail,omitempty"`
 	PhaseModels    []orchestrator.ModelDownloadProgress `json:"phase_models,omitempty"`
 	RentalProgress *orchestrator.RentalProgress         `json:"rental_progress,omitempty"`
@@ -1320,6 +1322,7 @@ func (s *Server) fillGPUWait(life *Lifecycle, row records.Request) {
 	if life.Status != "queued" && life.Status != "in_progress" {
 		return
 	}
+	life.GPUAllocation, _ = s.store.MachineGPUAllocation(row.ID)
 	wait, problem := s.store.MachineGPUWait(row.ID)
 	if problem != nil || wait == nil {
 		return

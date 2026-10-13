@@ -234,6 +234,10 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 			if err := insertCallV1(tx, id, max(ordinal, 1), value.Call); err != nil {
 				return err
 			}
+		case *v1.RunEvent_Gpu:
+			if err := insertGPUAllocationV1(tx, id, max(ordinal, 1), value.Gpu, at); err != nil {
+				return err
+			}
 		}
 		if event.Sequence != 0 {
 			_, err = tx.Exec(`UPDATE machine_executions SET remote_cursor=? WHERE request_id=?`, event.Sequence, id)
@@ -245,6 +249,25 @@ func (s *Store) ObserveRunV1(id string, event *v1.RunEvent, product *Product) *e
 	}
 	s.dropTelemetry(id, sampled)
 	return nil
+}
+
+// GPUAllocationKey keys the run's own GPU allocation among its `machine.gpu.*` events.
+const GPUAllocationKey = "allocation"
+
+// insertGPUAllocationV1 records a change of the run's GPU allocation as the machine.gpu
+// event the run views read: `grant` (its lane), `wait` (behind another run), `release`.
+func insertGPUAllocationV1(tx *sql.Tx, id string, attempt int64, gpu *v1.GpuAllocation, at string) error {
+	payload := map[string]any{"key": GPUAllocationKey, "width": gpu.Width, "ordinals": gpu.Gpus}
+	if gpu.Behind != "" {
+		payload["blocked_by"] = []string{gpu.Behind}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`,
+		id, "machine.gpu."+gpu.State, attempt, string(raw), at)
+	return err
 }
 
 // insertCallV1 records one settled call of the run as `machine.call`, the record `run show`

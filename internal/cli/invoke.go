@@ -1214,6 +1214,9 @@ func runListRows(rows []api.Lifecycle) output.List {
 		// The preparation facts are machine-readable as NUMBERS and absence, never as the
 		// human cell: a reader must be able to tell "no rate was measured" from "the rate
 		// was zero", and a rendered string cannot say that.
+		if life.GPUAllocation != nil {
+			typed["gpu_allocation"] = life.GPUAllocation
+		}
 		if life.Phase != "" {
 			typed["phase"] = life.Phase
 			if life.WaitingFor != nil {
@@ -1489,10 +1492,13 @@ func progressValue(life api.Lifecycle) string {
 		return stage
 	}
 	overall := fmt.Sprintf("%.0f%%", *life.OverallFraction*100)
-	if stage == "" {
-		return overall
+	if stage != "" {
+		overall = stage + " " + overall
 	}
-	return stage + " " + overall
+	if life.GPUAllocation != nil && life.GPUAllocation.State == "released" {
+		overall += " · GPUs released"
+	}
+	return overall
 }
 
 // reconnecting is a running run whose machine this computer lost: what it last heard is not
