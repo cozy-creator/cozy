@@ -2829,7 +2829,13 @@ impl GpuPool {
                     models,
                     authorized_device_limit_bytes:
                         device_total.or(self.config.authorized_device_limit_bytes),
-                    attention_pin: String::new(),
+                    // The request it loads for names a kernel: its build is imported first.
+                    attention_pin: match load_only
+                        || !session.executor.hello.offers("attention.load_pin/1")
+                    {
+                        true => String::new(),
+                        false => engine.get(id)?.invocation.attention_kernel,
+                    },
                     sealed_tiers: session.unsealed.is_none(),
                     model_sources: true,
                     staged_tiers: session.unsealed.is_none(),
@@ -2914,6 +2920,11 @@ impl GpuPool {
             ))),
             false => error,
         })?;
+        // Its pin needs another build of a kernel than this executor imported: the request
+        // never started, so a fresh executor, loaded with the pin, runs it.
+        if retained && !prepared.ok && prepared.code == "attention_kernel_needs_executor" {
+            return Err(io::Error::other(Undelivered(prepared.detail.clone())));
+        }
         if !prepared.ok
             && !matches!(
                 prepared.code.as_str(),
