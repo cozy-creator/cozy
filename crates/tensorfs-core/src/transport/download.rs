@@ -482,10 +482,7 @@ impl Run<'_> {
                 let part = Part::open(job.store, keep.owner, wanted, true)?;
                 let done = part.done();
                 keep.landed(part.covered() as i64);
-                let file = part.file.try_clone().map_err(|error| Refusal {
-                    code: Code::IO_FAILED,
-                    detail: format!("source download: {error}"),
-                })?;
+                let file = part.file.try_clone().map_err(|error| crate::store::classify_io("source download", error))?;
                 (part.bytes(), file, Some(part), missing(&done, length))
             }
             None => {
@@ -892,10 +889,7 @@ impl Run<'_> {
                 .writers
                 .write(&object.file, &buffer[..read], chunk.first)
             {
-                return Err(Ended::Fatal(Refusal {
-                    code: Code::IO_FAILED,
-                    detail: format!("write {}: {error}", object.path.display()),
-                }));
+                return Err(Ended::Fatal(crate::store::classify_io(format!("write {}", object.path.display()), error)));
             }
             chunk.first += read as u64;
             object.moved.fetch_add(read as u64, Ordering::Relaxed);
@@ -916,10 +910,7 @@ impl Run<'_> {
             .clone();
         let admitted = (|| {
             if job.store.flushes() {
-                object.file.sync_all().map_err(|error| Refusal {
-                    code: Code::IO_FAILED,
-                    detail: format!("fsync {}: {error}", object.path.display()),
-                })?;
+                object.file.sync_all().map_err(|error| crate::store::classify_io(format!("fsync {}", object.path.display()), error))?;
             }
             let mut reader = Verifying::new(&object.file, wanted.length);
             if object.grant.destination == Destination::Manifest {
@@ -934,10 +925,7 @@ impl Run<'_> {
             }
             let verified = Verified {
                 tmp: object.path.clone(),
-                file: object.file.try_clone().map_err(|error| Refusal {
-                    code: Code::IO_FAILED,
-                    detail: format!("clone {}: {error}", object.path.display()),
-                })?,
+                file: object.file.try_clone().map_err(|error| crate::store::classify_io(format!("clone {}", object.path.display()), error))?,
                 sha256,
                 length: wanted.length,
             };
@@ -1185,10 +1173,7 @@ impl<'a> Verifying<'a> {
         let mut hash = crate::sha256::Sha256::new();
         let mut buffer = vec![0u8; 1 << 20];
         loop {
-            let read = self.read(&mut buffer).map_err(|error| Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("read back the downloaded file: {error}"),
-            })?;
+            let read = self.read(&mut buffer).map_err(|error| crate::store::classify_io("read back the downloaded file", error))?;
             if read == 0 {
                 return Ok(crate::sha256::hex(&hash.finish()));
             }

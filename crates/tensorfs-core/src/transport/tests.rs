@@ -3,7 +3,7 @@
 //! no hub. The ledger tests run at millisecond resolution: the cadence is configuration,
 //! the RULE under test is production's.
 
-use super::credential::{credential_from_spec, Anonymous, HostToken};
+use super::credential::{credential_from_spec, Anonymous, ScopedHeaders};
 use super::download::{fetch_ranged, Ranged};
 use super::ledger::{Deadline, Ledger};
 use super::policy::{self, blocked, CheckedUrl, SourcePolicy};
@@ -2285,9 +2285,9 @@ fn credential_headers_reach_the_hub_and_not_the_object_host() {
     });
     let origin = origin(dispatch);
     *base_slot.lock().unwrap() = origin.base.clone();
-    let token = HostToken {
+    let token = ScopedHeaders {
         hosts: vec!["127.0.0.1".into()],
-        token: "worker-token".into(),
+        headers: vec![("authorization".into(), "Bearer worker-token".into())],
     };
     let policy = SourcePolicy::default();
     let mut request = PullRequest::new(&store, &origin.base, "acme/model", &token, &policy);
@@ -4304,9 +4304,9 @@ fn every_request_re_asks_the_credential_for_the_host_it_reaches() {
                 .push(request.header("authorization").map(str::to_string));
             partial(&served, request)
         });
-        let credential = HostToken {
+        let credential = ScopedHeaders {
             hosts: vec![scoped_to.into()],
-            token: "hf_secret".into(),
+            headers: vec![("authorization".into(), "Bearer hf_secret".into())],
         };
         fetch_ranged(
             &source.store,
@@ -4506,6 +4506,22 @@ fn a_real_enospc_from_the_kernel_is_a_capacity_verdict_not_an_io_failure() {
         crate::store::classify_io("open blob", ordinary).code,
         Code::IO_FAILED
     );
+}
+
+/// The same kernel ENOSPC met by a module that wraps its own I/O errors (here, writing a
+/// checkpoint part out) is the same verdict: every I/O error goes through one classifier.
+#[test]
+fn a_full_disk_met_outside_the_store_is_still_a_capacity_verdict() {
+    let root = temporary("full-outside-store");
+    let store = Store::init(&root).unwrap();
+    let part = crate::header::Part::plan(crate::dtype::Dtype::U8, vec![16], &[7u8; 16]);
+    let mut full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full is required for this arm");
+    let refusal = crate::checkpoint::materialize(&store, "w", &part, &mut full).unwrap_err();
+    assert_eq!(refusal.code, Code::CAPACITY_EXHAUSTED, "{refusal}");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 // These proofs deliberately occupy the process-scoped optional write pool.

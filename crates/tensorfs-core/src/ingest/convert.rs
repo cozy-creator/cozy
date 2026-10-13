@@ -67,7 +67,7 @@ pub const NORMALIZATION: &str = "normalization";
 /// The converter for a source no reviewed profile recognizes: its keys, stored as they are.
 pub const IDENTITY: &str = "identity/1";
 
-pub const CONVERTERS: [Converter; 8] = [
+pub const CONVERTERS: [Converter; 7] = [
     Converter {
         name: "diffusers.identity/1",
         dialect: "safetensors.diffusers",
@@ -75,17 +75,6 @@ pub const CONVERTERS: [Converter; 8] = [
         doc: "Diffusers component spelling IS the canonical logical key spelling. Each key \
               becomes one logical tensor; `.weight_scale` siblings fold into their base as \
               encoding ROLES; marker tensors are dropped. Bytes stream through untouched.",
-        validated_on_real_bytes: true,
-        normalization: None,
-        lane: None,
-        reference: None,
-    },
-    Converter {
-        name: "single_file.identity/1",
-        dialect: "safetensors.single_file",
-        class: Class::Identity,
-        doc: "One file carrying several components, split on the reviewed component prefix \
-              map. Same byte path as the diffusers converter — packaging is not identity.",
         validated_on_real_bytes: true,
         normalization: None,
         lane: None,
@@ -1494,11 +1483,6 @@ fn plan_seam(
 /// the canonical spelling); a renaming dialect declares its map here and nowhere else.
 fn rekey(conv: &Converter, key: &str) -> String {
     match conv.name {
-        "single_file.identity/1" => SINGLE_FILE_PREFIXES
-            .iter()
-            .find(|(from, _, _)| key.starts_with(*from))
-            .map(|(from, _, to)| format!("{to}{}", &key[from.len()..]))
-            .unwrap_or_else(|| key.to_string()),
         // Leaf first, then the block prefix — the two halves of the ratified map's own
         // `rekey` block, applied in the order it lists them.
         "h3.native/2" => {
@@ -1630,36 +1614,27 @@ pub fn is_fused_attention(key: &str) -> bool {
         || base.ends_with(".attn.qkv")
 }
 
-/// The reviewed single-file → canonical component prefix map. Data, not inference: a prefix
-/// that is not here does not get guessed at, it stays as it is and the fingerprint decides.
-pub const SINGLE_FILE_PREFIXES: [(&str, &str, &str); 4] = [
-    ("model.diffusion_model.", "unet", ""),
-    ("first_stage_model.", "vae", ""),
-    ("conditioner.embedders.0.transformer.", "text_encoder", ""),
-    ("conditioner.embedders.1.model.", "text_encoder_2", ""),
-];
-
 /// Project one reviewed component out of a multi-component single-file carrier. The
 /// source offsets remain those of the original file; only the key set presented to
-/// fingerprinting and planning narrows. The converter's prefixes are the sole authority (a
-/// routed converter's table, else the closed map above): a key belongs to the component
-/// whose prefix is the longest it starts with, and an absent component refuses.
+/// fingerprinting and planning narrows. The routed converter's table is the sole authority: a
+/// key belongs to the component whose prefix is the longest it starts with, and an absent
+/// component refuses.
 pub fn single_file_component(
     conv: &Converter,
     component: &str,
     source: &SourceHeader,
 ) -> Result<SourceHeader> {
-    let prefixes: Vec<(&str, &str)> = match super::routes::table(conv.name) {
-        Some(table) => table
-            .components
-            .iter()
-            .map(|c| (c.name.as_str(), c.prefix.as_str()))
-            .collect(),
-        None => SINGLE_FILE_PREFIXES
-            .iter()
-            .map(|(prefix, name, _)| (*name, *prefix))
-            .collect(),
+    let Some(table) = super::routes::table(conv.name) else {
+        return refuse(
+            Code::MISSING_TENSOR,
+            format!("{} has no reviewed component table", conv.name),
+        );
     };
+    let prefixes: Vec<(&str, &str)> = table
+        .components
+        .iter()
+        .map(|c| (c.name.as_str(), c.prefix.as_str()))
+        .collect();
     let Some(&(_, prefix)) = prefixes.iter().find(|(name, _)| *name == component) else {
         return refuse(
             Code::MISSING_TENSOR,

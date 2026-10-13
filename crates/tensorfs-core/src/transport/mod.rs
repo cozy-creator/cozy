@@ -51,8 +51,7 @@ mod tests;
 
 pub use api::{api_get, fetch_prefix, form_post, probe_length, Prefix};
 pub use credential::{
-    credential_from_spec, Anonymous, Answer, Ask, Both, CredentialProvider, HostToken,
-    ScopedHeaders,
+    credential_from_spec, Anonymous, Answer, Ask, Both, CredentialProvider, ScopedHeaders,
 };
 pub use download::{fetch_ranged, Ranged, CHUNK_BYTES, PART_BYTES};
 pub use dpop::{AccessToken, DpopCredential, DpopKey};

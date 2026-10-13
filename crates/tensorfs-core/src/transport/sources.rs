@@ -54,10 +54,7 @@ pub(crate) struct SourceJob {
 }
 
 fn io(error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("source download: {error}"),
-    }
+    crate::store::classify_io("source download", error)
 }
 
 fn area(store: &Store) -> PathBuf {

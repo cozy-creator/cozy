@@ -202,10 +202,7 @@ pub(crate) fn read_document(store: &Store, object: &ObjectRef, cap: usize) -> Re
         );
     }
     let mut bytes = vec![0; object.length as usize];
-    std::io::Read::read_exact(&mut file, &mut bytes).map_err(|error| crate::err::Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("read checkpoint document: {error}"),
-    })?;
+    std::io::Read::read_exact(&mut file, &mut bytes).map_err(|error| crate::store::classify_io("read checkpoint document", error))?;
     if ObjectRef::of(&bytes) != *object {
         return refuse(
             Code::OBJECT_ID_MISMATCH,

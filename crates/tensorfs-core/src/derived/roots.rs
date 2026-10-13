@@ -115,10 +115,7 @@ impl Plain for Root {
 }
 
 fn io(error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("private derived root: {error}"),
-    }
+    crate::store::classify_io("private derived root", error)
 }
 fn directory(store: &Store) -> PathBuf {
     store.root().join("roots/derived")

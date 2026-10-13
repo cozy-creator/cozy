@@ -512,10 +512,7 @@ impl DeliveryGrant {
             let mut bytes = Vec::with_capacity(capacity);
             r.take(self.object.length.saturating_add(1))
                 .read_to_end(&mut bytes)
-                .map_err(|error| crate::err::Refusal {
-                    code: Code::IO_FAILED,
-                    detail: format!("read manifest body: {error}"),
-                })?;
+                .map_err(|error| crate::store::classify_io("read manifest body", error))?;
             if ObjectRef::of(&bytes) != self.object {
                 return refuse(
                     Code::OBJECT_ID_MISMATCH,

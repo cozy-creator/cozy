@@ -83,10 +83,7 @@ pub fn repository(value: &str) -> Result<RepositoryName> {
 }
 
 fn io(error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("checkpoint root: {error}"),
-    }
+    crate::store::classify_io("checkpoint root", error)
 }
 
 fn directory(store: &Store) -> PathBuf {

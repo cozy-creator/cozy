@@ -85,10 +85,7 @@ fn store_role<R: Read>(
 }
 
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {e}", what.as_ref()),
-    }
+    crate::store::classify_io(what, e)
 }
 
 // ---------------------------------------------------------------- the resumable session

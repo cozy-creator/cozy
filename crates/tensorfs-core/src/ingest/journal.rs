@@ -49,10 +49,7 @@ use super::carrier::SourceHeader;
 use super::convert::{Bytes, Plan, Xform};
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {error}", what.as_ref()),
-    }
+    crate::store::classify_io(what, error)
 }
 
 /// One journalled op-role: the derive plane's `AddedPart`, on the ingest plane.

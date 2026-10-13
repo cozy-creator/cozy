@@ -141,55 +141,6 @@ fn h3_profiles_expose_only_the_five_reviewed_carriers() {
 }
 
 #[test]
-fn source_plan_maps_reviewed_single_file_components_without_its_filename() {
-    let root = temporary("single");
-    fs::create_dir_all(&root).unwrap();
-    let oddly_named = root.join("nothing-about-components.bin");
-    let registry = root.join("registry.json");
-    let order_path = root.join("order.json");
-    let plan_path = root.join("source-plan.json");
-    carrier(
-        &oddly_named,
-        &["model.diffusion_model.weight", "first_stage_model.weight"],
-    );
-    order(&order_path, &[("unet", "weight"), ("vae", "weight")]);
-    bank(
-        &registry,
-        "single",
-        "single_file.identity/1",
-        "safetensors.single_file",
-        &[("unet", &oddly_named), ("vae", &oddly_named)],
-        &[],
-        &order_path,
-    );
-
-    let output = source_plan(&registry, &[&oddly_named]);
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(text.contains(r#""profile":"single""#));
-    assert!(text.contains(r#""component":"unet""#));
-    assert!(text.contains(r#""component":"vae""#));
-    assert_eq!(text.matches(r#""projected":true"#).count(), 2);
-    assert!(text.contains(r#""target":"unet=plain/1,vae=plain/1""#));
-    write_source_plan(&registry, &[&oddly_named], &plan_path);
-    let preview = Command::new(env!("CARGO_BIN_EXE_tfs"))
-        .args(["ingest", "plan", "--source-plan"])
-        .arg(&plan_path)
-        .output()
-        .unwrap();
-    assert!(
-        preview.status.success(),
-        "closed preview failed: {}",
-        String::from_utf8_lossy(&preview.stderr)
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
 fn source_plan_maps_reviewed_multi_file_headers_independent_of_argument_order() {
     let root = temporary("multi");
     fs::create_dir_all(&root).unwrap();

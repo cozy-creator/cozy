@@ -37,10 +37,7 @@ use crate::storage::{self, Census, GcDelete, HeldKey};
 use crate::store::Store;
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {error}", what.as_ref()),
-    }
+    crate::store::classify_io(what, error)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

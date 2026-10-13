@@ -96,10 +96,7 @@ impl TreeRoot {
 }
 
 fn io(e: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("source artifact: {e}"),
-    }
+    crate::store::classify_io("source artifact", e)
 }
 fn directory(store: &Store) -> PathBuf {
     store.root().join("roots/trees")

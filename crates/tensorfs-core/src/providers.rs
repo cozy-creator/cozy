@@ -18,10 +18,9 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, FetchPlan};
 use crate::ids::ObjectRef;
 use crate::jcs::{self, Json};
-use crate::store::{Fault, Store};
+use crate::store::Store;
 use crate::transport::{
-    api_get, fetch_prefix, fetch_ranged, probe_length, CredentialProvider, Deadline, Ledger,
-    Ranged, SourcePolicy,
+    api_get, fetch_prefix, probe_length, CredentialProvider, Deadline, Ledger, SourcePolicy,
 };
 
 /// Listing documents are bounded like any other untrusted input.
@@ -236,28 +235,6 @@ fn digest64(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
     let lower = lower.strip_prefix("sha256:").unwrap_or(&lower);
     (lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit())).then(|| lower.to_string())
-}
-
-/// List what one pinned source reaches: every member with the identity the provider
-/// declares. Bounded, policy-fenced, credentialed through the trait.
-pub fn list(
-    uri: &SourceUri,
-    endpoints: &Endpoints,
-    credentials: &dyn CredentialProvider,
-    deadline: Deadline,
-) -> Result<Vec<SourceMember>> {
-    let ledger = Ledger::new();
-    list_observed(uri, endpoints, credentials, deadline, &ledger)
-}
-
-fn list_observed(
-    uri: &SourceUri,
-    endpoints: &Endpoints,
-    credentials: &dyn CredentialProvider,
-    deadline: Deadline,
-    ledger: &Ledger,
-) -> Result<Vec<SourceMember>> {
-    list_selected_observed(uri, endpoints, credentials, deadline, ledger, None, None)
 }
 
 /// `unnameable`, when given, collects tensor carriers whose paths are outside the member
@@ -495,136 +472,6 @@ pub struct Pulled {
     pub object: ObjectRef,
     pub transferred: u64,
     pub held: bool,
-}
-
-/// Fetch and ingest one pinned foreign source: list, resolve exact identities, split the
-/// declared set against the real store, move only `wanted` through the one transport, and
-/// hash-then-admit the members the provider does not identify. The warm half of th-124:
-/// a store that already holds the weights answers with zero transferred bytes.
-pub fn pull(
-    store: &Store,
-    uri: &SourceUri,
-    endpoints: &Endpoints,
-    credentials: &dyn CredentialProvider,
-    deadline: Deadline,
-    progress: &mut dyn FnMut(&str, u64),
-) -> Result<Vec<Pulled>> {
-    let policy = endpoints.policy(uri);
-    // One liveness ledger for the whole pull: the stall judgment learns this link's own
-    // pace across listings, probes and members alike.
-    let ledger = Ledger::new();
-    let members = list_observed(uri, endpoints, credentials, deadline, &ledger)?;
-
-    // Exact identities first: a Civitai listing declares a digest but only approximate
-    // kilobytes, so the exact length comes from a one-byte ranged probe.
-    let mut pinned: Vec<(SourceMember, ObjectRef)> = Vec::new();
-    let mut unpinned: Vec<SourceMember> = Vec::new();
-    for member in members {
-        match (&member.sha256, member.length) {
-            (Some(sha256), Some(length)) if length > 0 => {
-                let object = ObjectRef {
-                    sha256: sha256.clone(),
-                    length,
-                };
-                pinned.push((member, object));
-            }
-            (Some(sha256), _) => {
-                let length = probe_length(&member.url, &policy, credentials, deadline, &ledger)?;
-                if length == 0 {
-                    return refuse(
-                        Code::LENGTH_MISMATCH,
-                        format!("{}: origin reports a zero-length member", member.member),
-                    );
-                }
-                let object = ObjectRef {
-                    sha256: sha256.clone(),
-                    length,
-                };
-                pinned.push((member, object));
-            }
-            (None, _) => unpinned.push(member),
-        }
-    }
-
-    let mut declared: Vec<ObjectRef> = pinned.iter().map(|(_, object)| object.clone()).collect();
-    declared.sort_by(|left, right| left.sha256.cmp(&right.sha256));
-    declared.dedup_by(|left, right| left.sha256 == right.sha256);
-    let mut pulled = Vec::new();
-    if !declared.is_empty() {
-        let (plan, _) = FetchPlan::of_objects(store, "source-pull", &declared)?;
-        for (member, object) in &pinned {
-            if plan.wants(&object.sha256) {
-                let grant = DeliveryGrant::mint(&plan, object)?;
-                // A source member is whatever the uploader pushed, up to gigabytes: it is
-                // asked for as parallel ranges, or whole if the origin will not range.
-                let fetched = fetch_ranged(
-                    store,
-                    &grant,
-                    &member.url,
-                    &policy,
-                    credentials,
-                    deadline,
-                    &ledger,
-                    Ranged::default(),
-                    Some(&mut |current| progress(&member.member, current)),
-                )?;
-                pulled.push(Pulled {
-                    member: member.member.clone(),
-                    object: object.clone(),
-                    transferred: fetched.transferred,
-                    held: false,
-                });
-            } else {
-                pulled.push(Pulled {
-                    member: member.member.clone(),
-                    object: object.clone(),
-                    transferred: 0,
-                    held: true,
-                });
-            }
-        }
-        plan.complete(store)?;
-    }
-
-    // Members without a provider digest (HuggingFace non-LFS: configs, tokenizers) are
-    // fetched whole, hashed, and admitted at the identity the bytes computed. They cannot
-    // be planned HELD without an identity, so they re-fetch — bounded and small by git's
-    // own rules.
-    for member in &unpinned {
-        let cap = member
-            .length
-            .map_or(UNPINNED_MEMBER_MAX_BYTES, |declared_length| declared_length);
-        if cap > UNPINNED_MEMBER_MAX_BYTES {
-            return refuse(
-                Code::SIZE_CAP,
-                format!(
-                    "{}: an unidentified member may not exceed {UNPINNED_MEMBER_MAX_BYTES} bytes",
-                    member.member
-                ),
-            );
-        }
-        let (body, _) = api_get(&member.url, &policy, credentials, cap, deadline, &ledger)?;
-        if member
-            .length
-            .is_some_and(|declared_length| declared_length != body.len() as u64)
-        {
-            return refuse(
-                Code::LENGTH_MISMATCH,
-                format!("{}: body length disagrees with the listing", member.member),
-            );
-        }
-        let object = ObjectRef::of(&body);
-        store.put_stream(&mut body.as_slice(), Some(&object), &Fault::default())?;
-        progress(&member.member, object.length);
-        pulled.push(Pulled {
-            member: member.member.clone(),
-            object,
-            transferred: body.len() as u64,
-            held: false,
-        });
-    }
-    pulled.sort_by(|left, right| left.member.cmp(&right.member));
-    Ok(pulled)
 }
 
 // ---------------------------------------------------------------------------- resolution
@@ -1605,7 +1452,16 @@ pub fn resolve_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{Anonymous, Deadline, HostToken};
+    use crate::transport::{Anonymous, Deadline, ScopedHeaders};
+
+    fn list(
+        uri: &SourceUri,
+        endpoints: &Endpoints,
+        credentials: &dyn CredentialProvider,
+        deadline: Deadline,
+    ) -> Result<Vec<SourceMember>> {
+        list_selected_observed(uri, endpoints, credentials, deadline, &Ledger::new(), None, None)
+    }
     use std::io::{BufRead, Write as IoWrite};
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -1621,7 +1477,6 @@ mod tests {
 
     struct Request {
         path: String,
-        range: Option<String>,
     }
 
     type RequestLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
@@ -1643,7 +1498,6 @@ mod tests {
                 reader.read_line(&mut line).unwrap();
                 let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let mut authorization = None;
-                let mut range = None;
                 loop {
                     let mut header = String::new();
                     reader.read_line(&mut header).unwrap();
@@ -1655,12 +1509,9 @@ mod tests {
                     if let Some(value) = lower.strip_prefix("authorization: ") {
                         authorization = Some(value.to_string());
                     }
-                    if let Some(value) = lower.strip_prefix("range: ") {
-                        range = Some(value.to_string());
-                    }
                 }
                 log.lock().unwrap().push((path.clone(), authorization));
-                let response = handler(&Request { path, range });
+                let response = handler(&Request { path });
                 socket.write_all(&response).unwrap();
                 let _ = socket.flush();
             }
@@ -1708,114 +1559,6 @@ mod tests {
                 "{bad}"
             );
         }
-    }
-
-    #[test]
-    fn huggingface_lists_pulls_and_then_holds() {
-        let root = temporary("hf");
-        let store = Store::init(&root).unwrap();
-        let weights: Vec<u8> = (0u32..80_000).flat_map(|i| i.to_le_bytes()).collect();
-        let weights_ref = ObjectRef::of(&weights);
-        let config = b"{\"model_type\":\"test\"}".to_vec();
-        let revision = "ab".repeat(20);
-        let tree = format!(
-            r#"[
-  {{"type":"file","path":"model.safetensors","size":{},"oid":"deadbeef","lfs":{{"oid":"{}","size":{}}}}},
-  {{"type":"file","path":"config.json","size":{},"oid":"deadbeef"}},
-  {{"type":"directory","path":"scheduler"}}
-]"#,
-            weights_ref.length,
-            weights_ref.sha256,
-            weights_ref.length,
-            config.len()
-        );
-        let weights_body = weights.clone();
-        let config_body = config.clone();
-        let revision_for_routes = revision.clone();
-        // list: tree; pull #1: tree + weights + config; pull #2: tree + config (HELD weights).
-        let (base, seen, handle) = origin(6, move |request| {
-            let r = &revision_for_routes;
-            if request.path == format!("/api/models/org/repo/tree/{r}?recursive=true") {
-                ok_body(tree.as_bytes(), "application/json")
-            } else if request.path == format!("/org/repo/resolve/{r}/model.safetensors") {
-                ok_body(&weights_body, "application/octet-stream")
-            } else if request.path == format!("/org/repo/resolve/{r}/config.json") {
-                ok_body(&config_body, "application/json")
-            } else {
-                panic!("unrouted path {}", request.path)
-            }
-        });
-        let uri = SourceUri::parse(&format!("hf://org/repo@{revision}")).unwrap();
-        let endpoints = Endpoints {
-            huggingface: base.clone(),
-            allow_local: true,
-            ..Endpoints::default()
-        };
-        let credentials = HostToken {
-            hosts: vec!["127.0.0.1".into()],
-            token: "hf_secret".into(),
-        };
-
-        let listed = list(&uri, &endpoints, &credentials, Deadline::none()).unwrap();
-        assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].member, "config.json");
-        assert_eq!(listed[0].sha256, None);
-        assert_eq!(
-            listed[1].sha256.as_deref(),
-            Some(weights_ref.sha256.as_str())
-        );
-
-        let first = pull(
-            &store,
-            &uri,
-            &endpoints,
-            &credentials,
-            Deadline::none(),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        assert_eq!(first.len(), 2);
-        let weights_row = first
-            .iter()
-            .find(|row| row.member == "model.safetensors")
-            .unwrap();
-        assert_eq!(weights_row.object, weights_ref);
-        assert_eq!(weights_row.transferred, weights_ref.length);
-        assert!(!weights_row.held);
-        let config_row = first
-            .iter()
-            .find(|row| row.member == "config.json")
-            .unwrap();
-        assert_eq!(config_row.object, ObjectRef::of(&config));
-        assert!(store.record_valid(&weights_ref.sha256).is_ok());
-
-        // Warm: the weights are HELD and move nothing; the digestless config re-fetches.
-        let second = pull(
-            &store,
-            &uri,
-            &endpoints,
-            &credentials,
-            Deadline::none(),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        let weights_row = second
-            .iter()
-            .find(|row| row.member == "model.safetensors")
-            .unwrap();
-        assert!(weights_row.held);
-        assert_eq!(weights_row.transferred, 0);
-
-        // The bearer reached every loopback request, because the token is scoped to the
-        // host that was actually asked.
-        let log = seen.lock().unwrap();
-        assert_eq!(log.len(), 6);
-        assert!(log
-            .iter()
-            .all(|(_, authorization)| authorization.as_deref() == Some("bearer hf_secret")));
-        drop(log);
-        handle.join().unwrap();
-        let _ = std::fs::remove_dir_all(root);
     }
 
     // ------------------------------------------------------------------ resolution (tfs-067)
@@ -2349,7 +2092,7 @@ mod tests {
         let root = temporary("civitai-member");
         let store = Store::init(&root).unwrap();
         store
-            .put_stream(&mut body.as_slice(), Some(&object), &Fault::default())
+            .put_stream(&mut body.as_slice(), Some(&object), &crate::store::Fault::default())
             .unwrap();
         let tree = content_manifest(&resolved).unwrap();
         let owner = ObjectRef::of(b"civitai-member-owner").id();
@@ -2484,9 +2227,9 @@ mod tests {
             ..Endpoints::default()
         };
         // Scoped to a host this resolution never speaks to: nothing may present it.
-        let elsewhere = HostToken {
+        let elsewhere = ScopedHeaders {
             hosts: vec!["cdn.example.invalid".into()],
-            token: "hf_secret".into(),
+            headers: vec![("authorization".into(), "Bearer hf_secret".into())],
         };
         let resolved = resolve(&uri, &endpoints, &elsewhere, Deadline::none()).unwrap();
         assert_eq!(resolved.members.len(), 2);
@@ -2498,73 +2241,6 @@ mod tests {
             "a token scoped to another host must never be presented"
         );
         handle.join().unwrap();
-    }
-
-    #[test]
-    fn civitai_probes_exact_length_and_holds_when_warm() {
-        let root = temporary("civitai");
-        let store = Store::init(&root).unwrap();
-        let body: Vec<u8> = (0u32..70_000).flat_map(|i| i.to_le_bytes()).collect();
-        let object = ObjectRef::of(&body);
-        // No downloadUrl in the fixture: the handler must fall back to the provider's
-        // canonical download route under the configured base.
-        let listing = format!(
-            r#"{{"id":777,"files":[{{"id":92696,"name":"model.safetensors","sizeKB":273.4,"hashes":{{"SHA256":"{}"}}}}]}}"#,
-            object.sha256.to_ascii_uppercase()
-        );
-        let payload = body.clone();
-        let length = object.length;
-        // pull #1: listing + probe + body; pull #2: listing + probe (object HELD).
-        let (base, _, handle) = origin(5, move |request| {
-            if request.path == "/api/v1/model-versions/777" {
-                ok_body(listing.as_bytes(), "application/json")
-            } else if request.path == "/api/download/models/777?fileId=92696" {
-                if request.range.as_deref() == Some("bytes=0-0") {
-                    format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/{length}\r\nETag: \"tag\"\r\nConnection: close\r\n\r\n\0"
-                    )
-                    .into_bytes()
-                } else {
-                    ok_body(&payload, "application/octet-stream")
-                }
-            } else {
-                panic!("unrouted path {}", request.path)
-            }
-        });
-        let uri = SourceUri::parse("civitai://777").unwrap();
-        let endpoints = Endpoints {
-            civitai: base.clone(),
-            allow_local: true,
-            ..Endpoints::default()
-        };
-        // pull #1: listing + one-byte length probe + full body. The listing carried a
-        // digest and kilobytes; the probe turned that into an exact ObjectRef.
-        let pulled = pull(
-            &store,
-            &uri,
-            &endpoints,
-            &Anonymous,
-            Deadline::none(),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        assert_eq!(pulled[0].object, object);
-        assert_eq!(pulled[0].transferred, object.length);
-        assert!(store.record_valid(&object.sha256).is_ok());
-        // Warm: listing + probe again, zero bytes moved.
-        let warm = pull(
-            &store,
-            &uri,
-            &endpoints,
-            &Anonymous,
-            Deadline::none(),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        assert!(warm[0].held);
-        assert_eq!(warm[0].transferred, 0);
-        handle.join().unwrap();
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

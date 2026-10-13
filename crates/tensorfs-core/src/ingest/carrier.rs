@@ -26,10 +26,7 @@ use crate::jcs::{self, Json};
 use crate::limits;
 
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {e}", what.as_ref()),
-    }
+    crate::store::classify_io(what, e)
 }
 
 fn kind(v: &Json) -> &'static str {

@@ -18,10 +18,7 @@ use crate::sha256::{self, Sha256};
 use crate::store::{Fault, Store};
 
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {e}", what.as_ref()),
-    }
+    crate::store::classify_io(what, e)
 }
 
 /// A reader that hashes what passes through it — the whole-part digest costs no second pass.

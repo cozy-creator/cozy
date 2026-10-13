@@ -332,10 +332,7 @@ fn digest(parts: &[&str]) -> String {
 /// length prefix and header.
 fn local_head(store: &Store, member: &str, object: &ObjectRef) -> Result<Vec<u8>> {
     let mut file = store.open_verified(&object.sha256)?.into_file();
-    let io = |e: std::io::Error| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("read {member}: {e}"),
-    };
+    let io = |e: std::io::Error| crate::store::classify_io(format!("read {member}"), e);
     if member.ends_with(".json") {
         let mut body = Vec::new();
         file.take(crate::limits::DOC_MAX_BYTES as u64 + 1)
@@ -869,10 +866,7 @@ fn document(store: &Store, object: &ObjectRef) -> Result<Vec<u8>> {
         .into_file()
         .take(crate::limits::DOC_MAX_BYTES as u64 + 1)
         .read_to_end(&mut body)
-        .map_err(|e| Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("read {}: {e}", object.id()),
-        })?;
+        .map_err(|e| crate::store::classify_io(format!("read {}", object.id()), e))?;
     Ok(body)
 }
 
