@@ -34,6 +34,14 @@ async def relay(ctx: Context, payload: Relay, tel: Telemetry) -> Relayed:
 app.job(relay)
 
 
+async def relay_served(ctx: Context, payload: Relay) -> Relayed:
+    """A served entrypoint calls another package as a job does."""
+    return Relayed([(await measure(payload=Probe(value, payload.counter))).square for value in payload.values])
+
+
+app.entrypoint(relay_served)
+
+
 async def relay_nested(ctx: Context, payload: Relay) -> Relayed:
     squares = []
     for value in payload.values:

@@ -1,5 +1,6 @@
 //! Jobs and their child runs. A root job's executor holds its GPU allocation (`gpu_allocation`)
 //! until exit or `Context.release_gpus()`; an accelerator job also keeps its own GPU.
+//! A served call (`gpu_service`, or `call` here) is a `Caller` too: its children share its GPU.
 //! Each call it makes to one of its package's invocables arrives on the seam (`child_call`)
 //! and becomes a run of its own, `<parent>/<call_index>`, under the parent's signer: same
 //! records, dispatched like any run, canceled with the parent. A child's result and files
@@ -119,6 +120,35 @@ impl Parent {
     }
 }
 
+/// An attempt that may call (a job's or a served call's): its calls' record, kept for the
+/// nudges while it lives.
+pub(crate) struct Caller {
+    jobs: Arc<Jobs>,
+    parent: Arc<Parent>,
+}
+impl Caller {
+    /// One of its attempt's call frames: a child call, poll, cancel, prefetch or GPU release.
+    pub(crate) fn seam(&self, frame: &Frame) -> io::Result<(Answer, Option<File>)> {
+        self.jobs.seam(&self.parent, frame)
+    }
+    /// Its executor is still while a call it waits on runs: that call's executor is watched.
+    pub(crate) fn waits(&self, engine: &Arc<Engine>) -> crate::process::Waits {
+        let (parent, engine) = (self.parent.clone(), engine.clone());
+        Arc::new(move || parent.unfinished(&engine))
+    }
+}
+impl Drop for Caller {
+    fn drop(&mut self) {
+        self.jobs.parents.lock().unwrap().remove(&self.parent.id);
+    }
+}
+
+/// What a served package's executor may call, sent on its Start (`interface`: its App's
+/// interface beside the executor).
+pub(crate) fn call_interfaces(held: &HeldGeneration, interface: &Path) -> Vec<CallInterface> {
+    invocables(&held.record, &held.record.application, &held.record.interface, interface).0
+}
+
 #[derive(Default)]
 struct Calls {
     /// The parent's nudge socket (`child_events`): a byte when one of its calls may have moved.
@@ -213,6 +243,11 @@ impl Jobs {
         Ok(jobs)
     }
 
+    /// `id`'s attempt waits on a call it made.
+    pub(crate) fn waiting(&self, engine: &Engine, id: &str) -> bool {
+        self.parents.lock().unwrap().get(id).is_some_and(|parent| parent.unfinished(engine))
+    }
+
     /// Whether this record runs here: a job, or a call that needs no GPU.
     pub fn takes(record: &Execution) -> bool {
         record.invocation.job
@@ -257,9 +292,7 @@ impl Jobs {
                 Err(error) => settle(&engine, &id, error),
                 Ok(()) => Ok(()),
             };
-            if job {
-                jobs.ended(&id);
-            }
+            jobs.ended(&id);
             settled.and(result)
         })
     }
@@ -397,42 +430,8 @@ impl Jobs {
         let spool = self.spool(&executor, id)?;
         let scratch = self.scratch(id)?;
         let inputs = stage_inputs(&self.store, self.identity, &spool, &record.invocation.inputs)?;
-        let (call_interfaces, callables) =
-            invocables(&held.record, &application, &document, &interface);
-        let serving = call_interfaces
-            .iter()
-            .filter(|row| !row.self_call && row.kind == "entrypoint")
-            .map(|row| (row.module.clone(), row.export.clone()))
-            .collect();
-        let parent = Arc::new(Parent {
-            id: id.into(),
-            request: record
-                .submission
-                .as_ref()
-                .map_or_else(|| id.to_string(), |s| s.request_id.clone()),
-            actor: record
-                .submission
-                .as_ref()
-                .map(|s| s.actor.clone())
-                .unwrap_or_default(),
-            spool: spool.clone(),
-            callables,
-            pure: declarations(&document).any(|(declared, entry, kind)| {
-                kind == "job"
-                    && entry["name"].as_str() == Some(record.invocation.entrypoint.as_str())
-                    && declared["memoize"].as_bool() == Some(true)
-            }),
-            pure_callables: pure_callables(&held.record),
-            serving,
-            inputs: record.invocation.inputs.clone(),
-            calls: Mutex::new(Calls::default()),
-        });
-        self.parents
-            .lock()
-            .unwrap()
-            .insert(id.into(), parent.clone());
-        let (waiting, journal) = (parent.clone(), engine.clone());
-        executor.waits = Some(Arc::new(move || waiting.unfinished(&journal)));
+        let (caller, call_interfaces) = self.caller(&record, &held, &document, &interface, &spool);
+        executor.waits = Some(caller.waits(engine));
         let (grant, models) = self.weights_grant(engine, &record, &document, &spool)?;
         let mut services = Seam {
             engine,
@@ -441,7 +440,7 @@ impl Jobs {
             spool: &spool,
             completed: 0,
             publish: true,
-            job: Some((self, &parent)),
+            job: Some(&caller),
             appended: HashMap::new(),
             weights: Some((&self.weights, &grant)),
         };
@@ -464,15 +463,52 @@ impl Jobs {
         };
         // A command over the control frame fails its run by name; the executor never sees it.
         if let Some(why) = oversized(&command) {
-            self.parents.lock().unwrap().remove(id);
             executor.shutdown()?;
             let failure = Failure::executor("refused", "runtime", "job_command_too_large", &why);
             return engine.finish(id, Outcome::Failed(failure)).map(drop);
         }
         let reply = executor.command(&command, &mut services);
-        self.parents.lock().unwrap().remove(id);
+        drop(caller);
         conclude(engine, id, &executor, &spool, command_ok(reply?)?)?;
         executor.shutdown()
+    }
+
+    /// `record`'s attempt as a caller of its environment's callables (`document`: its App's
+    /// interface, at `interface` beside its executor), and the call interfaces it is sent.
+    pub(crate) fn caller(
+        self: &Arc<Self>,
+        record: &Execution,
+        held: &HeldGeneration,
+        document: &Value,
+        interface: &Path,
+        spool: &Path,
+    ) -> (Caller, Vec<CallInterface>) {
+        let (rows, callables) = invocables(&held.record, &record.invocation.module, document, interface);
+        let serving = rows
+            .iter()
+            .filter(|row| !row.self_call && row.kind == "entrypoint")
+            .map(|row| (row.module.clone(), row.export.clone()))
+            .collect();
+        let kind = if record.invocation.job { "job" } else { "entrypoint" };
+        let submission = record.submission.as_ref();
+        let parent = Arc::new(Parent {
+            id: record.id.clone(),
+            request: submission.map_or_else(|| record.id.clone(), |s| s.request_id.clone()),
+            actor: submission.map(|s| s.actor.clone()).unwrap_or_default(),
+            spool: spool.into(),
+            callables,
+            pure: declarations(document).any(|(declared, entry, declared_kind)| {
+                declared_kind == kind
+                    && entry["name"].as_str() == Some(record.invocation.entrypoint.as_str())
+                    && declared["memoize"].as_bool() == Some(true)
+            }),
+            pure_callables: pure_callables(&held.record),
+            serving,
+            inputs: record.invocation.inputs.clone(),
+            calls: Mutex::new(Calls::default()),
+        });
+        self.parents.lock().unwrap().insert(record.id.clone(), parent.clone());
+        (Caller { jobs: self.clone(), parent }, rows)
     }
 
     /// The job attempt's weights grant: its model inputs as sources (and as the executor's
@@ -529,6 +565,8 @@ impl Jobs {
         let (interface, application, document) =
             self.interface(&executor, &held, &record.invocation.module)?;
         let spool = self.spool(&executor, id)?;
+        let (caller, call_interfaces) = self.caller(&record, &held, &document, &interface, &spool);
+        executor.waits = Some(caller.waits(engine));
         let mut services = Seam {
             engine,
             id,
@@ -537,7 +575,7 @@ impl Jobs {
             completed: 0,
             // A child's products show nothing; its parent decides.
             publish: record.invocation.parent.is_empty(),
-            job: None,
+            job: Some(&caller),
             appended: HashMap::new(),
             weights: None,
         };
@@ -548,6 +586,7 @@ impl Jobs {
                 package_interface: interface.clone(),
                 sequence_parallel_degree: 1,
                 import_only: false,
+                call_interfaces,
             },
             &mut services,
         )?)?;
@@ -726,7 +765,7 @@ impl Jobs {
     }
 
     /// Every unfinished child of `parent` follows its stop: held (`hold`), else canceled.
-    fn stop_children(&self, parent: &str, hold: bool) {
+    pub(crate) fn stop_children(&self, parent: &str, hold: bool) {
         let Some(service) = self.service.upgrade() else {
             return;
         };
@@ -738,18 +777,20 @@ impl Jobs {
         }
     }
 
-    /// The job's root has stopped: its children follow, and unless it rests paused its
-    /// children prepare no more. A root that is queued again runs again and nothing ends: it
-    /// was deferred before it started, or resumed since this attempt stopped (its next
-    /// attempt waits for this thread, `Engine::dispatch_managed`). The run is read once: a
-    /// resume between two reads would cancel the children its next attempt needs.
-    fn ended(&self, id: &str) {
+    /// A run's attempt has stopped (a job's or a call's): its children follow, and unless it
+    /// rests paused its children prepare no more. A root that is queued again runs again and
+    /// nothing ends: it was deferred before it started, or resumed since this attempt stopped
+    /// (its next attempt waits for this thread, `Engine::dispatch_managed`). The run is read
+    /// once: a resume between two reads would cancel the children its next attempt needs.
+    pub(crate) fn ended(&self, id: &str) {
         let Some(service) = self.service.upgrade() else {
             return;
         };
         let record = service.engine.get(id).ok();
-        if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
-            eprintln!("canceled native outputs: {error}");
+        if record.as_ref().is_some_and(|r| r.invocation.job) {
+            if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
+                eprintln!("canceled native outputs: {error}");
+            }
         }
         if record.as_ref().is_some_and(|r| r.state == State::Queued) {
             return;
@@ -792,15 +833,18 @@ impl Jobs {
         }
     }
 
-    /// A cancel reached a job with no root running (paused or queued): its children end too.
+    /// A cancel reached a run with no attempt running (paused or queued): its children end too.
     pub fn canceled(&self, record: &Execution) {
-        if record.invocation.job && record.cancel_actor.is_some() {
-            if let Some(service) = self.service.upgrade() {
-                if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
-                    eprintln!("canceled native outputs: {error}");
-                }
+        if record.cancel_actor.is_none() {
+            return;
+        }
+        if let (true, Some(service)) = (record.invocation.job, self.service.upgrade()) {
+            if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
+                eprintln!("canceled native outputs: {error}");
             }
-            if record.state.terminal() { self.ended(&record.id); }
+        }
+        if record.state.terminal() {
+            self.ended(&record.id);
         }
     }
 
@@ -1112,6 +1156,39 @@ impl Jobs {
     }
 }
 
+/// One progress frame of run `id`'s executor: a package log line, or its stage (with the
+/// download bytes of the child call it relays, when it is one).
+pub(crate) fn observe(engine: &Engine, id: &str, completed: &mut u64, frame: &Frame, caller: Option<&Caller>) {
+    if !(frame.request_id.is_empty() || frame.request_id == id) {
+        return;
+    }
+    if let Some((level, text)) = frame.log() {
+        let _ = engine.append_package_log(id, level, &text);
+        return;
+    }
+    if frame.stage.is_empty() {
+        return;
+    }
+    // Zero-advance frames are telemetry (stage/position), not completed work.
+    *completed = completed.saturating_add(frame.advance);
+    let mut payload = json!({"stage": frame.stage.chars().take(120).collect::<String>(), "step_ms": frame.step_ms.unwrap_or(0.0)});
+    for (name, value) in [
+        ("stage_fraction", frame.stage_fraction.map(Value::from)),
+        ("overall_fraction", frame.overall_fraction.map(Value::from)),
+        ("position", frame.position.map(Value::from)),
+        ("total", frame.total.map(Value::from)),
+    ] {
+        if let Some(value) = value {
+            payload[name] = value;
+        }
+    }
+    let call = frame.call_request.as_deref().filter(|call| !call.is_empty());
+    if let Some((done, total)) = caller.zip(call).and_then(|(caller, call)| caller.parent.child_bytes(engine, call)) {
+        (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
+    }
+    let _ = engine.observe_progress(id, *completed, payload.to_string());
+}
+
 /// Every executor exchange of one job or child run.
 struct Seam<'a> {
     engine: &'a Arc<Engine>,
@@ -1121,7 +1198,7 @@ struct Seam<'a> {
     completed: u64,
     /// A job's products show to its owner; a child's do not (its parent publishes).
     publish: bool,
-    job: Option<(&'a Arc<Jobs>, &'a Arc<Parent>)>,
+    job: Option<&'a Caller>,
     /// This attempt's list items per output: a resumed job's replay adds no duplicates.
     appended: HashMap<String, usize>,
     /// A job's weights broker and this attempt's grant.
@@ -1129,36 +1206,7 @@ struct Seam<'a> {
 }
 impl Services for Seam<'_> {
     fn progress(&mut self, frame: &Frame) {
-        if !(frame.request_id.is_empty() || frame.request_id == self.id) {
-            return;
-        }
-        if let Some((level, text)) = frame.log() {
-            let _ = self.engine.append_package_log(self.id, level, &text);
-            return;
-        }
-        if frame.stage.is_empty() {
-            return;
-        }
-        self.completed = self.completed.saturating_add(frame.advance);
-        let mut payload = json!({"stage": frame.stage.chars().take(120).collect::<String>(), "step_ms": frame.step_ms.unwrap_or(0.0)});
-        for (name, value) in [
-            ("stage_fraction", frame.stage_fraction.map(Value::from)),
-            ("overall_fraction", frame.overall_fraction.map(Value::from)),
-            ("position", frame.position.map(Value::from)),
-            ("total", frame.total.map(Value::from)),
-        ] {
-            if let Some(value) = value {
-                payload[name] = value;
-            }
-        }
-        // A child's stage the job relays (the Runtime relays no bytes) carries its download's.
-        let call = frame.call_request.as_deref().filter(|call| !call.is_empty());
-        if let Some((done, total)) = self.job.zip(call).and_then(|((_, parent), call)| parent.child_bytes(self.engine, call)) {
-            (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
-        }
-        let _ = self
-            .engine
-            .observe_progress(self.id, self.completed, payload.to_string());
+        observe(self.engine, self.id, &mut self.completed, frame, self.job);
     }
     fn request(
         &mut self,
@@ -1195,7 +1243,7 @@ impl Services for Seam<'_> {
                 }
                 Ok((answer, channel))
             }
-            (_, Some((jobs, parent))) => jobs.seam(parent, frame),
+            (_, Some(caller)) => caller.seam(frame),
             _ => Ok((Answer::unavailable(frame.seq), None)),
         }
     }

@@ -1456,6 +1456,7 @@ print(json.dumps({"identity": generation.identity}))
                             package_interface: interface.clone(),
                             sequence_parallel_degree: 1,
                             import_only: false,
+                            call_interfaces: vec![],
                         },
                     )?;
                     command(

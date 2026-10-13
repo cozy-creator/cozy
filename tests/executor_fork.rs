@@ -66,6 +66,7 @@ fn start(generation: &Generation, interface: &Path, import_only: bool) -> Device
         package_interface: interface.to_path_buf(),
         sequence_parallel_degree: 1,
         import_only,
+        call_interfaces: vec![],
     }
 }
 

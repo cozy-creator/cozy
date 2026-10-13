@@ -2138,13 +2138,25 @@ mod v1_api {
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
         assert_eq!(result["squares"], serde_json::json!([9, 16]));
         assert_eq!(fs::read_to_string(&counter).unwrap(), "4");
+        // A served entrypoint calls children as a job does: each a child run that truly runs.
+        let mut served = spec.clone();
+        (served.kind, served.entrypoint) = (v1::RunKind::Call as i32, "relay_served".into());
+        served.payload = serde_json::to_vec(&serde_json::json!({"values": [5, 6], "counter": counter})).unwrap();
+        let events = collect(client.run(authorized(v1::RunRequest {
+            id: "relay-served".into(), after: 0, spec: Some(served),
+        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["squares"], serde_json::json!([25, 36]));
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "6");
         let mut restricted = spec;
         restricted.entrypoint = "relay_restricted".into();
         let events = collect(client.run(authorized(v1::RunRequest {
             id: "relay-restricted".into(), after: 0, spec: Some(restricted),
         }, &all)).await.unwrap().into_inner()).await.unwrap();
         assert_eq!(outcome(&events).status, "failed", "{events:?}");
-        assert_eq!(fs::read_to_string(&counter).unwrap(), "4", "a foreign internal export must run no effects");
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "6", "a foreign internal export must run no effects");
         // A published release's environment is described the same way, inside it.
         let python = fs::read_dir(machine.root.join("state/generations"))
             .unwrap()

@@ -90,8 +90,8 @@ pub struct Runs {
     pub own_hub: Option<hub::Source>,
     /// This machine's TLS leaf key: it trades a run's capability for its token.
     pub leaf: Option<Arc<hub::Leaf>>,
-    /// Unfinished jobs' preparation: their children prepare with it. Provider tokens live only
-    /// here; the rest is journaled too (`Durable`), for a paused job resumed after a restart.
+    /// Unfinished runs' preparation: their children prepare with it. Provider tokens live only
+    /// here; a job's is journaled too (`Durable`), for a paused job resumed after a restart.
     pub jobs: Mutex<HashMap<String, JobContext>>,
 }
 
@@ -728,8 +728,13 @@ impl Runs {
             Memo::Unmet(why) => (CallMemo { unmemoized: why, ..Default::default() }, None),
             Memo::Off => (CallMemo::default(), None),
         };
-        if spec.job && answer.is_none() {
-            let inputs = self.job_inputs(&spec, &installation.package, &interface, hub.as_ref(), &*observe, &stoppable.stop)?;
+        // Its children prepare with its context (a served call's too); a job's is journaled,
+        // for its resume.
+        if answer.is_none() {
+            let inputs = match spec.job {
+                true => self.job_inputs(&spec, &installation.package, &interface, hub.as_ref(), &*observe, &stoppable.stop)?,
+                false => BTreeMap::new(),
+            };
             let context = JobContext {
                 installation: installation.alias.clone(),
                 application: spec.application.clone(),
@@ -743,10 +748,12 @@ impl Runs {
                 inputs,
                 weights_destination: spec.weights_destination.clone(),
             };
-            let durable = serde_json::to_vec(&Durable::of(&context)).map_err(io::Error::other)?;
-            self.service
-                .engine
-                .with_journal(|journal| journal.bind_job_context(id, &durable))?;
+            if spec.job {
+                let durable = serde_json::to_vec(&Durable::of(&context)).map_err(io::Error::other)?;
+                self.service
+                    .engine
+                    .with_journal(|journal| journal.bind_job_context(id, &durable))?;
+            }
             self.jobs.lock().unwrap().insert(id.into(), context);
         }
         self.service.bind_prepared(

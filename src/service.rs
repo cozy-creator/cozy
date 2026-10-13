@@ -447,14 +447,16 @@ impl Service {
         let mut claims = vec![None; gpu.as_ref().map_or(0, |gpu| gpu.width())];
         // Started roots not bound to a lane yet: each keeps its place ahead of younger runs.
         let mut pending = gpu.as_ref().map(|gpu| gpu.pending()).unwrap_or_default().into_iter().peekable();
-        // A job mostly waits on its children; only they take CPU room.
+        let jobs = self.jobs.lock().unwrap().clone();
+        // A job mostly waits on its children, and a call waiting on its own takes none:
+        // only they take CPU room.
+        let waits = |r: &Execution| jobs.as_ref().is_some_and(|jobs| jobs.waiting(&self.engine, &r.id));
         let mut room = self.parallelism.saturating_sub(
             active
                 .iter()
-                .filter(|r| !is_gpu(r) && !r.invocation.job)
+                .filter(|r| !is_gpu(r) && !r.invocation.job && !waits(r))
                 .count(),
         );
-        let jobs = self.jobs.lock().unwrap().clone();
         // A queued job needs no room, so with jobs every ready record is looked at.
         if room == 0 && (gpu_fenced || gpu.is_none()) && jobs.is_none() {
             return Ok(());
@@ -515,7 +517,7 @@ impl Service {
                         )
                     })?;
                 let held = held.application(&record.invocation.module)?;
-                gpu.dispatch(&self.engine, &record, held, gpu.plan(&preparation)?, &mut claims)?;
+                gpu.dispatch(&self.engine, &record, held, gpu.plan(&preparation)?, &mut claims, jobs.clone())?;
             }
             if room == 0 && jobs.is_none() && (gpu_fenced || claims.iter().all(Option::is_some)) {
                 return Ok(());
