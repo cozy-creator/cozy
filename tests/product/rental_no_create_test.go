@@ -89,10 +89,15 @@ func TestRentalNoCreateStartupReconcilesStaleAcquiringRow(t *testing.T) {
 	if len(inventory.Rentals)+len(inventory.Unrecorded)+len(inventory.Pending) != 0 || inventory.MachinesRunning != 0 || inventory.HourlySpendUSDMicros != 0 {
 		t.Fatalf("stale failed acquisition remains active: %s", response.Body)
 	}
+	// The Hub proved the pod absent: the row leaves this host's books, its history stays at the Hub.
 	row, problem := st.RentalRow("pr-no-create-stale")
 	fatal(t, problem)
-	if row == nil || row.State != "failed" || row.Failure.Code != "provider_create_did_not_happen" {
-		t.Fatalf("startup did not preserve failure history: %+v", row)
+	if row != nil {
+		t.Fatalf("startup kept a rental the Hub failed: %+v", row)
+	}
+	if code, out := runCozy(t, root, "rental", "show", "pr-no-create-stale", "--json"); code != 0 ||
+		!strings.Contains(out, "provider_create_did_not_happen") {
+		t.Fatalf("the failure history is not shown [exit %d]: %s", code, out)
 	}
 	if stand.releases("pr-no-create-stale") != 0 {
 		t.Fatal("startup attempted to release a nonexistent pod")

@@ -112,23 +112,34 @@ func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 	if code != 0 || json.Unmarshal([]byte(raw), &listed) != nil || len(listed.Rentals) != 0 {
 		t.Fatalf("typed current fleet retained the failed rental [exit %d]:\n%s", code, raw)
 	}
+	// The Hub proved the pod absent: the row leaves this host's books and the Hub keeps the
+	// diagnosis, which `rental show` reads back.
 	persisted, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	stored, problem := persisted.RentalRow("pr-boot-failed")
 	fatal(t, problem)
-	if stored == nil || stored.State != "failed" || stored.Failure.Code != "container_exited_before_readiness" ||
-		stored.Failure.BaseWorkerImageDigest != "sha256:"+strings.Repeat("a", 64) ||
-		stored.Failure.Provider != "runpod" || stored.Failure.ProviderResourceID != "nuowj42m20y65g" ||
-		stored.Failure.ProviderHostID != "host-7" || stored.Failure.ProviderState != "running" ||
-		stored.Failure.ContainerState != "exited" {
-		t.Fatalf("local records lost the terminal diagnosis: %+v", stored)
+	persisted.Close()
+	if stored != nil {
+		t.Fatalf("the failed rental stayed on the books: %+v", stored)
 	}
-	changed := *stored
+	if code, out := runCozy(t, root, "rental", "show", "pr-boot-failed", "--json"); code != 0 ||
+		!strings.Contains(out, "container_exited_before_readiness") {
+		t.Fatalf("the terminal diagnosis is not shown [exit %d]: %s", code, out)
+	}
+	// A terminal diagnosis, once recorded, is never rewritten.
+	terminal := records.Rental{AcceleratorCount: 1, ID: "pr-boot-failed", MachineName: "yuzuriha", SKU: "gpu-cu130",
+		AcceleratorModel: "L4", HourlyRateUSDMicros: 100_000, State: "failed", Hub: hubURL,
+		Failure: records.RentalFailure{Code: "container_exited_before_readiness", Provider: "runpod",
+			ProviderResourceID: "nuowj42m20y65g", ContainerState: "exited"}}
+	scratch, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+	fatal(t, problem)
+	defer scratch.Close()
+	fatal(t, scratch.RecordRental(terminal))
+	changed := terminal
 	changed.Failure.ProviderResourceID = "another-pod"
-	if problem := persisted.RecordRental(changed); problem == nil || problem.ErrName() != "rental.attach_projection_conflict" {
+	if problem := scratch.RecordRental(changed); problem == nil || problem.ErrName() != "rental.attach_projection_conflict" {
 		t.Fatalf("a changed terminal diagnosis was not refused: %v", problem)
 	}
-	persisted.Close()
 
 	// The same diagnosis also remains the machine-stable error of a rental
 	// acquisition, which is the error a managed run records when its buy fails.

@@ -144,6 +144,10 @@ func (r LiveResolver) Record(live Live) (*records.Rental, *exit.Error) {
 	if remote.Failure != nil {
 		row.Failure.Code, row.Failure.ContainerState = remote.Failure.Code, remote.Failure.ContainerState
 	}
+	// An ended rental's cause is the one its runs settle with: who released it, else its failure.
+	if cause := remote.EndCause(); cause != "" {
+		row.Failure.Code = cause
+	}
 	if row.RentedAt == "" {
 		row.RentedAt = remote.CreatedAt
 	}
