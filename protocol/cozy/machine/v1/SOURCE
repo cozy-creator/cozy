@@ -1,6 +1,6 @@
 repository=https://github.com/cozy-creator/tensord
 path=proto/cozy/machine/v1/machine.proto
-commit=fee260b430fe135946ae565d5b6a258e634eff04
+commit=f9b576e64be043309611372eb113cc2c4cec1a36
 machine.proto=sha256:4653bd7d87cac55358d1ad969ee2424264b290d9ba357055132f96065abd75e1
 machine.pb.go=sha256:f4431e3ec778a7da73918b12bbccd5e147330dbaa57a60382b21ee65351176fc
 machine_grpc.pb.go=sha256:105c6ba7356fc594427b08d8373be940ff57f9713e26dd4885ea5d94acd99e7e
