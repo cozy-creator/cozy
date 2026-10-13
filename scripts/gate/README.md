@@ -1,7 +1,7 @@
 # Matched gate: ComfyUI vs TensorD
 
 `gate.py` drives ordinary `cozy run --rental=<pod> --await` from the controller (or this computer's machine) and writes
-one row per request. Nothing private: the CLI, the daemon and the published packages are the ones the owner uses.
+one row per request. Nothing private: the CLI, Calcifer and the published packages are the ones the owner uses.
 
 ```
 python3 gate.py run manifest.json OUT     # cells (and cycles) per the manifest; append OUT/results.jsonl, OUT/runs/*
@@ -64,7 +64,7 @@ checked not flat (per-channel stddev > 2) and hashed.
 - Wall (the gate's number): new root's birth, or submit, to the image saved and verified on the
   controller. The pod-clock birth is converted with an ssh round-trip offset (error ≤ rtt/2).
 - `machine_s`: the same start to the machine's `machine.outcome` event, both on the pod clock.
-- `result_lag_s`: pod outcome to the client noticing it. The controller's daemon is shared with other
+- `result_lag_s`: pod outcome to the client noticing it. The controller's Calcifer is shared with other
   sessions, so it stalls at times (up to ~47 s seen); this separates that from either arm's machine.
 - Stages: `cozy run show --json --full` per request (executor boot, load, denoise steps, decode).
 - 1 Hz pod sampler: `nvidia-smi` (memory, temperature, SM clock, power, throttle reasons) and the
