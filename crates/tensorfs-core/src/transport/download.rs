@@ -607,9 +607,7 @@ impl Run<'_> {
         let (Some(part), Some(keep)) = (&object.part, self.job.keep) else {
             return Ok(());
         };
-        let before = part.covered();
-        part.record(chunk.unit.0, end, keep.fault)?;
-        keep.landed((part.covered() - before) as i64);
+        keep.landed(part.record(chunk.unit.0, end, keep.fault)? as i64);
         Ok(())
     }
 
@@ -953,9 +951,9 @@ impl Run<'_> {
             if let (Some(part), Some(keep), Code::OBJECT_ID_MISMATCH) =
                 (&object.part, job.keep, refusal.code)
             {
-                keep.landed(-(part.covered() as i64));
-                if let Err(reset) = part.reset() {
-                    return Outcome::Fatal(named(reset, &wanted.id()));
+                match part.reset() {
+                    Ok(forgot) => keep.landed(-(forgot as i64)),
+                    Err(reset) => return Outcome::Fatal(named(reset, &wanted.id())),
                 }
             }
             return Outcome::Fatal(named(refusal, &wanted.id()));

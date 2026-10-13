@@ -421,16 +421,30 @@ fn one_large_member_is_asked_in_chunks_across_streams_and_every_byte_lands_once(
     let origin = Origin::start(vec![(name, bytes)], 12 << 20, |_, _| Act::Serve);
     let dir = root("split");
     let store = Store::init(&dir).unwrap();
+    let reports = Mutex::new(vec![]);
     let rows = materialize(
         &store,
         &owner("split"),
         &origin.resolution(&[name]),
         &options(MIB, 8),
-        &|_, _| {},
+        &|present, whole| reports.lock().unwrap().push((present, whole)),
     )
     .unwrap();
     verify(&store, &origin, &[name]);
     assert_eq!(rows[0].transferred, length, "a byte was written twice");
+    // Chunks landing side by side are each counted once.
+    let reports = reports.into_inner().unwrap();
+    assert!(
+        reports
+            .iter()
+            .all(|&(present, whole)| whole == length && present <= length),
+        "{reports:?}"
+    );
+    assert!(
+        reports.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "{reports:?}"
+    );
+    assert_eq!(reports.last(), Some(&(length, length)));
     assert!(
         origin.most_live.load(Ordering::SeqCst) >= 4,
         "the member was not split"
