@@ -1,7 +1,7 @@
 # TensorFS consumer interfaces
 
 Implementation is tracked in [tracker #339](https://github.com/cozy-creator/tracker/issues/339).
-TensorFS is a library used by TensorD (`cozy-machine`) and Runtime's executor processes.
+TensorFS is a library used by TensorD and Runtime's executor processes.
 TensorD embeds its Rust storage and shared-buffer mechanisms; Runtime calls its Python
 facade and native weight-plane/device APIs. TensorFS has no separate daemon. A Python
 installation does not grant authority over a managed execution's store.
