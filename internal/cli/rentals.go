@@ -527,6 +527,9 @@ func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHas
 		line := fmt.Sprintf("%s%s with a %d GB disk: %s", orchestrator.MachineLabel(skuName, gpus),
 			machineShape(quote.VCPUCount, quote.MemoryGB), quote.ContainerDiskGB,
 			rateBreakdown(quote.PriceUSDMicrosPerHour, quote.StorageUSDMicrosPerHour))
+		if quote.BandwidthUSDMicrosPerGB > 0 {
+			line += fmt.Sprintf(", plus traffic at up to $%.3f/GB", float64(quote.BandwidthUSDMicrosPerGB)/1e6)
+		}
 		if quote.PriceUSDMicrosPerHour != listed {
 			line += " (the default-disk listing is " + rentalPrice(listed) + ")"
 		}
@@ -1196,7 +1199,8 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		if row["rental"] != subject {
 			continue
 		}
-		fields, all, value := append([]string{"rental"}, append(list.Fields, "compute", "storage")...), list.AllFields,
+		// An operator reads why the provider refused a create without asking for every field.
+		fields, all, value := append([]string{"rental"}, append(list.Fields, "compute", "storage", "provider refusal")...), list.AllFields,
 			func(name string) (any, bool) { v, ok := row[name]; return v, ok }
 		if mode := ctx.Mode(); !mode.Human || mode.JSON {
 			fields, all = list.TypedFields, list.TypedAllFields
@@ -1328,14 +1332,18 @@ func endedRentalRecord(ctx *Context, hubName string, r hub.Rental) output.Record
 	if mode := ctx.Mode(); !mode.Human || mode.JSON {
 		fields = typed
 	}
-	record := output.Record{Fields: fields, AllFields: fields, Next: []string{"cozy rental list --all"}}
-	for _, identity := range [][3]string{{"provider", "provider", r.Provider}, {"provider machine", "provider_machine_id", r.ProviderMachineID}, {"provider resource", "provider_resource_id", r.ProviderResourceID}} {
+	record := output.Record{Fields: slices.Clip(fields), AllFields: slices.Clip(fields), Next: []string{"cozy rental list --all"}}
+	for _, identity := range [][3]string{{"provider", "provider", r.Provider}, {"provider machine", "provider_machine_id", r.ProviderMachineID},
+		{"provider resource", "provider_resource_id", r.ProviderResourceID}, {"provider refusal", "provider_refusal", r.ProviderRefusal}} {
 		if identity[2] != "" {
 			key := identity[0]
 			if mode := ctx.Mode(); !mode.Human || mode.JSON {
 				key = identity[1]
 			}
 			record.AllFields = append(record.AllFields, output.Field{K: key, V: identity[2]})
+			if identity[1] == "provider_refusal" {
+				record.Fields = append(record.Fields, output.Field{K: key, V: identity[2]})
+			}
 		}
 	}
 	if !hub.RentalAbsent(r.State) {
@@ -1509,7 +1517,8 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			[3]string{"provider machine", "provider_machine_id", r.ProviderMachineID},
 			[3]string{"provider resource", "provider_resource_id", either(r.ProviderResourceID, r.Failure.ProviderResourceID)},
 			[3]string{"provider host", "provider_host_id", r.Failure.ProviderHostID},
-			[3]string{"provider state", "provider_state", r.Failure.ProviderState})
+			[3]string{"provider state", "provider_state", r.Failure.ProviderState},
+			[3]string{"provider refusal", "provider_refusal", r.ProviderRefusal})
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub, "runtime_update": r.RuntimeUpdate,
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
@@ -1666,7 +1675,8 @@ func operatorFacts(row map[string]string, typed map[string]any, facts ...[3]stri
 // listing has no empty provider columns.
 func operatorColumns(list *output.List) {
 	for _, column := range [][2]string{{"provider", "provider"}, {"provider machine", "provider_machine_id"},
-		{"provider resource", "provider_resource_id"}, {"provider host", "provider_host_id"}, {"provider state", "provider_state"}} {
+		{"provider resource", "provider_resource_id"}, {"provider host", "provider_host_id"}, {"provider state", "provider_state"},
+		{"provider refusal", "provider_refusal"}} {
 		if slices.ContainsFunc(list.Rows, func(row map[string]string) bool { return row[column[0]] != "" }) {
 			list.AllFields, list.TypedAllFields = append(list.AllFields, column[0]), append(list.TypedAllFields, column[1])
 		}

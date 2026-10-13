@@ -48,6 +48,7 @@ func TestFullEndedRentalRetainsObservedProviderIdentity(t *testing.T) {
 		rental := hub.Rental{ID: "pr-proof", Name: "morlock", State: "released"}
 		if observed {
 			rental.Provider, rental.ProviderMachineID, rental.ProviderResourceID = "vast", "144163", "54878123"
+			rental.ProviderRefusal = refusal
 		}
 		ctx := &Context{Inv: &Invocation{Mode: output.Mode{JSON: true, Full: true}}}
 		var encoded bytes.Buffer
@@ -58,14 +59,27 @@ func TestFullEndedRentalRetainsObservedProviderIdentity(t *testing.T) {
 		if err := json.Unmarshal(encoded.Bytes(), &document); err != nil {
 			t.Fatal(err)
 		}
-		for field, want := range map[string]string{"provider": "vast", "provider_machine_id": "144163", "provider_resource_id": "54878123"} {
+		for field, want := range map[string]string{"provider": "vast", "provider_machine_id": "144163", "provider_resource_id": "54878123",
+			"provider_refusal": refusal} {
 			got, present := document[field]
 			if present != observed || observed && got != want {
 				t.Fatalf("ended identity %s: %s", field, encoded.Bytes())
 			}
 		}
+		// The refusal is shown without asking for every field.
+		human := &Context{Inv: &Invocation{Mode: output.Mode{Human: true}}}
+		encoded.Reset()
+		if err := endedRentalRecord(human, "http://127.0.0.1:8819", rental).Emit(&encoded, human.Mode()); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(encoded.Bytes(), []byte("vast.ai machine 136980")) != observed {
+			t.Fatalf("the default ended record: %s", encoded.Bytes())
+		}
 	}
 }
+
+// refusal is how vast.ai's adapter recorded the create the rtx-3090 proof lost (2026-10-13).
+const refusal = "provider.no_capacity: vast.ai machine 136980 has no on-demand 1x RTX 3090 ask"
 
 // An unresolved acquisition is not a rental: it neither weakens the accrued total to "at
 // least ... est." nor is drawn as a row, and two rentals on one host show their IDs.

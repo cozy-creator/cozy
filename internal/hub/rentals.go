@@ -67,14 +67,17 @@ func RentalAbsent(state string) bool {
 // Creator key is part of this view; the provider identities are in an operator's view only.
 type Rental struct {
 	Provider, ProviderMachineID, ProviderResourceID string
-	StableMachineName                               string
-	MachineAliases                                  []string
-	Development                                     bool
-	SSHAddress                                      string
-	ID                                              string
-	Name                                            string
-	State                                           string
-	AcceleratorModel                                string
+	// ProviderRefusal is why the provider refused the rental's latest refused create, in its
+	// own words; an operator's fact.
+	ProviderRefusal   string
+	StableMachineName string
+	MachineAliases    []string
+	Development       bool
+	SSHAddress        string
+	ID                string
+	Name              string
+	State             string
+	AcceleratorModel  string
 	// AcceleratorCount is the pod's WIDTH: how many accelerators this rental delivers,
 	// and therefore the size of the device envelope its worker holds and the only degree
 	// a group placement on it may be pinned to. One for a one-card pod, and one for a CPU
@@ -285,6 +288,7 @@ type wireRental struct {
 	StableMachineName     string         `json:"machine_name,omitempty"`
 	MachineAliases        []string       `json:"machine_aliases,omitempty"`
 	ProviderResourceID    string         `json:"provider_resource_id,omitempty"`
+	ProviderRefusal       string         `json:"provider_refusal,omitempty"`
 	Development           bool           `json:"development,omitempty"`
 	SSHAddress            string         `json:"ssh_address,omitempty"`
 	ID                    string         `json:"rental_id"`
@@ -355,6 +359,7 @@ func (w wireRental) machineName() string {
 func (w wireRental) rental() Rental {
 	return Rental{
 		Provider: w.Provider, ProviderMachineID: w.ProviderMachineID, ProviderResourceID: w.ProviderResourceID,
+		ProviderRefusal:   w.ProviderRefusal,
 		StableMachineName: validStableMachineName(w.StableMachineName),
 		MachineAliases:    w.MachineAliases,
 		Development:       w.Development, SSHAddress: w.SSHAddress, ID: w.ID, Name: w.machineName(), State: w.State,
@@ -962,6 +967,8 @@ type RentalSKUStatus struct {
 type RentalQuote struct {
 	PriceUSDMicrosPerHour   int64 `json:"price_usd_micros_per_hour"`
 	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
+	// BandwidthUSDMicrosPerGB is the most a GB of traffic costs where the provider bills it.
+	BandwidthUSDMicrosPerGB int64 `json:"bandwidth_usd_micros_per_gb,omitempty"`
 	ContainerDiskGB         int   `json:"container_disk_gb"`
 	VCPUCount               int   `json:"vcpu_count,omitempty"`
 	MemoryGB                int   `json:"memory_gb,omitempty"`
