@@ -132,7 +132,6 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 
 | Path | Use | Owner |
 |---|---|---|
-| `src/bin/device-pilot.rs` | Drive one stock executor from a JSON config on a rental | F |
 | `src/bin/degree2-pilot.rs` | Degree 2 on a rental: stock executors share GPU weights through `ResidentCustody` (replacement, count-once, revoke, output equality) | C |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
