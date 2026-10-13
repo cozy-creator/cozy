@@ -298,7 +298,11 @@ struct Checkpoint {
 }
 
 fn checkpoint(blobs: usize, size: usize) -> Checkpoint {
-    assert!(size.is_multiple_of(4) && size > 0);
+    checkpoint_sizes(&vec![size; blobs])
+}
+
+fn checkpoint_sizes(sizes: &[usize]) -> Checkpoint {
+    assert!(sizes.iter().all(|size| size.is_multiple_of(4) && *size > 0));
     let spec = registry::seeds()
         .into_iter()
         .find(|seed| seed.alias == "plain/1")
@@ -306,7 +310,7 @@ fn checkpoint(blobs: usize, size: usize) -> Checkpoint {
         .spec;
     let mut bodies = HashMap::new();
     let mut tensors = Vec::new();
-    for index in 0..blobs {
+    for (index, &size) in sizes.iter().enumerate() {
         let mut body = vec![0u8; size];
         for (at, byte) in body.iter_mut().enumerate() {
             *byte = ((at * 31 + index * 7 + 3) % 251) as u8;
@@ -5269,6 +5273,9 @@ struct PublicationHub {
     grants: HashMap<String, usize>,
     puts: HashMap<String, usize>,
     max_selection: usize,
+    blocked: String,
+    released_after_refill: bool,
+    max_unverified_grants: usize,
 }
 
 fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
@@ -5314,6 +5321,22 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                 *hub.puts.entry(id.clone()).or_default() += 1;
                 hub.mode
             };
+            if mode == "rolling" && id == hub.lock().unwrap().blocked {
+                let start = std::time::Instant::now();
+                loop {
+                    let mut state = hub.lock().unwrap();
+                    if state.uploaded.len() == state.declared.len() - 2
+                        && state.grants.get(&id).copied().unwrap_or(0) >= 2 {
+                        // All later small objects landed AND the long PUT's hold renewed,
+                        // before this response releases its upload slot.
+                        state.released_after_refill = true;
+                        break;
+                    }
+                    if start.elapsed() > Duration::from_secs(5) { break; }
+                    drop(state);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             if request.header("x-grant-generation") == Some("1")
                 && matches!(mode, "expired403" | "landed" | "heartbeat")
             {
@@ -5354,6 +5377,10 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
             }
             "PUT" => {
                 hub.declared = objects(&request.body, "objects");
+                if hub.mode == "rolling" {
+                    let blocked = hub.declared.iter().position(|id| *id == hub.blocked).unwrap();
+                    hub.declared.swap(1, blocked);
+                }
                 // The Hub already holds the first object: it is never pushed.
                 let rows = hub
                     .declared
@@ -5397,6 +5424,7 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                 let mut held = vec![];
                 for id in selected {
                     let mode = hub.mode;
+                    let blocked = id == hub.blocked;
                     let generation = hub.grants.entry(id.clone()).or_default();
                     *generation += 1;
                     let generation = *generation;
@@ -5410,6 +5438,7 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                     let lifetime = match mode {
                         "always-stale" => 0,
                         "stale" if generation == 1 => 0,
+                        "rolling" if blocked => 1,
                         "expired403" | "landed" | "heartbeat" if generation == 1 => 1,
                         _ => 600,
                     };
@@ -5426,6 +5455,8 @@ fn publication_hub(manifest: Vec<u8>) -> (Origin, Arc<Mutex<PublicationHub>>) {
                         ),
                     ]));
                 }
+                let unverified = hub.grants.keys().filter(|id| !hub.verified.contains(id)).count();
+                hub.max_unverified_grants = hub.max_unverified_grants.max(unverified);
                 ok_json(&Value::obj(vec![
                     ("grants", Value::arr(grants)),
                     ("held", Value::arr(held)),
@@ -5523,8 +5554,8 @@ fn publish_pushes_what_the_hub_lacks_and_follows_its_finalization() {
 }
 
 /// A closure larger than one request's selection (an SDXL LoRA's) is asked for and verified in
-/// requests the Hub accepts: this Hub takes fewer than the first request asks for, so the
-/// selection is halved until it fits, and stays there.
+/// requests the Hub accepts. Just-in-time singleton grants fit even a Hub whose selection
+/// limit is below the configured worker count.
 #[test]
 fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
     let root = temporary("publish-large");
@@ -5552,9 +5583,8 @@ fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
     assert_eq!(held.uploaded.len(), held.declared.len() - 1);
     assert_eq!(held.verified.len(), held.declared.len() - 1);
     assert_eq!(held.finalized, 1);
-    // Four dispatch slots exceed this Hub's three-object limit; two then fit.
-    assert_eq!(held.refused, 1);
-    assert!(held.max_selection <= 4);
+    assert_eq!(held.refused, 0);
+    assert!(held.max_selection <= SELECTION);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -5617,4 +5647,43 @@ fn publish_renews_only_expired_authority_and_keeps_long_puts_live() {
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn publish_refills_slots_while_a_large_put_waits_and_renews() {
+    let root = temporary("publish-rolling");
+    let store = Store::init(&root).unwrap();
+    let mut sizes = vec![512; 24];
+    sizes[0] = 1 << 20;
+    let checkpoint = Arc::new(checkpoint_sizes(&sizes));
+    let source = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = local_policy();
+    pull(&request_for(&store, &source.base, &policy)).unwrap();
+    let blocked = checkpoint.objects.iter().find(|object| object.length == 1 << 20).unwrap().id();
+    let (hub, state) = publication_hub(checkpoint.bodies[&checkpoint.manifest.sha256].clone());
+    {
+        let mut state = state.lock().unwrap();
+        state.mode = "rolling";
+        state.blocked = blocked.clone();
+    }
+    let published = super::publish(&super::Publication {
+        store: &store,
+        hub: &hub.base,
+        destination: "acme/model",
+        manifest: &checkpoint.manifest,
+        operation: "rolling",
+        credential: &Anonymous,
+        policy: &policy,
+        progress: &|_, _| {},
+        streams: 8,
+    }).unwrap();
+    let state = state.lock().unwrap();
+    assert!(state.released_after_refill, "later objects must finish before the slow PUT is released");
+    assert!(state.max_unverified_grants <= 8, "only dispatchable objects obtain grants");
+    assert!(state.grants[&blocked] >= 2, "a waiting PUT retains its publication hold");
+    assert_eq!(state.puts[&blocked], 1, "heartbeat does not restart a moving PUT");
+    assert_eq!(state.verified.len(), state.declared.len() - 1);
+    assert_eq!(published.checkpoint, checkpoint.manifest.id());
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
 }
