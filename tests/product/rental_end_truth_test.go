@@ -201,6 +201,7 @@ func TestRentalShutdownHasAConciseHumanSummary(t *testing.T) {
 			stand.publishListing()
 			const id = "pr-1234567890abcdef1234"
 			stand.add(id, "bellows")
+			stand.set(id, "machine_name", "bellows")
 			args := []string{"rental", "end", "bellows"}
 			if mode != "human" {
 				args = append(args, "--"+mode)
@@ -313,8 +314,9 @@ func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 	if err := json.Unmarshal([]byte(board), &listed); err != nil {
 		t.Fatalf("rental list is not JSON: %v\n%s", err, board)
 	}
+	// No host is placed yet, so Tensorhub names none: the row is the rental, under its alias.
 	if listed.UnattachedRentalOperations != 0 || len(listed.Rentals) != 1 ||
-		listed.Rentals[0]["machine"] != machine || listed.MachinesRunning != 1 ||
+		listed.Rentals[0]["rental_alias"] != machine || listed.Rentals[0]["machine"] != "pr-th198th198th198th19" || listed.MachinesRunning != 1 ||
 		listed.HourlySpendUSDMicros != 100_000 {
 		t.Fatalf("a paid pod with no local record is invisible on the board\n%s", board)
 	}

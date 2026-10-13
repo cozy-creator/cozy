@@ -170,6 +170,7 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 
 	const rentalID = "pr-a1a1a1a1a1a1a1a1a1a1"
 	stand.add(rentalID, "alpha")
+	stand.set(rentalID, "machine_name", "alpha")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{ID: rentalID, MachineName: "alpha", State: "ready",
@@ -389,7 +390,9 @@ func TestAllHubsListingIsolatesAnUnreadableHub(t *testing.T) {
 
 	const rentalA, rentalB = "pr-a3a3a3a3a3a3a3a3a3a3", "pr-b3b3b3b3b3b3b3b3b3b3"
 	standA.add(rentalA, "alpha")
+	standA.set(rentalA, "machine_name", "alpha")
 	standB.add(rentalB, "bravo")
+	standB.set(rentalB, "machine_name", "bravo")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	for id, row := range map[string]records.Rental{
@@ -477,6 +480,7 @@ func TestRemovedHubLeavesTheRunningDaemon(t *testing.T) {
 		"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	const rentalC = "pr-c5c5c5c5c5c5c5c5c5c5"
 	standC.add(rentalC, "charlie")
+	standC.set(rentalC, "machine_name", "charlie")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{ID: rentalC, MachineName: "charlie", State: "ready",

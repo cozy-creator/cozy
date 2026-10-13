@@ -71,8 +71,9 @@ func (r LiveResolver) Resolve(ctx context.Context, typed string) (Live, *exit.Er
 		return Live{}, exit.Named(exit.NotFound, "rental.selection_unavailable", "%q does not name a live rental on the queried Hubs", typed)
 	}
 	// The inventory establishes identity; the ID read supplies the current endpoint
-	// and catches a rental ending between selection and action.
-	remote, problem := r.Client(selected[0].Hub).Rental(ctx, selected[0].Rental.ID)
+	// and catches a rental ending between selection and action. Selection never judges
+	// whether a rental can be attached: ending one the Hub describes badly must still work.
+	remote, problem := r.Client(selected[0].Hub).RentalView(ctx, selected[0].Rental.ID)
 	return Live{Hub: selected[0].Hub, Rental: remote}, problem
 }
 
@@ -99,7 +100,7 @@ func (r LiveResolver) Read(ctx context.Context, id string) (Live, *exit.Error) {
 			}
 		}
 		if origin != "" {
-			remote, problem := r.Client(origin).Rental(ctx, id)
+			remote, problem := r.Client(origin).RentalView(ctx, id)
 			return Live{Hub: origin, Rental: remote}, problem
 		}
 	}
@@ -108,7 +109,7 @@ func (r LiveResolver) Read(ctx context.Context, id string) (Live, *exit.Error) {
 		return Live{}, problem
 	}
 	for _, origin := range origins {
-		remote, problem := r.Client(origin).Rental(ctx, id)
+		remote, problem := r.Client(origin).RentalView(ctx, id)
 		if problem == nil {
 			return Live{Hub: origin, Rental: remote}, nil
 		}

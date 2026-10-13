@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -42,6 +41,17 @@ func rentalHistory(ctx *Context, endedOnly bool) (func(context.Context) (output.
 		done()
 		return nil, nil, problem
 	}
+	var signedOut []string
+	for _, origin := range knownHubs(ctx) {
+		if !slices.Contains(origins, origin) {
+			origins = append(origins, origin)
+		}
+	}
+	for _, origin := range origins {
+		if len(origins) > 1 && !signedIn(ctx, origin) {
+			signedOut = append(signedOut, signedOutLine(ctx, origin))
+		}
+	}
 	var rentals []pastRental
 	var unanswered []string
 	var read time.Time
@@ -66,7 +76,9 @@ func rentalHistory(ctx *Context, endedOnly bool) (func(context.Context) (output.
 			}
 		}
 		ctx.exitCode = min(len(unanswered), 1)
-		return renderRentalHistory(rentals, unanswered, len(origins) > 1, endedOnly), nil
+		list := renderRentalHistory(rentals, unanswered, len(origins) > 1, endedOnly)
+		list.Lead = append(list.Lead, signedOut...)
+		return list, nil
 	}, done, nil
 }
 
@@ -77,7 +89,7 @@ func readRentalHistory(ctx *Context, origins []string, endedOnly bool) ([]pastRe
 	var wg sync.WaitGroup
 	for i, origin := range origins {
 		scoped := ctx.forHub(origin)
-		if len(origins) > 1 && !scoped.Cfg.HubToken.Present() && !accountauth.New(scoped.Cfg).CredentialPresent() {
+		if len(origins) > 1 && !signedIn(ctx, origin) {
 			continue
 		}
 		wg.Go(func() {
