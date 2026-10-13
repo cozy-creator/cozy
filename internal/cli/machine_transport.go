@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"maps"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 
@@ -64,12 +66,18 @@ func (m *machineRuns) readStatus(ctx context.Context, connection *machines.V1, m
 		return api.MachineStatus{}, machines.Transport(err)
 	}
 	status := statusOf(frame)
-	// Each installation's hub as this computer names it: a named hub at that origin, else the
-	// rental's own hub, which a rental reads at the address the Hub gives it, not this
-	// computer's URL of it.
-	hubs := map[string]string{originKey(m.context.Cfg.HubURL): m.context.Cfg.HubURL}
-	for _, url := range m.context.Cfg.Hubs {
+	// Each installation's hub as this computer names it: a named hub at that origin or at the
+	// origin it gives machines to read it at, else the rental's own hub, which a rental reads at
+	// the address the Hub gives it, not this computer's URL of it.
+	known := append([]string{m.context.Cfg.HubURL}, slices.Collect(maps.Values(m.context.Cfg.Hubs))...)
+	hubs := map[string]string{}
+	for _, url := range known {
 		hubs[originKey(url)] = url
+	}
+	for _, url := range known {
+		if reads := originKey(client(m.context.forHub(url)).KeptOrigin()); reads != "" && hubs[reads] == "" {
+			hubs[reads] = url
+		}
 	}
 	if row, _ := m.store.RentalRow(machine); row != nil && row.Hub != "" {
 		for _, own := range frame.GetHubs() {

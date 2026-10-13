@@ -3143,7 +3143,7 @@ func rentalInvocationTarget(ctx *Context, target Target) (Target, *launch.Packag
 }
 
 // machineRelease is the newest release of pkg from the selected Hub that the run's named
-// machine holds, or "" when it holds none.
+// machine holds, or "" when it holds none. The same name at another Hub is other code.
 func machineRelease(ctx *Context, pkg string) (string, *exit.Error) {
 	_, envs, problem := rentalEnvironments(ctx)
 	if problem != nil {
@@ -3153,7 +3153,7 @@ func machineRelease(ctx *Context, pkg string) (string, *exit.Error) {
 	var newestVersion pep440.Version
 	for _, env := range envs {
 		version, err := pep440.Parse(env.Release)
-		if env.Package != pkg || err != nil {
+		if env.Package != pkg || env.Hub != ctx.Cfg.HubURL || err != nil {
 			continue
 		}
 		if newest == "" || version.GreaterThan(newestVersion) {

@@ -1,6 +1,8 @@
 package producttest
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -121,6 +123,11 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 			"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	}
 	configure("source")
+	// The rental's Hub is one this computer is signed in to, as the one it was bought from is.
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	rentalHub.server.Config.Handler = machineKeyLogin("machine-rental", public, "rental-idle-test", rentalHub.server.Config.Handler)
+	plantMachineKey(t, root, rentalHub.server.URL, "machine-rental", private)
 	var mu sync.Mutex
 	var catalogReads, machineReads []string
 	wrongReads := []string{}
@@ -230,8 +237,9 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 		t.Fatalf("the client pinned or redirected the other source: %+v", otherRequest)
 	}
 
-	// The CLI names the newest release once per catalog revision: a newer one reaches a run
-	// once this client's yank moves the revision, and the output it added is collected.
+	// A rental that holds none of the selected Hub's releases runs the newest, named once per
+	// catalog revision, and keeps running the one it holds until `cozy package update --rental`
+	// moves it; the output the newer release added is collected.
 	moving := newMachineHub(t)
 	publishParityRelease(t, moving, root, parityProject(t))
 	newer := parityProject(t)
@@ -266,9 +274,6 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
 		}
 		movingCatalog.ServeHTTP(w, r)
 	})
-	moving.mux.HandleFunc("DELETE /v1/packages/"+parityPublished+"/releases/"+parityVersion, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"release":"` + parityVersion + `","state":"yanked","changed":true}`))
-	})
 	fixtureExecutionAccess(t, root, moving.server, moving.worker.Config.Handler)
 	configure(moving.server.URL)
 	moved := func(key, want string, reads int32) {
@@ -281,10 +286,10 @@ def add(payload: AddRequest, out: Outputs) -> AddResult:
 	moved("kept-release", `"value":42`, 1)
 	newest.Store("0.0.2")
 	moved("kept-release-warm", `"value":42`, 1)
-	if code, out := runCozy(t, root, "package", "yank", parityPublished, "--version", parityVersion); code != 0 {
-		t.Fatalf("yank [exit %d]\n%s", code, out)
+	if code, out := runCozy(t, root, "package", "update", parityPublished, "--rental=tessa", "--tensorhub="+moving.server.URL); code != 0 {
+		t.Fatalf("update on the rental [exit %d]\n%s", code, out)
 	}
-	moved("newer-release", `"value":141`, 2)
+	moved("newer-release", `"value":141`, newestReads.Load())
 	movingRequest, problem := store.RequestByIdempotencyKey("newer-release")
 	fatal(t, problem)
 	products, problem := store.Products(movingRequest.ID)

@@ -110,11 +110,8 @@ func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest
 }
 
 func (u *rentalRuntimeUpdates) begin(id string, options api.RuntimeUpdateRequest, target bool) (*records.RuntimeUpdate, *exit.Error) {
-	if options.TensorFSWheel != "" && options.RuntimeWheel == "" {
-		return nil, exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
-	}
-	if options.RuntimeWheel != "" && options.RuntimeVersion != "" || options.TensorFSWheel != "" && options.TensorFSVersion != "" {
-		return nil, exit.New(exit.Validation, "name a wheel or a version, not both")
+	if problem := options.Validate(); problem != nil {
+		return nil, problem
 	}
 	m := u.machines
 	row, problem := observedRental(m.context, m.store, id)
@@ -354,15 +351,6 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer store.Close()
-	live, problem := resolveLiveRental(ctx, store, strings.TrimSpace(ctx.Inv.Args[0]))
-	if problem != nil {
-		return problem
-	}
-	ctx = ctx.forHub(live.Hub)
-	row, problem := liveRentalResolver(ctx, store).Record(live)
-	if problem != nil {
-		return problem
-	}
 	request := api.RuntimeUpdateRequest{RuntimeVersion: ctx.Inv.Value("--runtime-version"), TensorFSVersion: ctx.Inv.Value("--tensorfs-version")}
 	for flag, into := range map[string]*string{"--runtime-wheel": &request.RuntimeWheel, "--tensorfs-wheel": &request.TensorFSWheel} {
 		if path := ctx.Inv.Value(flag); path != "" {
@@ -372,6 +360,18 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 			}
 			*into = absolute
 		}
+	}
+	if problem := request.Validate(); problem != nil {
+		return problem
+	}
+	live, problem := resolveLiveRental(ctx, store, strings.TrimSpace(ctx.Inv.Args[0]))
+	if problem != nil {
+		return problem
+	}
+	ctx = ctx.forHub(live.Hub)
+	row, problem := liveRentalResolver(ctx, store).Record(live)
+	if problem != nil {
+		return problem
 	}
 	if request == (api.RuntimeUpdateRequest{}) {
 		// Nothing named is the Hub's target, named here: a daemon older than this cozy reads an

@@ -14,9 +14,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 )
 
-// `cozy rental show` answers for a rental that has ended, by its id or by a name several rentals
-// bore (the newest), from any hub this host is signed in to: who ended it, when, and what it
-// cost, on the Hub's clock. A name no hub knows is unknown.
+// `cozy rental show` answers for a rental that has ended, by its id, from any hub this host is
+// signed in to: who ended it, when, and what it cost, on the Hub's clock. A name several
+// rentals bore lists their IDs; a name no hub knows is unknown.
 func TestRentalShowSaysHowAnEndedRentalEnded(t *testing.T) {
 	ended := map[string]map[string]any{
 		"pr-kanna-older": {"rental_id": "pr-kanna-older", "name": "kanna", "state": "released",
@@ -71,19 +71,23 @@ func TestRentalShowSaysHowAnEndedRentalEnded(t *testing.T) {
 		}
 		return record
 	}
-	newest := show("kanna")
+	if code, out := runCozy(t, root, "rental", "show", "kanna", "--json"); code == 0 || !strings.Contains(out, "rental.machine_name_ambiguous") ||
+		!strings.Contains(out, "pr-kanna-newest") || !strings.Contains(out, "pr-kanna-older") {
+		t.Fatalf("a name two ended rentals bore did not list both [exit %d]\n%s", code, out)
+	}
+	newest := show("pr-kanna-newest")
 	if newest["rental_id"] != "pr-kanna-newest" || newest["hub"] != "other" || newest["state"] != "released" ||
 		newest["release_cause"] != "idle_unreached" || newest["ended_at"] != "2026-10-06T17:37:50Z" ||
 		newest["spend_usd_micros"] != float64(69_500_000) || newest["spend_basis"] != "estimate" {
-		t.Fatalf("by name, not the newest kanna and how it ended: %v", newest)
+		t.Fatalf("by id, not how the newest kanna ended: %v", newest)
 	}
 	if older := show("pr-kanna-older"); older["rental_id"] != "pr-kanna-older" || older["release_cause"] != "owner_stop" ||
 		older["spend_basis"] != "charged" {
 		t.Fatalf("by id: %v", older)
 	}
-	if code, human := runCozy(t, root, "rental", "show", "kanna"); code != 0 ||
+	if code, human := runCozy(t, root, "rental", "show", "pr-kanna-newest"); code != 0 ||
 		!strings.Contains(human, "idle_unreached") || !strings.Contains(human, "$69.50 est.") {
-		t.Fatalf("rental show kanna [exit %d]\n%s", code, human)
+		t.Fatalf("rental show pr-kanna-newest [exit %d]\n%s", code, human)
 	}
 	if code, out := runCozy(t, root, "rental", "show", "nobody"); code == 0 || !strings.Contains(out, `no rental is named "nobody"`) {
 		t.Fatalf("an unknown name [exit %d]\n%s", code, out)

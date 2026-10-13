@@ -220,6 +220,8 @@ func TestRentalListShowsOtherClientsMachinesBesideItsOwn(t *testing.T) {
 	const own = "pr-2b2b2b2b2b2b2b2b2b2b"
 	stand.add(own, "loran")
 	stand.set(own, "machine_name", "loran")
+	stand.set(own, "requested_accelerator_model", "NVIDIA H100 80GB HBM3")
+	stand.set(own, "accelerator_count", 2)
 	stand.set(own, "state", "ready")
 	stand.setRate(own, 7_021_700)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

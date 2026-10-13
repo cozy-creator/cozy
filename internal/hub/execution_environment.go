@@ -41,6 +41,18 @@ func (c *Client) ExecutionEnvironment(ctx context.Context) (ExecutionEnvironment
 	return out, problem
 }
 
+// KeptOrigin is the origin machines read this Hub at, as last kept for this credential; ""
+// before a run asked. It reads no Hub.
+func (c *Client) KeptOrigin() string {
+	var held struct {
+		Environment map[string]string `json:"environment"`
+	}
+	if !loadRelease(c.keptPath("environments"), &held) {
+		return ""
+	}
+	return held.Environment["TENSORHUB_ORIGIN"]
+}
+
 func (c *Client) readExecutionEnvironment(ctx context.Context) (ExecutionEnvironment, *exit.Error) {
 	var out ExecutionEnvironment
 	if problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/execution-environment", auth: true, trustRoot: &out.TrustRoot}, &out); problem != nil {
