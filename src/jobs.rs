@@ -136,10 +136,6 @@ impl Caller {
         let (parent, engine) = (self.parent.clone(), engine.clone());
         Arc::new(move || parent.unfinished(&engine))
     }
-    /// The bytes done of the download the child call `request` is in now, of its total.
-    pub(crate) fn child_bytes(&self, engine: &Engine, request: &str) -> Option<(u64, u64)> {
-        self.parent.child_bytes(engine, request)
-    }
 }
 impl Drop for Caller {
     fn drop(&mut self) {
@@ -1160,6 +1156,39 @@ impl Jobs {
     }
 }
 
+/// One progress frame of run `id`'s executor: a package log line, or its stage (with the
+/// download bytes of the child call it relays, when it is one).
+pub(crate) fn observe(engine: &Engine, id: &str, completed: &mut u64, frame: &Frame, caller: Option<&Caller>) {
+    if !(frame.request_id.is_empty() || frame.request_id == id) {
+        return;
+    }
+    if let Some((level, text)) = frame.log() {
+        let _ = engine.append_package_log(id, level, &text);
+        return;
+    }
+    if frame.stage.is_empty() {
+        return;
+    }
+    // Zero-advance frames are telemetry (stage/position), not completed work.
+    *completed = completed.saturating_add(frame.advance);
+    let mut payload = json!({"stage": frame.stage.chars().take(120).collect::<String>(), "step_ms": frame.step_ms.unwrap_or(0.0)});
+    for (name, value) in [
+        ("stage_fraction", frame.stage_fraction.map(Value::from)),
+        ("overall_fraction", frame.overall_fraction.map(Value::from)),
+        ("position", frame.position.map(Value::from)),
+        ("total", frame.total.map(Value::from)),
+    ] {
+        if let Some(value) = value {
+            payload[name] = value;
+        }
+    }
+    let call = frame.call_request.as_deref().filter(|call| !call.is_empty());
+    if let Some((done, total)) = caller.zip(call).and_then(|(caller, call)| caller.parent.child_bytes(engine, call)) {
+        (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
+    }
+    let _ = engine.observe_progress(id, *completed, payload.to_string());
+}
+
 /// Every executor exchange of one job or child run.
 struct Seam<'a> {
     engine: &'a Arc<Engine>,
@@ -1177,36 +1206,7 @@ struct Seam<'a> {
 }
 impl Services for Seam<'_> {
     fn progress(&mut self, frame: &Frame) {
-        if !(frame.request_id.is_empty() || frame.request_id == self.id) {
-            return;
-        }
-        if let Some((level, text)) = frame.log() {
-            let _ = self.engine.append_package_log(self.id, level, &text);
-            return;
-        }
-        if frame.stage.is_empty() {
-            return;
-        }
-        self.completed = self.completed.saturating_add(frame.advance);
-        let mut payload = json!({"stage": frame.stage.chars().take(120).collect::<String>(), "step_ms": frame.step_ms.unwrap_or(0.0)});
-        for (name, value) in [
-            ("stage_fraction", frame.stage_fraction.map(Value::from)),
-            ("overall_fraction", frame.overall_fraction.map(Value::from)),
-            ("position", frame.position.map(Value::from)),
-            ("total", frame.total.map(Value::from)),
-        ] {
-            if let Some(value) = value {
-                payload[name] = value;
-            }
-        }
-        // A child's stage the job relays (the Runtime relays no bytes) carries its download's.
-        let call = frame.call_request.as_deref().filter(|call| !call.is_empty());
-        if let Some((done, total)) = self.job.zip(call).and_then(|(caller, call)| caller.child_bytes(self.engine, call)) {
-            (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
-        }
-        let _ = self
-            .engine
-            .observe_progress(self.id, self.completed, payload.to_string());
+        observe(self.engine, self.id, &mut self.completed, frame, self.job);
     }
     fn request(
         &mut self,

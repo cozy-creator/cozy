@@ -4226,44 +4226,7 @@ impl Services for Callbacks<'_> {
         })
     }
     fn progress(&mut self, frame: &Frame) {
-        if !(frame.request_id.is_empty() || frame.request_id == self.id) {
-            return;
-        }
-        if let Some((level, text)) = frame.log() {
-            let _ = self.engine.append_package_log(self.id, level, &text);
-            return;
-        }
-        if frame.stage.is_empty() {
-            return;
-        }
-        // Zero-advance frames are telemetry (stage/position), not completed work.
-        self.completed = self.completed.saturating_add(frame.advance);
-        // The Python worker's progress payload: stage and step_ms always, the rest when known.
-        let mut payload = serde_json::json!({"stage": frame.stage.chars().take(120).collect::<String>(), "step_ms": frame.step_ms.unwrap_or(0.0)});
-        for (name, value) in [
-            (
-                "stage_fraction",
-                frame.stage_fraction.map(serde_json::Value::from),
-            ),
-            (
-                "overall_fraction",
-                frame.overall_fraction.map(serde_json::Value::from),
-            ),
-            ("position", frame.position.map(serde_json::Value::from)),
-            ("total", frame.total.map(serde_json::Value::from)),
-        ] {
-            if let Some(value) = value {
-                payload[name] = value;
-            }
-        }
-        // A child's stage the call relays carries its download's bytes.
-        let call = frame.call_request.as_deref().filter(|call| !call.is_empty());
-        if let Some((done, total)) = self.job.zip(call).and_then(|(caller, call)| caller.child_bytes(self.engine, call)) {
-            (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
-        }
-        let _ = self
-            .engine
-            .observe_progress(self.id, self.completed, payload.to_string());
+        crate::jobs::observe(self.engine, self.id, &mut self.completed, frame, self.job);
     }
     fn request(
         &mut self,
