@@ -523,9 +523,9 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 			resolved, problem := s.resolveLocalJob(ctx, sub, out, refreshed)
 			return resolved, nil, problem
 		}
-		if len(sub.Trees) > 0 && (s.machineExecutions == nil || (out.Rental && out.RequestedRental == "" && out.Worker == "")) {
+		if len(sub.Trees) > 0 && s.machineExecutions == nil {
 			return out, nil, exit.Named(exit.Validation, "rental.job_tree_worker_required",
-				"Tree inputs require a named private Runtime worker")
+				"Tree inputs require a machine execution")
 		}
 		release, problem := s.installedRelease(hub, sub.Package, sub.Release, sub.InstallID)
 		if problem != nil {
@@ -604,6 +604,9 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		return out, nil, e
 	}
 	names := make([]string, 0, len(jobs))
+	// The declaration the inputs are checked against is the one their trees and files are
+	// captured by for the machine.
+	var declaration *launch.Entrypoint
 	for _, job := range jobs {
 		if !job.Internal {
 			names = append(names, job.Name)
@@ -618,7 +621,8 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Internal: job.Internal, Request: job.Request, Assets: job.Assets}, &out); problem != nil {
+		declaration = &launch.Entrypoint{Name: job.Name, Kind: "job", Internal: job.Internal, Request: job.Request, Assets: job.Assets}
+		if problem := validateInputs(declaration, &out); problem != nil {
 			return out, nil, problem
 		}
 		if problem := s.deriveOutputExport(&launch.Entrypoint{Result: job.Result}, &out); problem != nil {
@@ -644,7 +648,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		}
 		out.Trees = append(out.Trees, ref+"="+abs)
 	}
-	return out, nil, nil
+	return out, declaration, nil
 }
 
 func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
