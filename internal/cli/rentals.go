@@ -1201,9 +1201,11 @@ func unansweredHub(inventory api.RentalInventory, row api.RentalSummary) *exit.E
 	return exit.Named(exit.Unavailable, "rental.hub_unanswered", "the hub of rental %s did not answer", row.ID)
 }
 
-// showEndedRental answers `cozy rental show` for a rental no longer listed: by id, or by name
-// (the newest that bore it), from the history of every hub this host is signed in to, the
-// current one first. It says how the rental ended, when, and what it cost, by the Hub's clock.
+// showEndedRental answers `cozy rental show` for a rental no longer listed: by id, or by a
+// name exactly one ended rental bore, from the history of every hub this host is signed in
+// to. A machine name belongs to a provider host, so many rentals can bear it; that refuses
+// and names their IDs rather than choosing one. It says how the rental ended, when, and what
+// it cost, by the Hub's clock.
 func showEndedRental(ctx *Context, subject string) *exit.Error {
 	if subject == "" {
 		return exit.Usagef("name a rental: cozy rental show <machine or rental id>")
@@ -1214,7 +1216,7 @@ func showEndedRental(ctx *Context, subject string) *exit.Error {
 			origins = append(origins, origin)
 		}
 	}
-	// Every hub is asked at once; the first in order that knows the rental answers.
+	// Every hub is asked at once.
 	found := make([][]hub.Rental, len(origins))
 	problems := make([]*exit.Error, len(origins))
 	var wait sync.WaitGroup
@@ -1237,16 +1239,33 @@ func showEndedRental(ctx *Context, subject string) *exit.Error {
 		})
 	}
 	wait.Wait()
+	type ended struct {
+		hub    string
+		rental hub.Rental
+	}
+	var matches []ended
 	for i, origin := range origins {
 		if problems[i] != nil && problems[i].ErrName() != "rental.not_found" {
 			return problems[i]
 		}
-		if len(found[i]) > 0 {
-			return emit(ctx, endedRentalRecord(ctx, ctx.Cfg.HubLabel(origin), found[i][0]))
+		for _, each := range found[i] {
+			matches = append(matches, ended{ctx.Cfg.HubLabel(origin), each})
 		}
 	}
-	return exit.Named(exit.NotFound, "rental.unknown", "no rental is named %q on any hub this host is signed in to", subject).
-		WithNext("cozy rental list")
+	switch len(matches) {
+	case 0:
+		return exit.Named(exit.NotFound, "rental.unknown", "no rental is named %q on any hub this host is signed in to", subject).
+			WithNext("cozy rental list")
+	case 1:
+		return emit(ctx, endedRentalRecord(ctx, matches[0].hub, matches[0].rental))
+	}
+	ids := make([]string, len(matches))
+	for i, each := range matches {
+		ids[i] = each.rental.ID
+	}
+	return exit.Named(exit.Conflict, "rental.machine_name_ambiguous",
+		"%q names %d rentals (%s); use a rental ID", subject, len(matches), strings.Join(ids, ", ")).
+		WithNext("cozy rental show " + ids[0])
 }
 
 func endedRentalRecord(ctx *Context, hubName string, r hub.Rental) output.Record {
@@ -1577,9 +1596,23 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			row["state"] += " (unverified)"
 		}
 	}
+	sharedNameColumn(&list)
 	operatorColumns(&list)
 	hubRentalsView(cfg, &list, inventory, allHubs)
 	return list
+}
+
+// sharedNameColumn shows each row's rental ID when machine names repeat: a name belongs to a
+// provider host, so two rentals on one host are otherwise indistinguishable rows.
+func sharedNameColumn(list *output.List) {
+	seen := map[string]bool{}
+	for _, row := range list.Rows {
+		if seen[row["machine"]] {
+			list.Fields = slices.Insert(slices.Clone(list.Fields), 1, "rental")
+			return
+		}
+		seen[row["machine"]] = true
+	}
 }
 
 // operatorFacts sets the provider's facts only an operator's Hub view carries, as [table column,
@@ -1710,11 +1743,12 @@ func costCell(micros int64) string {
 
 // accruedSpend is the listed rentals' total for the spend line, on its weakest basis (charged,
 // then unmetered, then estimate), and as JSON facts only when every one of them said: a rental
-// whose Hub did not makes the total a lower bound.
+// whose Hub did not makes the total a lower bound. An unresolved acquisition is not a rental
+// and has no spend of its own, so it never weakens the total.
 func accruedSpend(inventory api.RentalInventory) (string, []output.Field) {
 	total := api.RentalSummary{SpendBasis: "charged"}
 	listed, unknown := 0, 0
-	for _, rows := range [][]api.RentalSummary{inventory.Rentals, inventory.Unrecorded, inventory.Pending} {
+	for _, rows := range [][]api.RentalSummary{inventory.Rentals, inventory.Unrecorded} {
 		for _, r := range rows {
 			listed++
 			total.SpendUSDMicros += r.SpendUSDMicros
@@ -2008,8 +2042,8 @@ type releaseWatch struct {
 }
 
 // rentalVerdict is what the hub said about the id it was asked, and the three answers are
-// deliberately not two. `rentalReleased` is the hub AFFIRMING a rental it knows and has
-// torn down; `rentalAbsent` is a 404, which affirms nothing — it means only that nothing
+// deliberately not two. `rentalReleased` is the hub AFFIRMING a rental it knows has ended,
+// released or failed, its pod proven gone; `rentalAbsent` is a 404, which affirms nothing — it means only that nothing
 // is filed under the key that was sent, whether because the pod is gone or because the key
 // was never one the hub could resolve. Collapsing the two is the whole defect (cl-193).
 type rentalVerdict int
@@ -2027,7 +2061,9 @@ func (w *releaseWatch) observe() (hub.Rental, rentalVerdict, *exit.Error) {
 	for {
 		r, e := w.c.RentalView(w.rctx, w.id)
 		switch {
-		case e == nil && r.State == hub.RentalReleased:
+		case e == nil && hub.RentalAbsent(r.State):
+			// Failed is as final as released: the Hub proved the pod absent, and a release
+			// of it changes nothing.
 			return r, rentalReleased, nil
 		case e == nil:
 			w.say(r.State, r.Detail)

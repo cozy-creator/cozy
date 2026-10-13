@@ -30,7 +30,7 @@ func TestRentalHistoryShowsEachRentalsLifetimeRunsAndCost(t *testing.T) {
 		mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 			rows := []map[string]any{}
 			if r.URL.Query().Get("state") == "all" {
-				rows = append(rows, map[string]any{"rental_id": "pr-kanna-newest", "name": "kanna", "state": "released",
+				rows = append(rows, map[string]any{"rental_id": "pr-kanna-newest", "name": "kanna", "machine_name": "kanna", "state": "released",
 					"requested_accelerator_model": "RTX PRO 6000", "accelerator_count": 4, "hourly_rate_usd_micros": 8_400_000,
 					"created_at": "2026-10-06T09:21:05Z", "ended_at": "2026-10-06T17:37:50Z", "release_cause": "idle_unreached",
 					"spend_usd_micros": 69_500_000, "spend_basis": "estimate"})
@@ -40,13 +40,14 @@ func TestRentalHistoryShowsEachRentalsLifetimeRunsAndCost(t *testing.T) {
 	})
 	current := newFakeRentalHub(t, 0)
 	current.add("pr-otter-live", "otter")
+	current.set("pr-otter-live", "machine_name", "otter")
 	current.mu.Lock()
 	current.rentals["pr-otter-live"]["created_at"] = time.Now().Add(-90 * time.Minute).UTC().Format(time.RFC3339Nano)
 	current.mu.Unlock()
 	ended := func(id, name, endedAt, cause string, spend int64) {
 		current.mu.Lock()
 		defer current.mu.Unlock()
-		current.rentals[id] = map[string]any{"rental_id": id, "name": name, "state": "released",
+		current.rentals[id] = map[string]any{"rental_id": id, "name": name, "machine_name": name, "state": "released",
 			"requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100_000,
 			"created_at": "2026-10-05T08:00:00Z", "ended_at": endedAt, "release_cause": cause,
 			"spend_usd_micros": spend, "spend_basis": "charged"}

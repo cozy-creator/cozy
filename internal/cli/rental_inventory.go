@@ -193,8 +193,9 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		if fleet.origin(row.Hub) != origin {
 			continue
 		}
+		// A row the Hub answered 404 for stays listed: that is not proof the pod is gone.
 		seen, current := live[row.ID]
-		if !current && result.HubUnanswered == nil {
+		if !current && result.HubUnanswered == nil && !census.hubUnknown[row.ID] {
 			continue
 		}
 		attached[row.ID] = true

@@ -213,7 +213,10 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		row["state"] = "released"
+		// As Tensorhub: a failed rental is already final, and releasing it changes nothing.
+		if row["state"] != "failed" {
+			row["state"] = "released"
+		}
 		h.released[r.PathValue("id")]++
 		w.WriteHeader(http.StatusNoContent)
 	})

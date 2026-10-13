@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRentalInventoryOmitsEndedMachinesButPreservesRunHistory(t *testing.T) {
+func TestRentalInventoryForgetsEndedMachinesButPreservesRunHistory(t *testing.T) {
 	root, hubURL, hub := rentalEndRoot(t, "rental-current-inventory")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -70,8 +70,11 @@ func TestRentalInventoryOmitsEndedMachinesButPreservesRunHistory(t *testing.T) {
 	fatal(t, problem)
 	after, problem := store.RequestRow(requestID)
 	fatal(t, problem)
-	if row == nil || row.State != "failed" || after == nil || after.Machine != before.Machine || after.State != before.State {
-		t.Fatal("listing removed rental or request history")
+	if row != nil {
+		t.Fatalf("the Hub-failed rental stayed on the books: %+v", row)
+	}
+	if after == nil || after.Machine != before.Machine || after.State != before.State {
+		t.Fatal("forgetting the rental changed request history")
 	}
 	if hub.releases(rentalID) != 0 {
 		t.Fatal("listing issued a provider release")

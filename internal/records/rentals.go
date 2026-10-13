@@ -533,13 +533,18 @@ func (s *Store) ObserveRental(r Rental) *exit.Error {
 		return exit.Internalf("cannot begin Hub rental observation: %s", err)
 	}
 	defer tx.Rollback()
-	_, err = tx.Exec(`INSERT INTO rentals(id,machine_name,stable_machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+	// The first failure the Hub states is kept, as RecordRental keeps it: it is the cause an
+	// ended rental's runs settle with, below and in every later settle.
+	_, err = tx.Exec(`INSERT INTO rentals(id,machine_name,stable_machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_container_state)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
 	 stable_machine_name=excluded.stable_machine_name, accelerator_model=excluded.accelerator_model,
 	 accelerator_count=excluded.accelerator_count,hourly_rate_usd_micros=excluded.hourly_rate_usd_micros,
 	 address=excluded.address,state=excluded.state,hub=excluded.hub,media_address=excluded.media_address,
-	 expected_worker_id=excluded.expected_worker_id,expected_worker_boot_id=excluded.expected_worker_boot_id`,
-		r.ID, r.MachineName, r.StableMachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.ManagedRequestID, r.Address, r.CertPath, r.State, r.Hub, r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt)
+	 expected_worker_id=excluded.expected_worker_id,expected_worker_boot_id=excluded.expected_worker_boot_id,
+	 failure_container_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_container_state ELSE excluded.failure_container_state END,
+	 failure_code=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_code ELSE excluded.failure_code END`,
+		r.ID, r.MachineName, r.StableMachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.ManagedRequestID, r.Address, r.CertPath, r.State, r.Hub, r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt,
+		r.Failure.Code, r.Failure.ContainerState)
 	if err != nil {
 		return exit.Internalf("cannot record Hub rental observation: %s", err)
 	}
