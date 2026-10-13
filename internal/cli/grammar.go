@@ -548,7 +548,7 @@ type RunExecuteCmd struct {
 	Assets              []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	AssetFidelity       []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
 	LoRAs               []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
-	AttentionKernel     string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend, e.g. model/fl2va_dit=kitchen-int8. It serves every step, waits for its own compile, and is refused rather than replaced when it cannot serve."`
+	AttentionKernel     string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend, e.g. model/fl2va_dit=kitchen-int8. It serves every step and waits for its own compile; only where it cannot run (this GPU, a site's shape) does a site keep its default kernel, and cozy run show says which and why."`
 	Rental              *string  `predictor:"rental" help:"Run only on this existing rental name or id; never buy a replacement."`
 	RentNew             bool     `help:"Buy a fresh managed rental for this run; do not reuse existing machines."`
 	RentalOnly          bool     `help:"Require a remote rental even when local capacity is ready."`
