@@ -95,6 +95,9 @@ without submitting another operation. `cozy machine installs cancel <id>` withdr
 only queued work that has never dispatched. Active or interrupted attempts remain
 protected. Both commands default to this computer; `--rental=<name-or-id>` selects
 an existing rental. Repeating cancellation returns the same canceled receipt.
+Temporary machine unavailability retains accepted installation work in the queue,
+including before any progress was reported. Machine install/start completion wakes
+that work; repeated automatic retries do not spin while the machine is unavailable.
 
 For development on an explicitly pinned owned worker, `cozy machine show
 --machine-endpoint-file <file>` reads its live status. `cozy machine update
