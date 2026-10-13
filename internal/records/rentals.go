@@ -250,12 +250,6 @@ func (op RentalOperation) Replayable() bool {
 	return op.State == "rejected" && op.RentalID == "" && op.Failure != ""
 }
 
-// RentalOperationsWithSecrets is every operation whose pending credentials are still owed: the
-// open ones and the replayable ones.
-func (s *Store) RentalOperationsWithSecrets() ([]RentalOperation, *exit.Error) {
-	return s.rentalOperationsWhere(`state NOT IN (` + finalRentalOperationStates + `) OR ` + replayableRentalOperation)
-}
-
 // ReopenRentalOperation makes a replayable ask open again for the command replaying it.
 func (s *Store) ReopenRentalOperation(key string) *exit.Error {
 	if _, err := s.db.Exec(`UPDATE rental_operations SET state='pending_acquisition',failure='',updated_at=?

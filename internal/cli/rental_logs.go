@@ -114,6 +114,12 @@ func rentalLogSubject(ctx *Context, typed string) (id, origin string, problem *e
 		return "", "", problem
 	}
 	// Ended logs use their immutable recorded authority, never a historical name.
-	recorded, problem := rental.RecordedSubject(store, typed)
-	return typed, recorded.Hub, problem
+	recorded, storedProblem := rental.RecordedSubject(store, typed)
+	if storedProblem != nil {
+		return "", "", storedProblem
+	}
+	if !recorded.Recorded() {
+		return "", "", problem
+	}
+	return typed, recorded.Hub, nil
 }

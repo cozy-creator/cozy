@@ -11,8 +11,6 @@ import (
 // Subject joins immutable rental IDs to this controller's operation history.
 // It supplies custody and replay metadata, never a live name or state lookup.
 type Subject struct {
-	// Typed is the argument exactly as given.
-	Typed string
 	// RentalID is the hub's identity for it, when this host ever learned one.
 	RentalID string
 	// Machine is the observed host name, or the original rental alias before allocation.
@@ -34,7 +32,7 @@ func (s Subject) Recorded() bool { return s.Row != nil || s.Operation != nil }
 // RecordedSubject looks up exact rental IDs only. Name selection belongs to
 // LiveResolver; retained aliases cannot make an ended host look live.
 func RecordedSubject(st *records.Store, id string) (Subject, *exit.Error) {
-	found := Subject{Typed: id}
+	found := Subject{}
 	row, problem := st.RentalRow(id)
 	if problem != nil {
 		return Subject{}, problem
