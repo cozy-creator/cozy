@@ -36,7 +36,7 @@ func endpointMaintenance(ctx *Context, call context.Context) (*machines.V1, *pb.
 		return nil, nil, problem
 	}
 	defer store.Close()
-	resolver := &machines.Resolver{Host: machines.NewHost(layout.Machine, ctx.Cfg.TensorFSRoot, nil), EndpointRental: rentalEndpoint(layout, store)}
+	resolver := &machines.Resolver{Host: machines.NewHost(layout.Machine, ctx.Cfg.TensorFSRoot, nil), EndpointRental: rentalEndpoint(ctx, layout, store)}
 	machine, problem := resolver.DialEndpointV1(*ep)
 	if problem != nil {
 		return nil, nil, problem

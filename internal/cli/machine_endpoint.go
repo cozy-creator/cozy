@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -121,7 +123,7 @@ func endpointRuns(ctx *Context, ep *machineendpoint.Endpoint, l home.Layout, st 
 		}
 		return nil, exit.Named(exit.Unavailable, "machine.endpoint_scope", "this foreground operation cannot access another machine")
 	}}
-	found.EndpointRental = rentalEndpoint(l, st)
+	found.EndpointRental = rentalEndpoint(ctx, l, st)
 	found.RentalHub = func(id string) *hub.Client { return client(fleet.atRental(id)) }
 	found.Only = ep.Name()
 	runs := newMachineRuns(&background, l, st, NewResolver(st, ctx.Cfg), fleet, found)
@@ -165,22 +167,27 @@ func endpointForRecordedRun(ctx *Context, id string) (func(), *exit.Error) {
 // rentalEndpoint answers the rental an explicit endpoint reaches (its recorded worker or
 // address), with the creator key its machine authorizes, not this computer's machine owner
 // key. Nil for an endpoint that is no rental of this host.
-func rentalEndpoint(l home.Layout, st *records.Store) func(*machineendpoint.Endpoint) (*machines.EndpointRental, *exit.Error) {
+func rentalEndpoint(ctx *Context, l home.Layout, st *records.Store) func(*machineendpoint.Endpoint) (*machines.EndpointRental, *exit.Error) {
 	return func(ep *machineendpoint.Endpoint) (*machines.EndpointRental, *exit.Error) {
-		rows, problem := st.Rentals()
+		// Workspace identity survives a missing inventory projection. A rental
+		// signing key is custody evidence; endpoint state still comes from its Hub.
+		if !rentalid.Valid(ep.WorkspaceID) {
+			return nil, nil
+		}
+		if _, err := os.Stat(l.RentalCreatorIdentity(ep.WorkspaceID)); os.IsNotExist(err) {
+			return nil, nil
+		}
+		row, problem := observedRental(ctx, st, ep.WorkspaceID)
 		if problem != nil {
 			return nil, problem
 		}
-		for _, row := range rows {
-			if row.ExpectedWorkerID != "" && row.ExpectedWorkerID == ep.WorkerID || row.Address != "" && row.Address == ep.Address {
-				key, problem := rental.CreatorIdentityFor(l, row.ID)
-				if problem != nil {
-					return nil, problem
-				}
-				return &machines.EndpointRental{ID: row.ID, Key: key}, nil
-			}
+		key, problem := rental.CreatorIdentityFor(l, row.ID)
+		if problem != nil {
+			return nil, problem
 		}
-		return nil, nil
+		ep.Address, ep.CertificatePEM = row.Address, row.CertificatePEM
+		ep.WorkerID, ep.WorkerBootID = row.ExpectedWorkerID, row.ExpectedWorkerBootID
+		return &machines.EndpointRental{ID: row.ID, Key: key}, nil
 	}
 }
 

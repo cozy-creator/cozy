@@ -136,7 +136,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
 		UseRental:      func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
 		RentalKey:      func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
-		EndpointRental: rentalEndpoint(l, st),
+		EndpointRental: rentalEndpoint(ctx, l, st),
 		Log:            ctx.Out,
 	}
 	machines := newMachineRuns(ctx, l, st, resolver, fleet, found)
