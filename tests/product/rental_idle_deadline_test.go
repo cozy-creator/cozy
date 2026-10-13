@@ -78,7 +78,7 @@ func TestRentalListAndKeepaliveShowTheMachinesIdleDeadline(t *testing.T) {
 		Address: listener.Addr().String(), CertPath: layout.RentalCert("pr-idle"), ExpectedWorkerID: "idle-worker", ExpectedWorkerBootID: "idle-boot",
 		AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, ReadyAt: time.Now().UTC().Format(time.RFC3339Nano)}))
 	h.mu.Lock()
-	h.rentals["pr-idle"] = map[string]any{"rental_id": "pr-idle", "name": "kirin", "state": "ready", "worker_address": listener.Addr().String(),
+	h.rentals["pr-idle"] = map[string]any{"rental_id": "pr-idle", "machine_name": "kirin", "state": "ready", "worker_address": listener.Addr().String(),
 		"cert_pem": string(certPEM), "worker_id": "idle-worker", "worker_boot_id": "idle-boot", "creator_public_key": owner.PublicKey(),
 		"hourly_rate_usd_micros": int64(1), "accelerator_count": 1, "requested_accelerator_model": "CPU"}
 	h.mu.Unlock()

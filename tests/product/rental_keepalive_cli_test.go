@@ -140,7 +140,7 @@ func TestRentalUpdateResumesOnAuthoritativeNativeReplacement(t *testing.T) {
 // explicit keepalive moves the machine's deadline: listing and a daemon restart never do, and
 // an ending rental is not kept alive.
 func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
-	root, store, launch, identity, daemon := statusRental(t)
+	root, store, launch, identity, daemon, h := statusRentalHub(t)
 	cert := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf}))
 
 	// The machine's own deadline, read over its API with the rental's owner key.
@@ -216,9 +216,12 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	fatal(t, problem)
 	recorded := *current
 
-	// An ending rental is never kept alive, and the machine is not asked.
+	// An ending rental is never kept alive, and the machine is not asked: its Hub says it ends.
 	recorded.State = "release_requested"
 	fatal(t, store.RecordRental(recorded))
+	h.mu.Lock()
+	h.rentals[parityRental]["state"] = "release_requested"
+	h.mu.Unlock()
 	before := held()
 	if code, out := runCozy(t, root, "rental", "keepalive", "tessa", "--json"); code == 0 {
 		t.Fatalf("ending rental kept alive: %s", out)

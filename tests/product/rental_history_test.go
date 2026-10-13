@@ -100,9 +100,15 @@ func TestRentalHistoryShowsEachRentalsLifetimeRunsAndCost(t *testing.T) {
 	run("otter-ok-0", "pr-otter-live", "succeeded", true)
 	run("otter-ok-1", "pr-otter-live", "succeeded", true)
 
+	// The built-in tensorhub, never logged in to here, is named rather than left out.
+	signedOut := "hub tensorhub: not logged in; `cozy auth login <email> --tensorhub=tensorhub`"
 	if code, live := runCozy(t, root, "rental", "list", "--no-watch"); code != 0 || !strings.Contains(live, "otter") ||
-		strings.Contains(live, "heron") || strings.Contains(live, "kanna") || !strings.Contains(live, "Next: cozy rental list --all") {
+		strings.Contains(live, "heron") || strings.Contains(live, "kanna") || !strings.Contains(live, "Next: cozy rental list --all") ||
+		!strings.Contains(live, signedOut) {
 		t.Fatalf("the default list shows ended rentals or hides where they are [exit %d]\n%s", code, live)
+	}
+	if code, history := runCozy(t, root, "rental", "list", "--all"); code != 0 || !strings.Contains(history, signedOut) {
+		t.Fatalf("the history leaves out a hub it could not read [exit %d]\n%s", code, history)
 	}
 	type historyRow struct {
 		Machine      string `json:"machine"`

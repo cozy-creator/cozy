@@ -42,6 +42,8 @@ func TestRentalListLiveBoard(t *testing.T) {
 			"tensorhub_token: rental-idle-test\n"), 0o600))
 
 	hub.add("rental-tui", "sparrow")
+	hub.set("rental-tui", "machine_name", "sparrow")
+	hub.set("rental-tui", "worker_address", "127.0.0.1:1")
 	hub.set("rental-tui", "state", "acquiring")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)

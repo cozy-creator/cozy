@@ -28,6 +28,7 @@ func TestRentalListingSaysWhenItsHubCannotReachARental(t *testing.T) {
 	fatal(t, problem)
 	for id, machine := range map[string]string{"pr-lost": "adashino", "pr-fine": "mokou"} {
 		hub.add(id, machine)
+		hub.set(id, "machine_name", machine)
 		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: id, MachineName: machine,
 			SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL}))
 	}

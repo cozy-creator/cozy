@@ -1123,8 +1123,47 @@ func rentalBoard(ctx *Context, watching bool) (func(context.Context) (output.Lis
 		if inventory.HubUnanswered != nil || len(inventory.UnreadableHubs) > 0 {
 			ctx.exitCode = 1
 		}
-		return renderRentalList(ctx.Cfg, inventory, allHubs), nil
+		list := renderRentalList(ctx.Cfg, inventory, allHubs)
+		unread := map[string]bool{}
+		for _, problem := range inventory.UnreadableHubs {
+			unread[problem.Hub] = true
+		}
+		var signedOut []string
+		for _, origin := range knownHubs(ctx) {
+			if !unread[origin] && !signedIn(ctx, origin) {
+				signedOut = append(signedOut, ctx.Cfg.HubLabel(origin))
+				list.Lead = append(list.Lead, signedOutLine(ctx, origin))
+			}
+		}
+		if len(signedOut) > 0 {
+			list.Aggregates = append(list.Aggregates, output.Field{K: "signed_out_hubs", V: jsonFact{signedOut}})
+		}
+		return list, nil
 	}, nil
+}
+
+// knownHubs is every hub this computer names: the current one and each in its config.
+func knownHubs(ctx *Context) []string {
+	origins := []string{ctx.Cfg.HubURL}
+	for _, origin := range ctx.Cfg.Hubs {
+		if !slices.Contains(origins, origin) {
+			origins = append(origins, origin)
+		}
+	}
+	slices.Sort(origins)
+	return origins
+}
+
+// signedIn is whether this computer holds a credential for the hub at origin.
+func signedIn(ctx *Context, origin string) bool {
+	scoped := ctx.forHub(origin)
+	return scoped.Cfg.HubToken.Present() || accountauth.New(scoped.Cfg).CredentialPresent()
+}
+
+// signedOutLine names a hub a listing spanning hubs could not read for want of a login.
+func signedOutLine(ctx *Context, origin string) string {
+	label := ctx.Cfg.HubLabel(origin)
+	return fmt.Sprintf("hub %s: not logged in; `cozy auth login <email> --tensorhub=%s`", label, label)
 }
 
 // handleRentalShow is `cozy rental show <rental>`: one rental's row of the every-hub
@@ -1210,11 +1249,9 @@ func showEndedRental(ctx *Context, subject string) *exit.Error {
 	if subject == "" {
 		return exit.Usagef("name a rental: cozy rental show <machine or rental id>")
 	}
-	origins := []string{ctx.Cfg.HubURL}
-	for _, origin := range ctx.Cfg.Hubs {
-		if !slices.Contains(origins, origin) {
-			origins = append(origins, origin)
-		}
+	origins := knownHubs(ctx)
+	if i := slices.Index(origins, ctx.Cfg.HubURL); i > 0 {
+		origins[0], origins[i] = origins[i], origins[0]
 	}
 	// Every hub is asked at once.
 	found := make([][]hub.Rental, len(origins))
@@ -1222,7 +1259,7 @@ func showEndedRental(ctx *Context, subject string) *exit.Error {
 	var wait sync.WaitGroup
 	for i, origin := range origins {
 		scoped := ctx.forHub(origin)
-		if !scoped.Cfg.HubToken.Present() && !accountauth.New(scoped.Cfg).CredentialPresent() {
+		if !signedIn(ctx, origin) {
 			continue
 		}
 		wait.Go(func() {
