@@ -266,12 +266,19 @@ func handleLs(ctx *Context) *exit.Error {
 	}
 	l := output.List{
 		Name:      "packages",
-		Fields:    []string{"package", "version", "python", "python_status", "size", "dependencies"},
+		Fields:    []string{"package", "version", "python", "size", "dependencies"},
 		AllFields: []string{"package", "major", "version", "python", "python_status", "size", "dependencies", "placement_set", "install_id", "source", "hub", "scope", "synced", "verified", "installed"},
 		Bytes:     []string{"size", "dependencies"},
 		Notes:     []string{"org/name references resolve at hub " + ctx.Cfg.HubText(ctx.Cfg.HubURL) + "; another hub's need --tensorhub=<hub>."},
 	}
-	inventory, pythonProblem := hostruntime.PythonExecutors(context.Background())
+	// Whether the host Runtime can still run each install's Python is its answer, an
+	// interpreter start: asked only when the listing shows it.
+	var inventory hostruntime.PythonInventory
+	var pythonProblem *exit.Error
+	showStatus := ctx.Mode().Full || slices.Contains(ctx.Mode().Fields, "python_status")
+	if showStatus {
+		inventory, pythonProblem = hostruntime.PythonExecutors(context.Background())
+	}
 	rows = slices.DeleteFunc(rows, func(inst records.PackageInstall) bool { return !inHubScope(ctx, inst) })
 	// Published installations first: a page of local captures must not hide them.
 	captured := func(inst records.PackageInstall) int {
@@ -283,7 +290,9 @@ func handleLs(ctx *Context) *exit.Error {
 	slices.SortStableFunc(rows, func(a, b records.PackageInstall) int { return captured(a) - captured(b) })
 	for _, inst := range rows {
 		pythonStatus := "supported"
-		if pythonProblem != nil {
+		if !showStatus {
+			pythonStatus = ""
+		} else if pythonProblem != nil {
 			pythonStatus = "unknown: " + pythonProblem.Message
 		} else if _, problem := inventory.Select("", inst.Python); problem != nil {
 			pythonStatus = "unusable: " + problem.Message
