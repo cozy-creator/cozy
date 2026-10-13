@@ -272,13 +272,6 @@ func (h *Host) place(staged *staged, uv string) (*Installed, *exit.Error) {
 	return &installed, nil
 }
 
-// Only the legacy identity is read during adoption. Worker tokens and Hub settings
-// are deliberately not decoded into the new lifecycle.
-type registration struct {
-	Hub string `json:"hub"`
-	ID  string `json:"id"`
-}
-
 type hostRecord struct {
 	PID        int    `json:"pid"`
 	WorkerID   string `json:"worker_id"`
@@ -679,28 +672,7 @@ func (h *Host) Pin() (*workertls.Pin, *exit.Error) {
 	return pin, nil
 }
 
-// registrations reads legacy identities for one-time adoption. It neither reads legacy
-// worker capabilities nor contacts the registry that issued them.
-func (h *Host) registrations() (map[string]registration, *exit.Error) {
-	out := map[string]registration{}
-	raw, err := os.ReadFile(h.path("registrations.json"))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, exit.Internalf("cannot read the machine's registrations: %s", err)
-	}
-	if err == nil && json.Unmarshal(raw, &out) != nil {
-		return nil, exit.New(exit.Conflict, "the machine's registrations are unreadable")
-	}
-	var legacy registration
-	if raw, err := os.ReadFile(h.path("registration.json")); err == nil && json.Unmarshal(raw, &legacy) == nil && legacy.ID != "" {
-		if _, known := out[legacy.Hub]; !known {
-			out[legacy.Hub] = legacy
-		}
-	}
-	return out, nil
-}
-
-// identity is locally allocated once. Import the last active legacy identity on adoption
-// so old records retain their machine, without retaining its Hub worker capability.
+// identity is locally allocated once.
 func (h *Host) identity() (string, *exit.Error) {
 	if raw, err := os.ReadFile(h.path("machine-id")); err == nil {
 		id := strings.TrimSpace(string(raw))
@@ -711,32 +683,7 @@ func (h *Host) identity() (string, *exit.Error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", exit.Internalf("cannot read machine identity: %s", err)
 	}
-	id := ""
-	if record, problem := h.record(); problem != nil {
-		return "", problem
-	} else if record != nil {
-		id = record.WorkerID
-	}
-	if id == "" {
-		all, problem := h.registrations()
-		if problem != nil {
-			return "", problem
-		}
-		keys := make([]string, 0, len(all))
-		for key := range all {
-			keys = append(keys, key)
-		}
-		slices.Sort(keys)
-		for _, key := range keys {
-			if all[key].ID != "" {
-				id = all[key].ID
-				break
-			}
-		}
-	}
-	if id == "" {
-		id = "machine-" + uuid.NewString()
-	}
+	id := "machine-" + uuid.NewString()
 	if err := writePrivate(h.path("machine-id"), []byte(id+"\n")); err != nil {
 		return "", exit.Internalf("cannot record machine identity: %s", err)
 	}
@@ -759,20 +706,6 @@ func (h *Host) secret(name string) (string, *exit.Error) {
 }
 
 func (h *Host) record() (*hostRecord, *exit.Error) {
-	if userunit.Available() && userunit.MainPID(userunit.Name("cozy-machine", h.dir, false)) > 0 {
-		return nil, exit.Named(exit.Conflict, "machine.legacy_process_running", "the retired machine unit still owns this root; stop it with the original CLI after its accepted work finishes")
-	}
-
-	// A namespace cut must not start a second process over an occupied root.
-	// This is a safety census only: no legacy request or credential is honored.
-	if raw, err := os.ReadFile(h.path("host.json")); err == nil {
-		var old hostRecord
-		if json.Unmarshal(raw, &old) == nil && h.legacyAlive(old.PID) {
-			return nil, exit.Named(exit.Conflict, "machine.legacy_process_running", "a retired machine process still owns this root; stop it with the original CLI after its accepted work finishes")
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, exit.Internalf("cannot inspect the previous machine record: %s", err)
-	}
 	raw, err := os.ReadFile(h.path("agent.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -871,33 +804,6 @@ func (h *Host) starting(pid int) bool {
 	return userunit.Available() && userunit.MainPID(h.Unit()) == pid && userunit.Running(h.Unit())
 }
 
-// Legacy identity is only a refusal census, never permission to signal a PID.
-func (h *Host) legacyAlive(pid int) bool {
-	if h.alive(pid) {
-		return true
-	}
-	if pid <= 0 {
-		return false
-	}
-	target, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe")
-	if err != nil {
-		return false
-	}
-	target = strings.TrimSuffix(target, " (deleted)")
-	for _, relative := range []string{"usr/local/bin/pod-supervisor", "usr/local/bin/cozy"} {
-		path := filepath.Join(h.Root(), relative)
-		if target == path {
-			return true
-		}
-		resolved, err := filepath.EvalSymlinks(path)
-		cwd, cwdErr := os.Readlink("/proc/" + strconv.Itoa(pid) + "/cwd")
-		if err == nil && target == resolved && cwdErr == nil && cwd == h.Root() {
-			return true
-		}
-	}
-	return false
-}
-
 func processStartTicks(pid int) uint64 {
 	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
@@ -915,13 +821,9 @@ func processStartTicks(pid int) uint64 {
 	return ticks
 }
 
-// guardLock is the one lock every machine on a root holds for its life: the Go agent's and
-// the Rust machine's alike (cozy-machine `machine::identity::hold`). runtimeLock is the Go
-// agent's Python Runtime's, which can outlive its agent; it counts while such a Runtime can exist.
-const (
-	guardLock   = "var/lib/cozy/machine/agent.lock"
-	runtimeLock = "run/cozy/worker/worker.lock"
-)
+// guardLock is the one lock a machine on a root holds for its life (TensorD
+// `machine::identity::hold`).
+const guardLock = "var/lib/cozy/machine/agent.lock"
 
 // guard holds the root's lock while this controller changes or starts its machine: the
 // kernel, not a client record, says no machine runs there.
@@ -935,20 +837,7 @@ func (h *Host) guard() (func(), *exit.Error) {
 	if held {
 		return nil, busy
 	}
-	release := func() { _ = flock.Release(file); _ = file.Close() }
-	runtime, held, err := probe(filepath.Join(h.Root(), runtimeLock), false)
-	if runtime != nil {
-		_ = flock.Release(runtime)
-		_ = runtime.Close()
-	}
-	if err != nil || held {
-		release()
-		if err != nil {
-			return nil, exit.Internalf("cannot inspect machine ownership: %s", err)
-		}
-		return nil, busy
-	}
-	return release, nil
+	return func() { _ = flock.Release(file); _ = file.Close() }, nil
 }
 
 // probe takes path's exclusive lock, or reports that a live process holds it. An absent file
