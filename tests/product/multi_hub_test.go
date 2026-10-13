@@ -282,6 +282,16 @@ func TestHubContextsSelectTheCurrentHub(t *testing.T) {
 	if code, out := runCozy(t, root, "hub", "add", "Local", "http://127.0.0.1:1/", "--json"); code != 0 {
 		t.Fatalf("hub add: %d %s", code, out)
 	}
+	// A URL is one identity in any host case and with or without its default port.
+	if code, out := runCozy(t, root, "hub", "add", "spelled", "HTTPS://Example.TEST:443/", "--json"); code != 0 {
+		t.Fatalf("hub add: %d %s", code, out)
+	}
+	if code, out := runCozy(t, root, "hub", "list", "--json"); code != 0 || !strings.Contains(out, `"url":"https://example.test"`) {
+		t.Fatalf("an equivalent URL spelling was not canonicalized: %d %s", code, out)
+	}
+	if code, out := runCozy(t, root, "hub", "remove", "spelled", "--json"); code != 0 {
+		t.Fatalf("hub remove: %d %s", code, out)
+	}
 	if code, out := runCozy(t, root, "hub", "add", "Bad Name", "http://127.0.0.1:1", "--json"); code == 0 {
 		t.Fatalf("an invalid hub name was accepted: %s", out)
 	}
