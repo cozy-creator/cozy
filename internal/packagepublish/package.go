@@ -48,7 +48,6 @@ type Package struct {
 	Root                   string // disposable wheel output, empty until Build
 	Name                   string
 	Release                string
-	ScriptModels           map[string]string // plain-main default model refs; ordinary CLI overrides win
 }
 
 func (p *Package) Close() {

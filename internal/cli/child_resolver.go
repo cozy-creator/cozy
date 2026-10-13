@@ -6,13 +6,12 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // composesChildren is Request.ComposesChildren for an installed request, with one exception:
-// a client script is a composition root whose captured bindings are the calls it makes, so a
-// script that writes weights still reserves capacity for its children.
+// a package whose captured bindings are the calls it makes is a composition root, so one that
+// writes weights still reserves capacity for its children.
 func (r *Resolver) composesChildren(request records.Request) (bool, *exit.Error) {
 	if request.InstallID == "" {
 		return false, nil
@@ -20,11 +19,7 @@ func (r *Resolver) composesChildren(request records.Request) (bool, *exit.Error)
 	if request.ComposesChildren() || request.SizedByOwnModels() {
 		return request.ComposesChildren(), nil
 	}
-	_, surface, problem := r.installPackageInterface(request.InstallID)
-	if problem != nil {
-		return false, problem
-	}
-	return surface.Application == packagepublish.ScriptApplication, nil
+	return r.store.HasChildBindings(request.InstallID)
 }
 
 // PrivateRentalNeedsAccelerator sizes the rental for its captured children while

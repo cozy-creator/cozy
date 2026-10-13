@@ -415,25 +415,36 @@ does not prohibit local execution; actual encoding support, model compatibility
 and memory capacity are still checked by Runtime. An explicit model/lane override
 takes precedence. Rental placement retains its existing capacity rules.
 
-Local scripts define ordinary `main()` or `main(ctx)`, synchronous or asynchronous.
-They need no App, request/result class, published package, or separate install command.
-Dependencies may be declared with PEP 723 inline metadata:
+A local script is a single-file unpublished package: an ordinary `main()` or `main(ctx)`,
+synchronous or asynchronous, with no App, request/result class, publication or install command.
+Its PEP 723 block is its `pyproject.toml` (Python, dependencies, `[tool.uv.sources]`), and
+`[tool.cozy]` is its `package.toml`: model defaults, weights outputs and `accelerator`.
 
 ```python
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = []
+# dependencies = ["cozy-runtime[media]>=0.23.32", "seedvr2"]
+# [tool.cozy.models]
+# model = "seedvr2@0.1.0/original"   # or a ladder: [{gpu = "H100", lane = "..."}, ...]
 # ///
+from seedvr2.model import RestorationModel
 
-async def main(ctx):
+async def main(ctx, *, model: RestorationModel) -> int:
     ctx.log("Starting my experiment")
-    ctx.raise_if_cancelled()
-    # Call your imported operations and write ordinary Python control flow here.
-    ctx.progress(1.0, stage="complete")
+    frames = model.restore(...)   # a constructed model, as a package entrypoint receives it
+    # Call package functions as children with ordinary Python control flow here.
+    return len(frames)
 ```
 
-The optional context supplies cancellation, logs, progress and metrics. Discovery checks the
-script's syntax without importing it on the client; its captured code executes on the worker.
+`main` takes what a package function takes: Model slots, services such as `Outputs` and
+`Telemetry`, and typed assets. A `main` that runs Model slots is served like a package
+entrypoint: Runtime constructs them through the weight plane and memory manager, and the run
+holds its GPU while its children run beside it. One that writes weights outputs, uses job
+services or reads a bare `Model` source runs as a job, as does one without Model slots.
+`[tool.cozy.models]` entries are the slot's default ladder, exactly as `defaults=` declares
+it; `model.<slot>=org/model@release/lane` overrides it per run. The optional context supplies
+cancellation, logs, progress and metrics. Discovery checks the script's syntax without
+importing it on the client; its captured code executes on the worker.
 Any target ending in `.py` is a script path, relative (with or without `./`) or absolute; a
 two-part `org/name.py` runs the file when it exists.
 Generator entrypoints are refused rather than reported as completed without running their body.
@@ -463,8 +474,7 @@ indexes.
 
 An **unpublished package** runs from its directory without a Tensorhub package release.
 A **local script** is its single-file form; **editable** describes a dependency's installation
-mode. These terms say where code comes from, not whether its model inputs must be downloaded
-or whether it is allowed to perform managed child calls.
+mode. These terms say where code comes from, never what the code may do.
 
 The existing worker protocol still uses `PreparePrivatePlacement` and related `Private*`
 messages. Persisted `private-revision` markers, historical SQLite column names, and stable
@@ -504,7 +514,7 @@ The calling single-file script needs neither App declaration.
 Installed callable wheels require Runtime 0.12 or newer. The machine installs them from the
 caller's lock like any other dependency.
 
-On either a local or rented worker, a memoized function, run directly or called by a job, can acquire
+On either a local or rented worker, a memoized function, run directly or called by another, can acquire
 an earlier successful result when its
 exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,
 and measured numerical environment match. A fresh script can reuse this work without a retry
