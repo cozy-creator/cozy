@@ -165,23 +165,18 @@ func (h *Host) recoverReplace(ctx context.Context) *exit.Error {
 	return nil
 }
 
-// vacated waits until a stopped machine's processes have let the root go: the machine's
-// lock and, under the Go agent, its Python Runtime's, which outlives a killed agent.
+// vacated waits until a stopped machine's processes have let the root go.
 func (h *Host) vacated(ctx context.Context) *exit.Error {
 	for {
-		busy := false
-		for _, lock := range []string{guardLock, runtimeLock} {
-			file, held, err := probe(filepath.Join(h.Root(), lock), false)
-			if err != nil {
-				return exit.Internalf("cannot inspect machine ownership: %s", err)
-			}
-			if file != nil {
-				_ = flock.Release(file)
-				_ = file.Close()
-			}
-			busy = busy || held
+		file, held, err := probe(filepath.Join(h.Root(), guardLock), false)
+		if err != nil {
+			return exit.Internalf("cannot inspect machine ownership: %s", err)
 		}
-		if !busy {
+		if file != nil {
+			_ = flock.Release(file)
+			_ = file.Close()
+		}
+		if !held {
 			return nil
 		}
 		select {
