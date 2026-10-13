@@ -673,10 +673,11 @@ func FindRentalSKU(skus []RentalSKU, name string, gpus int) (RentalSKU, bool) {
 // RentalSKUs reads Tensorhub's public product catalog, flattened to one machine per width.
 // A product or width this build cannot price or size is left out; one bad row never
 // hides the rest of the catalog. A named provider (an operator's development choice) is the
-// Hub's to filter.
+// Hub's to filter, for a caller it knows as an admin: the ask carries the sign-in.
 func (c *Client) RentalSKUs(ctx context.Context, provider string) ([]RentalSKU, *exit.Error) {
 	var products []RentalProduct
-	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rental-skus" + providerQuery("?", provider)}, &products); e != nil {
+	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rental-skus" + providerQuery("?", provider),
+		optionalAuth: provider != ""}, &products); e != nil {
 		return nil, e
 	}
 	var out []RentalSKU
@@ -977,7 +978,8 @@ func (c *Client) QuoteRental(ctx context.Context, body []byte) (RentalQuote, *ex
 func (c *Client) RentalSKUStatus(ctx context.Context, provider, name string, gpus int) (RentalSKUStatus, *exit.Error) {
 	var out RentalSKUStatus
 	if e := c.do(ctx, call{method: http.MethodGet,
-		path: "/v1/rental-skus/" + url.PathEscape(name) + "?accelerator_count=" + strconv.Itoa(gpus) + providerQuery("&", provider)}, &out); e != nil {
+		path:         "/v1/rental-skus/" + url.PathEscape(name) + "?accelerator_count=" + strconv.Itoa(gpus) + providerQuery("&", provider),
+		optionalAuth: provider != ""}, &out); e != nil {
 		return RentalSKUStatus{}, e
 	}
 	return out, nil

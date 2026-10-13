@@ -31,25 +31,36 @@ func TestRentalRequestNamesItsProviderOnlyWhenAsked(t *testing.T) {
 	}
 }
 
-// The catalog names no provider (th-254): a named one is the Hub's to filter, and an operator's
-// `?provider=` is asked and its answer listed as is.
+// The catalog names no provider (th-254): a named one is the Hub's to filter, for an admin
+// only, so an operator's `?provider=` is asked with the sign-in and its answer listed as is.
+// The public listing and status are asked anonymously.
 func TestRentalSKUsAskTheHubForANamedProvider(t *testing.T) {
 	product := `[{"name":"rtx-3070","accelerator_model":"NVIDIA GeForce RTX 3070","compute_capability":"8.6","vram_gb":8,` +
 		`"widths":[{"accelerator_count":1,"price_usd_micros_per_hour":100000}]}]`
 	for _, provider := range []string{"vast", ""} {
-		var asked string
+		var asked, statusAsked string
+		var signedIn, statusSignedIn bool
 		mux := http.NewServeMux()
 		mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, r *http.Request) {
-			asked = r.URL.Query().Get("provider")
+			asked, signedIn = r.URL.Query().Get("provider"), r.Header.Get("Authorization") == "Bearer proof"
 			_, _ = w.Write([]byte(product))
+		})
+		mux.HandleFunc("GET /v1/rental-skus/{name}", func(w http.ResponseWriter, r *http.Request) {
+			statusAsked, statusSignedIn = r.URL.Query().Get("provider"), r.Header.Get("Authorization") == "Bearer proof"
+			_, _ = w.Write([]byte(`{"name":"rtx-3070","offered":true}`))
 		})
 		server := httptest.NewServer(mux)
 		client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "rental-provider")
 		skus, problem := client.RentalSKUs(t.Context(), provider)
+		fatal(t, problem)
+		_, problem = client.RentalSKUStatus(t.Context(), provider, "rtx-3070", 1)
 		server.Close()
 		fatal(t, problem)
-		if asked != provider || len(skus) != 1 || skus[0].Name != "rtx-3070" || skus[0].PriceUSDMicrosPerHour != 100000 {
-			t.Fatalf("provider %q: asked %q, listed %+v", provider, asked, skus)
+		named := provider != ""
+		if asked != provider || len(skus) != 1 || skus[0].Name != "rtx-3070" || skus[0].PriceUSDMicrosPerHour != 100000 ||
+			signedIn != named || statusAsked != provider || statusSignedIn != named {
+			t.Fatalf("provider %q: asked %q (signed in %t, status %q signed in %t), listed %+v",
+				provider, asked, signedIn, statusAsked, statusSignedIn, skus)
 		}
 	}
 }
