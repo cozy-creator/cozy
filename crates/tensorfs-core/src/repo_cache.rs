@@ -190,10 +190,7 @@ impl RepoObjectCache {
         crate::stats::repo_cache_verified_read();
         let mut bytes = Vec::with_capacity(want.length as usize);
         file.read_to_end(&mut bytes)
-            .map_err(|error| crate::err::Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("read cached {}: {error}", want.id()),
-            })?;
+            .map_err(|error| crate::store::classify_io(format!("read cached {}", want.id()), error))?;
         if sha256::hex_digest(&bytes) != want.sha256 {
             return crate::err::refuse(
                 Code::OBJECT_CORRUPT,

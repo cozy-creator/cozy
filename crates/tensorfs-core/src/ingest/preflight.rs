@@ -170,10 +170,7 @@ impl Drop for Staged {
 }
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {error}", what.as_ref()),
-    }
+    crate::store::classify_io(what, error)
 }
 
 /// Write the headers into `root` as sparse carriers.

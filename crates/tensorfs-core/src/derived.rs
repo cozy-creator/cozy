@@ -3478,10 +3478,7 @@ pub fn add_indexed_part<R: Read>(
         reader,
     )?;
     let mut extra = [0u8; 1];
-    if reader.read(&mut extra).map_err(|error| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("read addition tail: {error}"),
-    })? != 0
+    if reader.read(&mut extra).map_err(|error| crate::store::classify_io("read addition tail", error))? != 0
     {
         return refuse(
             Code::LENGTH_MISMATCH,
@@ -3536,10 +3533,7 @@ pub fn add_config<R: Read>(
     reader
         .take(maximum + 1)
         .read_to_end(&mut input)
-        .map_err(|error| Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("read config: {error}"),
-        })?;
+        .map_err(|error| crate::store::classify_io("read config", error))?;
     if input.len() as u64 > maximum {
         return refuse(
             Code::SIZE_CAP,

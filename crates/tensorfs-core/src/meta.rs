@@ -23,10 +23,7 @@ fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
 }
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {error}", what.as_ref()),
-    }
+    crate::store::classify_io(what, error)
 }
 
 pub fn now_secs() -> u64 {

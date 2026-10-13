@@ -461,10 +461,7 @@ pub fn effective_registry(store: &Store, supplied: Option<&[u8]>) -> Result<(Str
 }
 
 pub fn read_header_only(path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
-    let json = fs::read(path).map_err(|error| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("read {}: {error}", path.display()),
-    })?;
+    let json = fs::read(path).map_err(|error| crate::store::classify_io(format!("read {}", path.display()), error))?;
     let data_start = json.len() as u64 + 8;
     let header = carrier::parse_header(&json, data_start, None)?;
     let mut raw = (json.len() as u64).to_le_bytes().to_vec();
@@ -508,15 +505,9 @@ pub fn read_carrier(carrier: &CarrierInput, set: &CarrierSet) -> Result<(SourceH
         return read_header_only(path);
     }
     let header = carrier::read_header(path)?;
-    let mut file = fs::File::open(path).map_err(|error| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("reopen {}: {error}", path.display()),
-    })?;
+    let mut file = fs::File::open(path).map_err(|error| crate::store::classify_io(format!("reopen {}", path.display()), error))?;
     let mut raw = vec![0u8; header.header_bytes as usize + 8];
-    file.read_exact(&mut raw).map_err(|error| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("reread header of {}: {error}", path.display()),
-    })?;
+    file.read_exact(&mut raw).map_err(|error| crate::store::classify_io(format!("reread header of {}", path.display()), error))?;
     Ok((header, raw))
 }
 
@@ -1297,10 +1288,7 @@ impl FileFence {
                 "verified source file has zero length",
             );
         }
-        let metadata = fs::symlink_metadata(&file.path).map_err(|error| Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("stat {}: {error}", file.path.display()),
-        })?;
+        let metadata = fs::symlink_metadata(&file.path).map_err(|error| crate::store::classify_io(format!("stat {}", file.path.display()), error))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return refuse(
                 Code::KEY_GRAMMAR,
@@ -1329,10 +1317,7 @@ impl FileFence {
     }
 
     fn check(&self) -> Result<()> {
-        let metadata = fs::symlink_metadata(&self.path).map_err(|error| Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("restat {}: {error}", self.path.display()),
-        })?;
+        let metadata = fs::symlink_metadata(&self.path).map_err(|error| crate::store::classify_io(format!("restat {}", self.path.display()), error))?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.dev() != self.dev
@@ -1495,15 +1480,9 @@ fn validate_request(
         fences.push(FileFence::capture(row)?);
         // The header used to plan must be the prefix of the admitted body, not a second
         // unauthenticated description of it. This reads only metadata, never the payload.
-        let mut file = fs::File::open(&row.path).map_err(|error| Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("open source header: {error}"),
-        })?;
+        let mut file = fs::File::open(&row.path).map_err(|error| crate::store::classify_io("open source header", error))?;
         let mut prefix = vec![0; row.header.len()];
-        file.read_exact(&mut prefix).map_err(|error| Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("read source header: {error}"),
-        })?;
+        file.read_exact(&mut prefix).map_err(|error| crate::store::classify_io("read source header", error))?;
         if prefix != row.header {
             return refuse(
                 Code::OBJECT_ID_MISMATCH,
@@ -2264,10 +2243,7 @@ pub fn release_model_source(store: &Store, operation_id: &str) -> Result<()> {
         match fs::remove_dir_all(transaction::candidate_dir(store.root(), operation_id)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("remove model-source journal: {error}"),
-            }),
+            Err(error) => Err(crate::store::classify_io("remove model-source journal", error)),
         }
     })
 }
@@ -2287,15 +2263,9 @@ pub fn source_checkpoints(store: &Store, operation: &str) -> Result<Vec<SourceCh
     let dir = transaction::candidate_dir(store.root(), operation);
     let mut checkpoints: BTreeMap<String, (std::time::SystemTime, SourceCheckpoint)> =
         BTreeMap::new();
-    for entry in fs::read_dir(&dir).map_err(|e| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("source progress directory: {e}"),
-    })? {
+    for entry in fs::read_dir(&dir).map_err(|e| crate::store::classify_io("source progress directory", e))? {
         let path = entry
-            .map_err(|e| Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("source progress entry: {e}"),
-            })?
+            .map_err(|e| crate::store::classify_io("source progress entry", e))?
             .path();
         let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
@@ -2309,16 +2279,10 @@ pub fn source_checkpoints(store: &Store, operation: &str) -> Result<Vec<SourceCh
         crate::ids::hex64("source progress plan", plan_hex)?;
         let mut bytes = Vec::new();
         fs::File::open(&path)
-            .map_err(|e| Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("source progress cursor: {e}"),
-            })?
+            .map_err(|e| crate::store::classify_io("source progress cursor", e))?
             .take(crate::limits::SPEC_MAX_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|e| Refusal {
-                code: Code::IO_FAILED,
-                detail: format!("source progress read: {e}"),
-            })?;
+            .map_err(|e| crate::store::classify_io("source progress read", e))?;
         let value = canon::parse_canonical(&bytes, crate::limits::SPEC_MAX_BYTES)?;
         let head = ObjectRef::from_value("source progress head", &value)?;
         let plan_digest = format!("sha256:{plan_hex}");

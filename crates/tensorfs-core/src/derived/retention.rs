@@ -80,10 +80,7 @@ impl Plain for RetainedResult {
 }
 
 fn io(error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("retained derived result: {error}"),
-    }
+    crate::store::classify_io("retained derived result", error)
 }
 
 fn directory(store: &Store) -> PathBuf {

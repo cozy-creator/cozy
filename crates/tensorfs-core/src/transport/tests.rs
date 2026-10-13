@@ -4508,6 +4508,22 @@ fn a_real_enospc_from_the_kernel_is_a_capacity_verdict_not_an_io_failure() {
     );
 }
 
+/// The same kernel ENOSPC met by a module that wraps its own I/O errors (here, writing a
+/// checkpoint part out) is the same verdict: every I/O error goes through one classifier.
+#[test]
+fn a_full_disk_met_outside_the_store_is_still_a_capacity_verdict() {
+    let root = temporary("full-outside-store");
+    let store = Store::init(&root).unwrap();
+    let part = crate::header::Part::plan(crate::dtype::Dtype::U8, vec![16], &[7u8; 16]);
+    let mut full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full is required for this arm");
+    let refusal = crate::checkpoint::materialize(&store, "w", &part, &mut full).unwrap_err();
+    assert_eq!(refusal.code, Code::CAPACITY_EXHAUSTED, "{refusal}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 // These proofs deliberately occupy the process-scoped optional write pool.
 static OPTIONAL_CACHE_PROOFS: Mutex<()> = Mutex::new(());
 

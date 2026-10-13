@@ -30,10 +30,7 @@ const FORMAT: &str = "tensorfs.source-custody/1";
 const EVIDENCE_MAX_BYTES: usize = 1024;
 
 fn io(what: &str, error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("source custody {what}: {error}"),
-    }
+    crate::store::classify_io(format!("source custody {what}"), error)
 }
 
 /// Every object this operation's custodian holds, with the evidence that says where.

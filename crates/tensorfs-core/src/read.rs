@@ -340,10 +340,7 @@ pub fn read_into(lease: &ReadLease, r: &ObjectRange, buf: &mut [u8]) -> Result<(
     // `fstat` on the PINNED fd against the declared length, before any byte moves: an
     // in-place truncation of this inode is caught by arithmetic rather than by a read
     // that half-succeeds. (A swap at the pathname is not caught — it is INEFFECTIVE.)
-    let size = vf.current_len().map_err(|e| Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("fstat {}: {e}", r.obj.id()),
-    })?;
+    let size = vf.current_len().map_err(|e| crate::store::classify_io(format!("fstat {}", r.obj.id()), e))?;
     if size != r.obj.length {
         return refuse(
             Code::SHORT_READ,
@@ -366,10 +363,7 @@ pub fn read_into(lease: &ReadLease, r: &ObjectRange, buf: &mut [u8]) -> Result<(
                 r.off + r.len
             ),
         ),
-        Err(e) => Err(Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("pread {}: {e}", r.obj.id()),
-        }),
+        Err(e) => Err(crate::store::classify_io(format!("pread {}", r.obj.id()), e)),
     }
 }
 

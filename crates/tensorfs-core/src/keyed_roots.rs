@@ -72,10 +72,7 @@ impl Plain for KeyedRoot {
 }
 
 fn io(e: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("keyed root: {e}"),
-    }
+    crate::store::classify_io("keyed root", e)
 }
 
 fn directory(store: &Store) -> PathBuf {
