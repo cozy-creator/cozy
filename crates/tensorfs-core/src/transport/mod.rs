@@ -57,7 +57,7 @@ pub use credential::{
 pub use download::{fetch_ranged, Ranged, CHUNK_BYTES, PART_BYTES};
 pub use dpop::{AccessToken, DpopCredential, DpopKey};
 pub use http::{trust_roots, Client};
-pub use hub::{closure, closure_all, hub_call, presign, Closure, Presigned};
+pub use hub::{closure, closure_all, presign, Closure, Presigned};
 pub use ledger::{
     Deadline, Ledger, PullCancellation, FETCH_ATTEMPTS, PULL_STREAMS, SAMPLE_SECONDS, STALL_FACTOR,
     STILL_SAMPLES, STREAMS,

@@ -391,30 +391,6 @@ fn call(
     call_method(client, "POST", base, path, body, credential, policy, deadline, ledger)
 }
 
-/// One JSON call of a Hub's API outside a pull (a machine renewing its publication token):
-/// `call_method` on a fresh connection, with no deadline but the Hub's own answers.
-pub fn hub_call(
-    method: &str,
-    base: &str,
-    path: &str,
-    body: &[u8],
-    credential: &dyn CredentialProvider,
-    policy: &SourcePolicy,
-) -> Result<Value> {
-    let ledger = Ledger::new();
-    call_method(
-        &Client::new(),
-        method,
-        base,
-        path,
-        body,
-        credential,
-        policy,
-        Deadline::none(),
-        &ledger,
-    )
-}
-
 /// One JSON call of the hub's control plane, re-asked only while the hub says "not now".
 #[allow(clippy::too_many_arguments)]
 pub(super) fn call_method(

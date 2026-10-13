@@ -1036,30 +1036,42 @@ fn plan_against_store(
     Ok((plan, report))
 }
 
-/// The closure this Store can answer for itself: the refspec is `org/name@release@sha256:<hex>`,
-/// a lane is named, and the local release index maps (model, release, lane) to exactly that
-/// manifest. Anything else — an unpinned ref, a moved pointer, a manifest or header this
-/// Store cannot read — is a question for the hub.
+/// The closure this Store can answer for itself: the refspec pins a manifest the local index
+/// records — `org/name@sha256:<hex>`, one of the repository's checkpoints (a checkpoint by
+/// digest has no lane), or `org/name@release@sha256:<hex>` with that release lane naming it.
+/// Anything else — an unpinned ref, a moved pointer, a manifest or header this Store cannot
+/// read — is a question for the hub.
 fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
-    let mut parts = request.refspec.split('@');
-    let (model, release, digest) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() || release.is_empty() || request.lane.is_empty() {
-        return None;
-    }
+    let parts: Vec<&str> = request.refspec.split('@').collect();
+    let (model, release, lane, digest) = match parts[..] {
+        [model, digest] => (model, "", "", digest),
+        [model, release, digest] if !release.is_empty() && !request.lane.is_empty() => {
+            (model, release, request.lane, digest)
+        }
+        _ => return None,
+    };
     let pinned = digest.strip_prefix("sha256:")?;
     let (org, name) = model.split_once('/')?;
     let repo = crate::repository::RepositoryName::new(org, name).ok()?;
     let bytes = std::fs::read(request.store.repository_path(&repo)).ok()?;
     let repository = crate::repository::Repository::parse(&bytes).ok()?;
-    let manifest = repository
-        .releases
-        .iter()
-        .find(|entry| entry.version == release && !entry.yanked)?
-        .lanes
-        .iter()
-        .find(|lane| lane.lane == request.lane && lane.manifest.sha256 == pinned)?
-        .manifest
-        .clone();
+    let manifest = match release {
+        "" => repository
+            .checkpoints
+            .iter()
+            .find(|entry| entry.manifest.sha256 == pinned)?
+            .manifest
+            .clone(),
+        _ => repository
+            .releases
+            .iter()
+            .find(|entry| entry.version == release && !entry.yanked)?
+            .lanes
+            .iter()
+            .find(|entry| entry.lane == lane && entry.manifest.sha256 == pinned)?
+            .manifest
+            .clone(),
+    };
     if !repository
         .checkpoints
         .iter()
@@ -1078,7 +1090,7 @@ fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
     Some(hub::Closure {
         model: model.to_string(),
         release: release.to_string(),
-        lane: request.lane.to_string(),
+        lane: lane.to_string(),
         scope: "runtime".to_string(),
         manifest,
         objects,

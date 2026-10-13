@@ -139,8 +139,10 @@ impl Hub {
     fn gets(&self, hex: &str) -> usize {
         *self.gets.lock().unwrap().get(hex).unwrap_or(&0)
     }
+    /// Object GETs, closures not counted.
     fn total_gets(&self) -> usize {
-        self.gets.lock().unwrap().values().sum()
+        let gets = self.gets.lock().unwrap();
+        gets.iter().filter(|(key, _)| *key != "closure").map(|(_, n)| n).sum()
     }
 }
 
@@ -194,6 +196,7 @@ fn serve(
     let json = |value: Value| (200, canon::write(&value));
     let (status, reply, truncate) = match (method.as_str(), path.as_str()) {
         ("POST", "/v1/tensorfs/closure") => {
+            *gets.lock().unwrap().entry("closure".into()).or_insert(0) += 1;
             let (status, reply) = json(Value::obj(vec![
                 ("complete", Value::Bool(true)),
                 ("lane", Value::str("public")),
@@ -463,6 +466,36 @@ fn a_cold_ensure_reports_and_lands_and_a_warm_one_moves_nothing() {
         checkpoint.bodies.len(),
         "a warm ensure moved bytes"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A checkpoint the Store holds whole, named by its digest alone (`org/name@sha256:<hex>`, a
+/// machine's exact model choice, lane or not), answers its own closure: a warm ensure asks the
+/// hub nothing, not even the closure.
+#[test]
+fn a_held_checkpoint_named_by_digest_asks_the_hub_nothing() {
+    let dir = temporary("held-digest");
+    let root = store(&dir);
+    let checkpoint = Arc::new(checkpoint(2, 16 << 10, 7));
+    let hub = hub(Arc::clone(&checkpoint), None, Duration::ZERO, serve_all());
+    let refspec = format!("acme/model@{}", checkpoint.manifest.id());
+    let by_digest = |lane: &str| {
+        let mut command = Command::new(TFS);
+        command
+            .args(["ensure", root.to_str().unwrap(), &refspec, "--hub", &hub.base])
+            .args(["--lane", lane, "--sample-seconds", "0.05"])
+            .env("TFS_CREDENTIAL", "");
+        finish(command.output().unwrap())
+    };
+    let cold = by_digest("");
+    assert!(cold.ok, "{}", cold.stdout);
+    assert_eq!(hub.gets("closure"), 1);
+    for lane in ["", "fp8"] {
+        let warm = by_digest(lane);
+        assert!(warm.ok, "{}", warm.stdout);
+        assert_eq!(hub.gets("closure"), 1, "a held checkpoint asked the hub (lane {lane:?})");
+    }
+    assert!(checkpoint.bodies.keys().all(|hex| hub.gets(hex) == 1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
