@@ -562,6 +562,37 @@ func (s *Store) MachineGPUsHeld(requestID string) (int, *exit.Error) {
 	return held, nil
 }
 
+// MachineGPUAllocation is the run's own GPU allocation as its newest machine event says:
+// held (with its GPUs), waiting or released; nil before its first GPU step.
+func (s *Store) MachineGPUAllocation(requestID string) (*GPUAllocation, *exit.Error) {
+	var kind, body string
+	err := s.db.QueryRow(`SELECT type, payload FROM request_events WHERE request_id=?
+		AND type IN ('machine.gpu.grant','machine.gpu.wait','machine.gpu.release')
+		AND json_extract(payload,'$.key')=? ORDER BY seq DESC LIMIT 1`, requestID, GPUAllocationKey).Scan(&kind, &body)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read the GPU allocation of %s: %s", requestID, err)
+	}
+	var event struct {
+		Ordinals []int `json:"ordinals"`
+	}
+	_ = json.Unmarshal([]byte(body), &event)
+	state := map[string]string{"machine.gpu.grant": "held", "machine.gpu.wait": "waiting", "machine.gpu.release": "released"}[kind]
+	allocation := &GPUAllocation{State: state}
+	if state == "held" {
+		allocation.GPUs = event.Ordinals
+	}
+	return allocation, nil
+}
+
+// GPUAllocation is a run's GPU allocation: held (on GPUs), waiting or released.
+type GPUAllocation struct {
+	State string `json:"state"`
+	GPUs  []int  `json:"gpus,omitempty"`
+}
+
 // MachineGPUWaiting is Runtime's gpu.wait body: the call, the device count it needs and the
 // roots holding the devices ahead of it.
 type MachineGPUWaiting struct {
