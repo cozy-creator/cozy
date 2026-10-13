@@ -33,9 +33,16 @@ func TestUnknownFieldsWarnAndRun(t *testing.T) {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	target := localWeightlessRef + "/labels"
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	_, installed, problem := store.ActivePackage("", localWeightlessRef)
+	store.Close()
+	fatal(t, problem)
 	warning := records.Warning{
 		Code:    "request_fields_ignored",
-		Message: "ignored unknown fields labels[1].foo, style — not in " + target + "'s interface",
+		Message: "ignored unknown fields labels[1].foo, style — not in " + target + " " + installed.Version + "'s interface",
 		Fields:  []string{"labels[1].foo", "style"},
 	}
 	nested := `labels:=[{"text":"a"},{"text":"b","foo":1}]`
@@ -58,9 +65,7 @@ func TestUnknownFieldsWarnAndRun(t *testing.T) {
 		len(run.Warnings) != 1 || !sameWarning(run.Warnings[0], warning) {
 		t.Fatalf("--json run lost its result or warning [exit %d]\n%s", code, out)
 	}
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
+	store, problem = records.Open(layout.DB)
 	fatal(t, problem)
 	request, problem := store.RequestByIdempotencyKey("unknown-fields")
 	store.Close()
