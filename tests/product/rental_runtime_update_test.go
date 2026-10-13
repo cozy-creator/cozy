@@ -62,7 +62,7 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 	}
 }
 
-// An update never waits on the daemon's own uses of the rental: the machine waits for its
+// An update never waits on Calcifer's own uses of the rental: the machine waits for its
 // running work before it restarts. While the update's record holds the rental, new uses wait;
 // other rentals are not held.
 func TestRentalMaintenanceLeavesRunningWorkToTheMachine(t *testing.T) {
@@ -88,7 +88,7 @@ func TestRentalMaintenanceLeavesRunningWorkToTheMachine(t *testing.T) {
 		return nil
 	}))
 	if !called {
-		t.Fatal("the update waited on the daemon's own use of the rental")
+		t.Fatal("the update waited on Calcifer's own use of the rental")
 	}
 }
 
@@ -135,7 +135,7 @@ func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 	}
 }
 
-// The real CLI/daemon snapshots before any remote maintenance. The rental's Hub names it
+// The real CLI/Calcifer snapshots before any remote maintenance. The rental's Hub names it
 // ready; its machine is deliberately unavailable: this test needs no worker or wheel install.
 func TestRentalRuntimeUpdateCLIFreezesLocalCandidate(t *testing.T) {
 	f := updateFixtureAt(t)
@@ -151,13 +151,13 @@ func TestRentalRuntimeUpdateCLIFreezesLocalCandidate(t *testing.T) {
 		"worker_id": updateWorkerID, "worker_boot_id": updateBootID, "creator_public_key": identity.PublicKey()} {
 		stand.set(f.rentalID, field, value)
 	}
-	must(t, os.WriteFile(filepath.Join(f.layout.Root, "config.yaml"), []byte("tensorhub_url: "+f.cfg.HubURL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(f.layout.Root, "config.yaml"), []byte("tensorhub_url: "+f.cfg.HubURL+"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0600))
 	source := filepath.Join(t.TempDir(), "cozy_runtime-0.18.25.dev1-cp312-abi3-manylinux_2_28_x86_64.whl")
 	content := []byte("bounded immutable candidate bytes; metadata checked during planning")
 	must(t, os.WriteFile(source, content, 0600))
 	tensorfsSource := filepath.Join(t.TempDir(), "tensorfs-0.3.54+dev.g9d02fc3-cp312-abi3-manylinux_2_28_x86_64.whl")
 	must(t, os.WriteFile(tensorfsSource, content, 0600))
-	startDaemonProcess(t, f.layout.Root)
+	startCalciferProcess(t, f.layout.Root)
 	code, out := runCozy(t, f.layout.Root, "rental", "update", "proof", "--tensorfs-wheel", tensorfsSource, "--json")
 	if code == 0 || !strings.Contains(out, "requires --runtime-wheel") {
 		t.Fatalf("unpaired TensorFS was admitted: %d %s", code, out)

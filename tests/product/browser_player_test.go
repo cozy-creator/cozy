@@ -533,7 +533,7 @@ func playerEval(t *testing.T, page playwright.Page, expression string) any {
 
 // `cozy run play` prints a link from the run's acceptance, the Hub's rental view and this home's
 // The ordinary CLI prints a direct link using the actual pinned machine and owner key.
-// It does not depend on Hub availability or a personal daemon upgrade. The browser follows
+// It does not depend on Hub availability or a personal Calcifer upgrade. The browser follows
 // that exact printed link to the completed synthetic CPU film.
 func TestRunPlayPrintsALinkThatPlays(t *testing.T) {
 	if *playerBrowsers == "" {

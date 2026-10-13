@@ -139,7 +139,7 @@ module-root = ""
 		}
 	}
 
-	// Run 1 finishes and run 2 starts while no client is attached: the daemon is down.
+	// Run 1 finishes and run 2 starts while no client is attached: Calcifer is down.
 	finished, running := filepath.Join(root, "finished.effect"), filepath.Join(root, "running.effect")
 	submit(finished, "20")
 	landed(t, "the first call to start", func() bool { return effects(finished) == 1 })
@@ -149,7 +149,7 @@ module-root = ""
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
 	if held := len(show().Live); held != 2 {
-		t.Fatalf("the first run ended before the daemon went down (%d live): its collection would prove nothing", held)
+		t.Fatalf("the first run ended before Calcifer went down (%d live): its collection would prove nothing", held)
 	}
 	landed(t, "the first run to end and the second to be mid-call", func() bool {
 		return effects(running) == 1 && len(show().Live) == 1

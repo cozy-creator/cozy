@@ -27,7 +27,7 @@ func TestARunFindsItsRentalOnAnyHub(t *testing.T) {
 	h.server.Config.Handler = machineKeyLogin("machine-b", public, "rental-idle-test", h.server.Config.Handler)
 	plantMachineKey(t, root, h.server.URL, "machine-b", private)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: a\nhubs:\n  a: "+elsewhere+
-		"\n  b: "+h.server.URL+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\n  b: "+h.server.URL+"\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	if code, out := runCozy(t, root, "package", "install", parityProject(t)); code != 0 {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}

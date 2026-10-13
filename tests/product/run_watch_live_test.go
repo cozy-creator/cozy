@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/cli"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
 )
@@ -117,7 +117,7 @@ Run 1514 · paul/minimax-h3/long_form · darkness · running · 8s
 
 // Run 1558 waited on nonomiya (4× H100 SXM) while the Hub booted it, and `queued` said
 // nothing more. Its stream is reconstructed from that record and the rental's boot, with a
-// measured replan onto another host: the phase frames the daemon streams while a run is
+// measured replan onto another host: the phase frames Calcifer streams while a run is
 // parked on a booting rental, then the install, the start and the weights.
 var liveFrames1558 = []struct{ at, frame string }{
 	{"10:30:01", `
@@ -226,7 +226,7 @@ func goldenStream(t *testing.T, run, machine string, events []localapi.Event, fr
 	}
 }
 
-// TestRunWatchDrawsInPlace drives the built CLI against a daemon serving a recorded stream:
+// TestRunWatchDrawsInPlace drives the built CLI against a Calcifer serving a recorded stream:
 // on a terminal the region redraws in place and settles to one record above the result;
 // redirected, the append-only lines are exactly what they were before the live display.
 func TestRunWatchDrawsInPlace(t *testing.T) {
@@ -260,7 +260,7 @@ func TestRunWatchDrawsInPlace(t *testing.T) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
+	held, problem := calcifer.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
 	fatal(t, problem)
 	defer held.Release()
 	_, problem = api.Mint(layout)

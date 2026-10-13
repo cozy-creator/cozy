@@ -11,7 +11,7 @@ import (
 // TestCanceledRunReleasesItsIdempotencyKey: a cancellation withdraws the
 // intent; an identical resubmission must get a fresh run, while every other
 // state keeps replaying (the live incident: the H3 four-lane upload's durable
-// run was canceled to unwedge a dead daemon's queue, and the identical
+// run was canceled to unwedge a dead Calcifer's queue, and the identical
 // resubmission replayed the cancellation forever).
 func TestCanceledRunReleasesItsIdempotencyKey(t *testing.T) {
 	l, e := home.Open(t.TempDir())

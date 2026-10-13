@@ -150,7 +150,7 @@ func startPTYSetup(t *testing.T, root string, rows, columns uint16, setup func(*
 }
 
 // TestRunProgressSurfaces (cl-104) proves the three progress surfaces of one live run
-// stream against the real daemon and worker. The weightless tile's delay is a measured
+// stream against the real Calcifer and worker. The weightless tile's delay is a measured
 // step loop — the fixture's stand-in for a denoising loop — so `--await` receives real
 // per-step frames while the run is in flight.
 func TestRunProgressSurfaces(t *testing.T) {
@@ -170,7 +170,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	code, _, stderr := runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=3", "delay_ms=2500", "--await")
 	if code != 0 {
-		t.Fatalf("piped run failed [exit %d]\n%s\n%s\ndaemon log:\n%s", code, stderr, productWorkerLogs(root), tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("piped run failed [exit %d]\n%s\n%s\ncalcifer log:\n%s", code, stderr, productWorkerLogs(root), tail(filepath.Join(root, "calcifer.log")))
 	}
 	if strings.ContainsAny(stderr, "\r\033") {
 		t.Fatalf("piped progress carries terminal control bytes\n%q", stderr)

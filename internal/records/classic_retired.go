@@ -7,7 +7,7 @@ import (
 )
 
 // ClassicRetiredCode names work accepted for the retired classic worker session: the local
-// `cozy-runtime serve` this daemon spawned, or a rental's classic WorkerControl dispatch.
+// `cozy-runtime serve` this Calcifer spawned, or a rental's classic WorkerControl dispatch.
 // Every request now runs as a machine execution.
 const ClassicRetiredCode = "request.classic_retired"
 
@@ -15,8 +15,8 @@ const ClassicRetiredCode = "request.classic_retired"
 // carries no receipt.
 const ClassicRetiredOutcome = "CLASSIC_RETIRED"
 
-// RetireClassicWork ends, once at daemon start, every unfinished request that has no
-// machine execution: it ran or would run on a classic worker session or as the daemon's
+// RetireClassicWork ends, once at Calcifer start, every unfinished request that has no
+// machine execution: it ran or would run on a classic worker session or as Calcifer's
 // own model transfer, which machines now do. Every open attempt closes, as ABANDONED unless it recorded a
 // terminal, and nothing is revived. A request being canceled ends canceled; every other
 // one fails with ClassicRetiredCode. Custody held for any classic run is forgotten.
@@ -103,7 +103,7 @@ func (s *Store) RetireClassicWork() ([]string, *exit.Error) {
 // no receipt.
 const RentalEndedOutcome = "RENTAL_ENDED"
 
-// ForgetEndedRentalCustody forgets, once at daemon start, custody tied to a rental this
+// ForgetEndedRentalCustody forgets, once at Calcifer start, custody tied to a rental this
 // host knows has ended (released or failed, or already forgotten here). Its store went
 // with the machine, so nothing can ever release it. Custody on a live rental stays.
 func (s *Store) ForgetEndedRentalCustody() *exit.Error {

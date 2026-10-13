@@ -40,7 +40,7 @@ func TestRentalNewWaitsOutARecordsWriter(t *testing.T) {
 	stand.setSKUs(cpuSKU)
 	var asks atomic.Int32
 	stand.rent = refusedAnswer("pr-busywriterproof0001", "pending_acquisition", &asks)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 
 	writer, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite")+"?_txlock=immediate")
 	must(t, err)
@@ -85,7 +85,7 @@ func TestARefusedAskSettlesOnceTheHubReportsItGone(t *testing.T) {
 	const id = "pr-refusedaskproof0001"
 	var asks atomic.Int32
 	stand.rent = refusedAnswer(id, "release_requested", &asks)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	if code, out := runCozy(t, root, "rental", "new", "cpu", "--json"); code == 0 || asks.Load() != 1 {
 		t.Fatalf("the width fence did not refuse the answer [exit %d]\n%s", code, out)
 	}
@@ -137,18 +137,18 @@ func TestVanishedEditableSourcesAreReportedOnce(t *testing.T) {
 	}
 	activate("deleted", deleted)
 	activate("broken", broken)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	// Every records write rescans every source.
 	for i := range 5 {
 		fatal(t, store.AppendPackageEvent("local/broken", "proof.write", map[string]any{"write": i}))
 	}
 	activate("live", live)
-	log := filepath.Join(root, "daemon.log")
+	log := filepath.Join(root, "calcifer.log")
 	var raw []byte
-	// A daemon niced on a loaded box can take longer than waitFor's 20 s to rescan.
+	// A Calcifer niced on a loaded box can take longer than waitFor's 20 s to rescan.
 	for deadline := time.Now().Add(3 * time.Minute); !strings.Contains(string(raw), "editable local/live: watching "+live); {
 		if time.Now().After(deadline) {
-			t.Fatalf("the daemon never rescanned the live source:\n%s", raw)
+			t.Fatalf("Calcifer never rescanned the live source:\n%s", raw)
 		}
 		time.Sleep(100 * time.Millisecond)
 		raw, _ = os.ReadFile(log)

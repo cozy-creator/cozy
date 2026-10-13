@@ -38,7 +38,7 @@ func TestConfigFileFromAnotherVersionKeepsCommandsWorking(t *testing.T) {
 func TestUnusableBehaviourSettingsFallBackToTheirDefaults(t *testing.T) {
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("port: 7433\nport: 7434\nyield: sometimes\n"+
-		"local_rate_micro_usd_per_hour: -3\nrentals:\n  development: maybe\ndaemon:\n  idle_shutdown_s: soon\n"+
+		"local_rate_micro_usd_per_hour: -3\nrentals:\n  development: maybe\ncalcifer:\n  idle_shutdown_s: soon\n"+
 		"maintenance:\n  gc_cron: nightly\nplacement:\n  prefer: fastest\n"), 0600))
 	code, stdout, stderr := runCozyStreams(t, root, "package", "list", "--json")
 	if code != 0 || !strings.Contains(stdout, `"packages"`) {
@@ -49,7 +49,7 @@ func TestUnusableBehaviourSettingsFallBackToTheirDefaults(t *testing.T) {
 		`yield "sometimes" is not smart, always or never; using "smart"`,
 		`local_rate_micro_usd_per_hour "-3" is not a non-negative integer; using "0"`,
 		`rentals.development "maybe" is not true or false; using "true"`,
-		`daemon.idle_shutdown_s "soon" is not a non-negative integer; using "900"`,
+		`calcifer.idle_shutdown_s "soon" is not a non-negative integer; using "900"`,
 		`this version does not use maintenance; ignored`, // the store GC schedule, removed
 		`placement.prefer "fastest" is not fast, balanced or cheap; using "balanced"`,
 	} {

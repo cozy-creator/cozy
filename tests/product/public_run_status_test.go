@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -103,7 +103,7 @@ func TestPublicRunStatusShowsFailedRetainedWork(t *testing.T) {
 	}
 }
 
-func TestPublicRunStatusWatchAcceptsOlderDaemonWithoutStopIdentity(t *testing.T) {
+func TestPublicRunStatusWatchAcceptsOlderCalciferWithoutStopIdentity(t *testing.T) {
 	for _, kind := range []string{"job", "invocation"} {
 		t.Run(kind, func(t *testing.T) {
 			var streams atomic.Int32
@@ -123,7 +123,7 @@ func TestPublicRunStatusWatchAcceptsOlderDaemonWithoutStopIdentity(t *testing.T)
 			defer server.Close()
 			layout, problem := home.Open(t.TempDir())
 			fatal(t, problem)
-			held, problem := daemon.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
+			held, problem := calcifer.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
 			fatal(t, problem)
 			defer held.Release()
 			_, problem = api.Mint(layout)
@@ -131,7 +131,7 @@ func TestPublicRunStatusWatchAcceptsOlderDaemonWithoutStopIdentity(t *testing.T)
 			code, out := runCozy(t, layout.Root, "run", "watch", "1", "--json")
 			var result struct{ Error struct{ Code string } }
 			if code == 0 || json.Unmarshal([]byte(out), &result) != nil || result.Error.Code != "failed" || strings.Contains(out, "--retry") || strings.Contains(out, "ended blocked") || streams.Load() != 1 {
-				t.Fatalf("older daemon manual stop was not tolerated [%d] streams=%d: %s", code, streams.Load(), out)
+				t.Fatalf("older Calcifer manual stop was not tolerated [%d] streams=%d: %s", code, streams.Load(), out)
 			}
 		})
 	}

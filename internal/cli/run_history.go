@@ -13,7 +13,7 @@ import (
 const runHistoryPage = 50
 
 // Only the board's single in-flight fetch touches this cache. Navigation reads
-// already rendered rows and never calls the daemon per key or per row.
+// already rendered rows and never calls Calcifer per key or per row.
 type runHistory struct {
 	client             *localapi.Client
 	state, packageName string

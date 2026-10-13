@@ -105,7 +105,7 @@ func TestForegroundCancelDeliversBeforeExitAndAwaitStillWaitsForTerminal(t *test
 				CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}))}
 			// Start the persistent owner before recording held queue intent, so its
 			// startup recovery cannot win dispatch before this explicit cancel.
-			startDaemonProcess(t, root)
+			startCalciferProcess(t, root)
 			queued, _, problem := store.SubmitWithEvent(records.Request{ID: "req-" + kind + "-queued", IdemKey: kind + "-queued", Package: "proof/foreground", Entrypoint: "main", Kind: kind,
 				Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true}, map[string]any{"machine_endpoint": ep})
 			fatal(t, problem)

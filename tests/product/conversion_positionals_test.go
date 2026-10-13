@@ -35,7 +35,7 @@ func TestConversionJobReadsInputAndDestinationPositionals(t *testing.T) {
 			t.Fatalf("ambiguous conversion spelling was accepted: %v %s", args, out)
 		}
 	}
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output",
 		"steps=7", "model.base=proof/source@1.0.0/bf16", "--rental-only", "--json", "--idempotency-key", "conversion-positionals")
 	if code != 0 {

@@ -129,7 +129,7 @@ func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
 	certServer := httptest.NewTLSServer(http.NotFoundHandler())
 	cert := certServer.TLS.Certificates[0]
 	certServer.Close()
-	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow pinned loopback machine fixture for the real daemon's runs
+	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow pinned loopback machine fixture for the real Calcifer's runs
 	must(t, err)
 	machine := newOpsMachine()
 	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}})))
@@ -146,7 +146,7 @@ func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
 		"cert_pem": string(certPEM), "worker_id": "ops-worker", "worker_boot_id": "ops-boot", "creator_public_key": owner.PublicKey(),
 		"hourly_rate_usd_micros": int64(1), "accelerator_count": 1, "requested_accelerator_model": "CPU"}
 	h.mu.Unlock()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 
 	install := func() (run struct {
 		Number int64
@@ -155,7 +155,7 @@ func TestAnOperationIsANumberedRunTheOwnerCancels(t *testing.T) {
 		t.Helper()
 		code, out := runCozy(t, root, "package", "install", "paul/demo", "--rental=kirin", "--no-wait", "--json")
 		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &run) != nil || run.Number == 0 || run.Kind != "install" {
-			t.Fatalf("package install --rental [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("package install --rental [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "calcifer.log")))
 		}
 		return run
 	}

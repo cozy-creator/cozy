@@ -8,7 +8,7 @@ import (
 )
 
 // A named rental no hub this computer is signed in to holds is refused, and a named rental
-// must never degrade to a boolean; both refuse without provider I/O, a daemon or an allocation.
+// must never degrade to a boolean; both refuse without provider I/O, a Calcifer or an allocation.
 func TestModelUploadNamedRentalGrammar(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source.safetensors")
@@ -27,7 +27,7 @@ func TestModelUploadNamedRentalGrammar(t *testing.T) {
 			t.Fatalf("%v [%d]: %s", args, code, out)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatal("placement refusal started a daemon")
+	if _, err := os.Stat(filepath.Join(root, "calcifer.lock")); !os.IsNotExist(err) {
+		t.Fatal("placement refusal started a Calcifer")
 	}
 }

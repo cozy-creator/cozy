@@ -91,7 +91,7 @@ func TestNativeCPUModelInputKeepsAuthoredLaneAndExplicitOverrideAtOneHub(t *test
 	access = newFakeHubAccess(server.URL, server.URL, "fixture-account")
 	root, err := os.MkdirTemp("", "czlad-")
 	must(t, err)
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: fixture-account\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: fixture-account\ncalcifer:\n  idle_shutdown_s: 0\n"), 0600))
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "machine", "stop")
 		_, _ = runCozy(t, root, "down")

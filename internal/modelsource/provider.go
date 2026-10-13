@@ -198,10 +198,10 @@ func (r *Resolver) authRequired() *exit.Error {
 	if r.token.Present() {
 		return exit.Named(exit.Credential, "model_source.auth_required",
 			"%s refused the configured %s for this source", provider, key).
-			WithRemedy("set %s in the daemon config (config.yaml or %s) to a token whose account can download this model", key, variable)
+			WithRemedy("set %s in the Calcifer config (config.yaml or %s) to a token whose account can download this model", key, variable)
 	}
 	return exit.Named(exit.Credential, "model_source.auth_required", "%s requires authentication for this source", provider).
-		WithRemedy("set %s in the daemon config (config.yaml or %s) and retry", key, variable)
+		WithRemedy("set %s in the Calcifer config (config.yaml or %s) and retry", key, variable)
 }
 
 func (r *Resolver) json(ctx context.Context, location string, value any) *exit.Error {

@@ -33,7 +33,7 @@ import (
 // loader, and the driver's writer are all gone, and the live driver installs a package
 // exactly as a user does.
 
-// Resolver is the Cozy daemon's package resolver.
+// Resolver is Calcifer's package resolver.
 type Resolver struct {
 	refreshMu sync.Mutex
 	store     *records.Store
@@ -78,7 +78,7 @@ func (s *EditableSnapshot) Close() {
 	}
 }
 
-// RefreshEditable is the daemon-owned pre-invocation fence for live source trees.
+// RefreshEditable is Calcifer-owned pre-invocation fence for live source trees.
 // It snapshots the current tree, builds a complete replacement install when it
 // moved, and swaps the active pin only after Runtime accepted the replacement.
 // A failure returns a typed refusal and leaves the last good install active. Only a local/
@@ -207,17 +207,17 @@ func short12(value string) string {
 	return value
 }
 
-// namespace answers the signed-in caller on the daemon's Tensorhub: the account an
+// namespace answers the signed-in caller on Calcifer's Tensorhub: the account an
 // editable source's account index and org-relative model defaults resolve against.
 func (r *Resolver) namespace() (packagepublish.Namespace, *exit.Error) {
 	return r.namespaceAt("")
 }
 
-// namespaceAt is the caller on one Tensorhub, "" the daemon's. Its account is read once per
+// namespaceAt is the caller on one Tensorhub, "" Calcifer's. Its account is read once per
 // credential and kept, so a run asks no Hub.
 func (r *Resolver) namespaceAt(origin string) (packagepublish.Namespace, *exit.Error) {
 	cfg := r.cfg.ForHub(origin)
-	c := hub.New(cfg, "cozy-daemon").WithTokenSource(accountauth.New(cfg))
+	c := hub.New(cfg, "calcifer").WithTokenSource(accountauth.New(cfg))
 	ctx, cancel := hub.Context()
 	defer cancel()
 	account, problem := c.CurrentAccount(ctx)
@@ -235,7 +235,7 @@ func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	}
 }
 
-// catalog is one Tensorhub origin's catalog; "" is the daemon's default hub. The
+// catalog is one Tensorhub origin's catalog; "" is Calcifer's default hub. The
 // static token reaches only the origin it was issued for.
 func (r *Resolver) catalog(origin string) *hub.Client {
 	cfg := r.cfg.ForHub(origin)
@@ -247,7 +247,7 @@ func (r *Resolver) catalog(origin string) *hub.Client {
 	if c := r.catalogs[cfg.HubURL]; c != nil {
 		return c
 	}
-	c := hub.New(cfg, "cozy-daemon")
+	c := hub.New(cfg, "calcifer")
 	r.catalogs[cfg.HubURL] = c
 	return c
 }
@@ -636,7 +636,7 @@ func jobsOf(facts *launch.Facts) ([]launch.JobFacts, *exit.Error) {
 
 func (r *Resolver) activeInstall(hub, ref string) (*records.PackageInstall, *exit.Error) {
 	if r.store == nil {
-		return nil, exit.Unavailablef("this Cozy daemon has no install records")
+		return nil, exit.Unavailablef("this Calcifer has no install records")
 	}
 	return activeInstall(r.store, hub, ref)
 }

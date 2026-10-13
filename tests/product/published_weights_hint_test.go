@@ -32,7 +32,7 @@ func TestARunThatPublishedItsWeightsNamesTheCheckpointAndThePublishCommand(t *te
 		Outputs: []*v1.Product{{Output: "fp8", Rev: 1, Length: 164, Digest: checkpoint, MediaType: "application/vnd.cozy.weights"}}}}))
 	store.Close()
 
-	_ = startDaemonProcess(t, root)
+	_ = startCalciferProcess(t, root)
 	code, out := runCozy(t, root, "run", "watch", request.ID)
 	t.Logf("cozy run watch:\n%s", out)
 	if code != 0 || !strings.Contains(out, checkpoint) ||

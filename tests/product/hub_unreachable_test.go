@@ -31,7 +31,7 @@ func hubHome(t *testing.T, name, hubURL string) string {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			""+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	seed := make([]byte, 32)
 	_, err = rand.Read(seed)
 	must(t, err)

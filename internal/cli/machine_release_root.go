@@ -17,7 +17,7 @@ import (
 
 // localSourceV1 writes the unpublished code of install to machine and answers its manifest's
 // digest, and whether any byte moved. This computer's machine reads the project where it is;
-// another keeps one tree per package, so only what changed since this daemon last sent it
+// another keeps one tree per package, so only what changed since this Calcifer last sent it
 // there is offered again.
 func (m *machineRuns) localSourceV1(ctx context.Context, machine *machines.V1, install string) (string, bool, *exit.Error) {
 	source, problem := m.resolver.LocalInstallation(install)
@@ -52,7 +52,7 @@ func (m *machineRuns) localSourceV1(ctx context.Context, machine *machines.V1, i
 }
 
 // forgetSent drops what machine was last sent of the request's package: the machine said its
-// tree lacks a file this daemon did not offer (another computer synced it, or it was reset).
+// tree lacks a file this Calcifer did not offer (another computer synced it, or it was reset).
 // It answers whether there was anything to forget.
 func (m *machineRuns) forgetSent(machine *machines.V1, request records.Request) bool {
 	_, held := m.sent.LoadAndDelete(machine.Name + "\x00" + machine.BootID + "\x00" + request.Package)

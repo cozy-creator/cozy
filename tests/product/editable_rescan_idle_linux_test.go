@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// A records write that changes no editable install reads no editable source. The daemon
+// A records write that changes no editable install reads no editable source. Calcifer
 // watched the records file and, on every write, re-read every editable package's project and
 // the wheels it depends on: gigabytes a minute on the owner's laptop.
 func TestRecordsWritesReadNoEditableSource(t *testing.T) {
@@ -53,27 +53,27 @@ func TestRecordsWritesReadNoEditableSource(t *testing.T) {
 		writer.Unlock()
 		fatal(t, problem)
 	}
-	daemon := startDaemonProcess(t, root)
-	log := filepath.Join(root, "daemon.log")
+	calcifer := startCalciferProcess(t, root)
+	log := filepath.Join(root, "calcifer.log")
 	for deadline := time.Now().Add(time.Minute); ; time.Sleep(100 * time.Millisecond) {
 		if raw, _ := os.ReadFile(log); strings.Count(string(raw), ": watching "+sources) == 10 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the daemon did not watch the editable sources\n%s", tail(log))
+			t.Fatalf("Calcifer did not watch the editable sources\n%s", tail(log))
 		}
 	}
 	time.Sleep(3 * time.Second)
-	before := readBytes(t, daemon.cmd.Process.Pid)
+	before := readBytes(t, calcifer.cmd.Process.Pid)
 	for i := range 30 {
 		fatal(t, store.AppendPackageEvent("local/editable0", "proof.write", map[string]any{"write": i}))
 		time.Sleep(50 * time.Millisecond)
 	}
 	time.Sleep(2 * time.Second)
-	if read := readBytes(t, daemon.cmd.Process.Pid) - before; read > 4<<20 {
-		t.Fatalf("30 records writes made the daemon read %d bytes", read)
+	if read := readBytes(t, calcifer.cmd.Process.Pid) - before; read > 4<<20 {
+		t.Fatalf("30 records writes made Calcifer read %d bytes", read)
 	} else {
-		t.Logf("30 records writes made the daemon read %d bytes", read)
+		t.Logf("30 records writes made Calcifer read %d bytes", read)
 	}
 }
 

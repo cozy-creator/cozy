@@ -7,12 +7,12 @@ import (
 	"time"
 )
 
-// daemonStartup is what a started daemon owes its records: recovery of the work a previous
-// daemon left, and the sweeps of what crashed writers left behind. It runs after the API
+// calciferStartup is what a started Calcifer owes its records: recovery of the work a previous
+// Calcifer left, and the sweeps of what crashed writers left behind. It runs after the API
 // serves, one step after another, and gates no request: a step waiting on another writer
 // or a slow disk waits alone. Each step logs what it did and how long it took, and the idle
 // exit waits for the last one.
-type daemonStartup struct {
+type calciferStartup struct {
 	log  io.Writer
 	step atomic.Pointer[string]
 }
@@ -22,7 +22,7 @@ type startupStep struct {
 	run  func() string
 }
 
-func (s *daemonStartup) run(quit <-chan struct{}, steps []startupStep) {
+func (s *calciferStartup) run(quit <-chan struct{}, steps []startupStep) {
 	defer s.step.Store(nil)
 	for _, step := range steps {
 		select {
@@ -38,7 +38,7 @@ func (s *daemonStartup) run(quit <-chan struct{}, steps []startupStep) {
 }
 
 // holding names the step still running, for the idle exit.
-func (s *daemonStartup) holding() []string {
+func (s *calciferStartup) holding() []string {
 	if step := s.step.Load(); step != nil {
 		return []string{"startup " + *step}
 	}

@@ -2,7 +2,7 @@
 // package's own store under outputs/ or a caller's --out — and how that directory is
 // proven writable before a run is queued. The worker writes the file there itself under
 // this same name (cozy-runtime `author._media.EXTENSIONS` spells the identical table);
-// the daemon recomputes the name from the accepted manifest and reads exactly it, so
+// Calcifer recomputes the name from the accepted manifest and reads exactly it, so
 // execution never composes a path from a terminal document.
 package resultfiles
 
@@ -55,7 +55,7 @@ func Extension(mediaType string) string {
 
 // Preflight proves the destination can accept a published file BEFORE a request is
 // queued: create-if-absent, then a touch-and-unlink probe in the final directory. It
-// runs in the daemon — the process that later publishes — so it proves the writer's own
+// runs in Calcifer — the process that later publishes — so it proves the writer's own
 // access, not a client's. A probe that passes is not a reservation; the durable export
 // still handles a destination that dies later.
 func Preflight(directory string) *exit.Error {

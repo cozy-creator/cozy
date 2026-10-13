@@ -53,7 +53,7 @@ func rentalEndRoot(t *testing.T, name string) (string, string, *fakeRentalHub) {
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
 			""+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	return root, hubURL, stand
 }
 
@@ -268,7 +268,7 @@ func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 			"requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 100_000,
 		}
 	}
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 
 	code, out := runCozy(t, root, "rental", "new", "cpu", "--json")
 	if code == 0 {
@@ -357,7 +357,7 @@ func TestRentAskCarriesTheChosenGPUCount(t *testing.T) {
 		return map[string]any{"rental_id": "pr-gpucountgpucount0003", "name": name,
 			"state": "pending_acquisition", "hourly_rate_usd_micros": 3_000_000}
 	}
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 
 	code, out := runCozy(t, root, "rent", "new", "h100-sxm5-80gb", "--gpus", "3")
 	mu.Lock()

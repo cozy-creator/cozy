@@ -44,7 +44,7 @@ func handleWarm(ctx *Context, target Target, ep *launch.Entrypoint, level string
 			return problem
 		}
 	}
-	if _, _, problem := ensureDaemon(ctx); problem != nil {
+	if _, _, problem := ensureCalcifer(ctx); problem != nil {
 		return problem
 	}
 	return runOperation(ctx, either(ctx.Inv.Value("--rental"), machines.Local), op, true)

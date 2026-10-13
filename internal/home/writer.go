@@ -13,7 +13,7 @@ import (
 // shared for captures, which touch only their own new installs.
 type Writer struct{ file *os.File }
 
-// LockWriter claims the root exclusively without waiting; daemon housekeeping defers instead.
+// LockWriter claims the root exclusively without waiting; Calcifer housekeeping defers instead.
 func LockWriter(layout Layout) (*Writer, *exit.Error) {
 	file, problem := openWriter(layout)
 	if problem != nil {

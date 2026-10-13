@@ -13,11 +13,11 @@ import (
 	"time"
 )
 
-// Abandoned scratch roots are the disk half of the orphan-daemon leak. A product
+// Abandoned scratch roots are the disk half of the orphan-Calcifer leak. A product
 // test builds an isolated COZY_HOME under os.TempDir() and relies on deferred
 // cleanup; SIGKILL, a test timeout and a fork-starved box all skip it. Nothing
 // else reaps them, so they accumulate — 65 GB of dead COZY_HOMEs and 143 orphan
-// daemons over three days, until the box refused fork/exec outright.
+// Calcifers over three days, until the box refused fork/exec outright.
 //
 // The suite reaps its predecessors on the way in. A run cleans the corpses of
 // the run before it, so the resource that creates the garbage is the one that
@@ -58,15 +58,15 @@ func processAlive(pid int) bool {
 }
 
 // ownerPID returns the pid that owns root and whether one was recorded at all.
-// The scratch marker is authoritative; a daemon.lock left by an isolated daemon
-// is the fallback, since that daemon is the thing holding the root open.
+// The scratch marker is authoritative; a calcifer.lock left by an isolated Calcifer
+// is the fallback, since that Calcifer is the thing holding the root open.
 func ownerPID(root string) (pid int, recorded bool) {
 	if b, err := os.ReadFile(filepath.Join(root, scratchOwnerFile)); err == nil {
 		if v, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
 			return v, true
 		}
 	}
-	b, err := os.ReadFile(filepath.Join(root, "daemon.lock"))
+	b, err := os.ReadFile(filepath.Join(root, "calcifer.lock"))
 	if err != nil {
 		return 0, false
 	}
@@ -173,7 +173,7 @@ func hasScratchPrefix(name string) bool {
 const scratchReapMinAge = 2 * time.Hour
 
 // forkHeadroom reports whether the box can still fork. The suite starts a real
-// daemon per test; on a box out of headroom the fork fails partway through with
+// Calcifer per test; on a box out of headroom the fork fails partway through with
 // EAGAIN, killing tests that each leak a scratch root — the spiral that made the
 // box unusable for hours.
 //

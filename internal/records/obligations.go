@@ -43,7 +43,7 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 		 WHERE state IN ('pending','exporting')
 		ORDER BY 1,2`)
 	if err != nil {
-		return nil, exit.Internalf("cannot read the daemon's obligations: %s", err)
+		return nil, exit.Internalf("cannot read Calcifer's obligations: %s", err)
 	}
 	defer rows.Close()
 	var out []Obligation
@@ -55,7 +55,7 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 		out = append(out, o)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, exit.Internalf("cannot finish reading the daemon's obligations: %s", err)
+		return nil, exit.Internalf("cannot finish reading Calcifer's obligations: %s", err)
 	}
 	return out, nil
 }
@@ -63,5 +63,5 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 func (o Obligation) String() string { return o.Kind + " " + o.ID + " (" + o.State + ")" }
 
 // AtRest is work that waits on its owner alone: a paused run, or a finished one keeping its
-// results. Nothing happens to it until a command asks, so it holds no daemon up.
+// results. Nothing happens to it until a command asks, so it holds no Calcifer up.
 func (o Obligation) AtRest() bool { return o.State == "paused" || o.State == "succeeded" }

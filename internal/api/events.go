@@ -182,8 +182,8 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 	}
 }
 
-// phaseInterval is how often a stream re-reads a queued request's phase: the cadence the
-// daemon itself samples a booting rental at.
+// phaseInterval is how often a stream re-reads a queued request's phase: the cadence
+// Calcifer itself samples a booting rental at.
 const phaseInterval = time.Second
 
 // waitFrame is a queued request's current phase: its own preparation, or the boot of the

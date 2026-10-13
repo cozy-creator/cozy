@@ -131,7 +131,7 @@ func rememberCredit(ctx *Context, credit *hub.Credit) {
 }
 
 // warnLowCredit warns a run or rental command whose Hub last stated the account's credit
-// under its warning, recently. It asks the Hub nothing: the daemon's rental listing and
+// under its warning, recently. It asks the Hub nothing: Calcifer's rental listing and
 // `cozy credits` keep the statement current.
 func warnLowCredit(ctx *Context) {
 	layout, problem := home.Open(ctx.Cfg.Home)

@@ -15,7 +15,7 @@ func publicFailureEvent(event localapi.Event) localapi.Event {
 	return event
 }
 
-// Older daemons report a current manual stop as blocked without the optional
+// Older Calcifers report a current manual stop as blocked without the optional
 // event identity. They already report ambiguous acceptance as queued.
 func currentManualStop(status string, stoppedEventID, eventID int64) bool {
 	return status == "blocked" || status == "failed" && stoppedEventID == eventID

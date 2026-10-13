@@ -231,7 +231,7 @@ func (s *Store) MachineExecution(id string) (*MachineExecution, *exit.Error) {
 // neither abandoned nor lost.
 func (s *Store) UnplacedMachineExecutions() ([]string, *exit.Error) {
 	rows, err := s.db.Query(`SELECT e.request_id FROM machine_executions e WHERE e.machine_id='' AND length(e.receipt)=0
- AND NOT `+machineExecutionAbandoned+` AND NOT `+machineExecutionLost+` ORDER BY e.rowid`)
+ AND NOT ` + machineExecutionAbandoned + ` AND NOT ` + machineExecutionLost + ` ORDER BY e.rowid`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the outbox: %s", err)
 	}

@@ -15,7 +15,7 @@ import (
 // A memoizable run says in `cozy run show` how its machine's memo answered it: from a result
 // the machine held (nothing ran), computed, or not memoized and why. A job's nested
 // call says the same. A machine that predates the memo says nothing, and neither does show.
-// The real store, daemon API and CLI, from the machine's outcome and call records.
+// The real store, Calcifer API and CLI, from the machine's outcome and call records.
 func TestRunShowSaysHowTheMachineMemoAnsweredARun(t *testing.T) {
 	o := hostOwner(t, "run-show-memo")
 	computed, held := childDigest("c"), childDigest("d")

@@ -10,7 +10,7 @@ import (
 )
 
 // The durable trace of an editable package's life outside any request: one row per refresh
-// the daemon's source watcher performed (cl-097), the same shape request_events has, keyed by
+// Calcifer's source watcher performed (cl-097), the same shape request_events has, keyed by
 // package because no request asked for it. `cozy package list --full` reads the latest row.
 // A lock tip shown for an unlocked package directory is keyed by that directory.
 var packageEventSchema = []string{`

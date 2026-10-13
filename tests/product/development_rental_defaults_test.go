@@ -27,7 +27,7 @@ func TestDevelopmentDefaultsRefuseMissingOrPrivateKeyBeforeAcquisition(t *testin
 		if private {
 			must(t, os.WriteFile(filepath.Join(root, "operator.pub"), []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nprivate\n"), 0600))
 		}
-		startDaemonProcess(t, root)
+		startCalciferProcess(t, root)
 		code, out := runCozy(t, root, "rental", "new", "cpu", "--json")
 		if code == 0 || !strings.Contains(out, "key") || strings.Contains(out, "BEGIN OPENSSH") {
 			t.Fatalf("invalid development key was not safely refused: %d %s", code, out)
@@ -46,7 +46,7 @@ func TestDevelopmentFalseOverridesConfiguredDefault(t *testing.T) {
 	configureDevelopmentRental(t, root)
 	// The configured key deliberately does not exist: disabling development
 	// must neither read it nor require SSH credentials.
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	args := []string{"rental", "new", "cpu", "--idempotency-key", "ordinary-override", "--json"}
 	code, out := runCozy(t, root, append(args, "--development=false")...)
 	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
@@ -87,7 +87,7 @@ func TestRetiredDevelopmentImageOptionIsUnknown(t *testing.T) {
 
 func TestPrivateRentalDefaultCreatesAndReusesManagedSSHIdentity(t *testing.T) {
 	root, mu, posts, _, _ := runModelCatalog(t)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	args := []string{"rental", "new", "cpu", "--idempotency-key", "managed-ssh-default", "--json"}
 	code, out := runCozy(t, root, args...)
 	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
@@ -124,7 +124,7 @@ func TestPrivateRentalDefaultCreatesAndReusesManagedSSHIdentity(t *testing.T) {
 
 func TestImmutableRentalOverrideDoesNotCreateManagedSSHIdentity(t *testing.T) {
 	root, mu, posts, _, _ := runModelCatalog(t)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	code, out := runCozy(t, root, "rental", "new", "cpu", "--development=false", "--json")
 	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
 		t.Fatalf("immutable override did not reach isolated acquisition: %d %s", code, out)

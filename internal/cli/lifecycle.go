@@ -5,8 +5,8 @@ import (
 	"io"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostgpu"
@@ -17,7 +17,7 @@ import (
 )
 
 func handleUp(ctx *Context) *exit.Error {
-	state, changed, problem := ensureDaemon(ctx)
+	state, changed, problem := ensureCalcifer(ctx)
 	if problem != nil {
 		return problem
 	}
@@ -34,7 +34,7 @@ func handleUp(ctx *Context) *exit.Error {
 			float64(gpu.VRAMTotalBytes)/(1<<30), gpu.DriverVersion, cuda, gpu.SM))
 	}
 	fields := []output.Field{
-		{K: "daemon", V: "running"}, {K: "url", V: "http://" + state.Addr + "/"},
+		{K: "calcifer", V: "running"}, {K: "url", V: "http://" + state.Addr + "/"},
 		{K: "api", V: "http://" + state.Addr}, {K: "pid", V: state.PID},
 		{K: "since", V: state.Since}, {K: "gpus", V: summaries},
 		{K: "gpu_count", V: len(inventory.GPUs)}, {K: "gpu_details", V: inventory.GPUs},
@@ -56,10 +56,10 @@ func handleUp(ctx *Context) *exit.Error {
 
 func handleDown(ctx *Context) *exit.Error {
 	all := ctx.Inv.Bool("--all")
-	state := daemon.Probe(ctx.Cfg)
+	state := calcifer.Probe(ctx.Cfg)
 	if !state.Up {
 		if !all {
-			return emit(ctx, output.Record{Fields: []output.Field{{K: "daemon", V: "stopped"}, {K: "changed", V: false}}})
+			return emit(ctx, output.Record{Fields: []output.Field{{K: "calcifer", V: "stopped"}, {K: "changed", V: false}}})
 		}
 		blockers, problem := offlineDownBlockers(ctx)
 		if problem != nil {
@@ -67,15 +67,15 @@ func handleDown(ctx *Context) *exit.Error {
 		}
 		if len(blockers) == 0 {
 			return emit(ctx, output.Record{Fields: []output.Field{
-				{K: "daemon", V: "stopped"}, {K: "changed", V: false},
+				{K: "calcifer", V: "stopped"}, {K: "changed", V: false},
 			}})
 		}
-		state, _, problem = ensureDaemon(ctx)
+		state, _, problem = ensureCalcifer(ctx)
 		if problem != nil {
 			return problem
 		}
 	}
-	ctx.Daemon = state
+	ctx.Calcifer = state
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -89,15 +89,15 @@ func handleDown(ctx *Context) *exit.Error {
 			return exit.Internalf("down returned without a shutdown decision")
 		}
 		// NAME WHAT KEEPS RUNNING. Machines and rentals own the work; nothing here stopped
-		// it, and the next command's daemon picks each one up where it was.
+		// it, and the next command's Calcifer picks each one up where it was.
 		var running []string
 		for _, identity := range result.Active {
 			running = append(running, identity.Kind+" "+identity.ID+" ("+identity.State+")")
 		}
 		if len(running) == 0 {
-			return finishDaemonDown(ctx, nil)
+			return finishCalciferDown(ctx, nil)
 		}
-		return finishDaemonDown(ctx, []output.Field{{K: "in_flight", V: running}},
+		return finishCalciferDown(ctx, []output.Field{{K: "in_flight", V: running}},
 			"the work in flight continues; the next cozy command reattaches")
 	}
 	return downAll(ctx, client)
@@ -106,15 +106,15 @@ func handleDown(ctx *Context) *exit.Error {
 // downAll is the GUARANTEED teardown (owner ruling 2026-09-04): cancel every request, end
 // every rental, and close. It is the verb a person reaches for because reconciliation is
 // not working, so no single failure inside it may stop the rest — the previous version
-// returned on the first problem with "the daemon remains alive for reconciliation", which
+// returned on the first problem with "Calcifer remains alive for reconciliation", which
 // is plain `down`'s job and left an operator with one wedged request unable to stop their
-// daemon by any documented means.
+// Calcifer by any documented means.
 // downAll is the GUARANTEED teardown (owner ruling 2026-09-04): cancel every request, end
 // every rental, and close. It is the verb a person reaches for because reconciliation is
 // not working, so no single failure inside it may stop the rest — the previous version
-// returned on the first problem with "the daemon remains alive for reconciliation", which
+// returned on the first problem with "Calcifer remains alive for reconciliation", which
 // is plain `down`'s job and left an operator with one wedged request unable to stop their
-// daemon by any documented means.
+// Calcifer by any documented means.
 func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 	canceled := map[string]bool{}
 	ended := map[string]bool{}
@@ -131,10 +131,10 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 	for {
 		result, problem := client.Down(true)
 		if problem != nil {
-			// The daemon itself refused or is unreachable. Nothing further can be asked of
+			// Calcifer itself refused or is unreachable. Nothing further can be asked of
 			// it here, so report honestly rather than pretending a teardown happened.
 			return problem.WithRemedy(
-				"the daemon did not accept the teardown; `cozy down --all` again, or stop the process")
+				"Calcifer did not accept the teardown; `cozy down --all` again, or stop the process")
 		}
 		for _, identity := range result.CancellationRequested {
 			canceled[identity.ID] = true
@@ -165,7 +165,7 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 					note("rental "+id, problem.Message)
 					continue
 				}
-				// Keyed under BOTH names: the warning loop below walks the daemon's
+				// Keyed under BOTH names: the warning loop below walks Calcifer's
 				// identities, which spell an operation by its key, and a pod that was
 				// ended must not be reported as still billing.
 				ended[id], ended[identity.ID] = true, true
@@ -198,7 +198,7 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 					fmt.Fprintf(ctx.Err, "  %s\n", line)
 				}
 			}
-			return finishDaemonDown(ctx, fields)
+			return finishCalciferDown(ctx, fields)
 		}
 		// Local cancellations settle through their durable worker terminals. Rental
 		// work above is synchronous through confirmed provider absence.
@@ -283,26 +283,26 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 	return blockers, nil
 }
 
-// finishDaemonDown waits for the daemon it stopped — that pid — to let go of the root. Any
-// other command may already have started the next daemon, which is not the one stopping.
-// The daemon bounds its own drain; a slow one is reported as it goes, never cut off.
-func finishDaemonDown(ctx *Context, extra []output.Field, notes ...string) *exit.Error {
-	stopping, began := ctx.Daemon.PID, time.Now()
+// finishCalciferDown waits for the Calcifer it stopped — that pid — to let go of the root. Any
+// other command may already have started the next Calcifer, which is not the one stopping.
+// Calcifer bounds its own drain; a slow one is reported as it goes, never cut off.
+func finishCalciferDown(ctx *Context, extra []output.Field, notes ...string) *exit.Error {
+	stopping, began := ctx.Calcifer.PID, time.Now()
 	reported := began
 	for {
-		state := daemon.Probe(ctx.Cfg)
+		state := calcifer.Probe(ctx.Cfg)
 		// A held record with no pid is an owner releasing or claiming it, not a successor.
 		if !state.Up || stopping != 0 && state.PID != 0 && state.PID != stopping {
 			if state.Up {
-				notes = append(notes, fmt.Sprintf("another command has already started the next daemon (pid %d)", state.PID))
+				notes = append(notes, fmt.Sprintf("another command has already started the next Calcifer (pid %d)", state.PID))
 			}
-			fields := []output.Field{{K: "daemon", V: "stopped"}, {K: "changed", V: true}}
+			fields := []output.Field{{K: "calcifer", V: "stopped"}, {K: "changed", V: true}}
 			fields = append(fields, extra...)
 			return emit(ctx, output.Record{Fields: fields, Notes: notes})
 		}
 		if time.Since(reported) >= 5*time.Second {
 			reported = time.Now()
-			fmt.Fprintf(ctx.Err, "waiting for the daemon (pid %d) to finish stopping: %s so far\n",
+			fmt.Fprintf(ctx.Err, "waiting for Calcifer (pid %d) to finish stopping: %s so far\n",
 				stopping, time.Since(began).Round(time.Second))
 		}
 		time.Sleep(50 * time.Millisecond)

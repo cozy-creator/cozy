@@ -62,7 +62,7 @@ func uploadV1Output(ctx *Context, run, slot, destination string) (bool, *exit.Er
 	}
 	if machineendpoint.IsName(link.MachineID) {
 		return true, exit.Named(exit.Structural, "machine.upload_unsupported",
-			"run %s ran on an explicitly pinned endpoint, which takes no operations from this daemon", run)
+			"run %s ran on an explicitly pinned endpoint, which takes no operations from this Calcifer", run)
 	}
 	model := records.ModelRef{Slot: output.Output, Manifest: output.Digest, ManifestLength: output.Length}
 	op := records.Operation{Models: []records.ModelRef{model}, Destination: destination, Hub: request.Hub}

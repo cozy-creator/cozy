@@ -13,7 +13,7 @@ func (c *Client) requireGPUCount(count uint32) *exit.Error {
 		return problem
 	}
 	if !caps.RunGPUs {
-		return exit.Named(exit.Unavailable, "daemon.gpu_count_unavailable",
+		return exit.Named(exit.Unavailable, "calcifer.gpu_count_unavailable",
 			"this controller cannot retain an explicit GPU count; nothing was submitted").
 			WithRemedy("update Cozy Creator before using --gpus")
 	}

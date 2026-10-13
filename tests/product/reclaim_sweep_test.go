@@ -144,7 +144,7 @@ func TestReclaimSweeps(t *testing.T) {
 
 // settledRun drives one request through the store to a closed, succeeded attempt whose
 // single output sits in the package's store under its digest name — where the worker
-// wrote it — and settles its export row the way the daemon does.
+// wrote it — and settles its export row the way Calcifer does.
 func settledRun(t *testing.T, l home.Layout, store *records.Store, requestID string) {
 	t.Helper()
 	submitSweepRequest(t, store, requestID)

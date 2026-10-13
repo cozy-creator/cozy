@@ -5,7 +5,7 @@ Package installation remains separate. Updating a package can raise its Runtime
 requirement; that requirement must be checked against the worker's observed
 distribution before importing the package.
 
-Creator's existing daemon owns the operation and the rental's dispatch hold. The
+Creator's existing Calcifer owns the operation and the rental's dispatch hold. The
 short-lived CLI starts or observes it. The Host owns replacement of its Runtime
 process and the worker's installed distributions. TensorFS state stays outside
 the replaceable environment. Creator does not run inside the worker.
@@ -30,7 +30,7 @@ the replaceable environment. Creator does not run inside the worker.
    retained boot and TLS identity before reopening dispatch. Failed candidates
    roll back to the previous healthy pair.
 
-An interrupted CLI does not cancel the daemon operation. A daemon restart sees
+An interrupted CLI does not cancel the Calcifer operation. A Calcifer restart sees
 the durable maintenance row and keeps dispatch closed while reconciling the Host
 selection. Unknown remote completion is neither success nor proof of rollback.
 
@@ -51,8 +51,8 @@ does not purchase or replace a rental.
 
 The existing developer Host wrapper already provides exact-wheel validation,
 cooperative replacement, rollback, retained readiness and an operator SSH path.
-Use that implementation with the daemon's per-rental control hold; never stop the
-whole Creator daemon. Existing
+Use that implementation with Calcifer's per-rental control hold; never stop the
+whole Calcifer. Existing
 ordinary images without this maintenance contract must give a clear unsupported
 image error. New private rental defaults need an explicit maintenance-capable
 image/access contract; shared worker image policy remains independent.
@@ -61,7 +61,7 @@ image/access contract; shared worker image policy remains independent.
 
 Use the ordinary Creator CLI against local Host fixtures for successful update,
 repeated no-op, busy refusal, another rental remaining usable, invalid wheels,
-rollback, client disconnect, daemon restart and retained TensorFS state. Biao's
+rollback, client disconnect, Calcifer restart and retained TensorFS state. Biao's
 observed failure was Runtime 0.18.2 against H3's >=0.18.3 requirement. Real rental
 qualification uses an explicitly owned rental and the ordinary Creator CLI.
 

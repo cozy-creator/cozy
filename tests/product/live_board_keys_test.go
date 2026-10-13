@@ -104,11 +104,11 @@ func TestRunBoardEscExits(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: http://127.0.0.1:1\n"+
 			"tensorhub_token: run-board-esc-test\n"+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	// More runs than a 14-row terminal pages: the live run board has no footer.
 	for i := range 20 {
 		id := fmt.Sprintf("req-board-%02d", i)

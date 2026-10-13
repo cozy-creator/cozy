@@ -154,7 +154,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 		}
 		_ = removeAllForce(providerHome)
 	})
-	trackDaemonRoot(t, providerHome)
+	trackCalciferRoot(t, providerHome)
 	host := machines.NewHost(dir, "", nil)
 	host.WebRTCPort, _ = strconv.Atoi(h.grants["COZY_WEBRTC_INTERNAL_PORT"])
 	_, problem = host.Install(context.Background(), source, uv)
@@ -322,9 +322,9 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 	return out
 }
 
-// parityMachines is one daemon root with both machines of the parity body: this computer's,
-// installed and launched by the daemon, and the rental `tessa`, the same Host binary a
-// provider booted and the daemon attached. Each measures what its launcher lets it see.
+// parityMachines is one Calcifer root with both machines of the parity body: this computer's,
+// installed and launched by Calcifer, and the rental `tessa`, the same Host binary a
+// provider booted and Calcifer attached. Each measures what its launcher lets it see.
 func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.Store) {
 	t.Helper()
 	return parityMachinesOn(t, machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel})
@@ -345,7 +345,7 @@ func parityMachinesOn(t *testing.T, source machines.Source, front ...func(string
 	root, err := os.MkdirTemp("", "czp")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "machine", "stop")
 		_, _ = runCozy(t, root, "down")

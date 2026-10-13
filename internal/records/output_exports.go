@@ -40,7 +40,7 @@ type OutputExportIntent struct {
 	Outputs   []OutputExportEntry `json:"outputs"`
 }
 
-// OutputExport is the durable daemon-owned publication obligation and its settlement.
+// OutputExport is the durable Calcifer-owned publication obligation and its settlement.
 type OutputExport struct {
 	RequestID string
 	OutputExportIntent

@@ -12,7 +12,7 @@ import (
 )
 
 // Lease holds one install against reclamation for the life of a submission: from the
-// moment a caller resolves the install until the daemon has recorded the request that
+// moment a caller resolves the install until Calcifer has recorded the request that
 // references it. It is a shared flock on the install's lease file, so the kernel ends it
 // with its holder, SIGKILL included, and nothing about it is timed.
 type Lease struct{ file *os.File }

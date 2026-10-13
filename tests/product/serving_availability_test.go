@@ -73,7 +73,7 @@ func TestUnboundServingDefaultRefusesBeforeAcquisitionButExplicitModelsProceed(t
 	requests, _ := probe.snapshot()
 	for _, request := range requests {
 		if request != "GET /v1/packages/proof/h3" && request != "GET /v1/packages/proof/h3/releases/1.0.0" &&
-			request != "GET /v1/packages/proof/h3/bindings" && !daemonFleetHousekeeping(request) {
+			request != "GET /v1/packages/proof/h3/bindings" && !calciferFleetHousekeeping(request) {
 			t.Errorf("unbound function reached %s (activity %s)", request, tail(activity))
 		}
 	}

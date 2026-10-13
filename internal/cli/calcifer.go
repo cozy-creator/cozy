@@ -17,43 +17,43 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/userunit"
 )
 
-const daemonProcessName = "cozy-daemon"
+const calciferProcessName = "calcifer"
 
-const maxDaemonStartupDiagnostic = 16 << 10
+const maxCalciferStartupDiagnostic = 16 << 10
 
-const maxDaemonStartupLog = 1 << 20
+const maxCalciferStartupLog = 1 << 20
 
-type daemonExit struct {
+type calciferExit struct {
 	err        error
 	code       exit.Code
 	diagnostic string
 }
 
-type daemonChild struct {
+type calciferChild struct {
 	pid              int
-	done             <-chan daemonExit
+	done             <-chan calciferExit
 	closeDiagnostics func()
 }
 
-// DaemonProcess reports whether argv0 names the binary's private daemon
+// CalciferProcess reports whether argv0 names the binary's private Calcifer
 // entrypoint. It is a process boundary, not a hidden public command.
-func DaemonProcess(argv0 string) bool {
-	return filepath.Base(argv0) == daemonProcessName
+func CalciferProcess(argv0 string) bool {
+	return filepath.Base(argv0) == calciferProcessName
 }
 
-// RunDaemon owns the persistent loopback daemon. Public `up` and stateful
+// RunCalcifer owns the persistent loopback Calcifer. Public `up` and stateful
 // commands start this private process entrypoint. stderr is the parent's startup
-// diagnostic pipe; everything else the daemon says goes to its own log.
-func RunDaemon(stderr io.Writer) int {
-	ignoreDaemonBrokenPipe()
+// diagnostic pipe; everything else Calcifer says goes to its own log.
+func RunCalcifer(stderr io.Writer) int {
+	ignoreCalciferBrokenPipe()
 	cfg, problem := config.Load()
 	if problem != nil {
 		fmt.Fprintln(stderr, problem.Error())
@@ -63,20 +63,20 @@ func RunDaemon(stderr io.Writer) int {
 		return int(exit.Internal)
 	}
 	if err := raiseOpenFileLimit(); err != nil {
-		fmt.Fprintf(stderr, "cannot raise cozy-daemon's open-file limit: %v\n", err)
+		fmt.Fprintf(stderr, "cannot raise Calcifer's open-file limit: %v\n", err)
 		return int(exit.Internal)
 	}
-	// THE DAEMON'S OWN LOG (cl-096). The process is detached from any terminal, so its
+	// CALCIFER'S OWN LOG (cl-096). The process is detached from any terminal, so its
 	// words — the orchestrator's frame-by-frame account above all — go to
-	// $COZY_HOME/daemon.log, bounded by rotation on observed size (daemon.LogBytes, one
-	// predecessor). `cozy daemon log` reads it. stdout is never written: the parent hands
-	// this process /dev/null there, and a hand-started daemon needs no redirect.
+	// $COZY_HOME/calcifer.log, bounded by rotation on observed size (calcifer.LogBytes, one
+	// predecessor). `cozy calcifer log` reads it. stdout is never written: the parent hands
+	// this process /dev/null there, and a hand-started Calcifer needs no redirect.
 	layout, problem := home.Open(cfg.Home)
 	if problem != nil {
 		fmt.Fprintln(stderr, string(startupRefusal{Error: problem}.encode()))
 		return int(exit.Internal)
 	}
-	log, err := daemon.OpenLog(layout.Log)
+	log, err := calcifer.OpenLog(layout.Log)
 	if err != nil {
 		fmt.Fprintln(stderr, string(startupRefusal{Error: exit.Internalf("%s", err)}.encode()))
 		return int(exit.Internal)
@@ -87,12 +87,12 @@ func RunDaemon(stderr io.Writer) int {
 			"--port", intText(cfg.Port), "--yield", cfg.Yield), Mode: output.Mode{}},
 		Out: log, Err: stderr, Cfg: cfg, AccountAuth: accountauth.New(cfg),
 	}
-	if problem := serveDaemon(ctx); problem != nil {
+	if problem := serveCalcifer(ctx); problem != nil {
 		// The parent `cozy up` reads this pipe: one typed document, so the refusal reaches
 		// the human under its own name and remedy rather than as startup prose. The log
 		// keeps the same words, so the refusal outlives the pipe.
 		fmt.Fprintln(stderr, string(startupRefusal{Error: problem}.encode()))
-		fmt.Fprintf(log, "cozy-daemon refused to start: %s\n", problem.Error())
+		fmt.Fprintf(log, "Calcifer refused to start: %s\n", problem.Error())
 		if problem.Code.Valid() && problem.Code != exit.OK {
 			return int(problem.Code)
 		}
@@ -101,8 +101,8 @@ func RunDaemon(stderr io.Writer) int {
 	return 0
 }
 
-// startupRefusal is the daemon's last word on stderr when it refuses to start: the typed
-// error itself, so `daemonStartupFailure` re-raises it verbatim.
+// startupRefusal is Calcifer's last word on stderr when it refuses to start: the typed
+// error itself, so `calciferStartupFailure` re-raises it verbatim.
 type startupRefusal struct {
 	Error *exit.Error `json:"error"`
 }
@@ -115,7 +115,7 @@ func (r startupRefusal) encode() []byte {
 	return data
 }
 
-// startupRefusalOf reads the daemon's typed refusal back out of its startup diagnostic.
+// startupRefusalOf reads Calcifer's typed refusal back out of its startup diagnostic.
 func startupRefusalOf(diagnostic string) *exit.Error {
 	lines := strings.Split(strings.TrimSpace(diagnostic), "\n")
 	var doc startupRefusal
@@ -126,16 +126,16 @@ func startupRefusalOf(diagnostic string) *exit.Error {
 	return doc.Error
 }
 
-func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
+func ensureCalcifer(ctx *Context) (calcifer.State, bool, *exit.Error) {
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
-		return daemon.State{}, false, problem
+		return calcifer.State{}, false, problem
 	}
-	// The daemon record carries the per-launch token; a relaunch rewrites the whole
-	// body, so "the bytes changed" is exactly "a fresh daemon minted a fresh token".
-	staleCredential, _ := os.ReadFile(layout.Daemon)
-	var child *daemonChild
-	var childResult *daemonExit
+	// The Calcifer record carries the per-launch token; a relaunch rewrites the whole
+	// body, so "the bytes changed" is exactly "a fresh Calcifer minted a fresh token".
+	staleCredential, _ := os.ReadFile(layout.Calcifer)
+	var child *calciferChild
+	var childResult *calciferExit
 	started := false
 	defer func() {
 		if child != nil {
@@ -147,15 +147,15 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 	defer tick.Stop()
 	// Readiness follows the live owner, not elapsed time: migrations and startup
 	// may legitimately take longer on a busy host. The caller can interrupt its
-	// wait without stopping the detached daemon; child exits still report failure.
+	// wait without stopping the detached Calcifer; child exits still report failure.
 	for {
-		if state := daemon.Probe(ctx.Cfg); state.Up {
+		if state := calcifer.Probe(ctx.Cfg); state.Up {
 			if state.OperatorOwned {
-				return daemon.State{}, false, exit.Named(exit.Conflict, "daemon.operator_owned",
-					"an operator process holds this Cozy root without starting a daemon").
+				return calcifer.State{}, false, exit.Named(exit.Conflict, "calcifer.operator_owned",
+					"an operator process holds this Cozy root without starting a Calcifer").
 					WithRemedy("finish or stop the operator handoff before starting Cozy")
 			}
-			current, _ := os.ReadFile(layout.Daemon)
+			current, _ := os.ReadFile(layout.Calcifer)
 			credentialReady := !started || !bytes.Equal(current, staleCredential)
 			// Schema generations belong to the records reader, not this API client.
 			// Missing/newer schema metadata never authorizes replacing a live owner.
@@ -170,16 +170,16 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 				}
 			}
 		} else if childResult != nil {
-			return daemon.State{}, false, daemonStartupFailure(*childResult)
+			return calcifer.State{}, false, calciferStartupFailure(*childResult)
 		} else if !started {
-			spawned, err := startDaemon(ctx)
+			spawned, err := startCalcifer(ctx)
 			if err != nil {
-				return daemon.State{}, false, err
+				return calcifer.State{}, false, err
 			}
 			started = true
 			child = spawned
 		}
-		var done <-chan daemonExit
+		var done <-chan calciferExit
 		if child != nil {
 			done = child.done
 		}
@@ -197,47 +197,47 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 	}
 }
 
-func startDaemon(ctx *Context) (*daemonChild, *exit.Error) {
+func startCalcifer(ctx *Context) (*calciferChild, *exit.Error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, exit.Internalf("cannot locate the Cozy executable: %s", err)
 	}
-	// The daemon is a background product process, not an attached Compose-style log
-	// producer: its stdout is nothing. Its words go to $COZY_HOME/daemon.log (RunDaemon),
-	// read with `cozy daemon log`; only the startup refusal crosses the stderr pipe.
+	// Calcifer is a background product process, not an attached Compose-style log
+	// producer: its stdout is nothing. Its words go to $COZY_HOME/calcifer.log (RunCalcifer),
+	// read with `cozy calcifer log`; only the startup refusal crosses the stderr pipe.
 	discard, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		return nil, exit.Internalf("cannot open the null diagnostics sink: %s", err)
 	}
-	// The daemon serves every hub and each request names its own. Its default is the
+	// Calcifer serves every hub and each request names its own. Its default is the
 	// configured hub, never a one-command --tensorhub selection.
 	env := ctx.Cfg.Child("COZY_HOME="+ctx.Cfg.Home, "TENSORHUB_URL="+ctx.Cfg.ConfiguredHubURL)
 	if userunit.Available() {
 		discard.Close()
-		return startDaemonUnit(ctx, self, env)
+		return startCalciferUnit(ctx, self, env)
 	}
 	command := exec.Command(self)
-	command.Args[0] = daemonProcessName
+	command.Args[0] = calciferProcessName
 	command.Env = env
 	command.Stdout = discard
 	diagnostics, err := command.StderrPipe()
 	if err != nil {
 		discard.Close()
-		return nil, exit.Internalf("cannot open the daemon startup diagnostic pipe: %s", err)
+		return nil, exit.Internalf("cannot open the Calcifer startup diagnostic pipe: %s", err)
 	}
 	detachProcess(command)
 	if err := command.Start(); err != nil {
 		diagnostics.Close()
 		discard.Close()
-		return nil, exit.Internalf("cannot start the Cozy daemon: %s", err)
+		return nil, exit.Internalf("cannot start Calcifer: %s", err)
 	}
 	discard.Close()
 	diagnosticDone := make(chan string, 1)
 	go func() { diagnosticDone <- readBoundedDiagnostic(diagnostics) }()
-	done := make(chan daemonExit, 1)
+	done := make(chan calciferExit, 1)
 	go func() {
 		waitErr := command.Wait()
-		result := daemonExit{err: waitErr, code: exit.Internal, diagnostic: <-diagnosticDone}
+		result := calciferExit{err: waitErr, code: exit.Internal, diagnostic: <-diagnosticDone}
 		var processExit *exec.ExitError
 		if errors.As(waitErr, &processExit) {
 			if code := exit.Code(processExit.ExitCode()); code.Valid() && code != exit.OK {
@@ -247,41 +247,41 @@ func startDaemon(ctx *Context) (*daemonChild, *exit.Error) {
 		done <- result
 	}()
 	var closeOnce sync.Once
-	return &daemonChild{
+	return &calciferChild{
 		pid: command.Process.Pid, done: done,
 		closeDiagnostics: func() { closeOnce.Do(func() { _ = diagnostics.Close() }) },
 	}, nil
 }
 
-// DaemonUnit is the systemd user unit a home's daemon runs as: cozy-daemon for ~/.cozy.
-func DaemonUnit(home string) string {
-	return userunit.Name(daemonProcessName, home, home == config.DefaultHome())
+// CalciferUnit is the systemd user unit a home's Calcifer runs as: calcifer for ~/.cozy.
+func CalciferUnit(home string) string {
+	return userunit.Name(calciferProcessName, home, home == config.DefaultHome())
 }
 
-// startDaemonUnit runs the daemon as its own user unit, outside the caller's scope and
+// startCalciferUnit runs Calcifer as its own user unit, outside the caller's scope and
 // cgroup: ending the session that started it never ends it, and `cozy down` ends the unit.
-// A unit already running is the daemon, starting. Its stderr — a startup refusal, a panic, a
-// SIGQUIT goroutine dump — appends to daemon-startup.log after a start marker, so the next
-// start never erases the last daemon's words.
-func startDaemonUnit(ctx *Context, self string, env []string) (*daemonChild, *exit.Error) {
-	// The daemon entry is named by argv0; a unit runs its command's own name.
-	entry := filepath.Join(ctx.Cfg.Home, daemonProcessName)
+// A unit already running is Calcifer, starting. Its stderr — a startup refusal, a panic, a
+// SIGQUIT goroutine dump — appends to calcifer-startup.log after a start marker, so the next
+// start never erases the last Calcifer's words.
+func startCalciferUnit(ctx *Context, self string, env []string) (*calciferChild, *exit.Error) {
+	// The Calcifer entry is named by argv0; a unit runs its command's own name.
+	entry := filepath.Join(ctx.Cfg.Home, calciferProcessName)
 	if target, err := os.Readlink(entry); err != nil || target != self {
 		next := entry + ".new" + strconv.Itoa(os.Getpid()) // concurrent starts each rename their own
 		_ = os.Remove(next)
 		if err := os.Symlink(self, next); err != nil {
-			return nil, exit.Internalf("cannot name the daemon entry: %s", err)
+			return nil, exit.Internalf("cannot name the Calcifer entry: %s", err)
 		}
 		if err := os.Rename(next, entry); err != nil {
-			return nil, exit.Internalf("cannot name the daemon entry: %s", err)
+			return nil, exit.Internalf("cannot name the Calcifer entry: %s", err)
 		}
 	}
-	unit, startup := DaemonUnit(ctx.Cfg.Home), filepath.Join(ctx.Cfg.Home, "daemon-startup.log")
-	offset := markDaemonStart(unit, startup)
+	unit, startup := CalciferUnit(ctx.Cfg.Home), filepath.Join(ctx.Cfg.Home, "calcifer-startup.log")
+	offset := markCalciferStart(unit, startup)
 	if _, err := userunit.Start(userunit.Spec{Unit: unit, Argv: []string{entry}, Env: env, Stderr: startup}); err != nil {
-		return nil, exit.Internalf("cannot start the Cozy daemon unit: %s", err)
+		return nil, exit.Internalf("cannot start the Calcifer unit: %s", err)
 	}
-	done, stop := make(chan daemonExit, 1), make(chan struct{})
+	done, stop := make(chan calciferExit, 1), make(chan struct{})
 	go func() {
 		for {
 			select {
@@ -292,27 +292,27 @@ func startDaemonUnit(ctx *Context, self string, env []string) (*daemonChild, *ex
 			if state := userunit.Property(unit, "ActiveState"); state == "active" || state == "activating" {
 				continue
 			}
-			result := daemonExit{code: exit.Internal, diagnostic: startupDiagnostic(startup, offset)}
+			result := calciferExit{code: exit.Internal, diagnostic: startupDiagnostic(startup, offset)}
 			// A unit that ended in a word refused; one that ended silently found another owner.
 			if result.diagnostic != "" {
-				result.err = errors.New("the Cozy daemon unit ended")
+				result.err = errors.New("the Calcifer unit ended")
 			}
 			done <- result
 			return
 		}
 	}()
 	var closeOnce sync.Once
-	return &daemonChild{pid: userunit.MainPID(unit), done: done,
+	return &calciferChild{pid: userunit.MainPID(unit), done: done,
 		closeDiagnostics: func() { closeOnce.Do(func() { close(stop) }) }}, nil
 }
 
-// startMarker opens each start's part of daemon-startup.log.
-const startMarker = "--- cozy-daemon start "
+// startMarker opens each start's part of calcifer-startup.log.
+const startMarker = "--- calcifer start "
 
-// markDaemonStart appends this start's marker and answers where its diagnostic begins. A file
-// past maxDaemonStartupLog moves to .1 first, keeping the previous daemon's words; a running
+// markCalciferStart appends this start's marker and answers where its diagnostic begins. A file
+// past maxCalciferStartupLog moves to .1 first, keeping the previous Calcifer's words; a running
 // unit's file is never moved.
-func markDaemonStart(unit, path string) int64 {
+func markCalciferStart(unit, path string) int64 {
 	if userunit.Running(unit) {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -320,7 +320,7 @@ func markDaemonStart(unit, path string) int64 {
 		}
 		return info.Size()
 	}
-	if info, err := os.Stat(path); err == nil && info.Size() > maxDaemonStartupLog {
+	if info, err := os.Stat(path); err == nil && info.Size() > maxCalciferStartupLog {
 		_ = os.Rename(path, path+".1")
 	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
@@ -334,7 +334,7 @@ func markDaemonStart(unit, path string) int64 {
 	return offset
 }
 
-// startupDiagnostic is what the daemon wrote after this start's marker, without the markers of
+// startupDiagnostic is what Calcifer wrote after this start's marker, without the markers of
 // starts that raced it.
 func startupDiagnostic(path string, offset int64) string {
 	file, err := os.Open(path)
@@ -342,7 +342,7 @@ func startupDiagnostic(path string, offset int64) string {
 		return ""
 	}
 	defer file.Close()
-	raw, _ := io.ReadAll(io.NewSectionReader(file, offset, maxDaemonStartupDiagnostic))
+	raw, _ := io.ReadAll(io.NewSectionReader(file, offset, maxCalciferStartupDiagnostic))
 	var kept []string
 	for _, line := range strings.Split(string(raw), "\n") {
 		if !strings.HasPrefix(line, startMarker) {
@@ -353,20 +353,20 @@ func startupDiagnostic(path string, offset int64) string {
 }
 
 func readBoundedDiagnostic(reader io.Reader) string {
-	kept := make([]byte, 0, maxDaemonStartupDiagnostic)
+	kept := make([]byte, 0, maxCalciferStartupDiagnostic)
 	buffer := make([]byte, 4096)
 	truncated := false
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
-			remaining := maxDaemonStartupDiagnostic - len(kept)
+			remaining := maxCalciferStartupDiagnostic - len(kept)
 			if remaining > 0 {
 				if n < remaining {
 					remaining = n
 				}
 				kept = append(kept, buffer[:remaining]...)
 			}
-			if len(kept) == maxDaemonStartupDiagnostic && n > remaining {
+			if len(kept) == maxCalciferStartupDiagnostic && n > remaining {
 				truncated = true
 			}
 		}
@@ -381,7 +381,7 @@ func readBoundedDiagnostic(reader io.Reader) string {
 	return diagnostic
 }
 
-func daemonStartupFailure(result daemonExit) *exit.Error {
+func calciferStartupFailure(result calciferExit) *exit.Error {
 	if refusal := startupRefusalOf(result.diagnostic); refusal != nil {
 		return refusal
 	}
@@ -390,11 +390,11 @@ func daemonStartupFailure(result daemonExit) *exit.Error {
 		diagnostic = result.err.Error()
 	}
 	if diagnostic == "" {
-		diagnostic = "the Cozy daemon exited before publishing a healthy API"
+		diagnostic = "Calcifer exited before publishing a healthy API"
 	}
-	return exit.Named(result.code, "daemon_startup_failed",
-		"Cozy daemon startup failed: %s", diagnostic).
-		WithRemedy("correct the reported startup condition and retry `cozy up`; `cozy daemon log` keeps the daemon's own words")
+	return exit.Named(result.code, "calcifer_startup_failed",
+		"Calcifer startup failed: %s", diagnostic).
+		WithRemedy("correct the reported startup condition and retry `cozy up`; `cozy calcifer log` keeps Calcifer's own words")
 }
 
 func uiReady(address string) bool {

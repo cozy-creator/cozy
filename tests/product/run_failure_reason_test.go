@@ -71,7 +71,7 @@ func TestFailedRunWatchCarriesItsTriageBundle(t *testing.T) {
 	}
 }
 
-// A pre-attempt failure recorded by an older daemon (no error_code, the old message
+// A pre-attempt failure recorded by an older Calcifer (no error_code, the old message
 // shape; run 862) shows the same reason in `run list` as in `run watch`.
 func TestRecordedLegacyFailureReasonIsTheSameInListAndWatch(t *testing.T) {
 	o := hostOwner(t, "legacy-failure-reason")

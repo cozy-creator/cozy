@@ -33,7 +33,7 @@ import (
 
 // Inherited is the complete set of environment variables a package process
 // may inherit. Launchers impose every other value explicitly. XDG_RUNTIME_DIR is where the
-// user's systemd manager answers, which the daemon and machine run their own units under.
+// user's systemd manager answers, which Calcifer and machine run their own units under.
 // CUDA_VISIBLE_DEVICES is where this computer's machine may find GPUs: empty is none.
 var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "XDG_RUNTIME_DIR", "CUDA_VISIBLE_DEVICES"}
 
@@ -108,10 +108,10 @@ type Config struct {
 	RentalsDevelopment  bool
 	RentalsSSHPublicKey string
 
-	// DaemonIdleShutdown is how long "nothing to manage" must stay true before the daemon
+	// CalciferIdleShutdown is how long "nothing to manage" must stay true before Calcifer
 	// exits on its own. It is a debounce over an observed fact, never the decision; zero
-	// keeps the daemon up until `cozy down`.
-	DaemonIdleShutdown time.Duration
+	// keeps Calcifer up until `cozy down`.
+	CalciferIdleShutdown time.Duration
 
 	// HubLiveness is the longest a connection to Tensorhub may show no sign of life (no
 	// frame, no ACK to a probe) before it is dead. It never bounds how long a Hub that is
@@ -145,7 +145,7 @@ type values struct {
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
 	RentalsDevelopment       bool   `name:"rentals_development" default:"true"`
 	RentalsSSHPublicKey      string `name:"rentals_ssh_public_key"`
-	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
+	CalciferIdleShutdownS    int64  `name:"calcifer_idle_shutdown_s" default:"900"`
 	HubLivenessS             int64  `name:"tensorhub_liveness_s" default:"40"`
 	PlacementPrefer          string `name:"placement_prefer" default:"balanced"`
 	PlayerURL                string `name:"player_url" default:"https://cozy-creator.github.io/cozy/play/"`
@@ -174,7 +174,7 @@ var behaviour = map[string]struct {
 }{
 	"local_rate_micro_usd_per_hour": {"local_rate_micro_usd_per_hour", nonNegative},
 	"rentals_development":           {"rentals.development", boolean},
-	"daemon_idle_shutdown_s":        {"daemon.idle_shutdown_s", nonNegative},
+	"calcifer_idle_shutdown_s":      {"calcifer.idle_shutdown_s", nonNegative},
 	"tensorhub_liveness_s":          {"tensorhub_liveness_s", positive},
 	"placement_prefer":              {"placement.prefer", oneOf("fast", "balanced", "cheap")},
 	"port":                          {"port", tcpPort},
@@ -264,7 +264,7 @@ var fileKeys = map[string]bool{
 	"port":                          true,
 	"yield":                         true,
 	"rentals":                       true,
-	"daemon":                        true,
+	"calcifer":                      true,
 	"placement":                     true,
 	"hubs":                          true,
 	"machine":                       true,
@@ -275,7 +275,7 @@ var fileKeys = map[string]bool{
 var nestedFileKeys = map[string]map[string]string{
 	"rentals": {"development": "rentals_development",
 		"ssh_public_key": "rentals_ssh_public_key"},
-	"daemon":    {"idle_shutdown_s": "daemon_idle_shutdown_s"},
+	"calcifer":  {"idle_shutdown_s": "calcifer_idle_shutdown_s"},
 	"placement": {"prefer": "placement_prefer"},
 	"machine":   {"gpu_budget": "machine_gpu_budget"},
 }
@@ -491,7 +491,7 @@ func load() (Config, *exit.Error) {
 		LocalRateSource:          sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
 		RentalsDevelopment:       input.RentalsDevelopment,
 		RentalsSSHPublicKey:      strings.TrimSpace(input.RentalsSSHPublicKey),
-		DaemonIdleShutdown:       time.Duration(input.DaemonIdleShutdownS) * time.Second,
+		CalciferIdleShutdown:     time.Duration(input.CalciferIdleShutdownS) * time.Second,
 		HubLiveness:              time.Duration(input.HubLivenessS) * time.Second,
 		PlacementPrefer:          input.PlacementPrefer,
 		PlayerURL:                strings.TrimSpace(input.PlayerURL),

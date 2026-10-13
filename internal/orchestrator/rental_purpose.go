@@ -8,7 +8,7 @@ import (
 // RentalOwedBy answers whether the request this rental was bought for still owes it a
 // pin: not yet settled, and not durably routed to another machine. The debt is read from
 // the durable rows alone — `rentals.managed_request_id` is written with the paid create —
-// so it holds across a daemon restart and across the whole boot, when the request row
+// so it holds across a Calcifer restart and across the whole boot, when the request row
 // still says worker=” because the pin is routing's output (cl-092) and routing has not
 // run yet. Without this, a booting or freshly ready pod looks unowed to every observer
 // and an idle sweep — or any fleet hygiene reading the same records — reaps a pod whose

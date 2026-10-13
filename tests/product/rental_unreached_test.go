@@ -76,7 +76,7 @@ func TestARunOnARentalItsHubCouldNotReachFailsWithTheCause(t *testing.T) {
 	hub := newFakeRentalHub(t, 0)
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubURL+"\n"+
-		"tensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"tensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	hub.packageReleases = map[string]any{"fake/lost@1": rentalReleaseFacts()}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -101,7 +101,7 @@ func TestARunOnARentalItsHubCouldNotReachFailsWithTheCause(t *testing.T) {
 		}
 	}
 
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	hub.set("rental-unreached", "release_cause", "idle_unreached")
 	hub.setState("rental-unreached", "released", "")
 

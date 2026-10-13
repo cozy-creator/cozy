@@ -178,7 +178,7 @@ func TestAutomaticAndNamedRentalChoicesAllowPrivateSDKVersions(t *testing.T) {
 	}
 	st.Close()
 	installedHere(t, root, h.server.URL, ladderPackage, "1.0.0")
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	for _, arm := range []struct{ key, flag string }{{"automatic-runtime", "--rental-only"}, {"named-runtime", "--rental=giriko"}} {
 		_, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", arm.flag, "--json", "--idempotency-key", arm.key)
 		st, problem = records.Open(filepath.Join(root, "creator.sqlite"))
@@ -251,7 +251,7 @@ func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
 	}
 }
 
-func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
+func TestNamedRentalReplayAfterEndUsesExistingCalciferRequest(t *testing.T) {
 	for _, kind := range []string{"serving", "job"} {
 		t.Run(kind, func(t *testing.T) {
 			h := newLadderHub(t)
@@ -266,7 +266,7 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 			h.addReady(id, "isao", h100SXM, 2490000)
 			st.Close()
 			installedHere(t, root, h.server.URL, ladderPackage, "1.0.0")
-			startDaemonProcess(t, root)
+			startCalciferProcess(t, root)
 			args := []string{"run", ladderPackage + "/generate", "steps=1", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
 			if kind == "job" {
 				args = []string{"run", ladderPackage + "/lane", "--model.pruned=proof/minimax@1.0.0-rc.1/fp8-adaln-pruned", "--rental=isao", "--json", "--idempotency-key=ended-replay"}

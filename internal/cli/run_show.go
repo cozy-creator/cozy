@@ -21,8 +21,8 @@ import (
 )
 
 // runReport is one run's execution evidence: cold setup apart from inference, the per-step
-// series, which GPUs ran it, and each child call it made. Every fact comes from the
-// daemon's records (durable events and the kept triage bundle); JSON also carries both
+// series, which GPUs ran it, and each child call it made. Every fact comes from
+// Calcifer's records (durable events and the kept triage bundle); JSON also carries both
 // sources whole.
 type runReport struct {
 	Number    int64  `json:"number"`

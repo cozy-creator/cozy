@@ -61,21 +61,21 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 	if ctx.foregroundClient != nil {
 		return ctx.foregroundClient, nil
 	}
-	if ctx.Daemon.Addr == "" {
-		state, _, problem := ensureDaemon(ctx)
+	if ctx.Calcifer.Addr == "" {
+		state, _, problem := ensureCalcifer(ctx)
 		if problem != nil {
 			return nil, problem
 		}
-		ctx.Daemon = state
+		ctx.Calcifer = state
 	}
-	return localapi.Open(ctx.Cfg, ctx.Daemon)
+	return localapi.Open(ctx.Cfg, ctx.Calcifer)
 }
 
 // ----------------------------------------------------------------------------- run
 
-// foregroundTarget takes a named --rental the running daemon cannot carry (it predates
+// foregroundTarget takes a named --rental the running Calcifer cannot carry (it predates
 // cozy.machine.v1) as this process's own run: the rental's machine as an explicit endpoint,
-// signed with the rental's own key. close ends the controller; nil: the daemon carries it.
+// signed with the rental's own key. close ends the controller; nil: Calcifer carries it.
 func foregroundTarget(ctx *Context) (func(), *exit.Error) {
 	name := ctx.Inv.Value("--rental")
 	if name == "" || ctx.Inv.Value("--machine-endpoint-file") != "" {
@@ -971,7 +971,7 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	// The recorded run decides the route; the daemon reads the machine's own state right
+	// The recorded run decides the route; Calcifer reads the machine's own state right
 	// before it sends the cancel, so this read does not dial the machine first.
 	before, problem := client.RecordedRequest(id)
 	if problem != nil {
@@ -1074,7 +1074,7 @@ func handleRunList(ctx *Context) *exit.Error {
 	case older != nil:
 		list.Total, list.More = len(list.Rows)+*older, "Use --limit 0 to show all."
 	case len(list.Rows) == limit:
-		// A daemon that does not count what it left out.
+		// A Calcifer that does not count what it left out.
 		list.Trail = append(list.Trail, fmt.Sprintf("Showing the newest %d runs; older ones may not be shown. Use --limit 0 to show all.", limit))
 	}
 	return emit(ctx, list)
@@ -1089,7 +1089,7 @@ func nameHubs(cfg config.Config, list *output.List) {
 }
 
 // runList reads up to limit runs (0: all), newest first, and how many matching runs it left
-// out: nil when the daemon does not count them.
+// out: nil when Calcifer does not count them.
 func runList(requestCtx context.Context, client *localapi.Client, state, packageName string, limit int) (output.List, *int, *exit.Error) {
 	pkg := strings.TrimSpace(packageName)
 	var rows []api.Lifecycle
@@ -1111,7 +1111,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		}
 		next := page[len(page)-1].Number
 		if next < 1 || (before > 0 && next >= before) {
-			return output.List{}, nil, exit.New(exit.Conflict, "run history pagination did not advance; restart the Cozy daemon to load the current API")
+			return output.List{}, nil, exit.New(exit.Conflict, "run history pagination did not advance; restart Calcifer to load the current API")
 		}
 		rows = append(rows, page...)
 		if len(page) < pageSize {
@@ -1403,7 +1403,7 @@ func PhaseCell(life api.Lifecycle) string {
 		activity = "loading models"
 	}
 	parts := []string{activity}
-	// Older daemons carried completed download counters into these phases.
+	// Older Calcifers carried completed download counters into these phases.
 	// Job preparation may report real conversion progress; serving setup cannot.
 	if life.Phase == orchestrator.PhaseWarming || life.Phase == orchestrator.PhasePreparing && life.Kind != "job" {
 		return activity
@@ -1499,7 +1499,7 @@ func progressValue(life api.Lifecycle) string {
 }
 
 // reconnecting is a running run whose machine this computer lost: what it last heard is not
-// live, so the cell says what the daemon is doing first.
+// live, so the cell says what Calcifer is doing first.
 func reconnecting(life api.Lifecycle) string {
 	cell := "reconnecting to " + cmp.Or(life.Machine, "its machine")
 	if since, err := time.Parse(time.RFC3339Nano, life.ObservationLost.Since); err == nil {
@@ -1556,7 +1556,7 @@ func invocationSettled(status string) bool {
 
 // optimisticObservation is long enough for a warm, weightless callable to answer in the
 // foreground without turning an ordinary GPU submission into a terminal hostage. Expiry
-// never cancels the request and never predicts its duration: the daemon keeps owning it.
+// never cancels the request and never predicts its duration: Calcifer keeps owning it.
 const optimisticObservation = 3 * time.Second
 
 // observe follows the real event stream for one bounded optimistic window. A context
@@ -1629,7 +1629,7 @@ func custodyOwed(view *api.MachineExecutionView, status string, products int) bo
 
 // awaitResultCustody follows a finished machine run's events past its terminal until its
 // result's custody settles: collected, refused until its owner acts, kept on the machine,
-// or lost with it. The daemon's observer collects; a client only listens.
+// or lost with it. Calcifer's observer collects; a client only listens.
 func awaitResultCustody(c *localapi.Client, id string) *exit.Error {
 	terminal, problem := c.Watch(id, 0, func(localapi.Event) bool { return true })
 	if problem != nil || terminal == nil {
@@ -1665,7 +1665,7 @@ func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *e
 		case "failed":
 			// A failed export is NOT a run failure: the run's own terminal stands, the
 			// bytes are safe in internal media, and the export stays a durable obligation
-			// the daemon retries. renderRun reports the completed-with-export-owed verdict.
+			// Calcifer retries. renderRun reports the completed-with-export-owed verdict.
 			return life, nil
 		case "pending", "exporting":
 			time.Sleep(50 * time.Millisecond)
@@ -1696,7 +1696,7 @@ func outputExportHint(mode output.Mode, export *api.OutputExportRef) string {
 }
 
 // outputDirectoryHint is where this run's files will land: the caller's --out, else the
-// package's own store — the same directory the daemon derives, spelled by the one layout.
+// package's own store — the same directory Calcifer derives, spelled by the one layout.
 func outputDirectoryHint(ctx *Context, target Target, explicit string) string {
 	if explicit != "" {
 		return explicit
@@ -1768,7 +1768,7 @@ func runStatus(status string) string {
 
 // watch consumes the request's own event stream to its terminal, rendering progress as
 // it goes. A SIGNAL NEVER CANCELS THE RUN (cl-108): SIGINT/SIGTERM merely DETACHES this
-// client — the daemon owns the accepted run, which keeps running, exports, and stays
+// client — Calcifer owns the accepted run, which keeps running, exports, and stays
 // watchable — because a dying watcher is not a person asking for cancellation, and the
 // recurring "CLIENT_CANCELED on disconnect" silent-cancel is exactly what that
 // translation produced. Only `cozy run cancel` and the caller-authored `--timeout`
@@ -2730,7 +2730,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		humanStatus = humanCancellationStatus(life.CanceledBy)
 	}
 	e := exit.Named(code, status, "request %s ended %s", life.RequestID, humanStatus)
-	// ONE SOURCE: the daemon's lifecycle, which `cozy run list` reads too. A failure before
+	// ONE SOURCE: Calcifer's lifecycle, which `cozy run list` reads too. A failure before
 	// any attempt is filled there from its settled event, so list and watch cannot disagree.
 	errType, errCode, why := life.ErrorType, life.ErrorCode, life.Error
 	e.Cause = errCode
@@ -2846,7 +2846,7 @@ func failureDetails(ctx *Context, life api.Lifecycle, errType, errCode, why stri
 // it is not there. A kept bundle is a path on THIS host — a pod's bundle is fetched over
 // its media plane and kept here like a local worker's (cl-101) — and the traceback's tail
 // is the part a person reads first, so it is quoted rather than pointed at. A bundle that
-// was not kept names the fault the daemon recorded instead of pretending one exists.
+// was not kept names the fault Calcifer recorded instead of pretending one exists.
 func triageRemedy(ctx *Context, ref *api.TriageRef, terminal *localapi.Event) string {
 	if !ref.Kept {
 		fault := eventText(terminal, "triage_fault")
@@ -3023,7 +3023,7 @@ type Target struct {
 	Held           string
 	Snapshot       bool
 	releaseCapture func()
-	// lease holds the resolved install until the daemon has recorded the submission.
+	// lease holds the resolved install until Calcifer has recorded the submission.
 	lease *install.Lease
 	// surface is the package's interface: the model slots its callables declare.
 	surface *launch.PackageInterface
@@ -3386,7 +3386,7 @@ func refreshLocal(ctx *Context, pkg string) *exit.Error {
 }
 
 // leasedInstallFacts resolves the active install of pkg and leases it for this submission,
-// so no superseding install can reclaim it before the daemon records the request. An
+// so no superseding install can reclaim it before Calcifer records the request. An
 // install reclaimed before the lease was taken is resolved again.
 func leasedInstallFacts(ctx *Context, pkg string) (*launch.Facts, *install.Lease, *exit.Error) {
 	layout, store, _, problem := open(ctx.Cfg, false)

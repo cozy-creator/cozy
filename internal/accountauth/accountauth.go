@@ -158,7 +158,7 @@ var managers struct {
 }
 
 // New returns this process's one Manager for cfg's Tensorhub origin, so every caller
-// addressing that origin shares one short bearer, and a daemon serving several hubs
+// addressing that origin shares one short bearer, and a Calcifer serving several hubs
 // holds one credential per origin, each sent only to its own.
 func New(cfg config.Config) *Manager {
 	origin := strings.TrimRight(strings.TrimSpace(cfg.HubURL), "/")
@@ -180,7 +180,7 @@ func New(cfg config.Config) *Manager {
 // Hub is the one origin this Manager's credential belongs to.
 func (m *Manager) Hub() string { return m.hub }
 
-// AccessToken satisfies hub.TokenSource. A daemon reuses the cached token while it is
+// AccessToken satisfies hub.TokenSource. A Calcifer reuses the cached token while it is
 // comfortably live; a short CLI process performs one cheap login exchange.
 func (m *Manager) AccessToken(ctx context.Context) (secret.Value, *exit.Error) {
 	session, problem := m.Authenticate(ctx)

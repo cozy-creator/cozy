@@ -10,8 +10,8 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/output"
 )
@@ -43,10 +43,10 @@ func watchList(ctx *Context, anchor string,
 	}, nil)
 }
 
-// following keeps a board on the daemon across its restarts. The board redraws every
+// following keeps a board on Calcifer across its restarts. The board redraws every
 // second, so the reattachment is not announced.
 func following(ctx *Context, c *localapi.Client) *localapi.Client {
-	return c.Following(func() { ctx.Daemon = daemon.Probe(ctx.Cfg) })
+	return c.Following(func() { ctx.Calcifer = calcifer.Probe(ctx.Cfg) })
 }
 
 type listSnapshot struct {

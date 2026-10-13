@@ -66,7 +66,7 @@ func TestModelQuantizeRunsTheServingPackagesQuantizer(t *testing.T) {
 	// serves the model; one that reads a component the checkpoint lacks does not.
 	installQuantizer(t, root, "proof/quantize", iface)
 	installQuantizer(t, root, "proof/other", []byte(strings.ReplaceAll(string(iface), `["model"]`, `["unet"]`)))
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	for key, args := range map[string][]string{
 		"quantize-name":       {"proof/source"},
 		"quantize-lane":       {"proof/source@1.0.0/bf16", "proof/output"},

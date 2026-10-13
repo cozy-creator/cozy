@@ -50,7 +50,7 @@ func TestRentalInventoryForgetsEndedMachinesButPreservesRunHistory(t *testing.T)
 	if before.Machine != "celty" {
 		t.Fatalf("fixture did not record rental history: %+v", before)
 	}
-	live := startDaemonProcess(t, root)
+	live := startCalciferProcess(t, root)
 	response := live.call(t, "GET", "/v1/local/rentals", nil)
 	if response.Status != http.StatusOK {
 		t.Fatalf("inventory API failed: %s", response.brief())

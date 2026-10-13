@@ -10,9 +10,9 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -74,7 +74,7 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 		if r.Method == "GET" && r.URL.Path == "/" {
 			return
 		}
-		if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // a current daemon: it records operations
+		if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // a current Calcifer: it records operations
 			_, _ = w.Write([]byte(`{"machine_v1":true,"operations":true}`))
 			return
 		}
@@ -102,7 +102,7 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 	if problem = store.RecordRental(records.Rental{ID: "rental-proof", MachineName: "kirukiru", State: "booting", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: hubPeer.URL}); problem != nil {
 		t.Fatal(problem)
 	}
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
+	held, problem := calcifer.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -154,7 +154,7 @@ func TestRentalModelLatestUsesVersionOrderWithoutDates(t *testing.T) {
 }
 
 // queueRentalModelDownload runs `cozy model download <ref> --rental=kirukiru` against a
-// stand-in daemon and returns the selection the CLI froze and handed to the queue.
+// stand-in Calcifer and returns the selection the CLI froze and handed to the queue.
 func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.Operation {
 	t.Helper()
 	var accepted records.Operation
@@ -162,7 +162,7 @@ func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.Operatio
 		if r.Method == "GET" && r.URL.Path == "/" {
 			return
 		}
-		if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // a current daemon: it records operations
+		if r.Method == "GET" && r.URL.Path == "/v1/capabilities" { // a current Calcifer: it records operations
 			_, _ = w.Write([]byte(`{"machine_v1":true,"operations":true}`))
 			return
 		}
@@ -184,7 +184,7 @@ func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.Operatio
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{ID: "rental-proof", MachineName: "kirukiru", State: "booting", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: hubURL}))
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
+	held, problem := calcifer.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
 	fatal(t, problem)
 	defer held.Release()
 	_, problem = api.Mint(layout)

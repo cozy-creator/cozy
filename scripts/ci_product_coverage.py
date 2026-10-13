@@ -45,7 +45,7 @@ def audit(root: Path, full: bool) -> None:
     if full:
         for required in (
             "TestStandaloneHostPreparesOrderedPrivateLoRAView",
-            "TestNativeCollectedFailureCancelSurvivesDaemonRestart",
+            "TestNativeCollectedFailureCancelSurvivesCalciferRestart",
         ):
             if outcomes.get(required) != "PASS":
                 raise ValueError(f"required native qualification did not pass: {required}")

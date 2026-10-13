@@ -27,8 +27,8 @@ func (c *Orchestrator) Managing() ([]string, *exit.Error) {
 	return held, nil
 }
 
-// CloseAdmission stops new work for a client down. Nothing in flight holds the daemon:
-// machines run the work, and the next daemon resumes it from durable records.
+// CloseAdmission stops new work for a client down. Nothing in flight holds Calcifer:
+// machines run the work, and the next Calcifer resumes it from durable records.
 func (c *Orchestrator) CloseAdmission() {
 	c.mu.Lock()
 	c.closing = true

@@ -11,15 +11,15 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 )
 
-func TestDaemonHTTPDrainFlushesReplyAndEndsStream(t *testing.T) {
+func TestCalciferHTTPDrainFlushesReplyAndEndsStream(t *testing.T) {
 	buffered, canceled, finish := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	streamStarted, streamStopped := make(chan struct{}), make(chan struct{})
 	const reply = `{"shutting_down":true}`
-	server := daemon.NewHTTPServer()
+	server := calcifer.NewHTTPServer()
 	server.Open(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/events" {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -90,18 +90,18 @@ func TestRepeatedCLIUpDownReceivesTheFinalResponse(t *testing.T) {
 			t.Fatalf("up iteration%d: %d %s", i, code, out)
 		}
 		if code, out := runCozy(t, root, "down", "--json"); code != 0 ||
-			!strings.Contains(out, `"daemon":"stopped"`) {
+			!strings.Contains(out, `"calcifer":"stopped"`) {
 			t.Fatalf("down iteration%d: %d %s", i, code, out)
 		}
-		if state := daemon.Probe(config.Config{Home: root}); state.Up {
-			t.Fatalf("down left its daemon alive: %s\n%s", state.Details, tail(filepath.Join(root, "daemon.log")))
+		if state := calcifer.Probe(config.Config{Home: root}); state.Up {
+			t.Fatalf("down left its Calcifer alive: %s\n%s", state.Details, tail(filepath.Join(root, "calcifer.log")))
 		}
 	}
 }
 
-func TestDaemonHTTPDrainHonorsItsCancellationBound(t *testing.T) {
+func TestCalciferHTTPDrainHonorsItsCancellationBound(t *testing.T) {
 	started, canceled, finish := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	server := daemon.NewHTTPServer()
+	server := calcifer.NewHTTPServer()
 	server.Open(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		<-r.Context().Done()

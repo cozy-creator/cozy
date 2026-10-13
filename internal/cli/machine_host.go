@@ -11,8 +11,8 @@ import (
 	"syscall"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machines"
@@ -204,7 +204,7 @@ func wakeAfterLocalMachineChange(ctx *Context) {
 // Readiness wakes accepted controller work. With no controller, its normal
 // startup recovers that work; this notification starts none.
 func notifyLocalMachineReady(ctx *Context) *exit.Error {
-	state := daemon.Probe(ctx.Cfg)
+	state := calcifer.Probe(ctx.Cfg)
 	if !state.Up || state.Addr == "" {
 		return nil
 	}
@@ -216,7 +216,7 @@ func notifyLocalMachineReady(ctx *Context) *exit.Error {
 }
 
 // startForCancel starts this computer's stopped machine for a canceled run still waiting on
-// it, as `cozy machine start` does: the daemon then delivers the cancel and the run settles
+// it, as `cozy machine start` does: Calcifer then delivers the cancel and the run settles
 // as its machine says (canceled, or completed if it finished first). A machine that cannot
 // start leaves the run canceling, and the caller is told why and what to do next.
 func startForCancel(ctx *Context, number int64, id, status string, view *api.MachineExecutionView) *exit.Error {

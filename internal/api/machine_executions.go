@@ -81,7 +81,7 @@ type MachineWarmMember struct {
 
 func (s *Server) machineStatus(w http.ResponseWriter, r *http.Request) {
 	if s.machineExecutions == nil {
-		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+		s.refuseTyped(w, r, exit.Unavailablef("this Calcifer runs no machines"))
 		return
 	}
 	status, problem := s.machineExecutions.Status(r.Context(), r.PathValue("machine"))
@@ -102,7 +102,7 @@ type MachineLog struct {
 
 func (s *Server) machineLog(w http.ResponseWriter, r *http.Request) {
 	if s.machineExecutions == nil {
-		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+		s.refuseTyped(w, r, exit.Unavailablef("this Calcifer runs no machines"))
 		return
 	}
 	var tail uint64
@@ -293,7 +293,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 				state.ErrorType = body.Cause
 				if providerRefusal.MatchString(body.Message) {
 					state.ErrorType = "model_source.auth_required"
-					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the daemon config"
+					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the Calcifer config"
 				}
 			}
 			if view.Collected && len(body.Result) > 0 {
@@ -455,7 +455,7 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 			return true, problem
 		}
 		// Control's cancel arm only wakes the existing observer. The durable
-		// request survives a closing daemon or an unavailable machine.
+		// request survives a closing Calcifer or an unavailable machine.
 		if s.machineExecutions != nil {
 			_ = s.machineExecutions.Control(ctx, row, action)
 		}

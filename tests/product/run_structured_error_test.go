@@ -10,7 +10,7 @@ import (
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
-// Exercise the current machine contract through the real store, daemon API and CLI:
+// Exercise the current machine contract through the real store, Calcifer API and CLI:
 // codes stay typed, messages stay verbatim, and human views render the code once.
 func TestRunFailureKeepsCodeSeparateFromMessage(t *testing.T) {
 	const errorCode = "model_choice_absent"

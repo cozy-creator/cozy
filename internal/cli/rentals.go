@@ -139,11 +139,11 @@ func handleRent(ctx *Context) *exit.Error {
 		}
 	}
 
-	state, _, problem := ensureDaemon(ctx)
+	state, _, problem := ensureCalcifer(ctx)
 	if problem != nil {
 		return problem
 	}
-	ctx.Daemon = state
+	ctx.Calcifer = state
 	watchCtx, restoreInput, _, problem := liveWatchContext(ctx, context.Background(), nil)
 	if problem != nil {
 		return problem
@@ -694,7 +694,7 @@ func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitio
 }
 
 // finishRentalAttachment is the shared durable handoff for foreground acquisition
-// and daemon recovery. It validates the same retained credentials before the row
+// and Calcifer recovery. It validates the same retained credentials before the row
 // advertises an authenticated worker target.
 func finishRentalAttachment(l home.Layout, st *records.Store, row records.Rental,
 	attachable hub.Rental, operationKey string, token secret.Value, creator rental.CreatorIdentity,
@@ -1100,8 +1100,8 @@ func handleRentalList(ctx *Context) *exit.Error {
 	return emit(ctx, list)
 }
 
-// rentalBoard reads the live fleet from the daemon, reconciling with the hubs every pollCadence.
-// A board draws its first frame from the daemon's last sweep, then reconciles; a snapshot
+// rentalBoard reads the live fleet from Calcifer, reconciling with the hubs every pollCadence.
+// A board draws its first frame from Calcifer's last sweep, then reconciles; a snapshot
 // reconciles first.
 func rentalBoard(ctx *Context, watching bool) (func(context.Context) (output.List, *exit.Error), *exit.Error) {
 	const allHubs = true
@@ -1170,7 +1170,7 @@ func signedOutLine(ctx *Context, origin string) string {
 }
 
 // handleRentalShow is `cozy rental show <rental>`: one rental's row of the every-hub
-// listing, a fact per line. The listing the daemon just reconciled names the rental; one it
+// listing, a fact per line. The listing Calcifer just reconciled names the rental; one it
 // does not list has ended, and its Hub's history says how.
 func handleRentalShow(ctx *Context) *exit.Error {
 	typed := strings.TrimSpace(ctx.Inv.Args[0])
@@ -1413,7 +1413,7 @@ func machineStatusFields(status api.MachineStatus, typed bool) []output.Field {
 	return fields
 }
 
-// renderRentalList formats the daemon's public read model; it never opens SQLite.
+// renderRentalList formats Calcifer's public read model; it never opens SQLite.
 func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs bool) output.List {
 	count, burn := inventory.MachinesRunning, inventory.HourlySpendUSDMicros
 	rows, unrecorded := inventory.Rentals, inventory.Unrecorded

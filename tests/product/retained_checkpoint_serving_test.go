@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Exercise CLI -> daemon admission using the existing metadata-only catalog.
+// Exercise CLI -> Calcifer admission using the existing metadata-only catalog.
 // Its acquisition route refuses all rentals; this proves no model execution.
 func TestRunServingAcceptsRetainedCheckpointWithoutRelease(t *testing.T) {
 	root, _, _, digest, manifest := runModelCatalog(t, func(_ *http.ServeMux, detail *hub.PackageReleaseDetail) {
@@ -21,7 +21,7 @@ func TestRunServingAcceptsRetainedCheckpointWithoutRelease(t *testing.T) {
 		detail.Release.PackageInterfaceDigest = assessmentDigest(contract.Raw)
 		detail.Release.PackageInterfaceLength = int64(len(iface))
 	})
-	daemon := startDaemonProcess(t, root)
+	calcifer := startCalciferProcess(t, root)
 	code, out := runCozy(t, root, "run", "proof/quantize/generate", "prompt=Compare the candidate",
 		"model.model=proof/source#"+digest, "--rental-only", "--json", "--idempotency-key", "retained-serving")
 	if code != 0 {
@@ -53,7 +53,7 @@ func TestRunServingAcceptsRetainedCheckpointWithoutRelease(t *testing.T) {
 		t.Run(invalid.name, func(t *testing.T) {
 			bad := model
 			invalid.edit(&bad)
-			response := daemon.call(t, "POST", "/v1/requests", map[string]any{
+			response := calcifer.call(t, "POST", "/v1/requests", map[string]any{
 				"package": row.Package, "release": row.Release, "function": row.Entrypoint,
 				"rental": true, "input": map[string]any{"prompt": "Compare the candidate"},
 				"models": []records.ModelRef{bad},

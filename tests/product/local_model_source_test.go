@@ -18,7 +18,7 @@ func TestLocalModelSourceStaysLocalAfterCanonicalization(t *testing.T) {
 	source := filepath.Join(root, "fixture.safetensors")
 	body := []byte("small local source")
 	must(t, os.WriteFile(source, body, 0o600))
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	accepted := queuedTransfer(t, root, "model", "download", source, "local/classification-proof", "--json", "--full")
 	sum := sha256.Sum256(body)
 	if len(accepted.Models) != 1 || accepted.Models[0].Source != "object://sha256:"+hex.EncodeToString(sum[:])+"/fixture.safetensors" ||

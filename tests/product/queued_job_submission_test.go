@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -58,7 +58,7 @@ func TestDetachedMachineJobReturnsQueuedRun(t *testing.T) {
 				case r.Method == "POST" && r.URL.Path == "/v1/local/jobs":
 					submissions.Add(1)
 					if r.Header.Get("Authorization") == "" {
-						t.Error("missing daemon authentication")
+						t.Error("missing Calcifer authentication")
 					}
 					_ = json.NewEncoder(w).Encode(api.JobHandle{Number: 42, JobID: "req-queued", Package: "proof/queued", Function: "compute", Status: "queued", MachineExecution: true})
 				case r.Method == "GET" && r.URL.Path == "/v1/local/jobs/req-queued":
@@ -68,14 +68,14 @@ func TestDetachedMachineJobReturnsQueuedRun(t *testing.T) {
 					}
 					_ = json.NewEncoder(w).Encode(api.JobState{Number: 42, JobID: "req-queued", Package: "proof/queued", Function: "compute", Status: "queued", Stage: "uploading captured package", MachineExecution: &api.MachineExecutionView{Machine: "cooler", Accepted: false}})
 				default:
-					t.Errorf("unexpected daemon request: %s %s", r.Method, r.URL)
+					t.Errorf("unexpected Calcifer request: %s %s", r.Method, r.URL)
 					http.Error(w, "unexpected request", 500)
 				}
 			}))
 			defer local.Close()
 			layout, problem := home.Open(t.TempDir())
 			check(problem)
-			held, problem := daemon.Hold(layout, strings.TrimPrefix(local.URL, "http://"), "")
+			held, problem := calcifer.Hold(layout, strings.TrimPrefix(local.URL, "http://"), "")
 			check(problem)
 			defer held.Release()
 			_, problem = api.Mint(layout)

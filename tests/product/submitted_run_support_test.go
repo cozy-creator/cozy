@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// submitRun sends a run or transfer through the real CLI and daemon admission and returns the durable
+// submitRun sends a run or transfer through the real CLI and Calcifer admission and returns the durable
 // request it recorded (nil when the CLI refused first). The run is canceled as soon as it is
 // recorded, so no placement continues once its admitted facts are read and the CLI's
 // optimistic observation ends on that terminal instead of waiting out its window.

@@ -94,12 +94,12 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	mux.HandleFunc("POST /v1/rental-quotes", listedRentalQuote(mux))
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
-	// Runs start the daemon, whose children may still be leaving when the test ends;
-	// the root is reaped with the daemon rather than by the strict TempDir check.
+	// Runs start Calcifer, whose children may still be leaving when the test ends;
+	// the root is reaped with Calcifer rather than by the strict TempDir check.
 	root, err := os.MkdirTemp(scratchBase, "model-catalog-")
 	must(t, err)
 	t.Cleanup(func() { _ = removeAllForce(root) })
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: model-run-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: model-run-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0600))
 	return root, &mu, &posts, digest, manifest
 }
 
@@ -176,7 +176,7 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 
 func TestManualRentalAcceptsRetainedCheckpointIdentity(t *testing.T) {
 	root, mu, posts, digest, _ := runModelCatalog(t)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	args := []string{"rental", "new", "cpu", "--idempotency-key", "retained-manual-rental",
 		"--model", "proof/source#" + digest, "--model", "proof/source#" + digest, "--json"}
 	code, out := runCozy(t, root, args...)
@@ -211,7 +211,7 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 	input := filepath.Join(root, "quantize.json")
 	must(t, os.WriteFile(input, []byte(`{"steps":7}`), 0600))
 	args := []string{"run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--input", input, "--upload-to", "proof/output", "--rental-only", "--json", "--full", "--idempotency-key", "published-model-job"}
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	code, out := runCozy(t, root, args...)
 	if code != 0 {
 		t.Fatalf("ordinary modeled job did not queue: %d %s", code, out)
@@ -238,7 +238,7 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 		}
 		mu.Unlock()
 		if time.Now().After(deadline) {
-			t.Fatalf("no rental declaration: %s", tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("no rental declaration: %s", tail(filepath.Join(root, "calcifer.log")))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -282,7 +282,7 @@ func TestCatalogCheckpointReferenceRoundTripsThroughRun(t *testing.T) {
 }
 
 // queuedTransfer runs a model transfer and answers the operation it recorded for this
-// computer's machine, as the daemon recorded it: the models, file and destination the
+// computer's machine, as Calcifer recorded it: the models, file and destination the
 // command froze.
 func queuedTransfer(t *testing.T, root string, args ...string) records.Operation {
 	t.Helper()

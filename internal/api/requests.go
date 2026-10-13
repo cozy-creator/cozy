@@ -42,7 +42,7 @@ type Submission struct {
 	Function        string                    `json:"function"`
 	Input           json.RawMessage           `json:"input"`
 	// InstallID is the immutable local install selected by the CLI. It is opaque to users;
-	// omitting it asks the daemon to resolve the active package pointer.
+	// omitting it asks Calcifer to resolve the active package pointer.
 	InstallID string   `json:"install_id,omitempty"`
 	Release   string   `json:"release,omitempty"`
 	Outputs   []string `json:"outputs,omitempty"`
@@ -208,7 +208,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		spec.Warnings = ignoredWarnings(sub.Package, sub.Function, spec.Release, sub.Ignored)
-		// The DAEMON is the process that publishes --out, so the daemon probes the
+		// Calcifer is the process that publishes --out, so it probes the
 		// destination — here, where the path is finally resolved, before an input is
 		// bound or a row recorded. A doomed export refuses in milliseconds instead
 		// of after GPU minutes.
@@ -226,7 +226,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// An inference root is Runtime's to execute on whichever machine runs it: its root
 		// bytes are frozen for native staging before anything is recorded.
 		if s.machineExecutions == nil {
-			s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+			s.refuseTyped(w, r, exit.Unavailablef("this Calcifer runs no machines"))
 			return
 		}
 		spec.MachineExecutionObserver = true
@@ -464,7 +464,7 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 	// Only immutable package metadata is validated here. The scheduler chooses and records
 	// the machine after admission.
 	if s.packages == nil {
-		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
+		return out, exit.Unavailablef("this Calcifer resolves no packages")
 	}
 	if strings.HasPrefix(sub.Package, "local/") {
 		if sub.InstallID != "" {
@@ -803,7 +803,7 @@ type Lifecycle struct {
 	OverallFraction *float64 `json:"overall_fraction,omitempty"`
 	Position        *int64   `json:"position,omitempty"`
 	Total           *int64   `json:"total,omitempty"`
-	// RemainingMS is read-only compatibility with older daemons; future-stage time is unknown.
+	// RemainingMS is read-only compatibility with older Calcifers; future-stage time is unknown.
 	RemainingMS *int64 `json:"remaining_ms,omitempty"`
 	// StageRemainingMS estimates only the current counted stage; later stages are unknown.
 	StageRemainingMS *int64   `json:"stage_remaining_ms,omitempty"`
@@ -848,10 +848,10 @@ type Lifecycle struct {
 	Error          string `json:"error,omitempty"`
 	Retaining      bool   `json:"retaining,omitempty"`
 	RetryAvailable bool   `json:"retry_available,omitempty"`
-	StoppedEventID int64  `json:"stopped_event_id,omitempty"` // an older daemon's blocked stop
+	StoppedEventID int64  `json:"stopped_event_id,omitempty"` // an older Calcifer's blocked stop
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
-	// for a run this daemon canceled on request.
+	// for a run this Calcifer canceled on request.
 	CanceledBy string     `json:"canceled_by,omitempty"`
 	Result     any        `json:"result,omitempty"`
 	Outputs    []MediaRef `json:"outputs"`
@@ -876,7 +876,7 @@ type Lifecycle struct {
 	Memo
 }
 
-// DisplayMachine also reads the selection facts older daemons expose before an
+// DisplayMachine also reads the selection facts older Calcifers expose before an
 // attempt exists. An executing or historical venue always takes precedence.
 func (l Lifecycle) DisplayMachine() string {
 	if l.Machine != "" || l.Status != "queued" {
@@ -936,7 +936,7 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var problem *exit.Error
-	// observe=false answers from the journal the daemon's own observer keeps, without
+	// observe=false answers from the journal Calcifer's own observer keeps, without
 	// dialing the machine: a caller about to act on the run needs only its record.
 	if r.URL.Query().Get("observe") != "false" {
 		problem = s.refreshMachineExecution(r.Context(), *row)
@@ -1226,7 +1226,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
 		return
 	}
-	// No machine executes it: the daemon's own model transfer, which has no attempt.
+	// No machine executes it: Calcifer's own model transfer, which has no attempt.
 	if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
 		s.refuseTyped(w, r, e)
 		return

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
@@ -109,24 +109,24 @@ func TestAWarmRunWaitsOnFewDiskWrites(t *testing.T) {
 		}
 	}
 
-	// The daemon runs under strace from here: a symlink named as its process is.
+	// Calcifer runs under strace from here: a symlink named as its process is.
 	if code, out := runCozy(t, root, "down"); code != 0 {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
-	entry := filepath.Join(t.TempDir(), "cozy-daemon")
+	entry := filepath.Join(t.TempDir(), "calcifer")
 	must(t, os.Symlink(cozyBin, entry))
-	daemonTrace := filepath.Join(root, "daemon.strace")
-	served := exec.Command(strace, "-f", "-ttt", "-e", tracedCalls, "-o", daemonTrace, entry)
+	calciferTrace := filepath.Join(root, "calcifer.strace")
+	served := exec.Command(strace, "-f", "-ttt", "-e", tracedCalls, "-o", calciferTrace, entry)
 	served.Env = childEnv(t, root)
 	must(t, served.Start())
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down"); _ = served.Wait() })
-	eventually(t, root, "the traced daemon", func() bool { return daemon.Probe(config.Config{Home: root}).Up })
+	eventually(t, root, "the traced Calcifer", func() bool { return calcifer.Probe(config.Config{Home: root}).Up })
 
 	for _, venue := range []struct {
 		name string
 		args []string
 	}{{"local", nil}, {"rental", []string{"--rental=tessa"}}} {
-		// Once more untraced: this daemon's first run reattaches its machines.
+		// Once more untraced: this Calcifer's first run reattaches its machines.
 		if code, out := runCozy(t, root, touch(venue.args...)...); code != 0 {
 			t.Fatalf("touch on %s [exit %d]\n%s", venue.name, code, out)
 		}
@@ -139,23 +139,23 @@ func TestAWarmRunWaitsOnFewDiskWrites(t *testing.T) {
 		if err != nil || !strings.Contains(string(out), `"value":2`) {
 			t.Fatalf("traced touch on %s: %v\n%s", venue.name, err, out)
 		}
-		cli, served := traced(t, cliTrace, began, ended), traced(t, daemonTrace, began, ended)
-		t.Logf("warm run on %s: command %d disk waits; daemon %d commits, %d other syncs, %d changes\n  %s", venue.name,
+		cli, served := traced(t, cliTrace, began, ended), traced(t, calciferTrace, began, ended)
+		t.Logf("warm run on %s: command %d disk waits; Calcifer %d commits, %d other syncs, %d changes\n  %s", venue.name,
 			len(cli.calls), served.commits, served.syncs, served.changes, strings.Join(served.calls, "\n  "))
 		if len(cli.calls) > 0 {
 			t.Errorf("the command of a warm run on %s waited on the disk %d times; it only reads:\n  %s", venue.name, len(cli.calls), strings.Join(cli.calls, "\n  "))
 		}
 		if served.commits > 4 || served.changes > 0 {
-			t.Errorf("the daemon made %d synced commits and %d metadata writes for a warm run on %s; its request (placed), dispatch, acceptance and outcome are 4 commits",
+			t.Errorf("Calcifer made %d synced commits and %d metadata writes for a warm run on %s; its request (placed), dispatch, acceptance and outcome are 4 commits",
 				served.commits, served.changes, venue.name)
 		}
 	}
 
-	// Holding a rental and running nothing, the daemon re-reads its rentals at the Hub
+	// Holding a rental and running nothing, Calcifer re-reads its rentals at the Hub
 	// (every 10 s) and writes what it learns without waiting on the disk.
 	began := time.Now()
 	time.Sleep(12 * time.Second)
-	if idle := traced(t, daemonTrace, began, time.Now()); len(idle.calls) > 0 {
-		t.Errorf("the idle daemon waited on the disk %d times:\n  %s", len(idle.calls), strings.Join(idle.calls, "\n  "))
+	if idle := traced(t, calciferTrace, began, time.Now()); len(idle.calls) > 0 {
+		t.Errorf("the idle Calcifer waited on the disk %d times:\n  %s", len(idle.calls), strings.Join(idle.calls, "\n  "))
 	}
 }

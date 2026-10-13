@@ -19,9 +19,9 @@ func (c *Client) requireModelOverrides(pkg, function string, models []records.Mo
 		return problem
 	}
 	if !capabilities.ModelOverrides {
-		return exit.Named(exit.Unavailable, "daemon.model_overrides_unavailable",
-			"the running Cozy daemon cannot retain these model overrides; nothing was submitted").
-			WithRemedy("update cozy and restart the daemon with `cozy down` followed by `cozy up`; existing machine work remains running")
+		return exit.Named(exit.Unavailable, "calcifer.model_overrides_unavailable",
+			"the running Calcifer cannot retain these model overrides; nothing was submitted").
+			WithRemedy("update cozy and restart Calcifer with `cozy down` followed by `cozy up`; existing machine work remains running")
 	}
 	return nil
 }

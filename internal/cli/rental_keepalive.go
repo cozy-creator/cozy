@@ -29,7 +29,7 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 		return problem
 	}
 	// The command itself resets the deadline, with the rental's recorded address, pin and key:
-	// no daemon is asked, so it works whatever daemon runs and whatever the pod's machine is.
+	// no Calcifer is asked, so it works whatever Calcifer runs and whatever the pod's machine is.
 	observed, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	receipt, problem := rental.KeepAlive(observed, layout, row)
@@ -43,7 +43,7 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 	return emit(ctx, output.Record{Fields: fields, AllFields: fields})
 }
 
-// keepalive is the daemon's route for the same reset (a cozy before the command did it
+// keepalive is Calcifer's route for the same reset (a cozy before the command did it
 // itself still asks here).
 func (m *managedRentals) keepalive(ctx context.Context, id string) (api.RentalKeepaliveResult, *exit.Error) {
 	var out api.RentalKeepaliveResult

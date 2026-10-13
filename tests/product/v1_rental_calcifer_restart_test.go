@@ -11,10 +11,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
-// A run on a rental belongs to the rental's machine, not to the daemon that sent it. While the
-// daemon is down the run goes on and its bytes arrive after the restart; a cancel recorded
+// A run on a rental belongs to the rental's machine, not to the Calcifer that sent it. While
+// Calcifer is down the run goes on and its bytes arrive after the restart; a cancel recorded
 // meanwhile reaches the machine; and no restart ends the rental, which takes new work after.
-func TestV1RentalRunSurvivesDaemonRestart(t *testing.T) {
+func TestV1RentalRunSurvivesCalciferRestart(t *testing.T) {
 	h, root, layout, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", nativeLifecycleProject(t)); code != 0 {
 		t.Fatalf("installing authored lifecycle fixture [%d]: %s", code, out)
@@ -22,7 +22,7 @@ func TestV1RentalRunSurvivesDaemonRestart(t *testing.T) {
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
 		Rentals: rental.Resolver(layout, store.RentalRow), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
 		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
-	machine, problem := found.DialV1(t.Context(), parityRental, "rental daemon restart test")
+	machine, problem := found.DialV1(t.Context(), parityRental, "rental Calcifer restart test")
 	fatal(t, problem)
 	t.Cleanup(machine.Close)
 	start := func(key string) (*records.Request, string, string) {
@@ -37,21 +37,21 @@ func TestV1RentalRunSurvivesDaemonRestart(t *testing.T) {
 	}
 	down := func() {
 		if code, out := runCozy(t, root, "down", "--json"); code != 0 {
-			t.Fatalf("stopping the daemon [%d]: %s", code, out)
+			t.Fatalf("stopping Calcifer [%d]: %s", code, out)
 		}
 	}
 	up := func() {
 		if code, out := runCozy(t, root, "up", "--json"); code != 0 {
-			t.Fatalf("restarting the daemon [%d]: %s", code, out)
+			t.Fatalf("restarting Calcifer [%d]: %s", code, out)
 		}
 	}
 
-	t.Log("rental bytes after daemon shutdown")
+	t.Log("rental bytes after Calcifer shutdown")
 	row, gate, directory := start("rental-down-bytes")
 	down()
 	must(t, os.WriteFile(gate, nil, 0o600))
 	if ended := nativeLifecycleOutcome(t, machine, row.ID); ended != "succeeded" {
-		t.Fatalf("the daemon's shutdown changed the rental run's outcome: %s", ended)
+		t.Fatalf("Calcifer's shutdown changed the rental run's outcome: %s", ended)
 	}
 	up()
 	if code, out := runCozy(t, root, "run", "watch", row.ID, "--json"); code != 0 {
@@ -59,7 +59,7 @@ func TestV1RentalRunSurvivesDaemonRestart(t *testing.T) {
 	}
 	nativeLifecycleBytes(t, directory, 200000)
 
-	t.Log("durable cancel recorded while the daemon is down")
+	t.Log("durable cancel recorded while Calcifer is down")
 	row, _, _ = start("rental-down-cancel")
 	down()
 	_, problem = store.RequestMachineCancellation(row.ID, "cozy run cancel")
@@ -70,11 +70,11 @@ func TestV1RentalRunSurvivesDaemonRestart(t *testing.T) {
 		return row != nil && row.State == "canceled"
 	})
 	if ended := nativeLifecycleOutcome(t, machine, row.ID); ended != "canceled" {
-		t.Fatalf("the cancel recorded while the daemon was down did not reach the rental: %s", ended)
+		t.Fatalf("the cancel recorded while Calcifer was down did not reach the rental: %s", ended)
 	}
 
 	if released := h.releases(parityRental); released != 0 {
-		t.Fatalf("a daemon restart ended the rental (%d release(s))", released)
+		t.Fatalf("a Calcifer restart ended the rental (%d release(s))", released)
 	}
 	warm := filepath.Join(root, "after-restart-gate")
 	must(t, os.WriteFile(warm, nil, 0o600))

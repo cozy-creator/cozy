@@ -1,6 +1,6 @@
 //go:build windows
 
-// Detaching the daemon on Windows.
+// Detaching Calcifer on Windows.
 package cli
 
 import (
@@ -10,9 +10,9 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func ignoreDaemonBrokenPipe() {}
+func ignoreCalciferBrokenPipe() {}
 
-// detachProcess starts the daemon in its own process group and with no console attached, which is
+// detachProcess starts Calcifer in its own process group and with no console attached, which is
 // what "survives the terminal that started it" means here.
 func detachProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{

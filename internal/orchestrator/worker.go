@@ -181,7 +181,7 @@ func digestMatches(value canonical.Value, spelled string) bool {
 	return err == nil && bytes.Equal(canonical.Digest(data), want)
 }
 
-// WorkerConnection is the dial identity for a worker this daemon did not spawn. The
+// WorkerConnection is the dial identity for a worker this Calcifer did not spawn. The
 // worker server certificate is pinned exactly, and Creator signs Claim with the
 // per-rental Ed25519 key whose public half Tensorhub provisioned into the pod.
 type WorkerConnection struct {
@@ -214,7 +214,7 @@ type RemoteTarget struct {
 // WorkerLaunchSpec names one attached rental worker and the placement it hosts. The
 // orchestrator starts no process: this computer runs work through its machine's Host.
 type WorkerLaunchSpec struct {
-	// Devices is the rental's paid width, which this daemon only reads. Lane ordinals are
+	// Devices is the rental's paid width, which this Calcifer only reads. Lane ordinals are
 	// positions in it, and its length is the placement's device-group degree.
 	Devices []string `json:"devices"`
 	// Placement is what this worker is launched to host. LAUNCH CLAMPS THE SET TO ONE
@@ -417,10 +417,10 @@ func ClassicRetired() *exit.Error {
 // SIGTERM deserved three budgets.
 const StopGrace = 30 * time.Second
 
-// Reconcile rebuilds the daemon's work from its records. It runs as startup work, after the
+// Reconcile rebuilds Calcifer's work from its records. It runs as startup work, after the
 // API serves: nothing a client asks waits on it.
 func (c *Orchestrator) Reconcile() *exit.Error {
-	// Work an older daemon left waiting ends here, failed with its reason.
+	// Work an older Calcifer left waiting ends here, failed with its reason.
 	ended, e := c.opt.Store.EndUnfinishedWork()
 	if e != nil {
 		return e
@@ -461,11 +461,11 @@ func (c *Orchestrator) Reconcile() *exit.Error {
 }
 
 // ResumeQueuedRequests re-enters the one placement path for every request a
-// prior daemon accepted but never made resident. A submission's selectOrStart
-// dies with its daemon, and a queued row with no attempt then waits forever —
+// prior Calcifer accepted but never made resident. A submission's selectOrStart
+// dies with its Calcifer, and a queued row with no attempt then waits forever —
 // the "worst of both" selectOrStart's own comment warns about (live: three
-// four-lane submissions orphaned by daemon restarts, 2026-09-02). A rental
-// request whose prior daemon had already acquired may briefly double-rent;
+// four-lane submissions orphaned by Calcifer restarts, 2026-09-02). A rental
+// request whose prior Calcifer had already acquired may briefly double-rent;
 // the idle-release timer reaps the orphan.
 func (c *Orchestrator) ResumeQueuedRequests() *exit.Error {
 	queued, problem := c.opt.Store.Requests("queued", "", 512)
@@ -473,7 +473,7 @@ func (c *Orchestrator) ResumeQueuedRequests() *exit.Error {
 		return problem
 	}
 	for _, req := range queued {
-		c.logf("%s was queued when a prior daemon exited; resuming its placement", req.ID)
+		c.logf("%s was queued when a prior Calcifer exited; resuming its placement", req.ID)
 		c.start(req)
 	}
 	return nil

@@ -13,9 +13,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// A settled worker.v1 run that still carries a cancel is history: the daemon resumes nothing
+// A settled worker.v1 run that still carries a cancel is history: Calcifer resumes nothing
 // for it. Restarting its observer at once made a busy loop that slowed `cozy run list` 3×.
-func TestSettledArchivedRunWithACancelLeavesTheDaemonIdle(t *testing.T) {
+func TestSettledArchivedRunWithACancelLeavesTheCalciferIdle(t *testing.T) {
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: http://127.0.0.1:1\ntensorhub_token: unreachable\n"), 0o600))
 	path := filepath.Join(root, "creator.sqlite")
@@ -42,15 +42,15 @@ func TestSettledArchivedRunWithACancelLeavesTheDaemonIdle(t *testing.T) {
 	must(t, err)
 	must(t, db.Close())
 
-	daemon := startDaemonProcess(t, root)
+	calcifer := startCalciferProcess(t, root)
 	time.Sleep(time.Second)
-	before, began := cpuTime(t, daemon.cmd.Process.Pid), time.Now()
+	before, began := cpuTime(t, calcifer.cmd.Process.Pid), time.Now()
 	time.Sleep(3 * time.Second)
-	busy, elapsed := cpuTime(t, daemon.cmd.Process.Pid)-before, time.Since(began)
+	busy, elapsed := cpuTime(t, calcifer.cmd.Process.Pid)-before, time.Since(began)
 	if busy > elapsed/10 {
-		t.Fatalf("the daemon used %s of CPU in %s with nothing to do\n%s", busy, elapsed, tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("Calcifer used %s of CPU in %s with nothing to do\n%s", busy, elapsed, tail(filepath.Join(root, "calcifer.log")))
 	}
-	t.Logf("the daemon used %s of CPU in %s", busy, elapsed)
+	t.Logf("Calcifer used %s of CPU in %s", busy, elapsed)
 }
 
 // cpuTime is a process's user and system CPU time (USER_HZ is 100 on Linux).

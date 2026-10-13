@@ -108,7 +108,7 @@ func fakeAgentMachine(t *testing.T, root string, executor time.Duration) (*machi
 	must(t, os.MkdirAll(root, 0o700))
 	// The reaper learns the root before its agent can exist: a test interrupted after the
 	// launch, its cleanup never run, still has its agent ended.
-	trackDaemonRoot(t, root)
+	trackCalciferRoot(t, root)
 	dir := filepath.Join(root, "machine")
 	self, err := os.Executable()
 	must(t, err)
@@ -234,7 +234,7 @@ func TestAnAgentWithoutItsRecordIsAdoptedAndStopped(t *testing.T) {
 }
 
 // Work the machine already accepted (observing, collecting, controlling) never starts it: it
-// attaches while the machine runs and waits while it is stopped. The daemon used to relaunch a
+// attaches while the machine runs and waits while it is stopped. Calcifer used to relaunch a
 // stopped machine within 3 s to re-read output bytes its Runtime refused, hundreds of times.
 func TestAttachingNeverStartsAStoppedMachine(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "home")

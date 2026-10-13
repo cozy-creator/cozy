@@ -1,5 +1,5 @@
 // Package api is Cozy's local client API server: the request-level CORE served on
-// loopback by the one Cozy daemon, plus an explicitly Cozy-only extension module.
+// loopback by the one Calcifer, plus an explicitly Cozy-only extension module.
 //
 // It is a client of internal/orchestrator and nothing else. Every submission still flows
 // orchestrator → worker protocol → runtime; this package adds an HTTP shape, a typed error
@@ -61,10 +61,10 @@ import (
 )
 
 // MaxBody caps a submitted request body. Asset bytes never ride JSON: the local extension
-// names files the daemon ingests, while a network host uses its own upload surface.
+// names files Calcifer ingests, while a network host uses its own upload surface.
 const MaxBody = 8 << 20
 
-// Server is the local client API. One per Cozy daemon.
+// Server is the local client API. One per Calcifer.
 type Server struct {
 	scopedEndpoint    string
 	machineExecutions MachineExecutions
@@ -160,12 +160,12 @@ func New(opt Options) *Server {
 	}
 }
 
-// HubHeader names the Tensorhub origin a client command addresses. The daemon serves
+// HubHeader names the Tensorhub origin a client command addresses. Calcifer serves
 // every hub at once: work it records keeps this origin, and reads are scoped to it.
 const HubHeader = "Cozy-Tensorhub"
 
-// hubOf is the request's Tensorhub origin; a client that names none uses the
-// daemon's configured default.
+// hubOf is the request's Tensorhub origin; a client that names none uses
+// Calcifer's configured default.
 func (s *Server) hubOf(r *http.Request) (string, *exit.Error) {
 	value := strings.TrimSpace(r.Header.Get(HubHeader))
 	if value == "" {
@@ -175,7 +175,7 @@ func (s *Server) hubOf(r *http.Request) (string, *exit.Error) {
 }
 
 // requestHub is the hub a recorded request belongs to: its own, else its rental's, else
-// this daemon's configured hub.
+// this Calcifer's configured hub.
 func (s *Server) requestHub(row records.Request) string {
 	if row.Hub != "" {
 		return row.Hub
@@ -205,7 +205,7 @@ func (s *Server) recordSubmission(spec orchestrator.Submission) (records.Request
 	defer s.shutdownAdmission.RUnlock()
 	if s.shuttingDown {
 		return records.Request{}, false, exit.Named(exit.Unavailable,
-			"daemon_shutting_down", "the daemon has accepted shutdown and no longer admits work")
+			"calcifer_shutting_down", "Calcifer has accepted shutdown and no longer admits work")
 	}
 	return s.orchestrator.RecordSubmission(spec)
 }
@@ -234,7 +234,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/machines/{machine}/operations":      s.submitOperation,
 		"POST /v1/local/rentals/{rental_id}/runtime-update": s.startRuntimeUpdate,
 		"GET /v1/local/rentals/{rental_id}/runtime-update":  s.readRuntimeUpdate,
-		"POST /v1/local/daemon/down":                        s.downDaemon,
+		"POST /v1/local/calcifer/down":                      s.downCalcifer,
 		"POST /v1/local/jobs":                               s.submitJob,
 		"GET /v1/local/jobs/{id}":                           s.getJob,
 		"POST /v1/local/jobs/{id}/pause":                    s.pauseJob,
@@ -325,7 +325,7 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 			if origin := r.Header.Get("Origin"); origin != "" && !s.allowedOrigin(origin) {
 				s.refuse(w, r, http.StatusForbidden, "origin_not_allowed",
 					fmt.Sprintf("Origin %q may not reach this route", origin),
-					"only a page served by this Cozy daemon may mutate or open a stream")
+					"only a page served by this Calcifer may mutate or open a stream")
 				return
 			}
 		}
@@ -344,14 +344,14 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 				"one key names one request forever; retrying under it is safe by construction")
 			return
 		}
-		if route.Mutation && route.Path != "/v1/local/daemon/down" &&
+		if route.Mutation && route.Path != "/v1/local/calcifer/down" &&
 			route.Path != "/v1/requests" && route.Path != "/v1/local/jobs" {
 			s.shutdownAdmission.RLock()
 			defer s.shutdownAdmission.RUnlock()
 			if s.shuttingDown {
-				s.refuse(w, r, http.StatusServiceUnavailable, "daemon_shutting_down",
-					"the daemon has accepted shutdown and no longer admits mutations",
-					"wait for the daemon to finish stopping")
+				s.refuse(w, r, http.StatusServiceUnavailable, "calcifer_shutting_down",
+					"Calcifer has accepted shutdown and no longer admits mutations",
+					"wait for Calcifer to finish stopping")
 				return
 			}
 		}

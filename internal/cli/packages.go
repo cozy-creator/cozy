@@ -344,9 +344,9 @@ func installHub(ctx *Context, inst records.PackageInstall) string {
 	return ctx.Cfg.HubLabel(ctx.forHub(inst.Hub).Cfg.HubURL)
 }
 
-// syncedText is what the daemon's source watcher last recorded about an editable install's
+// syncedText is what Calcifer's source watcher last recorded about an editable install's
 // tree (cl-097): `synced` once its rebuild activated this install, `stale <error>` when the
-// last rebuild was refused, nothing for a published install or a tree no daemon has read.
+// last rebuild was refused, nothing for a published install or a tree no Calcifer has read.
 func syncedText(st *records.Store, inst records.PackageInstall) (string, *exit.Error) {
 	if inst.SourceKind != "local" {
 		return "", nil

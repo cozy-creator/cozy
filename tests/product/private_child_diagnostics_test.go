@@ -53,7 +53,7 @@ func tracePrivateChildState(parent context.Context, root string) {
 			fmt.Printf("private composition %s: %s\n", query.name, value)
 		}
 	}
-	fmt.Printf("private composition daemon: %s\n", privateChildLogTail(filepath.Join(root, "daemon.log")))
+	fmt.Printf("private composition Calcifer: %s\n", privateChildLogTail(filepath.Join(root, "calcifer.log")))
 	logs, _ := filepath.Glob(filepath.Join(root, "workers", "*", "*.log"))
 	for i, path := range logs {
 		if i == 20 {

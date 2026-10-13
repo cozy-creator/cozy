@@ -28,7 +28,7 @@ Trackers: [331](https://github.com/cozy-creator/tracker/issues/331),
 The source/type cut is validated on fetched master52b2b159. Product compilation and
 all-package compilation pass; go vet passes. Focused archive/capture/custody/recovery
 and native dispatch-marker checks pass. Actual native CPU consumers pass with merged
-machine9636781: nested callees, delayed acceptance/cancel, client/watcher exit, daemon
+machine9636781: nested callees, delayed acceptance/cancel, client/watcher exit, Calcifer
 restart, missing source reattach and immutable input readback after original edits.
 The frozen original binding-producer fixtures read without worker bindings, including
 additive archived fields. GPU observations and existing outbox/archive rows are preserved.

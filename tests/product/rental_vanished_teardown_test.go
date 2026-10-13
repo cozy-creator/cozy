@@ -16,7 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// plantLostAttempt puts one request in the exact state that wedged the live daemon:
+// plantLostAttempt puts one request in the exact state that wedged the live Calcifer:
 // pinned to a rental, holding an `accepted` attempt, with the rental record GONE. That is
 // what `cozy rental end` leaves behind when it destroys a pod that was still holding work.
 func plantLostAttempt(t *testing.T, store *records.Store, root, requestID, rentalID string) int64 {
@@ -49,11 +49,11 @@ func plantLostAttempt(t *testing.T, store *records.Store, root, requestID, renta
 // Measured live on the code this was written against, with one request whose pod had been
 // destroyed:
 //
-//	$ cozy down       -> daemon shutdown refused: active req-b2df33d1…(dispatching)
+//	$ cozy down       -> Calcifer shutdown refused: active req-b2df33d1…(dispatching)
 //	$ cozy down --all -> the stream that holds req-b2df33d17e663a8a1e047246#1 is gone
 //
 // `--all` refused for the SAME reason plain `down` did, so the documented escape from a
-// wedged request was itself blocked by the wedged request, and the daemon could only be
+// wedged request was itself blocked by the wedged request, and Calcifer could only be
 // stopped with a signal. Cancelling an attempt normally means telling its worker to stop;
 // when the worker is gone there is nobody to tell, and teardown may not wait on it.
 func TestDownAllIsNotRefusable(t *testing.T) {
@@ -67,7 +67,7 @@ func TestDownAllIsNotRefusable(t *testing.T) {
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
 			""+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -94,23 +94,23 @@ func TestDownAllIsNotRefusable(t *testing.T) {
 	// PINNED TO THE HEALTHY-LOOKING RENTAL ON PURPOSE. If this named a vanished rental the
 	// recovery sweep would settle it and the teardown would never be tested. Here the rental
 	// row is `ready`, so recovery correctly leaves the attempt alone — and the only thing
-	// standing between the operator and a stopped daemon is teardown's own handling of a
+	// standing between the operator and a stopped Calcifer is teardown's own handling of a
 	// control stream this process does not hold. "Never refusable" is its own property and
 	// gets its own arm.
 	plantLostAttempt(t, store, root, "req-wedged", "rental-down-all")
 
-	daemon := startDaemonProcess(t, root)
+	calcifer := startCalciferProcess(t, root)
 
-	logPath := filepath.Join(root, "daemon.log")
+	logPath := filepath.Join(root, "calcifer.log")
 	// Plain `down` MAY refuse — that is its job, and it names what is holding it.
 	// `--all` may not, and it must actually stop the process.
 	code, out := runCozy(t, root, "down", "--all")
 	if code != 0 {
-		t.Fatalf("`cozy down --all` refused with a wedged request [exit %d]; the daemon "+
+		t.Fatalf("`cozy down --all` refused with a wedged request [exit %d]; Calcifer "+
 			"cannot be stopped by any documented means\n%s\n%s", code, out, tail(logPath))
 	}
-	if code := awaitDaemonExit(t, daemon, 30*time.Second); code != 0 {
-		t.Fatalf("`cozy down --all` reported success but the daemon exited %d\n%s", code, out)
+	if code := awaitCalciferExit(t, calcifer, 30*time.Second); code != 0 {
+		t.Fatalf("`cozy down --all` reported success but Calcifer exited %d\n%s", code, out)
 	}
 	if hub.releases("rental-down-all") != 1 {
 		t.Fatalf("the rental was not ended by the teardown (%d releases)\n%s",

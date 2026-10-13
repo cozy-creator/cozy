@@ -425,7 +425,7 @@ func (m *machineRuns) stepV1(parent context.Context, request records.Request, li
 }
 
 // resend answers whether a refused run is worth sending again with its whole package: the
-// machine's tree lacks a file this daemon did not offer, because what it remembers sending
+// machine's tree lacks a file this Calcifer did not offer, because what it remembers sending
 // there is no longer what the machine holds. Forgotten, every file is offered next time.
 func (m *machineRuns) resend(machine *machines.V1, request records.Request, spec *v1.RunSpec, err error) bool {
 	return spec.GetLocal() != nil && strings.Contains(status.Convert(err).Message(), "local_source_incomplete") &&

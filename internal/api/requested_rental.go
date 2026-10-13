@@ -5,7 +5,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// validateRequestedRental refuses work for a rental its authority says is absent: the daemon's
+// validateRequestedRental refuses work for a rental its authority says is absent: Calcifer's
 // (its record, else its Hub), or without one this host's record.
 func (s *Server) validateRequestedRental(id string) *exit.Error {
 	if id == "" {

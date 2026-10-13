@@ -11,15 +11,15 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Lifecycle commands operate on an existing request. A miss must reach the
-// daemon's typed job lookup, without treating pause/resume as package names or
+// Lifecycle commands operate on an existing request. A miss must reach
+// Calcifer's typed job lookup, without treating pause/resume as package names or
 // creating a replacement transaction.
 func TestUnpublishedTransactionCommandsResolveExistingRequest(t *testing.T) {
 	root := t.TempDir()
-	daemon := startDaemonProcess(t, root)
+	calcifer := startCalciferProcess(t, root)
 	for _, action := range []string{"pause", "resume"} {
 		t.Run(action, func(t *testing.T) {
-			response := daemon.call(t, http.MethodPost,
+			response := calcifer.call(t, http.MethodPost,
 				"/v1/local/jobs/req-private-transaction-absent/"+action,
 				map[string]any{"actor": "product proof"})
 			if response.Status != http.StatusNotFound || response.code() != "not_found" {

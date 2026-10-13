@@ -29,7 +29,7 @@ func awaitLog(t *testing.T, logPath, substr string, within time.Duration) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("the daemon log never said %q within %s\n%s", substr, within, tail(logPath))
+	t.Fatalf("the Calcifer log never said %q within %s\n%s", substr, within, tail(logPath))
 }
 
 // reservePort finds a loopback port nothing listens on, for a hub that must be absent.
@@ -64,7 +64,7 @@ type fakeRentalHub struct {
 	mux      *http.ServeMux // the routes, however server's handler is wrapped
 	// publishes is whether this stand-in hub carries th-199's account listing.
 	publishes bool
-	// reads counts rental reads, so a test can plant a transition after the daemon's first look;
+	// reads counts rental reads, so a test can plant a transition after Calcifer's first look;
 	// byID counts each rental's reads by id.
 	reads int
 	byID  map[string]int
@@ -220,7 +220,7 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		h.released[r.PathValue("id")]++
 		w.WriteHeader(http.StatusNoContent)
 	})
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)) //cozy:allow the stand-in HUB binds where the daemon was told the hub is, on loopback; the product binds through internal/api
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)) //cozy:allow the stand-in HUB binds where Calcifer was told the hub is, on loopback; the product binds through internal/api
 	must(t, err)
 	h.server = &httptest.Server{Listener: l, Config: &http.Server{Handler: mux}}
 	h.server.Start()
@@ -320,7 +320,7 @@ func (h *fakeRentalHub) setRate(id string, usdMicros int64) {
 }
 
 // setState moves one rental to a hub lifecycle state, with the failure Tensorhub reports
-// alongside a terminal one. It is how a pod DYING reaches this daemon: the hub owns
+// alongside a terminal one. It is how a pod DYING reaches this Calcifer: the hub owns
 // provider reclaim, so a rental that fails after it was serving is served as `failed` with
 // the code that reclaimed it, and there is no other channel that carries the fact.
 func (h *fakeRentalHub) setState(id, state, failureCode string) {

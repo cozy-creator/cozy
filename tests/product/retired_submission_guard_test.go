@@ -38,7 +38,7 @@ func TestArchivedWorkerSubmissionIsAbandonedNeverResent(t *testing.T) {
 			must(t, err)
 			must(t, db.Close())
 			store.Close()
-			_ = startDaemonProcess(t, root)
+			_ = startCalciferProcess(t, root)
 			reader, problem := records.OpenReadOnly(path)
 			fatal(t, problem)
 			defer reader.Close()

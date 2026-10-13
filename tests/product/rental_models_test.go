@@ -89,11 +89,11 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: rental-models-test\n"+
 			""+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	const sshKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea fixture"
 	keyPath := filepath.Join(root, "operator.pub")
 	must(t, os.WriteFile(keyPath, []byte(sshKey+"\n"), 0600))
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	runRental := func(args ...string) (int, string) {
 		return runCozy(t, root, append(args, "--json")...)
 	}

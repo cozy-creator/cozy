@@ -860,7 +860,7 @@ func validateRendered(raw json.RawMessage, value any, path string, r *reading) *
 // canonicalFieldKey folds one typed argv key onto the PackageInterface's own field spelling
 // (Paul, 2026-09-02): request-field NAMES are case-insensitive at the CLI composition
 // seam, the PackageInterface's spelling is canonical, and the wire carries ONLY the canonical
-// name — the daemon-side validator stays strict. An exact match always wins; a fold that
+// name — Calcifer-side validator stays strict. An exact match always wins; a fold that
 // could reach two fields differing only by case refuses as ambiguous rather than
 // guessing. Values are untouched. An unmatched key returns unchanged so `declared`
 // refuses it with the contract remedy.

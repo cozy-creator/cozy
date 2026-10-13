@@ -39,7 +39,7 @@ func TestLocalTransfersAreWarmRunsOnThisComputersMachine(t *testing.T) {
 	root, err := os.MkdirTemp("", "czt")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	h.hubAccess.signIn(t, root)
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "machine", "stop")

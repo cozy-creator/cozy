@@ -13,9 +13,9 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/accountauth"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -58,7 +58,7 @@ type Context struct {
 	Out              io.Writer
 	Err              io.Writer
 	Cfg              config.Config
-	Daemon           daemon.State
+	Calcifer         calcifer.State
 	AccountAuth      *accountauth.Manager
 	namespace        packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
 	warnings         *[]records.Warning             // this command's, shared by its scoped copies
@@ -123,7 +123,7 @@ type Runtime struct {
 }
 
 func (r *Runtime) call(h handler, args []string, flags map[string]bool,
-	values map[string][]string, daemon bool,
+	values map[string][]string, calcifer bool,
 ) error {
 	ctx := &Context{
 		commandStarted: time.Now(), argv: r.argv,
@@ -134,12 +134,12 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 		Out: r.Out, Err: r.Err, Cfg: r.Cfg, AccountAuth: accountauth.New(r.Cfg),
 		warnings: new([]records.Warning),
 	}
-	if daemon {
-		state, _, problem := ensureDaemon(ctx)
+	if calcifer {
+		state, _, problem := ensureCalcifer(ctx)
 		if problem != nil {
 			return problem
 		}
-		ctx.Daemon = state
+		ctx.Calcifer = state
 	}
 	if creditCommand(r.argv) {
 		warnLowCredit(ctx)

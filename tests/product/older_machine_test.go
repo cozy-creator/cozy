@@ -127,7 +127,7 @@ func (m *olderMachine) Control(_ context.Context, request *v1.ControlRequest) (*
 	return &v1.RunState{Id: request.GetId(), Number: 1, State: "succeeded", Sequence: 2}, nil
 }
 
-// A machine older than this cozy refuses a new call it does not serve. The daemon updates it to
+// A machine older than this cozy refuses a new call it does not serve. Calcifer updates it to
 // the Hub's target software and sends the call again, which it then serves; work it accepted
 // before is observed and collected without any update. When the target cannot help (it already
 // runs it), the call fails naming the next step.
@@ -139,7 +139,7 @@ func TestAnOlderMachineTakesTheTargetBeforeNewWork(t *testing.T) {
 			held: accepted, release: make(chan struct{})}
 		root, store, submit := olderMachineHome(t, machine)
 		submit(accepted)
-		daemon := startDaemonProcess(t, root)
+		calcifer := startCalciferProcess(t, root)
 		eventually(t, root, "the machine accepting the call", func() bool {
 			machine.mu.Lock()
 			defer machine.mu.Unlock()
@@ -149,7 +149,7 @@ func TestAnOlderMachineTakesTheTargetBeforeNewWork(t *testing.T) {
 		machine.serves = "0.18.102"
 		machine.mu.Unlock()
 		submit(fresh)
-		crashAndRestartTransactionDaemon(t, daemon)
+		crashAndRestartTransactionCalcifer(t, calcifer)
 		reachesState(t, root, store, fresh, "completed")
 		close(machine.release)
 		reachesState(t, root, store, accepted, "completed")
@@ -181,7 +181,7 @@ func TestAnOlderMachineTakesTheTargetBeforeNewWork(t *testing.T) {
 			InstallID: "install-live-probe", LocalInstallationID: "install-live-probe"})
 		fatal(t, problem)
 		fatal(t, store.LinkMachineExecution(id, olderRental))
-		startDaemonProcess(t, root)
+		startCalciferProcess(t, root)
 		reachesState(t, root, store, id, "completed")
 		machine.mu.Lock()
 		updates, refusals, writes := machine.updates, machine.refusals, machine.writes
@@ -198,7 +198,7 @@ func TestAnOlderMachineTakesTheTargetBeforeNewWork(t *testing.T) {
 		root, store, submit := olderMachineHome(t, machine)
 		const stuck = "run-the-target-cannot-help"
 		submit(stuck)
-		startDaemonProcess(t, root)
+		startCalciferProcess(t, root)
 		reachesState(t, root, store, stuck, "failed")
 		_, out := runCozy(t, root, "run", "show", stuck, "--json")
 		if !strings.Contains(out, "machine.upgrade_required") || !strings.Contains(out, "cozy rental update elder --runtime-version") ||
@@ -224,8 +224,8 @@ func olderMachineHome(t *testing.T, machine *olderMachine) (string, *records.Sto
 	t.Cleanup(func() {
 		if t.Failed() {
 			update, _ := store.RuntimeUpdate(olderRental)
-			log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
-			t.Logf("software update: %+v\ndaemon log:\n%s", update, log)
+			log, _ := os.ReadFile(filepath.Join(root, "calcifer.log"))
+			t.Logf("software update: %+v\ncalcifer log:\n%s", update, log)
 			for _, id := range []string{"run-accepted-earlier", "run-after-the-target"} {
 				_, show := runCozy(t, root, "run", "show", id, "--json")
 				t.Logf("%s: %s", id, show)
@@ -267,7 +267,7 @@ func olderMachineHome(t *testing.T, machine *olderMachine) (string, *records.Sto
 	cert := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 	fatal(t, rental.Attach(layout, store, row, cert, secret.New(strings.Repeat("m", 43)), identity))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	return root, store, func(id string) {
 		t.Helper()
 		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Package: "proof/example", Release: "1.0.0",

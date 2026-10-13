@@ -5,7 +5,7 @@ run, using the same model preferences and spend limits as ordinary automatic
 rental placement. Existing rentals are not reused or ended.
 The selected machine, GPU count and hourly price are recorded as usual.
 
-An idempotent retry keeps its original paid acquisition. A daemon restart does
+An idempotent retry keeps its original paid acquisition. A Calcifer restart does
 not buy an extra machine for the same request. Replacement after a proved lost
 rental continues through the existing durable acquisition lifecycle.
 

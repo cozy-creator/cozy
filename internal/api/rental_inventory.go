@@ -9,7 +9,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 )
 
-// RentalInventory is the daemon's reconciled fleet read model. It contains
+// RentalInventory is Calcifer's reconciled fleet read model. It contains
 // public rental facts and activity, never records schema, credentials, certificate
 // paths, or acquisition request bodies.
 type RentalInventory struct {
@@ -136,7 +136,7 @@ type RentalSummary struct {
 	MemoryGB                int   `json:"memory_gb,omitempty"`
 }
 
-// Activity is absent for machines known only to the Hub: this daemon cannot
+// Activity is absent for machines known only to the Hub: this Calcifer cannot
 // observe their queued/running work and must not report zero for them.
 type RentalActivity struct {
 	Running int `json:"running"`
@@ -146,7 +146,7 @@ type RentalActivity struct {
 func (s *Server) listRentals(w http.ResponseWriter, r *http.Request) {
 	if s.rentalInventory == nil {
 		s.refuse(w, r, http.StatusNotImplemented, "rental_inventory_unavailable",
-			"this daemon cannot report its rental inventory", "update the daemon when its work permits")
+			"this Calcifer cannot report its rental inventory", "update Calcifer when its work permits")
 		return
 	}
 	hub, problem := s.hubOf(r)

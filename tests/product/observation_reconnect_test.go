@@ -189,7 +189,7 @@ func within(t *testing.T, root, what string, limit time.Duration, done func() bo
 	start := time.Now()
 	for !done() {
 		if time.Since(start) > limit {
-			t.Fatalf("%s: not within %s\n%s", what, limit, tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("%s: not within %s\n%s", what, limit, tail(filepath.Join(root, "calcifer.log")))
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -226,7 +226,7 @@ func observations(t *testing.T, store *records.Store, id string) (lost, restored
 // A machine path that dies silently mid-run, the TCP socket still open and acknowledged, is
 // noticed by the connection's own unanswered pings, not by any deadline on the run. While the
 // machine cannot be heard, `cozy run list` says the run is reconnecting instead of showing its
-// last progress as if live; once the path heals the daemon attaches again by itself, with no
+// last progress as if live; once the path heals Calcifer attaches again by itself, with no
 // reader asking, and the run goes on to its result.
 func TestASilentMachinePathIsNoticedAndTheRunAttachedAgain(t *testing.T) {
 	var front *blackhole
@@ -280,7 +280,7 @@ func TestASilentMachinePathIsNoticedAndTheRunAttachedAgain(t *testing.T) {
 // A Hub the rental cannot reach for many of its authority leases is weather: the run on it
 // goes on and is observed to its result, and a run submitted meanwhile is taken. A machine
 // that lets the lease lapse ends the run's stream and refuses this computer's key until the
-// Hub answers; the daemon attaches again and submits again, never failing either run.
+// Hub answers; Calcifer attaches again and submits again, never failing either run.
 func TestARentalsHubOutageNeitherLosesNorRefusesItsRuns(t *testing.T) {
 	h, root, _, store := parityMachines(t)
 	if code, out := runCozy(t, root, "package", "install", holdProject(t)); code != 0 {

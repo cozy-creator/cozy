@@ -96,8 +96,8 @@ func TestManualRentalSizesDiskFromAProviderSource(t *testing.T) {
 	must(t, err)
 	t.Cleanup(func() { _ = removeAllForce(root) })
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+
-		"\ntensorhub_token: source-sizing-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	startDaemonProcess(t, root)
+		"\ntensorhub_token: source-sizing-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
+	startCalciferProcess(t, root)
 
 	declared := func(key string, args ...string) hub.RentalRequest {
 		t.Helper()

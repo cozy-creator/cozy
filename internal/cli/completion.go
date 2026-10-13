@@ -22,7 +22,7 @@ import (
 //
 // Candidates are derived from the Kong model, so the grammar is the only command list.
 // A value's `predictor` tag (or Kong's path type) chooses its value completion. It prints
-// candidates only: no errors, no daemon, no network, no writes.
+// candidates only: no errors, no Calcifer, no network, no writes.
 const completeVerb = "__complete"
 
 // CompletionCmd prints the script that wires a shell's <TAB> to completeVerb.
@@ -357,7 +357,7 @@ func prefixed(prefix string, in []candidate) []candidate {
 }
 
 // completionInventory is this machine's installed packages and rentals, read once per
-// completion from the records database opened read-only. It never starts the daemon,
+// completion from the records database opened read-only. It never starts Calcifer,
 // contacts Tensorhub, or creates the local root; any failure completes nothing.
 type completionInventory struct {
 	installs []records.PackageInstall

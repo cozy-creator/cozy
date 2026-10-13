@@ -10,8 +10,8 @@ import (
 	"syscall"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -25,9 +25,9 @@ import (
 	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
-// serveDaemon is the private process entrypoint shared by explicit `up` and
-// commands that ensure the daemon is running.
-func serveDaemon(ctx *Context) *exit.Error {
+// serveCalcifer is the private process entrypoint shared by explicit `up` and
+// commands that ensure Calcifer is running.
+func serveCalcifer(ctx *Context) *exit.Error {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return e
@@ -48,14 +48,14 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 
 	// Already running is idempotent 0 printing the live status.
-	if st := daemon.Probe(ctx.Cfg); st.Up {
+	if st := calcifer.Probe(ctx.Cfg); st.Up {
 		return emit(ctx, output.Record{Fields: []output.Field{
-			{K: "daemon", V: "running"}, {K: "address", V: st.Addr},
+			{K: "calcifer", V: "running"}, {K: "address", V: st.Addr},
 			{K: "socket", V: st.Socket}, {K: "pid", V: st.PID}, {K: "since", V: st.Since},
 		}, Notes: []string{"already running: `cozy run list` is idempotent"}})
 	}
 
-	// Arm shutdown before publishing the daemon or starting owned work. Clients
+	// Arm shutdown before publishing Calcifer or starting owned work. Clients
 	// can send SIGTERM as soon as the lock/credential or API becomes visible.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -85,9 +85,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 		}
 	}
 
-	// The claim: a second daemon on this root fails here. It comes after the bind so a
+	// The claim: a second Calcifer on this root fails here. It comes after the bind so a
 	// port conflict is reported as a port conflict, and before anything is written.
-	held, e := daemon.Hold(l, addr, socket)
+	held, e := calcifer.Hold(l, addr, socket)
 	if e != nil {
 		closeListeners()
 		return e
@@ -95,9 +95,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 	defer held.Release()
 
 	// SERVED FROM THE CLAIM ON. A bound port the kernel accepts connections for while nothing
-	// answers them is a hung client; until the API opens below, every request is told the
-	// daemon is starting, and everything the restart owes runs after it opens (startup).
-	httpServer := daemon.NewHTTPServer()
+	// answers them is a hung client; until the API opens below, every request is told
+	// Calcifer is starting, and everything the restart owes runs after it opens (startup).
+	httpServer := calcifer.NewHTTPServer()
 	go func() { _ = httpServer.Serve(v4) }()
 	if v6 != nil {
 		go func() { _ = httpServer.Serve(v6) }()
@@ -132,7 +132,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	})
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	// The daemon starts this computer's machine as `cozy machine start` does.
+	// Calcifer starts this computer's machine as `cozy machine start` does.
 	localMachine, problem := localMachineHost(ctx)
 	if problem != nil {
 		return problem
@@ -159,7 +159,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Cfg:                   ctx.Cfg, Layout: l, Store: st, Log: ctx.Out,
 		Rentals: rentals,
 		ReclaimInstall: func(id string) *exit.Error {
-			// Background cleanup and editable refresh are mutations by this same daemon.
+			// Background cleanup and editable refresh are mutations by this same Calcifer.
 			// Serialize them before the cross-process writer claim so cleanup cannot
 			// make an otherwise valid submission fail with a writer conflict.
 			resolver.refreshMu.Lock()
@@ -182,10 +182,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet.placeReleased = machines.PlaceReleased
 	// Rental readiness is a queue-capacity edge. The fleet reconciler wakes
 	// pinned machine executions as soon as the hub publishes an attachable
-	// worker, including after a daemon restart.
+	// worker, including after a Calcifer restart.
 	fleet.wakeQueue = c.WakeQueue
 
-	// One per-launch CLI credential rides the daemon's own held 0600 record. It is never
+	// One per-launch CLI credential rides Calcifer's own held 0600 record. It is never
 	// printed, logged, or placed on argv, and rotates with every launch. The public web
 	// stub exposes no state; full browser authorization is a later, separately reviewed
 	// door.
@@ -218,23 +218,23 @@ func serveDaemon(ctx *Context) *exit.Error {
 	httpServer.Open(handler)
 	go func() { _ = c.Serve() }()
 
-	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
+	fmt.Fprintf(ctx.Out, "Calcifer up: api %s (%s, loopback only) · worker socket %s\n",
 		addr, strings.Join(bound, "+"), socket)
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s\n", l.DB, yield)
-	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Daemon)
+	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Calcifer)
 	fmt.Fprintln(ctx.Out, "  rentals: "+idleReleaseNote())
-	if ctx.Cfg.DaemonIdleShutdown > 0 {
+	if ctx.Cfg.CalciferIdleShutdown > 0 {
 		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down · exits on its own after %s with nothing to manage\n",
-			ctx.Cfg.DaemonIdleShutdown)
+			ctx.Cfg.CalciferIdleShutdown)
 	} else {
 		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down\n")
 	}
-	fmt.Fprintf(ctx.Out, "  claim: %s; this daemon stops if that record stops naming it\n", l.Daemon)
+	fmt.Fprintf(ctx.Out, "  claim: %s; this Calcifer stops if that record stops naming it\n", l.Calcifer)
 
 	// The idle exit takes exactly the path a SIGTERM takes: the server's shutdown hook
 	// feeds the same channel, and everything after `<-stop` is shared.
 	quit := make(chan struct{})
-	startup := &daemonStartup{log: ctx.Out}
+	startup := &calciferStartup{log: ctx.Out}
 	go startup.run(quit, []startupStep{
 		// The lifecycle sweep is a few reads: it goes first, before anything owed can buy.
 		{"lifecycle sweep", func() string {
@@ -291,20 +291,20 @@ func serveDaemon(ctx *Context) *exit.Error {
 		}},
 	})
 	go fleet.watch(quit)
-	// Every editable install's source tree is watched for as long as this daemon runs
+	// Every editable install's source tree is watched for as long as this Calcifer runs
 	// (cl-097): an edit is rebuilt and every worker holding the package re-prepared before
 	// the next run asks. A watch that cannot be set up is reported, not fatal — runs still
 	// refresh at submission.
 	if _, e := startEditableSync(l, st, resolver, ctx.Out, quit); e != nil {
 		fmt.Fprintf(ctx.Out, "editable watch unavailable: %s\n", e.Message)
 	}
-	idle := idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,
+	idle := idleWatch{debounce: ctx.Cfg.CalciferIdleShutdown, store: st, owner: c,
 		server: server, startup: startup, log: ctx.Out}
-	if ctx.Cfg.DaemonIdleShutdown > 0 {
+	if ctx.Cfg.CalciferIdleShutdown > 0 {
 		go idle.run(quit)
 	}
-	// Unconditional, and deliberately not behind `daemon.idle_shutdown_s`: a root that
-	// stops carrying this daemon's claim has taken away every way to reach it or stop it.
+	// Unconditional, and deliberately not behind `calcifer.idle_shutdown_s`: a root that
+	// stops carrying this Calcifer's claim has taken away every way to reach it or stop it.
 	go claimWatch{held: held, root: l.Root, managed: idle.managed, log: ctx.Out,
 		stop: func() { stop <- syscall.SIGTERM }}.run(quit)
 
@@ -325,7 +325,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 }
 
 // reclaimNote turns a reclaim sweep's first refusal into a banner note; like the install
-// sweep, nothing here may keep the daemon down.
+// sweep, nothing here may keep Calcifer down.
 func reclaimNote(swept reclaim.Swept, problem *exit.Error) (reclaim.Swept, string) {
 	if problem != nil {
 		return swept, " · incomplete: " + problem.Message

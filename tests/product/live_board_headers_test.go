@@ -98,14 +98,14 @@ func TestLiveBoardHeadersSurviveResizeAndRefresh(t *testing.T) {
 			hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+hubURL+"\ntensorhub_token: rental-idle-test\n"+
-					"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+					"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)
 			defer store.Close()
 			heading := "MACHINE"
 			if board == "run" {
 				heading = "NUMBER"
-				startDaemonProcess(t, root)
+				startCalciferProcess(t, root)
 			}
 			seed := func(i int) {
 				t.Helper()

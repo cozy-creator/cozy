@@ -3,7 +3,7 @@
 // (cozy-creator.md "Records"). There is no state.json and no second lifecycle store;
 // any JSON output is a derived read.
 //
-// Seam for cl-001: the Cozy daemon adopts THIS package as its lifecycle store and
+// Seam for cl-001: Calcifer adopts THIS package as its lifecycle store and
 // adds its own tables (worker sessions, requests, attempts, outputs) to the same
 // database. Nothing here assumes a CLI caller; Open takes a path.
 //
@@ -219,7 +219,7 @@ func open(path string) (*Store, *exit.Error) {
 		}
 	}
 	// The database retains request payloads, rental facts and triage bundles; 0600 is
-	// the same boundary the daemon record carries, and the WAL/SHM siblings SQLite
+	// the same boundary the Calcifer record carries, and the WAL/SHM siblings SQLite
 	// creates next inherit these bits (cl-116). Windows mode bits are a fiction; the
 	// user-profile ACL scopes the root there.
 	if err := home.Protect(path, 0o600); err != nil {
@@ -631,7 +631,7 @@ func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
 		FROM installs i WHERE i.id NOT IN (SELECT install_id FROM pins)
 		-- Keep the newest local environment for each exact package/version. Remote
-		-- capture may reuse that compatible metadata environment after a daemon
+		-- capture may reuse that compatible metadata environment after a Calcifer
 		-- restart; unlike a pin, this retention is bounded to one candidate per
 		-- source revision and older candidates remain ordinary GC work.
 		AND NOT (i.source_kind='local' AND NOT EXISTS(

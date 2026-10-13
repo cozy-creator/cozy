@@ -31,7 +31,7 @@ func servesAPI(ctx context.Context, path string) bool {
 	return err == nil && json.Unmarshal(out, &version) == nil && version.Name == "tensord" && slices.Contains(version.API, MachineAPI)
 }
 
-// servesAPI asks the installed machine's executable once per file: a daemon asks on every
+// servesAPI asks the installed machine's executable once per file: a Calcifer asks on every
 // launch, and an install replaces the file under it.
 func (h *Host) servesAPI(ctx context.Context) bool {
 	info, err := os.Stat(h.binary())

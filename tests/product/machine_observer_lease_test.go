@@ -134,7 +134,7 @@ func (p *observerLeasePeer) Control(context.Context, *v1.ControlRequest) (*v1.Ru
 	return nil, status.Error(codes.PermissionDenied, "observation cannot control work")
 }
 
-func observerLeaseFixture(t *testing.T, peer *observerLeasePeer, rented ...bool) (string, *records.Store, records.Request, *daemonProcess) {
+func observerLeaseFixture(t *testing.T, peer *observerLeasePeer, rented ...bool) (string, *records.Store, records.Request, *calciferProcess) {
 	t.Helper()
 	layout, problem := home.Open(t.TempDir())
 	if problem != nil {
@@ -192,10 +192,10 @@ func observerLeaseFixture(t *testing.T, peer *observerLeasePeer, rented ...bool)
 	t.Cleanup(func() { server.Stop(); store.Close() })
 	t.Cleanup(func() {
 		if t.Failed() {
-			t.Logf("daemon log:\n%s", tail(filepath.Join(layout.Root, "daemon.log")))
+			t.Logf("Calcifer log:\n%s", tail(filepath.Join(layout.Root, "calcifer.log")))
 		}
 	})
-	controller := startDaemonProcess(t, layout.Root)
+	controller := startCalciferProcess(t, layout.Root)
 	return layout.Root, store, request, controller
 }
 
@@ -252,7 +252,7 @@ func TestAcceptedRunObserverRetriesTemporaryRentalResolutionRefusal(t *testing.T
 	}
 	close(peer.expireRelease)
 	observerEventually(t, func() bool {
-		log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
+		log, _ := os.ReadFile(filepath.Join(root, "calcifer.log"))
 		return strings.Contains(string(log), "this rental is updating its software")
 	})
 	update.State = "succeeded"
@@ -285,7 +285,7 @@ func TestEndingRentalStopsAuthorityRecoveryWithoutControllingWork(t *testing.T) 
 	fatal(t, store.RecordRental(*row))
 	close(peer.expireRelease)
 	observerEventually(t, func() bool {
-		log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
+		log, _ := os.ReadFile(filepath.Join(root, "calcifer.log"))
 		return strings.Contains(string(log), "observation stopped")
 	})
 	peer.mu.Lock()
@@ -296,7 +296,7 @@ func TestEndingRentalStopsAuthorityRecoveryWithoutControllingWork(t *testing.T) 
 }
 
 // A key its machine keeps refusing is asked again with growing pauses, never in a busy loop,
-// and a daemon that detaches meanwhile leaves the accepted work alone.
+// and a Calcifer that detaches meanwhile leaves the accepted work alone.
 func TestRevokedRunObserverBacksOffAndDetachDoesNotControlWork(t *testing.T) {
 	peer := &observerLeasePeer{denyRun: true}
 	_, store, request, owner := observerLeaseFixture(t, peer, true)
@@ -305,7 +305,7 @@ func TestRevokedRunObserverBacksOffAndDetachDoesNotControlWork(t *testing.T) {
 	select {
 	case <-owner.exited:
 	case <-time.After(5 * time.Second):
-		t.Fatal("observer daemon did not detach")
+		t.Fatal("observer Calcifer did not detach")
 	}
 	peer.mu.Lock()
 	defer peer.mu.Unlock()

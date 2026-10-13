@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/units"
 )
 
-// RetryOutputExport settles one daemon-owned publication obligation — the package's
+// RetryOutputExport settles one Calcifer-owned publication obligation — the package's
 // store under outputs/ or the caller's --out. Serving files are already at that
 // destination. Top-level jobs retain internal publication custody and materialize
 // independent user copies of their declared media. Both settle the same export row
@@ -167,7 +167,7 @@ func (c *Orchestrator) failOutputExport(requestID string, problem *exit.Error) {
 	c.logf("output export %s failed (%s): %s", requestID, problem.ErrName(), problem.Message)
 }
 
-// ResumeOutputExports settles every terminal obligation a previous daemon left.
+// ResumeOutputExports settles every terminal obligation a previous Calcifer left.
 func (c *Orchestrator) ResumeOutputExports() *exit.Error {
 	owed, problem := c.opt.Store.OutputExportsOwed()
 	if problem != nil {

@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Real CLI -> HTTP daemon -> SQLite, without a GPU. A parser-only test missed two
+// Real CLI -> HTTP Calcifer -> SQLite, without a GPU. A parser-only test missed two
 // copies dropping the kernel pin before a paid H3 request reached its worker.
 func TestAttentionPinSurvivesSubmissionAndConflictingReplayRefuses(t *testing.T) {
 	root := t.TempDir()
@@ -86,7 +86,7 @@ func TestScopedAttentionPinSurvivesSubmission(t *testing.T) {
 
 func TestAttentionOverrideMalformedHTTPRefusesBeforeAdmission(t *testing.T) {
 	root := t.TempDir()
-	svc := startDaemonProcess(t, root)
+	svc := startCalciferProcess(t, root)
 	for _, pin := range []string{"=kitchen-int8", "dit=", "dit=a=b", "dit =a"} {
 		reply := svc.call(t, "POST", "/v1/requests", map[string]any{
 			"package": "local/not-installed", "function": "generate", "input": map[string]any{}, "attention_kernel": pin,

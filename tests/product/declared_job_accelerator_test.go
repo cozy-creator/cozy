@@ -15,7 +15,7 @@ import (
 // excluded:wrong_class on the owner's CPU pod. A job's own `accelerator` declaration decides
 // its class. The package here names torch, binds its serving slot, and declares one CPU and
 // one GPU conversion of the same shape; each is sent to the owner's named CPU rental through
-// the real binary and daemon against the stand-in hub, which buys nothing.
+// the real binary and Calcifer against the stand-in hub, which buys nothing.
 func TestDeclaredJobAcceleratorDecidesTheRentalClass(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
@@ -47,7 +47,7 @@ func TestDeclaredJobAcceleratorDecidesTheRentalClass(t *testing.T) {
 	defer store.Close()
 	plantAttached(t, root, h, store, records.Rental{AcceleratorCount: 1, ID: "pr-karam", MachineName: "karam", SKU: "cpu",
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 70_000, State: "ready", Hub: h.server.URL}, true)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	source := "--model.pruned=" + ladderModel + "@" + ladderRelease + "/" + ladderLane
 	run := func(function, key string) *records.Request {
 		t.Helper()

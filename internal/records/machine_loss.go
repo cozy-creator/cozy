@@ -30,7 +30,7 @@ func (s *Store) MachineExecutionLost(id string) (bool, *exit.Error) {
 }
 
 // executionRental is the machine an execution ran on: its recorded machine, or for an explicit
-// endpoint (a foreground --rental run of a daemon older than cozy.machine.v1) the rental its
+// endpoint (a foreground --rental run of a Calcifer older than cozy.machine.v1) the rental its
 // retained selector names as its workspace.
 const executionRental = `CASE WHEN e.machine_id LIKE 'endpoint-%' THEN (SELECT json_extract(v.payload,'$.machine_endpoint.execution_workspace_id')
  FROM request_events v WHERE v.request_id=e.request_id AND v.type IN ('run.created','request.submitted') ORDER BY v.seq DESC LIMIT 1)

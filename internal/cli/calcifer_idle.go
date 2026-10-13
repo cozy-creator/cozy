@@ -8,21 +8,21 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// The daemon's own reason to leave. The owner's ruling: it may stop only once there is
+// Calcifer's own reason to leave. The owner's ruling: it may stop only once there is
 // nothing left for it to manage — no rental it owns, no request or attempt it owes, no
 // transfer, export, launch or teardown in flight, no client stream attached — and only
 // once that has stayed true for a while. Work at rest (a paused run, a finished one keeping
-// its results) is not managed: the next command's daemon resumes or serves it. User interaction is not the signal; the absence
-// of a CLI is not the signal. The next command brings the daemon back (ensureDaemon).
+// its results) is not managed: the next command's Calcifer resumes or serves it. User interaction is not the signal; the absence
+// of a CLI is not the signal. The next command brings Calcifer back (ensureCalcifer).
 //
 // The duration is a DEBOUNCE over an observed fact, never the decision. `managed` decides;
-// daemon.idle_shutdown_s says how long its answer must stay empty; the sample cadence is
+// calcifer.idle_shutdown_s says how long its answer must stay empty; the sample cadence is
 // only how often it is asked.
 
 const idleSampleCadence = time.Second
@@ -32,7 +32,7 @@ type idleWatch struct {
 	store    *records.Store
 	owner    *orchestrator.Orchestrator
 	server   *api.Server
-	startup  *daemonStartup
+	startup  *calciferStartup
 	log      io.Writer
 }
 
@@ -58,7 +58,7 @@ func (w idleWatch) managed() ([]string, *exit.Error) {
 }
 
 // run samples until the predicate has answered "nothing" for the whole debounce, then asks
-// the API server to stop under its admission gate. It returns once the daemon is stopping,
+// the API server to stop under its admission gate. It returns once Calcifer is stopping,
 // or when quit closes because a signal or `cozy down` got there first.
 func (w idleWatch) run(quit <-chan struct{}) {
 	tick := time.NewTicker(idleSampleCadence)
@@ -74,7 +74,7 @@ func (w idleWatch) run(quit <-chan struct{}) {
 		held, problem := w.managed()
 		if problem != nil {
 			if problem.Message != lastProblem {
-				fmt.Fprintf(w.log, "idle exit deferred: cannot read what the daemon manages: %s\n", problem.Message)
+				fmt.Fprintf(w.log, "idle exit deferred: cannot read what Calcifer manages: %s\n", problem.Message)
 			}
 			lastProblem = problem.Message
 			idleSince = time.Time{}
@@ -114,28 +114,28 @@ func (w idleWatch) run(quit <-chan struct{}) {
 			idleSince = time.Time{}
 			continue
 		}
-		fmt.Fprintf(w.log, "nothing to manage for %s; stopping (daemon.idle_shutdown_s=%d)\n",
+		fmt.Fprintf(w.log, "nothing to manage for %s; stopping (calcifer.idle_shutdown_s=%d)\n",
 			w.debounce, int64(w.debounce/time.Second))
 		return
 	}
 }
 
-// The daemon's OTHER reason to leave, and the one no configuration turns off: it no
-// longer owns the root it published itself under. `daemon.idle_shutdown_s` is the knob
-// for "nothing to manage"; there is deliberately no knob for this, because a daemon whose
+// Calcifer's OTHER reason to leave, and the one no configuration turns off: it no
+// longer owns the root it published itself under. `calcifer.idle_shutdown_s` is the knob
+// for "nothing to manage"; there is deliberately no knob for this, because a Calcifer whose
 // claim is gone cannot be found by a client, cannot be told to stop, and cannot write a
 // record anyone will read. Staying alive is not a safety property there — it is a process
 // nobody can reach and nobody can kill by any documented means, which is exactly how 143
-// unreachable daemons once accumulated over three days on one development host.
+// unreachable Calcifers once accumulated over three days on one development host.
 //
 // The signal is an observed fact about the filesystem, never elapsed time: `Claimed`
 // compares the file this process holds against the path it published it at. Samples are
 // required to agree `claimLostSamples` times running only so that a single unlucky read
-// cannot end a daemon.
+// cannot end a Calcifer.
 const claimLostSamples = 3
 
 type claimWatch struct {
-	held    *daemon.Held
+	held    *calcifer.Held
 	root    string
 	managed func() ([]string, *exit.Error)
 	stop    func()
@@ -163,13 +163,13 @@ func (w claimWatch) run(quit <-chan struct{}) {
 		// these words may reach no one — which is the honest shape of the situation and
 		// not a reason to stay: the records naming this work went with the root.
 		if held, problem := w.managed(); problem != nil {
-			fmt.Fprintf(w.log, "%s no longer carries this daemon's claim; stopping (what it manages is unreadable: %s)\n",
+			fmt.Fprintf(w.log, "%s no longer carries this Calcifer's claim; stopping (what it manages is unreadable: %s)\n",
 				w.root, problem.Message)
 		} else if len(held) > 0 {
-			fmt.Fprintf(w.log, "%s no longer carries this daemon's claim; stopping and ABANDONING: %s\n",
+			fmt.Fprintf(w.log, "%s no longer carries this Calcifer's claim; stopping and ABANDONING: %s\n",
 				w.root, strings.Join(held, ", "))
 		} else {
-			fmt.Fprintf(w.log, "%s no longer carries this daemon's claim; stopping\n", w.root)
+			fmt.Fprintf(w.log, "%s no longer carries this Calcifer's claim; stopping\n", w.root)
 		}
 		w.stop()
 		return

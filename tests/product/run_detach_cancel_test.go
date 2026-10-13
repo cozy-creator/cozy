@@ -16,7 +16,7 @@ import (
 )
 
 // TestClientDeathNeverCancels is cl-108's ruling as behaviour: an ACCEPTED run belongs to
-// the daemon, not to the client that submitted it. A watcher that dies — SIGKILL, or the
+// Calcifer, not to the client that submitted it. A watcher that dies — SIGKILL, or the
 // SIGTERM an agent harness sends — merely detaches; the run completes, its export
 // publishes, and it stays watchable. Only an explicit `cozy run cancel` cancels, every
 // cancellation records its actor durably, and a canceled run renders LOUDLY with that
@@ -41,7 +41,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 	}
 
 	// ------------------------------------------------ the incident's shape, survived
-	// Submit --await, SIGKILL the client the moment the daemon owns the run, resubmit
+	// Submit --await, SIGKILL the client the moment Calcifer owns the run, resubmit
 	// with different args: BOTH runs complete. This is req-d0144ed0's exact sequence,
 	// which used to end CLIENT_CANCELED with a skipped export.
 	before := invocationIDSet(t, root)
@@ -146,7 +146,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 		t.Fatalf("run list does not carry the cancellation cause [exit %d]\n%s", code, out)
 	}
 
-	// The attribution is DURABLE: the daemon's own records answer who canceled, for the
+	// The attribution is DURABLE: Calcifer's own records answer who canceled, for the
 	// queued settlement and for the live attempt's cancel request alike.
 	for _, ref := range []string{dref, parkedID} {
 		row, problem := store.RequestByReference(ref)
@@ -192,7 +192,7 @@ func invocationIDSet(t *testing.T, root string) map[string]bool {
 	return seen
 }
 
-// awaitNewInvocation waits until the daemon owns a run that was not there before —
+// awaitNewInvocation waits until Calcifer owns a run that was not there before —
 // the moment the submission's fate no longer depends on its client staying alive.
 func awaitNewInvocation(t *testing.T, root string, before map[string]bool,
 	stdout, stderr *renderBuffer) listedInvocation {

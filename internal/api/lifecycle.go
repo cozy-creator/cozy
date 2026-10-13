@@ -21,7 +21,7 @@ type LifecycleIdentity struct {
 }
 
 // DownResult answers `cozy down`. Plain down names the work in flight, which continues
-// without the daemon. Under --all, a false result tells the caller exactly what
+// without Calcifer. Under --all, a false result tells the caller exactly what
 // cancellation was requested and which paid obligations must be ended through Tensorhub
 // before retrying.
 type DownResult struct {
@@ -35,7 +35,7 @@ type DownResult struct {
 	Refused []string `json:"refused,omitempty"`
 }
 
-func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
+func (s *Server) downCalcifer(w http.ResponseWriter, r *http.Request) {
 	s.shutdownAdmission.Lock()
 	defer s.shutdownAdmission.Unlock()
 	if s.shuttingDown {
@@ -63,8 +63,8 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 			s.refuse(w, r, http.StatusConflict, "conflict", "this server was built with no shutdown hook", "")
 			return
 		}
-		// The daemon only submits, follows and collects. Machines and rentals run the
-		// work, and the next daemon resumes every run, upload and control from its records.
+		// Calcifer only submits, follows and collects. Machines and rentals run the
+		// work, and the next Calcifer resumes every run, upload and control from its records.
 		s.orchestrator.CloseAdmission()
 		s.shuttingDown = true
 		s.ok(w, r, http.StatusAccepted, DownResult{ShuttingDown: true, Active: s.inFlight()})
@@ -84,7 +84,7 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 	// reaches for BECAUSE reconciliation is not working, so it may not refuse for the
 	// same reason plain `down` did — which is exactly what happened live: one request
 	// whose pod had been destroyed made both verbs fail with "the stream that holds
-	// req-b2df33d1…#1 is gone", and the daemon could not be stopped by any documented
+	// req-b2df33d1…#1 is gone", and Calcifer could not be stopped by any documented
 	// means. It had to be killed.
 	//
 	// So: one failure never aborts the rest. Every request is tried, what could not be
@@ -109,7 +109,7 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Re-read rather than trusting the pre-pass sample: what a client is told is still
-	// holding the daemon has to be what IS.
+	// holding Calcifer has to be what IS.
 	remaining, remainingRentals, problem := s.downBlockers()
 	if problem != nil {
 		remaining, remainingRentals = active, rentals
@@ -150,9 +150,9 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 
 // StopUnlessManaging is the idle exit's last word. It re-reads `managing` UNDER the
 // shutdown-admission gate — the same boundary `down` closes — so a submission cannot
-// commit between the daemon's last "nothing to manage" sample and the listener close.
+// commit between Calcifer's last "nothing to manage" sample and the listener close.
 // An empty answer there marks the server shutting down and fires the shutdown hook; a
-// non-empty one is returned so the caller can say what held the daemon up.
+// non-empty one is returned so the caller can say what held Calcifer up.
 func (s *Server) StopUnlessManaging(managing func() ([]string, *exit.Error)) ([]string, *exit.Error) {
 	s.shutdownAdmission.Lock()
 	defer s.shutdownAdmission.Unlock()
@@ -230,8 +230,8 @@ func (s *Server) newDownRentals(rentals []LifecycleIdentity) bool {
 	return !same && len(ids) > 0
 }
 
-// cancelForDown asks each request's owner to stop it: the machine executing it, or the
-// daemon for its own model transfer.
+// cancelForDown asks each request's owner to stop it: the machine executing it, or
+// Calcifer for its own model transfer.
 func (s *Server) cancelForDown(ctx context.Context, row records.Request) (bool, *exit.Error) {
 	if owned, problem := s.controlMachineExecution(ctx, row, "cancel", "cozy down --all"); owned {
 		return problem == nil && row.State != "canceling", problem

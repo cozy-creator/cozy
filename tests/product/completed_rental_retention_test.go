@@ -22,7 +22,7 @@ func TestRentalEndPreservesCompletedNativeResultHistory(t *testing.T) {
 			SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000,
 			State: "ready", Hub: origin, Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem")}))
 	}
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/native", WorkerID: "worker", Devices: []string{"cpu"}}))
 	completed := func(id, rental string) records.Request {
 		t.Helper()

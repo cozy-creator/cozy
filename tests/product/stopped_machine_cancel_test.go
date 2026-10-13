@@ -36,7 +36,7 @@ func TestCancelOnTheStoppedLocalMachineStartsItAndDelivers(t *testing.T) {
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machines.Local}))
 	code, out := cozyWithin(t, root, 3*time.Minute, "run", "cancel", request.ID, "--await", "--json")
 	if code != 0 || !strings.Contains(out, `"status":"canceled"`) || !strings.Contains(out, `"canceled_by":"cozy run cancel"`) {
-		t.Fatalf("the awaited cancel did not end canceled by its actor [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("the awaited cancel did not end canceled by its actor [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "calcifer.log")))
 	}
 	if status, problem := host.Status(); problem != nil || !status.Running {
 		t.Fatalf("the cancel did not start this computer's machine: %+v %v", status, problem)
@@ -88,7 +88,7 @@ func TestCancelOnALocalMachineThatCannotStartSaysSo(t *testing.T) {
 	fatal(t, store.LinkMachineExecution(request.ID, machines.Local))
 	fatal(t, store.AppendEvent(request.ID, records.RunV1Sent, 0, map[string]any{"machine": machines.Local}))
 	store.Close()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	code, out := cozyWithin(t, root, 3*time.Minute, "run", "cancel", request.ID, "--await")
 	if code == 0 || !strings.Contains(out, "stays canceling") || !strings.Contains(out, "cozy machine start") ||
 		!strings.Contains(out, "cannot open its store") {

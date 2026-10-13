@@ -18,8 +18,8 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -59,7 +59,7 @@ func TestMain(m *testing.M) {
 	// The reaper is this same binary under another argv (see reap_test.go). It must be
 	// recognised before anything else happens: it builds nothing and runs no test.
 	if len(os.Args) == 2 && strings.HasPrefix(os.Args[1], reapMode) {
-		runDaemonReaper(strings.TrimPrefix(os.Args[1], reapMode), os.Stdin) //cozy:stdin-value owned reaper subprocess liveness pipe
+		runCalciferReaper(strings.TrimPrefix(os.Args[1], reapMode), os.Stdin) //cozy:stdin-value owned reaper subprocess liveness pipe
 		os.Exit(0)
 	}
 	// So is a root's machine agent (local_machine_lifecycle_test.go).
@@ -75,7 +75,7 @@ func TestMain(m *testing.M) {
 	}
 	if ok, detail := forkHeadroom(); !ok {
 		fmt.Fprintf(os.Stderr, "refusing to start: the box is out of fork headroom (%s).\n"+
-			"Reap orphaned daemons and scratch roots before running the suite.\n", detail)
+			"Reap orphaned Calcifers and scratch roots before running the suite.\n", detail)
 		os.Exit(1)
 	}
 	dir, err := os.MkdirTemp("", "cozy-product-test-bin")
@@ -110,14 +110,14 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "building cozy: %v\n%s", err, out)
 		os.Exit(1)
 	}
-	// Every daemon this run causes to exist dies with it. Layer 3 first, so the roots a
+	// Every Calcifer this run causes to exist dies with it. Layer 3 first, so the roots a
 	// test registers are known to a process that outlives a SIGKILL of this one.
-	startDaemonReaper()
+	startCalciferReaper()
 	code := m.Run()
 	for _, root := range trackedRoots() {
-		reapDaemonRoot(root)
+		reapCalciferRoot(root)
 	}
-	stopDaemonReaper()
+	stopCalciferReaper()
 	_ = os.RemoveAll(dir)
 	_ = removeAllForce(scratchBase)
 	os.Exit(code)
@@ -178,7 +178,7 @@ func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *
 }
 
 // publicationControlAPI serves an in-process owner through the ordinary authenticated
-// API and daemon record, so the built CLI reaches it exactly as it reaches a daemon.
+// API and Calcifer record, so the built CLI reaches it exactly as it reaches a Calcifer.
 func publicationControlAPI(t *testing.T, o *owner, configure ...func(*api.Options)) func() {
 	t.Helper()
 	v4, v6, addr, problem := api.Listeners(0)
@@ -186,7 +186,7 @@ func publicationControlAPI(t *testing.T, o *owner, configure ...func(*api.Option
 	if v6 != nil {
 		_ = v6.Close()
 	}
-	held, problem := daemon.Hold(o.l, addr, "")
+	held, problem := calcifer.Hold(o.l, addr, "")
 	fatal(t, problem)
 	creds, problem := api.Mint(o.l)
 	fatal(t, problem)
@@ -202,7 +202,7 @@ func publicationControlAPI(t *testing.T, o *owner, configure ...func(*api.Option
 }
 
 // awaitMachineReceipt waits for Runtime's durable acceptance of a machine execution. A
-// detached `cozy run` returns once the run is queued; the daemon records the receipt when
+// detached `cozy run` returns once the run is queued; Calcifer records the receipt when
 // the machine accepts it. It fails as soon as the run settles without one.
 func awaitMachineReceipt(t *testing.T, store *records.Store, requestID string) *records.MachineExecution {
 	t.Helper()
@@ -237,31 +237,31 @@ func submission(planID, pkg, idem string, body map[string]any) orchestrator.Subm
 	}
 }
 
-// ------------------------------------------------------------- a real hidden daemon process
+// ------------------------------------------------------------- a real hidden Calcifer process
 
-// daemonProcess is one Cozy daemon this suite owns. The separate process is the point:
+// calciferProcess is one Calcifer this suite owns. The separate process is the point:
 // the suite is a CLIENT, which is the seat a real client occupies.
-type daemonProcess struct {
+type calciferProcess struct {
 	root, addr, token string
 	cmd               *exec.Cmd
-	// exited delivers the daemon's own exit code once, for the arms where leaving is
+	// exited delivers Calcifer's own exit code once, for the arms where leaving is
 	// the behaviour under test rather than the suite's cleanup.
 	exited <-chan int
 }
 
-func startDaemonProcess(t *testing.T, root string, imposed ...string) *daemonProcess {
-	return startDaemonBinary(t, cozyBin, root, imposed...)
+func startCalciferProcess(t *testing.T, root string, imposed ...string) *calciferProcess {
+	return startCalciferBinary(t, cozyBin, root, imposed...)
 }
 
-func startDaemonBinary(t *testing.T, binary, root string, imposed ...string) *daemonProcess {
+func startCalciferBinary(t *testing.T, binary, root string, imposed ...string) *calciferProcess {
 	t.Helper()
 	must(t, os.MkdirAll(root, 0o755))
-	// The daemon's words are its own bounded log, <root>/daemon.log (cl-096) — the
+	// Calcifer's words are its own bounded log, <root>/calcifer.log (cl-096) — the
 	// product surface the arms read. stderr, the startup-refusal pipe, is kept beside it.
-	log, err := os.Create(filepath.Join(root, "daemon-test.log"))
+	log, err := os.Create(filepath.Join(root, "calcifer-test.log"))
 	must(t, err)
 	cmd := exec.Command(binary)
-	cmd.Args[0] = "cozy-daemon"
+	cmd.Args[0] = "calcifer"
 	cmd.Env = childEnv(t, root, imposed...)
 	cmd.Stdout, cmd.Stderr = log, log
 	setProcessGroup(cmd)
@@ -272,14 +272,14 @@ func startDaemonBinary(t *testing.T, binary, root string, imposed ...string) *da
 		_ = cmd.Wait()
 		exited <- cmd.ProcessState.ExitCode()
 	}()
-	s := &daemonProcess{root: root, cmd: cmd, exited: exited}
+	s := &calciferProcess{root: root, cmd: cmd, exited: exited}
 	t.Cleanup(func() {
 		_ = killGroup(cmd.Process.Pid)
 		log.Close()
 	})
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		lock, lockErr := os.ReadFile(filepath.Join(root, "daemon.lock"))
+		lock, lockErr := os.ReadFile(filepath.Join(root, "calcifer.lock"))
 		if lockErr == nil {
 			for _, line := range strings.Split(string(lock), "\n") {
 				if value, ok := strings.CutPrefix(line, "addr="); ok {
@@ -295,7 +295,7 @@ func startDaemonBinary(t *testing.T, binary, root string, imposed ...string) *da
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("the Cozy daemon did not publish its address in 30s\n%s", tail(filepath.Join(root, "daemon.log")))
+	t.Fatalf("Calcifer did not publish its address in 30s\n%s", tail(filepath.Join(root, "calcifer.log")))
 	return nil
 }
 
@@ -325,7 +325,7 @@ func (r reply) brief() string {
 
 // call issues one authenticated request. Headers may be overridden per call, which is how
 // the refusal matrix presents a foreign Host or a foreign Origin.
-func (s *daemonProcess) call(t *testing.T, method, path string, body any, headers ...string) reply {
+func (s *calciferProcess) call(t *testing.T, method, path string, body any, headers ...string) reply {
 	t.Helper()
 	var data []byte
 	var contentType string
@@ -340,7 +340,7 @@ func (s *daemonProcess) call(t *testing.T, method, path string, body any, header
 
 // callBytes drives byte-oriented routes without smuggling a host path or JSON encoding
 // into the request. Authentication and hostile-header overrides remain identical to call.
-func (s *daemonProcess) callBytes(t *testing.T, method, path string, body []byte, contentType string, headers ...string) reply {
+func (s *calciferProcess) callBytes(t *testing.T, method, path string, body []byte, contentType string, headers ...string) reply {
 	t.Helper()
 	var reader io.Reader
 	if body != nil {
@@ -373,7 +373,7 @@ func (s *daemonProcess) callBytes(t *testing.T, method, path string, body []byte
 
 // ----------------------------------------------------------------- the product binary
 
-// runCozy runs the product binary as a user would type it, against one daemon root. The
+// runCozy runs the product binary as a user would type it, against one Calcifer root. The
 // child's environment comes through the PRODUCT's own allowlist: the suite has no business
 // inventing a second child-env mechanism, and the env fence says there is one reader.
 func runCozy(t *testing.T, root string, args ...string) (int, string) {
@@ -428,9 +428,9 @@ func runCozyStreamsWith(t *testing.T, root string, imposed []string, args ...str
 	return code, stdout.String(), stderr.String()
 }
 
-// childEnv is the ONE chokepoint every daemon-capable child process passes: a Cozy daemon
+// childEnv is the ONE chokepoint every Calcifer-capable child process passes: a Calcifer
 // can only ever be started by a process that got its COZY_HOME from here. Registering the
-// root here is therefore the same thing as registering every daemon that can exist, and a
+// root here is therefore the same thing as registering every Calcifer that can exist, and a
 // test cannot forget to do it. See reap_test.go for what the registration arms.
 // testDefaultHub is the suite's default Tensorhub: loopback port 1, which only root can bind,
 // so it always refuses. It is never production and never the owner's local Hub on 8819.
@@ -438,7 +438,7 @@ const testDefaultHub = "http://127.0.0.1:1"
 
 func childEnv(t *testing.T, root string, imposed ...string) []string {
 	t.Helper()
-	trackDaemonRoot(t, root)
+	trackCalciferRoot(t, root)
 	must(t, os.Setenv("COZY_HOME", root))
 	cfg, e := config.Load()
 	fatal(t, e)

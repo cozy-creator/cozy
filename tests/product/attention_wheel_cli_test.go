@@ -25,7 +25,7 @@ func TestAttentionWheelCLIExecutesCapturedABA(t *testing.T) {
 	root, err := os.MkdirTemp("", "cozy-attn-")
 	must(t, err)
 	t.Cleanup(func() {
-		reapDaemonRoot(root)
+		reapCalciferRoot(root)
 		if t.Failed() {
 			t.Log("attention wheel evidence retained", root)
 			return

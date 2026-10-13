@@ -9,7 +9,7 @@
 #
 # The archive is checked against the release's SHA256SUMS, the new binary must run and the host
 # tools must install before anything is replaced. The replacement is a rename, so a running
-# daemon keeps its binary and its work; the new one starts after the next `cozy down`.
+# Calcifer keeps its binary and its work; the new one starts after the next `cozy down`.
 set -eu
 
 releases=https://github.com/cozy-creator/cozy/releases

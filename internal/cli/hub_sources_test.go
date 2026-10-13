@@ -18,7 +18,7 @@ import (
 )
 
 // The same package name, even the same version, is a separate identity at each Hub.
-// Exercise the daemon's catalog resolver, installed metadata and the CLI's warmed cache
+// Exercise Calcifer's catalog resolver, installed metadata and the CLI's warmed cache
 // together, including authored model defaults that must not leak into the other Hub.
 func TestSelectedHubScopesInstalledAndCachedPackageMetadata(t *testing.T) {
 	for _, otherRelease := range []string{"1.0.0", "2.0.0"} {

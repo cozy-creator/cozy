@@ -67,7 +67,7 @@ func TestHubSpendCapRefusalBuysNothing(t *testing.T) {
 			peer.publishListing()
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\n"+
-					"daemon:\n  idle_shutdown_s: 0\n"), 0600))
+					"calcifer:\n  idle_shutdown_s: 0\n"), 0600))
 			peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1,
 				"price_usd_micros_per_hour": 100_000, "storage_usd_micros_per_hour": 10_000,
 				"base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86"})

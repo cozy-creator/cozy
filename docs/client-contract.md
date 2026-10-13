@@ -1,6 +1,6 @@
 # Cozy local client API — v1
 
-This document describes the HTTP API implemented by the Cozy daemon. The routes in the
+This document describes the HTTP API implemented by Calcifer. The routes in the
 CORE module are the proposed common request-level API for
 future Tensorhub and private-rental servers, but no cross-host parity is claimed until
 those servers exist and pass shared conformance tests. The LOCAL module is Cozy-only.
@@ -17,11 +17,11 @@ payloads, and behavior are documented below but are outside that row-level fence
 | encoding | JSON, UTF-8. SSE for streams. |
 | auth | `Authorization: Bearer <token>`. Cozy never accepts a cookie. |
 | idempotency | `Idempotency-Key` header on submit; required. |
-| hub | `Cozy-Tensorhub: <origin>` names the Tensorhub a command addresses; absent is the daemon's configured hub. Submissions record it; `GET /v1/requests` and `GET /v1/local/rentals` are scoped to it unless `hubs=all`. |
+| hub | `Cozy-Tensorhub: <origin>` names the Tensorhub a command addresses; absent is Calcifer's configured hub. Submissions record it; `GET /v1/requests` and `GET /v1/local/rentals` are scoped to it unless `hubs=all`. |
 | errors | one envelope, §6 |
 
 Bearer-only prevents a cross-site request from carrying ambient authority into the local
-daemon.
+Calcifer.
 
 ## 2. Core routes
 
@@ -39,7 +39,7 @@ daemon.
 
 Clients requesting adapters or a qualified captured-callable override first require
 `model_overrides: true` from `/v1/capabilities`. A missing route or false/absent field
-refuses only that operation before submission and asks for a daemon update. Ordinary
+refuses only that operation before submission and asks for a Calcifer update. Ordinary
 root checkpoint overrides require no new preflight. This capability describes durable
 client transport; the selected Host and Runtime are checked separately before execution.
 
@@ -127,7 +127,7 @@ loader preserves the input's resolution.
 
 `local_assets` is the CLI-only local extension carrying those attachments.
 Each row names the exact request-schema field path plus a source
-path, digest, length, and detected media type. The daemon verifies those claims and
+path, digest, length, and detected media type. Calcifer verifies those claims and
 copies the bytes into its private content-addressed input store before recording the
 request. Only an opaque digest reference enters `input`; only the field-path identity,
 digest, length, media type, and ordered occurrence enter the invocation spec. A client
@@ -135,7 +135,7 @@ filesystem path is never portable authority. This field requires the OS-protecte
 bearer. A future web UI must upload selected bytes through its own reviewed surface.
 
 The private staged object remains only while some unsettled request references its
-digest. The daemon serializes the filesystem-to-request-row ownership handoff with the
+digest. Calcifer serializes the filesystem-to-request-row ownership handoff with the
 same guard used by terminal cleanup, so deduplication cannot turn cleanup into a race.
 Per-attempt input directories are removed after the outcome is mirrored, committed, and
 acknowledged; locally mirrored output bytes remain addressable by their media ids. A
@@ -172,7 +172,7 @@ Answers:
 
 Status and list responses expose `overall_fraction` when whole-run progress is
 known. Completed runs report `1`; failed and canceled runs retain the last
-measured fraction of their current attempt across daemon restarts. The field is
+measured fraction of their current attempt across Calcifer restarts. The field is
 omitted when no overall measurement was recorded. Stage coordinates and ETA
 remain live-only, and stage progress has its own denominator.
 
@@ -315,10 +315,10 @@ through one envelope, including an unknown route.
 Cozy-only control routes use `/v1/local/`. Uploads and embedded web assets use their product
 URLs but remain local-scope rows in the same guarded route table.
 
-Client API compatibility is independent of the daemon's SQLite schema. Updating
-the CLI never authorizes stopping a live owner. `cozy rental list` reads the
-daemon's inventory, including its idle-release policy; unknown fields are ignored.
-A daemon that lacks a route answers `unknown_route`; restart it to pick up the
+Client API compatibility is independent of Calcifer's SQLite schema. Updating
+the CLI never authorizes stopping a live owner. `cozy rental list` reads
+Calcifer's inventory, including its idle-release policy; unknown fields are ignored.
+A Calcifer that lacks a route answers `unknown_route`; restart it to pick up the
 installed build. Records at an older schema are refused, never migrated.
 
 | route | scope | auth | notes |
@@ -334,7 +334,7 @@ installed build. Records at an older schema are refused, never migrated.
 | `POST /v1/local/machines/{machine}/operations` | local | yes | record one package or model operation on a machine (`local` or a rental id) as a numbered run and start it; the same operation still unsettled there is answered instead; `/v1/requests/{id}` and its cancel follow it like any run |
 | `POST /v1/local/rentals/{rental_id}/runtime-update` | local | yes | start or rejoin a durable per-rental Runtime update; the CLI may disconnect without canceling it |
 | `GET /v1/local/rentals/{rental_id}/runtime-update` | local | yes | read the selected update, phase, actual result, or reconciliation error |
-| `POST /v1/local/daemon/down` | local | yes | non-destructive disconnect guarded by required online work; `{force:true}` overrides that guard without canceling work; mutually exclusive `{all:true}` requests cancellation and paid teardown |
+| `POST /v1/local/calcifer/down` | local | yes | non-destructive disconnect guarded by required online work; `{force:true}` overrides that guard without canceling work; mutually exclusive `{all:true}` requests cancellation and paid teardown |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
@@ -350,7 +350,7 @@ ids into invocation assets; it will never send a host filesystem path.
 
 ### The job family is local
 
-A job is an ATTEMPT CLASS in the same Cozy daemon, not a second scheduler: the same
+A job is an ATTEMPT CLASS in the same Calcifer, not a second scheduler: the same
 orchestrator places and dispatches it, and the same record owner gives it an ordinal,
 settles its terminal transaction, and streams it over the same durable event route
 (`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and
@@ -465,7 +465,7 @@ This host's chain, in order:
    is read anywhere.
 5. **No CORS headers at all**, and a strict CSP on every response.
 
-One credential is minted per daemon launch and handed to the CLI through a 0600 file.
+One credential is minted per Calcifer launch and handed to the CLI through a 0600 file.
 It never appears in argv, inherited environment, a log line, or a rendered error. A future
 web UI owns its own authentication design rather than inheriting this filesystem authority.
 
@@ -527,7 +527,7 @@ local intent. This action does not make a remote cancellation or lifecycle reque
 before connecting to the machine or reading its execution generation. Accepted work
 is shown as `canceling`; an unavailable machine cannot prevent that acknowledgement.
 The background observer delivers the generation-checked command and resumes delivery
-after a daemon restart. A lost reply reuses the recorded command identity.
+after a Calcifer restart. A lost reply reuses the recorded command identity.
 
 `--await` waits for the authoritative terminal outcome. Recording intent does not
 claim that remote execution has stopped, and a completed outcome remains unchanged.

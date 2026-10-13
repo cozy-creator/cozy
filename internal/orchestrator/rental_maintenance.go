@@ -14,7 +14,7 @@ func (c *Orchestrator) UseRental(id, _ string) (func(), *exit.Error) {
 	closing := c.closing
 	c.mu.Unlock()
 	if closing {
-		return nil, exit.Named(exit.Unavailable, "daemon.stopping", "the daemon is stopping")
+		return nil, exit.Named(exit.Unavailable, "calcifer.stopping", "Calcifer is stopping")
 	}
 	if problem := c.opt.Store.RuntimeUpdateHold(id); problem != nil {
 		return nil, problem

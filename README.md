@@ -17,7 +17,7 @@ curl -fsSL https://github.com/cozy-creator/cozy/releases/latest/download/install
 The installer checks the release against its `SHA256SUMS`, puts `cozy` in `~/.local/bin` and, in
 its own uv tool environment, the host tool Cozy drives: `cozy-runtime`.
 `COZY_VERSION=v0.1.0` picks a release. Rerun it to upgrade: the new binary replaces the old by
-rename, so a running daemon keeps its binary and its work; the new one starts after the next
+rename, so a running Calcifer keeps its binary and its work; the new one starts after the next
 `cozy down`; work in flight continues and the next command reattaches. From source: `go build -o ~/.local/bin/cozy .`
 (Go 1.26+; Windows: `scripts\install.ps1 -Binary .\cozy.exe`). Tab completion is installed
 automatically for bash and fish, and for zsh when `~/.local/share/zsh/site-functions` is on
@@ -72,11 +72,11 @@ cozy up
 # open http://127.0.0.1:8818/ (or the returned fallback URL when 8818 is occupied)
 ```
 
-`up` backgrounds one lightweight per-user Cozy daemon: web UI, local API, submission
+`up` backgrounds Calcifer, the one lightweight per-user process behind `cozy`: web UI, local API, submission
 records, output following, and private-rental sessions. It does not attach a log stream or load a package or
 model. Repeating `up` returns the same healthy URL with `changed: false`; concurrent callers
-converge on one daemon. A startup failure is returned directly as a bounded diagnostic and does
-not create a persistent log. Commands that require the daemon may ensure the same process is
+converge on one Calcifer. A startup failure is returned directly as a bounded diagnostic and does
+not create a persistent log. Commands that require Calcifer may ensure the same process is
 running automatically.
 
 The machine server is TensorD, the separate `tensord` executable that Linux Runtime wheels
@@ -85,7 +85,7 @@ or asks an existing current machine to update its Runtime, TensorFS and bundled 
 through one durable transaction. The same machine API runs on a laptop and a rented pod;
 restarting the personal controller leaves accepted machine work running. `cozy machine stop`
 explicitly stops the local machine (its systemd user unit, record or not); it stays stopped
-until `cozy machine start` or the next local run, and the daemon never starts it to observe or
+until `cozy machine start` or the next local run, and Calcifer never starts it to observe or
 collect accepted work. Optional `machine.webrtc_port` in the Cozy config
 enables its WebRTC media listener; Hub grants cannot change machine listening ports.
 
@@ -180,9 +180,9 @@ An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path
 as an editable Python install is: the directory is the package. Nothing is copied and no
 environment is built here; only its interface is read from source. This computer's machine
 installs it in place, building its environment only when `uv.lock` changes, and a rental keeps
-one copy updated with the files that changed. While the daemon runs it watches the tree, and
+one copy updated with the files that changed. While Calcifer runs it watches the tree, and
 every invocation checks it too; installing it again unchanged does nothing. A failed rebuild (a syntax error mid-edit) keeps the last good
-install pinned, is logged typed in `cozy daemon log`, and refuses an invocation only if the tree
+install pinned, is logged typed in `cozy calcifer log`, and refuses an invocation only if the tree
 is still broken. `cozy package list --full` shows `synced` or `stale <error>` for the tree.
 Editable installs are not published releases. Model bindings resolve the exact release and lane
 declared in `package.toml` from the local TensorFS store; they never synthesize Hub release records.
@@ -542,7 +542,7 @@ arbitrary Python side effects are reversible or safe to repeat.
 
 Scalar and tensor compositions use the same Runtime workspace journal locally and on a
 private rental. The journal belongs to the configured TensorFS store and survives package
-worker and daemon restarts. The remote Host authenticates access to that same service.
+worker and Calcifer restarts. The remote Host authenticates access to that same service.
 A completed result stored only on a rented machine continues holding the rental until its
 owner releases it; completion alone does not make those bytes remotely durable.
 Parent and child attempts retain separate history.
@@ -584,7 +584,7 @@ cozy run cancel <run-id>
 
 Every run is durable. Cozy observes its first three seconds so a warm, weightless function can still
 return its result directly; otherwise it prints the run id, live status, and authoritative queue
-position, then returns while the daemon continues. `--await` stays attached through the terminal and
+position, then returns while Calcifer continues. `--await` stays attached through the terminal and
 shows named pipeline stages, measured step speed, elapsed time, and a whole-run estimate only when
 the package reports `overall_fraction`; stage-local fractions are labeled as stage progress.
 `--await --json` writes typed JSONL progress events to stderr and one final JSON result to stdout.
@@ -627,8 +627,8 @@ checkpoints stay internal. Text-only results create no output directory. Input a
 the original input paths without copying them. Keep those files available and unchanged until the
 request finishes; missing or modified inputs are refused before execution. Downloaded or resized
 media lives in the system temporary directory under `cozy/`, named by its content hash.
-`saved:` lists the absolute paths (`saved[].path` under `--json`). The
-daemon probes the destination writable at submit and refuses typed (`output_destination_unwritable`)
+`saved:` lists the absolute paths (`saved[].path` under `--json`).
+Calcifer probes the destination writable at submit and refuses typed (`output_destination_unwritable`)
 before any execution, and records the destination with the request, so closing the command or
 restarting Cozy does not lose where the files are.
 
@@ -740,30 +740,30 @@ These commands have deliberately different scopes:
 ```sh
 cozy machine stop # stop this computer's machine and free its GPU; `cozy machine start` or the next run starts it
 cozy machine logs --tensorfs # this computer's TensorFS transport decisions
-cozy down         # stop the daemon; runs, uploads and rentals continue
-cozy down --all   # cancel all work, end all rentals, then stop the daemon
+cozy down         # stop Calcifer; runs, uploads and rentals continue
+cozy down --all   # cancel all work, end all rentals, then stop Calcifer
 ```
 
 None deletes installed package or model bytes. `cozy down` never refuses over work: it
 names what is in flight, and this computer's machine and every rental keep running it.
-The next command starts the daemon, which resumes each submission, upload, control and
+The next command starts Calcifer, which resumes each submission, upload, control and
 output collection from its records. Idle rented machines still end themselves after 15
 minutes; `cozy rental keepalive <name>` resets that clock once. `--all`
 remains explicit cancellation and rental teardown. See
-[daemon shutdown](docs/daemon-shutdown.md).
+[Calcifer shutdown](docs/calcifer-shutdown.md).
 
-The daemon's own words — the orchestrator's frame-by-frame account — are in
-`$COZY_HOME/daemon.log`, rotated once at 32 MiB (`daemon.log.1`). `cozy daemon log` prints it;
-`cozy daemon log -f` follows it.
+Calcifer's own words — the orchestrator's frame-by-frame account — are in
+`$COZY_HOME/calcifer.log`, rotated once at 32 MiB (`calcifer.log.1`). `cozy calcifer log` prints it;
+`cozy calcifer log -f` follows it.
 
-The daemon also leaves on its own once it has had nothing to manage for `daemon.idle_shutdown_s`
+Calcifer also leaves on its own once it has had nothing to manage for `calcifer.idle_shutdown_s`
 (default 900): no rental it owns, no request or attempt it owes, no transfer, export, launch or
-teardown in flight, no event stream attached. User interaction is not the signal. A rental holds the
-daemon until its idle release, or `cozy rental end`, has confirmed the pod gone. Set
-`idle_shutdown_s: 0` to keep the daemon up until `cozy down`. The next command that needs the
-daemon starts it again.
+teardown in flight, no event stream attached. User interaction is not the signal. A rental holds
+Calcifer until its idle release, or `cozy rental end`, has confirmed the pod gone. Set
+`idle_shutdown_s: 0` to keep Calcifer up until `cozy down`. The next command that needs
+Calcifer starts it again.
 
-The launch web UI is currently a stub rooted in [`web/`](web/). The daemon already serves
+The launch web UI is currently a stub rooted in [`web/`](web/). Calcifer already serves
 opaque output media and a bounded authenticated content-addressed upload API; full browser
 authentication, upload-to-invocation binding, and media-history UX come with the real frontend.
 
@@ -780,10 +780,10 @@ The default local root is `~/.cozy`. The TensorFS store is its own independent h
 | `inputs/` | uploaded/streamed request bodies only, created on demand; a local CLI file input stays at its caller path |
 | `machine/` | this computer's machine: the same Host a rental runs, with its grant |
 | `tmp/<request-id>/` | bytes in flight for a model transfer; removed when the request settles |
-| `creator.sqlite`, `daemon.log` | the one local lifecycle database (mode 0600) and the daemon's own log |
-| `daemon.lock` | the daemon's lifetime ownership record: address, pid, and the per-launch CLI token (mode 0600) |
+| `creator.sqlite`, `calcifer.log` | the one local lifecycle database (mode 0600) and Calcifer's own log |
+| `calcifer.lock` | Calcifer's lifetime ownership record: address, pid, and the per-launch CLI token (mode 0600) |
 
-Nothing is kept on disk without a live reason; the daemon's start-time sweeps (`cozy up` prints
+Nothing is kept on disk without a live reason; Calcifer's start-time sweeps (`cozy up` prints
 them) are only the backstop for a process that crashed and report `reclaimed 0` on a healthy box.
 
 Configuration is read once from `~/.cozy/config.yaml`, then credential/location environment
@@ -801,7 +801,7 @@ tfs: /usr/local/bin/tfs
 port: 8818
 player_url: https://cozy-creator.github.io/cozy/play/   # the page `cozy run play` links open
 local_rate_micro_usd_per_hour: 250000
-daemon:
+calcifer:
   idle_shutdown_s: 900
 ```
 
@@ -835,10 +835,10 @@ new run reads packages and models from. If that source differs, the CLI delegate
 selected Hub's execution access to the rental's pinned certificate. The rental's lifecycle
 credential stays at its owning Hub. Each Hub uses its own `cozy auth login --tensorhub=<hub>`.
 
-One daemon can retain runs and rentals created under earlier selections without restarting.
+One Calcifer can retain runs and rentals created under earlier selections without restarting.
 `cozy rental list` shows rentals across every known Hub, including signed-in Hubs
 whose rentals were created by another client. A name alone adds no Hub, so `cozy hub remove`
-takes effect in a running daemon at once; rentals on a removed name are listed under its URL.
+takes effect in a running Calcifer at once; rentals on a removed name are listed under its URL.
 A Hub that cannot answer leaves its
 last observed rentals visible as unverified. `--tensorhub=<hub>` selects the source
 for new work; it does not narrow the rental inventory. `cozy run list` shows every
@@ -861,7 +861,7 @@ Supported environment variables are limited to:
 - `TENSORHUB_URL`
 - `TENSORHUB_TOKEN`
 
-The daemon launcher also uses a private per-process bootstrap credential. Secrets are never
+Calcifer's launcher also uses a private per-process bootstrap credential. Secrets are never
 accepted as command-line values.
 
 ## Authentication
@@ -924,7 +924,7 @@ not advertise placeholder commands for features that do not exist yet.
 
 
 Choose existing capacity explicitly with `cozy run org/package/function --rental=name`
-(or its rental ID). This constraint survives retries and daemon restarts. If that
+(or its rental ID). This constraint survives retries and Calcifer restarts. If that
 rental becomes unavailable, the run fails or retains its work; it never buys a
 replacement or moves onto another machine. `--rental-only` retains automatic remote
 allocation. Create capacity with `cozy rental new <machine-slug>`, such as `cozy rental new h100-sxm5-80gb --gpus 2`;
