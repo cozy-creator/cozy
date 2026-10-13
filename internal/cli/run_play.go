@@ -120,7 +120,7 @@ func playMachine(ctx *Context, layout home.Layout, store *records.Store, row rec
 		if pin, err = workertls.ParsePin([]byte(ep.CertificatePEM)); err != nil {
 			return nil, nil, exit.New(exit.Credential, "the machine's pinned certificate is unreadable")
 		}
-		rented, p := rentalEndpoint(layout, store)(ep)
+		rented, p := rentalEndpoint(ctx, layout, store)(ep)
 		switch {
 		case p != nil:
 			problem = p
