@@ -98,11 +98,12 @@ func TestLiveRentalSelectorsIgnoreHistoryAndMissingProjection(t *testing.T) {
 	lock.Lock()
 	broken = true
 	lock.Unlock()
+	// Verbs that read or change the rental itself need its Hub. Work sent to it does not: its
+	// dispatch reads the Hub when it dials the machine.
 	for _, command := range [][]string{
 		{"rental", "show", "katsuie", "--json"},
 		{"rental", "update", "katsuie", "--runtime-version=0.23.25", "--json"},
 		{"rental", "end", "katsuie", "--json"},
-		{"model", "upload", "proof/source@1.0.0/bf16", "paul/copy", "--rental=katsuie", "--json"},
 	} {
 		if code, out := runCozy(t, root, command...); code == 0 || strings.Contains(out, `"state":"ended"`) {
 			t.Fatalf("Hub failure became local truth [%d]: %v %s", code, command, out)
