@@ -123,12 +123,16 @@ func (r *Resolver) resolve(ctx context.Context, name, holder string, machine *pl
 	if problem != nil {
 		return target{}, problem
 	}
+	return r.rentalTarget(name, holder, remote.Connection, machine)
+}
+
+// rentalTarget holds a rental for holder and names its dial identity.
+func (r *Resolver) rentalTarget(name, holder string, identity *orchestrator.WorkerConnection, machine *placement) (target, *exit.Error) {
 	release, problem := r.UseRental(name, holder)
 	if problem != nil {
 		return target{}, problem
 	}
 	machine.release = release
-	identity := remote.Connection
 	pin, err := workertls.EndpointPin(identity.CertificatePEM, identity.CACert)
 	if err != nil {
 		release()

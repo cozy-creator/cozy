@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
@@ -1097,16 +1098,18 @@ func handleRentalList(ctx *Context) *exit.Error {
 }
 
 // rentalBoard reads the live fleet from the daemon, reconciling with the hubs every pollCadence.
+// A board draws its first frame from the daemon's last sweep, then reconciles; a snapshot
+// reconciles first.
 func rentalBoard(ctx *Context, watching bool) (func(context.Context) (output.List, *exit.Error), *exit.Error) {
 	const allHubs = true
 	client, problem := dial(ctx)
 	if problem != nil {
 		return nil, problem
 	}
-	if watching {
-		client = following(ctx, client)
-	}
 	var last time.Time
+	if watching {
+		client, last = following(ctx, client), time.Now()
+	}
 	return func(call context.Context) (output.List, *exit.Error) {
 		reconcile := last.IsZero() || time.Since(last) >= pollCadence
 		inventory, problem := client.RentalInventory(call, reconcile, allHubs)
@@ -1125,21 +1128,10 @@ func rentalBoard(ctx *Context, watching bool) (func(context.Context) (output.Lis
 }
 
 // handleRentalShow is `cozy rental show <rental>`: one rental's row of the every-hub
-// listing, a fact per line.
+// listing, a fact per line. The listing the daemon just reconciled names the rental; one it
+// does not list has ended, and its Hub's history says how.
 func handleRentalShow(ctx *Context) *exit.Error {
-	_, store, problem := rentalStores(ctx)
-	if problem != nil {
-		return problem
-	}
-	live, problem := resolveLiveRental(ctx, store, strings.TrimSpace(ctx.Inv.Args[0]))
-	store.Close()
-	if problem != nil {
-		if problem.Code == exit.NotFound {
-			return showEndedRental(ctx, strings.TrimSpace(ctx.Inv.Args[0]))
-		}
-		return problem
-	}
-
+	typed := strings.TrimSpace(ctx.Inv.Args[0])
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -1148,19 +1140,21 @@ func handleRentalShow(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	subject := live.Rental.ID
+	selected := inventory.Select(typed)
+	if len(selected) > 1 {
+		return exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple live rentals; use a rental ID", typed)
+	}
+	if len(selected) == 0 {
+		return showEndedRental(ctx, typed)
+	}
+	if problem := unansweredHub(inventory, selected[0]); problem != nil {
+		// A hub that cannot answer leaves only this host's records: never shown as the rental.
+		return problem
+	}
+	subject := selected[0].ID
 	list := renderRentalList(ctx.Cfg, inventory, true)
-	matches := 0
-	for _, row := range list.Rows {
-		if row["rental"] == subject || row["machine"] == subject || row["rental alias"] == subject {
-			matches++
-		}
-	}
-	if matches > 1 {
-		return exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple rentals; use a rental ID", subject)
-	}
 	for i, row := range list.Rows {
-		if row["rental"] != subject && row["machine"] != subject && row["rental alias"] != subject {
+		if row["rental"] != subject {
 			continue
 		}
 		fields, all, value := append([]string{"rental"}, append(list.Fields, "compute", "storage")...), list.AllFields,
@@ -1183,12 +1177,28 @@ func handleRentalShow(ctx *Context) *exit.Error {
 		}
 		record := output.Record{Fields: pick(fields), AllFields: pick(all), Next: []string{"cozy rental list"}}
 		if list.TypedRows[i]["state"] == "ready" {
-			status, notes := rentalStatus(client, row["rental"], !ctx.Mode().Human || ctx.Mode().JSON)
+			status, notes := rentalStatus(client, selected[0], !ctx.Mode().Human || ctx.Mode().JSON)
 			record.Fields, record.AllFields, record.Notes = append(record.Fields, status...), append(record.AllFields, status...), notes
 		}
 		return emit(ctx, record)
 	}
 	return showEndedRental(ctx, subject)
+}
+
+// unansweredHub is the problem of the hub a listed rental's row could not be verified on.
+func unansweredHub(inventory api.RentalInventory, row api.RentalSummary) *exit.Error {
+	if !row.Unverified {
+		return nil
+	}
+	for _, unread := range inventory.UnreadableHubs {
+		if unread.Hub == row.Hub {
+			return unread.Error
+		}
+	}
+	if inventory.HubUnanswered != nil {
+		return inventory.HubUnanswered
+	}
+	return exit.Named(exit.Unavailable, "rental.hub_unanswered", "the hub of rental %s did not answer", row.ID)
 }
 
 // showEndedRental answers `cozy rental show` for a rental no longer listed: by id, or by name
@@ -1204,26 +1214,35 @@ func showEndedRental(ctx *Context, subject string) *exit.Error {
 			origins = append(origins, origin)
 		}
 	}
-	for _, origin := range origins {
+	// Every hub is asked at once; the first in order that knows the rental answers.
+	found := make([][]hub.Rental, len(origins))
+	problems := make([]*exit.Error, len(origins))
+	var wait sync.WaitGroup
+	for i, origin := range origins {
 		scoped := ctx.forHub(origin)
 		if !scoped.Cfg.HubToken.Present() && !accountauth.New(scoped.Cfg).CredentialPresent() {
 			continue
 		}
-		owner := client(scoped)
-		call, cancel := hub.Context()
-		found, problem := owner.RentalHistory(call, subject)
-		if problem == nil && len(found) == 0 && rentalid.Valid(subject) {
-			var one hub.Rental
-			if one, problem = owner.RentalView(call, subject); problem == nil {
-				found = []hub.Rental{one}
+		wait.Go(func() {
+			owner := client(scoped)
+			call, cancel := hub.Context()
+			defer cancel()
+			found[i], problems[i] = owner.RentalHistory(call, subject)
+			if problems[i] == nil && len(found[i]) == 0 && rentalid.Valid(subject) {
+				var one hub.Rental
+				if one, problems[i] = owner.RentalView(call, subject); problems[i] == nil {
+					found[i] = []hub.Rental{one}
+				}
 			}
+		})
+	}
+	wait.Wait()
+	for i, origin := range origins {
+		if problems[i] != nil && problems[i].ErrName() != "rental.not_found" {
+			return problems[i]
 		}
-		cancel()
-		if problem != nil && problem.ErrName() != "rental.not_found" {
-			return problem
-		}
-		if len(found) > 0 {
-			return emit(ctx, endedRentalRecord(ctx, ctx.Cfg.HubLabel(origin), found[0]))
+		if len(found[i]) > 0 {
+			return emit(ctx, endedRentalRecord(ctx, ctx.Cfg.HubLabel(origin), found[i][0]))
 		}
 	}
 	return exit.Named(exit.NotFound, "rental.unknown", "no rental is named %q on any hub this host is signed in to", subject).
@@ -1271,8 +1290,13 @@ func endedRentalRecord(ctx *Context, hubName string, r hub.Rental) output.Record
 
 // rentalStatus is what a ready rental's machine reports of itself. One that cannot answer
 // leaves a note, never a failed show.
-func rentalStatus(client *localapi.Client, rentalID string, typed bool) ([]output.Field, []string) {
-	status, problem := client.MachineStatus(rentalID)
+func rentalStatus(client *localapi.Client, row api.RentalSummary, typed bool) ([]output.Field, []string) {
+	status, problem := api.MachineStatus{}, row.MachineProblem
+	if row.Machine != nil {
+		status = *row.Machine
+	} else if problem == nil {
+		status, problem = client.MachineStatus(row.ID)
+	}
 	if problem != nil {
 		return nil, []string{"machine status unavailable: " + problem.Message}
 	}

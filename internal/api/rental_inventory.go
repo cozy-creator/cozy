@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"slices"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -55,6 +56,29 @@ func (inventory RentalInventory) Current() RentalInventory {
 	return inventory
 }
 
+// Select is the rentals a typed subject names, as the live resolver reads one: an exact
+// rental ID, else every live rental bearing that name or one of its machine aliases.
+func (inventory RentalInventory) Select(typed string) []RentalSummary {
+	var exact, named []RentalSummary
+	for _, rows := range [][]RentalSummary{inventory.Rentals, inventory.Unrecorded} {
+		for _, row := range rows {
+			switch {
+			case row.ID == typed:
+				exact = append(exact, row)
+			case !hub.RentalAbsent(row.State) && (strings.EqualFold(row.MachineName, typed) ||
+				strings.EqualFold(row.RentalAlias, typed) || slices.ContainsFunc(row.MachineAliases, func(alias string) bool {
+				return strings.EqualFold(alias, typed)
+			})):
+				named = append(named, row)
+			}
+		}
+	}
+	if len(exact) > 0 {
+		return exact
+	}
+	return named
+}
+
 type RentalSummary struct {
 	Provider            string          `json:"provider,omitempty"`
 	ProviderMachineID   string          `json:"provider_machine_id,omitempty"`
@@ -62,6 +86,7 @@ type RentalSummary struct {
 	ID                  string          `json:"rental_id"`
 	MachineName         string          `json:"machine"`
 	RentalAlias         string          `json:"rental_alias,omitempty"`
+	MachineAliases      []string        `json:"machine_aliases,omitempty"`
 	SKU                 string          `json:"sku,omitempty"`
 	State               string          `json:"state"`
 	AcceleratorModel    string          `json:"accelerator,omitempty"`
@@ -77,7 +102,11 @@ type RentalSummary struct {
 	// ReleaseDue is when the rental's machine says it ends itself unless a job is queued
 	// or running by then (RFC 3339); blank when it names none or cannot answer.
 	ReleaseDue string `json:"release_due_at,omitempty"`
-	Operation  string `json:"operation,omitempty"`
+	// Machine is a ready rental's own Status as this listing read it, or MachineProblem why
+	// it could not be read.
+	Machine        *MachineStatus `json:"machine_status,omitempty"`
+	MachineProblem *exit.Error    `json:"machine_problem,omitempty"`
+	Operation      string         `json:"operation,omitempty"`
 	// Boot is the pod's boot while the Hub still acquires it.
 	Boot *hub.RentalBoot `json:"boot,omitempty"`
 	// RuntimeUpdate is the state of a Runtime update holding this rental's work.

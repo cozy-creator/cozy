@@ -64,8 +64,10 @@ type fakeRentalHub struct {
 	mux      *http.ServeMux // the routes, however server's handler is wrapped
 	// publishes is whether this stand-in hub carries th-199's account listing.
 	publishes bool
-	// reads counts rental reads, so a test can plant a transition after the daemon's first look.
+	// reads counts rental reads, so a test can plant a transition after the daemon's first look;
+	// byID counts each rental's reads by id.
 	reads int
+	byID  map[string]int
 	// software is the target pair GET /v1/software answers; unset, none.
 	software map[string]string
 	// providers is each `?provider=` the catalog was asked for ("" for none); as Tensorhub,
@@ -75,7 +77,7 @@ type fakeRentalHub struct {
 
 func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	t.Helper()
-	h := &fakeRentalHub{rentals: map[string]map[string]any{}, released: map[string]int{}, publishes: true}
+	h := &fakeRentalHub{rentals: map[string]map[string]any{}, released: map[string]int{}, byID: map[string]int{}, publishes: true}
 	mux := http.NewServeMux()
 	h.mux = mux
 	mux.HandleFunc("GET /v1/packages/{owner}/{name}/releases/{release}", func(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +139,7 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		h.reads++
+		h.byID[r.PathValue("id")]++
 		row, ok := h.rentals[r.PathValue("id")]
 		if !ok || r.Header.Get("Authorization") != "Bearer rental-idle-test" {
 			// As Tensorhub answers an id it does not hold for this caller.
@@ -377,6 +380,13 @@ func rentUntilRecorded(t *testing.T, root, id string, args ...string) (int, stri
 
 // port is where this stand-in listens. It binds first and the config names it after,
 // so no other process can take the address in between.
+// idReads is how many times one rental was read by id.
+func (h *fakeRentalHub) idReads(id string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.byID[id]
+}
+
 func (h *fakeRentalHub) port() int { return h.server.Listener.Addr().(*net.TCPAddr).Port }
 
 func (h *fakeRentalHub) close() {

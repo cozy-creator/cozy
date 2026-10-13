@@ -48,6 +48,10 @@ type managedRentals struct {
 	boot func(string)
 	// wakeMachine asks again about the runs a newly attached boot holds.
 	wakeMachine func(string)
+	// machineStatus reads ready machines' own Status (daemon setup installs it); statuses is
+	// the last read, by rental.
+	machineStatus func(context.Context, []hub.Rental) map[string]machineRead
+	statuses      map[string]machineRead
 	// said holds the last line printed about each rental, so the fleet speaks once per change.
 	said map[string]string
 	// letGone holds the failed rentals this daemon has let go: a failure is acted on once, not
@@ -90,6 +94,8 @@ type rentalCensus struct {
 	// reconcile. A 404 is not proof of provider destruction, so the row is KEPT and shown;
 	// it must never stop the reconcile of every other rental against the same hub.
 	hubUnknown map[string]bool
+	// observed is whether a full reconcile of this hub has finished since the daemon began.
+	observed bool
 }
 
 // at is the fleet's context for one hub origin, with that origin's credential.
@@ -798,17 +804,19 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 			}
 		}()
 	}
-	for {
-		select {
-		case <-quit:
-			return
-		case <-tick.C:
+	for first := true; ; first = false {
+		if !first {
+			select {
+			case <-quit:
+				return
+			case <-tick.C:
+			}
 		}
 		m.mu.Lock()
 		closed := m.closed
 		m.mu.Unlock()
 		if !closed {
-			if time.Since(reconciled) < hubReconcileCadence {
+			if !first && time.Since(reconciled) < hubReconcileCadence {
 				m.refreshBooting()
 			} else {
 				reconciled = time.Now()
@@ -834,6 +842,50 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 		default:
 		}
 	}
+}
+
+// readMachines reads each ready machine of this host's own Status at the identity its Hub
+// last listed, and keeps the answers for a listing that does not read them again.
+func (m *managedRentals) readMachines(ctx context.Context) {
+	m.mu.Lock()
+	ready := m.readyLocked()
+	m.mu.Unlock()
+	if m.machineStatus == nil {
+		return
+	}
+	statuses := m.machineStatus(ctx, ready)
+	m.mu.Lock()
+	m.statuses = statuses
+	m.mu.Unlock()
+}
+
+// listedReady is a ready rental of this host's as its Hub last listed it.
+func (m *managedRentals) listedReady(id string) (hub.Rental, bool) {
+	if m == nil {
+		return hub.Rental{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ready := range m.readyLocked() {
+		if ready.ID == id {
+			return ready, true
+		}
+	}
+	return hub.Rental{}, false
+}
+
+// readyLocked is every ready, reachable rental of this host's in the last listings.
+func (m *managedRentals) readyLocked() []hub.Rental {
+	var ready []hub.Rental
+	for _, census := range m.census {
+		for _, seen := range census.live {
+			if seen.State == hub.RentalReady && seen.UnreachableSince == "" &&
+				!slices.ContainsFunc(census.unrecorded, func(other hub.Rental) bool { return other.ID == seen.ID }) {
+				ready = append(ready, seen)
+			}
+		}
+	}
+	return ready
 }
 
 // report says, once per change, what the Hub knows that this host's records do not: rentals
@@ -1050,11 +1102,40 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 		}
 	}
 	owner := client(m.at(origin))
+	// One listing answers for every live rental. A row is read by id only when the listing
+	// cannot speak for it, and a row already ended (the Hub commits that only after proving
+	// the provider absent) is never read again.
+	var listing []hub.Rental
+	var listed bool
+	var listingProblem *exit.Error
+	if only == nil {
+		hctx, cancel := hub.Context()
+		var stated hub.RentalListing
+		stated, listingProblem = owner.RentalListing(hctx)
+		listed = listingProblem == nil
+		cancel()
+		if listed {
+			listing = stated.Rentals
+			_ = m.store.StateHubBindingsRevision(origin, stated.BindingsRevision)
+			_ = stateCredit(m.store, m.origin(origin), stated.Credit)
+		}
+	}
+	live := make(map[string]hub.Rental, len(listing))
+	for _, seen := range listing {
+		live[seen.ID] = seen
+	}
 	views := make([]rentalView, 0, len(rows))
 	var asked *exit.Error
 	for _, row := range rows {
-		if row.State == hub.RentalReleased {
-			views = append(views, rentalView{id: row.ID, released: true})
+		if hub.RentalAbsent(row.State) {
+			views = append(views, rentalView{id: row.ID, released: row.State == hub.RentalReleased, ended: true})
+			continue
+		}
+		if seen, ok := live[row.ID]; ok {
+			if asked = seen.Stated("listed rental " + row.ID); asked != nil {
+				break
+			}
+			views = append(views, rentalView{id: row.ID, remote: seen})
 			continue
 		}
 		hctx, cancel := hub.Context()
@@ -1071,8 +1152,8 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 	// the Hub answers 404 for is over: nothing is rented under that id.
 	var gone, unknown []records.RentalOperation
 	for _, op := range asks {
-		if asked != nil {
-			break
+		if _, ok := live[op.RentalID]; ok || asked != nil {
+			continue
 		}
 		hctx, cancel := hub.Context()
 		remote, observed := owner.RentalView(hctx, op.RentalID)
@@ -1086,21 +1167,6 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 			asked = observed
 		}
 	}
-	var listing []hub.Rental
-	var listed bool
-	var listingProblem *exit.Error
-	if asked == nil && only == nil {
-		hctx, cancel := hub.Context()
-		var stated hub.RentalListing
-		stated, listingProblem = owner.RentalListing(hctx)
-		listed = listingProblem == nil
-		cancel()
-		if listed {
-			listing = stated.Rentals
-			_ = m.store.StateHubBindingsRevision(origin, stated.BindingsRevision)
-			_ = stateCredit(m.store, m.origin(origin), stated.Credit)
-		}
-	}
 	m.mu.Lock()
 	released, failed, rebooted, problem := m.applyRowsLocked(origin, views)
 	if problem == nil {
@@ -1112,6 +1178,7 @@ func (m *managedRentals) reconcileRows(origin string, only func(records.Rental) 
 		}
 	}
 	census := m.censusLocked(origin)
+	census.observed = census.observed || only == nil
 	switch {
 	case problem != nil:
 	case asked != nil:
@@ -1158,22 +1225,36 @@ type rentalView struct {
 	// KEPT and shown, and never stops the reconcile of every other rental on the hub.
 	unknown  bool
 	released bool
+	// ended is a row already recorded failed or released: nothing the Hub says changes it.
+	ended bool
 }
 
-// reconcileAll reconciles every hub this host holds rentals on. A hub that cannot
-// be reconciled defers only its own rentals; every other hub still converges.
+// reconcileAll reconciles every hub this host holds rentals on, all at once. A hub that
+// cannot be reconciled defers only its own rentals; every other hub still converges.
 func (m *managedRentals) reconcileAll() map[string]*exit.Error {
 	origins, problem := m.origins()
 	if problem != nil {
 		return map[string]*exit.Error{"": problem}
 	}
-	problems := map[string]*exit.Error{}
-	for _, origin := range origins {
-		if problem := m.reconcile(origin); problem != nil {
-			problems[origin] = problem
+	return m.reconcileEach(origins)
+}
+
+// reconcileEach reconciles origins concurrently: a listing is one round trip per hub, so
+// a fleet across hubs costs the slowest hub's, not their sum.
+func (m *managedRentals) reconcileEach(origins []string) map[string]*exit.Error {
+	problems := make([]*exit.Error, len(origins))
+	var wait sync.WaitGroup
+	for i, origin := range origins {
+		wait.Go(func() { problems[i] = m.reconcile(origin) })
+	}
+	wait.Wait()
+	out := map[string]*exit.Error{}
+	for i, origin := range origins {
+		if problems[i] != nil {
+			out[origin] = problems[i]
 		}
 	}
-	return problems
+	return out
 }
 
 // reconcilableLocked is origin's rental rows, less those an operation in flight is
@@ -1375,6 +1456,12 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 		if current == nil || busy[view.id] {
 			continue
 		}
+		if view.ended && !view.released {
+			if m.failedOnceLocked(*current) {
+				failed = append(failed, current.ID)
+			}
+			continue
+		}
 		row, remote := *current, view.remote
 		row.StableMachineName = remote.StableMachineName
 		if view.unknown {
@@ -1455,15 +1542,24 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			// retries its existing execution without a second submission.
 			m.wakeQueueAsync()
 		}
-		if row.State == hub.RentalFailed && !m.letGone[row.ID] {
-			if m.letGone == nil {
-				m.letGone = map[string]bool{}
-			}
-			m.letGone[row.ID] = true
+		if m.failedOnceLocked(row) {
 			failed = append(failed, row.ID)
 		}
 	}
 	return released, failed, rebooted, nil
+}
+
+// failedOnceLocked reports a failed row the first time this daemon meets it: a failure is
+// let go once, not on every poll that repeats it.
+func (m *managedRentals) failedOnceLocked(row records.Rental) bool {
+	if row.State != hub.RentalFailed || m.letGone[row.ID] {
+		return false
+	}
+	if m.letGone == nil {
+		m.letGone = map[string]bool{}
+	}
+	m.letGone[row.ID] = true
+	return true
 }
 
 // letGo detaches the workers of rentals the hub has failed or released, and forgets the

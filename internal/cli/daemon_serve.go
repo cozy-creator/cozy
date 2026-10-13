@@ -146,6 +146,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	machines.updates = updates
 	fleet.boot = updates.Boot
 	fleet.wakeMachine = machines.WakeMachine
+	fleet.machineStatus = machines.statuses
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution: machines.Start,
 		Cfg:                   ctx.Cfg, Layout: l, Store: st, Log: ctx.Out,
@@ -208,11 +209,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
 		RentalInventory: func(call context.Context, hub string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
-			inventory, problem := readRentalInventory(st, fleet, hub, allHubs, reconcile)
-			if problem == nil {
-				machines.releaseDue(call, inventory.Rentals)
-			}
-			return inventory, problem
+			return readRentalInventory(call, st, fleet, hub, allHubs, reconcile)
 		},
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
