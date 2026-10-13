@@ -13,7 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRunCancelAbandonCLIIsLocalAndSurvivesDaemonRestart(t *testing.T) {
+func TestRunCancelAbandonCLIIsLocalAndSurvivesCalciferRestart(t *testing.T) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -25,7 +25,7 @@ func TestRunCancelAbandonCLIIsLocalAndSurvivesDaemonRestart(t *testing.T) {
 	before, problem := store.MachineExecution(request.ID)
 	fatal(t, problem)
 	store.Close()
-	svc := startDaemonProcess(t, root)
+	svc := startCalciferProcess(t, root)
 	refusal := svc.call(t, http.MethodPost, "/v1/local/requests/"+request.ID+"/abandon", map[string]any{})
 	if refusal.Status != http.StatusBadRequest {
 		t.Fatalf("unnamed abandonment: %s", refusal.brief())
@@ -87,7 +87,7 @@ func TestRunCancelAbandonCLIIsLocalAndSurvivesDaemonRestart(t *testing.T) {
 		t.Fatalf("stop isolated observer [%d]: %s", code, out)
 	}
 	<-svc.exited
-	svc = startDaemonProcess(t, root)
+	svc = startCalciferProcess(t, root)
 	row := svc.call(t, http.MethodGet, "/v1/requests/"+request.ID+"?recorded=1", nil)
 	if row.Status != http.StatusOK || !strings.Contains(string(row.Body), `"abandoned_locally":true`) {
 		t.Fatalf("restart forgot abandonment: %s", row.brief())

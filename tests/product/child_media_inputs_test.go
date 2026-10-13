@@ -90,8 +90,8 @@ func TestChildMediaBorrowsOnlyParentInputs(t *testing.T) {
 
 func TestJobMediaRequiresLocalCredentialBeforePathRead(t *testing.T) {
 	root := t.TempDir()
-	daemon := startDaemonProcess(t, root)
-	response := daemon.call(t, http.MethodPost, "/v1/local/jobs", map[string]any{
+	calcifer := startCalciferProcess(t, root)
+	response := calcifer.call(t, http.MethodPost, "/v1/local/jobs", map[string]any{
 		"package": "local/proof", "function": "score", "input": map[string]any{},
 		"local_assets": []map[string]any{{"field_path": "image", "local_path": "/not-a-granted-file", "digest": childDigest("8"), "length": 1}},
 	}, "Authorization", "")

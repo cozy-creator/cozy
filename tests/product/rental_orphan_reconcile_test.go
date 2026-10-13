@@ -159,18 +159,18 @@ func TestEndingAnUnrecordedMachineByItsHubNameReleasesIt(t *testing.T) {
 	}
 }
 
-// TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt is the idle ruling as behaviour.
+// TestTheCalciferSaysUnrecordedSpendAndDoesNotEndIt is the idle ruling as behaviour.
 //
-// Rentals end themselves after fifteen idle minutes; this daemon ends none on its own. A
+// Rentals end themselves after fifteen idle minutes; this Calcifer ends none on its own. A
 // rental the hub bills this account for that this host has no record of may be
-// another host's live machine: this daemon holds none of its credentials, cannot see
+// another host's live machine: this Calcifer holds none of its credentials, cannot see
 // its work, and cannot tell an abandoned pod from one somebody is using. Ending it on
 // that evidence is worse than the leak.
 //
-// So the daemon's answer is an ALARM, not a reaper: it says the machine, its rate and
+// So Calcifer's answer is an ALARM, not a reaper: it says the machine, its rate and
 // its unknown activity, once, and leaves control with the person paying.
-func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
-	root := filepath.Join(scratchBase, "rental-orphan-daemon")
+func TestTheCalciferSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
+	root := filepath.Join(scratchBase, "rental-orphan-calcifer")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	stand := newFakeRentalHub(t, 0)
@@ -179,8 +179,8 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	logPath := filepath.Join(root, "daemon.log")
+			"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
+	logPath := filepath.Join(root, "calcifer.log")
 
 	stand.publishListing()
 	orphan(stand, "pr-6666666666666666take", "takemikazuchi", 3_190_000)
@@ -198,13 +198,13 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-orphan-owned.pem"),
 	}))
 
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	awaitLog(t, logPath, "this host holds no record of it; activity is unknown to this controller",
 		20*time.Second)
 	// Several fleet ticks pass over it: it is said ONCE and never ended.
 	time.Sleep(6 * time.Second)
 	if stand.releases("pr-6666666666666666take") != 0 {
-		t.Fatalf("the daemon ended a machine it holds no record of and cannot judge\n%s", tail(logPath))
+		t.Fatalf("Calcifer ended a machine it holds no record of and cannot judge\n%s", tail(logPath))
 	}
 	log, _ := os.ReadFile(logPath)
 	if strings.Count(string(log), "this host holds no record of it; activity is unknown to this controller") != 1 {

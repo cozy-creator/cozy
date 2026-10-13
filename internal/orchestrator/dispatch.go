@@ -17,7 +17,7 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
-	// Hub is the Tensorhub origin the request belongs to; empty is the daemon's default.
+	// Hub is the Tensorhub origin the request belongs to; empty is Calcifer's default.
 	Hub                      string
 	RequestID                string // server-reserved identity for request-owned input capture
 	MachineExecutionObserver bool
@@ -37,7 +37,7 @@ type Submission struct {
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
 	// substitute it.
 	Payload []byte
-	// Assets are immutable, daemon-staged files bound to exact payload field paths.
+	// Assets are immutable, Calcifer-staged files bound to exact payload field paths.
 	// The request row keeps them so every requeue derives the same spec and grant.
 	Assets []records.AssetBinding
 
@@ -425,7 +425,7 @@ func (c *Orchestrator) startMachineExecution(req records.Request) *exit.Error {
 	c.mu.Lock()
 	if c.closing {
 		c.mu.Unlock()
-		return exit.Named(exit.Unavailable, "daemon.closing", "the daemon is closing; retained work will reconnect on startup")
+		return exit.Named(exit.Unavailable, "calcifer.closing", "Calcifer is closing; retained work will reconnect on startup")
 	}
 	token := "machine/" + req.ID
 	if c.starting[token] {
@@ -517,7 +517,7 @@ func settledState(state string) bool {
 // failQueued settles a request that can never be placed. It is a request-level terminal:
 // no offer crossed to a worker, so there is no worker terminal to replay and the request
 // row is what settles. A closed dispatch_aborted row may remain as preparation history.
-// retireClassic ends a request no machine executes and that is not the daemon's own
+// retireClassic ends a request no machine executes and that is not Calcifer's own
 // transfer: it was accepted for the retired classic worker.
 func (c *Orchestrator) retireClassic(req records.Request) {
 	cause := ClassicRetired()

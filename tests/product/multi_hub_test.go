@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -140,10 +140,10 @@ func plantMachineKey(t *testing.T, root, origin, deviceID string, private ed2551
 	must(t, os.WriteFile(filepath.Join(directory, hex.EncodeToString(key[:])+".json"), credential, 0o600))
 }
 
-// One daemon serves two Tensorhubs at once. A rental bought from hub A and a model
+// One Calcifer serves two Tensorhubs at once. A rental bought from hub A and a model
 // upload to hub B are both live under it; switching the current hub strands neither,
 // `rental end` reaches A with A's credential, and B never receives A's credential.
-func TestOneDaemonServesTwoHubs(t *testing.T) {
+func TestOneCalciferServesTwoHubs(t *testing.T) {
 	root, hubA, stand := rentalEndRoot(t, "multi-hub")
 	// Each hub knows only its own machine key and mints its own bearer for it; hub a's
 	// bearer is the one its rental routes accept.
@@ -180,12 +180,12 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
 		t.Fatalf("up: %d %s", code, out)
 	}
-	started := daemon.Probe(config.Config{Home: root})
+	started := calcifer.Probe(config.Config{Home: root})
 	if !started.Up {
-		t.Fatal("the daemon did not start")
+		t.Fatal("Calcifer did not start")
 	}
 
-	// The upload to hub b is accepted by the same daemon that holds a's rental.
+	// The upload to hub b is accepted by the same Calcifer that holds a's rental.
 	source := filepath.Join(root, "source.safetensors")
 	must(t, os.WriteFile(source, []byte("multi-hub upload source"), 0o600))
 	code, out := runCozy(t, root, "model", "upload", source, "proof/multi-hub", "--tensorhub=b", "--json")
@@ -270,8 +270,8 @@ func TestOneDaemonServesTwoHubs(t *testing.T) {
 	if witnessA.loggedIn("machine-a") == 0 || witnessB.loggedIn("machine-b") == 0 {
 		t.Fatal("a hub's own machine key was never used")
 	}
-	if after := daemon.Probe(config.Config{Home: root}); after.PID != started.PID {
-		t.Fatalf("a hub switch replaced the daemon: %d -> %d", started.PID, after.PID)
+	if after := calcifer.Probe(config.Config{Home: root}); after.PID != started.PID {
+		t.Fatalf("a hub switch replaced Calcifer: %d -> %d", started.PID, after.PID)
 	}
 }
 
@@ -463,10 +463,10 @@ func TestAllHubsListingIsolatesAnUnreadableHub(t *testing.T) {
 	}
 }
 
-// Removing a hub name takes effect in the running daemon: an every-hub listing stops asking
-// a hub only its name (or the daemon's start-up selection) brought in, and a rental recorded
+// Removing a hub name takes effect in the running Calcifer: an every-hub listing stops asking
+// a hub only its name (or Calcifer's start-up selection) brought in, and a rental recorded
 // on a hub whose name was removed stays listed, under its URL.
-func TestRemovedHubLeavesTheRunningDaemon(t *testing.T) {
+func TestRemovedHubLeavesTheRunningCalcifer(t *testing.T) {
 	root, hubA, standA := rentalEndRoot(t, "hub-remove")
 	standC := newFakeRentalHub(t, 0)
 	hubC := standC.server.URL
@@ -476,11 +476,11 @@ func TestRemovedHubLeavesTheRunningDaemon(t *testing.T) {
 		stand.server.Config.Handler = machineKeyLogin(device, public, "rental-idle-test", stand.server.Config.Handler)
 		plantMachineKey(t, root, stand.server.URL, device, private)
 	}
-	// b answers nothing and holds no login; the daemon starts with it current.
+	// b answers nothing and holds no login; Calcifer starts with it current.
 	const hubB = testDefaultHub
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: b\n"+
 		"hubs:\n  a: "+hubA+"\n  b: "+hubB+"\n  c: "+hubC+"\n"+
-		"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	const rentalC = "pr-c5c5c5c5c5c5c5c5c5c5"
 	standC.add(rentalC, "charlie")
 	standC.set(rentalC, "machine_name", "charlie")
@@ -492,7 +492,7 @@ func TestRemovedHubLeavesTheRunningDaemon(t *testing.T) {
 	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
 		t.Fatalf("up: %d %s", code, out)
 	}
-	started := daemon.Probe(config.Config{Home: root})
+	started := calcifer.Probe(config.Config{Home: root})
 
 	type listing struct {
 		Rentals []struct {
@@ -524,14 +524,14 @@ func TestRemovedHubLeavesTheRunningDaemon(t *testing.T) {
 		}
 	}
 	if doc := list(0); len(doc.Unreadable) != 0 || len(doc.Rentals) != 1 || doc.Rentals[0].ID != rentalC || doc.Rentals[0].Hub != hubC {
-		t.Fatalf("the running daemon still lists a removed hub, or dropped its rental: %+v", doc)
+		t.Fatalf("the running Calcifer still lists a removed hub, or dropped its rental: %+v", doc)
 	}
 	code, out := runCozy(t, root, "rental", "list", "--all-hubs", "--no-watch")
 	if code != 0 || strings.Contains(out, "unreachable") || !strings.Contains(out, "charlie") || !strings.Contains(out, hubC) {
 		t.Fatalf("human listing warned about a removed hub or lost charlie's URL: %d %s", code, out)
 	}
-	if after := daemon.Probe(config.Config{Home: root}); after.PID != started.PID {
-		t.Fatalf("the daemon was replaced: %d -> %d", started.PID, after.PID)
+	if after := calcifer.Probe(config.Config{Home: root}); after.PID != started.PID {
+		t.Fatalf("Calcifer was replaced: %d -> %d", started.PID, after.PID)
 	}
 }
 
@@ -707,13 +707,13 @@ func TestRunsWithoutAHubStayListed(t *testing.T) {
 	root := t.TempDir()
 	const hubA, hubB = "http://127.0.0.1:1", "http://127.0.0.1:2"
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: a\nport: 0\n"+
-		"daemon:\n  idle_shutdown_s: 0\nhubs:\n  a: "+hubA+"\n  b: "+hubB+"\n"), 0o600))
+		"calcifer:\n  idle_shutdown_s: 0\nhubs:\n  a: "+hubA+"\n  b: "+hubB+"\n"), 0o600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{ID: "pr-d5d5d5d5d5d5d5d5d5d5", MachineName: "delta", State: "ready",
 		Hub: hubB, AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	for id, worker := range map[string]string{"req-hubless-local": "", "req-hubless-rented": "pr-d5d5d5d5d5d5d5d5d5d5"} {
 		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: "sha256:" + strings.Repeat("ab", 32),
 			Package: "proof/example", Entrypoint: "generate", Payload: []byte("{}"), Worker: worker, Rental: worker != ""})

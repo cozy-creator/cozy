@@ -25,15 +25,15 @@ import (
 )
 
 // statusRental gives a fresh root a ready rental named "tessa" whose machine is the real one
-// (-machine-host) behind a stand-in Hub, and a running daemon.
-func statusRental(t *testing.T) (string, *records.Store, *machines.Launch, rental.CreatorIdentity, *daemonProcess) {
+// (-machine-host) behind a stand-in Hub, and a running Calcifer.
+func statusRental(t *testing.T) (string, *records.Store, *machines.Launch, rental.CreatorIdentity, *calciferProcess) {
 	t.Helper()
-	root, store, launch, identity, daemon, _ := statusRentalHub(t)
-	return root, store, launch, identity, daemon
+	root, store, launch, identity, calcifer, _ := statusRentalHub(t)
+	return root, store, launch, identity, calcifer
 }
 
 // statusRentalHub is statusRental with the stand-in Hub the rental was bought from.
-func statusRentalHub(t *testing.T) (string, *records.Store, *machines.Launch, rental.CreatorIdentity, *daemonProcess, *machineHub) {
+func statusRentalHub(t *testing.T) (string, *records.Store, *machines.Launch, rental.CreatorIdentity, *calciferProcess, *machineHub) {
 	t.Helper()
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: a machine serving cozy.machine.v1")
@@ -46,7 +46,7 @@ func statusRentalHub(t *testing.T) (string, *records.Store, *machines.Launch, re
 	root, err := os.MkdirTemp("", "czk")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "down")
 		if !t.Failed() {
@@ -71,8 +71,8 @@ func statusRentalHub(t *testing.T) (string, *records.Store, *machines.Launch, re
 		AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: h.server.URL,
 		Address: launch.Addr, MediaAddress: launch.MediaAddr, ExpectedWorkerID: launch.WorkerID, ExpectedWorkerBootID: launch.BootID}
 	fatal(t, rental.Attach(layout, store, row, cert, secret.New(token), identity))
-	daemon := startDaemonProcess(t, root)
-	return root, store, launch, identity, daemon, h
+	calcifer := startCalciferProcess(t, root)
+	return root, store, launch, identity, calcifer, h
 }
 
 // The accepted update survives a provider replacement. Its old address, TLS pin,
@@ -104,7 +104,7 @@ func TestRentalUpdateResumesOnAuthoritativeNativeReplacement(t *testing.T) {
 	fatal(t, problem)
 	old.State = "updating"
 	fatal(t, store.SaveRuntimeUpdate(*old))
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	eventually(t, root, "accepted update moves to native replacement", func() bool {
 		current, problem := store.RuntimeUpdate(parityRental)
 		return problem == nil && current != nil && current.ID != old.ID && !current.Active()
@@ -112,7 +112,7 @@ func TestRentalUpdateResumesOnAuthoritativeNativeReplacement(t *testing.T) {
 	current, problem := store.RuntimeUpdate(parityRental)
 	fatal(t, problem)
 	if current.State != "succeeded" || current.BootID != launch.BootID || string(current.Selection) != string(selection) {
-		t.Fatalf("replacement lost accepted software selection: %+v\n%s", current, tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("replacement lost accepted software selection: %+v\n%s", current, tail(filepath.Join(root, "calcifer.log")))
 	}
 	old.State = "failed"
 	if problem := store.SaveRuntimeUpdate(*old); problem == nil {
@@ -136,11 +136,11 @@ func TestRentalUpdateResumesOnAuthoritativeNativeReplacement(t *testing.T) {
 	}
 }
 
-// Ordinary CLI -> actual daemon/records -> the rental's machine over cozy.machine.v1. Only an
-// explicit keepalive moves the machine's deadline: listing and a daemon restart never do, and
+// Ordinary CLI -> actual calcifer/records -> the rental's machine over cozy.machine.v1. Only an
+// explicit keepalive moves the machine's deadline: listing and a Calcifer restart never do, and
 // an ending rental is not kept alive.
 func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
-	root, store, launch, identity, daemon, h := statusRentalHub(t)
+	root, store, launch, identity, calcifer, h := statusRentalHub(t)
 	cert := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf}))
 
 	// The machine's own deadline, read over its API with the rental's owner key.
@@ -163,7 +163,7 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 		t.Helper()
 		code, out := runCozy(t, root, "rental", "keepalive", "tessa", "--json", "--full")
 		if code != 0 {
-			t.Fatalf("keepalive CLI: %d %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("keepalive CLI: %d %s\n%s", code, out, tail(filepath.Join(root, "calcifer.log")))
 		}
 		var result struct {
 			ReleaseDue string `json:"release_due_at"`
@@ -187,29 +187,13 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	if code, out := runCozy(t, root, "rental", "list", "--json", "--no-watch"); code != 0 {
 		t.Fatalf("list: %s", out)
 	}
-	daemon = crashAndRestartTransactionDaemon(t, daemon)
+	calcifer = crashAndRestartTransactionCalcifer(t, calcifer)
 	if held() != second.UnixMilli() {
-		t.Fatal("listing or a daemon restart renewed the rental")
+		t.Fatal("listing or a Calcifer restart renewed the rental")
 	}
-	_ = daemon
+	_ = calcifer
 	if code, _ := runCozy(t, root, "rental", "keepalive", "tessa", "--duration", "0"); code == 0 {
 		t.Fatal("CLI duration override admitted")
-	}
-	if *olderCozy != "" {
-		// Version skew: a daemon that predates cozy.machine.v1 cannot keep a Rust rental
-		// alive, so the command does it itself over the rental's pinned machine.
-		if code, out := runCozy(t, root, "down"); code != 0 {
-			t.Fatalf("down [exit %d]\n%s", code, out)
-		}
-		up := exec.Command(*olderCozy, "up")
-		up.Env = childEnv(t, root)
-		if raw, err := up.CombinedOutput(); err != nil {
-			t.Fatalf("the older cozy did not start its daemon: %v\n%s", err, raw)
-		}
-		time.Sleep(20 * time.Millisecond)
-		if third := keepalive(); !third.After(second) || third.UnixMilli() != held() {
-			t.Fatal("keepalive under the older daemon did not reset the machine")
-		}
 	}
 
 	current, problem := store.RentalRow(parityRental)

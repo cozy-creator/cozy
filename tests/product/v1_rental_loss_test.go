@@ -9,7 +9,7 @@ import (
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
-// rentedRunV1 records a run the daemon placed on rental pr-owned-machine and sent there over
+// rentedRunV1 records a run Calcifer placed on rental pr-owned-machine and sent there over
 // cozy.machine.v1; accepted there when accepted, else its acceptance never reached this client.
 func rentedRunV1(t *testing.T, store *records.Store, label string, accepted bool) records.Request {
 	t.Helper()
@@ -179,7 +179,7 @@ func TestCancelingARunBackInTheOutboxEndsItAtOnce(t *testing.T) {
 }
 
 // A run that succeeded but whose result could not be written here waits for its machine to
-// hand it over; once its rental is gone, it no longer holds the daemon.
+// hand it over; once its rental is gone, it no longer holds Calcifer.
 func TestAnEndedRentalReleasesASucceededRunItCouldNotHandOver(t *testing.T) {
 	store := rentalLossStore(t)
 	request := rentedRunV1(t, store, "uncollected", true)
@@ -202,6 +202,6 @@ func TestAnEndedRentalReleasesASucceededRunItCouldNotHandOver(t *testing.T) {
 	_, problem := store.ForgetRental("pr-owned-machine")
 	fatal(t, problem)
 	if holds() {
-		t.Fatal("a succeeded run of an ended rental still holds the daemon")
+		t.Fatal("a succeeded run of an ended rental still holds Calcifer")
 	}
 }

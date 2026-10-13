@@ -38,7 +38,7 @@ func (s *Server) startRuntimeUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.runtimeUpdate == nil {
-		s.refuse(w, r, http.StatusServiceUnavailable, "runtime_update_unavailable", "this daemon cannot update private workers", "")
+		s.refuse(w, r, http.StatusServiceUnavailable, "runtime_update_unavailable", "this Calcifer cannot update private workers", "")
 		return
 	}
 	result, problem := s.runtimeUpdate(r.PathValue("rental_id"), *body)

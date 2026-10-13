@@ -24,9 +24,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machines"
@@ -237,8 +237,8 @@ func TestEndpointSoftwareUpdateUsesOwnerPreservesTensorFSAndReattaches(t *testin
 	defer store.Close()
 	rentals, problem := store.Rentals()
 	fatal(t, problem)
-	if !bytes.Equal(before, after) || len(rentals) != 0 || hubCalls.Load() != 0 || daemon.Probe(config.Config{Home: root}).Up || peer.controls.Load() != 0 {
-		t.Fatal("endpoint maintenance changed config, enrolled a rental, asked a Hub, started the daemon, or sent Control")
+	if !bytes.Equal(before, after) || len(rentals) != 0 || hubCalls.Load() != 0 || calcifer.Probe(config.Config{Home: root}).Up || peer.controls.Load() != 0 {
+		t.Fatal("endpoint maintenance changed config, enrolled a rental, asked a Hub, started Calcifer, or sent Control")
 	}
 }
 

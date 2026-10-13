@@ -286,7 +286,7 @@ func eventually(t *testing.T, root, what string, ok func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Minute); !ok(); time.Sleep(50 * time.Millisecond) {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s did not happen: %s\n%s", what, tail(filepath.Join(root, "daemon.log")), transportLogs(root))
+			t.Fatalf("%s did not happen: %s\n%s", what, tail(filepath.Join(root, "calcifer.log")), transportLogs(root))
 		}
 	}
 }
@@ -300,7 +300,7 @@ func cozyWithin(t *testing.T, root string, within time.Duration, args ...string)
 	cmd.Env = childEnv(t, root)
 	data, _ := cmd.CombinedOutput()
 	if ctx.Err() != nil {
-		t.Fatalf("cozy %s hung past %s: %s\n%s", strings.Join(args, " "), within, data, tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("cozy %s hung past %s: %s\n%s", strings.Join(args, " "), within, data, tail(filepath.Join(root, "calcifer.log")))
 	}
 	return cmd.ProcessState.ExitCode(), string(data)
 }

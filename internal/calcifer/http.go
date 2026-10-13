@@ -1,4 +1,4 @@
-package daemon
+package calcifer
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 )
 
 // HTTPServer owns both loopback listeners and their active handlers. It answers from the
-// moment it serves: until Open hands it the API, every request is told the daemon is
+// moment it serves: until Open hands it the API, every request is told Calcifer is
 // starting, so a bound port never holds connections nobody accepts. Canceling its request
 // context ends event streams; Shutdown then waits for buffered replies.
 type HTTPServer struct {
@@ -40,7 +40,7 @@ func (s *HTTPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Cache-Control", "no-store")
 	h.Set("Retry-After", "1")
 	w.WriteHeader(http.StatusServiceUnavailable)
-	_, _ = io.WriteString(w, `{"error":{"code":"daemon_starting","message":"the Cozy daemon is opening its records","remedy":"retry in a moment"}}`+"\n")
+	_, _ = io.WriteString(w, `{"error":{"code":"calcifer_starting","message":"Calcifer is opening its records","remedy":"retry in a moment"}}`+"\n")
 }
 
 func (s *HTTPServer) Serve(listener net.Listener) error { return s.server.Serve(listener) }
@@ -48,7 +48,7 @@ func (s *HTTPServer) Serve(listener net.Listener) error { return s.server.Serve(
 func (s *HTTPServer) Shutdown(ctx context.Context) error {
 	s.cancel()
 	if err := s.server.Shutdown(ctx); err != nil {
-		// An uncooperative handler cannot prevent bounded daemon teardown.
+		// An uncooperative handler cannot prevent bounded Calcifer teardown.
 		_ = s.server.Close()
 		return err
 	}

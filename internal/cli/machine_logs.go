@@ -20,11 +20,11 @@ func handleMachineLogs(ctx *Context) *exit.Error {
 // printMachineLog prints the TensorFS log a machine keeps, oldest line first. A machine whose
 // agent predates the read, or whose TensorFS has logged nothing, prints a note and succeeds.
 func printMachineLog(ctx *Context, machine, label string) *exit.Error {
-	daemon, problem := dial(ctx)
+	calcifer, problem := dial(ctx)
 	if problem != nil {
 		return problem
 	}
-	log, problem := daemon.MachineLog(machine, "tensorfs", 0)
+	log, problem := calcifer.MachineLog(machine, "tensorfs", 0)
 	if problem != nil {
 		return problem
 	}

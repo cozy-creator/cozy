@@ -46,7 +46,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 	m.mu.Lock()
 	if m.ctx.Err() != nil {
 		m.mu.Unlock()
-		return exit.Named(exit.Unavailable, "daemon.closing", "the client observer has disconnected")
+		return exit.Named(exit.Unavailable, "calcifer.closing", "the client observer has disconnected")
 	}
 	if m.running[request.ID] != nil {
 		m.mu.Unlock()
@@ -179,7 +179,7 @@ func (m *machineRuns) Refresh(parent context.Context, request records.Request) *
 		m.mu.Lock()
 		if m.ctx.Err() != nil {
 			m.mu.Unlock()
-			return exit.Named(exit.Unavailable, "daemon.closing", "the client observer has disconnected")
+			return exit.Named(exit.Unavailable, "calcifer.closing", "the client observer has disconnected")
 		}
 		following := m.running[request.ID]
 		if following == nil {
@@ -209,7 +209,7 @@ func (m *machineRuns) Refresh(parent context.Context, request records.Request) *
 		case <-parent.Done():
 			return exit.New(exit.Canceled, "machine observation detached")
 		case <-m.ctx.Done():
-			return exit.Named(exit.Unavailable, "daemon.closing", "the client observer has disconnected")
+			return exit.Named(exit.Unavailable, "calcifer.closing", "the client observer has disconnected")
 		}
 	}
 }
@@ -225,7 +225,7 @@ func (m *machineRuns) collectionRefused(id string) bool {
 	return problem == nil && code != ""
 }
 
-// Control wakes the daemon's durable cancellation delivery. A foreground controller
+// Control wakes Calcifer's durable cancellation delivery. A foreground controller
 // instead waits for the machine's acknowledgement before its CLI owner can close it;
 // --await separately observes the terminal outcome. A stopped local machine stays
 // canceling until `cozy run cancel` starts it. Pause/resume keep their synchronous path.

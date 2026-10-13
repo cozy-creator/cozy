@@ -29,7 +29,7 @@ const (
 	sharedSecond = "reference_media_to_video"
 )
 
-// The daemon derives the shared slots from what the owner bound: the sibling slot's class
+// Calcifer derives the shared slots from what the owner bound: the sibling slot's class
 // is the selected slot's, and its hub default names the same model release under the same
 // ladder (or offers the pinned lane). Another class, another release or another ladder is
 // another construction.

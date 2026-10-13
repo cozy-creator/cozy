@@ -2,7 +2,7 @@
 // process". Every entry under tmp/ is claimed through it: the owner holds a kernel lock
 // on `<dir>/.claim` for as long as it needs the bytes, and the lock dies with the
 // process, SIGKILL included. The owner removes the directory the moment the bytes are
-// dead (Release); the daemon's start-time sweep is the backstop for a writer that
+// dead (Release); Calcifer's start-time sweep is the backstop for a writer that
 // crashed — observed liveness and the request's recorded state, never elapsed time.
 package scratch
 
@@ -41,7 +41,7 @@ func Temp(root, prefix string) (*Dir, *exit.Error) {
 }
 
 // Named claims `<root>/<id>` — a request's scratch, named by the request so a restarted
-// daemon resumes what a crashed one left (a verified `.part` continues; anything else is
+// Calcifer resumes what a crashed one left (a verified `.part` continues; anything else is
 // re-derived) and the sweep can read the request's state for it. What a previous holder
 // left is kept: the claim proves nothing live holds it, and every reader re-verifies
 // bytes before trusting them.

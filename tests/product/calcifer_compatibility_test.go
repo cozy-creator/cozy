@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
 )
@@ -34,7 +34,7 @@ func compatibilityOwner(t *testing.T) (home.Layout, *os.File, int, <-chan error)
 	done := make(chan error, 1)
 	go func() { done <- process.Wait() }()
 	t.Cleanup(func() { _ = process.Process.Kill() })
-	lock, err := os.OpenFile(layout.Daemon, os.O_RDWR|os.O_CREATE, 0600)
+	lock, err := os.OpenFile(layout.Calcifer, os.O_RDWR|os.O_CREATE, 0600)
 	must(t, err)
 	must(t, flock.Exclusive(lock))
 	t.Cleanup(func() { _ = flock.Release(lock); _ = lock.Close() })
@@ -66,7 +66,7 @@ func compatibilityCLI(t *testing.T, root string, args ...string) (string, error)
 	return string(out), err
 }
 
-func TestDaemonAPICompatibilityPreservesLiveOwner(t *testing.T) {
+func TestCalciferAPICompatibilityPreservesLiveOwner(t *testing.T) {
 	for _, schema := range []string{"", "schema=1\n", "schema=999\n"} {
 		t.Run(strings.TrimSpace(schema), func(t *testing.T) {
 			layout, lock, pid, done := compatibilityOwner(t)
@@ -77,12 +77,12 @@ func TestDaemonAPICompatibilityPreservesLiveOwner(t *testing.T) {
 			}))
 			defer server.Close()
 			publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), schema)
-			before, err := os.ReadFile(layout.Daemon)
+			before, err := os.ReadFile(layout.Calcifer)
 			must(t, err)
 			if output, err := compatibilityCLI(t, layout.Root, "run", "list", "--json"); err != nil {
 				t.Fatalf("compatible API refused: %v %s", err, output)
 			}
-			after, err := os.ReadFile(layout.Daemon)
+			after, err := os.ReadFile(layout.Calcifer)
 			must(t, err)
 			if string(before) != string(after) {
 				t.Fatal("API access changed the owner's record")
@@ -96,7 +96,7 @@ func TestDaemonAPICompatibilityPreservesLiveOwner(t *testing.T) {
 	}
 }
 
-func TestDaemonCLIWaitsForPublication(t *testing.T) {
+func TestCalciferCLIWaitsForPublication(t *testing.T) {
 	for _, partial := range []string{"", "addr=", "addr=127.0.0.1:"} {
 		t.Run(partial, func(t *testing.T) {
 			layout, lock, pid, done := compatibilityOwner(t)
@@ -135,17 +135,17 @@ func TestDaemonCLIWaitsForPublication(t *testing.T) {
 	}
 }
 
-func TestDaemonHeldRecordNeverFallsBackToConfiguredPort(t *testing.T) {
+func TestCalciferHeldRecordNeverFallsBackToConfiguredPort(t *testing.T) {
 	layout, lock, pid, _ := compatibilityOwner(t)
 	_, err := lock.WriteAt([]byte("pid="+strconv.Itoa(pid)+"\n"), 0)
 	must(t, err)
-	state := daemon.Probe(config.Config{Home: layout.Root, Port: 8080})
+	state := calcifer.Probe(config.Config{Home: layout.Root, Port: 8080})
 	if !state.Up || state.Addr != "" || state.OperatorOwned {
 		t.Fatalf("incomplete owner record became a configured address or operator: %+v", state)
 	}
 }
 
-func TestDaemonReadinessWaitFollowsOwnerBeyondTenSeconds(t *testing.T) {
+func TestCalciferReadinessWaitFollowsOwnerBeyondTenSeconds(t *testing.T) {
 	fullRun(t, "outwaits the deleted ten-second readiness deadline")
 	layout, lock, pid, ownerDone := compatibilityOwner(t)
 	publishCompatibilityOwner(t, layout, lock, pid, "127.0.0.1:0", "")
@@ -182,7 +182,7 @@ func TestDaemonReadinessWaitFollowsOwnerBeyondTenSeconds(t *testing.T) {
 	}
 }
 
-func TestDaemonReadinessWaitCanBeInterruptedWithoutStoppingOwner(t *testing.T) {
+func TestCalciferReadinessWaitCanBeInterruptedWithoutStoppingOwner(t *testing.T) {
 	layout, lock, pid, ownerDone := compatibilityOwner(t)
 	publishCompatibilityOwner(t, layout, lock, pid, "127.0.0.1:0", "")
 	command := exec.Command(cozyBin, "up", "--json")
@@ -210,16 +210,16 @@ func TestDaemonReadinessWaitCanBeInterruptedWithoutStoppingOwner(t *testing.T) {
 		t.Fatal("interrupting caller stopped the owner")
 	default:
 	}
-	if state := daemon.Probe(config.Config{Home: layout.Root}); !state.Up || state.PID != pid {
+	if state := calcifer.Probe(config.Config{Home: layout.Root}); !state.Up || state.PID != pid {
 		t.Fatalf("interruption changed owner: %+v", state)
 	}
 }
 
-func TestDaemonOperatorLockRefusesBeforeAPIReadiness(t *testing.T) {
+func TestCalciferOperatorLockRefusesBeforeAPIReadiness(t *testing.T) {
 	layout, lock, pid, done := compatibilityOwner(t)
 	publishCompatibilityOwner(t, layout, lock, pid, "", "")
 	output, err := compatibilityCLI(t, layout.Root, "run", "list", "--json")
-	if err == nil || !strings.Contains(output, "daemon.operator_owned") {
+	if err == nil || !strings.Contains(output, "calcifer.operator_owned") {
 		t.Fatalf("operator handoff was not preserved: %v %s", err, output)
 	}
 	select {
@@ -232,7 +232,7 @@ func TestDaemonOperatorLockRefusesBeforeAPIReadiness(t *testing.T) {
 	}
 }
 
-func TestConcurrentCLIStartsConvergeOnOneEphemeralDaemon(t *testing.T) {
+func TestConcurrentCLIStartsConvergeOnOneEphemeralCalcifer(t *testing.T) {
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("port: 0\n"), 0600))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -256,14 +256,14 @@ func TestConcurrentCLIStartsConvergeOnOneEphemeralDaemon(t *testing.T) {
 	if t.Failed() {
 		t.FailNow()
 	}
-	state := daemon.Probe(config.Config{Home: root})
+	state := calcifer.Probe(config.Config{Home: root})
 	if !state.Up || state.PID <= 0 || state.Addr == "" || strings.HasSuffix(state.Addr, ":0") {
-		t.Fatalf("concurrent startup did not publish one bound daemon: %+v", state)
+		t.Fatalf("concurrent startup did not publish one bound Calcifer: %+v", state)
 	}
 	if output, err := compatibilityCLI(t, root, "run", "list", "--json"); err != nil {
 		t.Fatalf("winner did not remain ready: %v %s", err, output)
 	}
-	if next := daemon.Probe(config.Config{Home: root}); next.PID != state.PID {
+	if next := calcifer.Probe(config.Config{Home: root}); next.PID != state.PID {
 		t.Fatal("a subsequent client replaced the startup winner")
 	}
 }

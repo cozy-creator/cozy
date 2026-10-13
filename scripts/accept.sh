@@ -59,17 +59,17 @@ run exit
 check "retired exit command refuses instead of aliasing" "$([ "$CODE" = 2 ] && printf '%s' "$OUT" | grep -q 'unexpected argument exit' && echo 1 || echo 0)" "$OUT"
 
 run up --json
-check "up returns only useful daemon facts" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q '"url":"http://127.0.0.1:' && printf '%s' "$OUT" | grep -q '"changed":true' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data)"' && echo 1 || echo 0)" "$OUT"
-check "up writes the daemon's own bounded log" "$([ -s "$COZY_HOME/daemon.log" ] && grep -q 'Cozy daemon up:' "$COZY_HOME/daemon.log" && echo 1 || echo 0)" "$COZY_HOME/daemon.log"
+check "up returns only useful Calcifer facts" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q '"url":"http://127.0.0.1:' && printf '%s' "$OUT" | grep -q '"changed":true' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data)"' && echo 1 || echo 0)" "$OUT"
+check "up writes Calcifer's own bounded log" "$([ -s "$COZY_HOME/calcifer.log" ] && grep -q 'Calcifer up:' "$COZY_HOME/calcifer.log" && echo 1 || echo 0)" "$COZY_HOME/calcifer.log"
 
-run daemon log
-check "daemon log prints the daemon's words" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Cozy daemon up:' && echo 1 || echo 0)" "$OUT"
+run calcifer log
+check "cozy calcifer log prints Calcifer's words" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Calcifer up:' && echo 1 || echo 0)" "$OUT"
 
 run down
-check "down stops the explicit daemon" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'daemon: +stopped' && echo 1 || echo 0)" "$OUT"
+check "down stops the explicit Calcifer" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'calcifer: +stopped' && echo 1 || echo 0)" "$OUT"
 
 run run list --json
-check "run list can auto-start the same daemon" "$([ "$CODE" = 0 ] && grep -q '^token=' "$COZY_HOME/daemon.lock" && echo 1 || echo 0)" "$OUT"
+check "run list can auto-start the same Calcifer" "$([ "$CODE" = 0 ] && grep -q '^token=' "$COZY_HOME/calcifer.lock" && echo 1 || echo 0)" "$OUT"
 check "JSON success is domain-shaped without renderer scaffolding" "$(printf '%s' "$OUT" | grep -q '"invocations":\[\]' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data|fields|rows|count|aggregates)"' && echo 1 || echo 0)" "$OUT"
 
 if [ -n "$PACKAGE_ARCHIVE" ] && [ -f "$PACKAGE_ARCHIVE" ]; then
@@ -82,7 +82,7 @@ if [ -n "$PACKAGE_ARCHIVE" ] && [ -f "$PACKAGE_ARCHIVE" ]; then
 fi
 
 run down
-check "down stops the daemon and proves lock release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'daemon: +stopped' && echo 1 || echo 0)" "$OUT"
+check "down stops Calcifer and proves lock release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'calcifer: +stopped' && echo 1 || echo 0)" "$OUT"
 
 if [ -n "$UPGRADE" ] && [ -d "$UPGRADE" ]; then
   BEFORE="$("$COZY" -v)"

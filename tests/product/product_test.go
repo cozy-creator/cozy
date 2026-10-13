@@ -23,12 +23,12 @@ var tensorfsFixtureWheel = flag.String("tensorfs-fixture-wheel", "", "exact nati
 // TestProductPath is the one end-to-end product path: a local package installed from
 // source, invoked as a user types it, answered with a typed result and real bytes on
 // disk — then edited underneath a running system and re-invoked. Every step is the real
-// binary against a real daemon on a real root; the only fixture is the weightless
+// binary against a real Calcifer on a real root; the only fixture is the weightless
 // package, which has no weights and so needs no card.
 func TestProductPath(t *testing.T) {
 	// A per-process root: sessions on one box run this suite concurrently, and a shared
-	// fixed path let one run's setup wipe another's mid-flight. Short on purpose — the
-	// daemon's worker socket lives under it and unix socket paths are bounded.
+	// fixed path let one run's setup wipe another's mid-flight. Short on purpose —
+	// Calcifer's worker socket lives under it and unix socket paths are bounded.
 	root, err := os.MkdirTemp(os.TempDir(), "cozy-product-")
 	must(t, err)
 	t.Cleanup(func() {
@@ -291,14 +291,14 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("default run did not detach with its durable destination [exit %d]\nstdout:\n%s\nstderr:\n%s",
 			code, stdout, stderr)
 	}
-	// The daemon finishes the detached run and publishes its file with no client attached;
+	// Calcifer finishes the detached run and publishes its file with no client attached;
 	// a later watch reads the settled run and its export.
 	if code, out := runCozy(t, root, "run", "watch", submittedRunReference(t, code, stdout), "--json"); code != 0 ||
 		!strings.Contains(out, `"status":"completed"`) {
 		t.Fatalf("detached run did not complete [exit %d]\n%s", code, out)
 	}
 	if detached, err := os.ReadDir(detachedDir); err != nil || len(detached) != 1 || !requestOutputName(detached[0].Name(), ".webp") {
-		t.Fatalf("daemon did not publish the detached WebP: %v, %v", detached, err)
+		t.Fatalf("Calcifer did not publish the detached WebP: %v, %v", detached, err)
 	}
 
 	// cl-089 first half: an unwritable --out refuses AT SUBMIT, typed, before any GPU

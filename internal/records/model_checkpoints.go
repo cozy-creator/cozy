@@ -217,7 +217,7 @@ func (s *Store) AcknowledgeModelSourceCheckpoint(requestID, selection, bootID, p
 	return nil
 }
 
-// NextCheckpointGrantRevision fences refreshed capabilities across daemon restarts.
+// NextCheckpointGrantRevision fences refreshed capabilities across Calcifer restarts.
 // The counter covers one typed checkpoint slot; individual transfer identities remain exact.
 func (s *Store) NextCheckpointGrantRevision(requestID, kind, slot string) (uint64, *exit.Error) {
 	var revision int64
@@ -230,7 +230,7 @@ func (s *Store) NextCheckpointGrantRevision(requestID, kind, slot string) (uint6
 }
 
 // RecordCheckpointPublication precedes the external open so cancellation can release
-// every hold even if the daemon dies before the checkpoint is acknowledged.
+// every hold even if Calcifer dies before the checkpoint is acknowledged.
 func (s *Store) RecordCheckpointPublication(requestID, operation string, objects []byte) *exit.Error {
 	if _, err := s.db.Exec(`INSERT OR IGNORE INTO request_model_checkpoint_publications(request_id,operation,objects) VALUES(?,?,?)`,
 		requestID, operation, objects); err != nil {

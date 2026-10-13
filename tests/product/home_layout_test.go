@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/reclaim"
@@ -38,7 +38,7 @@ func rootEntries(t *testing.T, root string) []string {
 }
 
 // TestFreshHomeIsMinimal proves cl-116's allowlist as a property of a REAL fresh home:
-// opening the layout, the records authority and the daemon record creates exactly the
+// opening the layout, the records authority and the Calcifer record creates exactly the
 // target entries and nothing else — no triage/uploads/publications/workers/tmp/
 // companions root exists until real work does.
 func TestFreshHomeIsMinimal(t *testing.T) {
@@ -49,13 +49,13 @@ func TestFreshHomeIsMinimal(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 
-	held, problem := daemon.Hold(l, "127.0.0.1:0", l.Root+"/worker.sock")
+	held, problem := calcifer.Hold(l, "127.0.0.1:0", l.Root+"/worker.sock")
 	fatal(t, problem)
 	defer held.Release()
 	creds, problem := api.Mint(l)
 	fatal(t, problem)
 
-	want := []string{"creator.sqlite", "daemon.lock", "installs", "outputs"}
+	want := []string{"calcifer.lock", "creator.sqlite", "installs", "outputs"}
 	if got := rootEntries(t, root); strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("fresh home holds %v, want exactly %v", got, want)
 	}
@@ -65,10 +65,10 @@ func TestFreshHomeIsMinimal(t *testing.T) {
 	read, problem := api.ClientCredential(l)
 	fatal(t, problem)
 	if read.Digest() != creds.CLI.Digest() {
-		t.Fatal("the daemon record did not carry the minted client credential back")
+		t.Fatal("the Calcifer record did not carry the minted client credential back")
 	}
 	if runtime.GOOS != "windows" {
-		for _, path := range []string{l.Daemon, l.DB} {
+		for _, path := range []string{l.Calcifer, l.DB} {
 			info, err := os.Stat(path)
 			must(t, err)
 			if info.Mode().Perm() != 0o600 {

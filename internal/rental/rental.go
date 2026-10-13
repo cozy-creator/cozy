@@ -138,7 +138,7 @@ func PendingMediaToken(l home.Layout, operationKey string) (secret.Value, *exit.
 
 // RetainedAcquisitionCredentials reads the credentials minted before the paid
 // operation. It never replaces missing keys. Foreground completion may already
-// have moved them to their final names while a daemon observation was in flight.
+// have moved them to their final names while a Calcifer observation was in flight.
 func RetainedAcquisitionCredentials(l home.Layout, operation records.RentalOperation) (secret.Value, CreatorIdentity, *exit.Error) {
 	token, problem := tokenAt(l.PendingRentalMediaToken(operation.Key), "pending rental operation "+operation.Key)
 	if problem == nil {
@@ -291,10 +291,10 @@ func noAddress(id, state string) *exit.Error {
 		WithNext("cozy rental")
 }
 
-// Resolver is what the daemon entrypoint hands the orchestrator as `Options.Rentals`. It
+// Resolver is what the Calcifer entrypoint hands the orchestrator as `Options.Rentals`. It
 // is the dial-time resolution of the machine pin and Creator signing identity. It reads the
 // supplied reader on every call. The production reader asks the owning Hub, so
-// an existing daemon observes new rentals and replacement worker identities.
+// an existing Calcifer observes new rentals and replacement worker identities.
 func Resolver(l home.Layout, read func(string) (*records.Rental, *exit.Error)) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
 	return func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
 		row, e := read(id)

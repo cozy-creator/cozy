@@ -15,7 +15,7 @@ import (
 // which is byte for byte the behaviour before lanes were on the wire.
 
 // RentalDeviceEnvelope is the envelope a RENTED pod's worker holds: its width, spelled as
-// the ordinals its lanes index into. This daemon grants a rental nothing — the pod's cards
+// the ordinals its lanes index into. This Calcifer grants a rental nothing — the pod's cards
 // are the pod's, and its worker was launched over all of them by whoever provisioned it —
 // so this is not a grant but the paid WIDTH read back onto the same space a local grant
 // occupies, which is what lets one lane reader and one breach check serve both. A CPU

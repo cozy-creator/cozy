@@ -27,7 +27,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// A run reports its work as it happens, over the real CLI, daemon, Host and Runtime. The
+// A run reports its work as it happens, over the real CLI, Calcifer, Host and Runtime. The
 // package publishes three revisions of one output and one list item per revision. Each lands
 // in its item's one stable file in the outputs folder while the run goes on: the CLI names
 // the file once and each revision after, live video is appended in place, and completion

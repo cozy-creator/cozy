@@ -9,9 +9,9 @@ import (
 )
 
 // Unfinished work that only the retired classic worker session could run ends once,
-// named, at daemon start, as does a model transfer the daemon once ran itself; machine
+// named, at Calcifer start, as does a model transfer Calcifer once ran itself; machine
 // executions stay.
-func TestDaemonStartRetiresClassicWork(t *testing.T) {
+func TestCalciferStartRetiresClassicWork(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -49,7 +49,7 @@ func TestDaemonStartRetiresClassicWork(t *testing.T) {
 	retired, problem := store.RetireClassicWork()
 	fatal(t, problem)
 	if len(retired) != 3 {
-		t.Fatalf("retired %v, want the two unfinished classic requests and the daemon's old model transfer", retired)
+		t.Fatalf("retired %v, want the two unfinished classic requests and Calcifer's old model transfer", retired)
 	}
 	attempt, problem := store.AttemptRow(unacked.ID, 1)
 	fatal(t, problem)
@@ -87,9 +87,9 @@ func TestDaemonStartRetiresClassicWork(t *testing.T) {
 	}
 }
 
-// Custody tied to a rental this host knows has ended is forgotten at daemon start; custody
+// Custody tied to a rental this host knows has ended is forgotten at Calcifer start; custody
 // on a live rental stays held.
-func TestDaemonStartForgetsEndedRentalCustody(t *testing.T) {
+func TestCalciferStartForgetsEndedRentalCustody(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
 	fatal(t, problem)

@@ -26,10 +26,10 @@ import (
 // capability offline with its device key: nothing asks the Hub to authorize it.
 type fakeHubAccess struct {
 	server, origin, public, bearer string
-	deviceKeyID, userID           string
+	deviceKeyID, userID            string
 	// account is the signed-in account's name.
 	account string
-	device                        ed25519.PrivateKey
+	device  ed25519.PrivateKey
 	// refuse, when set, answers every trade invalid_grant.
 	refuse bool
 	mu     sync.Mutex

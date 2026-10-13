@@ -72,7 +72,7 @@ func TestRentalNewNamesARegisteredImageAndListShowsIt(t *testing.T) {
 	fatal(t, store.RecordRental(records.Rental{ID: recorded, MachineName: "wren", SKU: "cpu",
 		AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL}))
 	store.Close()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	code, out = runCozy(t, root, "rental", "list", "--json")
 	if code != 0 {
 		t.Fatalf("rental list failed: %d %s", code, out)

@@ -16,7 +16,7 @@ func killGroup(pid int) error { return syscall.Kill(-pid, syscall.SIGKILL) }
 // the run that started it, including a run that is interrupted or SIGKILLed.
 func detachSession(cmd *exec.Cmd) { cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} }
 
-// kill ends one process for certain: its group first, because a daemon detaches into its
+// kill ends one process for certain: its group first, because a Calcifer detaches into its
 // own session and therefore leads a group, then the bare pid for anything that does not.
 func kill(pid int) {
 	if pid <= 0 {

@@ -16,7 +16,7 @@ import (
 )
 
 // `cozy model download` without --rental installs into this computer's machine through the
-// same durable queue and Host preparation a rental uses: the daemon dials the real local
+// same durable queue and Host preparation a rental uses: Calcifer dials the real local
 // Host, never a classic worker, and the Host's own answer settles the installation.
 func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 	if *machineHostBinary == "" {
@@ -40,7 +40,7 @@ func TestLocalModelDownloadRunsOnThisComputersMachine(t *testing.T) {
 	root, err := os.MkdirTemp("", "czd")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "machine", "stop")
 		_, _ = runCozy(t, root, "down")

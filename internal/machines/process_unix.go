@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-// detach starts the Host in its own session: it survives this daemon as a pod survives its
+// detach starts the Host in its own session: it survives this Calcifer as a pod survives its
 // controller.
 func detach(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}

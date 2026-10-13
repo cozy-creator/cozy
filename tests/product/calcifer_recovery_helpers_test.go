@@ -8,19 +8,19 @@ import (
 	"time"
 )
 
-func crashAndRestartTransactionDaemon(t *testing.T, first *daemonProcess) *daemonProcess {
+func crashAndRestartTransactionCalcifer(t *testing.T, first *calciferProcess) *calciferProcess {
 	t.Helper()
 	must(t, first.cmd.Process.Kill())
 	select {
 	case <-first.exited:
 	case <-time.After(10 * time.Second):
-		t.Fatal("owned daemon process did not exit after SIGKILL")
+		t.Fatal("owned Calcifer process did not exit after SIGKILL")
 	}
-	second := startDaemonProcess(t, first.root)
+	second := startCalciferProcess(t, first.root)
 	// A hard crash leaves the old lock. Observe the new process replace it;
 	// deleting that lock here would hide the recovery behavior under test.
-	waitUntil(t, "restarted daemon publishes its new credential", func() bool {
-		data, err := os.ReadFile(filepath.Join(first.root, "daemon.lock"))
+	waitUntil(t, "restarted Calcifer publishes its new credential", func() bool {
+		data, err := os.ReadFile(filepath.Join(first.root, "calcifer.lock"))
 		if err != nil {
 			return false
 		}

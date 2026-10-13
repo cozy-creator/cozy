@@ -29,15 +29,15 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-// Client is one CLI process's connection to the running Cozy daemon.
+// Client is one CLI process's connection to the running Calcifer.
 type Client struct {
 	fixedTransport bool
 	base           string
@@ -47,19 +47,19 @@ type Client struct {
 	hub string
 	// allHubs widens history reads from the command's hub to every hub.
 	allHubs bool
-	// cfg locates the daemon record, so a following client can find a restarted daemon.
+	// cfg locates the Calcifer record, so a following client can find a restarted Calcifer.
 	cfg config.Config
 	// reattached is set on a following client: it is told once per re-attachment.
 	reattached func()
 }
 
-// reattachPoll is how often a following client re-reads the daemon record while no
-// daemon answers. It is a sampling rate, not a deadline: the wait ends only when a
-// daemon answers or the caller stops.
+// reattachPoll is how often a following client re-reads the Calcifer record while no
+// Calcifer answers. It is a sampling rate, not a deadline: the wait ends only when a
+// Calcifer answers or the caller stops.
 const reattachPoll = 250 * time.Millisecond
 
-// Following returns this client re-attaching across a daemon restart: a read or an event
-// stream that loses the daemon waits until a daemon answers again, adopts its address and
+// Following returns this client re-attaching across a Calcifer restart: a read or an event
+// stream that loses Calcifer waits until a Calcifer answers again, adopts its address and
 // credential, and continues. reattached is called once each time that happens.
 func (c *Client) Following(reattached func()) *Client {
 	following := *c
@@ -67,14 +67,14 @@ func (c *Client) Following(reattached func()) *Client {
 	return &following
 }
 
-// reattach waits for a live daemon's record and credential and adopts them. It returns
+// reattach waits for a live Calcifer's record and credential and adopts them. It returns
 // false only when the caller stops.
 func (c *Client) reattach(ctx context.Context) bool {
 	if c.fixedTransport {
 		return false
 	}
 	for {
-		if st := daemon.Probe(c.cfg); st.Up && st.Addr != "" {
+		if st := calcifer.Probe(c.cfg); st.Up && st.Addr != "" {
 			if next, e := Open(c.cfg, st); e == nil {
 				c.base, c.token = next.base, next.token
 				return true
@@ -88,18 +88,18 @@ func (c *Client) reattach(ctx context.Context) bool {
 	}
 }
 
-// lostDaemon answers whether a failed exchange means the daemon this client addressed went
-// away: the connection failed, or a daemon refused this client's credential while the record
+// lostCalcifer answers whether a failed exchange means the Calcifer this client addressed went
+// away: the connection failed, or a Calcifer refused this client's credential while the record
 // now carries another (a restart, however quick, mints a fresh one).
-func (c *Client) lostDaemon(problem *exit.Error) bool {
+func (c *Client) lostCalcifer(problem *exit.Error) bool {
 	if problem == nil {
 		return false
 	}
 	switch problem.ErrName() {
-	case "daemon_unreachable":
+	case "calcifer_unreachable":
 		return true
 	case "unauthenticated":
-		next, e := Open(c.cfg, daemon.State{})
+		next, e := Open(c.cfg, calcifer.State{})
 		return e == nil && next.token != c.token
 	}
 	return false
@@ -112,10 +112,10 @@ func (c *Client) AllHubs() *Client {
 	return &wide
 }
 
-// Open reads the running daemon's address and its 0600 credential. It never probes:
+// Open reads the running Calcifer's address and its 0600 credential. It never probes:
 // the caller already passed the shared exit-9 gate, and a second probe here would be a
 // second spelling of "is it up".
-func Open(cfg config.Config, st daemon.State) (*Client, *exit.Error) {
+func Open(cfg config.Config, st calcifer.State) (*Client, *exit.Error) {
 	l, e := home.Open(cfg.Home)
 	if e != nil {
 		return nil, e
@@ -136,7 +136,7 @@ func Open(cfg config.Config, st daemon.State) (*Client, *exit.Error) {
 	}, nil
 }
 
-// Addr is the daemon address this client talks to, for rendering.
+// Addr is the Calcifer address this client talks to, for rendering.
 func (c *Client) Addr() string { return strings.TrimPrefix(c.base, "http://") }
 
 // RentalInventory is this command's hub's fleet, or every hub's when allHubs.
@@ -198,7 +198,7 @@ func (c *Client) callContext(ctx context.Context, method, path string, body, out
 	recovering := false
 	for {
 		problem := c.exchange(ctx, method, path, body, out, headers...)
-		if c.reattached == nil || method != http.MethodGet || !c.lostDaemon(problem) {
+		if c.reattached == nil || method != http.MethodGet || !c.lostCalcifer(problem) {
 			if recovering && problem == nil {
 				c.reattached()
 			}
@@ -222,14 +222,14 @@ func (c *Client) exchange(ctx context.Context, method, path string, body, out an
 	res, err := c.http.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return exit.New(exit.Canceled, "the Cozy daemon request was canceled: %s", ctx.Err())
+			return exit.New(exit.Canceled, "the Calcifer request was canceled: %s", ctx.Err())
 		}
 		return c.unreachable(err)
 	}
 	defer res.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
 	if err != nil {
-		return exit.Internalf("the Cozy daemon answer could not be read: %s", err)
+		return exit.Internalf("Calcifer's answer could not be read: %s", err)
 	}
 	if res.StatusCode >= 300 {
 		return Refusal(res.StatusCode, data)
@@ -238,17 +238,17 @@ func (c *Client) exchange(ctx context.Context, method, path string, body, out an
 		return nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return exit.Internalf("the Cozy daemon answered %s with a body this client cannot read: %s",
+		return exit.Internalf("Calcifer answered %s with a body this client cannot read: %s",
 			path, err)
 	}
 	return nil
 }
 
-// unreachable is what a dead or dying daemon looks like from a client's seat: not a
+// unreachable is what a dead or dying Calcifer looks like from a client's seat: not a
 // refusal document, a transport failure. It carries the SAME remedy every server-backed
 // verb's exit-9 gate carries, because it is the same condition arriving later.
 func (c *Client) unreachable(err error) *exit.Error {
-	return exit.Named(exit.Unavailable, "daemon_unreachable", "the Cozy daemon stopped answering on %s: %s", c.Addr(), err).
+	return exit.Named(exit.Unavailable, "calcifer_unreachable", "Calcifer stopped answering on %s: %s", c.Addr(), err).
 		WithRemedy("it may have stopped mid-request; retry or run `cozy up`").
 		WithNext("cozy up", "cozy run list")
 }
@@ -272,7 +272,7 @@ func Refusal(status int, data []byte) *exit.Error {
 			body = body[:200] + "…"
 		}
 		return exit.Named(code, "untyped_answer",
-			"the Cozy daemon answered %d with no typed envelope: %s", status, body)
+			"Calcifer answered %d with no typed envelope: %s", status, body)
 	}
 	e := exit.Named(code, doc.Error.Code, "%s", doc.Error.Message)
 	if doc.Error.Remedy != "" {
@@ -296,7 +296,7 @@ func (c *Client) Submit(sub api.Submission, key string) (api.Handle, *exit.Error
 			return h, problem
 		}
 		if !caps.MachineEndpoints {
-			return h, exit.Named(exit.Unavailable, "daemon.machine_endpoint_unavailable", "this controller cannot retain an explicit machine endpoint; nothing was submitted")
+			return h, exit.Named(exit.Unavailable, "calcifer.machine_endpoint_unavailable", "this controller cannot retain an explicit machine endpoint; nothing was submitted")
 		}
 	}
 	if problem := c.requireModelOverrides(sub.Package, sub.Function, sub.Models); problem != nil {
@@ -313,14 +313,14 @@ func (c *Client) Capabilities() (api.Capabilities, *exit.Error) {
 }
 
 // At uses an owned foreground controller's normal authenticated API transport.
-// It neither reads nor rewrites a daemon record and never reattaches to another owner.
+// It neither reads nor rewrites a Calcifer record and never reattaches to another owner.
 func At(cfg config.Config, address string, token secret.Value) *Client {
 	return &Client{fixedTransport: true, base: "http://" + address, token: token, http: &http.Client{}, hub: cfg.HubURL, cfg: cfg}
 }
 
 // Request reads one request's lifecycle document.
-// Triage fetches one attempt's kept triage bundle — raw bytes, already verified by the
-// daemon against the terminal's own reference before it was stored (cl-116).
+// Triage fetches one attempt's kept triage bundle — raw bytes, already verified by
+// Calcifer against the terminal's own reference before it was stored (cl-116).
 func (c *Client) Triage(attemptKey string) ([]byte, *exit.Error) {
 	req, e := c.request(http.MethodGet, "/v1/local/attempts/"+url.PathEscape(attemptKey)+"/triage", nil)
 	if e != nil {
@@ -354,7 +354,7 @@ func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 	return life, e
 }
 
-// RecordedRequest reads the request as the daemon recorded it, without observing its
+// RecordedRequest reads the request as Calcifer recorded it, without observing its
 // machine first.
 func (c *Client) RecordedRequest(id string) (api.Lifecycle, *exit.Error) {
 	var life api.Lifecycle
@@ -363,7 +363,7 @@ func (c *Client) RecordedRequest(id string) (api.Lifecycle, *exit.Error) {
 }
 
 // RequestHistory is one page of run history, newest first, and how many matching runs are
-// older than it: nil from a daemon that does not count them.
+// older than it: nil from a Calcifer that does not count them.
 type RequestHistory struct {
 	Requests []api.Lifecycle `json:"requests"`
 	Older    *int            `json:"older"`
@@ -433,8 +433,8 @@ func (c *Client) SubmitOperation(machine string, op records.Operation) (api.Hand
 		return api.Handle{}, problem
 	}
 	if !caps.Operations {
-		return api.Handle{}, exit.Named(exit.Unavailable, "daemon.operations_unavailable",
-			"this computer's daemon predates numbered operations").
+		return api.Handle{}, exit.Named(exit.Unavailable, "calcifer.operations_unavailable",
+			"this computer's Calcifer predates numbered operations").
 			WithRemedy("restart it with `cozy down`; running work and rentals continue")
 	}
 	var h api.Handle
@@ -457,16 +457,16 @@ func (c *Client) RentalRuntimeUpdate(rentalID string) (api.RuntimeUpdate, *exit.
 	return result, problem
 }
 
-// Down stops the daemon. A plain down never cancels work and names what is in flight.
-// Under all=true, the daemon requests cancellation and returns the exact paid obligations
+// Down stops Calcifer. A plain down never cancels work and names what is in flight.
+// Under all=true, Calcifer requests cancellation and returns the exact paid obligations
 // the caller must terminate and confirm through Tensorhub before retrying.
-// ShuttingDown=true means the daemon is stopping.
+// ShuttingDown=true means Calcifer is stopping.
 func (c *Client) Down(all bool) (api.DownResult, *exit.Error) {
 	var out api.DownResult
-	// "force" is what a daemon from before this release needs to stop without refusing
-	// over work (the first down after an upgrade reaches one); a current daemon ignores it.
+	// "force" is what a Calcifer from before this release needs to stop without refusing
+	// over work (the first down after an upgrade reaches one); a current Calcifer ignores it.
 	body := map[string]bool{"all": all, "force": !all}
-	e := c.call(http.MethodPost, "/v1/local/daemon/down", body, &out)
+	e := c.call(http.MethodPost, "/v1/local/calcifer/down", body, &out)
 	return out, e
 }
 

@@ -544,7 +544,7 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, record host
 var errExitedAtStart = errors.New("the machine Host exited as it started")
 
 // spawn starts the Host detached from whatever started this process: as its own user unit
-// where user systemd runs (it outlives the daemon's unit and any session scope), else in
+// where user systemd runs (it outlives Calcifer's unit and any session scope), else in
 // its own session. Its output appends to host.log.
 func (h *Host) spawn(env []string, log *os.File) (int, error) {
 	if userunit.Available() {

@@ -22,8 +22,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
-// A rental's newly attached boot runs the Hub's target software before it takes work: the
-// daemon sends its machine Run kind: update with the target's published versions, once per
+// A rental's newly attached boot runs the Hub's target software before it takes work:
+// Calcifer sends its machine Run kind: update with the target's published versions, once per
 // boot, older or newer alike. A boot already on the target is left as it is; a target the
 // machine cannot install leaves it serving its own software, and that boot is not tried again.
 func TestARentalBootFollowsTheHubsTarget(t *testing.T) {
@@ -124,7 +124,7 @@ func TestARentalBootFollowsTheHubsTarget(t *testing.T) {
 	if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil || shown["status"] != "unchanged: it already runs this software" {
 		t.Fatalf("rental update with nothing named [exit %d]\n%s", code, out)
 	}
-	// The cozy names the target's versions: a daemon older than it reads an empty request as the
+	// The cozy names the target's versions: a Calcifer older than it reads an empty request as the
 	// newest published pair.
 	asked, problem := store.RuntimeUpdate(parityRental)
 	fatal(t, problem)
@@ -144,7 +144,7 @@ func TestALocalMachineStartFollowsTheHubsTargetUnlessPinned(t *testing.T) {
 	root, err := os.MkdirTemp("", "czf")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "machine", "stop")
 		_, _ = runCozy(t, root, "down")

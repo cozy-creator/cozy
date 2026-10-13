@@ -9,8 +9,8 @@ import (
 
 	"golang.org/x/text/width"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -31,7 +31,7 @@ func (p *RunProgress) rentalNotice(e localapi.Event) {
 	p.notice(e, line)
 }
 
-// reattachNotice says, once per daemon restart, that a follower re-attached: through the
+// reattachNotice says, once per Calcifer restart, that a follower re-attached: through the
 // live progress block while one is drawing, plainly otherwise.
 type reattachNotice struct {
 	ctx   *Context
@@ -39,9 +39,9 @@ type reattachNotice struct {
 }
 
 func (n *reattachNotice) say() {
-	const line = "daemon restarted; reattached"
-	// Later dials in this command address the restarted daemon, not the one that stopped.
-	n.ctx.Daemon = daemon.Probe(n.ctx.Cfg)
+	const line = "Calcifer restarted; reattached"
+	// Later dials in this command address the restarted Calcifer, not the one that stopped.
+	n.ctx.Calcifer = calcifer.Probe(n.ctx.Cfg)
 	if n.lines != nil {
 		n.lines.mu.Lock()
 		defer n.lines.mu.Unlock()

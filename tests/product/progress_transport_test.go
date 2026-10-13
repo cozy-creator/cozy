@@ -65,7 +65,7 @@ func TestPreparationSnapshotCarriesRentalAndSeparateModelProgress(t *testing.T) 
 	}
 }
 
-// Reattaching after daemon recovery has durable rental facts but may have no live
+// Reattaching after Calcifer recovery has durable rental facts but may have no live
 // preparation sample yet. The queue fallback must preserve that existing quote.
 func TestQueuePhaseFallbackRetainsRecordedRental(t *testing.T) {
 	o := hostOwner(t, "queue-rental-progress")

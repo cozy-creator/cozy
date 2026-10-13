@@ -11,16 +11,16 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Exercise the public grammar and authenticated daemon client against isolated peers. The
+// Exercise the public grammar and authenticated Calcifer client against isolated peers. The
 // command asks the Hub nothing: the machine reads the release at its hub (the newest when
 // none is named) and answers which it installed. No worker, Python environment or weights.
 func TestPackageInstallRental(t *testing.T) {
@@ -50,7 +50,7 @@ func TestPackageInstallRental(t *testing.T) {
 					return
 				}
 				if r.Method != "POST" || r.URL.Path != "/v1/local/machines/rental-proof/operations" || r.Header.Get("Authorization") == "" {
-					t.Errorf("unexpected daemon request: %s %s", r.Method, r.URL)
+					t.Errorf("unexpected Calcifer request: %s %s", r.Method, r.URL)
 					http.Error(w, "unexpected request", 500)
 					return
 				}
@@ -72,7 +72,7 @@ func TestPackageInstallRental(t *testing.T) {
 			check(problem)
 			defer store.Close()
 			check(store.RecordRental(records.Rental{ID: "rental-proof", MachineName: "kirukiru", State: "ready", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: hubPeer.URL}))
-			held, problem := daemon.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
+			held, problem := calcifer.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
 			check(problem)
 			defer held.Release()
 			_, problem = api.Mint(layout)

@@ -103,6 +103,6 @@ func TestCachedAccountSessionFollowsPersistedDeviceKeyChanges(t *testing.T) {
 	}
 	must(t, os.Remove(path))
 	if _, problem := manager.Authenticate(t.Context()); problem == nil || problem.ErrName() != "auth.machine_key_missing" {
-		t.Fatalf("a signed-out daemon retained its cached account session: %v", problem)
+		t.Fatalf("a signed-out Calcifer retained its cached account session: %v", problem)
 	}
 }

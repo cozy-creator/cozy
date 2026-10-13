@@ -62,7 +62,7 @@ func TestRentalShowUsesOnlyTheWorkerDeadline(t *testing.T) {
 	}
 }
 
-func TestRentalListUsesDaemonAPIWithoutOpeningSQLite(t *testing.T) {
+func TestRentalListUsesCalciferAPIWithoutOpeningSQLite(t *testing.T) {
 	layout, lock, pid, done := compatibilityOwner(t)
 	var reads atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,17 +79,17 @@ func TestRentalListUsesDaemonAPIWithoutOpeningSQLite(t *testing.T) {
 	defer server.Close()
 	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "schema=999\n")
 	// This file cannot be opened by SQLite. A client that still couples listing to
-	// its records reader fails before the daemon can provide a valid inventory.
-	before := []byte("newer daemon's private storage format")
+	// its records reader fails before Calcifer can provide a valid inventory.
+	before := []byte("newer Calcifer's private storage format")
 	must(t, os.WriteFile(layout.DB, before, 0600))
 	output, err := compatibilityCLI(t, layout.Root, "rental", "list", "--json")
 	if err != nil || !strings.Contains(output, `"machine":"shelly"`) || !strings.Contains(output, `"running":1`) || !strings.Contains(output, `"queued":2`) || reads.Load() != 1 {
-		t.Fatalf("rental list did not use the daemon inventory: %v %s (reads=%d)", err, output, reads.Load())
+		t.Fatalf("rental list did not use the Calcifer inventory: %v %s (reads=%d)", err, output, reads.Load())
 	}
 	after, err := os.ReadFile(layout.DB)
 	must(t, err)
 	if string(before) != string(after) {
-		t.Fatal("API listing changed daemon-owned storage")
+		t.Fatal("API listing changed Calcifer-owned storage")
 	}
 	select {
 	case <-done:
@@ -111,7 +111,7 @@ func TestRentalInventoryHumanDrainingKeepsRawStates(t *testing.T) {
 	// A paid ask with no rental yet is summed in one line, not drawn as a machine.
 	if err != nil || strings.Count(output, "draining") != 1 || !strings.Contains(output, "Unresolved rental acquisitions: 1") ||
 		strings.Contains(output, "release_requested") || !strings.Contains(output, "Rentals end themselves after 15 minutes idle") {
-		t.Fatalf("inventory lost human state or daemon-owned idle policy: %v %s", err, output)
+		t.Fatalf("inventory lost human state or Calcifer-owned idle policy: %v %s", err, output)
 	}
 	output, err = compatibilityCLI(t, layout.Root, "rental", "list", "--json")
 	if err != nil || strings.Count(output, `"state":"release_requested"`) != 2 || strings.Contains(output, `"state":"draining"`) {
@@ -137,9 +137,9 @@ func TestRentalInventoryAPIKeepsUnknownActivityAndPrivateFieldsAbsent(t *testing
 	defer hub.Close()
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: test\n"), 0600))
-	live := startDaemonProcess(t, root)
+	live := startCalciferProcess(t, root)
 	if code, output := runCozy(t, root, "rental", "list", "--json"); code != 0 || !strings.Contains(output, `"recorded":false`) {
-		t.Fatalf("real daemon inventory failed: %d %s", code, output)
+		t.Fatalf("real Calcifer inventory failed: %d %s", code, output)
 	}
 	// The CLI proof above reads the real server; its HTTP read model also keeps
 	// the unavailable activity absent instead of inventing idle zeroes.

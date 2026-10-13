@@ -96,7 +96,7 @@ var Routes = []Route{
 		"Update one private worker's Runtime under a maintenance hold.", "`cozy rental update`"},
 	{"GET", "/v1/local/rentals/{rental_id}/runtime-update", Local, true, false, false, "",
 		"Observe one private worker's recorded Runtime update.", "`cozy rental update`"},
-	{"POST", "/v1/local/daemon/down", Local, true, true, false, "",
+	{"POST", "/v1/local/calcifer/down", Local, true, true, false, "",
 		"stop, leaving work in flight running; under explicit --all request cancellation before confirmed rental teardown",
 		"cl-045 `cozy down [--all]`"},
 

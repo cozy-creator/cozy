@@ -16,7 +16,7 @@ import (
 )
 
 // Named hubs work like kubectl contexts: `cozy hub use` picks the hub later commands
-// address, `--tensorhub` picks one for a single command, and the one daemon serves every
+// address, `--tensorhub` picks one for a single command, and the one Calcifer serves every
 // hub at once. Records keep the hub they were created on, so switching strands nothing.
 
 func handleHubList(ctx *Context) *exit.Error {
@@ -82,7 +82,7 @@ func handleHubList(ctx *Context) *exit.Error {
 	return emit(ctx, list)
 }
 
-// localRentalsByHub counts this host's live rental records per hub, without the daemon.
+// localRentalsByHub counts this host's live rental records per hub, without Calcifer.
 func localRentalsByHub(ctx *Context) (map[string]int, bool) {
 	store, recorded := existingRecords(ctx)
 	if store == nil {
@@ -125,7 +125,7 @@ func handleHubUse(ctx *Context) *exit.Error {
 		{K: "hub", V: selected.HubLabel(origin)}, {K: "url", V: origin}, {K: "current", V: true},
 	}, "hub", "url")
 	record.Summary = []string{"Commands now use " + selected.HubLabel(origin) + " (" + origin + ")."}
-	record.Notes = []string{"existing runs and rentals keep their own hub; the daemon serves every hub"}
+	record.Notes = []string{"existing runs and rentals keep their own hub; Calcifer serves every hub"}
 	if ctx.Cfg.HubURLSource == "env" {
 		record.Summary = []string{"Saved " + selected.HubLabel(origin) + " as the current hub.", envHubNote}
 	}
@@ -159,7 +159,7 @@ func handleHubRemove(ctx *Context) *exit.Error {
 
 // adoptRentalHub points a command that names an existing rental at that rental's hub,
 // with that hub's credential: work on a record uses the record's hub. An explicit
-// --tensorhub is kept, and the daemon refuses the mismatch for this one command.
+// --tensorhub is kept, and Calcifer refuses the mismatch for this one command.
 func adoptRentalHub(ctx *Context, name string) {
 	name = strings.TrimSpace(name)
 	if name == "" || ctx.Cfg.HubURLSource == "flag" {

@@ -28,7 +28,7 @@ type HubCredit struct {
 // StateHubCredit records what hub stated; nil forgets it.
 func (s *Store) StateHubCredit(hub string, credit *HubCredit) *exit.Error {
 	// An observation the Hub states again at every listing: it never waits on the disk, which
-	// the daemon would otherwise sync every few seconds for as long as it holds a rental.
+	// Calcifer would otherwise sync every few seconds for as long as it holds a rental.
 	err := s.unsynced(func(tx *sql.Tx) error {
 		if credit == nil {
 			_, err := tx.Exec(`DELETE FROM hub_credit WHERE hub=?`, hub)

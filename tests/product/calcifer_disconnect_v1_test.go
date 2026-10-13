@@ -13,8 +13,8 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -37,9 +37,9 @@ func v1RetainedRun(t *testing.T, store *records.Store, label, rental string) rec
 // `cozy down` disconnects; it never ends work kept for its owner. A paused run, a failed one
 // and a finished one whose result is still on its machine stay exactly as they were across
 // two disconnects, and so does their rental.
-func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
+func TestCalciferDownPreservesInactiveRetainedWork(t *testing.T) {
 	root := t.TempDir()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -74,11 +74,11 @@ func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
 	}
 	for cycle := range 2 {
 		code, out := runCozy(t, root, "down", "--json")
-		if code != 0 || !strings.Contains(out, `"daemon":"stopped"`) {
+		if code != 0 || !strings.Contains(out, `"calcifer":"stopped"`) {
 			t.Fatalf("retained down [%d]: %s", code, out)
 		}
-		if daemon.Probe(config.Config{Home: root}).Up {
-			t.Fatal("daemon remained online")
+		if calcifer.Probe(config.Config{Home: root}).Up {
+			t.Fatal("Calcifer remained online")
 		}
 		for id, prior := range before {
 			current, problem := store.RequestRow(id)
@@ -106,12 +106,12 @@ func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
 	}
 }
 
-// A handoff its machine has not confirmed does not hold `cozy down`: the daemon stops, names it
+// A handoff its machine has not confirmed does not hold `cozy down`: Calcifer stops, names it
 // in flight, and leaves it exactly as it was, neither canceled nor accepted, for the next
-// daemon to confirm. A second down is a no-op.
-func TestDaemonDownDoesNotCancelAnUnconfirmedHandoff(t *testing.T) {
+// Calcifer to confirm. A second down is a no-op.
+func TestCalciferDownDoesNotCancelAnUnconfirmedHandoff(t *testing.T) {
 	root := t.TempDir()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -125,7 +125,7 @@ func TestDaemonDownDoesNotCancelAnUnconfirmedHandoff(t *testing.T) {
 	before, problem := store.RequestRow(request.ID)
 	fatal(t, problem)
 	code, out := runCozy(t, root, "down", "--json")
-	if code != 0 || !strings.Contains(out, `"daemon":"stopped"`) || !strings.Contains(out, request.ID) {
+	if code != 0 || !strings.Contains(out, `"calcifer":"stopped"`) || !strings.Contains(out, request.ID) {
 		t.Fatalf("down did not stop and name the unconfirmed handoff [%d]: %s", code, out)
 	}
 	after, problem := store.MachineExecution(request.ID)
@@ -141,8 +141,8 @@ func TestDaemonDownDoesNotCancelAnUnconfirmedHandoff(t *testing.T) {
 	if code != 0 || !strings.Contains(out, `"changed":false`) {
 		t.Fatalf("offline down restarted or refused [%d]: %s", code, out)
 	}
-	if daemon.Probe(config.Config{Home: root}).Up {
-		t.Fatal("offline down restarted the daemon")
+	if calcifer.Probe(config.Config{Home: root}).Up {
+		t.Fatal("offline down restarted Calcifer")
 	}
 }
 
@@ -160,7 +160,7 @@ func (r shutdownRaceResolver) ResolveRemoteJob(hub, pkg, release, function strin
 	return r.publishedRouteResolver.ResolveRemoteJob(hub, pkg, release, function, models, deferred)
 }
 
-func TestDaemonDownFencesConcurrentMachineIntake(t *testing.T) {
+func TestCalciferDownFencesConcurrentMachineIntake(t *testing.T) {
 	for _, beforeCommit := range []bool{true, false} {
 		t.Run(fmt.Sprintf("before_commit=%v", beforeCommit), func(t *testing.T) {
 			entered, release := make(chan struct{}), make(chan struct{})
@@ -220,7 +220,7 @@ func TestDaemonDownFencesConcurrentMachineIntake(t *testing.T) {
 				<-entered
 				replied <- response
 			}
-			down := call("/v1/local/daemon/down", map[string]bool{})
+			down := call("/v1/local/calcifer/down", map[string]bool{})
 			if beforeCommit {
 				if down.Code != http.StatusAccepted {
 					t.Fatalf("pre-commit down %d %s", down.Code, down.Body.String())
@@ -228,7 +228,7 @@ func TestDaemonDownFencesConcurrentMachineIntake(t *testing.T) {
 				<-stopped
 				close(release)
 				result := <-replied
-				if result.Code != http.StatusServiceUnavailable || !strings.Contains(result.Body.String(), "daemon_shutting_down") {
+				if result.Code != http.StatusServiceUnavailable || !strings.Contains(result.Body.String(), "calcifer_shutting_down") {
 					t.Fatalf("late intake crossed shutdown: %d %s", result.Code, result.Body.String())
 				}
 				row, problem := o.store.RequestByIdempotencyKey("shutdown-race")

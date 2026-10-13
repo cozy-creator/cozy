@@ -21,7 +21,7 @@ import (
 )
 
 // managedRentals serializes fleet admission, acknowledged keepalive and release. Each
-// rental's machine ends itself when idle; durable records survive daemon restarts.
+// rental's machine ends itself when idle; durable records survive Calcifer restarts.
 //
 // mu guards this struct and each decision's read-then-write of the records. It is never
 // held across Hub or provider I/O: an operation snapshots under it, asks with it
@@ -33,27 +33,27 @@ type managedRentals struct {
 	layout home.Layout
 	store  *records.Store
 	owner  *orchestrator.Orchestrator
-	// wakeQueue is installed by daemon setup. A rental becoming attachable is
+	// wakeQueue is installed by Calcifer setup. A rental becoming attachable is
 	// an external capacity edge: queued machine executions must be re-asked
 	// immediately rather than waiting for the next poll or a new CLI request.
 	wakeQueue func()
-	// forget closes the daemon's connection to a machine whose rental ended.
+	// forget closes Calcifer's connection to a machine whose rental ended.
 	forget func(string)
 	// placeReleased places again the runs a rental proven gone left in the outbox.
 	placeReleased func()
 	// boot brings a newly attached worker boot to the Hub's target software before it takes
-	// work: daemon setup installs it.
+	// work: Calcifer setup installs it.
 	boot func(string)
 	// wakeMachine asks again about the runs a newly attached boot holds.
 	wakeMachine func(string)
-	// machineStatus reads ready machines' own Status (daemon setup installs it); statuses is
+	// machineStatus reads ready machines' own Status (Calcifer setup installs it); statuses is
 	// the last read, by rental.
 	machineStatus func(context.Context, []hub.Rental) map[string]machineRead
 	statuses      map[string]machineRead
 	// said holds the last line printed about each rental, so the fleet speaks once per change.
 	said   map[string]string
 	closed bool
-	// census is each Tensorhub's account view, by origin. One daemon serves every hub;
+	// census is each Tensorhub's account view, by origin. One Calcifer serves every hub;
 	// each rental is reconciled, released and counted against the hub it was bought
 	// from, with that hub's own credential.
 	census map[string]*rentalCensus
@@ -89,7 +89,7 @@ type rentalCensus struct {
 	// reconcile. A 404 is not proof of provider destruction, so the row is KEPT and shown;
 	// it must never stop the reconcile of every other rental against the same hub.
 	hubUnknown map[string]bool
-	// observed is whether a full reconcile of this hub has finished since the daemon began.
+	// observed is whether a full reconcile of this hub has finished since Calcifer began.
 	observed bool
 }
 
@@ -720,7 +720,7 @@ func (m *managedRentals) catalog(origin string) ([]hub.RentalSKU, *exit.Error) {
 	return client(m.at(origin)).RentalSKUs(hctx, "")
 }
 
-// releaseOrphaned resumes after a daemon restart: every rental is reconciled with the hub
+// releaseOrphaned resumes after a Calcifer restart: every rental is reconciled with the hub
 // and lost work is recovered.
 func (m *managedRentals) releaseOrphaned() {
 	if problems := m.reconcileAll(); len(problems) > 0 {
@@ -739,7 +739,7 @@ func (m *managedRentals) releaseOrphaned() {
 // because it elapsed; the only thing a tick does is ask a question, and every decision is
 // still made from the answer.
 //
-// The sweep needs it because the daemon cannot learn a rental died any other way. Tensorhub
+// The sweep needs it because Calcifer cannot learn a rental died any other way. Tensorhub
 // owns provider reclaim, and a rental that fails AFTER it was serving reaches this host
 // through no other channel — the worker control stream dying looks the same as a network
 // blip, which is why it is not the signal. Every other reconcile is driven by a rental verb
@@ -750,8 +750,8 @@ func (m *managedRentals) releaseOrphaned() {
 // work happened to arrive and poll the hub for its own reasons.
 //
 // Ten seconds is chosen against the dispatch retry cadence, not picked round: a pinned
-// request re-asks its rental for a seat roughly every 20 s, so noticing at 10 s means the
-// daemon never spends a whole retry believing in a machine the hub has already reclaimed.
+// request re-asks its rental for a seat roughly every 20 s, so noticing at 10 s means
+// Calcifer never spends a whole retry believing in a machine the hub has already reclaimed.
 // The cost is one GET per rental — a fleet is a handful of pods, not a datacenter.
 const hubReconcileCadence = 10 * time.Second
 
@@ -1324,7 +1324,7 @@ func (m *managedRentals) failAskLocked(op records.RentalOperation, reason string
 	if op.RentalID != "" {
 		rental.ForgetPending(m.layout, op.Key)
 	}
-	// The daemon says so in its log; a command says so beside its own output.
+	// Calcifer says so in its log; a command says so beside its own output.
 	said := m.ctx.Err
 	if m.owner != nil {
 		said = m.ctx.Out
@@ -1400,9 +1400,9 @@ func (m *managedRentals) applyListingLocked(origin string, remote []hub.Rental, 
 	census.live, census.unrecorded = live, unrecorded
 }
 
-// sayUnrecordedLocked is the DAEMON's alarm, and it belongs to the sweep rather than
+// sayUnrecordedLocked is CALCIFER's alarm, and it belongs to the sweep rather than
 // to the reconcile because the reconcile also runs under a CLI verb, whose stdout is
-// a machine document that a log line would corrupt. The daemon has no reader watching
+// a machine document that a log line would corrupt. Calcifer has no reader watching
 // a board, so a machine billing outside its records has to reach the log by itself —
 // once per machine, at the sweep's own cadence, stating the missing local activity.
 func (m *managedRentals) sayUnrecordedLocked() {
@@ -1534,7 +1534,7 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (end
 // still bill, and keeping the row would leave its paid operation open forever. It runs with
 // the lock released.
 //
-// This is where the daemon LEARNS a rental died — it is the only place that reads the
+// This is where Calcifer LEARNS a rental died — it is the only place that reads the
 // hub's verdict for a rental that was already serving. An ended rental's worker record is
 // dropped so no replan can choose the corpse: `rentalHeld` reads live worker records and a
 // stale one would make `selectOrStart` decide the dead rental still holds the placement.

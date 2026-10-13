@@ -18,7 +18,7 @@ import (
 func TestLocalAPIDoor(t *testing.T) {
 	root := filepath.Join(scratchBase, "api-door")
 	must(t, os.RemoveAll(root))
-	svc := startDaemonProcess(t, root)
+	svc := startCalciferProcess(t, root)
 
 	// A credential is required, and the refusal is the TYPED envelope naming its scheme.
 	no := svc.call(t, "GET", "/v1/requests?limit=1", nil, "Authorization", "")
@@ -141,16 +141,16 @@ func TestLocalAPIDoor(t *testing.T) {
 		t.Errorf("a submission with no Idempotency-Key: %s", noKey.brief())
 	}
 
-	// The credential rides the daemon's own OS-protected record, never argv, and never
-	// appears in anything the daemon writes elsewhere.
-	info, err := os.Stat(filepath.Join(root, "daemon.lock"))
+	// The credential rides Calcifer's own OS-protected record, never argv, and never
+	// appears in anything Calcifer writes elsewhere.
+	info, err := os.Stat(filepath.Join(root, "calcifer.lock"))
 	must(t, err)
 	if info.Mode().Perm() != 0o600 {
-		t.Errorf("the daemon record carrying the credential is %v, wanted 0600", info.Mode().Perm())
+		t.Errorf("the Calcifer record carrying the credential is %v, wanted 0600", info.Mode().Perm())
 	}
-	log, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
+	log, _ := os.ReadFile(filepath.Join(root, "calcifer.log"))
 	if strings.Contains(string(log), svc.token) {
-		t.Error("the daemon's own log contains the credential")
+		t.Error("Calcifer's own log contains the credential")
 	}
 	if r := svc.call(t, "GET", "/v1/requests/req-nope", nil); strings.Contains(string(r.Body), svc.token) {
 		t.Error("a rendered error contains the credential")
@@ -165,7 +165,7 @@ func TestLocalAPIDoor(t *testing.T) {
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 		State: "ready", Hub: "https://hub.invalid",
 	}))
-	stopped := svc.call(t, "POST", "/v1/local/daemon/down", map[string]bool{"all": false})
+	stopped := svc.call(t, "POST", "/v1/local/calcifer/down", map[string]bool{"all": false})
 	if stopped.Status != http.StatusAccepted || !strings.Contains(string(stopped.Body), `"shutting_down":true`) {
 		t.Errorf("plain down refused an idle rental: %s", stopped.brief())
 	}

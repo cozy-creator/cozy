@@ -64,7 +64,7 @@ func civitaiPrimaryBytes(t *testing.T, version int) int64 {
 	return 0
 }
 
-// rentalCapture starts a daemon against a stand-in Hub that captures the first paid rental
+// rentalCapture starts a Calcifer against a stand-in Hub that captures the first paid rental
 // request and refuses it.
 func rentalCapture(t *testing.T) (string, func(*testing.T, []byte, int) hub.RentalRequest) {
 	t.Helper()
@@ -102,8 +102,8 @@ func rentalCapture(t *testing.T) (string, func(*testing.T, []byte, int) hub.Rent
 	t.Cleanup(func() { _ = removeAllForce(root) })
 	// An operator identity publishes to its named org without a Hub account read.
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+
-		"\ntensorhub_token: operator-proof\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	startDaemonProcess(t, root)
+		"\ntensorhub_token: operator-proof\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
+	startCalciferProcess(t, root)
 	return root, func(t *testing.T, out []byte, code int) hub.RentalRequest {
 		t.Helper()
 		deadline := time.Now().Add(90 * time.Second)
@@ -120,7 +120,7 @@ func rentalCapture(t *testing.T) (string, func(*testing.T, []byte, int) hub.Rent
 				return request
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("no rental was asked for [exit %d]: %s\nunserved Hub routes: %v\n%s", code, out, seen, tail(filepath.Join(root, "daemon.log")))
+				t.Fatalf("no rental was asked for [exit %d]: %s\nunserved Hub routes: %v\n%s", code, out, seen, tail(filepath.Join(root, "calcifer.log")))
 			}
 			time.Sleep(50 * time.Millisecond)
 		}

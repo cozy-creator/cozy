@@ -65,11 +65,11 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 // machineUpload hands the upload to the machine as a warm run of the pinned source with the
 // destination: the machine makes it with TensorFS profiles and puts the checkpoint there.
 func machineUpload(ctx *Context, machine, name string, parsed modelsource.Source, destination string) *exit.Error {
-	state, _, problem := ensureDaemon(ctx)
+	state, _, problem := ensureCalcifer(ctx)
 	if problem != nil {
 		return problem
 	}
-	ctx.Daemon = state
+	ctx.Calcifer = state
 	client, problem := localapi.Open(ctx.Cfg, state)
 	if problem != nil {
 		return problem

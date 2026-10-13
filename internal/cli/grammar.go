@@ -13,19 +13,19 @@ type CLI struct {
 	Full      bool     `help:"Include complete values and all available fields."`
 	Fields    []string `help:"Select result fields." sep:","`
 
-	Package PackageCmd `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
-	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
-	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Sign in to Tensorhub with this device key."`
-	Hub     HubCmd     `cmd:"" group:"Authentication" help:"Choose which Tensorhub commands use; one daemon serves them all."`
-	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
-	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
-	Machine MachineCmd `cmd:"" group:"Rentals" help:"This computer as a machine: the same Host a rental runs."`
-	Credits CreditsCmd `cmd:"" group:"Rentals" help:"Your prepaid Tensorhub credit: balance, history, and buying more."`
-	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
-	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
-	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui; running work continues."`
-	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
-	Dev     DevCmd     `cmd:"" group:"Development" help:"Explicit tools for owned development services."`
+	Package  PackageCmd  `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
+	Model    ModelCmd    `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
+	Auth     AuthCmd     `cmd:"" group:"Authentication" help:"Sign in to Tensorhub with this device key."`
+	Hub      HubCmd      `cmd:"" group:"Authentication" help:"Choose which Tensorhub commands use; one Calcifer serves them all."`
+	Run      RunCmd      `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
+	Rental   RentalCmd   `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
+	Machine  MachineCmd  `cmd:"" group:"Rentals" help:"This computer as a machine: the same Host a rental runs."`
+	Credits  CreditsCmd  `cmd:"" group:"Rentals" help:"Your prepaid Tensorhub credit: balance, history, and buying more."`
+	Rent     RentalCmd   `cmd:"" hidden:"" help:"Alias of cozy rental."`
+	Up       UpCmd       `cmd:"" group:"Lifecycle" help:"Start Calcifer and localhost web-ui."`
+	Down     DownCmd     `cmd:"" group:"Lifecycle" help:"Stop Calcifer and localhost web-ui; running work continues."`
+	Calcifer CalciferCmd `cmd:"" group:"Lifecycle" help:"Read Calcifer's own log."`
+	Dev      DevCmd      `cmd:"" group:"Development" help:"Explicit tools for owned development services."`
 
 	Completion CompletionCmd `cmd:"" group:"Lifecycle" help:"Print a bash, zsh or fish tab-completion script."`
 }
@@ -125,16 +125,16 @@ func (c *MachineLogsCmd) Run(r *Runtime) error {
 	return r.call(handleMachineLogs, nil, bools("--tensorfs", c.TensorFS), nil, false)
 }
 
-type DaemonCmd struct {
-	Log DaemonLogCmd `cmd:"" help:"Print the cozy-daemon log ($COZY_HOME/daemon.log)."`
+type CalciferCmd struct {
+	Log CalciferLogCmd `cmd:"" help:"Print Calcifer's log ($COZY_HOME/calcifer.log)."`
 }
 
-type DaemonLogCmd struct {
-	Follow bool `short:"f" help:"Keep printing as the daemon writes."`
+type CalciferLogCmd struct {
+	Follow bool `short:"f" help:"Keep printing as Calcifer writes."`
 }
 
-func (c *DaemonLogCmd) Run(r *Runtime) error {
-	return r.call(handleDaemonLog, nil, bools("--follow", c.Follow), nil, false)
+func (c *CalciferLogCmd) Run(r *Runtime) error {
+	return r.call(handleCalciferLog, nil, bools("--follow", c.Follow), nil, false)
 }
 
 type AuthCmd struct {
@@ -316,7 +316,7 @@ type PackageRemoveCmd struct {
 }
 
 func (c *PackageRemoveCmd) Run(r *Runtime) error {
-	// The daemon is ensured inside the verb, after the removal: a daemon started here
+	// Calcifer is ensured inside the verb, after the removal: a Calcifer started here
 	// sweeps unreferenced installs on boot, and the verb would then find nothing to
 	// report for a package whose pin was already gone.
 	return r.call(handleRm, c.Refs, nil, values("--rental", c.Rental), false)

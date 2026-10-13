@@ -28,7 +28,7 @@ import (
 //
 // A rental that is only unreachable (degraded) proves nothing: its unconfirmed run waits on it.
 //
-// The daemon is the real process against a hub that moves the rental to `failed` the way
+// Calcifer is the real process against a hub that moves the rental to `failed` the way
 // Tensorhub does, only after proving provider absence.
 func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 	root := filepath.Join(scratchBase, "v1-rental-failure-recovery")
@@ -43,8 +43,8 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 	hub := newFakeRentalHub(t, 0)
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubURL+"\n"+
-		"tensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	logPath := filepath.Join(root, "daemon.log")
+		"tensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
+	logPath := filepath.Join(root, "calcifer.log")
 	hub.packageReleases = map[string]any{"fake/lost@1": rentalReleaseFacts()}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -98,7 +98,7 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 		}
 	}
 
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	// THE MACHINE DIES. That state, not an elapsed clock, is the whole trigger.
 	hub.setState("rental-lost", "failed", "readiness.receipt_conflict")
 
@@ -188,8 +188,8 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 	}
 }
 
-// A failure the previous daemon recorded, which released an unconfirmed run to the outbox,
-// is let go again by the next daemon on its first look: the run is placed again even though
+// A failure the previous Calcifer recorded, which released an unconfirmed run to the outbox,
+// is let go again by the next Calcifer on its first look: the run is placed again even though
 // no poll will ever show the rental changing.
 func TestARunReleasedBeforeARestartIsPlacedAgain(t *testing.T) {
 	root := filepath.Join(scratchBase, "v1-rental-failure-restart")
@@ -204,7 +204,7 @@ func TestARunReleasedBeforeARestartIsPlacedAgain(t *testing.T) {
 	hub := newFakeRentalHub(t, 0)
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubURL+"\n"+
-		"tensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"tensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	hub.packageReleases = map[string]any{"fake/lost@1": rentalReleaseFacts()}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -224,7 +224,7 @@ func TestARunReleasedBeforeARestartIsPlacedAgain(t *testing.T) {
 	if send, problem := store.MarkRunV1Sent(id); problem != nil || !send {
 		t.Fatalf("the run was not sent: %v %v", send, problem)
 	}
-	// What the previous daemon recorded before it stopped: the failure, and the run released.
+	// What the previous Calcifer recorded before it stopped: the failure, and the run released.
 	rental.State = "failed"
 	rental.Failure = records.RentalFailure{Code: "readiness.receipt_conflict"}
 	fatal(t, store.RecordRental(rental))
@@ -232,7 +232,7 @@ func TestARunReleasedBeforeARestartIsPlacedAgain(t *testing.T) {
 		t.Fatalf("the fixture's run was not released to the outbox: %+v %v", link, problem)
 	}
 
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	for deadline := time.Now().Add(60 * time.Second); ; time.Sleep(500 * time.Millisecond) {
 		events, problem := store.EventsAfter(id, 0, 1000)
 		fatal(t, problem)
@@ -243,7 +243,7 @@ func TestARunReleasedBeforeARestartIsPlacedAgain(t *testing.T) {
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the released run was not placed again after the restart\n%s", tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("the released run was not placed again after the restart\n%s", tail(filepath.Join(root, "calcifer.log")))
 		}
 	}
 }

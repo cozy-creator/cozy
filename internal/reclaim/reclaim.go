@@ -94,7 +94,7 @@ func Workers(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 }
 
 // Worker reclaims one closed worker's root. With keepLog the log stays for the person
-// the exit message pointed at it; the next daemon start removes the rest.
+// the exit message pointed at it; the next Calcifer start removes the rest.
 func Worker(l home.Layout, instanceID string, keepLog bool) (int64, *exit.Error) {
 	dir := l.WorkerDir(instanceID)
 	if instanceID == "" || filepath.Base(instanceID) != instanceID || filepath.Dir(dir) != l.Workers {
@@ -341,7 +341,7 @@ func publicationRoot(l home.Layout, st *records.Store, root, requestID string) (
 		return 0, false, problem
 	}
 	if publication == nil {
-		// A run's product store is the daemon's copy of its output log.
+		// A run's product store is Calcifer's copy of its output log.
 		if products, problem := st.Products(requestID); problem != nil || len(products) > 0 {
 			return 0, false, problem
 		}

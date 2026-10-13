@@ -25,9 +25,9 @@ whether execution is available.
 
 The CLI composes the existing business API, capture, orchestration and transport in
 its own process. It writes normal install/request/output records in the existing
-home, without taking the daemon lock, changing the machine roster, changing Hub
-configuration, starting a local machine or performing daemon reconciliation. The
-running daemon and global CLI installation need not change. An older controller
+home, without taking the Calcifer lock, changing the machine roster, changing Hub
+configuration, starting a local machine or performing Calcifer reconciliation. The
+running Calcifer and global CLI installation need not change. An older controller
 that cannot retain the selector is refused before any submission POST.
 
 `cozy run watch <number-or-id>`, `show` and `cancel` use that request's retained

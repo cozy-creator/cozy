@@ -11,7 +11,7 @@ import (
 )
 
 // A published job run on this computer with --upload-to takes its Tree input like every other
-// job: the daemon captures the directory and the machine materializes it for the callable,
+// job: Calcifer captures the directory and the machine materializes it for the callable,
 // whether it is bound with --input-tree or --asset. The stand-in Hub serves no checkpoint
 // publication, so each run ends at its upload call, after the job ran against the tree.
 func TestAPublishedUploadJobStagesItsInputTree(t *testing.T) {

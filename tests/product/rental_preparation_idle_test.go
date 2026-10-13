@@ -75,14 +75,14 @@ func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
 
 // Preparation can spend minutes on a paid pod before an attempt exists. The terminal
 // request event ends that work even across a controller restart; the listing never
-// invents the machine's deadline, and the daemon never releases the rental itself.
+// invents the machine's deadline, and Calcifer never releases the rental itself.
 func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 	for _, outcome := range []string{"failed", "canceled"} {
 		t.Run(outcome, func(t *testing.T) {
 			root := t.TempDir()
 			defer func() {
 				if t.Failed() {
-					t.Log(tail(filepath.Join(root, "daemon.log")))
+					t.Log(tail(filepath.Join(root, "calcifer.log")))
 				}
 			}()
 			peer := newFakeRentalHub(t, 0)
@@ -91,7 +91,7 @@ func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\n"+
 					""+
-					"daemon:\n  idle_shutdown_s: 0\n"), 0600))
+					"calcifer:\n  idle_shutdown_s: 0\n"), 0600))
 			peer.publishListing()
 			const rentalID, requestID = "rental-preparation-idle", "job-preparation-idle"
 			peer.add(rentalID, "sherlock")
@@ -108,7 +108,7 @@ func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 				Package: "proof/preparing", Entrypoint: "prepare", Payload: []byte("{}"),
 				Rental: true, RentalRequired: true, Worker: rentalID, RequestedRental: rentalID})
 			fatal(t, problem)
-			// Observe the queued setup before starting the real daemon below.
+			// Observe the queued setup before starting the real Calcifer below.
 			// The listing command now starts it, allowing the intentional missing-
 			// bearer refusal to settle before an initial queued-state assertion.
 			queued, running, problem := store.RentalRunCounts(rentalID)
@@ -117,9 +117,9 @@ func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 				t.Fatalf("preparation setup lost queued work: queued=%d running=%d", queued, running)
 			}
 			if outcome == "failed" {
-				// The real daemon rejects preparation: this recorded peer has no
+				// The real Calcifer rejects preparation: this recorded peer has no
 				// media credential. No attempt exists, exactly as with run467.
-				d := startDaemonProcess(t, root)
+				d := startCalciferProcess(t, root)
 				until := time.Now().Add(10 * time.Second)
 				for {
 					r, problem := store.RequestRow(requestID)
@@ -136,10 +136,10 @@ func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 				select {
 				case code := <-d.exited:
 					if code != 0 {
-						t.Fatalf("daemon exit=%d", code)
+						t.Fatalf("Calcifer exit=%d", code)
 					}
 				case <-time.After(10 * time.Second):
-					t.Fatal("daemon did not stop")
+					t.Fatal("Calcifer did not stop")
 				}
 			} else {
 				// No idle sweep can observe this transition; use its durable event.
@@ -166,12 +166,12 @@ func TestRentalPreparationSettlementEndsItsWorkAcrossRestart(t *testing.T) {
 			if listed.Queued == nil || *listed.Queued != 0 || listed.Running == nil || *listed.Running != 0 || listed.ReleaseDue != "" {
 				t.Fatalf("settled preparation still listed as work, or a deadline from a machine that cannot answer: %+v", listed)
 			}
-			startDaemonProcess(t, root)
+			startCalciferProcess(t, root)
 			if queued, running, problem := store.RentalWorkCounts(rentalID, ""); problem != nil || queued+running != 0 {
 				t.Fatalf("restart revived settled preparation: queued=%d running=%d %v", queued, running, problem)
 			}
 			if peer.releases(rentalID) != 0 {
-				t.Fatal("the daemon released a rental; its machine ends itself")
+				t.Fatal("Calcifer released a rental; its machine ends itself")
 			}
 			attempts, problem := store.Attempts(requestID)
 			fatal(t, problem)

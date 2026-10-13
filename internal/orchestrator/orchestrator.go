@@ -20,7 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Options is the frozen input to one Cozy daemon. Every field is decided by the
+// Options is the frozen input to one Calcifer. Every field is decided by the
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
 	// StartMachineExecution transfers and observes an execution owned by Runtime.
@@ -31,7 +31,7 @@ type Options struct {
 	Layout         home.Layout
 	Store          *records.Store
 	Log            io.Writer
-	// Rentals resolves an attached rental id to its dial spec; nil = this daemon attaches
+	// Rentals resolves an attached rental id to its dial spec; nil = this Calcifer attaches
 	// no rentals.
 	Rentals func(id string) (*RemoteTarget, *exit.Error)
 }
@@ -150,7 +150,7 @@ const (
 	VerdictExcluded = "excluded:"
 )
 
-// Attached says the candidate is a rental this daemon already holds.
+// Attached says the candidate is a rental this Calcifer already holds.
 func (c PlacementCandidate) Attached() bool { return c.Rental != "" }
 
 // Name is how a reader knows the candidate: the machine word, or the product.
@@ -243,7 +243,7 @@ func (c PlacementCandidate) describe() string {
 	return name + " (" + strings.Join(detail, ", ") + ")"
 }
 
-// verdicts renders every candidate with its verdict, for the daemon log.
+// verdicts renders every candidate with its verdict, for the Calcifer log.
 func (d PlacementDecision) verdicts() string {
 	parts := make([]string, 0, len(d.Candidates))
 	for _, c := range d.Candidates {
@@ -299,11 +299,11 @@ const (
 	ExcludedDiskShort = "disk_short"
 )
 
-// Orchestrator is the Cozy daemon's scheduling role.
+// Orchestrator is Calcifer's scheduling role.
 type Orchestrator struct {
 	opt Options
 
-	// done closes when the daemon is closing; Serve blocks on it. closeOnce makes Close
+	// done closes when Calcifer is closing; Serve blocks on it. closeOnce makes Close
 	// idempotent — harnesses close defensively and twice is not an event.
 	done      chan struct{}
 	closeOnce sync.Once
@@ -320,7 +320,7 @@ type Orchestrator struct {
 	// parked is the last wait each queued request announced, by id. An entry lives
 	// exactly as long as its request is in `pending`.
 	parked map[string]string
-	// closing is set by Close: nothing new starts on a daemon that is going away.
+	// closing is set by Close: nothing new starts on a Calcifer that is going away.
 	closing bool
 	// starting names the machine executions whose start is in flight.
 	starting map[string]bool
@@ -343,7 +343,7 @@ type wait struct {
 }
 
 // Open builds the orchestrator. No listener binds here: the owner DIALS each worker's
-// own socket (#436); a second Cozy daemon on one root fails on the daemon lock instead.
+// own socket (#436); a second Calcifer on one root fails on the Calcifer lock instead.
 func Open(opt Options) (*Orchestrator, *exit.Error) {
 	if opt.Log == nil {
 		opt.Log = io.Discard
@@ -369,7 +369,7 @@ func (c *Orchestrator) Serve() error {
 	return nil
 }
 
-// Close ends the daemon's own work: machines keep running theirs.
+// Close ends Calcifer's own work: machines keep running theirs.
 func (c *Orchestrator) Close(grace time.Duration) {
 	c.mu.Lock()
 	c.closing = true

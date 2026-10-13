@@ -26,7 +26,7 @@ func TestALocalUploadCarriesACapabilityForThisComputersMachine(t *testing.T) {
 	root, err := os.MkdirTemp("", "czg")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	h.hubAccess.signIn(t, root)
 	t.Cleanup(func() {
 		_, _ = runCozy(t, root, "machine", "stop")
@@ -58,7 +58,7 @@ func TestALocalUploadCarriesACapabilityForThisComputersMachine(t *testing.T) {
 		t.Fatalf("the capability is not exactly the destination: %s", ops)
 	}
 
-	// A fresh daemon reaches the machine the last one left running and delivers the next upload.
+	// A fresh Calcifer reaches the machine the last one left running and delivers the next upload.
 	if code, out := runCozy(t, root, "down"); code != 0 {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
@@ -70,10 +70,10 @@ func TestALocalUploadCarriesACapabilityForThisComputersMachine(t *testing.T) {
 	select {
 	case out := <-done:
 		if trades := h.hubAccess.trades(); len(trades) != 2 || !strings.Contains(out, "capability_refused") {
-			t.Fatalf("the upload after a daemon restart did not reach the machine: %d trades %s", len(trades), out)
+			t.Fatalf("the upload after a Calcifer restart did not reach the machine: %d trades %s", len(trades), out)
 		}
 	case <-time.After(2 * time.Minute):
-		daemonLog, _ := os.ReadFile(filepath.Join(root, "daemon.log"))
-		t.Fatalf("the upload after a daemon restart never reached the machine; daemon log:\n%s", daemonLog)
+		calciferLog, _ := os.ReadFile(filepath.Join(root, "calcifer.log"))
+		t.Fatalf("the upload after a Calcifer restart never reached the machine; Calcifer log:\n%s", calciferLog)
 	}
 }

@@ -245,7 +245,7 @@ func handleModelYank(ctx *Context) *exit.Error {
 	}, "model", "release", "revision", "status", "changed"))
 }
 
-// emitModelChange tells the machines this daemon knows that a model's releases or lanes
+// emitModelChange tells the machines this Calcifer knows that a model's releases or lanes
 // changed: each keeps what it read of the model until told, as it does a package.
 func emitModelChange(ctx *Context, ref hub.Ref, changedAtHub bool, record output.Record) *exit.Error {
 	if changedAtHub {

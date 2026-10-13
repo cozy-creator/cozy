@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-// Component-boundary proof: real CLI/daemon and machine on an isolated fixture root,
+// Component-boundary proof: real CLI/Calcifer and machine on an isolated fixture root,
 // candidate SDK wheels, three ordinary packages. It never installs a personal machine.
 func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 	if *machineHostBinary == "" || *privateChildRuntimeWheel == "" || *tensorfsFixtureWheel == "" {

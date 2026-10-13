@@ -10,9 +10,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// The daemon keeps one connection per machine: a warm run rides the connection the first
+// Calcifer keeps one connection per machine: a warm run rides the connection the first
 // run opened, with no new TLS handshake, and a restarted machine is connected to anew.
-func TestTheDaemonKeepsOneConnectionPerMachine(t *testing.T) {
+func TestTheCalciferKeepsOneConnectionPerMachine(t *testing.T) {
 	if *machineHostBinary == "" {
 		t.Skip("requires -machine-host: this computer's machine runs the call")
 	}
@@ -53,7 +53,7 @@ func TestTheDaemonKeepsOneConnectionPerMachine(t *testing.T) {
 	}
 	connections := func() int {
 		t.Helper()
-		log, err := os.ReadFile(filepath.Join(root, "daemon.log"))
+		log, err := os.ReadFile(filepath.Join(root, "calcifer.log"))
 		must(t, err)
 		return strings.Count(string(log), "machine local: connecting to ")
 	}

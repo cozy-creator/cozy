@@ -21,7 +21,7 @@ import (
 
 // Run 1558 as behaviour. It was queued on nonomiya while the Hub booted the rental, and
 // `cozy run list` said `queued - 0.0s`: its park reason was in its own record and the boot
-// was on the Hub, and no view said either. The real daemon, against a stand-in Hub whose
+// was on the Hub, and no view said either. The real Calcifer, against a stand-in Hub whose
 // rental stays booting with an advancing boot log, now says what the run waits on in the
 // run list, run show and the live watch, as the boot advances and when the Hub replans it
 // onto another host; the rental list says the same of the rental.
@@ -32,7 +32,7 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 	stand := newFakeRentalHub(t, 0)
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", stand.port())
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
-		"tensorhub_url: "+hubURL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"tensorhub_url: "+hubURL+"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	const rental, run = "pr-0886bdd3d3be9a2ec01c", "req-1558"
 	stand.add(rental, "nonomiya")
 	stand.set(rental, "state", "booting")
@@ -86,8 +86,8 @@ func TestWaitingRunNamesItsBootingRental(t *testing.T) {
 		Rental: true, Worker: rental, MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(run, rental))
-	startDaemonProcess(t, root)
-	logPath := filepath.Join(root, "daemon.log")
+	startCalciferProcess(t, root)
+	logPath := filepath.Join(root, "calcifer.log")
 
 	list := func() (api.Lifecycle, string) {
 		t.Helper()

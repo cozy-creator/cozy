@@ -18,7 +18,7 @@ func compositionTail(value string) string {
 	return value
 }
 
-// A successful result is not proof that the daemon released its owned processes.
+// A successful result is not proof that Calcifer released its owned processes.
 // Keep the home (including shutdown logs) if normal teardown leaves one behind.
 func compositionDown(t *testing.T, root, path string) {
 	t.Helper()

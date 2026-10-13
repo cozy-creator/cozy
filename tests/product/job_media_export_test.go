@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Exercise the real CLI, daemon, Runtime, accepted publication and exporter.
+// Exercise the real CLI, Calcifer, Runtime, accepted publication and exporter.
 func TestTopLevelJobMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
 	integration(t)
 	if *privateScriptRuntimeWheel == "" {

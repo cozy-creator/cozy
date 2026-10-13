@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -142,7 +142,7 @@ async def echo(ctx: Context, payload: Request) -> Value:
 		}
 	}
 	cfg := config.Config{Home: root, HubURL: config.DefaultHubURL}
-	client, problem := localapi.Open(cfg, daemon.Probe(cfg))
+	client, problem := localapi.Open(cfg, calcifer.Probe(cfg))
 	fatal(t, problem)
 	sub := api.JobSubmission{Package: "local/application-json-proof", Function: "echo", Input: json.RawMessage(`{"seed":18446744073709551615,"number":1.0,"ordered":[2,1]}`)}
 	h, problem := client.SubmitJob(sub, "json-api-semantic-replay")

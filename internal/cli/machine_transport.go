@@ -169,7 +169,7 @@ func (m *machineRuns) MachineLog(ctx context.Context, machine, log string, tailB
 	return out, nil
 }
 
-// statusOf is a machine's Status frame as the daemon's API answers it.
+// statusOf is a machine's Status frame as Calcifer's API answers it.
 func statusOf(frame *machinepb.StatusFrame) api.MachineStatus {
 	out := api.MachineStatus{WorkerID: frame.GetWorkerId(), BootID: frame.GetBootId(), Agent: frame.GetVersion(),
 		Phase: frame.GetPhase(), Runtime: frame.GetRuntime(), TensorFS: frame.GetTensorfs(),

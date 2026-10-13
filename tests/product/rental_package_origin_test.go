@@ -68,7 +68,7 @@ func TestAMissingPackageNamesItsHubAndWhereItExists(t *testing.T) {
 	}))
 	defer local.Close()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: local\nhubs:\n  local: "+local.URL+
-		"\n  prod: "+prod+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\n  prod: "+prod+"\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -108,7 +108,7 @@ func TestAMissingPackageNamesItsHubAndWhereItExists(t *testing.T) {
 	}
 }
 
-// The same contract with real CLI, daemon, machine and Runtime. The package exists only on
+// The same contract with real CLI, Calcifer, machine and Runtime. The package exists only on
 // the selected source Hub. The run names its release (th-245): the CLI reads it there and the
 // machine installs it by name at that Hub's own origin, and the rental's Hub never receives
 // package requests.
@@ -120,7 +120,7 @@ func TestNamedRentalReadsSelectedPackageHub(t *testing.T) {
 		t.Helper()
 		must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+current+
 			"\ntensorhub_token: rental-idle-test\nhubs:\n  source: "+source.server.URL+"\n  rental: "+rentalHub.server.URL+
-			"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	}
 	configure("source")
 	// The rental's Hub is one this computer is signed in to, as the one it was bought from is.

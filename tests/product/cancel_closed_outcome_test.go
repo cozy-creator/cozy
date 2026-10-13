@@ -10,7 +10,7 @@ import (
 // Run 524: a job paused on 2026-09-12 holds one attempt whose CANCELED outcome closed long
 // ago, and the local worker that ran it is gone. `cozy run cancel` settles it at once — no
 // worker is started to reach the held attempt — and returns on the terminal event (it used
-// to sit in `canceling` while the daemon started a workspace worker and waited on it).
+// to sit in `canceling` while Calcifer started a workspace worker and waited on it).
 func TestCancelOfAPausedRunWithAClosedOutcomeSettlesAtOnce(t *testing.T) {
 	o := hostOwner(t, "paused-cancel")
 	const id = "job-paused-closed-outcome"

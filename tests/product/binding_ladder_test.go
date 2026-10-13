@@ -23,7 +23,7 @@ import (
 // cl-166, the run that filed it: the hub binding said release "1.0.0" lane
 // "profile=fp8-adaln-pruned" while the card carried "1.0.0-rc.1" / "fp8-adaln-pruned",
 // and the mismatch surfaced only at run time as a bare "no lane". These arms drive the
-// REAL binary and the REAL daemon against a stand-in hub that answers the catalog routes
+// REAL binary and the REAL Calcifer against a stand-in hub that answers the catalog routes
 // the way Tensorhub does and refuses every paid create typed, so no pod is ever bought.
 
 // ladderHub is the stand-in: one package with one modeled entrypoint, one model with one
@@ -406,7 +406,7 @@ func ladderRoot(t *testing.T, h *ladderHub) string {
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
 		"\ntensorhub_token: ladder-test\n"+
-		"daemon:\n  idle_shutdown_s: 0\n"), 0600))
+		"calcifer:\n  idle_shutdown_s: 0\n"), 0600))
 	return root
 }
 
@@ -529,7 +529,7 @@ func TestRunRefusesEarlyWithWhatTheCardOffers(t *testing.T) {
 	if code == 0 || !strings.Contains(out, "model.lane_not_found") || !strings.Contains(out, "lanes: bf16-full, fp8-adaln-pruned, mxfp8-adaln-pruned") {
 		t.Fatalf("a stale lane did not refuse with the release's lanes [exit %d]: %s", code, out)
 	}
-	// Early means before submission: no request row exists on this root, so no daemon
+	// Early means before submission: no request row exists on this root, so no Calcifer
 	// ever had work, and nothing reached a paid ask.
 	if store, problem := records.Open(filepath.Join(root, "creator.sqlite")); problem == nil {
 		defer store.Close()
@@ -557,7 +557,7 @@ func waitFor(t *testing.T, root, what string, ok func() bool) {
 	deadline := time.Now().Add(20 * time.Second)
 	for !ok() {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s did not happen: %s", what, tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("%s did not happen: %s", what, tail(filepath.Join(root, "calcifer.log")))
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -568,7 +568,7 @@ func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
 	h.bind(goodLadder())
 	h.soldOut["h100-80"], h.soldOut["h100-nvl"], h.soldOut["b200"] = true, true, true
 	root := ladderRoot(t, h)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	// The fixture pod fails to provision after the walk, so the short observation the
 	// client keeps may already see that terminal; what is asserted is the walk itself.
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
@@ -603,13 +603,13 @@ func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
 	if row.Models[0].Manifest != bf16Manifest || len(row.Models[0].Ladder) != 3 {
 		t.Fatalf("the buy did not pin the H200's rung exactly, ladder kept: %+v", row.Models[0])
 	}
-	log := tail(filepath.Join(root, "daemon.log"))
+	log := tail(filepath.Join(root, "calcifer.log"))
 	for _, want := range []string{"renting h100-80", "(rung 1, lane fp8-adaln-pruned, fit components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 80 GB)",
 		"h100-80 has no inventory; choosing again without it",
 		"renting b200", "(rung 2, lane mxfp8-adaln-pruned, fit rung_asserted)",
 		"renting h200", "(rung 3, lane bf16-full, fit components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 141 GB)"} {
 		if !strings.Contains(log, want) {
-			t.Fatalf("daemon.log does not say %q:\n%s", want, log)
+			t.Fatalf("calcifer.log does not say %q:\n%s", want, log)
 		}
 	}
 }
@@ -639,7 +639,7 @@ func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
 		h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)
 	}
 	store.Close()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	// The seeded rental has no media bearer on this host, so the request fails after the
 	// pin; the pin and the lane it carries are what this proves.
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
@@ -663,10 +663,10 @@ func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("a fitting live rental was passed over for a buy: %v", asks)
 	}
-	log := tail(filepath.Join(root, "daemon.log"))
+	log := tail(filepath.Join(root, "calcifer.log"))
 	if !strings.Contains(log, "cheap excluded:vram_short: needs 51.5 GiB resident (condition_text: text_encoder), rtx-5090 has 32 GB") ||
 		!strings.Contains(log, "placement: reuse morgiana (h100-80, fp8-adaln-pruned) — balanced, unmeasured (rung 1)") {
-		t.Fatalf("daemon.log does not record the passed-over 5090's need and the placement:\n%s", log)
+		t.Fatalf("calcifer.log does not record the passed-over 5090's need and the placement:\n%s", log)
 	}
 	// A hub without the throughput route measured nothing: the record says every open
 	// candidate was unmeasured and cites no row, and the live H100 won by the ladder's
@@ -726,7 +726,7 @@ func TestAJobIsNotSizedByTheComponentsItNeverStages(t *testing.T) {
 	// 24 GB product is asked for FIRST, which the component figure made impossible.
 	h.soldOut["rtx-4090"] = true
 	root := ladderRoot(t, h)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	_, out := runCozy(t, root, "run", ladderPackage+"/lane",
 		"--model.pruned="+ladderModel+"@"+ladderRelease+"/"+ladderLane,
 		"--rental-only", "--json", "--idempotency-key", "job-derive-fit")
@@ -747,11 +747,11 @@ func TestAJobIsNotSizedByTheComponentsItNeverStages(t *testing.T) {
 	if !strings.HasPrefix(posted[0], "rtx-4090/") || !strings.HasPrefix(posted[1], "rtx-5090/") {
 		t.Fatalf("paid asks %v; want the cheapest cards first for a job that stages nothing", posted)
 	}
-	log := tail(filepath.Join(root, "daemon.log"))
+	log := tail(filepath.Join(root, "calcifer.log"))
 	for _, want := range []string{"renting rtx-4090", "(lane fp8-adaln-pruned, fit derive_only)",
 		"rtx-4090 has no inventory; choosing again without it", "renting rtx-5090"} {
 		if !strings.Contains(log, want) {
-			t.Fatalf("daemon.log does not say %q:\n%s", want, log)
+			t.Fatalf("calcifer.log does not say %q:\n%s", want, log)
 		}
 	}
 	if strings.Contains(log, "vram_short") {
@@ -766,7 +766,7 @@ func TestRunSkipsAStaleRungAndKeepsTheLadder(t *testing.T) {
 	h.bind(hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0-rc.1",
 		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "retired-lane"}, {GPU: "*", Lane: "bf16-full"}}, Revision: 1})
 	root := ladderRoot(t, h)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
 		"--idempotency-key", "ladder-stale-rung")
 	if strings.Contains(out, "model.lane_not_found") {

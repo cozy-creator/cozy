@@ -23,7 +23,7 @@ import (
 // BOTH attached H100s — one running that very lane, one idle — read excluded:vram_short; the
 // H200 and B200 fit and the spend cap refused them; the refusal FAILED the request with no
 // request.placement record. At 00:05:40Z a bare run had also taken the busy H100 over the idle
-// one on the name tie. These arms drive the real binary and daemon against the stand-in hub
+// one on the name tie. These arms drive the real binary and Calcifer against the stand-in hub
 // with the card as it stood: rc.1 unsized, rc.2 sized and bound.
 
 const fleetCapVerdict = "excluded:rental.fleet_spend_cap"
@@ -148,7 +148,7 @@ func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 	defer store.Close()
 	plantH100(t, root, h, store, "pr-guchuko", "guchuko", true)
 	plantH100(t, root, h, store, "pr-lumachina", "lumachina", true)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	submitExplicit(t, root, "fleet-reuse")
 	var row *records.Request
 	waitFor(t, root, "the request pinned and its placement recorded", func() bool {
@@ -189,7 +189,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *t
 	plantH100(t, root, h, store, "pr-guchuko", "guchuko", true)
 	holdQueued(t, store, "req-held", "pr-guchuko")
 	lumachina := plantH100(t, root, h, store, "pr-lumachina", "lumachina", false)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	submitExplicit(t, root, "fleet-wait")
 	var first *records.Request
 	waitFor(t, root, "the placement waiting on the attaching H100", func() bool {
@@ -202,7 +202,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *t
 		verdicts["h100-80"] == "chosen" || verdicts["h200"] == "chosen" || verdicts["b200"] == "chosen" ||
 		placement["line"] != "placement: wait for lumachina (h100-80, fp8-adaln-pruned) to attach — balanced" {
 		held, _ := store.RequestRow("req-held")
-		t.Fatalf("the wait record: %v; held request: %+v\n%s", placement, held, tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("the wait record: %v; held request: %+v\n%s", placement, held, tail(filepath.Join(root, "calcifer.log")))
 	}
 	if current, problem := store.RequestByIdempotencyKey("fleet-wait"); problem != nil || current.Worker != "" || settled(current.State) {
 		t.Fatalf("the waiting request is %+v; want queued and unpinned", current)
@@ -227,7 +227,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *t
 	})
 	if verdicts := candidateVerdicts(lastPlacement(t, store, second.ID)); verdicts["guchuko"] != "excluded:attaching: lumachina" {
 		busy, _ := store.RequestByIdempotencyKey("fleet-wait")
-		t.Fatalf("the second wait record: %v; the busy H100's request: %+v\n%s", verdicts, busy, tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("the second wait record: %v; the busy H100's request: %+v\n%s", verdicts, busy, tail(filepath.Join(root, "calcifer.log")))
 	}
 	attached := lumachina
 	attached.Address, attached.CertPath = "127.0.0.1:1", filepath.Join(root, "rentals", "pr-lumachina.pem")
@@ -268,7 +268,7 @@ func TestExplicitLaneFailsOnTheCapOnlyWhenNoRentalFits(t *testing.T) {
 		HourlyRateUSDMicros: 740_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL}
 	fatal(t, store.RecordRental(hairu))
 	h.addReady(hairu.ID, hairu.MachineName, hairu.AcceleratorModel, hairu.HourlyRateUSDMicros)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", explicitFP8, "--rental-only", "--json",
 		"--idempotency-key", "fleet-refusal")
 	var row *records.Request

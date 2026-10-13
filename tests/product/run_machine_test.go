@@ -25,7 +25,7 @@ func TestRunListMachineColumn(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: http://127.0.0.1:1\n"+
 			"tensorhub_token: machine-column-test\n"+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"calcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -35,8 +35,8 @@ func TestRunListMachineColumn(t *testing.T) {
 		HourlyRateUSDMicros: 100_000, State: "ready", Hub: "http://127.0.0.1:1",
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "pr-machine-column.pem"),
 	}))
-	startDaemonProcess(t, root)
-	// Planted after startup, so the startup requeue does not race the daemon's own
+	startCalciferProcess(t, root)
+	// Planted after startup, so the startup requeue does not race Calcifer's own
 	// acquisition attempt against the deliberately unreachable hub: both runs WAIT,
 	// which is the state whose venue this test reads.
 	submit := func(id, worker string) {
@@ -240,8 +240,8 @@ func TestRunListMachineColumn(t *testing.T) {
 	}
 }
 
-// Older daemons already carry the pinned or preparing machine in separate facts.
-// A new client must show those facts without requiring a daemon restart.
+// Older Calcifers already carry the pinned or preparing machine in separate facts.
+// A new client must show those facts without requiring a Calcifer restart.
 func TestQueuedRunMachineProjection(t *testing.T) {
 	for _, tc := range []struct {
 		name string

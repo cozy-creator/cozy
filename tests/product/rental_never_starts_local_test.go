@@ -17,7 +17,7 @@ import (
 )
 
 // A run named for a rental never starts or contacts this computer's machine: not to package a
-// local directory, not to describe it, not under a daemon that predates cozy.machine.v1 (the
+// local directory, not to describe it, not under a Calcifer that predates cozy.machine.v1 (the
 // run then goes from the command itself). This computer's machine is a sentinel that records
 // any launch; the rental is a real machine a provider booted.
 func TestARentalRunNeverStartsThisComputersMachine(t *testing.T) {
@@ -32,7 +32,7 @@ func TestARentalRunNeverStartsThisComputersMachine(t *testing.T) {
 	root, err := os.MkdirTemp("", "czn")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	witness := filepath.Join(root, "local-machine-launched")
 	stubMachine(t, root, "#!/bin/sh\necho \"$@\" >> "+witness+"\nexit 3\n")
 	t.Cleanup(func() {
@@ -71,31 +71,17 @@ func TestARentalRunNeverStartsThisComputersMachine(t *testing.T) {
 		t.Fatalf("editable install [exit %d]\n%s", code, out)
 	}
 	untouched(t, "installing a local directory")
-	runs := func(t *testing.T, daemon string, value, want string) {
+	runs := func(t *testing.T, calcifer string, value, want string) {
 		t.Helper()
 		code, out := runCozy(t, root, "run", parityPackage+"/echo", "value="+value, "--rental=tessa", "--await", "--json")
-		untouched(t, "a local package's run on a rental under "+daemon)
+		untouched(t, "a local package's run on a rental under "+calcifer)
 		if code != 0 || !strings.Contains(out, want) {
-			t.Fatalf("the local package did not run on the rental under %s [exit %d]\n%s", daemon, code, out)
+			t.Fatalf("the local package did not run on the rental under %s [exit %d]\n%s", calcifer, code, out)
 		}
 		// A package this client never installed, spelled as the command line allows (it was
 		// once described by this computer's machine): refused or run, never started here.
 		_, _ = runCozy(t, root, "run", "./readbench_pkg/blob", "--rental=tessa", "--await", "--json")
-		untouched(t, "an uninstalled package's run on a rental under "+daemon)
+		untouched(t, "an uninstalled package's run on a rental under "+calcifer)
 	}
-	runs(t, "the current daemon", "41", `"value":82`)
-
-	// Under a running daemon that predates cozy.machine.v1, the command runs it itself.
-	if *olderCozy == "" {
-		return
-	}
-	if code, stopped := runCozy(t, root, "down"); code != 0 {
-		t.Fatalf("down [exit %d]\n%s", code, stopped)
-	}
-	up := exec.Command(*olderCozy, "up")
-	up.Env = childEnv(t, root)
-	if raw, err := up.CombinedOutput(); err != nil {
-		t.Fatalf("the older cozy did not start its daemon: %v\n%s", err, raw)
-	}
-	runs(t, "an older daemon", "5", `"value":10`)
+	runs(t, "the current Calcifer", "41", `"value":82`)
 }

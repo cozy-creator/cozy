@@ -494,7 +494,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 		return out, nil, e
 	}
 	if s.packages == nil {
-		return out, nil, exit.Unavailablef("this Cozy daemon resolves no packages")
+		return out, nil, exit.Unavailablef("this Calcifer resolves no packages")
 	}
 	if sub.Worker != "" && !sub.Rental && !sub.RentalRequired {
 		return out, nil, exit.Named(exit.Validation, "rental.job_worker_without_rental",
@@ -821,7 +821,7 @@ type JobState struct {
 	RetainWork       bool                  `json:"retain_work,omitempty"`
 	Retaining        bool                  `json:"retaining,omitempty"`
 	RetryAvailable   bool                  `json:"retry_available,omitempty"`
-	StoppedEventID   int64                 `json:"stopped_event_id,omitempty"` // an older daemon's blocked stop
+	StoppedEventID   int64                 `json:"stopped_event_id,omitempty"` // an older Calcifer's blocked stop
 	RetryOf          string                `json:"retry_of,omitempty"`
 	ReuseScope       string                `json:"reuse_scope,omitempty"`
 	Number           int64                 `json:"number"`
@@ -1063,7 +1063,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 				if transfer.State == "materializing" {
 					state.Stage = "source materialization"
 					// members_verified/members_total is the "44 of 48" a human reads. It
-					// was in the daemon log and on no client surface at all.
+					// was in the Calcifer log and on no client surface at all.
 					state.Progress = map[string]any{"stage": state.Stage,
 						"transferred_bytes": transferred, "total_bytes": total,
 						"members_verified": verified, "members_converted": converted, "members_total": len(statuses)}
@@ -1294,7 +1294,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
 		return
 	}
-	// No machine executes it: the daemon's own model transfer, which has no attempt.
+	// No machine executes it: Calcifer's own model transfer, which has no attempt.
 	if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
 		s.refuseTyped(w, r, e)
 		return

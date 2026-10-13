@@ -24,7 +24,7 @@ import (
 
 // handleRunPlay prints a link that plays one output of a run in any browser, straight from
 // the machine that ran it. The address and the DTLS fingerprint come from that machine's own
-// Status, read with the key it authorizes: no Hub and no daemon is asked. The capability
+// Status, read with the key it authorizes: no Hub and no Calcifer is asked. The capability
 // names the run's output and rides the fragment, which never leaves the browser.
 func handleRunPlay(ctx *Context) *exit.Error {
 	layout, store, problem := rentalStores(ctx)

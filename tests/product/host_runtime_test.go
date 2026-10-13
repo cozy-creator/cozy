@@ -19,7 +19,7 @@ import (
 // TestHostRuntimeAdmission: the host tool answers typed CLI verbs and speaks no machine protocol
 // to this Cozy, so a Runtime of any protocol serves: the worker.v1 Runtime, the cohort Runtime
 // of cozy.machine.v1, and one that names none. Only a release below ToolFloor does not. A host
-// tool that cannot serve never stops the daemon (rentals and the Hub need none): `cozy up`
+// tool that cannot serve never stops Calcifer (rentals and the Hub need none): `cozy up`
 // names the upgrade, and only what needs the host tool refuses by name, with the reinstall.
 // Every arm is the real binary against a real root; the tool is a stand-in that answers only
 // `version`.
@@ -64,11 +64,11 @@ func TestHostRuntimeAdmission(t *testing.T) {
 		}
 	}
 
-	// (d) No tool at all starts the daemon: rentals and the hub need none, and a local
+	// (d) No tool at all starts Calcifer: rentals and the hub need none, and a local
 	// launch refuses `host_runtime_missing` for itself.
 	root, path = hostRuntimeRoot(t, "missing", "")
 	if code, out := runCozyPath(t, root, path, "up"); code != 0 {
-		t.Fatalf("a host without cozy-runtime could not start its daemon [exit %d]\n%s", code, out)
+		t.Fatalf("a host without cozy-runtime could not start its Calcifer [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyPath(t, root, path, "down"); code != 0 {
 		t.Fatalf("down [exit %d]\n%s", code, out)
@@ -100,8 +100,8 @@ func stubRuntime(t *testing.T, release, protocol string) string {
 	return "#!/bin/sh\nprintf '%s\\n' '" + string(answer) + "'\n"
 }
 
-// hostRuntimeRoot is a fresh daemon root and a PATH holding only the stand-in tool (none
-// when script is empty), so the daemon can find nothing else by that name.
+// hostRuntimeRoot is a fresh Calcifer root and a PATH holding only the stand-in tool (none
+// when script is empty), so Calcifer can find nothing else by that name.
 func hostRuntimeRoot(t *testing.T, name, script string) (root, path string) {
 	t.Helper()
 	root = filepath.Join(scratchBase, "host-runtime-"+name)

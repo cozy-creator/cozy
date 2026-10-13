@@ -11,7 +11,7 @@ import (
 
 func TestCancellationPresentationPreservesMachineVocabulary(t *testing.T) {
 	root := t.TempDir()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()

@@ -28,10 +28,10 @@ func TestAFailedSourceMemberReachesTheClientAndTheCLI(t *testing.T) {
 		detail    = "the origin answered 401 for b.safetensors and will not answer another way"
 	)
 	root := t.TempDir()
-	daemon := startDaemonProcess(t, root)
+	calcifer := startCalciferProcess(t, root)
 
-	// The request is recorded through the store the daemon is serving. Dispatch is not the
-	// subject here — cl-133's arm drives the whole wire — and a row the daemon's queue
+	// The request is recorded through the store Calcifer is serving. Dispatch is not the
+	// subject here — cl-133's arm drives the whole wire — and a row Calcifer's queue
 	// never saw stays exactly where it is put.
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -71,7 +71,7 @@ func TestAFailedSourceMemberReachesTheClientAndTheCLI(t *testing.T) {
 
 	// SURFACE ONE, while the request is still live. The rows used to be read only while the
 	// transfer was `materializing` — only while there was nothing to explain.
-	answer := daemon.call(t, "GET", "/v1/local/jobs/"+requestID, nil)
+	answer := calcifer.call(t, "GET", "/v1/local/jobs/"+requestID, nil)
 	if answer.Status != 200 {
 		t.Fatalf("the job document refused: %s", answer.brief())
 	}
@@ -110,7 +110,7 @@ func TestAFailedSourceMemberReachesTheClientAndTheCLI(t *testing.T) {
 
 func TestCompletedSourcePublicationSuppressesStalePendingRows(t *testing.T) {
 	root := t.TempDir()
-	daemon := startDaemonProcess(t, root)
+	calcifer := startCalciferProcess(t, root)
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
@@ -121,7 +121,7 @@ func TestCompletedSourcePublicationSuppressesStalePendingRows(t *testing.T) {
 	_, _, problem = store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: childDigest("c"), Package: "local/pdd", Entrypoint: "main", Kind: "job", Payload: []byte("{}"), ModelTransfer: intent})
 	fatal(t, problem)
 	read := func() api.JobState {
-		answer := daemon.call(t, "GET", "/v1/local/jobs/"+id, nil)
+		answer := calcifer.call(t, "GET", "/v1/local/jobs/"+id, nil)
 		if answer.Status != 200 {
 			t.Fatal(answer.brief())
 		}

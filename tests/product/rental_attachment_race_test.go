@@ -12,8 +12,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
-// Two independent database connections model the foreground handoff racing the
-// daemon's release. Channels stop at the actual credential-staging boundary.
+// Two independent database connections model the foreground handoff racing
+// Calcifer's release. Channels stop at the actual credential-staging boundary.
 func TestRentalAttachmentSerializesWithRelease(t *testing.T) {
 	for _, mode := range []string{"released", "release_requested", "attachment-first", "stage-failed", "already-attached"} {
 		t.Run(mode, func(t *testing.T) {

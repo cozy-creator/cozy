@@ -59,8 +59,8 @@ type tool struct {
 }
 
 // hostRuntimeVerdicts memoizes the tool chosen per minimum for this process: a version verb is
-// one interpreter start and an install one uv run, so the host is asked once per daemon. Only
-// an admission is kept, so a reinstall takes effect without a daemon restart.
+// one interpreter start and an install one uv run, so the host is asked once per Calcifer. Only
+// an admission is kept, so a reinstall takes effect without a Calcifer restart.
 var hostRuntimeVerdicts = struct {
 	sync.Mutex
 	chosen map[string]tool

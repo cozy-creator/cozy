@@ -20,14 +20,14 @@ import (
 //	rental.no_fitting_sku — no rental SKU on offer fits paul/minimax-h3:
 //	  karam excluded:not_ready; gyokuyou excluded:not_ready
 //
-// Both machines were rentals this daemon had already bought. `karam` was bought at
+// Both machines were rentals this Calcifer had already bought. `karam` was bought at
 // 10:56:45Z and the hub reported it `ready` at 11:08:19Z — the refusal landed four
 // minutes INSIDE its own acquisition window, and the recorded decision carried no
 // purchase candidate at all, because Tensorhub's catalog answered with nothing of the
 // request's class in that instant. Neither fact was permanent. Both reached the owner as
 // a sentence about the ladder.
 //
-// These arms drive the REAL binary and the REAL daemon against the stand-in hub, with the
+// These arms drive the REAL binary and the REAL Calcifer against the stand-in hub, with the
 // fleet and the market in the exact shapes of that minute.
 
 // plantRental records one H100 rental the fleet holds in the hub's own lifecycle word.
@@ -71,7 +71,7 @@ func TestAFleetStillComingUpIsWaitedForAndNeverRefused(t *testing.T) {
 	defer store.Close()
 	plantRental(t, root, h, store, "pr-karam", "karam", "acquiring", false)
 	plantRental(t, root, h, store, "pr-gyokuyou", "gyokuyou", "pending_acquisition", false)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	submitExplicit(t, root, "coming-up")
 	var row *records.Request
 	waitFor(t, root, "the placement waiting on the fleet that is coming up", func() bool {
@@ -116,7 +116,7 @@ func TestAnEmptyCatalogBesideADeadFleetWaitsAndSaysWhichIsWhich(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	plantRental(t, root, h, store, "pr-karam", "karam", "failed", false)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	submitExplicit(t, root, "empty-catalog")
 	var row *records.Request
 	waitFor(t, root, "the placement over an empty catalog and its park", func() bool {
@@ -154,7 +154,7 @@ func TestAMarketNoRungNamesStillFailsTerminally(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	plantRental(t, root, h, store, "pr-karam", "karam", "failed", false)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
 		"--idempotency-key", "no-rung")
 	var row *records.Request
@@ -191,7 +191,7 @@ func TestAnIdleAttachedMachineOutranksWaitingForOneComingUp(t *testing.T) {
 	defer store.Close()
 	plantRental(t, root, h, store, "pr-guchuko", "guchuko", "ready", true)
 	plantRental(t, root, h, store, "pr-lumachina", "lumachina", "acquiring", false)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	submitExplicit(t, root, "idle-wins")
 	var row *records.Request
 	waitFor(t, root, "the request pinned to the idle attached machine and its placement recorded", func() bool {

@@ -18,7 +18,7 @@ import (
 	v1 "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 )
 
-// endpointRunOnRental records a run a daemon older than cozy.machine.v1 sent to a rental as an
+// endpointRunOnRental records a run a Calcifer older than cozy.machine.v1 sent to a rental as an
 // explicit endpoint (a foreground --rental run): accepted there, running, still owed, with an
 // output export waiting on its result.
 func endpointRunOnRental(t *testing.T, store *records.Store, root, label string, ep *machineendpoint.Endpoint, cancel bool) records.Request {

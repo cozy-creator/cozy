@@ -1,9 +1,9 @@
-// Package daemon owns ONE spelling of "is the Cozy daemon running", and it is an OS
+// Package calcifer owns ONE spelling of "is Calcifer running", and it is an OS
 // fact rather than a file's contents.
 //
-// The running Cozy daemon holds an exclusive advisory lock on `<home>/daemon.lock` for
+// The running Calcifer holds an exclusive advisory lock on `<home>/calcifer.lock` for
 // its whole life. The kernel drops that lock when the process dies — including under
-// SIGKILL — so a reader that CAN take the lock has proof the daemon is gone, and one
+// SIGKILL — so a reader that CAN take the lock has proof Calcifer is gone, and one
 // that cannot has proof of the opposite. There is no pidfile, no heartbeat and no grace
 // period, which is exactly the class of bug cl#85/53/83/82 were: a sidecar that outlived
 // its launcher and said COLD forever.
@@ -12,7 +12,7 @@
 // the address is data the live owner publishes, never evidence that it lives. The same
 // record carries the per-launch CLI token (cl-116): the file is mode 0600, rewritten on
 // every launch, and there is no separate client.cred handoff file.
-package daemon
+package calcifer
 
 import (
 	"errors"
@@ -47,10 +47,10 @@ func Probe(cfg config.Config) State {
 		st.Details = "no local root"
 		return st
 	}
-	st.Path = cfg.Home + "/daemon.lock"
+	st.Path = cfg.Home + "/calcifer.lock"
 	f, err := os.OpenFile(st.Path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		st.Details = "the daemon lock is unreadable: " + err.Error()
+		st.Details = "the Calcifer lock is unreadable: " + err.Error()
 		return st
 	}
 	defer f.Close()
@@ -58,13 +58,13 @@ func Probe(cfg config.Config) State {
 		// Taking it IS the proof of absence. Release immediately: probing must never
 		// look like holding.
 		_ = flock.Release(f)
-		st.Details = "the daemon lock is free — no Cozy daemon owns this root"
+		st.Details = "the Calcifer lock is free — no Calcifer owns this root"
 		return st
 	}
 	st.Up = true
 	// A held root's address comes only from its owner. In particular, an empty
 	// or partially written record must never direct a client to another root's
-	// daemon on the configured/default port.
+	// Calcifer on the configured/default port.
 	st.Addr = ""
 	data, _ := os.ReadFile(st.Path)
 	addrPublished := false
@@ -87,12 +87,12 @@ func Probe(cfg config.Config) State {
 		}
 	}
 	st.OperatorOwned = addrPublished && st.Addr == "" && st.PID > 0 && st.Since != ""
-	st.Details = "the daemon lock is held by pid " + strconv.Itoa(st.PID)
+	st.Details = "the Calcifer lock is held by pid " + strconv.Itoa(st.PID)
 	return st
 }
 
-// Held is the live Cozy daemon's own claim on this root. It exists only inside the
-// daemon process; nothing reads it, and nothing outlives it.
+// Held is the live Calcifer's own claim on this root. It exists only inside the
+// Calcifer process; nothing reads it, and nothing outlives it.
 type Held struct{ f *os.File }
 
 // Hold takes the root's exclusive claim and publishes the live addresses under it. A
@@ -100,39 +100,39 @@ type Held struct{ f *os.File }
 // The body is rewritten on every launch; api.Mint appends the per-launch CLI token to
 // the same record, which is why the file is 0600 and why no client.cred exists.
 func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
-	f, err := os.OpenFile(l.Daemon, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(l.Calcifer, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, exit.Internalf("cannot establish daemon ownership for %s: %s", l.Root, err)
+		return nil, exit.Internalf("cannot establish Calcifer ownership for %s: %s", l.Root, err)
 	}
 	// Chmod anyway: O_CREAT's mode is masked by umask, and a prior build's 0644 lock
 	// file would otherwise keep its old width under the new token-carrying body.
 	if err := f.Chmod(0o600); err != nil {
 		f.Close()
-		return nil, exit.Internalf("cannot protect the daemon record: %s", err)
+		return nil, exit.Internalf("cannot protect the Calcifer record: %s", err)
 	}
 	if err := flock.Exclusive(f); err != nil {
 		f.Close()
 		return nil, exit.New(exit.Conflict,
-			"another Cozy daemon already owns %s", l.Root).
-			WithRemedy("one daemon per local root; stop it with `cozy down`").
+			"another Calcifer already owns %s", l.Root).
+			WithRemedy("one Calcifer per local root; stop it with `cozy down`").
 			WithNext("cozy run list", "cozy down")
 	}
 	body := fmt.Sprintf("addr=%s\nsocket=%s\npid=%d\nsince=%s\n",
 		addr, socket, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	if err := f.Truncate(0); err != nil {
 		f.Close()
-		return nil, exit.Internalf("cannot publish the daemon address: %s", err)
+		return nil, exit.Internalf("cannot publish the Calcifer address: %s", err)
 	}
 	if _, err := f.WriteAt([]byte(body), 0); err != nil {
 		f.Close()
-		return nil, exit.Internalf("cannot publish the daemon address: %s", err)
+		return nil, exit.Internalf("cannot publish the Calcifer address: %s", err)
 	}
 	return &Held{f: f}, nil
 }
 
 // Release drops the claim. The kernel does this anyway, on any exit; this is only the
 // polite spelling of it. The published body — the address and the CLI token api.Mint
-// appended — is truncated first: a credential must not outlive its daemon on disk, and
+// appended — is truncated first: a credential must not outlive its Calcifer on disk, and
 // a client polling the record must never read a dead launch's token as a live one. A
 // SIGKILL skips this, which is why clients also compare the body across a relaunch.
 func (h *Held) Release() {
@@ -145,15 +145,15 @@ func (h *Held) Release() {
 	h.f = nil
 }
 
-// Claimed reports whether the path this daemon published its claim at still names the
+// Claimed reports whether the path this Calcifer published its claim at still names the
 // file it holds. The lock file IS the claim (see the package comment): a client reaches
-// this daemon only by opening `<home>/daemon.lock` and failing to take the lock. If the
-// root was deleted, moved, or wiped out from under the running daemon, that path no
+// this Calcifer only by opening `<home>/calcifer.lock` and failing to take the lock. If the
+// root was deleted, moved, or wiped out from under the running Calcifer, that path no
 // longer resolves to this file — nothing can find this process, nothing can stop it, and
 // nothing it writes will ever be read again.
 //
 // The comparison is by identity, not existence: a root that was removed and recreated is
-// the same absence as one that was removed, and a second daemon that took the recreated
+// the same absence as one that was removed, and a second Calcifer that took the recreated
 // lock must not be mistaken for this one. Any answer other than "the path is not there"
 // — an unreadable directory, a filesystem in trouble — reads as still claimed: this is a
 // reason to leave, so it must never fire on an answer the kernel could not give.
@@ -174,7 +174,7 @@ func (h *Held) Claimed() bool {
 
 // Unavailable is the typed refusal every server-dependent verb shares.
 func (s State) Unavailable() *exit.Error {
-	return exit.Unavailablef("the Cozy daemon is not running (%s)", s.Addr).
+	return exit.Unavailablef("Calcifer is not running (%s)", s.Addr).
 		WithRemedy("start it with `cozy up`; it binds %s, loopback only", s.Addr).
 		WithNext("cozy up")
 }

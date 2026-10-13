@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 )
 
 func TestTensorhubFlagOverridesFileAndEnvironment(t *testing.T) {
@@ -67,9 +67,9 @@ func TestTensorhubFlagOverridesFileAndEnvironment(t *testing.T) {
 	}
 }
 
-// `up` with a one-command hub starts the one daemon on the configured default, and that
-// daemon then serves commands for any hub.
-func TestTensorhubFlagDoesNotBindTheDaemon(t *testing.T) {
+// `up` with a one-command hub starts the one Calcifer on the configured default, and that
+// Calcifer then serves commands for any hub.
+func TestTensorhubFlagDoesNotBindTheCalcifer(t *testing.T) {
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()
 	root := t.TempDir()
@@ -80,19 +80,19 @@ func TestTensorhubFlagDoesNotBindTheDaemon(t *testing.T) {
 	cmd.Env = childEnv(t, root, "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("daemon startup failed: %v %s", err, out)
+		t.Fatalf("Calcifer startup failed: %v %s", err, out)
 	}
-	state := daemon.Probe(config.Config{Home: root})
+	state := calcifer.Probe(config.Config{Home: root})
 	if !state.Up {
-		t.Fatalf("daemon did not start as a multi-hub daemon: %+v", state)
+		t.Fatalf("Calcifer did not start as a multi-hub Calcifer: %+v", state)
 	}
 	for _, args := range [][]string{{"run", "list", "--json"}, {"--tensorhub=" + server.URL, "run", "list", "--json"}} {
 		if code, outText := runCozy(t, root, args...); code != 0 {
-			t.Fatalf("%v was refused by the multi-hub daemon: %d %s", args, code, outText)
+			t.Fatalf("%v was refused by the multi-hub Calcifer: %d %s", args, code, outText)
 		}
 	}
-	if after := daemon.Probe(config.Config{Home: root}); after.PID != state.PID {
-		t.Fatalf("a hub selection restarted the daemon: %d -> %d", state.PID, after.PID)
+	if after := calcifer.Probe(config.Config{Home: root}); after.PID != state.PID {
+		t.Fatalf("a hub selection restarted Calcifer: %d -> %d", state.PID, after.PID)
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 )
 
 // Freeze before creating the maintenance row: a retry never reopens the caller's
-// mutable build output, and a daemon crash cannot change a local ask into PyPI.
+// mutable build output, and a Calcifer crash cannot change a local ask into PyPI.
 func freezeRuntimeWheel(root, source string) (_ *runtimeUpdateWheel, _ *scratch.Dir, problem *exit.Error) {
 	const limit = 128 << 20
 	name := filepath.Base(source)

@@ -257,7 +257,7 @@ func nativeLifecycleOutcome(t *testing.T, machine *machines.V1, id string) strin
 	}
 }
 
-func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
+func TestV1CalciferRestartPreservesBytesAndCancellation(t *testing.T) {
 	root, store, machine := nativeLifecycleHome(t)
 	start := func(key string) (*records.Request, string, string) {
 		gate := filepath.Join(root, key+"-gate")
@@ -285,8 +285,8 @@ func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
 		})
 	}
 
-	// The machine produces exact authored bytes while its client daemon is gone.
-	t.Log("native bytes after daemon shutdown")
+	// The machine produces exact authored bytes while its client Calcifer is gone.
+	t.Log("native bytes after Calcifer shutdown")
 	row, gate, directory := start("native-down-bytes")
 	down()
 	must(t, os.WriteFile(gate, nil, 0o600))
@@ -305,7 +305,7 @@ func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
 	}
 
 	// A locally durable explicit cancel waits through a controller restart.
-	t.Log("durable native cancel recorded while daemon is down")
+	t.Log("durable native cancel recorded while Calcifer is down")
 	row, _, _ = start("native-down-cancel")
 	down()
 	_, problem = store.RequestMachineCancellation(row.ID, "cozy run cancel")
@@ -342,8 +342,8 @@ func TestV1DaemonRestartPreservesBytesAndCancellation(t *testing.T) {
 		t.Fatalf("cancel after native success was not a no-op [%d]: %s", code, out)
 	}
 
-	// One actual watcher survives a daemon restart and only observes the run.
-	t.Log("same native watcher across daemon restart")
+	// One actual watcher survives a Calcifer restart and only observes the run.
+	t.Log("same native watcher across Calcifer restart")
 	row, gate, directory = start("native-watch-reconnect")
 	stdout, err := os.Create(filepath.Join(root, "watch.stdout"))
 	must(t, err)
@@ -441,7 +441,7 @@ func TestV1LostAcceptanceReattachesWithoutLocalPackage(t *testing.T) {
 		t.Fatalf("fixture controller up [%d]: %s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "watch", request.ID, "--json"); code != 0 || !strings.Contains(out, `"status":"completed"`) {
-		t.Fatalf("native attach rebuilt unavailable local source [%d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("native attach rebuilt unavailable local source [%d]: %s\n%s", code, out, tail(filepath.Join(root, "calcifer.log")))
 	}
 	accepted, problem = store.RunV1(request.ID)
 	fatal(t, problem)

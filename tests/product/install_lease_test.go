@@ -10,10 +10,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// A run's submission leases the install it resolved until the daemon has recorded the
+// A run's submission leases the install it resolved until Calcifer has recorded the
 // request that references it. An install that supersedes it meanwhile (an explicit
-// reinstall, or the editable watcher's refresh) must not reclaim it in that window: the
-// daemon would answer "request install … is no longer present" for work already sent.
+// reinstall, or the editable watcher's refresh) must not reclaim it in that window:
+// Calcifer would answer "request install … is no longer present" for work already sent.
 // The lease is the submitter's own process claim, so here the test holds it exactly as
 // a submitting process does while the real CLI installs over it.
 func TestLeasedInstallSurvivesASupersedingInstall(t *testing.T) {

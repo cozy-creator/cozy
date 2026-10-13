@@ -15,7 +15,7 @@ import (
 // ladder — and the user's ready H100 was `excluded:unattached` for the seconds before its
 // worker's control stream opened, so a 24 GB RTX 4090 was bought for the 103 GB lane and
 // refused on the pod (device_shortfall, short by 35.8 GB). The next request reused another
-// 4090 over the attached H100 on the rung tie. These arms drive the real binary and daemon
+// 4090 over the attached H100 on the rung tie. These arms drive the real binary and Calcifer
 // against the stand-in hub with the card's lanes unsized, as the card stood.
 
 const (
@@ -64,7 +64,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 		AcceleratorModel: h100SXM, HourlyRateUSDMicros: 2_490_000, State: "ready", Hub: h.server.URL}
 	fatal(t, store.RecordRental(yumichika))
 	h.addReady(yumichika.ID, yumichika.MachineName, yumichika.AcceleratorModel, yumichika.HourlyRateUSDMicros)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", explicitFP8, "--rental-only", "--json",
 		"--idempotency-key", "explicit-wait")
 	row, problem := store.RequestByIdempotencyKey("explicit-wait")
@@ -101,7 +101,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 		t.Fatalf("the waiting request is %+v; want queued and unpinned", queued)
 	}
 	// The worker attaches — address and certificate land on the row — and the fleet's next
-	// observation pins the waiting request to the H100. The daemon's own reconcile can
+	// observation pins the waiting request to the H100. Calcifer's own reconcile can
 	// rewrite the row from a read taken before the attach, so it is re-asserted until seen.
 	cert := filepath.Join(root, "yumichika.pem")
 	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
@@ -129,12 +129,12 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 	if last := candidateVerdicts(placements[len(placements)-1]); len(placements) < 2 || last["rtx-4090"] != fourKShort {
 		t.Fatalf("%d placement record(s), last %v; want the wait and then the reuse", len(placements), last)
 	}
-	log, err := os.ReadFile(filepath.Join(root, "daemon.log"))
+	log, err := os.ReadFile(filepath.Join(root, "calcifer.log"))
 	must(t, err)
 	for _, want := range []string{"placement: wait for yumichika (h100-80, fp8-adaln-pruned) to attach — balanced",
 		"placement: reuse yumichika (h100-80, fp8-adaln-pruned) — balanced, unmeasured;"} {
 		if !strings.Contains(string(log), want) {
-			t.Fatalf("daemon.log does not say %q:\n%s", want, tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("calcifer.log does not say %q:\n%s", want, tail(filepath.Join(root, "calcifer.log")))
 		}
 	}
 }
@@ -159,7 +159,7 @@ func TestExplicitLaneReusesTheFittingRentalOverTheCheaperShortOne(t *testing.T) 
 		h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)
 	}
 	store.Close()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", explicitFP8, "--rental-only", "--json",
 		"--idempotency-key", "explicit-reuse")
 	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))

@@ -17,7 +17,7 @@ import (
 //
 //   - CURSOR RESUME. Every durable event carries `id:`. A stream that drops without a
 //     terminal is NOT a verdict — reconnect from the last id and the server replays
-//     everything after it, in order, across a daemon restart.
+//     everything after it, in order, across a Calcifer restart.
 //   - TERMINAL-STOP. A terminal event closes the per-request stream, and that is where
 //     `cozy run` gets its exit code: the request's own settled status, mapped through the
 //     shared matrix. There is no polling loop and no timeout guessing what happened.
@@ -63,8 +63,8 @@ func (c *Client) WatchContext(ctx context.Context, requestID string, from int64,
 			cursor = last
 			attempts = 0 // progress resets the budget: a long run is not a broken one
 		}
-		if c.reattached != nil && c.lostDaemon(e) {
-			// The run is durable and the daemon owns it; a restarted daemon replays the
+		if c.reattached != nil && c.lostCalcifer(e) {
+			// The run is durable and Calcifer owns it; a restarted Calcifer replays the
 			// stream from this cursor.
 			if !c.reattach(ctx) {
 				return nil, nil
@@ -84,7 +84,7 @@ func (c *Client) WatchContext(ctx context.Context, requestID string, from int64,
 		}
 		// The stream ended with no terminal. That means reconnect, and it is bounded so a
 		// server that closes instantly cannot spin: three consecutive closes with no new
-		// event is a daemon that is not going to answer.
+		// event is a Calcifer that is not going to answer.
 		attempts++
 		if attempts > 3 {
 			return nil, exit.Unavailablef(

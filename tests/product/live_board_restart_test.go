@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 )
 
 type screenBuffer struct {
@@ -35,9 +35,9 @@ func (s *screenBuffer) String() string {
 	return s.buf.String()
 }
 
-// An open `cozy run list` board keeps drawing across a daemon restart. A restart too quick
-// for a client to see the daemon gone still mints a new credential, which it adopts.
-func TestRunListBoardFollowsAQuickDaemonRestart(t *testing.T) {
+// An open `cozy run list` board keeps drawing across a Calcifer restart. A restart too quick
+// for a client to see Calcifer gone still mints a new credential, which it adopts.
+func TestRunListBoardFollowsAQuickCalciferRestart(t *testing.T) {
 	root := t.TempDir()
 	// The owner's port: each launch binds it again, so a restart answers where the last did.
 	free, err := net.Listen("tcp", "127.0.0.1:0")
@@ -45,7 +45,7 @@ func TestRunListBoardFollowsAQuickDaemonRestart(t *testing.T) {
 	port := free.Addr().(*net.TCPAddr).Port
 	must(t, free.Close())
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(fmt.Sprintf("port: %d\n", port)), 0o600))
-	first := startDaemonProcess(t, root)
+	first := startCalciferProcess(t, root)
 	board := exec.Command("script", "-qfec", "stty cols 160 rows 40; exec "+cozyBin+" run list", "/dev/null")
 	board.Env = childEnv(t, root)
 	screen := &screenBuffer{}
@@ -62,14 +62,14 @@ func TestRunListBoardFollowsAQuickDaemonRestart(t *testing.T) {
 
 	must(t, syscall.Kill(-board.Process.Pid, syscall.SIGSTOP))
 	if code, out := runCozy(t, root, "down", "--json"); code != 0 {
-		t.Fatalf("stopping the daemon [%d]: %s", code, out)
+		t.Fatalf("stopping Calcifer [%d]: %s", code, out)
 	}
-	if second := startDaemonProcess(t, root); second.token == first.token {
-		t.Fatal("the restarted daemon kept its predecessor's credential")
+	if second := startCalciferProcess(t, root); second.token == first.token {
+		t.Fatal("the restarted Calcifer kept its predecessor's credential")
 	}
 	before := frames()
 	must(t, syscall.Kill(-board.Process.Pid, syscall.SIGCONT))
-	landed(t, "frames drawn from the restarted daemon", func() bool {
+	landed(t, "frames drawn from the restarted Calcifer", func() bool {
 		select {
 		case err := <-exited:
 			t.Fatalf("the board exited across the restart (%v): %q", err, screen.String())
@@ -90,16 +90,16 @@ func TestRunListBoardFollowsAQuickDaemonRestart(t *testing.T) {
 	fatal(t, e)
 	// The process config is frozen by whichever test loaded it first.
 	cfg.Home, cfg.Port = root, port
-	following, e := localapi.Open(cfg, daemon.Probe(cfg))
+	following, e := localapi.Open(cfg, calcifer.Probe(cfg))
 	fatal(t, e)
 	following = following.Following(func() {})
 	if code, out := runCozy(t, root, "down", "--json"); code != 0 {
-		t.Fatalf("stopping the daemon [%d]: %s", code, out)
+		t.Fatalf("stopping Calcifer [%d]: %s", code, out)
 	}
-	startDaemonProcess(t, root)
-	// Its first exchange reaches the new daemon directly: no failed connection precedes it.
+	startCalciferProcess(t, root)
+	// Its first exchange reaches the new Calcifer directly: no failed connection precedes it.
 	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
 	if _, e := following.RequestPage(t.Context(), "", "", 1, 0); e != nil {
-		t.Fatalf("a following client refused by the restarted daemon: %s", e.Message)
+		t.Fatalf("a following client refused by the restarted Calcifer: %s", e.Message)
 	}
 }

@@ -21,7 +21,7 @@ func requestedRentalRequest(id, rentalID string) records.Request {
 
 // `cozy run --rental <name>` records requested_rental and leaves worker empty until the
 // scheduler assigns the run. Those runs are the rental's queue in the inventory. They are
-// recorded once the daemon runs: at its start it places every recorded run, and ends work
+// recorded once Calcifer runs: at its start it places every recorded run, and ends work
 // no machine execution holds.
 func TestRentalInventoryCountsRequestedRentalQueue(t *testing.T) {
 	root, hubURL, hub := rentalEndRoot(t, "rental-requested-queue")
@@ -33,7 +33,7 @@ func TestRentalInventoryCountsRequestedRentalQueue(t *testing.T) {
 	fatal(t, store.RecordRental(records.Rental{ID: rentalID, MachineName: "loran", State: "ready",
 		Hub: hubURL, AcceleratorCount: 1, HourlyRateUSDMicros: 100_000,
 		ReadyAt: time.Now().UTC().Format(time.RFC3339Nano)}))
-	live := startDaemonProcess(t, root)
+	live := startCalciferProcess(t, root)
 	var ids []string
 	for i := 0; i < 4; i++ {
 		request := requestedRentalRequest(fmt.Sprintf("req-loran-%d", i), rentalID)

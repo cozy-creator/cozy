@@ -21,7 +21,7 @@ import (
 // pod with work queued beats a cold one. The model's published throughput rows now give
 // every candidate — attached rental or purchase — an expected time and cost, and
 // `placement.prefer` picks among them. These arms are the design's worked example on the
-// real chooser, then the real daemon against a stand-in hub serving the rows.
+// real chooser, then the real Calcifer against a stand-in hub serving the rows.
 
 const fp8Lane = "fp8-adaln-pruned"
 
@@ -152,7 +152,7 @@ func placementRoot(t *testing.T, h *ladderHub, prefer string) (string, string) {
 	t.Helper()
 	root := t.TempDir()
 	body := []byte("tensorhub_url: " + h.server.URL + "\ntensorhub_token: ladder-test\n" +
-		"daemon:\n  idle_shutdown_s: 0\nplacement:\n  prefer: " + prefer + "\n")
+		"calcifer:\n  idle_shutdown_s: 0\nplacement:\n  prefer: " + prefer + "\n")
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), body, 0600))
 	sum := sha256.Sum256(body)
 	return root, hex.EncodeToString(sum[:])
@@ -181,7 +181,7 @@ func TestPlacementReusesTheMeasuredCard(t *testing.T) {
 	fatal(t, store.RecordRental(seed))
 	h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)
 	store.Close()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	// The attached H100 with nothing ahead: 1016 s at $2.70/h × 1016 s = $0.76, against a
 	// bought H100 at 1406 s. It wins, and the run says so in one line.
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--idempotency-key", "placement-reuse")
@@ -195,7 +195,7 @@ func TestPlacementReusesTheMeasuredCard(t *testing.T) {
 	}
 	const line = "placement: reuse morgiana (h100-80, fp8-adaln-pruned) — balanced, 1016 s, $0.76"
 	if !strings.Contains(out, line) {
-		t.Fatalf("cozy run did not print %q:\n%s\nDaemon log:\n%s", line, out, tail(filepath.Join(root, "daemon.log")))
+		t.Fatalf("cozy run did not print %q:\n%s\nCalcifer log:\n%s", line, out, tail(filepath.Join(root, "calcifer.log")))
 	}
 	placement := placementEvent(t, store, row.ID)
 	if placement["tier"] != "balanced" || placement["config_digest"] != digest || placement["line"] != line ||
@@ -235,7 +235,7 @@ func TestPlacementBuysAroundAStockOut(t *testing.T) {
 	h.provisions = true
 	h.soldOut["h100-80"] = true
 	root, _ := placementRoot(t, h, "fast")
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	// fast: the two H100s tie at 1406 s and the cheaper is asked first; the hub has none,
 	// so it is dropped and the choice repeats onto the H100 NVL over the slower H200.
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--idempotency-key", "placement-stock")
@@ -277,7 +277,7 @@ func TestUnusablePlacementPreferPlacesBalanced(t *testing.T) {
 	fatal(t, store.RecordRental(seed))
 	h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)
 	store.Close()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	_, stdout, stderr := runCozyStreams(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--idempotency-key", "placement-fallback")
 	if !strings.Contains(stderr, `placement.prefer "fastest" is not fast, balanced or cheap; using "balanced"`) {
 		t.Fatalf("the unusable tier was not named:\n%s", stderr)

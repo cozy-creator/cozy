@@ -24,11 +24,11 @@ type Layout struct {
 	DB       string // creator.sqlite — the one local SQLite lifecycle database
 	Installs string // one immutable directory per package install
 	Lock     string // installs/.lock — the install-filesystem single-writer flock
-	// Daemon is the Cozy daemon's lifetime ownership/address record (cl-001). The live
+	// Calcifer is calcifer.lock, Calcifer's lifetime ownership/address record (cl-001). The live
 	// owner holds its kernel lock and publishes the client address, worker socket and
 	// the per-launch CLI token under it, mode 0600. There is no separate client.cred.
-	Daemon  string
-	Workers string // per-worker roots: journal, logs, staged binding plans (live only)
+	Calcifer string
+	Workers  string // per-worker roots: journal, logs, staged binding plans (live only)
 	// Outputs is the user-facing store: `<org>-<package>/<digest>.<ext>`, one file per
 	// result file, named by its own content digest so a regenerated file lands on itself.
 	// User-owned result files are never automatically removed.
@@ -48,8 +48,8 @@ type Layout struct {
 	// pod's `/` for the same pod-supervisor Host, beside the controller's own grant for it
 	// (registration, owner key, launch record).
 	Machine string
-	// Log is the Cozy daemon's own log, bounded by rotation on an observed size
-	// (internal/daemon.OpenLog). Its one rotated predecessor is Log + ".1".
+	// Log is Calcifer's own log, bounded by rotation on an observed size
+	// (internal/calcifer.OpenLog). Its one rotated predecessor is Log + ".1".
 	Log string
 }
 
@@ -58,7 +58,7 @@ func Open(root string) (Layout, *exit.Error) {
 		return Layout{}, exit.Internalf("the local root is unset: internal/config.Load did not run")
 	}
 	// The records database retains request payloads and path-free creative prompts; the
-	// daemon lock carries the CLI token and rental secrets live under rentals/, so this
+	// Calcifer lock carries the CLI token and rental secrets live under rentals/, so this
 	// is an OS-private user root. Protecting the directory also protects SQLite's
 	// lazily-created WAL/SHM siblings.
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -96,7 +96,7 @@ func Paths(root string) Layout {
 		Root:     root,
 		DB:       filepath.Join(root, "creator.sqlite"),
 		Installs: filepath.Join(root, "installs"),
-		Daemon:   filepath.Join(root, "daemon.lock"),
+		Calcifer: filepath.Join(root, "calcifer.lock"),
 		Workers:  filepath.Join(root, "workers"),
 		Outputs:  filepath.Join(root, "outputs"),
 		Tmp:      filepath.Join(root, "tmp"),
@@ -105,12 +105,12 @@ func Paths(root string) Layout {
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
 	l.Machine = filepath.Join(root, "machine")
-	l.Log = filepath.Join(root, "daemon.log")
+	l.Log = filepath.Join(root, "calcifer.log")
 	return l
 }
 
 // DependencyCache is disposable immutable payload storage under tmp/: a capture holds its
-// scratch claim shared while it reads, and a daemon that starts with no capture reading it
+// scratch claim shared while it reads, and a Calcifer that starts with no capture reading it
 // reclaims it with the rest of tmp/.
 func (l Layout) DependencyCache() string {
 	return filepath.Join(l.Tmp, "dependency-objects")

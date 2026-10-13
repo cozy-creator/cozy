@@ -8,7 +8,7 @@ import (
 )
 
 // Work ends completed or failed with a reason; nothing waits for a retry. EndUnfinishedWork
-// ends, at daemon start, what an older daemon left waiting: each `blocked` request (a
+// ends, at Calcifer start, what an older Calcifer left waiting: each `blocked` request (a
 // failure kept open for a --retry) fails with the reason it stopped for, and each weights
 // destination of a run that already ended without publishing to it ends with that run. It
 // answers the requests it failed.

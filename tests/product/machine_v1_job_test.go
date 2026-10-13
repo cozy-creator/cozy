@@ -27,8 +27,6 @@ import (
 
 var cpuLongform = flag.String("cpu-longform", "", "tensord tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
 
-var olderCozy = flag.String("older-cozy", "", "a released cozy whose daemon predates cozy.machine.v1 (0.1.26)")
-
 // `cozy run <pkg>/long_form` on a machine that serves cozy.machine.v1, as a user types it: a
 // job whose file input is a reference image, each segment a child run of the package's own
 // invocable, the film published after every segment and saved to --out at its end.
@@ -120,7 +118,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	}
 }
 
-// A job on an explicit endpoint runs in the foreground (no daemon owns it), with its pause and
+// A job on an explicit endpoint runs in the foreground (no Calcifer owns it), with its pause and
 // resume, and an endpoint that is one of this host's rentals is signed with that rental's own
 // key: a rental's machine authorizes it, not this computer's machine owner key. Here this
 // computer's machine stands in for the rental: its key moves to a rental's credential and the
@@ -175,7 +173,7 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	der, err := x509.MarshalPKCS8PrivateKey(private)
 	must(t, err)
 	must(t, os.WriteFile(owner, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600))
-	// The daemon is not this run's controller: every command below is its own foreground one.
+	// Calcifer is not this run's controller: every command below is its own foreground one.
 	if code, out := runCozy(t, root, "down"); code != 0 {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
@@ -267,44 +265,6 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	if err != nil || grant.Run == "" || grant.Run != link.Get("r") || len(grant.Outputs) != 1 || grant.Outputs[0] != "video" {
 		t.Fatalf("the play link's capability is not the rental key's for run %s's video: %+v %v", link.Get("r"), grant, err)
 	}
-	if *olderCozy == "" {
-		return
-	}
-	// Version skew: under a running daemon that predates cozy.machine.v1, a run naming the
-	// rental goes from this command itself to the rental's machine; the daemon is not asked.
-	if code, stopped := runCozy(t, root, "down"); code != 0 {
-		t.Fatalf("down [exit %d]\n%s", code, stopped)
-	}
-	up := exec.Command(*olderCozy, "up")
-	up.Env = childEnv(t, root)
-	if raw, err := up.CombinedOutput(); err != nil {
-		t.Fatalf("the older cozy did not start its daemon: %v\n%s", err, raw)
-	}
-	daemonBinary := func() string {
-		lock, _ := os.ReadFile(filepath.Join(root, "daemon.lock"))
-		for line := range strings.Lines(string(lock)) {
-			if pid, ok := strings.CutPrefix(strings.TrimSpace(line), "pid="); ok {
-				exe, _ := os.Readlink("/proc/" + pid + "/exe")
-				return exe
-			}
-		}
-		return ""
-	}
-	older, err := filepath.EvalSymlinks(*olderCozy)
-	must(t, err)
-	if running := daemonBinary(); running != older {
-		t.Fatalf("the daemon runs %q, not the older cozy %q", running, older)
-	}
-	must(t, os.WriteFile(in, []byte(`{"segments":["solo"]}`), 0o600))
-	skewed := filepath.Join(root, "skewed")
-	code, awaited := runCozy(t, root, "run", "local/tensord-cpu-longform/long_form", "--rental=standin",
-		"--input", in, "--asset", "reference="+reference, "--await", "--json", "--out", skewed)
-	if files, _ := filepath.Glob(filepath.Join(skewed, "*video*")); code != 0 || len(files) != 1 {
-		t.Fatalf("the run under the older daemon did not save its film [exit %d]: %v\n%s", code, files, awaited)
-	}
-	if running := daemonBinary(); running != older {
-		t.Fatalf("the run replaced the older daemon with %q", running)
-	}
 }
 
 // A run its machine already accepted never starts a stopped machine: observing attaches while
@@ -365,7 +325,7 @@ func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 	if code, out := runCozy(t, root, "machine", "stop"); code != 0 || running() {
 		t.Fatalf("machine stop [exit %d]\n%s", code, out)
 	}
-	// The daemon's observer retries within seconds; a reader asks at once. Neither starts it.
+	// Calcifer's observer retries within seconds; a reader asks at once. Neither starts it.
 	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); time.Sleep(time.Second) {
 		if status(); running() {
 			t.Fatal("observing an accepted run started the stopped machine")
@@ -423,7 +383,7 @@ func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 	if got := status("1"); got != "canceled" {
 		t.Fatalf("the run its deadline ended is %q, not canceled", got)
 	}
-	// Detached: nobody waits, and the daemon still cancels it at the deadline.
+	// Detached: nobody waits, and Calcifer still cancels it at the deadline.
 	if code, out := runCozy(t, root, run...); code != 0 {
 		t.Fatalf("detached submit [exit %d]\n%s", code, out)
 	}

@@ -21,7 +21,7 @@ import (
 
 // THE JOB VERBS (cl-004): `submit` · `status` · `ls` · `follow` · `cancel`. They are
 // SIBLINGS of the request verbs, not a second surface — `internal/client` is the one way
-// each of them reaches the daemon, the durable event stream they follow is the same one
+// each of them reaches Calcifer, the durable event stream they follow is the same one
 // `cozy run` follows, and the terminal mapping is the same shared matrix
 // (0 · 11 · 12 · 10, through `exit.JobTerminal`).
 //
@@ -151,7 +151,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		}
 	}
 	if handle.MachineExecution {
-		// The daemon already owns this run. Waiting for the worker's receipt is
+		// Calcifer already owns this run. Waiting for the worker's receipt is
 		// part of --await, not a second acceptance gate for a detached command. A
 		// foreground controller ends with this command, so it submits before it does.
 		if !ctx.Inv.Bool("--follow") && ctx.endpoint == nil {
@@ -436,7 +436,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 				return
 			}
 			// A SIGNAL NEVER CANCELS THE JOB (cl-108): a dying follower is not a person
-			// asking for cancellation. The daemon owns the accepted job; this client
+			// asking for cancellation. Calcifer owns the accepted job; this client
 			// merely detaches, and only an explicit `cozy job cancel` cancels.
 			if !ctx.Mode().JSON {
 				lines.Detach(fmt.Sprintf(
@@ -791,8 +791,8 @@ func settled(status string) bool {
 	return false
 }
 
-// awaitMachineCollection follows the result collection the daemon owns after a run
-// completes on its machine. Each read waits on the daemon's own progress-bounded
+// awaitMachineCollection follows the result collection Calcifer owns after a run
+// completes on its machine. Each read waits on Calcifer's own progress-bounded
 // collection; only an unmet observation that stays unchanged for the whole stall budget
 // is reported, and the run and its retained result are untouched either way.
 func awaitMachineCollection(ctx *Context, state api.JobState) (api.JobState, *exit.Error) {

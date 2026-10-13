@@ -25,7 +25,7 @@ func TestOlderControllerCannotDropExplicitEndpointAndSubmitLocally(t *testing.T)
 	defer server.Close()
 	c := At(config.Config{}, strings.TrimPrefix(server.URL, "http://"), secret.Mint())
 	_, problem := c.Submit(api.Submission{Package: "local/fixture", Function: "classify", MachineEndpoint: &machineendpoint.Endpoint{}}, "key")
-	if problem == nil || problem.ErrName() != "daemon.machine_endpoint_unavailable" || posts.Load() != 0 {
+	if problem == nil || problem.ErrName() != "calcifer.machine_endpoint_unavailable" || posts.Load() != 0 {
 		t.Fatalf("endpoint absence must stop before POST: problem=%v posts=%d", problem, posts.Load())
 	}
 }

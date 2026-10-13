@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
 )
@@ -38,7 +38,7 @@ func TestScopedProgressKeepsChildTimingSeparateFromOverallWork(t *testing.T) {
 	}
 }
 
-// This is a built CLI subprocess consuming representative daemon SSE frames.
+// This is a built CLI subprocess consuming representative Calcifer SSE frames.
 // It proves presentation and protocol consumption, not live model execution.
 func TestRunWatchRendersScopedChildProgress(t *testing.T) {
 	frames := []api.Envelope{
@@ -70,7 +70,7 @@ func TestRunWatchRendersScopedChildProgress(t *testing.T) {
 				_, _ = fmt.Fprintf(w, "data: %s\n\n", encoded)
 			}
 		default:
-			t.Errorf("unexpected daemon route: %s", r.URL.Path)
+			t.Errorf("unexpected Calcifer route: %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
@@ -78,7 +78,7 @@ func TestRunWatchRendersScopedChildProgress(t *testing.T) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
+	held, problem := calcifer.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
 	fatal(t, problem)
 	defer held.Release()
 	_, problem = api.Mint(layout)

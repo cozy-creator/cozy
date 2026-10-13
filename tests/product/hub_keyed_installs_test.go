@@ -25,7 +25,7 @@ func TestOneNameFromTwoHubsInstallsAndRunsSeparately(t *testing.T) {
 	must(t, os.WriteFile(body, []byte(strings.ReplaceAll(string(raw), "payload.value + 1", "payload.value + 100")), 0o600))
 	publishParityRelease(t, b, root, project)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: a\ntensorhub_token: rental-idle-test\nhubs:\n  a: "+
-		a.server.URL+"\n  b: "+b.server.URL+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		a.server.URL+"\n  b: "+b.server.URL+"\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	fixtureExecutionAccess(t, root, b.server, b.worker.Config.Handler)
 
 	for _, hub := range []string{"a", "b"} {

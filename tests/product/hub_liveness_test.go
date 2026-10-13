@@ -38,7 +38,7 @@ func livenessHome(t *testing.T, name string) string {
 func addressHub(t *testing.T, root, hubURL string, seconds int) {
 	t.Helper()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(fmt.Sprintf(
-		"tensorhub_url: %s\ntensorhub_liveness_s: %d\ndaemon:\n  idle_shutdown_s: 0\n", hubURL, seconds)), 0o600))
+		"tensorhub_url: %s\ntensorhub_liveness_s: %d\ncalcifer:\n  idle_shutdown_s: 0\n", hubURL, seconds)), 0o600))
 }
 
 // tlsHub serves handler over HTTP/2 with TLS and returns the SSL_CERT_FILE setting that

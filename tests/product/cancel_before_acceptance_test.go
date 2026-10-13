@@ -29,7 +29,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 		t.Skip("requires -machine-host: the current native machine fixture")
 	}
 	for _, arm := range []struct{ name, machine string }{{"rental unavailable", "pr-deadpoddeadpoddead0"},
-		{"rental cancel recorded while daemon down", "pr-deadpoddeadpoddead0"},
+		{"rental cancel recorded while Calcifer down", "pr-deadpoddeadpoddead0"},
 		{"rental native signing key lost", "pr-deadpoddeadpoddead0"},
 		{"rental executing", "pr-deadpoddeadpoddead0"}} {
 		machine := arm.machine
@@ -58,7 +58,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			if executing {
 				fatal(t, store.AcceptRunV1(request.ID, machine, &v1.RunState{Id: request.ID, Number: 1, State: "running", Attempt: 1}))
 			}
-			if arm.name == "rental cancel recorded while daemon down" {
+			if arm.name == "rental cancel recorded while Calcifer down" {
 				_, problem := store.RequestMachineCancellation(request.ID, "cozy run cancel")
 				fatal(t, problem)
 			}
@@ -67,7 +67,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 			}
 			store.Close()
 			began := time.Now()
-			startDaemonProcess(t, root)
+			startCalciferProcess(t, root)
 			if code, out := runCozy(t, root, "run", "cancel", request.ID, "--json"); code != 0 ||
 				!strings.Contains(out, `"canceling"`) {
 				observations, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -78,7 +78,7 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 					t.Logf("%s: %v", event.Type, event.Payload)
 				}
 				observations.Close()
-				t.Fatalf("cancel did not end the run [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
+				t.Fatalf("cancel did not end the run [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "calcifer.log")))
 			}
 
 			store, problem = records.Open(filepath.Join(root, "creator.sqlite"))

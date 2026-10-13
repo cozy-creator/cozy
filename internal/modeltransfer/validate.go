@@ -21,7 +21,7 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		// as serving. Private operation-local manifests have no such authority.
 		for _, model := range spec.Models {
 			// A choice on a named rental is resolved to a Hub checkpoint before it runs: by
-			// the machine (release roots) or by the daemon at dispatch (prepared path).
+			// the machine (release roots) or by Calcifer at dispatch (prepared path).
 			if model.Choice && spec.RequestedRental != "" {
 				continue
 			}

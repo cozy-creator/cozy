@@ -48,7 +48,7 @@ func (m *idleClockMachine) Status(request *v1.StatusRequest, stream grpc.ServerS
 	return stream.Send(frame)
 }
 
-// The real CLI and daemon say the owner's rule, and `rental list`, `rental show` and
+// The real CLI and Calcifer say the owner's rule, and `rental list`, `rental show` and
 // `rental keepalive` show the deadline the rental's machine names, never one of their own.
 func TestRentalListAndKeepaliveShowTheMachinesIdleDeadline(t *testing.T) {
 	h := newFakeRentalHub(t, 0)
@@ -65,7 +65,7 @@ func TestRentalListAndKeepaliveShowTheMachinesIdleDeadline(t *testing.T) {
 	certServer := httptest.NewTLSServer(http.NotFoundHandler())
 	cert := certServer.TLS.Certificates[0]
 	certServer.Close()
-	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow pinned loopback machine fixture for the real daemon's Status reads
+	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow pinned loopback machine fixture for the real Calcifer's Status reads
 	must(t, err)
 	machine := &idleClockMachine{}
 	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}})))
@@ -82,7 +82,7 @@ func TestRentalListAndKeepaliveShowTheMachinesIdleDeadline(t *testing.T) {
 		"cert_pem": string(certPEM), "worker_id": "idle-worker", "worker_boot_id": "idle-boot", "creator_public_key": owner.PublicKey(),
 		"hourly_rate_usd_micros": int64(1), "accelerator_count": 1, "requested_accelerator_model": "CPU"}
 	h.mu.Unlock()
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 
 	stamp := func(ms int64) string { return time.UnixMilli(ms).UTC().Format(time.RFC3339Nano) }
 	listed := func() map[string]any {
@@ -92,7 +92,7 @@ func TestRentalListAndKeepaliveShowTheMachinesIdleDeadline(t *testing.T) {
 			Rentals []map[string]any `json:"rentals"`
 		}
 		if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Rentals) != 1 {
-			t.Fatalf("rental list [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("rental list [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "calcifer.log")))
 		}
 		return document.Rentals[0]
 	}

@@ -102,7 +102,7 @@ func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, 
 		"if [ \"$#\" -eq 0 ]; then printf 'CUDA Version: 13.0\\n'; else printf '%s\\n' "+
 		quote("0, "+gpu+", 8192, 8192, 580.82.09, 8.9")+"; fi\n"), 0700))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(fmt.Sprintf(
-		"tensorhub_url: %s\ntensorhub_token: ladder-test\ntfs: %s\ndaemon:\n  idle_shutdown_s: 0\n", server.URL, tensorfs)), 0600))
+		"tensorhub_url: %s\ntensorhub_token: ladder-test\ntfs: %s\ncalcifer:\n  idle_shutdown_s: 0\n", server.URL, tensorfs)), 0600))
 	installDir := filepath.Join(root, "installs", "inst-admission")
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installDir)), 0700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(installDir), iface, 0600))
@@ -129,17 +129,17 @@ func runAdmissionCLI(t *testing.T, root, path string, args ...string) (int, stri
 	return cmd.ProcessState.ExitCode(), string(out)
 }
 
-// daemonFleetHousekeeping is the traffic the DAEMON generates for its own reasons,
-// which these arms are not about. `cozy run` dials the daemon, and a daemon asks the
+// calciferFleetHousekeeping is the traffic CALCIFER generates for its own reasons,
+// which these arms are not about. `cozy run` dials Calcifer, and a Calcifer asks the
 // hub what rentals this account owns whether or not it holds any records of its own
 // (cl-199) — that reverse reconcile is the only way a pod nobody recorded is ever
 // noticed, so it cannot be conditioned on the local fleet being non-empty. It is the
-// same class as the per-rental reconcile the daemon already runs, which this fixture
+// same class as the per-rental reconcile Calcifer already runs, which this fixture
 // simply never saw because it holds no rentals.
 //
 // What these arms assert is unchanged: nothing the INVALID INPUT touches reaches the
 // hub, the store, or the GPU.
-func daemonFleetHousekeeping(request string) bool { return request == "GET /v1/rentals" }
+func calciferFleetHousekeeping(request string) bool { return request == "GET /v1/rentals" }
 
 func (p *admissionProbe) snapshot() (requests, lanes []string) {
 	p.mu.Lock()
@@ -190,7 +190,7 @@ func TestRunValidatesArgumentsBeforeModelResolution(t *testing.T) {
 			requests, _ := probe.snapshot()
 			for _, request := range requests {
 				if request != "GET /v1/packages/proof/h3" && request != "GET /v1/packages/proof/h3/releases/1.0.0" &&
-					!daemonFleetHousekeeping(request) {
+					!calciferFleetHousekeeping(request) {
 					t.Errorf("invalid input reached %s", request)
 				}
 			}
@@ -212,7 +212,7 @@ func TestBareRunReportsRequiredArgumentsAndFullInterface(t *testing.T) {
 	}
 	requests, _ := probe.snapshot()
 	for _, request := range requests {
-		if !daemonFleetHousekeeping(request) {
+		if !calciferFleetHousekeeping(request) {
 			t.Errorf("rendering argument help dialed Hub: %v", requests)
 			break
 		}

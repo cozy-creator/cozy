@@ -16,7 +16,7 @@ import (
 const bashWordBreaks = " \t\n\"'><=;|&(:"
 
 // The real binary answers the shell protocol from the Kong grammar and this root's
-// records, read-only: no daemon starts and nothing is written.
+// records, read-only: no Calcifer starts and nothing is written.
 func TestShellCompletion(t *testing.T) {
 	root, work := t.TempDir(), t.TempDir()
 	seedCompletionRoot(t, root)
@@ -73,8 +73,8 @@ func TestShellCompletion(t *testing.T) {
 	if got := complete("bash", "cozy run "); !slices.Contains(got, "cancel") || !slices.Contains(got, "proof/dryrun/prepare") {
 		t.Errorf("cozy run <TAB> = %q, want its verbs and installed callables", got)
 	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatalf("completion touched the daemon: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "calcifer.lock")); !os.IsNotExist(err) {
+		t.Fatalf("completion touched Calcifer: %v", err)
 	}
 
 	// The printed bash script drives the same protocol from COMP_LINE/COMP_POINT.

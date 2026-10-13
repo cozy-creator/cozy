@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localapi "github.com/cozy-creator/cozy/internal/client"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -25,7 +25,7 @@ import (
 )
 
 // startEndpointController composes the existing business API and machine observer for
-// one explicit target. It does not take the daemon lock, reconcile/sweep other work,
+// one explicit target. It does not take the Calcifer lock, reconcile/sweep other work,
 // register a rental, change the Hub or start this computer's machine.
 func startEndpointController(ctx *Context, path string) (func(), *exit.Error) {
 	ep, err := machineendpoint.Read(path)
@@ -90,7 +90,7 @@ func endpointController(ctx *Context, ep *machineendpoint.Endpoint) (func(), *ex
 		}
 		_, run := runIDOf(r.URL.Path)
 		submit := r.URL.Path == "/v1/requests" || r.URL.Path == "/v1/local/jobs"
-		if r.Method == http.MethodPost && !submit && !run || r.Method == http.MethodDelete && r.URL.Path == "/v1/local/daemon" {
+		if r.Method == http.MethodPost && !submit && !run || r.Method == http.MethodDelete && r.URL.Path == "/v1/local/calcifer" {
 			http.Error(w, "foreground operation is scoped to this request lifecycle", http.StatusForbidden)
 			return
 		}
@@ -132,7 +132,7 @@ func endpointRuns(ctx *Context, ep *machineendpoint.Endpoint, l home.Layout, st 
 }
 
 // endpointForRecordedRun keeps watch/cancel on the recorded target after the
-// selector file or original observer is gone. The existing daemon remains usable.
+// selector file or original observer is gone. The existing Calcifer remains usable.
 func endpointForRecordedRun(ctx *Context, id string) (func(), *exit.Error) {
 	st, problem := records.Open(filepath.Join(ctx.Cfg.Home, "creator.sqlite"))
 	if problem != nil {
@@ -203,10 +203,10 @@ func runIDOf(path string) (string, bool) {
 }
 
 // foregroundRental is a named rental's machine as an explicit endpoint, for a run the running
-// daemon cannot carry (it predates cozy.machine.v1): nil when no daemon runs (this CLI starts
-// its own) or the daemon runs v1 work itself.
+// Calcifer cannot carry (it predates cozy.machine.v1): nil when no Calcifer runs (this CLI starts
+// its own) or Calcifer runs v1 work itself.
 func foregroundRental(ctx *Context, name string) (*machineendpoint.Endpoint, *exit.Error) {
-	state := daemon.Probe(ctx.Cfg)
+	state := calcifer.Probe(ctx.Cfg)
 	if !state.Up || state.OperatorOwned {
 		return nil, nil
 	}

@@ -4,7 +4,7 @@ package cli
 // directory on my machine) and I edit it, are those edits moved onto the machines I'm
 // connected to occasionally? ... otherwise they'd get out of date as I evolve my package
 // locally." Before this, an edit reached a worker only at the next `cozy run`, which paid
-// the rebuild and the cold placement itself. Now the daemon watches every editable
+// the rebuild and the cold placement itself. Now Calcifer watches every editable
 // install's source tree; a change is rebuilt on the path a run would have taken
 // (RefreshSnapshot: rebuild, Runtime accepts, the pin swaps), so the next run on any
 // machine starts from the new install.
@@ -186,8 +186,8 @@ func (s *editableSync) rescanLoop() {
 // single-writer lock, and the database event that woke this arrives while the writer is
 // still inside its transaction, so the set is read only once that writer has let go.
 func (s *editableSync) reconcile() {
-	// This read barrier briefly owns the same writer claim as a refresh. Join the
-	// daemon's mutation lock so a foreground refresh waits for the barrier instead
+	// This read barrier briefly owns the same writer claim as a refresh. Join
+	// Calcifer's mutation lock so a foreground refresh waits for the barrier instead
 	// of reporting our own watcher as a competing install process.
 	s.resolver.refreshMu.Lock()
 	if file, err := os.OpenFile(s.layout.Lock, os.O_CREATE|os.O_RDWR, 0o644); err == nil {
@@ -284,7 +284,7 @@ func (s *editableSync) reconcile() {
 		}
 		fmt.Fprintf(s.log, "editable %s: watching %s\n", pkg, root)
 		go s.syncTree(tree)
-		// The daemon has not read this tree yet: what changed while nobody watched is
+		// Calcifer has not read this tree yet: what changed while nobody watched is
 		// found by reading it once now.
 		wake(tree.kick)
 	}

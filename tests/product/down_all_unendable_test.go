@@ -9,7 +9,7 @@ import (
 )
 
 // `cozy down --all` ends what it can. A rental whose hub is gone, or one that never
-// finishes draining, is reported with its reason; the daemon still stops and the verb
+// finishes draining, is reported with its reason; Calcifer still stops and the verb
 // exits non-zero instead of retrying forever.
 func TestDownAllStopsWhenRentalsCannotBeEnded(t *testing.T) {
 	for _, mode := range []string{"hub-unreachable", "never-drains"} {
@@ -42,8 +42,8 @@ func TestDownAllStopsWhenRentalsCannotBeEnded(t *testing.T) {
 			if !strings.Contains(out, id) || !strings.Contains(out, "NOT ended") {
 				t.Fatalf("down --all did not name the unended rental and why\n%s", out)
 			}
-			if pids := daemonPidsOn(root); len(pids) != 0 {
-				t.Fatalf("daemon still running after down --all: %v\n%s", pids, out)
+			if pids := calciferPidsOn(root); len(pids) != 0 {
+				t.Fatalf("Calcifer still running after down --all: %v\n%s", pids, out)
 			}
 		})
 	}

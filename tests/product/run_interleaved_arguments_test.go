@@ -41,8 +41,8 @@ func TestRunDescribeAcceptsPayloadAfterOptions(t *testing.T) {
 			t.Fatalf("normalization reinterpreted a non-run argument: %d %s", code, out)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatal("describe or parser refusal started a daemon")
+	if _, err := os.Stat(filepath.Join(root, "calcifer.lock")); !os.IsNotExist(err) {
+		t.Fatal("describe or parser refusal started a Calcifer")
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()

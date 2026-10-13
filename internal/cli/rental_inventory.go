@@ -41,7 +41,7 @@ func readRentalInventory(ctx context.Context, st *records.Store, fleet *managedR
 		origins = held
 	}
 	// Without reconcile the listing serves what the fleet's own loop and the last listing read,
-	// but a hub never asked since this daemon started is asked now: no answer is not an empty fleet.
+	// but a hub never asked since this Calcifer started is asked now: no answer is not an empty fleet.
 	fleet.mu.Lock()
 	unobserved := slices.DeleteFunc(slices.Clone(origins), func(each string) bool { return fleet.censusLocked(each).observed })
 	fleet.mu.Unlock()
@@ -97,7 +97,7 @@ func readRentalInventory(ctx context.Context, st *records.Store, fleet *managedR
 // rentalInventoryOrigins is every hub an every-hub listing asks, from what holds now: the
 // asking command's hub, every hub this machine is signed in to (another client's rentals
 // need no local record), and every hub this host holds a rental or acquisition on. A hub
-// name never adds a hub, so a daemon's start-up copy of config.yaml cannot keep a removed
+// name never adds a hub, so a Calcifer's start-up copy of config.yaml cannot keep a removed
 // one listed.
 func rentalInventoryOrigins(ctx *Context, st *records.Store, asked string) ([]string, *exit.Error) {
 	seen := map[string]bool{asked: true}

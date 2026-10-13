@@ -208,7 +208,7 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		if problem != nil {
 			row.Error = problem.Message
 			if m.ctx.Err() != nil && row.State != "preparing" {
-				row.State = "reconciling" // the next daemon attaches to the same update
+				row.State = "reconciling" // the next Calcifer attaches to the same update
 			} else {
 				row.State = "failed" // refused or rolled back: it serves its previous software
 			}
@@ -222,7 +222,7 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 }
 
 // update sends the recorded selection to the rental's machine as Run kind: update and follows
-// it to its outcome. The run's id is this update's id, so a daemon that resumes the update
+// it to its outcome. The run's id is this update's id, so a Calcifer that resumes the update
 // attaches to the same run; local wheels go up first with Write. Published versions the
 // machine already runs are not installed again.
 func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeUpdate, identity *orchestrator.WorkerConnection) *exit.Error {
@@ -272,7 +272,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			return finish("the Hub names no target software")
 		}
 		cohort.Runtime, cohort.TensorFS = &machinev1.Member{Version: target.Runtime}, &machinev1.Member{Version: target.TensorFS}
-		// Recorded as exact versions: a daemon that resumes this update installs what was resolved.
+		// Recorded as exact versions: a Calcifer that resumes this update installs what was resolved.
 		selection.RuntimeVersion, selection.TensorFSVersion = target.Runtime, target.TensorFS
 		row.Selection, _ = json.Marshal(selection)
 	}
@@ -374,7 +374,7 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 		return problem
 	}
 	if request == (api.RuntimeUpdateRequest{}) {
-		// Nothing named is the Hub's target, named here: a daemon older than this cozy reads an
+		// Nothing named is the Hub's target, named here: a Calcifer older than this cozy reads an
 		// empty request as the newest published pair.
 		hctx, cancel := hub.Context()
 		target, problem := client(ctx).Software(hctx)
@@ -458,7 +458,7 @@ func heldBy(c *localapi.Client, machine string) string {
 
 // bootSoftware is a new rental's software once the Hub's target is in place, for `rental new`
 // to show: the fields, or the note saying why it kept its image's.
-// The versions are named, never left empty: a daemon older than this cozy reads an empty
+// The versions are named, never left empty: a Calcifer older than this cozy reads an empty
 // request as the newest published pair, and a Hub naming no target asks for nothing.
 func bootSoftware(ctx *Context, rentalID, machine string) ([]output.Field, string) {
 	hctx, cancel := hub.Context()

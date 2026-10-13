@@ -10,15 +10,15 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 )
 
 // Real CLI subprocesses read a published package and submit through their normal HTTP
-// transport. The daemon fixture observes submission without starting machine work.
+// transport. The Calcifer fixture observes submission without starting machine work.
 func invocationNamesRoot(t *testing.T, raw []byte) (string, <-chan api.JobSubmission) {
 	t.Helper()
 	submitted := make(chan api.JobSubmission, 8)
@@ -49,7 +49,7 @@ func invocationNamesRoot(t *testing.T, raw []byte) (string, <-chan api.JobSubmis
 	t.Cleanup(server.Close)
 	layout, problem := home.Open(t.TempDir())
 	fatal(t, problem)
-	held, problem := daemon.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
+	held, problem := calcifer.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
 	fatal(t, problem)
 	t.Cleanup(held.Release)
 	_, problem = api.Mint(layout)

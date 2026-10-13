@@ -33,13 +33,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// idleRoot is a daemon root whose idle exit follows one second with nothing to manage.
+// idleRoot is a Calcifer root whose idle exit follows one second with nothing to manage.
 func idleRoot(t *testing.T, name string) (string, *records.Store) {
 	t.Helper()
 	root := filepath.Join(scratchBase, name)
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("daemon:\n  idle_shutdown_s: 1\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("calcifer:\n  idle_shutdown_s: 1\n"), 0o600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	t.Cleanup(func() { store.Close() })
@@ -47,11 +47,11 @@ func idleRoot(t *testing.T, name string) (string, *records.Store) {
 }
 
 // The owner's ruling: work ends completed or failed, never waits forever, and dead work never
-// holds the daemon. These are the records an older daemon left on his machine — retained jobs
+// holds Calcifer. These are the records an older Calcifer left on his machine — retained jobs
 // `blocked` for a retry with their output export pending, a classic terminal its worker never
 // acknowledged, rentals the Hub reported failed, and a weights destination of a run that had
-// already failed. The next daemon fails each with its reason, keeps every row, and leaves.
-func TestDaemonEndsWorkAnOlderDaemonLeftWaiting(t *testing.T) {
+// already failed. The next Calcifer fails each with its reason, keeps every row, and leaves.
+func TestCalciferEndsWorkAnOlderCalciferLeftWaiting(t *testing.T) {
 	root, store := idleRoot(t, "work-ends")
 	blocked, _, problem := store.Submit(records.Request{ID: "job-blocked-refused", IdemKey: "job-blocked-refused", Kind: "job",
 		Package: "local/sage2-lease-proof", Entrypoint: "prove", Payload: []byte(`{}`), BodyDigest: childDigest("1"),
@@ -90,14 +90,14 @@ func TestDaemonEndsWorkAnOlderDaemonLeftWaiting(t *testing.T) {
 	must(t, err)
 	must(t, db.Close())
 
-	logPath := filepath.Join(root, "daemon.log")
-	if code := awaitDaemonExit(t, startDaemonProcess(t, root), 30*time.Second); code != 0 {
-		t.Fatalf("the daemon exited %d\n%s", code, tail(logPath))
+	logPath := filepath.Join(root, "calcifer.log")
+	if code := awaitCalciferExit(t, startCalciferProcess(t, root), 30*time.Second); code != 0 {
+		t.Fatalf("Calcifer exited %d\n%s", code, tail(logPath))
 	}
 	log, _ := os.ReadFile(logPath)
 	if !strings.Contains(string(log), "nothing to manage for 1s; stopping") || strings.Contains(string(log), "idle exit held") ||
 		!strings.Contains(string(log), blocked.ID+": "+reason+"; it waited for a retry and has failed") {
-		t.Fatalf("dead work held the daemon, or its end went unsaid\n%s", tail(logPath))
+		t.Fatalf("dead work held Calcifer, or its end went unsaid\n%s", tail(logPath))
 	}
 	row, problem := store.RequestRow(blocked.ID)
 	fatal(t, problem)
@@ -134,7 +134,7 @@ func TestDaemonEndsWorkAnOlderDaemonLeftWaiting(t *testing.T) {
 }
 
 // An export whose destination cannot hold its files fails with the reason, once: it holds
-// nothing, and no later daemon start tries it again.
+// nothing, and no later Calcifer start tries it again.
 func TestAnExportToAnInvalidDestinationFailsOnce(t *testing.T) {
 	root, store := idleRoot(t, "export-invalid")
 	blocker := filepath.Join(root, "not-a-directory")
@@ -158,11 +158,11 @@ func TestAnExportToAnInvalidDestinationFailsOnce(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.Closed(request.ID, 1))
 
-	logPath := filepath.Join(root, "daemon.log")
+	logPath := filepath.Join(root, "calcifer.log")
 	var settled string
 	for start := range 2 {
-		if code := awaitDaemonExit(t, startDaemonProcess(t, root), 30*time.Second); code != 0 {
-			t.Fatalf("start %d: the daemon exited %d\n%s", start, code, tail(logPath))
+		if code := awaitCalciferExit(t, startCalciferProcess(t, root), 30*time.Second); code != 0 {
+			t.Fatalf("start %d: Calcifer exited %d\n%s", start, code, tail(logPath))
 		}
 		export, problem := store.OutputExportOf(request.ID)
 		fatal(t, problem)
@@ -175,7 +175,7 @@ func TestAnExportToAnInvalidDestinationFailsOnce(t *testing.T) {
 		settled = export.UpdatedAt
 	}
 	if raw, _ := os.ReadFile(logPath); strings.Contains(string(raw), "idle exit held") {
-		t.Fatalf("a failed export held the daemon\n%s", tail(logPath))
+		t.Fatalf("a failed export held Calcifer\n%s", tail(logPath))
 	}
 }
 
@@ -187,7 +187,7 @@ func TestARunTheMarketCannotServeFails(t *testing.T) {
 		h.soldOut[sku.Name] = true
 	}
 	root := ladderRoot(t, h)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json", "--idempotency-key", "sold-out")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -213,7 +213,7 @@ func TestARunWhoseMachineNeverBootedFailsInsteadOfPlacingAgain(t *testing.T) {
 	hub := newFakeRentalHub(t, 0)
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubURL+"\n"+
-		"tensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"tensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 0\n"), 0o600))
 	hub.packageReleases = map[string]any{"fake/lost@1": rentalReleaseFacts()}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -228,7 +228,7 @@ func TestARunWhoseMachineNeverBootedFailsInsteadOfPlacingAgain(t *testing.T) {
 		Release: "1", Entrypoint: "generate", Payload: []byte("{}"), Rental: true, Worker: "rental-unbooted", MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(id, "rental-unbooted"))
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	hub.setState("rental-unbooted", "failed", "supervisor_never_started")
 	waitFor(t, root, "the run failing with its unbooted rental", func() bool {
 		row, problem := store.RequestRow(id)
@@ -287,7 +287,7 @@ func TestACancelTheMachineNeverTookEndsCanceled(t *testing.T) {
 	ep := &machineendpoint.Endpoint{Format: machineendpoint.Format, Address: listener.Addr().String(), WorkerID: "fixture-worker",
 		WorkerBootID: "fixture-boot", WorkspaceID: "fixture",
 		CertificatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}))}
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	row, _, problem := store.SubmitWithEvent(records.Request{ID: "req-never-taken", IdemKey: "never-taken", Package: "proof/never",
 		Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
 		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Destination: "proof/never", Outputs: []records.ModelTransferOutput{{Name: "model"}}}},
@@ -320,7 +320,7 @@ func TestARentalAskNobodyCanFinishFails(t *testing.T) {
 	hub := newFakeRentalHub(t, 0)
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", hub.port())
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hubURL+"\n"+
-		"tensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 1\n"), 0o600))
+		"tensorhub_token: rental-idle-test\ncalcifer:\n  idle_shutdown_s: 1\n"), 0o600))
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	author := func(string) ([]byte, string, *exit.Error) { return []byte(`{}`), "proof", nil }
@@ -335,8 +335,8 @@ func TestARentalAskNobodyCanFinishFails(t *testing.T) {
 	release, problem := rental.HoldAsk(layout, "ask-in-flight")
 	fatal(t, problem)
 
-	logPath := filepath.Join(root, "daemon.log")
-	d := startDaemonProcess(t, root)
+	logPath := filepath.Join(root, "calcifer.log")
+	d := startCalciferProcess(t, root)
 	ended := func(key, state, reason string) bool {
 		op, problem := store.RentalOperation(key)
 		fatal(t, problem)
@@ -347,8 +347,8 @@ func TestARentalAskNobodyCanFinishFails(t *testing.T) {
 	})
 	awaitIdleHold(t, d, logPath, "rental_operation ask-in-flight (pending_acquisition)")
 	release()
-	if code := awaitDaemonExit(t, d, 60*time.Second); code != 0 {
-		t.Fatalf("the daemon exited %d\n%s", code, tail(logPath))
+	if code := awaitCalciferExit(t, d, 60*time.Second); code != 0 {
+		t.Fatalf("Calcifer exited %d\n%s", code, tail(logPath))
 	}
 	if !ended("ask-in-flight", "rejected", "the command that made it is gone") {
 		op, _ := store.RentalOperation("ask-in-flight")
@@ -381,9 +381,9 @@ func TestARunWhoseLocalMachineIsGoneFails(t *testing.T) {
 	_, problem := store.RequestMachineCancellation("req-machine-gone-canceling", "cozy run cancel")
 	fatal(t, problem)
 
-	logPath := filepath.Join(root, "daemon.log")
-	if code := awaitDaemonExit(t, startDaemonProcess(t, root), 60*time.Second); code != 0 {
-		t.Fatalf("the daemon exited %d\n%s", code, tail(logPath))
+	logPath := filepath.Join(root, "calcifer.log")
+	if code := awaitCalciferExit(t, startCalciferProcess(t, root), 60*time.Second); code != 0 {
+		t.Fatalf("Calcifer exited %d\n%s", code, tail(logPath))
 	}
 	row, problem := store.RequestRow("req-machine-gone")
 	fatal(t, problem)
@@ -397,9 +397,9 @@ func TestARunWhoseLocalMachineIsGoneFails(t *testing.T) {
 	}
 }
 
-// Work at rest holds no daemon up: a paused run and a finished one keeping its results wait
+// Work at rest holds no Calcifer up: a paused run and a finished one keeping its results wait
 // for their owner's next command, exactly as they were.
-func TestWorkAtRestDoesNotHoldTheDaemon(t *testing.T) {
+func TestWorkAtRestDoesNotHoldTheCalcifer(t *testing.T) {
 	root, store := idleRoot(t, "at-rest")
 	acceptedLocalRun(t, store, "job-paused", records.Request{RetainWork: true})
 	fatal(t, store.ObserveRunV1("job-paused", &v1.RunEvent{Sequence: 1, Event: &v1.RunEvent_State{
@@ -418,12 +418,12 @@ func TestWorkAtRestDoesNotHoldTheDaemon(t *testing.T) {
 		t.Fatalf("the fixture's run is not paused: %+v", row)
 	}
 
-	logPath := filepath.Join(root, "daemon.log")
-	if code := awaitDaemonExit(t, startDaemonProcess(t, root), 60*time.Second); code != 0 {
-		t.Fatalf("the daemon exited %d\n%s", code, tail(logPath))
+	logPath := filepath.Join(root, "calcifer.log")
+	if code := awaitCalciferExit(t, startCalciferProcess(t, root), 60*time.Second); code != 0 {
+		t.Fatalf("Calcifer exited %d\n%s", code, tail(logPath))
 	}
 	if log, _ := os.ReadFile(logPath); strings.Contains(string(log), "idle exit held") {
-		t.Fatalf("work at rest held the daemon\n%s", tail(logPath))
+		t.Fatalf("work at rest held Calcifer\n%s", tail(logPath))
 	}
 	for id, state := range map[string]string{"job-paused": "paused", "job-kept": "succeeded"} {
 		if row, problem := store.RequestRow(id); problem != nil || row == nil || row.State != state || !row.RetainWork {

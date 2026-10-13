@@ -65,9 +65,9 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		}
 		return out
 	}
-	restartDaemon := func() {
+	restartCalcifer := func() {
 		t.Helper()
-		lock, err := os.ReadFile(filepath.Join(root, "daemon.lock"))
+		lock, err := os.ReadFile(filepath.Join(root, "calcifer.lock"))
 		must(t, err)
 		pid := 0
 		for _, line := range strings.Split(string(lock), "\n") {
@@ -77,7 +77,7 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			}
 		}
 		if pid <= 0 {
-			t.Fatal("the test daemon has no process identity")
+			t.Fatal("the test Calcifer has no process identity")
 		}
 		process, err := os.FindProcess(pid)
 		must(t, err)
@@ -198,7 +198,7 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			// Only the failed predecessor still needs explicit abandonment.
 			run("run", "cancel", "1")
 		}
-		restartDaemon()
+		restartCalcifer()
 		checkTensor(originalA, 7)
 		value := 15
 		if cycle == 1 {

@@ -42,7 +42,7 @@ func (s *Server) pauseJob(w http.ResponseWriter, r *http.Request) {
 	s.refuseTyped(w, r, notOnAMachine("pause"))
 }
 
-// notOnAMachine refuses control of work no machine executes: the daemon's own model
+// notOnAMachine refuses control of work no machine executes: Calcifer's own model
 // transfer only cancels.
 func notOnAMachine(action string) *exit.Error {
 	return exit.Named(exit.Conflict, "request.not_on_a_machine", "only work a machine executes can %s", action)

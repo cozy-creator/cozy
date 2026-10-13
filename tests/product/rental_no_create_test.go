@@ -82,7 +82,7 @@ func TestRentalNoCreateStartupReconcilesStaleAcquiringRow(t *testing.T) {
 	fatal(t, st.RecordRental(records.Rental{ID: "pr-no-create-stale", MachineName: "ayanojou",
 		SKU: "l4", AcceleratorModel: "NVIDIA L4", AcceleratorCount: 1,
 		HourlyRateUSDMicros: 100_000, State: "acquiring", Hub: hubURL}))
-	live := startDaemonProcess(t, root)
+	live := startCalciferProcess(t, root)
 	response := live.call(t, "GET", "/v1/local/rentals", nil)
 	var inventory api.RentalInventory
 	must(t, json.Unmarshal(response.Body, &inventory))
@@ -105,6 +105,6 @@ func TestRentalNoCreateStartupReconcilesStaleAcquiringRow(t *testing.T) {
 	held, problem := st.Obligations()
 	fatal(t, problem)
 	if len(held) != 0 {
-		t.Fatalf("definitive no-create still holds the daemon: %+v", held)
+		t.Fatalf("definitive no-create still holds Calcifer: %+v", held)
 	}
 }

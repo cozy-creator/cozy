@@ -17,10 +17,10 @@ import (
 
 // `cozy rental update` with local wheels sends them to the rental's machine with Write and
 // runs Run kind: update there: the machine restarts its service on the candidate in place
-// (same boot), the daemon records the outcome, and a daemon that crashed mid-update attaches
+// (same boot), Calcifer records the outcome, and a Calcifer that crashed mid-update attaches
 // to the same update rather than starting another.
-func TestRentalUpdateRunsOnTheMachineAcrossADaemonCrash(t *testing.T) {
-	root, store, launch, identity, daemon := statusRental(t)
+func TestRentalUpdateRunsOnTheMachineAcrossACalciferCrash(t *testing.T) {
+	root, store, launch, identity, calcifer := statusRental(t)
 	pin, err := workertls.ParsePin(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf}))
 	must(t, err)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
@@ -55,7 +55,7 @@ func TestRentalUpdateRunsOnTheMachineAcrossADaemonCrash(t *testing.T) {
 		code, out := runCozy(t, root, "rental", "update", "tessa", "--runtime-wheel", candidate, "--tensorfs-wheel", *machineTensorFSWheel, "--json")
 		var shown map[string]any
 		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &shown) != nil {
-			t.Fatalf("rental update [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
+			t.Fatalf("rental update [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "calcifer.log")))
 		}
 		return shown
 	}
@@ -66,20 +66,20 @@ func TestRentalUpdateRunsOnTheMachineAcrossADaemonCrash(t *testing.T) {
 		t.Fatalf("the update did not leave the machine on %s: %v", version(first), shown)
 	}
 
-	// The daemon crashes while the machine updates; the next daemon finishes the same update.
+	// Calcifer crashes while the machine updates; the next Calcifer finishes the same update.
 	second := localBuild(t, *machineRuntimeWheel, "v1crash")
 	command := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "rental", "update", "tessa", "--runtime-wheel", second, "--tensorfs-wheel", *machineTensorFSWheel, "--json")
 	command.Env = childEnv(t, root)
 	must(t, command.Start())
 	t.Cleanup(func() { _ = command.Process.Kill(); _ = command.Wait() })
-	eventually(t, root, "the daemon sends the update", func() bool {
+	eventually(t, root, "Calcifer sends the update", func() bool {
 		row, problem := store.RuntimeUpdate(parityRental)
 		return problem == nil && row != nil && row.State == "updating"
 	})
 	sent, problem := store.RuntimeUpdate(parityRental)
 	fatal(t, problem)
-	daemon = crashAndRestartTransactionDaemon(t, daemon)
-	_ = daemon
+	calcifer = crashAndRestartTransactionCalcifer(t, calcifer)
+	_ = calcifer
 	eventually(t, root, "the resumed update settles", func() bool {
 		row, problem := store.RuntimeUpdate(parityRental)
 		return problem == nil && row != nil && !row.Active()

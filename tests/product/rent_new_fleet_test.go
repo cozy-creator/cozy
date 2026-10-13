@@ -15,7 +15,7 @@ func TestRentNewCLIExcludesExistingFleetAndReplaysAcquisition(t *testing.T) {
 	fatal(t, problem)
 	defer st.Close()
 	plantH100(t, root, h, st, "pr-guchuko", "guchuko", true)
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	args := []string{"run", "proof/h3/generate", "steps=1", explicitFP8, "--rent-new", "--json", "--idempotency-key", "fresh-one"}
 	// The stand-in hub fails every pod it sells, so the run may settle failed inside the
 	// CLI's observation window. The fresh acquisition and its replay are the proof.

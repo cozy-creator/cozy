@@ -93,7 +93,7 @@ type GrantResponse struct {
 	Grants []Grant        `json:"grants"`
 	Held   []HeldTransfer `json:"held"`
 	// ServerTimeUnix is the signer's own now. Staleness is measured against it and never
-	// against the local clock, so skew between this daemon and the hub cannot misjudge
+	// against the local clock, so skew between this Calcifer and the hub cannot misjudge
 	// how much of a grant is left.
 	ServerTimeUnix int64 `json:"server_time_unix"`
 }

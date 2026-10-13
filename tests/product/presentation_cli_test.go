@@ -38,7 +38,7 @@ func TestRentalHumanDrainingPreservesWireState(t *testing.T) {
 func TestRentalConflictNamesDrainingOperation(t *testing.T) {
 	root, origin, stand := rentalEndRoot(t, "draining-conflict")
 	stand.publishListing()
-	// Tensorhub holds the draining rental, so the daemon's reconciliation keeps the operation draining.
+	// Tensorhub holds the draining rental, so Calcifer's reconciliation keeps the operation draining.
 	stand.add("pr-draining-op", "draining-op")
 	stand.setState("pr-draining-op", "release_requested", "")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

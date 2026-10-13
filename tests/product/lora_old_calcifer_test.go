@@ -9,9 +9,9 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/calcifer"
 	localclient "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -22,7 +22,7 @@ func TestModelOverrideClientRequiresOnlyItsOperationCapability(t *testing.T) {
 			root := t.TempDir()
 			layout, problem := home.Open(root)
 			fatal(t, problem)
-			must(t, os.WriteFile(layout.Daemon, nil, 0600))
+			must(t, os.WriteFile(layout.Calcifer, nil, 0600))
 			_, problem = api.Mint(layout)
 			fatal(t, problem)
 			var reads, submitted atomic.Int32
@@ -39,7 +39,7 @@ func TestModelOverrideClientRequiresOnlyItsOperationCapability(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			client, problem := localclient.Open(config.Config{Home: root}, daemon.State{Addr: strings.TrimPrefix(server.URL, "http://")})
+			client, problem := localclient.Open(config.Config{Home: root}, calcifer.State{Addr: strings.TrimPrefix(server.URL, "http://")})
 			fatal(t, problem)
 			_, problem = client.Submit(api.Submission{Package: "proof/parent", Function: "compose", Models: []records.ModelRef{{
 				Choice: true, Package: "proof/parent", Slot: "child.models.model", Model: "proof/base",
@@ -47,7 +47,7 @@ func TestModelOverrideClientRequiresOnlyItsOperationCapability(t *testing.T) {
 			supported := strings.Contains(response, `"model_overrides":true`)
 			if supported {
 				fatal(t, problem)
-			} else if problem == nil || problem.ErrName() != "daemon.model_overrides_unavailable" || submitted.Load() != 0 {
+			} else if problem == nil || problem.ErrName() != "calcifer.model_overrides_unavailable" || submitted.Load() != 0 {
 				t.Fatalf("absent capability submitted the child override: %v", problem)
 			}
 			_, problem = client.Submit(api.Submission{Package: "proof/parent", Function: "compose", Models: []records.ModelRef{{

@@ -16,7 +16,7 @@ import (
 )
 
 // The Hub commits failed, like released, only after proving the pod absent at its provider,
-// so the daemon forgets such a rental on its first look: its paid operation closes, its row
+// so Calcifer forgets such a rental on its first look: its paid operation closes, its row
 // goes, and the Hub is not asked about it again. Failed rentals once stayed on the owner's
 // books for weeks, each with an open paid operation that `cozy rental list` showed as "a pod
 // may be provisioning and billing", and every poll re-read them all (2026-10-13).
@@ -37,7 +37,7 @@ func TestHubEndedRentalsAreForgottenOnFirstLook(t *testing.T) {
 		})
 		fatal(t, problem)
 		fatal(t, store.AdvanceRentalOperation(op.Key, id, "attached"))
-		// Half were already recorded failed by an older daemon; half fail now.
+		// Half were already recorded failed by an older Calcifer; half fail now.
 		local, remote := "failed", "failed"
 		if i%2 == 1 {
 			local = "ready"
@@ -53,7 +53,7 @@ func TestHubEndedRentalsAreForgottenOnFirstLook(t *testing.T) {
 	}
 	store.Close()
 
-	startDaemonProcess(t, root)
+	startCalciferProcess(t, root)
 	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -67,7 +67,7 @@ func TestHubEndedRentalsAreForgottenOnFirstLook(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the daemon kept %d ended rentals and %d open paid operations", len(rows), len(open))
+			t.Fatalf("Calcifer kept %d ended rentals and %d open paid operations", len(rows), len(open))
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -89,7 +89,7 @@ func TestHubEndedRentalsAreForgottenOnFirstLook(t *testing.T) {
 	before := asked()
 	time.Sleep(12 * time.Second) // longer than one Hub reconcile cadence
 	if after := asked(); after != before {
-		t.Fatalf("the daemon asked the Hub about forgotten rentals %d more times", after-before)
+		t.Fatalf("Calcifer asked the Hub about forgotten rentals %d more times", after-before)
 	}
 	for id := range ended {
 		if h.releases(id) != 0 {

@@ -635,33 +635,33 @@ def check_manifest() -> list[str]:
 
 
 def check_web_boundary() -> list[str]:
-    """cl-045: one embedded stub, bounded pathless uploads; cl-096: the daemon's ONE log.
+    """cl-045: one embedded stub, bounded pathless uploads; cl-096: Calcifer's ONE log.
 
-    cl-045 refused any persistent daemon log. cl-096 (owner, 2026-09-02) reverses that with
-    the smallest honest surface: the daemon writes its own words to $COZY_HOME/daemon.log,
-    bounded by rotation on observed bytes (never a timer), and `cozy daemon log` reads it.
+    cl-045 refused any persistent Calcifer log. cl-096 (owner, 2026-09-02) reverses that with
+    the smallest honest surface: Calcifer writes its own words to $COZY_HOME/calcifer.log,
+    bounded by rotation on observed bytes (never a timer), and `cozy calcifer log` reads it.
     stdout stays /dev/null — the log is the surface, not an attached stream."""
     bad = []
     for required in ("web/index.html", "web/app.css", "web/app.js", "web/embed.go"):
         if not pathlib.Path(required).is_file():
             bad.append(f"[web] missing {required}")
-    daemon = pathlib.Path("internal/cli/daemon.go").read_text()
-    for required in ("os.DevNull", "command.StderrPipe()", "maxDaemonStartupDiagnostic",
-                     "readBoundedDiagnostic", "daemonStartupFailure"):
-        if required not in daemon:
-            bad.append(f"[web] daemon startup boundary missing {required!r}")
-    if "daemon.OpenLog(layout.Log)" not in daemon:
-        bad.append("[web] the daemon does not write its own bounded log (daemon.OpenLog)")
-    daemon_log = pathlib.Path("internal/daemon/log.go")
-    if not daemon_log.is_file() or "const LogBytes = 32 << 20" not in daemon_log.read_text():
-        bad.append("[web] the daemon log is not bounded by rotation on observed bytes (daemon.LogBytes)")
-    if "time.After" in (daemon_log.read_text() if daemon_log.is_file() else ""):
-        bad.append("[web] the daemon log rotates on a timer; the bound is bytes")
-    if "func handleDaemonLog" not in pathlib.Path("internal/cli/daemon_log.go").read_text():
-        bad.append("[web] `cozy daemon log` is missing")
+    calcifer = pathlib.Path("internal/cli/calcifer.go").read_text()
+    for required in ("os.DevNull", "command.StderrPipe()", "maxCalciferStartupDiagnostic",
+                     "readBoundedDiagnostic", "calciferStartupFailure"):
+        if required not in calcifer:
+            bad.append(f"[web] Calcifer startup boundary missing {required!r}")
+    if "calcifer.OpenLog(layout.Log)" not in calcifer:
+        bad.append("[web] Calcifer does not write its own bounded log (calcifer.OpenLog)")
+    calcifer_log = pathlib.Path("internal/calcifer/log.go")
+    if not calcifer_log.is_file() or "const LogBytes = 32 << 20" not in calcifer_log.read_text():
+        bad.append("[web] the Calcifer log is not bounded by rotation on observed bytes (calcifer.LogBytes)")
+    if "time.After" in (calcifer_log.read_text() if calcifer_log.is_file() else ""):
+        bad.append("[web] the Calcifer log rotates on a timer; the bound is bytes")
+    if "func handleCalciferLog" not in pathlib.Path("internal/cli/calcifer_log.go").read_text():
+        bad.append("[web] `cozy calcifer log` is missing")
     for forbidden in ("os.FindProcess(", 'exec.Command("ps"', 'exec.Command("pgrep"', '"/proc/'):
-        if forbidden in daemon:
-            bad.append(f"[web] daemon singleton uses process-list evidence {forbidden!r}")
+        if forbidden in calcifer:
+            bad.append(f"[web] Calcifer singleton uses process-list evidence {forbidden!r}")
     if pathlib.Path("internal/service").exists():
         bad.append("[web] retired internal/service package remains")
     retired_names = (
@@ -978,6 +978,6 @@ print(
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
-    f"web(stub+bounded-upload+bounded-daemon-log) retired-planes(absent) "
+    f"web(stub+bounded-upload+bounded-calcifer-log) retired-planes(absent) "
     f"resources(typed package/model, no aliases) python(independent uv venvs) test(tests/product only)"
 )

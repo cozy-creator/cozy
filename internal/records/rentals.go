@@ -260,7 +260,7 @@ func (s *Store) ReopenRentalOperation(key string) *exit.Error {
 }
 
 // ActiveRentalOperations is every paid acquisition/release operation whose absence has
-// not been proved. A row may precede its provider rental id, so a safe daemon exit
+// not been proved. A row may precede its provider rental id, so a safe Calcifer exit
 // must fence on the operation key as well as on attached rental rows.
 func (s *Store) ActiveRentalOperations() ([]RentalOperation, *exit.Error) {
 	return s.rentalOperationsWhere(`state NOT IN (` + finalRentalOperationStates + `)`)
@@ -1143,7 +1143,7 @@ func (s *Store) ForgetRental(id string) (bool, *exit.Error) {
 }
 
 // PinnedRentalWork is every unsettled request pinned to one rental, oldest first. It is
-// what the daemon asks when that rental reaches a terminal failed state: the pin named a
+// what Calcifer asks when that rental reaches a terminal failed state: the pin named a
 // machine, the machine is gone, and these rows are the work that went with it.
 //
 // It is deliberately the SAME predicate `RentalRunCounts` totals — `pinnedToRental` and an
@@ -1226,7 +1226,7 @@ const (
 	// RequeueAfterLoss parks retained work for its loss settlement (FailLostRetainedWork).
 	RequeueAfterLoss LostAttemptOutcome = iota
 	// CancelAfterLoss settles the request as canceled. Teardown uses it: the operator asked
-	// for everything to stop, and requeueing into a daemon that is shutting down would be
+	// for everything to stop, and requeueing into a Calcifer that is shutting down would be
 	// answering a different question than the one they asked.
 	CancelAfterLoss
 	// FailAfterLoss fails the request. Recovery uses it: the work may have started, and
@@ -1291,7 +1291,7 @@ func (s *Store) AbandonLostAttempt(requestID string, attempt int64, reason strin
 	case CancelAfterLoss:
 		// The operator asked for everything to stop. The attempt's closure above is what
 		// makes this reachable at all: `CancelQueuedRequest` refuses a request that holds
-		// an open attempt, which is exactly how one lost attempt made the whole daemon
+		// an open attempt, which is exactly how one lost attempt made the whole Calcifer
 		// unstoppable.
 		if _, err := tx.Exec(`UPDATE requests SET state='canceled'
 			WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, requestID); err != nil {
