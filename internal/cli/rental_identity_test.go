@@ -66,3 +66,21 @@ func TestFullEndedRentalRetainsObservedProviderIdentity(t *testing.T) {
 		}
 	}
 }
+
+// An unresolved acquisition is not a rental: it neither weakens the accrued total to "at
+// least ... est." nor is drawn as a row, and two rentals on one host show their IDs.
+func TestRentalBoardTotalsAndSharedHostNames(t *testing.T) {
+	unmetered := func(id string) api.RentalSummary {
+		return api.RentalSummary{ID: id, MachineName: "otogi", State: "ready", HourlyRateUSDMicros: 3_800_000,
+			SpendUSDMicros: 1_000_000, SpendBasis: "unmetered"}
+	}
+	list := renderRentalList(config.Config{}, api.RentalInventory{MachinesRunning: 2, HourlySpendUSDMicros: 7_600_000,
+		Rentals: []api.RentalSummary{unmetered("pr-a"), unmetered("pr-b")},
+		Pending: []api.RentalSummary{{ID: "pr-ghost", State: "pending_acquisition", HourlyRateUSDMicros: 2_890_000}}}, false)
+	if lead := list.Lead[1]; lead != "Current spend per hour: $7.60 · accrued $2.00 unmetered" {
+		t.Fatalf("pending acquisition changed the spend line: %q", lead)
+	}
+	if len(list.Rows) != 2 || list.Fields[1] != "rental" {
+		t.Fatalf("rows %d, fields %v: a shared host name must show each rental's ID", len(list.Rows), list.Fields)
+	}
+}

@@ -176,14 +176,15 @@ func TestARentalsFailureRecoversItsRuns(t *testing.T) {
 		}
 	}
 
-	// A failed machine has left the current fleet; its diagnosis survives.
+	// A failed machine has left the fleet and this host's books; its diagnosis survives on
+	// the runs it settled (above) and in the Hub's history.
 	if code, out := runCozy(t, root, "rental", "list", "--json", "--full"); code != 0 || strings.Contains(out, "rental-lost") {
 		t.Fatalf("failed rental remained in the current fleet [exit %d]: %s", code, out)
 	}
 	stored, problem := store.RentalRow("rental-lost")
 	fatal(t, problem)
-	if stored == nil || stored.MachineName != "nitian" || stored.State != "failed" || stored.Failure.Code != "readiness.receipt_conflict" {
-		t.Fatalf("failed rental history lost its diagnosis: %+v", stored)
+	if stored != nil {
+		t.Fatalf("failed rental stayed on the books: %+v", stored)
 	}
 }
 

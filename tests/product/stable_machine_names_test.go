@@ -51,6 +51,9 @@ func TestStableMachineNameCLIAndOriginalAlias(t *testing.T) {
 	// A host label must never pick an arbitrary DELETE target.
 	h.add("pr-collision", "egami")
 	h.set("pr-collision", "machine_name", "mikatan-356e23")
+	if code, out := runCozy(t, root, "rental", "list"); code != 0 || !strings.Contains(out, "pr-stable") || !strings.Contains(out, "pr-collision") {
+		t.Fatalf("two rentals on one host are indistinguishable rows [%d]: %s", code, out)
+	}
 	code, out = runCozy(t, root, "rental", "end", "mikatan-356e23", "--json")
 	if code == 0 || !strings.Contains(out, "rental.machine_name_ambiguous") {
 		t.Fatalf("ambiguous host was accepted [%d]: %s", code, out)
@@ -87,5 +90,15 @@ func TestStableMachineNameCLIAndOriginalAlias(t *testing.T) {
 	code, out = runCozy(t, root, "rental", "list", "--all", "--json")
 	if code != 0 || strings.Count(out, `"machine":"mikatan-356e23"`) != 2 {
 		t.Fatalf("re-rental history lost original IDs [%d]: %s", code, out)
+	}
+
+	// Once both have ended, the host name names neither: history never picks one.
+	h.setState("pr-rerented", "released", "")
+	code, out = runCozy(t, root, "rental", "show", "mikatan-356e23", "--json")
+	if code == 0 || !strings.Contains(out, "rental.machine_name_ambiguous") || !strings.Contains(out, "pr-stable") || !strings.Contains(out, "pr-rerented") {
+		t.Fatalf("an ended host name chose one of its rentals [%d]: %s", code, out)
+	}
+	if code, out := runCozy(t, root, "rental", "show", "pr-stable", "--json"); code != 0 || !strings.Contains(out, `"machine":"mikatan-356e23"`) {
+		t.Fatalf("an ended rental's ID did not show it [%d]: %s", code, out)
 	}
 }

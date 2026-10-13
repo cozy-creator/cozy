@@ -154,6 +154,46 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 	}
 }
 
+// Failed is as final as released: the Hub proved the pod absent and keeps the rental failed
+// through any release. Ending one finishes at once with nothing destroyed, and forgets it.
+func TestEndingAFailedRentalIsAnHonestNoOp(t *testing.T) {
+	root, hubURL, stand := rentalEndRoot(t, "rental-end-failed")
+	const id = "pr-2b2b2b2b2b2b2b2b2b2b"
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	machine := ""
+	op, _, problem := store.BeginRentalOperation(records.RentalOperation{
+		Key: "failed-proof", Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100_000,
+	}, func(name string) ([]byte, string, *exit.Error) {
+		machine = name
+		body, problem := hub.RentalRequestBytes(name, "cpu", 1, strings.Repeat("ab", 32),
+			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil, "", "")
+		return body, "digest-" + name, problem
+	})
+	fatal(t, problem)
+	fatal(t, store.AdvanceRentalOperation(op.Key, id, "attached"))
+	stand.add(id, machine)
+	stand.setState(id, "failed", "readiness.provider_lost")
+	fatal(t, store.RecordRental(records.Rental{ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
+		AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, State: "failed", Hub: hubURL}))
+	store.Close()
+
+	code, out := runCozy(t, root, "rental", "end", id, "--json")
+	if code != 0 || !strings.Contains(out, `"state":"ended"`) || !strings.Contains(out, `"changed":false`) {
+		t.Fatalf("ending a failed rental did not finish as a no-op [exit %d]\n%s", code, out)
+	}
+	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	row, problem := store.RentalRow(id)
+	fatal(t, problem)
+	settled, problem := store.RentalOperation(op.Key)
+	fatal(t, problem)
+	if row != nil || settled == nil || settled.State != "released" {
+		t.Fatalf("the failed rental stayed on the books: row=%+v operation=%+v", row, settled)
+	}
+}
+
 func TestRentalShutdownHasAConciseHumanSummary(t *testing.T) {
 	for _, mode := range []string{"human", "json", "full"} {
 		t.Run(mode, func(t *testing.T) {
