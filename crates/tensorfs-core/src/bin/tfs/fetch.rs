@@ -113,7 +113,7 @@ pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     // that output to EOF, and the owner logged the resulting stage change once. So a
     // 210 GB materialization was, to every layer above it, a single silent edge lasting
     // hours: an operator could not tell a healthy pull from a wedged one without reading
-    // the daemon's raw log, and on 2026-09-03 a person had to.
+    // Calcifer's raw log, and on 2026-09-03 a person had to.
     //
     // What is printed is what was MEASURED — bytes through each door and the instant they
     // landed — and nothing derived. A rate is the consumer's division of two of these
