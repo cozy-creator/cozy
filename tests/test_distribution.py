@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from cozy_machine_client.distribution import package_name
+from tensord_client.distribution import package_name
 
 
 @pytest.mark.parametrize("url", [

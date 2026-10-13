@@ -1,7 +1,7 @@
 //! A software update, as `Run kind: update` on `cozy.machine.v1` and (until cutover)
 //! `runtime-update/1` behind the CLI's maintenance routes: stage and verify a Runtime/TensorFS
 //! pair, wait for measured idleness, then restart the service on it in place. Executors' package environments take the new pair; a candidate Runtime wheel that
-//! bundles a Rust machine also replaces the service binary (the stable parent runs it). The
+//! bundles TensorD also replaces the service binary (the stable parent runs it). The
 //! previous pair and binary stay installed; a candidate that never proves readiness is rolled
 //! back by the parent. Boot id, leaf, journal and outputs are kept.
 use serde::{Deserialize, Serialize};
@@ -411,7 +411,7 @@ impl Updates {
                             s.enter("failed");
                         }
                     }) {
-                        eprintln!("cozy-machine: Runtime update failed: {error}; status: {persist}");
+                        eprintln!("tensord: Runtime update failed: {error}; status: {persist}");
                     }
                 }
             })
@@ -458,7 +458,7 @@ impl Updates {
             fs::copy(&wheel, &prepared)?;
             fs::File::open(prepared)?.sync_all()?;
             if let Some(binary) = bundled.filter(|_| request.agent != "explicit") {
-                agent = rust_machine(&binary, &candidate)?;
+                agent = bundled_tensord(&binary, &candidate)?;
             }
         }
         fs::File::open(&candidate)?.sync_all()?;
@@ -496,7 +496,7 @@ impl Updates {
                 }
                 Ok(false) => {}
                 Err(rollback) => {
-                    eprintln!("cozy-machine: update publication: {error}; rollback: {rollback}");
+                    eprintln!("tensord: update publication: {error}; rollback: {rollback}");
                     // The links cannot be trusted. Restart while admission remains closed;
                     // startup recovers before selecting software, or refuses this launch.
                     exit(REPLACE_EXIT);
@@ -505,7 +505,7 @@ impl Updates {
             return Err(error);
         }
         eprintln!(
-            "cozy-machine: Runtime update {}: restarting on {} / {}",
+            "tensord: Runtime update {}: restarting on {} / {}",
             request.operation, to.runtime, to.tensorfs
         );
         exit(REPLACE_EXIT);
@@ -549,7 +549,7 @@ fn existing_wheel(dir: &Path, distribution: &str) -> io::Result<PathBuf> {
 }
 
 /// Checks the wheel's METADATA names the distribution and version its file name does; returns
-/// a bundled `cozy-machine` executable when a Runtime wheel carries one.
+/// a bundled `tensord` executable when a Runtime wheel carries one.
 fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> {
     let name = path
         .file_name()
@@ -581,7 +581,7 @@ fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> 
             "{name} METADATA names another distribution or version"
         )));
     }
-    let script = format!("{distribution}-{version}.data/scripts/cozy-machine");
+    let script = format!("{distribution}-{version}.data/scripts/tensord");
     let Ok(mut entry) = archive.by_name(&script) else {
         return Ok(None);
     };
@@ -590,10 +590,10 @@ fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> 
     Ok(Some(binary))
 }
 
-/// The bundled executable when it is a Rust machine (its `version --json` says so). A wheel
-/// bundling another machine agent leaves this one running.
-fn rust_machine(binary: &[u8], dir: &Path) -> io::Result<Option<PathBuf>> {
-    let path = dir.join("cozy-machine");
+/// The bundled executable when it is TensorD (its `version --json` says so). A wheel bundling
+/// anything else leaves this one running.
+fn bundled_tensord(binary: &[u8], dir: &Path) -> io::Result<Option<PathBuf>> {
+    let path = dir.join("tensord");
     fs::write(&path, binary)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
     let output = std::process::Command::new(&path)
@@ -602,21 +602,18 @@ fn rust_machine(binary: &[u8], dir: &Path) -> io::Result<Option<PathBuf>> {
     #[derive(Deserialize)]
     struct Identity {
         name: String,
-        #[serde(default)]
-        implementation: String,
     }
-    let rust = output
+    let tensord = output
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| serde_json::from_slice::<Identity>(&o.stdout).ok())
-        .is_some_and(|i| i.name == "cozy-machine" && i.implementation == "rust");
-    if !rust {
+        .is_some_and(|i| i.name == "tensord");
+    if !tensord {
         fs::remove_file(&path)?;
+        return Ok(None);
     }
-    if rust {
-        fs::File::open(&path)?.sync_all()?;
-    }
-    Ok(rust.then_some(path))
+    fs::File::open(&path)?.sync_all()?;
+    Ok(Some(path))
 }
 
 /// `cozy_runtime-0.18.102-cp312-…whl` → ("cozy_runtime", "0.18.102").
@@ -722,7 +719,7 @@ mod tests {
         .unwrap();
         if let Some(script) = script {
             zip.start_file(
-                format!("{distribution}-{version}.data/scripts/cozy-machine"),
+                format!("{distribution}-{version}.data/scripts/tensord"),
                 options,
             )
             .unwrap();
@@ -733,18 +730,18 @@ mod tests {
     }
 
     #[test]
-    fn wheels_verify_by_metadata_and_a_rust_machine_is_recognized() {
+    fn wheels_verify_by_metadata_and_a_bundled_tensord_is_recognized() {
         let dir = std::env::temp_dir().join(format!("cozy-update-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let script = b"#!/bin/sh\necho '{\"name\":\"cozy-machine\",\"implementation\":\"rust\"}'\n";
+        let script = b"#!/bin/sh\necho '{\"name\":\"tensord\"}'\n";
         let runtime = wheel(&dir, "cozy_runtime", "0.18.103", Some(script));
         let binary = verify_wheel(&runtime, "cozy_runtime").unwrap().unwrap();
-        assert!(rust_machine(&binary, &dir).unwrap().is_some());
-        let go = b"#!/bin/sh\necho '{\"name\":\"cozy-machine\",\"version\":\"0.18.103\"}'\n";
+        assert!(bundled_tensord(&binary, &dir).unwrap().is_some());
+        let other = b"#!/bin/sh\necho '{\"name\":\"other\",\"version\":\"0.18.103\"}'\n";
         assert!(
-            rust_machine(go, &dir).unwrap().is_none(),
-            "another agent leaves this machine running"
+            bundled_tensord(other, &dir).unwrap().is_none(),
+            "another executable leaves this machine running"
         );
         assert!(verify_wheel(&runtime, "tensorfs").is_err());
         let wrong = dir.join("tensorfs-0.3.94-py3-none-any.whl");
@@ -781,7 +778,7 @@ mod tests {
         )
         .unwrap();
         relink(&paths.current_sdk_link(), Some(&new)).unwrap();
-        relink(&paths.current_agent_link(), Some(&new.join("cozy-machine"))).unwrap();
+        relink(&paths.current_agent_link(), Some(&new.join("tensord"))).unwrap();
         assert!(rollback_pending(&paths, "candidate never became ready").unwrap());
         assert_eq!(fs::read_link(paths.current_sdk_link()).unwrap(), old);
         assert!(fs::symlink_metadata(paths.current_agent_link()).is_err());
@@ -869,17 +866,17 @@ mod tests {
                 fs::create_dir_all(dir).unwrap();
                 wheel(dir, "cozy_runtime", version, None);
                 wheel(dir, "tensorfs", version, None);
-                fs::write(dir.join("cozy-machine"), b"executable").unwrap();
+                fs::write(dir.join("tensord"), b"executable").unwrap();
             }
             relink(&paths.current_sdk_link(), Some(&old)).unwrap();
-            relink(&paths.current_agent_link(), Some(&old.join("cozy-machine"))).unwrap();
+            relink(&paths.current_agent_link(), Some(&old.join("tensord"))).unwrap();
             let mut status = Status { operation: "transaction".into(), ..Default::default() };
             status.enter("installing");
             write_json(&paths.update("status.json"), &status).unwrap();
             write_json(&paths.update("pending.json"), &Pending {
                 status,
                 sdk_before: Some(old.clone()),
-                agent_before: Some(old.join("cozy-machine")),
+                agent_before: Some(old.join("tensord")),
             }).unwrap();
             Self { root, paths, old, new }
         }
@@ -890,7 +887,7 @@ mod tests {
         }
         fn links(&self, dir: &Path) {
             assert_eq!(fs::read_link(self.paths.current_sdk_link()).unwrap(), dir);
-            assert_eq!(fs::read_link(self.paths.current_agent_link()).unwrap(), dir.join("cozy-machine"));
+            assert_eq!(fs::read_link(self.paths.current_agent_link()).unwrap(), dir.join("tensord"));
         }
     }
     impl Drop for Activation {
@@ -907,7 +904,7 @@ mod tests {
                 relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
             }
             if changed_links >= 2 {
-                relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("cozy-machine"))).unwrap();
+                relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
             }
             let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
             assert!(updates.commit().is_err(), "unpublished state committed");
@@ -924,7 +921,7 @@ mod tests {
     fn published_activation_waits_for_readiness_and_committed_cleanup_keeps_it() {
         let transaction = Activation::prepare();
         relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
-        relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("cozy-machine"))).unwrap();
+        relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
         transaction.state("starting");
         assert!(!recover_activation(&transaction.paths).unwrap());
         assert!(transaction.paths.update("pending.json").exists());
@@ -961,7 +958,7 @@ mod tests {
         for restored_links in 0..=1 {
             let transaction = Activation::prepare();
             relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
-            relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("cozy-machine"))).unwrap();
+            relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("tensord"))).unwrap();
             transaction.state("starting");
             transaction.state("rolled_back");
             if restored_links == 1 {

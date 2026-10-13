@@ -1510,7 +1510,7 @@ mod tests {
             archive.append_path_with_name(fixture.join(name), name).unwrap();
         }
         let (source, length) = write(&objects, "alice", &archive.into_inner().unwrap());
-        let manifest = json!({"package": "local/cozy-machine-cpu-lifecycle", "release": "0.1.0",
+        let manifest = json!({"package": "local/tensord-cpu-lifecycle", "release": "0.1.0",
             "python_version": "3.12", "source": {"digest": source, "length": length}});
         let (manifest, _) = write(&objects, "alice", manifest.to_string().as_bytes());
 
@@ -1541,7 +1541,7 @@ mod tests {
             .unwrap();
         let warm = settled(&service.engine, &warm.id);
         assert_eq!(warm.state, State::Completed, "{:?}", warm.failure);
-        assert_eq!(warm.result.unwrap().value["package"], "local/cozy-machine-cpu-lifecycle");
+        assert_eq!(warm.result.unwrap().value["package"], "local/tensord-cpu-lifecycle");
 
         // A warm run's set is kept in the journal as sent, replacing the caller's last one.
         // This function binds no model, so its member holds its code and says why no more.
@@ -1595,7 +1595,7 @@ mod tests {
         // A remove run takes the installation away and deletes its environment; another
         // finds nothing to remove; the written code installs again.
         let generation = service.engine.installations("alice").unwrap()[0].generation.clone();
-        let package = || Source::Release { package: "local/cozy-machine-cpu-lifecycle".into(), release: String::new() };
+        let package = || Source::Release { package: "local/tensord-cpu-lifecycle".into(), release: String::new() };
         let remove = |id: &str| {
             let spec = Spec { remove: true, ..spec(package(), false, id) };
             settled(&service.engine, &runs.submit("alice", id, spec).unwrap().id)

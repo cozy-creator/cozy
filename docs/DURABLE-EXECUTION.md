@@ -106,7 +106,7 @@ It returns at most 1,024 nonterminal records.
 - Failed: `execution_id`, `code`, `detail`
 
 An event for another execution fails the attempt. The runner is
-`python/cozy_machine_client/runner.py`. It imports nothing authored before `Invoke`.
+`python/tensord_client/runner.py`. It imports nothing authored before `Invoke`.
 
 ## Output custody
 

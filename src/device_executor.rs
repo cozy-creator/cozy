@@ -1142,7 +1142,7 @@ impl Codec {
             .args([
                 "-I",
                 "-c",
-                include_str!("../python/cozy_machine_client/device_codec.py"),
+                include_str!("../python/tensord_client/device_codec.py"),
             ])
             .env_clear()
             .envs(&self.config.environment)
@@ -2354,7 +2354,7 @@ mod codec_tests {
     #[test]
     #[ignore = "requires an explicitly configured installed SDK interpreter; no GPU imports"]
     fn one_sdk_encoder_serves_every_output_of_an_executor() {
-        let python = PathBuf::from(std::env::var("COZY_MACHINE_CPU_TEST_PYTHON").unwrap());
+        let python = PathBuf::from(std::env::var("TENSORD_CPU_TEST_PYTHON").unwrap());
         let root = std::env::temp_dir().join(format!("codec-{}", uuid::Uuid::new_v4().simple()));
         let spool = root.join("spool");
         fs::create_dir_all(&spool).unwrap();

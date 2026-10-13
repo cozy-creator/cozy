@@ -1,4 +1,4 @@
-# Matched gate: ComfyUI vs the Rust machine
+# Matched gate: ComfyUI vs TensorD
 
 `gate.py` drives ordinary `cozy run --rental=<pod> --await` from the controller (or this computer's machine) and writes
 one row per request. Nothing private: the CLI, the daemon and the published packages are the ones the owner uses.

@@ -1238,7 +1238,7 @@ mod product_log_tests {
     const INSTALL: &str = r#"
 import json, subprocess, sys
 from pathlib import Path
-from cozy_machine_client.packages import install
+from tensord_client.packages import install
 fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
 subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
 generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12")

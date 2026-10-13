@@ -343,7 +343,7 @@ fn control_socket(root: &Path, name: &str) -> io::Result<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .unwrap_or_else(std::env::temp_dir);
-    let directory = runtime.join(format!("cozy-machine-{uid}"));
+    let directory = runtime.join(format!("tensord-{uid}"));
     match std::fs::create_dir(&directory) {
         Ok(()) => std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),

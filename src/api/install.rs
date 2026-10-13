@@ -232,7 +232,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status
             [("UV_CACHE_DIR", seed.as_os_str()), ("UV_LINK_MODE", std::ffi::OsStr::new("symlink"))]
         }))
         .arg("-m")
-        .arg("cozy_machine_client.installer")
+        .arg("tensord_client.installer")
         .arg("install-captured")
         .arg("--generations")
         .arg(&config.generations)

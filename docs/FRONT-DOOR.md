@@ -10,7 +10,7 @@ store and installer; the API owns no scheduler, journal or store. Backend calls 
 
 ## Identity and configuration (`identity.rs`)
 
-`cozy-machine serve --machine-config <json> --listen <addr>` (both or neither).
+`tensord serve --machine-config <json> --listen <addr>` (both or neither).
 
 `MachineConfig` (relative paths resolve against the config file):
 - `worker_id`: printable ASCII, at most 256 bytes.
@@ -28,7 +28,7 @@ The readiness receipt is `{payload, hmac_sha256}`, where the HMAC covers
 ## Install (`install.rs`)
 
 `prepare_uploaded(InstallerConfig, UploadedPackage)` materializes verified descriptors into a
-private stage and runs `cozy_machine_client.installer install-captured` (see `PACKAGE-BRIDGE.md`).
+private stage and runs `tensord_client.installer install-captured` (see `PACKAGE-BRIDGE.md`).
 - No wall-clock kill. Stdout is capped at 8 MiB.
 - A failure `{kind: "install_failed", code, detail}` maps `*_unsupported` to `UNIMPLEMENTED`.
   Anything else is `FAILED_PRECONDITION`.

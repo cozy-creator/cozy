@@ -100,7 +100,7 @@ impl Layout {
     }
     /// This service's execution journal and package generations.
     pub fn engine(&self) -> PathBuf {
-        self.root.join("var/lib/cozy/rust-machine")
+        self.root.join("var/lib/cozy/tensord")
     }
 }
 

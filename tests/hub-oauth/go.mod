@@ -1,4 +1,4 @@
-module github.com/cozy-creator/cozy-machine/tests/hub-oauth
+module github.com/cozy-creator/tensord/tests/hub-oauth
 
 go 1.26.6
 

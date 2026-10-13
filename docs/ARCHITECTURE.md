@@ -1,6 +1,6 @@
 # Architecture
 
-TensorD (`cozy-machine`) is the persistent Rust daemon that owns the API, execution journal,
+TensorD (executable `tensord`) is the persistent Rust daemon that owns the API, execution journal,
 node scheduling, memory budgets and executor supervision. Package code runs in Python
 executors (cozy-runtime) inside each package environment. TensorFS is a library embedded in
 TensorD and used inside Runtime; it is not a separate daemon. TensorD has no CUDA context:
@@ -41,7 +41,7 @@ machine.sock (weight peers) / admin.sock ─> main.rs ▼
                                           service::Service (dispatch policy)
                                            │ journal + supervision: execution::Engine / journal::Journal
                          CPU ──────────────┤
-                          python -m cozy_machine_client.runner (one process per request)
+                          python -m tensord_client.runner (one process per request)
                          GPU ──────────────┘
                           gpu_service::GpuPool ─> device_executor::DeviceExecutor
                             (one retained executor per plan, via the Runtime trampoline)
@@ -119,12 +119,12 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
 
-## Python package `cozy_machine_client`
+## Python package `tensord_client`
 
 | Module | Role |
 |---|---|
 | `runner.py`, `runtime_bridge.py`, `execution_protocol.py`, `progress.py` | CPU runner: `Ready` before importing Runtime, then Runtime author `prepare`/`invoke` |
-| `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m cozy_machine_client.installer`) |
+| `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m tensord_client.installer`) |
 | `device_codec.py` | Output encoder, embedded into `device_executor.rs` with `include_str!` |
 | `client.py`, `protocol.py`, `linux.py`, `execution_client.py`, `cpu_gate.py` | Private control-socket client and the CPU component gate |
 
@@ -135,7 +135,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `src/bin/degree2-pilot.rs` | Degree 2 on a rental: stock executors share GPU weights through `ResidentCustody` (replacement, count-once, revoke, output equality) | C |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
-| `scripts/gate/` | Matched old-stack vs Rust-machine gate through ordinary `cozy run` | F |
+| `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |
 | `scripts/benchmarks/permission_probe.py` | CPU executor permission probe | E |
 | `scripts/service_cpu_gate.py` | CPU service end-to-end gate over the admin socket, including machine kill and restart | E |
 
@@ -176,12 +176,12 @@ metadata transitions are coordinated with cancellation.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
 - [Host tier](HOST-TIER.md), [model sources](MODEL-SOURCES.md): Degree 1.
 - [Resident custody](RESIDENT-CUSTODY.md): Degree 2 foundation.
-- [Matched gate](../scripts/gate/README.md): old stack vs Rust machine, ordinary CLI.
+- [Matched gate](../scripts/gate/README.md): ComfyUI vs TensorD, ordinary CLI.
 
 ## Build and test
 
 ```sh
-export CARGO_TARGET_DIR=~/cozy/.cargo-target/cozy-machine
+export CARGO_TARGET_DIR=~/cozy/.cargo-target/tensord
 L=~/cozy_v2/outputs/cozy-machine-takeover-20261002/locks
 flock $L/rust-build.lock nice -n 19 cargo clippy --all-targets -j 2 -- -D warnings
 flock $L/rust-build.lock nice -n 19 cargo test -j 2 -- --test-threads=2
@@ -189,4 +189,4 @@ nice -n 19 uv run --locked --extra test pytest -q
 ```
 
 The test extra installs cozy-runtime; tests fail without it. Ignored Rust tests need installed SDK
-generations (paths or `COZY_MACHINE_CPU_TEST_PYTHON`); run them with `--ignored` on purpose.
+generations (paths or `TENSORD_CPU_TEST_PYTHON`); run them with `--ignored` on purpose.

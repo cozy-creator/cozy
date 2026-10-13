@@ -5,7 +5,7 @@
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use cozy_machine::api::{
+use tensord::api::{
     capability::{self, Grant},
     v1::{self, machine_client::MachineClient},
 };
@@ -160,7 +160,7 @@ async fn an_unreachable_hub_revokes_nothing_and_its_answer_revokes_at_once() {
     let (port, webrtc) = (free(), free());
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     let mut machine = Machine(
-        Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
+        Command::new(env!("CARGO_BIN_EXE_tensord"))
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("COZY_MACHINE_ROOT", &root)

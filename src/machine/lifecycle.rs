@@ -251,7 +251,7 @@ pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
             }
             Err(Refusal::Denied) => {
                 eprintln!(
-                    "cozy-machine: the Hub denied rental authority; no new control is admitted"
+                    "tensord: the Hub denied rental authority; no new control is admitted"
                 );
                 keys.revoke();
                 Duration::from_secs(1)
@@ -282,7 +282,7 @@ pub async fn release_when_idle(
         match jobs(lifecycle.ended_ms()) {
             Ok(read) => lifecycle.observe(read, epoch),
             Err(error) => {
-                eprintln!("cozy-machine: cannot read this rental's jobs: {error}");
+                eprintln!("tensord: cannot read this rental's jobs: {error}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -292,11 +292,11 @@ pub async fn release_when_idle(
             match lifecycle.claim() {
                 Ok(true) => match hub.release().await {
                     Ok(()) => {
-                        eprintln!("cozy-machine: 15 minutes without a job; Tensorhub accepted the release");
+                        eprintln!("tensord: 15 minutes without a job; Tensorhub accepted the release");
                         return;
                     }
                     Err(error) => {
-                        eprintln!("cozy-machine: idle release not accepted; retrying without extending the deadline: {error}");
+                        eprintln!("tensord: idle release not accepted; retrying without extending the deadline: {error}");
                         next_ask = now + 5_000;
                         if unheard(hub.contact_ms(), lifecycle.deadline_ms(), lifecycle.grace) {
                             end_without_hub(provider.as_ref()).await;
@@ -306,7 +306,7 @@ pub async fn release_when_idle(
                 },
                 Ok(false) => (),
                 Err(error) => {
-                    eprintln!("cozy-machine: idle release could not be recorded: {error}")
+                    eprintln!("tensord: idle release could not be recorded: {error}")
                 }
             }
         }
@@ -320,15 +320,15 @@ fn unheard(contact_ms: i64, deadline_ms: i64, grace: i64) -> bool {
 }
 
 async fn end_without_hub(provider: Option<&super::provider::ProviderSelf>) {
-    eprintln!("cozy-machine: idle past the deadline with no answer from Tensorhub through the whole idle window; ending this rental itself");
+    eprintln!("tensord: idle past the deadline with no answer from Tensorhub through the whole idle window; ending this rental itself");
     match provider {
         Some(provider) => match provider.end().await {
-            Ok(()) => eprintln!("cozy-machine: the provider accepted this pod's end"),
+            Ok(()) => eprintln!("tensord: the provider accepted this pod's end"),
             Err(error) => {
-                eprintln!("cozy-machine: the provider did not end this pod ({error}); stopping")
+                eprintln!("tensord: the provider did not end this pod ({error}); stopping")
             }
         },
-        None => eprintln!("cozy-machine: no provider credential; stopping"),
+        None => eprintln!("tensord: no provider credential; stopping"),
     }
 }
 

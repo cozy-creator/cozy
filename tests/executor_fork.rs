@@ -1,8 +1,8 @@
 //! Executors forked from an import-only executor (`fork/1`) on real Runtime processes of
 //! `tests/fixtures/cpu_lifecycle`, no doubles. CUDA is hidden by the seal; the GPU half is
-//! proven on a rental. `COZY_MACHINE_FORK_GENERATIONS` names installed generations whose
+//! proven on a rental. `TENSORD_FORK_GENERATIONS` names installed generations whose
 //! Runtime offers `fork/1`.
-use cozy_machine::{
+use tensord::{
     device_executor::{
         Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Forked, FORK,
     },
@@ -30,7 +30,7 @@ struct Generation {
 
 fn generations() -> Vec<(Generation, File)> {
     let root = PathBuf::from(
-        std::env::var("COZY_MACHINE_FORK_GENERATIONS").expect("installed fork/1 generations"),
+        std::env::var("TENSORD_FORK_GENERATIONS").expect("installed fork/1 generations"),
     );
     let mut found = vec![];
     for entry in fs::read_dir(root).unwrap() {
@@ -159,7 +159,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         let reply = child
             .command(
                 &DeviceCommand::Invoke {
-                    max_output_bytes: cozy_machine::output_capacity::DEFAULT_BYTES,
+                    max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                     request_id: "forked".into(),
                     construction: "lifecycle".into(),
                     entrypoint: "steps".into(),

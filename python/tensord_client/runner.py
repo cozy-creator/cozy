@@ -98,7 +98,7 @@ def execute(command: Invoke, canceled: threading.Event, writer: EventWriter):
         if (generation.identity != command.generation or generation.package != command.package
                 or generation.application != application):
             raise ValueError("invocation does not match this held environment generation")
-        bridge = importlib.import_module("cozy_machine_client.runtime_bridge")
+        bridge = importlib.import_module("tensord_client.runtime_bridge")
         return bridge.execute(command, canceled, writer.progress)
 
 
@@ -131,7 +131,7 @@ def run(sock: socket.socket) -> int:
     try:
         terminal = execute(command, canceled, writer)
     except Exception as exc:
-        bridge = sys.modules.get("cozy_machine_client.runtime_bridge")
+        bridge = sys.modules.get("tensord_client.runtime_bridge")
         code = (bridge.error_code(exc) if bridge is not None else
                 "runtime_sdk_unavailable" if isinstance(exc, ImportError) else type(exc).__name__)
         terminal = Failed(command.execution_id, code, str(exc))

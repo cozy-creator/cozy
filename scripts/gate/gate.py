@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Matched old-stack vs Rust-machine gate on one rental, through ordinary `cozy run`.
+"""Matched ComfyUI vs TensorD gate on one rental, through ordinary `cozy run`.
 
   gate.py run MANIFEST OUT    alternate arms per the manifest; append to OUT/results.jsonl
   gate.py report OUT          medians, spread and the pre-declared verdict -> OUT/summary.json
