@@ -28,6 +28,9 @@ func TestQueuedInstallCancellationCompetesWithDispatch(t *testing.T) {
 	rentalInstallCheck(t, problem)
 	_, problem = store.StartRentalInstall(prior.ID, "")
 	rentalInstallCheck(t, problem)
+	if problem := store.SettleRentalInstall(prior.ID, "queued", nil, nil); problem == nil {
+		t.Fatal("retry lost its evidence of prior dispatch")
+	}
 	rentalInstallCheck(t, store.SettleRentalInstall(prior.ID, "queued", nil, exit.Unavailablef("controller disconnected; native work may continue")))
 	if _, problem := store.CancelQueuedRentalInstall(machines.Local, prior.ID); problem == nil || problem.ErrName() != "install.not_queued" {
 		t.Fatalf("previously dispatched work was cancelable after requeue: %v", problem)

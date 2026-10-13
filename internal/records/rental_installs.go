@@ -239,7 +239,7 @@ func (s *Store) StartRentalInstall(id, boot string) (*RentalInstall, *exit.Error
 }
 
 func (s *Store) SettleRentalInstall(id, state string, result json.RawMessage, problem *exit.Error) *exit.Error {
-	if state != "queued" && state != "succeeded" && state != "failed" || len(result) > 0 && (state != "succeeded" || !json.Valid(result)) {
+	if state != "queued" && state != "succeeded" && state != "failed" || len(result) > 0 && (state != "succeeded" || !json.Valid(result)) || state == "queued" && problem == nil {
 		return exit.New(exit.Validation, "invalid rental installation settlement")
 	}
 	code, message := "", ""
