@@ -440,6 +440,12 @@ func (c *Client) RentalInstall(rentalID, id string) (api.RentalInstallStatus, *e
 	return result, problem
 }
 
+func (c *Client) CancelRentalInstall(rentalID, id string) (api.RentalInstallStatus, *exit.Error) {
+	var result api.RentalInstallStatus
+	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/installs/"+url.PathEscape(id)+"/cancel", nil, &result)
+	return result, problem
+}
+
 func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateRequest) (api.RuntimeUpdate, *exit.Error) {
 	var result api.RuntimeUpdate
 	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", request, &result)

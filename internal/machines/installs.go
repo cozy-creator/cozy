@@ -85,6 +85,16 @@ func (q *Installs) Status(machine, id string) (*InstallStatus, *exit.Error) {
 	return status, nil
 }
 
+// Cancel only withdraws work that the queue has not dispatched.
+func (q *Installs) Cancel(machine, id string) (*InstallStatus, *exit.Error) {
+	row, problem := q.store.CancelQueuedRentalInstall(machine, id)
+	if problem != nil {
+		return nil, problem
+	}
+	q.Wake()
+	return &InstallStatus{RentalInstall: *row}, nil
+}
+
 // InstallTarget names the machine an installation goes to: this computer's machine, or a
 // rental by its machine name or id.
 func InstallTarget(store *records.Store, name string) (string, *exit.Error) {

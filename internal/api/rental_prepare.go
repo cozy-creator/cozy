@@ -143,6 +143,19 @@ func (s *Server) rentalInstallState(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, status)
 }
 
+func (s *Server) cancelRentalInstall(w http.ResponseWriter, r *http.Request) {
+	if s.rentalInstallCancel == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("queued installation cancellation is unavailable"))
+		return
+	}
+	status, problem := s.rentalInstallCancel(r.PathValue("rental_id"), r.PathValue("id"))
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	s.ok(w, r, http.StatusOK, status)
+}
+
 func canonicalPackageRef(value string) (string, *exit.Error) {
 	ref, problem := hub.ParseRef(value)
 	if problem != nil {

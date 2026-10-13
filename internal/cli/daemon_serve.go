@@ -195,6 +195,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		RentalKeepalive:     fleet.keepalive,
 		RentalInstall:       installs.Accept,
 		RentalInstallStatus: installs.Status,
+		RentalInstallCancel: installs.Cancel,
 		MachineExecutions:   machines,
 		Orchestrator:        c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,

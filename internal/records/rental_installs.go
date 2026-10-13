@@ -140,6 +140,28 @@ func (s *Store) RentalInstall(id string) (*RentalInstall, *exit.Error) {
 	return scanRentalInstall(s.db.QueryRow(`SELECT `+rentalInstallCols+` FROM rental_installs WHERE id=?`, id))
 }
 
+// CancelQueuedRentalInstall competes atomically with dispatch. Once claimed, an
+// installation cannot be canceled here: its machine may already be changing state.
+// The queue retains a typed error when an interrupted attempt returns to queued;
+// those rows require reconciliation, not withdrawal of their already dispatched work.
+func (s *Store) CancelQueuedRentalInstall(machine, id string) (*RentalInstall, *exit.Error) {
+	_, err := s.db.Exec(`UPDATE rental_installs SET state='failed',error_code='install.canceled',error='canceled by the owner before dispatch',updated_at=? WHERE rental_id=? AND id=? AND state='queued' AND error_code=''`, now(), machine, id)
+	if err != nil {
+		return nil, exit.Internalf("cannot cancel queued installation: %s", err)
+	}
+	row, problem := s.RentalInstall(id)
+	if problem != nil {
+		return nil, problem
+	}
+	if row == nil || row.RentalID != machine {
+		return nil, exit.New(exit.NotFound, "no installation %s on %s", id, machine)
+	}
+	if row.State == "failed" && row.ErrorCode == "install.canceled" {
+		return row, nil
+	}
+	return nil, exit.Named(exit.Conflict, "install.not_queued", "installation %s is %s; only queued installations without a prior dispatch error can be canceled", id, row.State)
+}
+
 // BeginRentalInstall persists before acknowledging acceptance. Repeated commands
 // converge while the same immutable selection is still pending. A completed
 // selection can be requested again, including after a worker reboot.
