@@ -29,6 +29,7 @@ func TestRentalViewsShowProviderFactsOnlyWhereTheHubGivesThem(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	hub.add("pr-renter", "otter")
+	hub.set("pr-renter", "machine_name", "otter")
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "pr-renter", MachineName: "otter",
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL}))
 	store.Close()
@@ -36,6 +37,7 @@ func TestRentalViewsShowProviderFactsOnlyWhereTheHubGivesThem(t *testing.T) {
 	hub.set("pr-renter", "spend_basis", "unmetered")
 	// Another client's rental, booting its second attempt after a replan.
 	hub.add("pr-booting", "heron")
+	hub.set("pr-booting", "machine_name", "heron")
 	hub.set("pr-booting", "state", "acquiring")
 	started := time.Now().UTC().Add(-10 * time.Minute)
 	boot := func(where ...string) map[string]any {
