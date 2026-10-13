@@ -350,14 +350,13 @@ impl GpuMemory {
         }
     }
 
-    /// Grant reclaimed room and notify this rank through its existing budget cell. The
-    /// ledger lock serializes the grant and its publication with the floor watchdog.
+    /// Grant reclaimed room and notify this rank through its existing budget cell: what the
+    /// process holds and everything free above the floor (the ledger's room is never more),
+    /// so a grant never undoes the floor watchdog's lowered cap. The ledger lock serializes
+    /// the grant and its publication with the watchdog.
     fn grant_room(&self, plan: &str, sample: &Sample, cell: Option<&File>) -> io::Result<u64> {
         self.with(|gpu| {
-            let cap = gpu
-                .room(plan, sample)
-                .max(gpu.tenant(plan).map_or(0, |t| t.cap))
-                .max(gpu.physical_cap(plan, sample));
+            let cap = gpu.physical_cap(plan, sample);
             if let Some(cell) = cell {
                 ask_cap(cell, cap)?;
             }
@@ -463,7 +462,8 @@ impl GpuMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use policy::HEADLESS_FLOOR;
+    use policy::{HEADLESS_FLOOR, MIB};
+    const GIB: u64 = 1 << 30;
 
     fn memory() -> GpuMemory {
         let mut gpu = Gpu::default();
@@ -535,6 +535,37 @@ mod tests {
             10
         );
         assert_eq!(read_cell(&follower), [3, CELL_CAP - 10, 0, 0]);
+    }
+
+    #[test]
+    fn a_room_grant_below_the_floor_never_raises_the_cap_the_watchdog_lowered() {
+        // Run 5424 (an 8 GB laptop card): the executor held its cap, the card was below its
+        // floor, and the grant answered with what the process held, above the watchdog's cap.
+        let cell = crate::os::memfd().unwrap();
+        cell.set_len(32).unwrap();
+        let memory = memory();
+        memory.observe(
+            "plan",
+            policy::Facts {
+                process: Some(7 * GIB),
+                ..Default::default()
+            },
+            None,
+        );
+        let below = Sample {
+            total: 8 * GIB,
+            free: HEADLESS_FLOOR - 100 * MIB,
+            ..Default::default()
+        };
+        let (_, lowered) = memory.with(|gpu| {
+            gpu.set_cap("plan", 7 * GIB);
+            gpu.below_floor(&below).unwrap()
+        });
+        memory.with(|gpu| gpu.set_cap("plan", lowered));
+        let granted = memory.grant_room("plan", &below, Some(&cell)).unwrap();
+        assert_eq!(granted, 7 * GIB - 100 * MIB);
+        assert!(granted <= lowered + policy::MARGIN);
+        assert_eq!(read_cell(&cell), [1, CELL_CAP - granted as i64, 0, 0]);
     }
 
     #[test]

@@ -301,12 +301,14 @@ impl Gpu {
 
     /// What `plan`'s process holds now plus everything free above the floor: what a running
     /// call that asked for room may grow into although the ledger's charges for idle tenants
-    /// (their last reports) say less is free. The floor watchdog still guards the card.
+    /// (their last reports) say less is free. Below the floor it is less than the process
+    /// holds: no cap takes the floor's bytes (run 5424: a grant 110 MB above it drove an
+    /// 8 GB laptop card to 10 MB free).
     pub fn physical_cap(&self, plan: &str, sample: &Sample) -> u64 {
         let held = self
             .tenant(plan)
             .map_or(0, |tenant| self.actual(plan, tenant, sample));
-        held + sample.free.saturating_sub(self.floor(sample))
+        (held + sample.free).saturating_sub(self.floor(sample))
     }
 
     /// What `plan`'s process may hold: the card less the floor, everything external, every
@@ -1397,6 +1399,12 @@ mod tests {
         };
         assert!(gpu.room("anima", &s) < gpu.physical_cap("anima", &s));
         assert_eq!(gpu.physical_cap("anima", &s), GIB / 2 + 2 * GIB - HEADLESS_FLOOR);
+        // Below the floor it never reaches what the process holds.
+        let squeezed = Sample {
+            free: HEADLESS_FLOOR - 100 * MIB,
+            ..s
+        };
+        assert_eq!(gpu.physical_cap("anima", &squeezed), GIB / 2 - 100 * MIB);
     }
 
     #[test]
