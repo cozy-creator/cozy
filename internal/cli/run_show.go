@@ -178,7 +178,7 @@ type solCalls struct {
 	DensePrefix int `json:"dense_prefix"`
 }
 
-// legacyRank is a Runtime's `ranks` row, all the Rust machine's Runtime sends: its `ordinal`
+// legacyRank is a Runtime's `ranks` row, all TensorD's Runtime sends: its `ordinal`
 // is the GPU's number.
 type legacyRank struct {
 	reportGPU

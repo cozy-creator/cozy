@@ -102,7 +102,7 @@ func machineChildren(t *testing.T, root string, store *records.Store, parentRef 
 
 // rustJournal is this computer's machine's execution journal.
 func rustJournal(root string) string {
-	return filepath.Join(root, "machine", "root", "var", "lib", "cozy", "rust-machine", "execution", "executions.sqlite3")
+	return filepath.Join(root, "machine", "root", "var", "lib", "cozy", "tensord", "execution", "executions.sqlite3")
 }
 
 func assertMachineChildScalar(t *testing.T, child machineChildProof, value int) {

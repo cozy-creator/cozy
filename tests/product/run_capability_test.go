@@ -17,7 +17,7 @@ import (
 
 func machineLeaf(t *testing.T, key any, public any) []byte {
 	t.Helper()
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "cozy-machine"},
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "tensord"},
 		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(48 * time.Hour)}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, public, key)
 	must(t, err)

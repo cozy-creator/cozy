@@ -70,7 +70,7 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 	if code, out := runCozyPath(t, root, path, "down", "--json"); code != 0 {
 		t.Fatalf("detach client [%d]: %s", code, out)
 	}
-	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine", "root", "var", "lib", "cozy", "rust-machine", "execution", "executions.sqlite3")+"?mode=ro&_pragma=busy_timeout(5000)")
+	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine", "root", "var", "lib", "cozy", "tensord", "execution", "executions.sqlite3")+"?mode=ro&_pragma=busy_timeout(5000)")
 	must(t, err)
 	defer journal.Close()
 	deadline := time.Now().Add(3 * time.Minute)

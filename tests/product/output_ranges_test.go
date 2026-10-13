@@ -152,7 +152,7 @@ func (l *farLink) carry(to, from net.Conn, connection int) {
 // bytes cross several times faster than one connection can carry them, and it lands whole.
 func TestABigOutputCrossesAFarLinkOnSeveralConnections(t *testing.T) {
 	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host=<cozy-machine>")
+		t.Skip("requires -machine-host=<tensord>")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czr")
 	must(t, err)

@@ -313,7 +313,7 @@ func playerLargeMdat(t *testing.T, movie []byte, padding int) []byte {
 	return nil
 }
 
-// playerMachine is the Rust machine's WebRTC listener, reached on this computer's LAN address
+// playerMachine is TensorD's WebRTC listener, reached on this computer's LAN address
 // through a relay the test can cut.
 type playerMachine struct {
 	t       *testing.T

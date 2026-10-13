@@ -79,8 +79,8 @@ converge on one daemon. A startup failure is returned directly as a bounded diag
 not create a persistent log. Commands that require the daemon may ensure the same process is
 running automatically.
 
-The machine server is the separate `cozy-machine` executable, built in `cozy-runtime`.
-Linux Runtime wheels include this agent. `cozy machine install` bootstraps a new machine
+The machine server is TensorD, the separate `tensord` executable that Linux Runtime wheels
+bundle. `cozy machine install` bootstraps a new machine
 or asks an existing current machine to update its Runtime, TensorFS and bundled agent
 through one durable transaction. The same machine API runs on a laptop and a rented pod;
 restarting the personal controller leaves accepted machine work running. `cozy machine stop`

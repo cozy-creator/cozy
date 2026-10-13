@@ -81,7 +81,7 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 		return nil, Transport(err)
 	}
 	installed := &Installed{InstalledAt: time.Now().UTC(), Pinned: source.pinned(),
-		Host:    installedArtifact{Name: "cozy-machine " + frame.GetVersion()},
+		Host:    installedArtifact{Name: "tensord " + frame.GetVersion()},
 		Runtime: installedArtifact{Name: hostruntime.Distribution + " " + frame.GetRuntime()}, TensorFS: installedArtifact{Name: "tensorfs " + frame.GetTensorfs()}}
 	// Activation replaces the service, while its stable parent keeps running. Once that
 	// update has succeeded, retain the activated executable as the next local supervisor
@@ -114,7 +114,7 @@ func (h *Host) updateLocked(ctx context.Context, source Source) (*Installed, *ex
 // needed to commit it. A pending activation belongs to the native supervisor's recovery:
 // its candidate must not replace that supervisor before readiness or rollback completes.
 func (h *Host) retainActivatedHost() (*installedArtifact, *exit.Error) {
-	engine := filepath.Join(h.Root(), "var/lib/cozy/rust-machine")
+	engine := filepath.Join(h.Root(), "var/lib/cozy/tensord")
 	if _, err := os.Lstat(filepath.Join(engine, "update/pending.json")); err == nil {
 		return nil, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -130,7 +130,7 @@ func (h *Host) retainActivatedHost() (*installedArtifact, *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot retain the activated machine for the next start: %s", err)
 	}
-	host.Name = "cozy-machine"
+	host.Name = "tensord"
 	return &host, nil
 }
 

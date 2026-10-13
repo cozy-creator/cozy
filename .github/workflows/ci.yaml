@@ -146,8 +146,8 @@ jobs:
           echo "COZY_EVAL_VERSION=$eval_version" >> "$GITHUB_ENV"
       - name: Bundled machine agent
         run: |
-          python3 scripts/ci-machine-agent.py "$RUNTIME_WHEEL" "$RUNNER_TEMP/cozy-machine"
-          echo "MACHINE_HOST=$RUNNER_TEMP/cozy-machine" >> "$GITHUB_ENV"
+          python3 scripts/ci-machine-agent.py "$RUNTIME_WHEEL" "$RUNNER_TEMP/tensord"
+          echo "MACHINE_HOST=$RUNNER_TEMP/tensord" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: cozy-ci-media

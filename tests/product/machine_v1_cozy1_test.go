@@ -128,7 +128,7 @@ func cozy1Sessions(t *testing.T, root string, port int, run string) (*mediaHarne
 	}
 }
 
-// cozy1Machine is root's running Rust machine as a browser holding a link reaches it: the
+// cozy1Machine is root's running TensorD as a browser holding a link reaches it: the
 // WebRTC port its receipt names, its leaf's fingerprint, and the owner key that signs caps.
 type cozy1Machine struct {
 	t           *testing.T
@@ -214,7 +214,7 @@ func savedVideo(t *testing.T, out string, ran *bytes.Buffer) []byte {
 // A finished output is read by range, and a capability for another output is refused.
 func TestCozy1FollowsAJobsFilmOnAV1Machine(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, port := cozy1Root(t)
 	project := filepath.Join(t.TempDir(), "cpu_longform")
@@ -231,7 +231,7 @@ func TestCozy1FollowsAJobsFilmOnAV1Machine(t *testing.T) {
 	must(t, os.WriteFile(reference, encoded.Bytes(), 0o600))
 	in, out := filepath.Join(root, "req.json"), filepath.Join(root, "film")
 	must(t, os.WriteFile(in, []byte(`{"segments":["a dawn","a storm","a calm"],"hold":2}`), 0o600))
-	run, command, ran := cozy1Run(t, root, "local/cozy-machine-cpu-longform/long_form",
+	run, command, ran := cozy1Run(t, root, "local/tensord-cpu-longform/long_form",
 		"--input", in, "--asset", "reference="+reference, "--await", "--json", "--out", out)
 	h, open := cozy1Sessions(t, root, port, run)
 	c := open(capability.Grant{})
@@ -296,7 +296,7 @@ func TestCozy1FollowsAJobsFilmOnAV1Machine(t *testing.T) {
 // its cursor and ends with the same film `cozy run --out` saved.
 func TestCozy1FollowsAGrowingVideoOnAV1Machine(t *testing.T) {
 	if *machineHostBinary == "" || *privateScriptRuntimeWheel == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -script-runtime-wheel")
+		t.Skip("requires -machine-host=<tensord> and -script-runtime-wheel")
 	}
 	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)

@@ -85,7 +85,7 @@ def script(ctx: Context, payload: Script, out: Outputs) -> Shown:
 	return project
 }
 
-// mediaMachine is a test home's Rust machine, granted a WebRTC port, running scripted runs of
+// mediaMachine is a test home's TensorD, granted a WebRTC port, running scripted runs of
 // mediaScriptPackage. A test names its runs by number; a link and a cap name each by its id,
 // as the machine does.
 type mediaMachine struct {
@@ -100,7 +100,7 @@ type scriptedRun struct {
 
 func newMediaMachine(t *testing.T) *mediaMachine {
 	if *machineHostBinary == "" || *privateScriptRuntimeWheel == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -script-runtime-wheel")
+		t.Skip("requires -machine-host=<tensord> and -script-runtime-wheel")
 	}
 	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)
@@ -204,7 +204,7 @@ func (m *mediaMachine) mint(g capability.Grant) string {
 	return m.cozy1Machine.mint(g)
 }
 
-// Every test runs the real Rust machine and a real pion ICE-TCP client over real TCP; outputs
+// Every test runs the real TensorD and a real pion ICE-TCP client over real TCP; outputs
 // are what a real run published.
 
 type mediaHarness struct {

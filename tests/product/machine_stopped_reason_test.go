@@ -11,7 +11,7 @@ import (
 
 // A run whose machine stopped mid-run says so plainly, says it was not retried, and names how
 // to run it again: in `run list` and in `run watch`, whether its machine sent the reason's code
-// or (before cozy-machine 0.1.1) only its internal words.
+// or (before tensord 0.1.1) only its internal words.
 func TestARunWhoseMachineStoppedSaysSoAndHowToRunItAgain(t *testing.T) {
 	for name, reason := range map[string]*v1.Reason{
 		"coded":  {Code: records.MachineStopped, Message: "machine_stopped: the machine running this run stopped mid-run", Origin: "machine"},

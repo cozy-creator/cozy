@@ -83,7 +83,7 @@ func TestLocalMachineStartsAfterItsUpdateObserverDisconnects(t *testing.T) {
 			t.Fatalf("the committed update cannot restart after observer loss [%d]: %s", code, out)
 		}
 	}
-	if fileSHA(t, filepath.Join(host.Root(), "usr/local/bin/cozy-machine")) != fileSHA(t, filepath.Join(host.Root(), "var/lib/cozy/rust-machine/agent/current")) {
+	if fileSHA(t, filepath.Join(host.Root(), "usr/local/bin/tensord")) != fileSHA(t, filepath.Join(host.Root(), "var/lib/cozy/tensord/agent/current")) {
 		t.Fatal("the next launch did not retain the committed machine executable")
 	}
 }
