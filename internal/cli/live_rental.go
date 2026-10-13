@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"slices"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -10,9 +12,45 @@ import (
 
 func liveRentalResolver(ctx *Context, store *records.Store) rental.LiveResolver {
 	return rental.LiveResolver{Store: store,
-		Origins: func() ([]string, *exit.Error) { return rentalInventoryOrigins(ctx, store, ctx.Cfg.HubURL) },
+		Origins: func() ([]string, *exit.Error) { return selectedHubFirst(ctx, store) },
 		Client:  func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 	}
+}
+
+// selectedRental is the rental a command sends work to, by ID or name: one this host recorded
+// and still holds is used as recorded, asking no Hub (the work's dispatch reads the rental's
+// own Hub when it dials it); any other is resolved at the Hubs. Verbs that end or change a
+// rental resolve it at its Hub (resolveLiveRental).
+func selectedRental(ctx *Context, store *records.Store, name string) (string, *exit.Error) {
+	if id := recordedRental(store, name); id != "" {
+		return id, nil
+	}
+	live, problem := resolveLiveRental(ctx, store, name)
+	if problem != nil {
+		return "", problem
+	}
+	if hub.RentalAbsent(live.Rental.State) || live.Rental.State == hub.RentalReleaseRequested {
+		return "", exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
+	}
+	return live.Rental.ID, nil
+}
+
+// recordedRental is the ID of the rental this host recorded and still holds by that ID or name;
+// "" for any other.
+func recordedRental(store *records.Store, name string) string {
+	if row, _ := store.RentalByMachine(name); row != nil && !hub.RentalAbsent(row.State) && row.State != hub.RentalReleaseRequested {
+		return row.ID
+	}
+	return ""
+}
+
+// selectedHubFirst is every hub a rental may live on, the command's own first.
+func selectedHubFirst(ctx *Context, store *records.Store) ([]string, *exit.Error) {
+	origins, problem := rentalInventoryOrigins(ctx, store, ctx.Cfg.HubURL)
+	if i := slices.Index(origins, ctx.Cfg.HubURL); i > 0 {
+		origins = append([]string{ctx.Cfg.HubURL}, slices.Delete(origins, i, i+1)...)
+	}
+	return origins, problem
 }
 
 // observedRental refreshes the endpoint from its owning Hub on every use. Only

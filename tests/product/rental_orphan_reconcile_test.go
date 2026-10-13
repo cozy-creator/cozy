@@ -41,6 +41,7 @@ func orphanHub(t *testing.T, name string) (string, *fakeRentalHub) {
 // accelerator, a rate, and the moment its billing began.
 func orphan(stand *fakeRentalHub, id, machine string, rate int64) {
 	stand.add(id, machine)
+	stand.set(id, "machine_name", machine)
 	stand.set(id, "state", "booting")
 	stand.set(id, "requested_accelerator_model", "NVIDIA H100 NVL")
 	stand.set(id, "hourly_rate_usd_micros", rate)
@@ -189,6 +190,7 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	stand.add("rental-orphan-owned", "heron")
+	stand.set("rental-orphan-owned", "machine_name", "heron")
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ReadyAt: time.Now().UTC().Format(time.RFC3339Nano),
 		ID:      "rental-orphan-owned", MachineName: "heron", SKU: "cpu", AcceleratorModel: "CPU",
@@ -217,6 +219,9 @@ func TestRentalListShowsOtherClientsMachinesBesideItsOwn(t *testing.T) {
 	stand.publishListing()
 	const own = "pr-2b2b2b2b2b2b2b2b2b2b"
 	stand.add(own, "loran")
+	stand.set(own, "machine_name", "loran")
+	stand.set(own, "requested_accelerator_model", "NVIDIA H100 80GB HBM3")
+	stand.set(own, "accelerator_count", 2)
 	stand.set(own, "state", "ready")
 	stand.setRate(own, 7_021_700)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

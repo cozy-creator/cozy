@@ -76,7 +76,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		_, problem = resolveLiveRental(ctx, store, machine)
+		_, problem = selectedRental(ctx, store, machine)
 		store.Close()
 		if problem != nil {
 			return problem

@@ -135,12 +135,23 @@ func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 	}
 }
 
-// The real CLI/daemon snapshots before any remote maintenance. The independent
-// peer is deliberately unavailable: this test needs no worker or wheel install.
+// The real CLI/daemon snapshots before any remote maintenance. The rental's Hub names it
+// ready; its machine is deliberately unavailable: this test needs no worker or wheel install.
 func TestRentalRuntimeUpdateCLIFreezesLocalCandidate(t *testing.T) {
 	f := updateFixtureAt(t)
+	stand := newFakeRentalHub(t, 0)
+	f.cfg.HubURL = fmt.Sprintf("http://127.0.0.1:%d", stand.port())
 	f.attach(t, "127.0.0.1:1")
-	must(t, os.WriteFile(filepath.Join(f.layout.Root, "config.yaml"), []byte("tensorhub_url: http://127.0.0.1:1\ntensorhub_token: local-update-proof\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+	identity, problem := rental.CreatorIdentityFor(f.layout, f.rentalID)
+	fatal(t, problem)
+	certificate, err := os.ReadFile(f.cert)
+	must(t, err)
+	stand.add(f.rentalID, "proof")
+	for field, value := range map[string]any{"machine_name": "proof", "worker_address": "127.0.0.1:1", "cert_pem": string(certificate),
+		"worker_id": updateWorkerID, "worker_boot_id": updateBootID, "creator_public_key": identity.PublicKey()} {
+		stand.set(f.rentalID, field, value)
+	}
+	must(t, os.WriteFile(filepath.Join(f.layout.Root, "config.yaml"), []byte("tensorhub_url: "+f.cfg.HubURL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	source := filepath.Join(t.TempDir(), "cozy_runtime-0.18.25.dev1-cp312-abi3-manylinux_2_28_x86_64.whl")
 	content := []byte("bounded immutable candidate bytes; metadata checked during planning")
 	must(t, os.WriteFile(source, content, 0600))

@@ -936,3 +936,40 @@ func TestExecutionEnvironmentToleratesNewHubSettings(t *testing.T) {
 		t.Fatalf("non-access environment reached the machine: %v", environment.Environment)
 	}
 }
+
+// A command on one hub's rental never depends on another hub: with hub b down, a rental of
+// hub a is ended by its recorded name and by a name only hub a's listing knows. (Agents' local
+// `cozy run --rental` and `rental end` failed "Tensorhub unreachable at https://tensorhub.com".)
+func TestARentalIsReachedWhileAnotherHubIsDown(t *testing.T) {
+	root, hubA, standA := rentalEndRoot(t, "rental-other-hub-down")
+	standB := newFakeRentalHub(t, 0)
+	hubB := standB.server.URL
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	standB.server.Config.Handler = machineKeyLogin("machine-b", public, "rental-idle-test", standB.server.Config.Handler)
+	configPath := filepath.Join(root, config.FileName)
+	raw, err := os.ReadFile(configPath)
+	must(t, err)
+	must(t, os.WriteFile(configPath, append(raw, []byte("hubs:\n  a: "+hubA+"\n  b: "+hubB+"\n")...), 0o600))
+	plantMachineKey(t, root, hubB, "machine-b", private)
+	for id, name := range map[string]string{"pr-a7a7a7a7a7a7a7a7a7a7": "alpha", "pr-a8a8a8a8a8a8a8a8a8a8": "anon"} {
+		standA.add(id, name)
+		standA.set(id, "machine_name", name)
+	}
+	standB.add("pr-b7b7b7b7b7b7b7b7b7b7", "bravo")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	for id, row := range map[string]records.Rental{
+		"pr-a7a7a7a7a7a7a7a7a7a7": {MachineName: "alpha", Hub: hubA}, "pr-b7b7b7b7b7b7b7b7b7b7": {MachineName: "bravo", Hub: hubB},
+	} {
+		row.ID, row.State, row.AcceleratorCount, row.HourlyRateUSDMicros = id, "ready", 1, 100_000
+		fatal(t, store.RecordRental(row))
+	}
+	store.Close()
+	standB.close()
+	for id, name := range map[string]string{"pr-a7a7a7a7a7a7a7a7a7a7": "alpha", "pr-a8a8a8a8a8a8a8a8a8a8": "anon"} {
+		if code, out := runCozy(t, root, "rental", "end", name, "--json"); code != 0 || standA.releases(id) != 1 {
+			t.Fatalf("ending %s on hub a depended on hub b [exit %d]\n%s", name, code, out)
+		}
+	}
+}

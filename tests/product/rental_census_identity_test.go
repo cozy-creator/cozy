@@ -18,11 +18,12 @@ func TestRentalCensusDoesNotHideSameIDFromAnotherHub(t *testing.T) {
 	root, origin, peer := rentalEndRoot(t, "census-hub-scope")
 	peer.publishListing()
 	peer.add("rental-collision", "current")
+	peer.set("rental-collision", "machine_name", "current")
 	peer.setRate("rental-collision", 40_000)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	fatal(t, store.RecordRental(records.Rental{ID: "rental-collision", MachineName: "elsewhere",
+	fatal(t, store.RecordRental(records.Rental{ID: "rental-collision", MachineName: "elsewhere", StableMachineName: "elsewhere",
 		Hub: "http://127.0.0.1:1", State: "ready", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
 	type listing struct {
 		Count  *int             `json:"machines_running"`

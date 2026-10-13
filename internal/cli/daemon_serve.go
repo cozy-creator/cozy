@@ -122,7 +122,14 @@ func serveDaemon(ctx *Context) *exit.Error {
 	readRental := func(id string) (*records.Rental, *exit.Error) { return observedRental(ctx, st, id) }
 	rentals := rental.Resolver(l, readRental)
 	readProjection := func(id string) (*records.Rental, *exit.Error) { return liveRentalProjection(ctx, st, id) }
-	knownRentals := rental.Known(readProjection)
+	// A submission to a ready rental this host recorded asks no Hub: dispatch reads its Hub
+	// when it dials the machine. Any other is read at its Hub.
+	knownRentals := rental.Known(func(id string) (*records.Rental, *exit.Error) {
+		if row, _ := st.RentalRow(id); row != nil && row.State == hub.RentalReady && row.Address != "" && row.CertPath != "" {
+			return row, nil
+		}
+		return readProjection(id)
+	})
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	// The daemon starts this computer's machine as `cozy machine start` does.

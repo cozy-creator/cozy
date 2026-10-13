@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -15,6 +16,17 @@ type RuntimeUpdateRequest struct {
 	TensorFSWheel   string `json:"tensorfs_wheel,omitempty"`
 	RuntimeVersion  string `json:"runtime_version,omitempty"`
 	TensorFSVersion string `json:"tensorfs_version,omitempty"`
+}
+
+// Validate refuses a request that names TensorFS alone, or a wheel and a version of one package.
+func (r RuntimeUpdateRequest) Validate() *exit.Error {
+	if r.TensorFSWheel != "" && r.RuntimeWheel == "" {
+		return exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
+	}
+	if r.RuntimeWheel != "" && r.RuntimeVersion != "" || r.TensorFSWheel != "" && r.TensorFSVersion != "" {
+		return exit.New(exit.Validation, "name a wheel or a version, not both")
+	}
+	return nil
 }
 
 func (s *Server) startRuntimeUpdate(w http.ResponseWriter, r *http.Request) {

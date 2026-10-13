@@ -37,7 +37,7 @@ func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 	fatal(t, problem)
 	for id, name := range map[string]string{current: "isao", old: "giriko", earlierPython: "priorpython"} {
 		fatal(t, store.RecordRental(records.Rental{ID: id, MachineName: name, AcceleratorModel: "CPU",
-			AcceleratorCount: 1, State: "ready", HourlyRateUSDMicros: 100000, Hub: "fixture"}))
+			AcceleratorCount: 1, State: "ready", HourlyRateUSDMicros: 100000, Hub: "fixture", Address: "127.0.0.1:1", CertPath: "unused"}))
 	}
 	store.Close()
 	script := filepath.Join(t.TempDir(), "main.py")
