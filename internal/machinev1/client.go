@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,11 +40,13 @@ type Client struct {
 	Machine pb.MachineClient
 	worker  string
 	signer  Signer
-	// dial opens another connection to the machine: a lane of ReadRanges.
-	dial    func() (*grpc.ClientConn, error)
-	lanesMu sync.Mutex
-	lanes   []*grpc.ClientConn
-	ranges  atomic.Int32
+	// dial opens another connection to the machine: a lane of ReadRanges. dialUploads opens
+	// the one Writes ride.
+	dial, dialUploads func() (*grpc.ClientConn, error)
+	lanesMu           sync.Mutex
+	lanes             []*grpc.ClientConn
+	upload            *grpc.ClientConn
+	ranges            atomic.Int32
 }
 
 // Dial connects to the machine at addr whose pinned leaf tlsConfig trusts; worker is the
@@ -63,6 +66,17 @@ func Dial(addr string, tlsConfig *tls.Config, worker string, signer Signer) (*Cl
 	}
 	c.conn, c.Machine = conn, pb.NewMachineClient(conn)
 	c.dial = func() (*grpc.ClientConn, error) { return grpc.NewClient(addr, options...) }
+	// Uploads ride their own connection, its socket holding little unsent: over a slow uplink a
+	// keepalive ping then waits behind kilobytes, not seconds, of an upload, and a connection an
+	// upload loses takes no run or status with it.
+	uploading := slices.Concat(options, []grpc.DialOption{grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+		conn, err := raceDial(ctx, addr)
+		if err == nil {
+			boundUnsent(conn)
+		}
+		return conn, err
+	})})
+	c.dialUploads = func() (*grpc.ClientConn, error) { return grpc.NewClient(addr, uploading...) }
 	return c, nil
 }
 
@@ -140,15 +154,53 @@ func (c *Client) Close() error {
 			c.lanes[i] = nil
 		}
 	}
+	if c.upload != nil {
+		_ = c.upload.Close()
+		c.upload = nil
+	}
 	c.lanesMu.Unlock()
 	return c.conn.Close()
 }
 
 // Broken is a connection gRPC has given up on for now, or one closed: a caller dials anew
 // rather than wait out its reconnect backoff.
-func (c *Client) Broken() bool {
-	state := c.conn.GetState()
+func (c *Client) Broken() bool { return broken(c.conn) }
+
+func broken(conn *grpc.ClientConn) bool {
+	state := conn.GetState()
 	return state == connectivity.TransientFailure || state == connectivity.Shutdown
+}
+
+// uploads is the connection Writes ride, dialed when first used and again once it broke.
+// Without one of its own (a client not made by Dial), the client's.
+func (c *Client) uploads() (*grpc.ClientConn, pb.MachineClient) {
+	if c.dialUploads == nil {
+		return nil, c.Machine
+	}
+	c.lanesMu.Lock()
+	defer c.lanesMu.Unlock()
+	if c.upload != nil && broken(c.upload) {
+		_ = c.upload.Close()
+		c.upload = nil
+	}
+	if c.upload == nil {
+		conn, err := c.dialUploads()
+		if err != nil {
+			return nil, c.Machine
+		}
+		c.upload = conn
+	}
+	return c.upload, pb.NewMachineClient(c.upload)
+}
+
+// dropUploads closes conn, the uploads' connection a transfer lost, unless it was replaced.
+func (c *Client) dropUploads(conn *grpc.ClientConn) {
+	c.lanesMu.Lock()
+	defer c.lanesMu.Unlock()
+	if conn != nil && c.upload == conn {
+		_ = c.upload.Close()
+		c.upload = nil
+	}
 }
 
 // Cap mints a cap for this machine: machine scope (run empty) or one run's outputs.

@@ -12,9 +12,12 @@ import (
 	"encoding/json"
 	"flag"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,8 +32,19 @@ var (
 	cpuFixture      = flag.String("cpu-fixture", "", "cozy-machine tests/fixtures/cpu_lifecycle")
 )
 
+// machine is a real machine serving on a loopback port, and the key it authorizes.
+type machine struct {
+	Address, Worker, Cert string
+	signer                Signer
+}
+
 // serve starts the real machine on a loopback port and answers a machine-scope client.
-func serve(t *testing.T, args ...string) pb.MachineClient {
+func serve(t *testing.T, args ...string) *Client {
+	m := start(t, args...)
+	return m.connect(t, m.Address)
+}
+
+func start(t *testing.T, args ...string) machine {
 	if *machineBinary == "" {
 		t.Skip("requires -machine-binary=<cozy-machine>")
 	}
@@ -47,12 +61,12 @@ func serve(t *testing.T, args ...string) pb.MachineClient {
 	put("machine.json", map[string]any{"worker_id": "cli-objects", "identity_directory": "identity",
 		"authorized_keys_file": "keys.json", "readiness_hmac_key_file": "readiness.json"})
 	state := filepath.Join(root, "state")
-	machine := exec.Command(*machineBinary, "serve", "--state", state, "--machine-config",
+	process := exec.Command(*machineBinary, "serve", "--state", state, "--machine-config",
 		filepath.Join(config, "machine.json"), "--listen", "127.0.0.1:0", "--host-bytes", "0")
-	machine.Args = append(machine.Args, args...)
-	machine.Stderr = os.Stderr
-	must(t, machine.Start())
-	t.Cleanup(func() { _ = machine.Process.Kill(); _, _ = machine.Process.Wait() })
+	process.Args = append(process.Args, args...)
+	process.Stderr = os.Stderr
+	must(t, process.Start())
+	t.Cleanup(func() { _ = process.Process.Kill(); _, _ = process.Process.Wait() })
 	var ready struct {
 		Address string `json:"address"`
 		Worker  string `json:"worker_id"`
@@ -67,13 +81,92 @@ func serve(t *testing.T, args ...string) pb.MachineClient {
 			t.Fatal("the machine did not publish api-ready.json")
 		}
 	}
-	roots := x509.NewCertPool()
-	roots.AppendCertsFromPEM([]byte(ready.Cert))
 	sign := func(message []byte) []byte { return ed25519.Sign(private, message) }
-	client, err := Dial(ready.Address, &tls.Config{RootCAs: roots, ServerName: "localhost"}, ready.Worker, Signer{Public: public, Sign: sign})
+	return machine{Address: ready.Address, Worker: ready.Worker, Cert: ready.Cert, signer: Signer{Public: public, Sign: sign}}
+}
+
+// connect dials the machine at addr (its own, or a relay's) as its owner.
+func (m machine) connect(t *testing.T, addr string) *Client {
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM([]byte(m.Cert))
+	client, err := Dial(addr, &tls.Config{RootCAs: roots, ServerName: "localhost"}, m.Worker, m.signer)
 	must(t, err)
 	t.Cleanup(func() { client.Close() })
-	return client.Machine
+	return client
+}
+
+// relay forwards loopback connections to the machine, counting the bytes it carries there.
+// cut, when positive, ends the connection whose bytes first pass it, once.
+type relay struct {
+	sent atomic.Int64
+	cut  int64
+	once sync.Once
+}
+
+func (r *relay) start(t *testing.T, target string) string {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	must(t, err)
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			from, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			to, err := net.Dial("tcp", target)
+			if err != nil {
+				from.Close()
+				continue
+			}
+			go func() { _, _ = io.Copy(from, to); from.Close() }()
+			go r.forward(from, to)
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func (r *relay) forward(from, to net.Conn) {
+	defer to.Close()
+	defer from.Close()
+	var carried int64
+	buffer := make([]byte, 32<<10)
+	for {
+		n, err := from.Read(buffer)
+		if n > 0 {
+			if _, err := to.Write(buffer[:n]); err != nil {
+				return
+			}
+			r.sent.Add(int64(n))
+			carried += int64(n)
+		}
+		if err != nil {
+			return
+		}
+		if r.cut > 0 && carried > r.cut {
+			ended := false
+			r.once.Do(func() { ended = true })
+			if ended {
+				return
+			}
+		}
+	}
+}
+
+// object is length deterministic bytes and their digest.
+func object(length int, seed byte) ([]byte, string) {
+	data := make([]byte, length)
+	for i := range data {
+		data[i] = byte(i%251) ^ seed
+	}
+	sum := sha256.Sum256(data)
+	return data, "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// heldBy is how many of the object's bytes the machine holds for client's signer.
+func heldBy(t *testing.T, client *Client, digest string, length int) uint64 {
+	held, err := send(context.Background(), client.Machine, &pb.WriteFrame{Digest: digest, Length: uint64(length)}, nil)
+	must(t, err)
+	return held
 }
 
 func must(t *testing.T, err error) {
@@ -88,33 +181,74 @@ func must(t *testing.T, err error) {
 func TestWriteResumesFromHeldBytesOnTheRealMachine(t *testing.T) {
 	client := serve(t)
 	ctx := context.Background()
-	data := make([]byte, 3*writeChunk+12345)
-	for i := range data {
-		data[i] = byte(i % 251)
-	}
-	sum := sha256.Sum256(data)
-	digest := "sha256:" + hex.EncodeToString(sum[:])
-	length := int64(len(data))
+	data, digest := object(3*writeChunk+12345, 0)
 	// A first attempt ends after one chunk.
-	held, err := write(ctx, client, &pb.WriteFrame{Digest: digest, Length: uint64(length)}, bytes.NewReader(data[:writeChunk]))
+	held, err := send(ctx, client.Machine, &pb.WriteFrame{Digest: digest, Length: uint64(len(data))}, bytes.NewReader(data[:writeChunk]))
 	must(t, err)
 	if held != writeChunk {
 		t.Fatalf("held %d after the first chunk", held)
 	}
-	sent := 0
-	open := func() (io.ReadSeekCloser, error) {
-		sent++
-		return nopCloser{bytes.NewReader(data)}, nil
-	}
-	must(t, Write(ctx, client, digest, length, open))
-	must(t, Write(ctx, client, digest, length, open))
-	if sent != 1 {
-		t.Fatalf("the bytes were opened %d times; a held object needs none", sent)
+	sent, err := client.write(ctx, digest, uint64(len(data)), bytes.NewReader(data))
+	must(t, err)
+	again, err := client.write(ctx, digest, uint64(len(data)), bytes.NewReader(data))
+	must(t, err)
+	if !sent || again {
+		t.Fatalf("the rest was sent %t, the held object again %t", sent, again)
 	}
 	// Bytes that differ from their digest are refused, not stored.
 	wrong := "sha256:" + hex.EncodeToString(make([]byte, 32))
-	if err := Write(ctx, client, wrong, 3, func() (io.ReadSeekCloser, error) { return nopCloser{bytes.NewReader([]byte("abc"))}, nil }); err == nil {
+	if err := client.Write(ctx, wrong, 3, bytes.NewReader([]byte("abc"))); err == nil {
 		t.Fatal("a digest mismatch was accepted")
+	}
+}
+
+// Runs submitted together write the same package to one machine: its bytes cross once,
+// whichever of this process's connections each writer holds.
+func TestConcurrentWritesOfOneObjectMoveItsBytesOnce(t *testing.T) {
+	m := start(t)
+	var r relay
+	addr := r.start(t, m.Address)
+	clients := []*Client{m.connect(t, addr), m.connect(t, addr)}
+	data, digest := object(24<<20, 1)
+	var wait sync.WaitGroup
+	errs := make(chan error, 4)
+	for i := range 4 {
+		wait.Go(func() {
+			errs <- clients[i%2].Write(context.Background(), digest, uint64(len(data)), bytes.NewReader(data))
+		})
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		must(t, err)
+	}
+	if held := heldBy(t, clients[0], digest, len(data)); held != uint64(len(data)) {
+		t.Fatalf("the machine holds %d of %d bytes", held, len(data))
+	}
+	if sent := r.sent.Load(); sent > int64(len(data))*5/4 {
+		t.Fatalf("%d bytes crossed for a %d-byte object written four times at once", sent, len(data))
+	}
+}
+
+// A connection lost mid-upload costs only what it had in flight: the write resumes on a new one
+// from what the machine holds, and the machine ends with the exact object.
+func TestAWriteResumesWhenItsConnectionIsCut(t *testing.T) {
+	m := start(t)
+	data, digest := object(24<<20, 2)
+	r := relay{cut: int64(len(data)) / 2}
+	client := m.connect(t, r.start(t, m.Address))
+	must(t, client.Write(context.Background(), digest, uint64(len(data)), bytes.NewReader(data)))
+	if held := heldBy(t, client, digest, len(data)); held != uint64(len(data)) {
+		t.Fatalf("the machine holds %d of %d bytes", held, len(data))
+	}
+	if sent := r.sent.Load(); sent > int64(len(data))*5/4 {
+		t.Fatalf("%d bytes crossed for a %d-byte object cut halfway: it started over", sent, len(data))
+	}
+	// The machine verified the bytes: the stored object is the one named.
+	again, err := client.write(context.Background(), digest, uint64(len(data)), bytes.NewReader(data))
+	must(t, err)
+	if again {
+		t.Fatal("the completed object was sent again")
 	}
 }
 
@@ -138,18 +272,18 @@ func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 		must(t, err)
 		installation.Files = append(installation.Files, localpackage.File{Name: name, Digest: object.Digest, Length: object.Length, Path: path})
 	}
-	manifest, sent, held, err := LocalSource(ctx, client, installation, nil, false)
+	manifest, sent, held, err := client.LocalSource(ctx, installation, nil, false)
 	must(t, err)
 	if !sent {
 		t.Fatal("new code was not written")
 	}
 	var stages []string
 	spec := &pb.RunSpec{Source: &pb.RunSpec_Local{Local: &pb.LocalSource{Manifest: manifest}}, Entrypoint: "steps", Owner: "alice"}
-	must(t, Prepare(ctx, client, "warm-1", spec, func(p Progress) { stages = append(stages, p.Stage) }))
+	must(t, Prepare(ctx, client.Machine, "warm-1", spec, func(p Progress) { stages = append(stages, p.Stage) }))
 	if len(stages) == 0 {
 		t.Fatal("the warm run reported no progress")
 	}
-	again, sent, _, err := LocalSource(ctx, client, installation, held, false)
+	again, sent, _, err := client.LocalSource(ctx, installation, held, false)
 	must(t, err)
 	if again != manifest || sent {
 		t.Fatalf("the same code named another manifest (%s, then %s) or was written again (%t)", manifest, again, sent)
@@ -162,20 +296,20 @@ func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 	object, err := fileObject(edited.Path)
 	must(t, err)
 	edited.Digest, edited.Length = object.Digest, object.Length
-	next, sent, _, err := LocalSource(ctx, client, installation, held, false)
+	next, sent, _, err := client.LocalSource(ctx, installation, held, false)
 	must(t, err)
 	if next == manifest || !sent {
 		t.Fatalf("the edit named the same manifest or moved no byte (%s, %t)", next, sent)
 	}
 	spec.Source = &pb.RunSpec_Local{Local: &pb.LocalSource{Manifest: next}}
-	must(t, Prepare(ctx, client, "warm-2", spec, nil))
+	must(t, Prepare(ctx, client.Machine, "warm-2", spec, nil))
 	// This computer's machine reads the project where it is: no file of it is written.
 	installation.Root = project
-	inPlace, _, kept, err := LocalSource(ctx, client, installation, nil, true)
+	inPlace, _, kept, err := client.LocalSource(ctx, installation, nil, true)
 	must(t, err)
 	if len(kept) != len(installation.Files) {
 		t.Fatalf("in place, the machine holds %d of %d files by name", len(kept), len(installation.Files))
 	}
 	spec.Source = &pb.RunSpec_Local{Local: &pb.LocalSource{Manifest: inPlace}}
-	must(t, Prepare(ctx, client, "warm-3", spec, nil))
+	must(t, Prepare(ctx, client.Machine, "warm-3", spec, nil))
 }

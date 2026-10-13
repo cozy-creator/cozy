@@ -24,7 +24,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/machines"
-	"github.com/cozy-creator/cozy/internal/machinev1"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
@@ -556,7 +555,7 @@ func (m *machineRuns) specV1(ctx context.Context, request records.Request, machi
 			if asset.Snapshot != nil && asset.Snapshot.Path != "" {
 				path = filepath.Join(asset.Snapshot.Path+".files", strings.TrimPrefix(asset.Digest, "sha256:"))
 			}
-			object, err := machinev1.WriteFile(ctx, machine.Machine, path)
+			object, err := machine.WriteFile(ctx, path)
 			if err != nil {
 				return nil, machines.Transport(err)
 			}
@@ -761,7 +760,7 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 	}
 	if selection.Write != "" {
 		report(machines.InstallProgress{Stage: "writing " + filepath.Base(selection.Write)})
-		object, err := machinev1.WriteFile(ctx, machine.Machine, selection.Write)
+		object, err := machine.WriteFile(ctx, selection.Write)
 		if err != nil {
 			return nil, machines.Transport(err)
 		}
@@ -833,7 +832,7 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 		return problem
 	}
 	for _, member := range members {
-		object, err := machinev1.WriteFile(ctx, machine.Machine, filepath.Join(snapshot.Path+".files", strings.TrimPrefix(member.Digest, "sha256:")))
+		object, err := machine.WriteFile(ctx, filepath.Join(snapshot.Path+".files", strings.TrimPrefix(member.Digest, "sha256:")))
 		if err != nil {
 			return machines.Transport(err)
 		}
@@ -841,7 +840,7 @@ func writeTreeV1(ctx context.Context, machine *machines.V1, snapshot *records.By
 			return exit.Named(exit.Conflict, "input_changed", "tree member %s changed since the run was submitted", member.Path)
 		}
 	}
-	if _, err := machinev1.WriteBytes(ctx, machine.Machine, snapshot.Body); err != nil {
+	if _, err := machine.WriteBytes(ctx, snapshot.Body); err != nil {
 		return machines.Transport(err)
 	}
 	return nil
