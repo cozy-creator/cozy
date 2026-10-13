@@ -205,7 +205,8 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		}
 		summary := api.RentalSummary{
 			Provider: live[row.ID].Provider, ProviderMachineID: live[row.ID].ProviderMachineID, ProviderResourceID: live[row.ID].ProviderResourceID,
-			ID: row.ID, MachineName: row.DisplayName(), RentalAlias: row.MachineName, SKU: row.SKU, State: row.State,
+			ProviderRefusal: live[row.ID].ProviderRefusal,
+			ID:              row.ID, MachineName: row.DisplayName(), RentalAlias: row.MachineName, SKU: row.SKU, State: row.State,
 			AcceleratorModel: row.AcceleratorModel, AcceleratorCount: row.AcceleratorCount,
 			HourlyRateUSDMicros: row.HourlyRateUSDMicros,
 			SpendUSDMicros:      live[row.ID].SpendUSDMicros, SpendBasis: live[row.ID].SpendBasis,
