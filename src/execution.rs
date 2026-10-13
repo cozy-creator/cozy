@@ -28,6 +28,7 @@ use std::{
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::Duration,
 };
+use tensorfs_core::transport::PullCancellation;
 
 pub const MAX_RUNNER_FRAME: usize = 1024 * 1024;
 /// The most text one package log line keeps.
@@ -183,6 +184,52 @@ pub struct Engine {
     activity_changed: Condvar,
     /// What holds a memoizable run's success for its signer (`call_memo`), once configured.
     memo: OnceLock<Weak<crate::objects::Objects>>,
+    /// Each preparing run's stop, and whether it has begun what cannot stop (`Stoppable`).
+    preparations: Mutex<HashMap<String, (PullCancellation, bool)>>,
+}
+
+/// One run's preparation, registered while it lasts: its cancel stops `stop`, which ends the
+/// run's downloads, provider fetches and package installs.
+pub struct Stoppable {
+    engine: Arc<Engine>,
+    id: String,
+    pub stop: PullCancellation,
+}
+impl Stoppable {
+    /// From here on the run cannot stop (an upload pushing to its Hub): it refuses cancellation.
+    /// False when it was canceled first.
+    pub fn commit(&self) -> bool {
+        let mut preparations = self.engine.preparations.lock().unwrap();
+        let Some((stop, committed)) = preparations.get_mut(&self.id) else {
+            return false;
+        };
+        *committed = !stop.is_cancelled();
+        *committed
+    }
+}
+impl Drop for Stoppable {
+    fn drop(&mut self) {
+        self.engine.preparations.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// A cancel of a preparing run past its point of no return is refused; any other stops it.
+fn stop_preparation(
+    preparations: &HashMap<String, (PullCancellation, bool)>,
+    id: &str,
+    journal: impl FnOnce() -> io::Result<Execution>,
+) -> io::Result<Execution> {
+    if preparations.get(id).is_some_and(|(_, committed)| *committed) {
+        return Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            "this run is uploading to its Hub and ends on its own; its upload cannot be canceled",
+        ));
+    }
+    let record = journal()?;
+    if let Some((stop, _)) = preparations.get(id) {
+        stop.cancel();
+    }
+    Ok(record)
 }
 
 #[derive(Clone)]
@@ -214,7 +261,19 @@ impl Engine {
             activity: Mutex::new(0),
             activity_changed: Condvar::new(),
             memo: OnceLock::new(),
+            preparations: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Registers run `id`'s preparation until the answer is dropped. A cancel journaled before
+    /// it registered stops it at once.
+    pub fn stoppable(self: &Arc<Self>, id: &str) -> Stoppable {
+        let stop = PullCancellation::default();
+        self.preparations.lock().unwrap().insert(id.into(), (stop.clone(), false));
+        if self.get(id).is_ok_and(|record| record.cancel_actor.is_some()) {
+            stop.cancel();
+        }
+        Stoppable { engine: self.clone(), id: id.into(), stop }
     }
 
     /// A memoizable run's success is kept by `objects` from now on (`Objects::keep`).
@@ -702,13 +761,12 @@ impl Engine {
     /// The durable actor record precedes delivery. Transport loss never calls this.
     pub fn cancel(&self, id: &str, actor: &str) -> io::Result<Execution> {
         let record = {
+            let preparations = self.preparations.lock().unwrap();
             let owned = self.owned.lock().unwrap();
             let mut progress = self.progress.lock().unwrap();
-            let mut record =
-                self.journal
-                    .lock()
-                    .unwrap()
-                    .cancel_observed(id, actor, progress.get(id))?;
+            let mut record = stop_preparation(&preparations, id, || {
+                self.journal.lock().unwrap().cancel_observed(id, actor, progress.get(id))
+            })?;
             progress.remove(id);
             overlay_observation(&mut record, &owned, &progress);
             record
@@ -720,11 +778,14 @@ impl Engine {
     /// Explicit native cancellation also fences an actor/ID not yet accepted by Run.
     pub fn cancel_run(&self, actor: &str, id: &str) -> io::Result<Execution> {
         let record = {
+            let preparations = self.preparations.lock().unwrap();
             let owned = self.owned.lock().unwrap();
             let mut progress = self.progress.lock().unwrap();
             let mut journal = self.journal.lock().unwrap();
             let prior = journal.reserve_run_cancellation(actor, id)?;
-            let mut record = journal.cancel_observed(&prior.id, actor, progress.get(&prior.id))?;
+            let mut record = stop_preparation(&preparations, &prior.id, || {
+                journal.cancel_observed(&prior.id, actor, progress.get(&prior.id))
+            })?;
             progress.remove(&prior.id);
             overlay_observation(&mut record, &owned, &progress);
             record

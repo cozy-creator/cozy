@@ -6,6 +6,7 @@
 use crate::{
     api::domain,
     call_memo::{self, Memo},
+    execution::Stoppable,
     gpu_service::{without_gpus, KeptMember, Level, Member},
     hub,
     journal::{CallMemo, Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
@@ -16,7 +17,7 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use tensorfs_core::ids::ObjectRef;
+use tensorfs_core::{ids::ObjectRef, transport::PullCancellation};
 use std::{
     collections::{BTreeMap, HashMap},
     io,
@@ -389,7 +390,8 @@ impl Runs {
             std::thread::Builder::new()
                 .name(format!("prepare-{run}"))
                 .spawn(move || {
-                    let outcome = this.prepare(&actor, &run, spec);
+                    let stoppable = this.service.engine.stoppable(&run);
+                    let outcome = this.prepare(&actor, &run, spec, &stoppable);
                     let ended = match outcome {
                         Ok(None) => {
                             if let Some(publisher) = &this.publisher {
@@ -443,7 +445,9 @@ impl Runs {
         id: &str,
         spec: &Spec,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
+        stoppable: &Stoppable,
     ) -> Result<Vec<Value>, Refused> {
+        let stop = Some(&stoppable.stop);
         let destination = spec.weights_destination.trim_start_matches("model://");
         if !destination.is_empty() && spec.models.len() != 1 {
             return Err(refused("invalid_request", "a weights destination takes one model"));
@@ -463,7 +467,7 @@ impl Runs {
         let mut models = vec![];
         for choice in &spec.models {
             let (manifest, mut row) = if !choice.source.is_empty() {
-                let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, observe)?;
+                let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, stop, observe)?;
                 let row = json!({"parameter": choice.parameter, "source": choice.source,
                     "resolved": made.resolved, "profiles": made.profiles,
                     "repository": made.repository, "manifest": made.manifest.id()});
@@ -492,7 +496,7 @@ impl Runs {
                 let named = crate::published::choose(choice, &choice.parameter, (&gpu, width))
                     .map_err(|(code, message)| refused(code, message))?;
                 let stage = format!("downloading {}", choice.repository);
-                let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, &|done, total| {
+                let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
@@ -527,6 +531,10 @@ impl Runs {
                     &tensorfs_core::sha256::hex_digest(format!("{actor}\0{id}").as_bytes())[..40]
                 );
                 let stage = format!("uploading to {destination}");
+                // Pushed objects cannot be taken back: from here the upload ends on its own.
+                if !stoppable.commit() {
+                    return Err(refused(crate::published::CANCELED, "the run was canceled before its upload began"));
+                }
                 let published = tensorfs_core::transport::publish(&tensorfs_core::transport::Publication {
                     store: publisher.store(),
                     hub: publishing.origin(),
@@ -552,7 +560,7 @@ impl Runs {
 
     /// The run's code and models made ready: Ok(None) once it is dispatchable, Ok(Some) for a
     /// warm run's result.
-    fn prepare(&self, actor: &str, id: &str, spec: Spec) -> Result<Option<ResultRecord>, Refused> {
+    fn prepare(&self, actor: &str, id: &str, spec: Spec, stoppable: &Stoppable) -> Result<Option<ResultRecord>, Refused> {
         let engine = self.service.engine.clone();
         let run = id.to_string();
         // Byte counts arrive per chunk: a new stage shows at once, bytes at most 4 times a second.
@@ -580,10 +588,10 @@ impl Runs {
             return self.remove(actor, &spec).map(Some);
         }
         if let Some(items) = &spec.set {
-            return self.warm_set(actor, &spec, items, &observe);
+            return self.warm_set(actor, &spec, items, &observe, stoppable);
         }
         if let Source::Models = spec.source {
-            let models = self.warm_models(actor, id, &spec, &*observe)?;
+            let models = self.warm_models(actor, id, &spec, &*observe, stoppable)?;
             return warm_result(json!({}), models);
         }
         // A warm run naming no entrypoint installs its code, then makes its choices present.
@@ -606,7 +614,7 @@ impl Runs {
                 let local = self.local.as_ref().ok_or_else(|| {
                     refused("capability_unavailable", "this machine installs no local packages")
                 })?;
-                let installed = local.install(&self.service, actor, digest)?;
+                let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop))?;
                 self.supersede(actor, &installed)?;
                 local.collect(actor, &installed.package);
                 Some(installed)
@@ -635,6 +643,7 @@ impl Runs {
                 let observe = observe.clone();
                 move |stage: &str, done: u64, total: u64| observe(stage, done, total)
             })),
+            Some(&stoppable.stop),
         )?;
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
@@ -687,7 +696,7 @@ impl Runs {
         }
         if spec.warm {
             let models = match install_only {
-                true => self.warm_models(actor, id, &spec, &*observe)?,
+                true => self.warm_models(actor, id, &spec, &*observe, stoppable)?,
                 false => vec![],
             };
             // The installed release and its interface, in the warm run's result.
@@ -720,7 +729,7 @@ impl Runs {
             Memo::Off => (CallMemo::default(), None),
         };
         if spec.job && answer.is_none() {
-            let inputs = self.job_inputs(&spec, &installation.package, &interface, hub.as_ref(), &*observe)?;
+            let inputs = self.job_inputs(&spec, &installation.package, &interface, hub.as_ref(), &*observe, &stoppable.stop)?;
             let context = JobContext {
                 installation: installation.alias.clone(),
                 application: spec.application.clone(),
@@ -769,6 +778,7 @@ impl Runs {
         spec: &Spec,
         items: &[SetItem],
         observe: &Arc<impl Fn(&str, u64, u64) + Send + Sync + 'static>,
+        stoppable: &Stoppable,
     ) -> Result<Option<ResultRecord>, Refused> {
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let (mut members, mut kept, mut rows) = (vec![], vec![], vec![]);
@@ -797,6 +807,7 @@ impl Runs {
                 entrypoint,
                 choices,
                 Some(Box::new(move |stage: &str, done: u64, total: u64| report(stage, done, total))),
+                Some(&stoppable.stop),
             )?;
             if item.level > Level::Installed && !declares(&installation, &item.entrypoint)? {
                 return Err(refused(
@@ -936,6 +947,7 @@ impl Runs {
         entrypoint: &str,
         choices: &[domain::ModelChoice],
         observe: Option<crate::published::Observer>,
+        stop: Option<&PullCancellation>,
     ) -> Result<(Installation, Option<crate::gpu_service::GpuPlan>), Refused> {
         let needs_hub = held
             .as_ref()
@@ -956,7 +968,7 @@ impl Runs {
                     gpus: spec.gpus,
                 };
                 let prepared = publisher
-                    .prepare_now(&self.service, actor, &request, observe)
+                    .prepare_now(&self.service, actor, &request, observe, stop)
                     .map_err(|(code, message)| refused(code, message))?;
                 Ok((prepared.installation.clone(), prepared.plan.clone()))
             }
@@ -1126,7 +1138,7 @@ impl Runs {
                         None => None,
                     };
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
-                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, None)
+                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, None, None)
                 })();
             match prepared {
                 Ok((installation, Some(plan))) => {
@@ -1188,6 +1200,7 @@ impl Runs {
         interface: &Value,
         hub: Option<&hub::Source>,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
+        stop: &PullCancellation,
     ) -> Result<BTreeMap<String, (String, ObjectRef)>, Refused> {
         let declared = interface["jobs"]
             .as_array()
@@ -1223,7 +1236,7 @@ impl Runs {
                 ObjectRef { sha256, length }
             } else if let Some(choice) = choice.filter(|c| !c.source.is_empty()) {
                 publisher
-                    .make_source(&choice.source, &choice.profiles, &spec.providers, observe)?
+                    .make_source(&choice.source, &choice.profiles, &spec.providers, Some(stop), observe)?
                     .manifest
             } else {
                 // A Hub checkpoint by name, or the owner's by hash (th-245); unnamed, the
@@ -1240,7 +1253,7 @@ impl Runs {
                     refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
                 })?;
                 let stage = format!("downloading {}", named.repository);
-                let named = publisher.download(&self.service, hub, named, &spec.catalog_revision, &|done, total| {
+                let named = publisher.download(&self.service, hub, named, &spec.catalog_revision, Some(stop), &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
@@ -1434,12 +1447,12 @@ mod tests {
         for job in [false, true] {
             let mut root_call = spec(Source::Installation("installed".into()), true, "root");
             root_call.job = job;
-            let refused = runs.prepare("alice", "root", root_call).err().unwrap();
+            let refused = runs.prepare("alice", "root", root_call, &runs.service.engine.stoppable("root")).err().unwrap();
             assert_eq!(refused.code, "callable_internal");
             let mut child = spec(Source::Installation("installed".into()), true, "child");
             child.job = job;
             child.parent = "managed-parent".into();
-            let prepared = runs.prepare("alice", "child", child).unwrap().unwrap();
+            let prepared = runs.prepare("alice", "child", child, &runs.service.engine.stoppable("child")).unwrap().unwrap();
             assert_eq!(prepared.value["release"], "2.0.0");
         }
         let mut warm = spec(Source::Models, true, "set");
@@ -1447,7 +1460,7 @@ mod tests {
             source: Source::Installation("installed".into()), entrypoint: "steps".into(),
             models: vec![], level: Level::Host, sent: vec![],
         }]);
-        assert_eq!(runs.prepare("alice", "set", warm).err().unwrap().code, "callable_internal");
+        assert_eq!(runs.prepare("alice", "set", warm, &runs.service.engine.stoppable("set")).err().unwrap().code, "callable_internal");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1457,53 +1470,8 @@ mod tests {
     fn a_local_source_prepares_inside_its_run_and_runs() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = std::env::temp_dir().join(format!("cm-runs-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        assert!(Command::new("uv")
-            .current_dir(repo)
-            .args(["build", "--wheel", "--out-dir"])
-            .arg(root.join("client"))
-            .status()
-            .unwrap()
-            .success());
-        let helper = Command::new("uv")
-            .current_dir(repo)
-            .args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"])
-            .output()
-            .unwrap();
-        let client = fs::read_dir(root.join("client"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.extension().is_some_and(|e| e == "whl"))
-            .unwrap();
-        let state = root.join("state");
-        let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
-        let objects =
-            Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
-        let local = LocalSources::new(
-            objects.clone(),
-            InstallerConfig {
-                helper_python: String::from_utf8(helper.stdout).unwrap().trim().into(),
-                python: "3.12".into(),
-                generations: root.join("generations"),
-                client_wheel: client,
-                staging_root: root.join("staging"),
-                sdk: vec![],
-                uv: "uv".into(),
-                seed_cache: None,
-            },
-            store.clone(),
-        );
-        let runs = Arc::new(Runs {
-            service: service.clone(),
-            objects: objects.clone(),
-            publisher: None,
-            local: Some(Arc::new(local)),
-            own_hub: None,
-            leaf: None,
-            jobs: Default::default(),
-        });
-        crate::jobs::Jobs::configure(&service, store.clone(), Some(&runs)).unwrap();
+        let (runs, objects) = local_runs(&root);
+        let service = runs.service.clone();
         let mut archive = tar::Builder::new(Vec::new());
         let fixture = repo.join("tests/fixtures/cpu_lifecycle");
         for name in ["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"] {
@@ -1619,6 +1587,134 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Runs that install local code with this repository's client and the real uv installer.
+    fn local_runs(root: &Path) -> (Arc<Runs>, Arc<Objects>) {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        fs::create_dir_all(root).unwrap();
+        assert!(Command::new("uv")
+            .current_dir(repo)
+            .args(["build", "--wheel", "--out-dir"])
+            .arg(root.join("client"))
+            .status()
+            .unwrap()
+            .success());
+        let helper = Command::new("uv")
+            .current_dir(repo)
+            .args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        let client = fs::read_dir(root.join("client"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "whl"))
+            .unwrap();
+        let state = root.join("state");
+        let service = Service::open(&state, &root.join("generations"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+        let objects =
+            Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+        let local = LocalSources::new(
+            objects.clone(),
+            InstallerConfig {
+                helper_python: String::from_utf8(helper.stdout).unwrap().trim().into(),
+                python: "3.12".into(),
+                generations: root.join("generations"),
+                client_wheel: client,
+                staging_root: root.join("staging"),
+                sdk: vec![],
+                uv: "uv".into(),
+                seed_cache: None,
+            },
+            store.clone(),
+        );
+        let runs = Arc::new(Runs {
+            service: service.clone(),
+            objects: objects.clone(),
+            publisher: None,
+            local: Some(Arc::new(local)),
+            own_hub: None,
+            leaf: None,
+            jobs: Default::default(),
+        });
+        crate::jobs::Jobs::configure(&service, store, Some(&runs)).unwrap();
+        (runs, objects)
+    }
+
+    /// A local package whose build never returns (its backend sleeps, moving no byte and no
+    /// CPU), written for `alice`; the backend writes its PID to `pid`.
+    fn hanging_package(objects: &Objects, pid: &Path) -> String {
+        let backend = format!(
+            "import os, time\ndef hang(*args, **kwargs):\n    open({pid:?}, 'w').write(str(os.getpid()))\n    time.sleep(3600)\n\
+             get_requires_for_build_wheel = prepare_metadata_for_build_wheel = build_wheel = hang\n\
+             get_requires_for_build_editable = prepare_metadata_for_build_editable = build_editable = hang\n"
+        );
+        let pyproject = "[build-system]\nrequires = []\nbuild-backend = \"hang\"\nbackend-path = [\".\"]\n\n\
+            [project]\nname = \"hanging-build\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\n\
+            [project.entry-points.\"cozy.application\"]\ndefault = \"hang:app\"\n";
+        let mut archive = tar::Builder::new(Vec::new());
+        for (name, body) in [("pyproject.toml", pyproject.to_string()), ("hang.py", backend), ("package.toml", "[application]\nobject = \"hang:app\"\n".into())] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, body.as_bytes()).unwrap();
+        }
+        let (source, length) = write(objects, "alice", &archive.into_inner().unwrap());
+        let manifest = json!({"package": "local/hanging-build", "release": "0.1.0",
+            "python_version": "3.12", "source": {"digest": source, "length": length}});
+        write(objects, "alice", manifest.to_string().as_bytes()).0
+    }
+
+    /// The hanging backend's PID once it runs; a run that ends first is the test's failure.
+    fn backend_pid(engine: &Engine, id: &str, pid: &Path) -> u32 {
+        loop {
+            if let Some(pid) = fs::read_to_string(pid).ok().and_then(|text| text.trim().parse().ok()) {
+                return pid;
+            }
+            let record = engine.get(id).unwrap();
+            assert!(!record.state.terminal(), "the run ended before its build: {:?}", record.failure);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    fn gone(pid: u32) -> bool {
+        // A zombie is gone too: its parent (uv) has not reaped it yet.
+        fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| stat.contains(") Z "))
+    }
+
+    /// A canceled preparation stops its work: the install's process group is killed at once,
+    /// not left running behind a run that says canceled.
+    #[test]
+    fn a_canceled_preparation_kills_its_install() {
+        let root = std::env::temp_dir().join(format!("cm-cancel-{}", uuid::Uuid::new_v4()));
+        let (runs, objects) = local_runs(&root);
+        let manifest = hanging_package(&objects, &root.join("backend.pid"));
+        let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
+        let backend = backend_pid(&runs.service.engine, &accepted.id, &root.join("backend.pid"));
+        let canceled = runs.service.engine.cancel_run("alice", "warm-1").unwrap();
+        assert_eq!(canceled.state, State::Canceled);
+        while !gone(backend) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(settled(&runs.service.engine, &accepted.id).state, State::Canceled);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An install that stops moving fails on that measurement, never hanging its run.
+    #[test]
+    fn a_wedged_install_fails_its_run() {
+        let root = std::env::temp_dir().join(format!("cm-wedge-{}", uuid::Uuid::new_v4()));
+        let (runs, objects) = local_runs(&root);
+        let manifest = hanging_package(&objects, &root.join("backend.pid"));
+        let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
+        let backend = backend_pid(&runs.service.engine, &accepted.id, &root.join("backend.pid"));
+        let failed = settled(&runs.service.engine, &accepted.id);
+        assert_eq!(failed.state, State::Failed);
+        let failure = failed.failure.unwrap();
+        assert!(failure.contains("package_installation_stalled") && failure.contains("no measurable progress"), "{failure}");
+        assert!(gone(backend));
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// A model passed by value to a job's model slot (a `ModelArtifact` a sibling produced
     /// here) is that exact checkpoint; one this machine does not hold is refused by name.
     #[test]
@@ -1640,10 +1736,10 @@ mod tests {
         let mut spec = spec(Source::Models, false, "d");
         (spec.job, spec.entrypoint) = (true, "compute".into());
         spec.input = json!({"source": artifact(&held), "factor": 2});
-        let inputs = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| ()).unwrap();
+        let inputs = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| (), &PullCancellation::default()).unwrap();
         assert_eq!(inputs["source"], ("Source".to_string(), ObjectRef { sha256: held, length: 8 }));
         spec.input = json!({"source": artifact(&"cd".repeat(32)), "factor": 2});
-        let absent = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| ()).unwrap_err();
+        let absent = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| (), &PullCancellation::default()).unwrap_err();
         assert_eq!(absent.code, "checkpoint_absent", "{}", absent.message);
         fs::remove_dir_all(root).unwrap();
     }

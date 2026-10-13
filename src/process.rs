@@ -235,6 +235,11 @@ pub fn wait_readable(file: &File) -> io::Result<()> {
 /// CPU nanoseconds plus every byte moved (`rchar`, `wchar`, `read_bytes`, `write_bytes`):
 /// Runtime's `proctree.progress_burn`. `None` is unreadable and decides nothing.
 pub fn burn(pid: u32) -> Option<u64> {
+    meter(pid).map(|(cpu, moved)| cpu.saturating_add(moved))
+}
+
+/// `burn`'s two parts: CPU nanoseconds, and bytes moved.
+fn meter(pid: u32) -> Option<(u64, u64)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
     let ticks = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
@@ -251,7 +256,7 @@ pub fn burn(pid: u32) -> Option<u64> {
                 .map(|(_, value)| value.trim().parse::<u64>().ok())
                 .sum::<Option<u64>>()
         });
-    Some(cpu.saturating_add(moved.unwrap_or(0)))
+    Some((cpu, moved.unwrap_or(0)))
 }
 
 /// Every process still in `leader`'s process group and born with or after it: an executor's
@@ -596,6 +601,81 @@ pub fn reap_group(
         }
     }
     Ok(reaped)
+}
+
+/// How a supervised process ended (`supervise`).
+#[derive(Debug)]
+pub enum Supervised {
+    Exited(ExitStatus),
+    /// Its run was canceled: its group was killed.
+    Canceled,
+    /// Its group's CPU and bytes stopped moving past its measured patience: killed.
+    Wedged(String),
+}
+
+/// Waits for `child`, the leader of its own process group, reading it once a second: `read`
+/// sees the bytes it has read, and its group is killed when `stop` is canceled or when the
+/// group's CPU and bytes stop moving for longer than its measured patience (`Pace`, floored by
+/// `Liveness`). The second is resolution, never a verdict.
+pub fn supervise(
+    child: &mut Child,
+    stop: Option<&tensorfs_core::transport::PullCancellation>,
+    what: &str,
+    read: &dyn Fn(u64),
+) -> io::Result<Supervised> {
+    let exact = match process_birth(child.id()) {
+        Ok(birth) => Exact::open(&birth)?,
+        Err(error) if gone(&error) => None,
+        Err(error) => return Err(error),
+    };
+    let Some(exact) = exact else {
+        return child.wait().map(Supervised::Exited);
+    };
+    let (floor, tick) = (Liveness::default().floor(), Duration::from_secs(1));
+    let (mut pace, mut ended) = (Pace::default(), None);
+    let (mut last, mut advances) = (None, 0u64);
+    while !readable_within(exact.as_file(), tick)? {
+        if ended.is_some() {
+            continue;
+        }
+        let now = Instant::now();
+        // Bytes moved are progress, and CPU at a tenth of a core or more. An idle process's
+        // timer wakeups are not: uv waiting on its build spends one 10 ms tick in about 10 s.
+        let members = group_members(&exact.birth).into_iter().map(|member| member.pid);
+        let reading = std::iter::once(exact.birth.pid).chain(members).filter_map(meter)
+            .fold((0u64, 0u64), |(cpu, moved), (c, m)| (cpu + c, moved + m));
+        if last.is_some_and(|(cpu, moved): (u64, u64)| reading.1 != moved || reading.0.saturating_sub(cpu) >= tick.as_nanos() as u64 / 10) {
+            advances += 1;
+        }
+        last = Some(reading);
+        pace.observe(Some(advances), now);
+        if let Some(bytes) = read_bytes(exact.birth.pid) {
+            read(bytes);
+        }
+        if stop.is_some_and(|stop| stop.is_cancelled()) {
+            exact.kill()?;
+            ended = Some(Supervised::Canceled);
+        } else if let Some(since) = pace.still_since() {
+            let still = now - since;
+            if still > pace.patience(floor) {
+                exact.kill()?;
+                ended = Some(Supervised::Wedged(format!("{what} wedged: {}", pace.verdict(still, floor))));
+            }
+        }
+    }
+    let status = child.wait()?;
+    Ok(ended.unwrap_or(Supervised::Exited(status)))
+}
+
+/// The bytes a process has read (`rchar`).
+fn read_bytes(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("rchar: "))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn readable_within(file: &File, period: Duration) -> io::Result<bool> {

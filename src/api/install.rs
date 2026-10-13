@@ -6,11 +6,15 @@ use serde::Deserialize;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
 };
+use tensorfs_core::transport::PullCancellation;
 use tonic::Status;
 
 #[derive(Clone)]
@@ -163,6 +167,7 @@ pub fn materialize_uploaded(
 pub fn prepare_uploaded(
     config: &InstallerConfig,
     uploaded: &UploadedPackage,
+    stop: Option<&PullCancellation>,
 ) -> Result<PreparedGeneration, Status> {
     let materialized = materialize_uploaded(uploaded, &config.staging_root)?;
     let mut command = installer(config, &materialized.root_set)?;
@@ -175,11 +180,12 @@ pub fn prepare_uploaded(
     if let Some(requirements) = &materialized.requirements {
         command.arg("--requirements").arg(requirements);
     }
-    publish(config, command)
+    publish(config, command, stop)
 }
 
 /// A live project installed editable in `environment`, which is built when it is not there
 /// yet: the generation it publishes describes the project now and runs in that environment.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_editable(
     config: &InstallerConfig,
     root: &RootSet,
@@ -188,6 +194,7 @@ pub fn prepare_editable(
     wheels: &[PathBuf],
     indexes: &std::collections::BTreeMap<String, String>,
     source_digest: &str,
+    stop: Option<&PullCancellation>,
 ) -> Result<PreparedGeneration, Status> {
     let mut command = installer(config, root)?;
     command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
@@ -198,7 +205,7 @@ pub fn prepare_editable(
     for wheel in wheels {
         command.arg("--wheel").arg(wheel);
     }
-    publish(config, command)
+    publish(config, command, stop)
 }
 
 /// The trusted helper's command for one package: this machine's interpreter, SDK pair, runner
@@ -257,11 +264,12 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status
     Ok(command)
 }
 
-/// Run the helper to its exit and hold the generation it published.
-fn publish(config: &InstallerConfig, mut command: Command) -> Result<PreparedGeneration, Status> {
-    // Bounds on output memory do not kill a progressing installer. Always drain
-    // its stdout and wait for its actual exit; no wall-clock kill is inserted.
+/// Run the helper to its exit and hold the generation it published. Its process group ends
+/// with its run's cancel (`stop`), or when it stops moving past its measured patience
+/// (`process::supervise`); a long install that moves is never killed.
+fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&PullCancellation>) -> Result<PreparedGeneration, Status> {
     let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -270,14 +278,22 @@ fn publish(config: &InstallerConfig, mut command: Command) -> Result<PreparedGen
     let stderr = child.stderr.take().expect("piped installer stderr");
     let tail = std::thread::spawn(move || forward_tail(stderr));
     let mut stdout = child.stdout.take().expect("piped installer stdout");
-    let mut output = Vec::new();
-    stdout
-        .by_ref()
-        .take((8 << 20) + 1)
-        .read_to_end(&mut output)
-        .map_err(storage)?;
-    std::io::copy(&mut stdout, &mut std::io::sink()).map_err(storage)?;
-    let exited = child.wait().map_err(storage)?;
+    // Its typed record, bounded; the rest is drained so the helper never blocks on a pipe.
+    let output = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.by_ref().take((8 << 20) + 1).read_to_end(&mut output)?;
+        std::io::copy(&mut stdout, &mut std::io::sink())?;
+        Ok::<_, std::io::Error>(output)
+    });
+    let ended = crate::process::supervise(&mut child, stop, "the package installer", &|_| ()).map_err(storage)?;
+    let output = output.join().map_err(|_| Status::internal("installer output reader panicked"))?.map_err(storage)?;
+    let exited = match ended {
+        crate::process::Supervised::Exited(status) => status,
+        crate::process::Supervised::Canceled => {
+            return Err(Status::cancelled("the run was canceled while its package installed"))
+        }
+        crate::process::Supervised::Wedged(verdict) => return Err(Status::aborted(verdict)),
+    };
     let tail = tail.join().unwrap_or_default();
     if !exited.success() {
         #[derive(Deserialize)]
@@ -459,7 +475,7 @@ mod tests {
         let mut helper = std::process::Command::new("sh");
         helper.args(["-c", r#"echo '{"kind":"install_failed","code":"package_dependency_operation_failed","detail":"uv pip install"}'
             i=0; while [ $i -lt 40 ]; do echo "  uv line $i https://user:tok@hub.example/simple" >&2; i=$((i+1)); done; exit 1"#]);
-        let refused = super::publish(&config, helper).err().expect("the helper failed");
+        let refused = super::publish(&config, helper, None).err().expect("the helper failed");
         let message = refused.message();
         assert!(message.starts_with("package_dependency_operation_failed: uv pip install:\nuv line 0 "), "{message}");
         assert!(message.ends_with("uv line 39 https://***@hub.example/simple") && message.lines().count() == 41, "{message}");
