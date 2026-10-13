@@ -184,7 +184,7 @@ func handleRent(ctx *Context) *exit.Error {
 	ready := attachable
 	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release",
 		idleReleaseNote()}
-	software, kept := bootSoftware(ctx, ready.ID, row.MachineName)
+	software, kept := bootSoftware(ctx, ready.ID, row.DisplayName())
 	if kept != "" {
 		notes = append(notes, kept)
 	}
@@ -1127,6 +1127,19 @@ func rentalBoard(ctx *Context, watching bool) (func(context.Context) (output.Lis
 // handleRentalShow is `cozy rental show <rental>`: one rental's row of the every-hub
 // listing, a fact per line.
 func handleRentalShow(ctx *Context) *exit.Error {
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return problem
+	}
+	live, problem := resolveLiveRental(ctx, store, strings.TrimSpace(ctx.Inv.Args[0]))
+	store.Close()
+	if problem != nil {
+		if problem.Code == exit.NotFound {
+			return showEndedRental(ctx, strings.TrimSpace(ctx.Inv.Args[0]))
+		}
+		return problem
+	}
+
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -1135,7 +1148,7 @@ func handleRentalShow(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	subject := strings.TrimSpace(ctx.Inv.Args[0])
+	subject := live.Rental.ID
 	list := renderRentalList(ctx.Cfg, inventory, true)
 	matches := 0
 	for _, row := range list.Rows {
@@ -1534,7 +1547,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	// what stays here is the half the hub could not or would not answer for.
 	unattached := len(inventory.Pending)
 	for _, op := range inventory.Pending {
-		machine := op.MachineName
+		machine := either(op.ID, op.Operation)
 		state := humanRentalState(op.State)
 		if op.Unverified {
 			state += " (unverified)"
@@ -1852,9 +1865,21 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
-	known, e := rental.Resolve(st, subject)
+	live, lookup := resolveLiveRental(ctx, st, subject)
+	if lookup != nil && lookup.Code != exit.NotFound {
+		return lookup
+	}
+	listed, listing := lookup == nil, 0
+	lookupID := subject
+	if listed {
+		lookupID = live.Rental.ID
+	}
+	known, e := rental.Resolve(st, lookupID)
 	if e != nil {
 		return e
+	}
+	if listed {
+		known.RentalID, known.Hub, known.Machine = live.Rental.ID, live.Hub, live.Rental.DisplayName()
 	}
 	row := known.Row
 	// The rental's own hub answers for it, with that hub's credential, whatever hub
@@ -1893,35 +1918,6 @@ func handleRentRelease(ctx *Context) *exit.Error {
 				WithNext("cozy rental")
 		}
 		known.RentalID = id
-	}
-	// THE HUB CAN NOW BE ASKED WHO OWNS WHAT (cl-199, on th-199). A machine word is
-	// Creator's own alias, so before this route existed an unrecorded name could not be
-	// looked up at all and the command could only refuse. The account listing turns the
-	// word back into the id the hub minted, which is what a DELETE takes — and it is the
-	// ONLY path to a pod whose local record was never written, was lost, or belongs to
-	// another host.
-	listed, listing := false, 0
-	if known.RentalID == "" || known.Row != nil && strings.EqualFold(known.Row.StableMachineName, subject) {
-		hctx, cancel := hub.Context()
-		remote, problem := c.Rentals(hctx)
-		cancel()
-		if problem != nil {
-			return problem.WithRemedy("the hub could not be asked which rentals this account owns; " +
-				"a pod may still be billing under this name and nothing here has been changed")
-		}
-		listed, listing = true, len(remote)
-		for _, seen := range remote {
-			if seen.ID != subject && !seen.MatchesName(subject) {
-				continue
-			}
-			if known.RentalID != "" && known.RentalID != seen.ID {
-				return exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple rentals; use a rental ID", subject)
-			}
-			known.RentalID = seen.ID
-			if known.Machine == "" {
-				known.Machine = seen.DisplayName()
-			}
-		}
 	}
 	id := known.RentalID
 	if id == "" {

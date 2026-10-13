@@ -4,10 +4,6 @@
 package rentalid
 
 import (
-	"crypto/rand"
-	"errors"
-	"fmt"
-	"math/big"
 	"regexp"
 	"strings"
 )
@@ -29,37 +25,8 @@ func Valid(id string) bool {
 		base[3] >= '1' && base[3] <= '9')
 }
 
-// ValidMachineName reports whether a user-facing machine alias is short, shell-safe,
-// and distinct from the reserved name for this computer.
+// ValidMachineName is the portable booking-alias grammar. Canonical host names
+// are supplied by Tensorhub and are never drawn or hashed by this client.
 func ValidMachineName(name string) bool {
 	return name != "local" && machinePattern.MatchString(name)
-}
-
-// ErrNoFreeMachineName means every word in the vocabulary names a live rental.
-var ErrNoFreeMachineName = errors.New("every machine word is in use by a live rental")
-
-// NewMachineName draws one word this owner is not already using. A machine name
-// only has to be unambiguous among the owner's own live rentals — Tensorhub's
-// identity for the rental is its `pr-…` id — so a single memorable word is enough,
-// and a word comes back into the draw once its rental is released.
-func NewMachineName(taken map[string]bool) (string, error) {
-	free := make([]string, 0, len(words))
-	for _, word := range words {
-		if !taken[word] {
-			free = append(free, word)
-		}
-	}
-	if len(free) == 0 {
-		return "", ErrNoFreeMachineName
-	}
-	index, err := rand.Int(rand.Reader, big.NewInt(int64(len(free))))
-	if err != nil {
-		return "", fmt.Errorf("mint private rental name: %w", err)
-	}
-	return free[index.Int64()], nil
-}
-
-// Words is the whole machine vocabulary, sorted.
-func Words() []string {
-	return append([]string(nil), words...)
 }

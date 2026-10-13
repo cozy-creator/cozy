@@ -164,11 +164,11 @@ func (m *machineRuns) loopV1(request records.Request) {
 				_ = m.store.LoseObservation(request.ID, problem.Message)
 			}
 			if !machines.IsLocal(link.MachineID) {
-				rental, _ := m.store.RentalRow(link.MachineID)
-				if rental != nil && records.RentalTerminalState(rental.State) {
-					fmt.Fprintf(m.context.Out, "machine execution %s: rental %s is %s; observation stopped\n", request.ID, link.MachineID, rental.State)
-				}
-				if rental == nil || records.RentalTerminalState(rental.State) {
+				call, cancel := hub.Context()
+				live, lookup := liveRentalResolver(m.context, m.store).Read(call, link.MachineID)
+				cancel()
+				if lookup == nil && hub.RentalAbsent(live.Rental.State) {
+					fmt.Fprintf(m.context.Out, "machine execution %s: Hub confirms rental %s is %s; observation stopped\n", request.ID, link.MachineID, live.Rental.State)
 					return
 				}
 			}

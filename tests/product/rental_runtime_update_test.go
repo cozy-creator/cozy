@@ -30,7 +30,7 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 	reopened, problem := records.Open(f.layout.DB)
 	fatal(t, problem)
 	defer reopened.Close()
-	c, problem := orchestrator.Open(orchestrator.Options{Store: reopened, Layout: f.layout, Rentals: rental.Resolver(f.layout, reopened)})
+	c, problem := orchestrator.Open(orchestrator.Options{Store: reopened, Layout: f.layout, Rentals: rental.Resolver(f.layout, reopened.RentalRow)})
 	fatal(t, problem)
 	defer c.Close(orchestrator.StopGrace)
 	if _, problem := c.UseRental(f.rentalID, "run 7 reading its execution"); problem == nil || problem.ErrName() != "rental.maintenance" {
@@ -68,7 +68,7 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 func TestRentalMaintenanceLeavesRunningWorkToTheMachine(t *testing.T) {
 	f := updateFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
-	c, problem := orchestrator.Open(orchestrator.Options{Store: f.store, Layout: f.layout, Rentals: rental.Resolver(f.layout, f.store)})
+	c, problem := orchestrator.Open(orchestrator.Options{Store: f.store, Layout: f.layout, Rentals: rental.Resolver(f.layout, f.store.RentalRow)})
 	fatal(t, problem)
 	defer c.Close(orchestrator.StopGrace)
 	release, problem := c.UseRental(f.rentalID, "run 7 reading its execution")

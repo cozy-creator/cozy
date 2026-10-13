@@ -13,7 +13,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 // Named hubs work like kubectl contexts: `cozy hub use` picks the hub later commands
@@ -171,7 +170,7 @@ func adoptRentalHub(ctx *Context, name string) {
 		return
 	}
 	defer store.Close()
-	known, problem := rental.Resolve(store, name)
+	known, problem := resolveLiveRental(ctx, store, name)
 	if problem != nil {
 		return
 	}

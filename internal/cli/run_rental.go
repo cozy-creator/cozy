@@ -4,8 +4,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/hub"
 )
 
 func requestedRental(ctx *Context) (string, *exit.Error) {
@@ -18,6 +17,8 @@ func requestedRental(ctx *Context) (string, *exit.Error) {
 		return "", problem
 	}
 	defer store.Close()
+	// Replaying a durable request observes its accepted identity; it is not a
+	// fresh rental selection and must still work after that rental has ended.
 	if key := ctx.Inv.Value("--idempotency-key"); key != "" {
 		prior, problem := store.RequestByIdempotencyKey(key)
 		if problem != nil {
@@ -27,15 +28,15 @@ func requestedRental(ctx *Context) (string, *exit.Error) {
 			return prior.RequestedRental, nil
 		}
 	}
-	selected, problem := rental.Resolve(store, name)
+	selected, problem := resolveLiveRental(ctx, store, name)
 	if problem != nil {
 		return "", problem
 	}
-	if selected.Row == nil || records.RentalTerminalState(selected.Row.State) {
+	if hub.RentalAbsent(selected.Rental.State) || selected.Rental.State == hub.RentalReleaseRequested {
 		return "", exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
 	}
 	// A named rental is where the call goes. What it cannot run, its machine refuses.
-	return selected.RentalID, nil
+	return selected.Rental.ID, nil
 }
 
 func rentalArgument(value *string) (string, *exit.Error) {

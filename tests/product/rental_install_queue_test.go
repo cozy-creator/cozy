@@ -89,7 +89,7 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 		<-ctx.Done()
 		return exit.New(exit.Canceled, "controller disconnected")
 	}
-	q := machines.NewInstalls(store, prepared(prepare), io.Discard)
+	q := fixtureInstalls(store, prepared(prepare), io.Discard)
 	accepted, problem := q.Accept(machine.ID, selection)
 	rentalInstallCheck(t, problem)
 	replayed, problem := q.Accept(machine.ID, selection)
@@ -139,7 +139,7 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	resumed, problem := records.Open(layout.DB)
 	rentalInstallCheck(t, problem)
 	defer resumed.Close()
-	q2 := machines.NewInstalls(resumed, prepared(func(_ context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
+	q2 := fixtureInstalls(resumed, prepared(func(_ context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
 		calls.Add(1)
 		if !reflect.DeepEqual(row.Selection, selection) || row.WorkerBootID != "boot-proof" {
 			t.Errorf("recovery changed immutable inputs: %+v", row)
@@ -166,7 +166,7 @@ func TestRentalInstallQueueRetainsTypedTerminalFailures(t *testing.T) {
 			machine := rentalInstallMachine("converging")
 			rentalInstallCheck(t, store.RecordRental(machine))
 			selection := records.RentalInstallSelection{Models: []records.ModelRef{{Model: "paul/minimax-h3", Release: "1.0.0", Lane: "fp8", Manifest: "sha256:" + strings.Repeat("a", 64), ManifestLength: 321, CatalogRepository: "paul/minimax-h3"}}}
-			q := machines.NewInstalls(store, prepared(func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
+			q := fixtureInstalls(store, prepared(func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
 				if state != "worker-refused" {
 					t.Error("terminal rental received work")
 				}
@@ -209,7 +209,7 @@ func TestRentalInstallAdmissionAndStatusAPIWhileBooting(t *testing.T) {
 	rentalInstallCheck(t, problem)
 	defer owner.Close(time.Second)
 	credential := secret.New("installation-test-only")
-	q := machines.NewInstalls(store, prepared(func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
+	q := fixtureInstalls(store, prepared(func(context.Context, records.RentalInstall, func(machines.InstallProgress)) *exit.Error {
 		t.Error("admission attempted a worker call")
 		return nil
 	}), io.Discard)
@@ -252,7 +252,7 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 	entered := make(chan string, 4)
 	release := make(chan struct{})
 	var calls, active atomic.Int32
-	q := machines.NewInstalls(store, prepared(func(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) *exit.Error {
+	q := fixtureInstalls(store, prepared(func(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) *exit.Error {
 		if active.Add(1) != 1 {
 			t.Error("one rental received concurrent installations")
 		}
@@ -326,7 +326,7 @@ func TestRentalInstallWithNoProgressFailsInsteadOfQueuingAgain(t *testing.T) {
 	machine := rentalInstallMachine("ready")
 	rentalInstallCheck(t, store.RecordRental(machine))
 	var calls atomic.Int32
-	q := machines.NewInstalls(store, prepared(func(_ context.Context, _ records.RentalInstall, report func(machines.InstallProgress)) *exit.Error {
+	q := fixtureInstalls(store, prepared(func(_ context.Context, _ records.RentalInstall, report func(machines.InstallProgress)) *exit.Error {
 		calls.Add(1)
 		report(machines.InstallProgress{Stage: "connect"})
 		return exit.Named(exit.Unavailable, "machine.stopped", "this computer's machine is stopped")
@@ -359,4 +359,10 @@ func prepared(prepare func(context.Context, records.RentalInstall, func(machines
 	return func(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) (json.RawMessage, *exit.Error) {
 		return nil, prepare(ctx, row, report)
 	}
+}
+
+func fixtureInstalls(store *records.Store, prepare machines.Prepare, log io.Writer) *machines.Installs {
+	q := machines.NewInstalls(store, prepare, log)
+	q.Rental = store.RentalRow
+	return q
 }

@@ -409,7 +409,7 @@ func RentalSample(r hub.Rental) (PhaseSample, bool) {
 			detail += " on " + r.Failure.ProviderHostID
 		}
 	}
-	sample := PhaseSample{Name: name, Machine: r.Name, Detail: detail, Rental: &RentalProgress{
+	sample := PhaseSample{Name: name, Machine: r.DisplayName(), Detail: detail, Rental: &RentalProgress{
 		AcceleratorModel: r.AcceleratorModel, AcceleratorCount: r.AcceleratorCount,
 		HourlyRateUSDMicros: r.HourlyRateUSDMicros, BaseWorkerImageDigest: r.BaseWorkerImageDigest,
 		BaseWorkerImageTag: r.BaseWorkerImageTag, BaseWorkerProfile: r.BaseWorkerProfile,
@@ -473,7 +473,7 @@ func (c *Orchestrator) phaseRental(requestID string, phase PhaseObservation) Pha
 		return phase
 	}
 	if phase.Machine == "" {
-		phase.Machine = rental.MachineName
+		phase.Machine = rental.DisplayName()
 	}
 	phase.Rental = &RentalProgress{AcceleratorModel: rental.AcceleratorModel,
 		AcceleratorCount: rental.AcceleratorCount, HourlyRateUSDMicros: rental.HourlyRateUSDMicros}

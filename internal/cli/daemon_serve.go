@@ -119,8 +119,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// Two questions, deliberately not one object: the API resolves the persisted,
 	// non-secret attempt control (so a bad pin refuses before a request row), and the
 	// orchestrator resolves the dial triple at dial time. Only the second reads the token.
-	rentals := rental.Resolver(l, st)
-	knownRentals := rental.Known(st)
+	readRental := func(id string) (*records.Rental, *exit.Error) { return observedRental(ctx, st, id) }
+	rentals := rental.Resolver(l, readRental)
+	knownRentals := rental.Known(readRental)
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	// The daemon starts this computer's machine as `cozy machine start` does.
@@ -176,6 +177,16 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
 	installs := machineset.NewInstalls(st, machines.Prewarm, ctx.Out)
+	installs.Rental = func(id string) (*records.Rental, *exit.Error) {
+		call, cancel := hub.Context()
+		defer cancel()
+		resolver := liveRentalResolver(ctx, st)
+		live, problem := resolver.Read(call, id)
+		if problem != nil {
+			return nil, problem
+		}
+		return resolver.Record(live)
+	}
 	fleet.installs = installs
 	installsStopped := make(chan struct{})
 	defer cancelInstalls()

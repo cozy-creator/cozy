@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -222,19 +221,19 @@ func rentalMachineEndpoint(ctx *Context, name string) (*machineendpoint.Endpoint
 		return nil, problem
 	}
 	defer st.Close()
-	row, problem := st.RentalByMachine(name)
+	live, problem := resolveLiveRental(ctx, st, name)
 	if problem != nil {
 		return nil, problem
 	}
-	if row == nil || row.Address == "" || row.CertPath == "" || row.ExpectedWorkerID == "" {
+	row, problem := observedRental(ctx, st, live.Rental.ID)
+	if problem != nil {
+		return nil, problem
+	}
+	if row == nil || row.Address == "" || row.CertificatePEM == "" || row.ExpectedWorkerID == "" {
 		return nil, exit.Named(exit.Unavailable, "rental.not_attached", "rental %s has no machine this host can reach", name)
 	}
-	leaf, err := os.ReadFile(row.CertPath)
-	if err != nil {
-		return nil, exit.New(exit.Credential, "rental %s's pinned certificate is unreadable: %s", name, err)
-	}
 	ep := &machineendpoint.Endpoint{Format: machineendpoint.Format, Address: row.Address, WorkerID: row.ExpectedWorkerID,
-		WorkerBootID: cmp.Or(row.ExpectedWorkerBootID, row.ID), CertificatePEM: string(leaf), WorkspaceID: row.ID}
+		WorkerBootID: cmp.Or(row.ExpectedWorkerBootID, row.ID), CertificatePEM: row.CertificatePEM, WorkspaceID: row.ID}
 	if err := ep.Validate(); err != nil {
 		return nil, exit.New(exit.Validation, "rental %s is not reachable as a machine endpoint: %s", name, err)
 	}

@@ -19,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
@@ -59,15 +58,15 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 		if problem != nil {
 			return true, problem
 		}
-		selected, problem := rental.Resolve(store, name)
+		selected, problem := resolveLiveRental(ctx, store, name)
 		store.Close()
 		if problem != nil {
 			return true, problem
 		}
-		if selected.Row == nil || records.RentalTerminalState(selected.Row.State) {
+		if hub.RentalAbsent(selected.Rental.State) || selected.Rental.State == hub.RentalReleaseRequested {
 			return true, exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
 		}
-		rentalID = selected.Row.ID
+		rentalID = selected.Rental.ID
 	}
 	destination, problem := hub.ParseRef(ctx.Inv.Args[1])
 	if problem != nil {

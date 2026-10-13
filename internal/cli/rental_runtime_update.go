@@ -33,6 +33,11 @@ type rentalRuntimeUpdates struct {
 	running  sync.Map
 }
 
+type runningRuntimeUpdate struct {
+	id, boot string
+	cancel   context.CancelFunc
+}
+
 type runtimeUpdateWheel struct {
 	Path     string `json:"path,omitempty"`
 	Version  string `json:"version"`
@@ -71,6 +76,21 @@ type runtimeUpdateResult struct {
 // takes work. Only a new boot is followed, so an explicit update stands until the pod boots
 // again.
 func (u *rentalRuntimeUpdates) Boot(id string) {
+	current, problem := u.machines.store.RuntimeUpdate(id)
+	if problem == nil && current != nil && current.Active() {
+		row, problem := observedRental(u.machines.context, u.machines.store, id)
+		if problem != nil {
+			return
+		}
+		if row.ExpectedWorkerBootID != current.BootID {
+			// Keep the accepted software choice when the Hub replaces the worker.
+			next, problem := u.machines.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, current.Selection)
+			if problem == nil {
+				u.run(*next)
+			}
+			return
+		}
+	}
 	if _, problem := u.follow(id); problem != nil {
 		fmt.Fprintf(u.machines.context.Out, "rental %s keeps its software: %s\n", id, problem.Message)
 	}
@@ -95,7 +115,7 @@ func (u *rentalRuntimeUpdates) begin(id string, options api.RuntimeUpdateRequest
 		return nil, exit.New(exit.Validation, "name a wheel or a version, not both")
 	}
 	m := u.machines
-	row, problem := m.store.RentalRow(id)
+	row, problem := observedRental(m.context, m.store, id)
 	if problem != nil {
 		return nil, problem
 	}
@@ -158,10 +178,18 @@ func (u *rentalRuntimeUpdates) Resume() {
 }
 
 func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
-	if _, exists := u.running.LoadOrStore(row.RentalID, true); exists {
+	ctx, cancel := context.WithCancel(u.machines.ctx)
+	active := &runningRuntimeUpdate{id: row.ID, boot: row.BootID, cancel: cancel}
+	if prior, exists := u.running.LoadOrStore(row.RentalID, active); exists {
+		cancel()
+		previous := prior.(*runningRuntimeUpdate)
+		if previous.id != row.ID && previous.boot != row.BootID {
+			previous.cancel()
+		}
 		return
 	}
 	go func() {
+		defer cancel()
 		m := u.machines
 		defer func() {
 			u.running.Delete(row.RentalID)
@@ -170,7 +198,7 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 				u.run(*current)
 			}
 		}()
-		problem := m.fleet.owner.MaintainRental(m.ctx, row.RentalID, func(ctx context.Context, identity *orchestrator.WorkerConnection) *exit.Error {
+		problem := m.fleet.owner.MaintainRental(ctx, row.RentalID, func(ctx context.Context, identity *orchestrator.WorkerConnection) *exit.Error {
 			if identity.WorkerBootID != row.BootID {
 				return exit.New(exit.Conflict, "the rental's worker boot changed before its update")
 			}
@@ -208,7 +236,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 		row.Result, _ = json.Marshal(runtimeUpdateResult{Unchanged: true, Note: "the update named no software"})
 		return nil
 	}
-	pin, err := workertls.LoadPin(identity.CACert)
+	pin, err := workertls.EndpointPin(identity.CertificatePEM, identity.CACert)
 	if err != nil {
 		return exit.New(exit.Credential, "the machine's TLS identity cannot be read")
 	}
@@ -319,18 +347,19 @@ func published(member *machinev1.Member, running string) bool {
 }
 
 func handleRentalUpdate(ctx *Context) *exit.Error {
-	adoptRentalHub(ctx, ctx.Inv.Args[0])
 	_, store, problem := rentalStores(ctx)
 	if problem != nil {
 		return problem
 	}
 	defer store.Close()
-	row, problem := store.RentalByMachine(strings.TrimSpace(ctx.Inv.Args[0]))
+	live, problem := resolveLiveRental(ctx, store, strings.TrimSpace(ctx.Inv.Args[0]))
 	if problem != nil {
 		return problem
 	}
-	if row == nil {
-		return exit.New(exit.NotFound, "no rental %q on this host", ctx.Inv.Args[0])
+	ctx = ctx.forHub(live.Hub)
+	row, problem := liveRentalResolver(ctx, store).Record(live)
+	if problem != nil {
+		return problem
 	}
 	request := api.RuntimeUpdateRequest{RuntimeVersion: ctx.Inv.Value("--runtime-version"), TensorFSVersion: ctx.Inv.Value("--tensorfs-version")}
 	for flag, into := range map[string]*string{"--runtime-wheel": &request.RuntimeWheel, "--tensorfs-wheel": &request.TensorFSWheel} {

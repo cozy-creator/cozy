@@ -115,21 +115,21 @@ func (r *Resolver) resolve(ctx context.Context, name, holder string, machine *pl
 		return target{name: name, addr: launch.Addr, workerID: launch.WorkerID, bootID: launch.BootID, pin: pin, key: key,
 			lifetime: fmt.Sprint(launch.PID)}, nil
 	}
-	release, problem := r.UseRental(name, holder)
-	if problem != nil {
-		return target{}, problem
-	}
-	machine.release = release
+	// Refresh the Hub incarnation before checking an update's boot-scoped hold.
 	remote, problem := r.Rentals(name)
 	if problem == nil && (remote == nil || remote.Connection == nil) {
 		problem = exit.New(exit.Conflict, "rental %s has no dial identity", name)
 	}
 	if problem != nil {
-		release()
 		return target{}, problem
 	}
+	release, problem := r.UseRental(name, holder)
+	if problem != nil {
+		return target{}, problem
+	}
+	machine.release = release
 	identity := remote.Connection
-	pin, err := workertls.LoadPin(identity.CACert)
+	pin, err := workertls.EndpointPin(identity.CertificatePEM, identity.CACert)
 	if err != nil {
 		release()
 		return target{}, exit.New(exit.Credential, "machine TLS identity cannot be read")
