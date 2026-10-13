@@ -242,7 +242,8 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	if row.ModelTransfer != nil {
 		if transfer, problem := s.store.ModelTransferOf(row.ID); problem == nil && transfer != nil {
 			state.ModelDestination, state.ModelOutputs = transfer.Destination, transfer.Checkpoints
-			if transfer.State == "failed" {
+			// A run that failed says why; its destination only failed with it.
+			if transfer.State == "failed" && state.Error == "" {
 				state.ErrorType, state.Error = transfer.ErrorCode, transfer.SafeError
 			}
 		}

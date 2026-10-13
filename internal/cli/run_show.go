@@ -52,10 +52,12 @@ type runReport struct {
 	Unmemoized  string `json:"unmemoized,omitempty"`
 	// Warnings are what the run reported without failing: its admission's and its machine's.
 	Warnings []records.Warning `json:"warnings,omitempty"`
-	Stages   []reportStage     `json:"stages"`
-	Steps    []reportSteps     `json:"steps,omitempty"`
-	Degree   int               `json:"degree,omitempty"`
-	GPUs     []reportGPU       `json:"gpus,omitempty"`
+	// Logs are the lines its package and machine logged, its calls' among them.
+	Logs   []reportLog   `json:"logs,omitempty"`
+	Stages []reportStage `json:"stages"`
+	Steps  []reportSteps `json:"steps,omitempty"`
+	Degree int           `json:"degree,omitempty"`
+	GPUs   []reportGPU   `json:"gpus,omitempty"`
 	// Transport is how a group's GPUs exchanged data: Runtime's record, kept whole.
 	Transport json.RawMessage `json:"transport,omitempty"`
 	Calls     []reportCall    `json:"calls,omitempty"`
@@ -382,7 +384,20 @@ type preparingEvent struct {
 
 // logEvent is one Runtime log record. A phase record (a source download, a conversion, a
 // call's input check) names its phase and elapsed time, and its call when it is one's.
+// reportLog is one line a run's package or machine logged.
+type reportLog struct {
+	AtUnixMS int64  `json:"at_unix_ms"`
+	Level    string `json:"level"`
+	Text     string `json:"text"`
+}
+
+// shownLogs is how many of a run's last log lines `run show` prints without --full.
+const shownLogs = 20
+
 type logEvent struct {
+	// A machine's log line: its level and text.
+	Level    string `json:"level"`
+	Message  string `json:"message"`
 	Name     string `json:"name"`
 	AtUnixMS int64  `json:"at_unix_ms"`
 	Fields   struct {
@@ -663,6 +678,10 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				continue
 			}
 			switch {
+			case record.Name == "" && record.Message != "" && (record.Level == "warning" || record.Level == "error"):
+				report.Warnings = append(report.Warnings, records.Warning{Message: record.Message})
+			case record.Name == "" && record.Message != "":
+				report.Logs = append(report.Logs, reportLog{AtUnixMS: at.UnixMilli(), Level: record.Level, Text: record.Message})
 			case record.Name == "model fetch" && record.Fields.Event == "end":
 				fetched = true
 				report.Stages = append(report.Stages, fetchStage(record))
@@ -1080,6 +1099,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		fmt.Fprintf(w, "collection ended: %s — %s; `cozy run watch %d` tries again\n", r.CollectionRefused, r.CollectionError, r.Number)
 	}
 	table := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	emitLogs(w, r.Logs, offset, mode.Full)
 	if len(r.Output) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(table, "OUTPUT\tREV\tSIZE\tSTATUS\tFILE")
@@ -1126,6 +1146,25 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		c.emit(w, table, r.childCalls(), offset, true)
 	}
 	return nil
+}
+
+// emitLogs prints the run's log lines, its last shownLogs without full.
+func emitLogs(w io.Writer, logs []reportLog, offset func(int64) string, full bool) {
+	if len(logs) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\nLOG")
+	if hidden := len(logs) - shownLogs; hidden > 0 && !full {
+		fmt.Fprintf(w, "… %d earlier lines; --full shows them\n", hidden)
+		logs = logs[hidden:]
+	}
+	for _, line := range logs {
+		level := ""
+		if line.Level != "" && line.Level != "info" {
+			level = line.Level + " "
+		}
+		fmt.Fprintf(w, "%-9s %s%s\n", offset(line.AtUnixMS), level, line.Text)
+	}
 }
 
 // childCalls counts the calls the run made, not its own execution (call 0).
