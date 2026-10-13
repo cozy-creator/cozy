@@ -25,7 +25,7 @@ automatically for bash and fish, and for zsh when `~/.local/share/zsh/site-funct
 The host-tool step alone is:
 
 ```sh
-uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.67'
+uv tool install --force --refresh-package cozy-runtime --refresh-package tensorfs --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.67'
 ```
 
 Keep `--python 3.12`: uv
@@ -79,27 +79,41 @@ not create a persistent log. Commands that require the daemon may ensure the sam
 running automatically.
 
 The machine server is the separate `cozy-machine` executable, built in `cozy-runtime`.
-`cozy machine install` installs its independently versioned public release and a Runtime
-Python environment. The same agent and machine API run on a laptop and a rented pod;
+Linux Runtime wheels include this agent. `cozy machine install` bootstraps a new machine
+or asks an existing current machine to update its Runtime, TensorFS and bundled agent
+through one durable transaction. The same machine API runs on a laptop and a rented pod;
 restarting the personal controller leaves accepted machine work running. `cozy machine stop`
 explicitly stops the local machine. Optional `machine.webrtc_port` in the Cozy config
 enables its WebRTC media listener; Hub grants cannot change machine listening ports.
-Agent replacement waits for confirmed idle state and
-retains the machine identity, execution journal, installed packages, and outputs.
+Software replacement waits for confirmed idle state and retains the machine identity,
+execution journal, installed packages, and outputs. A stable bootstrap process owns
+Runtime lifetime while the public agent changes; losing an observer does not cancel
+the update. Candidate failure restores the previous pair and application.
 
 An owned machine boots offline and is never registered with Tensorhub. Tensorhub allocates
 and releases rentals. Catalog, storage, and explicitly authorized publication access use
 account grants bound to the machine certificate; these grants do not give Tensorhub a
 lifecycle role on the laptop. Local code and observation of existing work do not need a
-Hub grant. Machine-agent releases use `machine-vVERSION` tags and `machine-agent.json` with
-artifact hashes; ordinary Cozy releases and their `latest` installer stay separate.
+Hub grant. The agent is selected from the Runtime wheel. There is no separate agent
+release lookup. Ordinary Cozy releases and their CLI installer remain separate.
+
+The machine owns `etc/cozy/software-policy.json`, with required `startup_update`
+(`auto` or `off`) and `agent` (`bundled` or `explicit`) fields. Unpinned machines check
+for updates on startup. Rentals do this only before their first accepted work, then
+retain that software. An explicit wheel installation pins the pair. Installing the
+published pair without wheel overrides restores automatic updates. On an existing
+machine, `--host` can retain the running agent; a different agent must be bundled in
+the selected Runtime wheel. The stable bootstrap itself changes with the image or
+service bootstrap, and its identity is reported separately from the running agent.
 
 Cached execution access belongs to the current device key or operator credential. Signing
 out or switching credentials cannot reuse another account's cached grant. The agent retains
 one delegated account per Hub: that account can renew access, while a different account
 receives an explicit conflict so retained jobs keep their original authority.
-Delegated Hub access requires machine agent 0.1.1 or newer; an older installation receives
-an explicit request to run `cozy machine install` once its work is idle.
+Delegated access and updates require their advertised capabilities. Retired Hosts and
+agents lacking transactional replacement are refused before new work or updates;
+they require a current image or service bootstrap. Existing accepted work and its
+authority are preserved. There is no legacy submission or credential fallback.
 
 ## Packages
 
@@ -413,6 +427,11 @@ Cancellation records intent and returns the observed state. If a sent submission
 acceptance is unknown, it remains `canceling` until the machine closes its key or
 confirms the execution outcome. Use `cozy run cancel <id> --await` to wait for that
 confirmation. Work never submitted cancels immediately.
+If the machine cannot be reconciled, `cozy run cancel <id> --abandon` permanently
+ends local tracking while retaining the original submission and any real receipts
+or outcomes. This does **not** confirm remote work stopped or end any rental.
+The abandoned run cannot be resubmitted or resumed; late real facts remain history
+without reopening it. `--abandon` cannot be combined with `--await`.
 An unchanged deterministic failure is not automatically retried. `--await` returns when a
 transaction blocks or pauses, and the ordinary run view explains the stopped state.
 

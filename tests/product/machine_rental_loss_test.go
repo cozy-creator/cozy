@@ -26,13 +26,13 @@ func TestEndedRentalSettlesMachineControlWithoutInventingOutcome(t *testing.T) {
 			before, problem := store.MachineExecution(request.ID)
 			fatal(t, problem)
 			// An absent unrelated pod and a pending release cannot discharge accepted work.
-			// A run no machine accepted owes nothing once canceled.
+			// A frozen offer with unknown acceptance still needs authoritative closure.
 			_, problem = store.ForgetRental("pr-unrelated")
 			fatal(t, problem)
 			owed, problem := store.MachineExecutionOwesWork(request.ID)
 			fatal(t, problem)
-			if owed != accepted {
-				t.Fatalf("before its machine is known gone the run owes it work: %v, want %v", owed, accepted)
+			if !owed {
+				t.Fatalf("before its machine is known gone the run owes it work: %v, want %v", owed, true)
 			}
 			// This is the same records boundary used after the Hub confirms destruction.
 			_, problem = store.ForgetRental("pr-owned-machine")
@@ -60,8 +60,8 @@ func TestEndedRentalSettlesMachineControlWithoutInventingOutcome(t *testing.T) {
 			}
 			lost, problem := store.MachineExecutionLost(request.ID)
 			fatal(t, problem)
-			if lost != accepted {
-				t.Fatalf("loss recorded %v for a run whose acceptance was %v", lost, accepted)
+			if !lost {
+				t.Fatalf("destroyed context remained observable for acceptance=%v", accepted)
 			}
 			if accepted {
 				late := &pb.MachineExecutionState{RequestId: request.ID, WorkerId: receipt.WorkerId,

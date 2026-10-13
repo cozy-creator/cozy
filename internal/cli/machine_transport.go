@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -11,9 +14,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -28,10 +33,11 @@ import (
 // prepared on it. Every call below is the same PodHost call whichever machine answers it.
 type machineConnection struct {
 	*machines.Machine
-	runs       *machineRuns
-	installed  map[string]*pb.InstalledPackage
-	placements map[string]*pb.DesiredPlacementSet // each captured revision's code-only placement
-	progress   *transfer.Progress
+	runs             *machineRuns
+	installed        map[string]*pb.InstalledPackage
+	placements       map[string]*pb.DesiredPlacementSet // each captured revision's code-only placement
+	closureWorkspace string                             // workspace whose end-to-end closure route this connection proved
+	progress         *transfer.Progress
 }
 
 // connect opens a machine for work that reads no hub; holder is what the caller is doing
@@ -53,10 +59,116 @@ func (m *machineRuns) connectFor(ctx context.Context, request records.Request, n
 			return nil, problem
 		}
 		if len(consent) == 0 {
-			origin = ""
+			scope, problem := m.capturedHubScope(request)
+			if problem != nil {
+				return nil, problem
+			}
+			if !scope.required {
+				if scope.possible && origin != "" && client(m.context.forHub(origin)).CredentialIdentity() != "" {
+					if connected, problem := m.connectAt(ctx, name, origin, m.runHolder(request, doing), true); problem == nil {
+						return connected, nil
+					}
+				}
+				// Optional authority could not be attached. Empty scope cannot borrow
+				// a retained Hub grant, even when the same machine still holds one.
+				origin = ""
+			}
 		}
 	}
 	return m.connectAt(ctx, name, origin, m.runHolder(request, doing), true)
+}
+
+type capturedHubUse struct{ required, possible bool }
+
+// Captured Model slots may receive local artifacts, so they establish only
+// possible catalog use. Account-index dependencies require delegated authority.
+// Explicit model selections and publication are handled by connectFor.
+func (m *machineRuns) capturedHubScope(request records.Request) (capturedHubUse, *exit.Error) {
+	use := capturedHubUse{}
+	if request.LocalInstallationID == "" {
+		return use, nil
+	}
+	capture, problem := m.resolver.CaptureMachineExecution(request)
+	if problem != nil {
+		return use, problem
+	}
+	var document pb.MachineExecutionCapture
+	if err := canonical.Unmarshal(capture.Canonical, &document); err != nil {
+		return use, exit.New(exit.Validation, "captured installation graph is unreadable: %s", err)
+	}
+	selected := map[string]map[string]bool{request.LocalInstallationID: {request.Entrypoint: true}}
+	for _, binding := range document.Bindings {
+		if selected[binding.CalleeInstallationId] == nil {
+			selected[binding.CalleeInstallationId] = map[string]bool{}
+		}
+		selected[binding.CalleeInstallationId][binding.Entrypoint] = true
+	}
+	for _, installation := range capture.Installations {
+		face, problem := launch.DecodePackageInterface(installation.PackageInterface)
+		if problem != nil {
+			return use, problem
+		}
+		for name := range selected[installation.ID] {
+			callable, problem := face.Function(name)
+			if problem != nil {
+				return use, problem
+			}
+			use.possible = use.possible || len(callable.Models) > 0
+		}
+		if installation.SourceArchive == "" {
+			continue
+		}
+		found := false
+		for _, file := range installation.Files {
+			if file.Filename != installation.SourceArchive {
+				continue
+			}
+			found = true
+			uses, problem := capturedSourceAccountIndex(file.Path)
+			if problem != nil {
+				return use, problem
+			}
+			if uses {
+				use.required = true
+				return use, nil
+			}
+		}
+		if !found {
+			return use, exit.Named(exit.Validation, "machine_execution.source_metadata_missing", "captured source archive is missing")
+		}
+	}
+	return use, nil
+}
+
+func capturedSourceAccountIndex(path string) (bool, *exit.Error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, exit.Named(exit.Validation, "machine_execution.source_metadata_missing", "cannot read captured source archive: %s", err)
+	}
+	defer file.Close()
+	archive := tar.NewReader(io.LimitReader(file, (1<<30)+1))
+	for count := 0; count <= packagepublish.MaxSourceFiles; count++ {
+		header, err := archive.Next()
+		if err == io.EOF {
+			return false, exit.Named(exit.Validation, "machine_execution.source_metadata_missing", "captured source has no pyproject.toml")
+		}
+		if err != nil {
+			return false, exit.Named(exit.Validation, "machine_execution.source_metadata_invalid", "captured source archive is unreadable: %s", err)
+		}
+		if header.Name != "pyproject.toml" {
+			continue
+		}
+		limit := packagepublish.SourceFileLimit(header.Name)
+		if header.Typeflag != tar.TypeReg || header.Size <= 0 || header.Size > limit {
+			return false, exit.Named(exit.Validation, "machine_execution.source_metadata_invalid", "captured pyproject.toml is not a bounded regular file")
+		}
+		raw, err := io.ReadAll(io.LimitReader(archive, limit+1))
+		if err != nil {
+			return false, exit.Named(exit.Validation, "machine_execution.source_metadata_invalid", "captured pyproject.toml is unreadable: %s", err)
+		}
+		return packagepublish.UsesAccountIndexDocument(raw)
+	}
+	return false, exit.Named(exit.Validation, "machine_execution.source_metadata_invalid", "captured source archive has too many members")
 }
 
 // connectAtHub opens a machine for a published release read at hub.
@@ -136,6 +248,10 @@ func (c *machineConnection) readBytes(ctx context.Context, source *pb.NativeByte
 // through the Host's verified upload, then the Host prepares its environment.
 func (c *machineConnection) prepare(ctx context.Context, request string, revision localpackage.Installation) *exit.Error {
 	m := c.runs
+	// Wire 69 carries the selected Hub on this operation; older peers would drop it.
+	if c.Hub != "" && c.WireMinor < 69 {
+		return exit.Named(exit.Structural, "machine.local_package_hub_required", "this machine must support explicit Hub selection for unpublished package dependencies; update its agent and Runtime")
+	}
 	baseOperation := machinePackageOperation(request, revision)
 	transfer, problem := m.store.MachinePackageTransfer(request, c.Claim.WorkerBootId, revision.ID)
 	if problem != nil {
@@ -159,7 +275,7 @@ func (c *machineConnection) prepare(ctx context.Context, request string, revisio
 	if !transfer.Uploaded {
 		// A machine that already holds this installation (an unchanged editable package run
 		// again) reopens it: nothing is uploaded. Any other answer is an upload.
-		if stream, err := c.Host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: c.Claim, LocalPackageSet: selected}); err == nil {
+		if stream, err := c.Host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: c.Claim, LocalPackageSet: selected, Hub: c.Hub}); err == nil {
 			if event, problem := readMachinePreparationEvent(stream, nil); problem == nil {
 				c.placements[revision.ID] = event.PlacementSet
 				return retainWorkerInstallation(c, revision, event.InstalledPackage)
@@ -177,7 +293,7 @@ func (c *machineConnection) prepare(ctx context.Context, request string, revisio
 			return problem
 		}
 	}
-	stream, err := c.Host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: c.Claim, LocalPackageSet: selected})
+	stream, err := c.Host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: c.Claim, LocalPackageSet: selected, Hub: c.Hub})
 	if err != nil {
 		return machineTransport(err)
 	}

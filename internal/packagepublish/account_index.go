@@ -52,15 +52,38 @@ func (n Namespace) IndexURL() (string, *exit.Error) {
 // UsesAccountIndex reports whether an authored project resolves any dependency from the
 // account index. Authored source never declares that index itself.
 func UsesAccountIndex(project string) (bool, *exit.Error) {
-	document, problem := readProjectDocument(filepath.Join(project, "pyproject.toml"))
+	raw, err := os.ReadFile(filepath.Join(project, "pyproject.toml"))
+	if err != nil {
+		return false, exit.Named(exit.Validation, "project_metadata_unreadable", "cannot read pyproject.toml: %s", err)
+	}
+	uses, declared, problem := accountIndexDocument(raw)
 	if problem != nil {
 		return false, problem
 	}
-	uses, declared := accountIndexUse(document)
 	if declared != "" {
 		return false, declaredAccountIndex()
 	}
 	return uses, nil
+}
+
+// UsesAccountIndexDocument reads a frozen installation's metadata. Its reserved
+// index may already be bound by Creator; only authored dependency selectors decide
+// whether the machine needs the request's explicitly selected Hub authority.
+func UsesAccountIndexDocument(raw []byte) (bool, *exit.Error) {
+	uses, _, problem := accountIndexDocument(raw)
+	return uses, problem
+}
+
+func accountIndexDocument(raw []byte) (bool, string, *exit.Error) {
+	if len(raw) == 0 || len(raw) > maxProjectMetadataBytes {
+		return false, "", exit.Named(exit.Validation, "project_metadata_unreadable", "pyproject.toml must be non-empty and at most %d bytes", maxProjectMetadataBytes)
+	}
+	var document projectMetadata
+	if err := toml.Unmarshal(raw, &document); err != nil {
+		return false, "", exit.Named(exit.Validation, "project_metadata_invalid", "pyproject.toml is not valid TOML: %v", err)
+	}
+	uses, declared := accountIndexUse(document)
+	return uses, declared, nil
 }
 
 func declaredAccountIndex() *exit.Error {

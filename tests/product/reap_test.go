@@ -148,7 +148,7 @@ func reapMachineRuntimeRoot(root string) bool {
 	}
 	// The Host runs as pod-supervisor, a symlink to the cozy it installed or a Host binary itself.
 	bin := filepath.Join(machine, "root", "usr", "local", "bin")
-	hosts := []string{filepath.Join(bin, "cozy-machine"), filepath.Join(bin, "pod-supervisor"), filepath.Join(bin, "cozy")}
+	hosts := []string{filepath.Join(bin, "cozy-machine"), filepath.Join(bin, "pod-supervisor"), filepath.Join(bin, "cozy"), filepath.Join(machine, "root/opt/cozy/python/bin/cozy-machine")}
 	var owned []int
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())

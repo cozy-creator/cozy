@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
@@ -25,33 +24,4 @@ func installMachinePair(ctx context.Context, uv, python string, requirements []s
 		}
 	}
 	return nil
-}
-
-// restorePair restores the previous Runtime and TensorFS after a failed install.
-// Dependency resolution can change shared dependencies; this restores the selected
-// pair, not a snapshot of the entire Python environment.
-func (h *Host) restorePair(ctx context.Context, uv string, previous *Installed) error {
-	var requirements []string
-	for _, pair := range []struct {
-		distribution string
-		artifact     installedArtifact
-	}{{hostruntime.Distribution, previous.Runtime}, {"tensorfs", previous.TensorFS}} {
-		name := pair.distribution
-		if name == hostruntime.Distribution {
-			name += "[media]"
-		}
-		if strings.HasSuffix(pair.artifact.Name, ".whl") {
-			path := filepath.Join(h.wheels(), filepath.Base(pair.artifact.Name))
-			digest, err := fileDigest(path)
-			if err != nil || digest != pair.artifact.SHA256 {
-				return fmt.Errorf("the previous %s wheel is unavailable or changed", pair.distribution)
-			}
-			requirements = append(requirements, name+" @ file://"+path)
-		} else if version, ok := strings.CutPrefix(pair.artifact.Name, pair.distribution+" "); ok && version != "" {
-			requirements = append(requirements, name+"=="+version)
-		} else {
-			return fmt.Errorf("the previous %s version is unknown", pair.distribution)
-		}
-	}
-	return installMachinePair(ctx, uv, filepath.Join(h.python(), "bin/python"), requirements)
 }

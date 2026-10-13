@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -45,6 +46,18 @@ func TestCancelWithUnknownAcceptanceStaysPending(t *testing.T) {
 				PayloadCanonicalBytes: []byte(`{}`), ReleaseRoot: &pb.ReleaseRoot{Package: "proof/stuck", Release: "1.0.0", Entrypoint: "generate"}}))
 			store.Close()
 			left := arm.name == "left canceling by an older cozy"
+			if !rented {
+				// The full native suite provisions machines automatically. Hold this
+				// fixture's real lifecycle lock so it remains genuinely unavailable.
+				provisionMachine(t, root)
+				dir := filepath.Join(root, "machine")
+				must(t, os.MkdirAll(dir, 0700))
+				lease, err := os.OpenFile(filepath.Join(dir, "host.lock"), os.O_CREATE|os.O_RDWR, 0600)
+				must(t, err)
+				must(t, flock.Exclusive(lease))
+				defer lease.Close()
+				defer flock.Release(lease)
+			}
 			if left {
 				// What cozy before this fix recorded for such a cancel.
 				db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))

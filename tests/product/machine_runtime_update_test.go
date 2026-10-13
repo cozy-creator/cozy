@@ -19,7 +19,7 @@ import (
 // A machine updates its own Runtime when `cozy rental update` asks it to: no SSH, no image
 // script. Its daemon waits for a guarded restart, installs the pair, relaunches and checks the
 // new Runtime answers. With the run's Runtime build X: from X to a second build Y with local
-// wheels, a broken build rolls back to Y, back to X, then published versions by name. After
+// wheels, a broken build rolls back to Y, back to X, then a retired named pair is refused. After
 // each step a package run's executor loaded the machine's Runtime, as `run show` names it. The
 // machine keeps its pair as an image does, in var/lib/cozy/dev/current.
 func TestTheMachineUpdatesItsOwnRuntime(t *testing.T) {
@@ -112,9 +112,10 @@ func TestTheMachineUpdatesItsOwnRuntime(t *testing.T) {
 	run(version(from))
 
 	code, out = update("--runtime-version", machines.RuntimeFloor, "--tensorfs-version", "0.3.78")
-	if code != 0 || installed() != machines.RuntimeFloor+" 0.3.78" || !strings.Contains(kept(), "cozy_runtime-"+machines.RuntimeFloor+"-") {
-		t.Fatalf("the machine did not install the named versions [exit %d]: runs %s, keeps %s\n%s", code, installed(), kept(), out)
+	if code == 0 || !strings.Contains(out, "rental.runtime_update_failed") || !strings.HasPrefix(installed(), version(from)+" ") || !strings.Contains(kept(), filepath.Base(from)) {
+		t.Fatalf("a retired named pair changed the current machine [exit %d]: runs %s, keeps %s\n%s", code, installed(), kept(), out)
 	}
+	run(version(from))
 }
 
 // brokenBuild is a local build of wheel whose Runtime worker exits the moment it starts.

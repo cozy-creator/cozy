@@ -1,6 +1,8 @@
 package producttest
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -9,10 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // TestSubmitSchemaValidation is cl-105/cl-106 as behaviour. The defect: `cozy run
@@ -169,52 +177,88 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		t.Fatalf("optional-field omission no longer queues [exit %d]\n%s", code, out)
 	}
 
-	// THE RED ARM: worker-side enforcement stands untouched behind this seam. A payload
-	// injected PAST the client API — straight into the orchestrator, as no product client
-	// can — still dies at execution on the runtime's own author-surface check.
-	if code, out := runCozy(t, root, "down", "--all"); code != 0 {
-		t.Fatalf("down before the red arm [exit %d]\n%s", code, out)
-	}
-	o := ownerAtRoot(t, root)
-	// The prior successful request holds the binding returned by its worker. An
-	// install now carries static metadata until preparation, so it has no plan to
-	// inject here. Reuse the real retained binding while bypassing only validation.
-	prepared, problem := o.store.RequestRow(handle.RequestID)
+	// The Runtime owns preparation. Its accepted immutable release root, not an
+	// obsolete client PlanID, binds the installed code behind client validation.
+	layout, problem := home.Open(root)
 	fatal(t, problem)
-	if prepared.PlanID == "" || prepared.LocalInstallationID == "" {
-		t.Fatal("the completed request retained no worker-prepared local binding")
-	}
-	requestID, _, problem := o.c.Submit(orchestrator.Submission{
-		IdemKey: "schema-past-client", Package: localWeightlessRef, Entrypoint: "tile",
-		PlanID: prepared.PlanID, Payload: []byte(`{"size":"big"}`),
-		Outputs:   strings.FieldsFunc(prepared.Outputs, func(r rune) bool { return r == ',' }),
-		InstallID: prepared.InstallID, Release: prepared.Release,
-		LocalInstallationID: prepared.LocalInstallationID,
-	})
+	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	deadline := time.Now().Add(180 * time.Second)
+	defer store.Close()
+	prepared, problem := store.RequestRow(handle.RequestID)
+	fatal(t, problem)
+	link, problem := store.MachineExecution(handle.RequestID)
+	fatal(t, problem)
+	if link == nil || len(link.Submission) == 0 || len(link.Receipt) == 0 {
+		t.Fatal("successful request retained no immutable submission and accepted receipt")
+	}
+	var frozen pb.MachineExecutionSubmit
+	var receipt pb.MachineExecutionReceipt
+	must(t, proto.Unmarshal(link.Submission, &frozen))
+	must(t, proto.Unmarshal(link.Receipt, &receipt))
+	if prepared.LocalInstallationID == "" || frozen.ReleaseRoot == nil ||
+		frozen.ReleaseRoot.InstallationId != prepared.LocalInstallationID ||
+		frozen.ReleaseRoot.Entrypoint != "tile" || receipt.RequestId != handle.RequestID ||
+		receipt.SubmissionId != frozen.SubmissionId || receipt.ExecutionWorkspaceId != frozen.ExpectedExecutionWorkspaceId ||
+		len(receipt.CaptureDigest) != 32 || len(receipt.InvocationSpecDigest) != 32 {
+		t.Fatal("accepted root lost its installation, callable or workspace authority")
+	}
+
+	// Inject past only the client schema seam, through the current authenticated
+	// agent to its real Runtime. The prepared installation and root stay identical.
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	resolver := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil)}
+	machine, problem := resolver.DialAt(ctx, machines.Local, frozen.ReleaseRoot.Hub, "schema enforcement proof", true)
+	fatal(t, problem)
+	defer machine.Close()
+	injected := proto.Clone(&frozen).(*pb.MachineExecutionSubmit)
+	injected.SubmissionId = "schema-past-client"
+	injected.Offer.RequestId = "schema-past-client"
+	injected.PayloadCanonicalBytes = []byte(`{"size":"big"}`)
+	injected.Claim = machine.Claim
+	var injectedReceipt *pb.MachineExecutionReceipt
 	for {
-		row, problem := o.store.RequestRow(requestID)
-		fatal(t, problem)
-		if row.State == "failed" || row.State == "refused" {
-			attempts, problem := o.store.Attempts(requestID)
-			fatal(t, problem)
-			last := attempts[len(attempts)-1]
-			if last.TerminalCause != "INVALID_REQUEST" ||
-				!strings.Contains(last.SafeMessage, "invalid_request") {
-				t.Fatalf("the worker-side check answered %q (%s), not INVALID_REQUEST",
-					last.TerminalCause, last.SafeMessage)
-			}
-			break
+		injectedReceipt, err = machine.Host.SubmitMachineExecution(ctx, injected)
+		if status.Code(err) == codes.Unavailable && ctx.Err() == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue // asynchronous preparation, under the unchanged test deadline
 		}
-		if row.State == "succeeded" {
-			t.Fatal("a payload injected past the client EXECUTED")
+		must(t, err)
+		if injectedReceipt == nil || injectedReceipt.RequestId != injected.Offer.RequestId || injectedReceipt.ExecutionWorkspaceId != injected.ExpectedExecutionWorkspaceId {
+			t.Fatal("Runtime did not journal the injected request under its exact identity")
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no worker-side verdict; request stayed %q\n%s", row.State, productWorkerLogs(root))
-		}
-		time.Sleep(100 * time.Millisecond)
+		break
 	}
+	query := &pb.MachineExecutionQuery{Claim: machine.Claim, RequestId: injected.Offer.RequestId,
+		ExpectedExecutionWorkspaceId: injected.ExpectedExecutionWorkspaceId}
+	var terminal *pb.AttemptOutcome
+	cursor := uint64(0)
+	for terminal == nil {
+		page, err := machine.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor, Limit: 256, Wait: true})
+		must(t, err)
+		for _, event := range page.Events {
+			if event.GetOutcome() != nil {
+				terminal = event.Outcome
+			}
+		}
+		cursor = page.NextAfter
+	}
+	var verdict pb.AttemptOutcomeBody
+	must(t, canonical.Unmarshal(terminal.OutcomeCanonicalBytes, &verdict))
+	if verdict.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED || verdict.GetCause().GetCode() != pb.CauseCode_CAUSE_CODE_INVALID_REQUEST ||
+		!strings.Contains(verdict.SafeMessage, "invalid_request") || verdict.ExecutionStarted {
+		t.Fatalf("Runtime did not reject the invalid payload before author execution: %s", &verdict)
+	}
+	_, err = machine.Host.AcknowledgeMachineExecutionCollection(ctx, &pb.MachineExecutionCollectionAck{Execution: query,
+		Outcome: &pb.AttemptOutcomeAck{RequestId: terminal.RequestId, AttemptOrdinal: terminal.AttemptOrdinal,
+			InvocationSpecDigest: terminal.InvocationSpecDigest, OutcomeId: terminal.OutcomeId, OutcomeDigest: terminal.OutcomeDigest}})
+	must(t, err)
+	preserved, problem := store.MachineExecution(handle.RequestID)
+	fatal(t, problem)
+	if !bytes.Equal(preserved.Submission, link.Submission) || !bytes.Equal(preserved.Receipt, link.Receipt) {
+		t.Fatal("schema rejection changed the prior accepted authority")
+	}
+
 }
 
 // attachDaemon joins the hidden daemon a `cozy run` already started: the suite stays a

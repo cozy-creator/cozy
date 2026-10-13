@@ -57,7 +57,7 @@ type runtimeMachine struct {
 
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	workspace := &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "rented-workspace"}
+		ExecutionWorkspaceId: "rented-workspace", SubmissionClose: true}
 	for ordinal := range m.devices {
 		workspace.Devices = append(workspace.Devices, &pb.MachineDevice{Ordinal: uint32(ordinal), Name: "fake-4090"})
 	}
@@ -108,7 +108,7 @@ func (m *runtimeMachine) CloseMachineSubmission(_ context.Context, q *pb.Machine
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := &pb.MachineSubmissionClosure{RequestId: q.RequestId, SubmissionId: q.SubmissionId, ExecutionWorkspaceId: q.ExpectedExecutionWorkspaceId}
-	if m.receipt != nil {
+	if m.receipt != nil && m.receipt.RequestId == q.RequestId && m.receipt.SubmissionId == q.SubmissionId {
 		out.Receipt = proto.Clone(m.receipt).(*pb.MachineExecutionReceipt)
 	} else {
 		if m.closed == nil {

@@ -156,9 +156,9 @@ func (f *retainedWeights) settle(t *testing.T) {
 // A rented job that writes its declared weights output and returns a plain result, run
 // without --upload-to (upload bench, runs 1280/1283): its weights have no recipient here.
 // The weights are held on the machine in this host's custody, the run settles with them
-// named as retained on the rental, and the rental is free for maintenance. Before, the
+// named as retained on the rental. Before, the
 // collection waited for a custody nothing drove: the follower never settled and each
-// retry held the rental in use, so `cozy rental update` was refused.
+// retry held the rental in use. Native update qualification belongs to the real-agent matrix.
 func TestRentedWeightsOutputSettlesRetainedOnTheRental(t *testing.T) {
 	f := newRetainedWeights(t)
 	startDaemonProcess(t, f.root)
@@ -175,11 +175,4 @@ func TestRentedWeightsOutputSettlesRetainedOnTheRental(t *testing.T) {
 		t.Fatalf("the rental counts %d retained bytes, want the %d the write added", retained, f.written)
 	}
 
-	// The retained bytes are custody, not a use: maintenance goes past the fence to the
-	// rental's own update endpoint, which this stand-in Hub does not publish.
-	f.hub.set(podRental, "development", true)
-	code, out, errs := runCozyWithin(t, f.root, "rental", "update", "collector", "--json")
-	if code == 0 || strings.Contains(out+errs, "rental.maintenance_busy") || !strings.Contains(out+errs, "maintenance endpoint") {
-		t.Fatalf("rental update was held by the retained result [exit %d]: %s%s", code, out, errs)
-	}
 }

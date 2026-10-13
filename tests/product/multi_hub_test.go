@@ -531,16 +531,25 @@ func TestPackageUpdateAllUsesEachInstallsHub(t *testing.T) {
 // installed from, not from whichever hub is current.
 // fixtureExecutionAccess delegates only catalog/storage requests to a machine leaf.
 // The fixture deliberately exposes no owned-machine registration or lifecycle API.
-func fixtureExecutionAccess(t *testing.T, server *httptest.Server, worker http.Handler) string {
+func fixtureExecutionAccess(t *testing.T, root string, server *httptest.Server, worker http.Handler) string {
 	t.Helper()
-	token := "execution-" + randomToken(t)
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	const deviceID = "fixture-device"
+	plantMachineKey(t, root, server.URL, deviceID, private)
+	accountToken := "account-" + randomToken(t)
+	token := executionGrantToken(server.URL, "fixture-account", 1)
 	account := server.Config.Handler
-	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server.Config.Handler = machineKeyLogin(deviceID, public, accountToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/machines":
 			t.Error("owned machine attempted registration")
 			http.Error(w, "no machine registry", http.StatusGone)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access":
+			if r.Header.Get("Authorization") != "Bearer "+accountToken {
+				http.Error(w, "this Hub requires its own current device login", http.StatusForbidden)
+				return
+			}
 			var body struct {
 				Leaf string `json:"delegate_certificate_der_b64url"`
 			}
@@ -554,7 +563,7 @@ func fixtureExecutionAccess(t *testing.T, server *httptest.Server, worker http.H
 		default:
 			account.ServeHTTP(w, r)
 		}
-	})
+	}))
 	return "Bearer " + token
 }
 
@@ -566,7 +575,7 @@ func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
 	var askedA, askedB sync.Map
 	hubA, hubB := packageCardHub(t, &askedA), packageCardHub(t, &askedB)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName),
-		[]byte("tensorhub_url: b\nport: 0\ntensorhub_token: two-hubs\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
+		[]byte("tensorhub_url: b\nport: 0\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
@@ -582,7 +591,7 @@ func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
 	fatal(t, problem)
 	store.Close()
 	provisionMachine(t, root)
-	fixtureExecutionAccess(t, hubA, hubA.Config.Handler)
+	fixtureExecutionAccess(t, root, hubA, hubA.Config.Handler)
 	// The machine resolves the call's Models; the release it runs is read from the hub the
 	// install came from, never from the current one.
 	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")
@@ -651,7 +660,7 @@ func TestRunsWithoutAHubStayListed(t *testing.T) {
 }
 
 // A package published only at a second hub runs on this computer's machine through
-// `cozy run --tensorhub <second>`. The machine is registered with both hubs; it reads the
+// `cozy run --tensorhub <second>`. The client has a device credential at each Hub; it reads the
 // release at the hub the command names and never asks the first hub for it.
 func TestLocalRunReadsTheCommandsHub(t *testing.T) {
 	if *machineHostBinary == "" {
@@ -689,10 +698,10 @@ func TestLocalRunReadsTheCommandsHub(t *testing.T) {
 	t.Cleanup(hubB.Close)
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName),
-		[]byte("tensorhub_url: a\nport: 0\ntensorhub_token: two-hubs\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
+		[]byte("tensorhub_url: a\nport: 0\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
 	provisionMachine(t, root)
-	fixtureExecutionAccess(t, hubA, catalog(&machineA, false))
-	fixtureExecutionAccess(t, hubB, catalog(&machineB, true))
+	fixtureExecutionAccess(t, root, hubA, catalog(&machineA, false))
+	fixtureExecutionAccess(t, root, hubB, catalog(&machineB, true))
 	code, out := runCozy(t, root, "run", "proof/beta/generate", "--tensorhub", "b", "--json")
 	if strings.Contains(out, "not a published release") || strings.Contains(out, "not a published package") {
 		t.Fatalf("the machine read the release at another hub than the command's: %d %s", code, out)
@@ -795,16 +804,16 @@ func TestLocalMachineServesEveryHubWhereItIs(t *testing.T) {
 	t.Cleanup(hubB.Close)
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName),
-		[]byte("tensorhub_url: a\nport: 0\ntensorhub_token: two-hubs\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
+		[]byte("tensorhub_url: a\nport: 0\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
 	provisionMachine(t, root)
 	var doorA, doorB door
-	accessA := fixtureExecutionAccess(t, hubA, catalog(&doorA, "proof/alpha"))
-	accessB := fixtureExecutionAccess(t, hubB, catalog(&doorB, "proof/beta"))
+	accessA := fixtureExecutionAccess(t, root, hubA, catalog(&doorA, "proof/alpha"))
+	accessB := fixtureExecutionAccess(t, root, hubB, catalog(&doorB, "proof/beta"))
 	_ = accessA
 	launched := func() (record struct {
 		PID int `json:"pid"`
 	}) {
-		raw, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
+		raw, err := os.ReadFile(filepath.Join(root, "machine", "agent.json"))
 		must(t, err)
 		must(t, json.Unmarshal(raw, &record))
 		return record

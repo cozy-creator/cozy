@@ -320,6 +320,7 @@ installed build. Records at an older schema are refused, never migrated.
 | route | scope | auth | notes |
 |---|---|---|---|
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | one attempt's kept triage bundle from its own row; 404 when none was kept |
+| `POST /v1/local/requests/{id}/abandon` | local | yes | explicit actor abandons local Runtime-run tracking; preserves remote evidence and does not confirm remote stop or release a rental |
 | `GET /v1/local/requests/{id}/evidence` | local | yes | one run's lifecycle events, the latest sample of each progress stream, and its last attempt's kept triage bundle; the `cozy run show` source |
 | `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, and activity; `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
 | `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | explicit acknowledged fixed fifteen-minute reset; request ID only |
@@ -511,3 +512,12 @@ the caller interface and computation key. The worker does not execute a byte-ide
 copy of the downloaded archive, and mismatched protected base versions must refuse.
 Wheel discovery reads metadata and source without importing the package; ordinary
 non-App dependencies and Runtime's native facade keep their existing behavior.
+
+
+`POST /v1/local/requests/{id}/abandon` requires `{"actor":"..."}` and is
+idempotent for that recorded Runtime-owned run. It returns `abandoned_locally`,
+`changed`, `remote_stop_confirmed: false`, and `rental_released: false` alongside
+the run identity and local status. An unfinished local intent becomes abandoned;
+prior terminal outcomes remain unchanged. Submission, acceptance, control and
+outcome evidence are retained, and late real facts cannot reopen the abandoned
+local intent. This action does not make a remote cancellation or lifecycle request.

@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -25,7 +24,7 @@ import (
 // fences another's or the orchestrator's (hakufu: five Claim cycles on a fresh boot).
 func TestFreshRentalConcurrentCallsShareOneControlClaim(t *testing.T) {
 	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host: the pod-supervisor the rental runs")
+		t.Skip("requires -machine-host: the independent agent the rental runs")
 	}
 	uv, err := exec.LookPath("uv")
 	if err != nil {
@@ -83,13 +82,18 @@ func TestFreshRentalConcurrentCallsShareOneControlClaim(t *testing.T) {
 			t.Fatalf("%s\nrental Host log:\n%s", failure, log)
 		}
 	}
-	var ownership struct {
-		Epoch int `json:"control_stream_epoch"`
+	// The private Runtime records every accepted Control Claim before serving it.
+	// The old standalone Runtime ownership file is absent under the agent.
+	claims := 0
+	for _, line := range strings.Split(string(log), "\n") {
+		if strings.Contains(line, "session: claimed by ") {
+			claims++
+			if !strings.Contains(line, "owner epoch 1, stream epoch 1") {
+				t.Fatalf("a concurrent call replaced the private control stream: %s", line)
+			}
+		}
 	}
-	raw, err := os.ReadFile(filepath.Join(provider, "run/cozy/worker/ownership.json"))
-	must(t, err)
-	must(t, json.Unmarshal(raw, &ownership))
-	if ownership.Epoch != 1 {
-		t.Fatalf("the fresh rental took %d Control Claims; its owner holds one stream\nrental Host log:\n%s", ownership.Epoch, log)
+	if claims != 1 {
+		t.Fatalf("the fresh rental took %d Control Claims; its owner holds one stream\nrental Host log:\n%s", claims, log)
 	}
 }

@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
 const indexAccount = "author"
@@ -107,6 +109,39 @@ def add(payload: AddRequest) -> AddResult:
 // the same account path at its grant origin, the rental exactly as this computer's machine.
 func TestAccountIndexResolvesAtEachMachinesOwnHub(t *testing.T) {
 	h, root, _, _ := parityMachines(t)
+	// Rental authority is current-attempt scoped, not a blanket fixture grant.
+	for _, valid := range []bool{false, true} {
+		h.mu.Lock()
+		worker, token, key := h.authorityWorker, h.authorityToken, h.authorityKey
+		h.mu.Unlock()
+		if !valid {
+			token = "not-the-provider-token"
+		}
+		request, err := http.NewRequest(http.MethodGet, h.worker.URL+"/v1/worker/rental/authorized-keys", nil)
+		must(t, err)
+		request.Header.Set("X-Cozy-Worker-ID", worker)
+		request.Header.Set("X-Cozy-Worker-Token", token)
+		response, err := h.worker.Client().Do(request)
+		must(t, err)
+		if !valid {
+			response.Body.Close()
+			if response.StatusCode != http.StatusForbidden {
+				t.Fatal("unbound provider received fixture authority")
+			}
+			continue
+		}
+		var authority struct {
+			Worker string   `json:"worker_id"`
+			Keys   []string `json:"authorized_keys"`
+			Lease  int      `json:"lease_seconds"`
+		}
+		err = json.NewDecoder(response.Body).Decode(&authority)
+		response.Body.Close()
+		must(t, err)
+		if response.StatusCode != http.StatusOK || authority.Worker != worker || len(authority.Keys) != 1 || authority.Keys[0] != key || authority.Lease <= 0 {
+			t.Fatal("fixture authority differs from current provider grant")
+		}
+	}
 	wheel := orgRelativeWheel(t, "1.0.0", "VALUE = 7\n")
 	var laptopOpen, machineOpen atomic.Bool
 	laptopOpen.Store(true)
@@ -148,5 +183,26 @@ func TestAccountIndexResolvesAtEachMachinesOwnHub(t *testing.T) {
 	}
 	if machineServed.Load() == 0 {
 		t.Fatal("no machine fetched the dependency at its own Hub")
+	}
+}
+
+func TestCapturedAccountIndexDocumentNeedsOnlyAuthoredDependencyAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name, text    string
+		uses, invalid bool
+	}{
+		{"offline", "[project]\nname='offline'\nversion='1'\n", false, false},
+		{"bound-private", "[tool.uv.sources]\nprivate={index='tensorhub'}\n[[tool.uv.index]]\nname='tensorhub'\nurl='https://authored.example/v1/index/me/simple/'\n", true, false},
+		{"conditional-private", "[tool.uv.sources]\nprivate=[{index='tensorhub',marker=\"sys_platform == 'linux'\"}]\n", true, false},
+		{"unselected-index", "[[tool.uv.index]]\nname='tensorhub'\nurl='https://unselected.example/'\n", false, false},
+		{"missing", "", false, true},
+		{"invalid", "[tool.uv.sources\n", false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			uses, problem := packagepublish.UsesAccountIndexDocument([]byte(test.text))
+			if (problem != nil) != test.invalid || uses != test.uses {
+				t.Fatalf("captured dependency authority: uses=%v problem=%v", uses, problem)
+			}
+		})
 	}
 }

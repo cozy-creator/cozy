@@ -200,11 +200,11 @@ func (m *machineRuns) observeRootDownload(request string, trailer metadata.MD) *
 
 // submissionRefused resolves permanent refusals through the durable submission key.
 func (m *machineRuns) submissionRefused(ctx context.Context, connection *machineConnection, requestID string, trailer metadata.MD, err error) *exit.Error {
-	for _, code := range trailer.Get("cozy-error-code") {
-		switch code {
-		case "execution_workspace_changed", "execution_workspace_required":
-			return exit.Named(exit.Conflict, "machine_execution.workspace_changed", "execution workspace no longer matches the frozen submission; prior acceptance remains unresolved")
-		}
+	if executionWorkspaceChanged(err, trailer) {
+		return m.loseSubmissionWorkspace(requestID, connection.Name)
+	}
+	if slices.Contains(trailer.Get("cozy-error-code"), "execution_workspace_required") {
+		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "the machine requires the frozen submission's workspace identity; prior acceptance remains unresolved")
 	}
 	return m.settleSubmissionRefusal(ctx, connection, requestID, machineTransport(err))
 }

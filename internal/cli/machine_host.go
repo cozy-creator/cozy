@@ -3,8 +3,11 @@ package cli
 import (
 	"cmp"
 	"context"
+	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -40,13 +43,9 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 		}
 		*target = absolute
 	}
-	// The machine agent is released independently from the CLI.
-	if source.Pinned = source.Host != ""; !source.Pinned {
-		source.Host, problem = host.PublishedAgent(context.Background())
-		if problem != nil {
-			return problem
-		}
-	} else if module := machines.HostModule(source.Host); module != machines.AgentModule {
+	// The Runtime wheel supplies the default agent; --host deliberately pins a copy.
+	if source.Pinned = source.Host != ""; source.Pinned && machines.HostModule(source.Host) != machines.AgentModule {
+		module := machines.HostModule(source.Host)
 		return exit.Usagef("--host %s is not a cozy-machine binary (%s)", source.Host, cmp.Or(module, "not a Go program")).
 			WithRemedy("omit --host to install the published machine agent")
 	}
@@ -54,7 +53,9 @@ func handleMachineInstall(ctx *Context) *exit.Error {
 	if err != nil {
 		return exit.Named(exit.Structural, "machine.uv_missing", "uv builds the machine's Python environment and is not on PATH")
 	}
-	installed, problem := host.Install(context.Background(), source, uv)
+	installCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	installed, problem := host.Install(installCtx, source, uv)
 	if problem != nil {
 		return problem
 	}
@@ -76,10 +77,21 @@ func handleMachineShow(ctx *Context) *exit.Error {
 	fields := []output.Field{{K: "root", V: host.Root()}, {K: "machine", V: status.MachineID},
 		{K: "running", V: status.Running}, {K: "pid", V: status.PID}}
 	if status.Installed != nil {
-		fields = append(fields, output.Field{K: "host", V: status.Installed.Host.Name},
-			output.Field{K: "runtime", V: status.Installed.Runtime.Name}, output.Field{K: "tensorfs", V: status.Installed.TensorFS.Name})
+		fields = append(fields, output.Field{K: "last_install", V: status.Installed})
 	}
-	return emit(ctx, output.Record{Fields: fields})
+	var notes []string
+	if status.Running {
+		readCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		live, problem := host.ReadSoftware(readCtx)
+		if problem != nil {
+			notes = append(notes, "live software could not be observed: "+problem.Message)
+		} else if live != nil {
+			fields = append(fields, output.Field{K: "runtime", V: live.Runtime}, output.Field{K: "tensorfs", V: live.TensorFS},
+				output.Field{K: "agent", V: live.Agent}, output.Field{K: "bootstrap", V: live.Bootstrap}, output.Field{K: "phase", V: live.Phase})
+		}
+	}
+	return emit(ctx, output.Record{Fields: fields, Notes: notes})
 }
 
 func handleMachineStop(ctx *Context) *exit.Error {

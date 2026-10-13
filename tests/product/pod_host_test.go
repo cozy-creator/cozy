@@ -105,7 +105,8 @@ type fakePod struct {
 	// onJobReady can delay and sequence the independent peer's readiness facts.
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// machine answers Runtime-owned machine execution observation and collection.
-	machine machineExecutionPeer
+	machine         machineExecutionPeer
+	submissionClose *bool // nil advertises the normal durable-closure contract
 	// onFrame lets a product test delegate selected frames to a real Runtime peer.
 	onFrame func(*pb.RecordOwnerFrame, func(*pb.WorkerFrame) error) (bool, error)
 	// preparedPlacement supplies a complete second-implementation placement for

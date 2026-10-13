@@ -53,15 +53,24 @@ def main() -> int:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--runtime-wheel", help="exact Runtime wheel to vendor")
     source.add_argument("--runtime-version", help="released Runtime version to fetch from PyPI")
-    parser.add_argument(
-        "--expect-commit", required=True,
-        help="the host cozy-runtime's commit; the vendored wheel must embed it",
+    provenance = parser.add_mutually_exclusive_group(required=True)
+    provenance.add_argument(
+        "--expect-commit",
+        help="the released host cozy-runtime's commit; the vendored wheel must embed it",
+    )
+    provenance.add_argument(
+        "--expect-sha256",
+        help="explicit development artifact sha256; does not assert a released Git identity",
     )
     parser.add_argument("--out", required=True)
     parser.add_argument("--source-out")
     parser.add_argument("--tensorfs-wheel", default="")
     parser.add_argument("--version", default="1.0.0")
     args = parser.parse_args()
+    if args.expect_sha256 and (
+        not args.runtime_wheel or not re.fullmatch(r"[0-9a-f]{64}", args.expect_sha256)
+    ):
+        parser.error("--expect-sha256 requires an explicit wheel and one lowercase sha256")
 
     out = pathlib.Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -77,14 +86,19 @@ def main() -> int:
             shutil.copy2(pathlib.Path(args.runtime_wheel).resolve(), wheel)
         else:
             wheel = released_wheel(args.runtime_version, vendor)
-        # The package runs the Runtime the host runs, never a neighbour of it.
-        full_sha = embedded_commit(wheel)
-        if not full_sha.startswith(args.expect_commit):
-            raise RuntimeError(
-                f"{wheel.name} embeds {full_sha} and the host cozy-runtime is {args.expect_commit}; "
-                "pass -script-runtime-wheel with the wheel the host Runtime was installed from"
-            )
-        runtime_version = wheel.name.split("-")[1]
+        if args.expect_sha256:
+            if hashlib.sha256(wheel.read_bytes()).hexdigest() != args.expect_sha256:
+                raise RuntimeError("selected Runtime wheel does not match the explicit sha256")
+            verified_identity = "sha256:" + args.expect_sha256
+        else:
+            full_sha = embedded_commit(wheel)
+            if not full_sha.startswith(args.expect_commit):
+                raise RuntimeError(
+                    f"{wheel.name} embeds {full_sha} and the host cozy-runtime is {args.expect_commit}; "
+                    "pass -script-runtime-wheel with the wheel the host Runtime was installed from"
+                )
+            verified_identity = full_sha
+        runtime_version = wheel.name.split("-")[1].split("+", 1)[0]
         wheels = [wheel]
         native = pathlib.Path(args.tensorfs_wheel).resolve() if args.tensorfs_wheel else None
         if native is not None:
@@ -145,7 +159,7 @@ def main() -> int:
                 ignore=shutil.ignore_patterns(".venv", "__pycache__", "dist"),
             )
         print(f"source:   {source_out if args.source_out else tree}")
-        print(f"runtime: {full_sha} ({wheel.name})")
+        print(f"runtime: {verified_identity} ({wheel.name})")
     return 0
 
 

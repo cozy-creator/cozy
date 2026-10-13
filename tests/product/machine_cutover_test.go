@@ -1,12 +1,14 @@
 package producttest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -14,9 +16,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/machines"
 )
 
-// Migrating the executable requires both the controller's idle decision and a fresh
-// Runtime observation. Another controller's work and an unknown Runtime remain protected.
-func TestAgentAdoptionRequiresObservedIdle(t *testing.T) {
+// Retired lifecycle metadata is a refusal census, even if a stale activity file
+// says idle. It cannot authorize adoption or signal the old process.
+func TestLegacyAgentAdoptionPreservesRetiredProcess(t *testing.T) {
 	source, err := exec.LookPath("sleep")
 	must(t, err)
 	dir := t.TempDir()
@@ -28,31 +30,31 @@ func TestAgentAdoptionRequiresObservedIdle(t *testing.T) {
 	must(t, os.WriteFile(binary, raw, 0755))
 	command := exec.Command(binary, "3600")
 	must(t, command.Start())
-	exited := make(chan error, 1)
-	go func() { exited <- command.Wait() }()
-	t.Cleanup(func() { _ = command.Process.Kill(); <-exited })
+	t.Cleanup(func() { _ = command.Process.Kill(); _ = command.Wait() })
 	record, _ := json.Marshal(map[string]any{"pid": command.Process.Pid, "worker_id": "machine-still-working"})
 	must(t, os.WriteFile(filepath.Join(dir, "host.json"), record, 0600))
 	must(t, os.WriteFile(filepath.Join(dir, "installed.json"), []byte(`{"host":{"module":"github.com/cozy-creator/cozy","name":"cozy"}}`), 0600))
-	for _, idle := range []bool{false, true} {
-		changed, problem := host.Adopt(context.Background(), idle)
-		fatal(t, problem)
-		if changed {
-			t.Fatal("adoption stopped a machine without idle evidence")
-		}
-	}
 	activity := filepath.Join(host.Root(), "run/cozy/bootstrap/worker-activity")
 	must(t, os.MkdirAll(filepath.Dir(activity), 0755))
-	must(t, os.WriteFile(activity, []byte(`{"active_work":true,"holding":["accepted run 7"]}`), 0600))
-	changed, problem := host.Adopt(context.Background(), true)
-	fatal(t, problem)
-	if changed {
-		t.Fatal("controller-local idle overrode accepted Runtime work")
+	for _, state := range []string{`{"active_work":true,"holding":["accepted run 7"]}`, `{"active_work":false,"holding":[]}`} {
+		must(t, os.WriteFile(activity, []byte(state), 0600))
+		for _, idle := range []bool{false, true} {
+			changed, problem := host.Adopt(t.Context(), idle)
+			if changed || problem == nil || problem.ErrName() != "machine.legacy_process_running" {
+				t.Fatalf("retired namespace authorized adoption: changed=%v problem=%v", changed, problem)
+			}
+		}
 	}
-	status, problem := host.Status()
-	fatal(t, problem)
-	if !status.Running || status.PID != command.Process.Pid {
-		t.Fatal("the existing machine process did not survive refused adoption")
+	if err := command.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("retired process was terminated: %v", err)
+	}
+	after, err := os.ReadFile(binary)
+	must(t, err)
+	if !bytes.Equal(after, raw) {
+		t.Fatal("refusal replaced the retired executable")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "agent.json")); !os.IsNotExist(err) {
+		t.Fatal("refusal created current launch authority")
 	}
 }
 

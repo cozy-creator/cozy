@@ -2,194 +2,74 @@ package machines
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
-	"strings"
 
-	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// AgentModule is the standalone machine server, built from the Runtime repository.
 const AgentModule = "github.com/cozy-creator/cozy-runtime/machine-agent"
+const HubAccessCapability = "hub-access/1"
+const RuntimeUpdateCapability = "runtime-update/1"
+const BootstrapCapability = "machine-bootstrap/1"
 
-// AgentFloor is the first agent that keeps delegated Hub authority bound to one principal.
-const AgentFloor = "0.1.1"
+func (h *Host) bundledAgent() string { return filepath.Join(h.python(), "bin/cozy-machine") }
 
-var agentFloor = pep440.MustParse(AgentFloor)
-
-const agentReleases = "https://api.github.com/repos/cozy-creator/cozy/releases"
-
-type agentManifest struct {
-	Version   string `json:"version"`
-	Platforms map[string]struct {
-		URL    string `json:"url"`
-		SHA256 string `json:"sha256"`
-	} `json:"platforms"`
+// Capabilities name the supported operations; release numbers are descriptive.
+func compatibleAgent(ctx context.Context, path string) bool {
+	if HostModule(path) != AgentModule {
+		return false
+	}
+	out, err := exec.CommandContext(ctx, path, "version").Output()
+	var version struct {
+		Name             string   `json:"name"`
+		WireMinor        uint32   `json:"wire_minor"`
+		MinimumWireMinor uint32   `json:"minimum_wire_minor"`
+		Capabilities     []string `json:"capabilities"`
+	}
+	return err == nil && json.Unmarshal(out, &version) == nil && version.Name == "cozy-machine" &&
+		version.WireMinor >= pb.MinCompatibleWireMinor && version.MinimumWireMinor <= pb.WireMinor &&
+		slices.Contains(version.Capabilities, HubAccessCapability) && slices.Contains(version.Capabilities, RuntimeUpdateCapability) &&
+		slices.Contains(version.Capabilities, BootstrapCapability)
 }
 
-type agentRelease struct {
-	Tag        string `json:"tag_name"`
-	Draft      bool   `json:"draft"`
-	Prerelease bool   `json:"prerelease"`
-	Assets     []struct {
-		Name string `json:"name"`
-		URL  string `json:"browser_download_url"`
-	} `json:"assets"`
-}
-
-// PublishedAgent selects the newest compatible public machine release. Agent releases use
-// their own immutable tags; GitHub's latest release belongs to the CLI, not this server.
-// An explicit --host bypasses discovery for development, never the shipping default.
-func (h *Host) PublishedAgent(ctx context.Context) (string, *exit.Error) {
-	path, err := h.publishedAgent(ctx, http.DefaultClient, agentReleases)
-	if err != nil {
-		return "", exit.Named(exit.Unavailable, "machine.agent_unavailable", "cannot install cozy-machine: %s", err).
-			WithRemedy("retry `cozy machine install`, or supply a built machine agent with --host")
+func (h *Host) defaultAgent(ctx context.Context) (string, *exit.Error) {
+	path := h.bundledAgent()
+	if !compatibleAgent(ctx, path) {
+		return "", exit.Named(exit.Structural, "machine.agent_update_required", "the Runtime wheel must contain a cozy-machine with %s, %s and %s", HubAccessCapability, RuntimeUpdateCapability, BootstrapCapability).
+			WithRemedy("install the current published Runtime pair, or supply a current development agent with --host")
 	}
 	return path, nil
 }
 
-func (h *Host) publishedAgent(ctx context.Context, client *http.Client, releasesURL string) (string, error) {
-	var releases []agentRelease
-	for page := 1; ; page++ {
-		var batch []agentRelease
-		if err := agentJSON(ctx, client, fmt.Sprintf("%s?per_page=100&page=%d", releasesURL, page), &batch); err != nil {
-			return "", err
-		}
-		for _, release := range batch {
-			if !release.Draft && !release.Prerelease && strings.HasPrefix(release.Tag, "machine-v") {
-				if version, err := pep440.Parse(strings.TrimPrefix(release.Tag, "machine-v")); err == nil && !version.IsPreRelease() && version.Compare(agentFloor) >= 0 {
-					releases = append(releases, release)
-				}
-			}
-		}
-		if len(batch) < 100 {
-			break
-		}
-	}
-	slices.SortFunc(releases, func(a, b agentRelease) int {
-		left, _ := pep440.Parse(strings.TrimPrefix(a.Tag, "machine-v"))
-		right, _ := pep440.Parse(strings.TrimPrefix(b.Tag, "machine-v"))
-		return right.Compare(left)
-	})
-	for _, release := range releases {
-		manifestURL := ""
-		for _, asset := range release.Assets {
-			if asset.Name == "machine-agent.json" {
-				manifestURL = asset.URL
-				break
-			}
-		}
-		if manifestURL == "" {
-			continue
-		}
-		var manifest agentManifest
-		if err := agentJSON(ctx, client, manifestURL, &manifest); err != nil {
-			return "", err
-		}
-		if "machine-v"+manifest.Version != release.Tag {
-			return "", fmt.Errorf("%s has an invalid machine manifest", release.Tag)
-		}
-		if artifact, ok := manifest.Platforms[runtime.GOOS+"-"+runtime.GOARCH]; ok {
-			want, err := hex.DecodeString(artifact.SHA256)
-			if err != nil || len(want) != sha256.Size || strings.ToLower(artifact.SHA256) != artifact.SHA256 {
-				return "", fmt.Errorf("%s has an invalid artifact digest", release.Tag)
-			}
-			directory := h.path(filepath.Join("agents", manifest.Version))
-			path := filepath.Join(directory, "cozy-machine")
-			if digest, err := fileDigest(path); err == nil && digest == artifact.SHA256 {
-				return path, nil
-			}
-			if err := os.MkdirAll(directory, 0o700); err != nil {
-				return "", err
-			}
-			if err := downloadAgent(ctx, client, artifact.URL, path, artifact.SHA256); err != nil {
-				return "", err
-			}
-			if HostModule(path) != AgentModule {
-				return "", fmt.Errorf("%s is not a cozy-machine executable", release.Tag)
-			}
-			return path, nil
-		}
-	}
-	return "", fmt.Errorf("no compatible cozy-machine release for %s/%s", runtime.GOOS, runtime.GOARCH)
-}
-
-func agentRequest(ctx context.Context, client *http.Client, address string) (*http.Response, error) {
-	parsed, err := url.Parse(address)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
-		return nil, fmt.Errorf("machine release URL must use HTTPS")
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
+// Link the wheel-owned executable so later Runtime updates also update the agent.
+func (h *Host) linkAgent() (installedArtifact, error) {
+	source := h.bundledAgent()
+	digest, err := fileDigest(source)
 	if err != nil {
-		return nil, err
+		return installedArtifact{}, err
 	}
-	request.Header.Set("Accept", "application/json")
-	response, err := client.Do(request)
+	artifact := installedArtifact{Name: "cozy-machine", SHA256: digest, Module: HostModule(source)}
+	target := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return artifact, err
+	}
+	file, err := os.CreateTemp(filepath.Dir(target), ".agent-link-*")
 	if err != nil {
-		return nil, err
+		return artifact, err
 	}
-	if response.StatusCode != http.StatusOK {
-		response.Body.Close()
-		return nil, fmt.Errorf("machine release server answered HTTP %d", response.StatusCode)
+	staged := file.Name()
+	file.Close()
+	defer os.Remove(staged)
+	if err := os.Remove(staged); err != nil {
+		return artifact, err
 	}
-	return response, nil
-}
-
-func agentJSON(ctx context.Context, client *http.Client, address string, into any) error {
-	response, err := agentRequest(ctx, client, address)
-	if err != nil {
-		return err
+	if err := os.Symlink(source, staged); err != nil {
+		return artifact, err
 	}
-	defer response.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(response.Body, (8<<20)+1))
-	if err != nil {
-		return err
-	}
-	if len(raw) > 8<<20 {
-		return fmt.Errorf("machine release metadata exceeds 8 MiB")
-	}
-	return json.Unmarshal(raw, into)
-}
-
-func downloadAgent(ctx context.Context, client *http.Client, address, destination, digest string) error {
-	response, err := agentRequest(ctx, client, address)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	file, err := os.CreateTemp(filepath.Dir(destination), ".cozy-machine-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	defer file.Close()
-	hash := sha256.New()
-	n, err := io.Copy(io.MultiWriter(file, hash), io.LimitReader(response.Body, (256<<20)+1))
-	if err != nil {
-		return err
-	}
-	if n > 256<<20 || hex.EncodeToString(hash.Sum(nil)) != digest {
-		return fmt.Errorf("cozy-machine artifact does not match its published digest or size bound")
-	}
-	if err := file.Chmod(0o755); err != nil {
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return os.Rename(file.Name(), destination)
+	return artifact, os.Rename(staged, target)
 }

@@ -49,7 +49,7 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 				return row
 			}
 			down := func(want *records.Request, state string) {
-				host, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
+				host, err := os.ReadFile(filepath.Join(root, "machine", "agent.json"))
 				must(t, err)
 				code, out := runCozy(t, root, "down", "--json")
 				if code != 0 || !strings.Contains(out, `"daemon":"stopped"`) || !strings.Contains(out, want.ID+" ("+state) {
@@ -60,7 +60,7 @@ func TestDownMidRunLeavesTheWorkRunning(t *testing.T) {
 				}
 				t.Logf("cozy down --json: %s", out)
 				var record struct{ PID int }
-				now, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
+				now, err := os.ReadFile(filepath.Join(root, "machine", "agent.json"))
 				if err != nil || !bytes.Equal(now, host) || json.Unmarshal(now, &record) != nil || syscall.Kill(record.PID, 0) != nil {
 					t.Fatalf("down touched this computer's machine Host: %s", now)
 				}

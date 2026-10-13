@@ -88,7 +88,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 		"size=32", "seed=24", "delay_ms=4500")
 	dref := submittedRunReference(t, code, dout)
 	awaitRunReferenceStatus(t, root, dref, "in_progress")
-	if code, out := runCozy(t, root, "run", "cancel", dref, "--json"); code != 0 ||
+	if code, out := runCozy(t, root, "run", "cancel", dref, "--await", "--json"); code != 0 ||
 		!strings.Contains(out, `"status":"canceled"`) ||
 		!strings.Contains(out, `"canceled_by":"cozy run cancel"`) {
 		t.Fatalf("live cancel was not attributed [exit %d]\n%s", code, out)

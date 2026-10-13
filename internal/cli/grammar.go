@@ -497,8 +497,9 @@ func (c *RunUploadCmd) Run(r *Runtime) error {
 }
 
 type RunCancelCmd struct {
-	ID    string `arg:"" name:"run" help:"Run id."`
-	Await bool   `help:"Wait until the machine confirms the cancellation outcome."`
+	ID      string `arg:"" name:"run" help:"Run id."`
+	Await   bool   `help:"Wait until the machine confirms the cancellation outcome."`
+	Abandon bool   `help:"Abandon local Runtime-run tracking only; does not confirm remote stop or end a rental."`
 }
 
 type RunPauseCmd struct {
@@ -518,7 +519,7 @@ func (c *RunResumeCmd) Run(r *Runtime) error {
 }
 
 func (c *RunCancelCmd) Run(r *Runtime) error {
-	return r.call(handleRunCancel, []string{c.ID}, bools("--await", c.Await), nil, true)
+	return r.call(handleRunCancel, []string{c.ID}, bools("--await", c.Await, "--abandon", c.Abandon), nil, true)
 }
 
 type RunListCmd struct {

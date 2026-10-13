@@ -86,6 +86,7 @@ func (s *Server) describeRelease(w http.ResponseWriter, r *http.Request) {
 
 // This is a client observation, not an execution or custody receipt of its own.
 type MachineExecutionView struct {
+	AbandonedLocally bool   `json:"abandoned_locally,omitempty"`
 	Accepted         bool   `json:"accepted"`
 	Machine          string `json:"machine"`
 	Collected        bool   `json:"collected"`
@@ -118,7 +119,7 @@ var providerRefusal = regexp.MustCompile(`CREDENTIAL_REQUIRED|origin answered HT
 
 func (s *Server) refreshMachineExecution(ctx context.Context, request records.Request) *exit.Error {
 	link, problem := s.store.MachineExecution(request.ID)
-	if problem != nil || link == nil || len(link.Receipt) == 0 || link.Collected && len(link.PendingControl) == 0 {
+	if problem != nil || link == nil || link.Abandoned || len(link.Receipt) == 0 || link.Collected && len(link.PendingControl) == 0 {
 		return problem
 	}
 	if lost, problem := s.store.MachineExecutionLost(request.ID); problem != nil || lost {
@@ -138,7 +139,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	if machine == "" {
 		machine = link.MachineID
 	}
-	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected}
+	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected, AbandonedLocally: link.Abandoned}
 	var receipt pb.MachineExecutionReceipt
 	if proto.Unmarshal(link.Receipt, &receipt) == nil {
 		view.Worker, view.Number = receipt.WorkerId, receipt.Number
@@ -182,7 +183,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	if row.State == "blocked" && state.Status == "failed" {
 		state.StoppedEventID = s.store.StoppedEventID(row)
 	}
-	if row.State == "failed" || row.State == "blocked" {
+	if row.State == "failed" || row.State == "blocked" || row.State == "abandoned" {
 		state.ErrorType, state.ErrorCode, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
 	// The run's output log as this client holds it; its result is the fold once collected.
@@ -365,6 +366,12 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 	}
 	if link == nil {
 		return false, nil
+	}
+	if link.Abandoned {
+		if action == "cancel" {
+			return true, nil
+		}
+		return true, exit.Named(exit.Conflict, "request.abandoned", "this run was abandoned locally and cannot be resumed")
 	}
 	if action == "cancel" && records.Settled(row.State) && !row.RetainWork {
 		// Already terminal and holding nothing a cancel would release: the same answer

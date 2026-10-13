@@ -45,12 +45,13 @@ const (
 // An owned machine receives scoped execution access without joining the rental registry.
 type machineHub struct {
 	*fakeRentalHub
-	worker   *httptest.Server
-	access   *httptest.Server // local account-delegated content API, separate from account calls
-	ca       []byte           // the worker doors' private CA
-	provider string           // the rental's machine root, as its provider booted it
-	mu       sync.Mutex
-	grants   map[string]string // more of the grant, as a Hub adds a port for an image that serves it
+	worker                                        *httptest.Server
+	access                                        *httptest.Server // local account-delegated content API, separate from account calls
+	ca                                            []byte           // the worker doors' private CA
+	provider                                      string           // the rental's machine root, as its provider booted it
+	mu                                            sync.Mutex
+	grants                                        map[string]string // more of the grant, as a Hub adds a port for an image that serves it
+	authorityWorker, authorityToken, authorityKey string            // current provider attempt only
 }
 
 func newMachineHub(t *testing.T) *machineHub {
@@ -58,6 +59,16 @@ func newMachineHub(t *testing.T) *machineHub {
 	h := &machineHub{fakeRentalHub: newFakeRentalHub(t, 0)}
 	h.worker, h.ca = hubTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/v1/worker/rental/authorized-keys":
+			h.mu.Lock()
+			worker, token, key := h.authorityWorker, h.authorityToken, h.authorityKey
+			h.mu.Unlock()
+			if r.Method != http.MethodGet || worker == "" || token == "" || key == "" ||
+				r.Header.Get("X-Cozy-Worker-ID") != worker || r.Header.Get("X-Cozy-Worker-Token") != token {
+				http.Error(w, "worker authority refused", http.StatusForbidden)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"worker_id": worker, "authorized_keys": []string{key}, "lease_seconds": 30})
 		case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -77,7 +88,7 @@ func newMachineHub(t *testing.T) *machineHub {
 			t.Error("owned machine attempted Hub registration")
 			http.Error(w, "registration is not a local machine lifecycle", http.StatusGone)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/execution-access" && authorized:
-			_ = json.NewEncoder(w).Encode(map[string]any{"token": "execution-test-access", "expires_at": time.Now().Add(time.Hour),
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": executionGrantToken(h.server.URL, "fixture-account", 1), "expires_at": time.Now().Add(time.Hour),
 				"environment": map[string]string{"TENSORHUB_ORIGIN": h.access.URL, "TENSORHUB_PUBLIC_ORIGIN": h.server.URL}})
 		case strings.HasPrefix(r.URL.Path, "/v1/tensorfs/"):
 			h.worker.Config.Handler.ServeHTTP(w, r)
@@ -162,9 +173,13 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(dir, "media-token"), []byte(mediaToken), 0600))
 	environment := h.environment()
+	workerToken := randomToken(t)
+	h.mu.Lock()
+	h.authorityWorker, h.authorityToken, h.authorityKey = parityWorker, workerToken, identity.PublicKey()
+	h.mu.Unlock()
 	maps.Copy(environment, map[string]string{
 		"COZY_MACHINE_ROOT": host.Root(), "COZY_MACHINE_LIFETIME": "rental", "COZY_LISTEN_HOST": "127.0.0.1",
-		"COZY_WORKER_ID": parityWorker, "COZY_WORKER_AUTH_TOKEN": randomToken(t),
+		"COZY_WORKER_ID": parityWorker, "COZY_WORKER_AUTH_TOKEN": workerToken,
 		"COZY_WORKER_INTERNAL_PORT": strconv.Itoa(workerPort), "COZY_MEDIA_INTERNAL_PORT": strconv.Itoa(mediaPort),
 		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL": receiptKey, "COZY_RECORD_OWNER_AUTH_JSON": string(auth),
 	})
@@ -183,7 +198,7 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 	record, err := json.Marshal(map[string]any{"pid": command.Process.Pid, "worker_id": parityWorker,
 		"worker_port": workerPort, "media_port": mediaPort, "receipt_key": receiptKey})
 	must(t, err)
-	must(t, os.WriteFile(filepath.Join(dir, "host.json"), record, 0600))
+	must(t, os.WriteFile(filepath.Join(dir, "agent.json"), record, 0600))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	launch, problem := host.Ensure(ctx, "", nil, false)
@@ -270,10 +285,16 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 		if kind == "request.rentals" || kind == "request.placement" || kind == "machine.collected" {
 			continue
 		}
+		// Local boot may briefly park while the already-started rental connects.
+		// Connection diagnostics and stdout can interleave with durable machine
+		// events; parity concerns the accepted execution and its result lifecycle.
+		if kind == "request.parked" || kind == "request.log" ||
+			kind == "request.preparing" && event.Payload["stage"] == "connect" {
+			continue
+		}
 		// Progress is lossy by design: the machine records it only while the run lives, so a
 		// frame that reaches it after the terminal is dropped on one venue and not the other.
-		fields, _ := event.Payload["fields"].(map[string]any)
-		if kind == "machine.progress" || kind == "request.progress" || kind == "request.log" && fields["position"] != nil {
+		if kind == "machine.progress" || kind == "request.progress" {
 			continue
 		}
 		if kind == "request.preparing" {
