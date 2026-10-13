@@ -5653,7 +5653,7 @@ fn publish_renews_only_expired_authority_and_keeps_long_puts_live() {
 fn publish_refills_slots_while_a_large_put_waits_and_renews() {
     let root = temporary("publish-rolling");
     let store = Store::init(&root).unwrap();
-    let mut sizes = vec![4; 24];
+    let mut sizes = vec![512; 24];
     sizes[0] = 1 << 20;
     let checkpoint = Arc::new(checkpoint_sizes(&sizes));
     let source = hub_origin(Arc::clone(&checkpoint), |_, _| None);
