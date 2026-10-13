@@ -380,7 +380,9 @@ func parityMachinesOn(t *testing.T, source machines.Source, front ...func(string
 	h.mu.Lock()
 	h.rentals[parityRental] = map[string]any{"rental_id": parityRental, "name": "tessa", "state": "ready",
 		"requested_accelerator_model": model, "accelerator_count": count, "hourly_rate_usd_micros": 1,
-		"worker_address": launch.Addr, "media_address": launch.MediaAddr}
+		"worker_address": launch.Addr, "media_address": launch.MediaAddr, "machine_name": "tessa",
+		"cert_pem":  string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: launch.Leaf})),
+		"worker_id": launch.WorkerID, "worker_boot_id": launch.BootID, "creator_public_key": identity.PublicKey()}
 	h.mu.Unlock()
 	fatal(t, rental.Attach(layout, store, records.Rental{ID: parityRental, MachineName: "tessa", SKU: "virtual-4", State: "ready",
 		AcceleratorModel: model, AcceleratorCount: count, HourlyRateUSDMicros: 1, Hub: h.server.URL,

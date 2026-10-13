@@ -485,9 +485,15 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 // candidate too, before its pod has a row: the machine on its way.
 func (m *managedRentals) attachedLocked(origin string, req records.Request, runtimeOwned bool, bySKU map[machineKey]hub.RentalSKU,
 	needsAccelerator bool, constraints rental.Constraints) ([]orchestrator.PlacementCandidate, *exit.Error) {
-	rows, problem := m.store.Rentals()
-	if problem != nil {
-		return nil, problem
+	// Reconciliation above supplied the authoritative live census. A local row
+	// only joins durable request ownership; its absence cannot hide paid capacity.
+	var rows []records.Rental
+	for _, remote := range m.censusLocked(origin).live {
+		row, problem := (rental.LiveResolver{Store: m.store}).Record(rental.Live{Hub: origin, Rental: remote})
+		if problem != nil {
+			return nil, problem
+		}
+		rows = append(rows, *row)
 	}
 	reserved, problem := m.reservationsLocked(rows)
 	if problem != nil {
@@ -1423,13 +1429,13 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			rebooted = append(rebooted, row.ID)
 			continue
 		}
-		if remote.Attachable() && localRentalAttachable(row) && remote.WorkerID == row.ExpectedWorkerID &&
-			(remote.WorkerBootID != row.ExpectedWorkerBootID || remote.Address != row.Address || remote.MediaAddress != row.MediaAddress) {
+		if remote.Attachable() && localRentalAttachable(row) &&
+			(remote.WorkerID != row.ExpectedWorkerID || remote.WorkerBootID != row.ExpectedWorkerBootID || remote.Address != row.Address || remote.MediaAddress != row.MediaAddress) {
 			if problem := rental.Reboot(m.layout, m.store, row.ID, remote); problem != nil {
 				m.sayLocked("reboot:"+row.ID, "rental "+row.ID+" rebooted and is not re-attached: "+problem.Message)
 			} else {
 				fmt.Fprintf(m.ctx.Out, "rental %s (%s) rebooted; attaching its new worker\n", row.ID, row.MachineName)
-				row.ExpectedWorkerBootID, row.Address, row.MediaAddress = remote.WorkerBootID, remote.Address, remote.MediaAddress
+				row.ExpectedWorkerID, row.ExpectedWorkerBootID, row.Address, row.MediaAddress = remote.WorkerID, remote.WorkerBootID, remote.Address, remote.MediaAddress
 				rebooted = append(rebooted, row.ID)
 			}
 		}

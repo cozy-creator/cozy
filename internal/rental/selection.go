@@ -443,7 +443,7 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	case records.RentalTerminalState(row.State):
 		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedNotReady + ": " + row.State
 		return false
-	case !records.RentalReadyState(row.State) || row.Address == "" || row.CertPath == "":
+	case !records.RentalReadyState(row.State) || row.Address == "" || row.CertPath == "" && row.CertificatePEM == "":
 		c.Verdict = orchestrator.VerdictAttaching
 		return false
 	}

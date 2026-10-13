@@ -1,11 +1,5 @@
-// Package rental is the local side of a rented pod (cl-015): where its facts live, where
-// its credential lives, and the ONE function that turns a rental id into the dial triple
-// the orchestrator attaches a remote worker with.
-//
-// The split is deliberate and is the same one cl-006 already made for the CLI's own
-// credential: facts are rows in the records authority; the media bearer and Creator
-// private key are separate 0600 files. The pinned worker certificate is public and sits
-// beside them because crypto/x509 consumes a file.
+// Package rental owns local key custody and durable acquisition replay.
+// Live identity, endpoint and lifecycle come from Tensorhub through LiveResolver.
 package rental
 
 import (
@@ -299,9 +293,8 @@ func noAddress(id, state string) *exit.Error {
 
 // Resolver is what the daemon entrypoint hands the orchestrator as `Options.Rentals`. It
 // is the dial-time resolution of the machine pin and Creator signing identity. It reads the
-// store on EVERY call rather than closing over a
-// snapshot: `cozy rental new` is a records-plane act that runs against a daemon already up, so
-// a resolver that cached would refuse the rental the user just made until a restart.
+// supplied reader on every call. The production reader asks the owning Hub, so
+// an existing daemon observes new rentals and replacement worker identities.
 func Resolver(l home.Layout, read func(string) (*records.Rental, *exit.Error)) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
 	return func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
 		row, e := read(id)

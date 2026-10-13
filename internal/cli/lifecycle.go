@@ -232,7 +232,7 @@ func rentalAuthority(ctx *Context, id string) (string, *exit.Error) {
 		return "", problem
 	}
 	defer store.Close()
-	known, problem := rental.Resolve(store, id)
+	known, problem := rental.RecordedSubject(store, id)
 	if problem != nil {
 		return "", problem
 	}

@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -140,5 +143,91 @@ func TestRentalObservationReplacesEndpointAndOldBootUpdateHold(t *testing.T) {
 	update.State = "failed"
 	if problem := store.SaveRuntimeUpdate(*update); problem == nil {
 		t.Fatal("stale updater overwrote replacement operation")
+	}
+	row.State, row.Failure.Code = "degraded", "readiness.provider_stopped"
+	fatal(t, store.ObserveRental(row))
+	stopped, problem := store.RuntimeUpdate(row.ID)
+	fatal(t, problem)
+	if stopped.Active() || !strings.Contains(stopped.Error, "provider reports this rental stopped") {
+		t.Fatalf("provider stop retained update hold: %+v", stopped)
+	}
+	row.State, row.Failure.Code = "ready", ""
+	fatal(t, store.ObserveRental(row))
+	stopped, problem = store.RuntimeUpdate(row.ID)
+	fatal(t, problem)
+	if stopped.Active() {
+		t.Fatal("observed resume restarted a canceled software change")
+	}
+	next, problem = store.BeginRuntimeUpdate(row.ID, row.ExpectedWorkerBootID, update.Selection)
+	fatal(t, problem) // A new explicit update remains possible after resume.
+	row.State = "released"
+	fatal(t, store.ObserveRental(row))
+	settled, problem := store.RuntimeUpdate(row.ID)
+	fatal(t, problem)
+	if settled.Active() || !strings.Contains(settled.Error, "Hub confirmed") {
+		t.Fatalf("gone rental kept update active: %+v", settled)
+	}
+	next.State = "updating"
+	if problem := store.SaveRuntimeUpdate(*next); problem == nil {
+		t.Fatal("late observer resurrected ended rental update")
+	}
+}
+
+func TestRentalSecretSweepRequiresAffirmativeHubAbsence(t *testing.T) {
+	layout, problem := home.Open(t.TempDir())
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	const id = "pr-live-without-projection"
+	adoptCreatorIdentity(t, layout, id)
+	pending := filepath.Join(layout.Rentals, "pending-unknown.creator.pem")
+	must(t, os.WriteFile(pending, []byte("retained pending custody"), 0600))
+	for _, read := range []func(string) (bool, *exit.Error){
+		func(string) (bool, *exit.Error) { return false, nil },
+		func(string) (bool, *exit.Error) { return false, exit.New(exit.Unavailable, "Hub unavailable") },
+		func(string) (bool, *exit.Error) { return false, exit.New(exit.NotFound, "unknown authority") },
+	} {
+		_, _ = reclaim.RentalSecrets(layout, store, read)
+		if _, err := os.Stat(layout.RentalCreatorIdentity(id)); err != nil {
+			t.Fatalf("lost live key custody: %s", err)
+		}
+	}
+	_, problem = reclaim.RentalSecrets(layout, store, func(string) (bool, *exit.Error) { return true, nil })
+	fatal(t, problem)
+	if _, err := os.Stat(layout.RentalCreatorIdentity(id)); !os.IsNotExist(err) {
+		t.Fatal("confirmed terminal key was retained")
+	}
+	if _, err := os.Stat(pending); err != nil {
+		t.Fatal("unknown pending custody was deleted")
+	}
+}
+
+func TestHistoricalAttachedAcquisitionsDoNotBecomeFleetRows(t *testing.T) {
+	root, origin, stand := rentalEndRoot(t, "historical-attached")
+	stand.publishListing()
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	for _, id := range []string{"sep-first", "sep-second", "sep-third", "oct-first", "oct-second", "oct-third"} {
+		_, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: id, Hub: origin, HourlyRateUSDMicros: 100000}, func(name string) ([]byte, string, *exit.Error) {
+			return []byte(`{"name":"` + name + `","sku":"cpu"}`), id, nil
+		})
+		fatal(t, problem)
+		fatal(t, store.AdvanceRentalOperation(id, "pr-"+id, "attached"))
+	}
+	code, out := runCozy(t, root, "rental", "list", "--json", "--full")
+	var report struct {
+		Rentals  []any `json:"rentals"`
+		Machines int   `json:"machines_running"`
+		Pending  int   `json:"unattached_rental_operations"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &report) != nil || len(report.Rentals) != 0 || report.Machines != 0 || report.Pending != 0 {
+		t.Fatalf("historical receipts masqueraded as live fleet: %d %s", code, out)
+	}
+	ops, problem := store.RentalOperations()
+	fatal(t, problem)
+	if len(ops) != 6 {
+		t.Fatal("fleet listing removed durable acquisition history")
 	}
 }

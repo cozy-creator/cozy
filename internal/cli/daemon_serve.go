@@ -121,7 +121,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// orchestrator resolves the dial triple at dial time. Only the second reads the token.
 	readRental := func(id string) (*records.Rental, *exit.Error) { return observedRental(ctx, st, id) }
 	rentals := rental.Resolver(l, readRental)
-	knownRentals := rental.Known(readRental)
+	readProjection := func(id string) (*records.Rental, *exit.Error) { return liveRentalProjection(ctx, st, id) }
+	knownRentals := rental.Known(readProjection)
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	// The daemon starts this computer's machine as `cozy machine start` does.
@@ -177,16 +178,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
 	installs := machineset.NewInstalls(st, machines.Prewarm, ctx.Out)
-	installs.Rental = func(id string) (*records.Rental, *exit.Error) {
-		call, cancel := hub.Context()
-		defer cancel()
-		resolver := liveRentalResolver(ctx, st)
-		live, problem := resolver.Read(call, id)
-		if problem != nil {
-			return nil, problem
-		}
-		return resolver.Record(live)
-	}
+	installs.Rental = readProjection
 	fleet.installs = installs
 	installsStopped := make(chan struct{})
 	defer cancelInstalls()
@@ -255,7 +247,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 		// The lifecycle sweep is a few reads: it goes first, before anything owed can buy.
 		{"lifecycle sweep", func() string {
 			publications, publicationsNote := reclaimNote(reclaim.Publications(l, st))
-			rentalSecrets, rentalSecretsNote := reclaimNote(reclaim.RentalSecrets(l, st))
+			rentalSecrets, rentalSecretsNote := reclaimNote(reclaim.RentalSecrets(l, st, func(id string) (bool, *exit.Error) {
+				call, cancel := hub.Context()
+				defer cancel()
+				live, problem := liveRentalResolver(ctx, st).Read(call, id)
+				return problem == nil && hub.RentalAbsent(live.Rental.State), problem
+			}))
 			return fmt.Sprintf("%d publication root(s) settled%s · %d stale rental secret(s) erased%s",
 				publications.Removed, publicationsNote, rentalSecrets.Removed, rentalSecretsNote)
 		}},

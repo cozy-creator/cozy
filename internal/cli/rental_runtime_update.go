@@ -90,6 +90,8 @@ func (u *rentalRuntimeUpdates) Boot(id string) {
 			}
 			return
 		}
+		u.run(*current)
+		return
 	}
 	if _, problem := u.follow(id); problem != nil {
 		fmt.Fprintf(u.machines.context.Out, "rental %s keeps its software: %s\n", id, problem.Message)
@@ -173,7 +175,7 @@ func (u *rentalRuntimeUpdates) Resume() {
 		return
 	}
 	for _, row := range rows {
-		u.run(row)
+		u.Boot(row.RentalID)
 	}
 }
 
@@ -381,8 +383,8 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 			return problem
 		}
 		if target.Runtime == "" {
-			return exit.Named(exit.Validation, "rental.no_target_software", "the Hub names no target software for %s", row.MachineName).
-				WithRemedy("name it: cozy rental update %s --runtime-version <version> --tensorfs-version <version>", row.MachineName)
+			return exit.Named(exit.Validation, "rental.no_target_software", "the Hub names no target software for %s", row.DisplayName()).
+				WithRemedy("name it: cozy rental update %s --runtime-version <version> --tensorfs-version <version>", row.DisplayName())
 		}
 		request.RuntimeVersion, request.TensorFSVersion = target.Runtime, target.TensorFS
 	}
@@ -392,13 +394,13 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	}
 	update, problem := c.UpdateRentalRuntime(row.ID, request)
 	if problem == nil {
-		update, problem = awaitRentalUpdate(ctx, c, row.MachineName, update)
+		update, problem = awaitRentalUpdate(ctx, c, row.DisplayName(), update)
 	}
 	if problem != nil {
 		return problem
 	}
 	if update.State == "failed" {
-		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.MachineName, update.Error)
+		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.DisplayName(), update.Error)
 	}
 	var result runtimeUpdateResult
 	_ = json.Unmarshal(update.Result, &result)
@@ -407,7 +409,7 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 		status = "unchanged: " + result.Note
 	}
 	return emit(ctx, compactRecord([]output.Field{
-		{K: "machine", V: row.MachineName}, {K: "runtime", V: result.To.Runtime}, {K: "tensorfs", V: result.To.TensorFS},
+		{K: "machine", V: row.DisplayName()}, {K: "runtime", V: result.To.Runtime}, {K: "tensorfs", V: result.To.TensorFS},
 		{K: "status", V: status}, {K: "previous_runtime", V: result.From.Runtime}, {K: "update_id", V: update.ID},
 	}, "machine", "runtime", "tensorfs", "status"))
 }

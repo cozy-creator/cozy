@@ -138,7 +138,12 @@ func (r LiveResolver) Record(live Live) (*records.Rental, *exit.Error) {
 	row.AcceleratorModel, row.AcceleratorCount = remote.AcceleratorModel, remote.AcceleratorCount
 	row.HourlyRateUSDMicros = remote.HourlyRateUSDMicros
 	row.Address, row.MediaAddress = remote.Address, remote.MediaAddress
+	row.CertificatePEM = remote.CertPEM
 	row.ExpectedWorkerID, row.ExpectedWorkerBootID = remote.WorkerID, remote.WorkerBootID
+	row.Failure = records.RentalFailure{}
+	if remote.Failure != nil {
+		row.Failure.Code, row.Failure.ContainerState = remote.Failure.Code, remote.Failure.ContainerState
+	}
 	if row.RentedAt == "" {
 		row.RentedAt = remote.CreatedAt
 	}

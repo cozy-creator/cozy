@@ -221,7 +221,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		costOf(&summary, live[row.ID])
 		if update, problem := st.RuntimeUpdate(row.ID); problem != nil {
 			return result, problem
-		} else if update != nil && update.Active() {
+		} else if update != nil && update.Active() && current && seen.State == hub.RentalReady && seen.WorkerBootID == update.BootID {
 			summary.RuntimeUpdate = update.State
 		}
 		result.Rentals = append(result.Rentals, summary)
@@ -250,7 +250,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		return result, problem
 	}
 	for _, op := range open {
-		if attached[op.RentalID] || fleet.origin(op.Hub) != origin {
+		if op.State == "attached" || attached[op.RentalID] || fleet.origin(op.Hub) != origin {
 			continue
 		}
 		var request hub.RentalRequest

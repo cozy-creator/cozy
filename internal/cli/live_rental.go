@@ -26,6 +26,10 @@ func observedRental(ctx *Context, store *records.Store, id string) (*records.Ren
 		return nil, problem
 	}
 	remote := live.Rental
+	row, problem := resolver.Record(live)
+	if problem != nil {
+		return nil, problem
+	}
 	if !remote.Ready() {
 		return nil, exit.Named(exit.Unavailable, "rental.not_ready", "rental %s is %s; its Hub has not supplied a ready endpoint", id, remote.State)
 	}
@@ -36,10 +40,6 @@ func observedRental(ctx *Context, store *records.Store, id string) (*records.Ren
 	}
 	if key.PublicKey() != remote.CreatorPublicKey {
 		return nil, exit.Named(exit.Credential, "rental.creator_identity_conflict", "rental %s does not authorize this computer's retained key", id)
-	}
-	row, problem := resolver.Record(live)
-	if problem != nil {
-		return nil, problem
 	}
 	row.CertificatePEM = remote.CertPEM
 	return row, nil
@@ -54,4 +54,15 @@ func resolveLiveRental(ctx *Context, store *records.Store, name string) (rental.
 		_, problem = resolver.Record(live)
 	}
 	return live, problem
+}
+
+func liveRentalProjection(ctx *Context, store *records.Store, id string) (*records.Rental, *exit.Error) {
+	call, cancel := hub.Context()
+	defer cancel()
+	resolver := liveRentalResolver(ctx, store)
+	live, problem := resolver.Read(call, id)
+	if problem != nil {
+		return nil, problem
+	}
+	return resolver.Record(live)
 }

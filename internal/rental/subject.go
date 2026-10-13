@@ -2,24 +2,14 @@ package rental
 
 import (
 	"encoding/json"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Subject is what a person typed on the command line, resolved against everything this
-// host durably knows about paid pods (cl-193).
-//
-// It exists because a machine word — `aeirik` — is CREATOR'S alias and never a key the
-// hub can look anything up by: Tensorhub identifies a rental by the opaque id it minted,
-// which only the host that rented it holds. Sending the word as that id and reading the
-// resulting 404 as "already released" is not a lookup, it is a guess dressed as a fact,
-// and it answered `state: ended` for six H100s that were booting and billing.
-//
-// So the ladder below is the whole point: a 404 proves absence ONLY for an id this host
-// recorded. Everything else must say it does not know.
+// Subject joins immutable rental IDs to this controller's operation history.
+// It supplies custody and replay metadata, never a live name or state lookup.
 type Subject struct {
 	// Typed is the argument exactly as given.
 	Typed string
@@ -41,20 +31,13 @@ type Subject struct {
 // hub 404 for it is absence rather than a failed lookup.
 func (s Subject) Recorded() bool { return s.Row != nil || s.Operation != nil }
 
-// Resolve walks the local ladder: the rental record by machine word, then by id, then the
-// paid operations by rental id and by the machine word the ask was authored under. A live
-// operation outranks a settled one; among equals the newest ask wins, because that is the
-// one that may still be running.
-func Resolve(st *records.Store, typed string) (Subject, *exit.Error) {
-	found := Subject{Typed: typed}
-	row, problem := st.RentalByMachine(typed)
+// RecordedSubject looks up exact rental IDs only. Name selection belongs to
+// LiveResolver; retained aliases cannot make an ended host look live.
+func RecordedSubject(st *records.Store, id string) (Subject, *exit.Error) {
+	found := Subject{Typed: id}
+	row, problem := st.RentalRow(id)
 	if problem != nil {
 		return Subject{}, problem
-	}
-	if row == nil {
-		if row, problem = st.RentalRow(typed); problem != nil {
-			return Subject{}, problem
-		}
 	}
 	if row != nil {
 		found.Row = row
@@ -66,23 +49,14 @@ func Resolve(st *records.Store, typed string) (Subject, *exit.Error) {
 	}
 	for index := range operations {
 		op := &operations[index]
-		name := operationMachineName(op)
-		match := op.RentalID != "" && op.RentalID == found.RentalID
-		if found.Row == nil {
-			match = match || op.RentalID != "" && op.RentalID == typed || strings.EqualFold(name, typed)
-		}
-		if !match {
-			continue
-		}
-		if found.Operation != nil && settledOperation(*op) && !settledOperation(*found.Operation) {
+		if op.RentalID != id {
 			continue
 		}
 		found.Operation = op
-	}
-	// Without a record the subject is the chosen ask's pod: a word several asks used names
-	// each pod in turn, and the newest one is meant, never the first that bore it.
-	if op := found.Operation; found.Row == nil && op != nil {
-		found.RentalID, found.Machine, found.Hub = op.RentalID, operationMachineName(op), op.Hub
+		if row == nil {
+			found.RentalID, found.Machine, found.Hub = op.RentalID, operationMachineName(op), op.Hub
+		}
+		break
 	}
 	return found, nil
 }
@@ -97,8 +71,4 @@ func operationMachineName(op *records.RentalOperation) string {
 		return ""
 	}
 	return request.Name
-}
-
-func settledOperation(op records.RentalOperation) bool {
-	return op.State == "released" || op.State == "rejected"
 }

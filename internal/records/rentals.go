@@ -534,7 +534,12 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 // ObserveRental refreshes only the Hub-owned projection. Acquisition intent,
 // private-key custody, request ownership and update records remain independent.
 func (s *Store) ObserveRental(r Rental) *exit.Error {
-	_, err := s.db.Exec(`INSERT INTO rentals(id,machine_name,stable_machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin Hub rental observation: %s", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO rentals(id,machine_name,stable_machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at)
 	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
 	 stable_machine_name=excluded.stable_machine_name, accelerator_model=excluded.accelerator_model,
 	 accelerator_count=excluded.accelerator_count,hourly_rate_usd_micros=excluded.hourly_rate_usd_micros,
@@ -543,6 +548,19 @@ func (s *Store) ObserveRental(r Rental) *exit.Error {
 		r.ID, r.MachineName, r.StableMachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.ManagedRequestID, r.Address, r.CertPath, r.State, r.Hub, r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt)
 	if err != nil {
 		return exit.Internalf("cannot record Hub rental observation: %s", err)
+	}
+	if r.State == "failed" || r.State == "released" {
+		if problem := settleLostMachine(tx, r.ID); problem != nil {
+			return problem
+		}
+	}
+	if r.State == "degraded" && r.Failure.Code == "readiness.provider_stopped" {
+		if problem := settleUnavailableRuntimeUpdate(tx, r.ID, "the provider reports this rental stopped; its software update was not completed"); problem != nil {
+			return problem
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit Hub rental observation: %s", err)
 	}
 	return nil
 }
@@ -684,6 +702,9 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 	// Runtime work settles in the same transaction that records it.
 	if stored.State == "failed" || stored.State == "released" {
 		return settleLostMachine(tx, r.ID)
+	}
+	if r.State == "degraded" && r.Failure.Code == "readiness.provider_stopped" {
+		return settleUnavailableRuntimeUpdate(tx, r.ID, "the provider reports this rental stopped; its software update was not completed")
 	}
 	return nil
 }

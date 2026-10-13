@@ -38,6 +38,13 @@ func (r RuntimeUpdate) Active() bool {
 	return r.State == "preparing" || r.State == "updating" || r.State == "reconciling" || r.State == "waiting_activation"
 }
 
+func settleUnavailableRuntimeUpdate(tx *sql.Tx, rental, reason string) *exit.Error {
+	if _, err := tx.Exec(`UPDATE rental_runtime_updates SET state='failed',error=?,updated_at=? WHERE rental_id=? AND state NOT IN ('succeeded','failed')`, reason, now(), rental); err != nil {
+		return exit.Internalf("cannot settle the unavailable rental's software update: %s", err)
+	}
+	return nil
+}
+
 // RuntimeUpdateHold is why a rental takes no work because of its software update, or nil:
 // work waits for an update of the rental's current boot to end.
 func (s *Store) RuntimeUpdateHold(rental string) *exit.Error {
@@ -106,7 +113,7 @@ func (s *Store) SaveRuntimeUpdate(r RuntimeUpdate) *exit.Error {
 		return exit.New(exit.Validation, "Runtime update metadata is invalid or exceeds its bound")
 	}
 	selection, resultBytes := append([]byte{}, r.Selection...), append([]byte{}, r.Result...)
-	result, err := s.db.Exec(`UPDATE rental_runtime_updates SET state=?,selection=?,result=?,error=?,updated_at=? WHERE rental_id=? AND operation_id=? AND worker_boot_id=?`, r.State, selection, resultBytes, r.Error, now(), r.RentalID, r.ID, r.BootID)
+	result, err := s.db.Exec(`UPDATE rental_runtime_updates SET state=?,selection=?,result=?,error=?,updated_at=? WHERE rental_id=? AND operation_id=? AND worker_boot_id=? AND state NOT IN ('succeeded','failed')`, r.State, selection, resultBytes, r.Error, now(), r.RentalID, r.ID, r.BootID)
 	if err != nil {
 		return exit.Internalf("cannot save Runtime update: %s", err)
 	}

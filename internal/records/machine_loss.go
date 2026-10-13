@@ -155,6 +155,9 @@ func (s *Store) LoseMachine(machine, message string) *exit.Error {
 // confirmed run may have executed: it ends FAILED with its machine's loss, and its owner
 // resubmits.
 func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
+	if problem := settleUnavailableRuntimeUpdate(tx, machine, "the Hub confirmed this rental is no longer available"); problem != nil {
+		return problem
+	}
 	return settleLost(tx, machine, "", "", "")
 }
 
