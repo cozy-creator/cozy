@@ -1,5 +1,5 @@
 //! tfs: the Hub's TensorFS verifier, fixture writer and maintainer tool. `USAGE` lists the
-//! verbs; the library is the product path (cozy-machine links it).
+//! verbs; the library is the product path (TensorD links it).
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
