@@ -16,7 +16,7 @@ use std::{
     },
     path::PathBuf,
     process::{Child, Command},
-    sync::Arc,
+    sync::{Arc, Barrier},
     time::Duration,
 };
 use tensorfs_core::{
@@ -1051,4 +1051,39 @@ fn a_whole_reader_takes_a_window_when_a_layout_staged_in_part_cannot_grow() {
     let facts = tier.facts();
     assert_eq!(facts.windows, 1, "{facts:?}");
     assert!(facts.charged_bytes <= limit, "{facts:?}");
+}
+
+/// Two whole readers too large for the tier open their windows at once. Each window's room is
+/// reserved before it is allocated, so the second sees what the first took: past the one region
+/// each reader needs at least, the two never spend the same bytes.
+#[test]
+fn concurrent_windows_never_spend_the_same_room() {
+    let a = Fixture::new("window-a", &[8 * MIB; 4]);
+    let b = Fixture::new("window-b", &[8 * MIB; 4]);
+    copy_store(&b, &a);
+    let limit = 24 * MIB as u64;
+    for round in 0..20 {
+        let tier = tier(&a, limit);
+        let (_one, p) = Executor::spawn(&tier);
+        let (_two, q) = Executor::spawn(&tier);
+        let start = Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                start.wait();
+                ask(&tier, p, &a).unwrap()
+            });
+            let right = scope.spawn(|| {
+                start.wait();
+                ask(&tier, q, &b).unwrap()
+            });
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        let facts = tier.facts();
+        assert_eq!(facts.windows, 2, "{facts:?}");
+        assert!(
+            facts.window_bytes <= limit + (8 * MIB + MIB) as u64,
+            "round {round}: two windows spent the same room: {facts:?}"
+        );
+        drop((first, second));
+    }
 }
