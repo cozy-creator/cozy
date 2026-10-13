@@ -2978,6 +2978,99 @@ fn the_tls_pump_carries_a_real_exchange() {
     assert_eq!(response.read_capped(1 << 20).unwrap(), payload);
 }
 
+/// Run 5438: one handshake of a long upload failed certificate verification from a host that
+/// had verified many times in the same process. A certificate verdict from an origin this
+/// process verified is weather, asked again after the transfer's measured patience; once the
+/// transfer moves nothing for longer than its measured stillness, the verdict stands.
+#[test]
+fn a_certificate_refused_by_an_origin_verified_before_is_asked_again() {
+    let identity = || {
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
+        let private = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der())
+            .unwrap()
+            .clone_key();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], private)
+        .unwrap();
+        (cert, Arc::new(config))
+    };
+    let (trusted, good) = identity();
+    let (_, stranger) = identity();
+    // Connection 1 presents a certificate nobody trusts, between two trusted ones; every one
+    // from connection 3 on presents it again.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for (index, socket) in listener.incoming().enumerate() {
+            let Ok(socket) = socket else { return };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let config = if index == 0 || index == 2 {
+                &good
+            } else {
+                &stranger
+            };
+            let conn = rustls::ServerConnection::new(Arc::clone(config)).unwrap();
+            let mut stream = rustls::StreamOwned::new(conn, socket);
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(n) if n > 0 => head.extend_from_slice(&chunk[..n]),
+                    _ => break,
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+        }
+    });
+    let client = super::http::Client::with_extra_roots(&[trusted]);
+    let policy = SourcePolicy {
+        allowed_hosts: vec!["localhost".into()],
+        allow_local: true,
+        max_redirects: 0,
+        ..Default::default()
+    };
+    let base = format!("https://localhost:{port}");
+    let ask = |ledger: &Ledger| {
+        super::hub::call_method(
+            &client,
+            "GET",
+            &base,
+            "/v1/ping",
+            b"",
+            &Anonymous,
+            &policy,
+            Deadline::none(),
+            ledger,
+        )
+    };
+    let ledger = Ledger::with_resolution(Duration::from_millis(10));
+    ask(&ledger).unwrap();
+    ask(&ledger).expect("a verified origin's certificate verdict is asked again");
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+
+    // A transfer that moves nothing while it re-asks keeps the verdict.
+    let still = Ledger::with_resolution(Duration::from_millis(10));
+    let refused = ask(&still).unwrap_err();
+    assert_eq!(refused.code, Code::TLS_UNTRUSTED, "{}", refused.detail);
+    assert!(
+        refused.detail.contains("verified localhost before"),
+        "{}",
+        refused.detail
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 5);
+}
+
 // ---------------------------------------------------------------- the parity benchmark
 
 /// The tfs-049 parity benchmark, opt-in:

@@ -32,6 +32,7 @@ use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::CheckedUrl;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
+use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -258,6 +259,54 @@ struct Idle {
 /// trusted stays trusted, and every shared client picks up an addition on its next exchange.
 static EXTRA_ROOTS: Mutex<Vec<CertificateDer<'static>>> = Mutex::new(Vec::new());
 static TRUST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Origins (host, port) whose certificate this process has verified in a completed handshake.
+static VERIFIED: Mutex<BTreeSet<(String, u16)>> = Mutex::new(BTreeSet::new());
+
+/// A certificate verdict from an origin this process has already verified is the link's
+/// weather (run 5438: tensorhub.com, after many handshakes in one upload), not the origin's
+/// identity. It waits the transfer's measured patience and answers as the exchange's own
+/// failure, so each caller asks again backed off. Once the transfer has moved nothing for
+/// longer than its measured stillness, the verdict stands.
+fn recanted(
+    checked: &CheckedUrl,
+    refusal: Refusal,
+    ledger: &Ledger,
+    deadline: Deadline,
+    fail: Code,
+) -> Refusal {
+    let origin = (checked.host.clone(), checked.port);
+    if refusal.code != Code::TLS_UNTRUSTED || !VERIFIED.lock().unwrap().contains(&origin) {
+        return refusal;
+    }
+    let (still, stillness) = (ledger.still(), ledger.stillness());
+    if still.silent > stillness {
+        return Refusal {
+            code: Code::TLS_UNTRUSTED,
+            detail: format!(
+                "{}; this process verified {} before, and the transfer has moved nothing for \
+                 {:.1} s against the {:.1} s its measured pace allows",
+                refusal.detail,
+                checked.host,
+                still.silent.as_secs_f64(),
+                stillness.as_secs_f64(),
+            ),
+        };
+    }
+    let patience = ledger.patience();
+    if let Err(stopped) = ledger.pause(patience, deadline) {
+        return stopped;
+    }
+    Refusal {
+        code: fail,
+        detail: format!(
+            "{} — {} verified earlier in this process, so asked again after {:.1} s",
+            refusal.detail,
+            checked.host,
+            patience.as_secs_f64(),
+        ),
+    }
+}
 
 /// Trust the PEM certificates in `pem` for every client this process uses.
 pub fn trust_roots(pem: &[u8]) -> Result<usize> {
@@ -1186,7 +1235,7 @@ pub fn send<'l>(
             })?;
             let mut sock = sock;
             let mut conn = Box::new(conn);
-            tls_handshake(
+            let shaken = tls_handshake(
                 &checked.host,
                 &mut sock,
                 &mut conn,
@@ -1195,7 +1244,15 @@ pub fn send<'l>(
                 judge,
                 opened,
                 fail,
-            )?;
+            );
+            if let Err(refusal) = shaken {
+                drop((sock, conn));
+                return Err(recanted(checked, refusal, ledger, deadline, fail));
+            }
+            VERIFIED
+                .lock()
+                .unwrap()
+                .insert((checked.host.clone(), checked.port));
             Wire::Tls { sock, conn }
         } else {
             Wire::Plain(sock)
