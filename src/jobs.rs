@@ -1131,7 +1131,14 @@ struct Seam<'a> {
 }
 impl Services for Seam<'_> {
     fn progress(&mut self, frame: &Frame) {
-        if !(frame.request_id.is_empty() || frame.request_id == self.id) || frame.stage.is_empty() {
+        if !(frame.request_id.is_empty() || frame.request_id == self.id) {
+            return;
+        }
+        if let Some((level, text)) = frame.log() {
+            let _ = self.engine.append_package_log(self.id, level, &text);
+            return;
+        }
+        if frame.stage.is_empty() {
             return;
         }
         self.completed = self.completed.saturating_add(frame.advance);

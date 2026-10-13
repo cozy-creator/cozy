@@ -10,7 +10,7 @@ import msgspec
 import tensorfs
 from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import (App, Context, FileAsset, ImageAsset, ImageFrame, ModelArtifact, Outputs, WeightsOutput,
+from cozy_runtime.author import (App, Context, FileAsset, ImageAsset, ImageFrame, ModelArtifact, Outputs, Telemetry, WeightsOutput,
                                  invocable)
 
 app = App()
@@ -78,9 +78,10 @@ class Greeted(msgspec.Struct):
 
 
 @app.entrypoint
-def greet(ctx: Context, payload: Greeting) -> Greeted:
+def greet(ctx: Context, payload: Greeting, tel: Telemetry) -> Greeted:
     """A serving entrypoint another package calls with its request's fields, as H3 calls
     qwen-image-2's generate_image."""
+    tel.log("greeting", level="warning", times=payload.times)
     return Greeted(" ".join([payload.text] * payload.times))
 
 

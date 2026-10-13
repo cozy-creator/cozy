@@ -30,6 +30,20 @@ use std::{
 };
 
 pub const MAX_RUNNER_FRAME: usize = 1024 * 1024;
+/// The most text one package log line keeps.
+const PACKAGE_LOG_LINE: usize = 2 << 10;
+
+/// `text` cut to at most `max` bytes on a character boundary, marked when cut.
+fn bounded(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max - '…'.len_utf8();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
 
 impl crate::native_inputs::IntakeJournal for Engine {
     fn begin_intake(
@@ -351,6 +365,28 @@ impl Engine {
         drop(progress);
         self.notify_activity();
         Ok(sequence)
+    }
+    /// One line a run's package logged (`Telemetry.log`), on its root run's log, the one
+    /// `run show` displays: a call's lines lead with its function. A line keeps at most
+    /// `PACKAGE_LOG_LINE` bytes of text; past the root log's bound the first line becomes one
+    /// notice and later ones are dropped (`Journal::append_package_log`).
+    pub fn append_package_log(&self, id: &str, level: &str, text: &str) -> io::Result<()> {
+        let progress = self.progress.lock().unwrap();
+        let mut journal = self.journal.lock().unwrap();
+        let record = journal.get(id)?;
+        let (root, text) = match record.invocation.root.as_str() {
+            "" => (id, text.to_string()),
+            root => (root, format!("{}: {text}", record.invocation.entrypoint)),
+        };
+        let text = bounded(&text, PACKAGE_LOG_LINE);
+        let line = serde_json::to_vec(&serde_json::json!({"level": level, "text": text}))?;
+        let appended = journal.append_package_log(root, progress.get(root), &line)?;
+        drop(journal);
+        drop(progress);
+        if appended {
+            self.notify_activity();
+        }
+        Ok(())
     }
     /// A root's GPU allocation changed: a `gpu` entry in its log (`gpu_service::note_gpus`).
     pub fn append_gpu(&self, id: &str, entry: &serde_json::Value) -> io::Result<u64> {

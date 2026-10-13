@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import msgspec
 
-from cozy_runtime.author import App, Context, FileAsset, ImageAsset, Outputs
+from cozy_runtime.author import App, Context, FileAsset, ImageAsset, Outputs, Telemetry
 from cozy_runtime.derive.operations import QuantizationPlan, quantize
 from cpu_memo import Probe, greet, measure, nested, note, paint, produce, restricted
 
@@ -21,12 +21,13 @@ class Relayed(msgspec.Struct):
     greeting: str = ""
 
 
-async def relay(ctx: Context, payload: Relay) -> Relayed:
+async def relay(ctx: Context, payload: Relay, tel: Telemetry) -> Relayed:
     squares = []
     for value in payload.values:
         squares.append((await measure(payload=Probe(value, payload.counter))).square)
     # Another package's serving entrypoint, called with its request's fields (H3 -> qwen).
     greeted = await greet(text="squared", times=len(squares))
+    tel.log("relayed", squares=len(squares), greeting=greeted.text)
     return Relayed(squares=squares, greeting=greeted.text)
 
 

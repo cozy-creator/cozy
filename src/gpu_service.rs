@@ -4195,7 +4195,14 @@ impl Services for Callbacks<'_> {
         })
     }
     fn progress(&mut self, frame: &Frame) {
-        if !(frame.request_id.is_empty() || frame.request_id == self.id) || frame.stage.is_empty() {
+        if !(frame.request_id.is_empty() || frame.request_id == self.id) {
+            return;
+        }
+        if let Some((level, text)) = frame.log() {
+            let _ = self.engine.append_package_log(self.id, level, &text);
+            return;
+        }
+        if frame.stage.is_empty() {
             return;
         }
         // Zero-advance frames are telemetry (stage/position), not completed work.
