@@ -1,7 +1,7 @@
 //! DPoP over the real transport, against a server that verifies every proof the way
 //! AuthKit's resource servers and token endpoint do (`internal/dpop/proof.go`).
 use super::*;
-use crate::transport::{api_get, form_post, hub_call, AccessToken, DpopCredential, DpopKey};
+use crate::transport::{api_get, form_post, AccessToken, Client, DpopCredential, DpopKey};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 use serde_json::{Map, Value};
@@ -249,13 +249,16 @@ fn resource_requests_carry_proofs_authkit_accepts() {
     );
 
     // The first proof carries no nonce: challenged once, answered with it.
-    hub_call(
+    crate::transport::hub::call_method(
+        &Client::new(),
         "POST",
         &origin.url,
         "/v1/tensorfs/closure",
         b"{}",
         &credential,
         &policy,
+        Deadline::none(),
+        &Ledger::new(),
     )
     .unwrap();
     let asks = origin.asks.lock().unwrap().clone();
@@ -346,13 +349,16 @@ fn proofs_can_name_the_resource_servers_public_origin() {
         vec!["localhost".into()],
     )
     .proving_origin("https://hub.example/");
-    hub_call(
+    crate::transport::hub::call_method(
+        &Client::new(),
         "GET",
         &origin.url,
         "/v1/me",
         b"",
         &credential,
         &Origin::policy(),
+        Deadline::none(),
+        &Ledger::new(),
     )
     .unwrap();
     assert_eq!(origin.asks.lock().unwrap().len(), 1);
