@@ -91,8 +91,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   `Budget` (pinned, if `weight_plane/1`) and Activate once. Each request sends PrepareRequest and
   Invoke. Executors of other plans stay; the policy decides what they keep on the device.
 - Each Invoke carries a real grant: `cap_bytes` (whole process: context + torch + plane) to
-  `process_cap/1` executors, else a plane budget derived from it. `stages` is false: no per-stage
-  exchanges.
+  `process_cap/1` executors, else a plane budget derived from it.
 - Making room, in order: idle executors unmap (`Budget{vram 0}`, LRU), idle executors end (only
   while the lowest rung is unmet), a running call shrinks through its budget cell. Never refused by
   size: with nothing left, the cap is what there is.
@@ -116,7 +115,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 
 Executor requests:
 - `device_room`: idle tenants give room (unmap, then end); the answer's `cap_bytes` raises the
-  caller's cap into it. `stage_enter`/`stage_exit` (never asked for) keep the budget.
+  caller's cap into it.
 - `sealed_tier` goes to `HostTier` (`HOST-TIER.md`); `Load.pinned_bytes` carries the pinned budget.
 - `model_source` goes to `ModelSources` for selected headers/assets in sealed descriptors;
   payload buffers and granted object files are supplied by `HostTier`.

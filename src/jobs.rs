@@ -565,7 +565,6 @@ impl Jobs {
                 models: vec![],
                 authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
-                stages: false,
                 sealed_tiers: false,
                 model_sources: false,
                 staged_tiers: false,
@@ -618,7 +617,6 @@ impl Jobs {
                 deadline_s: None,
                 attention_kernel: String::new(),
                 plane_budget_bytes: -1,
-                stages: false,
                 cap_bytes: None,
                 inputs: inputs.inputs,
                 trees: inputs.trees,
@@ -1182,7 +1180,6 @@ impl Services for Seam<'_> {
             )),
             // A child call's product shows nothing (`sequence` 0): its parent decides.
             (Kind::Publish, _) => Ok((Answer::ok(frame.seq), None)),
-            (Kind::StageEnter | Kind::StageExit, _) => Ok((Answer::ok(frame.seq), None)),
             (Kind::WeightsWriter, _) => {
                 let Some((weights, grant)) = self.weights else {
                     return Ok((Answer::unavailable(frame.seq), None));

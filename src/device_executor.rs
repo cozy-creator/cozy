@@ -212,7 +212,6 @@ pub enum DeviceCommand {
         authorized_device_limit_bytes: Option<u64>,
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_pin: String,
-        stages: bool,
         /// `host_tiers.sealed/1`: each weight set asks for TensorD's sealed CPU-buffer layout.
         #[serde(skip_serializing_if = "is_false")]
         sealed_tiers: bool,
@@ -260,7 +259,6 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_kernel: String,
         plane_budget_bytes: i64,
-        stages: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cap_bytes: Option<u64>,
         /// File inputs by field path: read-only copies in this call's spool.
@@ -428,8 +426,6 @@ pub enum Kind {
     SealedPrefetch,
     DeviceTier,
     BudgetCell,
-    StageEnter,
-    StageExit,
     DeviceRoom,
     Publish,
     StageMemoLookup,
@@ -786,7 +782,6 @@ pub struct Answer {
     pub code: String,
     pub detail: String,
     pub held: bool,
-    pub budget_bytes: i64,
     /// A `DeviceRoom` answer: the process cap raised into the room made; -1 keeps it.
     pub cap_bytes: i64,
     /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
@@ -878,7 +873,6 @@ impl Answer {
             code: "capability_unavailable".into(),
             detail: "owner has not qualified this operation".into(),
             held: false,
-            budget_bytes: -1,
             cap_bytes: -1,
             descriptor: false,
             sha256: String::new(),
@@ -1874,16 +1868,6 @@ impl DeviceExecutor {
                     "sealed host tiers or a Load pinned budget without the executor capability",
                 ));
             }
-        }
-        if matches!(
-            command,
-            DeviceCommand::Load { stages: true, .. } | DeviceCommand::Invoke { stages: true, .. }
-        ) && !self.hello.offers("stage/1")
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "stage-turn capability absent",
-            ));
         }
         let sharing = match command {
             DeviceCommand::Load { device_weights, .. } => *device_weights,

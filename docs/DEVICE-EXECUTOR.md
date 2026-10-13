@@ -72,7 +72,6 @@ allocations, but that executor still needs its own model objects and CUDA contex
 | `Budget` | `weight_plane/1` |
 | `Load.device_weights`, `share` | `weights.attach/1` |
 | `revoke` | `weights.revoke/1` |
-| `Load.stages`, `Invoke.stages` | `stage/1` |
 | `Load.descriptor_sources` | `model_sources.descriptors/1` and degree 1 |
 | `Load.sealed_tiers` | `host_tiers.sealed/1` and `weight_plane/1` |
 | `Load.pinned_bytes` | `load_pinned/1` and `weight_plane/1` |
@@ -82,9 +81,7 @@ Hello's version and revision fields are provenance only. There is no SDK or Tens
 ## Observations
 
 `LoadFacts`, `PlaneFacts` and `Metrics` are typed optional records. An absent value is unknown,
-and signed byte fields keep the SDK's `-1` sentinel. A `stage_exit` with `yielded` is the
-executor's acknowledgement that it applied the returned budget, separate from the first exit.
-Observations never authorize kills.
+and signed byte fields keep the SDK's `-1` sentinel. Observations never authorize kills.
 
 ## Results
 

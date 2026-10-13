@@ -2830,7 +2830,6 @@ impl GpuPool {
                     authorized_device_limit_bytes:
                         device_total.or(self.config.authorized_device_limit_bytes),
                     attention_pin: String::new(),
-                    stages: false,
                     sealed_tiers: session.unsealed.is_none(),
                     model_sources: true,
                     staged_tiers: session.unsealed.is_none(),
@@ -3025,7 +3024,6 @@ impl GpuPool {
                 deadline_s: None,
                 attention_kernel: record.invocation.attention_kernel.clone(),
                 plane_budget_bytes,
-                stages: false,
                 cap_bytes,
                 inputs: inputs.inputs,
                 trees: inputs.trees,
@@ -4330,11 +4328,6 @@ impl Services for Callbacks<'_> {
                     return Err(io::Error::other("budget cell layout differs"));
                 }
                 self.cells.insert(frame.rank, file);
-                answer.ok = true;
-            }
-            // Calls never ask for turns (Invoke sends `stages: false`); keep the budget.
-            Kind::StageEnter | Kind::StageExit => {
-                drop(descriptor);
                 answer.ok = true;
             }
             Kind::DeviceRoom => {

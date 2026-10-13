@@ -38,7 +38,6 @@ struct Config {
 struct Pilot {
     custody: Arc<Mutex<ResidentCustody>>,
     reader: Option<(cozy_machine::journal::ProcessBirth, File)>,
-    budget: i64,
     cells: Vec<File>,
     log: File,
 }
@@ -48,23 +47,11 @@ impl Services for Pilot {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
-        let mut answer = Answer::unavailable(frame.seq);
-        match frame.kind {
-            Kind::BudgetCell => {
-                self.cells.extend(descriptor);
-                answer.ok = true;
-            }
-            Kind::StageEnter | Kind::StageExit => {
-                answer.ok = true;
-                answer.budget_bytes = self.budget;
-            }
-            _ => (),
+        if frame.kind != Kind::BudgetCell {
+            return Ok((Answer::unavailable(frame.seq), None));
         }
-        if answer.ok {
-            answer.code.clear();
-            answer.detail.clear();
-        }
-        Ok((answer, None))
+        self.cells.extend(descriptor);
+        Ok((Answer::ok(frame.seq), None))
     }
     fn device_tier(
         &mut self,
@@ -197,7 +184,6 @@ fn exec(
     let mut pilot = Pilot {
         custody: custody.clone(),
         reader: Some((executor.birth.clone(), exit)),
-        budget: config.plane_budget_bytes,
         cells: Vec::new(),
         log: File::create(root.join("events.jsonl"))?,
     };
@@ -236,7 +222,6 @@ fn exec(
             models: Vec::new(),
             authorized_device_limit_bytes: Some(config.authorized_device_limit_bytes),
             attention_pin: String::new(),
-            stages: false,
             sealed_tiers: false,
             model_sources: false,
             staged_tiers: false,
@@ -295,7 +280,6 @@ fn exec(
                 deadline_s: None,
                 attention_kernel: String::new(),
                 plane_budget_bytes: config.plane_budget_bytes,
-                stages: false,
                 cap_bytes: None,
                 inputs: Default::default(),
                 trees: Default::default(),
