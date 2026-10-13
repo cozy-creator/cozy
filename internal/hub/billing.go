@@ -16,8 +16,6 @@ import (
 // micros of USD; the wire carries it as decimal strings.
 const (
 	CreditCurrency = "USD"
-	creditProduct  = "api-credit"
-	creditPrice    = "deposit"
 	// CreditReturnPath is the hub page Stripe Checkout returns a buyer to.
 	CreditReturnPath = "/credits/return"
 )
@@ -112,51 +110,17 @@ type CreditDeposit struct {
 	Max     int64
 }
 
-// CreditDeposit reads the credit deposit for the merchant the hub publishes in its config.
+// CreditDeposit reads what one credit purchase may be from the hub's deposit endpoint.
 func (c *Client) CreditDeposit(ctx context.Context) (CreditDeposit, *exit.Error) {
-	var config struct {
-		Credit struct {
-			MerchantID string `json:"merchant_id"`
-		} `json:"credit"`
-	}
-	if problem := c.do(ctx, call{method: http.MethodGet, path: "/app/config.json"}, &config); problem != nil {
-		return CreditDeposit{}, problem
-	}
-	if config.Credit.MerchantID == "" {
-		return CreditDeposit{}, exit.Named(exit.Unavailable, "credits.merchant_missing",
-			"this hub does not publish its billing merchant; update Tensorhub before buying credit")
-	}
 	var out struct {
-		Data []struct {
-			Key    string `json:"key"`
-			Prices []struct {
-				ID             string `json:"id"`
-				Key            string `json:"key"`
-				Archived       bool   `json:"archived"`
-				Currency       string `json:"currency"`
-				CustomerAmount *struct {
-					Min int64 `json:"min_amount,string"`
-					Max int64 `json:"max_amount,string"`
-				} `json:"customer_amount"`
-			} `json:"prices"`
-		} `json:"data"`
+		PriceID string `json:"price_id"`
+		Min     int64  `json:"min_amount,string"`
+		Max     int64  `json:"max_amount,string"`
 	}
-	path := "/billing/v1/products?" + url.Values{"merchant": {config.Credit.MerchantID}, "keys": {creditProduct}}.Encode()
-	if problem := c.do(ctx, call{method: http.MethodGet, path: path, optionalAuth: true}, &out); problem != nil {
+	if problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/credit/deposit"}, &out); problem != nil {
 		return CreditDeposit{}, problem
 	}
-	for _, product := range out.Data {
-		if product.Key != creditProduct {
-			continue
-		}
-		for _, price := range product.Prices {
-			if price.Key == creditPrice && !price.Archived && price.Currency == CreditCurrency && price.CustomerAmount != nil {
-				return CreditDeposit{PriceID: price.ID, Min: price.CustomerAmount.Min, Max: price.CustomerAmount.Max}, nil
-			}
-		}
-	}
-	return CreditDeposit{}, exit.Named(exit.NotFound, "credits.not_sold",
-		"this hub sells no credit (%s/%s)", creditProduct, creditPrice)
+	return CreditDeposit{PriceID: out.PriceID, Min: out.Min, Max: out.Max}, nil
 }
 
 // CreditCheckout is a credit purchase awaiting the buyer on Stripe's hosted page. ID
