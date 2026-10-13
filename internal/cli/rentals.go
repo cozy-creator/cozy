@@ -1200,7 +1200,9 @@ func handleRentalShow(ctx *Context) *exit.Error {
 			continue
 		}
 		// An operator reads why the provider refused a create without asking for every field.
-		fields, all, value := append([]string{"rental"}, append(list.Fields, "compute", "storage", "provider refusal")...), list.AllFields,
+		// The list names the rental only when machine names repeat; the record always leads with it.
+		listed := slices.DeleteFunc(slices.Clone(list.Fields), func(field string) bool { return field == "rental" })
+		fields, all, value := append([]string{"rental"}, append(listed, "compute", "storage", "provider refusal")...), list.AllFields,
 			func(name string) (any, bool) { v, ok := row[name]; return v, ok }
 		if mode := ctx.Mode(); !mode.Human || mode.JSON {
 			fields, all = list.TypedFields, list.TypedAllFields

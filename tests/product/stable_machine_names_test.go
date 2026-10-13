@@ -54,6 +54,9 @@ func TestStableMachineNameCLIAndOriginalAlias(t *testing.T) {
 	if code, out := runCozy(t, root, "rental", "list"); code != 0 || !strings.Contains(out, "pr-stable") || !strings.Contains(out, "pr-collision") {
 		t.Fatalf("two rentals on one host are indistinguishable rows [%d]: %s", code, out)
 	}
+	if code, out := runCozy(t, root, "rental", "show", "pr-stable"); code != 0 || strings.Count(out, "pr-stable") != 1 {
+		t.Fatalf("show by ID beside a rental on the same host [%d]: %s", code, out)
+	}
 	code, out = runCozy(t, root, "rental", "end", "mikatan-356e23", "--json")
 	if code == 0 || !strings.Contains(out, "rental.machine_name_ambiguous") {
 		t.Fatalf("ambiguous host was accepted [%d]: %s", code, out)
