@@ -73,9 +73,9 @@ fn owner_dir(store: &Store, owner: &str) -> Result<PathBuf> {
 type Chunks = BTreeMap<u64, (u64, String)>;
 
 /// Recorded ranges, merged into the bytes they cover.
-fn covered(done: &BTreeMap<u64, u64>) -> u64 {
+fn covered(chunks: &Chunks) -> u64 {
     let (mut total, mut reached) = (0, 0);
-    for (first, end) in done {
+    for (first, (end, _)) in chunks {
         let first = (*first).max(reached);
         if *end > first {
             total += end - first;
@@ -232,12 +232,13 @@ impl Part {
     }
 
     pub fn covered(&self) -> u64 {
-        covered(&self.done())
+        covered(&self.record.lock().unwrap().1)
     }
 
     /// Bytes `first..end` are home: data first, then the record line. A crash leaves the
-    /// record without it, and the range is asked for again.
-    pub fn record(&self, first: u64, end: u64, fault: &Fault) -> Result<()> {
+    /// record without it, and the range is asked for again. Answers the bytes it newly
+    /// covers, counted under the record's lock so ranges recorded side by side count once.
+    pub fn record(&self, first: u64, end: u64, fault: &Fault) -> Result<u64> {
         fault.hit(if first == 0 {
             "chunk-written"
         } else {
@@ -257,22 +258,26 @@ impl Part {
             .write_all(format!("{first} {end} {sha256}\n").as_bytes())
             .and_then(|()| record.0.sync_data())
             .map_err(io)?;
+        let before = covered(&record.1);
         record.1.insert(first, (end, sha256));
+        let added = covered(&record.1) - before;
         drop(record);
         fault.hit("chunk-recorded");
-        Ok(())
+        Ok(added)
     }
 
-    /// Forget every range: the bytes hashed wrong as a whole.
-    pub fn reset(&self) -> Result<()> {
+    /// Forget every range: the bytes hashed wrong as a whole. Answers the bytes it forgot.
+    pub fn reset(&self) -> Result<u64> {
         let mut record = self.record.lock().unwrap();
+        let forgot = covered(&record.1);
         record.1.clear();
         record
             .0
             .set_len(self.identity.len() as u64 + 1)
             .and_then(|()| record.0.sync_data())
             .and_then(|()| self.file.set_len(0))
-            .map_err(io)
+            .map_err(io)?;
+        Ok(forgot)
     }
 
     /// The record as it stands, replaced whole: a crash leaves the old one, whose
@@ -514,4 +519,41 @@ pub(crate) fn adopt_owner(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunks_recorded_side_by_side_count_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "tfs-source-part-{}-{}",
+            std::process::id(),
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&dir).unwrap();
+        let (chunk, chunks) = (64 << 10, 32u64);
+        let bytes: Vec<u8> = (0..chunk * chunks).map(|i| (i % 251) as u8).collect();
+        let object = ObjectRef::of(&bytes);
+        let part = Part::open(&store, &object.id(), &object, true).unwrap();
+        part.file.write_all_at(&bytes, 0).unwrap();
+        let added: u64 = std::thread::scope(|scope| {
+            let recording: Vec<_> = (0..chunks)
+                .map(|at| {
+                    let part = &part;
+                    scope.spawn(move || {
+                        part.record(at * chunk, (at + 1) * chunk, &Fault::default())
+                            .unwrap()
+                    })
+                })
+                .collect();
+            recording.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!((added, part.covered()), (object.length, object.length));
+        assert_eq!(part.record(0, chunk, &Fault::default()).unwrap(), 0);
+        assert_eq!(part.reset().unwrap(), object.length);
+        assert_eq!(part.covered(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
