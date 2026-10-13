@@ -446,6 +446,8 @@ pub enum Kind {
     Checkpoint,
     /// A job's weights: one source read, one output written, or an output adopted.
     WeightsWriter,
+    /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
+    Log,
     #[default]
     #[serde(other)]
     Unknown,
@@ -684,6 +686,10 @@ pub struct Frame {
     pub advance: u64,
     /// `progress`: the child call whose stage a job relays (the Runtime sends null for none).
     pub call_request: Option<String>,
+    /// A retained observation (`kind` log): `name` is its message, `value` its level and
+    /// `fields` its scalars.
+    pub value: Value,
+    pub fields: Value,
     /// PrepareRequest: the request's normalized features (its shape).
     pub features: BTreeMap<String, Value>,
     /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
@@ -736,6 +742,32 @@ pub struct Frame {
     pub transaction: String,
     pub logical_key: String,
     pub content_digest: String,
+}
+
+impl Frame {
+    /// A `log` observation (`Telemetry.log`) as its log line: the level (debug, info, warning
+    /// or error) and the message followed by ` key=value` for each field.
+    pub fn log(&self) -> Option<(&'static str, String)> {
+        if self.kind != Kind::Log {
+            return None;
+        }
+        let level = match self.value.as_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("warning" | "warn") => "warning",
+            Some("error" | "critical" | "fatal") => "error",
+            Some("debug") => "debug",
+            _ => "info",
+        };
+        let mut text = self.name.clone();
+        for (key, value) in self.fields.as_object().into_iter().flatten() {
+            match value {
+                Value::String(s) if !s.is_empty() && !s.contains(char::is_whitespace) => {
+                    text.push_str(&format!(" {key}={s}"))
+                }
+                other => text.push_str(&format!(" {key}={other}")),
+            }
+        }
+        Some((level, text))
+    }
 }
 
 /// One part of a composite product: a spool file and the media time it adds.

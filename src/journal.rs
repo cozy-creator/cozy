@@ -10,6 +10,11 @@ use std::{
 
 // Status observation cursor allocation, not a duration or liveness policy.
 const REVISION_WINDOW: u64 = 1 << 32;
+/// A root run's log keeps package log lines while it holds fewer lines than this and its
+/// records fit in the bytes (`Journal::append_package_log`).
+pub const PACKAGE_LOG_LINES: u64 = 512;
+pub const PACKAGE_LOG_BYTES: u64 = 256 << 10;
+const PACKAGE_LOG_DROPPED: &[u8] = br#"{"level":"warning","text":"later package log lines were dropped: a run's log keeps 512 lines and 256 KiB"}"#;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Invocation {
@@ -1971,6 +1976,41 @@ impl Journal {
         line: &[u8],
     ) -> io::Result<u64> {
         self.append_entry("INSERT INTO run_logs(execution,sequence,at_ms,record) VALUES(?1,?2,?3,?4)", id, progress, line)
+    }
+    /// A package's log line on a root run's log while the log holds fewer than
+    /// `PACKAGE_LOG_LINES` lines and the line fits in `PACKAGE_LOG_BYTES`; past that, one
+    /// `PACKAGE_LOG_DROPPED` notice and nothing more. True when a line was written.
+    pub fn append_package_log(
+        &mut self,
+        root: &str,
+        progress: Option<&ProgressSnapshot>,
+        line: &[u8],
+    ) -> io::Result<bool> {
+        let (lines, bytes): (u64, u64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(LENGTH(record)),0) FROM run_logs WHERE execution=?1",
+                [root],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(db_error)?;
+        if lines < PACKAGE_LOG_LINES && bytes + line.len() as u64 <= PACKAGE_LOG_BYTES {
+            self.append_log(root, progress, line)?;
+            return Ok(true);
+        }
+        let noticed: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_logs WHERE execution=?1 AND record=?2)",
+                params![root, PACKAGE_LOG_DROPPED],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if noticed {
+            return Ok(false);
+        }
+        self.append_log(root, progress, PACKAGE_LOG_DROPPED)?;
+        Ok(true)
     }
     /// A call of the run applied its attention pin: the pin is the root run's, whichever call
     /// holds the attention sites.

@@ -2001,6 +2001,22 @@ mod v1_api {
             })
             .collect();
         assert_eq!(calls, ["measure", "measure", "greet"], "{events:?}");
+        // Package log lines are the run's log: a call's lead with its function.
+        let logs: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Log(line)) => Some((line.level.clone(), line.text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            logs,
+            [
+                ("warning".to_string(), "greet: greeting times=2".to_string()),
+                ("info".to_string(), "relayed greeting=\"squared squared\" squares=2".to_string()),
+            ],
+            "{events:?}"
+        );
         // H3's references (run 4830): the job shows each image another package's entrypoint
         // returns as its own output the moment it exists, and returns them all at the end.
         let mut sitting = spec.clone();

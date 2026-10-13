@@ -75,3 +75,73 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
     drop(service);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A package's `Telemetry.log` lines, read from real wire frames, reach the root run's log
+/// (the one `run show` displays): the root's as written, a call's led by its function, each
+/// line bounded, and past the log's bound one notice and nothing more.
+#[test]
+fn package_log_lines_reach_the_root_log_and_stop_at_its_bound() {
+    let root = std::env::temp_dir().join(format!("cm-log-{}", uuid::Uuid::new_v4()));
+    let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+    let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+    let engine = &service.engine;
+    let accept = |id: &str, entrypoint: &str, parent: &str| {
+        let invocation = Invocation { entrypoint: entrypoint.into(), parent: parent.into(), ..Default::default() };
+        engine.accept_run("alice", id, id, invocation).unwrap().0.id
+    };
+    let job = accept("job", "long_form", "");
+    let child = accept("job/0", "caption_images", &job);
+    fn seam<'a>(engine: &'a Arc<Engine>, id: &'a str, store: &'a Store, spool: &'a std::path::Path) -> Seam<'a> {
+        Seam { engine, id, store, spool, completed: 0, publish: true, job: None, appended: HashMap::new(), weights: None }
+    }
+    let send = |seam: &mut Seam<'_>, request: &str, message: &str, level: &str, fields: Value| {
+        let event = json!({"event": "progress", "request_id": request, "kind": "log", "name": message,
+            "value": level, "fields": fields, "seq": 1, "at_unix_ms": 1});
+        let body = serde_json::to_vec(&event).unwrap();
+        let (mut runtime, mut machine) = UnixStream::pair().unwrap();
+        runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+        runtime.write_all(&body).unwrap();
+        seam.progress(&device_executor::read_frame(&mut machine).unwrap().unwrap());
+    };
+    let lines = || -> Vec<Value> {
+        engine.logs(&job).unwrap().iter().map(|l| serde_json::from_slice(&l.product).unwrap()).collect()
+    };
+    let (mut own, mut call) = (seam(engine, &job, &store, &root), seam(engine, &child, &store, &root));
+
+    // `Telemetry.log(message, /, *, level, **fields)`: a field may be called `name` or `text`.
+    send(&mut own, &job, "description text used", "info",
+        json!({"name": "Andrea", "text": "A woman with long dark hair", "index": 0}));
+    send(&mut call, &child, "caption slow", "warn", json!({"seconds": 3.5}));
+    // Another run's frame on this seam is not this run's line; other observations are not logs.
+    send(&mut own, &child, "not mine", "info", json!({}));
+    let body = serde_json::to_vec(&json!({"event": "progress", "request_id": job, "kind": "metric",
+        "name": "steps", "value": 3, "fields": {}})).unwrap();
+    let (mut runtime, mut machine) = UnixStream::pair().unwrap();
+    runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+    runtime.write_all(&body).unwrap();
+    own.progress(&device_executor::read_frame(&mut machine).unwrap().unwrap());
+    assert_eq!(lines(), vec![
+        json!({"level": "info", "text": "description text used index=0 name=Andrea text=\"A woman with long dark hair\""}),
+        json!({"level": "warning", "text": "caption_images: caption slow seconds=3.5"}),
+    ]);
+    assert!(engine.logs(&child).unwrap().is_empty(), "a call's lines are its root's");
+
+    // One line keeps at most 2 KiB of text, cut on a character boundary.
+    send(&mut own, &job, &"é".repeat(3000), "error", json!({}));
+    let long = lines().pop().unwrap();
+    let text = long["text"].as_str().unwrap();
+    assert_eq!((long["level"].as_str(), text.len() <= 2048, text.ends_with('…')), (Some("error"), true, true));
+
+    // The log stops at its bound: one notice, then nothing.
+    for n in 0..crate::journal::PACKAGE_LOG_LINES {
+        send(&mut call, &child, "step", "info", json!({"n": n}));
+    }
+    let kept = lines();
+    assert_eq!(kept.len() as u64, crate::journal::PACKAGE_LOG_LINES + 1);
+    assert_eq!(kept.last().unwrap()["level"], "warning");
+    assert!(kept.last().unwrap()["text"].as_str().unwrap().contains("dropped"), "{}", kept.last().unwrap());
+    assert_eq!(kept[crate::journal::PACKAGE_LOG_LINES as usize - 1]["text"], json!(format!("caption_images: step n={}", crate::journal::PACKAGE_LOG_LINES - 4)));
+    drop((own, call));
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
