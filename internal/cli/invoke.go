@@ -259,7 +259,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	input, ignored, e := validateInvocationPayload(ctx, target.Package, ep, input)
+	input, ignored, e := validateInvocationPayload(ctx, target, ep, input)
 	if e != nil {
 		return e
 	}
@@ -2953,10 +2953,15 @@ func requestKey(supplied string) string {
 // validateInvocationPayload applies the same validation and argument help to serving
 // functions and jobs, before either path resolves or acquires a model. It answers the
 // payload without its undeclared fields, and warns once naming them.
-func validateInvocationPayload(ctx *Context, pkg string, ep *launch.Entrypoint, input json.RawMessage) (json.RawMessage, []string, *exit.Error) {
-	cleaned, ignored, problem := launch.ValidatePayload(pkg, ep, input)
+func validateInvocationPayload(ctx *Context, target Target, ep *launch.Entrypoint, input json.RawMessage) (json.RawMessage, []string, *exit.Error) {
+	cleaned, ignored, problem := launch.ValidatePayload(target.Package, ep, input)
 	if len(ignored) > 0 {
-		ctx.warn(launch.IgnoredWarning(pkg+"/"+ep.Name, ignored))
+		warning := launch.IgnoredWarning(launch.Callable(target.Package, ep.Name, target.Release), ignored)
+		if target.Held != "" {
+			warning.Message += fmt.Sprintf("; %s holds %s %s, and `cozy package update %s --rental=%s` installs the newest",
+				target.Held, target.Package, target.Release, target.Package, target.Held)
+		}
+		ctx.warn(warning)
 	}
 	if problem != nil && !ctx.Mode().JSON {
 		problem.Message += "\n\n" + launch.DescribeArguments(ep)
@@ -3000,10 +3005,12 @@ func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 // Target is one package and optional callable selected for invocation. Interface
 // describes its inputs; an empty published Release leaves selection to the machine.
 type Target struct {
-	Package        string
-	Function       string
-	InstallID      string
-	Release        string
+	Package   string
+	Function  string
+	InstallID string
+	Release   string
+	// Held names the machine whose installation chose Release.
+	Held           string
 	Snapshot       bool
 	releaseCapture func()
 	// lease holds the resolved install until the daemon has recorded the submission.
@@ -3061,13 +3068,15 @@ func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInt
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	// An installed package is validated against its installed interface with no hub read;
-	// the machine that runs it prepares that release itself. A local package's interface is
-	// read again first if its directory changed since.
+	// A run executes the release its machine holds. This computer's installation decides only
+	// this computer's runs; a rental runs its own (rentalInvocationTarget). A local package's
+	// interface is read again first if its directory changed since.
 	if strings.HasPrefix(target.Package, "local/") {
 		if problem := refreshLocal(ctx, target.Package); problem != nil {
 			return Target{}, nil, problem
 		}
+	} else if rentalRequested(ctx) {
+		return rentalInvocationTarget(ctx, target)
 	}
 	facts, lease, problem := leasedInstallFacts(ctx, target.Package)
 	if problem == nil {
@@ -3085,22 +3094,63 @@ func invocationTarget(ctx *Context) (resolved Target, surface *launch.PackageInt
 	if problem.Code != exit.NotFound || strings.HasPrefix(target.Package, "local/") {
 		return Target{}, nil, problem
 	}
-	// A release this client has not installed: the one kept under the current catalog revision,
-	// else the selected Hub's newest. Every machine is sent that exact release with its card,
-	// so a machine reads no Hub to install it; a publish, yank or bind moves the revision.
+	return newestInvocationTarget(ctx, target)
+}
+
+// newestInvocationTarget is the newest release a machine holding none of target runs: the one
+// kept under the current catalog revision, else the selected Hub's newest. Every machine is sent
+// that exact release, so a machine reads no Hub to choose it; a publish, yank or bind moves the
+// revision.
+func newestInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
 	root, revision := home.Paths(ctx.Cfg.Home).Root, catalogRevision(ctx)
 	if release, surface := keptNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision); release != "" {
 		target.Release = release
 		return target, surface, nil
 	}
-	target, surface, problem = catalogInvocationTarget(ctx, target)
+	target, surface, problem := catalogInvocationTarget(ctx, target, "")
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	release := target.Release
-	keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision, release)
-	target.Release = release
+	keepNewestRelease(root, ctx.Cfg.HubURL, target.Package, revision, target.Release)
 	return target, surface, nil
+}
+
+// rentalInvocationTarget is the release a run on a rental executes, validated against that
+// release's interface: the newest the named machine holds from the selected Hub, else
+// newestInvocationTarget's, which the machine installs. `cozy package update --rental` moves it.
+func rentalInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
+	if machine := ctx.Inv.Value("--rental"); machine != "" {
+		release, problem := machineRelease(ctx, target.Package)
+		if problem != nil {
+			fmt.Fprintf(ctx.Err, "%s did not say which releases it holds (%s); running the newest release\n", machine, problem.Message)
+		}
+		if release != "" {
+			target.Held = machine
+			return catalogInvocationTarget(ctx, target, release)
+		}
+	}
+	return newestInvocationTarget(ctx, target)
+}
+
+// machineRelease is the newest release of pkg from the selected Hub that the run's named
+// machine holds, or "" when it holds none.
+func machineRelease(ctx *Context, pkg string) (string, *exit.Error) {
+	_, envs, problem := rentalEnvironments(ctx)
+	if problem != nil {
+		return "", problem
+	}
+	var newest string
+	var newestVersion pep440.Version
+	for _, env := range envs {
+		version, err := pep440.Parse(env.Release)
+		if env.Package != pkg || err != nil {
+			continue
+		}
+		if newest == "" || version.GreaterThan(newestVersion) {
+			newest, newestVersion = env.Release, version
+		}
+	}
+	return newest, nil
 }
 
 // catalogRevision is the catalog revision this client's runs at the selected Hub carry.
@@ -3114,9 +3164,16 @@ func catalogRevision(ctx *Context) string {
 	return revision
 }
 
-// catalogInvocationTarget is the selected Hub's newest release of target and its interface.
-func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
+// catalogInvocationTarget is target at release, the selected Hub's newest when empty, and its
+// interface: a release never changes, so one this computer kept is read with no Hub call.
+func catalogInvocationTarget(ctx *Context, target Target, release string) (Target, *launch.PackageInterface, *exit.Error) {
 	root := home.Paths(ctx.Cfg.Home).Root
+	if kept := readKeptRelease(root, ctx.Cfg.HubURL, target.Package, release); release != "" && kept.Interface != nil {
+		if surface, problem := launch.DecodePackageInterface(kept.Interface); problem == nil {
+			target.Release = release
+			return target, surface, nil
+		}
+	}
 	ref, problem := hub.ParseRef(target.Package)
 	if problem != nil {
 		return Target{}, nil, problem
@@ -3124,13 +3181,14 @@ func catalogInvocationTarget(ctx *Context, target Target) (Target, *launch.Packa
 	hctx, cancel := hub.Context()
 	defer cancel()
 	catalog := client(ctx)
-	card, problem := catalog.PackageCard(hctx, ref)
-	if problem != nil {
-		return Target{}, nil, problem
-	}
-	release, problem := newestPackageRelease(card.Releases)
-	if problem != nil {
-		return Target{}, nil, problem
+	if release == "" {
+		card, problem := catalog.PackageCard(hctx, ref)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		if release, problem = newestPackageRelease(card.Releases); problem != nil {
+			return Target{}, nil, problem
+		}
 	}
 	detail, problem := catalog.PackageRelease(hctx, ref, release)
 	if problem != nil {

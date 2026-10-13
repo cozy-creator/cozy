@@ -14,14 +14,15 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Real CLI submission must preserve the version chosen at install even when the
-// catalog publishes a newer version. This catalog supplies metadata only and has
-// no acquisition endpoint, so the proof cannot buy a machine or download weights.
-func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
+// A run on a machine the fleet chooses names the Hub's newest release, which that machine
+// installs: what this computer installed decides only this computer's runs. This catalog
+// supplies metadata only and has no acquisition endpoint, so the proof cannot buy a machine
+// or download weights.
+func TestARentalRunNamesTheNewestReleaseWhateverIsInstalledHere(t *testing.T) {
 	for _, installed := range []bool{true, false} {
 		name, want := "uninstalled uses latest", "2.10.0"
 		if installed {
-			name, want = "installed stays pinned", "2.9.0"
+			name = "installed here uses latest"
 		}
 		t.Run(name, func(t *testing.T) {
 			iface := []byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[{"name":"compute","models":[],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[]}]}`)
@@ -73,7 +74,7 @@ func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 			row, problem := store.RequestByIdempotencyKey("release-proof")
 			fatal(t, problem)
 			if row == nil || row.Release != want || row.InstallID != "" {
-				t.Fatalf("remote request did not pin published release %s: %+v", want, row)
+				t.Fatalf("remote request did not name published release %s: %+v", want, row)
 			}
 		})
 	}

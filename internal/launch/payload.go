@@ -562,6 +562,11 @@ func drop(document map[string]any, path string) string {
 	return shown
 }
 
+// Callable names a package's function as a run executes it: with its release, when known.
+func Callable(pkg, function, release string) string {
+	return strings.TrimSpace(pkg + "/" + function + " " + release)
+}
+
 // IgnoredWarning is the run's one warning for the undeclared fields ValidatePayload dropped.
 func IgnoredWarning(target string, ignored []string) records.Warning {
 	return records.Warning{
