@@ -116,14 +116,15 @@ func playMachine(ctx *Context, layout home.Layout, store *records.Store, row rec
 		if p != nil || ep == nil {
 			return nil, nil, cmp.Or(p, exit.New(exit.NotFound, "the run's recorded machine endpoint is gone"))
 		}
+		rented, p := rentalEndpoint(ctx, layout, store)(ep)
+		if p != nil {
+			return nil, nil, p
+		}
 		var err error
 		if pin, err = workertls.ParsePin([]byte(ep.CertificatePEM)); err != nil {
 			return nil, nil, exit.New(exit.Credential, "the machine's pinned certificate is unreadable")
 		}
-		rented, p := rentalEndpoint(ctx, layout, store)(ep)
 		switch {
-		case p != nil:
-			problem = p
 		case rented != nil:
 			key = rented.Key
 		default:
@@ -131,12 +132,12 @@ func playMachine(ctx *Context, layout home.Layout, store *records.Store, row rec
 		}
 		address, worker = ep.Address, ep.WorkerID // an endpoint's boot id is not the machine's word
 	case link.MachineID != "" && link.MachineID != machines.Local:
-		rented, p := store.RentalRow(link.MachineID)
+		rented, p := observedRental(ctx, store, link.MachineID)
 		if p != nil || rented == nil || rented.State != "ready" {
 			return nil, nil, cmp.Or(p, exit.Named(exit.Unavailable, "play.machine_unavailable", "the run's rental is not ready"))
 		}
 		var err error
-		if pin, err = workertls.LoadPin(rented.CertPath); err != nil {
+		if pin, err = workertls.EndpointPin(rented.CertificatePEM, rented.CertPath); err != nil {
 			return nil, nil, exit.New(exit.Credential, "the rental's pinned certificate is unreadable")
 		}
 		key, problem = rental.CreatorIdentityFor(layout, rented.ID)

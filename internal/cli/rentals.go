@@ -1878,6 +1878,10 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if !listed && known.RentalID != subject {
+		// Local history never turns an absent live name into another rental.
+		return lookup
+	}
 	if listed {
 		known.RentalID, known.Hub, known.Machine = live.Rental.ID, live.Hub, live.Rental.DisplayName()
 	}
