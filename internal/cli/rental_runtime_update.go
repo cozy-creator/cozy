@@ -34,8 +34,8 @@ type rentalRuntimeUpdates struct {
 }
 
 type runningRuntimeUpdate struct {
-	id, boot string
-	cancel   context.CancelFunc
+	id     string
+	cancel context.CancelFunc
 }
 
 type runtimeUpdateWheel struct {
@@ -181,11 +181,13 @@ func (u *rentalRuntimeUpdates) Resume() {
 
 func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 	ctx, cancel := context.WithCancel(u.machines.ctx)
-	active := &runningRuntimeUpdate{id: row.ID, boot: row.BootID, cancel: cancel}
+	active := &runningRuntimeUpdate{id: row.ID, cancel: cancel}
 	if prior, exists := u.running.LoadOrStore(row.RentalID, active); exists {
 		cancel()
 		previous := prior.(*runningRuntimeUpdate)
-		if previous.id != row.ID && previous.boot != row.BootID {
+		if previous.id != row.ID {
+			// A new accepted operation can also follow an intentional stop/resume
+			// of the same boot. Detach its obsolete observer, never its native job.
 			previous.cancel()
 		}
 		return
