@@ -768,6 +768,11 @@ func (w wireRental) named(what string) *exit.Error {
 	return validateRentalID(w.ID)
 }
 
+// Stated holds a listed rental to the by-id read's terms, for a caller that attaches it.
+func (r Rental) Stated(what string) *exit.Error {
+	return wireRental{ID: r.ID, HourlyRateUSDMicros: r.HourlyRateUSDMicros, AcceleratorCount: r.AcceleratorCount}.named(what)
+}
+
 // Rentals is every rental THE HUB says this account owns (th-199). It is the only
 // answer to a question Creator cannot answer from its own records: a pod bought by
 // this account that this host never recorded — because the create answer was

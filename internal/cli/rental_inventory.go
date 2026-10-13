@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/api"
@@ -16,8 +19,9 @@ import (
 // account's fleet. A listing of one hub still counts this host's live rentals
 // on the others, so switching hubs never hides a machine that is billing. The hubs are
 // asked before the fleet lock is taken, so a purchase or release in flight never holds
-// the listing.
-func readRentalInventory(st *records.Store, fleet *managedRentals, origin string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
+// the listing. Each ready machine's own Status is read beside the hubs, at the identity they
+// last listed; a hub not yet listed is read first.
+func readRentalInventory(ctx context.Context, st *records.Store, fleet *managedRentals, origin string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
 	origin = fleet.origin(origin)
 	origins := []string{origin}
 	if allHubs {
@@ -36,12 +40,24 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 		slices.Sort(held)
 		origins = held
 	}
-	asked := map[string]*exit.Error{}
+	// Without reconcile the listing serves what the fleet's own loop and the last listing read,
+	// but a hub never asked since this daemon started is asked now: no answer is not an empty fleet.
+	fleet.mu.Lock()
+	unobserved := slices.DeleteFunc(slices.Clone(origins), func(each string) bool { return fleet.censusLocked(each).observed })
+	fleet.mu.Unlock()
+	ask := unobserved
 	if reconcile {
-		for _, each := range origins {
-			asked[each] = fleet.reconcile(each)
-		}
+		ask = origins
 	}
+	var machines sync.WaitGroup
+	if reconcile && len(unobserved) == 0 {
+		machines.Go(func() { fleet.readMachines(ctx) })
+	}
+	asked := fleet.reconcileEach(ask)
+	if len(unobserved) > 0 {
+		fleet.readMachines(ctx)
+	}
+	machines.Wait()
 	// Keep account totals and the corresponding unrecorded set on one observation.
 	fleet.mu.Lock()
 	defer fleet.mu.Unlock()
@@ -208,7 +224,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			UnreachableSince:      live[row.ID].UnreachableSince,
 		}
 		if current {
-			summary.MachineName = seen.DisplayName()
+			summary.MachineName, summary.MachineAliases = seen.DisplayName(), seen.MachineAliases
 			summary.RentalAlias, summary.State = seen.Name, seen.State
 			summary.Address, summary.MediaAddress = seen.Address, seen.MediaAddress
 			summary.AcceleratorModel, summary.AcceleratorCount = seen.AcceleratorModel, seen.AcceleratorCount
@@ -216,6 +232,14 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			summary.Failure = hub.RentalFailure{}
 			if seen.Failure != nil {
 				summary.Failure = *seen.Failure
+			}
+		}
+		if read, ok := fleet.statuses[row.ID]; ok && current && seen.State == hub.RentalReady {
+			if summary.MachineProblem = read.problem; read.problem == nil {
+				summary.Machine = &read.status
+				if due := read.status.IdleDeadlineUnixMS; due > 0 {
+					summary.ReleaseDue = time.UnixMilli(due).UTC().Format(time.RFC3339Nano)
+				}
 			}
 		}
 		costOf(&summary, live[row.ID])
@@ -234,7 +258,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		}
 		result.Unrecorded = append(result.Unrecorded, api.RentalSummary{
 			Provider: seen.Provider, ProviderMachineID: seen.ProviderMachineID, ProviderResourceID: seen.ProviderResourceID,
-			ID: seen.ID, MachineName: seen.DisplayName(), RentalAlias: seen.Name, State: seen.State,
+			ID: seen.ID, MachineName: seen.DisplayName(), RentalAlias: seen.Name, MachineAliases: seen.MachineAliases, State: seen.State,
 			AcceleratorModel: seen.AcceleratorModel, AcceleratorCount: seen.AcceleratorCount,
 			HourlyRateUSDMicros: seen.HourlyRateUSDMicros, Address: seen.Address,
 			SpendUSDMicros: seen.SpendUSDMicros, SpendBasis: seen.SpendBasis,

@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	machinepb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
 
@@ -61,11 +60,22 @@ func (m *machineRuns) Prewarm(ctx context.Context, row records.RentalInstall, re
 
 // Status reads one machine's picture over cozy.machine.v1 as its owner.
 func (m *machineRuns) Status(ctx context.Context, machine string) (api.MachineStatus, *exit.Error) {
-	connection, problem := m.machines.DialV1(ctx, machine, "reading its status")
+	var connection *machines.V1
+	var problem *exit.Error
+	if observed, ok := m.fleet.listedReady(machine); ok {
+		connection, problem = m.machines.DialObserved(observed, "reading its status")
+	} else {
+		connection, problem = m.machines.DialV1(ctx, machine, "reading its status")
+	}
 	if problem != nil {
 		return api.MachineStatus{}, problem
 	}
 	defer connection.Close()
+	return m.readStatus(ctx, connection, machine)
+}
+
+// readStatus is one Status read on an open connection.
+func (m *machineRuns) readStatus(ctx context.Context, connection *machines.V1, machine string) (api.MachineStatus, *exit.Error) {
 	frame, err := connection.Status(ctx)
 	if err != nil {
 		return api.MachineStatus{}, machines.Transport(err)
@@ -91,6 +101,38 @@ func (m *machineRuns) Status(ctx context.Context, machine string) (api.MachineSt
 	return status, nil
 }
 
+// machineRead is one machine's Status as a listing read it, or why it could not.
+type machineRead struct {
+	status  api.MachineStatus
+	problem *exit.Error
+}
+
+// statuses reads each ready rental's machine, at most eight at once, at the identity its Hub
+// listed (DialV1 would ask the Hub again for each).
+func (m *machineRuns) statuses(ctx context.Context, ready []hub.Rental) map[string]machineRead {
+	out := make(map[string]machineRead, len(ready))
+	var mu sync.Mutex
+	var wait sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for _, observed := range ready {
+		wait.Go(func() {
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			var read machineRead
+			connection, problem := m.machines.DialObserved(observed, "reading its status")
+			if read.problem = problem; problem == nil {
+				read.status, read.problem = m.readStatus(ctx, connection, observed.ID)
+				connection.Close()
+			}
+			mu.Lock()
+			out[observed.ID] = read
+			mu.Unlock()
+		})
+	}
+	wait.Wait()
+	return out
+}
+
 // originKey is scheme://host:port, lowercase with the default port spelled, as a machine keys
 // a Hub origin; "" for anything else.
 func originKey(origin string) string {
@@ -109,29 +151,6 @@ func originKey(origin string) string {
 		return ""
 	}
 	return strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Hostname()) + ":" + port
-}
-
-// releaseDue asks each ready rental's machine, at most eight at once, when it ends itself.
-// One its Hub cannot reach is not asked; one that cannot answer, or names none (a job is
-// queued or running there), shows none.
-func (m *machineRuns) releaseDue(ctx context.Context, rows []api.RentalSummary) {
-	var wait sync.WaitGroup
-	slots := make(chan struct{}, 8)
-	for i := range rows {
-		if rows[i].State != hub.RentalReady || rows[i].UnreachableSince != "" {
-			continue
-		}
-		wait.Add(1)
-		go func(row *api.RentalSummary) {
-			defer wait.Done()
-			slots <- struct{}{}
-			defer func() { <-slots }()
-			if status, problem := m.Status(ctx, row.ID); problem == nil && status.IdleDeadlineUnixMS > 0 {
-				row.ReleaseDue = time.UnixMilli(status.IdleDeadlineUnixMS).UTC().Format(time.RFC3339Nano)
-			}
-		}(&rows[i])
-	}
-	wait.Wait()
 }
 
 // machineLogs maps the log names clients use to the logs machines keep: the name

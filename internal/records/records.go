@@ -124,6 +124,16 @@ var pinsByHub = []string{
 // startup sweep) reads them, and so does its delete's foreign-key check.
 const requestsByInstall = `CREATE INDEX IF NOT EXISTS requests_install ON requests(install_id)`
 
+// readIndexes keep the listings' per-row reads lookups rather than scans of history: a
+// rental's pinned work, a run's events of one type, and history in run-number order.
+var readIndexes = []string{
+	`CREATE INDEX IF NOT EXISTS requests_worker ON requests(worker)`,
+	`CREATE INDEX IF NOT EXISTS requests_requested_rental ON requests(requested_rental)`,
+	`CREATE INDEX IF NOT EXISTS requests_created ON requests(created_at, id)`,
+	`CREATE INDEX IF NOT EXISTS machine_executions_machine ON machine_executions(machine_id)`,
+	`CREATE INDEX IF NOT EXISTS request_events_by_type ON request_events(request_id, type)`,
+}
+
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orchestratorSchema,
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
@@ -135,6 +145,7 @@ func init() {
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex, hubCreditDDL)
 	schema = append(schema, obligationIndexes...)
 	schema = append(schema, requestsByInstall)
+	schema = append(schema, readIndexes...)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a

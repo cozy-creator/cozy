@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/machineendpoint"
 	"github.com/cozy-creator/cozy/internal/machinev1"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/machine/v1"
@@ -110,6 +111,27 @@ func (r *Resolver) DialV1(ctx context.Context, name, holder string) (*V1, *exit.
 	return &V1{Client: client, Name: name, WorkerID: t.workerID, BootID: t.bootID, Leaf: t.pin.DER(),
 		Local: t.lifetime != "", Rented: t.lifetime == "", HubID: machine.hubID, Owned: machine.owned, Account: machine.hub,
 		release: machine.release}, nil
+}
+
+// DialObserved opens a ready rental's cozy.machine.v1 API at the identity its Hub just
+// listed, for a reader already holding that answer: DialV1 would ask the Hub again.
+func (r *Resolver) DialObserved(observed hub.Rental, holder string) (*V1, *exit.Error) {
+	if problem := r.scoped(observed.ID); problem != nil {
+		return nil, problem
+	}
+	machine := &placement{}
+	t, problem := r.rentalTarget(observed.ID, holder, &orchestrator.WorkerConnection{RentalID: observed.ID,
+		Addr: observed.Address, CertificatePEM: observed.CertPEM, WorkerID: observed.WorkerID, WorkerBootID: observed.WorkerBootID}, machine)
+	if problem != nil {
+		return nil, problem
+	}
+	client, err := r.connect(observed.ID, t.addr, t.workerID, t.bootID, t.lifetime, t.pin, t.key.Signer())
+	if err != nil {
+		machine.release()
+		return nil, Transport(err)
+	}
+	return &V1{Client: client, Name: observed.ID, WorkerID: t.workerID, BootID: t.bootID, Leaf: t.pin.DER(),
+		Rented: true, HubID: machine.hubID, Account: machine.hub, release: machine.release}, nil
 }
 
 // EndpointRental is one of this host's rentals reached as an explicit endpoint.

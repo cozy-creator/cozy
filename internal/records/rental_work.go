@@ -20,7 +20,7 @@ func (s *Store) RentalWorkCounts(id, buyer string) (queued, running int, problem
  r.state IN ('submitted','queued','requeue_pending') AND `+accepted+` OR
  EXISTS(SELECT 1 FROM attempts a WHERE a.request_id=r.id AND a.state IN ('preparing','offered','accepted','recovered_open')) THEN 1 ELSE 0 END),0)
  FROM requests r WHERE `+pinned+` OR
- (r.id=? AND r.worker='') OR EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=r.id AND e.machine_id=?)`, append(args, buyer, id)...).Scan(&queued, &running)
+ (r.id=? AND r.worker='') OR r.id IN (SELECT request_id FROM machine_executions WHERE machine_id=?)`, append(args, buyer, id)...).Scan(&queued, &running)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot observe rental work: %s", err)
 	}

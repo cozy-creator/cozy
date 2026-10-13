@@ -1113,9 +1113,7 @@ func (s *Store) RequestByReference(reference string) (*Request, *exit.Error) {
 
 func requestNumber(q interface{ QueryRow(string, ...any) *sql.Row }, row Request) (int64, error) {
 	var number int64
-	err := q.QueryRow(`SELECT COUNT(*) FROM requests
-		WHERE created_at < ? OR (created_at = ? AND id <= ?)`,
-		row.CreatedAt, row.CreatedAt, row.ID).Scan(&number)
+	err := q.QueryRow(`SELECT COUNT(*) FROM requests WHERE (created_at,id)<=(?,?)`, row.CreatedAt, row.ID).Scan(&number)
 	return number, err
 }
 
@@ -1386,66 +1384,114 @@ func (s *Store) RequestHub(id, fallbackHub string) (string, *exit.Error) {
 }
 
 // PublicRequestsOlder counts the runs PublicRequestsBefore would list below run number
-// `before`: what a listing that stopped there leaves out.
+// `before`: what a listing that stopped there leaves out. Unfiltered, that is every earlier run.
 func (s *Store) PublicRequestsOlder(state, packageName, hub, fallbackHub string, before int64) (int, *exit.Error) {
-	numbered, where, args := requestHistory("", state, packageName, hub, fallbackHub, before, true)
+	where, args := requestHistory("", state, packageName, hub, fallbackHub, true)
+	if where == "" {
+		return int(max(before-1, 0)), nil
+	}
+	at, id, problem := s.numberedAt(before)
+	if problem != nil {
+		return 0, problem
+	}
 	var count int
-	if err := s.db.QueryRow(numbered+` SELECT COUNT(*) FROM numbered`+where, args...).Scan(&count); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM requests WHERE `+where+` AND (created_at,id)<(?,?)`,
+		append(args, at, id)...).Scan(&count); err != nil {
 		return 0, exit.Internalf("cannot count requests: %s", err)
 	}
 	return count, nil
 }
 
-// requestHistory is every request numbered host-wide, and the conditions one listing keeps.
-// Number only narrow index facts across history; a page loads payloads only for its rows.
-func requestHistory(kind, state, packageName, hub, fallbackHub string, before int64, public bool) (string, string, []any) {
+// requestHistory is the conditions one listing keeps, over the requests table.
+func requestHistory(kind, state, packageName, hub, fallbackHub string, public bool) (string, []any) {
 	selectedState := "state"
 	if public && state != "" {
 		selectedState = publicRunStatusSQL()
 	}
-	selectedHub := "hub"
-	args := []any{}
-	if hub != "" {
-		selectedHub = requestHubSQL
-		args = append(args, strings.TrimRight(fallbackHub, "/"))
-	}
-	numbered := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
-  id,created_at,kind,` + selectedState + ` AS state,package,` + selectedHub + ` AS hub FROM requests)`
-	where := []string{}
+	var where []string
+	var args []any
 	for _, condition := range []struct {
-		sql   string
-		value any
-		on    bool
-	}{{`number<?`, before, before > 0}, {`kind=?`, kind, kind != ""}, {`state=?`, state, state != ""},
-		{`package=?`, packageName, packageName != ""}, {`hub=?`, hub, hub != ""}} {
+		sql    string
+		values []any
+		on     bool
+	}{{`kind=?`, []any{kind}, kind != ""}, {selectedState + `=?`, []any{state}, state != ""},
+		{`package=?`, []any{packageName}, packageName != ""},
+		{requestHubSQL + `=?`, []any{strings.TrimRight(fallbackHub, "/"), hub}, hub != ""}} {
 		if condition.on {
-			where, args = append(where, condition.sql), append(args, condition.value)
+			where, args = append(where, condition.sql), append(args, condition.values...)
 		}
 	}
-	if len(where) == 0 {
-		return numbered, "", args
-	}
-	return numbered, ` WHERE ` + strings.Join(where, " AND "), args
+	return strings.Join(where, " AND "), args
 }
 
+// numberedAt is run number n's place in history, (created_at, id); past the newest run, a
+// place after every run.
+func (s *Store) numberedAt(n int64) (string, string, *exit.Error) {
+	var at, id string
+	err := s.db.QueryRow(`SELECT created_at,id FROM requests ORDER BY created_at,id LIMIT 1 OFFSET ?`, n-1).Scan(&at, &id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "\uffff", "", nil
+	}
+	if err != nil {
+		return "", "", exit.Internalf("cannot find run %d: %s", n, err)
+	}
+	return at, id, nil
+}
+
+// requestsBefore is one page, newest first, walked from history's newest end: only the rows a
+// page spans are read, and each is numbered by its place in all history.
 func (s *Store) requestsBefore(kind, state, packageName, hub, fallbackHub string, limit int, before int64, public bool) ([]Request, *exit.Error) {
-	numbered, where, args := requestHistory(kind, state, packageName, hub, fallbackHub, before, public)
-	query := numbered + `, page AS (SELECT number,id AS page_request_id FROM numbered` + where +
-		` ORDER BY created_at DESC, id DESC LIMIT ?) SELECT page.number, ` + requestCols +
-		` FROM requests JOIN page ON requests.id=page.page_request_id ORDER BY page.number DESC`
-	args = append(args, limit)
-	rows, err := s.db.Query(query, args...)
+	where, args := requestHistory(kind, state, packageName, hub, fallbackHub, public)
+	if before > 0 {
+		at, id, problem := s.numberedAt(before)
+		if problem != nil {
+			return nil, problem
+		}
+		where, args = strings.TrimPrefix(where+` AND (created_at,id)<(?,?)`, " AND "), append(args, at, id)
+	}
+	if where != "" {
+		where = ` WHERE ` + where
+	}
+	rows, err := s.db.Query(`SELECT 0,`+requestCols+` FROM requests`+where+` ORDER BY created_at DESC, id DESC LIMIT ?`, append(args, limit)...)
 	if err != nil {
 		return nil, exit.Internalf("cannot list requests: %s", err)
 	}
-	defer rows.Close()
 	var out []Request
 	for rows.Next() {
 		r, err := scanNumberedRequest(rows)
 		if err != nil {
+			rows.Close()
 			return nil, exit.Internalf("cannot read a request row: %s", err)
 		}
 		out = append(out, r)
+	}
+	rows.Close()
+	if len(out) == 0 {
+		return out, nil
+	}
+	// The newest row's number is its place in history; every row the page spans, listed or
+	// filtered out, is one below the row before it.
+	newest, oldest := out[0], out[len(out)-1]
+	var number int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM requests WHERE (created_at,id)<=(?,?)`, newest.CreatedAt, newest.ID).Scan(&number); err != nil {
+		return nil, exit.Internalf("cannot number requests: %s", err)
+	}
+	spanned, err := s.db.Query(`SELECT id FROM requests WHERE (created_at,id) BETWEEN (?,?) AND (?,?) ORDER BY created_at DESC, id DESC`,
+		oldest.CreatedAt, oldest.ID, newest.CreatedAt, newest.ID)
+	if err != nil {
+		return nil, exit.Internalf("cannot number requests: %s", err)
+	}
+	defer spanned.Close()
+	numbers := make(map[string]int64, len(out))
+	for ; spanned.Next(); number-- {
+		var id string
+		if err := spanned.Scan(&id); err != nil {
+			return nil, exit.Internalf("cannot number requests: %s", err)
+		}
+		numbers[id] = number
+	}
+	for i := range out {
+		out[i].Number = numbers[out[i].ID]
 	}
 	return out, nil
 }

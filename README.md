@@ -47,7 +47,7 @@ executors; one worker can execute packages using different supported minors.
 Captured environments retain their exact Python patch, native wheel ABI, and dependency
 closure, including Torch. Provisioning capability is reported separately from installed
 interpreters; it does not substitute a different captured patch or dependency version.
-`cozy package list` distinguishes supported installed Python from Python that can be
+`cozy package list --full` distinguishes supported installed Python from Python that can be
 provisioned on demand. A package outside the active window
 is unusable until upgraded; advancing the window is an explicit Runtime release change.
 
