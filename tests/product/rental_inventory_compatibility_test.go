@@ -108,7 +108,9 @@ func TestRentalInventoryHumanDrainingKeepsRawStates(t *testing.T) {
 	defer server.Close()
 	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
 	output, err := compatibilityCLI(t, layout.Root, "rental", "list", "--no-watch")
-	if err != nil || strings.Count(output, "draining") != 2 || strings.Contains(output, "release_requested") || !strings.Contains(output, "Rentals end themselves after 15 minutes idle") {
+	// A paid ask with no rental yet is summed in one line, not drawn as a machine.
+	if err != nil || strings.Count(output, "draining") != 1 || !strings.Contains(output, "Unresolved rental acquisitions: 1") ||
+		strings.Contains(output, "release_requested") || !strings.Contains(output, "Rentals end themselves after 15 minutes idle") {
 		t.Fatalf("inventory lost human state or daemon-owned idle policy: %v %s", err, output)
 	}
 	output, err = compatibilityCLI(t, layout.Root, "rental", "list", "--json")

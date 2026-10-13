@@ -36,6 +36,7 @@ func (r LiveResolver) Resolve(ctx context.Context, typed string) (Live, *exit.Er
 	if problem != nil {
 		return Live{}, problem
 	}
+	hint := ""
 	if r.Store != nil {
 		row, problem := r.Store.RentalRow(typed)
 		if problem != nil {
@@ -45,12 +46,17 @@ func (r LiveResolver) Resolve(ctx context.Context, typed string) (Live, *exit.Er
 			return r.Read(ctx, typed)
 		}
 		if named, _ := r.Store.RentalByMachine(typed); named != nil && named.Hub != "" {
-			origins = append([]string{named.Hub}, slices.DeleteFunc(origins, func(o string) bool { return o == named.Hub })...)
+			hint = named.Hub
+			origins = append([]string{hint}, slices.DeleteFunc(origins, func(o string) bool { return o == hint })...)
 		}
 	}
 	var unanswered *exit.Error
 	for _, origin := range origins {
 		selected, problem := r.named(ctx, origin, typed)
+		// A hub this computer holds no login for lists none of its rentals, unless it recorded one there.
+		if problem != nil && problem.ErrName() == SignedOut && origin != hint {
+			continue
+		}
 		if problem != nil && problem.ErrName() != "rental.machine_name_ambiguous" {
 			unanswered = cmp.Or(unanswered, problem)
 			continue
@@ -76,8 +82,11 @@ func (r LiveResolver) Resolve(ctx context.Context, typed string) (Live, *exit.Er
 	if unanswered != nil {
 		return Live{}, unanswered
 	}
-	return Live{}, exit.Named(exit.NotFound, "rental.selection_unavailable", "%q does not name a live rental on the queried Hubs", typed)
+	return Live{}, exit.Named(exit.NotFound, "rental.selection_unavailable", "no live rental is named %q on any hub this computer is signed in to", typed)
 }
+
+// SignedOut is the refusal of a hub this computer holds no login for.
+const SignedOut = "auth.machine_key_missing"
 
 // named is the one rental of origin's listing whose ID is typed, else the one live rental
 // it names; nil when it names none.
@@ -143,7 +152,7 @@ func (r LiveResolver) Read(ctx context.Context, id string) (Live, *exit.Error) {
 		if problem == nil {
 			return Live{Hub: origin, Rental: remote}, nil
 		}
-		if problem.Code != exit.NotFound {
+		if problem.Code != exit.NotFound && problem.ErrName() != SignedOut {
 			unanswered = cmp.Or(unanswered, problem)
 		}
 	}

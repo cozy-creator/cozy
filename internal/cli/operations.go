@@ -75,8 +75,7 @@ func submitOperation(ctx *Context, machine string, op records.Operation) (*local
 	}
 	id := machines.Local
 	if !machines.IsLocal(machine) {
-		live, failure := resolveLiveRental(ctx, store, machine)
-		problem, id = failure, live.Rental.ID
+		id, problem = selectedRental(ctx, store, machine)
 	}
 	store.Close()
 	if problem != nil {

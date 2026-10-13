@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hub"
 )
 
 func requestedRental(ctx *Context) (string, *exit.Error) {
@@ -32,19 +31,16 @@ func requestedRental(ctx *Context) (string, *exit.Error) {
 	if id, ok := ctx.rentalSelections[name]; ok {
 		return id, nil
 	}
-	selected, problem := resolveLiveRental(ctx, store, name)
+	id, problem := selectedRental(ctx, store, name)
 	if problem != nil {
 		return "", problem
-	}
-	if hub.RentalAbsent(selected.Rental.State) || selected.Rental.State == hub.RentalReleaseRequested {
-		return "", exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
 	}
 	if ctx.rentalSelections == nil {
 		ctx.rentalSelections = map[string]string{}
 	}
-	ctx.rentalSelections[name] = selected.Rental.ID
+	ctx.rentalSelections[name] = id
 	// A named rental is where the call goes. What it cannot run, its machine refuses.
-	return selected.Rental.ID, nil
+	return id, nil
 }
 
 func rentalArgument(value *string) (string, *exit.Error) {
