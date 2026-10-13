@@ -392,19 +392,16 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 }
 
 type ModelDownloadCmd struct {
-	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Tensorhub model (#lane or @release/lane), or with a local alias a provider source (hf://, civitai://)."`
-	Ref            string `arg:"" optional:"" name:"model" help:"Local alias (local/name) the machine keeps the model under; omit it to only download it."`
-	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental         string `help:"Download on this owned rental's machine instead of this computer's."`
-	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
-	Await          bool   `help:"Wait until the download settles, printing the machine's progress."`
-	IdempotencyKey string `help:"Stable request identity for exact replay; otherwise start a new run."`
+	Source string `arg:"" name:"source" predictor:"file-or-ref" help:"Tensorhub model (#lane or @release/lane), or with a local alias a provider source (hf://, civitai://)."`
+	Ref    string `arg:"" optional:"" name:"model" help:"Local alias (local/name) the machine keeps the model under; omit it to only download it."`
+	Lane   string `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental string `help:"Download on this owned rental's machine instead of this computer's."`
+	Await  bool   `help:"Wait until the download settles, printing the machine's progress."`
 }
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
-	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
-		"--rental-only", c.RentalOnly, "--await", c.Await),
-		values("--rental", c.Rental, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
+	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools("--await", c.Await),
+		values("--rental", c.Rental, "--lane", c.Lane), false)
 }
 
 type ModelListCmd struct{}
@@ -418,9 +415,7 @@ type ModelUploadCmd struct {
 	Ref            string   `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
 	Lane           string   `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         *string  `predictor:"rental" help:"Use this existing rental name or id; never buy a replacement."`
-	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
 	Await          bool     `help:"Watch the accepted run until it settles."`
-	IdempotencyKey string   `help:"Stable request identity for exact replay; otherwise a rented re-run of the same ingest reattaches or resumes."`
 	SourceProfiles []string `name:"source-profile" help:"Reviewed TensorFS source profile to convert on the rental (repeatable; several compose one model). Default: the one profile the source headers match."`
 }
 
@@ -429,10 +424,8 @@ func (c *ModelUploadCmd) Run(r *Runtime) error {
 	if problem != nil {
 		return problem
 	}
-	return r.call(handleModelUpload, []string{c.Source, c.Ref}, bools(
-		"--rental-only", c.RentalOnly, "--await", c.Await),
-		values("--rental", rentalName, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey,
-			"--source-profile", c.SourceProfiles), false)
+	return r.call(handleModelUpload, []string{c.Source, c.Ref}, bools("--await", c.Await),
+		values("--rental", rentalName, "--lane", c.Lane, "--source-profile", c.SourceProfiles), false)
 }
 
 type ModelQuantizeCmd struct {

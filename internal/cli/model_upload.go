@@ -63,9 +63,6 @@ func handleModelDownload(ctx *Context) *exit.Error {
 func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 	sourceArg, destinationArg := strings.TrimSpace(ctx.Inv.Args[0]), strings.TrimSpace(ctx.Inv.Args[1])
 	machine := ctx.Inv.Value("--rental")
-	if machine == "" && rentalRequested(ctx) {
-		return exit.Usagef("a model transfer runs on this computer's machine or on --rental=NAME")
-	}
 	if len(ctx.Inv.Values["--source-profile"]) > 0 {
 		return exit.Usagef("--source-profile selects the profiles a provider ingest converts").
 			WithRemedy("omit --source-profile to use the one profile the headers match")

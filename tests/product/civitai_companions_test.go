@@ -68,7 +68,7 @@ func TestCivitaiCompanionsArePlannedAsTheRentalSelectsThem(t *testing.T) {
 	} {
 		t.Run(fmt.Sprint(test.version), func(t *testing.T) {
 			root, paid := rentalCapture(t)
-			out, code := rentedUpload(t, root, host, fmt.Sprintf("civitai://%d", test.version), "proof/companions")
+			out, code := rentalForSource(t, root, host, fmt.Sprintf("civitai://%d", test.version))
 			if strings.Contains(string(out), tfs.AsIsNote) {
 				t.Fatalf("the host planned the version as-is:\n%s", out)
 			}
