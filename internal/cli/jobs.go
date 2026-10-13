@@ -78,7 +78,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
-	input, ignored, e := validateInvocationPayload(ctx, target.Package, job, input)
+	input, ignored, e := validateInvocationPayload(ctx, target, job, input)
 	if e != nil {
 		return e
 	}
@@ -145,7 +145,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	if !ctx.Mode().JSON {
-		fmt.Fprintf(ctx.Err, "Queued run %s: %s/%s\n", runReference(handle.Number, handle.JobID), handle.Package, handle.Function)
+		fmt.Fprintf(ctx.Err, "Queued run %s: %s\n", runReference(handle.Number, handle.JobID), launch.Callable(handle.Package, handle.Function, target.Release))
 		if rental := ctx.Inv.Value("--rental"); rental != "" {
 			fmt.Fprintf(ctx.Err, "Machine: %s\n", rental)
 		}

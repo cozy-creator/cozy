@@ -207,7 +207,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
-		spec.Warnings = ignoredWarnings(sub.Package, sub.Function, sub.Ignored)
+		spec.Warnings = ignoredWarnings(sub.Package, sub.Function, spec.Release, sub.Ignored)
 		// The DAEMON is the process that publishes --out, so the daemon probes the
 		// destination — here, where the path is finally resolved, before an input is
 		// bound or a row recorded. A doomed export refuses in milliseconds instead
@@ -729,11 +729,11 @@ func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission)
 	return launch.ValidateAssetCounts(entrypoint, out.Assets)
 }
 
-func ignoredWarnings(pkg, function string, ignored []string) []records.Warning {
+func ignoredWarnings(pkg, function, release string, ignored []string) []records.Warning {
 	if len(ignored) == 0 {
 		return nil
 	}
-	return []records.Warning{launch.IgnoredWarning(pkg+"/"+function, ignored)}
+	return []records.Warning{launch.IgnoredWarning(launch.Callable(pkg, function, release), ignored)}
 }
 
 func placementPlan(placement orchestrator.DesiredPlacement, function string) (string, []string, *exit.Error) {
@@ -788,6 +788,7 @@ type Lifecycle struct {
 	Status           string                `json:"status"`
 	Package          string                `json:"package"`
 	Function         string                `json:"function"`
+	Release          string                `json:"release,omitempty"`
 	Attempt          uint64                `json:"attempt"`
 	Attempts         int                   `json:"attempts"`
 	QueuedMS         int64                 `json:"queued_ms"`
@@ -970,7 +971,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 			kind = "job"
 		}
 		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
-			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
+			Package: row.Package, Function: row.Entrypoint, Release: row.Release, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS, ExecutionKnown: state.ExecutionKnown, Memo: state.Memo,
 			AttemptWallMS: state.AttemptWallMS, QueuedMS: state.QueuedMS,
 			Result: state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Output: state.Output,
@@ -1009,7 +1010,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 	life := Lifecycle{
 		Number: row.Number, Kind: kind, RequestID: row.ID,
 		Status: s.publicStatusOf(row), Package: row.Package,
-		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
+		Function: row.Entrypoint, Release: row.Release, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{}, Rental: row.Rental, RentalID: row.Worker,
 	}

@@ -29,6 +29,7 @@ type runReport struct {
 	RequestID string `json:"request_id"`
 	Status    string `json:"status"`
 	Target    string `json:"target"`
+	Release   string `json:"release,omitempty"`
 	Machine   string `json:"machine,omitempty"`
 	// Runtime is the cozy-runtime (and TensorFS) the run's own executor loaded.
 	Runtime        string `json:"runtime,omitempty"`
@@ -476,7 +477,7 @@ func handleRunShow(ctx *Context) *exit.Error {
 
 func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	report := runReport{Number: life.Number, RequestID: life.RequestID, Status: life.Status,
-		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Machine: life.Machine,
+		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Release: life.Release, Machine: life.Machine,
 		ErrorType: life.ErrorType, ErrorCode: life.ErrorCode, Error: life.Error,
 		Memoized: life.Memoized, Computation: life.Computation, Unmemoized: life.Unmemoized,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS,
@@ -1033,7 +1034,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		return emitJSON(w, r)
 	}
 	offset := r.offsets()
-	fmt.Fprintf(w, "run %d %s  %s", r.Number, r.Status, r.Target)
+	fmt.Fprintf(w, "run %d %s  %s", r.Number, r.Status, strings.TrimSpace(r.Target+" "+r.Release))
 	if r.Machine != "" {
 		fmt.Fprintf(w, "  on %s", r.Machine)
 	}

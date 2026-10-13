@@ -78,10 +78,13 @@ Hub. A request with private operations carries a capability for that source, eve
 same Hub rented the machine. A local unpublished run with no Hub model inputs can
 still execute offline. A remote published source requires login to the selected Hub.
 
-A bare `org/package/function` invocation takes one path on every machine, this computer's
-or a rental: the installed release, else the newest this client kept under its current
-catalog revision, else the newest the machine names at the selected Hub (the Hub's own
-answer only when no machine can say yet). The run names that release and each model as
+A bare `org/package/function` invocation runs the release its machine holds. On this
+computer that is the release `cozy package install` installed here, else the newest this
+client kept under its current catalog revision, else the selected Hub's newest. On a named
+rental it is the newest release that machine holds from the selected Hub (`cozy package
+install|update --rental` change it), else the Hub's newest; a run the fleet places names the
+Hub's newest. The CLI checks the payload against that release's interface, and both the
+submission and `cozy run show` name it. The run names that release and each model as
 `org/name@release` with a lane or the binding's GPU rungs, never a hash (th-245): a machine
 that does not hold them reads the release's card and lock, and resolves each release lane
 with the Hub's closure, by name and anonymously. Only the owner's own checkpoint travels by
