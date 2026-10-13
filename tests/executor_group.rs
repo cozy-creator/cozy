@@ -85,6 +85,7 @@ fn start(
         package_interface: root.join("package-interface.json"),
         sequence_parallel_degree: degree,
         import_only: false,
+        call_interfaces: vec![],
     }
 }
 
@@ -237,6 +238,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
                 package_interface: interface.clone(),
                 sequence_parallel_degree: 1,
                 import_only: true,
+                call_interfaces: vec![],
             },
             &mut Baseline,
         )
@@ -290,6 +292,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
                 package_interface: interface.clone(),
                 sequence_parallel_degree: 2,
                 import_only: false,
+                call_interfaces: vec![],
             },
             &mut Baseline,
         )

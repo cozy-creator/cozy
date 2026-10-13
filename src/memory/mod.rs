@@ -41,10 +41,8 @@ pub fn ask_cap(cell: &File, cap: u64) -> io::Result<i64> {
     Ok(asked)
 }
 
-struct Running {
-    plan: String,
-    cell: Option<File>,
-}
+/// Each running call's plan and its cap cell: a served call and its child may run on one GPU.
+type Running = std::collections::BTreeMap<String, Option<File>>;
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -61,7 +59,7 @@ pub(crate) fn note(event: serde_json::Value) {
 /// executors derive their own budgets (`grant` answers None).
 pub struct GpuMemory {
     ledger: Arc<Mutex<Gpu>>,
-    running: Arc<Mutex<Option<Running>>>,
+    running: Arc<Mutex<Running>>,
     sampler: Option<nvml::Sampler>,
 }
 
@@ -72,7 +70,7 @@ impl GpuMemory {
         gpu.learned = learned::Learned::open(&root.join("memory-learned.json"));
         gpu.device = device.into();
         let ledger = Arc::new(Mutex::new(gpu));
-        let running: Arc<Mutex<Option<Running>>> = Arc::new(Mutex::new(None));
+        let running: Arc<Mutex<Running>> = Arc::default();
         let log = config.sample_log.as_ref().and_then(|path| {
             OpenOptions::new()
                 .create(true)
@@ -101,16 +99,9 @@ impl GpuMemory {
                         return;
                     };
                     let running = cells.lock().unwrap();
-                    let Some(Running {
-                        plan: active,
-                        cell: Some(cell),
-                    }) = running.as_ref()
-                    else {
+                    let Some(Some(cell)) = running.get(&plan) else {
                         return;
                     };
-                    if *active != plan {
-                        return;
-                    }
                     match ask_cap(cell, cap) {
                         Ok(_) => {
                             ledger.set_cap(&plan, cap);
@@ -184,8 +175,8 @@ impl GpuMemory {
             });
             match decision {
                 Decision::Go(cap) => return Ok(Some(cap)),
-                // Calls on this GPU run one at a time, so a waiting decision has nothing to
-                // wait for: it takes the room there is.
+                // What another call holds frees only when it ends, which may wait on this one
+                // (a served call's child): it takes the room there is.
                 Decision::Wait => {
                     return Ok(self.with(|gpu| Some(gpu.room(plan, &sample))));
                 }
@@ -196,9 +187,8 @@ impl GpuMemory {
                             .running
                             .lock()
                             .unwrap()
-                            .as_ref()
-                            .filter(|running| running.plan == *other)
-                            .and_then(|running| running.cell.as_ref().map(File::try_clone))
+                            .get(other)
+                            .and_then(|cell| cell.as_ref().map(File::try_clone))
                             .transpose()?;
                         if let Some(cell) = cell {
                             ask_cap(&cell, *cap)?;
@@ -447,14 +437,11 @@ impl GpuMemory {
     /// A call starts with `cap`; its cell (if any) is what the floor watchdog lowers.
     pub fn running(&self, plan: &str, cap: u64, cell: Option<File>) {
         self.with(|gpu| gpu.active(plan, cap));
-        *self.running.lock().unwrap() = Some(Running {
-            plan: plan.into(),
-            cell,
-        });
+        self.running.lock().unwrap().insert(plan.into(), cell);
     }
 
     pub fn finished(&self, plan: &str) {
-        *self.running.lock().unwrap() = None;
+        self.running.lock().unwrap().remove(plan);
         self.with(|gpu| gpu.idle(plan));
     }
 }
@@ -471,7 +458,7 @@ mod tests {
         gpu.active("plan", 0);
         GpuMemory {
             ledger: Arc::new(Mutex::new(gpu)),
-            running: Arc::new(Mutex::new(None)),
+            running: Arc::default(),
             sampler: None,
         }
     }

@@ -44,7 +44,7 @@ pub struct Invocation {
     /// A child run's root: its outermost ancestor, whose acceptance orders its GPU work.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
-    /// A child run's outermost accelerator job ancestor, whose GPU its calls may borrow.
+    /// A child run's outermost accelerator job or served ancestor, whose GPU its calls share.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub family: String,
 }
@@ -286,9 +286,10 @@ impl Execution {
         let root = if self.invocation.root.is_empty() { &self.id } else { &self.invocation.root };
         root.parse().unwrap_or(u64::MAX)
     }
-    /// The accelerator job whose GPU its calls borrow: its outermost one, itself included.
+    /// The run whose GPU its calls share: its outermost accelerator job or served call, itself
+    /// included.
     pub fn family(&self) -> Option<&str> {
-        match (self.invocation.family.as_str(), self.invocation.accelerator) {
+        match (self.invocation.family.as_str(), self.invocation.accelerator || !self.invocation.job) {
             ("", true) => Some(&self.id),
             ("", false) => None,
             (family, _) => Some(family),

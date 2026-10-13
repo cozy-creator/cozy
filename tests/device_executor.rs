@@ -79,6 +79,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 package_interface: interface.clone(),
                 sequence_parallel_degree: 1,
                 import_only: false,
+                call_interfaces: vec![],
             },
             &mut Baseline,
         )

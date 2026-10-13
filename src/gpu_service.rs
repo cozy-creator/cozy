@@ -1629,6 +1629,7 @@ impl GpuPool {
         held: HeldGeneration,
         plan: GpuPlan,
         claims: &mut Claims,
+        jobs: Option<Arc<crate::jobs::Jobs>>,
     ) -> io::Result<bool> {
         let root = record.root_seq();
         let lane = match self.allocations.registered(root) {
@@ -1643,9 +1644,12 @@ impl GpuPool {
         };
         engine.dispatch_managed(&record.id, move |engine, id| {
             let pool = permit.pool.clone();
-            let result = pool.run(&engine, &id, held, plan, start);
+            let result = pool.run(&engine, &id, held, plan, start, jobs.as_ref());
             if let Err(error) = &result {
                 settle(&engine, &id, error)?;
+            }
+            if let Some(jobs) = &jobs {
+                jobs.ended(&id);
             }
             // The call slot is free: a warm set member this call pushed down may come back.
             drop(permit);
@@ -1835,7 +1839,7 @@ impl GpuPool {
             self.devices[start].memory.with(|gpu| gpu.spawned(&plan.id, birth.pid));
             Ok(())
         })?;
-        match self.call(engine, "", held, plan, &load_caps, &mut session, true) {
+        match self.call(engine, "", held, plan, &load_caps, &mut session, true, None) {
             Ok(_) => {
                 self.keep_idle(session);
                 Ok("loaded")
@@ -2157,6 +2161,7 @@ impl GpuPool {
                 &DeviceCommand::Start {
                     devices: self.lane_devices(0, 1)?,
                     application: held.record.application.clone(),
+                    call_interfaces: crate::jobs::call_interfaces(held, &interface),
                     package_interface: interface,
                     sequence_parallel_degree: 1,
                     import_only: true,
@@ -2262,9 +2267,10 @@ impl GpuPool {
         held: HeldGeneration,
         plan: GpuPlan,
         start: usize,
+        jobs: Option<&Arc<crate::jobs::Jobs>>,
     ) -> io::Result<()> {
         let (key, degree) = (plan.id.clone(), plan.degree);
-        let result = self.run_on(engine, id, held, plan, start);
+        let result = self.run_on(engine, id, held, plan, start, jobs);
         // Broken/failed exchanges close the owner channel. Sources and the journal
         // reservation survive until the exact receiver has exited.
         self.settle_lane(&key, start, degree);
@@ -2426,7 +2432,19 @@ impl GpuPool {
         held: HeldGeneration,
         plan: GpuPlan,
         start: usize,
+        jobs: Option<&Arc<crate::jobs::Jobs>>,
     ) -> io::Result<()> {
+        // A cancel ends the call's children with it.
+        let stops = |cancel: Cancellation| {
+            let (request, jobs) = (id.to_string(), jobs.map(Arc::downgrade));
+            Arc::new(move || {
+                let canceled = cancel.cancel(&request);
+                if let Some(jobs) = jobs.as_ref().and_then(std::sync::Weak::upgrade) {
+                    jobs.stop_children(&request, false);
+                }
+                canceled
+            })
+        };
         if let Some(custody) = &self.custody {
             log_released(custody.lock().unwrap().collect());
         }
@@ -2447,12 +2465,10 @@ impl GpuPool {
         };
         let (session, load_caps) = match retained {
             Some(session) => {
-                let cancel = session.executor.cancellation();
-                let request = id.to_string();
                 engine.register_managed(
                     id,
                     session.executor.birth.clone(),
-                    Arc::new(move || cancel.cancel(&request)),
+                    stops(session.executor.cancellation()),
                 )?;
                 (session, vec![])
             }
@@ -2469,13 +2485,7 @@ impl GpuPool {
                 let on_birth = |birth: &ProcessBirth, cancel: &Cancellation| {
                     // Rank 0 drives the lane's first GPU; followers are named after Start.
                     self.devices[start].memory.with(|gpu| gpu.spawned(&plan.id, birth.pid));
-                    let cancel = cancel.clone();
-                    let request = id.to_string();
-                    engine.register_managed(
-                        id,
-                        birth.clone(),
-                        Arc::new(move || cancel.cancel(&request)),
-                    )
+                    engine.register_managed(id, birth.clone(), stops(cancel.clone()))
                 };
                 match self.new_session(engine, &held, &plan, start, on_birth) {
                     Err(error) if error.kind() == io::ErrorKind::Unsupported => {
@@ -2499,7 +2509,7 @@ impl GpuPool {
         let fresh = plan.clone();
         let error = {
             let mut session = session;
-            match self.call(engine, id, &held, plan, &load_caps, &mut session, false) {
+            match self.call(engine, id, &held, plan, &load_caps, &mut session, false, jobs) {
                 Ok(true) => {
                     self.keep_idle(session);
                     return Ok(());
@@ -2523,7 +2533,7 @@ impl GpuPool {
         if !engine.redeliver(id)? {
             return Ok(()); // canceled meanwhile
         }
-        self.run_on(engine, id, held, fresh, start)
+        self.run_on(engine, id, held, fresh, start, jobs)
     }
 
     /// Launch an executor for `plan` (fork from its generation's import-only executor, else
@@ -2674,6 +2684,7 @@ impl GpuPool {
         load_caps: &[Option<u64>],
         session: &mut Session,
         load_only: bool,
+        jobs: Option<&Arc<crate::jobs::Jobs>>,
     ) -> io::Result<bool> {
         let start = session.start;
         let gpu = &self.devices[start].memory;
@@ -2706,6 +2717,7 @@ impl GpuPool {
             degree: plan.degree,
             store: &self.store,
             spool: None,
+            job: None,
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -2720,6 +2732,7 @@ impl GpuPool {
                     package_interface: interface_path.clone(),
                     sequence_parallel_degree: plan.degree,
                     import_only: false,
+                    call_interfaces: crate::jobs::call_interfaces(held, &interface_path),
                 },
                 &Group {
                     rank_cells: ranked,
@@ -2901,7 +2914,7 @@ impl GpuPool {
                 request_id: id.into(),
                 construction: plan.id.clone(),
                 entrypoint: plan.entrypoint.clone(),
-                payload: record.invocation.input,
+                payload: record.invocation.input.clone(),
                 attention_kernel: record.invocation.attention_kernel.clone(),
                 input_metadata: record
                     .invocation
@@ -3020,14 +3033,19 @@ impl GpuPool {
             }
         }
         callbacks.spool = Some(spool.clone());
+        let document = held.record.app(&record.invocation.module)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "installed output App is absent"))?.2;
+        // The request calls children as a job does: its frames reach their record.
+        let interface = session.executor.root_path().join("package-interface.json");
+        let caller = jobs.map(|jobs| jobs.caller(&record, held, document, &interface, &spool).0);
+        callbacks.job = caller.as_ref();
+        session.executor.waits = caller.as_ref().map(|caller| caller.waits(engine));
         let invoked = Instant::now();
         let first = !session.invoked;
         session.invoked = true;
         let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
-                max_output_bytes: crate::output_capacity::for_callable(
-                    held.record.app(&record.invocation.module).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "installed output App is absent"))?.2,
-                    "entrypoints", &plan.entrypoint)?,
+                max_output_bytes: crate::output_capacity::for_callable(document, "entrypoints", &plan.entrypoint)?,
                 request_id: id.into(),
                 construction: plan.id.clone(),
                 entrypoint: plan.entrypoint,
@@ -3045,7 +3063,9 @@ impl GpuPool {
             },
             &group,
             &mut callbacks,
-        )?;
+        );
+        session.executor.waits = None;
+        let reply = reply?;
         // A call that evicted nothing kept every weight it uses mapped: that is what it maps.
         let evictions = reply.plane.as_ref().and_then(|p| p.evictions);
         let mapped = reply
@@ -4108,6 +4128,8 @@ struct Callbacks<'a> {
     store: &'a Store,
     /// The invoking request's spool, where its published assets' bytes are.
     spool: Option<PathBuf>,
+    /// The invoking request as a caller: its child-call frames.
+    job: Option<&'a crate::jobs::Caller>,
 }
 impl Services for Callbacks<'_> {
     fn object_files(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
@@ -4233,6 +4255,11 @@ impl Services for Callbacks<'_> {
             if let Some(value) = value {
                 payload[name] = value;
             }
+        }
+        // A child's stage the call relays carries its download's bytes.
+        let call = frame.call_request.as_deref().filter(|call| !call.is_empty());
+        if let Some((done, total)) = self.job.zip(call).and_then(|(caller, call)| caller.child_bytes(self.engine, call)) {
+            (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
         }
         let _ = self
             .engine
@@ -4362,7 +4389,12 @@ impl Services for Callbacks<'_> {
                 answer.ok = true;
                 answer.cap_bytes = cap.map_or(-1, |cap| i64::try_from(cap).unwrap_or(i64::MAX));
             }
-            _ => drop(descriptor),
+            _ => {
+                drop(descriptor);
+                if let Some(caller) = self.job {
+                    return caller.seam(frame);
+                }
+            }
         }
         if answer.ok {
             answer.code.clear();

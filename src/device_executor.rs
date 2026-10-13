@@ -197,6 +197,10 @@ pub enum DeviceCommand {
         sequence_parallel_degree: u32,
         #[serde(skip_serializing_if = "is_false")]
         import_only: bool,
+        /// What its attempts may call: the Runtime installs their callers before it imports
+        /// the package and brokers each attempt's calls, a served call's as a job's.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        call_interfaces: Vec<CallInterface>,
     },
     Load {
         construction: String,

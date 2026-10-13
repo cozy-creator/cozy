@@ -35,6 +35,7 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
         inputs: vec![],
         calls: Mutex::new(Calls { by_index: [(0, call)].into(), ..Default::default() }),
     });
+    let caller = Caller { jobs: jobs.clone(), parent };
     let mut seam = Seam {
         engine,
         id: &job,
@@ -42,7 +43,7 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
         spool: &root,
         completed: 0,
         publish: true,
-        job: Some((&jobs, &parent)),
+        job: Some(&caller),
         appended: HashMap::new(),
         weights: None,
     };
@@ -71,6 +72,7 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
     let seen = relay("Reference / preparing ", Some("job/0"));
     assert!(seen.get("bytes_total").is_none(), "{seen}");
     drop(seam);
+    drop(caller);
     drop(jobs);
     drop(service);
     let _ = std::fs::remove_dir_all(root);
