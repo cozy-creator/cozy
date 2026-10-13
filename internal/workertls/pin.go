@@ -32,6 +32,15 @@ func LoadPin(path string) (*Pin, error) {
 	return ParsePin(data)
 }
 
+// EndpointPin prefers the current authority's leaf, without falling back to a
+// stale file when that leaf is invalid. Files serve retained explicit endpoints.
+func EndpointPin(certificatePEM, path string) (*Pin, error) {
+	if certificatePEM != "" {
+		return ParsePin([]byte(certificatePEM))
+	}
+	return LoadPin(path)
+}
+
 // ParsePin reads an already retained public endpoint leaf without a temporary file.
 func ParsePin(data []byte) (*Pin, error) {
 	for {

@@ -27,10 +27,10 @@ func KeepAlive(ctx context.Context, l home.Layout, row *records.Rental) (Acknowl
 	if row == nil || row.State != "ready" {
 		return out, exit.New(exit.Conflict, "keepalive requires a current ready rental")
 	}
-	if row.Address == "" || row.CertPath == "" || row.ExpectedWorkerID == "" || row.ExpectedWorkerBootID == "" {
+	if row.Address == "" || row.CertPath == "" && row.CertificatePEM == "" || row.ExpectedWorkerID == "" || row.ExpectedWorkerBootID == "" {
 		return out, exit.New(exit.Credential, "keepalive requires the rental's pinned machine, worker and boot identity")
 	}
-	pin, err := workertls.LoadPin(row.CertPath)
+	pin, err := workertls.EndpointPin(row.CertificatePEM, row.CertPath)
 	if err != nil {
 		return out, exit.New(exit.Credential, "the rental's machine certificate pin is unreadable: %s", err)
 	}

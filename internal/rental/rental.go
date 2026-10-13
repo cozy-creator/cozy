@@ -1,15 +1,8 @@
-// Package rental is the local side of a rented pod (cl-015): where its facts live, where
-// its credential lives, and the ONE function that turns a rental id into the dial triple
-// the orchestrator attaches a remote worker with.
-//
-// The split is deliberate and is the same one cl-006 already made for the CLI's own
-// credential: facts are rows in the records authority; the media bearer and Creator
-// private key are separate 0600 files. The pinned worker certificate is public and sits
-// beside them because crypto/x509 consumes a file.
+// Package rental owns local key custody and durable acquisition replay.
+// Live identity, endpoint and lifecycle come from Tensorhub through LiveResolver.
 package rental
 
 import (
-	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -60,18 +53,6 @@ func attach(l home.Layout, st *records.Store, row records.Rental, cert string,
 		return e
 	}
 	if stored != nil {
-		if stored.Address != "" && stored.Address != row.Address ||
-			stored.MediaAddress != "" && stored.MediaAddress != row.MediaAddress {
-			return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
-				"rental %s changed its control or media address before attachment", row.ID)
-		}
-		if stored.CertPath != "" {
-			pinned, err := os.ReadFile(stored.CertPath)
-			if err != nil || !bytes.Equal(pinned, []byte(cert)) {
-				return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
-					"rental %s changed its pinned certificate before attachment", row.ID)
-			}
-		}
 		if _, err := os.Stat(l.RentalCreatorIdentity(row.ID)); err == nil {
 			existing, problem := loadCreatorIdentity(l.RentalCreatorIdentity(row.ID))
 			if problem != nil || existing.PublicKey() != creator.PublicKey() {
@@ -273,9 +254,9 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 // Known is the non-secret target question. The HTTP layer asks it so a submission
 // naming an absent or not-yet-published pod is refused before a request row exists, and
 // so its plan resolves from the exact persisted snapshot. It never reads the media bearer.
-func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exit.Error) {
+func Known(read func(string) (*records.Rental, *exit.Error)) func(string) (*orchestrator.DesiredPlacement, *exit.Error) {
 	return func(id string) (*orchestrator.DesiredPlacement, *exit.Error) {
-		row, e := st.RentalRow(id)
+		row, e := read(id)
 		if e != nil {
 			return nil, e
 		}
@@ -290,7 +271,7 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 		if row.Address == "" {
 			return nil, noAddress(id, row.State)
 		}
-		if row.CertPath == "" {
+		if row.CertPath == "" && row.CertificatePEM == "" {
 			return nil, exit.Unavailablef("rental %s has exact control but its WorkerTarget is not attached yet", id).
 				WithRemedy("wait for `cozy rental new` to validate and atomically publish the target")
 		}
@@ -312,12 +293,11 @@ func noAddress(id, state string) *exit.Error {
 
 // Resolver is what the daemon entrypoint hands the orchestrator as `Options.Rentals`. It
 // is the dial-time resolution of the machine pin and Creator signing identity. It reads the
-// store on EVERY call rather than closing over a
-// snapshot: `cozy rental new` is a records-plane act that runs against a daemon already up, so
-// a resolver that cached would refuse the rental the user just made until a restart.
-func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
+// supplied reader on every call. The production reader asks the owning Hub, so
+// an existing daemon observes new rentals and replacement worker identities.
+func Resolver(l home.Layout, read func(string) (*records.Rental, *exit.Error)) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
 	return func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
-		row, e := st.RentalRow(id)
+		row, e := read(id)
 		if e != nil {
 			return nil, e
 		}
@@ -331,7 +311,7 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		if row.Address == "" {
 			return nil, noAddress(id, row.State)
 		}
-		if row.CertPath == "" {
+		if row.CertPath == "" && row.CertificatePEM == "" {
 			return nil, exit.Unavailablef("rental %s is not attached on this host", id).
 				WithRemedy("resume the original rental operation so control, certificate, and token publish together")
 		}
@@ -342,7 +322,7 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		if cert == "" {
 			cert = l.RentalCert(id)
 		}
-		if _, err := os.Stat(cert); err != nil {
+		if _, err := os.Stat(cert); err != nil && row.CertificatePEM == "" {
 			return nil, exit.New(exit.NotFound,
 				"rental %s pins a certificate this host cannot read: %s", id, err).
 				WithRemedy("release this rental and rent again; the pin is written with the token").
@@ -350,7 +330,8 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		}
 		spec := &orchestrator.WorkerConnection{
 			RentalID: row.ID, Addr: row.Address, CACert: cert,
-			WorkerID: row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID,
+			CertificatePEM: row.CertificatePEM,
+			WorkerID:       row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID,
 		}
 		// THE WIDTH TRAVELS WITH THE DIAL IDENTITY. It is the paid `accelerator_count`,
 		// spelled as the device envelope the pod's worker holds, and a CPU rental holds

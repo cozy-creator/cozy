@@ -174,10 +174,14 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 	}
 	attached := make(map[string]bool, len(rows))
 	for _, row := range rows {
-		attached[row.ID] = true
 		if fleet.origin(row.Hub) != origin {
 			continue
 		}
+		seen, current := live[row.ID]
+		if !current && result.HubUnanswered == nil {
+			continue
+		}
+		attached[row.ID] = true
 		queued, running, problem := st.RentalWorkCounts(row.ID, row.ManagedRequestID)
 		if problem != nil {
 			return result, problem
@@ -203,13 +207,21 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			HubUnknown:            census.hubUnknown[row.ID],
 			UnreachableSince:      live[row.ID].UnreachableSince,
 		}
-		if seen, ok := live[row.ID]; ok {
+		if current {
 			summary.MachineName = seen.DisplayName()
+			summary.RentalAlias, summary.State = seen.Name, seen.State
+			summary.Address, summary.MediaAddress = seen.Address, seen.MediaAddress
+			summary.AcceleratorModel, summary.AcceleratorCount = seen.AcceleratorModel, seen.AcceleratorCount
+			summary.HourlyRateUSDMicros = seen.HourlyRateUSDMicros
+			summary.Failure = hub.RentalFailure{}
+			if seen.Failure != nil {
+				summary.Failure = *seen.Failure
+			}
 		}
 		costOf(&summary, live[row.ID])
 		if update, problem := st.RuntimeUpdate(row.ID); problem != nil {
 			return result, problem
-		} else if update != nil && update.Active() {
+		} else if update != nil && update.Active() && current && seen.State == hub.RentalReady && seen.WorkerBootID == update.BootID {
 			summary.RuntimeUpdate = update.State
 		}
 		result.Rentals = append(result.Rentals, summary)
@@ -217,6 +229,9 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 	hubNamed := map[string]bool{}
 	for _, seen := range census.unrecorded {
 		hubNamed[seen.ID], hubNamed[seen.Name] = true, true
+		if attached[seen.ID] {
+			continue
+		}
 		result.Unrecorded = append(result.Unrecorded, api.RentalSummary{
 			Provider: seen.Provider, ProviderMachineID: seen.ProviderMachineID, ProviderResourceID: seen.ProviderResourceID,
 			ID: seen.ID, MachineName: seen.DisplayName(), RentalAlias: seen.Name, State: seen.State,
@@ -235,7 +250,7 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 		return result, problem
 	}
 	for _, op := range open {
-		if attached[op.RentalID] || fleet.origin(op.Hub) != origin {
+		if op.State == "attached" || attached[op.RentalID] || fleet.origin(op.Hub) != origin {
 			continue
 		}
 		var request hub.RentalRequest

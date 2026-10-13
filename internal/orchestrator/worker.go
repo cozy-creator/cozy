@@ -185,11 +185,12 @@ func digestMatches(value canonical.Value, spelled string) bool {
 // worker server certificate is pinned exactly, and Creator signs Claim with the
 // per-rental Ed25519 key whose public half Tensorhub provisioned into the pod.
 type WorkerConnection struct {
-	RentalID     string `json:"rental_id"`
-	Addr         string `json:"addr"`
-	CACert       string `json:"ca_cert"` // path to the worker's pinned PEM
-	WorkerID     string `json:"worker_id"`
-	WorkerBootID string `json:"worker_boot_id"`
+	RentalID       string `json:"rental_id"`
+	Addr           string `json:"addr"`
+	CACert         string `json:"ca_cert"`                   // path to the worker's pinned PEM
+	CertificatePEM string `json:"certificate_pem,omitempty"` // current Hub endpoint; no shared mutable pin file
+	WorkerID       string `json:"worker_id"`
+	WorkerBootID   string `json:"worker_boot_id"`
 	// Media is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media server
 	// this owner uploads inputs and binding records to and downloads outputs from. It is
 	// the pod's own listener with its own keys, not a second use of the control leg —

@@ -33,6 +33,11 @@ type rentalRuntimeUpdates struct {
 	running  sync.Map
 }
 
+type runningRuntimeUpdate struct {
+	id     string
+	cancel context.CancelFunc
+}
+
 type runtimeUpdateWheel struct {
 	Path     string `json:"path,omitempty"`
 	Version  string `json:"version"`
@@ -71,6 +76,23 @@ type runtimeUpdateResult struct {
 // takes work. Only a new boot is followed, so an explicit update stands until the pod boots
 // again.
 func (u *rentalRuntimeUpdates) Boot(id string) {
+	current, problem := u.machines.store.RuntimeUpdate(id)
+	if problem == nil && current != nil && current.Active() {
+		row, problem := observedRental(u.machines.context, u.machines.store, id)
+		if problem != nil {
+			return
+		}
+		if row.ExpectedWorkerBootID != current.BootID {
+			// Keep the accepted software choice when the Hub replaces the worker.
+			next, problem := u.machines.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, current.Selection)
+			if problem == nil {
+				u.run(*next)
+			}
+			return
+		}
+		u.run(*current)
+		return
+	}
 	if _, problem := u.follow(id); problem != nil {
 		fmt.Fprintf(u.machines.context.Out, "rental %s keeps its software: %s\n", id, problem.Message)
 	}
@@ -95,7 +117,7 @@ func (u *rentalRuntimeUpdates) begin(id string, options api.RuntimeUpdateRequest
 		return nil, exit.New(exit.Validation, "name a wheel or a version, not both")
 	}
 	m := u.machines
-	row, problem := m.store.RentalRow(id)
+	row, problem := observedRental(m.context, m.store, id)
 	if problem != nil {
 		return nil, problem
 	}
@@ -153,15 +175,25 @@ func (u *rentalRuntimeUpdates) Resume() {
 		return
 	}
 	for _, row := range rows {
-		u.run(row)
+		u.Boot(row.RentalID)
 	}
 }
 
 func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
-	if _, exists := u.running.LoadOrStore(row.RentalID, true); exists {
+	ctx, cancel := context.WithCancel(u.machines.ctx)
+	active := &runningRuntimeUpdate{id: row.ID, cancel: cancel}
+	if prior, exists := u.running.LoadOrStore(row.RentalID, active); exists {
+		cancel()
+		previous := prior.(*runningRuntimeUpdate)
+		if previous.id != row.ID {
+			// A new accepted operation can also follow an intentional stop/resume
+			// of the same boot. Detach its obsolete observer, never its native job.
+			previous.cancel()
+		}
 		return
 	}
 	go func() {
+		defer cancel()
 		m := u.machines
 		defer func() {
 			u.running.Delete(row.RentalID)
@@ -170,7 +202,7 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 				u.run(*current)
 			}
 		}()
-		problem := m.fleet.owner.MaintainRental(m.ctx, row.RentalID, func(ctx context.Context, identity *orchestrator.WorkerConnection) *exit.Error {
+		problem := m.fleet.owner.MaintainRental(ctx, row.RentalID, func(ctx context.Context, identity *orchestrator.WorkerConnection) *exit.Error {
 			if identity.WorkerBootID != row.BootID {
 				return exit.New(exit.Conflict, "the rental's worker boot changed before its update")
 			}
@@ -208,7 +240,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 		row.Result, _ = json.Marshal(runtimeUpdateResult{Unchanged: true, Note: "the update named no software"})
 		return nil
 	}
-	pin, err := workertls.LoadPin(identity.CACert)
+	pin, err := workertls.EndpointPin(identity.CertificatePEM, identity.CACert)
 	if err != nil {
 		return exit.New(exit.Credential, "the machine's TLS identity cannot be read")
 	}
@@ -319,18 +351,19 @@ func published(member *machinev1.Member, running string) bool {
 }
 
 func handleRentalUpdate(ctx *Context) *exit.Error {
-	adoptRentalHub(ctx, ctx.Inv.Args[0])
 	_, store, problem := rentalStores(ctx)
 	if problem != nil {
 		return problem
 	}
 	defer store.Close()
-	row, problem := store.RentalByMachine(strings.TrimSpace(ctx.Inv.Args[0]))
+	live, problem := resolveLiveRental(ctx, store, strings.TrimSpace(ctx.Inv.Args[0]))
 	if problem != nil {
 		return problem
 	}
-	if row == nil {
-		return exit.New(exit.NotFound, "no rental %q on this host", ctx.Inv.Args[0])
+	ctx = ctx.forHub(live.Hub)
+	row, problem := liveRentalResolver(ctx, store).Record(live)
+	if problem != nil {
+		return problem
 	}
 	request := api.RuntimeUpdateRequest{RuntimeVersion: ctx.Inv.Value("--runtime-version"), TensorFSVersion: ctx.Inv.Value("--tensorfs-version")}
 	for flag, into := range map[string]*string{"--runtime-wheel": &request.RuntimeWheel, "--tensorfs-wheel": &request.TensorFSWheel} {
@@ -352,8 +385,8 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 			return problem
 		}
 		if target.Runtime == "" {
-			return exit.Named(exit.Validation, "rental.no_target_software", "the Hub names no target software for %s", row.MachineName).
-				WithRemedy("name it: cozy rental update %s --runtime-version <version> --tensorfs-version <version>", row.MachineName)
+			return exit.Named(exit.Validation, "rental.no_target_software", "the Hub names no target software for %s", row.DisplayName()).
+				WithRemedy("name it: cozy rental update %s --runtime-version <version> --tensorfs-version <version>", row.DisplayName())
 		}
 		request.RuntimeVersion, request.TensorFSVersion = target.Runtime, target.TensorFS
 	}
@@ -363,13 +396,13 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	}
 	update, problem := c.UpdateRentalRuntime(row.ID, request)
 	if problem == nil {
-		update, problem = awaitRentalUpdate(ctx, c, row.MachineName, update)
+		update, problem = awaitRentalUpdate(ctx, c, row.DisplayName(), update)
 	}
 	if problem != nil {
 		return problem
 	}
 	if update.State == "failed" {
-		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.MachineName, update.Error)
+		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.DisplayName(), update.Error)
 	}
 	var result runtimeUpdateResult
 	_ = json.Unmarshal(update.Result, &result)
@@ -378,7 +411,7 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 		status = "unchanged: " + result.Note
 	}
 	return emit(ctx, compactRecord([]output.Field{
-		{K: "machine", V: row.MachineName}, {K: "runtime", V: result.To.Runtime}, {K: "tensorfs", V: result.To.TensorFS},
+		{K: "machine", V: row.DisplayName()}, {K: "runtime", V: result.To.Runtime}, {K: "tensorfs", V: result.To.TensorFS},
 		{K: "status", V: status}, {K: "previous_runtime", V: result.From.Runtime}, {K: "update_id", V: update.ID},
 	}, "machine", "runtime", "tensorfs", "status"))
 }

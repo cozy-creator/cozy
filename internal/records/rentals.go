@@ -3,7 +3,6 @@ package records
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -157,10 +156,8 @@ type RentalRequestAuthor func(machineName string) (body []byte, digest string, p
 
 // BeginRentalOperation durably installs the caller's operation identity. A replay returns
 // the existing row; the caller compares RequestDigest before making any network call. A new
-// operation is named here: the store draws a machine word no rental row or unsettled
-// operation on this host holds and has the request authored under it, inside the one
-// transaction that records it — so two acquisitions can never share a word, and
-// `cozy rental end <word>` is never ambiguous. Spend admission is Tensorhub's: it
+// operation receives an opaque booking alias inside the transaction. Tensorhub
+// assigns the canonical human name after choosing a physical host. Spend admission is Tensorhub's: it
 // checks the owner's fleet cap atomically when the rental is opened.
 func (s *Store) BeginRentalOperation(op RentalOperation,
 	author RentalRequestAuthor) (RentalOperation, bool, *exit.Error) {
@@ -195,15 +192,10 @@ func (s *Store) BeginRentalOperation(op RentalOperation,
 		return RentalOperation{}, false, exit.Named(exit.Usage, "rental.rate_required",
 			"a positive locked hourly rate is required")
 	}
-	taken, e := machineNamesInUse(tx)
-	if e != nil {
-		return RentalOperation{}, false, e
-	}
-	machineName, err := rentalid.NewMachineName(taken)
-	if err != nil {
-		return RentalOperation{}, false, exit.Named(exit.Capacity, "rental.machine_names_exhausted",
-			"%s", err).WithRemedy("release a rental before renting another")
-	}
+	// This is an opaque booking alias, persisted once for replay. Physical host
+	// names and their vocabulary belong exclusively to Tensorhub.
+	machineName := NewID("lease")
+	var e *exit.Error
 	op.RequestBody, op.RequestDigest, e = author(machineName)
 	if e != nil {
 		return RentalOperation{}, false, e
@@ -233,55 +225,6 @@ func (s *Store) BeginRentalOperation(op RentalOperation,
 	return stored, false, nil
 }
 
-// MachineNamesInUse is every word a rental row or an unsettled operation on this host
-// holds: exactly the set a new operation's word is drawn outside of.
-func (s *Store) MachineNamesInUse() (map[string]bool, *exit.Error) {
-	return machineNamesInUse(s.db)
-}
-
-type querier interface {
-	Query(query string, args ...any) (*sql.Rows, error)
-}
-
-func machineNamesInUse(q querier) (map[string]bool, *exit.Error) {
-	taken := map[string]bool{}
-	collect := func(query string, name func([]byte) string) *exit.Error {
-		rows, err := q.Query(query)
-		if err != nil {
-			return exit.Internalf("cannot list machine names in use: %s", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var value []byte
-			if err := rows.Scan(&value); err != nil {
-				return exit.Internalf("cannot read a machine name in use: %s", err)
-			}
-			if word := name(value); word != "" {
-				taken[word] = true
-			}
-		}
-		if err := rows.Err(); err != nil {
-			return exit.Internalf("cannot list machine names in use: %s", err)
-		}
-		return nil
-	}
-	if e := collect(`SELECT machine_name FROM rentals`, func(v []byte) string { return string(v) }); e != nil {
-		return nil, e
-	}
-	// An unsettled operation holds its word inside the closed request document it replays.
-	if e := collect(`SELECT request_body FROM rental_operations WHERE state NOT IN (`+
-		finalRentalOperationStates+`) OR `+replayableRentalOperation, func(v []byte) string {
-		var request struct {
-			Name string `json:"name"`
-		}
-		_ = json.Unmarshal(v, &request)
-		return request.Name
-	}); e != nil {
-		return nil, e
-	}
-	return taken, nil
-}
-
 func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
 	op, err := scanRentalOperation(s.db.QueryRow(
 		`SELECT `+rentalOperationCols+` FROM rental_operations WHERE operation_key=?`, key))
@@ -305,12 +248,6 @@ const replayableRentalOperation = `(state='rejected' AND rental_id='' AND failur
 // Replayable is replayableRentalOperation for one row.
 func (op RentalOperation) Replayable() bool {
 	return op.State == "rejected" && op.RentalID == "" && op.Failure != ""
-}
-
-// RentalOperationsWithSecrets is every operation whose pending credentials are still owed: the
-// open ones and the replayable ones.
-func (s *Store) RentalOperationsWithSecrets() ([]RentalOperation, *exit.Error) {
-	return s.rentalOperationsWhere(`state NOT IN (` + finalRentalOperationStates + `) OR ` + replayableRentalOperation)
 }
 
 // ReopenRentalOperation makes a replayable ask open again for the command replaying it.
@@ -495,9 +432,11 @@ type Rental struct {
 	ManagedRequestID    string
 	Address             string
 	CertPath            string
-	State               string
-	Hub                 string
-	RentedAt            string
+	// CertificatePEM belongs to one fresh Hub read, not the persisted projection.
+	CertificatePEM string
+	State          string
+	Hub            string
+	RentedAt       string
 	// MediaAddress is where the pod's co-resident media server answers (cl-014). It is a
 	// FACT about the pod like the control address is, so it is a row and not a file; the
 	// credential it takes is the rental's media bearer, which stays 0600 beside it.
@@ -586,6 +525,40 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	return s.RecordRentalContext(context.Background(), r)
 }
 
+// ObserveRental refreshes only the Hub-owned projection. Acquisition intent,
+// private-key custody, request ownership and update records remain independent.
+func (s *Store) ObserveRental(r Rental) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin Hub rental observation: %s", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO rentals(id,machine_name,stable_machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+	 stable_machine_name=excluded.stable_machine_name, accelerator_model=excluded.accelerator_model,
+	 accelerator_count=excluded.accelerator_count,hourly_rate_usd_micros=excluded.hourly_rate_usd_micros,
+	 address=excluded.address,state=excluded.state,hub=excluded.hub,media_address=excluded.media_address,
+	 expected_worker_id=excluded.expected_worker_id,expected_worker_boot_id=excluded.expected_worker_boot_id`,
+		r.ID, r.MachineName, r.StableMachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.ManagedRequestID, r.Address, r.CertPath, r.State, r.Hub, r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt)
+	if err != nil {
+		return exit.Internalf("cannot record Hub rental observation: %s", err)
+	}
+	if r.State == "failed" || r.State == "released" {
+		if problem := settleLostMachine(tx, r.ID); problem != nil {
+			return problem
+		}
+	}
+	if r.State == "degraded" && r.Failure.Code == "readiness.provider_stopped" {
+		if problem := settleUnavailableRuntimeUpdate(tx, r.ID, "the provider reports this rental stopped; its software update was not completed"); problem != nil {
+			return problem
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit Hub rental observation: %s", err)
+	}
+	return nil
+}
+
 // RecordRentalContext preserves an accepted Hub observation through local writer
 // contention. Cancellation stops waiting; the pre-existing paid operation remains
 // available for reconciliation under its original idempotency key.
@@ -667,14 +640,6 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 	if r.RentedAt == "" {
 		r.RentedAt = now()
 	}
-	var current string
-	switch err := tx.QueryRow(`SELECT state FROM rentals WHERE id=?`, r.ID).Scan(&current); {
-	case errors.Is(err, sql.ErrNoRows):
-	case err != nil:
-		return exit.Internalf("cannot read rental %s state: %s", r.ID, err)
-	default:
-		r.State = rentalStateForward(current, r.State)
-	}
 	if r.ReadyAt == "" && RentalReadyState(r.State) {
 		r.ReadyAt = now()
 	}
@@ -684,19 +649,16 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 		  stable_machine_name=excluded.stable_machine_name,
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
-		  accelerator_count=CASE WHEN rentals.accelerator_count>0
-		    THEN rentals.accelerator_count ELSE excluded.accelerator_count END,
+		  accelerator_count=excluded.accelerator_count,
 		  hourly_rate_usd_micros=CASE WHEN excluded.hourly_rate_usd_micros>0
 		    THEN excluded.hourly_rate_usd_micros ELSE rentals.hourly_rate_usd_micros END,
 		  managed_request_id=rentals.managed_request_id,
-		  address=CASE WHEN rentals.address<>'' THEN rentals.address ELSE excluded.address END,
+		  address=excluded.address,
 		  cert_path=CASE WHEN rentals.cert_path<>'' THEN rentals.cert_path ELSE excluded.cert_path END,
 		  state=excluded.state,
-		  media_address=CASE WHEN rentals.media_address<>'' THEN rentals.media_address ELSE excluded.media_address END,
-		  expected_worker_id=CASE WHEN rentals.expected_worker_id<>''
-		    THEN rentals.expected_worker_id ELSE excluded.expected_worker_id END,
-		  expected_worker_boot_id=CASE WHEN rentals.expected_worker_boot_id<>''
-		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END,
+		  media_address=excluded.media_address,
+		  expected_worker_id=excluded.expected_worker_id,
+		  expected_worker_boot_id=excluded.expected_worker_boot_id,
 		  ready_at=CASE WHEN rentals.ready_at<>'' THEN rentals.ready_at ELSE excluded.ready_at END,
 		  failure_code=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_code ELSE excluded.failure_code END,
 		  failure_image_digest=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_image_digest ELSE excluded.failure_image_digest END,
@@ -734,6 +696,9 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 	// Runtime work settles in the same transaction that records it.
 	if stored.State == "failed" || stored.State == "released" {
 		return settleLostMachine(tx, r.ID)
+	}
+	if r.State == "degraded" && r.Failure.Code == "readiness.provider_stopped" {
+		return settleUnavailableRuntimeUpdate(tx, r.ID, "the provider reports this rental stopped; its software update was not completed")
 	}
 	return nil
 }
@@ -805,7 +770,7 @@ func (r Rental) DisplayName() string {
 	if r.StableMachineName != "" {
 		return r.StableMachineName
 	}
-	return r.MachineName
+	return r.ID
 }
 
 // ObserveRentalWorker validates the direct ClaimAck against Tensorhub's pinned worker

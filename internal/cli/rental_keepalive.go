@@ -20,23 +20,24 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer store.Close()
-	subject, problem := rental.Resolve(store, strings.TrimSpace(ctx.Inv.Args[0]))
+	subject, problem := resolveLiveRental(ctx, store, strings.TrimSpace(ctx.Inv.Args[0]))
 	if problem != nil {
 		return problem
 	}
-	if subject.Row == nil {
-		return exit.New(exit.NotFound, "no current rental %q on this host", ctx.Inv.Args[0])
+	row, problem := observedRental(ctx, store, subject.Rental.ID)
+	if problem != nil {
+		return problem
 	}
 	// The command itself resets the deadline, with the rental's recorded address, pin and key:
 	// no daemon is asked, so it works whatever daemon runs and whatever the pod's machine is.
 	observed, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	receipt, problem := rental.KeepAlive(observed, layout, subject.Row)
+	receipt, problem := rental.KeepAlive(observed, layout, row)
 	if problem != nil {
 		return problem
 	}
 	// The deadline the machine answered: its clock restarted now, or none while it has a job.
-	fields := append([]output.Field{{K: "rental", V: subject.Row.ID},
+	fields := append([]output.Field{{K: "rental", V: row.ID},
 		{K: "acknowledged_at", V: time.UnixMilli(receipt.AcknowledgedAtMS).UTC().Format(time.RFC3339Nano)}},
 		rentalEnds(receipt.IdleDeadlineMS, !ctx.Mode().Human || ctx.Mode().JSON)...)
 	return emit(ctx, output.Record{Fields: fields, AllFields: fields})
@@ -46,12 +47,15 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 // itself still asks here).
 func (m *managedRentals) keepalive(ctx context.Context, id string) (api.RentalKeepaliveResult, *exit.Error) {
 	var out api.RentalKeepaliveResult
+	row, problem := observedRental(m.ctx, m.store, id)
+	if problem != nil {
+		return out, problem
+	}
 	m.mu.Lock()
 	if m.closed || m.owner == nil {
 		m.mu.Unlock()
 		return out, exit.Unavailablef("rental controller is unavailable")
 	}
-	row, problem := m.store.RentalRow(id)
 	if problem == nil && (row == nil || row.State != "ready" || m.settling[id]) {
 		problem = exit.New(exit.Conflict, "keepalive requires a current ready rental")
 	}

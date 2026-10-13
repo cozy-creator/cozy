@@ -20,7 +20,7 @@ func TestV1RentalRunSurvivesDaemonRestart(t *testing.T) {
 		t.Fatalf("installing authored lifecycle fixture [%d]: %s", code, out)
 	}
 	found := &machines.Resolver{Host: machines.NewHost(layout.Machine, "", nil), HubOrigin: h.server.URL,
-		Rentals: rental.Resolver(layout, store), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
+		Rentals: rental.Resolver(layout, store.RentalRow), UseRental: func(string, string) (func(), *exit.Error) { return func() {}, nil },
 		RentalKey: func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(layout, id) }}
 	machine, problem := found.DialV1(t.Context(), parityRental, "rental daemon restart test")
 	fatal(t, problem)

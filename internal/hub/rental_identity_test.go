@@ -29,17 +29,17 @@ func TestRentalIdentityFieldsAreOptionalAcrossHubVersions(t *testing.T) {
 }
 
 func TestStableHostNameDoesNotChangeRentalAlias(t *testing.T) {
-	for _, name := range []string{"mikatan-356e23", "", "../invalid"} {
-		wire := wireRental{ID: "pr-host", Name: "julian", StableMachineName: name}
+	for _, name := range []string{"katsuie", "", "../invalid"} {
+		wire := wireRental{ID: "pr-host", Name: "julian", StableMachineName: name, MachineAliases: []string{"adolf"}}
 		got := wire.rental()
-		if got.Name != "julian" || got.ID != "pr-host" || !got.MatchesName("JULIAN") {
+		if got.Name != "julian" || got.ID != "pr-host" || !got.MatchesName("JULIAN") || !got.MatchesName("ADOLF") {
 			t.Fatalf("rental alias changed: %+v", got)
 		}
-		if name == "mikatan-356e23" {
+		if name == "katsuie" {
 			if got.DisplayName() != name || !got.MatchesName(name) {
 				t.Fatalf("stable name unavailable: %+v", got)
 			}
-		} else if got.DisplayName() != "julian" || got.StableMachineName != "" {
+		} else if got.DisplayName() != "pr-host" || got.StableMachineName != "" {
 			t.Fatalf("invalid or missing host name changed display: %+v", got)
 		}
 	}

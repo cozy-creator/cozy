@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -24,6 +23,9 @@ type Installs struct {
 	wakeVersion atomic.Uint64
 	// progress is each running installation's latest preparation report, by install id.
 	progress sync.Map
+	// Rental reads current Hub state by immutable ID. A missing resolver is not
+	// permission to infer liveness from the local projection.
+	Rental func(string) (*records.Rental, *exit.Error)
 }
 
 // InstallProgress is the machine's latest report on one running installation.
@@ -52,7 +54,10 @@ func NewInstalls(store *records.Store, prepare Prepare, log io.Writer) *Installs
 // Accept durably queues one installation on a machine this host knows.
 func (q *Installs) Accept(machine string, selection records.RentalInstallSelection) (*records.RentalInstall, *exit.Error) {
 	if machine != Local {
-		row, problem := q.store.RentalRow(machine)
+		if q.Rental == nil {
+			return nil, exit.Unavailablef("live rental inventory is unavailable")
+		}
+		row, problem := q.Rental(machine)
 		if problem != nil {
 			return nil, problem
 		}
@@ -97,31 +102,17 @@ func (q *Installs) Cancel(machine, id string) (*InstallStatus, *exit.Error) {
 	return &InstallStatus{RentalInstall: *row}, nil
 }
 
-// InstallTarget names the machine an installation goes to: this computer's machine, or a
-// rental by its machine name or id.
-func InstallTarget(store *records.Store, name string) (string, *exit.Error) {
-	name = strings.TrimSpace(name)
-	if name == Local {
-		return Local, nil
-	}
-	row, problem := store.RentalByMachine(name)
-	if problem != nil {
-		return "", problem
-	}
-	if row == nil {
-		return "", exit.New(exit.NotFound, "no rental %q on this host", name)
-	}
-	return row.ID, nil
-}
-
 // installFence is the worker boot an installation is claimed on and whether the machine
 // takes it now, or why its installations end. This computer's machine is always present
 // and has no boot fence.
-func installFence(store *records.Store, machine string) (boot string, ready bool, ended, problem *exit.Error) {
+func installFence(read func(string) (*records.Rental, *exit.Error), machine string) (boot string, ready bool, ended, problem *exit.Error) {
 	if machine == Local {
 		return "", true, nil, nil
 	}
-	row, problem := store.RentalRow(machine)
+	if read == nil {
+		return "", false, nil, exit.Unavailablef("live rental inventory is unavailable")
+	}
+	row, problem := read(machine)
 	if problem != nil {
 		return "", false, nil, problem
 	}
@@ -183,7 +174,7 @@ func (q *Installs) Run(ctx context.Context) {
 				if ctx.Err() != nil {
 					break
 				}
-				boot, ready, ended, problem := installFence(q.store, row.RentalID)
+				boot, ready, ended, problem := installFence(q.Rental, row.RentalID)
 				if problem != nil {
 					q.report(problem)
 					continue

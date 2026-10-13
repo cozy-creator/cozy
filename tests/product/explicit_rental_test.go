@@ -20,6 +20,13 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	var inventoryReads atomic.Int32
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, detail *hub.PackageReleaseDetail) {
 		detail.ExecutionRequirements = []string{"cozy-runtime[media]>=0.15.0,<1"}
+		mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
+			inventoryReads.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"rentals": []any{
+				map[string]any{"rental_id": current, "name": "isao", "machine_name": "isao", "state": "ready", "accelerator_count": 1},
+				map[string]any{"rental_id": old, "name": "giriko", "machine_name": "giriko", "state": "ready", "accelerator_count": 1},
+			}})
+		})
 		mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 			id := r.PathValue("id")
 			name, ok := map[string]string{current: "isao", old: "giriko"}[id]
@@ -28,7 +35,8 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"rental_id": id, "name": name, "state": "ready", "development": false,
+				"rental_id": id, "name": name, "machine_name": name, "state": "ready", "development": false,
+				"worker_address": "127.0.0.1:1", "cert_pem": "fixture", "worker_id": "fixture", "worker_boot_id": "fixture", "creator_public_key": "fixture",
 				"requested_accelerator_model": "CPU", "accelerator_count": 1,
 				"hourly_rate_usd_micros": 100000,
 			})
@@ -58,7 +66,7 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	// ends; it does not need a fresh inventory read merely to retrieve history.
 	st, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	_, _, problem = st.Submit(records.Request{ID: "prior", IdemKey: "prior", BodyDigest: childDigest("f"), Package: "proof/quantize", Entrypoint: "quantize", Payload: []byte("{}"), Rental: true, RequestedRental: current})
+	_, _, problem = st.Submit(records.Request{ID: "prior", IdemKey: "prior", BodyDigest: childDigest("f"), Package: "proof/quantize", Entrypoint: "quantize", Payload: []byte("{}"), Rental: true, RequestedRental: current, Machine: "isao"})
 	fatal(t, problem)
 	_, problem = st.FailQueuedRequest("prior", map[string]any{"error_type": "proof", "error": "stopped"})
 	fatal(t, problem)
@@ -72,8 +80,8 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	}
 	before := inventoryReads.Load()
 	code, out = runCozy(t, root, append(append([]string{}, args...), "--rental=unknown")...)
-	if code == 0 || !strings.Contains(out, "rental.selection_unavailable") || inventoryReads.Load() != before {
-		t.Fatalf("unknown rental consulted remote: %d %s", code, out)
+	if code == 0 || !strings.Contains(out, "rental.selection_unavailable") || inventoryReads.Load() <= before {
+		t.Fatalf("unknown rental did not consult live inventory: %d %s", code, out)
 	}
 	code, out = runCozy(t, root, append(append([]string{}, args...), "--rental=isao", "--rental-only")...)
 	if code == 0 {

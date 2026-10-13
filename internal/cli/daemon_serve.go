@@ -119,8 +119,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// Two questions, deliberately not one object: the API resolves the persisted,
 	// non-secret attempt control (so a bad pin refuses before a request row), and the
 	// orchestrator resolves the dial triple at dial time. Only the second reads the token.
-	rentals := rental.Resolver(l, st)
-	knownRentals := rental.Known(st)
+	readRental := func(id string) (*records.Rental, *exit.Error) { return observedRental(ctx, st, id) }
+	rentals := rental.Resolver(l, readRental)
+	readProjection := func(id string) (*records.Rental, *exit.Error) { return liveRentalProjection(ctx, st, id) }
+	knownRentals := rental.Known(readProjection)
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	// The daemon starts this computer's machine as `cozy machine start` does.
@@ -135,7 +137,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
 		UseRental:      func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
 		RentalKey:      func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
-		EndpointRental: rentalEndpoint(l, st),
+		EndpointRental: rentalEndpoint(ctx, l, st),
 		Log:            ctx.Out,
 	}
 	machines := newMachineRuns(ctx, l, st, resolver, fleet, found)
@@ -176,6 +178,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
 	installs := machineset.NewInstalls(st, machines.Prewarm, ctx.Out)
+	installs.Rental = readProjection
 	fleet.installs = installs
 	installsStopped := make(chan struct{})
 	defer cancelInstalls()
@@ -244,7 +247,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 		// The lifecycle sweep is a few reads: it goes first, before anything owed can buy.
 		{"lifecycle sweep", func() string {
 			publications, publicationsNote := reclaimNote(reclaim.Publications(l, st))
-			rentalSecrets, rentalSecretsNote := reclaimNote(reclaim.RentalSecrets(l, st))
+			rentalSecrets, rentalSecretsNote := reclaimNote(reclaim.RentalSecrets(l, st, func(id string) (bool, *exit.Error) {
+				call, cancel := hub.Context()
+				defer cancel()
+				live, problem := liveRentalResolver(ctx, st).Read(call, id)
+				return problem == nil && hub.RentalAbsent(live.Rental.State), problem
+			}))
 			return fmt.Sprintf("%d publication root(s) settled%s · %d stale rental secret(s) erased%s",
 				publications.Removed, publicationsNote, rentalSecrets.Removed, rentalSecretsNote)
 		}},

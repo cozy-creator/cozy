@@ -358,11 +358,10 @@ func publicationRoot(l home.Layout, st *records.Store, root, requestID string) (
 
 // ------------------------------------------------------------------ rental secrets
 
-// RentalSecrets erases the secret files of every rental the records authority no longer
-// holds: an id in a proven-absent terminal state, an id with no row at all, and every
-// pending-operation credential whose paid operation is over. Files this package cannot
-// attribute are left where they are. The empty directory is removed last.
-func RentalSecrets(l home.Layout, st *records.Store) (Swept, *exit.Error) {
+// RentalSecrets requires affirmative Hub absence before erasing a canonical key.
+// A missing projection or an unavailable authority does not end key custody.
+// Pending keys are reclaimed only for a known, non-replayable settled operation.
+func RentalSecrets(l home.Layout, st *records.Store, absent func(string) (bool, *exit.Error)) (Swept, *exit.Error) {
 	entries, err := os.ReadDir(l.Rentals)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -374,15 +373,16 @@ func RentalSecrets(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 	if problem != nil {
 		return Swept{}, problem
 	}
-	operations, problem := st.RentalOperationsWithSecrets()
+	operations, problem := st.RentalOperations()
 	if problem != nil {
 		return Swept{}, problem
 	}
-	pending := map[string]bool{}
+	settled := map[string]bool{}
 	for _, op := range operations {
 		sum := sha256.Sum256([]byte(op.Key))
-		pending["pending-"+hex.EncodeToString(sum[:])] = true
+		settled["pending-"+hex.EncodeToString(sum[:])] = (op.State == "released" || op.State == "rejected") && !op.Replayable()
 	}
+	confirmed := map[string]bool{}
 	var swept Swept
 	var first *exit.Error
 	for _, entry := range entries {
@@ -395,11 +395,26 @@ func RentalSecrets(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 		}
 		swept.Scanned++
 		if strings.HasPrefix(owner, "pending-") {
-			if pending[owner] {
+			if !settled[owner] {
 				continue
 			}
 		} else if held[owner] {
 			continue
+		} else {
+			gone, checked := confirmed[owner]
+			if !checked && absent != nil {
+				gone, problem = absent(owner)
+				if problem != nil {
+					gone = false
+					if first == nil {
+						first = problem
+					}
+				}
+				confirmed[owner] = gone
+			}
+			if !gone {
+				continue
+			}
 		}
 		path := filepath.Join(l.Rentals, entry.Name())
 		info, err := entry.Info()

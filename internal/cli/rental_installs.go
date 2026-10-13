@@ -80,7 +80,12 @@ func rentalInstallClient(ctx *Context, rentalName string) (*localapi.Client, str
 	if problem != nil {
 		return nil, "", problem
 	}
-	rentalID, problem := machines.InstallTarget(store, rentalName)
+	rentalID := machines.Local
+	if !machines.IsLocal(rentalName) {
+		live, failure := resolveLiveRental(ctx, store, rentalName)
+		problem = failure
+		rentalID = live.Rental.ID
+	}
 	store.Close()
 	if problem != nil {
 		return nil, "", problem

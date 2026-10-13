@@ -68,6 +68,7 @@ func RentalAbsent(state string) bool {
 type Rental struct {
 	Provider, ProviderMachineID, ProviderResourceID string
 	StableMachineName                               string
+	MachineAliases                                  []string
 	Development                                     bool
 	SSHAddress                                      string
 	ID                                              string
@@ -282,6 +283,7 @@ type wireRental struct {
 	Provider              string         `json:"provider,omitempty"`
 	ProviderMachineID     string         `json:"provider_machine_id,omitempty"`
 	StableMachineName     string         `json:"machine_name,omitempty"`
+	MachineAliases        []string       `json:"machine_aliases,omitempty"`
 	ProviderResourceID    string         `json:"provider_resource_id,omitempty"`
 	Development           bool           `json:"development,omitempty"`
 	SSHAddress            string         `json:"ssh_address,omitempty"`
@@ -354,6 +356,7 @@ func (w wireRental) rental() Rental {
 	return Rental{
 		Provider: w.Provider, ProviderMachineID: w.ProviderMachineID, ProviderResourceID: w.ProviderResourceID,
 		StableMachineName: validStableMachineName(w.StableMachineName),
+		MachineAliases:    w.MachineAliases,
 		Development:       w.Development, SSHAddress: w.SSHAddress, ID: w.ID, Name: w.machineName(), State: w.State,
 		AcceleratorModel: w.AcceleratorModel, AcceleratorCount: w.AcceleratorCount,
 		Address: w.WorkerAddress, CertPEM: w.CertPEM,
@@ -989,11 +992,19 @@ func (r Rental) DisplayName() string {
 	if r.StableMachineName != "" {
 		return r.StableMachineName
 	}
-	return r.Name
+	return r.ID
 }
 
 func (r Rental) MatchesName(name string) bool {
-	return strings.EqualFold(r.Name, name) || r.StableMachineName != "" && strings.EqualFold(r.StableMachineName, name)
+	if strings.EqualFold(r.Name, name) || r.StableMachineName != "" && strings.EqualFold(r.StableMachineName, name) {
+		return true
+	}
+	for _, alias := range r.MachineAliases {
+		if strings.EqualFold(alias, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func validStableMachineName(name string) string {

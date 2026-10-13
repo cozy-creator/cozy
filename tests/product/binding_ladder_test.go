@@ -254,7 +254,15 @@ func newOrgLadderHub(t *testing.T, org string, authored ...[]launch.ModelDefault
 		defer h.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(hub.RentalProducts(h.market))
 	})
-	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"rentals":[]}`)) })
+	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		rows := make([]map[string]any, 0, len(h.rentals))
+		for _, row := range h.rentals {
+			rows = append(rows, row)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"rentals": rows})
+	})
 	mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -389,7 +397,8 @@ func (h *ladderHub) addReady(id, machine, accelerator string, rate int64) {
 	defer h.mu.Unlock()
 	h.rentals[id] = map[string]any{"rental_id": id, "name": machine, "state": "ready",
 		"requested_accelerator_model": accelerator, "accelerator_count": 1, "hourly_rate_usd_micros": rate,
-		"worker_address": "127.0.0.1:1", "media_address": "127.0.0.1:2"}
+		"worker_address": "127.0.0.1:1", "media_address": "127.0.0.1:2", "machine_name": machine,
+		"cert_pem": "fixture", "worker_id": "fixture", "worker_boot_id": "fixture", "creator_public_key": "fixture"}
 }
 
 func ladderRoot(t *testing.T, h *ladderHub) string {

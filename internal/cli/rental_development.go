@@ -209,23 +209,15 @@ type developmentRentalSSH struct {
 }
 
 func readDevelopmentRentalSSH(ctx *Context, store *records.Store, name string) (developmentRentalSSH, *exit.Error) {
-	row, problem := store.RentalByMachine(strings.TrimSpace(name))
+	live, problem := resolveLiveRental(ctx, store, strings.TrimSpace(name))
 	if problem != nil {
 		return developmentRentalSSH{}, problem
 	}
-	if row == nil {
-		return developmentRentalSSH{}, exit.New(exit.Conflict, "development rental is not attached on this Creator home")
-	}
-	c := client(ctx)
-	if row.Hub != c.Base() {
-		return developmentRentalSSH{}, exit.New(exit.Conflict, "rental belongs to another configured Hub")
-	}
-	call, cancel := hub.Context()
-	defer cancel()
-	remote, problem := c.Rental(call, row.ID)
+	row, problem := observedRental(ctx, store, live.Rental.ID)
 	if problem != nil {
 		return developmentRentalSSH{}, problem
 	}
+	remote := live.Rental
 	if !remote.Development || !remote.Ready() || remote.WorkerID != row.ExpectedWorkerID || remote.WorkerBootID != row.ExpectedWorkerBootID {
 		return developmentRentalSSH{}, exit.New(exit.Conflict, "development rental is not ready on its pinned worker boot")
 	}

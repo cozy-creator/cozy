@@ -109,19 +109,18 @@ func TestRentalLogsPrintsTheProviderBootLog(t *testing.T) {
 		"2026-09-25T20:50:43Z  starting_container  start container for index.docker.io/tensorhub/worker: begin\n") {
 		t.Fatalf("-f did not follow onto the replanned attempt and its new line [exit %d]:\n%s", code, out)
 	}
-	// The log outlives the pod: an ended rental no Hub lists any more still reads by name.
+	// The log outlives the pod and remains addressable by immutable rental ID.
 	hub.setState("pr-bootlog", "released", "")
 	if code, out := runCozy(t, root, "rental", "list", "--no-watch"); code != 0 || strings.Contains(out, "otter") {
 		t.Fatalf("the ended rental is still listed [exit %d]:\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "rental", "logs", "otter", "--attempt", "1"); code != 0 || !strings.Contains(out, want) {
-		t.Fatalf("an ended rental's log did not read by name [exit %d]:\n%s", code, out)
+	if code, out := runCozy(t, root, "rental", "logs", "pr-bootlog", "--attempt", "1"); code != 0 || !strings.Contains(out, want) {
+		t.Fatalf("an ended rental's log did not read by ID [exit %d]:\n%s", code, out)
 	}
 }
 
-// A machine word names each pod that bore it in turn. Once their records are forgotten,
-// `cozy rental logs <word>` reads the newest of them, never the first, and an id still reads
-// its own pod's log (an older pod's log was printed for the newest, from I's runs on 8819).
+// Names resolve through the live Hub even when old operations reuse that alias.
+// Historical logs keep their immutable identity; historical aliases select nothing.
 func TestRentalLogsByAReusedNameReadTheNewestPod(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-logs-reused")
 	must(t, os.RemoveAll(root))
@@ -151,6 +150,10 @@ func TestRentalLogsByAReusedNameReadTheNewestPod(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"attempt": 1, "attempts": 1, "booting": false, "next": 1, "lines": lines})
 	})
+	if code, out := runCozy(t, root, "rental", "logs", "mary", "--json"); code == 0 || !strings.Contains(out, "rental.selection_unavailable") {
+		t.Fatalf("historical aliases selected a pod: %d %s", code, out)
+	}
+	hub.add("pr-mary-october", "mary")
 	read := func(subject string) string {
 		t.Helper()
 		code, out := runCozy(t, root, "rental", "logs", subject, "--json")

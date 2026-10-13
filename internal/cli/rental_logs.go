@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -106,33 +105,21 @@ func rentalLogSubject(ctx *Context, typed string) (id, origin string, problem *e
 	if problem != nil {
 		return "", "", problem
 	}
-	recorded, problem := rental.Resolve(store, typed)
-	store.Close()
-	if problem != nil || recorded.RentalID != "" {
-		return recorded.RentalID, recorded.Hub, problem
+	defer store.Close()
+	live, problem := resolveLiveRental(ctx, store, typed)
+	if problem == nil {
+		return live.Rental.ID, live.Hub, nil
 	}
-	daemon, problem := dial(ctx)
-	if problem != nil {
+	if problem.Code != exit.NotFound || !rentalid.Valid(typed) {
 		return "", "", problem
 	}
-	inventory, problem := daemon.RentalInventory(context.Background(), true, true)
-	if problem != nil {
+	// Ended logs use their immutable recorded authority, never a historical name.
+	recorded, storedProblem := rental.RecordedSubject(store, typed)
+	if storedProblem != nil {
+		return "", "", storedProblem
+	}
+	if !recorded.Recorded() {
 		return "", "", problem
 	}
-	for _, row := range append(append(inventory.Rentals, inventory.Unrecorded...), inventory.Pending...) {
-		if row.ID != "" && (row.ID == typed || strings.EqualFold(row.MachineName, typed) || strings.EqualFold(row.RentalAlias, typed)) {
-			if id != "" && id != row.ID {
-				return "", "", exit.Named(exit.Conflict, "rental.machine_name_ambiguous", "machine %q identifies multiple rentals; use a rental ID", typed)
-			}
-			id, origin = row.ID, row.Hub
-		}
-	}
-	if id != "" {
-		return id, origin, nil
-	}
-	if rentalid.Valid(typed) {
-		return typed, "", nil
-	}
-	return "", "", exit.Named(exit.NotFound, "rental.unknown", "no rental is named %q", typed).
-		WithNext("cozy rental list")
+	return typed, recorded.Hub, nil
 }

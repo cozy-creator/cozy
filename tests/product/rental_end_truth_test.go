@@ -70,11 +70,11 @@ func TestEndingAnUnknownMachineDoesNotClaimItEnded(t *testing.T) {
 	if strings.Contains(out, `"state":"ended"`) {
 		t.Fatalf("the CLI reported an end it did not perform\n%s", out)
 	}
-	if !strings.Contains(out, "rental.unknown") {
+	if !strings.Contains(out, "rental.selection_unavailable") {
 		t.Fatalf("the refusal is not the typed one that names what happened\n%s", out)
 	}
 	// The refusal must distinguish an unknown name from a successful deletion.
-	if !strings.Contains(out, "none of them") {
+	if !strings.Contains(out, "live rental") {
 		t.Fatalf("the refusal does not report the account lookup\n%s", out)
 	}
 	if n := stand.releases("pr-0badc0de0badc0de0bad"); n != 0 {
@@ -135,6 +135,11 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 	delete(stand.rentals, id)
 	stand.mu.Unlock()
 	code, out = runCozy(t, root, "rental", "end", machine, "--json")
+	if code == 0 || !strings.Contains(out, "rental.selection_unavailable") {
+		t.Fatalf("historical alias selected an absent live host [exit %d]\n%s", code, out)
+	}
+	// Immutable identity retains idempotent operation history; a reused alias does not.
+	code, out = runCozy(t, root, "rental", "end", id, "--json")
 	if code != 0 || !strings.Contains(out, `"state":"ended"`) || !strings.Contains(out, `"changed":false`) {
 		t.Fatalf("the second end is not an idempotent no-op [exit %d]\n%s", code, out)
 	}
