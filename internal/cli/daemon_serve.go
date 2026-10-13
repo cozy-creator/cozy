@@ -206,8 +206,14 @@ func serveDaemon(ctx *Context) *exit.Error {
 		RentalKeepalive:     fleet.keepalive,
 		RentalInstall:       installs.Accept,
 		RentalInstallStatus: installs.Status,
-		MachineExecutions:   machines,
-		Orchestrator:        c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
+		RentalInstallCancel: installs.Cancel,
+		MachineReady: func(machine string) {
+			machines.WakeMachine(machine)
+			c.WakeQueue()
+			installs.Wake()
+		},
+		MachineExecutions: machines,
+		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
 		RentalInventory: func(call context.Context, hub string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
 			inventory, problem := readRentalInventory(st, fleet, hub, allHubs, reconcile)

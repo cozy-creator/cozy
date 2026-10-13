@@ -249,6 +249,9 @@ func watchRentalInstall(ctx *Context, client *localapi.Client, machine string, i
 		case "succeeded":
 			return status.RentalInstall, false, nil
 		case "failed":
+			if status.ErrorCode == "install.canceled" {
+				return install, false, exit.Named(exit.Canceled, status.ErrorCode, "%s: %s", machine, status.Error)
+			}
 			return install, false, exit.Named(exit.Failed, either(status.ErrorCode, "rental_install.failed"), "%s: %s", machine, status.Error)
 		}
 		stage, done, total := status.State, uint64(0), uint64(0)
