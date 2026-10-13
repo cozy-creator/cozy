@@ -43,7 +43,7 @@ func (m *machineRuns) localSourceV1(ctx context.Context, machine *machines.V1, i
 				"%s runs TensorD %s, which installs no such live package (%s)", machine.Name, frame.GetVersion(), need)
 		}
 	}
-	manifest, moved, now, err := machinev1.LocalSource(ctx, machine.Machine, source, sent, machine.Local)
+	manifest, moved, now, err := machine.LocalSource(ctx, source, sent, machine.Local)
 	if err != nil {
 		return "", false, machines.Transport(err)
 	}
