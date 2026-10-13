@@ -518,12 +518,7 @@ impl HostTier {
             // tier has room for all of it; else it reads through a window of its own.
             None if !self.stage_rest(&key) => {
                 let (read_plan, layout) = Self::layout(&plan, grants)?;
-                let staging = {
-                    let state = self.state.lock().unwrap();
-                    self.limit
-                        .staging(&crate::host_memory::read(), state.charged())
-                };
-                key = self.stream(format!("{key}.whole"), &plan, read_plan, layout, staging)?;
+                key = self.stream(format!("{key}.whole"), &plan, read_plan, layout)?;
             }
             None => {}
         }
@@ -628,12 +623,11 @@ impl HostTier {
                     need = 0;
                     break;
                 }
-                let staging = self.limit.staging(&host, charged);
                 drop(state);
                 if let Some(fd) = reserved {
                     drop(fd); // the component's reservation: a window is smaller
                 }
-                return self.stream(key, plan, read_plan, layout, staging);
+                return self.stream(key, plan, read_plan, layout);
             }
         }
         state.ledger.reserved_used += u64::from(reserved.is_some());
@@ -688,15 +682,16 @@ impl HostTier {
     }
 
     /// The disk rung: `layout` streamed through a window of as many of its largest regions as
-    /// `staging` bytes hold (one at least: the indivisible working set; two let one refill
+    /// the tier has room for (one at least: the indivisible working set; two let one refill
     /// while another is read), served from disk on its own thread until its last holder exits.
+    /// The room is read and reserved under one lock, so concurrent openers never spend the
+    /// same bytes.
     fn stream(
         &self,
         key: String,
         plan: &SealedPlan,
         read_plan: read::ReadPlan,
         layout: Layout,
-        staging: u64,
     ) -> io::Result<String> {
         let span = layout
             .regions
@@ -705,21 +700,35 @@ impl HostTier {
             .max()
             .unwrap_or(1)
             .max(1);
-        let slots = ((staging / span) as usize).clamp(1, layout.regions.len().max(1));
-        let (fd, open) = window::open_window(&plan.name, &layout, slots).map_err(failure)?;
+        let mut state = self.state.lock().unwrap();
+        loop {
+            match state.slots.get(&key) {
+                Some(Slot::Open(_)) => return Ok(key),
+                Some(Slot::Opening(_)) => state = self.filled.wait(state).unwrap(),
+                None => break,
+            }
+        }
+        let room = self.limit.staging(&crate::host_memory::read(), state.charged());
+        let slots = ((room / span) as usize).clamp(1, layout.regions.len().max(1));
+        state.slots.insert(key.clone(), Slot::Opening(slots as u64 * span));
+        drop(state);
+        let opened = window::open_window(&plan.name, &layout, slots).map_err(failure);
+        let mut state = self.state.lock().unwrap();
+        let (fd, open) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                state.slots.remove(&key);
+                drop(state);
+                self.filled.notify_all();
+                return Err(error);
+            }
+        };
         let streamer = Streamer {
             stop: Arc::new(AtomicBool::new(false)),
             tally: Arc::new(IoTally::default()),
         };
         let (stop, tally) = (streamer.stop.clone(), streamer.tally.clone());
         let charged = open.bytes();
-        let mut state = self.state.lock().unwrap();
-        if matches!(
-            state.slots.get(&key),
-            Some(Slot::Open(_)) | Some(Slot::Opening(_))
-        ) {
-            return Ok(key); // another ask opened it meanwhile; ours goes unused
-        }
         state.slots.insert(
             key.clone(),
             Slot::Open(Entry {
