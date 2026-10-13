@@ -100,20 +100,20 @@ func updateRentalPackage(ctx *Context, rental, pkg, hub string, held []api.Machi
 		hub = ctx.Cfg.HubURL // a machine that names no hub: this command's
 		row["hub"] = ctx.Cfg.HubLabel(hub)
 	}
-	installed, problem := settleRentalInstall(ctx, rental, records.RentalInstallSelection{Package: pkg, Hub: hub})
+	installed, problem := settleOperation(ctx, rental, records.Operation{Package: pkg, Hub: hub})
 	if problem != nil {
 		return fail(problem)
 	}
 	var result struct{ Release string }
-	_ = json.Unmarshal(installed.Result, &result)
+	_ = json.Unmarshal(installed, &result)
 	status := "current"
 	for _, env := range held {
 		if env.Release == result.Release {
 			continue
 		}
 		status = "updated"
-		removal := records.RentalInstallSelection{Package: pkg, Release: env.Release, Hub: hub, Remove: env.Installation}
-		if _, problem := settleRentalInstall(ctx, rental, removal); problem != nil {
+		removal := records.Operation{Package: pkg, Release: env.Release, Hub: hub, Remove: env.Installation}
+		if _, problem := settleOperation(ctx, rental, removal); problem != nil {
 			row["detail"] = fmt.Sprintf("%s@%s stays: %s", pkg, env.Release, problem.Message)
 		}
 	}
@@ -135,8 +135,8 @@ func rentalPackageRemove(ctx *Context) *exit.Error {
 		AllFields: []string{"package", "release", "hub", "reclaimed", "installation"}}
 	var freed int64
 	for _, env := range envs {
-		selection := records.RentalInstallSelection{Package: env.Package, Release: env.Release, Hub: env.Hub, Remove: env.Installation}
-		settled, problem := settleRentalInstall(ctx, rental, selection)
+		removal := records.Operation{Package: env.Package, Release: env.Release, Hub: env.Hub, Remove: env.Installation}
+		settled, problem := settleOperation(ctx, rental, removal)
 		if problem != nil {
 			return problem
 		}
@@ -144,7 +144,7 @@ func rentalPackageRemove(ctx *Context) *exit.Error {
 			Reclaimed int64    `json:"reclaimed_bytes"`
 			Retained  []string `json:"retained"`
 		}
-		_ = json.Unmarshal(settled.Result, &result)
+		_ = json.Unmarshal(settled, &result)
 		freed += result.Reclaimed
 		if len(result.Retained) > 0 {
 			removed.Notes = append(removed.Notes, env.Package+"@"+env.Release+"'s files stay until its running executor ends")

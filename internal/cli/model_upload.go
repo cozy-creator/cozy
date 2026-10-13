@@ -82,7 +82,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 			return problem
 		}
 	}
-	var selection records.RentalInstallSelection
+	var op records.Operation
 	if kind == "model-upload" {
 		ref, problem := hub.ParseRef(destinationArg)
 		if problem != nil {
@@ -95,7 +95,7 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		if _, problem := ownedPublication(ctx, ref); problem != nil {
 			return problem
 		}
-		selection.Destination = ref.String()
+		op.Destination = ref.String()
 	} else {
 		name, local, problem := modelsource.LocalAlias(destinationArg)
 		if !local {
@@ -104,14 +104,14 @@ func handleModelTransfer(ctx *Context, kind string) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		selection.Destination = "local/" + name
+		op.Destination = "local/" + name
 	}
 	model, file, problem := transferSource(ctx, sourceArg, kind == "model-upload")
 	if problem != nil {
 		return problem
 	}
-	selection.Models, selection.Write = []records.ModelRef{model}, file
-	return enqueueRentalInstall(ctx, either(machine, machines.Local), selection, ctx.Inv.Bool("--await"))
+	op.Models, op.Write = []records.ModelRef{model}, file
+	return runOperation(ctx, either(machine, machines.Local), op, ctx.Inv.Bool("--await"))
 }
 
 // transferSource is the model a transfer moves: a local file (written to the machine, then

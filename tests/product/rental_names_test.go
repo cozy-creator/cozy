@@ -2,15 +2,21 @@ package producttest
 
 import (
 	"encoding/json"
-	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rentalid"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 )
 
 func TestRentalBookingAliasIsOpaqueAndReplayPreservesIt(t *testing.T) {
-	_, store := rentalInstallStore(t)
+	layout, problem := home.Open(t.TempDir())
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
 	author := func(name string) ([]byte, string, *exit.Error) {
 		if !strings.HasPrefix(name, "lease-") || !rentalid.ValidMachineName(name) {
 			t.Fatalf("booking invented a host name: %q", name)

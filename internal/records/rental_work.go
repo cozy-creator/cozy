@@ -7,8 +7,8 @@ import (
 )
 
 // RentalWorkCounts is the work queued and running on one machine, as `cozy rental list`
-// counts it: work pinned there, its explicitly purchased acquisition and its
-// installations, never retained terminal attempts.
+// counts it: work pinned there (its operations among it) and its explicitly purchased
+// acquisition, never retained terminal attempts.
 func (s *Store) RentalWorkCounts(id, buyer string) (queued, running int, problem *exit.Error) {
 	pinned, args := pinnedToRental("r.", id)
 	// A machine's acceptance receipt is live work from that moment, before any observation
@@ -24,12 +24,7 @@ func (s *Store) RentalWorkCounts(id, buyer string) (queued, running int, problem
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot observe rental work: %s", err)
 	}
-	var queuedInstalls, runningInstalls int
-	err = s.db.QueryRow(`SELECT COALESCE(SUM(state='queued'),0),COALESCE(SUM(state='installing'),0) FROM rental_installs WHERE rental_id=? AND state IN ('queued','installing')`, id).Scan(&queuedInstalls, &runningInstalls)
-	if err != nil {
-		return 0, 0, exit.Internalf("cannot observe queued rental installations: %s", err)
-	}
-	return queued + queuedInstalls, running + runningInstalls, nil
+	return queued, running, nil
 }
 
 type rentalReader interface {

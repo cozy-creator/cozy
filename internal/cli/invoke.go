@@ -1129,11 +1129,11 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 func runListRows(rows []api.Lifecycle) output.List {
 	list := output.List{
 		Uncapped: true,
-		Name:     "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution", "reason"},
+		Name:     "invocations", Fields: []string{"number", "kind", "target", "machine", "status", "progress", "execution", "reason"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
 			"progress", "phase", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "queued", "execution", "attempt_wall", "attempts", "created", "reason", "hub"},
-		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
+		TypedFields: []string{"number", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "gpu_allocation", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
 			"stage_remaining_ms", "observation_lost", "execution_ms", "execution_known", "error_type", "error_code", "error", "retaining", "retry_available"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
@@ -1151,10 +1151,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 	for _, life := range rows {
 		life.Status = publicObservedStatus(life.Status)
 		life.Machine = life.DisplayMachine()
-		kind := life.Kind
-		if kind == "" {
-			kind = "invocation"
-		}
+		kind := runKind(life.Kind)
 		// A canceled run is LOUD about its cause (cl-108): the status cell itself names
 		// the recorded actor, so a list is never a quiet no-output ending.
 		status := life.Status
@@ -1169,7 +1166,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
-			"target": life.Package + "/" + life.Function, "machine": machine,
+			"target": lifeTarget(life), "machine": machine,
 			"rental_id": life.RentalID,
 			"status":    status, "progress": progressValue(life), "phase": life.Phase,
 			"progress_stage":   life.ProgressStage,
@@ -1185,7 +1182,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 		})
 		typed := map[string]any{
 			"number": life.Number, "id": life.RequestID, "kind": kind,
-			"target": life.Package + "/" + life.Function, "machine": life.Machine,
+			"target": lifeTarget(life), "machine": life.Machine,
 			"status": life.Status, "queued_ms": life.QueuedMS, "execution_ms": life.ExecutionMS,
 			"attempts": life.Attempts, "created_at": life.CreatedAt,
 		}
@@ -1524,7 +1521,7 @@ func invocationFields(life api.Lifecycle) []output.Field {
 	}
 	fields := []output.Field{
 		{K: "number", V: life.Number}, {K: "id", V: life.RequestID}, {K: "kind", V: kind},
-		{K: "target", V: life.Package + "/" + life.Function},
+		{K: "target", V: lifeTarget(life)},
 		{K: "machine", V: life.Machine},
 		{K: "rental_id", V: life.RentalID},
 		{K: "status", V: life.Status}, {K: "attempts", V: life.Attempts},
@@ -1533,6 +1530,19 @@ func invocationFields(life api.Lifecycle) []output.Field {
 		fields = append(fields, output.Field{K: "canceled_by", V: life.CanceledBy})
 	}
 	return fields
+}
+
+// lifeTarget is what a run names: its package function, or what its operation puts on its machine.
+func lifeTarget(life api.Lifecycle) string {
+	return either(life.Target, strings.Trim(life.Package+"/"+life.Function, "/"))
+}
+
+// runKind is the KIND column: a function's run, a job, or the operation's kind.
+func runKind(kind string) string {
+	if kind == "" || kind == "invocation" {
+		return "run"
+	}
+	return kind
 }
 
 func invocationSettled(status string) bool {
@@ -1574,7 +1584,7 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 	reference := runReference(life.Number, life.RequestID)
 	fields := []output.Field{
 		{K: "run", V: reference}, {K: "id", V: life.RequestID},
-		{K: "target", V: life.Package + "/" + life.Function},
+		{K: "target", V: lifeTarget(life)},
 		{K: "machine", V: life.Machine},
 		{K: "rental_id", V: life.RentalID},
 		{K: "status", V: status},
@@ -2637,7 +2647,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	}
 	fields := []output.Field{
 		{K: "number", V: life.Number}, {K: "id", V: life.RequestID},
-		{K: "target", V: life.Package + "/" + life.Function},
+		{K: "target", V: lifeTarget(life)},
 		{K: "package", V: life.Package},
 		{K: "function", V: life.Function},
 		{K: "machine", V: life.Machine},

@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -29,7 +28,7 @@ import (
 // imports the package: the interface comes from the Hub's release detail, for releases
 // with and without embedded metadata.
 func TestPublishedInstallUsesEmbeddedInterfaceWithoutImport(t *testing.T) {
-	h, root, _, store := parityMachines(t)
+	h, root, _, _ := parityMachines(t)
 	imports := filepath.Join(t.TempDir(), "imports")
 	objects := map[string][]byte{}
 	files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -136,13 +135,8 @@ def main(payload: Request) -> Result:
 	})
 	// 1.0.3 resolves at the Hub, but its machine finds no such release there.
 	plans["1.0.3"] = hub.PackageDownloadPlan{Release: "1.0.3", Downloads: plans["1.0.2"].Downloads}
-	logged := func(line string) bool {
-		log, err := os.ReadFile(filepath.Join(root, "daemon.log"))
-		must(t, err)
-		return regexp.MustCompile(`(?m)^\S+Z ` + line + `$`).Match(log)
-	}
-	// Interrupting the command detaches it from 1.0.0's installation, which goes on.
-	interrupted := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "package", "install", "proof/install-interface-probe", "--version", "1.0.0", "--rental=tessa")
+	// Interrupting the command detaches it from 1.0.0's installation run, which goes on.
+	interrupted := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "package", "install", "proof/install-interface-probe", "--version", "1.0.0", "--rental=tessa", "--json")
 	interrupted.Env = childEnv(t, root)
 	stderr, err := interrupted.StderrPipe()
 	must(t, err)
@@ -151,35 +145,30 @@ def main(payload: Request) -> Result:
 	must(t, interrupted.Start())
 	t.Cleanup(func() { _ = interrupted.Process.Kill() })
 	progress := bufio.NewReader(stderr)
-	for line := ""; !strings.HasPrefix(line, "tessa: "); {
-		if line, err = progress.ReadString('\n'); err != nil {
-			t.Fatalf("the install did not report its progress: %v", err)
-		}
+	if _, err := progress.ReadString('\n'); err != nil {
+		t.Fatalf("the install did not report its progress: %v", err)
 	}
 	must(t, interrupted.Process.Signal(os.Interrupt))
 	rest, _ := io.ReadAll(progress)
 	t.Logf("interrupted install:\n%s%s", rest, &stdout)
-	detached := regexp.MustCompile(`detached from installation (\S+); it continues on tessa`).FindSubmatch(rest)
-	if err := interrupted.Wait(); err != nil || detached == nil || !regexp.MustCompile(`queued|installing`).Match(stdout.Bytes()) {
+	var detached struct{ Number int64 }
+	if err := interrupted.Wait(); err != nil || json.Unmarshal([]byte(lastJSONLine(stdout.String())), &detached) != nil || detached.Number == 0 {
 		t.Fatalf("the interrupt did not detach: %v\n%s\n%s", err, rest, &stdout)
 	}
 	eventually(t, root, "the detached installation settles", func() bool {
-		row, problem := store.RentalInstall(string(detached[1]))
-		fatal(t, problem)
-		return row != nil && row.State == "succeeded"
+		_, shown := runCozy(t, root, "run", "show", fmt.Sprint(detached.Number), "--json")
+		return strings.Contains(shown, `"status":"completed"`)
 	})
-	// Each later install follows its installation to its outcome.
+	// Each later install follows its run to its outcome.
 	for _, version := range []string{"1.0.1", "1.0.2", "1.0.2"} {
 		started := time.Now()
 		code, out := runCozy(t, root, "package", "install", "proof/install-interface-probe", "--version", version, "--rental=tessa", "--json")
-		var installed struct{ ID, Status, Target string }
-		if code != 0 || json.Unmarshal([]byte(out), &installed) != nil || installed.Status != "succeeded" || installed.Target != "proof/install-interface-probe@"+version {
+		var installed struct{ Kind, Status, Target string }
+		if code != 0 || json.Unmarshal([]byte(lastJSONLine(out)), &installed) != nil || installed.Kind != "install" ||
+			installed.Status != "completed" || installed.Target != "proof/install-interface-probe@"+version {
 			t.Fatalf("install %s: %d %s", version, code, out)
 		}
 		t.Logf("ordinary published install %s: %s", version, time.Since(started))
-		if !logged(regexp.QuoteMeta(installed.ID + " on " + parityRental + " succeeded: proof/install-interface-probe@" + version)) {
-			t.Fatalf("the daemon did not log %s's outcome:\n%s", version, tail(filepath.Join(root, "daemon.log")))
-		}
 	}
 	for _, version := range []string{"1.0.0", "1.0.1", "1.0.2"} {
 		if _, read := machineReads.Load("/v1/packages/proof/install-interface-probe/releases/" + version + "/locked-requirements"); !read {
@@ -194,13 +183,10 @@ def main(payload: Request) -> Result:
 	if code != 0 || !strings.Contains(out, `"package":"proof/install-interface-probe","release":"1.0.2"`) {
 		t.Fatalf("package list --rental: %d %s", code, out)
 	}
-	// A failed installation ends the command with the machine's reason, and the daemon logs it.
+	// A failed installation ends the command with the machine's reason.
 	code, out = runCozy(t, root, "package", "install", "proof/install-interface-probe", "--version", "1.0.3", "--rental=tessa", "--json")
 	t.Logf("failed install [exit %d]: %s", code, out)
 	if code == 0 || !strings.Contains(out, "tessa: ") {
 		t.Fatalf("a failed install did not end with its reason: %d %s", code, out)
-	}
-	if !logged(`rental-install-\S+ on ` + parityRental + ` failed: proof/install-interface-probe@1\.0\.3: .+`) {
-		t.Fatalf("the daemon did not log the failure:\n%s", tail(filepath.Join(root, "daemon.log")))
 	}
 }

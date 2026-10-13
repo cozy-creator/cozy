@@ -91,18 +91,7 @@ func holdCheckpoint(ctx *Context, source string) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	client, problem := dial(ctx)
-	if problem != nil {
-		return problem
-	}
-	install, problem := client.PrepareRentalPackage(machine, records.RentalInstallSelection{Models: []records.ModelRef{model}})
-	if problem != nil {
-		return problem
-	}
-	_, detached, problem := watchRentalInstall(ctx, client, either(ctx.Inv.Value("--rental"), machine), install)
-	if detached {
-		return exit.New(exit.Canceled, "detached before the machine held the checkpoint; nothing was quantized")
-	}
+	_, problem = settleOperation(ctx, either(ctx.Inv.Value("--rental"), machine), records.Operation{Models: []records.ModelRef{model}})
 	return problem
 }
 

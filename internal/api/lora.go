@@ -20,18 +20,15 @@ type Capabilities struct {
 	ModelOverrides   bool `json:"model_overrides"`
 	// MachineV1 is a controller that runs work on cozy.machine.v1 machines (calls and jobs).
 	MachineV1 bool `json:"machine_v1"`
-	// WarmSet is a controller whose rental installations carry a warm set member.
-	WarmSet bool `json:"warm_set"`
-	// PackageVerbs is a controller whose rental installations take a hub's newest release,
-	// this computer's local code and removals.
-	PackageVerbs bool `json:"package_verbs"`
+	// Operations is a controller that records package and model operations as numbered runs.
+	Operations bool `json:"operations"`
 }
 
 func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
 	_, endpoint := s.machineExecutions.(interface {
 		ValidateEndpoint(context.Context, *machineendpoint.Endpoint) *exit.Error
 	})
-	s.ok(w, r, http.StatusOK, Capabilities{RunGPUs: true, ModelOverrides: true, MachineEndpoints: endpoint, MachineV1: s.machineExecutions != nil, WarmSet: true, PackageVerbs: true})
+	s.ok(w, r, http.StatusOK, Capabilities{RunGPUs: true, ModelOverrides: true, MachineEndpoints: endpoint, MachineV1: s.machineExecutions != nil, Operations: true})
 }
 
 // validateModelAdapters validates selection syntax; the executing Runtime owns

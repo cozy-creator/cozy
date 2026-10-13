@@ -496,6 +496,9 @@ func (m *machineRuns) place(ctx context.Context, request records.Request, link *
 // to the machine first (each resumes from what the machine holds); the Hub token and provider
 // tokens ride in the spec, which the machine holds in memory for the run's preparation only.
 func (m *machineRuns) specV1(ctx context.Context, request records.Request, machine *machines.V1) (*v1.RunSpec, *exit.Error) {
+	if request.IsOperation() {
+		return m.operationSpecV1(ctx, request, machine)
+	}
 	if request.GPUs > 0 {
 		frame, err := machine.Status(ctx)
 		if err != nil {
@@ -642,106 +645,94 @@ func modelChoicesV1(request records.Request, models []records.ModelRef) ([]*v1.M
 	return orchestrator.ModelChoices(request, models)
 }
 
-// warmSetV1 is the machine's warm set with the selection's member added, changed or (`off`)
+// warmSetV1 is the machine's warm set with the operation's member added, changed or (`off`)
 // removed; the other members are sent back as the machine reported them.
-func warmSetV1(current []*v1.WarmItem, selection records.RentalInstallSelection) (*v1.WarmSet, *exit.Error) {
+func warmSetV1(current []*v1.WarmItem, op records.Operation) (*v1.WarmSet, *exit.Error) {
 	set := &v1.WarmSet{}
 	for _, item := range current {
-		if item.GetRelease().GetPackage() == selection.Package && item.GetEntrypoint() == selection.Entrypoint {
+		if item.GetRelease().GetPackage() == op.Package && item.GetEntrypoint() == op.Entrypoint {
 			continue
 		}
 		item.Holds, item.HeldBack = "", ""
 		set.Items = append(set.Items, item)
 	}
-	if selection.Warm == "off" {
+	if op.Warm == "off" {
 		return set, nil
 	}
-	level := slices.Index(records.WarmLevels, selection.Warm)
+	level := slices.Index(records.WarmLevels, op.Warm)
 	if level < 0 {
-		return nil, exit.Usagef("--warm=%s is not one of %s or off", selection.Warm, strings.Join(records.WarmLevels, ", "))
+		return nil, exit.Usagef("--warm=%s is not one of %s or off", op.Warm, strings.Join(records.WarmLevels, ", "))
 	}
-	models, problem := modelChoicesV1(records.Request{Package: selection.Package, Entrypoint: selection.Entrypoint}, selection.Models)
+	models, problem := modelChoicesV1(records.Request{Package: op.Package, Entrypoint: op.Entrypoint}, op.Models)
 	if problem != nil {
 		return nil, problem
 	}
-	release := &v1.Release{Package: selection.Package, Release: selection.Release}
+	release := &v1.Release{Package: op.Package, Release: op.Release}
 	set.Items = append(set.Items, &v1.WarmItem{Source: &v1.WarmItem_Release{Release: release},
-		Entrypoint: selection.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1)})
+		Entrypoint: op.Entrypoint, Models: models, Level: v1.WarmLevel(level + 1)})
 	return set, nil
 }
 
-// prewarmV1 makes an installation present as a warm run named by the installation: its code
-// installed (no entrypoint), its Hub models downloaded, a provider source made and, with a
-// destination, uploaded under a publication authorization granted to this machine.
-func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, report func(machines.InstallProgress)) (json.RawMessage, *exit.Error) {
-	selection := row.Selection
-	machine, problem := m.machines.DialV1(ctx, row.RentalID, "installing "+either(selection.Package, "models"))
+// operationSpecV1 is an operation as its machine takes it: a warm run that installs its code
+// (no entrypoint), downloads its Hub models, makes a provider source and, with a destination,
+// uploads it under a capability granted to this machine; or a remove run.
+func (m *machineRuns) operationSpecV1(ctx context.Context, request records.Request, machine *machines.V1) (*v1.RunSpec, *exit.Error) {
+	op, problem := request.Operation()
 	if problem != nil {
 		return nil, problem
-	}
-	defer machine.Close()
-	if row.WorkerBootID != "" && machine.BootID != row.WorkerBootID {
-		return nil, exit.Unavailablef("the rental's worker restarted before preparation; the installation is claimed again on its new boot")
 	}
 	frame, err := machine.Status(ctx)
 	if err != nil {
 		return nil, machines.Transport(err)
 	}
 	capabilities := frame.GetCapabilities()
-	if !slices.Contains(capabilities, "warm/1") || selection.Destination != "" && !slices.Contains(capabilities, "upload/1") {
-		return nil, exit.Named(exit.Structural, "machine.warm_unsupported",
-			"this machine takes no warm runs or model uploads; %s", machines.RuntimeUpdate(row.RentalID))
+	needs := map[string]bool{"warm/1": true, "upload/1": request.Kind == "upload", "local-models/1": op.HoldsLocally(),
+		"remove/1": op.Remove != "", "warm/2": op.Warm != ""}
+	for capability, needed := range needs {
+		if needed && !slices.Contains(capabilities, capability) {
+			return nil, exit.Named(exit.Structural, "machine.operation_unsupported", "this machine cannot %s (%s); %s",
+				request.Kind, capability, machines.RuntimeUpdate(machine.Name))
+		}
 	}
-	if selection.HoldsLocally() && !slices.Contains(capabilities, "local-models/1") {
-		return nil, exit.Named(exit.Structural, "machine.local_models_unsupported",
-			"this machine holds no local files or local/ models; %s", machines.RuntimeUpdate(row.RentalID))
-	}
-	origin := selection.Hub
-	if origin == "" && machine.Account != nil {
-		origin = machine.Account.Base()
-	}
-	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_WARM, WeightsDestination: selection.Destination}
+	origin := either(op.Hub, request.Hub)
+	spec := &v1.RunSpec{Kind: v1.RunKind_RUN_KIND_WARM, WeightsDestination: op.Destination}
 	// Resolved under the same key as this computer's calls (owner, catalog revision), so a call
 	// after a warm run reuses its preparation.
 	if spec.CatalogRevision, problem = m.store.BindingRevision(m.context.forHub(origin).Cfg.HubURL); problem != nil {
 		return nil, problem
 	}
-	if strings.HasPrefix(selection.Package, "local/") {
-		// Only unpublished code names its owner, as a call of it does: the same preparation key.
-		if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
-			spec.Owner = caller.Account
-		}
+	owner := ""
+	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
+		owner = caller.Account
 	}
+	if strings.HasPrefix(op.Package, "local/") {
+		spec.Owner = owner // only unpublished code names its owner, as a call of it does
+	}
+	began := time.Now()
 	switch {
-	case selection.Remove != "":
-		if !slices.Contains(capabilities, "remove/1") {
-			return nil, exit.Named(exit.Structural, "machine.remove_unsupported",
-				"this machine cannot remove packages; %s", machines.RuntimeUpdate(row.RentalID))
-		}
-		spec.Kind, spec.Source = v1.RunKind_RUN_KIND_REMOVE, &v1.RunSpec_Installation{Installation: selection.Remove}
-	case selection.Local != "":
+	case op.Remove != "":
+		spec.Kind, spec.Source = v1.RunKind_RUN_KIND_REMOVE, &v1.RunSpec_Installation{Installation: op.Remove}
+	case op.Local != "":
 		// This computer's local code: only the files the machine's tree lacks go.
-		report(machines.InstallProgress{Stage: "writing " + selection.Package})
-		manifest, _, problem := m.localSourceV1(ctx, machine, selection.Local)
+		manifest, sent, problem := m.localSourceV1(ctx, machine, op.Local)
 		if problem != nil {
 			return nil, problem
 		}
 		spec.Source = &v1.RunSpec_Local{Local: &v1.LocalSource{Manifest: manifest}}
-	}
-	if selection.Warm != "" {
-		// A warm set member: the machine's whole set goes back with this one changed.
-		if !slices.Contains(capabilities, "warm/2") {
-			return nil, exit.Named(exit.Structural, "machine.warm_set_unsupported",
-				"this machine keeps no warm set; %s", machines.RuntimeUpdate(row.RentalID))
+		if sent {
+			m.submissionStage(request.ID, "package", op.Package, began)
 		}
-		if spec.Set, problem = warmSetV1(frame.GetWarm(), selection); problem != nil {
+	}
+	if op.Warm != "" {
+		// A warm set member: the machine's whole set goes back with this one changed.
+		if spec.Set, problem = warmSetV1(frame.GetWarm(), op); problem != nil {
 			return nil, problem
 		}
-		selection.Models = nil
-	} else if selection.Package != "" && !strings.HasPrefix(selection.Package, "local/") && spec.Source == nil {
-		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: selection.Package, Release: selection.Release}}
+		op.Models = nil
+	} else if op.Package != "" && !strings.HasPrefix(op.Package, "local/") && spec.Source == nil {
+		spec.Source = &v1.RunSpec_Release{Release: &v1.Release{Package: op.Package, Release: op.Release}}
 	}
-	for _, model := range selection.Models {
+	for _, model := range op.Models {
 		choice := &v1.ModelChoice{Parameter: either(model.Slot, model.Model), Repository: model.Model,
 			Release: model.Release, Lane: model.Lane, Source: model.Source, Profiles: model.Profiles}
 		if model.Release == "" {
@@ -750,52 +741,25 @@ func (m *machineRuns) prewarmV1(ctx context.Context, row records.RentalInstall, 
 		}
 		spec.Models = append(spec.Models, choice)
 	}
-	owner := ""
-	if caller, problem := m.resolver.namespaceAt(origin); problem == nil {
-		owner = caller.Account
-	}
 	operations := m.privateOperations(owner, spec)
-	if spec.Hub, problem = m.hubAccessV1(ctx, origin, machine, row.ID, operations, time.Now().Add(capabilityLife)); problem != nil {
+	if spec.Hub, problem = m.hubAccessV1(ctx, origin, machine, request.ID, operations, time.Now().Add(capabilityLife)); problem != nil {
 		return nil, problem
 	}
-	if selection.Write != "" {
-		report(machines.InstallProgress{Stage: "writing " + filepath.Base(selection.Write)})
-		object, err := machine.WriteFile(ctx, selection.Write)
+	if op.Write != "" {
+		began = time.Now()
+		object, err := machine.WriteFile(ctx, op.Write)
 		if err != nil {
 			return nil, machines.Transport(err)
 		}
-		if !strings.HasPrefix(strings.TrimPrefix(selection.Models[0].Source, "object://"), object.Digest+"/") {
-			return nil, exit.Named(exit.Conflict, "model_source.local_changed", "%s changed since it was measured", selection.Write)
+		if !strings.HasPrefix(strings.TrimPrefix(op.Models[0].Source, "object://"), object.Digest+"/") {
+			return nil, exit.Named(exit.Conflict, "model_source.local_changed", "%s changed since it was measured", op.Write)
 		}
+		m.submissionStage(request.ID, "inputs", filepath.Base(op.Write), began)
 	}
 	if providers := (&v1.ProviderAccess{Huggingface: m.resolver.cfg.HuggingFaceToken.Reveal(), Civitai: m.resolver.cfg.CivitaiToken.Reveal()}); providers.Huggingface != "" || providers.Civitai != "" {
 		spec.Providers = providers
 	}
-	ctx, stop := context.WithCancel(ctx) // the stream ends with this call; its connection stays
-	defer stop()
-	stream, err := machine.Run(ctx, row.ID, 0, spec)
-	if err != nil {
-		return nil, machines.Transport(err)
-	}
-	for {
-		event, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return nil, exit.Unavailablef("the machine ended the installation's stream before its outcome")
-		}
-		if err != nil {
-			return nil, machines.Transport(err)
-		}
-		if progress := event.GetProgress(); progress != nil {
-			report(machines.InstallProgress{Stage: progress.Stage, TotalBytes: progress.BytesTotal, TransferredBytes: progress.BytesDone})
-		}
-		if outcome := event.GetOutcome(); outcome != nil {
-			if outcome.Status != "succeeded" {
-				reason := outcome.GetReason()
-				return nil, exit.Named(exit.Failed, either(reason.GetCode(), "rental_install.failed"), "%s", either(reason.GetMessage(), outcome.Status))
-			}
-			return json.RawMessage(outcome.Result), nil
-		}
-	}
+	return spec, nil
 }
 
 // writeTreesV1 writes each `--input-tree ref=dir` to the machine as writeTreeV1 does; the

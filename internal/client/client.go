@@ -33,6 +33,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -424,26 +425,20 @@ func (c *Client) MachineLog(machine, log string, tailBytes uint64) (api.MachineL
 	return out, problem
 }
 
-// PrepareRentalPackage asks the daemon to materialize one exact package release
-// (and optional model checkpoints) on the named rental.  The worker's desired
-// package set and preparation ledger make repeats idempotent.
-func (c *Client) PrepareRentalPackage(rentalID string, request api.RentalPackagePrepareRequest) (api.RentalPackagePrepareResult, *exit.Error) {
-	var result api.RentalPackagePrepareResult
-	problem := c.call("POST", "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prepare", request, &result)
-	return result, problem
-}
-
-// RentalInstall reads one queued installation and, while it runs, its progress.
-func (c *Client) RentalInstall(rentalID, id string) (api.RentalInstallStatus, *exit.Error) {
-	var result api.RentalInstallStatus
-	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/installs/"+url.PathEscape(id), nil, &result)
-	return result, problem
-}
-
-func (c *Client) CancelRentalInstall(rentalID, id string) (api.RentalInstallStatus, *exit.Error) {
-	var result api.RentalInstallStatus
-	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/installs/"+url.PathEscape(id)+"/cancel", nil, &result)
-	return result, problem
+// SubmitOperation records one operation on a machine (`local`, or a rental by id) as a numbered
+// run and starts it; the same operation still unsettled there is answered instead.
+func (c *Client) SubmitOperation(machine string, op records.Operation) (api.Handle, *exit.Error) {
+	var caps api.Capabilities
+	if problem := c.call(http.MethodGet, "/v1/capabilities", nil, &caps); problem != nil {
+		return api.Handle{}, problem
+	}
+	if !caps.Operations {
+		return api.Handle{}, exit.Named(exit.Unavailable, "daemon.operations_unavailable",
+			"this computer's daemon predates numbered operations").
+			WithRemedy("restart it with `cozy down`; running work and rentals continue")
+	}
+	var h api.Handle
+	return h, c.call(http.MethodPost, "/v1/local/machines/"+url.PathEscape(machine)+"/operations", op, &h)
 }
 
 func (c *Client) MachineReady(machine string) *exit.Error {

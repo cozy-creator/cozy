@@ -60,27 +60,13 @@ func uploadV1Output(ctx *Context, run, slot, destination string) (bool, *exit.Er
 	if output == nil {
 		return true, exit.Named(exit.NotFound, "run_output.absent", "run %s has no weights output %q", run, slot)
 	}
+	if machineendpoint.IsName(link.MachineID) {
+		return true, exit.Named(exit.Structural, "machine.upload_unsupported",
+			"run %s ran on an explicitly pinned endpoint, which takes no operations from this daemon", run)
+	}
 	model := records.ModelRef{Slot: output.Output, Manifest: output.Digest, ManifestLength: output.Length}
-	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}, Destination: destination, Hub: request.Hub}
-	if !machineendpoint.IsName(link.MachineID) {
-		return true, enqueueRentalInstall(ctx, link.MachineID, selection, ctx.Inv.Bool("--await"))
-	}
-	// A foreground run's machine is the explicit endpoint it recorded; no daemon queue names it.
-	ep, problem := store.RequestMachineEndpoint(request.ID, link.MachineID)
-	if problem == nil && ep == nil {
-		problem = exit.New(exit.NotFound, "run %s's machine endpoint is no longer recorded", run)
-	}
-	if problem != nil {
-		return true, problem
-	}
-	label := link.MachineID
-	if rented, _ := store.RentalRow(ep.WorkspaceID); rented != nil && rented.MachineName != "" {
-		label = rented.MachineName
-	}
-	if taken, problem := foregroundInstall(ctx, ep, label, selection); taken || problem != nil {
-		return true, problem
-	}
-	return true, exit.Named(exit.Structural, "machine.upload_unsupported", "the machine run %s ran on takes no model uploads", run)
+	op := records.Operation{Models: []records.ModelRef{model}, Destination: destination, Hub: request.Hub}
+	return true, runOperation(ctx, link.MachineID, op, ctx.Inv.Bool("--await"))
 }
 
 // modelManifestMedia is a weights output's product: its bytes are the output's manifest.

@@ -133,8 +133,8 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 		return emitInstallResult(ctx, result, cleanup...)
 	}
 	writer.Unlock()
-	selection := records.RentalInstallSelection{Package: ref.Package, Release: pack.Release, Hub: ctx.Cfg.HubURL, Local: result.Install.ID}
-	return enqueueRentalInstall(ctx, rental, selection, !ctx.Inv.Bool("--no-wait"))
+	op := records.Operation{Package: ref.Package, Release: pack.Release, Hub: ctx.Cfg.HubURL, Local: result.Install.ID}
+	return runOperation(ctx, rental, op, !ctx.Inv.Bool("--no-wait"))
 }
 
 func handlePackageRecover(ctx *Context) *exit.Error {

@@ -220,9 +220,7 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 			fmt.Fprintln(m.context.Out, problem.Message)
 		}
 		m.fleet.owner.WakeQueue()
-		if m.fleet.installs != nil {
-			m.fleet.installs.Wake()
-		}
+		m.WakeMachine(row.RentalID)
 	}()
 }
 
@@ -424,6 +422,9 @@ func awaitRentalUpdate(ctx *Context, c *localapi.Client, machine string, update 
 			messages := map[string]string{"preparing": "checking its software", "updating": "updating its software",
 				"waiting_activation": "waiting for its work to finish", "reconciling": "following an interrupted update"}
 			if message := messages[update.State]; message != "" {
+				if held := heldBy(c, update.RentalID); update.State == "waiting_activation" && held != "" {
+					message += ": " + held
+				}
 				fmt.Fprintf(ctx.Err, "%s: %s...\n", machine, message)
 			}
 			said = update.State
@@ -435,6 +436,24 @@ func awaitRentalUpdate(ctx *Context, c *localapi.Client, machine string, update 
 		}
 	}
 	return update, nil
+}
+
+// heldBy names the unsettled runs on a machine among the newest, as its update waits for them.
+func heldBy(c *localapi.Client, machine string) string {
+	page, problem := c.AllHubs().RequestPage(context.Background(), "", "", runHistoryPage, 0)
+	if problem != nil {
+		return ""
+	}
+	var runs []string
+	for _, life := range page.Requests {
+		if life.RentalID == machine && !invocationSettled(life.Status) {
+			runs = append(runs, fmt.Sprintf("run %d (%s %s)", life.Number, runKind(life.Kind), lifeTarget(life)))
+		}
+	}
+	if len(runs) == 0 {
+		return ""
+	}
+	return strings.Join(runs, ", ") + "; `cozy run cancel <n>` stops one"
 }
 
 // bootSoftware is a new rental's software once the Hub's target is in place, for `rental new`
