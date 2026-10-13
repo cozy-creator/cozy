@@ -100,4 +100,15 @@ func TestAScriptThatRunsAModelSlotIsServed(t *testing.T) {
 	if code != 0 || strings.Contains(out, "(job)") || !strings.Contains(out, "model: Probe") {
 		t.Fatalf("a script running a Model slot was not described as served [exit %d]: %s", code, out)
 	}
+	// Its library travels with it as a local package's does: named relative to its project.
+	projects, _ := filepath.Glob(filepath.Join(root, "scripts", "cozy-script-*"))
+	if len(projects) != 1 {
+		t.Fatalf("expected one script project, found %v", projects)
+	}
+	raw, err := os.ReadFile(filepath.Join(projects[0], "pyproject.toml"))
+	must(t, err)
+	relative, _ := filepath.Rel(projects[0], library)
+	if !strings.Contains(string(raw), "path = '"+relative+"'") {
+		t.Fatalf("the library source is not %s relative to the script project:\n%s", relative, raw)
+	}
 }
