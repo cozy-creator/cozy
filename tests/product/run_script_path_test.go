@@ -73,3 +73,42 @@ func TestDescribeShowsAJobsAcceleratorDeclaration(t *testing.T) {
 		}
 	}
 }
+
+// A script is a single-file package: a main that runs a Model slot is served like a package
+// entrypoint, not a job, its slot read from the editable library's source.
+func TestAScriptThatRunsAModelSlotIsServed(t *testing.T) {
+	root, err := os.MkdirTemp(scratchBase, "script-model-")
+	must(t, err)
+	t.Cleanup(func() { _ = removeAllForce(root) })
+	project := t.TempDir()
+	library := filepath.Join(project, "probe-lib")
+	must(t, os.MkdirAll(filepath.Join(library, "probe_lib"), 0o755))
+	must(t, os.WriteFile(filepath.Join(library, "pyproject.toml"), []byte("[project]\nname = \"probe-lib\"\n"+
+		"version = \"0.1.0\"\nrequires-python = \">=3.12\"\ndependencies = [\"cozy-runtime>="+hostruntime.PackageFloor+"\"]\n"+
+		"[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(library, "probe_lib", "__init__.py"), []byte(
+		"from cozy_runtime.author import Loader, Model, uses_components\n\n"+
+			"class Probe(Model[object]):\n    def load(self, loader: Loader) -> None: pass\n\n"+
+			"    @uses_components(\"body\")\n    def run(self) -> int: return 1\n"), 0o600))
+	script := filepath.Join(project, "served.py")
+	must(t, os.WriteFile(script, []byte("# /// script\n# requires-python=\">=3.12,<3.13\"\n"+
+		"# dependencies=[\"cozy-runtime>="+hostruntime.PackageFloor+"\", \"probe-lib\"]\n"+
+		"# [tool.uv.sources]\n# probe-lib = {path = \"./probe-lib\", editable = true}\n"+
+		"# [tool.cozy.models]\n# model = \"acme/probe@1.0/fp8\"\n# ///\n"+
+		"from probe_lib import Probe\n\ndef main(*, model: Probe) -> int:\n    return model.run()\n"), 0o600))
+	code, out := runCozy(t, root, "run", script, "--describe")
+	if code != 0 || strings.Contains(out, "(job)") || !strings.Contains(out, "model: Probe") {
+		t.Fatalf("a script running a Model slot was not described as served [exit %d]: %s", code, out)
+	}
+	// Its library travels with it as a local package's does: named relative to its project.
+	projects, _ := filepath.Glob(filepath.Join(root, "scripts", "cozy-script-*"))
+	if len(projects) != 1 {
+		t.Fatalf("expected one script project, found %v", projects)
+	}
+	raw, err := os.ReadFile(filepath.Join(projects[0], "pyproject.toml"))
+	must(t, err)
+	relative, _ := filepath.Rel(projects[0], library)
+	if !strings.Contains(string(raw), "path = '"+relative+"'") {
+		t.Fatalf("the library source is not %s relative to the script project:\n%s", relative, raw)
+	}
+}

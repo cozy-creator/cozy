@@ -595,7 +595,6 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	facts.CPUOrchestration = facts.CPUOrchestration || facts.PackageInterface.Application == packagepublish.ScriptApplication
 	facts.SelfCallable, problem = r.store.SelfCallableEntrypoints(installID)
 	return facts, problem
 }

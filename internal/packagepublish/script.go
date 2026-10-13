@@ -49,10 +49,6 @@ func PrepareScript(ctx context.Context, path, scripts string, namespace Namespac
 	if problem != nil {
 		return nil, problem
 	}
-	models, problem := scriptModels(metadata)
-	if problem != nil {
-		return nil, problem
-	}
 	if metadata.RequiresPython == "" {
 		metadata.RequiresPython = ">=3.12"
 	}
@@ -73,27 +69,33 @@ func PrepareScript(ctx context.Context, path, scripts string, namespace Namespac
 	if !hasRuntime {
 		metadata.Dependencies = append(metadata.Dependencies, "cozy-runtime>=0.4.0,<1") //cozy:allow distribution metadata, not an executable invocation
 	}
-	if metadata.Tool != nil {
-		// A script's dependency metadata has the same explicit source rules as a
-		// project. Relative local sources must keep their original meaning when staged.
-		if uv, ok := metadata.Tool["uv"].(map[string]any); ok {
-			if sources, ok := uv["sources"].(map[string]any); ok {
-				for _, value := range sources {
-					if source, ok := value.(map[string]any); ok {
-						if relative, ok := source["path"].(string); ok && !filepath.IsAbs(relative) {
-							absolute, err := filepath.Abs(filepath.Join(filepath.Dir(path), relative))
-							if err != nil {
-								return nil, exit.Usagef("cannot resolve local script dependency: %s", err)
-							}
-							source["path"] = absolute
+	digest := sha256.Sum256(raw)
+	name := "cozy-script-" + hex.EncodeToString(digest[:12])
+	root, err := filepath.Abs(filepath.Join(scripts, name))
+	if err != nil {
+		return nil, exit.Internalf("cannot place script project: %s", err)
+	}
+	// A local source is relative to the generated project, as a local package's is to its
+	// own: the project and its libraries travel to a machine as one tree.
+	if uv, ok := metadata.Tool["uv"].(map[string]any); ok {
+		if sources, ok := uv["sources"].(map[string]any); ok {
+			for _, value := range sources {
+				if source, ok := value.(map[string]any); ok {
+					if declared, ok := source["path"].(string); ok {
+						if !filepath.IsAbs(declared) {
+							declared = filepath.Join(filepath.Dir(path), declared)
 						}
+						absolute, err := filepath.Abs(declared)
+						relative, relErr := filepath.Rel(root, absolute)
+						if err != nil || relErr != nil {
+							return nil, exit.Usagef("cannot resolve local script dependency %s", declared)
+						}
+						source["path"] = filepath.ToSlash(relative)
 					}
 				}
 			}
 		}
 	}
-	digest := sha256.Sum256(raw)
-	name := "cozy-script-" + hex.EncodeToString(digest[:12])
 	tool := metadata.Tool
 	if tool == nil {
 		tool = map[string]any{}
@@ -114,11 +116,9 @@ func PrepareScript(ctx context.Context, path, scripts string, namespace Namespac
 	if err != nil {
 		return nil, exit.Internalf("cannot encode script project metadata: %s", err)
 	}
-	root := filepath.Join(scripts, name)
 	if held, err := os.ReadFile(filepath.Join(root, "pyproject.toml")); err == nil && bytes.Equal(held, project) {
 		if _, err := os.Stat(filepath.Join(root, "uv.lock")); err == nil {
 			if pack, problem := PrepareLocalFrom(root); problem == nil {
-				pack.ScriptModels = models
 				return pack, nil
 			}
 		}
@@ -160,7 +160,6 @@ func PrepareScript(ctx context.Context, path, scripts string, namespace Namespac
 	if problem != nil {
 		return nil, problem
 	}
-	pack.ScriptModels = models
 	keep = true
 	return pack, nil
 }
@@ -204,24 +203,4 @@ func readScriptMetadata(raw []byte) (scriptMetadata, *exit.Error) {
 		return metadata, exit.Named(exit.Validation, "script_metadata_invalid", "invalid PEP 723 metadata: %s", err)
 	}
 	return metadata, nil
-}
-
-func scriptModels(metadata scriptMetadata) (map[string]string, *exit.Error) {
-	models := map[string]string{}
-	cozy, ok := metadata.Tool["cozy"].(map[string]any)
-	if !ok {
-		return models, nil
-	}
-	declared, ok := cozy["models"].(map[string]any)
-	if !ok && cozy["models"] != nil {
-		return nil, exit.Named(exit.Validation, "script_metadata_invalid", "tool.cozy.models must map model parameters to references")
-	}
-	for name, value := range declared {
-		ref, ok := value.(string)
-		if !ok || name == "" || strings.ContainsAny(name, ".= /\\") || ref == "" {
-			return nil, exit.Named(exit.Validation, "script_metadata_invalid", "script model default is invalid")
-		}
-		models[name] = ref
-	}
-	return models, nil
 }
