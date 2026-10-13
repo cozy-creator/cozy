@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -90,8 +91,15 @@ func TestMachineInstallControlsUseExistingQueueAPI(t *testing.T) {
 	cfg := config.Config{Home: layout.Root, HubURL: "https://unused.example"}
 	server := api.New(api.Options{Orchestrator: owner, Cfg: cfg, Creds: credentials, Addr: address,
 		RentalInstallStatus: q.Status, RentalInstallCancel: q.Cancel})
-	peer.Config.Handler, problem = server.Handler()
+	handler, problem := server.Handler()
 	rentalInstallCheck(t, problem)
+	peer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.WriteHeader(http.StatusOK) // The fixture has no frontend; all API routes remain real.
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
 	peer.Start()
 	command := func(verb string, extra ...string) string {
 		t.Helper()
