@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"context"
+	"strings"
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -15,7 +16,8 @@ func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.
 	}
 	workspace, err := machine.GetMachineExecutionWorkspace(ctx, request)
 	if err == nil {
-		workspace.RunOutputLog = true // every fake machine is a wire-65 Runtime
+		workspace.RunOutputLog = true // ordinary protocol fixtures support current new-work capabilities
+		workspace.SubmissionClose = true
 	}
 	if err == nil && request.Describe != nil && workspace.DescribedRelease == nil {
 		// The machine reads a release at its own Hub; this pod's Hub is the fixture's.
@@ -27,6 +29,20 @@ func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.
 		}
 	}
 	return workspace, err
+}
+
+// These protocol peers have no execution under a generated unused probe identity.
+// Real submission reconciliation remains delegated to the peer, never inferred here.
+func (p *fakePod) CloseMachineSubmission(ctx context.Context, request *pb.MachineSubmissionClose) (*pb.MachineSubmissionClosure, error) {
+	if peer, ok := p.machine.(interface {
+		CloseMachineSubmission(context.Context, *pb.MachineSubmissionClose) (*pb.MachineSubmissionClosure, error)
+	}); ok {
+		return peer.CloseMachineSubmission(ctx, request)
+	}
+	if strings.HasPrefix(request.RequestId, "closure-probe-") && request.RequestId == request.SubmissionId {
+		return &pb.MachineSubmissionClosure{RequestId: request.RequestId, SubmissionId: request.SubmissionId, ExecutionWorkspaceId: request.ExpectedExecutionWorkspaceId}, nil
+	}
+	return p.UnimplementedPodHostServer.CloseMachineSubmission(ctx, request)
 }
 
 // machineTriagePeer reads a retained triage bundle for its owner through the Host.

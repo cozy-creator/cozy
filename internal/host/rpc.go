@@ -48,7 +48,7 @@ var routes = func() map[string]*route {
 		}
 		out["/"+from+"/"+method] = &route{method: md, target: "/" + to + "/" + toMethod}
 	}
-	execution := []string{"GetMachineExecutionWorkspace", "SubmitMachineExecution", "GetMachineExecution",
+	execution := []string{"GetMachineExecutionWorkspace", "SubmitMachineExecution", "CloseMachineSubmission", "GetMachineExecution",
 		"ListMachineExecutionEvents", "ControlMachineExecution", "CollectMachineExecution",
 		"AcknowledgeMachineExecutionCollection", "ReadMachineExecutionTriage", "ListMachineExecutions", "ListPackages"}
 	for _, from := range []string{podHost, control} {
