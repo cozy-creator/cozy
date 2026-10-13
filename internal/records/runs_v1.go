@@ -407,7 +407,7 @@ const (
 )
 
 // plainReasonV1 is a failure as its owner reads it. A machine that stopped mid-run says so in
-// its own words (machines before cozy-machine 0.1.1 sent no code for it).
+// its own words (machines before TensorD 0.1.1 sent no code for it).
 func plainReasonV1(reason *v1.Reason) (string, string) {
 	if reason.Code == MachineStopped || strings.HasPrefix(reason.Message, "owner lost before durable result custody") {
 		return MachineStopped, MachineStoppedMessage

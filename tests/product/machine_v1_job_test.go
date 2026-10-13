@@ -25,7 +25,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-var cpuLongform = flag.String("cpu-longform", "", "cozy-machine tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
+var cpuLongform = flag.String("cpu-longform", "", "tensord tests/fixtures/cpu_longform: H3 long-form's shape on CPU")
 
 var olderCozy = flag.String("older-cozy", "", "a released cozy whose daemon predates cozy.machine.v1 (0.1.26)")
 
@@ -34,7 +34,7 @@ var olderCozy = flag.String("older-cozy", "", "a released cozy whose daemon pred
 // invocable, the film published after every segment and saved to --out at its end.
 func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czj")
 	must(t, err)
@@ -70,7 +70,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	must(t, os.WriteFile(in, request, 0o600))
 	out := filepath.Join(root, "film")
 
-	code, document := runCozy(t, root, "run", "local/cozy-machine-cpu-longform/long_form", "--input", in,
+	code, document := runCozy(t, root, "run", "local/tensord-cpu-longform/long_form", "--input", in,
 		"--asset", "reference="+reference, "--await", "--json", "--out", out)
 	skipWithoutMachine(t, code, document)
 	if code != 0 {
@@ -110,7 +110,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 	}
 	// A job's model choice for a slot that exists nowhere (this segment function declares no
 	// model slot) is a warning, never a refusal: the film is rendered all the same.
-	code, document = runCozy(t, root, "run", "local/cozy-machine-cpu-longform/long_form", "--input", in,
+	code, document = runCozy(t, root, "run", "local/tensord-cpu-longform/long_form", "--input", in,
 		"--asset", "reference="+reference, "model.render_segment.models.base=alice/model", "--await", "--json")
 	if code != 0 {
 		t.Fatalf("a choice naming no model slot failed the run [exit %d]\n%s", code, document)
@@ -127,7 +127,7 @@ func TestMachineV1JobRendersSegmentsThroughChildRuns(t *testing.T) {
 // owner key is replaced.
 func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "cze")
 	must(t, err)
@@ -190,7 +190,7 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	must(t, os.WriteFile(in, request, 0o600))
 	out := filepath.Join(root, "film")
 	run := func(extra ...string) (int, string) {
-		args := append([]string{"run", "local/cozy-machine-cpu-longform/long_form", "--machine-endpoint-file", endpoint,
+		args := append([]string{"run", "local/tensord-cpu-longform/long_form", "--machine-endpoint-file", endpoint,
 			"--input", in, "--asset", "reference=" + reference, "--json", "--out", out}, extra...)
 		return runCozy(t, root, args...)
 	}
@@ -297,7 +297,7 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 	}
 	must(t, os.WriteFile(in, []byte(`{"segments":["solo"]}`), 0o600))
 	skewed := filepath.Join(root, "skewed")
-	code, awaited := runCozy(t, root, "run", "local/cozy-machine-cpu-longform/long_form", "--rental=standin",
+	code, awaited := runCozy(t, root, "run", "local/tensord-cpu-longform/long_form", "--rental=standin",
 		"--input", in, "--asset", "reference="+reference, "--await", "--json", "--out", skewed)
 	if files, _ := filepath.Glob(filepath.Join(skewed, "*video*")); code != 0 || len(files) != 1 {
 		t.Fatalf("the run under the older daemon did not save its film [exit %d]: %v\n%s", code, files, awaited)
@@ -311,7 +311,7 @@ func TestEndpointJobSignsWithItsRentalKeyAndPauses(t *testing.T) {
 // the machine runs, and a machine whose process is gone ends the run as machine_stopped.
 func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czs")
 	must(t, err)
@@ -340,7 +340,7 @@ func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 	must(t, os.WriteFile(reference, encoded.Bytes(), 0o600))
 	in := filepath.Join(root, "req.json")
 	must(t, os.WriteFile(in, []byte(`{"segments":["one","two"],"hold":600}`), 0o600))
-	code, submitted := runCozy(t, root, "run", "local/cozy-machine-cpu-longform/long_form", "--input", in,
+	code, submitted := runCozy(t, root, "run", "local/tensord-cpu-longform/long_form", "--input", in,
 		"--asset", "reference="+reference, "--json")
 	if code != 0 {
 		t.Fatalf("submit [exit %d]\n%s", code, submitted)
@@ -377,7 +377,7 @@ func TestObservingAV1RunNeverStartsAStoppedMachine(t *testing.T) {
 // is canceled on its machine, attributed to the deadline, whether or not a client waits.
 func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czt")
 	must(t, err)
@@ -405,7 +405,7 @@ func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 	must(t, os.WriteFile(reference, encoded.Bytes(), 0o600))
 	in := filepath.Join(root, "req.json")
 	must(t, os.WriteFile(in, []byte(`{"segments":["one"],"hold":600}`), 0o600))
-	run := []string{"run", "local/cozy-machine-cpu-longform/long_form", "--input", in, "--asset", "reference=" + reference, "--json", "--timeout", "20s"}
+	run := []string{"run", "local/tensord-cpu-longform/long_form", "--input", in, "--asset", "reference=" + reference, "--json", "--timeout", "20s"}
 	status := func(number string) string {
 		_, shown := runCozy(t, root, "run", "show", number, "--json")
 		var state struct {
@@ -430,14 +430,14 @@ func TestRunTimeoutCancelsTheRunOnItsMachine(t *testing.T) {
 	landed(t, "the detached run to be canceled at its deadline", func() bool { return status("2") == "canceled" })
 }
 
-var cpuTree = flag.String("cpu-tree", "", "cozy-machine tests/fixtures/cpu_tree: a callable that reads one input Tree")
+var cpuTree = flag.String("cpu-tree", "", "tensord tests/fixtures/cpu_tree: a callable that reads one input Tree")
 
 // `cozy run <pkg>/count --asset data=<dir>` on a machine that serves cozy.machine.v1: the
 // directory's files and its tree manifest are written to the machine, which materializes the
 // tree for the callable.
 func TestMachineV1InputTreeReachesTheCallable(t *testing.T) {
 	if *machineHostBinary == "" || *cpuTree == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-tree=<cozy-machine>/tests/fixtures/cpu_tree")
+		t.Skip("requires -machine-host=<tensord> and -cpu-tree=<tensord>/tests/fixtures/cpu_tree")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czt")
 	must(t, err)
@@ -464,7 +464,7 @@ func TestMachineV1InputTreeReachesTheCallable(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(data, "a.txt"), []byte("alpha"), 0o600))
 	must(t, os.WriteFile(filepath.Join(data, "nested", "b.bin"), []byte("\x00\x01beta"), 0o600))
 
-	code, document := runCozy(t, root, "run", "local/cozy-machine-cpu-tree/count", "--asset", "data="+data, "--await", "--json")
+	code, document := runCozy(t, root, "run", "local/tensord-cpu-tree/count", "--asset", "data="+data, "--await", "--json")
 	skipWithoutMachine(t, code, document)
 	if code != 0 {
 		t.Fatalf("the run did not succeed [exit %d]\n%s", code, document)

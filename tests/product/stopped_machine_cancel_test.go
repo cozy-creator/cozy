@@ -76,10 +76,10 @@ func TestCancelOnALocalMachineThatCannotStartSaysSo(t *testing.T) {
 		[]byte("tensorhub_url: http://127.0.0.1:1\ntensorhub_token: unreachable\n"), 0o600))
 	provisionMachine(t, root)
 	// A machine that answers what it is but fails at boot, as one with a broken store does.
-	binary := filepath.Join(root, "machine", "root", "usr", "local", "bin", "cozy-machine")
+	binary := filepath.Join(root, "machine", "root", "usr", "local", "bin", "tensord")
 	must(t, os.Remove(binary))
 	must(t, os.WriteFile(binary, []byte("#!/bin/sh\nif [ \"$1\" = version ]; then exec '"+*machineHostBinary+
-		"' \"$@\"; fi\necho 'cozy-machine: cannot open its store: permission denied' >&2\nexit 1\n"), 0o755))
+		"' \"$@\"; fi\necho 'tensord: cannot open its store: permission denied' >&2\nexit 1\n"), 0o755))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	request, _, problem := store.Submit(records.Request{ID: "req-unstartable-cancel", IdemKey: "unstartable-cancel", Package: "proof/stuck",

@@ -1,4 +1,4 @@
-// cozy is the short-lived CLI and personal controller. Machines run cozy-machine independently.
+// cozy is the short-lived CLI and personal controller. Machines run tensord independently.
 package main
 
 import (

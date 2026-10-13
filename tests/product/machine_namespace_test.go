@@ -16,7 +16,7 @@ import (
 
 func TestMissingInstallationMetadataNeverBootstrapsOverLiveAgent(t *testing.T) {
 	h := machines.NewHost(t.TempDir(), "", nil)
-	binary := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
+	binary := filepath.Join(h.Root(), "usr/local/bin/tensord")
 	must(t, os.MkdirAll(filepath.Dir(binary), 0755))
 	sleep, err := exec.LookPath("sleep")
 	must(t, err)
@@ -50,7 +50,7 @@ func TestMissingInstallationMetadataNeverBootstrapsOverLiveAgent(t *testing.T) {
 }
 
 func TestSharedExecutableDoesNotAuthorizeProcessTermination(t *testing.T) {
-	for _, name := range []string{"cozy", "cozy-machine"} {
+	for _, name := range []string{"cozy", "tensord"} {
 		t.Run(name, func(t *testing.T) {
 			h := machines.NewHost(t.TempDir(), "", nil)
 			binary := filepath.Join(h.Root(), "usr/local/bin", name)
@@ -139,7 +139,7 @@ func TestEnsureRefusesConcurrentHostMutationWithoutWaiting(t *testing.T) {
 func TestStaleProcessGenerationDoesNotAuthorizeTermination(t *testing.T) {
 	dir := t.TempDir()
 	h := machines.NewHost(dir, "", nil)
-	binary := filepath.Join(h.Root(), "usr/local/bin/cozy-machine")
+	binary := filepath.Join(h.Root(), "usr/local/bin/tensord")
 	must(t, os.MkdirAll(filepath.Dir(binary), 0755))
 	sleep, err := exec.LookPath("sleep")
 	must(t, err)

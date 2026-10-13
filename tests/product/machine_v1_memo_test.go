@@ -27,7 +27,7 @@ func TestMemoizedCallsAreAnsweredFromTheMachinesMemo(t *testing.T) {
 		in := filepath.Join(t.TempDir(), "req.json")
 		raw, _ := json.Marshal(map[string]any{"values": values, "counter": counter})
 		must(t, os.WriteFile(in, raw, 0o600))
-		code, out := runCozy(t, root, "run", "local/cozy-machine-cpu-memo/survey", "--input", in, "--await", "--json")
+		code, out := runCozy(t, root, "run", "local/tensord-cpu-memo/survey", "--input", in, "--await", "--json")
 		var run struct {
 			Job    string `json:"job"`
 			Result struct {
@@ -90,7 +90,7 @@ func TestMemoizedRunIsAnsweredFromTheMachinesMemo(t *testing.T) {
 		in := filepath.Join(t.TempDir(), "req.json")
 		raw, _ := json.Marshal(map[string]any{"payload": map[string]any{"value": value, "counter": counter}})
 		must(t, os.WriteFile(in, raw, 0o600))
-		code, out := runCozy(t, root, "run", "local/cozy-machine-cpu-memo/measure", "--input", in, "--await", "--json", "--fields=id,status,result")
+		code, out := runCozy(t, root, "run", "local/tensord-cpu-memo/measure", "--input", in, "--await", "--json", "--fields=id,status,result")
 		var run struct {
 			ID     string `json:"id"`
 			Status string `json:"status"`
@@ -128,7 +128,7 @@ func TestMemoizedRunIsAnsweredFromTheMachinesMemo(t *testing.T) {
 func memoMachine(t *testing.T) (root, counter string) {
 	t.Helper()
 	if *machineHostBinary == "" || *cpuLongform == "" {
-		t.Skip("requires -machine-host=<cozy-machine> and -cpu-longform=<cozy-machine>/tests/fixtures/cpu_longform")
+		t.Skip("requires -machine-host=<tensord> and -cpu-longform=<tensord>/tests/fixtures/cpu_longform")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czm")
 	must(t, err)

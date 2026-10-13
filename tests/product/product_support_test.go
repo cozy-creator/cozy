@@ -63,7 +63,7 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	// So is a root's machine agent (local_machine_lifecycle_test.go).
-	if filepath.Base(os.Args[0]) == "cozy-machine" {
+	if filepath.Base(os.Args[0]) == "tensord" {
 		serveFakeMachineAgent()
 		os.Exit(0)
 	}

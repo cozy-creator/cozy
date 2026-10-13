@@ -174,7 +174,7 @@ async def main(ctx):
 	// The Runtime's operations are a callee App of the caller's own environment: quantize ran
 	// as package runtime/operations in its caller's generation (its numerical dependencies are
 	// the Runtime's own), not in an environment of its own.
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine/root/var/lib/cozy/rust-machine/execution/executions.sqlite3")+"?mode=ro")
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine/root/var/lib/cozy/tensord/execution/executions.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer db.Close()
 	rows, err := db.Query("SELECT id, invocation FROM executions ORDER BY id")

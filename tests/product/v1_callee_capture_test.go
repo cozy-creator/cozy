@@ -76,7 +76,7 @@ func TestV1CapturedPackageCallsNestedJobsOnTheRealMachine(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "local-packages")); !os.IsNotExist(err) {
 		t.Fatalf("the run staged a capture under local-packages: %v", err)
 	}
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine/root/var/lib/cozy/rust-machine/execution/executions.sqlite3")+"?mode=ro")
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "machine/root/var/lib/cozy/tensord/execution/executions.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer db.Close()
 	// The run's three executed jobs.

@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-// A real typed FileAsset callable on the Rust machine through ordinary CLI commands.
+// A real typed FileAsset callable on TensorD through ordinary CLI commands.
 // The exact authored octet-stream/131072-byte policy remains in force; no GPU work occurs.
 func TestRawFileAssetRetainsOctetStreamAndAuthoredBoundsThroughOrdinaryCLI(t *testing.T) {
 	if *machineHostBinary == "" || *machineRuntimeWheel == "" {

@@ -6,4 +6,4 @@ machine.pb.go=sha256:f4431e3ec778a7da73918b12bbccd5e147330dbaa57a60382b21ee65351
 machine_grpc.pb.go=sha256:105c6ba7356fc594427b08d8373be940ff57f9713e26dd4885ea5d94acd99e7e
 
 Generated with protoc-gen-go and protoc-gen-go-grpc (--go_opt=M, the proto unchanged).
-Regenerate from the named cozy-machine commit; never edit by hand.
+Regenerate from the named tensord commit; never edit by hand.

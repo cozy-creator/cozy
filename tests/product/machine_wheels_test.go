@@ -20,8 +20,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
-// `cozy machine install` makes this computer's machine the Rust machine a worker image runs:
-// the named executable at usr/local/bin/cozy-machine, exactly the Runtime and TensorFS wheels
+// `cozy machine install` makes this computer's machine the TensorD a worker image runs:
+// the named executable at usr/local/bin/tensord, exactly the Runtime and TensorFS wheels
 // at opt/cozy/machine/wheels, uv beside it, and no Python worker. It starts as a persistent
 // machine, proves readiness through Status, installs and runs a local package, and installing
 // again updates it in place with Run kind: update.
@@ -75,7 +75,7 @@ func TestMachineKeepsTheWheelsItInstalled(t *testing.T) {
 	if !slices.Equal(held, want) {
 		t.Fatalf("the machine holds %v, want exactly %v", held, want)
 	}
-	if fileSHA(t, filepath.Join(machineRoot, "usr/local/bin/cozy-machine")) != fileSHA(t, *machineHostBinary) {
+	if fileSHA(t, filepath.Join(machineRoot, "usr/local/bin/tensord")) != fileSHA(t, *machineHostBinary) {
 		t.Fatal("the installed machine differs from the named executable")
 	}
 	if _, err := os.Stat(filepath.Join(machineRoot, "usr/local/bin/uv")); err != nil {
@@ -226,7 +226,7 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 		t.Skip("requires a -machine-runtime-wheel/-machine-tensorfs-wheel pair")
 	}
 	if !bundlesMachine(t, *machineRuntimeWheel) {
-		t.Skip("requires a -machine-runtime-wheel that bundles a Rust machine")
+		t.Skip("requires a -machine-runtime-wheel that bundles TensorD")
 	}
 	if _, err := exec.LookPath("uv"); err != nil {
 		t.Skip("uv lays out the machine root")
@@ -283,13 +283,13 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 	if code, out := runCozy(t, root, "machine", "install", "--runtime-wheel", second, "--tensorfs-wheel", *machineTensorFSWheel); code != 0 {
 		t.Fatalf("machine install over the running machine [exit %d]\n%s", code, out)
 	}
-	if _, err := os.Lstat(filepath.Join(root, "machine", "root", "var/lib/cozy/rust-machine/agent/current")); err != nil {
+	if _, err := os.Lstat(filepath.Join(root, "machine", "root", "var/lib/cozy/tensord/agent/current")); err != nil {
 		t.Fatalf("the update in place did not activate the wheel's bundled machine: %v", err)
 	}
 	// A real upgrade starts with an older supervisor. Updating only its service leaves the
 	// next launch on the old parent, even when the new service contains a readiness fix.
-	launcher := filepath.Join(root, "machine", "root", "usr/local/bin/cozy-machine")
-	active := filepath.Join(root, "machine", "root", "var/lib/cozy/rust-machine/agent/current")
+	launcher := filepath.Join(root, "machine", "root", "usr/local/bin/tensord")
+	active := filepath.Join(root, "machine", "root", "var/lib/cozy/tensord/agent/current")
 	if fileSHA(t, launcher) != fileSHA(t, active) {
 		t.Fatal("the next launch still uses the old supervisor after a successful bundled update")
 	}
@@ -304,14 +304,14 @@ func TestALocalMachineUpdatedInPlaceStartsAgain(t *testing.T) {
 	}
 }
 
-// bundlesMachine answers whether a Runtime wheel carries a cozy-machine executable.
+// bundlesMachine answers whether a Runtime wheel carries a tensord executable.
 func bundlesMachine(t *testing.T, wheel string) bool {
 	t.Helper()
 	archive, err := zip.OpenReader(wheel)
 	must(t, err)
 	defer archive.Close()
 	for _, file := range archive.File {
-		if strings.HasSuffix(file.Name, ".data/scripts/cozy-machine") {
+		if strings.HasSuffix(file.Name, ".data/scripts/tensord") {
 			return true
 		}
 	}

@@ -26,10 +26,10 @@ import (
 )
 
 var (
-	machineBinary   = flag.String("machine-binary", "", "a cozy-machine binary to serve these tests")
-	installerPython = flag.String("installer-python", "", "the machine's package installer Python (cozy_machine_client importable)")
+	machineBinary   = flag.String("machine-binary", "", "a tensord binary to serve these tests")
+	installerPython = flag.String("installer-python", "", "the machine's package installer Python (tensord_client importable)")
 	clientWheel     = flag.String("client-wheel", "", "the machine's CPU runner client wheel")
-	cpuFixture      = flag.String("cpu-fixture", "", "cozy-machine tests/fixtures/cpu_lifecycle")
+	cpuFixture      = flag.String("cpu-fixture", "", "tensord tests/fixtures/cpu_lifecycle")
 )
 
 // machine is a real machine serving on a loopback port, and the key it authorizes.
@@ -46,7 +46,7 @@ func serve(t *testing.T, args ...string) *Client {
 
 func start(t *testing.T, args ...string) machine {
 	if *machineBinary == "" {
-		t.Skip("requires -machine-binary=<cozy-machine>")
+		t.Skip("requires -machine-binary=<tensord>")
 	}
 	root := t.TempDir()
 	public, private, _ := ed25519.GenerateKey(nil)
@@ -261,7 +261,7 @@ func TestLocalSourcePreparesOnTheRealMachine(t *testing.T) {
 	client := serve(t, "--installer-python", *installerPython, "--client-wheel", *clientWheel)
 	ctx := context.Background()
 	project := t.TempDir()
-	installation := localpackage.Installation{Package: "local/cozy-machine-cpu-lifecycle", Release: "0.1.0"}
+	installation := localpackage.Installation{Package: "local/tensord-cpu-lifecycle", Release: "0.1.0"}
 	for _, name := range []string{"pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"} {
 		raw, err := os.ReadFile(filepath.Join(*cpuFixture, name))
 		must(t, err)

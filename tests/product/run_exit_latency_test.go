@@ -19,7 +19,7 @@ import (
 // is logged.
 func TestRunExitsPromptlyAfterItsOutcome(t *testing.T) {
 	if *machineHostBinary == "" {
-		t.Skip("requires -machine-host=<cozy-machine>")
+		t.Skip("requires -machine-host=<tensord>")
 	}
 	root, err := os.MkdirTemp(os.TempDir(), "czx")
 	must(t, err)
@@ -61,7 +61,7 @@ func TestRunExitsPromptlyAfterItsOutcome(t *testing.T) {
 			must(t, err)
 			return db
 		}
-		journal := open(filepath.Join(root, "machine", "root", "var", "lib", "cozy", "rust-machine", "execution", "executions.sqlite3"))
+		journal := open(filepath.Join(root, "machine", "root", "var", "lib", "cozy", "tensord", "execution", "executions.sqlite3"))
 		defer journal.Close()
 		creator := open(filepath.Join(root, "creator.sqlite"))
 		defer creator.Close()

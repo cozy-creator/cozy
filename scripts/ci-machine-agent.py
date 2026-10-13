@@ -13,7 +13,7 @@ import zipfile
 
 def extract(wheel: Path, target: Path) -> None:
     with zipfile.ZipFile(wheel) as archive:
-        members = [name for name in archive.namelist() if name.endswith('.data/scripts/cozy-machine')]
+        members = [name for name in archive.namelist() if name.endswith('.data/scripts/tensord')]
         records = [name for name in archive.namelist() if name.endswith('.dist-info/RECORD')]
         if len(members) != 1 or len(records) != 1:
             raise ValueError('Runtime wheel must contain exactly one bundled agent and RECORD')
@@ -31,7 +31,7 @@ def extract(wheel: Path, target: Path) -> None:
     # These operations are static API contracts. Update/readiness authority belongs
     # to a running machine's Status, not its unbooted binary's version response.
     required = {'status/1', 'run/1', 'control/1', 'read/1', 'execution.cpu/1'}
-    if (version.get('name') != 'cozy-machine'
+    if (version.get('name') != 'tensord'
             or 'cozy.machine.v1' not in version.get('api', [])
             or not required.issubset(version.get('capabilities', []))):
         raise ValueError('bundled agent lacks the current machine operation contracts')
