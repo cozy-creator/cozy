@@ -90,7 +90,7 @@ shows `paused`. Resume replays the root, whose calls find their finished childre
 
 **Activity** (a rental's idle release, `rental-lifetime.md`) is a run queued or running (warm-ups
 and uploads included), and an explicit keepalive restarts the clock once. Updates, paused jobs,
-open streams and other calls are not activity: a daemon that holds a stream must not bill forever.
+open streams and other calls are not activity: a Calcifer that holds a stream must not bill forever.
 
 ## Today's 35 rows
 
