@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -400,16 +401,25 @@ func ResolveHub(value string, hubs map[string]string) (string, string, *exit.Err
 	return origin, Config{Hubs: hubs}.hubNamed(origin), nil
 }
 
-// HubOrigin validates one Tensorhub base URL and returns its canonical spelling.
+// HubOrigin validates one Tensorhub base URL and returns its canonical spelling: lowercase
+// host, no default port, no trailing slash. Every record and credential is keyed by it.
 func HubOrigin(value string) (string, *exit.Error) {
-	base := strings.TrimRight(strings.TrimSpace(value), "/")
-	parsed, err := url.Parse(base)
+	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(value), "/"))
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
 		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", exit.Named(exit.Validation, "config.tensorhub_url_invalid",
 			"%q is not a hub name or an http or https Tensorhub base URL without credentials, query, or fragment", redactURL(value))
 	}
-	return base, nil
+	host, port := strings.ToLower(parsed.Hostname()), parsed.Port()
+	if port == map[string]string{"http": "80", "https": "443"}[parsed.Scheme] {
+		port = ""
+	}
+	if port != "" || strings.Contains(host, ":") {
+		host = net.JoinHostPort(host, port)
+		host = strings.TrimSuffix(host, ":")
+	}
+	parsed.Host = host
+	return parsed.String(), nil
 }
 
 func redactURL(value string) string {
