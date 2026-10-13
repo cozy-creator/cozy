@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -319,38 +322,75 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 	}
 }
 
-// An unavailable machine that let an installation make no progress fails it with the reason:
-// it is not queued again, however often the queue wakes.
-func TestRentalInstallWithNoProgressFailsInsteadOfQueuingAgain(t *testing.T) {
-	_, store := rentalInstallStore(t)
-	machine := rentalInstallMachine("ready")
-	rentalInstallCheck(t, store.RecordRental(machine))
+// A local software update holds Host's lock while native work drains. Recovering
+// its accepted installation must retain that work, even before a progress event.
+func TestRentalInstallSurvivesMaintenanceBeforeProgress(t *testing.T) {
+	layout, store := rentalInstallStore(t)
+	must(t, os.MkdirAll(layout.Machine, 0700))
+	lock, err := os.OpenFile(filepath.Join(layout.Machine, "host.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	must(t, err)
+	defer lock.Close()
+	must(t, flock.Exclusive(lock))
+	defer flock.Release(lock)
+	host := machines.NewHost(layout.Machine, "", nil)
 	var calls atomic.Int32
-	q := machines.NewInstalls(store, prepared(func(_ context.Context, _ records.RentalInstall, report func(machines.InstallProgress)) *exit.Error {
-		calls.Add(1)
-		report(machines.InstallProgress{Stage: "connect"})
-		return exit.Named(exit.Unavailable, "machine.stopped", "this computer's machine is stopped")
-	}), io.Discard)
-	row, problem := q.Accept(machine.ID, records.RentalInstallSelection{Package: "proof/stalled", Release: "1.0.0"})
-	rentalInstallCheck(t, problem)
-	runRentalInstallQueue(t, q)
-	done := waitRentalInstall(t, store, row.ID, "failed")
-	if done.ErrorCode != "machine.stopped" {
-		t.Fatalf("the installation failed without its reason: %+v", done)
-	}
-	for range 5 {
-		q.Wake()
-		time.Sleep(10 * time.Millisecond)
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("a failed installation was tried %d times", calls.Load())
-	}
-	obligations, problem := store.Obligations()
-	rentalInstallCheck(t, problem)
-	for _, o := range obligations {
-		if o.Kind == "rental_install" {
-			t.Fatalf("a failed installation holds the daemon: %+v", o)
+	entered, finishSecond := make(chan struct{}), make(chan struct{})
+	var acceptedID string
+	q := machines.NewInstalls(store, prepared(func(ctx context.Context, row records.RentalInstall, _ func(machines.InstallProgress)) *exit.Error {
+		call := calls.Add(1)
+		if row.ID != acceptedID {
+			t.Errorf("recovery changed accepted identity: %s", row.ID)
 		}
+		if call > 2 {
+			return nil // The same native operation can now be observed to completion.
+		}
+		_, problem := host.Ensure(ctx, nil)
+		if call == 2 {
+			close(entered)
+			select {
+			case <-finishSecond:
+			case <-ctx.Done():
+			}
+		}
+		return problem
+	}), io.Discard)
+	row, problem := q.Accept(machines.Local, records.RentalInstallSelection{Package: "proof/held", Release: "1.0.0"})
+	rentalInstallCheck(t, problem)
+	acceptedID = row.ID
+	runRentalInstallQueue(t, q)
+	// Wait for the first attempt's durable maintenance reason, not its initial queued state.
+	deadline := time.After(3 * time.Second)
+	for {
+		got, problem := store.RentalInstall(row.ID)
+		rentalInstallCheck(t, problem)
+		if got.State == "queued" && got.ErrorCode == "machine.busy" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("maintenance was not retained: %+v", got)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	time.Sleep(25 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("unavailability caused a retry loop: %d", calls.Load())
+	}
+	if _, problem := q.Cancel(machines.Local, row.ID); problem == nil {
+		t.Fatal("previously attempted operation was cancelable")
+	}
+	q.Wake()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("availability wake did not retry")
+	}
+	must(t, flock.Release(lock))
+	q.Wake() // Install completion races the in-flight failed attempt's return.
+	close(finishSecond)
+	waitRentalInstall(t, store, row.ID, "succeeded")
+	if calls.Load() != 3 {
+		t.Fatalf("availability edge was lost or repeated: %d", calls.Load())
 	}
 }
 

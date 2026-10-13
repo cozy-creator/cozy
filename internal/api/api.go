@@ -88,6 +88,7 @@ type Server struct {
 	rentalInstall       func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	rentalInstallStatus func(string, string) (*RentalInstallStatus, *exit.Error)
 	rentalInstallCancel func(string, string) (*RentalInstallStatus, *exit.Error)
+	machineReady        func(string)
 	runtimeUpdate       func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
 
 	// shutdown asks the process that owns this server to drain and stop — `cozy down`'s
@@ -145,6 +146,7 @@ type Options struct {
 	// RentalInstallStatus reads one queued installation on one machine, with its progress.
 	RentalInstallStatus func(machine, id string) (*RentalInstallStatus, *exit.Error)
 	RentalInstallCancel func(machine, id string) (*RentalInstallStatus, *exit.Error)
+	MachineReady        func(machine string)
 	RuntimeUpdate       func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
@@ -161,7 +163,7 @@ func New(opt Options) *Server {
 		orchestrator:      opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
-		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, rentalKeepalive: opt.RentalKeepalive, rentalInstall: opt.RentalInstall, rentalInstallStatus: opt.RentalInstallStatus, rentalInstallCancel: opt.RentalInstallCancel, runtimeUpdate: opt.RuntimeUpdate, shutdown: opt.Shutdown,
+		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, rentalKeepalive: opt.RentalKeepalive, rentalInstall: opt.RentalInstall, rentalInstallStatus: opt.RentalInstallStatus, rentalInstallCancel: opt.RentalInstallCancel, machineReady: opt.MachineReady, runtimeUpdate: opt.RuntimeUpdate, shutdown: opt.Shutdown,
 	}
 }
 
@@ -234,6 +236,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/rentals/{rental_id}/keepalive":            s.keepRentalAlive,
 		"GET /v1/local/rentals":                                   s.listRentals,
 		"GET /v1/local/machines/{machine}/status":                 s.machineStatus,
+		"POST /v1/local/machines/{machine}/ready":                 s.machineBecameReady,
 		"GET /v1/local/machines/{machine}/logs/{log}":             s.machineLog,
 		"POST /v1/local/rentals/{rental_id}/prepare":              s.prepareRentalPackage,
 		"GET /v1/local/rentals/{rental_id}/installs/{id}":         s.rentalInstallState,

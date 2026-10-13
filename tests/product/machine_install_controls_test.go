@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/cli"
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -89,8 +91,17 @@ func TestMachineInstallControlsUseExistingQueueAPI(t *testing.T) {
 	credentials, problem := api.Mint(layout)
 	rentalInstallCheck(t, problem)
 	cfg := config.Config{Home: layout.Root, HubURL: "https://unused.example"}
+	var ready atomic.Int32
 	server := api.New(api.Options{Orchestrator: owner, Cfg: cfg, Creds: credentials, Addr: address,
-		RentalInstallStatus: q.Status, RentalInstallCancel: q.Cancel})
+		RentalInstallStatus: q.Status, RentalInstallCancel: q.Cancel,
+		MachineReady: func(machine string) {
+			if machine != machines.Local {
+				t.Errorf("readiness named %q", machine)
+			}
+			ready.Add(1)
+			q.Wake()
+		},
+	})
 	handler, problem := server.Handler()
 	rentalInstallCheck(t, problem)
 	peer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,6 +112,12 @@ func TestMachineInstallControlsUseExistingQueueAPI(t *testing.T) {
 		handler.ServeHTTP(w, r)
 	})
 	peer.Start()
+	client, problem := localapi.Open(cfg, daemon.Probe(cfg))
+	rentalInstallCheck(t, problem)
+	rentalInstallCheck(t, client.MachineReady(machines.Local))
+	if ready.Load() != 1 {
+		t.Fatal("ready notification did not reach the queue")
+	}
 	command := func(verb string, extra ...string) string {
 		t.Helper()
 		var out, diagnostic bytes.Buffer

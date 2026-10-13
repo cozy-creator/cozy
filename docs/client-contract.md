@@ -329,6 +329,7 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, activity, and each ready machine's own idle deadline (`release_due_at`); `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
 | `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | one reset of the machine's fifteen-minute idle clock (Status keepalive); answers the new deadline; no body |
 | `GET /v1/local/machines/{machine}/status` | local | yes | one machine's picture as it reports it (cozy.machine.v1 Status): software, GPUs, live runs, environments, disk, idle deadline |
+| `POST /v1/local/machines/{machine}/ready` | local | yes | notify the controller of an availability edge after install or start; resume already accepted work without creating requests |
 | `GET /v1/local/machines/{machine}/logs/{log}` | local | yes | one log a machine keeps (`tensorfs`: TensorFS's transport decisions), oldest line first, `?tail_bytes=` the newest; an older machine answers a note in `unavailable` |
 | `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |
 | `GET /v1/local/rentals/{rental_id}/installs/{id}` | local | yes | one queued installation's state and, while it runs, the machine's latest stage and byte counts |

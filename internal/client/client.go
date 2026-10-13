@@ -446,6 +446,10 @@ func (c *Client) CancelRentalInstall(rentalID, id string) (api.RentalInstallStat
 	return result, problem
 }
 
+func (c *Client) MachineReady(machine string) *exit.Error {
+	return c.call(http.MethodPost, "/v1/local/machines/"+url.PathEscape(machine)+"/ready", nil, nil)
+}
+
 func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateRequest) (api.RuntimeUpdate, *exit.Error) {
 	var result api.RuntimeUpdate
 	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", request, &result)

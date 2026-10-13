@@ -156,6 +156,15 @@ func (s *Server) cancelRentalInstall(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, status)
 }
 
+func (s *Server) machineBecameReady(w http.ResponseWriter, r *http.Request) {
+	if s.machineReady == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("machine readiness notifications are unavailable"))
+		return
+	}
+	s.machineReady(r.PathValue("machine"))
+	s.ok(w, r, http.StatusOK, map[string]bool{"notified": true})
+}
+
 func canonicalPackageRef(value string) (string, *exit.Error) {
 	ref, problem := hub.ParseRef(value)
 	if problem != nil {

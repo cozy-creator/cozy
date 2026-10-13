@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -16,10 +17,11 @@ import (
 // machine at a time. It observes only local records; the fleet reconciler owns provider
 // observation and attachment, and no installation can allocate or replace a rental.
 type Installs struct {
-	store   *records.Store
-	prepare Prepare
-	log     io.Writer
-	wake    chan struct{}
+	store       *records.Store
+	prepare     Prepare
+	log         io.Writer
+	wake        chan struct{}
+	wakeVersion atomic.Uint64
 	// progress is each running installation's latest preparation report, by install id.
 	progress sync.Map
 }
@@ -133,6 +135,11 @@ func installFence(store *records.Store, machine string) (boot string, ready bool
 }
 
 func (q *Installs) Wake() {
+	q.wakeVersion.Add(1)
+	q.kick()
+}
+
+func (q *Installs) kick() {
 	select {
 	case q.wake <- struct{}{}:
 	default:
@@ -148,8 +155,9 @@ func (q *Installs) Run(ctx context.Context) {
 	}
 	running := map[string]active{}
 	type completion struct {
-		rental string
-		retry  bool
+		rental      string
+		retry       bool
+		wakeVersion uint64
 	}
 	done := make(chan completion)
 	var workers sync.WaitGroup
@@ -161,8 +169,8 @@ func (q *Installs) Run(ctx context.Context) {
 			return
 		case finished := <-done:
 			delete(running, finished.rental)
-			if !finished.retry {
-				q.Wake()
+			if !finished.retry || q.wakeVersion.Load() != finished.wakeVersion {
+				q.kick()
 			}
 		case <-q.wake:
 			rows, problem := q.store.PendingRentalInstalls()
@@ -200,40 +208,28 @@ func (q *Installs) Run(ctx context.Context) {
 					continue
 				}
 				work, cancel := context.WithCancel(ctx)
+				wakeVersion := q.wakeVersion.Load()
 				running[row.RentalID] = active{id: row.ID, cancel: cancel}
 				workers.Add(1)
 				go func(row records.RentalInstall) {
 					defer workers.Done()
 					defer cancel()
-					var reported sync.Mutex
-					var first *InstallProgress
-					moved := false
 					result, problem := q.prepare(work, row, func(progress InstallProgress) {
-						reported.Lock()
-						if first == nil {
-							first = &progress
-						} else if progress.Stage != first.Stage || progress.TransferredBytes > first.TransferredBytes {
-							moved = true
-						}
-						reported.Unlock()
 						q.progress.Store(row.ID, progress)
 					})
-					reported.Lock()
-					progressed := moved
-					reported.Unlock()
 					q.progress.Delete(row.ID)
 					state := "succeeded"
 					if problem != nil {
-						// A stopping daemon leaves the installation to the next one. Otherwise it
-						// runs again only after an unavailable machine let it make progress.
+						// Maintenance can refuse before progress while accepted native work is
+						// still running. Retain the intent until another availability edge.
 						state, result = "failed", nil
-						if ctx.Err() != nil || progressed && problem.Code == exit.Unavailable {
+						if ctx.Err() != nil || problem.Code == exit.Unavailable {
 							state = "queued"
 						}
 					}
 					q.settle(row, state, result, problem)
 					select {
-					case done <- completion{rental: row.RentalID, retry: state == "queued"}:
+					case done <- completion{rental: row.RentalID, retry: state == "queued", wakeVersion: wakeVersion}:
 					case <-ctx.Done():
 					}
 				}(*claimed)
