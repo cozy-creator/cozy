@@ -3129,7 +3129,9 @@ func newestInvocationTarget(ctx *Context, target Target) (Target, *launch.Packag
 // release's interface: the newest the named machine holds from the selected Hub, else
 // newestInvocationTarget's, which the machine installs. `cozy package update --rental` moves it.
 func rentalInvocationTarget(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
-	if machine := ctx.Inv.Value("--rental"); machine != "" {
+	// Only a rental this host recorded is asked what it holds here: any other is resolved at
+	// its Hub after the payload is validated, and runs the newest release.
+	if machine := ctx.Inv.Value("--rental"); machine != "" && recordedRentalNamed(ctx, machine) {
 		release, problem := machineRelease(ctx, target.Package)
 		if problem != nil {
 			fmt.Fprintf(ctx.Err, "%s did not say which releases it holds (%s); running the newest release\n", machine, problem.Message)
@@ -3140,6 +3142,15 @@ func rentalInvocationTarget(ctx *Context, target Target) (Target, *launch.Packag
 		}
 	}
 	return newestInvocationTarget(ctx, target)
+}
+
+func recordedRentalNamed(ctx *Context, name string) bool {
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return false
+	}
+	defer store.Close()
+	return recordedRental(store, name) != ""
 }
 
 // machineRelease is the newest release of pkg from the selected Hub that the run's named

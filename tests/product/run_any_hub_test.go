@@ -1,6 +1,8 @@
 package producttest
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,7 +20,12 @@ import (
 func TestARunFindsItsRentalOnAnyHub(t *testing.T) {
 	h, root, _, store := parityMachines(t)
 	const elsewhere = "http://127.0.0.1:1"
-	// The current hub is another one, which does not even answer; the rental's hub is b.
+	// The current hub is another one, which does not even answer; the rental's hub is b, which
+	// this computer is signed in to, as to any hub it rents from.
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	h.server.Config.Handler = machineKeyLogin("machine-b", public, "rental-idle-test", h.server.Config.Handler)
+	plantMachineKey(t, root, h.server.URL, "machine-b", private)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: a\nhubs:\n  a: "+elsewhere+
 		"\n  b: "+h.server.URL+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	if code, out := runCozy(t, root, "package", "install", parityProject(t)); code != 0 {

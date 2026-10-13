@@ -22,8 +22,8 @@ func liveRentalResolver(ctx *Context, store *records.Store) rental.LiveResolver 
 // own Hub when it dials it); any other is resolved at the Hubs. Verbs that end or change a
 // rental resolve it at its Hub (resolveLiveRental).
 func selectedRental(ctx *Context, store *records.Store, name string) (string, *exit.Error) {
-	if row, _ := store.RentalByMachine(name); row != nil && !hub.RentalAbsent(row.State) && row.State != hub.RentalReleaseRequested {
-		return row.ID, nil
+	if id := recordedRental(store, name); id != "" {
+		return id, nil
 	}
 	live, problem := resolveLiveRental(ctx, store, name)
 	if problem != nil {
@@ -33,6 +33,15 @@ func selectedRental(ctx *Context, store *records.Store, name string) (string, *e
 		return "", exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
 	}
 	return live.Rental.ID, nil
+}
+
+// recordedRental is the ID of the rental this host recorded and still holds by that ID or name;
+// "" for any other.
+func recordedRental(store *records.Store, name string) string {
+	if row, _ := store.RentalByMachine(name); row != nil && !hub.RentalAbsent(row.State) && row.State != hub.RentalReleaseRequested {
+		return row.ID
+	}
+	return ""
 }
 
 // selectedHubFirst is every hub a rental may live on, the command's own first.
