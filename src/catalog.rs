@@ -261,7 +261,7 @@ impl HeldGeneration {
     pub fn runner(&self) -> RunnerConfig {
         RunnerConfig {
             python: self.record.python.clone(),
-            module: "cozy_machine_client.runner".into(),
+            module: "tensord_client.runner".into(),
             import_paths: vec![],
             generation_hold: Some(self.hold.clone()),
             unavailable: (!self.record.cpu_bridge.is_empty()).then(|| {

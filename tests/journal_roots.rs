@@ -3,7 +3,7 @@
 //! the paused one its children's results); the first tier of every pressured sweep
 //! (`gc::collect`, run here in the process that owns the store, as the machine runs it) then
 //! collects whatever nothing holds. Both runs are resumed and must finish whole.
-use cozy_machine::{
+use tensord::{
     api::install::InstallerConfig,
     execution::Engine,
     jobs::Jobs,
@@ -130,7 +130,7 @@ fn write_longform(objects: &Objects) -> String {
         archive.append_path_with_name(fixture.join(name), name).unwrap();
     }
     let (source, length) = write(objects, &archive.into_inner().unwrap());
-    let manifest = json!({"package": "local/cozy-machine-cpu-longform", "release": "0.1.0",
+    let manifest = json!({"package": "local/tensord-cpu-longform", "release": "0.1.0",
         "python_version": "3.12", "source": {"digest": source, "length": length}});
     write(objects, manifest.to_string().as_bytes()).0
 }

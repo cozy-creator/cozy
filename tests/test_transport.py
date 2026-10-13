@@ -8,9 +8,9 @@ import struct
 import msgspec
 import pytest
 
-from cozy_machine_client.client import FULL_SEALS, GET_SEALS, ProtocolError, read_exact, receive_fd, sealed_memfd, send_record
-from cozy_machine_client.protocol import MAX_FRAME, Hello, HelloReply, ObjectRef
-from cozy_machine_client.linux import MFD_ALLOW_SEALING, MFD_CLOEXEC, libc_memfd_create
+from tensord_client.client import FULL_SEALS, GET_SEALS, ProtocolError, read_exact, receive_fd, sealed_memfd, send_record
+from tensord_client.protocol import MAX_FRAME, Hello, HelloReply, ObjectRef
+from tensord_client.linux import MFD_ALLOW_SEALING, MFD_CLOEXEC, libc_memfd_create
 
 
 def descriptor_count():

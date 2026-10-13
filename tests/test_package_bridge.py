@@ -14,12 +14,12 @@ import pytest
 from cozy_runtime.author._services import ProgressFrame
 from packaging.version import Version
 
-from cozy_machine_client.execution_protocol import (
+from tensord_client.execution_protocol import (
     COMMAND_DECODER, EVENT_DECODER, Cancel, Canceled, Failed, Invoke, Progress, Ready, Result,
 )
-from cozy_machine_client.packages import GenerationHold, collect, describe, install, read_metadata
-from cozy_machine_client.package_records import GENERATION_DECODER, Generation
-from cozy_machine_client.progress import CompletedWork
+from tensord_client.packages import GenerationHold, collect, describe, install, read_metadata
+from tensord_client.package_records import GENERATION_DECODER, Generation
+from tensord_client.progress import CompletedWork
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "cpu_classifier"
@@ -59,7 +59,7 @@ def spawn_runner(generation):
     owner, child = socket.socketpair()
     # Timeout only bounds a broken test's wait; it never kills a production process.
     owner.settimeout(30)
-    process = subprocess.Popen([generation.python, "-m", "cozy_machine_client.runner",
+    process = subprocess.Popen([generation.python, "-m", "tensord_client.runner",
                                 "--execution-fd", str(child.fileno())],
                                pass_fds=[child.fileno()], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE)
@@ -126,7 +126,7 @@ def test_consumed_metadata_is_typed_and_unknown_extras_are_harmless(tmp_path):
     project = source / "pyproject.toml"
     project.write_text(project.read_text() + '\n[future.optional]\nnested = {x = [1, 2]}\n')
     metadata = read_metadata(source)
-    assert metadata.name == "cozy-machine-cpu-classifier"
+    assert metadata.name == "tensord-cpu-classifier"
     assert metadata.application == "cpu_classifier:app"
     project.write_text(project.read_text().replace('version = "0.1.0"', "version = 42"))
     with pytest.raises(msgspec.ValidationError):
@@ -264,5 +264,5 @@ def test_generation_collected_only_after_last_holder(tmp_path):
 def test_install_records_whether_the_cpu_runner_adapter_imports(generation):
     assert generation.cpu_bridge == ""
     # An interpreter without the adapter: the reason is recorded, the install is not refused.
-    from cozy_machine_client.packages import bridge_result, probe_cpu_bridge
-    assert "cozy_machine_client" in bridge_result(probe_cpu_bridge(Path("/usr/bin/python3")))
+    from tensord_client.packages import bridge_result, probe_cpu_bridge
+    assert "tensord_client" in bridge_result(probe_cpu_bridge(Path("/usr/bin/python3")))

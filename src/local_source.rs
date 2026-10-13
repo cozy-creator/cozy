@@ -597,7 +597,7 @@ mod tests {
         let tree = archive(&fixture, &["pyproject.toml", "package.toml", "cpu_input/__init__.py"]);
         let source = write(&objects, "alice", &tree);
         let manifest = serde_json::json!({
-            "package": "local/cozy-machine-cpu-input",
+            "package": "local/tensord-cpu-input",
             "release": "0.1.0",
             "python_version": "3.12",
             "source": {"digest": source.digest, "length": source.length},
@@ -614,7 +614,7 @@ mod tests {
         let installed = sources
             .install(&service, "alice", &manifest.digest)
             .unwrap();
-        assert_eq!(installed.package, "local/cozy-machine-cpu-input");
+        assert_eq!(installed.package, "local/tensord-cpu-input");
         let interface: serde_json::Value = serde_json::from_slice(&installed.interface).unwrap();
         assert!(interface["entrypoints"]
             .as_array()
@@ -665,7 +665,7 @@ mod tests {
         }
         fs::write(project.join("notes.txt"), "dropped by the edit").unwrap();
         let manifest = |files: Vec<serde_json::Value>, extra: serde_json::Value| {
-            let mut manifest = serde_json::json!({"package": "local/cozy-machine-cpu-input", "release": "0.1.0",
+            let mut manifest = serde_json::json!({"package": "local/tensord-cpu-input", "release": "0.1.0",
                 "python_version": "3.12", "files": files});
             manifest.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             write(&m.objects, "alice", manifest.to_string().as_bytes()).digest
@@ -673,7 +673,7 @@ mod tests {
         let none = serde_json::json!({});
         let first = manifest(live_files(&m.objects, "alice", &project, &["pyproject.toml", "package.toml", "cpu_input/__init__.py", "notes.txt"]), none.clone());
         let installed = sources.install(&m.service, "alice", &first).unwrap();
-        let home = sources.home("alice", "local/cozy-machine-cpu-input").unwrap();
+        let home = sources.home("alice", "local/tensord-cpu-input").unwrap();
         assert_eq!(fs::read_to_string(home.join("tree/notes.txt")).unwrap(), "dropped by the edit");
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         let environment = fs::read_link(m.installer.generations.join(&installed.generation).join("env")).unwrap();
@@ -715,7 +715,7 @@ mod tests {
         assert_eq!(sources.written("carol", &live).err().unwrap().code, "local_source_incomplete", "the manifest is hers to write");
         let live = {
             let files = vec![unchanged("pyproject.toml"), unchanged("package.toml"), unchanged("cpu_input/__init__.py")];
-            let document = serde_json::json!({"package": "local/cozy-machine-cpu-input", "release": "0.1.0", "python_version": "3.12",
+            let document = serde_json::json!({"package": "local/tensord-cpu-input", "release": "0.1.0", "python_version": "3.12",
                 "files": files, "path": project.to_string_lossy()});
             write(&m.objects, "carol", document.to_string().as_bytes()).digest
         };
@@ -724,13 +724,13 @@ mod tests {
         let python = m.service.catalog.resolve(&placed.generation).unwrap().record.python;
         let imported = run(Command::new(&python).args(["-I", "-c", "import cpu_input; print(cpu_input.__file__)"]));
         assert_eq!(Path::new(&imported), fs::canonicalize(project.join("cpu_input/__init__.py")).unwrap());
-        assert!(!sources.home("carol", "local/cozy-machine-cpu-input").unwrap().join("tree").exists());
+        assert!(!sources.home("carol", "local/tensord-cpu-input").unwrap().join("tree").exists());
 
         // An environment no generation names leaves; a package with none left leaves whole.
         fs::remove_dir_all(m.installer.generations.join(&placed.generation)).unwrap();
-        sources.collect("carol", "local/cozy-machine-cpu-input");
-        assert!(!sources.home("carol", "local/cozy-machine-cpu-input").unwrap().exists());
-        sources.collect("alice", "local/cozy-machine-cpu-input");
+        sources.collect("carol", "local/tensord-cpu-input");
+        assert!(!sources.home("carol", "local/tensord-cpu-input").unwrap().exists());
+        sources.collect("alice", "local/tensord-cpu-input");
         assert!(environment.is_dir());
         let _ = fs::remove_dir_all(m.root);
     }
@@ -756,22 +756,22 @@ mod tests {
         // The index the lock names is gone: only the carried wheel has the dependency.
         fs::remove_dir_all(&index).unwrap();
         let manifest = |wheels: serde_json::Value| {
-            let document = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+            let document = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
                 "files": live_files(&m.objects, "alice", &project, &[&files[..], &["uv.lock"]].concat()),
-                "wheels": wheels, "callees": {"cozy-machine-cpu-memo": "proof/cozy-machine-cpu-memo"}});
+                "wheels": wheels, "callees": {"tensord-cpu-memo": "proof/tensord-cpu-memo"}});
             write(&m.objects, "alice", document.to_string().as_bytes()).digest
         };
         let name = memo.file_name().unwrap().to_string_lossy();
         let with = manifest(serde_json::json!([{"name": name, "digest": carried.digest, "length": carried.length}]));
         let installed = sources.install(&m.service, "alice", &with).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
-        let callee = held.record.callees.iter().find(|c| c.distribution == "cozy-machine-cpu-memo").expect("the carried callee App");
-        assert_eq!((callee.package.as_str(), callee.version.as_str()), ("proof/cozy-machine-cpu-memo", "0.1.0"));
+        let callee = held.record.callees.iter().find(|c| c.distribution == "tensord-cpu-memo").expect("the carried callee App");
+        assert_eq!((callee.package.as_str(), callee.version.as_str()), ("proof/tensord-cpu-memo", "0.1.0"));
         // Its environment built, the wheels it was built from are no longer asked for.
         assert_eq!(sources.written("alice", &with).unwrap().len(), 1);
         // Without the wheel the lock's own source is all there is, and uv says so.
         let why = sources.install(&m.service, "alice", &manifest(serde_json::json!([]))).err().unwrap().message;
-        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("cozy-machine-cpu-memo"), "{why}");
+        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("tensord-cpu-memo"), "{why}");
         let _ = fs::remove_dir_all(m.root);
     }
 
@@ -798,8 +798,8 @@ mod tests {
             fs::copy(fixtures.join("cpu_caller").join(name), project.join(name)).unwrap();
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv.sources]\ncozy-machine-cpu-memo = { index = \"tensorhub\" }\n").unwrap();
-        let simple = served.join("simple/cozy-machine-cpu-memo");
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv.sources]\ntensord-cpu-memo = { index = \"tensorhub\" }\n").unwrap();
+        let simple = served.join("simple/tensord-cpu-memo");
         run(Command::new("uv").current_dir(fixtures.join("cpu_memo")).args(["build", "--wheel", "--out-dir"]).arg(&simple));
         let memo = fs::read_dir(&simple).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
         let name = memo.file_name().unwrap().to_string_lossy().to_string();
@@ -819,14 +819,14 @@ mod tests {
             fs::copy(project.join(name), unlocked.join(name)).unwrap();
         }
         let manifest = |dir: &Path, names: &[&str], indexes: serde_json::Value| {
-            let document = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+            let document = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
                 "files": live_files(&m.objects, "alice", dir, names), "path": dir.to_string_lossy(),
-                "indexes": indexes, "callees": {"cozy-machine-cpu-memo": "proof/cozy-machine-cpu-memo"}});
+                "indexes": indexes, "callees": {"tensord-cpu-memo": "proof/tensord-cpu-memo"}});
             write(&m.objects, "alice", document.to_string().as_bytes()).digest
         };
         let callee = |installed: Installation| {
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
-            assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
+            assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         };
         let locked = [&files[..], &["uv.lock"]].concat();
         callee(sources.install(&m.service, "alice", &manifest(&project, &locked, serde_json::json!({}))).unwrap());
@@ -855,12 +855,12 @@ mod tests {
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
         // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime<0.19\"]\n[tool.uv.sources]\ncozy-machine-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime<0.19\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let names = ["pyproject.toml", "package.toml", "uv.lock", "cpu_caller/__init__.py",
             "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"];
         let install = || {
-            let document = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+            let document = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
                 "files": live_files(&m.objects, "alice", &project, &names), "path": project.to_string_lossy(), "locals": ["deps/cpu_memo"]});
             let installed = sources.install(&m.service, "alice", &write(&m.objects, "alice", document.to_string().as_bytes()).digest).unwrap();
             m.service.catalog.resolve(&installed.generation).unwrap().record.python
@@ -899,7 +899,7 @@ mod tests {
         let wheel = write(&m.objects, "alice", &fs::read(&built).unwrap());
         let locked = write(&m.objects, "alice", requirements.as_bytes());
         let name = built.file_name().unwrap().to_string_lossy();
-        let manifest = serde_json::json!({"package": "local/cozy-machine-cpu-input", "release": "0.1.0", "python_version": "3.12",
+        let manifest = serde_json::json!({"package": "local/tensord-cpu-input", "release": "0.1.0", "python_version": "3.12",
             "wheels": [{"name": name, "digest": wheel.digest, "length": wheel.length}],
             "requirements": {"digest": locked.digest, "length": locked.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
@@ -924,17 +924,17 @@ mod tests {
         let compiled = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header", "--constraint"])
             .arg(m.root.join("settled.txt")).arg("--find-links")
             .arg(memo.parent().unwrap()).arg(repo.join("tests/fixtures/cpu_caller/pyproject.toml")));
-        let requirements = compiled.replace("cozy-machine-cpu-memo==0.1.0", &format!("cozy-machine-cpu-memo @ file://{}", memo.display()));
+        let requirements = compiled.replace("tensord-cpu-memo==0.1.0", &format!("tensord-cpu-memo @ file://{}", memo.display()));
         let wheel = write(&m.objects, "alice", &fs::read(&caller).unwrap());
         let locked = write(&m.objects, "alice", requirements.as_bytes());
         let name = caller.file_name().unwrap().to_string_lossy();
-        let manifest = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+        let manifest = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
             "wheels": [{"name": name, "digest": wheel.digest, "length": wheel.length}],
             "requirements": {"digest": locked.digest, "length": locked.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
         let installed = sources.install(&m.service, "alice", &manifest.digest).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
-        assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
+        assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
         assert!(!fs::symlink_metadata(site.join("cpu_memo/__init__.py")).unwrap().file_type().is_symlink());
         assert!(fs::symlink_metadata(site.join("msgspec/__init__.py")).unwrap().file_type().is_symlink());
@@ -950,17 +950,17 @@ mod tests {
             }
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime<0.19\"]\n[tool.uv.sources]\ncozy-machine-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime<0.19\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let tree = archive(&project, &["pyproject.toml", "uv.lock", "package.toml", "cpu_caller/__init__.py",
             "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"]);
         let source = write(&m.objects, "alice", &tree);
-        let manifest = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+        let manifest = serde_json::json!({"package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
             "source": {"digest": source.digest, "length": source.length}});
         let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
         let installed = sources.install(&m.service, "alice", &manifest.digest).unwrap();
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
-        assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
+        assert!(held.record.callees.iter().any(|c| c.distribution == "tensord-cpu-memo"), "{:?}", held.record.callees);
         let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
         for copied in ["cpu_caller/__init__.py", "cpu_memo/__init__.py"] {
             assert!(!fs::symlink_metadata(site.join(copied)).unwrap().file_type().is_symlink(), "{copied} is linked");
@@ -1002,7 +1002,7 @@ mod tests {
         .unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let manifest = |extra: serde_json::Value| {
-            let mut manifest = serde_json::json!({"package": "local/cozy-machine-cpu-input", "release": "0.1.0", "python_version": "3.12"});
+            let mut manifest = serde_json::json!({"package": "local/tensord-cpu-input", "release": "0.1.0", "python_version": "3.12"});
             manifest.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             write(&m.objects, "alice", manifest.to_string().as_bytes()).digest
         };
@@ -1020,10 +1020,10 @@ mod tests {
         let requirements = run(Command::new("uv").args([
             "export", "--frozen", "--no-dev", "--no-emit-project", "--no-emit-package", "cozy-runtime", "--project",
         ]).arg(&project));
-        let root_wheel = wheels.join("cozy_machine_cpu_input-0.1.0-py3-none-any.whl");
+        let root_wheel = wheels.join("tensord_cpu_input-0.1.0-py3-none-any.whl");
         let carried = manifest(serde_json::json!({
             "wheels": [
-                member("cozy_machine_cpu_input-0.1.0-py3-none-any.whl", &fs::read(root_wheel).unwrap()),
+                member("tensord_cpu_input-0.1.0-py3-none-any.whl", &fs::read(root_wheel).unwrap()),
                 member(vendored.trim_start_matches("vendor/"), &fs::read(project.join(&vendored)).unwrap()),
             ],
             "requirements": member("requirements.txt", requirements.as_bytes()),

@@ -12,9 +12,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from cozy_machine_client.client import Client, MachineError
-from cozy_machine_client.execution_client import ExecutionClient
-from cozy_machine_client.protocol import Shutdown, ShutdownReply
+from tensord_client.client import Client, MachineError
+from tensord_client.execution_client import ExecutionClient
+from tensord_client.protocol import Shutdown, ShutdownReply
 
 
 def terminal(client, identifier, seconds=30):

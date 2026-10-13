@@ -82,18 +82,18 @@ impl ProviderSelf {
         for copy in copies(root) {
             match scrub(&copy, &secrets) {
                 Ok(true) => eprintln!(
-                    "cozy-machine: removed the provider key from {}",
+                    "tensord: removed the provider key from {}",
                     copy.display()
                 ),
                 Ok(false) => (),
                 Err(error) => eprintln!(
-                    "cozy-machine: cannot remove the provider key from {}: {error}",
+                    "tensord: cannot remove the provider key from {}: {error}",
                     copy.display()
                 ),
             }
         }
         let error = reexec(own.as_ref());
-        eprintln!("cozy-machine: cannot restart without the provider key in the environment ({error}); children still never inherit it");
+        eprintln!("tensord: cannot restart without the provider key in the environment ({error}); children still never inherit it");
         for name in KEYS {
             std::env::remove_var(name);
         }
@@ -311,7 +311,7 @@ async fn call(
         .header("host", &host)
         .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
-        .header("user-agent", "cozy-machine")
+        .header("user-agent", "tensord")
         .body(Full::new(Bytes::from(body)))
         .map_err(io::Error::other)?;
     let response = if tls {

@@ -1,5 +1,5 @@
 use super::image_sdk;
-use cozy_machine::machine::update::Paths;
+use tensord::machine::update::Paths;
 use std::{fs, os::unix::fs::symlink, path::Path};
 
 const RUNTIME: &str = "cozy_runtime-0.21.1-py3-none-any.whl";
@@ -16,7 +16,7 @@ fn an_activated_sdk_selection_survives_a_same_filename_link_switch() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/sdk-selection")
         .join(uuid::Uuid::new_v4().to_string());
-    let engine = root.join("var/lib/cozy/rust-machine");
+    let engine = root.join("var/lib/cozy/tensord");
     let first = engine.join("sdk/first");
     let second = engine.join("sdk/second");
     pair(&first, b"first Runtime build");
@@ -69,7 +69,7 @@ fn image_sdk_selection_preserves_baked_and_absent_pair_behavior() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/sdk-selection")
         .join(uuid::Uuid::new_v4().to_string());
-    let engine = root.join("var/lib/cozy/rust-machine");
+    let engine = root.join("var/lib/cozy/tensord");
     let baked = root.join("opt/cozy/machine/wheels");
     let missing = image_sdk(&baked, &root, "uv".into());
     assert!(missing.requirements.is_empty());
@@ -91,7 +91,7 @@ fn image_sdk_selection_preserves_baked_and_absent_pair_behavior() {
 #[test]
 #[ignore = "requires COZY_SDK_TEST_RUNTIME_A/B, COZY_SDK_TEST_TENSORFS, COZY_SDK_TEST_REPORT and cached offline uv dependencies"]
 fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
-    use cozy_machine::{
+    use tensord::{
         api::install::InstallerConfig, local_source::LocalSources, machine::client,
         objects::Objects, service::Service,
     };
@@ -114,7 +114,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     let root = repo
         .join("target/sdk-installation")
         .join(uuid::Uuid::new_v4().to_string());
-    let engine = root.join("var/lib/cozy/rust-machine");
+    let engine = root.join("var/lib/cozy/tensord");
     let generations = root.join("generations");
     let first = engine.join("sdk/first");
     let second = engine.join("sdk/second");
@@ -155,14 +155,14 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     }
     let source = write(&archive.into_inner().unwrap());
     let manifest = write(
-        serde_json::json!({"package":"local/cozy-machine-cpu-lifecycle",
+        serde_json::json!({"package":"local/tensord-cpu-lifecycle",
         "release":"0.1.0","python_version":"3.12","source":source})
         .to_string()
         .as_bytes(),
     );
     let manifest = manifest["digest"].as_str().unwrap();
     let selected = || image_sdk(&paths.sdk(), &root, "uv".into());
-    let local = |sdk: &cozy_machine::published::PackageSdk| {
+    let local = |sdk: &tensord::published::PackageSdk| {
         LocalSources::new(
             objects.clone(),
             InstallerConfig {

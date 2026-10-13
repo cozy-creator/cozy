@@ -12,10 +12,10 @@ from pathlib import Path
 import pytest
 import tomllib
 
-from cozy_machine_client.captured_packages import install_captured, installed_description
-from cozy_machine_client.packages import GenerationHold, PackageError
-from cozy_machine_client.execution_protocol import Result
-from cozy_machine_client.package_records import GENERATION_DECODER
+from tensord_client.captured_packages import install_captured, installed_description
+from tensord_client.packages import GenerationHold, PackageError
+from tensord_client.execution_protocol import Result
+from tensord_client.package_records import GENERATION_DECODER
 from test_package_bridge import FIXTURE, ROOT, spawn_runner, send_command, invoke, terminal, finish
 
 
@@ -30,7 +30,7 @@ def capture(tmp_path_factory):
     subprocess.run(["uv", "build", "--wheel", "--out-dir", str(root / "client"), str(ROOT)], check=True)
     client = next((root / "client").glob("*.whl"))
     frozen = install_captured(project=source, wheels=[], requirements=None,
-        distribution="cozy-machine-cpu-classifier", release="0.1.0", python_requires=">=3.12", python_version="3.12",
+        distribution="tensord-cpu-classifier", release="0.1.0", python_requires=">=3.12", python_version="3.12",
         generations=root / "frozen", client_wheel=client, python="3.12")
     yield root, source, client, frozen
 
@@ -63,7 +63,7 @@ def test_real_wheel_roster_and_hashed_requirements_preserve_dependency_versions(
     requirements = root / "requirements.txt"
     subprocess.run(["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--project", str(source), "--output-file", str(requirements)], check=True)
     generation = install_captured(project=None, wheels=[wheel], requirements=requirements,
-        distribution="cozy-machine-cpu-classifier", release="0.1.0", python_requires=">=3.12", python_version="3.12",
+        distribution="tensord-cpu-classifier", release="0.1.0", python_requires=">=3.12", python_version="3.12",
         generations=root / "wheel-generations", client_wheel=client, python="3.12")
     before = {dependency.name: dependency.version for dependency in frozen.dependencies}
     after = {dependency.name: dependency.version for dependency in generation.dependencies}
@@ -75,11 +75,11 @@ def test_incoherent_source_lock_overlay_and_python_mismatch_refuse_only_installa
     root, source, client, generation = capture
     with pytest.raises(PackageError, match="cannot overlay"):
         install_captured(project=source, wheels=[client], requirements=None,
-            distribution="cozy-machine-cpu-classifier", release="0.1.0", python_requires="", python_version="",
+            distribution="tensord-cpu-classifier", release="0.1.0", python_requires="", python_version="",
             generations=root / "unsupported", client_wheel=client, python="3.12")
     with pytest.raises(PackageError, match="does not match"):
         install_captured(project=source, wheels=[], requirements=None,
-            distribution="cozy-machine-cpu-classifier", release="0.1.0", python_requires="", python_version="3.11",
+            distribution="tensord-cpu-classifier", release="0.1.0", python_requires="", python_version="3.11",
             generations=root / "unsupported", client_wheel=client, python="3.12")
     assert_inference(generation, root / "surviving-result")
 
@@ -92,7 +92,7 @@ def test_rust_tensorfs_materialization_and_trusted_installer_run_real_classifier
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
     subprocess.run([str(target / "debug/install-capture"), "--archive", str(archive), "--output", str(output),
         "--helper-python", sys.executable, "--client-wheel", str(client), "--python", "3.12",
-        "--package", "local/cozy-machine-cpu-classifier", "--release", "0.1.0"], check=True)
+        "--package", "local/tensord-cpu-classifier", "--release", "0.1.0"], check=True)
     generation = GENERATION_DECODER.decode((output / "prepared-generation.json").read_bytes())
     assert json.loads((output / "package-interface.json").read_bytes()) == json.loads(bytes(generation.interface))
     assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == "0.18.89"
@@ -106,9 +106,9 @@ def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(captu
     python = helper / "bin/python"
     subprocess.run(["uv", "pip", "install", "--python", str(python), str(client), "packaging"], check=True)
     subprocess.run([str(python), "-c", "import importlib.util;assert importlib.util.find_spec('cozy_runtime') is None"], check=True)
-    process = subprocess.run([str(python), "-m", "cozy_machine_client.installer", "install-captured",
+    process = subprocess.run([str(python), "-m", "tensord_client.installer", "install-captured",
         "--project", str(source), "--generations", str(root / "minimal-helper-generations"), "--client-wheel", str(client),
-        "--distribution", "cozy-machine-cpu-classifier", "--release", "0.1.0", "--python", "3.12"], check=True, capture_output=True)
+        "--distribution", "tensord-cpu-classifier", "--release", "0.1.0", "--python", "3.12"], check=True, capture_output=True)
     generation = GENERATION_DECODER.decode(process.stdout)
     assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == "0.18.89"
     site = next(Path(generation.python).parents[1].glob("lib/python*/site-packages"))
@@ -147,8 +147,8 @@ def test_an_installed_app_the_reader_refuses_fails_the_installation_naming_it(ca
     subprocess.run(["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--project", str(source), "--output-file", str(requirements)], check=True)
     refused = app_wheel(wheels, "refused_app", "from cozy_runtime.author import App\napp = App() if True else None\n")
     with pytest.raises(PackageError, match="installed package refused-app 0.1.0 cannot be described"):
-        install_captured(project=None, wheels=[next(wheels.glob("cozy_machine_cpu_classifier-*.whl")), refused],
-            requirements=requirements, distribution="cozy-machine-cpu-classifier", release="0.1.0", python_requires=">=3.12",
+        install_captured(project=None, wheels=[next(wheels.glob("tensord_cpu_classifier-*.whl")), refused],
+            requirements=requirements, distribution="tensord-cpu-classifier", release="0.1.0", python_requires=">=3.12",
             python_version="3.12", generations=root / "refused-generations", client_wheel=client, python="3.12")
 
 
@@ -161,7 +161,7 @@ def test_a_dependency_conflict_fails_the_installation_naming_it(capture):
     subprocess.run(["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--project", str(source), "--output-file", str(requirements)], check=True)
     conflicted = app_wheel(wheels, "conflicted_app", "from cozy_runtime.author import App\napp = App()\n", "Requires-Dist: numpy==1.0.0\n")
     with pytest.raises(PackageError, match="conflicted-app.* requires .numpy==1.0.0.") as raised:
-        install_captured(project=None, wheels=[next(wheels.glob("cozy_machine_cpu_classifier-*.whl")), conflicted],
-            requirements=requirements, distribution="cozy-machine-cpu-classifier", release="0.1.0", python_requires=">=3.12",
+        install_captured(project=None, wheels=[next(wheels.glob("tensord_cpu_classifier-*.whl")), conflicted],
+            requirements=requirements, distribution="tensord-cpu-classifier", release="0.1.0", python_requires=">=3.12",
             python_version="3.12", generations=root / "conflicted-generations", client_wheel=client, python="3.12")
     assert raised.value.code == "package_dependency_conflict"

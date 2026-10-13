@@ -2,11 +2,11 @@
 //! serve a request. Real executors and inference through the machine's own dispatch, GPU pool
 //! and custody; the front door is not in this path (`machine_surface.rs` covers its privacy).
 //!
-//! `COZY_MACHINE_GPU_TENANCY` names a JSON plan: `state`, `store`, `generations`, `gpu_config`,
+//! `TENSORD_GPU_TENANCY` names a JSON plan: `state`, `store`, `generations`, `gpu_config`,
 //! `entrypoint`, `input`, `output` (JSON lines) and `packages`: two published packages
 //! (`{package, release}`) of different publishers that bind the same checkpoint. On a card
 //! with room for both executors.
-use cozy_machine::{
+use tensord::{
     gpu_service::{GpuConfig, GpuPool},
     journal::{Execution, Preparation, State, SubmissionContext},
     process::process_ended,
@@ -165,7 +165,7 @@ fn bytes(held: &[HoldingFacts]) -> u64 {
 #[test]
 #[ignore = "rental GPU with installed generations and cached models"]
 fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights() {
-    let path = std::env::var("COZY_MACHINE_GPU_TENANCY").expect("plan path");
+    let path = std::env::var("TENSORD_GPU_TENANCY").expect("plan path");
     let plan: Plan = serde_json::from_reader(File::open(path).unwrap()).unwrap();
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
     let store = Arc::new(Store::ensure(&plan.store).unwrap());
@@ -266,7 +266,7 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
     // nothing.
     let birth = second.process.clone().unwrap();
     assert_eq!(
-        cozy_machine::execution::process_birth(birth.pid).unwrap(),
+        tensord::execution::process_birth(birth.pid).unwrap(),
         birth
     );
     // SAFETY: the exact process this test's pool started, by its recorded birth.

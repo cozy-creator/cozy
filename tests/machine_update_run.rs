@@ -3,7 +3,7 @@
 //! new service); the client attaches again across the restart and reads the outcome. A
 //! candidate whose service never proves readiness ends FAILED, rolled back.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use cozy_machine::api::{
+use tensord::api::{
     capability::{self, Grant},
     v1::{self, machine_client::MachineClient},
 };
@@ -47,7 +47,7 @@ fn wheel(distribution: &str, version: &str, script: Option<&[u8]>) -> (String, V
     zip.write_all(metadata.as_bytes()).unwrap();
     if let Some(script) = script {
         zip.start_file(
-            format!("{distribution}-{version}.data/scripts/cozy-machine"),
+            format!("{distribution}-{version}.data/scripts/tensord"),
             options,
         )
         .unwrap();
@@ -59,7 +59,7 @@ fn wheel(distribution: &str, version: &str, script: Option<&[u8]>) -> (String, V
 /// Puts `bytes` into the machine's store and records them as the owner's, as Write leaves an
 /// object; answers its digest.
 fn hold(root: &Path, bytes: &[u8]) -> String {
-    let engine = root.join("var/lib/cozy/rust-machine");
+    let engine = root.join("var/lib/cozy/tensord");
     let store = tensorfs_core::store::Store::ensure(&root.join("var/lib/tensorfs")).unwrap();
     let sha256 = tensorfs_core::sha256::hex(&tensorfs_core::sha256::digest(bytes));
     let object = tensorfs_core::ids::ObjectRef {
@@ -70,7 +70,7 @@ fn hold(root: &Path, bytes: &[u8]) -> String {
         .put_stream(&mut &bytes[..], Some(&object), &Default::default())
         .unwrap();
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
-    cozy_machine::journal::Journal::open(&engine.join("execution"))
+    tensord::journal::Journal::open(&engine.join("execution"))
         .unwrap()
         .bind_object(&tensorfs_core::sha256::hex(owner.as_bytes()), &object)
         .unwrap();
@@ -208,7 +208,7 @@ fn service_cmdline(parent: u32) -> String {
         .split_whitespace()
         .filter_map(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
         .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
-        .find(|line| line.contains("cozy-machine") || line.contains("agent/current"))
+        .find(|line| line.contains("tensord") || line.contains("agent/current"))
         .unwrap_or_default()
 }
 
@@ -226,10 +226,10 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     ] {
         std::fs::write(image.join(name), bytes).unwrap();
     }
-    let this_machine = std::fs::read(env!("CARGO_BIN_EXE_cozy-machine")).unwrap();
+    let this_machine = std::fs::read(env!("CARGO_BIN_EXE_tensord")).unwrap();
     let (runtime, runtime_bytes) = wheel("cozy_runtime", "0.18.103", Some(&this_machine));
     let (tensorfs, tensorfs_bytes) = wheel("tensorfs", "0.3.94", None);
-    let broken = b"#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"cozy-machine\",\"implementation\":\"rust\"}' && exit 0\nexit 3\n";
+    let broken = b"#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"tensord\"}' && exit 0\nexit 3\n";
     let (failing, failing_bytes) = wheel("cozy_runtime", "0.18.104", Some(broken));
     let (runtime_digest, tensorfs_digest, failing_digest) = (
         hold(&root, &runtime_bytes),
@@ -368,7 +368,7 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
 /// launch's readiness key (none: it cannot prove readiness).
 fn launch(root: &Path, port: u16, key: Option<[u8; 32]>, persistent: bool) -> Machine {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cozy-machine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tensord"));
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -427,7 +427,7 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
             .join("target/machine-update-recovery")
             .join(uuid::Uuid::new_v4().to_string());
         let image = root.join("opt/cozy/wheels");
-        let engine = root.join("var/lib/cozy/rust-machine");
+        let engine = root.join("var/lib/cozy/tensord");
         let candidate = engine.join("sdk/candidate");
         let updates = engine.join("update");
         for dir in [&image, &candidate, &updates, &engine.join("agent")] {
@@ -439,7 +439,7 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
             }
         }
         if state != "starting" || changed_links >= 3 {
-            std::fs::copy(env!("CARGO_BIN_EXE_cozy-machine"), candidate.join("cozy-machine")).unwrap();
+            std::fs::copy(env!("CARGO_BIN_EXE_tensord"), candidate.join("tensord")).unwrap();
         }
         // `starting` exercises a dangling selected executable. It must fail exec and roll
         // back, never fall through to the image executable and falsely commit the update.
@@ -458,7 +458,7 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
             let selected = if changed_links == 3 { engine.join("sdk/missing") } else { candidate.clone() };
             symlink(selected, engine.join("sdk/current")).unwrap();
         }
-        if changed_links >= 2 { symlink(candidate.join("cozy-machine"), engine.join("agent/current")).unwrap(); }
+        if changed_links >= 2 { symlink(candidate.join("tensord"), engine.join("agent/current")).unwrap(); }
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let mut machine = launch(&root, port, Some([7; 32]), true);
         let frame = self::status(&root, port).await;

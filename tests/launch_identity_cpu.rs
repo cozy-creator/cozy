@@ -1,5 +1,5 @@
 //! Real installed SDK trampoline CPU proof; no executor/model/GPU imports.
-use cozy_machine::launch_identity::{trampoline, LaunchIdentity};
+use tensord::launch_identity::{trampoline, LaunchIdentity};
 use serde_json::Value;
 use std::{fs, path::PathBuf};
 
@@ -7,7 +7,7 @@ use std::{fs, path::PathBuf};
 #[ignore = "requires an explicitly configured installed SDK interpreter; no GPU imports"]
 fn optional_same_uid_sdk_launch_seals_process_and_preserves_default_identity() {
     let python = PathBuf::from(
-        std::env::var("COZY_MACHINE_CPU_TEST_PYTHON")
+        std::env::var("TENSORD_CPU_TEST_PYTHON")
             .expect("installed SDK interpreter configuration"),
     );
     let identity = LaunchIdentity {
@@ -52,7 +52,7 @@ fn retained_child_is_killed_when_the_temporary_creator_thread_exits() {
         io::{BufRead, BufReader},
         os::{fd::FromRawFd, unix::process::ExitStatusExt},
     };
-    let python = PathBuf::from(std::env::var("COZY_MACHINE_CPU_TEST_PYTHON").unwrap());
+    let python = PathBuf::from(std::env::var("TENSORD_CPU_TEST_PYTHON").unwrap());
     let mut child = std::thread::spawn(move || {
         let mut child = trampoline(&python, None, None)
             .unwrap()
@@ -100,8 +100,8 @@ fn pool_launcher_keeps_retained_child_usable_after_requesting_thread_exits() {
         io::{BufRead, BufReader, Write},
         sync::Arc,
     };
-    let python = PathBuf::from(std::env::var("COZY_MACHINE_CPU_TEST_PYTHON").unwrap());
-    let launcher = Arc::new(cozy_machine::child_launcher::ChildLauncher::new().unwrap());
+    let python = PathBuf::from(std::env::var("TENSORD_CPU_TEST_PYTHON").unwrap());
+    let launcher = Arc::new(tensord::child_launcher::ChildLauncher::new().unwrap());
     let owner = launcher.clone();
     let (mut child,mut stdout)=std::thread::spawn(move || {
         let mut command=trampoline(&python, None, None).unwrap();

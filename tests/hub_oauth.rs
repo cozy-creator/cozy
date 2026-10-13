@@ -6,7 +6,7 @@
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
 
-use cozy_machine::hub::{reason, Capability, Catalog, Leaf, Op, Source};
+use tensord::hub::{reason, Capability, Catalog, Leaf, Op, Source};
 use serde_json::json;
 use std::{sync::Arc, thread::sleep, time::Duration};
 use tensorfs_core::transport::{AccessToken, DpopCredential, DpopKey, Publication};

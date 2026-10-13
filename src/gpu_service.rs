@@ -4432,7 +4432,7 @@ mod tests {
             ("cozy_runtime/__init__.py", ""),
             ("cozy_runtime/internal/__init__.py", ""),
             ("cozy_runtime/internal/machine_kernels.py", "import sys; print(__name__, sys.path[0])"),
-            ("cozy_runtime-9.9.9.data/scripts/cozy-machine", "not imported"),
+            ("cozy_runtime-9.9.9.data/scripts/tensord", "not imported"),
         ] {
             zip.start_file(name, options).unwrap();
             zip.write_all(body.as_bytes()).unwrap();

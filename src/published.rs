@@ -1929,7 +1929,7 @@ pub fn describe_environment(
     const BOOTSTRAP: &str = "import pathlib,runpy,sys;\
         root=pathlib.Path(sys.executable).absolute().parent.parent;\
         sys.path[:0]=[str(p) for p in (root/'lib').glob('python*/site-packages')];\
-        runpy.run_module('cozy_machine_client.runtime_describe',run_name='__main__')";
+        runpy.run_module('tensord_client.runtime_describe',run_name='__main__')";
     let described = Command::new(python)
         .args(["-I", "-S", "-c", BOOTSTRAP])
         .stdin(Stdio::piped())
@@ -2215,7 +2215,7 @@ mod tests {
         assert_eq!(packages, BTreeMap::from([("acme-pkg".to_string(), "acme/acme-pkg".to_string())]));
         let named = |packages: &BTreeMap<String, String>| {
             let script = format!(
-                "import importlib.metadata,json;from cozy_machine_client.distribution import package_name;\
+                "import importlib.metadata,json;from tensord_client.distribution import package_name;\
                  print(package_name(importlib.metadata.distribution('acme-pkg'),json.loads('{}')))",
                 serde_json::to_string(packages).unwrap()
             );

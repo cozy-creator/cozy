@@ -145,7 +145,7 @@ class Child:
     def __init__(self, socket_path: str, fixture_path: Path, logs: Path, number: int):
         self.log = (logs / f"executor-{number}.log").open("wb")
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "cozy_machine_client.cpu_gate", "--executor", "--socket", socket_path,
+            [sys.executable, "-m", "tensord_client.cpu_gate", "--executor", "--socket", socket_path,
              "--fixture", str(fixture_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
         )
         try:
@@ -277,7 +277,7 @@ def run_gate(binary: Path, output: Path, crashes: int) -> Evidence:
     host_allocation = ((fixture.object.length + page_size - 1) // page_size) * page_size
     children: list[Child] = []
     number = 0
-    with tempfile.TemporaryDirectory(prefix="cozy-machine-cpu-") as states:
+    with tempfile.TemporaryDirectory(prefix="tensord-cpu-") as states:
         service = Service(binary, Path(states) / "host", host_allocation, output / "machine-host.log")
         try:
             compatibility(service.socket)

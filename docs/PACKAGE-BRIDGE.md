@@ -1,6 +1,6 @@
 # Package bridge
 
-`python/cozy_machine_client` builds immutable uv environment generations and runs one CPU attempt
+`python/tensord_client` builds immutable uv environment generations and runs one CPU attempt
 in one through the Runtime author kernel (`prepare` + `invoke`). The wire and journal side are in
 `DURABLE-EXECUTION.md`.
 
@@ -15,7 +15,7 @@ atomically last. A generation is never updated. `catalog.rs` resolves one only u
   package code.
 - `install`: `uv build --wheel`, then a new venv with the package and client wheels. The package's
   own bounds apply. No SDK version is injected.
-- `install-captured` (`python -m cozy_machine_client.installer`, called by `api/install.rs`):
+- `install-captured` (`python -m tensord_client.installer`, called by `api/install.rs`):
   - Python comes from `uv python find` and must match the captured `python_requires`/`python_version`.
   - Locked source: `uv sync --frozen --no-dev --no-editable`.
   - Hashed requirements: `--require-hashes`, then the wheels with `--no-deps`.
@@ -58,7 +58,7 @@ other calls and same-App aliases continue to work.
 ## Runner (`runner.py`, `runtime_bridge.py`)
 
 `<generation python> -I -m cozy_runtime.internal.trampoline … -- <generation python> -m
-cozy_machine_client.runner --execution-fd N` (see durable execution).
+tensord_client.runner --execution-fd N` (see durable execution).
 
 1. Send `Ready` before importing Runtime or package code.
 2. Accept exactly one `Invoke`.

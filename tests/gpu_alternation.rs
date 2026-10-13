@@ -2,12 +2,12 @@
 //! dispatch, GPU pool and memory policy, with real executors and inference. The front door and
 //! Hub are not in this path, so it is not ordinary-CLI proof.
 //!
-//! `COZY_MACHINE_GPU_ALTERNATION` names a JSON plan: `state`, `store`, `generations`,
+//! `TENSORD_GPU_ALTERNATION` names a JSON plan: `state`, `store`, `generations`,
 //! `gpu_config`, `actor`, `models: {name: {package, release, entrypoint, input}}`, `order`
 //! (model names), `output` (JSON lines), and optional `squeeze: {at, start, release}`: before
 //! request `at`, run `start` (a ballast taking device memory while the call runs) and create
 //! `release` once that request ends.
-use cozy_machine::{
+use tensord::{
     gpu_service::{GpuConfig, GpuPool},
     journal::{Preparation, State, SubmissionContext},
     service::Service,
@@ -54,7 +54,7 @@ struct Plan {
 #[test]
 #[ignore = "rental GPU with installed generations and cached models"]
 fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
-    let path = std::env::var("COZY_MACHINE_GPU_ALTERNATION").expect("plan path");
+    let path = std::env::var("TENSORD_GPU_ALTERNATION").expect("plan path");
     let plan: Plan = serde_json::from_reader(File::open(path).unwrap()).unwrap();
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
     let store = Arc::new(Store::ensure(&plan.store).unwrap());
@@ -127,7 +127,7 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
             .submit_public(
                 context,
                 &installed.generation,
-                cozy_machine::service::Call {
+                tensord::service::Call {
                     entrypoint: model.entrypoint.clone(),
                     input: input.clone(),
                     ..Default::default()

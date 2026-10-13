@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cozy-machine-client"
+name = "tensord-client"
 version = "0.1.0"
 description = "Experimental typed Unix-socket client for Cozy machine component qualification"
 requires-python = ">=3.11"
@@ -15,7 +15,7 @@ installer = ["packaging>=24,<27"]
 test = ["cozy-runtime>=0.19,<0.20; python_version >= '3.12'", "numpy>=2,<3", "scikit-learn>=1.5,<2", "pytest>=8,<10"]
 
 [project.scripts]
-cozy-machine-cpu-gate = "cozy_machine_client.cpu_gate:main"
+tensord-cpu-gate = "tensord_client.cpu_gate:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]

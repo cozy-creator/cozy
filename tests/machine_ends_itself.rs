@@ -16,7 +16,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use cozy_machine::api::{
+use tensord::api::{
     capability::{self, Grant},
     v1::{self, machine_client::MachineClient},
 };
@@ -38,7 +38,7 @@ fn launch(root: &Path, port: u16, provider: u16) -> Machine {
 fn launch_idle(root: &Path, port: u16, provider: u16, idle: u32) -> Machine {
     let owner = SigningKey::from_bytes(&[3; 32]).verifying_key();
     Machine(
-        Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
+        Command::new(env!("CARGO_BIN_EXE_tensord"))
             .env_clear()
             .env("COZY_RENTAL_IDLE_SECONDS", idle.to_string())
             .env("PATH", "/usr/bin:/bin")
@@ -187,9 +187,9 @@ fn a_rental_the_hub_cannot_hear_ends_itself_at_its_provider() {
 
     // The same boot after its idle deadline, the Hub silent the whole window, now serving an
     // activated Runtime update: the parent hands the key to that service.
-    let agent = root.join("var/lib/cozy/rust-machine/agent");
+    let agent = root.join("var/lib/cozy/tensord/agent");
     std::fs::create_dir_all(&agent).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_cozy-machine"), agent.join("current")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tensord"), agent.join("current")).unwrap();
     let ledger = root.join("var/lib/cozy/machine/idle.json");
     let mut idle: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
@@ -260,12 +260,12 @@ fn an_older_service_is_never_handed_the_provider_key() {
         .join("target/machine-older-service")
         .join(std::process::id().to_string());
     let _ = std::fs::remove_dir_all(&root);
-    let agent = root.join("var/lib/cozy/rust-machine/agent");
+    let agent = root.join("var/lib/cozy/tensord/agent");
     std::fs::create_dir_all(&agent).unwrap();
     let older = agent.join("older");
     std::fs::write(
         &older,
-        "#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"cozy-machine\",\"implementation\":\"rust\",\"capabilities\":[]}' && exit 0\nls /proc/$$/fd > \"$COZY_MACHINE_ROOT/service-fds.part\" && mv \"$COZY_MACHINE_ROOT/service-fds.part\" \"$COZY_MACHINE_ROOT/service-fds\"\nexec sleep 60\n",
+        "#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"tensord\",\"capabilities\":[]}' && exit 0\nls /proc/$$/fd > \"$COZY_MACHINE_ROOT/service-fds.part\" && mv \"$COZY_MACHINE_ROOT/service-fds.part\" \"$COZY_MACHINE_ROOT/service-fds\"\nexec sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&older, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
@@ -534,14 +534,14 @@ async fn a_restart_neither_shortens_nor_extends_the_idle_clock() {
 /// releases itself one idle window later.
 #[tokio::test]
 async fn a_job_that_cannot_start_fails_once_and_the_rental_idles_out() {
-    use cozy_machine::journal::{Invocation, Journal, State};
+    use tensord::journal::{Invocation, Journal, State};
     let root = root("idle-unstartable");
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let (provider_port, received) = provider();
     let mut machine = launch(&root, port, provider_port);
     ready(&mut machine, &root, port);
     stop(&mut machine);
-    let journal_root = root.join("var/lib/cozy/rust-machine/execution");
+    let journal_root = root.join("var/lib/cozy/tensord/execution");
     let mut journal = Journal::open(&journal_root).unwrap();
     let job = || Invocation { package: "acme/absent".into(), input: serde_json::json!({}), ..Default::default() };
     let queued = journal.accept("left-queued", job()).unwrap().id;

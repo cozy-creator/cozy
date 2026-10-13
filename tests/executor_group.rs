@@ -1,9 +1,9 @@
 //! A degree-2 start on a real Runtime executor (`tests/fixtures/cpu_group`), no doubles: rank 0
 //! spawns a real follower under the group seal, the follower dials back, the start is refused
 //! (no torch is installed, so no device is touched) in the executor's own words, and teardown
-//! leaves no member of the group. `COZY_MACHINE_GROUP_GENERATIONS` names the installed
+//! leaves no member of the group. `TENSORD_GROUP_GENERATIONS` names the installed
 //! generations directory.
-use cozy_machine::{
+use tensord::{
     device_executor::{Baseline, DeviceCommand, DeviceExecutor, ExecutorConfig},
     journal::ProcessBirth,
     launch_identity::Seal,
@@ -35,7 +35,7 @@ struct Generation {
 
 fn generation() -> (Generation, File) {
     let root = PathBuf::from(
-        std::env::var("COZY_MACHINE_GROUP_GENERATIONS").expect("installed cpu_group generation"),
+        std::env::var("TENSORD_GROUP_GENERATIONS").expect("installed cpu_group generation"),
     );
     let path = fs::read_dir(root).unwrap().next().unwrap().unwrap().path();
     let hold = File::open(path.join(".hold")).unwrap();
@@ -184,14 +184,14 @@ fn a_degree_the_seal_does_not_name_is_refused_before_any_follower() {
 
 /// Fork for groups: an import-only parent sealed to one GPU forks a child that takes the
 /// group's device list and NCCL seal with its environment, and that child forms the group
-/// (rank 0 spawns its follower under the same seal). `COZY_MACHINE_GROUP_FORK_GENERATIONS`
+/// (rank 0 spawns its follower under the same seal). `TENSORD_GROUP_FORK_GENERATIONS`
 /// names a generation whose Runtime offers `fork/1` and has CPU torch (no device is touched).
 #[test]
 #[ignore = "needs a fork/1 cpu_group generation with CPU torch"]
 fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
-    use cozy_machine::device_executor::{Forked, FORK};
+    use tensord::device_executor::{Forked, FORK};
     let root_dir = PathBuf::from(
-        std::env::var("COZY_MACHINE_GROUP_FORK_GENERATIONS").expect("fork/1 generation"),
+        std::env::var("TENSORD_GROUP_FORK_GENERATIONS").expect("fork/1 generation"),
     );
     let path = fs::read_dir(root_dir)
         .unwrap()

@@ -1,6 +1,6 @@
-//! The real `cozy-machine serve` process behind its TLS/gRPC API, called as the CLI calls it.
+//! The real `tensord serve` process behind its TLS/gRPC API, called as the CLI calls it.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use cozy_machine::journal::Journal;
+use tensord::journal::Journal;
 use ed25519_dalek::SigningKey;
 use std::{
     fs,
@@ -97,7 +97,7 @@ fn actor_of(key: &[u8; 32]) -> String {
 fn launch(root: &Path, extra: &[std::ffi::OsString]) -> (Child, String) {
     let state = root.join("state");
     let _ = fs::remove_file(state.join("api-ready.json"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensord"))
         .args(["serve", "--state"])
         .arg(&state)
         .arg("--machine-config")
@@ -126,7 +126,7 @@ fn hold_classifier(state: &Path, actor: &str) {
     const INSTALL: &str = r#"
 import json, subprocess, sys
 from pathlib import Path
-from cozy_machine_client.packages import install
+from tensord_client.packages import install
 fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
 subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
 generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12")
@@ -163,7 +163,7 @@ print(json.dumps({"identity": generation.identity}))
     .unwrap();
     Journal::open(&state.join("execution"))
         .unwrap()
-        .bind_installation(cozy_machine::journal::Installation {
+        .bind_installation(tensord::journal::Installation {
             actor: actor.into(),
             alias: "fixture".into(),
             generation: identity.into(),
@@ -177,7 +177,7 @@ print(json.dumps({"identity": generation.identity}))
 
 mod v1_api {
     use super::*;
-    use cozy_machine::api::{
+    use tensord::api::{
         capability::{mint, Grant, MACHINE},
         v1,
     };
@@ -484,7 +484,7 @@ mod v1_api {
             let mut journal = Journal::open(&state.join("execution")).unwrap();
             let held = journal.installations(actor).unwrap().remove(0);
             journal
-                .bind_installation(cozy_machine::journal::Installation {
+                .bind_installation(tensord::journal::Installation {
                     actor: actor_of(&OTHER),
                     ..held
                 })
@@ -893,7 +893,7 @@ mod v1_api {
                 &mut peer,
                 &all,
                 "cpu_weights",
-                "local/cozy-machine-cpu-weights",
+                "local/tensord-cpu-weights",
             )
             .await;
             let mut stream = peer
@@ -1035,7 +1035,7 @@ mod v1_api {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_weights", "local/cozy-machine-cpu-weights").await;
+        let manifest = write_package(&mut client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
         let job = v1::RunSpec {
             kind: v1::RunKind::Job as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
@@ -1528,7 +1528,7 @@ mod v1_api {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_tree", "local/cozy-machine-cpu-tree").await;
+        let manifest = write_package(&mut client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
         let files: [(&str, &[u8]); 2] = [("a.txt", b"alpha"), ("nested/b.bin", b"\x00\x01beta")];
         let mut entries = vec![];
         for (path, body) in files {
@@ -1598,7 +1598,7 @@ mod v1_api {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_tree", "local/cozy-machine-cpu-tree").await;
+        let manifest = write_package(&mut client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
         let spec = v1::RunSpec {
             kind: v1::RunKind::Job as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
@@ -1638,7 +1638,7 @@ mod v1_api {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_tree", "local/cozy-machine-cpu-tree").await;
+        let manifest = write_package(&mut client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
         let spec = v1::RunSpec {
             kind: v1::RunKind::Job as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
@@ -1698,7 +1698,7 @@ mod v1_api {
             ..Default::default()
         });
         let manifest =
-            write_package(&mut client, &all, "cpu_memo", "local/cozy-machine-cpu-memo").await;
+            write_package(&mut client, &all, "cpu_memo", "local/tensord-cpu-memo").await;
         let counter = machine.root.join("measured");
         let survey = |id: &str, values: &[i64]| {
             let spec = v1::RunSpec {
@@ -1762,7 +1762,7 @@ mod v1_api {
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let names = ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"];
         let project = project("cpu_memo", &names);
-        let package = "local/cozy-machine-cpu-memo";
+        let package = "local/tensord-cpu-memo";
         let mut manifest = write_live(&mut client, &all, &project, package, &names).await;
         let (counter, noted) = (machine.root.join("measured"), machine.root.join("noted"));
         let mut runner = client.clone();
@@ -1853,7 +1853,7 @@ mod v1_api {
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let names = ["pyproject.toml", "package.toml", "cpu_seeded/__init__.py"];
         let project = project("cpu_seeded", &names);
-        let manifest = write_live(&mut client, &all, &project, "local/cozy-machine-cpu-seeded", &names).await;
+        let manifest = write_live(&mut client, &all, &project, "local/tensord-cpu-seeded", &names).await;
         let counter = machine.root.join("painted");
         let mut runner = client.clone();
         let mut run = async |id: &str, kind: v1::RunKind, entrypoint: &str, payload: serde_json::Value| {
@@ -1942,7 +1942,9 @@ mod v1_api {
             .status()
             .unwrap();
         assert!(status.success());
-        let wheel = fs::read_dir(&built).unwrap().next().unwrap().unwrap().path();
+        // uv also writes a .gitignore into the out dir.
+        let wheel = fs::read_dir(&built).unwrap().map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
         let bytes = fs::read(&wheel).unwrap();
         let wheel_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
         write(&mut client, &all, &wheel_digest, bytes.len() as u64, 0, &bytes).await.unwrap();
@@ -1956,10 +1958,10 @@ mod v1_api {
         let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
         write(&mut client, &all, &digest, source.len() as u64, 0, &source).await.unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
-            "package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+            "package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
             "source": {"digest": digest, "length": source.len()},
             "wheels": [{"name": wheel.file_name().unwrap().to_str().unwrap(), "digest": wheel_digest, "length": bytes.len()}],
-            "callees": {"cozy-machine-cpu-memo": "local/cozy-machine-cpu-memo"}}))
+            "callees": {"tensord-cpu-memo": "local/tensord-cpu-memo"}}))
         .unwrap();
         let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
         write(&mut client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
@@ -2150,28 +2152,28 @@ mod v1_api {
             .map(|g| g.path().join("env/bin/python"))
             .find(|p| p.exists())
             .unwrap();
-        let (digest, callees) = cozy_machine::published::describe_environment(
+        let (digest, callees) = tensord::published::describe_environment(
             python.to_str().unwrap(),
-            "cozy-machine-cpu-caller",
+            "tensord-cpu-caller",
             &Default::default(),
         ).unwrap();
         assert!(digest.starts_with("sha256:"), "{digest}");
         assert_eq!(callees[0].application, "cpu_memo:app", "{callees:?}");
-        assert_eq!(callees[0].package, "local/cozy-machine-cpu-memo");
+        assert_eq!(callees[0].package, "local/tensord-cpu-memo");
         // The root and callee can both be immutable wheels; no source archive is needed.
         assert!(std::process::Command::new("uv").args(["build", "--wheel", "--out-dir"])
             .arg(&built).arg(fixtures.join("cpu_caller")).status().unwrap().success());
         let root_wheel = fs::read_dir(&built).unwrap().flatten()
-            .map(|entry| entry.path()).find(|path| path.file_name().unwrap().to_str().unwrap().starts_with("cozy_machine_cpu_caller-")).unwrap();
+            .map(|entry| entry.path()).find(|path| path.file_name().unwrap().to_str().unwrap().starts_with("tensord_cpu_caller-")).unwrap();
         let root_bytes = fs::read(&root_wheel).unwrap();
         let root_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&root_bytes));
         write(&mut client, &all, &root_digest, root_bytes.len() as u64, 0, &root_bytes).await.unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
-            "package":"local/cozy-machine-cpu-caller","release":"0.1.0","python_version":"3.12",
+            "package":"local/tensord-cpu-caller","release":"0.1.0","python_version":"3.12",
             "wheels":[
                 {"name":root_wheel.file_name().unwrap().to_str().unwrap(),"digest":root_digest,"length":root_bytes.len()},
                 {"name":wheel.file_name().unwrap().to_str().unwrap(),"digest":wheel_digest,"length":bytes.len()}],
-            "callees":{"cozy-machine-cpu-memo":"local/cozy-machine-cpu-memo"}
+            "callees":{"tensord-cpu-memo":"local/tensord-cpu-memo"}
         })).unwrap();
         let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
         write(&mut client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
@@ -2211,9 +2213,9 @@ mod v1_api {
                 .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(prefix)).unwrap();
             (path.file_name().unwrap().to_str().unwrap().to_string(), fs::read(&path).unwrap())
         };
-        let ((root, root_bytes), callee) = (wheel("cozy_machine_cpu_caller-"), wheel("cozy_machine_cpu_memo-"));
+        let ((root, root_bytes), callee) = (wheel("tensord_cpu_caller-"), wheel("tensord_cpu_memo-"));
         let described = Command::new(installing_args(&tools)[1].clone())
-            .args(["-m", "cozy_machine_client.runtime_describe"])
+            .args(["-m", "tensord_client.runtime_describe"])
             .env("PYTHONPATH", Path::new(env!("CARGO_MANIFEST_DIR")).join("python"))
             .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
             .spawn().and_then(|mut child| {
@@ -2240,7 +2242,7 @@ mod v1_api {
             }).unwrap();
         assert!(pypi.status.success());
         let package = names_hub::Package {
-            name: "acme/cozy-machine-cpu-caller".into(), release: "0.1.0".into(),
+            name: "acme/tensord-cpu-caller".into(), release: "0.1.0".into(),
             interface: described["interface"].clone(), wheel: root, bytes: root_bytes, callees: vec![callee],
             pypi: String::from_utf8(pypi.stdout).unwrap(),
         };
@@ -2250,7 +2252,7 @@ mod v1_api {
             id: "published-relay".into(), after: 0, spec: Some(v1::RunSpec {
                 kind: v1::RunKind::Job as i32, entrypoint: "relay".into(), owner: "alice".into(),
                 source: Some(v1::run_spec::Source::Release(v1::Release {
-                    package: "acme/cozy-machine-cpu-caller".into(), release: "0.1.0".into() })),
+                    package: "acme/tensord-cpu-caller".into(), release: "0.1.0".into() })),
                 payload: serde_json::to_vec(&serde_json::json!({"values": [3, 4], "counter": counter})).unwrap(),
                 hub: Some(v1::HubAccess { origin, object_hosts: vec!["localhost".into()], ..Default::default() }),
                 catalog_revision: "r1".into(),
@@ -2270,10 +2272,10 @@ mod v1_api {
             .filter_map(|g| fs::read(g.path().join("generation.json")).ok())
             .filter_map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
             .flat_map(|record| record["callees"].as_array().cloned().unwrap_or_default())
-            .filter(|callee| callee["distribution"] == "cozy-machine-cpu-memo" || callee["distribution"] == "cozy_machine_cpu_memo")
+            .filter(|callee| callee["distribution"] == "tensord-cpu-memo" || callee["distribution"] == "tensord_cpu_memo")
             .map(|callee| callee["package"].as_str().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(named, ["acme/cozy-machine-cpu-memo"]);
+        assert_eq!(named, ["acme/tensord-cpu-memo"]);
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(tools);
     }
@@ -2345,7 +2347,7 @@ mod v1_api {
             length
         );
         let manifest = serde_json::to_vec(&serde_json::json!({
-            "package": "local/cozy-machine-cpu-lifecycle", "release": "0.1.0",
+            "package": "local/tensord-cpu-lifecycle", "release": "0.1.0",
             "python_version": "3.12", "source": {"digest": digest, "length": length}}))
         .unwrap();
         let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
@@ -2398,7 +2400,7 @@ mod v1_api {
         let installed = outcome(&installed);
         assert_eq!(installed.status, "succeeded", "{installed:?}");
         let result: serde_json::Value = serde_json::from_slice(&installed.result).unwrap();
-        assert_eq!(result["package"], "local/cozy-machine-cpu-lifecycle");
+        assert_eq!(result["package"], "local/tensord-cpu-lifecycle");
         assert_eq!(result["models"], serde_json::json!([]));
         // A warm run's set is the caller's warm set: Status shows each member as it was sent,
         // with what it holds now. This function binds no model, so it holds its code.
@@ -2486,7 +2488,7 @@ mod v1_api {
             &mut client,
             &all,
             "cpu_longform",
-            "local/cozy-machine-cpu-longform",
+            "local/tensord-cpu-longform",
         )
         .await;
         let mut reference = vec![];
@@ -2860,7 +2862,7 @@ mod v1_api {
             &mut client,
             &all,
             "cpu_longform",
-            "local/cozy-machine-cpu-longform",
+            "local/tensord-cpu-longform",
         )
         .await;
         let mut reference = vec![];
@@ -3114,7 +3116,7 @@ mod v1_api {
             &mut client,
             &all,
             "cpu_longform",
-            "local/cozy-machine-cpu-longform",
+            "local/tensord-cpu-longform",
         )
         .await;
         let mut reference = vec![];
@@ -3187,7 +3189,7 @@ mod v1_api {
             &mut client,
             &all,
             "cpu_longform",
-            "local/cozy-machine-cpu-longform",
+            "local/tensord-cpu-longform",
         )
         .await;
         let mut reference = vec![];

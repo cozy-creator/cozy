@@ -8,7 +8,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 
 ## Configuration
 
-`cozy-machine serve --gpu-config <json>` loads a root-sealed `GpuConfig`:
+`tensord serve --gpu-config <json>` loads a root-sealed `GpuConfig`:
 - `devices`: the GPU envelope, `"0"` or `"0,1,..."`. A plan of degree K > 1 runs on the first K;
   a one-GPU plan on any of them. An executor is sealed to its lane (`CUDA_VISIBLE_DEVICES`).
 - `models: [ModelGrant { package, slot, repository, release, lane, manifest, components }]`: the only
